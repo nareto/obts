@@ -1,23 +1,23 @@
 # Obsidian True Sync (`obts`) — Agent-Ready Product + Technical Spec
 
-**Status:** Draft v0.1  
+**Status:** Draft v1.0
 **Date:** 2026-06-25  
 **Author:** Product/technical owner  
 **Audience:** Coding agents, future maintainers, engineers, technical product owner  
 **Working product name:** Obsidian True Sync  
-**Implementation/plugin identity:** `obts`, display name preferably `True Sync` unless plugin review allows the longer name  
+**Implementation/plugin identity:** `obts`, display name `True Sync`
 
 ---
 
 ## 0. Executive Summary
 
-`obts` is a self-hosted, end-to-end encrypted sync system for Obsidian vaults. It is designed for users who want the simplicity of “one Docker container on the server, one plugin on each client, URL + auth + passphrase, and it works,” while preserving local-first editing, recoverable history, and clear conflict handling.
+`obts` is a self-hosted, end-to-end encrypted sync system for Obsidian vaults. It is designed for users who want the simplicity of “one Docker Compose stack on the server, one plugin on each client, URL + auth + passphrase, and it works,” while preserving local-first editing, recoverable history, and clear conflict handling.
 
-The architectural center is a single canonical server state called **server main**. Clients are local-first: they can edit immediately, including while offline. Their edits are snapshotted into durable local proposals and uploaded to per-device lanes. The server accepts clean changes into `main`, quarantines ambiguous changes as structured conflict objects, and exposes a central conflict review UI. Because vault encryption is required, conflict review and semantic merges must run in a trusted client context — the Obsidian plugin or a client-side browser app after the user enters the vault passphrase. The server must never receive the vault encryption passphrase or plaintext note content.
+The architectural center is a single canonical server state called **server main**. Clients are local-first: they can edit immediately, including while offline. Their edits are snapshotted into durable local proposals and uploaded to per-device lanes. The server accepts clean changes into `main`, quarantines ambiguous changes as structured conflict objects, and exposes a central conflict review UI. Because vault encryption is required, conflict review and semantic merges must run in trusted client contexts: the Obsidian plugin provides the primary resolver, and the browser dashboard provides the owner-facing resolver after the user enters the vault passphrase. The server must never receive the vault encryption passphrase or plaintext note content.
 
 The user-facing promise is:
 
-> There is one canonical published vault on the server. Devices may be ahead, behind, offline, or blocked, and `obts` tells the user exactly which. Safe changes publish automatically. Ambiguous changes go to Review. Every local edit is preserved before anything can overwrite it.
+> There is one canonical published vault on the server. Devices can be ahead, behind, offline, and blocked, and `obts` tells the user exactly which. Safe changes publish automatically. Ambiguous changes go to Review. Every local edit is preserved before anything can overwrite it.
 
 ---
 
@@ -27,7 +27,7 @@ The user-facing promise is:
 
 `obts` consists of:
 
-1. A self-hosted server deployed as one Docker container.
+1. A self-hosted server deployed as one Docker Compose stack with Postgres.
 2. An Obsidian community plugin installed on each client.
 3. A browser-based dashboard/conflict UI served by the server but running crypto and merge logic client-side.
 4. A protocol and storage layer that uses Git-like immutable history on the server, but does not expose Git to users and does not place `.git` in the visible Obsidian vault.
@@ -61,7 +61,7 @@ Primary users:
 
 Secondary users:
 
-- small teams or households sharing a vault, deferred beyond MVP;
+- self-hosting operators who want one server for multiple isolated personal vault accounts;
 - power users who want recoverable history without thinking about Git.
 
 ## 1.3 Business Context & Ecosystem
@@ -75,7 +75,7 @@ Implementation must account for Obsidian plugin guidance, especially mobile cons
 ### Product goals
 
 1. **Boring setup**
-   - Server install: one Docker Compose file or one `docker run` command.
+   - Server install: one Docker Compose stack with server and Postgres.
    - Client setup: server URL, pairing token/login, vault passphrase, sync profile, device name.
    - No visible CouchDB/Git/chunk/adapter/internal replication settings.
 
@@ -91,7 +91,7 @@ Implementation must account for Obsidian plugin guidance, especially mobile cons
 
 4. **No silent data loss**
    - Before applying server changes that could overwrite local files, the client must have snapshotted local edits into durable local state.
-   - Every uploaded proposal is either merged, pending, conflicted, or recoverable.
+   - Every uploaded proposal reaches exactly one visible state: merged, pending, conflicted, or recoverable.
    - Conflict resolution creates new history; it never destroys the conflicting originals.
 
 5. **Central conflict UX**
@@ -104,12 +104,12 @@ Implementation must account for Obsidian plugin guidance, especially mobile cons
    - Client-side web UI decrypts conflicts locally after user enters passphrase.
 
 7. **Clear state visibility**
-   - Plugin status shows `Synced`, `Ahead`, `Behind`, `Uploading`, `Applying`, `Offline`, `Blocked: conflict`, `Unsafe local error`, or `Needs recovery`.
+   - Plugin status shows `Synced`, `Ahead`, `Behind`, `Uploading`, `Applying`, `Offline`, `Blocked: conflict`, `Unsafe local error`, and `Needs recovery`.
    - Dashboard shows each device’s last known state and last-seen time.
 
 ### Technical success metrics
 
-MVP acceptance targets:
+v1 acceptance targets:
 
 - Two online clients syncing a small Markdown change should converge to the same server `main` and local file content within 5 seconds on a normal LAN.
 - For disjoint file edits from two offline clients, server must auto-merge both into `main` without user input.
@@ -118,38 +118,32 @@ MVP acceptance targets:
 - Server restart during upload must not corrupt `main`; client retry must be idempotent.
 - Deleting/rebuilding a client from server must not require manual database repair.
 - No `.git` directory may be created inside the visible Obsidian vault.
+- Multi-account hosting must isolate each user's vaults, devices, objects, proposals, conflicts, and event streams from every other user.
+- Managed Obsidian and plugin configuration sync must use typed encrypted sync entries with explicit materializers, not raw `.obsidian` file replication.
+- Vault passphrase change must re-key the current canonical vault snapshot, require other devices to rebuild, and avoid exposing plaintext or keys to the server.
+- Compact history must create a new encrypted baseline from current `main` and discard older server-side history only after explicit owner confirmation.
+- Docker Compose deployment must include the server, Postgres, internal Git history on local filesystem storage, and encrypted local object storage.
 
-## 1.5 Non-Goals
+## 1.5 Explicit Non-Goals
 
-MVP non-goals:
+v1 excludes the following product shapes:
 
-- Real-time Google-Docs-style collaborative editing with live cursors.
-- Multi-user authorization model beyond one vault owner/admin.
-- SaaS hosting.
+- SaaS hosting operated by this project.
+- Shared vault membership or note sharing between different `obts` users.
+- Real-time collaborative editing, live cursors, presence, CRDT/OT sessions, or Google-Docs-style multi-user editing.
 - Raw Git interoperability with GitHub/GitLab remotes.
-- Putting a normal `.git` repository in the vault.
-- Syncing all `.obsidian` configuration by default.
-- Syncing `obts`’ own plugin state.
-- Perfect conflict elimination for contradictory edits.
-- Server-side plaintext semantic merge when E2EE is enabled.
-- Automatic recovery if the user loses the vault passphrase.
-- Advanced selective sharing of individual notes.
-- Rich merge support for every third-party plugin data format.
-
-Deferred:
-
-- CRDT/OT live editing for currently open notes.
-- Multi-user vault sharing with per-user keys.
-- Key rotation and device revocation with full re-encryption.
-- Cloud object storage backends.
-- Git pack optimization/GC UI.
-- Mobile background sync guarantees beyond what the platform permits.
+- Putting a normal `.git` repository in the visible Obsidian vault.
+- Syncing `obts`’ own plugin state as vault content.
+- Server-side plaintext semantic merge while E2EE is enabled.
+- Recovery of encrypted vault content after the user loses both the vault passphrase and all user-held recovery material.
+- General-purpose S3/object-storage deployment for v1.
+- Mobile background execution beyond the guarantees provided by iOS, Android, and Obsidian.
 
 ## 1.6 Compliance / Policy Requirements
 
 1. **Obsidian plugin review compatibility**
    - Plugin `id`: `obts`.
-   - Prefer display name `True Sync` for submission unless reviewers accept `Obsidian True Sync`.
+   - Submit display name `True Sync`.
    - README must disclose: account/server requirement, network access, external file access, encryption behavior, recovery limitations, and absence of telemetry.
    - No client-side telemetry or analytics in plugin or web UI.
    - Use a lockfile and keep dependency count small.
@@ -162,11 +156,13 @@ Deferred:
 3. **Licensing**
    - Do not copy code from proprietary sync products.
    - All dependencies must be compatible with the project license.
-   - License choice is an open question; implementation must keep third-party notices accurate.
+   - License is AGPL-3.0-only.
+   - Implementation must keep third-party notices accurate.
 
 4. **Deployment**
    - Self-hosted first.
-   - HTTPS required for production. Development may allow `localhost` HTTP only.
+   - HTTPS required for production.
+   - Development allows `localhost` HTTP only.
    - Server must run without requiring external cloud services.
 
 ---
@@ -187,11 +183,11 @@ Deferred:
 - **Server API:** authenticates devices, receives objects/proposals, exposes state and dashboard APIs.
 - **Merge coordinator:** advances `main` for safe merges; creates conflicts for ambiguous cases.
 - **Client-side web app:** dashboard and conflict resolver; decrypts locally in browser.
-- **Local snapshot store:** durable client-side queue/cache, not a `.git` folder in the vault.
-- **Server metadata DB:** SQLite for MVP.
-- **Server object store:** encrypted objects and blob payloads on local disk.
-- **Server Git-like history store:** internal Git repository or Git-compatible immutable commit history, not exposed to users.
-- **Notification hub:** WebSocket or SSE channel for `main` changes, device state, and conflict events.
+- **Local `.obts` store:** durable client-side queue/cache/recovery state under vault-root `.obts/`, never synced as vault content.
+- **Server metadata DB:** Postgres for v1.
+- **Server object store:** encrypted objects and blob payloads on local filesystem storage.
+- **Server Git-like history store:** internal Git repository, not exposed to users.
+- **Notification hub:** WebSocket channel for `main` changes, device state, and conflict events, with polling as the required compatibility fallback.
 
 ## 2.2 Core Workflow A — Server Install
 
@@ -201,13 +197,37 @@ User wants to create a self-hosted sync endpoint.
 
 ### Inputs
 
-Docker Compose file:
+Required `docker-compose.yaml`:
 
 ```yaml
+name: obts
+
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: obts-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: obts
+      POSTGRES_USER: obts
+      POSTGRES_PASSWORD_FILE: /run/secrets/obts_postgres_password
+    volumes:
+      - ./obts-postgres:/var/lib/postgresql/data
+    secrets:
+      - obts_postgres_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U obts -d obts"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   obts:
     image: ghcr.io/obts/obts-server:latest
+    container_name: obts
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "8080:8080"
     volumes:
@@ -215,9 +235,25 @@ services:
     environment:
       OBTS_BASE_URL: "https://sync.example.com"
       OBTS_DATA_DIR: "/data"
+      OBTS_DATABASE_URL_FILE: "/run/secrets/obts_database_url"
       OBTS_LOG_LEVEL: "info"
       OBTS_REQUIRE_HTTPS: "true"
       OBTS_SERVER_SECRET_FILE: "/data/server-secret"
+      OBTS_METRICS_AUTH_REQUIRED: "true"
+    secrets:
+      - obts_database_url
+    healthcheck:
+      test: ["CMD", "obts-server", "healthcheck", "--ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+secrets:
+  obts_postgres_password:
+    file: ./secrets/postgres-password
+  obts_database_url:
+    file: ./secrets/database-url
 ```
 
 ### Behavior
@@ -225,11 +261,11 @@ services:
 On first boot:
 
 1. Create `/data` subdirectories.
-2. Initialize SQLite DB and migrations.
+2. Connect to Postgres and run migrations.
 3. Initialize admin setup flow.
 4. Generate server secret if missing.
 5. Start HTTP API and web UI.
-6. Expose readiness only after DB/object store/Git store are available.
+6. Expose readiness only after Postgres, object store, and Git store are available.
 
 ### Output
 
@@ -237,9 +273,9 @@ Admin visits `/setup`, creates admin user, creates first vault, receives a pairi
 
 ### Acceptance criteria
 
-- Container starts with empty `/data`.
+- Compose stack starts with empty Postgres and `/data` volumes.
 - `/health/live` returns `200` when process is alive.
-- `/health/ready` returns `200` only after DB and object store are writable.
+- `/health/ready` returns `200` only after Postgres, object store, and Git store are writable.
 - Setup token is one-time and expires.
 - Server logs do not include secrets.
 
@@ -254,13 +290,13 @@ Vault owner creates a new server vault and installs the plugin in Obsidian.
 In web UI:
 
 - vault display name;
-- optional retention settings;
-- sync profile defaults.
+- default file sync profile;
+- default managed configuration profile.
 
 In Obsidian plugin:
 
 1. Server URL.
-2. Pairing token or invite URL.
+2. Invite URL containing the pairing token.
 3. Vault encryption passphrase.
 4. Sync profile.
 5. Device name.
@@ -283,7 +319,7 @@ Plugin status: `Synced` or `Ahead: initial upload pending`.
 
 - `PAIR_TOKEN_EXPIRED`: show “Pairing link expired. Create a new invite from the dashboard.”
 - `WRONG_PASSPHRASE`: show “Passphrase could not decrypt vault metadata.”
-- `SERVER_REQUIRES_HTTPS`: show “This server requires HTTPS. Use HTTPS URL or disable only for local development.”
+- `SERVER_REQUIRES_HTTPS`: show “This server requires HTTPS. Use an HTTPS URL. Local development must use `localhost`.”
 - `VAULT_NOT_EMPTY`: show import/rebuild choice; never overwrite without snapshot.
 
 ### Acceptance criteria
@@ -318,9 +354,9 @@ Filesystem/vault events plus periodic scan fallback.
 
 ### Output
 
-- Clean: status returns to `Synced`.
-- Pending network: `Ahead: N changes pending upload`.
-- Conflict: `Blocked: N conflicts need review`.
+- Clean upload: status returns to `Synced`.
+- Pending network upload: `Ahead: N changes pending upload`.
+- Conflict response: `Blocked: N conflicts need review`.
 
 ### Acceptance criteria
 
@@ -351,7 +387,7 @@ Server `main` advances; plugin reconnects; user presses “Sync now”; periodic
 
 ### Output
 
-Status `Synced` or explicit error.
+Status `Synced` on success. Explicit error on failure.
 
 ### Acceptance criteria
 
@@ -374,7 +410,7 @@ Merge decision order:
 1. If proposal changed path IDs disjoint from server changes since base: merge automatically server-side without decrypting content.
 2. If same path ID changed but file type is Markdown and a merge-capable client is online: ask client to attempt local plaintext semantic merge.
 3. If semantic merge succeeds: client uploads resolution proposal; server advances `main`.
-4. If merge is ambiguous or no merge-capable client exists: server creates conflict record.
+4. If merge is ambiguous and no merge-capable client is online within the merge timeout, server creates a conflict record.
 
 ### Output
 
@@ -385,13 +421,13 @@ Merge decision order:
 
 - Same-line contradictory edits create a conflict.
 - Delete-vs-edit creates a conflict and preserves edited version.
-- Same binary filename changed differently creates a conflict or keep-both resolution, never last-writer-wins silently.
+- Same binary filename changed differently creates a conflict with keep-both as the default resolution; the system never uses last-writer-wins silently.
 
 ## 2.7 Core Workflow F — Conflict Review in Central Web UI
 
 ### Trigger
 
-User opens dashboard conflict center or clicks plugin alert.
+User clicks the plugin alert, which opens the dashboard conflict center.
 
 ### Inputs
 
@@ -410,7 +446,7 @@ User opens dashboard conflict center or clicks plugin alert.
    - base, server, device versions;
    - rendered Markdown diff;
    - source diff;
-   - proposed auto-merge where possible.
+   - available auto-merge preview.
 5. User chooses resolution:
    - accept server version;
    - accept device version;
@@ -450,25 +486,26 @@ Dashboard table:
 ### Acceptance criteria
 
 - Dashboard must distinguish “known out of sync” from “offline, state unknown.”
-- Device names may be stored plaintext only if user consents; otherwise store encrypted labels and show IDs until decrypted.
+- Device names are stored as encrypted labels. The dashboard shows device IDs until the vault is unlocked locally.
 
 ## 2.9 Core Workflow H — Recovery/Rebuild Client
 
 ### Trigger
 
-User clicks “Rebuild this device from server main,” or plugin detects local state corruption.
+User clicks “Rebuild this device from server main.” The plugin also starts this workflow after detecting local state corruption.
 
 ### Behavior
 
 1. Plugin scans for unsnapshotted local changes.
-2. Plugin writes encrypted local recovery bundle and/or uploads pending proposals if possible.
-3. Plugin verifies recovery bundle integrity.
-4. Plugin applies server `main` to local vault.
-5. Plugin marks previous local state as archived.
+2. Plugin writes an encrypted local recovery bundle.
+3. Plugin uploads pending proposals when the server is reachable.
+4. Plugin verifies recovery bundle integrity.
+5. Plugin applies server `main` to local vault.
+6. Plugin marks previous local state as archived.
 
 ### Acceptance criteria
 
-- Rebuild is impossible unless local pending edits are either snapshotted locally or explicitly exported by user.
+- Rebuild is impossible until local pending edits are snapshotted locally and included in the encrypted recovery bundle.
 - Rebuild never requires user to inspect database internals.
 
 ## 2.10 UX / Operator Experience
@@ -496,7 +533,7 @@ Use clear strings:
 - `Unsafe local changes saved to recovery; review before rebuild`
 - `Server full — edits saved locally, upload paused`
 
-Never show raw internal messages such as `storage -> db` or raw Git output unless in diagnostic export.
+Never show raw internal messages such as `storage -> db` and raw Git output in normal UX. Diagnostic exports include only redacted internal identifiers.
 
 ### Server CLI
 
@@ -536,8 +573,12 @@ Required Obsidian commands:
 - Setup with Docker.
 - Pairing a device.
 - Choosing sync profile.
+- What `.obts/` stores locally and why it is never synced.
+- Managed Obsidian/plugin configuration sync.
 - Resolving conflicts.
 - Recovering/rebuilding a device.
+- Changing vault passphrase and rebuilding devices.
+- Compacting history.
 - What encryption protects and does not protect.
 - Backup and restore.
 - Why not to run another sync tool on the same vault.
@@ -546,6 +587,7 @@ Required Obsidian commands:
 
 - Docker environment variables.
 - Reverse proxy/TLS setup.
+- Postgres setup and backup.
 - Backup paths.
 - Health endpoints.
 - Log redaction guarantees.
@@ -574,7 +616,7 @@ Required Obsidian commands:
 | Disk full local | “Local disk full — sync paused” | Stop applying changes; do not advance local cursor |
 | Server disk full | “Server storage full — uploads paused” | Return `507`; keep local proposals |
 | Corrupt encrypted object | “Integrity check failed” | Quarantine object; do not apply |
-| Missed file watcher event | No UX unless detected | Periodic scan detects divergence |
+| Missed file watcher event | No immediate UX; scan reports divergence after detection | Periodic scan detects divergence |
 | Stale device | Dashboard shows stale/unknown | Do not assume no local edits |
 | Large file exceeds limit | “File too large for current profile” | Exclude and report |
 | Plugin disabled | No sync | Server dashboard eventually shows stale |
@@ -614,10 +656,13 @@ Required Obsidian commands:
    - Crypto/auth/integrity failures pause sync and preserve local state.
 
 9. **No `.git` in visible vault**
-   - Git-like history lives server-side and/or in local sidecar stores, never as a normal vault repo.
+   - Git-like history lives server-side. Local client stores are under `.obts/`, never normal vault repos.
 
-10. **Diagnostics over knobs**
-    - Advanced state is visible in diagnostics, not configurable by users unless absolutely necessary.
+10. **Managed config, not raw `.obsidian` replication**
+    - Obsidian and plugin configuration syncs as typed encrypted entries with explicit handlers. The plugin materializes those entries into Obsidian's local config locations.
+
+11. **Diagnostics over knobs**
+    - Advanced state is visible in diagnostics. User-facing configuration remains limited to the required setup controls and documented advanced recovery commands.
 
 ## 3.2 Architecture
 
@@ -632,7 +677,7 @@ Required Obsidian commands:
         | Obsidian Vault API                             | local disk volume
         v                                                v
 +------------------+                         +------------------------+
-| Local vault      |                         | SQLite + object store  |
+| Local vault      |                         | Postgres + object store |
 | user-visible     |                         | internal Git history   |
 +------------------+                         +------------------------+
 
@@ -675,7 +720,7 @@ Server API
   HealthService
 
 Storage
-  SQLite metadata DB
+  Postgres metadata DB
   Local encrypted object store
   Internal Git repo per vault
 ```
@@ -719,10 +764,10 @@ Client-side dashboard
 
 The server stores one internal history per vault.
 
-Recommended MVP implementation:
+Required v1 implementation:
 
-- SQLite for metadata, refs, device state, conflicts, audit log.
-- Local filesystem object store for encrypted blobs.
+- Postgres for metadata, refs, device state, conflicts, audit log, and object catalog.
+- Local filesystem object store for encrypted blobs and file entries.
 - Internal Git repository for immutable commit history and branch-like refs.
 
 Server refs:
@@ -733,14 +778,16 @@ refs/obts/devices/<device_id>
 refs/obts/conflicts/<conflict_id>/base
 refs/obts/conflicts/<conflict_id>/main
 refs/obts/conflicts/<conflict_id>/proposal
-refs/obts/snapshots/<timestamp>
+refs/obts/generations/<generation_id>
 ```
 
-The server may use Git CLI or libgit2 internally. It must not expose arbitrary Git operations to clients. If using Git CLI, call it via fixed argv arrays with `shell: false`; never interpolate user input into shell commands.
+The server uses Git CLI internally, bundled in the Docker image. It must not expose arbitrary Git operations to clients. Git CLI calls must use fixed argv arrays with `shell: false`; never interpolate user input into shell commands.
 
 ### Why Git-like history?
 
 Git gives immutable commits, parent links, merge commits, object integrity, history inspection, and recovery semantics. But `obts` must not expose Git UX to users, and the visible vault must remain normal files.
+
+Internal Git history must use a real filesystem backend in v1. S3-compatible storage is not a v1 backend for Git history, refs, Postgres state, or control-plane data. The storage package should keep a narrow object-store interface so a future version can route large encrypted content blobs to an S3-compatible service such as Garage, but v1 stores encrypted objects on local filesystem storage.
 
 ## 3.3.2 Encrypted manifest model
 
@@ -778,7 +825,7 @@ Encrypted file entry payload:
   "plaintext_sha256": "...",
   "content_ref": "blob_a71...",
   "content_encoding": "utf8|binary",
-  "frontmatter_digest": "optional-client-only",
+  "frontmatter_digest": "client_computed",
   "created_by_device_id": "dev_..."
 }
 ```
@@ -787,8 +834,8 @@ Notes:
 
 - `path_id` leaks equality of pathnames across versions to the server, but not plaintext names.
 - `kind` and size bucket leak limited metadata. This leakage must be documented.
-- Exact sizes may be stored if needed for sync efficiency; default should use size buckets in dashboard/logs.
-- Full path privacy with zero metadata leakage is a non-goal for MVP.
+- Exact plaintext sizes are not stored in server metadata. The server enforces upload limits through encrypted object byte counts and declared size buckets.
+- Full path privacy with zero metadata leakage is outside v1 scope; v1 commits to HMAC path IDs, encrypted path payloads, kind leakage, and size-bucket leakage.
 
 ## 3.3.3 Object envelope
 
@@ -801,7 +848,7 @@ Plaintext header:
   "magic": "OBTS1",
   "object_id": "obj_...",
   "vault_id": "vlt_...",
-  "key_epoch": 1,
+  "generation_id": "gen_...",
   "type": "file_entry|content_blob|commit_payload|conflict_payload|recovery_bundle",
   "alg": "AES-256-GCM",
   "kdf": "argon2id",
@@ -829,7 +876,7 @@ Requirements:
 - Nonce must be unique per encryption key and object.
 - Header/AAD must be authenticated.
 - Decryption failure is fatal for that object and must fail closed.
-- Object ID is content-addressed over canonical envelope bytes or over ciphertext plus header, not plaintext.
+- Object ID is content-addressed over canonical envelope bytes, not plaintext.
 
 ## 3.3.4 Key hierarchy
 
@@ -837,7 +884,7 @@ Inputs:
 
 - User passphrase, never sent to server.
 - Vault salt, server-visible, random at vault creation.
-- Key epoch.
+- Vault generation.
 
 Derive:
 
@@ -848,11 +895,11 @@ path_key = HKDF(root_key, "obts/v1/path-id")
 mac_key = HKDF(root_key, "obts/v1/mac")
 ```
 
-MVP KDF parameters should be calibrated on device at setup with minimum floor:
+v1 KDF parameters are calibrated on device at setup with minimum floor:
 
 ```text
 Argon2id memory: >= 64 MiB desktop, >= 32 MiB mobile fallback
-Argon2id time cost: >= 3 iterations unless calibration selects stronger
+Argon2id time cost: >= 3 iterations, with calibration increasing cost on capable devices
 parallelism: 1-4 depending platform
 ```
 
@@ -862,11 +909,26 @@ If mobile cannot handle selected parameters, show a specific error and offer low
 
 Local state must not be a normal `.git` directory in the vault.
 
-Preferred cross-platform storage:
+Required local storage rule:
 
-- IndexedDB or equivalent browser storage for object cache and queue.
-- Obsidian plugin data only for small settings and device identity references.
-- Desktop may use sidecar app-data directory after capability detection, but MVP should not require it.
+- All `obts` runtime sync state that lives inside the vault root must live under `.obts/`.
+- `.obts/` is always excluded from sync scanning, import, managed config extraction, conflict handling, and compact history.
+- The plugin may use platform secure storage for auth tokens when available, but `.obts/` remains the local queue/cache/recovery/staging root.
+- The plugin must not store `obts` runtime sync state under `.obsidian/`.
+
+Required `.obts/` layout:
+
+```text
+.obts/
+  state.json
+  queue/
+  objects/
+  proposals/
+  recovery/
+  locks/
+  diagnostics/
+  managed-config/
+```
 
 Local state schema:
 
@@ -905,14 +967,14 @@ ACCEPTED | SERVER_PENDING | CONFLICTED | RETRY_WAIT | FAILED_PERMANENT
 |---|---|---|---|
 | `vault_id` | `vlt_` + ULID | server | Not secret |
 | `device_id` | `dev_` + 128-bit random base64url | client | Authenticated to server |
-| `main_id` / `commit_id` | `m_` + Git OID or SHA-256 | server | Immutable |
+| `main_id` / `commit_id` | `m_` + Git OID | server | Immutable |
 | `proposal_id` | `prop_` + ULID/hash | client/server | Idempotency key |
 | `conflict_id` | `con_` + ULID | server | Stable |
 | `object_id` | `obj_` + SHA-256 | client/server | Content-addressed encrypted object |
 | `path_id` | `p_` + HMAC-SHA256 | client | Server cannot decode path |
 | `blob_id` | `blob_` + SHA-256 | client | Encrypted content blob |
 
-## 3.4.2 Server DB tables
+## 3.4.2 Postgres tables
 
 ### `users`
 
@@ -928,22 +990,41 @@ last_login_at_ms INTEGER
 
 ```sql
 id TEXT PRIMARY KEY,
+owner_user_id TEXT NOT NULL,
 display_name TEXT NOT NULL,
-vault_salt BLOB NOT NULL,
+active_generation_id TEXT,
 main_commit_id TEXT,
 created_at_ms INTEGER NOT NULL,
 updated_at_ms INTEGER NOT NULL,
 settings_json TEXT NOT NULL
 ```
 
+Each vault has exactly one owning user in v1. Shared vault membership, cross-user note sharing, and owner/admin/member roles inside the same vault are not v1 concepts.
+
+### `vault_generations`
+
+```sql
+id TEXT PRIMARY KEY,
+vault_id TEXT NOT NULL,
+generation_number INTEGER NOT NULL,
+vault_salt BYTEA NOT NULL,
+root_commit_id TEXT,
+state TEXT NOT NULL,
+created_reason TEXT NOT NULL,
+created_at_ms BIGINT NOT NULL,
+activated_at_ms BIGINT,
+purged_at_ms BIGINT
+```
+
+Generations support initial vault creation, full-vault passphrase change, and compact history. A vault has exactly one active generation.
+
 ### `devices`
 
 ```sql
 id TEXT PRIMARY KEY,
 vault_id TEXT NOT NULL,
-owner_user_id TEXT NOT NULL,
+user_id TEXT NOT NULL,
 display_name_ciphertext TEXT,
-display_name_plaintext TEXT,
 last_seen_at_ms INTEGER,
 last_applied_main TEXT,
 last_uploaded_proposal TEXT,
@@ -971,6 +1052,7 @@ revoked_at_ms INTEGER
 ```sql
 id TEXT PRIMARY KEY,
 vault_id TEXT NOT NULL,
+generation_id TEXT NOT NULL,
 type TEXT NOT NULL,
 size_bytes INTEGER NOT NULL,
 storage_path TEXT NOT NULL,
@@ -984,6 +1066,7 @@ created_by_device_id TEXT
 ```sql
 id TEXT PRIMARY KEY,
 vault_id TEXT NOT NULL,
+generation_id TEXT NOT NULL,
 parent_ids_json TEXT NOT NULL,
 manifest_object_id TEXT NOT NULL,
 created_at_ms INTEGER NOT NULL,
@@ -999,13 +1082,15 @@ related_conflict_id TEXT
 vault_id TEXT NOT NULL,
 commit_id TEXT NOT NULL,
 path_id TEXT NOT NULL,
+entry_type TEXT NOT NULL,
 entry_object_id TEXT NOT NULL,
 content_object_id TEXT,
 kind TEXT NOT NULL,
+materializer TEXT NOT NULL,
 PRIMARY KEY (vault_id, commit_id, path_id)
 ```
 
-This table may be materialized for efficient diffing. It can be rebuilt from commit manifests.
+This table is materialized for efficient diffing and is rebuildable from commit manifests.
 
 ### `proposals`
 
@@ -1054,7 +1139,21 @@ created_at_ms INTEGER NOT NULL,
 correlation_id TEXT
 ```
 
-## 3.4.3 Main state transitions
+## 3.4.3 Account and vault isolation
+
+v1 supports multi-account hosting with strict vault isolation, not shared vault collaboration.
+
+Rules:
+
+1. A logged-in user can create, list, open, configure, and delete only vaults where `vaults.owner_user_id` equals their user ID.
+2. A device token is scoped to exactly one `user_id` and one `vault_id`.
+3. Every request carrying a `vault_id`, `object_id`, `proposal_id`, `conflict_id`, `device_id`, or event subscription must authorize through both the authenticated subject and the subject's vault scope.
+4. Pairing tokens can be created only by the owning user for that vault.
+5. Cross-user access to vault metadata, encrypted objects, proposals, conflicts, device state, and events must return `403` or `404` without revealing whether the other user's object exists.
+6. Server operators and application admins may reset account access and inspect operational health, but they cannot decrypt vault content without the user's vault passphrase.
+7. Sharing one vault between multiple `obts` user accounts is explicitly unsupported.
+
+## 3.4.4 Main state transitions
 
 ```text
 main M1
@@ -1073,7 +1172,7 @@ conflict C1 resolved by client-side UI
   -> main M4(parent M3, resolution C1)
 ```
 
-## 3.4.4 Client state transitions
+## 3.4.5 Client state transitions
 
 ```text
 UNPAIRED
@@ -1091,7 +1190,7 @@ SYNCED
   -> SYNCED | APPLY_FAILED_RECOVERABLE
 ```
 
-## 3.4.5 Invariants
+## 3.4.6 Invariants
 
 1. `main` is append-only: never rewrite existing `main` commits after publication.
 2. Server only advances `main` from its current value using a merge/resolution transaction.
@@ -1146,12 +1245,12 @@ When same `path_id` changed concurrently and file kind is Markdown:
    - parse YAML frontmatter;
    - merge safe frontmatter sets: `tags`, `aliases`, `cssclasses`;
    - use three-way text merge for body;
-   - optionally section-aware merge by headings;
+   - run heading/block-aware merge by Markdown section;
    - detect conflict markers or ambiguous hunks.
 4. If clean, encrypt merged result and upload resolution proposal.
 5. If ambiguous, leave conflict for user.
 
-MVP may implement simple three-way line merge plus frontmatter set merge. Heading/block-aware merge is deferred but interface must allow merge drivers.
+v1 implements line-level, frontmatter-aware, heading-aware, and block-aware merge drivers. Merge drivers must remain conservative: ambiguous hunks create conflicts.
 
 ## 3.5.3 Binary merge policy
 
@@ -1168,12 +1267,48 @@ Server must not choose last-writer-wins for binary conflicts.
 If one side deletes a path and another edits it:
 
 - conflict by default;
-- UI offers restore edited version, keep delete, or keep both under conflict filename;
+- UI offers three actions: restore edited version, keep delete, keep both under conflict filename;
 - edited content remains recoverable.
 
 ## 3.5.5 Rename policy
 
-MVP treats rename as delete old path + create new path. If another device edits old path concurrently, create conflict. True rename detection via stable encrypted file IDs is deferred.
+v1 uses stable encrypted file IDs for rename detection. If another device edits the previous path concurrently, create a rename/edit conflict that preserves the edited content and the rename target.
+
+## 3.5.6 Merge and materializer registry
+
+Every synced entry must bind to exactly one registry row. Unknown entry types are excluded or conflicted; they are never auto-merged and never resolved by last-writer-wins.
+
+| Entry type | Content kind | Materializer | Merge handler | Auto-merge policy | Conflict default |
+|---|---|---|---|---|---|
+| `vault_file` | `markdown` | vault file writer | `markdown_three_way` | conservative clean merges only | manual review |
+| `vault_file` | `binary` | vault file writer | `binary_identity_only` | identical content only | keep both |
+| `vault_file` | `css_snippet` | vault file writer | `text_three_way` | conservative clean merges only | manual review |
+| `managed_config` | `obsidian_core_json` | Obsidian config handler | `schema_json_merge` | allowlisted schemas only | manual review |
+| `managed_config` | `third_party_plugin_json` | plugin config handler | registered plugin handler | handler-declared safe merges only | manual review |
+| `managed_config` | `opaque` | plugin config handler | `identity_or_conflict` | one side changed or identical only | keep both or manual review |
+
+Markdown handler rules:
+
+- Normalize line endings to `\n`.
+- Parse YAML frontmatter.
+- Merge `tags`, `aliases`, and `cssclasses` as sets.
+- Three-way merge body text.
+- Use heading/block-aware merge only when block boundaries are stable.
+- Create a conflict for parser ambiguity, malformed frontmatter, existing conflict markers, or contradictory same-block edits.
+
+Managed JSON config handler rules:
+
+- Use schema-aware merge only for allowlisted config objects.
+- Set-like fields merge as sets.
+- Scalar fields conflict if both sides changed differently.
+- Device-local fields are stripped before sync.
+- Unknown fields are preserved if only one side changed and conflicted if both sides changed.
+
+Opaque config handler rules:
+
+- Excluded by default.
+- If explicitly opted in, merge only identical content or one-sided changes.
+- Concurrent divergent changes create a conflict or keep-both result according to the registered handler.
 
 ## 3.6 Interfaces & Contracts
 
@@ -1441,9 +1576,81 @@ Response:
 }
 ```
 
-## 3.6.9 Events
+## 3.6.9 Maintenance operations
 
-Use WebSocket or SSE. MVP can use SSE for simplicity; plugin must fall back to polling.
+### `POST /api/v1/vaults/{vault_id}/rekey/start`
+
+Starts a full-vault passphrase-change job after server-side precondition checks.
+
+Request:
+
+```json
+{
+  "client_job_id": "job_...",
+  "current_main_commit_id": "m_current"
+}
+```
+
+Response:
+
+```json
+{
+  "job_id": "job_...",
+  "state": "READY_FOR_UPLOAD",
+  "current_generation_id": "gen_old",
+  "target_generation_id": "gen_new"
+}
+```
+
+### `POST /api/v1/vaults/{vault_id}/rekey/{job_id}/complete`
+
+Completes passphrase change by atomically activating the uploaded generation.
+
+Request:
+
+```json
+{
+  "target_generation_id": "gen_new",
+  "manifest_object_id": "obj_manifest",
+  "root_commit_id": "m_rekeyed",
+  "revoke_other_devices": true,
+  "purge_old_generation": true
+}
+```
+
+### `POST /api/v1/vaults/{vault_id}/compact/start`
+
+Starts compact history after server-side precondition checks.
+
+Request:
+
+```json
+{
+  "client_job_id": "job_...",
+  "current_main_commit_id": "m_current"
+}
+```
+
+Response:
+
+```json
+{
+  "job_id": "job_...",
+  "state": "READY",
+  "current_generation_id": "gen_old",
+  "target_generation_id": "gen_compacted",
+  "estimated_discarded_objects": 1234,
+  "estimated_discarded_bytes": 987654321
+}
+```
+
+### `POST /api/v1/vaults/{vault_id}/compact/{job_id}/complete`
+
+Activates the compacted baseline after verifying the new manifest references all current live entries.
+
+## 3.6.10 Events
+
+Use WebSocket for event delivery. Plugin must fall back to polling when WebSocket connection fails.
 
 Event:
 
@@ -1476,7 +1683,7 @@ Other event types:
 | `OBTS_HTTP_PORT` | no | `8080` | Bind port |
 | `OBTS_REQUIRE_HTTPS` | no | `true` | Enforce HTTPS except localhost |
 | `OBTS_SERVER_SECRET_FILE` | yes | none | Secret for server token signing |
-| `OBTS_DB_URL` | no | `sqlite:///data/obts.db` | DB URL |
+| `OBTS_DATABASE_URL_FILE` | yes | none | File containing Postgres connection URL |
 | `OBTS_LOG_LEVEL` | no | `info` | Log level |
 | `OBTS_MAX_BLOB_BYTES` | no | `104857600` | Max object/blob size |
 | `OBTS_BACKUP_DIR` | no | `/data/backups` | Backup directory |
@@ -1489,7 +1696,8 @@ interface ObtsPluginSettings {
   vaultId?: string;
   deviceId?: string;
   deviceName: string;
-  syncProfile: 'notes_only' | 'notes_plus_attachments' | 'full_vault_advanced';
+  syncProfile: 'notes_only' | 'notes_plus_attachments' | 'full_vault_managed_config';
+  managedConfigProfile?: 'disabled' | 'core_obsidian' | 'core_plus_allowlisted_plugins';
   authTokenRef?: string;
   keyStorageMode: 'memory_only' | 'platform_secure_storage' | 'prompt_on_start';
   advanced?: {
@@ -1499,21 +1707,107 @@ interface ObtsPluginSettings {
 }
 ```
 
-Visible settings must remain limited. `advanced` should not appear unless user opens Diagnostics/Advanced.
+Visible settings must remain limited. `advanced` appears only inside Diagnostics/Advanced.
 
-## 3.8 Dependencies & Integrations
+## 3.8 Required v1 Feature Designs
+
+## 3.8.1 Managed Obsidian and plugin configuration
+
+`obts` must not blindly sync `.obsidian/` as ordinary vault files. Configuration sync uses the same encrypted proposal/history/conflict pipeline as notes, but with `managed_config` entries and explicit materializers.
+
+Rules:
+
+1. `.obts/` is local runtime state and is never synced.
+2. `.obsidian/` is an apply/read target, not a raw synced directory.
+3. The plugin reads local Obsidian configuration through Obsidian APIs or platform-specific config paths.
+4. The plugin normalizes config by removing device-local and volatile fields before creating proposals.
+5. Managed config proposals use encrypted objects in server `main` with stable logical IDs such as `cfg_obsidian_core_hotkeys` and `cfg_plugin_<plugin_id>_data`.
+6. Applying managed config first writes a local recovery copy under `.obts/recovery/`.
+7. Unknown third-party plugin config is excluded by default.
+8. Advanced opaque plugin config sync is allowed only path-by-path and uses identity-or-conflict merge behavior.
+
+v1 managed config support:
+
+| Config class | v1 behavior |
+|---|---|
+| Core Obsidian app settings | supported through schema handlers |
+| Hotkeys | supported through schema handlers |
+| Appearance settings | supported through schema handlers |
+| CSS snippets | synced as text files with conservative merge |
+| Themes | synced as ordinary vault assets only when selected |
+| Workspace/layout | excluded by default; device-local unless explicitly enabled later |
+| `obts` plugin state | always excluded |
+| Unknown plugin config | excluded by default; advanced opaque opt-in only |
+
+## 3.8.2 Vault passphrase change by full re-key
+
+Vault passphrase change is a rare owner-triggered maintenance operation. v1 does not perform incremental mixed-generation re-encryption. Instead, a trusted synced device creates a new encrypted generation from the current canonical vault snapshot.
+
+Preconditions:
+
+- initiating device is paired, unlocked, and `Synced`;
+- no unresolved conflicts;
+- no pending local proposals from the initiating device;
+- server has no in-progress vault maintenance job;
+- user confirms that other devices must rebuild and old server-side history will be purged.
+
+Behavior:
+
+1. Client downloads any missing encrypted objects for current `main`.
+2. Client decrypts current canonical vault state locally with the old passphrase.
+3. Client derives new vault keys from the new passphrase and new generation salt.
+4. Client re-encrypts the current canonical state into a new generation.
+5. Client uploads the complete new manifest and required encrypted objects.
+6. Server verifies object presence, object IDs, ciphertext hashes, and manifest completeness without decrypting.
+7. Server atomically switches the vault active generation to the new generation.
+8. Server revokes existing device tokens except the initiating device token, if the user chooses to keep it active.
+9. Other devices show `Needs rebuild — vault passphrase changed`.
+10. Old encrypted server generation is purged after successful switch and explicit confirmation.
+
+Guarantees:
+
+- server never receives old passphrase, new passphrase, plaintext content, plaintext paths, or encryption keys;
+- failed re-key leaves the old generation active;
+- successful re-key preserves current vault content but does not preserve old server-side history;
+- re-key does not erase data already present on other devices.
+
+## 3.8.3 Compact history
+
+`Compact history` is an explicit owner-triggered maintenance operation that creates a new encrypted baseline from current `main` and discards older server-side history after verification.
+
+Preconditions:
+
+- no unresolved conflicts;
+- no pending proposals;
+- no passphrase change in progress;
+- user confirms older server-side history will be deleted;
+- devices with cursors before the compacted baseline may need to rebuild.
+
+Behavior:
+
+1. Server acquires a vault maintenance lock.
+2. Server reads the current encrypted `main` manifest.
+3. Server creates a new generation/root commit whose manifest references only current live entries.
+4. Server switches active `main` to the compacted baseline after verifying all referenced encrypted objects exist.
+5. Devices whose `last_applied_main` is outside the compacted generation rebuild from the new baseline.
+6. Server discards older server-side commits, proposals, conflict payloads, manifests, and encrypted objects that are not referenced by the compacted current state.
+7. Server records an audit event with object counts and byte totals only.
+
+Compaction does not require the vault passphrase because it rewrites encrypted object references, not plaintext content.
+
+## 3.9 Dependencies & Integrations
 
 ### Server
 
-MVP recommended stack:
+v1 stack:
 
 - TypeScript.
 - Node.js runtime.
-- Fastify or equivalent HTTP framework.
-- SQLite with WAL mode for single-container deployment.
-- Local filesystem object store.
-- Git CLI bundled in Docker image or libgit2 binding.
-- Zod or equivalent runtime schema validation.
+- Fastify HTTP framework.
+- Postgres for server metadata/control-plane state.
+- Local filesystem object store for encrypted blobs and file entries.
+- Git CLI bundled in Docker image.
+- Zod runtime schema validation.
 - Structured logger with redaction.
 
 ### Plugin
@@ -1536,11 +1830,11 @@ MVP recommended stack:
 
 Required capabilities:
 
-- AEAD encryption: AES-256-GCM via WebCrypto or XChaCha20-Poly1305 via audited library.
+- AEAD encryption: AES-256-GCM via WebCrypto.
 - KDF: Argon2id.
 - HKDF-SHA-256.
 - HMAC-SHA-256.
-- SHA-256/BLAKE3 for object IDs.
+- SHA-256 for object IDs.
 - CSPRNG.
 
 All crypto must have deterministic test vectors in `/packages/crypto/test-vectors`.
@@ -1556,7 +1850,7 @@ All crypto must have deterministic test vectors in `/packages/crypto/test-vector
 ```text
 Trusted:
   - User's local Obsidian process, after plugin install
-  - User's browser runtime only if served JS is trusted
+  - User's browser runtime after the displayed build hash is verified
   - User-entered vault passphrase
 
 Semi-trusted:
@@ -1582,7 +1876,7 @@ E2EE protects against passive server/storage compromise and honest-but-curious s
 - Device tokens are high-entropy bearer tokens stored in platform storage where available.
 - Server stores token hashes, not raw tokens.
 - Device revocation prevents new uploads and event subscriptions.
-- Admin sessions use secure cookies with CSRF protection or bearer tokens with same-site constraints.
+- Admin sessions use secure cookies with CSRF protection.
 
 ## 4.1.3 Secrets
 
@@ -1617,20 +1911,21 @@ Pause sync on:
 
 ## 4.2 Performance & Scalability
 
-MVP target scale:
+v1 target scale:
 
-- 1 vault owner.
-- 2–5 devices.
+- 20 user accounts per server in the tested default deployment.
+- 1 owner per vault.
+- 10 paired devices per vault.
 - 50,000 files maximum tested.
 - 10 GB vault size maximum tested.
 - Individual blob default max 100 MB.
 - Server single-node only.
-- SQLite acceptable for single-container deployment.
+- Postgres is the supported v1 database.
 
 Latency targets:
 
 - Online Markdown edit under 32 KB: visible on second online client within 5 seconds on LAN.
-- Status update after server main advances: under 2 seconds with WebSocket/SSE, under polling interval otherwise.
+- Status update after server main advances: under 2 seconds with WebSocket, under polling interval otherwise.
 - Conflict list load under 2 seconds for 100 open conflicts.
 
 Resource targets:
@@ -1644,14 +1939,14 @@ Degradation:
 
 - If events fail, fall back to polling.
 - If semantic merge unavailable, create conflict rather than blocking all sync.
-- If object GC unavailable, retain objects and warn about disk use.
+- If compact history is unavailable, keep existing encrypted history and report storage growth.
 
 ## 4.3 Reliability & Failure Modes
 
 | Failure | Expected behavior | Test |
 |---|---|---|
-| Server crash during object upload | Partial object ignored or resumed | Kill server mid-upload |
-| Server crash during `main` advance | Transaction rolls back or completes atomically | Fault injection around DB/ref update |
+| Server crash during object upload | Partial object is ignored; retry resumes upload safely | Kill server mid-upload |
+| Server crash during `main` advance | Restart observes an atomic state with no partial `main` | Fault injection around DB/ref update |
 | Client crash before snapshot | Periodic scan catches dirty file on restart | Kill plugin during debounce |
 | Client crash after snapshot before upload | Proposal uploads on restart | Kill plugin after local queue write |
 | Client crash during apply | Cursor not advanced; retry safe | Kill after first file write |
@@ -1659,7 +1954,7 @@ Degradation:
 | Proposal replay | Idempotent same result | Submit same proposal twice |
 | Object corruption | AEAD/hash fail; no apply | Flip bytes in object store |
 | Delete/edit race | Conflict; preserve edit | E2E test |
-| Rename/edit race | Conflict in MVP | E2E test |
+| Rename/edit race | Rename/edit conflict preserves both intents | E2E test |
 | Auth revoked mid-sync | Stop uploads; local queue retained | Revoke device during upload |
 | Server disk full | Return 507; no main corruption | Fill disk/fake store |
 | Clock skew | No correctness dependency on client wall clock | Simulated wrong client time |
@@ -1689,7 +1984,7 @@ No plaintext paths or content.
 
 ## 4.4.2 Metrics
 
-Expose `/metrics` if enabled:
+Expose `/metrics` with admin bearer authentication:
 
 - `obts_proposals_total{state}`
 - `obts_conflicts_open`
@@ -1718,19 +2013,19 @@ Audit:
 ## 4.4.4 Health checks
 
 - `/health/live`: process alive.
-- `/health/ready`: DB writable, object store writable, Git store accessible.
+- `/health/ready`: Postgres writable, object store writable, Git store accessible.
 - `/health/version`: build version, protocol version, migration version.
 
 ## 4.4.5 Backup/restore
 
-MVP backup:
+v1 backup:
 
-- SQLite DB snapshot.
-- Object store directory.
+- Postgres dump or storage-consistent Postgres snapshot.
+- Local encrypted object store directory.
 - Internal Git repo directory.
-- Server config excluding secrets unless explicitly requested.
+- Server config excluding secrets.
 
-Backup command must create a consistent snapshot by pausing `main` advancement briefly or using DB transaction + filesystem sync strategy.
+Backup command must create a consistent snapshot by pausing `main` advancement briefly, taking a Postgres transaction snapshot or dump, and syncing filesystem object/Git data before the archive is finalized.
 
 Restore requires:
 
@@ -1747,18 +2042,21 @@ Acceptance:
 
 # 5. Delivery Plan
 
-## 5.1 MVP Cut
+## 5.1 v1 Scope
 
-## 5.1.1 Included in MVP
+## 5.1.1 Included in v1
 
 ### Server
 
 - Docker image.
 - Admin setup.
-- One-user admin auth.
+- Multi-account user auth.
+- Strict vault isolation by owning user.
 - Create vault.
 - Create pairing token.
 - Register devices.
+- Revoke devices.
+- Change vault passphrase through full-vault re-key and device rebuild.
 - Store encrypted objects.
 - Store proposals.
 - Maintain canonical `main`.
@@ -1767,6 +2065,9 @@ Acceptance:
 - Dashboard: devices, main state, conflicts.
 - Client-side web conflict resolver.
 - Backup/restore command.
+- Compact history operation.
+- Local filesystem object store.
+- Postgres-backed metadata/control-plane state.
 - Health checks and logs.
 
 ### Plugin
@@ -1775,7 +2076,9 @@ Acceptance:
 - Derive vault keys locally.
 - Initial scan/import.
 - Watch Markdown and attachments.
-- Local durable proposal queue.
+- Sync managed Obsidian configuration through explicit handlers.
+- Sync allowlisted third-party plugin configuration through registered handlers.
+- Local durable proposal queue under `.obts/`.
 - Upload proposals.
 - Pull/apply server main.
 - Status bar and commands.
@@ -1787,8 +2090,11 @@ Acceptance:
 
 - Encrypted manifest path-level merge.
 - Markdown line-level three-way merge in trusted client.
+- Markdown heading/block-aware merge in trusted client.
 - Basic frontmatter set merge for `tags`, `aliases`, `cssclasses`.
 - Binary conflict preservation.
+- Rename detection through stable encrypted file IDs.
+- Managed config merge/materializer registry.
 
 ### Encryption
 
@@ -1798,19 +2104,7 @@ Acceptance:
 - Authenticated object envelopes.
 - Crypto test vectors.
 
-## 5.1.2 Excluded/stubbed in MVP
-
-- Multi-user sharing.
-- Real-time CRDT collaboration.
-- Advanced Markdown block-aware merge beyond line/frontmatter.
-- Full `.obsidian` sync by default.
-- Key rotation.
-- Automatic passphrase recovery.
-- Cloud storage backends.
-- Object GC beyond conservative retention.
-- Public plugin marketplace polish beyond basic compliance.
-
-## 5.1.3 Must be production-grade in MVP
+## 5.1.2 Must be production-grade in v1
 
 - Data loss invariants.
 - Object integrity.
@@ -1821,24 +2115,28 @@ Acceptance:
 - Crash-safe local apply cursor.
 - Logs redaction.
 - Backup/restore.
+- Cross-account isolation.
+- Passphrase re-key safety.
+- Compact history correctness.
+- `.obts/` exclusion.
 
 ## 5.2 Implementation Plan
 
-## Phase 0 — Unknowns and spikes first
+## Phase 0 — Validation spikes first
 
 1. Obsidian mobile storage spike:
-   - Verify IndexedDB/local storage availability.
+   - Verify `.obts/` vault-local storage availability and platform secure-token fallback.
    - Verify large object handling.
    - Verify file read/write/delete APIs on desktop/iOS/Android.
    - Verify status bar, commands, settings UI.
 
 2. Crypto spike:
-   - Choose AEAD/KDF implementation.
+   - Validate AES-256-GCM via WebCrypto and Argon2id WASM.
    - Confirm bundle size and mobile performance.
    - Create test vectors.
 
 3. Server Git/history spike:
-   - Decide Git CLI vs libgit2 vs custom immutable history.
+   - Validate bundled Git CLI with fixed argv invocation.
    - Prove manifest commit creation and rollback safety.
 
 4. Client-side web UI E2EE spike:
@@ -1846,7 +2144,7 @@ Acceptance:
    - Decrypt conflict payload.
    - Upload encrypted resolution.
 
-Exit criteria: small proof-of-concept syncs one encrypted Markdown file between two clients or test harnesses.
+Exit criteria: small proof-of-concept syncs one encrypted Markdown file between two clients and exercises one conflict resolution through the client-side resolver.
 
 ## Phase 1 — Monorepo and protocol
 
@@ -1860,7 +2158,7 @@ Exit criteria: small proof-of-concept syncs one encrypted Markdown file between 
 ## Phase 2 — Server core
 
 - Build Fastify API.
-- Add SQLite migrations.
+- Add Postgres migrations.
 - Add auth, setup, vault, device, token services.
 - Add object store with hash verification.
 - Add proposal ingestion.
@@ -1874,13 +2172,13 @@ Exit criteria: small proof-of-concept syncs one encrypted Markdown file between 
 - Build settings/pairing flow.
 - Implement vault scan and path normalization.
 - Implement crypto/key unlock.
-- Implement local queue/cache.
+- Implement `.obts/` local queue/cache/recovery layout.
 - Implement upload proposals.
 - Implement pull/apply.
 - Implement status bar.
 - Add diagnostic bundle.
 
-## Phase 4 — Conflict system
+## Phase 4 — Conflict and managed config system
 
 - Server conflict records.
 - Web conflict list.
@@ -1889,6 +2187,8 @@ Exit criteria: small proof-of-concept syncs one encrypted Markdown file between 
 - Resolution upload.
 - Conflict resolution commit.
 - Plugin alert/link.
+- Managed config extraction, merge, recovery, and apply handlers.
+- Cross-account isolation tests for conflict and config APIs.
 
 ## Phase 5 — Recovery and ops
 
@@ -1896,7 +2196,9 @@ Exit criteria: small proof-of-concept syncs one encrypted Markdown file between 
 - Export local recovery bundle.
 - Server backup/restore.
 - Doctor command.
-- Object retention policy.
+- Compact history operation.
+- Full-vault passphrase re-key operation.
+- Device revocation flow.
 
 ## Phase 6 — Hardening
 
@@ -1905,11 +2207,11 @@ Exit criteria: small proof-of-concept syncs one encrypted Markdown file between 
 - Large vault tests.
 - Security review.
 - Documentation.
-- Alpha release.
+- v1 release candidate.
 
 ## 5.3 Rollout & Migration Strategy
 
-## 5.3.1 Alpha rollout
+## 5.3.1 v1 rollout
 
 - Target technical self-hosters.
 - Require full vault backup before first pairing.
@@ -1927,13 +2229,13 @@ Exit criteria: small proof-of-concept syncs one encrypted Markdown file between 
 ## 5.3.3 Upgrades
 
 - Server upgrade runs migrations at startup.
-- Migrations must be backward compatible within one minor version where possible.
+- Migrations must be backward compatible within one minor version.
 - Plugin refuses to sync with unsupported server protocol but keeps local queue.
-- Before destructive migration, server creates backup automatically or refuses without backup flag.
+- Before destructive migration, server creates a backup automatically. Migration stops if backup creation fails.
 
 ## 5.3.4 Migration from existing tools
 
-MVP migration is manual:
+v1 migration from existing tools:
 
 1. Disable other sync tools.
 2. Back up vault.
@@ -1942,7 +2244,7 @@ MVP migration is manual:
 5. Wait for initial `main` publication.
 6. Pair additional devices; choose rebuild from server main.
 
-Do not attempt to import LiveSync/CouchDB histories in MVP.
+v1 imports the current vault tree as authoritative content and stores the previous tool state in an encrypted recovery bundle. It does not import third-party replication history into `main`.
 
 ## 5.4 Testing / Evals
 
@@ -1957,6 +2259,8 @@ Do not attempt to import LiveSync/CouchDB histories in MVP.
 - Merge decision matrix.
 - Markdown merge driver.
 - Frontmatter merge.
+- Managed config handler registry.
+- `.obts/` exclusion rules.
 - Error serialization.
 
 ## 5.4.2 Integration tests
@@ -1977,12 +2281,19 @@ Use test harness with fake clients:
 12. Wrong passphrase cannot decrypt.
 13. Revoked device cannot upload.
 14. Server disk full returns 507 and preserves main.
+15. Cross-account vault/object/proposal/conflict/event access is denied.
+16. Managed Obsidian config syncs through handlers and applies with local recovery.
+17. Passphrase re-key succeeds and forces other devices to rebuild.
+18. Failed passphrase re-key leaves old generation active.
+19. Compact history preserves current state and requires stale devices to rebuild.
 
 ## 5.4.3 End-to-end tests
 
-- Docker server + two plugin clients in automated Obsidian test harness if available.
+- Docker server + two plugin clients in automated Obsidian test harness.
 - Browser conflict UI resolves conflict and both clients converge.
 - Rebuild second device from server main.
+- Change vault passphrase from a synced trusted device and rebuild another device.
+- Compact history and rebuild a stale device from the compacted baseline.
 - Export diagnostic bundle and verify redaction.
 
 ## 5.4.4 Security tests
@@ -1994,6 +2305,7 @@ Use test harness with fake clients:
 - AEAD tampering rejected.
 - Replay proposal safe.
 - Revoked device denied.
+- Cross-account isolation for every vault-scoped API.
 - CSRF/session tests for admin web UI.
 - Dependency audit.
 
@@ -2009,6 +2321,7 @@ Use test harness with fake clients:
 
 - Setup requires no more than five visible plugin inputs.
 - No `.git` appears in vault.
+- `.obts/` exists for local state and never appears in server manifest.
 - Offline edits show “saved locally.”
 - Conflict UI never shows raw Git markers unless source text itself had them.
 - Dashboard clearly shows stale/offline devices.
@@ -2022,27 +2335,27 @@ Rejected for this product because equal-peer database replication exposes too mu
 
 ## 5.5.2 Raw Git in the vault
 
-Rejected for MVP:
+Rejected for v1:
 
 - leaks `.git` into user vault;
 - mobile support is harder;
-- users may accidentally run Git commands;
+- users can accidentally run Git commands;
 - conflicts appear as developer artifacts;
-- other sync tools/backups may mishandle `.git`.
+- other sync tools/backups can mishandle `.git`.
 
 Git-like history remains useful internally.
 
 ## 5.5.3 Plaintext server-side merge
 
-Rejected because vault encryption is a core requirement. Server-side semantic merge is only allowed if the user explicitly disables E2EE for a vault, which is out of MVP scope.
+Rejected because vault encryption is a core requirement. Server-side semantic merge is forbidden while E2EE is enabled. Trusted client resolvers perform semantic merge.
 
 ## 5.5.4 CRDT-first design
 
-Deferred. CRDTs are appropriate for live same-note collaboration, but MVP’s main problem is reliable personal vault sync and recoverable conflicts. A future CRDT layer may handle currently open Markdown notes.
+Rejected. `obts` aims for seamless, reliable sync across one user's devices, not live shared editing. v1 has no CRDT/OT state, live cursors, presence, or multi-user same-note collaboration. Same-note concurrent edits use the normal proposal, merge, conflict, and review pipeline.
 
 ## 5.5.5 Git LFS
 
-Deferred/rejected for MVP. Large-file handling is needed, but a custom encrypted blob store gives more control over E2EE, object retention, and self-hosted simplicity. Git LFS remains a possible later backend inspiration.
+Rejected for v1. Large-file handling uses the encrypted object store because it gives control over E2EE, object identity, and self-hosted simplicity.
 
 ## 5.5.6 Syncthing-style file sync
 
@@ -2059,53 +2372,60 @@ Not sufficient by itself because `obts` needs central conflict dashboard, E2EE o
 | File watcher misses changes | Stale local state | Periodic full/incremental scan |
 | Huge vaults strain memory | Crashes | Streaming, paging, size limits |
 | Server disk fills | Upload failures | 507, dashboard alert, no main advancement |
-| User loses passphrase | Data unrecoverable | Clear setup warning; recovery key deferred |
+| Server history grows | Disk usage increases | Explicit compact history operation |
+| User loses passphrase and recovery material | Data unrecoverable | Clear setup warning; user-held recovery kit |
 | Plugin review rejects name | Distribution issue | Use `True Sync` display name, `obts` ID |
 | Dependency supply chain | Security risk | Minimal dependencies, lockfile, audits |
-| Other sync tool races | Corruption/confusion | Detect common sync folders? Warn strongly |
-| Path metadata leakage | Privacy concern | HMAC path IDs; document leakage; optional stricter mode later |
+| Other sync tool races | Corruption/confusion | Detect common sync folders and warn strongly |
+| Path metadata leakage | Privacy concern | HMAC path IDs; encrypted path payloads; documented kind and size-bucket leakage |
 
-## 5.7 Open Questions
+## 5.7 v1 Decisions
 
 1. **Project license**
-   - MIT/Apache-2.0 for broad adoption, or AGPL for server-side openness?
-   - Must decide before public release.
+   - Use AGPL-3.0-only for the repository.
+   - Include third-party notices in release artifacts and documentation.
 
 2. **Final plugin display name**
-   - `Obsidian True Sync` as product name vs `True Sync` for marketplace compliance.
-   - Must decide before plugin submission.
+   - Use `True Sync` for the Obsidian plugin display name.
+   - Use `Obsidian True Sync` only as the product name in long-form documentation.
 
 3. **Crypto library**
-   - WebCrypto AES-GCM + Argon2id WASM vs libsodium wrappers.
-   - Must decide after mobile bundle/performance spike.
+   - Use WebCrypto AES-256-GCM.
+   - Use audited Argon2id WASM with deterministic test vectors.
+   - Use WebCrypto HKDF, HMAC-SHA-256, SHA-256, and CSPRNG primitives.
 
 4. **Local storage on mobile**
-   - IndexedDB vs Obsidian plugin data vs hybrid.
-   - Must decide in Phase 0.
+   - Use vault-root `.obts/` as the local sync state root for queue, cache, proposals, recovery, locks, diagnostics, and managed-config staging.
+   - Never store `obts` runtime sync state under `.obsidian/`.
+   - Use platform secure storage for auth tokens when the platform exposes it; otherwise store encrypted token references under `.obts/`.
 
 5. **Server Git implementation**
-   - Git CLI vs libgit2 vs custom immutable commit graph.
-   - Must decide in Phase 0.
+   - Use Git CLI bundled in the server Docker image.
+   - Invoke Git through fixed argv arrays with `shell: false`.
 
 6. **Metadata leakage budget**
-   - Should file kind and size buckets be server-visible?
-   - Must be documented before alpha.
+   - Server-visible metadata includes vault ID, device IDs, HMAC path IDs, file kind, size bucket, object byte sizes, commit/proposal/conflict IDs, and timestamps.
+   - Server-visible metadata excludes plaintext paths, plaintext content, exact plaintext size, passphrases, and encryption keys.
+   - Documentation must include the metadata leakage table before the first public release.
 
 7. **Conflict resolver trust model**
-   - Is packaged plugin resolver required for first release, or is server-served SPA acceptable for self-hosted alpha?
-   - Must decide before security-sensitive beta.
+   - Packaged plugin resolver is the primary trusted resolver.
+   - Server-served browser dashboard is supported for operator convenience and displays a build hash before passphrase entry.
+   - Security documentation must explain that a malicious server can serve hostile dashboard JavaScript.
 
 8. **Default attachment limit**
-   - 100 MB is proposed.
-   - Must validate with mobile tests.
+   - Default individual blob limit is 100 MB.
+   - Mobile tests must cover upload, download, pause, retry, and apply for a 100 MB attachment.
 
-9. **Full `.obsidian` sync**
-   - Which config files are safe to sync?
-   - Deferred until after MVP.
+9. **Managed Obsidian/plugin configuration sync**
+   - v1 syncs Obsidian and plugin configuration as typed managed config entries, not by raw `.obsidian/` file replication.
+   - The plugin reads, normalizes, merges, and applies managed config through explicit handlers.
+   - Unknown third-party plugin config is excluded by default; advanced opaque opt-in uses identity-or-conflict behavior.
 
 10. **Automatic semantic merge aggressiveness**
-   - Conservative conflicts vs more automatic Markdown block merges.
-   - Prefer conservative for MVP.
+   - Automatic semantic merge remains conservative.
+   - Clean line, frontmatter-set, heading, and block merges are accepted automatically.
+   - Ambiguous content, delete/edit races, binary divergence, and unknown structured formats create conflicts.
 
 ---
 
@@ -2118,7 +2438,7 @@ The implementation is acceptable only when the following proofs pass:
 1. Client A edits note offline.
 2. Client B edits same note and syncs.
 3. Client A reconnects.
-4. System must either merge or create conflict.
+4. System must produce exactly one safe outcome: a merged state for non-ambiguous changes and a conflict record for ambiguous changes.
 5. Both A and B edits must be recoverable by object ID and UI.
 
 Repeat for:
@@ -2135,7 +2455,7 @@ Repeat for:
 At all times:
 
 - there is one `main` per vault;
-- proposals do not mutate `main` unless merge transaction succeeds;
+- proposals mutate `main` only through a successful merge transaction;
 - conflict creation does not advance `main`;
 - resolution advances `main` with parent/reference to previous `main`.
 
@@ -2177,6 +2497,24 @@ Manual tester with no Git/database knowledge must be able to:
 
 Tester must not encounter raw Git terms, raw database terms, or raw conflict markers during normal workflows.
 
+## 6.6 v1 Definition of Done
+
+v1 is complete only when the following checks pass:
+
+| Requirement | Where specified | How verified |
+|---|---|---|
+| Core sync across two devices | Workflows 2.3-2.6 | end-to-end sync tests |
+| No silent data loss | System principles and invariants | crash/fault injection tests |
+| E2EE privacy | Key hierarchy and object envelope | plaintext fixture scans and wrong-key tests |
+| Cross-account isolation | Account and vault isolation | unauthorized API/event tests |
+| `.obts/` local state | Local client state | manifest and scanner exclusion tests |
+| Managed config sync | Managed configuration design | handler fixtures and apply/recovery tests |
+| Passphrase change | Full-vault re-key design | success, failure, and rebuild tests |
+| Compact history | Compact history design | baseline verification and stale-device rebuild tests |
+| Postgres deployment | Server install and config | Docker Compose smoke test |
+| Backup/restore | Ops section | restore convergence test |
+| Diagnostics redaction | Observability and secrets | diagnostic bundle redaction test |
+
 ---
 
 # 7. Agent Guardrails
@@ -2192,9 +2530,11 @@ Implementation agents must not:
 - advance server `main` outside merge/resolution transaction;
 - log plaintext paths/content/secrets;
 - introduce telemetry;
-- depend on cloud services for MVP;
-- sync `obts`’ own local state as vault content;
-- use top-level Node/Electron imports in the plugin if mobile build is enabled;
+- require external cloud services for the default local-filesystem deployment;
+- sync `.obts/` or any other `obts` runtime state as vault content;
+- implement shared vault membership, cross-user note sharing, live cursors, presence, CRDT/OT sessions, or real-time collaborative editing;
+- blindly file-sync `.obsidian/` instead of using managed config handlers;
+- use top-level Node/Electron imports in plugin builds that target mobile;
 - silently lower KDF parameters without explicit user action.
 
 Implementation agents should prefer:
@@ -2219,8 +2559,7 @@ Implementation agents should prefer:
 - Git worktree docs: https://git-scm.com/docs/git-worktree
 - Git LFS: https://git-lfs.com/
 - isomorphic-git: https://isomorphic-git.org/
-- SQLite WAL: https://sqlite.org/wal.html
+- PostgreSQL documentation: https://www.postgresql.org/docs/
 - OWASP Password Storage Cheat Sheet: https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html
 - OWASP Cryptographic Storage Cheat Sheet: https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html
 - MDN Web Crypto API: https://developer.mozilla.org/en-US/docs/Web/API/Web_Crypto_API
-- Yjs docs: https://docs.yjs.dev/
