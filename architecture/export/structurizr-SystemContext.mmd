@@ -1,0 +1,19 @@
+graph LR
+
+  subgraph diagram ["System Context View: Obsidian True Sync"]
+
+    1["Vault owner [Person]"]
+    2["Device user [Person]"]
+    3["Maintainer/operator [Person]"]
+    4["Obsidian [Software System]"]
+    5["Deployment secret source [Software System]"]
+    6["Obsidian True Sync [Software System]"]
+
+    1-. "Self-hosts, creates vaults, pairs devices, reviews conflicts, and runs maintenance. [HTTPS and Obsidian UI]" .->6
+    2-. "Edits notes and observes sync status through paired Obsidian clients. [Obsidian UI]" .->6
+    3-. "Runs server CLI commands such as doctor, backup, restore, compact, key rewrap, and version. [CLI]" .->6
+    3-. "Provides and rotates server master key material outside the app repository. [Operational procedure]" .->5
+    6-. "Integrates as a community plugin and uses vault/workspace/plugin lifecycle APIs. [Obsidian Plugin API]" .->4
+    6-. "Loads server master key material for per-vault data key unwrap and rewrap operations. [Environment variable, secret mount, or KMS API]" .->5
+
+  end
