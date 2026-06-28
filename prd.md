@@ -32,7 +32,7 @@ Git provides commit identity, ancestry, merge bases, diffs, rename detection sup
 - Preserve local-first editing and offline commits.
 - Use Git as the authoritative internal history, ancestry, diff, and merge backbone.
 - Maintain a single server `main` Git ref per vault.
-- Use server-side Git merge plus conservative Obsidian-aware semantic merge policy for Markdown/text conflicts where safe.
+- Use server-side Git merge plus conservative Obsidian-aware semantic merge policy for Markdown, JSON Canvas, and Obsidian Bases conflicts where safe.
 - Provide a dashboard for devices, conflicts, note history, recovery, and maintenance.
 - Support deployment-managed at-rest protection through documented storage, permission, and backup requirements.
 - Enforce strict account and vault authorization for every API and event stream.
@@ -189,6 +189,8 @@ Acceptance criteria:
 - On restart, the plugin inspects the apply journal and either finishes an idempotent apply, rolls forward to target `main`, or blocks with recovery options.
 - If a file changed unexpectedly after preflight, apply stops and surfaces recovery instead of overwriting.
 - The plugin can recover after crash during apply.
+- The plugin has one v1 apply behavior: automatically pull and apply server `main` after preflight, apply journal creation, recovery bundle creation, and watcher suppression setup succeed.
+- If automatic apply cannot proceed safely, the plugin blocks sync, preserves local state, surfaces the blocked status, and directs the owner to the dashboard conflict or recovery workflow.
 
 ### 3.6 Concurrent Edits And Merge
 
@@ -204,8 +206,8 @@ Behavior:
 6. The server enqueues merge-eligible device refs in the per-vault merge queue ordered by `merge_sequence`.
 7. The server processes one merge transaction at a time under the per-vault lock.
 8. Disjoint path changes merge automatically when Git and `obts` policy agree they are safe.
-9. Same-path text and Markdown changes are checked out into an ephemeral server merge workspace.
-10. The merge service uses Git merge machinery plus conservative line/frontmatter/block-aware validation.
+9. Same-path Markdown, `.canvas`, `.base`, and selected text file changes are checked out into an ephemeral server merge workspace.
+10. The merge service uses Git merge machinery plus conservative Markdown, JSON Canvas, and Obsidian Bases semantic merge validation.
 11. Clean merges advance `main` with a merge commit.
 12. Ambiguous or unsafe merges create a conflict record.
 
@@ -232,12 +234,14 @@ Behavior:
 7. Dashboard verifies recent authentication and submits the selected resolution with the conflict ID and expected current `main`.
 8. Server accepts the resolution only if current `main` still matches the expected commit.
 9. If `main` advanced, the review package is marked stale and the dashboard must refresh or regenerate it before resolution.
-10. Server writes the accepted resolution as a normal Git commit or merge commit descending from current `main`, persists updated Git state, advances `main`, and marks the conflict resolved.
+10. Server writes the accepted resolution as a merge commit. Parent 1 is `expected_main`, parent 2 is the conflicted device commit, and the resulting tree is exactly the accepted final state.
+11. Server persists updated Git state, advances `main` to the resolution merge commit, and marks the conflict resolved.
 
 Acceptance criteria:
 
 - Unauthorized users cannot list, view, or resolve conflicts for another vault.
-- Resolution commits reference the conflict they resolved.
+- Resolution commits are merge commits that reference the conflict they resolved.
+- Accepting current `main` creates a same-tree merge commit with parent 1 set to `expected_main` and parent 2 set to the conflicted device commit.
 - Duplicate submission of the same accepted resolution is idempotent.
 - All clients receive a `main_advanced` event after resolution.
 - Conflict resolution submission requires dashboard re-authentication within the previous 15 minutes.
@@ -264,7 +268,7 @@ Behavior:
 2. Server authorizes the owning user for the vault.
 3. Server derives history from Git commits, path metadata, and rename/delete provenance.
 4. Server returns version metadata, including commit, timestamp, author device/user, operation type, and conflict/merge provenance.
-5. User views source or rendered diffs for Markdown/text versions.
+5. User views source and rendered diffs for Markdown versions, and source diffs for `.canvas` and `.base` versions.
 6. User restores a prior version after recent-auth verification by creating a normal Git commit through the same merge/resolution path as other edits; history is never mutated in place.
 
 Acceptance criteria:
@@ -284,13 +288,17 @@ Behavior:
 2. Plugin snapshots local pending edits and relevant hidden Git state into a recovery bundle.
 3. Plugin pulls current server `main`.
 4. Plugin applies server state to local vault.
-5. Plugin commits preserved patch series as a new local recovery commit, uploads preserved local commits through the device ref, and keeps divergent same-device history blocked until the owner exports the recovery bundle and resets the device.
+5. Plugin classifies preserved local state before resuming sync:
+   - pending fast-forward local commits whose ancestry descends from the current server device ref remain queued and are uploaded normally after rebuild;
+   - uncommitted or snapshot-only local edits become one new local recovery commit based on the rebuilt local `main`, then enter the normal upload queue;
+   - divergent same-device history that does not descend from the current server device ref remains only in the recovery bundle, the device enters `blocked_recovery`, and normal sync stays blocked until the owner exports the bundle and resets or re-pairs the device.
 
 Acceptance criteria:
 
 - Recovery never silently discards local edits.
 - Recovery bundles are available before destructive apply or rebuild operations.
 - Recovery can distinguish repeated commits, new commits, and divergent same-device history using Git ancestry.
+- Recovery never uploads same-device divergent history through a non-fast-forward device ref update.
 
 ## 4. Technical Design
 
@@ -340,7 +348,7 @@ Acceptance criteria:
 
 ### 4.4 Plugin Components
 
-- **SettingsView:** collects server URL, login/pairing token, device name, sync profile, apply mode, and plugin-sync setting.
+- **SettingsView:** collects server URL, login/pairing token, device name, sync profile, and plugin-sync setting.
 - **StatusBar:** displays Synced, Ahead, Behind, Uploading, Applying, Offline, Blocked, Unsafe local error, and Needs recovery.
 - **VaultWatcher:** observes local vault changes through Obsidian APIs.
 - **PeriodicScanner:** detects missed watcher events and crash recovery work.
@@ -449,16 +457,18 @@ Every vault-scoped write that can change Git refs, Git objects, Postgres metadat
 2. Create and commit a `sync_operations` row with operation type, actor, expected refs, target refs, target commit, and status `started`.
 3. Import uploaded or generated Git objects into a quarantine repository.
 4. Validate object integrity, ancestry, upload size, canonical paths, authorization scope, and operation-specific invariants.
-5. Promote validated Git objects into the per-vault server Git store.
-6. Update the target Git ref with compare-and-swap semantics against the expected old commit.
-7. In one Postgres transaction, write sync/conflict/history/index/audit metadata, append `event_log` rows, and mark the `sync_operations` row `committed`.
-8. Release the per-vault lock.
-9. Notify WebSocket and polling subscribers only from committed `event_log` rows.
+5. Write and commit a prepared operation manifest to the `sync_operations` row before any Git ref mutation. The manifest stores non-content application side effects required to finish the write exactly: actor, operation type, expected refs, target refs, target commit, merge or conflict inputs, validator summaries, affected path IDs, derived-index mutation summary, conflict row changes, audit row data, event rows, redacted result payload, and object-store promotion references.
+6. Promote validated Git objects into the per-vault server Git store.
+7. Update the target Git ref with compare-and-swap semantics against the expected old commit.
+8. In one Postgres transaction, apply the prepared sync/conflict/history/index/audit metadata, append the prepared `event_log` rows, and mark the `sync_operations` row `committed`.
+9. Release the per-vault lock.
+10. Notify WebSocket and polling subscribers only from committed `event_log` rows.
 
 Startup reconciliation and readiness rules:
 
-- operations with status `started` and no matching Git ref change are aborted, and their quarantine state is removed;
-- operations whose target Git ref already points at the recorded target commit are rolled forward by writing the missing Postgres metadata and `event_log` rows from the operation record and Git state;
+- operations with status `started` and no prepared manifest are aborted, and their quarantine state is removed;
+- operations with status `prepared` whose target Git ref has not moved are aborted, and their quarantine state is removed;
+- operations whose target Git ref already points at the prepared target commit are rolled forward by applying the prepared Postgres metadata and prepared `event_log` rows exactly as recorded in the manifest;
 - operations whose Git refs, Git objects, and Postgres rows cannot be reconciled deterministically set the vault status to `blocked_integrity`;
 - a vault in `blocked_integrity` rejects sync, merge, conflict-resolution, note-restore, and maintenance mutations and causes readiness to fail closed until an operator repair command resolves the mismatch.
 
@@ -483,10 +493,16 @@ Startup reconciliation and readiness rules:
 
 Auth requirements:
 
-- first-run setup creates the initial admin account and cannot be repeated after setup is complete;
+- first-run setup creates exactly one initial admin account, marks setup complete permanently, and cannot be repeated after setup is complete;
 - v1 supports multiple user accounts in one server instance;
 - every vault has exactly one owner, and v1 has no shared vault membership;
 - admin status does not grant vault-content access unless that admin account owns the vault;
+- admin accounts can create users, disable users, re-enable users, create one-time password-reset tokens, grant admin status, revoke admin status, and view account metadata;
+- account metadata visible to admins includes user ID, username or display name, admin flag, disabled flag, created timestamp, last login timestamp, and owned vault count;
+- account metadata visible to admins excludes vault names, vault paths, note paths, Git refs, conflict contents, note history, diagnostics exports, device tokens, and recovery bundle contents for vaults the admin does not own;
+- disabling a user immediately revokes that user's dashboard sessions, pairing tokens, device tokens, and event streams;
+- revoking admin status is rejected when it would remove the final enabled admin account;
+- every admin lifecycle action writes a redacted audit event;
 - user passwords require at least 12 characters and are hashed with Argon2id using `m=19456`, `t=2`, and `p=1` as the v1 minimum parameters;
 - login attempts are rate-limited by account and source IP: 5 failed attempts in 10 minutes triggers exponential backoff starting at 1 minute and capped at 1 hour;
 - dashboard auth uses a server-side cookie session named `__Host-obts_session` with at least 128 bits of entropy, `HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/`, and no `Domain` attribute;
@@ -503,8 +519,13 @@ Auth requirements:
 - unauthenticated requests return `401`;
 - requests for vault-scoped resources not owned by the authenticated user return `404`;
 - v1 does not ship email password reset;
-- account recovery uses an audited local admin CLI command that creates a one-time recovery token without exposing vault content;
-- plugin device tokens use platform secure storage when available, otherwise `.obts/` with restrictive local permissions.
+- account recovery uses an audited local admin CLI command that creates a one-time password-reset token for a specified account or creates a new admin account only when no enabled admin account exists;
+- plugin device tokens are stored locally at `.obts/auth/device-token.json`;
+- desktop plugin implementations create `.obts/auth/device-token.json` with owner-only permissions through the runtime filesystem APIs;
+- mobile plugin implementations rely on the Obsidian app sandbox for `.obts/auth/device-token.json`;
+- `.obts/auth/**` is excluded from Git worktree content, manifest scanning, recovery bundle file snapshots, diagnostics exports, and content-bearing exports;
+- device revocation and token rotation are enforced server-side immediately, and local token deletion is best-effort cleanup only;
+- dashboard and diagnostics surfaces show token presence, age, and revocation state, never token values.
 
 ### 6.3 Git Sync And Commit Contract
 
@@ -575,7 +596,9 @@ Policy:
 
 - Git merge-base and ancestry determine the candidate merge relationship;
 - disjoint path edits auto-merge when no delete/rename collision exists;
-- same-file Markdown/text edits auto-merge only when Git merge produces clean output and line, frontmatter, heading/block, link/embed, and conflict-marker validators all accept the final text;
+- same-file Markdown edits auto-merge only when Git merge produces clean output and line, frontmatter, heading/block, link/embed, and conflict-marker validators all accept the final text;
+- same-file `.canvas` edits auto-merge only through the JSON Canvas semantic merge contract below;
+- same-file `.base` edits auto-merge only through the Obsidian Bases semantic merge contract below;
 - frontmatter auto-merges only for disjoint keys; same-key edits conflict;
 - delete-vs-edit conflicts unless the edit is already contained in the deleted side's preserved history and the owner explicitly resolves it;
 - rename-vs-edit auto-merges only when one side renames and the other side edits content without path collision;
@@ -583,6 +606,33 @@ Policy:
 - binary and attachment changes auto-merge only when Git/object identity is identical or paths are disjoint;
 - selected `.obsidian` config and plugin files use file-level rules in v1; semantic config/plugin merge handlers are outside v1;
 - unsafe, unsupported, or ambiguous cases create structured conflicts with base/current/device variants and provenance.
+
+JSON Canvas semantic merge contract:
+
+- `.canvas` files are parsed as JSON Canvas 1.0 objects before semantic merge;
+- invalid JSON, non-object roots, missing `nodes` or `edges` arrays, duplicate node IDs, duplicate edge IDs, invalid required fields, and edges that reference missing nodes create structured conflicts;
+- `nodes` are merged as a map keyed by node `id`, and `edges` are merged as a map keyed by edge `id`;
+- one-sided node or edge additions, deletions, and edits auto-merge;
+- same node or edge edits auto-merge only when the edited field sets are disjoint;
+- same node or edge same-field edits with different values conflict;
+- node `type` changes conflict unless both sides make the same `type` change;
+- deletion of a node conflicts when the other side edits that node or adds/edits an edge that references that node;
+- node order is preserved by keeping surviving base nodes in base order, inserting one-sided additions at that side's relative position, and conflicting concurrent order changes that move the same existing node to different relative positions;
+- successful `.canvas` semantic merge output is deterministic pretty JSON.
+
+Obsidian Bases semantic merge contract:
+
+- `.base` files are parsed as valid YAML matching the documented Obsidian Bases syntax before semantic merge;
+- `formulas`, `properties`, and `summaries` are merged as maps keyed by formula, property, or summary name;
+- one-sided map-entry additions, deletions, and edits auto-merge;
+- same map-entry edits auto-merge only when the edited nested keys are disjoint;
+- same-key formula expression edits, same-key summary expression edits, and same nested property-key edits with different values conflict;
+- top-level `filters` is treated as one semantic field, and concurrent edits to `filters` conflict unless both sides produce identical YAML values;
+- each `views[]` entry is keyed by the stable pair `(type, name)`, and duplicate `(type, name)` pairs conflict;
+- one-sided view additions, deletions, and edits auto-merge;
+- same-view edits auto-merge only when the edited keys are disjoint;
+- view reorder, same-view `type` edits, same-view `filters` edits, same-view `order` edits, and concurrent edits to plugin-specific or unknown view keys conflict;
+- successful `.base` semantic merge output is deterministic YAML.
 
 Merge queue rules:
 
@@ -601,7 +651,7 @@ Conflict review lifecycle:
 - the server accepts a resolution only when current `main` still matches `expected_main`;
 - if `main` advanced, the review package becomes stale and must be refreshed or regenerated;
 - duplicate submission of the same accepted resolution returns an idempotent success;
-- accepted resolutions are written as normal Git commits or merge commits descending from current `main`.
+- accepted resolutions are written as merge commits with parent 1 set to `expected_main`, parent 2 set to the conflicted device commit, and the resulting tree set to the accepted final state.
 
 ### 6.5 Main APIs
 
@@ -684,13 +734,12 @@ interface ObtsPluginSettings {
   deviceName: string;
   syncProfile: 'notes_only' | 'notes_plus_attachments' | 'full_vault_config';
   syncPlugins: boolean;
-  applyMode: 'auto_safe' | 'ask_before_apply';
 }
 ```
 
 `syncPlugins` defaults to `false`. When `false`, `.obsidian/plugins/**` is ignored completely. When `true`, `.obsidian/plugins/**` is included in sync like other selected vault state, including plugin code and settings, except `.obsidian/plugins/obts/**`.
 
-Auth tokens are stored using Obsidian/platform secret storage when available; otherwise they are stored under `.obts/` with restrictive local permissions.
+The plugin stores the device token at `.obts/auth/device-token.json`. The token file is never synced as vault content, never committed to hidden Git state, never included in recovery bundle file snapshots, and never included in diagnostics or content-bearing exports. Server-side token revocation and rotation are authoritative even when the local token file remains present.
 
 ## 8. Required v1 Feature Designs
 
@@ -748,7 +797,8 @@ Required behavior:
 
 - list versions for an authorized vault path;
 - show create, update, delete, rename, conflict, merge, and restore provenance;
-- show source and rendered diffs for Markdown/text note files;
+- show source and rendered diffs for Markdown note files;
+- show source diffs for `.canvas` and `.base` note files;
 - show metadata-only history for plugin files by default and require an explicit owner content export to display plugin file bodies;
 - restore a historical note version by creating a normal Git-backed merge/resolution commit;
 - preserve local recovery semantics before applying a restored server `main`.
@@ -783,7 +833,7 @@ Every recovery bundle contains:
 - `manifest.json` with bundle ID, vault ID, device ID, created timestamp, operation type, target `main`, prior local `main`, prior local device ref, affected paths, platform, plugin version, and checksum manifest;
 - `files/` with pre-apply snapshots of every file that will be deleted, overwritten, or renamed;
 - `git/local-refs.pack` with local commits and refs needed to recover pending local history;
-- `patches/` with text patch series for changed Markdown/text files;
+- `patches/` with text patch series for changed Markdown, `.canvas`, `.base`, and selected text configuration files;
 - `journal/apply-journal.json` with the apply journal state at bundle creation;
 - `checksums.sha256` covering every file in the bundle.
 
@@ -799,8 +849,8 @@ Local apply/recovery rules:
 
 v1 platform support:
 
-- **Desktop Linux/macOS/Windows:** supported target platforms for file watching, periodic scanning, hidden local Git state, local recovery bundles, secure token storage where available, plugin settings, and plugin sync when enabled.
-- **Android/iOS:** supported v1 target platforms for foreground sync, periodic scanning, hidden local Git state, local recovery bundles, secure token storage where available, plugin settings, safe apply, and plugin sync when enabled.
+- **Desktop Linux/macOS/Windows:** supported target platforms for file watching, periodic scanning, hidden local Git state, local recovery bundles, `.obts/auth/device-token.json` token storage, plugin settings, and plugin sync when enabled.
+- **Android/iOS:** supported v1 target platforms for foreground sync, periodic scanning, hidden local Git state, local recovery bundles, `.obts/auth/device-token.json` token storage protected by the Obsidian app sandbox, plugin settings, safe apply, and plugin sync when enabled.
 - **Client Git implementation:** the Obsidian plugin uses `isomorphic-git` for client-side Git operations on every supported platform.
 - **Client storage:** the plugin stores hidden Git state under `.obts/` through an `isomorphic-git` filesystem adapter backed by Obsidian's `DataAdapter`, including mobile `CapacitorAdapter`.
 - **Server Git implementation:** the server uses the native `git` CLI for repository validation, packfile import/export, ref updates, merge-base, merge, diff, history, maintenance, and conflict workflows.
@@ -932,7 +982,7 @@ Included:
 
 - derived path/history indexes backed by Git commits, path metadata, rename/delete provenance, and conflict/merge provenance;
 - note history query APIs and dashboard history view for creates, updates, deletes, renames, conflicts, merges, and restores;
-- source and rendered diffs for Markdown/text versions;
+- source and rendered diffs for Markdown versions, plus source diffs for `.canvas` and `.base` versions;
 - metadata-only history for plugin files by default, with explicit owner action required for content-bearing export;
 - note restore through a new Git-backed commit or merge/resolution path, never by rewriting history;
 - persistent-state integrity checks, Git maintenance needed to preserve reachable history, diagnostics export rules, and backup documentation for history-bearing state.
@@ -961,6 +1011,8 @@ Acceptance proof:
 - multi-user account lifecycle, setup, session TTL, recent-auth checks, rate limits, and local admin recovery;
 - device ref fast-forward, no-op retry, and non-fast-forward rejection rules;
 - merge policy decisions;
+- JSON Canvas semantic merge decisions;
+- Obsidian Bases semantic merge decisions;
 - merge queue ordering, merge policy versioning, and validator result persistence;
 - event-log cursor, replay, retention, and expired-cursor behavior;
 - note history indexing and restore commit creation;
@@ -982,6 +1034,8 @@ Acceptance proof:
 - same-device non-fast-forward update blocks and requires recovery;
 - concurrent disjoint edits auto-merge;
 - concurrent same-file Markdown edits merge when safe;
+- concurrent same-file `.canvas` edits merge when the JSON Canvas semantic merge contract accepts them;
+- concurrent same-file `.base` edits merge when the Obsidian Bases semantic merge contract accepts them;
 - ambiguous same-file edits create a conflict;
 - dashboard resolves a conflict and advances `main`;
 - note history shows prior versions and restores one note through a new Git commit;
