@@ -4,9 +4,9 @@
 
 `obts` is a self-hosted, Git-backed sync system for Obsidian vaults. It preserves local-first editing, central canonical state, recoverable history, conflict review, and clear device status without exposing Git workflows to note authors and without putting a normal `.git` directory in the visible vault.
 
-Git is the internal history engine for v1. Local edits become hidden Git commits, device uploads advance per-device Git refs, and the server advances canonical `main` through Git-backed merge or explicit conflict resolution. `obts` adds the Obsidian-specific product layer around Git: pairing, authorization, deployment-managed storage protection, safe local apply, recovery bundles, dashboard conflict review, note history, and maintenance.
+Git is the internal history engine for v1. Local edits become hidden Git commits, device uploads advance protected per-device Git refs that act as internal merge candidates, and the server advances canonical `main` through Git-backed merge or explicit conflict resolution. `obts` adds the Obsidian-specific product layer around Git: pairing, authorization, deployment-managed storage protection, safe local apply, recovery bundles, dashboard conflict review, note history, and maintenance.
 
-v1 uses a trusted self-hosted server model. The server is authorized to read vault content, internal Git state, and sensitive metadata for sync, merge, conflict review, note history, compaction, and recovery. v1 is multi-tenant: it supports multiple user accounts, but each vault belongs to exactly one owner and other users must not be able to see that vault through the application.
+v1 uses a trusted self-hosted server model. The server is authorized to read vault content, internal Git state, and sensitive metadata for sync, merge, conflict review, note history, maintenance, and recovery. v1 is multi-tenant: it supports multiple user accounts, but each vault belongs to exactly one owner and other users must not be able to see that vault through the application.
 
 This is not a true end-to-end encrypted or zero-knowledge design. The live server process and the server operator are trusted for v1.
 
@@ -59,17 +59,16 @@ Git provides commit identity, ancestry, merge bases, diffs, rename detection sup
 
 ### 2.1 Trust Boundary
 
-v1 trusts the server process. The server may read vault content, internal Git objects, Git trees, Git refs, and sensitive metadata in memory and in temporary workspaces to perform:
+v1 trusts the server process. The server is authorized to read vault content, internal Git objects, Git trees, Git refs, and sensitive metadata in memory and in temporary workspaces to perform:
 
-- Git pack/bundle validation and sync;
+- Git packfile validation and sync;
 - content upload validation;
 - server-side Git merge and text/Markdown semantic merge;
 - conflict package rendering;
 - dashboard conflict review;
-- search or inspection features added later;
-- compaction, note history, restore-from-history, and recovery.
+- note history, restore-from-history, maintenance, and recovery.
 
-The server must still enforce multi-tenant user isolation. v1 supports multiple user accounts, but a user can access only vaults they own. Admin or operator status in the application must not grant vault-content access unless that account owns the vault. Cross-user access to vaults, devices, Git refs, Git objects, conflicts, history entries, events, and diagnostics must return `403` or `404` without leaking useful information. v1 does not support shared vault membership.
+The server must still enforce multi-tenant user isolation. v1 supports multiple user accounts, but a user can access only vaults they own. Admin or operator status in the application must not grant vault-content access unless that account owns the vault. Cross-user access to vaults, devices, Git refs, Git objects, conflicts, history entries, events, and diagnostics must return `404` without leaking useful information. v1 does not support shared vault membership.
 
 ### 2.2 Deployment-Managed At-Rest Protection
 
@@ -85,7 +84,7 @@ Deployment requirements:
 
 `obts` must document the persistent state that deployments must protect and back up, but the app repo must not prescribe private environment-specific infrastructure paths, backup schedules, offsite targets, or secret-store locations.
 
-The storage layer should keep a clear repository/store abstraction so application-level encrypted persistence can be added later without replacing the sync model.
+The storage layer must keep a clear repository/store abstraction so application-level encrypted persistence can be added beyond v1 without replacing the sync model.
 
 ### 2.3 What At-Rest Protection Does Not Claim
 
@@ -104,9 +103,9 @@ It does not protect against:
 
 ### 2.4 Logging And Diagnostics
 
-Even though the server can read content and internal Git state, default logs and diagnostics must avoid note content unless an explicit owner-initiated export requests it. Logs must redact tokens, passwords, request bodies containing vault content, Git pack contents, bundle contents, raw blob contents, and large content payloads.
+Even though the server can read content and internal Git state, default logs and diagnostics must avoid note content unless an explicit owner-initiated export requests it. Logs must redact tokens, passwords, request bodies containing vault content, Git pack contents, raw blob contents, and large content payloads.
 
-Audit records should identify who accessed or changed a vault and which resource class was affected. They should not store full note bodies, raw Git blobs, raw paths, or secret values.
+Audit records must identify who accessed or changed a vault and which resource class was affected. They must not store full note bodies, raw Git blobs, raw paths, or secret values.
 
 ## 3. Experience And Workflows
 
@@ -139,17 +138,16 @@ Behavior:
 1. Server creates the vault record.
 2. Server initializes per-vault Git state.
 3. Server creates a server-authored empty-tree root commit on `refs/heads/main`.
-4. Dashboard issues a one-time pairing token or URL.
+4. Dashboard issues a one-time pairing token or URL after recent-auth verification.
 5. Plugin consumes the pairing token, registers device metadata, and stores a device token locally.
 6. Plugin initializes hidden Git state under `.obts/` without creating a visible vault `.git`.
 7. Plugin performs an initial scan of the local vault and local `.obts/` state.
 8. Plugin imports the current server `main` root as its base.
-9. If the local vault is empty, the client records itself as synced to current `main`.
-10. If the local vault contains user content, the plugin creates a recovery bundle, computes a local-vs-server summary from Git state, and requires the owner to choose a safe join path:
-    - commit and upload local differences through the device ref;
-    - keep local content aside and apply server state;
-    - cancel pairing.
-11. If local `.obts/` Git state belongs to another device/vault or is partially initialized, pairing blocks until the owner runs a recovery or reset flow.
+9. If the local vault is empty and server `main` contains only the server-authored empty-tree root commit, the client records itself as synced to current `main`.
+10. If the local vault is empty and server `main` contains user content, the plugin applies server `main` through the normal apply journal and records itself as synced after apply succeeds.
+11. If this is the first paired device for a newly created vault and the local vault contains user content, the plugin creates a recovery bundle, asks the owner to confirm initial import, commits the local content as the initial device commit, and uploads that commit through the device ref.
+12. If this is an additional paired device and the local vault contains user content that differs from server `main`, the plugin creates a recovery bundle, shows a local-vs-server summary, blocks normal sync, and requires an explicit replace-local-with-server command before applying server state. The original local content remains recoverable only from the recovery bundle after replacement.
+13. If local `.obts/` Git state belongs to another device/vault or is partially initialized, pairing blocks until the owner runs a recovery or reset flow.
 
 Acceptance criteria:
 
@@ -159,11 +157,12 @@ Acceptance criteria:
 - No visible `.git` directory is created inside the vault.
 - Server `main` exists immediately after vault creation and points to a real empty-tree root commit, not an empty or unborn ref.
 - First sync never silently discards local content.
-- Non-empty local vault joins require a recovery bundle before server state is applied.
+- First-device import of non-empty local content requires a recovery bundle and explicit owner confirmation before upload.
+- Additional-device pairing of non-empty divergent local content blocks normal sync until the owner explicitly replaces local content with server state after recovery bundle creation.
 
 ### 3.4 Local Edit Sync
 
-When a user edits local vault files, the plugin records the edit as one or more hidden Git commits under `.obts/`, uploads Git objects over authenticated HTTPS, and keeps retry state durable.
+When a user edits local vault files, the plugin records the edit as one or more hidden Git commits under `.obts/`, uploads Git packfiles over authenticated HTTPS, and keeps retry state durable.
 
 Acceptance criteria:
 
@@ -183,7 +182,7 @@ Acceptance criteria:
 - Local uncommitted changes are never overwritten without a recovery snapshot.
 - Local commits not yet present on the server are preserved or surfaced for recovery before destructive apply.
 - Local changes are never silently discarded; if safe apply is impossible, sync blocks and surfaces recovery options.
-- Apply operations use supported Obsidian vault APIs where possible.
+- Apply operations use Obsidian `Vault` and `DataAdapter` APIs only.
 - Apply operations use a local vault lock and an apply journal under `.obts/` with target `main`, expected prior local state, affected paths, per-file preflight hashes, and current phase.
 - The plugin creates a recovery bundle before any destructive file operation.
 - Watcher events caused by `obts` apply writes are suppressed or tagged so they are not recommitted as new local edits.
@@ -197,16 +196,18 @@ The server receives Git updates from multiple devices and advances `main` only t
 
 Behavior:
 
-1. A device upload carries Git objects and an expected current device ref.
+1. A device upload carries a Git packfile and an expected current device ref.
 2. If the uploaded commit is already present and the device ref already points to it, the server treats the upload as an idempotent no-op.
 3. If the uploaded commit is a fast-forward of the device ref, the server advances `refs/obts/devices/{device_id}`.
 4. If the uploaded commit is not a descendant of the current device ref, the server blocks that device and requires recovery.
-5. The server attempts to merge eligible device refs into `refs/heads/main`.
-6. Disjoint path changes merge automatically when Git and `obts` policy agree they are safe.
-7. Same-path text and Markdown changes are checked out into an ephemeral server merge workspace.
-8. The merge service uses Git merge machinery plus conservative line/frontmatter/block-aware validation.
-9. Clean merges advance `main` with a merge commit.
-10. Ambiguous or unsafe merges create a conflict record.
+5. The server classifies the device ref as merge-eligible only after authentication, object validation, path-policy validation, fast-forward ref update, device-not-blocked checks, not-already-merged checks, not-already-conflicted checks, and assignment of a server `merge_sequence`.
+6. The server enqueues merge-eligible device refs in the per-vault merge queue ordered by `merge_sequence`.
+7. The server processes one merge transaction at a time under the per-vault lock.
+8. Disjoint path changes merge automatically when Git and `obts` policy agree they are safe.
+9. Same-path text and Markdown changes are checked out into an ephemeral server merge workspace.
+10. The merge service uses Git merge machinery plus conservative line/frontmatter/block-aware validation.
+11. Clean merges advance `main` with a merge commit.
+12. Ambiguous or unsafe merges create a conflict record.
 
 Acceptance criteria:
 
@@ -214,6 +215,7 @@ Acceptance criteria:
 - Device ref updates use fast-forward or compare-and-swap semantics.
 - Conflict originals remain recoverable from Git commits.
 - Binary conflicts default to identity-only merge or keep-both review.
+- Every merge decision records `merge_sequence`, `merge_policy_version`, base commit, current `main`, device commit, decision, and validator results.
 
 ### 3.7 Conflict Review In Dashboard
 
@@ -227,9 +229,9 @@ Behavior:
 4. Server returns conflict metadata and content needed for review over HTTPS.
 5. Dashboard displays rendered Markdown diff, source diff, affected paths, and available merge choices.
 6. User accepts current `main`, accepts device version, keeps both, inserts both blocks, or manually edits a final result.
-7. Dashboard submits the selected resolution with the conflict ID and expected current `main`.
-8. Server accepts the resolution only if current `main` still matches the expected commit or Git can safely re-evaluate the resolution against the new `main`.
-9. If `main` advanced incompatibly, the review package is marked stale and the dashboard must refresh or regenerate it before resolution.
+7. Dashboard verifies recent authentication and submits the selected resolution with the conflict ID and expected current `main`.
+8. Server accepts the resolution only if current `main` still matches the expected commit.
+9. If `main` advanced, the review package is marked stale and the dashboard must refresh or regenerate it before resolution.
 10. Server writes the accepted resolution as a normal Git commit or merge commit descending from current `main`, persists updated Git state, advances `main`, and marks the conflict resolved.
 
 Acceptance criteria:
@@ -238,6 +240,7 @@ Acceptance criteria:
 - Resolution commits reference the conflict they resolved.
 - Duplicate submission of the same accepted resolution is idempotent.
 - All clients receive a `main_advanced` event after resolution.
+- Conflict resolution submission requires dashboard re-authentication within the previous 15 minutes.
 
 ### 3.8 Device Dashboard
 
@@ -262,14 +265,14 @@ Behavior:
 3. Server derives history from Git commits, path metadata, and rename/delete provenance.
 4. Server returns version metadata, including commit, timestamp, author device/user, operation type, and conflict/merge provenance.
 5. User views source or rendered diffs for Markdown/text versions.
-6. User restores a prior version by creating a normal Git commit through the same merge/resolution path as other edits; history is never mutated in place.
+6. User restores a prior version after recent-auth verification by creating a normal Git commit through the same merge/resolution path as other edits; history is never mutated in place.
 
 Acceptance criteria:
 
 - Note history can show creates, updates, deletes, and renames.
 - Restoring a prior note version advances `main` through the same Git-backed merge/resolution path as other edits.
 - Git timestamps are display metadata only and never determine sync ordering.
-- Compaction preserves the current baseline and any history retained by policy, or clearly marks older pruned history as unavailable.
+- v1 retains all commits reachable from `main`, device refs, unresolved conflict refs, and recovery refs indefinitely. Destructive history truncation is outside v1.
 
 ### 3.10 Recovery And Rebuild
 
@@ -281,7 +284,7 @@ Behavior:
 2. Plugin snapshots local pending edits and relevant hidden Git state into a recovery bundle.
 3. Plugin pulls current server `main`.
 4. Plugin applies server state to local vault.
-5. Plugin uploads any preserved local commits, Git bundles, or patch series through the device ref, or exposes them for manual review.
+5. Plugin commits preserved patch series as a new local recovery commit, uploads preserved local commits through the device ref, and keeps divergent same-device history blocked until the owner exports the recovery bundle and resets the device.
 
 Acceptance criteria:
 
@@ -295,7 +298,7 @@ Acceptance criteria:
 
 1. Git is the authoritative internal history engine for vault content.
 2. `refs/heads/main` is the only published server state for a vault.
-3. Each paired device uploads through a server-side device ref such as `refs/obts/devices/{device_id}`.
+3. Each paired device uploads through a protected server-side device ref such as `refs/obts/devices/{device_id}`; device refs are internal merge candidates, not user-visible Git branches.
 4. Clients commit locally; only server merge/resolution transactions advance `main`.
 5. Git commit hashes identify immutable commits; parent links define ancestry; timestamps are display metadata only.
 6. The server uses the native `git` CLI as the authoritative server-side Git implementation.
@@ -311,7 +314,7 @@ Acceptance criteria:
 - **Server API and CLI:** TypeScript/Node/Fastify service for auth, vaults, devices, Git sync, merge, conflicts, note history, persistent-state checks, and health.
 - **Dashboard SPA:** browser UI served by the server for setup, device dashboard, conflict review, and maintenance.
 - **Obsidian plugin:** TypeScript plugin that watches local vaults, records hidden Git commits with `isomorphic-git`, uploads device ref updates, pulls `main`, and applies accepted state.
-- **Postgres:** control-plane metadata for users, single-owner vaults, devices, token hashes, derived indexes, conflict workflow records, sync attempts, and audit records. Postgres does not own the authoritative commit graph, tree manifests, blobs, or refs.
+- **Postgres:** control-plane metadata for users, single-owner vaults, devices, token hashes, durable sync operations, derived indexes, conflict workflow records, event log rows, sync attempts, and audit records. Postgres does not own the authoritative commit graph, tree manifests, blobs, or refs.
 - **Server Git store:** per-vault internal Git repositories, object databases, packs, refs, trees, commits, blobs, and history state stored outside visible vaults.
 - **Temporary Git workspace:** ephemeral plaintext bare repos and working trees for sync, merge, history, conflict review, restore, and maintenance transactions; cleaned after transaction.
 - **Local `.obts` store:** client-local hidden Git state, queues, cache, recovery bundles, locks, diagnostics, and device token state.
@@ -322,7 +325,7 @@ Acceptance criteria:
 - **VaultService:** creates vaults, enforces owner isolation, and coordinates initial Git state creation.
 - **DeviceService:** registers, tracks, and revokes paired devices.
 - **ServerGitStoreService:** manages per-vault server Git repositories and verifies store integrity.
-- **GitRepositoryService:** invokes the native `git` CLI to materialize authorized temporary Git repos, import/export packs or bundles, update refs, compute diffs, and read history.
+- **GitRepositoryService:** invokes the native `git` CLI to materialize authorized temporary Git repos, import/export packfiles, update refs, compute diffs, and read history.
 - **PathPolicyService:** validates canonical vault-relative paths, collision rules, and platform-safe materialization rules.
 - **SyncService:** accepts authenticated device Git uploads, enforces device ref fast-forward rules, records sync attempts, and submits eligible updates to merge.
 - **HistoryService:** exposes Git-backed canonical `main`, refs, provenance, integrity checks, and maintenance operations.
@@ -371,25 +374,29 @@ Acceptance criteria:
 - `git_commit_id`: Git object ID for authorized runtime/API use.
 - `git_ref`: internal Git ref name, such as `refs/heads/main` or `refs/obts/devices/{device_id}`.
 - `sync_attempt_id`: `sync_` plus ULID.
+- `sync_operation_id`: `op_` plus ULID.
 - `path_id`: `pth_` plus opaque identifier for path-scoped workflow and indexes; not a security boundary.
 - `conflict_id`: `conf_` plus ULID.
+- `event_id`: `evt_` plus ULID.
 
 ### 5.2 Core Tables
 
 - `users`: account identity and password hash.
-- `vaults`: owner user ID, display name, status, current main cursor where needed, created/updated timestamps.
+- `vaults`: owner user ID, display name, status, current main cursor, created timestamp, and updated timestamp.
 - `devices`: vault-scoped paired devices, owning user ID, device ref name, and server-known state.
 - `api_tokens`: hashed dashboard, device, and pairing tokens.
+- `sync_operations`: durable per-vault write workflow rows with operation type, expected refs, target refs, target commit, lifecycle status, validation summary, and reconciliation state.
 - `sync_attempts`: authenticated device push/pull attempts, lifecycle, expected ref metadata, result state, and redacted error category.
 - `derived_indexes`: path, history, and summary indexes derived from Git for authorized lookup and dashboard performance.
-- `conflicts`: thin workflow state, affected `path_id`s, affected path metadata, base/current/device commit cursors, expected `main`, stale/resolved status, and resolution commit cursor.
+- `conflicts`: thin workflow state, affected `path_id`s, affected path metadata, base/current/device commit cursors, expected `main`, stale/resolved status, resolution commit cursor, `merge_sequence`, `merge_policy_version`, and validator summary.
+- `event_log`: persistent per-vault event rows with monotonic `event_seq`, event ID, event type, vault scope, resource IDs, commit cursors, redacted payload, and timestamp.
 - `audit_log`: redacted operational events.
 
 Postgres must not become the authoritative store for Git commits, trees, blobs, refs, or manifests. Those belong to the server Git store.
 
 ### 5.3 Git Persistence
 
-The server may receive Git packs, bundles, or equivalent Git object transfers over authenticated HTTPS. After authorization and validation, `GitRepositoryService` imports them with the native `git` CLI into a temporary Git repository, `SyncService` validates ref update rules, and `ServerGitStoreService` persists updated per-vault Git state.
+The server receives Git packfiles over authenticated HTTPS. After authorization and validation, `GitRepositoryService` imports packfiles with the native `git` CLI into quarantine, `SyncService` validates ref update rules, and `ServerGitStoreService` persists updated per-vault Git state through the durable Git/Postgres write workflow. Git bundles and alternate object-transfer formats are outside v1.
 
 Plugin settings and selected `.obsidian` files are treated as vault content inside Git for history, conflict, and logging rules.
 
@@ -410,15 +417,15 @@ Rules:
 - path collisions are sync-blocking conflicts requiring user rename, not automatic overwrites;
 - symlinks are not followed or synced in v1;
 - file mode bits, executable bits, mtimes, and extended attributes are ignored except where the Obsidian vault API exposes required data for safe write checks;
-- audit logs may include resource classes and opaque IDs, but not note bodies, Git pack contents, raw blobs, plugin settings, or full content payloads.
+- audit logs include resource classes and opaque IDs, but not note bodies, Git pack contents, raw blobs, plugin settings, or full content payloads.
 
 ### 5.5 Git History Model
 
-Server `main` is `refs/heads/main` in the per-vault internal Git repository. Each paired device has a server-side device ref such as `refs/obts/devices/{device_id}`. The server may use additional internal refs for conflicts, recovery, maintenance, and temporary operations, but these are not exposed as user-facing Git workflow.
+Server `main` is `refs/heads/main` in the per-vault internal Git repository. Each paired device has a protected server-side device ref such as `refs/obts/devices/{device_id}`. Device refs are internal change proposals analogous to protected-branch merge candidates in Git hosting systems. The server may use additional internal refs for conflicts, recovery, maintenance, and temporary operations, but these are not exposed as user-facing Git workflow.
 
 Each Git commit records normal Git parents, tree state, author/committer metadata, timestamps, and message metadata. `obts` associates commits with device/user/provenance through derived metadata and audit records. Git commit parent links, not timestamps, define ancestry and merge relationships.
 
-Note history is derived from Git commits, path metadata, rename/delete provenance, and derived indexes. Note restore creates a new Git commit; it never rewrites existing commits unless an explicit owner-confirmed history truncation workflow is used.
+Note history is derived from Git commits, path metadata, rename/delete provenance, and derived indexes. Note restore creates a new Git commit; it never rewrites existing commits. Destructive history truncation is outside v1.
 
 Temporary Git repositories and merge workspaces may contain plaintext checked-out file trees and raw Git objects. They must be scoped to one transaction, permission-restricted, and cleaned after success or failure.
 
@@ -434,18 +441,42 @@ Failure rules:
 - missing native `git` CLI fails readiness;
 - deployment-managed storage encryption and backup-key handling remain outside the app repo.
 
+### 5.7 Durable Git/Postgres Write Workflow
+
+Every vault-scoped write that can change Git refs, Git objects, Postgres metadata, derived indexes, conflict records, audit rows, or event rows follows one server workflow:
+
+1. Acquire the per-vault lock.
+2. Create and commit a `sync_operations` row with operation type, actor, expected refs, target refs, target commit, and status `started`.
+3. Import uploaded or generated Git objects into a quarantine repository.
+4. Validate object integrity, ancestry, upload size, canonical paths, authorization scope, and operation-specific invariants.
+5. Promote validated Git objects into the per-vault server Git store.
+6. Update the target Git ref with compare-and-swap semantics against the expected old commit.
+7. In one Postgres transaction, write sync/conflict/history/index/audit metadata, append `event_log` rows, and mark the `sync_operations` row `committed`.
+8. Release the per-vault lock.
+9. Notify WebSocket and polling subscribers only from committed `event_log` rows.
+
+Startup reconciliation and readiness rules:
+
+- operations with status `started` and no matching Git ref change are aborted, and their quarantine state is removed;
+- operations whose target Git ref already points at the recorded target commit are rolled forward by writing the missing Postgres metadata and `event_log` rows from the operation record and Git state;
+- operations whose Git refs, Git objects, and Postgres rows cannot be reconciled deterministically set the vault status to `blocked_integrity`;
+- a vault in `blocked_integrity` rejects sync, merge, conflict-resolution, note-restore, and maintenance mutations and causes readiness to fail closed until an operator repair command resolves the mismatch.
+
 ## 6. Interfaces And Contracts
 
 ### 6.1 API Conventions
 
-- HTTPS JSON or multipart APIs under `/api/v1`.
+- HTTPS APIs are served under `/api/v1`.
+- Non-sync APIs use JSON request and response bodies.
+- Device sync push and pull APIs use `multipart/form-data` with one `manifest` JSON part and one `packfile` part using Git packfile bytes.
 - Device APIs authenticate with device tokens.
-- Dashboard APIs authenticate with session cookies or bearer tokens.
+- Dashboard APIs authenticate with server-side session cookies only.
 - Every vault-scoped endpoint checks account ownership, vault ownership, and device scope where applicable.
 - Git sync APIs use commit identity, ref expectations, and idempotent retry behavior rather than custom proposal ordering.
 - Events are available through WebSocket with polling fallback.
-- v1 must ship a committed, versioned API contract artifact, such as OpenAPI plus shared TypeScript schemas.
-- Server, plugin, and dashboard contract tests must validate auth scopes, typed errors, redaction rules, idempotency/retry semantics, upload limits, pagination where needed, event cursors/replay, and version compatibility.
+- v1 must ship a committed OpenAPI 3.1 contract as the canonical API contract artifact plus shared TypeScript schemas generated or validated against that contract.
+- JSON errors use one redacted envelope: `{"error":{"code":"...","message":"...","request_id":"...","details":{...}}}`. `details` contains typed validation metadata only and never contains note bodies, raw paths, Git object bytes, token values, or secret values.
+- Server, plugin, and dashboard contract tests must validate auth scopes, typed errors, redaction rules, idempotency/retry semantics, upload limits, pagination for list endpoints, event cursors/replay, and version compatibility.
 - Incompatible or too-old clients must fail closed before mutating sync state.
 
 ### 6.2 Auth, Sessions, And Tokens
@@ -456,29 +487,56 @@ Auth requirements:
 - v1 supports multiple user accounts in one server instance;
 - every vault has exactly one owner, and v1 has no shared vault membership;
 - admin status does not grant vault-content access unless that admin account owns the vault;
-- user passwords are hashed with a memory-hard KDF such as Argon2id;
-- password policy, login rate limits, lockout/backoff behavior, and password recovery/reset stance are explicit v1 requirements;
-- dashboard cookie sessions use `HttpOnly`, `Secure`, and `SameSite` protections;
-- dashboard sessions have explicit TTL, refresh/rotation behavior, logout, and server-side revocation;
-- cookie-authenticated mutation APIs require CSRF protection;
-- bearer, dashboard, device, and pairing tokens are opaque and stored server-side only as hashes;
-- pairing tokens are one-time, scoped to one owning user and vault, short-lived, and rate-limited;
+- user passwords require at least 12 characters and are hashed with Argon2id using `m=19456`, `t=2`, and `p=1` as the v1 minimum parameters;
+- login attempts are rate-limited by account and source IP: 5 failed attempts in 10 minutes triggers exponential backoff starting at 1 minute and capped at 1 hour;
+- dashboard auth uses a server-side cookie session named `__Host-obts_session` with at least 128 bits of entropy, `HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/`, and no `Domain` attribute;
+- dashboard sessions have a 30-day absolute TTL and a 7-day idle TTL, refreshed on authenticated dashboard use;
+- sensitive dashboard operations require password re-authentication within the previous 15 minutes: pairing token creation, device revocation, conflict resolution submission, note restore, content-bearing recovery export, Git maintenance start, password change, and admin account management;
+- logout and account/device revocation invalidate matching server-side sessions immediately;
+- cookie-authenticated mutation APIs require a CSRF token bound to the session and submitted in the `X-OBTS-CSRF` header;
+- dashboard bearer tokens are not supported in v1;
+- device and pairing tokens are opaque, contain at least 256 bits of entropy, and are stored server-side only as hashes with a non-secret lookup prefix;
+- pairing tokens are one-time, scoped to one owning user and vault, expire after 10 minutes, allow at most 10 failed consume attempts, and are rate-limited by source IP;
 - device tokens are scoped to one user, one vault, and one device;
 - token rotation and device revocation take effect without waiting for client reconnect;
 - login, pairing, failed auth, token rotation, and revocation write redacted audit records;
+- unauthenticated requests return `401`;
+- requests for vault-scoped resources not owned by the authenticated user return `404`;
+- v1 does not ship email password reset;
+- account recovery uses an audited local admin CLI command that creates a one-time recovery token without exposing vault content;
 - plugin device tokens use platform secure storage when available, otherwise `.obts/` with restrictive local permissions.
 
 ### 6.3 Git Sync And Commit Contract
 
-Device push fields:
+Device push request:
+
+- content type: `multipart/form-data`;
+- `manifest` part: JSON metadata;
+- `packfile` part: Git packfile bytes.
+
+Device push manifest fields:
 
 - `vault_id`;
 - `device_id`;
 - expected current device ref or empty-ref marker;
 - target commit ID;
-- Git pack, bundle, or equivalent object transfer;
+- packfile SHA-256 and byte length;
 - client-known `main` commit for merge context;
 - sync attempt metadata and timestamps for diagnostics only.
+
+Device pull request fields:
+
+- `vault_id`;
+- `device_id`;
+- current local `main` commit;
+- requested target `main` commit or `latest`;
+- client API version.
+
+Device pull response:
+
+- content type: `multipart/form-data`;
+- `manifest` part: JSON metadata with target `main`, required apply summary, changed-path metadata, and event cursor;
+- `packfile` part: Git packfile bytes required to reach the target `main`.
 
 Supported committed operations:
 
@@ -517,14 +575,22 @@ Policy:
 
 - Git merge-base and ancestry determine the candidate merge relationship;
 - disjoint path edits auto-merge when no delete/rename collision exists;
-- same-file Markdown/text edits may auto-merge only when Git merge and line, frontmatter, heading/block, and link/embed validation agree the final text is deterministic and safe;
+- same-file Markdown/text edits auto-merge only when Git merge produces clean output and line, frontmatter, heading/block, link/embed, and conflict-marker validators all accept the final text;
 - frontmatter auto-merges only for disjoint keys; same-key edits conflict;
 - delete-vs-edit conflicts unless the edit is already contained in the deleted side's preserved history and the owner explicitly resolves it;
-- rename-vs-edit may auto-merge only when one side renames and the other side edits content without path collision;
+- rename-vs-edit auto-merges only when one side renames and the other side edits content without path collision;
 - rename-vs-rename conflicts unless both sides produce the same target path;
 - binary and attachment changes auto-merge only when Git/object identity is identical or paths are disjoint;
-- selected `.obsidian` config and plugin files use file-level rules unless a later handler defines a stricter semantic merge;
+- selected `.obsidian` config and plugin files use file-level rules in v1; semantic config/plugin merge handlers are outside v1;
 - unsafe, unsupported, or ambiguous cases create structured conflicts with base/current/device variants and provenance.
+
+Merge queue rules:
+
+- each accepted device ref update receives a server-assigned `merge_sequence`;
+- one merge transaction runs at a time for each vault under the per-vault lock;
+- merge candidates are processed in ascending `merge_sequence`;
+- every merge decision stores `merge_policy_version`, base commit, current `main`, device commit, decision, and validator results;
+- retries of the same merge candidate return the stored decision.
 
 Conflict review lifecycle:
 
@@ -532,8 +598,8 @@ Conflict review lifecycle:
 - conflict workflow metadata is thin Postgres state over Git-backed commits, not an independent conflict-resolution engine;
 - conflict records store conflict ID, vault/device/user scope, affected path IDs, lifecycle status, audit fields, base commit, current `main` at conflict creation, device commit, expected `main`, and optional resolution commit;
 - resolution submissions include `expected_main`;
-- the server accepts a resolution only when current `main` still matches `expected_main` or Git can safely re-evaluate the resolution against the new `main`;
-- if `main` advanced incompatibly, the review package becomes stale and must be refreshed or regenerated;
+- the server accepts a resolution only when current `main` still matches `expected_main`;
+- if `main` advanced, the review package becomes stale and must be refreshed or regenerated;
 - duplicate submission of the same accepted resolution returns an idempotent success;
 - accepted resolutions are written as normal Git commits or merge commits descending from current `main`.
 
@@ -541,16 +607,17 @@ Conflict review lifecycle:
 
 - `POST /api/v1/pair/consume`: consume a pairing token and register a device.
 - `GET /api/v1/vaults/{vault_id}/main`: return current `main` metadata and authorized summary.
-- `POST /api/v1/vaults/{vault_id}/sync/push`: upload Git objects and request a device ref update.
-- `POST /api/v1/vaults/{vault_id}/sync/pull`: request Git objects, diff metadata, or apply summary needed to reach a target `main`.
+- `POST /api/v1/vaults/{vault_id}/sync/push`: upload a push manifest and Git packfile, then request a device ref update.
+- `POST /api/v1/vaults/{vault_id}/sync/pull`: request a target `main` and receive a pull manifest plus Git packfile needed to reach it.
 - `POST /api/v1/vaults/{vault_id}/history/query`: list note history for an authorized path supplied in a redacted request body.
 - `POST /api/v1/vaults/{vault_id}/history/version`: fetch a historical note version or diff source for a commit/path supplied in a redacted request body.
 - `POST /api/v1/vaults/{vault_id}/history/restore`: restore a historical note version through a new Git-backed merge/resolution commit.
 - `GET /api/v1/vaults/{vault_id}/conflicts?status=open`: list conflicts visible to the authorized user/device.
 - `GET /api/v1/vaults/{vault_id}/conflicts/{conflict_id}`: fetch conflict review content.
 - `POST /api/v1/vaults/{vault_id}/conflicts/{conflict_id}/resolve`: submit a resolution.
-- `POST /api/v1/vaults/{vault_id}/maintenance/git-gc/start`: run owner-confirmed Git maintenance over server Git state.
-- `POST /api/v1/vaults/{vault_id}/maintenance/compact/start`: create an owner-confirmed baseline/truncation point when history retention policy allows it.
+- `GET /api/v1/vaults/{vault_id}/events?after={event_seq}`: poll authorized events after a cursor.
+- `GET /api/v1/vaults/{vault_id}/events/stream`: subscribe to authorized event delivery over WebSocket.
+- `POST /api/v1/vaults/{vault_id}/maintenance/git-gc/start`: run owner-confirmed Git verification and repack over server Git state.
 
 ### 6.6 Events
 
@@ -567,7 +634,16 @@ Events include:
 - `vault_maintenance_started`;
 - `vault_maintenance_finished`.
 
-Event payloads must be authorized by vault scope and should avoid full note bodies, raw blobs, Git pack data, or raw paths.
+Event payloads must be authorized by vault scope and must not include full note bodies, raw blobs, Git pack data, or raw paths.
+
+Event log contract:
+
+- each vault has a persistent event log with monotonically increasing `event_seq`;
+- each event contains `event_id`, `event_seq`, event type, vault ID, redacted resource IDs, commit cursors, redacted payload, and timestamp;
+- WebSocket and polling return the same event envelope;
+- event retention is 30 days and 100,000 events per vault;
+- a request for an expired or pruned cursor returns `410 Gone`, and the client performs a full state refresh before resuming from the returned current cursor;
+- event payloads must not contain full note bodies, raw blobs, Git pack data, token values, secret values, plugin settings, or raw paths.
 
 ## 7. Config
 
@@ -589,6 +665,15 @@ Optional:
 - `OBTS_EVENT_POLL_INTERVAL_MS`
 - `OBTS_GIT_BINARY`
 
+Defaults:
+
+- `OBTS_GIT_STORE_DIR`: `${OBTS_DATA_DIR}/git`
+- `OBTS_TEMP_DIR`: `${OBTS_DATA_DIR}/tmp`
+- `OBTS_LOG_LEVEL`: `info`
+- `OBTS_MAX_UPLOAD_BYTES`: `104857600`
+- `OBTS_EVENT_POLL_INTERVAL_MS`: `15000`
+- `OBTS_GIT_BINARY`: `git`
+
 ### 7.2 Plugin Settings
 
 ```ts
@@ -603,7 +688,7 @@ interface ObtsPluginSettings {
 }
 ```
 
-`syncPlugins` defaults to `false`. When `false`, `.obsidian/plugins/**` is ignored completely. When `true`, `.obsidian/plugins/**` is included in sync like other selected vault state, including plugin code and settings.
+`syncPlugins` defaults to `false`. When `false`, `.obsidian/plugins/**` is ignored completely. When `true`, `.obsidian/plugins/**` is included in sync like other selected vault state, including plugin code and settings, except `.obsidian/plugins/obts/**`.
 
 Auth tokens are stored using Obsidian/platform secret storage when available; otherwise they are stored under `.obts/` with restrictive local permissions.
 
@@ -627,13 +712,31 @@ Rules:
 - v1 attachment file types are Obsidian-supported non-note files: images (`.avif`, `.bmp`, `.gif`, `.jpeg`, `.jpg`, `.png`, `.svg`, `.webp`), audio (`.flac`, `.m4a`, `.mp3`, `.ogg`, `.wav`, `.webm`, `.3gp`), video (`.mkv`, `.mov`, `.mp4`, `.ogv`, `.webm`), and PDFs (`.pdf`).
 - Unknown, unreadable, or invalid attachment-location settings block sync with a clear error instead of guessing.
 - The server enforces a documented maximum upload byte limit through `OBTS_MAX_UPLOAD_BYTES`; files larger than that limit block upload/apply for the affected file with a clear error.
-- The `full_vault_config` profile syncs notes, attachments, and selected `.obsidian` config files by file policy.
-- The default policy includes useful core Obsidian config and CSS snippets, and excludes known local/runtime/cache paths.
+- The `full_vault_config` profile syncs notes, attachments, and only these `.obsidian` files by default:
+  - `.obsidian/app.json`;
+  - `.obsidian/appearance.json`;
+  - `.obsidian/backlinks.json`;
+  - `.obsidian/bookmarks.json`;
+  - `.obsidian/command-palette.json`;
+  - `.obsidian/core-plugins.json`;
+  - `.obsidian/core-plugins-migration.json`;
+  - `.obsidian/daily-notes.json`;
+  - `.obsidian/editor.json`;
+  - `.obsidian/graph.json`;
+  - `.obsidian/hotkeys.json`;
+  - `.obsidian/outgoing-link.json`;
+  - `.obsidian/page-preview.json`;
+  - `.obsidian/properties.json`;
+  - `.obsidian/switcher.json`;
+  - `.obsidian/templates.json`;
+  - `.obsidian/types.json`;
+  - `.obsidian/snippets/*.css`.
+- `full_vault_config` always excludes `.obsidian/workspace.json`, `.obsidian/workspace-mobile.json`, `.obsidian/cache/**`, `.obsidian/trash/**`, `.obsidian/plugins/**` unless `syncPlugins` is `true`, and every `.obsidian` path not listed in the allowlist above.
 - `.obsidian/plugins/**` is controlled only by the `syncPlugins` setting.
 - When `syncPlugins` is `false`, `.obsidian/plugins/**` is completely ignored.
-- When `syncPlugins` is `true`, the full `.obsidian/plugins/**` directory is synced as normal vault state, including `manifest.json`, `main.js`, `styles.css`, `data.json`, and any plugin-owned files.
+- When `syncPlugins` is `true`, the full `.obsidian/plugins/**` directory is synced as normal vault state, including `manifest.json`, `main.js`, `styles.css`, `data.json`, and any plugin-owned files, except `.obsidian/plugins/obts/**`.
 - Changing `syncPlugins` takes effect on future scans without requiring Obsidian restart.
-- Plugin files are executable/sensitive content; they are never logged, included in history/recovery/conflict handling, and are applied as vault state without forcing restart.
+- Plugin files are executable/sensitive content. When synced, they are Git-backed vault state and participate in file-level history, recovery, and conflict handling. Diagnostics exports and note-history UI redact plugin file content by default.
 - Already-loaded plugin code may continue to run until Obsidian or the plugin reloads; `obts` does not force that reload as part of sync.
 - `obts` must not update its own running plugin code through normal plugin sync.
 
@@ -645,7 +748,8 @@ Required behavior:
 
 - list versions for an authorized vault path;
 - show create, update, delete, rename, conflict, merge, and restore provenance;
-- show source and rendered diffs for Markdown/text where possible;
+- show source and rendered diffs for Markdown/text note files;
+- show metadata-only history for plugin files by default and require an explicit owner content export to display plugin file bodies;
 - restore a historical note version by creating a normal Git-backed merge/resolution commit;
 - preserve local recovery semantics before applying a restored server `main`.
 
@@ -662,24 +766,33 @@ Backup orchestration is a deployment concern. The app repo must not prescribe ba
 
 State capture must be quiesced or point-in-time consistent across Postgres and the server Git store. After restore, `GET /health/ready` must fail closed when required Git state, database state, migrations, filesystem permissions, or native `git` CLI availability is missing or inconsistent.
 
-### 8.4 Git Maintenance And Compact History
+### 8.4 Git Maintenance
 
-Routine maintenance may verify Git object integrity, repack server Git state, prune unreachable objects, and refresh derived indexes without changing visible history.
+Routine maintenance verifies Git object integrity, repacks server Git state, prunes objects unreachable from `main`, device refs, unresolved conflict refs, and recovery refs, and refreshes derived indexes without changing visible history.
 
-History truncation is a separate owner-confirmed compaction workflow. It creates a new baseline from current `main`, verifies referenced content, preserves retention-policy history, and removes unreferenced old commits/content only after explicit owner confirmation.
+v1 retains all commits reachable from `main`, device refs, unresolved conflict refs, and recovery refs indefinitely. v1 does not provide destructive history truncation, baseline compaction, or a compact-history API.
 
 ### 8.5 Recovery Bundles
 
-Before destructive local apply or rebuild, the plugin writes a local recovery bundle under `.obts/`. Recovery bundles are local sensitive state and are not synced as vault content.
+Before destructive local apply or rebuild, the plugin writes a local recovery bundle under `.obts/recovery/{bundle_id}/`. Recovery bundles are local sensitive state and are not synced as vault content.
 
-Recovery bundles may contain snapshots, Git bundles, patch series, commit IDs, the local apply journal state, and enough metadata to distinguish repeated commits from divergent same-device history.
+The apply journal is stored at `.obts/apply-journal.json` and contains apply ID, operation type, target `main`, expected prior local `main`, expected prior local device ref, phase, affected paths, per-file preflight SHA-256 values, recovery bundle ID, last completed step, and redacted error category. The phase value is one of `planned`, `recovery_bundle_written`, `writing_files`, `verifying`, `committed`, or `blocked_recovery`.
+
+Every recovery bundle contains:
+
+- `manifest.json` with bundle ID, vault ID, device ID, created timestamp, operation type, target `main`, prior local `main`, prior local device ref, affected paths, platform, plugin version, and checksum manifest;
+- `files/` with pre-apply snapshots of every file that will be deleted, overwritten, or renamed;
+- `git/local-refs.pack` with local commits and refs needed to recover pending local history;
+- `patches/` with text patch series for changed Markdown/text files;
+- `journal/apply-journal.json` with the apply journal state at bundle creation;
+- `checksums.sha256` covering every file in the bundle.
 
 Local apply/recovery rules:
 
 - destructive apply and rebuild operations require a recovery bundle first;
 - recovery bundles are created before file deletes, overwrites, renames, or profile changes that remove local content;
 - recovery bundle creation failure blocks the destructive operation;
-- recovery bundles are retained until the user explicitly clears them or retention policy safely prunes them;
+- recovery bundles are retained until the user explicitly deletes them;
 - diagnostics exports must redact or omit recovery bundle content unless the owner explicitly requests a content-bearing export.
 
 ### 8.6 Platform Support Matrix
@@ -690,7 +803,7 @@ v1 platform support:
 - **Android/iOS:** supported v1 target platforms for foreground sync, periodic scanning, hidden local Git state, local recovery bundles, secure token storage where available, plugin settings, safe apply, and plugin sync when enabled.
 - **Client Git implementation:** the Obsidian plugin uses `isomorphic-git` for client-side Git operations on every supported platform.
 - **Client storage:** the plugin stores hidden Git state under `.obts/` through an `isomorphic-git` filesystem adapter backed by Obsidian's `DataAdapter`, including mobile `CapacitorAdapter`.
-- **Server Git implementation:** the server uses the native `git` CLI for repository validation, object import/export, ref updates, merge-base, merge, diff, history, maintenance, and conflict workflows.
+- **Server Git implementation:** the server uses the native `git` CLI for repository validation, packfile import/export, ref updates, merge-base, merge, diff, history, maintenance, and conflict workflows.
 - **Unsupported behavior:** background real-time sync guarantees, OS-level file access outside the vault, and platform-specific plugin installation management.
 - **Plugin API rule:** the sync path must not require Node.js or Electron APIs in the Obsidian plugin; desktop-only optional behavior must be gated away from mobile sync.
 
@@ -704,12 +817,15 @@ Linux, macOS, Windows, Android, and iOS must each have explicit manual acceptanc
 - Missing server Git store: readiness fails.
 - Missing temp workspace: readiness fails.
 - Missing or unusable native `git` CLI: readiness fails.
-- Unauthorized vault access: `403` or `404`.
+- Unauthenticated access: `401`.
+- Cross-user vault access: `404`.
 - Malformed Git transfer: reject without advancing refs.
 - Same-device non-fast-forward update: block and require recovery.
 - Merge ambiguity: create conflict instead of overwriting.
 - Local apply risk: recovery bundle and apply journal first or block.
 - Restored persistent state incomplete: readiness fails closed.
+- Unreconciled Git/Postgres mismatch: vault enters `blocked_integrity` and readiness fails closed.
+- Expired event cursor: event endpoint returns `410 Gone` and client performs a full state refresh.
 
 ### 9.2 Observability
 
@@ -730,7 +846,7 @@ Server:
 - native `git` CLI integration and server Git store;
 - Git sync, device refs, derived indexes, note history, conflicts, and server-side merge;
 - dashboard APIs and static dashboard serving;
-- persistent-state integrity checks, Git maintenance, compaction, health, and deployment backup documentation.
+- persistent-state integrity checks, Git maintenance, health, and deployment backup documentation.
 
 Plugin:
 
@@ -757,7 +873,7 @@ Dashboard:
 2. Server auth, multi-user account lifecycle, vault/device setup, native `git` CLI repository service, server Git store, and schema.
 3. Plugin `isomorphic-git` hidden Git state, Obsidian filesystem adapter, scan/commit/upload/pull/apply loop, and first-sync safety.
 4. Server device ref updates, server-side merge, conflicts, dashboard review, and resolution commits.
-5. Git-backed note history/restore, Git maintenance, compaction, persistent-state checks, diagnostics, and recovery.
+5. Git-backed note history/restore, Git maintenance, persistent-state checks, diagnostics, and recovery.
 6. Hardening, performance, mobile constraints, and release packaging.
 
 ## 11. Testing And Proof
@@ -769,16 +885,19 @@ Dashboard:
 - `isomorphic-git` local Git engine commit/import behavior;
 - Obsidian `DataAdapter` filesystem adapter behavior;
 - server Git store persistence and materialization boundaries;
+- durable Git/Postgres write workflow and startup reconciliation;
 - server native `git` CLI invocation and error handling;
 - authz checks for every vault-scoped resource;
 - auth/session/token hashing, rotation, revocation, and CSRF rules;
-- multi-user account lifecycle, setup, session TTL, rate limits, and password reset/recovery stance;
+- multi-user account lifecycle, setup, session TTL, recent-auth checks, rate limits, and local admin recovery;
 - device ref fast-forward, no-op retry, and non-fast-forward rejection rules;
 - merge policy decisions;
+- merge queue ordering, merge policy versioning, and validator result persistence;
+- event-log cursor, replay, retention, and expired-cursor behavior;
 - note history indexing and restore commit creation;
 - conflict creation and resolution;
 - stale conflict review and idempotent duplicate resolution submission;
-- local queue, apply journal, and Git state crash recovery.
+- local queue, fixed apply journal schema, fixed recovery bundle schema, and Git state crash recovery.
 
 ### 11.2 Integration Tests
 
@@ -786,7 +905,8 @@ Dashboard:
 - vault creation initializes `main` with a server-authored empty-tree root commit;
 - no visible `.git` appears in the vault while `.obts/` contains hidden Git state;
 - `isomorphic-git` commits and trees produced by the plugin are accepted by server native `git`;
-- pack/object transfer from plugin to server validates with native `git`;
+- Git packfile transfer from plugin to server validates with native `git`;
+- device push and pull use multipart manifests plus Git packfiles exactly as described in OpenAPI;
 - ancestry, fast-forward, and merge-base behavior are compatible between client expectations and server authority;
 - repeated push of the same commit is idempotent;
 - new commit advances the device ref;
@@ -797,8 +917,11 @@ Dashboard:
 - dashboard resolves a conflict and advances `main`;
 - note history shows prior versions and restores one note through a new Git commit;
 - non-empty local vault join creates a recovery bundle and never silently discards local content;
+- first-device non-empty local vault import creates a recovery bundle, requires owner confirmation, uploads an initial device commit, and merges through server `main`;
+- additional-device non-empty divergent vault pairing creates a recovery bundle and blocks normal sync until explicit replace-local-with-server;
 - plugin sync disabled ignores `.obsidian/plugins/**`;
 - plugin sync enabled includes `.obsidian/plugins/**` and blocks self-update of `obts`;
+- destructive history compaction API is absent in v1;
 - unauthorized user cannot access another user's vault resources;
 - restored persistent state with missing Git state, missing database state, missing migrations, bad filesystem permissions, or missing native `git` CLI fails readiness.
 
@@ -836,7 +959,7 @@ Deferred beyond v1. Application-level encrypted Git storage, per-vault data keys
 
 ### 12.3 Custom History Engine
 
-Rejected for v1. Git already provides commit identity, ancestry, trees, diffs, merge bases, object integrity, and ref semantics. `obts` should build an Obsidian-safe product layer on top of Git instead of recreating those primitives in Postgres.
+Rejected for v1. Git already provides commit identity, ancestry, trees, diffs, merge bases, object integrity, and ref semantics. `obts` builds an Obsidian-safe product layer on top of Git instead of recreating those primitives in Postgres.
 
 ### 12.4 Raw Git In The Vault
 
@@ -858,6 +981,10 @@ Rejected for v1. Typed handlers for every Obsidian and plugin setting would turn
 
 Rejected for v1. Backup scheduling, retention, offsite storage, and restore orchestration are deployment concerns. The app defines required persistent state and fail-closed readiness checks, while external infrastructure performs backups.
 
+### 12.9 Destructive History Compaction
+
+Rejected for v1. v1 promises Git-backed note history and recovery, so reachable history remains available indefinitely. v1 Git maintenance verifies, repacks, and prunes only unreachable objects.
+
 ## 13. Agent Guardrails
 
 - Do not reintroduce true E2EE as a v1 requirement unless the product decision changes.
@@ -866,6 +993,8 @@ Rejected for v1. Backup scheduling, retention, offsite storage, and restore orch
 - Do not add shared vault membership or cross-user vault sharing to v1 unless the product decision changes.
 - Keep v1 multi-tenant: multiple users are supported, but each vault has exactly one owner.
 - Keep client-side Git on `isomorphic-git` and server-side Git on the native `git` CLI unless the product decision changes.
+- Keep v1 Git transfer on multipart manifests plus Git packfiles; do not add bundles or alternate object transports unless the product decision changes.
+- Do not add destructive history compaction, baseline truncation, or a compact-history API to v1 unless the product decision changes.
 - Do not add environment-specific infrastructure-specific deployment files, organization-specific image repository names, deployment secret store paths, or private hostnames to this app repo.
 - Do not create `.git` directories inside visible vault content.
 - Keep `.obts/` excluded from vault sync, Git worktree content, and manifest/path scanning.
