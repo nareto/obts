@@ -258,7 +258,273 @@ The dashboard shows:
 - maintenance state;
 - persistent-state and health summaries.
 
-### 3.9 Note History And Restore
+### 3.9 Dashboard UI Contract
+
+The dashboard must be implemented as a compact authenticated application shell,
+not as a landing page, marketing site, or decorative analytics dashboard.
+
+#### 3.9.1 App Shell
+
+Desktop layout:
+
+- left sidebar: fixed width `240px`, full viewport height;
+- content header: `56px` high, pinned to the top of the content area;
+- main content: scrollable area using a 12-column grid, `16px` column gap, and
+  `24px` page padding;
+- minimum supported desktop content width: `1024px`;
+- wide tables may scroll horizontally instead of being converted into card
+  grids.
+
+Responsive layout:
+
+- below `900px` viewport width, collapse the sidebar into a menu button in the
+  content header;
+- below `900px`, all page layouts become one column with `16px` page padding;
+- table/list rows remain the primary representation on mobile, with secondary
+  fields allowed to wrap into a row detail area.
+
+Sidebar:
+
+- the current vault selector appears at the top;
+- primary navigation items appear in this order: Overview, Devices, Conflicts,
+  History, Maintenance, Settings;
+- unresolved conflict count appears as a badge beside Conflicts;
+- account/session actions appear at the bottom.
+
+Content header:
+
+- left side: page title and optional vault/status subtitle;
+- right side: last refreshed timestamp, refresh action, and the page's primary
+  action;
+- each page may have at most one primary button in the header.
+
+#### 3.9.2 Visual System
+
+Use these implementation constraints unless an explicit design-system file later
+replaces them:
+
+- font family: system sans-serif for UI text, system monospace for technical
+  identifiers;
+- base text: `14px` font size, `20px` line height;
+- table text: `13px` or `14px`;
+- page title: `24px` font size, `32px` line height, `600` weight;
+- section heading: `16px` font size, `24px` line height, `600` weight;
+- no viewport-scaled font sizes;
+- spacing scale: `4px`, `8px`, `12px`, `16px`, `24px`, `32px`;
+- border radius: `6px` for panels, tables, inputs, buttons, badges, menus, and
+  dialogs; `8px` maximum anywhere in the dashboard;
+- panel border: one-pixel solid border using the current theme border token;
+- do not nest cards or panels inside other cards or panels;
+- do not use hero sections, marketing copy blocks, decorative illustrations,
+  gradient backgrounds, gradient text, or oversized decorative cards.
+
+Theme tokens:
+
+| Token | Light | Dark |
+| --- | --- | --- |
+| Background | `#F7F8FA` | `#0F1117` |
+| Surface | `#FFFFFF` | `#171A21` |
+| Raised surface | `#F1F3F7` | `#202633` |
+| Border | `#D8DEE8` | `#313847` |
+| Text | `#17202E` | `#E7EAF1` |
+| Muted text | `#5C667A` | `#A6AEBE` |
+| Primary | `#4F5BD5` | `#7A86FF` |
+| Success | `#1F8F5A` | `#36B979` |
+| Info | `#2474D6` | `#4A9DFF` |
+| Warning | `#B7791F` | `#D89B2B` |
+| Danger | `#C93C45` | `#EF5B63` |
+| Neutral | `#6B7280` | `#8792A2` |
+
+Status color roles:
+
+- Success: synced, healthy, completed;
+- Info: uploading, applying, checking, merging, maintenance running;
+- Warning: ahead, behind, offline, review needed, stale review;
+- Danger: blocked, needs recovery, unsafe local state, integrity failure,
+  failed maintenance;
+- Neutral: idle, unknown, metadata-only state.
+
+Color alone is never sufficient. Every status must include an icon and a text
+label.
+
+#### 3.9.3 Controls And Buttons
+
+Buttons:
+
+- default button height: `32px`; mobile/touch button height: at least `40px`;
+- primary button: filled with the Primary token, used only for the main next
+  action on a page or dialog;
+- secondary button: neutral outline or neutral surface;
+- danger button: filled or outlined with the Danger token and used only for
+  destructive or blocking actions;
+- destructive actions require a confirmation dialog;
+- sensitive actions that require recent authentication must open the recent-auth
+  dialog before submission;
+- disabled buttons must explain the blocking reason in nearby helper text or a
+  tooltip.
+
+Icon buttons:
+
+- size: `32px` square on desktop, at least `40px` square on touch layouts;
+- icon-only buttons require a tooltip;
+- copy actions use a copy icon button immediately beside the value being copied.
+
+Technical identifiers:
+
+- commit IDs, refs, event IDs, request IDs, operation IDs, vault IDs, device IDs,
+  and conflict IDs use monospace text;
+- identifiers are truncated by default, with full value available through copy
+  action and an expandable details section;
+- raw Git refs and commit IDs may appear as secondary metadata, but not as the
+  primary explanation of user-visible state.
+
+#### 3.9.4 Status Vocabulary
+
+Dashboard and plugin status labels must use this shared vocabulary:
+
+| Label | Role | Use |
+| --- | --- | --- |
+| Synced | Success | Device and server state are current. |
+| Uploading | Info | Device changes are being sent to the server. |
+| Applying | Info | Accepted server state is being written locally. |
+| Checking | Info | The server or client is verifying state. |
+| Merging | Info | The server is evaluating accepted device changes. |
+| Ahead | Warning | The device has local committed changes not yet on server `main`. |
+| Behind | Warning | The device has not yet applied current server `main`. |
+| Offline | Warning | The device has not been seen within the configured offline window. |
+| Review needed | Warning | A conflict requires owner review. |
+| Stale review | Warning | A conflict package must be refreshed before resolution. |
+| Blocked | Danger | Sync is stopped until user or operator action completes. |
+| Needs recovery | Danger | A recovery bundle or reset/re-pair flow is required. |
+| Unsafe local state | Danger | Local apply or upload is blocked to avoid data loss. |
+| Integrity failure | Danger | Persistent state is inconsistent and mutations are blocked. |
+
+#### 3.9.5 Overview Page Wireframe
+
+Header:
+
+- title: `Overview`;
+- subtitle: selected vault name and top-level vault status;
+- primary action: `Pair device`.
+
+First row: four equal summary panels, each spanning three grid columns and using
+a fixed minimum height of `104px`:
+
+1. Sync status;
+2. Unresolved conflicts;
+3. Paired devices;
+4. Health/readiness.
+
+Second row:
+
+- left eight columns: Devices table;
+- right four columns: Attention panel.
+
+Third row:
+
+- left eight columns: Recent activity list;
+- right four columns: Maintenance and backup health checklist.
+
+The Attention panel lists, in order: integrity failures, blocked devices,
+conflicts, stale reviews, unsafe local states, offline devices. Each item has a
+single action link or button.
+
+#### 3.9.6 Devices Page Wireframe
+
+The Devices page uses a compact table. Row height should be `44px` on desktop.
+
+Columns, in order:
+
+1. Device;
+2. Status;
+3. Last seen;
+4. Ahead/behind;
+5. Sync profile;
+6. Last successful sync;
+7. Actions.
+
+The Actions column uses an overflow menu for secondary actions. Device
+revocation is always a danger action and requires recent authentication.
+
+#### 3.9.7 Conflicts Page Wireframe
+
+Conflict list view:
+
+- table columns: Path, Device, Conflict type, Created, Status, Action;
+- unresolved conflicts appear before resolved conflicts;
+- stale conflicts show the Stale review status and a Refresh action.
+
+Conflict detail view uses a three-region workbench:
+
+- left rail: `280px` wide, with affected paths, provenance summary, current
+  server version, device name, conflict type, and stale status;
+- center region: tabbed diff area with Rendered and Source tabs;
+- right rail: `320px` wide, with resolution choices and submit controls.
+
+Resolution choices are radio options:
+
+1. Keep server version;
+2. Use device version;
+3. Keep both files;
+4. Insert both blocks;
+5. Manually edit final result.
+
+Manual edit opens an editor below the diff area spanning the center region. If
+the review package is stale, show a blocking warning banner above the workbench,
+disable Submit resolution, and show Refresh review as the primary action.
+
+Submit resolution requires recent authentication when the session has not been
+reauthenticated within the required window.
+
+#### 3.9.8 History Page Wireframe
+
+Top row:
+
+- path search/input on the left;
+- selected file metadata and status on the right.
+
+Main area:
+
+- left timeline: `320px` wide list of versions;
+- right preview: rendered/source diff tabs.
+
+The version timeline shows operation type, timestamp, device/user provenance,
+and conflict/merge/restore provenance when present. Restore is disabled until a
+version is selected and requires recent authentication.
+
+#### 3.9.9 Maintenance Page Wireframe
+
+The Maintenance page uses checklist rows, not charts.
+
+Rows, in order:
+
+1. Postgres;
+2. Server Git store;
+3. Temp workspace;
+4. Migrations;
+5. Native `git`;
+6. Filesystem permissions;
+7. Event delivery;
+8. Persistent-state backup contract.
+
+Each row shows status, last checked, short detail, and one action when
+available. Git maintenance start is a primary or secondary action depending on
+whether maintenance is recommended; it requires recent authentication.
+
+#### 3.9.10 Pair Device Dialog
+
+`Pair device` opens a modal dialog, not a separate page.
+
+Dialog requirements:
+
+- width: `520px` on desktop;
+- first step asks for device display name and intended sync profile;
+- second step shows the one-time pairing URL/token, expiration countdown, and
+  copy button;
+- the token/URL is shown only after recent authentication succeeds;
+- token values are never shown in logs, event payloads, or diagnostics.
+
+### 3.10 Note History And Restore
 
 The owner can inspect and restore prior versions of individual notes without exposing raw Git workflows.
 
@@ -278,7 +544,7 @@ Acceptance criteria:
 - Git timestamps are display metadata only and never determine sync ordering.
 - v1 retains all commits reachable from `main`, device refs, unresolved conflict refs, and recovery refs indefinitely. Destructive history truncation is outside v1.
 
-### 3.10 Recovery And Rebuild
+### 3.11 Recovery And Rebuild
 
 If a client loses local state or apply fails, it can rebuild from server `main`.
 
