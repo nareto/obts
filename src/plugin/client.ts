@@ -6,7 +6,7 @@ import { newId, nowIso } from '../shared/ids.js';
 import { isSyncableVaultPath, type SyncPathPolicy } from '../shared/pathPolicy.js';
 import { API_VERSION, type DevicePushManifest, type SyncProfile } from '../shared/types.js';
 import { LocalGitEngine } from './localGit.js';
-import { type ApplyJournal, RecoveryManager, sha256File } from './recovery.js';
+import { ApplyLockActiveError, type ApplyJournal, RecoveryManager, sha256File } from './recovery.js';
 import { TransportClient, TransportError } from './transport.js';
 
 const PLUGIN_VERSION = '0.1.0-phase1';
@@ -374,101 +374,128 @@ export class ObtsPluginClient {
       await this.writeState({ ...state, status_label: 'Synced', updated_at: nowIso() });
       return;
     }
-    const targetFiles = new Set(await this.git.listTreeFiles(targetMain));
-    const affected = new Set(changedPaths);
-    if (state.local_main) {
-      for (const path of await this.git.listTreeFiles(state.local_main)) {
-        if (!targetFiles.has(path)) {
-          affected.add(path);
+    const applyId = newId('apply');
+    let releaseApplyLock: (() => Promise<void>) | null = null;
+    try {
+      releaseApplyLock = await this.recovery.acquireApplyLock(applyId);
+    } catch (error) {
+      if (error instanceof ApplyLockActiveError) {
+        await this.block('apply_lock_active', 'Another apply operation already holds the local vault lock.');
+      }
+      throw error;
+    }
+    try {
+      const targetFiles = new Set(await this.git.listTreeFiles(targetMain));
+      const affected = new Set(changedPaths);
+      if (state.local_main) {
+        for (const path of await this.git.listTreeFiles(state.local_main)) {
+          if (!targetFiles.has(path)) {
+            affected.add(path);
+          }
         }
       }
-    }
-    for (const path of options.extraAffectedPaths ?? []) {
-      affected.add(path);
-    }
-    const affectedPaths = [...affected].filter((path) => isSyncableVaultPath(path, this.policy)).sort();
-    const preflight: Record<string, string | null> = {};
-    for (const path of affectedPaths) {
-      preflight[path] = await sha256File(join(this.vaultDir, path));
-    }
-
-    const journal: ApplyJournal = {
-      apply_id: newId('apply'),
-      operation_type: 'pull_apply',
-      target_main: targetMain,
-      expected_prior_local_main: state.local_main,
-      expected_prior_local_device_ref: state.server_device_ref,
-      phase: 'planned',
-      affected_paths: affectedPaths,
-      preflight_sha256: preflight,
-      recovery_bundle_id: null,
-      last_completed_step: null,
-      redacted_error_category: null
-    };
-    await this.recovery.writeApplyJournal(journal);
-
-    if (affectedPaths.length > 0) {
-      if (!allowDestructive) {
-        journal.phase = 'blocked_recovery';
-        journal.redacted_error_category = 'destructive_apply_not_allowed';
-        await this.recovery.writeApplyJournal(journal);
-        await this.block('unsafe_local_state', 'Destructive apply is not allowed in this mode.');
+      for (const path of options.extraAffectedPaths ?? []) {
+        affected.add(path);
       }
-      const bundleId = await this.recovery.createRecoveryBundle({
-        vaultId: state.vault_id ?? 'unknown',
-        deviceId: state.device_id ?? 'unknown',
-        operationType: 'pull_apply',
-        targetMain,
-        priorLocalMain: state.local_main,
-        priorLocalDeviceRef: state.server_device_ref,
-        affectedPaths,
-        platform: process.platform,
-        pluginVersion: PLUGIN_VERSION,
-        journal
-      });
-      journal.recovery_bundle_id = bundleId;
-      journal.phase = 'recovery_bundle_written';
-      journal.last_completed_step = 'recovery_bundle';
+      const affectedPaths = [...affected].filter((path) => isSyncableVaultPath(path, this.policy)).sort();
+      const preflight: Record<string, string | null> = {};
+      for (const path of affectedPaths) {
+        preflight[path] = await sha256File(join(this.vaultDir, path));
+      }
+
+      const journal: ApplyJournal = {
+        apply_id: applyId,
+        operation_type: 'pull_apply',
+        target_main: targetMain,
+        expected_prior_local_main: state.local_main,
+        expected_prior_local_device_ref: state.server_device_ref,
+        phase: 'planned',
+        affected_paths: affectedPaths,
+        preflight_sha256: preflight,
+        recovery_bundle_id: null,
+        last_completed_step: null,
+        redacted_error_category: null
+      };
       await this.recovery.writeApplyJournal(journal);
-    }
 
-    journal.phase = 'writing_files';
-    await this.recovery.writeApplyJournal(journal);
-    for (const path of affectedPaths) {
-      const currentHash = await sha256File(join(this.vaultDir, path));
-      if (currentHash !== preflight[path]) {
-        journal.phase = 'blocked_recovery';
-        journal.redacted_error_category = 'preflight_hash_changed';
+      if (affectedPaths.length > 0) {
+        if (!allowDestructive) {
+          journal.phase = 'blocked_recovery';
+          journal.redacted_error_category = 'destructive_apply_not_allowed';
+          await this.recovery.writeApplyJournal(journal);
+          await this.block('unsafe_local_state', 'Destructive apply is not allowed in this mode.');
+        }
+        let bundleId: string | null = null;
+        try {
+          bundleId = await this.recovery.createRecoveryBundle({
+            vaultId: state.vault_id ?? 'unknown',
+            deviceId: state.device_id ?? 'unknown',
+            operationType: 'pull_apply',
+            targetMain,
+            priorLocalMain: state.local_main,
+            priorLocalDeviceRef: state.server_device_ref,
+            affectedPaths,
+            platform: process.platform,
+            pluginVersion: PLUGIN_VERSION,
+            journal
+          });
+        } catch {
+          journal.phase = 'blocked_recovery';
+          journal.redacted_error_category = 'recovery_bundle_failed';
+          await this.recovery.writeApplyJournal(journal);
+          await this.block('recovery_bundle_failed', 'Recovery bundle creation failed before apply.');
+        }
+        if (bundleId === null) {
+          throw new Error('Recovery bundle creation did not produce a bundle ID.');
+        }
+        journal.recovery_bundle_id = bundleId;
+        journal.phase = 'recovery_bundle_written';
+        journal.last_completed_step = 'recovery_bundle';
         await this.recovery.writeApplyJournal(journal);
-        await this.block('unsafe_local_state', 'A local file changed during apply preflight.');
       }
-      const targetContent = targetFiles.has(path) ? await this.git.readBlob(targetMain, path) : null;
-      const absolutePath = join(this.vaultDir, path);
-      if (targetContent === null) {
-        await rm(absolutePath, { force: true });
-      } else {
-        await mkdir(dirname(absolutePath), { recursive: true, mode: 0o700 });
-        await writeFile(absolutePath, targetContent);
+
+      journal.phase = 'writing_files';
+      await this.recovery.writeApplyJournal(journal);
+      for (const path of affectedPaths) {
+        const currentHash = await sha256File(join(this.vaultDir, path));
+        if (currentHash !== preflight[path]) {
+          journal.phase = 'blocked_recovery';
+          journal.redacted_error_category = 'preflight_hash_changed';
+          await this.recovery.writeApplyJournal(journal);
+          await this.block('unsafe_local_state', 'A local file changed during apply preflight.');
+        }
+        const targetContent = targetFiles.has(path) ? await this.git.readBlob(targetMain, path) : null;
+        const absolutePath = join(this.vaultDir, path);
+        if (targetContent === null) {
+          await rm(absolutePath, { force: true });
+        } else {
+          await mkdir(dirname(absolutePath), { recursive: true, mode: 0o700 });
+          await writeFile(absolutePath, targetContent);
+        }
+      }
+
+      journal.phase = 'verifying';
+      journal.last_completed_step = 'files_written';
+      await this.recovery.writeApplyJournal(journal);
+      await this.git.setLocalMain(targetMain);
+      await this.git.setLocalHead(targetMain);
+      journal.phase = 'committed';
+      journal.last_completed_step = 'refs_updated';
+      await this.recovery.writeApplyJournal(journal);
+      await this.writeState({
+        ...state,
+        local_main: targetMain,
+        local_head: targetMain,
+        status_label: 'Synced',
+        last_error_code: null,
+        updated_at: nowIso()
+      });
+      await this.recovery.clearApplyJournal();
+    } finally {
+      if (releaseApplyLock) {
+        await releaseApplyLock();
       }
     }
-
-    journal.phase = 'verifying';
-    journal.last_completed_step = 'files_written';
-    await this.recovery.writeApplyJournal(journal);
-    await this.git.setLocalMain(targetMain);
-    await this.git.setLocalHead(targetMain);
-    journal.phase = 'committed';
-    journal.last_completed_step = 'refs_updated';
-    await this.recovery.writeApplyJournal(journal);
-    await this.writeState({
-      ...state,
-      local_main: targetMain,
-      local_head: targetMain,
-      status_label: 'Synced',
-      last_error_code: null,
-      updated_at: nowIso()
-    });
-    await this.recovery.clearApplyJournal();
   }
 
   private async createLocalRecoveryBundle(

@@ -422,6 +422,66 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect((await plugin.readState()).status_label).toBe('Unsafe local state');
   });
 
+  it('uses a local apply lock before applying pulled server changes', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const { plugin2, device2Dir } = await preparePullApplyScenario(root, admin, 'lock-device-1', 'lock-device-2');
+    await writeFile(join(device2Dir, '.obts', 'apply.lock'), '{"apply_id":"apply_existing"}\n');
+
+    await expect(plugin2.syncOnce()).rejects.toMatchObject({ code: 'apply_lock_active' });
+    expect(await readFile(join(device2Dir, 'shared.md'), 'utf8')).toBe('base\n');
+    expect((await plugin2.readState()).status_label).toBe('Unsafe local state');
+    expect(await exists(join(device2Dir, '.obts', 'apply-journal.json'))).toBe(false);
+  });
+
+  it('blocks destructive apply if recovery bundle creation fails', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const { plugin2, device2Dir } = await preparePullApplyScenario(root, admin, 'bundle-device-1', 'bundle-device-2');
+    const internal = plugin2 as unknown as { recovery: { createRecoveryBundle(input: unknown): Promise<string> } };
+    internal.recovery.createRecoveryBundle = async () => {
+      throw new Error('simulated recovery storage failure');
+    };
+
+    await expect(plugin2.syncOnce()).rejects.toMatchObject({ code: 'recovery_bundle_failed' });
+    expect(await readFile(join(device2Dir, 'shared.md'), 'utf8')).toBe('base\n');
+    expect(await exists(join(device2Dir, '.obts', 'apply.lock'))).toBe(false);
+    const journal = JSON.parse(await readFile(join(device2Dir, '.obts', 'apply-journal.json'), 'utf8')) as {
+      phase: string;
+      redacted_error_category: string;
+      recovery_bundle_id: string | null;
+    };
+    expect(journal).toMatchObject({
+      phase: 'blocked_recovery',
+      redacted_error_category: 'recovery_bundle_failed',
+      recovery_bundle_id: null
+    });
+  });
+
+  it('blocks destructive apply if an affected file changes after preflight', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const { plugin2, device2Dir } = await preparePullApplyScenario(root, admin, 'preflight-device-1', 'preflight-device-2');
+    const internal = plugin2 as unknown as { recovery: { createRecoveryBundle(input: unknown): Promise<string> } };
+    const originalCreateRecoveryBundle = internal.recovery.createRecoveryBundle.bind(internal.recovery);
+    internal.recovery.createRecoveryBundle = async (input: unknown) => {
+      const bundleId = await originalCreateRecoveryBundle(input);
+      await writeFile(join(device2Dir, 'shared.md'), 'changed after preflight\n');
+      return bundleId;
+    };
+
+    await expect(plugin2.syncOnce()).rejects.toMatchObject({ code: 'unsafe_local_state' });
+    expect(await readFile(join(device2Dir, 'shared.md'), 'utf8')).toBe('changed after preflight\n');
+    expect(await exists(join(device2Dir, '.obts', 'apply.lock'))).toBe(false);
+    const journal = JSON.parse(await readFile(join(device2Dir, '.obts', 'apply-journal.json'), 'utf8')) as {
+      phase: string;
+      redacted_error_category: string;
+      recovery_bundle_id: string | null;
+      affected_paths: string[];
+    };
+    expect(journal.phase).toBe('blocked_recovery');
+    expect(journal.redacted_error_category).toBe('preflight_hash_changed');
+    expect(journal.recovery_bundle_id).toMatch(/^rec_/u);
+    expect(journal.affected_paths).toEqual(['shared.md']);
+  });
+
   it('resumes merge evaluation when a retry finds the device ref already advanced', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'retry-device');
@@ -684,6 +744,28 @@ async function pairPlugin(admin: BrowserSession & { vaultId: string }, vaultDir:
   });
   await plugin.pairWithToken(pairing.body.pairing_token);
   return plugin;
+}
+
+async function preparePullApplyScenario(
+  root: string,
+  admin: BrowserSession & { vaultId: string },
+  device1Name: string,
+  device2Name: string
+): Promise<{ plugin2: ObtsPluginClient; device2Dir: string }> {
+  const device1Dir = join(root, device1Name);
+  const device2Dir = join(root, device2Name);
+  await mkdirp(device1Dir);
+  await mkdirp(device2Dir);
+  await writeFile(join(device1Dir, 'shared.md'), 'base\n');
+  const plugin1 = await pairPlugin(admin, device1Dir, device1Name);
+  await plugin1.syncOnce({ confirmInitialImport: true });
+
+  const plugin2 = await pairPlugin(admin, device2Dir, device2Name);
+  expect(await readFile(join(device2Dir, 'shared.md'), 'utf8')).toBe('base\n');
+
+  await writeFile(join(device1Dir, 'shared.md'), 'server update\n');
+  expect((await plugin1.syncOnce()).status).toBe('Synced');
+  return { plugin2, device2Dir };
 }
 
 function baseUrlFromAdmin(admin: BrowserSession): string {

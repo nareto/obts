@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { newId, nowIso } from '../shared/ids.js';
@@ -31,8 +31,59 @@ export type RecoveryBundleInput = {
   journal?: ApplyJournal;
 };
 
+export class ApplyLockActiveError extends Error {
+  readonly code = 'apply_lock_active';
+
+  constructor() {
+    super('Another apply operation already holds the local vault lock.');
+  }
+}
+
 export class RecoveryManager {
   constructor(private readonly vaultDir: string) {}
+
+  async acquireApplyLock(applyId: string): Promise<() => Promise<void>> {
+    const lockPath = join(this.vaultDir, '.obts', 'apply.lock');
+    await mkdir(dirname(lockPath), { recursive: true, mode: 0o700 });
+
+    let handle: Awaited<ReturnType<typeof open>>;
+    try {
+      handle = await open(lockPath, 'wx', 0o600);
+    } catch (error) {
+      if (hasErrorCode(error, 'EEXIST')) {
+        throw new ApplyLockActiveError();
+      }
+      throw error;
+    }
+
+    try {
+      await handle.writeFile(
+        `${JSON.stringify(
+          {
+            apply_id: applyId,
+            created_at: nowIso(),
+            pid: process.pid
+          },
+          null,
+          2
+        )}\n`
+      );
+    } catch (error) {
+      await handle.close().catch(() => undefined);
+      await rm(lockPath, { force: true });
+      throw error;
+    }
+    await handle.close();
+
+    let released = false;
+    return async () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      await rm(lockPath, { force: true });
+    };
+  }
 
   async writeApplyJournal(journal: ApplyJournal): Promise<void> {
     await writeJson(join(this.vaultDir, '.obts', 'apply-journal.json'), journal);
@@ -114,4 +165,8 @@ function sha256(data: Buffer): string {
 async function writeJson(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+}
+
+function hasErrorCode(error: unknown, code: string): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === code;
 }

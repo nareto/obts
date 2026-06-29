@@ -14,7 +14,7 @@ Implemented runtime pieces:
 - Pairing stores the device sync profile and plugin-sync setting, and server-side upload validation rejects changed paths outside that paired policy while preserving inherited server tree entries.
 - Shared client/server path policy rejects internal state, visible Git directories, traversal, empty path segments, cross-platform-invalid names, case-fold collisions, unsupported Git tree modes, and `.obsidian` files outside the explicit sync profile.
 - Server-side automatic merge for disjoint path changes, durable merge decision operation records, blocked-device rejection, and durable conflict records for unsafe overlapping or file/directory hierarchy-collision changes.
-- Plugin-side `.obts/` state with `isomorphic-git`, device token storage, queue state, recovery bundles, apply journal, local commit creation, multipart push, multipart pull, safe apply, incomplete-journal blocking, and explicit replace-local-with-server recovery.
+- Plugin-side `.obts/` state with `isomorphic-git`, device token storage, queue state, recovery bundles, local apply lock, apply journal, local commit creation, multipart push, multipart pull, safe apply, incomplete-journal blocking, and explicit replace-local-with-server recovery.
 - Minimal dashboard shell and dashboard summary API.
 - Readiness checks that fail closed when metadata, Git refs, conflict commits, writable storage, or native Git readiness are inconsistent.
 
@@ -41,4 +41,7 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - cross-user access to vault main, conflicts, and events returns `404`;
 - restored metadata that points at missing Git state makes `/health/ready` return `503`;
 - incomplete apply journals block sync on restart instead of attempting an unsafe apply;
+- local apply lock contention blocks before a destructive pull apply starts;
+- recovery bundle creation failures leave a blocked apply journal and do not write files;
+- files changed after apply preflight block before overwrite;
 - shared path policy rejects `.obts/`, visible `.git`, traversal, empty path segments, cross-platform-invalid names, case-fold collisions, unapproved `.obsidian` files, and non-regular Git tree entries.
