@@ -55,6 +55,17 @@ export function readNumber(record: Record<string, unknown>, field: string): numb
   return value;
 }
 
+export function readOptionalBoolean(record: Record<string, unknown>, field: string): boolean | undefined {
+  const value = record[field];
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== 'boolean') {
+    throw new ValidationError('invalid_request', `Invalid field: ${field}.`, { field });
+  }
+  return value;
+}
+
 export function readSyncProfile(record: Record<string, unknown>, field: string): SyncProfile {
   const value = readString(record, field);
   if (value !== 'notes_only' && value !== 'notes_plus_attachments' && value !== 'full_vault_config') {

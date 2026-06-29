@@ -61,6 +61,7 @@ export type VaultSummary = {
 export type CreatePairingTokenRequest = {
   device_name: string;
   sync_profile: SyncProfile;
+  sync_plugins?: boolean;
 };
 
 export type PairingTokenResponse = {
@@ -73,6 +74,7 @@ export type ConsumePairingTokenRequest = {
   pairing_token: string;
   device_name: string;
   sync_profile: SyncProfile;
+  sync_plugins?: boolean;
   client_name?: string;
 };
 

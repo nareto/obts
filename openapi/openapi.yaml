@@ -292,6 +292,9 @@ components:
           type: string
         sync_profile:
           $ref: "#/components/schemas/SyncProfile"
+        sync_plugins:
+          type: boolean
+          default: false
     ConsumePairingTokenRequest:
       allOf:
         - $ref: "#/components/schemas/CreatePairingTokenRequest"

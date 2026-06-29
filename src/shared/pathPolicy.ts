@@ -190,6 +190,20 @@ export function assertSyncableTreePaths(paths: string[]): void {
   }
 }
 
+export function assertChangedPathsAllowedByPolicy(paths: string[], policy: SyncPathPolicy): void {
+  for (const path of paths) {
+    const normalized = normalizeVaultPath(path);
+    if (!normalized.ok) {
+      throw new PathPolicyViolation(normalized.code, normalized.message, normalized.details);
+    }
+    if (!isSyncableVaultPath(normalized.path, policy)) {
+      throw new PathPolicyViolation('profile_path_rejected', 'Vault path is outside the device sync profile.', {
+        profile: policy.profile
+      });
+    }
+  }
+}
+
 export class PathPolicyViolation extends Error {
   readonly code: string;
   readonly details?: Record<string, unknown>;

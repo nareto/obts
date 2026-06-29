@@ -11,6 +11,7 @@ Implemented runtime pieces:
 - Fastify server with first-run setup, login sessions, CSRF-protected dashboard mutations, admin user creation, vault creation, pairing tokens, device tokens, push, pull, events, conflicts, and health checks.
 - Per-vault native Git stores under `OBTS_DATA_DIR/git`, with server-authored empty-tree root commits on `refs/heads/main`.
 - Protected device refs at `refs/obts/devices/{device_id}` with no-op, fast-forward, stale-ref, malformed-pack, path-policy, and same-device non-fast-forward handling.
+- Pairing stores the device sync profile and plugin-sync setting, and server-side upload validation rejects changed paths outside that paired policy while preserving inherited server tree entries.
 - Server-side automatic merge for disjoint path changes, durable merge decision operation records, blocked-device rejection, and durable conflict records for unsafe overlapping changes.
 - Plugin-side `.obts/` state with `isomorphic-git`, device token storage, queue state, recovery bundles, apply journal, local commit creation, multipart push, multipart pull, safe apply, incomplete-journal blocking, and explicit replace-local-with-server recovery.
 - Minimal dashboard shell and dashboard summary API.
@@ -31,6 +32,8 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - partial or already-paired local `.obts/` state blocks pairing before a one-time pairing token is consumed;
 - concurrent same-path edits create a durable conflict record and do not overwrite current `main`;
 - devices with open conflicts cannot upload newer commits until recovery or conflict review is completed;
+- retried uploads whose device ref already advanced but whose commit is not yet in `main` resume merge evaluation instead of becoming a false no-op;
+- uploaded commits that introduce paths outside the paired device's sync profile are rejected before refs advance;
 - a third device receives the safe current `main` while a conflict remains open;
 - cross-user access to vault main, conflicts, and events returns `404`;
 - restored metadata that points at missing Git state makes `/health/ready` return `503`;

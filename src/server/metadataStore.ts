@@ -49,6 +49,7 @@ export type DeviceRow = {
   user_id: string;
   device_name: string;
   sync_profile: SyncProfile;
+  sync_plugins: boolean;
   device_ref: string;
   device_ref_head: string | null;
   status: 'paired' | 'synced' | 'ahead' | 'review_needed' | 'blocked_recovery' | 'revoked';
@@ -127,6 +128,7 @@ export class MetadataStore {
     try {
       const raw = await readFile(this.filePath, 'utf8');
       this.db = JSON.parse(raw) as MetadataDb;
+      this.normalizeLoadedDb(this.db);
     } catch (error) {
       if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') {
         this.db = createEmptyDb();
@@ -225,6 +227,15 @@ export class MetadataStore {
     await mkdir(dirname(this.filePath), { recursive: true, mode: 0o700 });
     await writeFile(tempFile, serialized, { mode: 0o600 });
     await rename(tempFile, this.filePath);
+  }
+
+  private normalizeLoadedDb(db: MetadataDb): void {
+    for (const device of db.devices) {
+      const legacyDevice = device as DeviceRow & { sync_plugins?: boolean };
+      if (legacyDevice.sync_plugins === undefined) {
+        legacyDevice.sync_plugins = false;
+      }
+    }
   }
 }
 

@@ -212,6 +212,7 @@ export class AuthService {
     vaultId: string;
     deviceName: string;
     syncProfile: SyncProfile;
+    syncPlugins: boolean;
     publicBaseUrl: string;
   }): Promise<{ token: string; expiresAt: string; pairingUrl: string }> {
     const token = newSecretToken('obts_pair');
@@ -233,7 +234,8 @@ export class AuthService {
         revoked_at: null,
         metadata: {
           device_name: input.deviceName,
-          sync_profile: input.syncProfile
+          sync_profile: input.syncProfile,
+          sync_plugins: input.syncPlugins
         },
         created_at: nowIso()
       });
@@ -259,6 +261,7 @@ export class AuthService {
     pairingToken: string;
     deviceName: string;
     syncProfile: SyncProfile;
+    syncPlugins: boolean;
   }): Promise<{ user: UserRow; vault: VaultRow; device: DeviceRow; deviceToken: string }> {
     const tokenHash = hashToken(input.pairingToken);
     const deviceToken = newSecretToken('obts_dev');
@@ -285,12 +288,19 @@ export class AuthService {
       if (!user || user.disabled || !vault || vault.owner_user_id !== user.user_id) {
         throw new AuthError(401, 'invalid_pairing_token', 'Pairing token is invalid or expired.');
       }
+      const tokenSyncProfile = readTokenSyncProfile(token);
+      const tokenSyncPlugins = token.metadata.sync_plugins === true;
+      if (input.syncProfile !== tokenSyncProfile || input.syncPlugins !== tokenSyncPlugins) {
+        token.failed_attempts += 1;
+        throw new AuthError(401, 'invalid_pairing_token', 'Pairing token is invalid or expired.');
+      }
       const device: DeviceRow = {
         device_id: newId('dev'),
         vault_id: vault.vault_id,
         user_id: user.user_id,
         device_name: input.deviceName,
-        sync_profile: input.syncProfile,
+        sync_profile: tokenSyncProfile,
+        sync_plugins: tokenSyncPlugins,
         device_ref: '',
         device_ref_head: null,
         status: 'paired',
@@ -316,7 +326,8 @@ export class AuthService {
         revoked_at: null,
         metadata: {
           device_name: input.deviceName,
-          sync_profile: input.syncProfile
+          sync_profile: tokenSyncProfile,
+          sync_plugins: tokenSyncPlugins
         },
         created_at: nowIso()
       });
@@ -410,6 +421,14 @@ function createSession(userId: string): SessionRow {
     recent_auth_at: new Date(now).toISOString(),
     revoked_at: null
   };
+}
+
+function readTokenSyncProfile(token: TokenRow): SyncProfile {
+  const value = token.metadata.sync_profile;
+  if (value === 'notes_only' || value === 'notes_plus_attachments' || value === 'full_vault_config') {
+    return value;
+  }
+  throw new AuthError(401, 'invalid_pairing_token', 'Pairing token is invalid or expired.');
 }
 
 function parseBearer(header: string | undefined): string {

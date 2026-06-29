@@ -17,6 +17,7 @@ export class TransportClient {
     pairingToken: string;
     deviceName: string;
     syncProfile: string;
+    syncPlugins: boolean;
   }): Promise<PairConsumeResult> {
     const response = await fetch(this.url('/api/v1/pair/consume'), {
       method: 'POST',
@@ -24,7 +25,8 @@ export class TransportClient {
       body: JSON.stringify({
         pairing_token: input.pairingToken,
         device_name: input.deviceName,
-        sync_profile: input.syncProfile
+        sync_profile: input.syncProfile,
+        sync_plugins: input.syncPlugins
       })
     });
     return await readJsonOrThrow<PairConsumeResult>(response);

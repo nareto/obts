@@ -12,6 +12,7 @@ import {
   parseDevicePullRequest,
   parseDevicePushManifest,
   parseJsonObject,
+  readOptionalBoolean,
   readString,
   readSyncProfile,
   ValidationError
@@ -251,6 +252,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         status_label: deviceStatusLabel(device.status),
         last_seen_at: device.last_seen_at,
         sync_profile: device.sync_profile,
+        sync_plugins: device.sync_plugins,
         device_ref_head: device.device_ref_head,
         last_successful_sync_at: device.last_successful_sync_at
       }));
@@ -281,6 +283,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       vaultId,
       deviceName: readString(body, 'device_name'),
       syncProfile: readSyncProfile(body, 'sync_profile'),
+      syncPlugins: readOptionalBoolean(body, 'sync_plugins') ?? false,
       publicBaseUrl: config.publicBaseUrl
     });
     return reply.status(201).send({
@@ -295,7 +298,8 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const result = await auth.consumePairingToken({
       pairingToken: readString(body, 'pairing_token'),
       deviceName: readString(body, 'device_name'),
-      syncProfile: readSyncProfile(body, 'sync_profile')
+      syncProfile: readSyncProfile(body, 'sync_profile'),
+      syncPlugins: readOptionalBoolean(body, 'sync_plugins') ?? false
     });
     return reply.status(201).send({
       user_id: result.user.user_id,

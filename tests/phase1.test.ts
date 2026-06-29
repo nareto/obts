@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -5,6 +6,8 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { ObtsPluginClient, PluginBlockedError } from '../src/plugin/client.js';
+import { LocalGitEngine } from '../src/plugin/localGit.js';
+import { TransportClient } from '../src/plugin/transport.js';
 import { createObtsServer, type ObtsServer } from '../src/server/app.js';
 import { assertSyncableTreePaths, PathPolicyViolation } from '../src/shared/pathPolicy.js';
 import { API_VERSION } from '../src/shared/types.js';
@@ -277,6 +280,103 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect((await plugin.readState()).status_label).toBe('Unsafe local state');
   });
 
+  it('resumes merge evaluation when a retry finds the device ref already advanced', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'retry-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'laptop');
+    const state = await plugin.readState();
+    expect(state.local_main).toMatch(/^[0-9a-f]{40}$/u);
+
+    await writeFile(join(deviceDir, 'retry.md'), 'commit survived server restart\n');
+    const localGit = new LocalGitEngine(deviceDir, {
+      profile: 'notes_only',
+      syncPlugins: false,
+      attachmentLocation: { mode: 'same_folder_as_note' }
+    });
+    const commit = await localGit.createLocalCommit('obts: retry test commit');
+    expect(commit).toMatch(/^[0-9a-f]{40}$/u);
+    const packfile = await localGit.createPackForCommit(commit!);
+    const token = await readDeviceToken(deviceDir);
+    const auth = await server.auth.authenticateDevice(`Bearer ${token}`, admin.vaultId);
+
+    await server.git.importPack(admin.vaultId, packfile);
+    await server.git.updateRef(admin.vaultId, auth.device.device_ref, commit!, null);
+    await server.store.mutate((db) => {
+      const device = db.devices.find((candidate) => candidate.device_id === auth.device.device_id);
+      expect(device).toBeDefined();
+      device!.device_ref_head = commit!;
+      device!.status = 'ahead';
+    });
+
+    const result = await server.sync.pushDeviceCommit(
+      auth,
+      {
+        api_version: API_VERSION,
+        vault_id: admin.vaultId,
+        device_id: auth.device.device_id,
+        expected_device_ref: null,
+        target_commit: commit!,
+        packfile_sha256: sha256(packfile),
+        packfile_bytes: packfile.byteLength,
+        client_known_main: state.local_main
+      },
+      packfile
+    );
+
+    expect(result.status).toBe('merged');
+    if (result.status !== 'merged') {
+      throw new Error(`Expected merge result, got ${result.status}`);
+    }
+    const db = await server.store.snapshot();
+    expect(db.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(result.main);
+    expect(await server.git.isAncestor(admin.vaultId, commit!, result.main)).toBe(true);
+  });
+
+  it('rejects uploaded changes outside the paired device sync profile before refs advance', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'profile-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'laptop');
+    const state = await plugin.readState();
+    const token = await readDeviceToken(deviceDir);
+
+    await writeFile(join(deviceDir, 'photo.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    const permissiveGit = new LocalGitEngine(deviceDir, {
+      profile: 'notes_plus_attachments',
+      syncPlugins: false,
+      attachmentLocation: { mode: 'vault_folder' }
+    });
+    const commit = await permissiveGit.createLocalCommit('obts: out-of-profile attachment');
+    expect(commit).toMatch(/^[0-9a-f]{40}$/u);
+    const packfile = await permissiveGit.createPackForCommit(commit!);
+
+    const transport = new TransportClient(baseUrl);
+    await expect(
+      transport.push({
+        vaultId: admin.vaultId,
+        deviceId: state.device_id!,
+        deviceToken: token,
+        manifest: {
+          api_version: API_VERSION,
+          vault_id: admin.vaultId,
+          device_id: state.device_id!,
+          expected_device_ref: state.server_device_ref,
+          target_commit: commit!,
+          packfile_sha256: sha256(packfile),
+          packfile_bytes: packfile.byteLength,
+          client_known_main: state.local_main
+        },
+        packfile
+      })
+    ).rejects.toMatchObject({ status: 409, code: 'profile_path_rejected' });
+
+    const db = await server.store.snapshot();
+    const device = db.devices.find((candidate) => candidate.device_id === state.device_id);
+    expect(device?.device_ref_head).toBeNull();
+    expect(db.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(state.local_main);
+  });
+
   it('returns 404 for cross-user vault, conflict, sync, and event resources', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const created = await admin.post<{ user_id: string }>('/api/v1/admin/users', {
@@ -405,4 +505,15 @@ async function exists(path: string): Promise<boolean> {
 
 async function awaitState(plugin: ObtsPluginClient) {
   return await plugin.readState();
+}
+
+async function readDeviceToken(vaultDir: string): Promise<string> {
+  const tokenFile = JSON.parse(await readFile(join(vaultDir, '.obts', 'auth', 'device-token.json'), 'utf8')) as {
+    device_token: string;
+  };
+  return tokenFile.device_token;
+}
+
+function sha256(data: Buffer): string {
+  return createHash('sha256').update(data).digest('hex');
 }

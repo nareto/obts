@@ -1,5 +1,5 @@
 import { newId, nowIso } from '../shared/ids.js';
-import { PathPolicyViolation } from '../shared/pathPolicy.js';
+import { assertChangedPathsAllowedByPolicy, PathPolicyViolation, type SyncPathPolicy } from '../shared/pathPolicy.js';
 import type { ConflictRecord, DevicePushManifest, PushResult } from '../shared/types.js';
 import type { AuthenticatedDevice } from './authService.js';
 import { GitCommandError, GitService, sha256Hex, type GitDiffEntry } from './gitService.js';
@@ -85,6 +85,19 @@ export class SyncService {
         if (currentDeviceRef && !(await this.git.isAncestor(auth.vault.vault_id, currentDeviceRef, manifest.target_commit))) {
           return await this.blockDeviceForRecovery(auth, operation, currentDeviceRef, manifest.target_commit);
         }
+        try {
+          const changedPaths = await this.changedPathsForUploadPolicy(
+            auth.vault.vault_id,
+            currentDeviceRef,
+            manifest.target_commit,
+            manifest.client_known_main
+          );
+          assertChangedPathsAllowedByPolicy(changedPaths, deviceSyncPathPolicy(auth.device));
+        } catch (error) {
+          const code = error instanceof PathPolicyViolation ? error.code : 'path_policy_rejected';
+          await this.abortOperation(operation.operation_id, code);
+          return { status: 'rejected', code, message: 'Uploaded commit changes paths outside the device sync profile.' };
+        }
 
         await this.store.mutate((db) => {
           const op = requireOperation(db, operation.operation_id);
@@ -97,6 +110,7 @@ export class SyncService {
             validation: {
               object_integrity: 'ok',
               path_policy: 'ok',
+              changed_path_policy: 'ok',
               fast_forward: 'ok'
             }
           };
@@ -147,12 +161,13 @@ export class SyncService {
     operation: SyncOperationRow,
     targetCommit: string
   ): Promise<PushResult> {
-    const existingConflict = await this.findOpenConflict(auth.vault.vault_id, auth.device.device_id, targetCommit);
     const main = await this.git.getRef(auth.vault.vault_id, 'refs/heads/main');
     if (!main) {
       await this.abortOperation(operation.operation_id, 'missing_main');
       return { status: 'rejected', code: 'missing_main', message: 'Server main is missing.' };
     }
+    const existingConflict = await this.findOpenConflict(auth.vault.vault_id, auth.device.device_id, targetCommit);
+    const fallbackEventSeq = this.latestEventSeq(auth.vault.vault_id, await this.store.snapshot());
     await this.store.mutate((db) => {
       const op = requireOperation(db, operation.operation_id);
       op.status = 'committed';
@@ -165,15 +180,43 @@ export class SyncService {
         conflict_id: existingConflict.conflict_id,
         device_ref: targetCommit,
         main,
-        event_seq: this.latestEventSeq(auth.vault.vault_id, await this.store.snapshot())
+        event_seq: fallbackEventSeq
       };
+    }
+    if (!(await this.git.isAncestor(auth.vault.vault_id, targetCommit, main))) {
+      return await this.mergeDeviceCommit(auth.vault.vault_id, auth.device.device_id, targetCommit, fallbackEventSeq);
     }
     return {
       status: 'noop',
       device_ref: targetCommit,
       main,
-      event_seq: this.latestEventSeq(auth.vault.vault_id, await this.store.snapshot())
+      event_seq: fallbackEventSeq
     };
+  }
+
+  private async changedPathsForUploadPolicy(
+    vaultId: string,
+    currentDeviceRef: string | null,
+    targetCommit: string,
+    clientKnownMain: string | null
+  ): Promise<string[]> {
+    const currentMain = await this.git.getRef(vaultId, 'refs/heads/main');
+    let base = currentDeviceRef;
+    if (
+      base === null &&
+      clientKnownMain &&
+      currentMain &&
+      clientKnownMain !== targetCommit &&
+      (await this.git.commitExists(vaultId, clientKnownMain)) &&
+      (await this.git.isAncestor(vaultId, clientKnownMain, targetCommit)) &&
+      (await this.git.isAncestor(vaultId, clientKnownMain, currentMain))
+    ) {
+      base = clientKnownMain;
+    }
+    if (!base) {
+      return await this.git.listTreePaths(vaultId, targetCommit);
+    }
+    return [...changedPathSet(await this.git.changedPaths(vaultId, base, targetCommit))].sort();
   }
 
   private async mergeDeviceCommit(
@@ -526,13 +569,14 @@ export class SyncService {
     const next = new Promise<void>((resolve) => {
       release = resolve;
     });
-    this.locks.set(vaultId, previous.then(() => next));
+    const chained = previous.then(() => next);
+    this.locks.set(vaultId, chained);
     await previous;
     try {
       return await fn();
     } finally {
       release();
-      if (this.locks.get(vaultId) === next) {
+      if (this.locks.get(vaultId) === chained) {
         this.locks.delete(vaultId);
       }
     }
@@ -583,4 +627,12 @@ function changedPathSet(entries: GitDiffEntry[]): Set<string> {
     }
   }
   return paths;
+}
+
+function deviceSyncPathPolicy(device: DeviceRow): SyncPathPolicy {
+  return {
+    profile: device.sync_profile,
+    syncPlugins: device.sync_plugins,
+    attachmentLocation: { mode: 'same_folder_as_note' }
+  };
 }

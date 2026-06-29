@@ -114,7 +114,8 @@ export class ObtsPluginClient {
     const result = await this.transport.consumePairingToken({
       pairingToken,
       deviceName: this.settings.deviceName,
-      syncProfile: this.settings.syncProfile
+      syncProfile: this.settings.syncProfile,
+      syncPlugins: this.settings.syncPlugins
     });
     await this.initialize();
     await writeJson(join(this.vaultDir, '.obts', 'auth', 'device-token.json'), {
