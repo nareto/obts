@@ -1,15 +1,30 @@
-import { timingSafeEqual, randomBytes, scrypt as scryptCallback, createHash } from 'node:crypto';
+import { createHash, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
+
+import { Algorithm, hash as argonHash, verify as argonVerify, Version } from '@node-rs/argon2';
 
 import { newId, newSecretToken, nowIso } from '../shared/ids.js';
 import type { SyncProfile } from '../shared/types.js';
-import type { DeviceRow, MetadataDb, MetadataStore, SessionRow, TokenRow, UserRow, VaultRow } from './metadataStore.js';
+import type {
+  DeviceRow,
+  LegacyPasswordHash,
+  MetadataDb,
+  MetadataStore,
+  PasswordHash,
+  SessionRow,
+  TokenRow,
+  UserRow,
+  VaultRow
+} from './metadataStore.js';
 
 const scrypt = promisify(scryptCallback);
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_IDLE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const RECENT_AUTH_MS = 15 * 60 * 1000;
 const PAIRING_TTL_MS = 10 * 60 * 1000;
+const ARGON2ID_MEMORY_COST = 19_456;
+const ARGON2ID_TIME_COST = 2;
+const ARGON2ID_PARALLELISM = 1;
 
 export class AuthError extends Error {
   readonly statusCode: number;
@@ -392,17 +407,27 @@ export function hashToken(token: string): { lookupPrefix: string; hash: string }
   return { lookupPrefix: hash.slice(0, 16), hash };
 }
 
-async function hashPassword(password: string): Promise<{ algorithm: 'scrypt'; salt: string; hash: string }> {
-  const salt = randomBytes(16).toString('base64url');
-  const derived = (await scrypt(password, salt, 64)) as Buffer;
+async function hashPassword(password: string): Promise<PasswordHash> {
+  const hash = await argonHash(password, {
+    algorithm: Algorithm.Argon2id,
+    version: Version.V0x13,
+    memoryCost: ARGON2ID_MEMORY_COST,
+    timeCost: ARGON2ID_TIME_COST,
+    parallelism: ARGON2ID_PARALLELISM
+  });
   return {
-    algorithm: 'scrypt',
-    salt,
-    hash: derived.toString('base64url')
+    algorithm: 'argon2id',
+    hash,
+    memory_cost: ARGON2ID_MEMORY_COST,
+    time_cost: ARGON2ID_TIME_COST,
+    parallelism: ARGON2ID_PARALLELISM
   };
 }
 
-async function verifyPassword(password: string, stored: { algorithm: 'scrypt'; salt: string; hash: string }): Promise<boolean> {
+async function verifyPassword(password: string, stored: PasswordHash | LegacyPasswordHash): Promise<boolean> {
+  if (stored.algorithm === 'argon2id') {
+    return await argonVerify(stored.hash, password);
+  }
   const derived = (await scrypt(password, stored.salt, 64)) as Buffer;
   const expected = Buffer.from(stored.hash, 'base64url');
   return expected.byteLength === derived.byteLength && timingSafeEqual(expected, derived);

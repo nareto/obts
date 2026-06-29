@@ -1,5 +1,5 @@
 import { API_VERSION, type DevicePullManifest, type DevicePushManifest, type PushResult } from '../shared/types.js';
-import { parseDevicePushManifest } from '../shared/validators.js';
+import { parseDevicePullRequest, parseDevicePushManifest } from '../shared/validators.js';
 
 export type PairConsumeResult = {
   user_id: string;
@@ -61,19 +61,23 @@ export class TransportClient {
     deviceToken: string;
     currentLocalMain: string | null;
   }): Promise<{ manifest: DevicePullManifest; packfile: Buffer }> {
+    const manifest = {
+      api_version: API_VERSION,
+      vault_id: input.vaultId,
+      device_id: input.deviceId,
+      current_local_main: input.currentLocalMain,
+      requested_target: 'latest'
+    } as const;
+    parseDevicePullRequest(manifest);
+    const form = new FormData();
+    form.append('manifest', JSON.stringify(manifest));
+    form.append('packfile', new Blob([new ArrayBuffer(0)], { type: 'application/x-git-packed-objects' }), 'have.pack');
     const response = await fetch(this.url(`/api/v1/vaults/${input.vaultId}/sync/pull`), {
       method: 'POST',
       headers: {
-        authorization: `Bearer ${input.deviceToken}`,
-        'content-type': 'application/json'
+        authorization: `Bearer ${input.deviceToken}`
       },
-      body: JSON.stringify({
-        api_version: API_VERSION,
-        vault_id: input.vaultId,
-        device_id: input.deviceId,
-        current_local_main: input.currentLocalMain,
-        requested_target: 'latest'
-      })
+      body: form
     });
     if (!response.ok) {
       await throwResponseError(response);

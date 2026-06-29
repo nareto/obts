@@ -9,7 +9,12 @@ import { ObtsPluginClient, PluginBlockedError } from '../src/plugin/client.js';
 import { LocalGitEngine } from '../src/plugin/localGit.js';
 import { TransportClient } from '../src/plugin/transport.js';
 import { createObtsServer, type ObtsServer } from '../src/server/app.js';
-import { assertSyncableTreePaths, PathPolicyViolation } from '../src/shared/pathPolicy.js';
+import {
+  assertSyncableTreePaths,
+  isSyncableVaultPath,
+  normalizeVaultPath,
+  PathPolicyViolation
+} from '../src/shared/pathPolicy.js';
 import { API_VERSION } from '../src/shared/types.js';
 
 type Json = Record<string, unknown>;
@@ -126,6 +131,74 @@ describe('Phase 1 sync without conflict resolution', () => {
         overlapping_path_count: 0
       }
     });
+  });
+
+  it('stores new dashboard passwords with the PRD Argon2id parameters', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const db = await server.store.snapshot();
+    const user = db.users.find((candidate) => candidate.username === 'admin');
+    expect(user?.password_hash).toMatchObject({
+      algorithm: 'argon2id',
+      memory_cost: 19456,
+      time_cost: 2,
+      parallelism: 1
+    });
+    expect(user?.password_hash.hash).toMatch(/^\$argon2id\$v=19\$m=19456,t=2,p=1\$/u);
+    expect(user?.password_hash.hash).not.toContain('admin-password-1234');
+
+    const login = await admin.post<{ csrf_token: string }>('/api/v1/auth/login', {
+      username: 'admin',
+      password: 'admin-password-1234'
+    }, false);
+    expect(login.status).toBe(200);
+  });
+
+  it('uses multipart pull requests and rejects legacy JSON pull bodies', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'multipart-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'laptop');
+    const state = await plugin.readState();
+    const token = await readDeviceToken(deviceDir);
+
+    const jsonPull = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/pull`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        api_version: API_VERSION,
+        vault_id: admin.vaultId,
+        device_id: state.device_id,
+        current_local_main: state.local_main,
+        requested_target: 'latest'
+      })
+    });
+    expect(jsonPull.status).toBe(400);
+    expect(((await jsonPull.json()) as { error: { code: string } }).error.code).toBe('invalid_content_type');
+
+    const form = new FormData();
+    form.append(
+      'manifest',
+      JSON.stringify({
+        api_version: API_VERSION,
+        vault_id: admin.vaultId,
+        device_id: state.device_id,
+        current_local_main: state.local_main,
+        requested_target: 'latest'
+      })
+    );
+    form.append('packfile', new Blob([new ArrayBuffer(0)], { type: 'application/x-git-packed-objects' }), 'have.pack');
+    const multipartPull = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/pull`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`
+      },
+      body: form
+    });
+    expect(multipartPull.status).toBe(200);
+    expect(multipartPull.headers.get('content-type')).toContain('multipart/form-data');
   });
 
   it('records a durable conflict for unsafe concurrent same-path edits and does not overwrite main', async () => {
@@ -377,6 +450,36 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(db.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(state.local_main);
   });
 
+  it('rejects non-regular Git tree entries before they can be synced', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const repo = server.git.repoPath(admin.vaultId);
+    const blob = asText((await server.git.exec(repo, ['hash-object', '-w', '--stdin'], Buffer.from('target.md'))).stdout);
+    const tree = asText(
+      (await server.git.exec(repo, ['mktree'], Buffer.from(`120000 blob ${blob.trim()}\tlink.md\n`))).stdout
+    );
+    const currentMain = (await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main;
+    expect(currentMain).toMatch(/^[0-9a-f]{40}$/u);
+    const commit = asText(
+      (
+        await server.git.exec(
+          repo,
+          ['commit-tree', tree.trim(), '-p', currentMain!, '-m', 'malicious symlink tree'],
+          undefined,
+          {
+            GIT_AUTHOR_NAME: 'test',
+            GIT_AUTHOR_EMAIL: 'test@obts.local',
+            GIT_COMMITTER_NAME: 'test',
+            GIT_COMMITTER_EMAIL: 'test@obts.local'
+          }
+        )
+      ).stdout
+    ).trim();
+
+    await expect(server.git.validateTreePathPolicy(admin.vaultId, commit)).rejects.toMatchObject({
+      code: 'unsupported_file_mode'
+    });
+  });
+
   it('returns 404 for cross-user vault, conflict, sync, and event resources', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const created = await admin.post<{ user_id: string }>('/api/v1/admin/users', {
@@ -428,19 +531,24 @@ describe('Phase 1 sync without conflict resolution', () => {
       expect(response.body.error.code).toBe('not_found');
     }
 
-    const syncResponse = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/pull`, {
-      method: 'POST',
-      headers: {
-        authorization: `Bearer ${otherTokenFile.device_token}`,
-        'content-type': 'application/json'
-      },
-      body: JSON.stringify({
+    const form = new FormData();
+    form.append(
+      'manifest',
+      JSON.stringify({
         api_version: API_VERSION,
         vault_id: admin.vaultId,
         device_id: otherPluginState.device_id,
         current_local_main: null,
         requested_target: 'latest'
       })
+    );
+    form.append('packfile', new Blob([new ArrayBuffer(0)], { type: 'application/x-git-packed-objects' }), 'have.pack');
+    const syncResponse = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/pull`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${otherTokenFile.device_token}`
+      },
+      body: form
     });
     expect(syncResponse.status).toBe(404);
     const syncBody = (await syncResponse.json()) as { error: { code: string } };
@@ -451,6 +559,29 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(() => assertSyncableTreePaths(['notes/a.md', '.obts/state.json'])).toThrow(PathPolicyViolation);
     expect(() => assertSyncableTreePaths(['notes/a.md', '.git/config'])).toThrow(PathPolicyViolation);
     expect(() => assertSyncableTreePaths(['Notes/A.md', 'notes/a.md'])).toThrow(PathPolicyViolation);
+    expect(normalizeVaultPath('notes//a.md').ok).toBe(false);
+    expect(normalizeVaultPath('notes/../a.md').ok).toBe(false);
+    expect(normalizeVaultPath('notes/./a.md').ok).toBe(false);
+    expect(normalizeVaultPath('notes/bad:name.md').ok).toBe(false);
+    expect(normalizeVaultPath('notes/trailing.').ok).toBe(false);
+  });
+
+  it('applies the explicit Obsidian config and plugin path policy before note-extension shortcuts', () => {
+    const notesOnly = { profile: 'notes_only' as const, syncPlugins: false, attachmentLocation: { mode: 'same_folder_as_note' as const } };
+    const fullNoPlugins = {
+      profile: 'full_vault_config' as const,
+      syncPlugins: false,
+      attachmentLocation: { mode: 'same_folder_as_note' as const }
+    };
+    const fullWithPlugins = { ...fullNoPlugins, syncPlugins: true };
+
+    expect(isSyncableVaultPath('.obsidian/readme.md', notesOnly)).toBe(false);
+    expect(isSyncableVaultPath('.obsidian/readme.md', fullNoPlugins)).toBe(false);
+    expect(isSyncableVaultPath('.obsidian/app.json', fullNoPlugins)).toBe(true);
+    expect(isSyncableVaultPath('.obsidian/snippets/theme.css', fullNoPlugins)).toBe(true);
+    expect(isSyncableVaultPath('.obsidian/plugins/example/main.js', fullNoPlugins)).toBe(false);
+    expect(isSyncableVaultPath('.obsidian/plugins/example/main.js', fullWithPlugins)).toBe(true);
+    expect(isSyncableVaultPath('.obsidian/plugins/obts/main.js', fullWithPlugins)).toBe(false);
   });
 });
 
@@ -516,4 +647,8 @@ async function readDeviceToken(vaultDir: string): Promise<string> {
 
 function sha256(data: Buffer): string {
   return createHash('sha256').update(data).digest('hex');
+}
+
+function asText(value: string | Buffer): string {
+  return Buffer.isBuffer(value) ? value.toString('utf8') : value;
 }

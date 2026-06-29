@@ -3,7 +3,7 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { spawn } from 'node:child_process';
 
-import { assertSyncableTreePaths } from '../shared/pathPolicy.js';
+import { assertSyncableTreePaths, PathPolicyViolation } from '../shared/pathPolicy.js';
 import type { ServerConfig } from './config.js';
 
 const ZERO_OID = '0000000000000000000000000000000000000000';
@@ -12,6 +12,12 @@ export type GitDiffEntry = {
   status: string;
   path: string;
   oldPath?: string;
+};
+
+type GitTreeEntry = {
+  mode: string;
+  type: string;
+  path: string;
 };
 
 export class GitCommandError extends Error {
@@ -120,17 +126,41 @@ export class GitService {
   }
 
   async listTreePaths(vaultId: string, commit: string): Promise<string[]> {
+    return (await this.listTreeEntries(vaultId, commit)).map((entry) => entry.path);
+  }
+
+  async listTreeEntries(vaultId: string, commit: string): Promise<GitTreeEntry[]> {
     const repo = this.repoPath(vaultId);
-    const { stdout } = await this.exec(repo, ['ls-tree', '-r', '-z', '--name-only', commit], undefined, undefined, {
+    const { stdout } = await this.exec(repo, ['ls-tree', '-r', '-z', commit], undefined, undefined, {
       encoding: 'buffer'
     });
     const data = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
-    return splitNul(data).filter((entry) => entry.length > 0);
+    return splitNul(data)
+      .filter((entry) => entry.length > 0)
+      .map((entry) => {
+        const match = /^(\d{6}) (\S+) [0-9a-f]+\t(.+)$/u.exec(entry);
+        if (!match?.[1] || !match[2] || !match[3]) {
+          throw new GitCommandError('Malformed git tree output.', '');
+        }
+        return {
+          mode: match[1],
+          type: match[2],
+          path: match[3]
+        };
+      });
   }
 
   async validateTreePathPolicy(vaultId: string, commit: string): Promise<void> {
-    const paths = await this.listTreePaths(vaultId, commit);
-    assertSyncableTreePaths(paths);
+    const entries = await this.listTreeEntries(vaultId, commit);
+    assertSyncableTreePaths(entries.map((entry) => entry.path));
+    for (const entry of entries) {
+      if (entry.type !== 'blob' || entry.mode === '120000' || entry.mode === '160000') {
+        throw new PathPolicyViolation(
+          'unsupported_file_mode',
+          'Git tree entries must be regular files; symlinks and submodules cannot be synced.'
+        );
+      }
+    }
   }
 
   async changedPaths(vaultId: string, base: string, commit: string): Promise<GitDiffEntry[]> {

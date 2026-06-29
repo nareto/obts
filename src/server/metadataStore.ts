@@ -5,6 +5,14 @@ import { newId, nowIso } from '../shared/ids.js';
 import type { ConflictRecord, EventEnvelope, SyncProfile } from '../shared/types.js';
 
 export type PasswordHash = {
+  algorithm: 'argon2id';
+  hash: string;
+  memory_cost: 19456;
+  time_cost: 2;
+  parallelism: 1;
+};
+
+export type LegacyPasswordHash = {
   algorithm: 'scrypt';
   salt: string;
   hash: string;
@@ -14,7 +22,7 @@ export type UserRow = {
   user_id: string;
   username: string;
   display_name: string;
-  password_hash: PasswordHash;
+  password_hash: PasswordHash | LegacyPasswordHash;
   is_admin: boolean;
   disabled: boolean;
   created_at: string;

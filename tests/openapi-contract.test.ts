@@ -26,5 +26,14 @@ describe('OpenAPI Phase 1 contract', () => {
     expect(contract).toContain('ErrorEnvelope');
     expect(contract).toContain('__Host-obts_session');
     expect(contract).toContain('X-OBTS-CSRF');
+
+    const pullSection = contract.slice(
+      contract.indexOf('/vaults/{vault_id}/sync/pull'),
+      contract.indexOf('/vaults/{vault_id}/conflicts')
+    );
+    expect(pullSection).toContain('multipart/form-data');
+    expect(pullSection).toContain('DevicePullRequest');
+    expect(pullSection).toContain('packfile');
+    expect(pullSection).not.toContain('application/json:');
   });
 });

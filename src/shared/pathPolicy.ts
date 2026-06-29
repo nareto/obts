@@ -1,4 +1,4 @@
-import { extname, posix } from 'node:path';
+import { extname } from 'node:path';
 
 import type { SyncProfile } from './types.js';
 
@@ -82,6 +82,7 @@ const WINDOWS_RESERVED = new Set([
   'lpt8',
   'lpt9'
 ]);
+const WINDOWS_INVALID_CHARS = /[<>:"|?*]/u;
 
 export function normalizeVaultPath(input: string): PathPolicyResult {
   if (typeof input !== 'string' || input.length === 0) {
@@ -105,14 +106,13 @@ export function normalizeVaultPath(input: string): PathPolicyResult {
     return { ok: false, code: 'path_too_long', message: 'Vault path exceeds the v1 path length limit.' };
   }
 
-  const normalized = posix.normalize(trimmedPrefix);
-  if (normalized === '.' || normalized.startsWith('../') || normalized === '..') {
-    return { ok: false, code: 'invalid_path', message: 'Vault path must not traverse outside the vault.' };
-  }
-  const segments = normalized.split('/');
+  const segments = trimmedPrefix.split('/');
   for (const segment of segments) {
     if (segment.length === 0 || segment === '.' || segment === '..') {
       return { ok: false, code: 'invalid_path', message: 'Vault path contains an empty or traversal segment.' };
+    }
+    if (WINDOWS_INVALID_CHARS.test(segment)) {
+      return { ok: false, code: 'invalid_path', message: 'Vault path contains a cross-platform-invalid character.' };
     }
     if (segment.endsWith(' ') || segment.endsWith('.')) {
       return { ok: false, code: 'invalid_path', message: 'Vault path has a trailing space or dot segment.' };
@@ -130,7 +130,7 @@ export function normalizeVaultPath(input: string): PathPolicyResult {
     return { ok: false, code: 'excluded_git_path', message: 'Visible .git directories cannot be synced.' };
   }
 
-  return { ok: true, path: normalized };
+  return { ok: true, path: trimmedPrefix };
 }
 
 export function isSyncableVaultPath(path: string, policy: SyncPathPolicy): boolean {
@@ -148,6 +148,18 @@ export function isSyncableVaultPath(path: string, policy: SyncPathPolicy): boole
   if (isOsOrEditorMetadata(cleanPath)) {
     return false;
   }
+  if (firstSegment === '.obsidian') {
+    if (cleanPath.startsWith('.obsidian/plugins/')) {
+      return policy.profile === 'full_vault_config' && policy.syncPlugins && !cleanPath.startsWith('.obsidian/plugins/obts/');
+    }
+    if (policy.profile !== 'full_vault_config') {
+      return false;
+    }
+    if (cleanPath.startsWith('.obsidian/snippets/') && cleanPath.endsWith('.css')) {
+      return true;
+    }
+    return OBSIDIAN_ALLOWLIST.has(cleanPath);
+  }
   if (NOTE_EXTENSIONS.has(extension)) {
     return true;
   }
@@ -156,18 +168,6 @@ export function isSyncableVaultPath(path: string, policy: SyncPathPolicy): boole
   }
   if (policy.profile === 'notes_plus_attachments') {
     return isAttachmentPath(cleanPath, policy);
-  }
-  if (cleanPath.startsWith('.obsidian/plugins/')) {
-    return policy.syncPlugins && !cleanPath.startsWith('.obsidian/plugins/obts/');
-  }
-  if (cleanPath.startsWith('.obsidian/snippets/') && cleanPath.endsWith('.css')) {
-    return true;
-  }
-  if (OBSIDIAN_ALLOWLIST.has(cleanPath)) {
-    return true;
-  }
-  if (cleanPath.startsWith('.obsidian/')) {
-    return false;
   }
   return isAttachmentPath(cleanPath, policy);
 }

@@ -173,9 +173,16 @@ paths:
       requestBody:
         required: true
         content:
-          application/json:
+          multipart/form-data:
             schema:
-              $ref: "#/components/schemas/DevicePullRequest"
+              type: object
+              required: [manifest, packfile]
+              properties:
+                manifest:
+                  $ref: "#/components/schemas/DevicePullRequest"
+                packfile:
+                  type: string
+                  contentEncoding: binary
       responses:
         "200":
           description: Multipart manifest and packfile.

@@ -6,7 +6,7 @@ import multipart from '@fastify/multipart';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 
 import { newId, nowIso } from '../shared/ids.js';
-import { API_VERSION, type DevicePullManifest } from '../shared/types.js';
+import { API_VERSION, type DevicePullManifest, type DevicePullRequest } from '../shared/types.js';
 import {
   assertRecord,
   parseDevicePullRequest,
@@ -333,7 +333,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   app.post('/api/v1/vaults/:vaultId/sync/pull', async (request, reply) => {
     const { vaultId } = pathParams(request);
     const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
-    const pullRequest = parseDevicePullRequest(requestBody(request));
+    const pullRequest = await readPullMultipart(request);
     if (pullRequest.vault_id !== vaultId || pullRequest.device_id !== deviceAuth.device.device_id) {
       throw new AuthError(404, 'not_found', 'Resource not found.');
     }
@@ -456,6 +456,27 @@ async function readPushMultipart(request: FastifyRequest): Promise<{
     manifest: parseDevicePushManifest(parseJsonObject(manifestText)),
     packfile
   };
+}
+
+async function readPullMultipart(request: FastifyRequest): Promise<DevicePullRequest> {
+  if (!request.isMultipart()) {
+    throw new ValidationError('invalid_content_type', 'Expected multipart/form-data.');
+  }
+  let manifestText: string | null = null;
+  let sawPackfilePart = false;
+  for await (const part of request.parts()) {
+    if (part.type === 'field' && part.fieldname === 'manifest') {
+      manifestText = String(part.value);
+    }
+    if (part.type === 'file' && part.fieldname === 'packfile') {
+      await part.toBuffer();
+      sawPackfilePart = true;
+    }
+  }
+  if (!manifestText || !sawPackfilePart) {
+    throw new ValidationError('invalid_request', 'Pull requires manifest and packfile parts.');
+  }
+  return parseDevicePullRequest(parseJsonObject(manifestText));
 }
 
 function sendMultipart(reply: FastifyReply, input: { manifest: DevicePullManifest; packfile: Buffer }): FastifyReply {
