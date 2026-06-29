@@ -153,6 +153,34 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(login.status).toBe(200);
   });
 
+  it('requires recent dashboard authentication for admin account creation', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    await server.store.mutate((db) => {
+      for (const session of db.sessions) {
+        session.recent_auth_at = new Date(Date.now() - 16 * 60 * 1000).toISOString();
+      }
+    });
+
+    const stale = await admin.post<{ error: { code: string } }>('/api/v1/admin/users', {
+      username: 'stale-admin-action',
+      password: 'other-password-1234'
+    });
+    expect(stale.status).toBe(403);
+    expect(stale.body.error.code).toBe('recent_auth_required');
+
+    const login = await admin.post<{ csrf_token: string }>('/api/v1/auth/login', {
+      username: 'admin',
+      password: 'admin-password-1234'
+    }, false);
+    expect(login.status).toBe(200);
+    const fresh = await admin.post<{ user_id: string }>('/api/v1/admin/users', {
+      username: 'fresh-admin-action',
+      password: 'other-password-1234'
+    });
+    expect(fresh.status).toBe(201);
+    expect(fresh.body.user_id).toMatch(/^usr_/u);
+  });
+
   it('uses multipart pull requests and rejects legacy JSON pull bodies', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'multipart-device');
@@ -345,6 +373,62 @@ describe('Phase 1 sync without conflict resolution', () => {
 
     await writeFile(join(device2Dir, 'after-conflict.md'), 'still blocked\n');
     await expect(plugin2.syncOnce()).rejects.toMatchObject({ code: 'device_blocked' });
+  });
+
+  it('auto-merges clean overlapping Markdown edits through native Git before creating conflicts', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const device1Dir = join(root, 'markdown-merge-device-1');
+    const device2Dir = join(root, 'markdown-merge-device-2');
+    await mkdirp(device1Dir);
+    await mkdirp(device2Dir);
+
+    const baseLines = [
+      '# Shared',
+      '',
+      'alpha',
+      'bravo',
+      'charlie',
+      'delta',
+      'echo',
+      'foxtrot',
+      'golf',
+      'hotel',
+      ''
+    ];
+    await writeFile(join(device1Dir, 'shared.md'), baseLines.join('\n'));
+    const plugin1 = await pairPlugin(admin, device1Dir, 'desktop');
+    await plugin1.syncOnce({ confirmInitialImport: true });
+
+    const plugin2 = await pairPlugin(admin, device2Dir, 'tablet');
+    expect(await readFile(join(device2Dir, 'shared.md'), 'utf8')).toBe(baseLines.join('\n'));
+
+    const device1Lines = [...baseLines];
+    device1Lines[3] = 'bravo from desktop';
+    const device2Lines = [...baseLines];
+    device2Lines[8] = 'golf from tablet';
+    await writeFile(join(device1Dir, 'shared.md'), device1Lines.join('\n'));
+    await writeFile(join(device2Dir, 'shared.md'), device2Lines.join('\n'));
+
+    expect((await plugin1.syncOnce()).status).toBe('Synced');
+    expect((await plugin2.syncOnce()).status).toBe('Synced');
+    await plugin1.syncOnce();
+
+    const mergedLines = [...baseLines];
+    mergedLines[3] = 'bravo from desktop';
+    mergedLines[8] = 'golf from tablet';
+    expect(await readFile(join(device1Dir, 'shared.md'), 'utf8')).toBe(mergedLines.join('\n'));
+    expect(await readFile(join(device2Dir, 'shared.md'), 'utf8')).toBe(mergedLines.join('\n'));
+
+    const db = await server.store.snapshot();
+    expect(db.conflicts).toHaveLength(0);
+    expect(db.sync_operations.at(-1)?.prepared_manifest).toMatchObject({
+      decision: 'merge',
+      validator_results: {
+        native_git_merge: 'clean',
+        conflict_markers: 'absent',
+        overlapping_path_count: 1
+      }
+    });
   });
 
   it('records a conflict for file-directory hierarchy collisions instead of attempting an unsafe merge', async () => {
@@ -714,6 +798,53 @@ describe('Phase 1 sync without conflict resolution', () => {
         packfile
       })
     ).rejects.toMatchObject({ status: 409, code: 'profile_path_rejected' });
+
+    const db = await server.store.snapshot();
+    const device = db.devices.find((candidate) => candidate.device_id === state.device_id);
+    expect(device?.device_ref_head).toBeNull();
+    expect(db.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(state.local_main);
+  });
+
+  it('rejects uploaded files larger than the configured byte limit before refs advance', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'large-file-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'laptop');
+    const state = await plugin.readState();
+    const token = await readDeviceToken(deviceDir);
+
+    const content = Buffer.from(`# Big note\n\n${'a'.repeat(10_000)}\n`);
+    await writeFile(join(deviceDir, 'big.md'), content);
+    const localGit = new LocalGitEngine(deviceDir, {
+      profile: 'notes_only',
+      syncPlugins: false,
+      attachmentLocation: { mode: 'same_folder_as_note' }
+    });
+    const commit = await localGit.createLocalCommit('obts: oversized file');
+    expect(commit).toMatch(/^[0-9a-f]{40}$/u);
+    const packfile = await localGit.createPackForCommit(commit!);
+    expect(packfile.byteLength).toBeLessThan(content.byteLength);
+    (server.sync as unknown as { maxUploadBytes: number }).maxUploadBytes = packfile.byteLength + 1;
+
+    const transport = new TransportClient(baseUrl);
+    await expect(
+      transport.push({
+        vaultId: admin.vaultId,
+        deviceId: state.device_id!,
+        deviceToken: token,
+        manifest: {
+          api_version: API_VERSION,
+          vault_id: admin.vaultId,
+          device_id: state.device_id!,
+          expected_device_ref: state.server_device_ref,
+          target_commit: commit!,
+          packfile_sha256: sha256(packfile),
+          packfile_bytes: packfile.byteLength,
+          client_known_main: state.local_main
+        },
+        packfile
+      })
+    ).rejects.toMatchObject({ status: 409, code: 'file_too_large' });
 
     const db = await server.store.snapshot();
     const device = db.devices.find((candidate) => candidate.device_id === state.device_id);

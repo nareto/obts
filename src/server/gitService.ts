@@ -17,6 +17,7 @@ export type GitDiffEntry = {
 type GitTreeEntry = {
   mode: string;
   type: string;
+  oid: string;
   path: string;
 };
 
@@ -138,19 +139,20 @@ export class GitService {
     return splitNul(data)
       .filter((entry) => entry.length > 0)
       .map((entry) => {
-        const match = /^(\d{6}) (\S+) [0-9a-f]+\t(.+)$/u.exec(entry);
-        if (!match?.[1] || !match[2] || !match[3]) {
+        const match = /^(\d{6}) (\S+) ([0-9a-f]+)\t(.+)$/u.exec(entry);
+        if (!match?.[1] || !match[2] || !match[3] || !match[4]) {
           throw new GitCommandError('Malformed git tree output.', '');
         }
         return {
           mode: match[1],
           type: match[2],
-          path: match[3]
+          oid: match[3],
+          path: match[4]
         };
       });
   }
 
-  async validateTreePathPolicy(vaultId: string, commit: string): Promise<void> {
+  async validateTreePathPolicy(vaultId: string, commit: string, maxBlobBytes = Number.POSITIVE_INFINITY): Promise<void> {
     const entries = await this.listTreeEntries(vaultId, commit);
     assertSyncableTreePaths(entries.map((entry) => entry.path));
     for (const entry of entries) {
@@ -159,6 +161,12 @@ export class GitService {
           'unsupported_file_mode',
           'Git tree entries must be regular files; symlinks and submodules cannot be synced.'
         );
+      }
+      const blobSize = await this.objectSize(vaultId, `${commit}:${entry.path}`);
+      if (blobSize > maxBlobBytes) {
+        throw new PathPolicyViolation('file_too_large', 'A file exceeds the configured upload byte limit.', {
+          max_upload_bytes: maxBlobBytes
+        });
       }
     }
   }
@@ -253,6 +261,75 @@ export class GitService {
     }
   }
 
+  async tryNativeMergeTree(
+    vaultId: string,
+    base: string,
+    currentMain: string,
+    deviceCommit: string,
+    mergedTextPaths: string[]
+  ): Promise<string | null> {
+    const repo = this.repoPath(vaultId);
+    let tree: string;
+    try {
+      const { stdout } = await this.exec(repo, [
+        'merge-tree',
+        '--write-tree',
+        '--no-messages',
+        '--merge-base',
+        base,
+        currentMain,
+        deviceCommit
+      ]);
+      tree = asText(stdout).trim();
+    } catch {
+      return null;
+    }
+
+    if (!/^[0-9a-f]{40}$/u.test(tree)) {
+      return null;
+    }
+
+    try {
+      await this.validateTreePathPolicy(vaultId, tree);
+      await this.validateMergedTextPaths(vaultId, tree, mergedTextPaths);
+    } catch {
+      return null;
+    }
+
+    return tree;
+  }
+
+  async createMergeCommitFromTree(input: {
+    vaultId: string;
+    tree: string;
+    base: string;
+    currentMain: string;
+    deviceCommit: string;
+    mergeSequence: number;
+    strategy: 'disjoint_overlay' | 'native_clean';
+  }): Promise<string> {
+    const repo = this.repoPath(input.vaultId);
+    const commit = asText(
+      await this.exec(
+        repo,
+        [
+          'commit-tree',
+          input.tree,
+          '-p',
+          input.currentMain,
+          '-p',
+          input.deviceCommit,
+          '-m',
+          `obts: merge device changes\n\nmerge_sequence=${input.mergeSequence}\nbase=${input.base}\nstrategy=${input.strategy}`
+        ],
+        undefined,
+        serverGitEnv('obts-merge')
+      ).then((result) => result.stdout)
+    ).trim();
+    await this.updateRef(input.vaultId, 'refs/heads/main', commit, input.currentMain);
+    return commit;
+  }
+
   async readBlobAtPath(vaultId: string, commit: string, path: string): Promise<Buffer> {
     const repo = this.repoPath(vaultId);
     const { stdout } = await this.exec(repo, ['show', `${commit}:${path}`], undefined, undefined, {
@@ -266,6 +343,12 @@ export class GitService {
     const repo = this.repoPath(vaultId);
     const { stdout } = await this.exec(repo, ['show', '-s', '--format=%T', commit]);
     return asText(stdout).trim();
+  }
+
+  async objectSize(vaultId: string, oid: string): Promise<number> {
+    const repo = this.repoPath(vaultId);
+    const { stdout } = await this.exec(repo, ['cat-file', '-s', oid]);
+    return Number.parseInt(asText(stdout).trim(), 10);
   }
 
   async exec(
@@ -346,6 +429,24 @@ export class GitService {
       }
     });
   }
+
+  private async validateMergedTextPaths(vaultId: string, tree: string, paths: string[]): Promise<void> {
+    for (const path of paths) {
+      let content: Buffer;
+      try {
+        content = await this.readBlobAtPath(vaultId, tree, path);
+      } catch {
+        continue;
+      }
+      const text = content.toString('utf8');
+      if (text.includes('<<<<<<<') || text.includes('=======') || text.includes('>>>>>>>')) {
+        throw new GitCommandError('Merged text contains conflict markers.', '');
+      }
+      if (path.endsWith('.canvas')) {
+        assertValidJsonCanvas(text);
+      }
+    }
+  }
 }
 
 export function sha256Hex(data: Buffer | string): string {
@@ -370,4 +471,43 @@ function serverGitEnv(actor: string): NodeJS.ProcessEnv {
     GIT_AUTHOR_DATE: date,
     GIT_COMMITTER_DATE: date
   };
+}
+
+function assertValidJsonCanvas(text: string): void {
+  const parsed: unknown = JSON.parse(text);
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new GitCommandError('Merged canvas must be a JSON object.', '');
+  }
+  const record = parsed as { nodes?: unknown; edges?: unknown };
+  if (!Array.isArray(record.nodes) || !Array.isArray(record.edges)) {
+    throw new GitCommandError('Merged canvas must contain nodes and edges arrays.', '');
+  }
+  const nodeIds = new Set<string>();
+  for (const node of record.nodes) {
+    if (typeof node !== 'object' || node === null || Array.isArray(node)) {
+      throw new GitCommandError('Merged canvas node must be an object.', '');
+    }
+    const id = (node as { id?: unknown }).id;
+    if (typeof id !== 'string' || nodeIds.has(id)) {
+      throw new GitCommandError('Merged canvas node IDs must be unique strings.', '');
+    }
+    nodeIds.add(id);
+  }
+  const edgeIds = new Set<string>();
+  for (const edge of record.edges) {
+    if (typeof edge !== 'object' || edge === null || Array.isArray(edge)) {
+      throw new GitCommandError('Merged canvas edge must be an object.', '');
+    }
+    const edgeRecord = edge as { id?: unknown; fromNode?: unknown; toNode?: unknown };
+    if (typeof edgeRecord.id !== 'string' || edgeIds.has(edgeRecord.id)) {
+      throw new GitCommandError('Merged canvas edge IDs must be unique strings.', '');
+    }
+    if (typeof edgeRecord.fromNode !== 'string' || typeof edgeRecord.toNode !== 'string') {
+      throw new GitCommandError('Merged canvas edges must reference node IDs.', '');
+    }
+    if (!nodeIds.has(edgeRecord.fromNode) || !nodeIds.has(edgeRecord.toNode)) {
+      throw new GitCommandError('Merged canvas edges must reference existing nodes.', '');
+    }
+    edgeIds.add(edgeRecord.id);
+  }
 }

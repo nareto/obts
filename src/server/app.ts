@@ -146,6 +146,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   app.post('/api/v1/admin/users', async (request, reply) => {
     const session = await auth.authenticateSession(request.cookies[SESSION_COOKIE]);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
+    auth.requireRecentAuth(session.session);
     const body = requestBody(request);
     const baseInput = {
       actorUserId: session.user.user_id,

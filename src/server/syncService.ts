@@ -76,7 +76,7 @@ export class SyncService {
           return { status: 'rejected', code: 'missing_target_commit', message: 'Target commit is not present.' };
         }
         try {
-          await this.git.validateTreePathPolicy(auth.vault.vault_id, manifest.target_commit);
+          await this.git.validateTreePathPolicy(auth.vault.vault_id, manifest.target_commit, this.maxUploadBytes);
         } catch (error) {
           const code = error instanceof PathPolicyViolation ? error.code : 'path_policy_rejected';
           await this.abortOperation(operation.operation_id, code);
@@ -259,6 +259,10 @@ export class SyncService {
     const deviceChanges = await this.git.changedPaths(vaultId, base, deviceCommit);
     const overlapping = intersectChangedPaths(mainChanges, deviceChanges);
     if (overlapping.length > 0) {
+      const cleanMerge = await this.tryCleanOverlappingMerge(vaultId, deviceId, base, main, deviceCommit, deviceChanges, overlapping);
+      if (cleanMerge) {
+        return cleanMerge;
+      }
       return await this.createConflict(vaultId, deviceId, base, main, deviceCommit, overlapping, 'overlapping_paths');
     }
 
@@ -363,6 +367,140 @@ export class SyncService {
       });
       return event.event_seq;
     });
+    return {
+      status: 'merged',
+      device_ref: deviceCommit,
+      main: mergeCommit,
+      merge_commit: mergeCommit,
+      event_seq: eventSeq
+    };
+  }
+
+  private async tryCleanOverlappingMerge(
+    vaultId: string,
+    deviceId: string,
+    base: string,
+    currentMain: string,
+    deviceCommit: string,
+    deviceChanges: GitDiffEntry[],
+    overlapping: string[]
+  ): Promise<PushResult | null> {
+    if (!overlapping.every(isNativeTextMergePath)) {
+      return null;
+    }
+
+    const mergeTree = await this.git.tryNativeMergeTree(vaultId, base, currentMain, deviceCommit, overlapping);
+    if (!mergeTree) {
+      return null;
+    }
+
+    const mergePreparation = await this.store.mutate((db) => {
+      const device = requireDevice(db, deviceId);
+      const mergeSequence = this.store.nextMergeSequence(db, vaultId);
+      const operation = this.store.startOperation(db, {
+        vault_id: vaultId,
+        device_id: deviceId,
+        operation_type: 'server_merge',
+        expected_refs: {
+          'refs/heads/main': currentMain,
+          [device.device_ref]: deviceCommit
+        },
+        target_refs: {
+          'refs/heads/main': null
+        },
+        target_commit: null
+      });
+      operation.status = 'prepared';
+      operation.prepared_manifest = {
+        merge_sequence: mergeSequence,
+        merge_policy_version: MERGE_POLICY_VERSION,
+        base_commit: base,
+        current_main: currentMain,
+        device_commit: deviceCommit,
+        decision: 'merge',
+        validator_results: {
+          native_git_merge: 'clean',
+          conflict_markers: 'absent',
+          overlapping_path_count: overlapping.length
+        }
+      };
+      operation.updated_at = nowIso();
+      return { mergeSequence, operationId: operation.operation_id };
+    });
+
+    let mergeCommit: string;
+    try {
+      mergeCommit = await this.git.createMergeCommitFromTree({
+        vaultId,
+        tree: mergeTree,
+        base,
+        currentMain,
+        deviceCommit,
+        mergeSequence: mergePreparation.mergeSequence,
+        strategy: 'native_clean'
+      });
+    } catch (error) {
+      await this.abortOperation(mergePreparation.operationId, 'merge_git_error');
+      throw error;
+    }
+
+    const eventSeq = await this.store.mutate((db) => {
+      const operation = requireOperation(db, mergePreparation.operationId);
+      operation.status = 'committed';
+      operation.target_refs = {
+        'refs/heads/main': mergeCommit
+      };
+      operation.target_commit = mergeCommit;
+      operation.result = {
+        decision: 'merged',
+        merge_commit: mergeCommit
+      };
+      operation.updated_at = nowIso();
+      const vault = requireVault(db, vaultId);
+      const device = requireDevice(db, deviceId);
+      vault.current_main = mergeCommit;
+      vault.updated_at = nowIso();
+      device.status = 'synced';
+      device.last_successful_sync_at = nowIso();
+      const event = this.store.appendEvent(db, {
+        event_type: 'main_advanced',
+        vault_id: vaultId,
+        resource_ids: {
+          device_id: deviceId
+        },
+        commit_cursors: {
+          previous_main: currentMain,
+          main: mergeCommit,
+          device_commit: deviceCommit
+        },
+        payload: {
+          decision: 'merged',
+          merge_sequence: mergePreparation.mergeSequence,
+          merge_policy_version: MERGE_POLICY_VERSION,
+          base_commit: base,
+          current_main: currentMain,
+          device_commit: deviceCommit,
+          validator_results: {
+            native_git_merge: 'clean',
+            conflict_markers: 'absent',
+            overlapping_path_count: overlapping.length
+          },
+          changed_path_count: changedPathSet(deviceChanges).size
+        }
+      });
+      db.audit_log.push({
+        audit_id: newId('aud'),
+        actor_user_id: device.user_id,
+        actor_device_id: deviceId,
+        vault_id: vaultId,
+        action: 'main_advanced',
+        resource_class: 'vault',
+        resource_id: vaultId,
+        created_at: nowIso()
+      });
+      return event.event_seq;
+    });
+
     return {
       status: 'merged',
       device_ref: deviceCommit,
@@ -635,6 +773,10 @@ function changedPathSet(entries: GitDiffEntry[]): Set<string> {
     }
   }
   return paths;
+}
+
+function isNativeTextMergePath(path: string): boolean {
+  return path.endsWith('.md') || path.endsWith('.canvas') || path.endsWith('.base');
 }
 
 function deviceSyncPathPolicy(device: DeviceRow): SyncPathPolicy {

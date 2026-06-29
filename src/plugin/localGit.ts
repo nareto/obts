@@ -204,9 +204,10 @@ export class LocalGitEngine {
     seen.add(treeOid);
     const { tree } = await git.readTree({ fs, dir: this.vaultDir, gitdir: this.gitdir, oid: treeOid });
     for (const entry of tree) {
-      seen.add(entry.oid);
       if (entry.type === 'tree') {
         await this.collectTreeObjects(entry.oid, seen);
+      } else {
+        seen.add(entry.oid);
       }
     }
   }
