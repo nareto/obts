@@ -1,0 +1,28 @@
+{
+  "name": "obts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Obsidian True Sync Phase 1 implementation.",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "lint": "npm run check",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.0.2",
+    "@fastify/multipart": "^9.3.0",
+    "fastify": "^5.9.0",
+    "isomorphic-git": "^1.38.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.8",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

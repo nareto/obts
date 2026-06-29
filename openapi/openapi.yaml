@@ -1,0 +1,388 @@
+openapi: 3.1.0
+info:
+  title: Obsidian True Sync Phase 1 API
+  version: 0.1.0
+  summary: Sync without conflict resolution.
+servers:
+  - url: /api/v1
+security:
+  - dashboardSession: []
+paths:
+  /setup/status:
+    get:
+      summary: Return whether first-run setup is complete.
+      security: []
+      responses:
+        "200":
+          description: Setup status.
+  /setup:
+    post:
+      summary: Create the initial admin account.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetupRequest"
+      responses:
+        "201":
+          description: Initial admin session.
+        "409":
+          $ref: "#/components/responses/Error"
+  /auth/login:
+    post:
+      summary: Create a dashboard session and CSRF token.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Dashboard session.
+        "401":
+          $ref: "#/components/responses/Error"
+  /admin/users:
+    post:
+      summary: Create a user account as an admin.
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminCreateUserRequest"
+      responses:
+        "201":
+          description: Created user metadata.
+        "403":
+          $ref: "#/components/responses/Error"
+  /vaults:
+    get:
+      summary: List vaults owned by the authenticated user.
+      responses:
+        "200":
+          description: Owned vaults.
+    post:
+      summary: Create a vault and initialize server main to an empty-tree root commit.
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateVaultRequest"
+      responses:
+        "201":
+          description: Vault metadata.
+  /vaults/{vault_id}/main:
+    get:
+      summary: Return current server main for an owned vault.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+      responses:
+        "200":
+          description: Current main.
+        "404":
+          $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/dashboard:
+    get:
+      summary: Return minimal Phase 1 dashboard state.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+      responses:
+        "200":
+          description: Device, conflict, and health summary.
+        "404":
+          $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/pairing-tokens:
+    post:
+      summary: Create a one-time pairing token after recent dashboard auth.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - $ref: "#/components/parameters/CsrfHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePairingTokenRequest"
+      responses:
+        "201":
+          description: One-time pairing token and URL.
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /pair/consume:
+    post:
+      summary: Consume a one-time pairing token and register a device.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConsumePairingTokenRequest"
+      responses:
+        "201":
+          description: Device token and initial server main.
+        "401":
+          $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/sync/push:
+    post:
+      summary: Upload a device commit pack and request a protected device-ref update.
+      security:
+        - deviceBearer: []
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [manifest, packfile]
+              properties:
+                manifest:
+                  $ref: "#/components/schemas/DevicePushManifest"
+                packfile:
+                  type: string
+                  contentEncoding: binary
+      responses:
+        "200":
+          description: Push result.
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/sync/pull:
+    post:
+      summary: Pull Git objects needed to reach current server main.
+      security:
+        - deviceBearer: []
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DevicePullRequest"
+      responses:
+        "200":
+          description: Multipart manifest and packfile.
+          content:
+            multipart/form-data:
+              schema:
+                type: object
+                properties:
+                  manifest:
+                    $ref: "#/components/schemas/DevicePullManifest"
+                  packfile:
+                    type: string
+                    contentEncoding: binary
+        "404":
+          $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/conflicts:
+    get:
+      summary: List durable conflict records for an owned vault.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [open, resolved]
+      responses:
+        "200":
+          description: Conflict records.
+        "404":
+          $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/events:
+    get:
+      summary: Poll redacted vault-scoped events after a cursor.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - name: after
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        "200":
+          description: Event page.
+        "404":
+          $ref: "#/components/responses/Error"
+components:
+  securitySchemes:
+    dashboardSession:
+      type: apiKey
+      in: cookie
+      name: __Host-obts_session
+    deviceBearer:
+      type: http
+      scheme: bearer
+  parameters:
+    VaultId:
+      name: vault_id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^vlt_"
+    CsrfHeader:
+      name: X-OBTS-CSRF
+      in: header
+      required: true
+      schema:
+        type: string
+  responses:
+    Error:
+      description: Redacted JSON error envelope.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+  schemas:
+    SetupRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+          minLength: 12
+        display_name:
+          type: string
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+    AdminCreateUserRequest:
+      allOf:
+        - $ref: "#/components/schemas/SetupRequest"
+        - type: object
+          properties:
+            is_admin:
+              type: boolean
+    CreateVaultRequest:
+      type: object
+      required: [display_name]
+      properties:
+        display_name:
+          type: string
+    CreatePairingTokenRequest:
+      type: object
+      required: [device_name, sync_profile]
+      properties:
+        device_name:
+          type: string
+        sync_profile:
+          $ref: "#/components/schemas/SyncProfile"
+    ConsumePairingTokenRequest:
+      allOf:
+        - $ref: "#/components/schemas/CreatePairingTokenRequest"
+        - type: object
+          required: [pairing_token]
+          properties:
+            pairing_token:
+              type: string
+    DevicePushManifest:
+      type: object
+      required:
+        - api_version
+        - vault_id
+        - device_id
+        - expected_device_ref
+        - target_commit
+        - packfile_sha256
+        - packfile_bytes
+        - client_known_main
+      properties:
+        api_version:
+          const: 2026-06-29.phase1
+        vault_id:
+          type: string
+        device_id:
+          type: string
+        expected_device_ref:
+          type: [string, "null"]
+        target_commit:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        packfile_sha256:
+          type: string
+        packfile_bytes:
+          type: integer
+          minimum: 0
+        client_known_main:
+          type: [string, "null"]
+        attempt_id:
+          type: string
+    DevicePullRequest:
+      type: object
+      required: [api_version, vault_id, device_id, current_local_main, requested_target]
+      properties:
+        api_version:
+          const: 2026-06-29.phase1
+        vault_id:
+          type: string
+        device_id:
+          type: string
+        current_local_main:
+          type: [string, "null"]
+        requested_target:
+          oneOf:
+            - const: latest
+            - type: string
+              pattern: "^[0-9a-f]{40}$"
+    DevicePullManifest:
+      type: object
+      required: [api_version, vault_id, device_id, target_main, changed_paths, event_seq]
+      properties:
+        api_version:
+          const: 2026-06-29.phase1
+        vault_id:
+          type: string
+        device_id:
+          type: string
+        target_main:
+          type: string
+        changed_paths:
+          type: array
+          items:
+            type: string
+        event_seq:
+          type: integer
+    SyncProfile:
+      type: string
+      enum: [notes_only, notes_plus_attachments, full_vault_config]
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, request_id]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+            request_id:
+              type: string
+            details:
+              type: object

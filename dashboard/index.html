@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>obts dashboard</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #f7f8fa;
+        --surface: #ffffff;
+        --raised: #f1f3f7;
+        --border: #d8dee8;
+        --text: #17202e;
+        --muted: #5c667a;
+        --primary: #4f5bd5;
+        --warning: #b7791f;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0f1117;
+          --surface: #171a21;
+          --raised: #202633;
+          --border: #313847;
+          --text: #e7eaf1;
+          --muted: #a6aebe;
+          --primary: #7a86ff;
+          --warning: #d89b2b;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/20px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      .shell {
+        display: grid;
+        min-height: 100vh;
+        grid-template-columns: 240px 1fr;
+      }
+      aside {
+        border-right: 1px solid var(--border);
+        background: var(--surface);
+        padding: 16px;
+      }
+      .vault {
+        min-height: 32px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 6px 8px;
+        font-weight: 600;
+      }
+      nav {
+        display: grid;
+        gap: 4px;
+        margin-top: 24px;
+      }
+      nav a {
+        color: var(--text);
+        padding: 6px 8px;
+        border-radius: 6px;
+        text-decoration: none;
+      }
+      nav a:first-child {
+        background: var(--raised);
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        height: 56px;
+        border-bottom: 1px solid var(--border);
+        background: var(--surface);
+        padding: 0 24px;
+      }
+      h1 {
+        margin: 0;
+        font-size: 24px;
+        line-height: 32px;
+        font-weight: 600;
+      }
+      main {
+        display: grid;
+        grid-template-columns: repeat(12, minmax(0, 1fr));
+        gap: 16px;
+        padding: 24px;
+      }
+      section {
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: var(--surface);
+        padding: 16px;
+      }
+      .summary {
+        grid-column: span 3;
+        min-height: 104px;
+      }
+      .wide {
+        grid-column: span 8;
+      }
+      .side {
+        grid-column: span 4;
+      }
+      h2 {
+        margin: 0 0 8px;
+        font-size: 16px;
+        line-height: 24px;
+      }
+      .muted {
+        color: var(--muted);
+      }
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 13px;
+      }
+      button {
+        height: 32px;
+        border: 1px solid var(--primary);
+        border-radius: 6px;
+        background: var(--primary);
+        color: white;
+        padding: 0 12px;
+        font: inherit;
+      }
+      @media (max-width: 900px) {
+        .shell {
+          grid-template-columns: 1fr;
+        }
+        aside {
+          display: none;
+        }
+        header {
+          padding: 0 16px;
+        }
+        main {
+          grid-template-columns: 1fr;
+          padding: 16px;
+        }
+        .summary,
+        .wide,
+        .side {
+          grid-column: auto;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <aside>
+        <div class="vault">Select vault</div>
+        <nav aria-label="Primary">
+          <a href="/">Overview</a>
+          <a href="/">Devices</a>
+          <a href="/">Conflicts</a>
+          <a href="/">History</a>
+          <a href="/">Maintenance</a>
+          <a href="/">Settings</a>
+        </nav>
+      </aside>
+      <div>
+        <header>
+          <div>
+            <h1>Overview</h1>
+            <div class="muted">Phase 1 sync status</div>
+          </div>
+          <button type="button">Pair device</button>
+        </header>
+        <main>
+          <section class="summary">
+            <h2>Sync status</h2>
+            <div class="muted">Use <code>/api/v1/vaults/{vault_id}/dashboard</code>.</div>
+          </section>
+          <section class="summary">
+            <h2>Unresolved conflicts</h2>
+            <div class="muted">Conflict count is available from the dashboard API.</div>
+          </section>
+          <section class="summary">
+            <h2>Paired devices</h2>
+            <div class="muted">Device rows use shared status labels.</div>
+          </section>
+          <section class="summary">
+            <h2>Health</h2>
+            <div class="muted">Readiness checks native Git and persistent state.</div>
+          </section>
+          <section class="wide">
+            <h2>Devices</h2>
+            <div class="muted">The API-backed table is implemented server-side for Phase 1.</div>
+          </section>
+          <section class="side">
+            <h2>Attention</h2>
+            <div class="muted">Open conflicts and blocked devices appear here in later UI work.</div>
+          </section>
+        </main>
+      </div>
+    </div>
+  </body>
+</html>
