@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { newId, nowIso } from '../shared/ids.js';
@@ -397,7 +397,11 @@ export class ObtsPluginClient {
       for (const path of options.extraAffectedPaths ?? []) {
         affected.add(path);
       }
-      const affectedPaths = [...affected].filter((path) => isSyncableVaultPath(path, this.policy)).sort();
+      const localVaultFiles = await listLocalVaultFiles(this.vaultDir);
+      for (const path of materializationConflictFiles(new Set([...targetFiles, ...affected]), localVaultFiles)) {
+        affected.add(path);
+      }
+      const affectedPaths = [...affected].filter((path) => isRecoverableApplyPath(path, this.policy)).sort();
       const preflight: Record<string, string | null> = {};
       for (const path of affectedPaths) {
         preflight[path] = await sha256File(join(this.vaultDir, path));
@@ -464,11 +468,33 @@ export class ObtsPluginClient {
           await this.recovery.writeApplyJournal(journal);
           await this.block('unsafe_local_state', 'A local file changed during apply preflight.');
         }
+      }
+      const assertRecoveredDescendants = async (path: string): Promise<void> => {
+        const descendants = await listLocalDescendantFiles(this.vaultDir, path);
+        if (descendants.some((descendant) => !(descendant in preflight))) {
+          journal.phase = 'blocked_recovery';
+          journal.redacted_error_category = 'preflight_hash_changed';
+          await this.recovery.writeApplyJournal(journal);
+          await this.block('unsafe_local_state', 'A local file changed during apply preflight.');
+        }
+      };
+      const obsoleteLocalPaths = affectedPaths
+        .filter((path) => !targetFiles.has(path))
+        .sort((left, right) => right.length - left.length);
+      for (const path of obsoleteLocalPaths) {
+        if (await pathIsDirectory(join(this.vaultDir, path))) {
+          await assertRecoveredDescendants(path);
+        }
+        await rm(join(this.vaultDir, path), { recursive: true, force: true });
+      }
+      for (const path of affectedPaths.filter((candidate) => targetFiles.has(candidate))) {
         const targetContent = targetFiles.has(path) ? await this.git.readBlob(targetMain, path) : null;
         const absolutePath = join(this.vaultDir, path);
-        if (targetContent === null) {
-          await rm(absolutePath, { force: true });
-        } else {
+        if (targetContent !== null) {
+          if (await pathIsDirectory(absolutePath)) {
+            await assertRecoveredDescendants(path);
+            await rm(absolutePath, { recursive: true, force: true });
+          }
           await mkdir(dirname(absolutePath), { recursive: true, mode: 0o700 });
           await writeFile(absolutePath, targetContent);
         }
@@ -664,6 +690,82 @@ function blockStatusLabel(code: string): string {
     return 'Needs recovery';
   }
   return 'Unsafe local state';
+}
+
+function isRecoverableApplyPath(path: string, policy: SyncPathPolicy): boolean {
+  return (
+    isSyncableVaultPath(path, policy) ||
+    (path !== '.obts' && !path.startsWith('.obts/') && path !== '.git' && !path.startsWith('.git/') && !path.includes('/.git/'))
+  );
+}
+
+function materializationConflictFiles(targetFiles: Set<string>, localVaultFiles: string[]): string[] {
+  const conflicts = new Set<string>();
+  for (const targetFile of targetFiles) {
+    for (const localFile of localVaultFiles) {
+      if (localFile.startsWith(`${targetFile}/`)) {
+        conflicts.add(localFile);
+      }
+    }
+    for (const prefix of directoryPrefixes(targetFile)) {
+      if (localVaultFiles.includes(prefix)) {
+        conflicts.add(prefix);
+      }
+    }
+  }
+  return [...conflicts].sort();
+}
+
+function directoryPrefixes(path: string): string[] {
+  const segments = path.split('/');
+  const prefixes: string[] = [];
+  for (let index = 1; index < segments.length; index += 1) {
+    prefixes.push(segments.slice(0, index).join('/'));
+  }
+  return prefixes;
+}
+
+async function listLocalVaultFiles(root: string): Promise<string[]> {
+  const files: string[] = [];
+  await walkVaultFiles(root, root, files);
+  return files.sort();
+}
+
+async function listLocalDescendantFiles(root: string, relativePath: string): Promise<string[]> {
+  const absolutePath = join(root, relativePath);
+  if (!(await pathIsDirectory(absolutePath))) {
+    return [];
+  }
+  const files: string[] = [];
+  await walkVaultFiles(root, absolutePath, files);
+  return files.sort();
+}
+
+async function walkVaultFiles(root: string, current: string, files: string[]): Promise<void> {
+  const entries = await readdir(current, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.name === '.obts' || entry.name === '.git') {
+      continue;
+    }
+    const absolutePath = join(current, entry.name);
+    if (entry.isDirectory()) {
+      await walkVaultFiles(root, absolutePath, files);
+    } else if (entry.isFile()) {
+      files.push(relativeVaultPath(root, absolutePath));
+    }
+  }
+}
+
+function relativeVaultPath(root: string, absolutePath: string): string {
+  return absolutePath.slice(root.length + 1).replaceAll('\\', '/');
+}
+
+async function pathIsDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 async function exists(path: string): Promise<boolean> {

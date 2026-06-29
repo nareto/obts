@@ -201,6 +201,114 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(multipartPull.headers.get('content-type')).toContain('multipart/form-data');
   });
 
+  it('rejects malformed commit identifiers in multipart sync manifests', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'invalid-manifest-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'laptop');
+    const state = await plugin.readState();
+    const token = await readDeviceToken(deviceDir);
+    const emptyPack = Buffer.alloc(0);
+
+    const pushForm = new FormData();
+    pushForm.append(
+      'manifest',
+      JSON.stringify({
+        api_version: API_VERSION,
+        vault_id: admin.vaultId,
+        device_id: state.device_id,
+        expected_device_ref: state.server_device_ref,
+        target_commit: 'refs/heads/main',
+        packfile_sha256: sha256(emptyPack),
+        packfile_bytes: emptyPack.byteLength,
+        client_known_main: state.local_main
+      })
+    );
+    pushForm.append('packfile', new Blob([emptyPack], { type: 'application/x-git-packed-objects' }), 'pack.pack');
+    const push = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/push`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`
+      },
+      body: pushForm
+    });
+    expect(push.status).toBe(400);
+    expect(((await push.json()) as { error: { code: string } }).error.code).toBe('invalid_request');
+
+    const pullForm = new FormData();
+    pullForm.append(
+      'manifest',
+      JSON.stringify({
+        api_version: API_VERSION,
+        vault_id: admin.vaultId,
+        device_id: state.device_id,
+        current_local_main: 'HEAD',
+        requested_target: 'latest'
+      })
+    );
+    pullForm.append('packfile', new Blob([new ArrayBuffer(0)], { type: 'application/x-git-packed-objects' }), 'have.pack');
+    const pull = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/pull`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`
+      },
+      body: pullForm
+    });
+    expect(pull.status).toBe(400);
+    expect(((await pull.json()) as { error: { code: string } }).error.code).toBe('invalid_request');
+  });
+
+  it('enforces pairing token scope and one-time consumption', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
+      device_name: 'phone',
+      sync_profile: 'notes_plus_attachments'
+    });
+    expect(pairing.status).toBe(201);
+
+    const wrongProfile = await fetch(`${baseUrl}/api/v1/pair/consume`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        pairing_token: pairing.body.pairing_token,
+        device_name: 'phone',
+        sync_profile: 'notes_only',
+        sync_plugins: false
+      })
+    });
+    expect(wrongProfile.status).toBe(401);
+
+    const consumed = await fetch(`${baseUrl}/api/v1/pair/consume`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        pairing_token: pairing.body.pairing_token,
+        device_name: 'phone',
+        sync_profile: 'notes_plus_attachments',
+        sync_plugins: false
+      })
+    });
+    expect(consumed.status).toBe(201);
+    expect(((await consumed.json()) as { device_id: string }).device_id).toMatch(/^dev_/u);
+
+    const replay = await fetch(`${baseUrl}/api/v1/pair/consume`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        pairing_token: pairing.body.pairing_token,
+        device_name: 'phone',
+        sync_profile: 'notes_plus_attachments',
+        sync_plugins: false
+      })
+    });
+    expect(replay.status).toBe(401);
+
+    const db = await server.store.snapshot();
+    const pairingTokenRows = db.tokens.filter((token) => token.kind === 'pairing');
+    expect(pairingTokenRows).toHaveLength(1);
+    expect(pairingTokenRows[0]?.consumed_at).toEqual(expect.any(String));
+  });
+
   it('records a durable conflict for unsafe concurrent same-path edits and does not overwrite main', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const device1Dir = join(root, 'conflict-device-1');
@@ -311,6 +419,40 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await exists(join(device2Dir, 'local-only.md'))).toBe(false);
     expect((await awaitState(plugin2)).initial_import_confirmed).toBe(true);
     expect((await plugin2.syncOnce()).status).toBe('Synced');
+  });
+
+  it('recovers and replaces local file-directory collisions during replace-local-with-server', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const device1Dir = join(root, 'replace-collision-device-1');
+    await mkdirp(device1Dir);
+    await writeFile(join(device1Dir, 'topic.md'), 'server file wins\n');
+    const plugin1 = await pairPlugin(admin, device1Dir, 'desktop');
+    await expect(plugin1.syncOnce()).rejects.toMatchObject({ code: 'initial_import_confirmation_required' });
+    await plugin1.syncOnce({ confirmInitialImport: true });
+
+    const device2Dir = join(root, 'replace-collision-device-2');
+    await mkdirp(join(device2Dir, 'topic.md'));
+    await writeFile(join(device2Dir, 'topic.md', 'child.md'), 'local directory content\n');
+    const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
+      device_name: 'phone',
+      sync_profile: 'notes_only'
+    });
+    expect(pairing.status).toBe(201);
+    const plugin2 = new ObtsPluginClient(device2Dir, {
+      serverUrl: baseUrlFromAdmin(admin),
+      deviceName: 'phone',
+      syncProfile: 'notes_only',
+      syncPlugins: false
+    });
+
+    await expect(plugin2.pairWithToken(pairing.body.pairing_token)).rejects.toMatchObject({
+      code: 'replace_local_with_server_required'
+    });
+    const replaced = await plugin2.replaceLocalWithServer();
+    expect(replaced.status).toBe('Synced');
+    expect(await readFile(join(device2Dir, 'topic.md'), 'utf8')).toBe('server file wins\n');
+    expect(await exists(join(device2Dir, 'topic.md', 'child.md'))).toBe(false);
+    expect(await recoveryBundleContains(device2Dir, 'topic.md/child.md')).toBe(true);
   });
 
   it('blocks additional-device local content even when server main is still empty', async () => {
@@ -794,6 +936,16 @@ async function readDeviceToken(vaultDir: string): Promise<string> {
     device_token: string;
   };
   return tokenFile.device_token;
+}
+
+async function recoveryBundleContains(vaultDir: string, relativePath: string): Promise<boolean> {
+  const recoveryDir = join(vaultDir, '.obts', 'recovery');
+  for (const bundleId of await readdir(recoveryDir)) {
+    if (await exists(join(recoveryDir, bundleId, 'files', relativePath))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function sha256(data: Buffer): string {

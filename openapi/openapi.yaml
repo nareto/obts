@@ -359,17 +359,24 @@ components:
         device_id:
           type: string
         expected_device_ref:
-          type: [string, "null"]
+          oneOf:
+            - type: "null"
+            - type: string
+              pattern: "^[0-9a-f]{40}$"
         target_commit:
           type: string
           pattern: "^[0-9a-f]{40}$"
         packfile_sha256:
           type: string
+          pattern: "^[0-9a-f]{64}$"
         packfile_bytes:
           type: integer
           minimum: 0
         client_known_main:
-          type: [string, "null"]
+          oneOf:
+            - type: "null"
+            - type: string
+              pattern: "^[0-9a-f]{40}$"
         attempt_id:
           type: string
     DevicePullRequest:
@@ -383,7 +390,10 @@ components:
         device_id:
           type: string
         current_local_main:
-          type: [string, "null"]
+          oneOf:
+            - type: "null"
+            - type: string
+              pattern: "^[0-9a-f]{40}$"
         requested_target:
           oneOf:
             - const: latest
@@ -401,6 +411,7 @@ components:
           type: string
         target_main:
           type: string
+          pattern: "^[0-9a-f]{40}$"
         changed_paths:
           type: array
           items:

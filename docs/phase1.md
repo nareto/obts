@@ -9,6 +9,7 @@ Implemented runtime pieces:
 - Shared API types, status labels, validation helpers, and vault path policy.
 - Committed OpenAPI 3.1 contract at `openapi/openapi.yaml`.
 - Fastify server with first-run setup, Argon2id password storage, login sessions, CSRF-protected dashboard mutations, admin user creation, vault creation, pairing tokens, device tokens, multipart push, multipart pull, events, conflicts, and health checks.
+- Multipart sync manifests reject non-commit ref strings and malformed SHA-256 packfile digests before Git ref mutation logic runs.
 - Per-vault native Git stores under `OBTS_DATA_DIR/git`, with server-authored empty-tree root commits on `refs/heads/main`.
 - Protected device refs at `refs/obts/devices/{device_id}` with no-op, fast-forward, stale-ref, malformed-pack, path-policy, and same-device non-fast-forward handling.
 - Pairing stores the device sync profile and plugin-sync setting, and server-side upload validation rejects changed paths outside that paired policy while preserving inherited server tree entries.
@@ -29,9 +30,12 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - two paired devices sync non-conflicting vault changes through server `main`;
 - dashboard passwords are stored as Argon2id hashes using the PRD v1 minimum parameters;
 - device push and pull both use multipart manifests with Git packfile parts;
+- malformed commit IDs in multipart sync manifests are rejected before Git ref mutation;
 - hidden Git state is under `.obts/`, with no visible vault `.git`;
 - first-device import of existing local content creates a recovery bundle and requires confirmation;
 - divergent additional-device local content creates a recovery bundle, blocks normal sync, and requires explicit replace-local-with-server before destructive apply, even when current server `main` is still the empty root;
+- pairing tokens are scoped to their issued sync profile and cannot be consumed twice;
+- replace-local-with-server recovers and safely materializes file/directory collisions, including local directories that must be replaced by server files;
 - partial or already-paired local `.obts/` state blocks pairing before a one-time pairing token is consumed;
 - concurrent same-path edits and file/directory hierarchy collisions create a durable conflict record and do not overwrite current `main`;
 - devices with open conflicts cannot upload newer commits until recovery or conflict review is completed;
