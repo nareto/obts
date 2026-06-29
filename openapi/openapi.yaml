@@ -132,6 +132,10 @@ paths:
       responses:
         "201":
           description: Device token and initial server main.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConsumePairingTokenResponse"
         "401":
           $ref: "#/components/responses/Error"
   /vaults/{vault_id}/sync/push:
@@ -310,6 +314,32 @@ components:
           properties:
             pairing_token:
               type: string
+    ConsumePairingTokenResponse:
+      type: object
+      required:
+        - user_id
+        - vault_id
+        - device_id
+        - device_token
+        - device_ref
+        - current_main
+        - is_first_device
+      properties:
+        user_id:
+          type: string
+        vault_id:
+          type: string
+        device_id:
+          type: string
+        device_token:
+          type: string
+        device_ref:
+          type: string
+        current_main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        is_first_device:
+          type: boolean
     DevicePushManifest:
       type: object
       required:

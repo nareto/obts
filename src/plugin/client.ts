@@ -148,21 +148,23 @@ export class ObtsPluginClient {
       localFiles.length > 0 && serverFiles.length > 0
         ? await this.localContentMatchesTree(localFiles, pulled.manifest.target_main)
         : false;
-    if (localFiles.length > 0 && serverFiles.length > 0) {
-      if (!localAlreadyMatchesServer) {
-        await this.createLocalRecoveryBundle('replace_local_with_server', pulled.manifest.target_main, localFiles);
-        await this.writeQueue({
-          pending_commit: null,
-          expected_device_ref: null,
-          status: 'blocked_recovery',
-          attempts: 0,
-          updated_at: nowIso()
-        });
-        await this.block(
-          'replace_local_with_server_required',
-          'Additional device has local content that differs from server main.'
-        );
-      }
+    const divergentLocalContent =
+      localFiles.length > 0 &&
+      !localAlreadyMatchesServer &&
+      (!result.is_first_device || serverFiles.length > 0);
+    if (divergentLocalContent) {
+      await this.createLocalRecoveryBundle('replace_local_with_server', pulled.manifest.target_main, localFiles);
+      await this.writeQueue({
+        pending_commit: null,
+        expected_device_ref: null,
+        status: 'blocked_recovery',
+        attempts: 0,
+        updated_at: nowIso()
+      });
+      await this.block(
+        'replace_local_with_server_required',
+        'Additional device has local content that differs from server main.'
+      );
     }
     await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true);
     if (localFiles.length === 0 || localAlreadyMatchesServer) {

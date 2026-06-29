@@ -239,6 +239,40 @@ describe('Phase 1 sync without conflict resolution', () => {
     await expect(plugin2.syncOnce()).rejects.toMatchObject({ code: 'device_blocked' });
   });
 
+  it('records a conflict for file-directory hierarchy collisions instead of attempting an unsafe merge', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const device1Dir = join(root, 'hierarchy-device-1');
+    const device2Dir = join(root, 'hierarchy-device-2');
+    await mkdirp(device1Dir);
+    await mkdirp(device2Dir);
+
+    const plugin1 = await pairPlugin(admin, device1Dir, 'desktop');
+    const plugin2 = await pairPlugin(admin, device2Dir, 'tablet');
+
+    await writeFile(join(device1Dir, 'topic.md'), 'main file\n');
+    await mkdirp(join(device2Dir, 'topic.md'));
+    await writeFile(join(device2Dir, 'topic.md', 'child.md'), 'nested note\n');
+    expect((await plugin1.syncOnce()).status).toBe('Synced');
+    const mainBeforeConflict = (await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)
+      ?.current_main;
+
+    const result = await plugin2.syncOnce();
+    expect(result.status).toBe('Review needed');
+
+    const db = await server.store.snapshot();
+    expect(db.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(mainBeforeConflict);
+    const conflict = db.conflicts.find((candidate) => candidate.conflict_id === result.conflictId);
+    expect(conflict).toMatchObject({
+      status: 'open',
+      affected_paths: ['topic.md', 'topic.md/child.md'],
+      validator_summary: {
+        decision: 'conflict',
+        reason: 'overlapping_paths',
+        path_count: 2
+      }
+    });
+  });
+
   it('blocks divergent additional-device content until explicit replace-local-with-server', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const device1Dir = join(root, 'replace-device-1');
@@ -276,6 +310,41 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await readFile(join(device2Dir, 'server.md'), 'utf8')).toBe('server state\n');
     expect(await exists(join(device2Dir, 'local-only.md'))).toBe(false);
     expect((await awaitState(plugin2)).initial_import_confirmed).toBe(true);
+    expect((await plugin2.syncOnce()).status).toBe('Synced');
+  });
+
+  it('blocks additional-device local content even when server main is still empty', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const device1Dir = join(root, 'empty-server-device-1');
+    await mkdirp(device1Dir);
+    const plugin1 = await pairPlugin(admin, device1Dir, 'empty-desktop');
+    expect((await plugin1.syncOnce()).status).toBe('Synced');
+
+    const device2Dir = join(root, 'empty-server-device-2');
+    await mkdirp(device2Dir);
+    await writeFile(join(device2Dir, 'local-only.md'), 'should not become initial import\n');
+    const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
+      device_name: 'phone',
+      sync_profile: 'notes_only'
+    });
+    expect(pairing.status).toBe(201);
+    const plugin2 = new ObtsPluginClient(device2Dir, {
+      serverUrl: baseUrlFromAdmin(admin),
+      deviceName: 'phone',
+      syncProfile: 'notes_only',
+      syncPlugins: false
+    });
+
+    await expect(plugin2.pairWithToken(pairing.body.pairing_token)).rejects.toMatchObject({
+      code: 'replace_local_with_server_required'
+    });
+    expect(await readFile(join(device2Dir, 'local-only.md'), 'utf8')).toBe('should not become initial import\n');
+    expect((await readdir(join(device2Dir, '.obts', 'recovery'))).length).toBeGreaterThan(0);
+    await expect(plugin2.syncOnce()).rejects.toMatchObject({ code: 'replace_local_with_server_required' });
+
+    const replaced = await plugin2.replaceLocalWithServer();
+    expect(replaced.status).toBe('Synced');
+    expect(await exists(join(device2Dir, 'local-only.md'))).toBe(false);
     expect((await plugin2.syncOnce()).status).toBe('Synced');
   });
 

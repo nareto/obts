@@ -85,6 +85,7 @@ export type ConsumePairingTokenResponse = {
   device_token: string;
   device_ref: string;
   current_main: string;
+  is_first_device: boolean;
 };
 
 export type DevicePushManifest = {

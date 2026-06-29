@@ -26,6 +26,8 @@ describe('OpenAPI Phase 1 contract', () => {
     expect(contract).toContain('ErrorEnvelope');
     expect(contract).toContain('__Host-obts_session');
     expect(contract).toContain('X-OBTS-CSRF');
+    expect(contract).toContain('ConsumePairingTokenResponse');
+    expect(contract).toContain('is_first_device');
 
     const pullSection = contract.slice(
       contract.indexOf('/vaults/{vault_id}/sync/pull'),

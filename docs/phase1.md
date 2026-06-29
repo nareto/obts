@@ -13,7 +13,7 @@ Implemented runtime pieces:
 - Protected device refs at `refs/obts/devices/{device_id}` with no-op, fast-forward, stale-ref, malformed-pack, path-policy, and same-device non-fast-forward handling.
 - Pairing stores the device sync profile and plugin-sync setting, and server-side upload validation rejects changed paths outside that paired policy while preserving inherited server tree entries.
 - Shared client/server path policy rejects internal state, visible Git directories, traversal, empty path segments, cross-platform-invalid names, case-fold collisions, unsupported Git tree modes, and `.obsidian` files outside the explicit sync profile.
-- Server-side automatic merge for disjoint path changes, durable merge decision operation records, blocked-device rejection, and durable conflict records for unsafe overlapping changes.
+- Server-side automatic merge for disjoint path changes, durable merge decision operation records, blocked-device rejection, and durable conflict records for unsafe overlapping or file/directory hierarchy-collision changes.
 - Plugin-side `.obts/` state with `isomorphic-git`, device token storage, queue state, recovery bundles, apply journal, local commit creation, multipart push, multipart pull, safe apply, incomplete-journal blocking, and explicit replace-local-with-server recovery.
 - Minimal dashboard shell and dashboard summary API.
 - Readiness checks that fail closed when metadata, Git refs, conflict commits, writable storage, or native Git readiness are inconsistent.
@@ -31,9 +31,9 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - device push and pull both use multipart manifests with Git packfile parts;
 - hidden Git state is under `.obts/`, with no visible vault `.git`;
 - first-device import of existing local content creates a recovery bundle and requires confirmation;
-- divergent additional-device local content creates a recovery bundle, blocks normal sync, and requires explicit replace-local-with-server before destructive apply;
+- divergent additional-device local content creates a recovery bundle, blocks normal sync, and requires explicit replace-local-with-server before destructive apply, even when current server `main` is still the empty root;
 - partial or already-paired local `.obts/` state blocks pairing before a one-time pairing token is consumed;
-- concurrent same-path edits create a durable conflict record and do not overwrite current `main`;
+- concurrent same-path edits and file/directory hierarchy collisions create a durable conflict record and do not overwrite current `main`;
 - devices with open conflicts cannot upload newer commits until recovery or conflict review is completed;
 - retried uploads whose device ref already advanced but whose commit is not yet in `main` resume merge evaluation instead of becoming a false no-op;
 - uploaded commits that introduce paths outside the paired device's sync profile are rejected before refs advance;

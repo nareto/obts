@@ -307,7 +307,8 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       device_id: result.device.device_id,
       device_token: result.deviceToken,
       device_ref: result.device.device_ref,
-      current_main: result.vault.current_main
+      current_main: result.vault.current_main,
+      is_first_device: result.isFirstDevice
     });
   });
 

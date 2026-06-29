@@ -608,14 +608,22 @@ function requireOperation(db: MetadataDb, operationId: string): SyncOperationRow
 }
 
 function intersectChangedPaths(left: GitDiffEntry[], right: GitDiffEntry[]): string[] {
-  const leftPaths = changedPathSet(left);
+  const leftPaths = [...changedPathSet(left)];
+  const rightPaths = [...changedPathSet(right)];
   const result = new Set<string>();
-  for (const path of changedPathSet(right)) {
-    if (leftPaths.has(path)) {
-      result.add(path);
+  for (const leftPath of leftPaths) {
+    for (const rightPath of rightPaths) {
+      if (changedPathsConflict(leftPath, rightPath)) {
+        result.add(leftPath);
+        result.add(rightPath);
+      }
     }
   }
   return [...result].sort();
+}
+
+function changedPathsConflict(left: string, right: string): boolean {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
 }
 
 function changedPathSet(entries: GitDiffEntry[]): Set<string> {
