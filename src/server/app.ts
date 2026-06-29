@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import cookie from '@fastify/cookie';
@@ -19,7 +19,7 @@ import {
 import { AuthError, AuthService, ownedVaultOrThrow } from './authService.js';
 import { createServerConfig, ensureServerDirectories, type ServerConfig } from './config.js';
 import { GitCommandError, GitService, sha256Hex } from './gitService.js';
-import { MetadataStore } from './metadataStore.js';
+import { MetadataStore, type MetadataDb } from './metadataStore.js';
 import { SyncService } from './syncService.js';
 
 const SESSION_COOKIE = '__Host-obts_session';
@@ -63,17 +63,41 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   app.get('/health/ready', async (_request, reply) => {
     const gitReady = await git.checkReady();
     const db = await store.snapshot();
+    const metadataStoreReady = await checkWritableDirectory(join(config.dataDir, 'metadata'));
+    const gitStoreReady = await checkWritableDirectory(config.gitStoreDir);
+    const tempWorkspaceReady = await checkWritableDirectory(config.tempDir);
+    const persistentState = await checkPersistentState(db, git);
     const checks = {
       metadata: true,
+      metadata_store: metadataStoreReady.ok,
       git: gitReady.ok,
       setup_complete: db.setup_complete,
-      git_store: true,
-      temp_workspace: true
+      migrations: db.schema_version === 1,
+      git_store: gitStoreReady.ok,
+      temp_workspace: tempWorkspaceReady.ok,
+      persistent_state: persistentState.ok
     };
-    if (!gitReady.ok) {
-      return reply.status(503).send({ status: 'not_ready', checks, detail: gitReady.error });
+    const ready =
+      checks.metadata_store &&
+      checks.git &&
+      checks.migrations &&
+      checks.git_store &&
+      checks.temp_workspace &&
+      checks.persistent_state;
+    if (!ready) {
+      return reply.status(503).send({
+        status: 'not_ready',
+        checks,
+        detail: firstDetail([
+          gitReady.ok ? null : gitReady.error,
+          readinessError(metadataStoreReady),
+          readinessError(gitStoreReady),
+          readinessError(tempWorkspaceReady),
+          readinessError(persistentState)
+        ])
+      });
     }
-    return { status: 'ready', checks, git_version: gitReady.version };
+    return { status: 'ready', checks, git_version: gitReady.ok ? gitReady.version : 'unknown' };
   });
 
   app.get('/api/v1/setup/status', async () => {
@@ -224,7 +248,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         device_id: device.device_id,
         device_name: device.device_name,
         status: device.status,
-        status_label: device.status === 'review_needed' ? 'Review needed' : device.status === 'synced' ? 'Synced' : 'Ahead',
+        status_label: deviceStatusLabel(device.status),
         last_seen_at: device.last_seen_at,
         sync_profile: device.sync_profile,
         device_ref_head: device.device_ref_head,
@@ -490,4 +514,69 @@ async function sendError(error: Error, request: FastifyRequest, reply: FastifyRe
       details: {}
     }
   });
+}
+
+async function checkWritableDirectory(path: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  const probe = join(path, `.obts-ready-${process.pid}-${Date.now()}`);
+  try {
+    await mkdir(path, { recursive: true, mode: 0o700 });
+    await writeFile(probe, 'ok', { mode: 0o600 });
+    await rm(probe, { force: true });
+    return { ok: true };
+  } catch {
+    return { ok: false, error: 'persistent directory is not writable' };
+  }
+}
+
+async function checkPersistentState(db: MetadataDb, git: GitService): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (db.schema_version !== 1) {
+    return { ok: false, error: 'metadata schema version is unsupported' };
+  }
+  for (const vault of db.vaults) {
+    const mainRef = await git.getRef(vault.vault_id, 'refs/heads/main');
+    if (mainRef !== vault.current_main) {
+      return { ok: false, error: 'vault main ref is inconsistent with metadata' };
+    }
+    if (!(await git.commitExists(vault.vault_id, vault.current_main))) {
+      return { ok: false, error: 'vault main commit is missing from the Git store' };
+    }
+    for (const device of db.devices.filter((candidate) => candidate.vault_id === vault.vault_id)) {
+      const deviceRef = await git.getRef(vault.vault_id, device.device_ref);
+      if ((device.device_ref_head ?? null) !== deviceRef) {
+        return { ok: false, error: 'device ref is inconsistent with metadata' };
+      }
+    }
+    for (const conflict of db.conflicts.filter((candidate) => candidate.vault_id === vault.vault_id)) {
+      for (const commit of [conflict.current_main, conflict.device_commit, conflict.base_commit]) {
+        if (commit && !(await git.commitExists(vault.vault_id, commit))) {
+          return { ok: false, error: 'conflict commit is missing from the Git store' };
+        }
+      }
+    }
+  }
+  return { ok: true };
+}
+
+function firstDetail(details: Array<string | null | undefined>): string {
+  return details.find((detail): detail is string => typeof detail === 'string' && detail.length > 0) ?? 'readiness failed';
+}
+
+function readinessError(result: { ok: true } | { ok: false; error: string }): string | null {
+  return result.ok ? null : result.error;
+}
+
+function deviceStatusLabel(status: string): string {
+  if (status === 'synced') {
+    return 'Synced';
+  }
+  if (status === 'review_needed') {
+    return 'Review needed';
+  }
+  if (status === 'blocked_recovery') {
+    return 'Needs recovery';
+  }
+  if (status === 'paired') {
+    return 'Checking';
+  }
+  return 'Ahead';
 }

@@ -13,9 +13,11 @@ Back up these paths atomically:
 - `OBTS_DATA_DIR/tmp` only when an operator intentionally preserves recovery
   residue for investigation. Normal merge workspaces are transaction-scoped.
 
-Backups must be point-in-time consistent across metadata and Git stores. If a
-restore loses required Git state or metadata, `/health/ready` must fail closed
-or the affected vault must remain blocked until operator repair.
+Backups must be point-in-time consistent across metadata and Git stores.
+`/health/ready` verifies that every metadata `current_main` matches
+`refs/heads/main`, every recorded device ref matches its Git ref, and every
+open conflict still points at existing commits. If a restore loses required Git
+state or metadata, readiness fails closed until operator repair.
 
 Phase 1 does not implement application-level encrypted persistence. Offline
 disclosure protection depends on deployment-managed filesystem, volume,

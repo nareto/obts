@@ -59,6 +59,11 @@ export class SyncService {
           await this.abortOperation(operation.operation_id, 'stale_device_ref');
           return { status: 'rejected', code: 'stale_device_ref', message: 'Device ref changed before this upload.' };
         }
+        const deviceBlock = await this.deviceBlockRejection(auth.device.device_id);
+        if (deviceBlock) {
+          await this.abortOperation(operation.operation_id, deviceBlock.code);
+          return { status: 'rejected', code: deviceBlock.code, message: deviceBlock.message };
+        }
 
         try {
           await this.git.importPack(auth.vault.vault_id, packfile);
@@ -214,9 +219,64 @@ export class SyncService {
       return await this.createConflict(vaultId, deviceId, base, main, deviceCommit, overlapping, 'overlapping_paths');
     }
 
-    const mergeSequence = await this.store.mutate((db) => this.store.nextMergeSequence(db, vaultId));
-    const mergeCommit = await this.git.createOverlayMergeCommit(vaultId, base, main, deviceCommit, deviceChanges, mergeSequence);
+    const mergePreparation = await this.store.mutate((db) => {
+      const device = requireDevice(db, deviceId);
+      const mergeSequence = this.store.nextMergeSequence(db, vaultId);
+      const operation = this.store.startOperation(db, {
+        vault_id: vaultId,
+        device_id: deviceId,
+        operation_type: 'server_merge',
+        expected_refs: {
+          'refs/heads/main': main,
+          [device.device_ref]: deviceCommit
+        },
+        target_refs: {
+          'refs/heads/main': null
+        },
+        target_commit: null
+      });
+      operation.status = 'prepared';
+      operation.prepared_manifest = {
+        merge_sequence: mergeSequence,
+        merge_policy_version: MERGE_POLICY_VERSION,
+        base_commit: base,
+        current_main: main,
+        device_commit: deviceCommit,
+        decision: 'merge',
+        validator_results: {
+          disjoint_paths: 'ok',
+          overlapping_path_count: 0
+        }
+      };
+      operation.updated_at = nowIso();
+      return { mergeSequence, operationId: operation.operation_id };
+    });
+    let mergeCommit: string;
+    try {
+      mergeCommit = await this.git.createOverlayMergeCommit(
+        vaultId,
+        base,
+        main,
+        deviceCommit,
+        deviceChanges,
+        mergePreparation.mergeSequence
+      );
+    } catch (error) {
+      await this.abortOperation(mergePreparation.operationId, 'merge_git_error');
+      throw error;
+    }
     const eventSeq = await this.store.mutate((db) => {
+      const operation = requireOperation(db, mergePreparation.operationId);
+      operation.status = 'committed';
+      operation.target_refs = {
+        'refs/heads/main': mergeCommit
+      };
+      operation.target_commit = mergeCommit;
+      operation.result = {
+        decision: 'merged',
+        merge_commit: mergeCommit
+      };
+      operation.updated_at = nowIso();
       const vault = requireVault(db, vaultId);
       const device = requireDevice(db, deviceId);
       vault.current_main = mergeCommit;
@@ -236,8 +296,15 @@ export class SyncService {
         },
         payload: {
           decision: 'merged',
-          merge_sequence: mergeSequence,
+          merge_sequence: mergePreparation.mergeSequence,
           merge_policy_version: MERGE_POLICY_VERSION,
+          base_commit: base,
+          current_main: main,
+          device_commit: deviceCommit,
+          validator_results: {
+            disjoint_paths: 'ok',
+            overlapping_path_count: 0
+          },
           changed_path_count: changedPathSet(deviceChanges).size
         }
       });
@@ -274,6 +341,36 @@ export class SyncService {
     const conflictId = newId('conf');
     const mergeSequence = await this.store.mutate((db) => this.store.nextMergeSequence(db, vaultId));
     const eventSeq = await this.store.mutate((db) => {
+      const device = requireDevice(db, deviceId);
+      const operation = this.store.startOperation(db, {
+        vault_id: vaultId,
+        device_id: deviceId,
+        operation_type: 'conflict_create',
+        expected_refs: {
+          'refs/heads/main': currentMain,
+          [device.device_ref]: deviceCommit
+        },
+        target_refs: {},
+        target_commit: deviceCommit
+      });
+      operation.status = 'committed';
+      operation.prepared_manifest = {
+        merge_sequence: mergeSequence,
+        merge_policy_version: MERGE_POLICY_VERSION,
+        base_commit: base,
+        current_main: currentMain,
+        device_commit: deviceCommit,
+        decision: 'conflict',
+        validator_results: {
+          reason,
+          affected_paths: affectedPaths
+        }
+      };
+      operation.result = {
+        decision: 'conflict',
+        conflict_id: conflictId
+      };
+      operation.updated_at = nowIso();
       const conflict: ConflictRecord = {
         conflict_id: conflictId,
         vault_id: vaultId,
@@ -295,7 +392,6 @@ export class SyncService {
         created_at: nowIso()
       };
       db.conflicts.push(conflict);
-      const device = requireDevice(db, deviceId);
       device.status = 'review_needed';
       const event = this.store.appendEvent(db, {
         event_type: 'conflict_created',
@@ -366,6 +462,16 @@ export class SyncService {
           reason: 'same_device_non_fast_forward'
         }
       });
+      db.audit_log.push({
+        audit_id: newId('aud'),
+        actor_user_id: auth.user.user_id,
+        actor_device_id: auth.device.device_id,
+        vault_id: auth.vault.vault_id,
+        action: 'device_recovery_required',
+        resource_class: 'device',
+        resource_id: auth.device.device_id,
+        created_at: nowIso()
+      });
     });
     return {
       status: 'rejected',
@@ -385,6 +491,18 @@ export class SyncService {
           conflict.status === 'open'
       ) ?? null
     );
+  }
+
+  private async deviceBlockRejection(deviceId: string): Promise<{ code: string; message: string } | null> {
+    const db = await this.store.snapshot();
+    const device = db.devices.find((candidate) => candidate.device_id === deviceId);
+    if (device?.status === 'review_needed') {
+      return { code: 'device_blocked', message: 'Device has an open conflict that requires review.' };
+    }
+    if (device?.status === 'blocked_recovery') {
+      return { code: 'device_blocked', message: 'Device requires recovery before more uploads are accepted.' };
+    }
+    return null;
   }
 
   private latestEventSeq(vaultId: string, db: MetadataDb): number {

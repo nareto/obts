@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { newId, nowIso } from '../shared/ids.js';
@@ -7,7 +7,7 @@ import { isSyncableVaultPath, type SyncPathPolicy } from '../shared/pathPolicy.j
 import { API_VERSION, type DevicePushManifest, type SyncProfile } from '../shared/types.js';
 import { LocalGitEngine } from './localGit.js';
 import { type ApplyJournal, RecoveryManager, sha256File } from './recovery.js';
-import { TransportClient } from './transport.js';
+import { TransportClient, TransportError } from './transport.js';
 
 const PLUGIN_VERSION = '0.1.0-phase1';
 
@@ -75,6 +75,32 @@ export class ObtsPluginClient {
     await mkdir(join(this.vaultDir, '.obts', 'auth'), { recursive: true, mode: 0o700 });
     await this.git.initialize();
     const state = await this.readState();
+    const journal = await this.recovery.readApplyJournal();
+    if (journal && journal.phase === 'committed') {
+      await this.git.setLocalMain(journal.target_main);
+      await this.git.setLocalHead(journal.target_main);
+      await this.writeState({
+        ...state,
+        local_main: journal.target_main,
+        local_head: journal.target_main,
+        status_label: 'Synced',
+        last_error_code: null,
+        updated_at: nowIso()
+      });
+      await this.recovery.clearApplyJournal();
+      await this.writeQueue(await this.readQueue());
+      return;
+    }
+    if (journal) {
+      await this.writeState({
+        ...state,
+        status_label: 'Unsafe local state',
+        last_error_code: 'apply_journal_recovery_required',
+        updated_at: nowIso()
+      });
+      await this.writeQueue(await this.readQueue());
+      return;
+    }
     await this.writeState({
       ...state,
       status_label: state.status_label ?? 'Checking',
@@ -84,12 +110,13 @@ export class ObtsPluginClient {
   }
 
   async pairWithToken(pairingToken: string): Promise<void> {
-    await this.initialize();
+    await this.assertPairingCanStart();
     const result = await this.transport.consumePairingToken({
       pairingToken,
       deviceName: this.settings.deviceName,
       syncProfile: this.settings.syncProfile
     });
+    await this.initialize();
     await writeJson(join(this.vaultDir, '.obts', 'auth', 'device-token.json'), {
       device_token: result.device_token,
       created_at: nowIso()
@@ -116,12 +143,28 @@ export class ObtsPluginClient {
     await this.git.importPack(pulled.packfile);
     const localFiles = await this.git.scanSyncableFiles();
     const serverFiles = await this.git.listTreeFiles(pulled.manifest.target_main);
+    const localAlreadyMatchesServer =
+      localFiles.length > 0 && serverFiles.length > 0
+        ? await this.localContentMatchesTree(localFiles, pulled.manifest.target_main)
+        : false;
     if (localFiles.length > 0 && serverFiles.length > 0) {
-      await this.createLocalRecoveryBundle('replace_local_with_server', pulled.manifest.target_main, localFiles);
-      await this.block('unsafe_local_state', 'Additional device has local content that differs from server main.');
+      if (!localAlreadyMatchesServer) {
+        await this.createLocalRecoveryBundle('replace_local_with_server', pulled.manifest.target_main, localFiles);
+        await this.writeQueue({
+          pending_commit: null,
+          expected_device_ref: null,
+          status: 'blocked_recovery',
+          attempts: 0,
+          updated_at: nowIso()
+        });
+        await this.block(
+          'replace_local_with_server_required',
+          'Additional device has local content that differs from server main.'
+        );
+      }
     }
     await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true);
-    if (localFiles.length === 0) {
+    if (localFiles.length === 0 || localAlreadyMatchesServer) {
       await this.writeState({
         ...(await this.readState()),
         initial_import_confirmed: true,
@@ -136,6 +179,7 @@ export class ObtsPluginClient {
     if (!state.vault_id || !state.device_id) {
       throw new PluginBlockedError('not_paired', 'Device is not paired.');
     }
+    this.throwIfSyncBlocked(state);
     const localFiles = await this.git.scanSyncableFiles();
     if (localFiles.length > 0 && !state.initial_import_confirmed && state.server_device_ref === null) {
       await this.createLocalRecoveryBundle('initial_import', state.local_main, localFiles);
@@ -187,13 +231,7 @@ export class ObtsPluginClient {
         client_known_main: currentState.local_main,
         attempt_id: newId('sync')
       };
-      const result = await this.transport.push({
-        vaultId: currentState.vault_id,
-        deviceId: currentState.device_id,
-        deviceToken: token,
-        manifest,
-        packfile
-      });
+      const result = await this.pushOrBlock(currentState, queue, token, manifest, packfile);
       if (result.status === 'conflicted') {
         await this.writeQueue({
           ...queue,
@@ -232,6 +270,44 @@ export class ObtsPluginClient {
     return finalState.local_main
       ? { status: finalState.status_label, main: finalState.local_main }
       : { status: finalState.status_label };
+  }
+
+  async replaceLocalWithServer(): Promise<{ status: string; main: string }> {
+    await this.initialize();
+    const state = await this.readState();
+    if (!state.vault_id || !state.device_id) {
+      throw new PluginBlockedError('not_paired', 'Device is not paired.');
+    }
+    if (state.last_error_code !== 'replace_local_with_server_required') {
+      throw new PluginBlockedError('replace_local_with_server_not_required', 'Local replacement is not currently required.');
+    }
+    const token = await this.readDeviceToken();
+    const localFiles = await this.git.scanSyncableFiles();
+    const pulled = await this.transport.pull({
+      vaultId: state.vault_id,
+      deviceId: state.device_id,
+      deviceToken: token,
+      currentLocalMain: state.local_main
+    });
+    await this.git.importPack(pulled.packfile);
+    await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true, {
+      extraAffectedPaths: localFiles
+    });
+    await this.writeQueue({
+      pending_commit: null,
+      expected_device_ref: state.server_device_ref,
+      status: 'idle',
+      attempts: 0,
+      updated_at: nowIso()
+    });
+    await this.writeState({
+      ...(await this.readState()),
+      initial_import_confirmed: true,
+      status_label: 'Synced',
+      last_error_code: null,
+      updated_at: nowIso()
+    });
+    return { status: 'Synced', main: pulled.manifest.target_main };
   }
 
   async pullAndApply(options: { allowDestructive: boolean }): Promise<void> {
@@ -284,9 +360,14 @@ export class ObtsPluginClient {
     }
   }
 
-  private async applyTargetMain(targetMain: string, changedPaths: string[], allowDestructive: boolean): Promise<void> {
+  private async applyTargetMain(
+    targetMain: string,
+    changedPaths: string[],
+    allowDestructive: boolean,
+    options: { extraAffectedPaths?: string[] } = {}
+  ): Promise<void> {
     const state = await this.readState();
-    if (state.local_main === targetMain) {
+    if (state.local_main === targetMain && (options.extraAffectedPaths?.length ?? 0) === 0) {
       await this.writeState({ ...state, status_label: 'Synced', updated_at: nowIso() });
       return;
     }
@@ -298,6 +379,9 @@ export class ObtsPluginClient {
           affected.add(path);
         }
       }
+    }
+    for (const path of options.extraAffectedPaths ?? []) {
+      affected.add(path);
     }
     const affectedPaths = [...affected].filter((path) => isSyncableVaultPath(path, this.policy)).sort();
     const preflight: Record<string, string | null> = {};
@@ -403,10 +487,108 @@ export class ObtsPluginClient {
     });
   }
 
+  private async assertPairingCanStart(): Promise<void> {
+    const obtsDir = join(this.vaultDir, '.obts');
+    if (!(await exists(obtsDir))) {
+      return;
+    }
+    const existingState = await this.readExistingState();
+    const hasDeviceToken = await exists(join(this.vaultDir, '.obts', 'auth', 'device-token.json'));
+    if (existingState?.vault_id || existingState?.device_id || hasDeviceToken) {
+      await this.block('local_state_already_paired', 'Local .obts state already belongs to a paired device.');
+    }
+    await this.block('partial_local_state', 'Local .obts state is partially initialized and requires reset or recovery.');
+  }
+
+  private async readExistingState(): Promise<LocalPluginState | null> {
+    try {
+      return JSON.parse(await readFile(this.statePath, 'utf8')) as LocalPluginState;
+    } catch {
+      return null;
+    }
+  }
+
+  private async localContentMatchesTree(localFiles: string[], targetMain: string): Promise<boolean> {
+    const serverFiles = await this.git.listTreeFiles(targetMain);
+    if (localFiles.length !== serverFiles.length) {
+      return false;
+    }
+    const localSet = new Set(localFiles);
+    for (const path of serverFiles) {
+      if (!localSet.has(path)) {
+        return false;
+      }
+      const localHash = await sha256File(join(this.vaultDir, path));
+      const serverContent = await this.git.readBlob(targetMain, path);
+      if (serverContent === null || localHash !== sha256(serverContent)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private throwIfSyncBlocked(state: LocalPluginState): void {
+    if (state.last_error_code === 'replace_local_with_server_required') {
+      throw new PluginBlockedError(
+        'replace_local_with_server_required',
+        'Replace local content with server state before normal sync can continue.'
+      );
+    }
+    if (state.last_error_code === 'apply_journal_recovery_required') {
+      throw new PluginBlockedError(
+        'apply_journal_recovery_required',
+        'An incomplete apply journal requires recovery before sync can continue.'
+      );
+    }
+    if (
+      state.last_error_code === 'same_device_non_fast_forward' ||
+      state.last_error_code === 'stale_device_ref' ||
+      state.last_error_code === 'device_blocked'
+    ) {
+      throw new PluginBlockedError(state.last_error_code, 'Device sync is blocked until recovery completes.');
+    }
+  }
+
+  private async pushOrBlock(
+    currentState: LocalPluginState,
+    queue: QueueState,
+    token: string,
+    manifest: DevicePushManifest,
+    packfile: Buffer
+  ) {
+    if (!currentState.vault_id || !currentState.device_id) {
+      throw new PluginBlockedError('not_paired', 'Device is not paired.');
+    }
+    try {
+      return await this.transport.push({
+        vaultId: currentState.vault_id,
+        deviceId: currentState.device_id,
+        deviceToken: token,
+        manifest,
+        packfile
+      });
+    } catch (error) {
+      if (
+        error instanceof TransportError &&
+        (error.code === 'same_device_non_fast_forward' ||
+          error.code === 'stale_device_ref' ||
+          error.code === 'device_blocked')
+      ) {
+        await this.writeQueue({
+          ...queue,
+          status: 'blocked_recovery',
+          updated_at: nowIso()
+        });
+        await this.block(error.code, error.message);
+      }
+      throw error;
+    }
+  }
+
   private async block(code: string, message: string): Promise<never> {
     await this.writeState({
       ...(await this.readState()),
-      status_label: code === 'initial_import_confirmation_required' ? 'Blocked' : 'Unsafe local state',
+      status_label: blockStatusLabel(code),
       last_error_code: code,
       updated_at: nowIso()
     });
@@ -442,6 +624,25 @@ export class ObtsPluginClient {
 
 function sha256(data: Buffer): string {
   return createHash('sha256').update(data).digest('hex');
+}
+
+function blockStatusLabel(code: string): string {
+  if (code === 'initial_import_confirmation_required') {
+    return 'Blocked';
+  }
+  if (code === 'same_device_non_fast_forward' || code === 'device_blocked') {
+    return 'Needs recovery';
+  }
+  return 'Unsafe local state';
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function writeJson(path: string, value: unknown): Promise<void> {
