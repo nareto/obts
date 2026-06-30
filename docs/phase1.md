@@ -20,7 +20,7 @@ Implemented runtime pieces:
 - Same-path binary and attachment edits merge automatically only when the accepted server version and uploaded device version have identical blob content; otherwise they remain review-needed conflicts.
 - Merge operations persist the exact target commit and target ref in the prepared operation manifest before advancing `refs/heads/main`; startup reconciliation aborts unprepared writes, rolls forward prepared writes whose Git refs already moved, resumes merged-or-conflicted processing for recovered device ref updates, and marks unreconcilable vault state as `blocked_integrity`.
 - Vault event polling retains 30 days or 100,000 events per vault, returns `410 event_cursor_expired` when a client cursor predates retained history, and includes the current and oldest available event cursors in the redacted error details.
-- Plugin-side `.obts/` state with `isomorphic-git`, device token storage, queue state, recovery bundles, local apply lock, apply journal, local commit creation, multipart push, multipart pull, safe apply, incomplete-journal blocking, and explicit replace-local-with-server recovery.
+- Plugin-side `.obts/` state with `isomorphic-git`, device token storage, queue state, recovery bundles with file snapshots, text patches, local Git refs packs, and artifact checksums, local apply lock, apply journal, local commit creation, multipart push, multipart pull, safe apply, incomplete-journal blocking, and explicit replace-local-with-server recovery.
 - API-backed dashboard shell for setup, login, vault creation, overview, device status, events, readiness, and pairing-token creation.
 - Readiness checks that fail closed when metadata, Git refs, conflict commits, writable storage, or native Git readiness are inconsistent.
 
@@ -67,5 +67,6 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - committed apply journals replay idempotently on restart and clear stale local apply locks;
 - local apply lock contention blocks before a destructive pull apply starts;
 - recovery bundle creation failures leave a blocked apply journal and do not write files;
+- recovery bundles written before destructive apply contain affected file snapshots, text patch artifacts, local Git refs packs, and checksums for generated artifacts;
 - files changed after apply preflight block before overwrite;
 - shared path policy rejects `.obts/`, visible `.git`, traversal, empty path segments, cross-platform-invalid names, case-fold collisions, unapproved `.obsidian` files, and non-regular Git tree entries.

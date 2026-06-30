@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
-import { mkdir, open, readFile, rm, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { mkdir, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { dirname, extname, join, relative } from 'node:path';
 
 import { newId, nowIso } from '../shared/ids.js';
 
@@ -29,6 +29,7 @@ export type RecoveryBundleInput = {
   platform: string;
   pluginVersion: string;
   journal?: ApplyJournal;
+  localRefsPack?: Buffer;
 };
 
 export class ApplyLockActiveError extends Error {
@@ -113,7 +114,7 @@ export class RecoveryManager {
     await mkdir(join(bundleDir, 'patches'), { recursive: true, mode: 0o700 });
     await mkdir(join(bundleDir, 'journal'), { recursive: true, mode: 0o700 });
 
-    const checksums: string[] = [];
+    const snapshotChecksums: string[] = [];
     for (const path of input.affectedPaths) {
       if (path.startsWith('.obts/auth/')) {
         continue;
@@ -124,9 +125,12 @@ export class RecoveryManager {
         const target = join(bundleDir, 'files', path);
         await mkdir(dirname(target), { recursive: true, mode: 0o700 });
         await writeFile(target, content, { mode: 0o600 });
-        checksums.push(`${sha256(content)}  files/${path}`);
+        snapshotChecksums.push(`${sha256(content)}  files/${path}`);
+        if (isTextPatchPath(path)) {
+          await writeTextSnapshotPatch(bundleDir, path, content);
+        }
       } catch {
-        checksums.push(`missing  files/${path}`);
+        snapshotChecksums.push(`missing  files/${path}`);
       }
     }
 
@@ -142,14 +146,16 @@ export class RecoveryManager {
       affected_paths: input.affectedPaths,
       platform: input.platform,
       plugin_version: input.pluginVersion,
-      checksum_manifest: checksums
+      checksum_manifest: snapshotChecksums
     };
     await writeJson(join(bundleDir, 'manifest.json'), manifest);
     if (input.journal) {
       await writeJson(join(bundleDir, 'journal', 'apply-journal.json'), input.journal);
     }
-    await writeFile(join(bundleDir, 'git', 'local-refs.pack'), Buffer.alloc(0), { mode: 0o600 });
-    await writeFile(join(bundleDir, 'checksums.sha256'), `${checksums.join('\n')}\n`, { mode: 0o600 });
+    await writeFile(join(bundleDir, 'git', 'local-refs.pack'), input.localRefsPack ?? Buffer.alloc(0), { mode: 0o600 });
+    await writeFile(join(bundleDir, 'checksums.sha256'), `${(await bundleChecksums(bundleDir)).join('\n')}\n`, {
+      mode: 0o600
+    });
     return bundleId;
   }
 }
@@ -169,6 +175,59 @@ function sha256(data: Buffer): string {
 async function writeJson(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+}
+
+async function writeTextSnapshotPatch(bundleDir: string, path: string, content: Buffer): Promise<void> {
+  const patchPath = join(bundleDir, 'patches', `${path.replaceAll('/', '__')}.patch`);
+  await mkdir(dirname(patchPath), { recursive: true, mode: 0o700 });
+  const text = content.toString('utf8');
+  const body = [
+    `diff --git a/${path} b/${path}`,
+    'new file mode 100644',
+    '--- /dev/null',
+    `+++ b/${path}`,
+    '@@ -0,0 +1 @@',
+    ...text.split('\n').map((line) => `+${line}`)
+  ].join('\n');
+  await writeFile(patchPath, `${body}\n`, { mode: 0o600 });
+}
+
+async function bundleChecksums(bundleDir: string): Promise<string[]> {
+  const entries: string[] = [];
+  await walkBundleFiles(bundleDir, async (absolutePath) => {
+    const path = relative(bundleDir, absolutePath).replaceAll('\\', '/');
+    if (path === 'checksums.sha256') {
+      return;
+    }
+    entries.push(`${sha256(await readFile(absolutePath))}  ${path}`);
+  });
+  return entries.sort();
+}
+
+async function walkBundleFiles(root: string, visitFile: (path: string) => Promise<void>): Promise<void> {
+  const entries = await readdir(root, { withFileTypes: true });
+  for (const entry of entries) {
+    const absolutePath = join(root, entry.name);
+    if (entry.isDirectory()) {
+      await walkBundleFiles(absolutePath, visitFile);
+      continue;
+    }
+    if (entry.isFile()) {
+      await visitFile(absolutePath);
+      continue;
+    }
+    try {
+      if ((await stat(absolutePath)).isFile()) {
+        await visitFile(absolutePath);
+      }
+    } catch {
+      // Recovery bundles are best-effort for non-regular generated artifacts.
+    }
+  }
+}
+
+function isTextPatchPath(path: string): boolean {
+  return new Set(['.md', '.canvas', '.base', '.json', '.css', '.txt', '.yaml', '.yml']).has(extname(path).toLowerCase());
 }
 
 function hasErrorCode(error: unknown, code: string): boolean {

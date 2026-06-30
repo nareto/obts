@@ -159,6 +159,28 @@ export class LocalGitEngine {
 
   async createPackForCommit(commit: string): Promise<Buffer> {
     const oids = await this.collectReachableObjects(commit);
+    return await this.packObjects(oids);
+  }
+
+  async createRecoveryRefsPack(): Promise<Buffer> {
+    const refs = await this.recoveryRefs();
+    const oids = new Set<string>();
+    for (const ref of refs) {
+      const commit = await this.resolveRef(ref);
+      if (!commit) {
+        continue;
+      }
+      for (const oid of await this.collectReachableObjects(commit)) {
+        oids.add(oid);
+      }
+    }
+    if (oids.size === 0) {
+      return Buffer.alloc(0);
+    }
+    return await this.packObjects([...oids].sort());
+  }
+
+  private async packObjects(oids: string[]): Promise<Buffer> {
     const { packfile } = await git.packObjects({
       fs,
       dir: this.vaultDir,
@@ -169,6 +191,16 @@ export class LocalGitEngine {
       throw new Error('isomorphic-git did not return a packfile.');
     }
     return Buffer.from(packfile);
+  }
+
+  private async recoveryRefs(): Promise<string[]> {
+    const refs = new Set<string>();
+    for (const ref of ['refs/heads/local', 'refs/heads/main']) {
+      if (await this.resolveRef(ref)) {
+        refs.add(ref);
+      }
+    }
+    return [...refs].sort();
   }
 
   async listTreeFiles(commit: string): Promise<string[]> {

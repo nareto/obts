@@ -1306,6 +1306,33 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(journal.affected_paths).toEqual(['shared.md']);
   });
 
+  it('writes recovery bundle snapshots, patches, local refs pack, and artifact checksums before apply', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const { plugin2, device2Dir } = await preparePullApplyScenario(root, admin, 'bundle-shape-device-1', 'bundle-shape-device-2');
+
+    expect((await plugin2.syncOnce()).status).toBe('Synced');
+
+    const bundleDir = await latestRecoveryBundle(device2Dir);
+    const manifest = JSON.parse(await readFile(join(bundleDir, 'manifest.json'), 'utf8')) as {
+      operation_type: string;
+      affected_paths: string[];
+      checksum_manifest: string[];
+    };
+    expect(manifest).toMatchObject({
+      operation_type: 'pull_apply',
+      affected_paths: ['shared.md']
+    });
+    expect(manifest.checksum_manifest.some((entry) => entry.endsWith('  files/shared.md'))).toBe(true);
+    expect(await readFile(join(bundleDir, 'files', 'shared.md'), 'utf8')).toBe('base\n');
+    expect(await readFile(join(bundleDir, 'patches', 'shared.md.patch'), 'utf8')).toContain('+base');
+    expect((await stat(join(bundleDir, 'git', 'local-refs.pack'))).size).toBeGreaterThan(0);
+    const checksums = await readFile(join(bundleDir, 'checksums.sha256'), 'utf8');
+    expect(checksums).toContain('  manifest.json');
+    expect(checksums).toContain('  files/shared.md');
+    expect(checksums).toContain('  patches/shared.md.patch');
+    expect(checksums).toContain('  git/local-refs.pack');
+  });
+
   it('resumes merge evaluation when a retry finds the device ref already advanced', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'retry-device');
@@ -1896,6 +1923,22 @@ async function recoveryBundleContains(vaultDir: string, relativePath: string): P
     }
   }
   return false;
+}
+
+async function latestRecoveryBundle(vaultDir: string): Promise<string> {
+  const recoveryDir = join(vaultDir, '.obts', 'recovery');
+  const bundleIds = await readdir(recoveryDir);
+  if (bundleIds.length === 0) {
+    throw new Error('Expected at least one recovery bundle.');
+  }
+  const bundles = await Promise.all(
+    bundleIds.map(async (bundleId) => ({
+      bundleId,
+      mtimeMs: (await stat(join(recoveryDir, bundleId))).mtimeMs
+    }))
+  );
+  bundles.sort((left, right) => right.mtimeMs - left.mtimeMs || right.bundleId.localeCompare(left.bundleId));
+  return join(recoveryDir, bundles[0]!.bundleId);
 }
 
 async function sleep(milliseconds: number): Promise<void> {

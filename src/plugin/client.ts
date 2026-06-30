@@ -446,7 +446,8 @@ export class ObtsPluginClient {
             affectedPaths,
             platform: process.platform,
             pluginVersion: PLUGIN_VERSION,
-            journal
+            journal,
+            localRefsPack: await this.git.createRecoveryRefsPack()
           });
         } catch {
           journal.phase = 'blocked_recovery';
@@ -544,7 +545,8 @@ export class ObtsPluginClient {
       priorLocalDeviceRef: state.server_device_ref,
       affectedPaths,
       platform: process.platform,
-      pluginVersion: PLUGIN_VERSION
+      pluginVersion: PLUGIN_VERSION,
+      localRefsPack: await this.git.createRecoveryRefsPack()
     });
   }
 
