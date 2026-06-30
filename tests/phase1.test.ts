@@ -181,6 +181,16 @@ describe('Phase 1 sync without conflict resolution', () => {
       status_label: 'Behind',
       behind_main: true
     });
+
+    expect((await plugin2.syncOnce()).status).toBe('Synced');
+    const afterApply = await admin.get<{
+      devices: Array<{ device_name: string; status_label: string; behind_main: boolean }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+    expect(afterApply.status).toBe(200);
+    expect(afterApply.body.devices.find((device) => device.device_name === 'phone')).toMatchObject({
+      status_label: 'Synced',
+      behind_main: false
+    });
   });
 
   it('requires recent dashboard authentication for admin account creation', async () => {
@@ -691,6 +701,14 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await readFile(join(device2Dir, 'server.md'), 'utf8')).toBe('server state\n');
     expect(await exists(join(device2Dir, 'local-only.md'))).toBe(false);
     expect((await awaitState(plugin2)).initial_import_confirmed).toBe(true);
+    const dashboard = await admin.get<{
+      devices: Array<{ device_name: string; status_label: string; behind_main: boolean }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+    expect(dashboard.status).toBe(200);
+    expect(dashboard.body.devices.find((device) => device.device_name === 'phone')).toMatchObject({
+      status_label: 'Synced',
+      behind_main: false
+    });
     expect((await plugin2.syncOnce()).status).toBe('Synced');
   });
 

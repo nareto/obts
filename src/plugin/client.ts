@@ -297,6 +297,7 @@ export class ObtsPluginClient {
     await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true, {
       extraAffectedPaths: localFiles
     });
+    await this.acknowledgeAppliedMain(state, token, pulled.manifest.target_main);
     await this.writeQueue({
       pending_commit: null,
       expected_device_ref: state.server_device_ref,
@@ -328,6 +329,9 @@ export class ObtsPluginClient {
     });
     await this.git.importPack(pulled.packfile);
     await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, options.allowDestructive);
+    if (state.local_main !== pulled.manifest.target_main) {
+      await this.acknowledgeAppliedMain(state, token, pulled.manifest.target_main);
+    }
   }
 
   async readState(): Promise<LocalPluginState> {
@@ -637,6 +641,26 @@ export class ObtsPluginClient {
           updated_at: nowIso()
         });
         await this.block(error.code, error.message);
+      }
+      throw error;
+    }
+  }
+
+  private async acknowledgeAppliedMain(state: LocalPluginState, token: string, targetMain: string): Promise<void> {
+    if (!state.vault_id || !state.device_id) {
+      return;
+    }
+    try {
+      await this.transport.pull({
+        vaultId: state.vault_id,
+        deviceId: state.device_id,
+        deviceToken: token,
+        currentLocalMain: targetMain,
+        requestedTarget: targetMain
+      });
+    } catch (error) {
+      if (error instanceof TransportError && error.status === 404 && error.code === 'not_found') {
+        return;
       }
       throw error;
     }

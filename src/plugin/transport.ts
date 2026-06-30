@@ -61,13 +61,14 @@ export class TransportClient {
     deviceId: string;
     deviceToken: string;
     currentLocalMain: string | null;
+    requestedTarget?: 'latest' | string;
   }): Promise<{ manifest: DevicePullManifest; packfile: Buffer }> {
     const manifest = {
       api_version: API_VERSION,
       vault_id: input.vaultId,
       device_id: input.deviceId,
       current_local_main: input.currentLocalMain,
-      requested_target: 'latest'
+      requested_target: input.requestedTarget ?? 'latest'
     } as const;
     parseDevicePullRequest(manifest);
     const form = new FormData();
