@@ -686,7 +686,12 @@ function blockStatusLabel(code: string): string {
   if (code === 'initial_import_confirmation_required') {
     return 'Blocked';
   }
-  if (code === 'same_device_non_fast_forward' || code === 'device_blocked') {
+  if (
+    code === 'replace_local_with_server_required' ||
+    code === 'same_device_non_fast_forward' ||
+    code === 'stale_device_ref' ||
+    code === 'device_blocked'
+  ) {
     return 'Needs recovery';
   }
   return 'Unsafe local state';

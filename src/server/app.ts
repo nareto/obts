@@ -137,6 +137,15 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     };
   });
 
+  app.get('/api/v1/auth/session', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[SESSION_COOKIE]);
+    return {
+      user_id: session.user.user_id,
+      csrf_token: session.session.csrf_token,
+      recent_auth_expires_at: new Date(Date.parse(session.session.recent_auth_at) + 15 * 60 * 1000).toISOString()
+    };
+  });
+
   app.post('/api/v1/auth/logout', async (request, reply) => {
     await auth.logout(request.cookies[SESSION_COOKIE]);
     reply.clearCookie(SESSION_COOKIE, { path: '/' });
@@ -244,19 +253,34 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const { vaultId } = pathParams(request);
     const db = await store.snapshot();
     const vault = ownedVaultOrThrow(db, session.user.user_id, vaultId);
-    const devices = db.devices
-      .filter((device) => device.vault_id === vault.vault_id && device.user_id === session.user.user_id)
-      .map((device) => ({
-        device_id: device.device_id,
-        device_name: device.device_name,
-        status: device.status,
-        status_label: deviceStatusLabel(device.status),
-        last_seen_at: device.last_seen_at,
-        sync_profile: device.sync_profile,
-        sync_plugins: device.sync_plugins,
-        device_ref_head: device.device_ref_head,
-        last_successful_sync_at: device.last_successful_sync_at
-      }));
+    const devices = await Promise.all(
+      db.devices
+        .filter((device) => device.vault_id === vault.vault_id && device.user_id === session.user.user_id)
+        .map(async (device) => {
+          const aheadOfMain =
+            device.device_ref_head !== null && !(await git.isAncestor(vault.vault_id, device.device_ref_head, vault.current_main));
+          const behindMain =
+            device.status === 'synced' &&
+            device.last_successful_sync_at !== null &&
+            Date.parse(device.last_successful_sync_at) < Date.parse(vault.updated_at);
+          const offline = device.last_seen_at !== null && Date.now() - Date.parse(device.last_seen_at) > 24 * 60 * 60 * 1000;
+          return {
+            device_id: device.device_id,
+            device_name: device.device_name,
+            status: device.status,
+            status_label: dashboardDeviceStatusLabel(device.status, { behindMain, offline }),
+            last_seen_at: device.last_seen_at,
+            sync_profile: device.sync_profile,
+            sync_plugins: device.sync_plugins,
+            device_ref_head: device.device_ref_head,
+            last_successful_sync_at: device.last_successful_sync_at,
+            ahead_of_main: aheadOfMain,
+            behind_main: behindMain,
+            blocked: device.status === 'review_needed' || device.status === 'blocked_recovery',
+            offline
+          };
+        })
+    );
     const conflicts = db.conflicts.filter((conflict) => conflict.vault_id === vault.vault_id && conflict.status === 'open');
     return {
       vault: {
@@ -362,6 +386,15 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       event_seq: db.event_seq_by_vault[vaultId] ?? 0
     };
     const packfile = await git.exportPack(vaultId, targetMain, have);
+    if (pullRequest.current_local_main === targetMain) {
+      await store.mutate((mutableDb) => {
+        const device = mutableDb.devices.find((candidate) => candidate.device_id === deviceAuth.device.device_id);
+        if (device && (device.status === 'paired' || device.status === 'synced')) {
+          device.status = 'synced';
+          device.last_successful_sync_at = nowIso();
+        }
+      });
+    }
     return sendMultipart(reply, {
       manifest,
       packfile
@@ -387,8 +420,11 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const session = await auth.authenticateSession(request.cookies[SESSION_COOKIE]);
     const { vaultId } = pathParams(request);
     const query = request.query as { after?: string };
+    if (query.after !== undefined && !/^\d+$/u.test(query.after)) {
+      throw new ValidationError('invalid_request', 'Invalid event cursor.');
+    }
     const after = query.after ? Number.parseInt(query.after, 10) : 0;
-    if (!Number.isFinite(after) || after < 0) {
+    if (!Number.isSafeInteger(after) || after < 0) {
       throw new ValidationError('invalid_request', 'Invalid event cursor.');
     }
     const db = await store.snapshot();
@@ -500,6 +536,17 @@ async function sendError(error: Error, request: FastifyRequest, reply: FastifyRe
   if (reply.sent) {
     return;
   }
+  if (isMultipartLimitError(error)) {
+    await reply.status(413).send({
+      error: {
+        code: 'upload_too_large',
+        message: 'Uploaded multipart content exceeds the configured byte limit.',
+        request_id: request.id,
+        details: {}
+      }
+    });
+    return;
+  }
   if (error instanceof AuthError) {
     await reply.status(error.statusCode).send({
       error: {
@@ -606,4 +653,25 @@ function deviceStatusLabel(status: string): string {
     return 'Checking';
   }
   return 'Ahead';
+}
+
+function dashboardDeviceStatusLabel(
+  status: string,
+  state: { behindMain: boolean; offline: boolean }
+): string {
+  if (status === 'synced' && state.offline) {
+    return 'Offline';
+  }
+  if (status === 'synced' && state.behindMain) {
+    return 'Behind';
+  }
+  return deviceStatusLabel(status);
+}
+
+function isMultipartLimitError(error: Error): boolean {
+  return (
+    'code' in error &&
+    typeof error.code === 'string' &&
+    (error.code === 'FST_REQ_FILE_TOO_LARGE' || error.code === 'FST_PARTS_LIMIT' || error.code === 'FST_FILES_LIMIT')
+  );
 }

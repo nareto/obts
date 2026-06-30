@@ -291,7 +291,13 @@ export class GitService {
 
     try {
       await this.validateTreePathPolicy(vaultId, tree);
-      await this.validateMergedTextPaths(vaultId, tree, mergedTextPaths);
+      await this.validateMergedTextPaths(vaultId, {
+        tree,
+        base,
+        currentMain,
+        deviceCommit,
+        paths: mergedTextPaths
+      });
     } catch {
       return null;
     }
@@ -430,21 +436,44 @@ export class GitService {
     });
   }
 
-  private async validateMergedTextPaths(vaultId: string, tree: string, paths: string[]): Promise<void> {
-    for (const path of paths) {
-      let content: Buffer;
-      try {
-        content = await this.readBlobAtPath(vaultId, tree, path);
-      } catch {
+  private async validateMergedTextPaths(
+    vaultId: string,
+    input: { tree: string; base: string; currentMain: string; deviceCommit: string; paths: string[] }
+  ): Promise<void> {
+    for (const path of input.paths) {
+      const mergedText = await this.readTextAtPathIfPresent(vaultId, input.tree, path);
+      if (mergedText === null) {
         continue;
       }
-      const text = content.toString('utf8');
+      const text = mergedText;
       if (text.includes('<<<<<<<') || text.includes('=======') || text.includes('>>>>>>>')) {
         throw new GitCommandError('Merged text contains conflict markers.', '');
       }
-      if (path.endsWith('.canvas')) {
-        assertValidJsonCanvas(text);
+      const baseText = await this.readTextAtPathIfPresent(vaultId, input.base, path);
+      const currentText = await this.readTextAtPathIfPresent(vaultId, input.currentMain, path);
+      const deviceText = await this.readTextAtPathIfPresent(vaultId, input.deviceCommit, path);
+      if (path.endsWith('.md') && baseText !== null && currentText !== null && deviceText !== null) {
+        assertMarkdownMergeAllowed(baseText, currentText, deviceText);
       }
+      if (path.endsWith('.canvas')) {
+        const merged = assertValidJsonCanvas(text);
+        if (baseText !== null && currentText !== null && deviceText !== null) {
+          assertCanvasMergeAllowed(
+            assertValidJsonCanvas(baseText),
+            assertValidJsonCanvas(currentText),
+            assertValidJsonCanvas(deviceText),
+            merged
+          );
+        }
+      }
+    }
+  }
+
+  private async readTextAtPathIfPresent(vaultId: string, treeish: string, path: string): Promise<string | null> {
+    try {
+      return (await this.readBlobAtPath(vaultId, treeish, path)).toString('utf8');
+    } catch {
+      return null;
     }
   }
 }
@@ -473,7 +502,14 @@ function serverGitEnv(actor: string): NodeJS.ProcessEnv {
   };
 }
 
-function assertValidJsonCanvas(text: string): void {
+type JsonCanvasObject = {
+  nodes: Map<string, Record<string, unknown>>;
+  edges: Map<string, Record<string, unknown>>;
+  nodeOrder: string[];
+  edgeOrder: string[];
+};
+
+function assertValidJsonCanvas(text: string): JsonCanvasObject {
   const parsed: unknown = JSON.parse(text);
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     throw new GitCommandError('Merged canvas must be a JSON object.', '');
@@ -483,22 +519,29 @@ function assertValidJsonCanvas(text: string): void {
     throw new GitCommandError('Merged canvas must contain nodes and edges arrays.', '');
   }
   const nodeIds = new Set<string>();
+  const nodes = new Map<string, Record<string, unknown>>();
+  const nodeOrder: string[] = [];
   for (const node of record.nodes) {
     if (typeof node !== 'object' || node === null || Array.isArray(node)) {
       throw new GitCommandError('Merged canvas node must be an object.', '');
     }
-    const id = (node as { id?: unknown }).id;
+    const nodeRecord = node as Record<string, unknown> & { id?: unknown };
+    const id = nodeRecord.id;
     if (typeof id !== 'string' || nodeIds.has(id)) {
       throw new GitCommandError('Merged canvas node IDs must be unique strings.', '');
     }
     nodeIds.add(id);
+    nodes.set(id, nodeRecord);
+    nodeOrder.push(id);
   }
   const edgeIds = new Set<string>();
+  const edges = new Map<string, Record<string, unknown>>();
+  const edgeOrder: string[] = [];
   for (const edge of record.edges) {
     if (typeof edge !== 'object' || edge === null || Array.isArray(edge)) {
       throw new GitCommandError('Merged canvas edge must be an object.', '');
     }
-    const edgeRecord = edge as { id?: unknown; fromNode?: unknown; toNode?: unknown };
+    const edgeRecord = edge as Record<string, unknown> & { id?: unknown; fromNode?: unknown; toNode?: unknown };
     if (typeof edgeRecord.id !== 'string' || edgeIds.has(edgeRecord.id)) {
       throw new GitCommandError('Merged canvas edge IDs must be unique strings.', '');
     }
@@ -509,5 +552,184 @@ function assertValidJsonCanvas(text: string): void {
       throw new GitCommandError('Merged canvas edges must reference existing nodes.', '');
     }
     edgeIds.add(edgeRecord.id);
+    edges.set(edgeRecord.id, edgeRecord);
+    edgeOrder.push(edgeRecord.id);
   }
+  return { nodes, edges, nodeOrder, edgeOrder };
+}
+
+function assertMarkdownMergeAllowed(baseText: string, currentText: string, deviceText: string): void {
+  const base = parseFrontmatter(baseText);
+  const current = parseFrontmatter(currentText);
+  const device = parseFrontmatter(deviceText);
+  if (!base.ok || !current.ok || !device.ok) {
+    throw new GitCommandError('Markdown frontmatter could not be validated for semantic merge.', '');
+  }
+  const currentChanged = changedFrontmatterKeys(base.keys, current.keys);
+  const deviceChanged = changedFrontmatterKeys(base.keys, device.keys);
+  for (const key of currentChanged) {
+    if (deviceChanged.has(key) && current.keys.get(key) !== device.keys.get(key)) {
+      throw new GitCommandError('Markdown frontmatter same-key edits require review.', '');
+    }
+  }
+}
+
+function parseFrontmatter(text: string): { ok: true; keys: Map<string, string> } | { ok: false } {
+  const normalized = text.replace(/\r\n/gu, '\n');
+  const lines = normalized.split('\n');
+  if (lines[0] !== '---') {
+    return { ok: true, keys: new Map() };
+  }
+  const end = lines.findIndex((line, index) => index > 0 && (line === '---' || line === '...'));
+  if (end < 0) {
+    return { ok: false };
+  }
+  const keys = new Map<string, string>();
+  let currentKey: string | null = null;
+  let currentValueLines: string[] = [];
+  const finishKey = (): boolean => {
+    if (currentKey === null) {
+      return true;
+    }
+    if (keys.has(currentKey)) {
+      return false;
+    }
+    keys.set(currentKey, currentValueLines.join('\n'));
+    currentKey = null;
+    currentValueLines = [];
+    return true;
+  };
+  for (const line of lines.slice(1, end)) {
+    const topLevel = /^([A-Za-z0-9_-]+):(.*)$/u.exec(line);
+    if (topLevel?.[1] !== undefined && !line.startsWith(' ') && !line.startsWith('\t')) {
+      if (!finishKey()) {
+        return { ok: false };
+      }
+      currentKey = topLevel[1];
+      currentValueLines = [topLevel[2] ?? ''];
+      continue;
+    }
+    if (currentKey === null) {
+      if (line.trim() === '' || line.trimStart().startsWith('#')) {
+        continue;
+      }
+      return { ok: false };
+    }
+    currentValueLines.push(line);
+  }
+  if (!finishKey()) {
+    return { ok: false };
+  }
+  return { ok: true, keys };
+}
+
+function changedFrontmatterKeys(base: Map<string, string>, side: Map<string, string>): Set<string> {
+  const changed = new Set<string>();
+  for (const key of new Set([...base.keys(), ...side.keys()])) {
+    if ((base.get(key) ?? null) !== (side.get(key) ?? null)) {
+      changed.add(key);
+    }
+  }
+  return changed;
+}
+
+function assertCanvasMergeAllowed(
+  base: JsonCanvasObject,
+  current: JsonCanvasObject,
+  device: JsonCanvasObject,
+  merged: JsonCanvasObject
+): void {
+  assertCanvasCollectionMergeAllowed(base.nodes, current.nodes, device.nodes, 'node');
+  assertCanvasCollectionMergeAllowed(base.edges, current.edges, device.edges, 'edge');
+  assertCanvasOrderMergeAllowed(base.nodeOrder, current.nodeOrder, device.nodeOrder, merged.nodeOrder, 'node');
+  assertCanvasOrderMergeAllowed(base.edgeOrder, current.edgeOrder, device.edgeOrder, merged.edgeOrder, 'edge');
+}
+
+function assertCanvasCollectionMergeAllowed(
+  base: Map<string, Record<string, unknown>>,
+  current: Map<string, Record<string, unknown>>,
+  device: Map<string, Record<string, unknown>>,
+  label: string
+): void {
+  for (const id of new Set([...base.keys(), ...current.keys(), ...device.keys()])) {
+    const baseValue = base.get(id);
+    const currentValue = current.get(id);
+    const deviceValue = device.get(id);
+    if (baseValue && currentValue === undefined && deviceValue && objectChanged(baseValue, deviceValue)) {
+      throw new GitCommandError(`Canvas ${label} delete-vs-edit requires review.`, '');
+    }
+    if (baseValue && deviceValue === undefined && currentValue && objectChanged(baseValue, currentValue)) {
+      throw new GitCommandError(`Canvas ${label} edit-vs-delete requires review.`, '');
+    }
+    if (!currentValue || !deviceValue) {
+      continue;
+    }
+    const currentChanged = changedObjectKeys(baseValue, currentValue);
+    const deviceChanged = changedObjectKeys(baseValue, deviceValue);
+    for (const key of currentChanged) {
+      if (deviceChanged.has(key) && stableJson(currentValue[key]) !== stableJson(deviceValue[key])) {
+        throw new GitCommandError(`Canvas ${label} same-field edits require review.`, '');
+      }
+    }
+  }
+}
+
+function assertCanvasOrderMergeAllowed(
+  baseOrder: string[],
+  currentOrder: string[],
+  deviceOrder: string[],
+  mergedOrder: string[],
+  label: string
+): void {
+  const baseIds = new Set(baseOrder);
+  const baseExistingOrder = orderOf(baseOrder, baseIds);
+  const currentExistingOrder = orderOf(currentOrder, baseIds);
+  const deviceExistingOrder = orderOf(deviceOrder, baseIds);
+  const mergedExistingOrder = orderOf(mergedOrder, baseIds);
+  if (
+    currentExistingOrder !== baseExistingOrder &&
+    deviceExistingOrder !== baseExistingOrder &&
+    currentExistingOrder !== deviceExistingOrder
+  ) {
+    throw new GitCommandError(`Canvas ${label} concurrent order changes require review.`, '');
+  }
+  if (
+    mergedExistingOrder !== currentExistingOrder &&
+    mergedExistingOrder !== deviceExistingOrder &&
+    mergedExistingOrder !== baseExistingOrder
+  ) {
+    throw new GitCommandError(`Canvas ${label} order merge could not be validated.`, '');
+  }
+}
+
+function changedObjectKeys(base: Record<string, unknown> | undefined, side: Record<string, unknown>): Set<string> {
+  const changed = new Set<string>();
+  for (const key of new Set([...(base ? Object.keys(base) : []), ...Object.keys(side)])) {
+    if (stableJson(base?.[key]) !== stableJson(side[key])) {
+      changed.add(key);
+    }
+  }
+  return changed;
+}
+
+function objectChanged(base: Record<string, unknown>, side: Record<string, unknown>): boolean {
+  return changedObjectKeys(base, side).size > 0;
+}
+
+function orderOf(order: string[], ids: Set<string>): string {
+  return order.filter((id) => ids.has(id)).join('\0');
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableJson).join(',')}]`;
+  }
+  if (typeof value === 'object' && value !== null) {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value);
 }

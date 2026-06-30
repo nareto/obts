@@ -4,7 +4,12 @@ import { dirname, join, relative } from 'node:path';
 
 import git from 'isomorphic-git';
 
-import { isSyncableVaultPath, normalizeVaultPath, type SyncPathPolicy } from '../shared/pathPolicy.js';
+import {
+  assertSyncableTreePaths,
+  isSyncableVaultPath,
+  normalizeVaultPath,
+  type SyncPathPolicy
+} from '../shared/pathPolicy.js';
 
 export type LocalGitState = {
   localMain: string | null;
@@ -88,7 +93,9 @@ export class LocalGitEngine {
         files.push(normalized.path);
       }
     });
-    return files.sort();
+    const sorted = files.sort();
+    assertSyncableTreePaths(sorted);
+    return sorted;
   }
 
   async createLocalCommit(message: string): Promise<string | null> {

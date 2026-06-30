@@ -151,6 +151,36 @@ describe('Phase 1 sync without conflict resolution', () => {
       password: 'admin-password-1234'
     }, false);
     expect(login.status).toBe(200);
+    const session = await admin.get<{ user_id: string; csrf_token: string }>('/api/v1/auth/session');
+    expect(session.status).toBe(200);
+    expect(session.body.csrf_token).toBe(login.body.csrf_token);
+  });
+
+  it('reports devices behind current main in the dashboard summary', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const device1Dir = join(root, 'dashboard-device-1');
+    const device2Dir = join(root, 'dashboard-device-2');
+    await mkdirp(device1Dir);
+    await mkdirp(device2Dir);
+    await writeFile(join(device1Dir, 'shared.md'), 'base\n');
+    const plugin1 = await pairPlugin(admin, device1Dir, 'desktop');
+    await plugin1.syncOnce({ confirmInitialImport: true });
+
+    const plugin2 = await pairPlugin(admin, device2Dir, 'phone');
+    expect((await plugin2.syncOnce()).status).toBe('Synced');
+    await sleep(5);
+
+    await writeFile(join(device1Dir, 'shared.md'), 'server advanced\n');
+    expect((await plugin1.syncOnce()).status).toBe('Synced');
+
+    const dashboard = await admin.get<{
+      devices: Array<{ device_name: string; status_label: string; behind_main: boolean }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+    expect(dashboard.status).toBe(200);
+    expect(dashboard.body.devices.find((device) => device.device_name === 'phone')).toMatchObject({
+      status_label: 'Behind',
+      behind_main: true
+    });
   });
 
   it('requires recent dashboard authentication for admin account creation', async () => {
@@ -435,6 +465,58 @@ describe('Phase 1 sync without conflict resolution', () => {
         native_git_merge: 'clean',
         conflict_markers: 'absent',
         overlapping_path_count: 1
+      }
+    });
+  });
+
+  it('creates a conflict for concurrent same-key Markdown frontmatter edits even when Git merges cleanly', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const device1Dir = join(root, 'frontmatter-device-1');
+    const device2Dir = join(root, 'frontmatter-device-2');
+    await mkdirp(device1Dir);
+    await mkdirp(device2Dir);
+
+    const baseLines = [
+      '---',
+      'tags:',
+      '  - alpha',
+      '  - bravo',
+      '  - charlie',
+      '  - delta',
+      '  - echo',
+      '  - foxtrot',
+      'category: notes',
+      '---',
+      '# Shared',
+      ''
+    ];
+    await writeFile(join(device1Dir, 'shared.md'), baseLines.join('\n'));
+    const plugin1 = await pairPlugin(admin, device1Dir, 'desktop');
+    await plugin1.syncOnce({ confirmInitialImport: true });
+
+    const plugin2 = await pairPlugin(admin, device2Dir, 'tablet');
+    expect(await readFile(join(device2Dir, 'shared.md'), 'utf8')).toBe(baseLines.join('\n'));
+
+    const device1Lines = [...baseLines];
+    device1Lines[2] = '  - alpha-desktop';
+    const device2Lines = [...baseLines];
+    device2Lines[6] = '  - echo-tablet';
+    await writeFile(join(device1Dir, 'shared.md'), device1Lines.join('\n'));
+    await writeFile(join(device2Dir, 'shared.md'), device2Lines.join('\n'));
+
+    expect((await plugin1.syncOnce()).status).toBe('Synced');
+    const result = await plugin2.syncOnce();
+    expect(result.status).toBe('Review needed');
+
+    const db = await server.store.snapshot();
+    const conflict = db.conflicts.find((candidate) => candidate.conflict_id === result.conflictId);
+    expect(conflict).toMatchObject({
+      status: 'open',
+      affected_paths: ['shared.md'],
+      validator_summary: {
+        decision: 'conflict',
+        reason: 'overlapping_paths',
+        path_count: 1
       }
     });
   });
@@ -1053,6 +1135,35 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
   });
 
+  it('rejects local case-fold path collisions before creating a hidden Git commit', async () => {
+    const deviceDir = join(root, 'local-collision-device');
+    await mkdirp(join(deviceDir, 'Notes'));
+    await mkdirp(join(deviceDir, 'notes'));
+    await writeFile(join(deviceDir, 'Notes', 'A.md'), 'upper\n');
+    await writeFile(join(deviceDir, 'notes', 'a.md'), 'lower\n');
+    const localGit = new LocalGitEngine(deviceDir, {
+      profile: 'notes_only',
+      syncPlugins: false,
+      attachmentLocation: { mode: 'same_folder_as_note' }
+    });
+    await localGit.initialize();
+
+    await expect(localGit.createLocalCommit('obts: collision')).rejects.toBeInstanceOf(PathPolicyViolation);
+    expect(await localGit.resolveRef('refs/heads/local')).toBeNull();
+  });
+
+  it('serves an API-backed dashboard shell for Phase 1 workflows', async () => {
+    const response = await fetch(baseUrl);
+    expect(response.status).toBe(200);
+    const html = await response.text();
+    expect(html).toContain('/api/v1/setup/status');
+    expect(html).toContain('/api/v1${path}');
+    expect(html).toContain('Pair Device');
+    expect(html).not.toContain('Use <code>/api/v1');
+    expect(html).not.toContain('later UI work');
+    expect(html).not.toContain('implemented server-side');
+  });
+
   it('returns 404 for cross-user vault, conflict, sync, and event resources', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const created = await admin.post<{ user_id: string }>('/api/v1/admin/users', {
@@ -1248,6 +1359,10 @@ async function recoveryBundleContains(vaultDir: string, relativePath: string): P
     }
   }
   return false;
+}
+
+async function sleep(milliseconds: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function sha256(data: Buffer): string {

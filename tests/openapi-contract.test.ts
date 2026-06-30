@@ -11,6 +11,7 @@ describe('OpenAPI Phase 1 contract', () => {
     for (const path of [
       '/setup',
       '/auth/login',
+      '/auth/session',
       '/vaults',
       '/vaults/{vault_id}/main',
       '/vaults/{vault_id}/pairing-tokens',

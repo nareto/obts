@@ -45,6 +45,18 @@ paths:
           description: Dashboard session.
         "401":
           $ref: "#/components/responses/Error"
+  /auth/session:
+    get:
+      summary: Return the current dashboard session and CSRF token.
+      responses:
+        "200":
+          description: Dashboard session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoginResponse"
+        "401":
+          $ref: "#/components/responses/Error"
   /admin/users:
     post:
       summary: Create a user account as an admin.
@@ -282,6 +294,17 @@ components:
           type: string
         password:
           type: string
+    LoginResponse:
+      type: object
+      required: [user_id, csrf_token, recent_auth_expires_at]
+      properties:
+        user_id:
+          type: string
+        csrf_token:
+          type: string
+        recent_auth_expires_at:
+          type: string
+          format: date-time
     AdminCreateUserRequest:
       allOf:
         - $ref: "#/components/schemas/SetupRequest"
