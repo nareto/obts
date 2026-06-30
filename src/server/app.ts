@@ -55,6 +55,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       fields: 2
     }
   });
+  await sync.resumePendingMerges();
 
   app.setErrorHandler((error, request, reply) => {
     void sendError(error instanceof Error ? error : new Error('Unknown error'), request, reply);

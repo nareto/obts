@@ -18,7 +18,7 @@ Implemented runtime pieces:
 - Shared client/server path policy rejects internal state, visible Git directories, traversal, empty path segments, cross-platform-invalid names, case-fold collisions, unsupported Git tree modes, and `.obsidian` files outside the explicit sync profile.
 - Server-side automatic merge for disjoint path changes, clean native Git merges of overlapping Markdown, and conservative semantic merges for safe overlapping JSON Canvas and Obsidian Bases files even when line-based Git merge cannot cleanly merge the compact source text. Merge decisions include deterministic Canvas JSON output, deterministic Bases YAML output, durable operation records, blocked-device rejection, and durable conflict records for unsafe overlapping or file/directory hierarchy-collision changes.
 - Same-path binary and attachment edits merge automatically only when the accepted server version and uploaded device version have identical blob content; otherwise they remain review-needed conflicts.
-- Merge operations persist the exact target commit and target ref in the prepared operation manifest before advancing `refs/heads/main`; startup reconciliation aborts unprepared writes, rolls forward prepared writes whose Git refs already moved, and marks unreconcilable vault state as `blocked_integrity`.
+- Merge operations persist the exact target commit and target ref in the prepared operation manifest before advancing `refs/heads/main`; startup reconciliation aborts unprepared writes, rolls forward prepared writes whose Git refs already moved, resumes merged-or-conflicted processing for recovered device ref updates, and marks unreconcilable vault state as `blocked_integrity`.
 - Vault event polling retains 30 days or 100,000 events per vault, returns `410 event_cursor_expired` when a client cursor predates retained history, and includes the current and oldest available event cursors in the redacted error details.
 - Plugin-side `.obts/` state with `isomorphic-git`, device token storage, queue state, recovery bundles, local apply lock, apply journal, local commit creation, multipart push, multipart pull, safe apply, incomplete-journal blocking, and explicit replace-local-with-server recovery.
 - API-backed dashboard shell for setup, login, vault creation, overview, device status, events, readiness, and pairing-token creation.
@@ -61,7 +61,7 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - cross-user access to vault main, dashboard, conflicts, device sync push/pull,
   and events returns `404`;
 - restored metadata that points at missing Git state makes `/health/ready` return `503`;
-- prepared sync operations recover deterministically on restart when Git refs already moved or abort safely before ref mutation;
+- prepared sync operations recover deterministically on restart when Git refs already moved, resume pending device ref merges, or abort safely before ref mutation;
 - event polling returns `410` for expired cursors after retention pruning;
 - incomplete apply journals block sync on restart instead of attempting an unsafe apply;
 - committed apply journals replay idempotently on restart and clear stale local apply locks;

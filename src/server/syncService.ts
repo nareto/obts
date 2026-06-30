@@ -16,6 +16,52 @@ export class SyncService {
     private readonly maxUploadBytes: number
   ) {}
 
+  async resumePendingMerges(): Promise<void> {
+    const db = await this.store.snapshot();
+    const candidates = db.sync_operations
+      .filter((operation) => {
+        return (
+          operation.operation_type === 'device_push' &&
+          operation.status === 'committed' &&
+          operation.device_id !== null &&
+          typeof operation.target_commit === 'string'
+        );
+      })
+      .sort((left, right) => left.created_at.localeCompare(right.created_at) || left.operation_id.localeCompare(right.operation_id));
+
+    for (const operation of candidates) {
+      await this.withVaultLock(operation.vault_id, async () => {
+        const currentDb = await this.store.snapshot();
+        const vault = currentDb.vaults.find((candidate) => candidate.vault_id === operation.vault_id);
+        const device = currentDb.devices.find((candidate) => candidate.device_id === operation.device_id);
+        if (
+          !vault ||
+          vault.status === 'blocked_integrity' ||
+          !device ||
+          device.status === 'revoked' ||
+          device.status === 'review_needed' ||
+          device.status === 'blocked_recovery' ||
+          device.device_ref_head !== operation.target_commit
+        ) {
+          return;
+        }
+        if (await this.findOpenConflict(vault.vault_id, device.device_id, operation.target_commit!)) {
+          return;
+        }
+        const main = await this.git.getRef(vault.vault_id, 'refs/heads/main');
+        if (!main || (await this.git.isAncestor(vault.vault_id, operation.target_commit!, main))) {
+          return;
+        }
+        await this.mergeDeviceCommit(
+          vault.vault_id,
+          device.device_id,
+          operation.target_commit!,
+          this.latestEventSeq(vault.vault_id, currentDb)
+        );
+      });
+    }
+  }
+
   async pushDeviceCommit(
     auth: AuthenticatedDevice,
     manifest: DevicePushManifest,

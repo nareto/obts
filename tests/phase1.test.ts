@@ -1068,6 +1068,82 @@ describe('Phase 1 sync without conflict resolution', () => {
     ).toBeDefined();
   });
 
+  it('resumes a reconciled device ref update and merges it on startup', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'reconcile-device-push-device');
+    await mkdirp(deviceDir);
+    await writeFile(join(deviceDir, 'pending-device-ref.md'), 'pending merge after restart\n');
+    const plugin = await pairPlugin(admin, deviceDir, 'desktop');
+    await plugin.syncOnce({ confirmInitialImport: true });
+
+    const committedDb = await server.store.snapshot();
+    const devicePush = committedDb.sync_operations.find(
+      (operation) => operation.operation_type === 'device_push' && operation.status === 'committed'
+    );
+    const originalMerge = committedDb.sync_operations.find(
+      (operation) => operation.operation_type === 'server_merge' && operation.status === 'committed'
+    );
+    expect(devicePush?.target_commit).toMatch(/^[0-9a-f]{40}$/u);
+    expect(originalMerge?.target_commit).toMatch(/^[0-9a-f]{40}$/u);
+    const previousMain = originalMerge!.expected_refs['refs/heads/main'];
+    expect(previousMain).toMatch(/^[0-9a-f]{40}$/u);
+
+    await server.git.updateRef(admin.vaultId, 'refs/heads/main', previousMain!, originalMerge!.target_commit);
+    await server.store.mutate((db) => {
+      const operation = db.sync_operations.find((candidate) => candidate.operation_id === devicePush!.operation_id);
+      expect(operation).toBeDefined();
+      operation!.status = 'prepared';
+      operation!.result = null;
+      const oldMerge = db.sync_operations.find((candidate) => candidate.operation_id === originalMerge!.operation_id);
+      expect(oldMerge).toBeDefined();
+      oldMerge!.status = 'aborted';
+      oldMerge!.result = { reason: 'test_rewind_to_pre_merge_crash_window' };
+      const vault = db.vaults.find((candidate) => candidate.vault_id === admin.vaultId);
+      expect(vault).toBeDefined();
+      vault!.current_main = previousMain!;
+      vault!.updated_at = new Date().toISOString();
+      const device = db.devices.find((candidate) => candidate.device_id === devicePush!.device_id);
+      expect(device).toBeDefined();
+      device!.device_ref_head = null;
+      device!.status = 'paired';
+      device!.last_successful_sync_at = null;
+    });
+
+    await server.app.close();
+    server = await createObtsServer({
+      dataDir: join(root, 'server-data'),
+      publicBaseUrl: 'http://127.0.0.1:0',
+      sessionSecret: 'test-session-secret-with-enough-entropy'
+    });
+    baseUrl = await server.app.listen({ port: 0, host: '127.0.0.1' });
+
+    const ready = await fetch(`${baseUrl}/health/ready`);
+    expect(ready.status).toBe(200);
+    const reconciledDb = await server.store.snapshot();
+    const reconciledPush = reconciledDb.sync_operations.find(
+      (operation) => operation.operation_id === devicePush!.operation_id
+    );
+    expect(reconciledPush).toMatchObject({
+      status: 'committed',
+      result: {
+        device_ref: devicePush!.target_commit,
+        reconciled_after_startup: true
+      }
+    });
+    const resumedMerge = reconciledDb.sync_operations.find(
+      (operation) =>
+        operation.operation_type === 'server_merge' &&
+        operation.status === 'committed' &&
+        operation.expected_refs['refs/heads/main'] === previousMain &&
+        operation.target_commit !== originalMerge!.target_commit
+    );
+    expect(resumedMerge?.target_commit).toMatch(/^[0-9a-f]{40}$/u);
+    expect(reconciledDb.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(
+      resumedMerge!.target_commit
+    );
+    expect(await server.git.getRef(admin.vaultId, 'refs/heads/main')).toBe(resumedMerge!.target_commit);
+  });
+
   it('returns 410 when an event cursor has fallen behind retained event history', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     await server.store.mutate((db) => {
