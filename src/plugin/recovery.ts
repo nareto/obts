@@ -101,6 +101,10 @@ export class RecoveryManager {
     await rm(join(this.vaultDir, '.obts', 'apply-journal.json'), { force: true });
   }
 
+  async clearApplyLock(): Promise<void> {
+    await rm(join(this.vaultDir, '.obts', 'apply.lock'), { force: true });
+  }
+
   async createRecoveryBundle(input: RecoveryBundleInput): Promise<string> {
     const bundleId = newId('rec');
     const bundleDir = join(this.vaultDir, '.obts', 'recovery', bundleId);

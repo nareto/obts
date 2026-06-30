@@ -87,6 +87,7 @@ export class ObtsPluginClient {
         last_error_code: null,
         updated_at: nowIso()
       });
+      await this.recovery.clearApplyLock();
       await this.recovery.clearApplyJournal();
       await this.writeQueue(await this.readQueue());
       return;

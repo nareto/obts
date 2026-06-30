@@ -54,6 +54,7 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - cross-user access to vault main, conflicts, and events returns `404`;
 - restored metadata that points at missing Git state makes `/health/ready` return `503`;
 - incomplete apply journals block sync on restart instead of attempting an unsafe apply;
+- committed apply journals replay idempotently on restart and clear stale local apply locks;
 - local apply lock contention blocks before a destructive pull apply starts;
 - recovery bundle creation failures leave a blocked apply journal and do not write files;
 - files changed after apply preflight block before overwrite;

@@ -791,6 +791,41 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect((await plugin.readState()).status_label).toBe('Unsafe local state');
   });
 
+  it('clears a stale local apply lock after replaying a committed apply journal', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'committed-journal-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'laptop');
+    const state = await plugin.readState();
+    expect(state.local_main).toMatch(/^[0-9a-f]{40}$/u);
+
+    await writeFile(
+      join(deviceDir, '.obts', 'apply-journal.json'),
+      `${JSON.stringify(
+        {
+          apply_id: 'apply_committed',
+          operation_type: 'pull_apply',
+          target_main: state.local_main,
+          expected_prior_local_main: state.local_main,
+          expected_prior_local_device_ref: state.server_device_ref,
+          phase: 'committed',
+          affected_paths: [],
+          preflight_sha256: {},
+          recovery_bundle_id: null,
+          last_completed_step: 'refs_updated',
+          redacted_error_category: null
+        },
+        null,
+        2
+      )}\n`
+    );
+    await writeFile(join(deviceDir, '.obts', 'apply.lock'), '{"apply_id":"apply_committed"}\n');
+
+    expect((await plugin.syncOnce()).status).toBe('Synced');
+    expect(await exists(join(deviceDir, '.obts', 'apply-journal.json'))).toBe(false);
+    expect(await exists(join(deviceDir, '.obts', 'apply.lock'))).toBe(false);
+  });
+
   it('uses a local apply lock before applying pulled server changes', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const { plugin2, device2Dir } = await preparePullApplyScenario(root, admin, 'lock-device-1', 'lock-device-2');
