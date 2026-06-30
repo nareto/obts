@@ -52,35 +52,48 @@ export class SyncService {
         operationId = operation.operation_id;
 
         const currentDeviceRef = await this.git.getRef(auth.vault.vault_id, auth.device.device_ref);
+        const deviceBlock = await this.deviceBlockRejection(auth.device.device_id);
+        if (deviceBlock?.deviceStatus === 'blocked_recovery') {
+          return await this.rejectDevicePush(auth, operation.operation_id, deviceBlock.code, deviceBlock.message);
+        }
         if (currentDeviceRef === manifest.target_commit) {
           return await this.finishExistingDeviceCommit(auth, operation, manifest.target_commit);
         }
         if ((manifest.expected_device_ref ?? null) !== currentDeviceRef) {
-          await this.abortOperation(operation.operation_id, 'stale_device_ref');
-          return { status: 'rejected', code: 'stale_device_ref', message: 'Device ref changed before this upload.' };
+          return await this.rejectDevicePush(
+            auth,
+            operation.operation_id,
+            'stale_device_ref',
+            'Device ref changed before this upload.'
+          );
         }
-        const deviceBlock = await this.deviceBlockRejection(auth.device.device_id);
         if (deviceBlock) {
-          await this.abortOperation(operation.operation_id, deviceBlock.code);
-          return { status: 'rejected', code: deviceBlock.code, message: deviceBlock.message };
+          return await this.rejectDevicePush(auth, operation.operation_id, deviceBlock.code, deviceBlock.message);
         }
 
         try {
           await this.git.importPack(auth.vault.vault_id, packfile);
         } catch (error) {
-          await this.abortOperation(operation.operation_id, 'malformed_packfile');
-          return { status: 'rejected', code: 'malformed_packfile', message: 'Malformed Git packfile.' };
+          return await this.rejectDevicePush(auth, operation.operation_id, 'malformed_packfile', 'Malformed Git packfile.');
         }
         if (!(await this.git.commitExists(auth.vault.vault_id, manifest.target_commit))) {
-          await this.abortOperation(operation.operation_id, 'missing_target_commit');
-          return { status: 'rejected', code: 'missing_target_commit', message: 'Target commit is not present.' };
+          return await this.rejectDevicePush(
+            auth,
+            operation.operation_id,
+            'missing_target_commit',
+            'Target commit is not present.'
+          );
         }
         try {
           await this.git.validateTreePathPolicy(auth.vault.vault_id, manifest.target_commit, this.maxUploadBytes);
         } catch (error) {
           const code = error instanceof PathPolicyViolation ? error.code : 'path_policy_rejected';
-          await this.abortOperation(operation.operation_id, code);
-          return { status: 'rejected', code, message: 'Uploaded commit violates the vault path policy.' };
+          return await this.rejectDevicePush(
+            auth,
+            operation.operation_id,
+            code,
+            'Uploaded commit violates the vault path policy.'
+          );
         }
         if (currentDeviceRef && !(await this.git.isAncestor(auth.vault.vault_id, currentDeviceRef, manifest.target_commit))) {
           return await this.blockDeviceForRecovery(auth, operation, currentDeviceRef, manifest.target_commit);
@@ -95,8 +108,12 @@ export class SyncService {
           assertChangedPathsAllowedByPolicy(changedPaths, deviceSyncPathPolicy(auth.device));
         } catch (error) {
           const code = error instanceof PathPolicyViolation ? error.code : 'path_policy_rejected';
-          await this.abortOperation(operation.operation_id, code);
-          return { status: 'rejected', code, message: 'Uploaded commit changes paths outside the device sync profile.' };
+          return await this.rejectDevicePush(
+            auth,
+            operation.operation_id,
+            code,
+            'Uploaded commit changes paths outside the device sync profile.'
+          );
         }
 
         await this.store.mutate((db) => {
@@ -674,14 +691,24 @@ export class SyncService {
     );
   }
 
-  private async deviceBlockRejection(deviceId: string): Promise<{ code: string; message: string } | null> {
+  private async deviceBlockRejection(
+    deviceId: string
+  ): Promise<{ code: string; message: string; deviceStatus: DeviceRow['status'] } | null> {
     const db = await this.store.snapshot();
     const device = db.devices.find((candidate) => candidate.device_id === deviceId);
     if (device?.status === 'review_needed') {
-      return { code: 'device_blocked', message: 'Device has an open conflict that requires review.' };
+      return {
+        code: 'device_blocked',
+        message: 'Device has an open conflict that requires review.',
+        deviceStatus: device.status
+      };
     }
     if (device?.status === 'blocked_recovery') {
-      return { code: 'device_blocked', message: 'Device requires recovery before more uploads are accepted.' };
+      return {
+        code: 'device_blocked',
+        message: 'Device requires recovery before more uploads are accepted.',
+        deviceStatus: device.status
+      };
     }
     return null;
   }
@@ -699,6 +726,38 @@ export class SyncService {
         operation.updated_at = nowIso();
       }
     });
+  }
+
+  private async rejectDevicePush(
+    auth: AuthenticatedDevice,
+    operationId: string,
+    code: string,
+    message: string
+  ): Promise<PushResult> {
+    await this.store.mutate((db) => {
+      const operation = requireOperation(db, operationId);
+      if (operation.status !== 'committed') {
+        operation.status = 'aborted';
+        operation.result = { reason: code };
+        operation.updated_at = nowIso();
+      }
+      const device = requireDevice(db, auth.device.device_id);
+      device.last_seen_at = nowIso();
+      const vault = requireVault(db, auth.vault.vault_id);
+      this.store.appendEvent(db, {
+        event_type: 'device_sync_rejected',
+        vault_id: auth.vault.vault_id,
+        resource_ids: { device_id: auth.device.device_id },
+        commit_cursors: {
+          main: vault.current_main,
+          device_ref: device.device_ref_head
+        },
+        payload: {
+          reason: code
+        }
+      });
+    });
+    return { status: 'rejected', code, message };
   }
 
   private async withVaultLock<T>(vaultId: string, fn: () => Promise<T>): Promise<T> {
@@ -776,7 +835,7 @@ function changedPathSet(entries: GitDiffEntry[]): Set<string> {
 }
 
 function isNativeTextMergePath(path: string): boolean {
-  return path.endsWith('.md') || path.endsWith('.canvas') || path.endsWith('.base');
+  return path.endsWith('.md') || path.endsWith('.canvas');
 }
 
 function deviceSyncPathPolicy(device: DeviceRow): SyncPathPolicy {

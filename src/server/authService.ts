@@ -281,7 +281,10 @@ export class AuthService {
     const tokenHash = hashToken(input.pairingToken);
     const deviceToken = newSecretToken('obts_dev');
     const deviceTokenHash = hashToken(deviceToken);
-    return await this.store.mutate((db) => {
+    const result = await this.store.mutate<
+      | { ok: true; user: UserRow; vault: VaultRow; device: DeviceRow; deviceToken: string; isFirstDevice: boolean }
+      | { ok: false; error: AuthError }
+    >((db) => {
       const token = db.tokens.find(
         (candidate) =>
           candidate.kind === 'pairing' &&
@@ -307,7 +310,7 @@ export class AuthService {
       const tokenSyncPlugins = token.metadata.sync_plugins === true;
       if (input.syncProfile !== tokenSyncProfile || input.syncPlugins !== tokenSyncPlugins) {
         token.failed_attempts += 1;
-        throw new AuthError(401, 'invalid_pairing_token', 'Pairing token is invalid or expired.');
+        return { ok: false, error: new AuthError(401, 'invalid_pairing_token', 'Pairing token is invalid or expired.') };
       }
       const isFirstDevice = db.devices.every(
         (candidate) => candidate.vault_id !== vault.vault_id || candidate.revoked_at !== null
@@ -359,8 +362,18 @@ export class AuthService {
         resource_id: device.device_id,
         created_at: nowIso()
       });
-      return { user, vault, device, deviceToken, isFirstDevice };
+      return { ok: true, user, vault, device, deviceToken, isFirstDevice };
     });
+    if (!result.ok) {
+      throw result.error;
+    }
+    return {
+      user: result.user,
+      vault: result.vault,
+      device: result.device,
+      deviceToken: result.deviceToken,
+      isFirstDevice: result.isFirstDevice
+    };
   }
 
   async authenticateDevice(authorizationHeader: string | undefined, vaultId: string): Promise<AuthenticatedDevice> {

@@ -305,6 +305,14 @@ describe('Phase 1 sync without conflict resolution', () => {
       })
     });
     expect(wrongProfile.status).toBe(401);
+    const persistedAfterWrongProfile = JSON.parse(
+      await readFile(join(root, 'server-data', 'metadata', 'phase1.json'), 'utf8')
+    ) as { tokens: Array<{ kind: string; failed_attempts: number; consumed_at: string | null }> };
+    const persistedPairing = persistedAfterWrongProfile.tokens.find((token) => token.kind === 'pairing');
+    expect(persistedPairing).toMatchObject({
+      failed_attempts: 1,
+      consumed_at: null
+    });
 
     const consumed = await fetch(`${baseUrl}/api/v1/pair/consume`, {
       method: 'POST',
@@ -427,6 +435,59 @@ describe('Phase 1 sync without conflict resolution', () => {
         native_git_merge: 'clean',
         conflict_markers: 'absent',
         overlapping_path_count: 1
+      }
+    });
+  });
+
+  it('records a conflict for same-file Bases edits without a semantic Bases merge', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const device1Dir = join(root, 'base-merge-device-1');
+    const device2Dir = join(root, 'base-merge-device-2');
+    await mkdirp(device1Dir);
+    await mkdirp(device2Dir);
+
+    const baseFile = [
+      'views:',
+      '  - type: table',
+      '    name: Notes',
+      'filters:',
+      '  and: []',
+      'formulas:',
+      '  score: rating * 2',
+      ''
+    ].join('\n');
+    await writeFile(join(device1Dir, 'library.base'), baseFile);
+    const plugin1 = await pairPlugin(admin, device1Dir, 'desktop');
+    await plugin1.syncOnce({ confirmInitialImport: true });
+
+    const plugin2 = await pairPlugin(admin, device2Dir, 'tablet');
+    expect(await readFile(join(device2Dir, 'library.base'), 'utf8')).toBe(baseFile);
+
+    await writeFile(
+      join(device1Dir, 'library.base'),
+      baseFile.replace('    name: Notes', '    name: Reading list')
+    );
+    await writeFile(
+      join(device2Dir, 'library.base'),
+      baseFile.replace('  score: rating * 2', '  score: rating * 3')
+    );
+    expect((await plugin1.syncOnce()).status).toBe('Synced');
+    const mainBeforeConflict = (await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)
+      ?.current_main;
+
+    const result = await plugin2.syncOnce();
+    expect(result.status).toBe('Review needed');
+
+    const db = await server.store.snapshot();
+    expect(db.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(mainBeforeConflict);
+    const conflict = db.conflicts.find((candidate) => candidate.conflict_id === result.conflictId);
+    expect(conflict).toMatchObject({
+      status: 'open',
+      affected_paths: ['library.base'],
+      validator_summary: {
+        decision: 'conflict',
+        reason: 'overlapping_paths',
+        path_count: 1
       }
     });
   });
@@ -761,6 +822,103 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await server.git.isAncestor(admin.vaultId, commit!, result.main)).toBe(true);
   });
 
+  it('keeps same-device non-fast-forward blocks active until recovery', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'non-fast-forward-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'laptop');
+    expect((await plugin.syncOnce()).status).toBe('Synced');
+    const pairedState = await plugin.readState();
+    expect(pairedState.local_main).toMatch(/^[0-9a-f]{40}$/u);
+
+    const localGit = new LocalGitEngine(deviceDir, {
+      profile: 'notes_only',
+      syncPlugins: false,
+      attachmentLocation: { mode: 'same_folder_as_note' }
+    });
+    const token = await readDeviceToken(deviceDir);
+    const auth = await server.auth.authenticateDevice(`Bearer ${token}`, admin.vaultId);
+
+    await writeFile(join(deviceDir, 'same-device.md'), 'first history\n');
+    const firstCommit = await localGit.createLocalCommit('obts: first same-device history');
+    expect(firstCommit).toMatch(/^[0-9a-f]{40}$/u);
+    const firstPack = await localGit.createPackForCommit(firstCommit!);
+    const firstPush = await server.sync.pushDeviceCommit(
+      auth,
+      {
+        api_version: API_VERSION,
+        vault_id: admin.vaultId,
+        device_id: pairedState.device_id!,
+        expected_device_ref: null,
+        target_commit: firstCommit!,
+        packfile_sha256: sha256(firstPack),
+        packfile_bytes: firstPack.byteLength,
+        client_known_main: pairedState.local_main
+      },
+      firstPack
+    );
+    expect(firstPush.status).toBe('merged');
+    if (firstPush.status !== 'merged') {
+      throw new Error(`Expected first same-device push to merge, got ${firstPush.status}`);
+    }
+
+    await localGit.setLocalHead(pairedState.local_main!);
+    await writeFile(join(deviceDir, 'same-device.md'), 'divergent history\n');
+    const divergentCommit = await localGit.createLocalCommit('obts: divergent same-device history');
+    expect(divergentCommit).toMatch(/^[0-9a-f]{40}$/u);
+    const divergentPack = await localGit.createPackForCommit(divergentCommit!);
+    const rejected = await server.sync.pushDeviceCommit(
+      auth,
+      {
+        api_version: API_VERSION,
+        vault_id: admin.vaultId,
+        device_id: pairedState.device_id!,
+        expected_device_ref: firstPush.device_ref,
+        target_commit: divergentCommit!,
+        packfile_sha256: sha256(divergentPack),
+        packfile_bytes: divergentPack.byteLength,
+        client_known_main: firstPush.main
+      },
+      divergentPack
+    );
+    expect(rejected).toMatchObject({
+      status: 'rejected',
+      code: 'same_device_non_fast_forward'
+    });
+    let db = await server.store.snapshot();
+    let device = db.devices.find((candidate) => candidate.device_id === pairedState.device_id);
+    expect(device).toMatchObject({
+      device_ref_head: firstPush.device_ref,
+      status: 'blocked_recovery'
+    });
+
+    const emptyPack = Buffer.alloc(0);
+    const retryCurrentRef = await server.sync.pushDeviceCommit(
+      auth,
+      {
+        api_version: API_VERSION,
+        vault_id: admin.vaultId,
+        device_id: pairedState.device_id!,
+        expected_device_ref: firstPush.device_ref,
+        target_commit: firstPush.device_ref,
+        packfile_sha256: sha256(emptyPack),
+        packfile_bytes: 0,
+        client_known_main: firstPush.main
+      },
+      emptyPack
+    );
+    expect(retryCurrentRef).toMatchObject({
+      status: 'rejected',
+      code: 'device_blocked'
+    });
+    db = await server.store.snapshot();
+    device = db.devices.find((candidate) => candidate.device_id === pairedState.device_id);
+    expect(device).toMatchObject({
+      device_ref_head: firstPush.device_ref,
+      status: 'blocked_recovery'
+    });
+  });
+
   it('rejects uploaded changes outside the paired device sync profile before refs advance', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'profile-device');
@@ -803,6 +961,19 @@ describe('Phase 1 sync without conflict resolution', () => {
     const device = db.devices.find((candidate) => candidate.device_id === state.device_id);
     expect(device?.device_ref_head).toBeNull();
     expect(db.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(state.local_main);
+
+    const events = await admin.get<{ events: Array<{ event_type: string; payload: { reason?: string } }> }>(
+      `/api/v1/vaults/${admin.vaultId}/events?after=0`
+    );
+    expect(events.status).toBe(200);
+    expect(events.body.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event_type: 'device_sync_rejected',
+          payload: { reason: 'profile_path_rejected' }
+        })
+      ])
+    );
   });
 
   it('rejects uploaded files larger than the configured byte limit before refs advance', async () => {
