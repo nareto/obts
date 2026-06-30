@@ -406,7 +406,7 @@ export class SyncService {
       return null;
     }
 
-    const mergeTree = await this.git.tryNativeMergeTree(vaultId, base, currentMain, deviceCommit, overlapping);
+    const mergeTree = await this.git.tryPolicyMergeTree(vaultId, base, currentMain, deviceCommit, deviceChanges, overlapping);
     if (!mergeTree) {
       return null;
     }
@@ -435,11 +435,7 @@ export class SyncService {
         current_main: currentMain,
         device_commit: deviceCommit,
         decision: 'merge',
-        validator_results: {
-          native_git_merge: 'clean',
-          conflict_markers: 'absent',
-          overlapping_path_count: overlapping.length
-        }
+        validator_results: mergeTree.validatorResults
       };
       operation.updated_at = nowIso();
       return { mergeSequence, operationId: operation.operation_id };
@@ -449,12 +445,12 @@ export class SyncService {
     try {
       mergeCommit = await this.git.createMergeCommitFromTree({
         vaultId,
-        tree: mergeTree,
+        tree: mergeTree.tree,
         base,
         currentMain,
         deviceCommit,
         mergeSequence: mergePreparation.mergeSequence,
-        strategy: 'native_clean'
+        strategy: mergeTree.validatorResults.semantic_merge === 'clean' ? 'semantic_clean' : 'native_clean'
       });
     } catch (error) {
       await this.abortOperation(mergePreparation.operationId, 'merge_git_error');
@@ -497,11 +493,7 @@ export class SyncService {
           base_commit: base,
           current_main: currentMain,
           device_commit: deviceCommit,
-          validator_results: {
-            native_git_merge: 'clean',
-            conflict_markers: 'absent',
-            overlapping_path_count: overlapping.length
-          },
+          validator_results: mergeTree.validatorResults,
           changed_path_count: changedPathSet(deviceChanges).size
         }
       });

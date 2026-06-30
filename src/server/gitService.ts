@@ -16,6 +16,11 @@ export type GitDiffEntry = {
   oldPath?: string;
 };
 
+export type MergeTreeResult = {
+  tree: string;
+  validatorResults: Record<string, unknown>;
+};
+
 type GitTreeEntry = {
   mode: string;
   type: string;
@@ -211,6 +216,36 @@ export class GitService {
     mergeSequence: number
   ): Promise<string> {
     const repo = this.repoPath(vaultId);
+    const tree = await this.createOverlayTree(vaultId, currentMain, deviceCommit, deviceChanges, new Map());
+    const commit = asText(
+      await this.exec(
+        repo,
+        [
+          'commit-tree',
+          tree,
+          '-p',
+          currentMain,
+          '-p',
+          deviceCommit,
+          '-m',
+          `obts: merge device changes\n\nmerge_sequence=${mergeSequence}\nbase=${base}`
+        ],
+        undefined,
+        serverGitEnv('obts-merge')
+      ).then((result) => result.stdout)
+    ).trim();
+    await this.updateRef(vaultId, 'refs/heads/main', commit, currentMain);
+    return commit;
+  }
+
+  private async createOverlayTree(
+    vaultId: string,
+    currentMain: string,
+    deviceCommit: string,
+    deviceChanges: GitDiffEntry[],
+    contentOverrides: Map<string, Buffer>
+  ): Promise<string> {
+    const repo = this.repoPath(vaultId);
     const tempRoot = join(this.config.tempDir, `merge-${vaultId}-${randomBytes(8).toString('hex')}`);
     const workTree = join(tempRoot, 'worktree');
     const indexFile = join(tempRoot, 'index');
@@ -228,48 +263,36 @@ export class GitService {
         if (entry.status.startsWith('D')) {
           await rm(join(workTree, entry.path), { recursive: true, force: true });
         } else {
-          const content = await this.readBlobAtPath(vaultId, deviceCommit, entry.path);
+          const content = contentOverrides.get(entry.path) ?? (await this.readBlobAtPath(vaultId, deviceCommit, entry.path));
           const absolutePath = join(workTree, entry.path);
           await mkdir(dirname(absolutePath), { recursive: true, mode: 0o700 });
           await writeFile(absolutePath, content);
         }
       }
+      for (const [path, content] of contentOverrides) {
+        if (deviceChanges.some((entry) => entry.path === path && !entry.status.startsWith('D'))) {
+          continue;
+        }
+        const absolutePath = join(workTree, path);
+        await mkdir(dirname(absolutePath), { recursive: true, mode: 0o700 });
+        await writeFile(absolutePath, content);
+      }
 
       await this.exec(repo, ['--work-tree', workTree, 'add', '-A', '--', '.'], undefined, env);
-      const tree = asText(
-        await this.exec(repo, ['write-tree'], undefined, env).then((result) => result.stdout)
-      ).trim();
-      const commit = asText(
-        await this.exec(
-          repo,
-          [
-            'commit-tree',
-            tree,
-            '-p',
-            currentMain,
-            '-p',
-            deviceCommit,
-            '-m',
-            `obts: merge device changes\n\nmerge_sequence=${mergeSequence}\nbase=${base}`
-          ],
-          undefined,
-          serverGitEnv('obts-merge')
-        ).then((result) => result.stdout)
-      ).trim();
-      await this.updateRef(vaultId, 'refs/heads/main', commit, currentMain);
-      return commit;
+      return asText(await this.exec(repo, ['write-tree'], undefined, env).then((result) => result.stdout)).trim();
     } finally {
       await rm(tempRoot, { recursive: true, force: true });
     }
   }
 
-  async tryNativeMergeTree(
+  async tryPolicyMergeTree(
     vaultId: string,
     base: string,
     currentMain: string,
     deviceCommit: string,
+    deviceChanges: GitDiffEntry[],
     mergedTextPaths: string[]
-  ): Promise<string | null> {
+  ): Promise<MergeTreeResult | null> {
     const repo = this.repoPath(vaultId);
     let tree: string;
     try {
@@ -284,31 +307,42 @@ export class GitService {
       ]);
       tree = asText(stdout).trim();
     } catch {
-      return null;
+      return await this.trySemanticOverlayMergeTree(vaultId, base, currentMain, deviceCommit, deviceChanges, mergedTextPaths);
     }
 
     if (!/^[0-9a-f]{40}$/u.test(tree)) {
-      return null;
+      return await this.trySemanticOverlayMergeTree(vaultId, base, currentMain, deviceCommit, deviceChanges, mergedTextPaths);
     }
 
+    let validation: { contentOverrides: Map<string, Buffer>; semanticKinds: Set<string> };
     try {
       await this.validateTreePathPolicy(vaultId, tree);
-      const semanticBaseFiles = await this.validateMergedTextPaths(vaultId, {
+      validation = await this.validateMergedTextPaths(vaultId, {
         tree,
         base,
         currentMain,
         deviceCommit,
         paths: mergedTextPaths
       });
-      if (semanticBaseFiles.size > 0) {
-        tree = await this.createTreeWithFileContents(vaultId, tree, semanticBaseFiles);
+      if (validation.contentOverrides.size > 0) {
+        tree = await this.createTreeWithFileContents(vaultId, tree, validation.contentOverrides);
         await this.validateTreePathPolicy(vaultId, tree);
       }
     } catch {
-      return null;
+      return await this.trySemanticOverlayMergeTree(vaultId, base, currentMain, deviceCommit, deviceChanges, mergedTextPaths);
     }
 
-    return tree;
+    return {
+      tree,
+      validatorResults: {
+        native_git_merge: 'clean',
+        conflict_markers: 'absent',
+        overlapping_path_count: mergedTextPaths.length,
+        ...(validation.semanticKinds.size > 0
+          ? { semantic_merge_kinds: [...validation.semanticKinds].sort() }
+          : {})
+      }
+    };
   }
 
   async createMergeCommitFromTree(input: {
@@ -318,7 +352,7 @@ export class GitService {
     currentMain: string;
     deviceCommit: string;
     mergeSequence: number;
-    strategy: 'disjoint_overlay' | 'native_clean';
+    strategy: 'disjoint_overlay' | 'native_clean' | 'semantic_clean';
   }): Promise<string> {
     const repo = this.repoPath(input.vaultId);
     const commit = asText(
@@ -468,8 +502,9 @@ export class GitService {
   private async validateMergedTextPaths(
     vaultId: string,
     input: { tree: string; base: string; currentMain: string; deviceCommit: string; paths: string[] }
-  ): Promise<Map<string, Buffer>> {
-    const semanticBaseFiles = new Map<string, Buffer>();
+  ): Promise<{ contentOverrides: Map<string, Buffer>; semanticKinds: Set<string> }> {
+    const contentOverrides = new Map<string, Buffer>();
+    const semanticKinds = new Set<string>();
     for (const path of input.paths) {
       const mergedText = await this.readTextAtPathIfPresent(vaultId, input.tree, path);
       if (mergedText === null) {
@@ -486,26 +521,68 @@ export class GitService {
         assertMarkdownMergeAllowed(baseText, currentText, deviceText);
       }
       if (path.endsWith('.canvas')) {
-        const merged = assertValidJsonCanvas(text);
+        assertValidJsonCanvas(text);
         if (baseText !== null && currentText !== null && deviceText !== null) {
-          assertCanvasMergeAllowed(
-            assertValidJsonCanvas(baseText),
-            assertValidJsonCanvas(currentText),
-            assertValidJsonCanvas(deviceText),
-            merged
-          );
+          contentOverrides.set(path, Buffer.from(semanticMergeCanvasFile(baseText, currentText, deviceText), 'utf8'));
+          semanticKinds.add('json_canvas');
         }
       }
       if (path.endsWith('.base') && baseText !== null && currentText !== null && deviceText !== null) {
-        semanticBaseFiles.set(path, Buffer.from(semanticMergeBasesFile(baseText, currentText, deviceText), 'utf8'));
+        contentOverrides.set(path, Buffer.from(semanticMergeBasesFile(baseText, currentText, deviceText), 'utf8'));
+        semanticKinds.add('obsidian_bases');
       }
     }
-    return semanticBaseFiles;
+    return { contentOverrides, semanticKinds };
   }
 
   private async readTextAtPathIfPresent(vaultId: string, treeish: string, path: string): Promise<string | null> {
     try {
       return (await this.readBlobAtPath(vaultId, treeish, path)).toString('utf8');
+    } catch {
+      return null;
+    }
+  }
+
+  private async trySemanticOverlayMergeTree(
+    vaultId: string,
+    base: string,
+    currentMain: string,
+    deviceCommit: string,
+    deviceChanges: GitDiffEntry[],
+    overlappingPaths: string[]
+  ): Promise<MergeTreeResult | null> {
+    const contentOverrides = new Map<string, Buffer>();
+    const semanticKinds = new Set<string>();
+    try {
+      for (const path of overlappingPaths) {
+        const baseText = await this.readTextAtPathIfPresent(vaultId, base, path);
+        const currentText = await this.readTextAtPathIfPresent(vaultId, currentMain, path);
+        const deviceText = await this.readTextAtPathIfPresent(vaultId, deviceCommit, path);
+        if (baseText === null || currentText === null || deviceText === null) {
+          return null;
+        }
+        if (path.endsWith('.canvas')) {
+          contentOverrides.set(path, Buffer.from(semanticMergeCanvasFile(baseText, currentText, deviceText), 'utf8'));
+          semanticKinds.add('json_canvas');
+        } else if (path.endsWith('.base')) {
+          contentOverrides.set(path, Buffer.from(semanticMergeBasesFile(baseText, currentText, deviceText), 'utf8'));
+          semanticKinds.add('obsidian_bases');
+        } else {
+          return null;
+        }
+      }
+      const tree = await this.createOverlayTree(vaultId, currentMain, deviceCommit, deviceChanges, contentOverrides);
+      await this.validateTreePathPolicy(vaultId, tree);
+      return {
+        tree,
+        validatorResults: {
+          native_git_merge: 'conflicted',
+          semantic_merge: 'clean',
+          semantic_merge_kinds: [...semanticKinds].sort(),
+          conflict_markers: 'absent',
+          overlapping_path_count: overlappingPaths.length
+        }
+      };
     } catch {
       return null;
     }
@@ -560,6 +637,7 @@ function assertValidJsonCanvas(text: string): JsonCanvasObject {
       throw new GitCommandError('Merged canvas node must be an object.', '');
     }
     const nodeRecord = node as Record<string, unknown> & { id?: unknown };
+    assertValidCanvasNode(nodeRecord);
     const id = nodeRecord.id;
     if (typeof id !== 'string' || nodeIds.has(id)) {
       throw new GitCommandError('Merged canvas node IDs must be unique strings.', '');
@@ -575,12 +653,23 @@ function assertValidJsonCanvas(text: string): JsonCanvasObject {
     if (typeof edge !== 'object' || edge === null || Array.isArray(edge)) {
       throw new GitCommandError('Merged canvas edge must be an object.', '');
     }
-    const edgeRecord = edge as Record<string, unknown> & { id?: unknown; fromNode?: unknown; toNode?: unknown };
+    const edgeRecord = edge as Record<string, unknown> & {
+      id?: unknown;
+      fromNode?: unknown;
+      fromSide?: unknown;
+      toNode?: unknown;
+      toSide?: unknown;
+    };
     if (typeof edgeRecord.id !== 'string' || edgeIds.has(edgeRecord.id)) {
       throw new GitCommandError('Merged canvas edge IDs must be unique strings.', '');
     }
-    if (typeof edgeRecord.fromNode !== 'string' || typeof edgeRecord.toNode !== 'string') {
-      throw new GitCommandError('Merged canvas edges must reference node IDs.', '');
+    if (
+      typeof edgeRecord.fromNode !== 'string' ||
+      typeof edgeRecord.fromSide !== 'string' ||
+      typeof edgeRecord.toNode !== 'string' ||
+      typeof edgeRecord.toSide !== 'string'
+    ) {
+      throw new GitCommandError('Merged canvas edges must contain required endpoint fields.', '');
     }
     if (!nodeIds.has(edgeRecord.fromNode) || !nodeIds.has(edgeRecord.toNode)) {
       throw new GitCommandError('Merged canvas edges must reference existing nodes.', '');
@@ -590,6 +679,17 @@ function assertValidJsonCanvas(text: string): JsonCanvasObject {
     edgeOrder.push(edgeRecord.id);
   }
   return { nodes, edges, nodeOrder, edgeOrder };
+}
+
+function assertValidCanvasNode(node: Record<string, unknown>): void {
+  if (typeof node.id !== 'string' || typeof node.type !== 'string') {
+    throw new GitCommandError('Canvas nodes must contain string id and type fields.', '');
+  }
+  for (const field of ['x', 'y', 'width', 'height']) {
+    if (typeof node[field] !== 'number' || !Number.isFinite(node[field])) {
+      throw new GitCommandError(`Canvas nodes must contain numeric ${field} fields.`, '');
+    }
+  }
 }
 
 function assertMarkdownMergeAllowed(baseText: string, currentText: string, deviceText: string): void {
@@ -734,6 +834,232 @@ function assertCanvasOrderMergeAllowed(
   ) {
     throw new GitCommandError(`Canvas ${label} order merge could not be validated.`, '');
   }
+}
+
+function semanticMergeCanvasFile(baseText: string, currentText: string, deviceText: string): string {
+  const base = assertValidJsonCanvas(baseText);
+  const current = assertValidJsonCanvas(currentText);
+  const device = assertValidJsonCanvas(deviceText);
+  const mergedNodes = mergeCanvasCollection(base.nodes, current.nodes, device.nodes, 'node');
+  const mergedEdges = mergeCanvasCollection(base.edges, current.edges, device.edges, 'edge');
+  const nodeOrder = mergeCanvasOrder(base.nodeOrder, current.nodeOrder, device.nodeOrder, new Set(mergedNodes.keys()), 'node');
+  const edgeOrder = mergeCanvasOrder(base.edgeOrder, current.edgeOrder, device.edgeOrder, new Set(mergedEdges.keys()), 'edge');
+  const root = mergeCanvasRootFields(
+    JSON.parse(baseText) as Record<string, unknown>,
+    JSON.parse(currentText) as Record<string, unknown>,
+    JSON.parse(deviceText) as Record<string, unknown>
+  );
+  const result: Record<string, unknown> = {
+    nodes: nodeOrder.map((id) => canonicalizeCanvasEntry(requiredCanvasEntry(mergedNodes, id), 'node')),
+    edges: edgeOrder.map((id) => canonicalizeCanvasEntry(requiredCanvasEntry(mergedEdges, id), 'edge'))
+  };
+  for (const key of Object.keys(root).sort()) {
+    if (key !== 'nodes' && key !== 'edges') {
+      result[key] = canonicalizeForJson(root[key]);
+    }
+  }
+  const text = `${JSON.stringify(result, null, 2)}\n`;
+  assertCanvasMergeAllowed(base, current, device, assertValidJsonCanvas(text));
+  return text;
+}
+
+function mergeCanvasRootFields(
+  base: Record<string, unknown>,
+  current: Record<string, unknown>,
+  device: Record<string, unknown>
+): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  const keys = [...new Set([...Object.keys(base), ...Object.keys(current), ...Object.keys(device)])]
+    .filter((key) => key !== 'nodes' && key !== 'edges')
+    .sort();
+  for (const key of keys) {
+    const merged = mergeAtomicField(
+      `Canvas top-level field ${key}`,
+      fieldState(base, key),
+      fieldState(current, key),
+      fieldState(device, key)
+    );
+    if (merged.present) {
+      result[key] = merged.value;
+    }
+  }
+  return result;
+}
+
+function mergeCanvasCollection(
+  base: Map<string, Record<string, unknown>>,
+  current: Map<string, Record<string, unknown>>,
+  device: Map<string, Record<string, unknown>>,
+  label: string
+): Map<string, Record<string, unknown>> {
+  const result = new Map<string, Record<string, unknown>>();
+  const ids = [...new Set([...base.keys(), ...current.keys(), ...device.keys()])].sort();
+  for (const id of ids) {
+    const merged = mergeCanvasEntry(label, id, base.get(id), current.get(id), device.get(id));
+    if (merged) {
+      result.set(id, merged);
+    }
+  }
+  return result;
+}
+
+function mergeCanvasEntry(
+  label: string,
+  id: string,
+  base: Record<string, unknown> | undefined,
+  current: Record<string, unknown> | undefined,
+  device: Record<string, unknown> | undefined
+): Record<string, unknown> | null {
+  if (!base) {
+    if (current && device && stableJson(current) !== stableJson(device)) {
+      throw new GitCommandError(`Canvas ${label} ${id} concurrent additions require review.`, '');
+    }
+    return current ?? device ?? null;
+  }
+  if (!current && !device) {
+    return null;
+  }
+  if (!current) {
+    if (device && objectChanged(base, device)) {
+      throw new GitCommandError(`Canvas ${label} ${id} delete-vs-edit requires review.`, '');
+    }
+    return null;
+  }
+  if (!device) {
+    if (objectChanged(base, current)) {
+      throw new GitCommandError(`Canvas ${label} ${id} edit-vs-delete requires review.`, '');
+    }
+    return null;
+  }
+  if (stableJson(current) === stableJson(base)) {
+    return device;
+  }
+  if (stableJson(device) === stableJson(base)) {
+    return current;
+  }
+  if (stableJson(current) === stableJson(device)) {
+    return current;
+  }
+
+  const merged: Record<string, unknown> = {};
+  const keys = [...new Set([...Object.keys(base), ...Object.keys(current), ...Object.keys(device)])].sort();
+  for (const key of keys) {
+    const currentChanged = stableJson(base[key]) !== stableJson(current[key]);
+    const deviceChanged = stableJson(base[key]) !== stableJson(device[key]);
+    if (currentChanged && deviceChanged && stableJson(current[key]) !== stableJson(device[key])) {
+      throw new GitCommandError(`Canvas ${label} ${id} same-field edits require review.`, '');
+    }
+    if (deviceChanged) {
+      merged[key] = device[key];
+    } else if (currentChanged) {
+      merged[key] = current[key];
+    } else if (Object.prototype.hasOwnProperty.call(base, key)) {
+      merged[key] = base[key];
+    }
+  }
+  if (label === 'node') {
+    assertValidCanvasNode(merged);
+  }
+  return merged;
+}
+
+function mergeCanvasOrder(
+  baseOrder: string[],
+  currentOrder: string[],
+  deviceOrder: string[],
+  mergedIds: Set<string>,
+  label: string
+): string[] {
+  const survivingBaseIds = new Set(baseOrder.filter((id) => mergedIds.has(id)));
+  const baseExistingOrder = orderOf(baseOrder, survivingBaseIds);
+  const currentExistingOrder = orderOf(currentOrder, survivingBaseIds);
+  const deviceExistingOrder = orderOf(deviceOrder, survivingBaseIds);
+  if (
+    currentExistingOrder !== baseExistingOrder &&
+    deviceExistingOrder !== baseExistingOrder &&
+    currentExistingOrder !== deviceExistingOrder
+  ) {
+    throw new GitCommandError(`Canvas ${label} concurrent order changes require review.`, '');
+  }
+  const orderedExisting =
+    currentExistingOrder !== baseExistingOrder
+      ? currentOrder.filter((id) => survivingBaseIds.has(id))
+      : deviceExistingOrder !== baseExistingOrder
+        ? deviceOrder.filter((id) => survivingBaseIds.has(id))
+        : baseOrder.filter((id) => survivingBaseIds.has(id));
+  const baseIds = new Set(baseOrder);
+  const result = [...orderedExisting];
+  integrateCanvasAdditions(result, currentOrder, baseIds, mergedIds);
+  integrateCanvasAdditions(result, deviceOrder, baseIds, mergedIds);
+  return result.filter((id, index) => mergedIds.has(id) && result.indexOf(id) === index);
+}
+
+function integrateCanvasAdditions(
+  result: string[],
+  sideOrder: string[],
+  baseIds: Set<string>,
+  mergedIds: Set<string>
+): void {
+  for (let index = 0; index < sideOrder.length; index += 1) {
+    const id = sideOrder[index];
+    if (id === undefined || baseIds.has(id) || !mergedIds.has(id) || result.includes(id)) {
+      continue;
+    }
+    const before = nearestPreviousPresent(sideOrder, index, result);
+    if (before) {
+      result.splice(result.indexOf(before) + 1, 0, id);
+      continue;
+    }
+    const after = nearestNextPresent(sideOrder, index, result);
+    if (after) {
+      result.splice(result.indexOf(after), 0, id);
+      continue;
+    }
+    result.push(id);
+  }
+}
+
+function nearestPreviousPresent(order: string[], start: number, candidates: string[]): string | null {
+  for (let index = start - 1; index >= 0; index -= 1) {
+    const id = order[index];
+    if (id !== undefined && candidates.includes(id)) {
+      return id;
+    }
+  }
+  return null;
+}
+
+function nearestNextPresent(order: string[], start: number, candidates: string[]): string | null {
+  for (let index = start + 1; index < order.length; index += 1) {
+    const id = order[index];
+    if (id !== undefined && candidates.includes(id)) {
+      return id;
+    }
+  }
+  return null;
+}
+
+function requiredCanvasEntry(entries: Map<string, Record<string, unknown>>, id: string): Record<string, unknown> {
+  const entry = entries.get(id);
+  if (!entry) {
+    throw new GitCommandError('Merged Canvas order references a missing entry.', '');
+  }
+  return entry;
+}
+
+function canonicalizeCanvasEntry(entry: Record<string, unknown>, kind: 'node' | 'edge'): Record<string, unknown> {
+  const preferred =
+    kind === 'node' ? ['id', 'type', 'x', 'y', 'width', 'height'] : ['id', 'fromNode', 'fromSide', 'toNode', 'toSide'];
+  const result: Record<string, unknown> = {};
+  for (const key of preferred) {
+    if (Object.prototype.hasOwnProperty.call(entry, key)) {
+      result[key] = canonicalizeForJson(entry[key]);
+    }
+  }
+  for (const key of Object.keys(entry).filter((candidate) => !preferred.includes(candidate)).sort()) {
+    result[key] = canonicalizeForJson(entry[key]);
+  }
+  return result;
 }
 
 type PlainRecord = Record<string, unknown>;
@@ -1083,6 +1409,20 @@ function canonicalizeForYaml(value: unknown): unknown {
     const ordered: PlainRecord = {};
     for (const key of Object.keys(value).sort()) {
       ordered[key] = canonicalizeForYaml(value[key]);
+    }
+    return ordered;
+  }
+  return value;
+}
+
+function canonicalizeForJson(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(canonicalizeForJson);
+  }
+  if (isPlainRecord(value)) {
+    const ordered: PlainRecord = {};
+    for (const key of Object.keys(value).sort()) {
+      ordered[key] = canonicalizeForJson(value[key]);
     }
     return ordered;
   }

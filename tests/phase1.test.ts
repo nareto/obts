@@ -630,6 +630,114 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
   });
 
+  it('auto-merges safe same-file Canvas edits when native Git reports a text conflict', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const device1Dir = join(root, 'canvas-merge-device-1');
+    const device2Dir = join(root, 'canvas-merge-device-2');
+    await mkdirp(device1Dir);
+    await mkdirp(device2Dir);
+
+    const baseCanvas = JSON.stringify({
+      nodes: [{ id: 'n1', type: 'text', x: 0, y: 0, width: 240, height: 120, text: 'base' }],
+      edges: []
+    }) + '\n';
+    await writeFile(join(device1Dir, 'board.canvas'), baseCanvas);
+    const plugin1 = await pairPlugin(admin, device1Dir, 'desktop');
+    await plugin1.syncOnce({ confirmInitialImport: true });
+
+    const plugin2 = await pairPlugin(admin, device2Dir, 'tablet');
+    expect(await readFile(join(device2Dir, 'board.canvas'), 'utf8')).toBe(baseCanvas);
+
+    await writeFile(join(device1Dir, 'board.canvas'), baseCanvas.replace('"text":"base"', '"text":"desktop"'));
+    await writeFile(join(device2Dir, 'board.canvas'), baseCanvas.replace('"text":"base"', '"text":"base","color":"2"'));
+    expect((await plugin1.syncOnce()).status).toBe('Synced');
+    expect((await plugin2.syncOnce()).status).toBe('Synced');
+    await plugin1.syncOnce();
+
+    const merged = JSON.parse(await readFile(join(device1Dir, 'board.canvas'), 'utf8')) as {
+      nodes: Array<{ text?: string; color?: string }>;
+    };
+    expect(merged.nodes[0]).toMatchObject({ text: 'desktop', color: '2' });
+    const db = await server.store.snapshot();
+    expect(db.conflicts).toHaveLength(0);
+    expect(db.sync_operations.at(-1)?.prepared_manifest).toMatchObject({
+      decision: 'merge',
+      validator_results: {
+        native_git_merge: 'conflicted',
+        semantic_merge: 'clean',
+        semantic_merge_kinds: ['json_canvas'],
+        overlapping_path_count: 1
+      }
+    });
+  });
+
+  it('creates a conflict for unsafe same-field Canvas semantic edits', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const device1Dir = join(root, 'canvas-conflict-device-1');
+    const device2Dir = join(root, 'canvas-conflict-device-2');
+    await mkdirp(device1Dir);
+    await mkdirp(device2Dir);
+
+    const baseCanvas = JSON.stringify({
+      nodes: [{ id: 'n1', type: 'text', x: 0, y: 0, width: 240, height: 120, text: 'base' }],
+      edges: []
+    }) + '\n';
+    await writeFile(join(device1Dir, 'board.canvas'), baseCanvas);
+    const plugin1 = await pairPlugin(admin, device1Dir, 'desktop');
+    await plugin1.syncOnce({ confirmInitialImport: true });
+    const plugin2 = await pairPlugin(admin, device2Dir, 'tablet');
+
+    await writeFile(join(device1Dir, 'board.canvas'), baseCanvas.replace('"text":"base"', '"text":"desktop"'));
+    await writeFile(join(device2Dir, 'board.canvas'), baseCanvas.replace('"text":"base"', '"text":"tablet"'));
+    expect((await plugin1.syncOnce()).status).toBe('Synced');
+    const mainBeforeConflict = (await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)
+      ?.current_main;
+
+    const result = await plugin2.syncOnce();
+    expect(result.status).toBe('Review needed');
+    const db = await server.store.snapshot();
+    expect(db.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(mainBeforeConflict);
+    expect(db.conflicts.find((candidate) => candidate.conflict_id === result.conflictId)).toMatchObject({
+      status: 'open',
+      affected_paths: ['board.canvas']
+    });
+  });
+
+  it('auto-merges safe compact Bases edits when native Git reports a text conflict', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const device1Dir = join(root, 'compact-base-merge-device-1');
+    const device2Dir = join(root, 'compact-base-merge-device-2');
+    await mkdirp(device1Dir);
+    await mkdirp(device2Dir);
+
+    const baseFile = '{views: [{type: table, name: Notes}], formulas: {score: rating * 2}}\n';
+    await writeFile(join(device1Dir, 'library.base'), baseFile);
+    const plugin1 = await pairPlugin(admin, device1Dir, 'desktop');
+    await plugin1.syncOnce({ confirmInitialImport: true });
+    const plugin2 = await pairPlugin(admin, device2Dir, 'tablet');
+
+    await writeFile(join(device1Dir, 'library.base'), baseFile.replace('name: Notes', 'name: Reading list'));
+    await writeFile(join(device2Dir, 'library.base'), baseFile.replace('rating * 2', 'rating * 3'));
+    expect((await plugin1.syncOnce()).status).toBe('Synced');
+    expect((await plugin2.syncOnce()).status).toBe('Synced');
+    await plugin1.syncOnce();
+
+    const merged = await readFile(join(device1Dir, 'library.base'), 'utf8');
+    expect(merged).toContain('name: Reading list');
+    expect(merged).toContain('score: rating * 3');
+    const db = await server.store.snapshot();
+    expect(db.conflicts).toHaveLength(0);
+    expect(db.sync_operations.at(-1)?.prepared_manifest).toMatchObject({
+      decision: 'merge',
+      validator_results: {
+        native_git_merge: 'conflicted',
+        semantic_merge: 'clean',
+        semantic_merge_kinds: ['obsidian_bases'],
+        overlapping_path_count: 1
+      }
+    });
+  });
+
   it('records a conflict for file-directory hierarchy collisions instead of attempting an unsafe merge', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const device1Dir = join(root, 'hierarchy-device-1');

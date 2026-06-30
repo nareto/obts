@@ -16,7 +16,7 @@ Implemented runtime pieces:
 - Protected device refs at `refs/obts/devices/{device_id}` with no-op, fast-forward, stale-ref, malformed-pack, path-policy, and same-device non-fast-forward handling.
 - Pairing stores the device sync profile and plugin-sync setting, and server-side upload validation rejects changed paths outside that paired policy while preserving inherited server tree entries.
 - Shared client/server path policy rejects internal state, visible Git directories, traversal, empty path segments, cross-platform-invalid names, case-fold collisions, unsupported Git tree modes, and `.obsidian` files outside the explicit sync profile.
-- Server-side automatic merge for disjoint path changes and clean native Git merges of overlapping Markdown, JSON Canvas, and Obsidian Bases files, including conservative Markdown frontmatter, JSON Canvas validation, deterministic Bases semantic merge output, durable merge decision operation records, blocked-device rejection, and durable conflict records for unsafe overlapping or file/directory hierarchy-collision changes.
+- Server-side automatic merge for disjoint path changes, clean native Git merges of overlapping Markdown, and conservative semantic merges for safe overlapping JSON Canvas and Obsidian Bases files even when line-based Git merge cannot cleanly merge the compact source text. Merge decisions include deterministic Canvas JSON output, deterministic Bases YAML output, durable operation records, blocked-device rejection, and durable conflict records for unsafe overlapping or file/directory hierarchy-collision changes.
 - Plugin-side `.obts/` state with `isomorphic-git`, device token storage, queue state, recovery bundles, local apply lock, apply journal, local commit creation, multipart push, multipart pull, safe apply, incomplete-journal blocking, and explicit replace-local-with-server recovery.
 - API-backed dashboard shell for setup, login, vault creation, overview, device status, events, readiness, and pairing-token creation.
 - Readiness checks that fail closed when metadata, Git refs, conflict commits, writable storage, or native Git readiness are inconsistent.
@@ -42,8 +42,9 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - partial or already-paired local `.obts/` state blocks pairing before a one-time pairing token is consumed;
 - clean overlapping Markdown edits merge through native Git before conflict creation;
 - Markdown merges with concurrent same-key frontmatter edits are rejected as conflicts even when Git can produce a clean text merge;
+- compact same-file JSON Canvas edits with disjoint semantic fields merge deterministically when native Git reports a text conflict, while same-field Canvas edits create a durable conflict;
 - local path collisions are rejected before local hidden Git commits are created;
-- safe same-file Obsidian Bases edits merge through the semantic Bases validator, while unsafe same-field Bases edits create a durable conflict;
+- safe same-file Obsidian Bases edits merge through the semantic Bases validator, including compact YAML that native Git cannot merge cleanly, while unsafe same-field Bases edits create a durable conflict;
 - unsafe concurrent same-path edits and file/directory hierarchy collisions create a durable conflict record and do not overwrite current `main`;
 - devices with open conflicts cannot upload newer commits until recovery or conflict review is completed;
 - retried uploads whose device ref already advanced but whose commit is not yet in `main` resume merge evaluation instead of becoming a false no-op;
