@@ -303,7 +303,6 @@ export class SyncService {
       const eventSeq = await this.store.mutate((db) => {
         const device = requireDevice(db, deviceId);
         device.status = 'synced';
-        device.last_successful_sync_at = nowIso();
         return this.latestEventSeq(vaultId, db);
       });
       return { status: 'noop', device_ref: deviceCommit, main, event_seq: eventSeq || fallbackEventSeq };
@@ -405,7 +404,6 @@ export class SyncService {
       vault.current_main = mergeCommit;
       vault.updated_at = nowIso();
       device.status = 'synced';
-      device.last_successful_sync_at = nowIso();
       const event = this.store.appendEvent(db, {
         event_type: 'main_advanced',
         vault_id: vaultId,
@@ -539,7 +537,6 @@ export class SyncService {
       vault.current_main = mergeCommit;
       vault.updated_at = nowIso();
       device.status = 'synced';
-      device.last_successful_sync_at = nowIso();
       const event = this.store.appendEvent(db, {
         event_type: 'main_advanced',
         vault_id: vaultId,
@@ -678,7 +675,6 @@ export class SyncService {
       vault.current_main = mergeCommit;
       vault.updated_at = nowIso();
       device.status = 'synced';
-      device.last_successful_sync_at = nowIso();
       const event = this.store.appendEvent(db, {
         event_type: 'main_advanced',
         vault_id: vaultId,

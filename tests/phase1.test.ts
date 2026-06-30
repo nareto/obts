@@ -233,6 +233,69 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
   });
 
+  it('keeps an uploading device behind until it acknowledges applying the merge commit', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const device1Dir = join(root, 'merge-ack-device-1');
+    const device2Dir = join(root, 'merge-ack-device-2');
+    await mkdirp(device1Dir);
+    await mkdirp(device2Dir);
+    await writeFile(join(device1Dir, 'base.md'), 'base\n');
+    const plugin1 = await pairPlugin(admin, device1Dir, 'desktop');
+    await plugin1.syncOnce({ confirmInitialImport: true });
+
+    const plugin2 = await pairPlugin(admin, device2Dir, 'phone');
+    expect((await plugin2.syncOnce()).status).toBe('Synced');
+    const device2State = await plugin2.readState();
+    const device2Token = await readDeviceToken(device2Dir);
+
+    await sleep(5);
+    await writeFile(join(device1Dir, 'desktop.md'), 'server-side change\n');
+    expect((await plugin1.syncOnce()).status).toBe('Synced');
+
+    await writeFile(join(device2Dir, 'phone.md'), 'uploading device change\n');
+    const localGit = new LocalGitEngine(device2Dir, {
+      profile: 'notes_only',
+      syncPlugins: false,
+      attachmentLocation: { mode: 'same_folder_as_note' }
+    });
+    const phoneCommit = await localGit.createLocalCommit('obts: phone change before applying latest main');
+    expect(phoneCommit).toMatch(/^[0-9a-f]{40}$/u);
+    const packfile = await localGit.createPackForCommit(phoneCommit!);
+    const transport = new TransportClient(baseUrl);
+    const push = await transport.push({
+      vaultId: admin.vaultId,
+      deviceId: device2State.device_id!,
+      deviceToken: device2Token,
+      manifest: {
+        api_version: API_VERSION,
+        vault_id: admin.vaultId,
+        device_id: device2State.device_id!,
+        expected_device_ref: device2State.server_device_ref,
+        target_commit: phoneCommit!,
+        packfile_sha256: sha256(packfile),
+        packfile_bytes: packfile.byteLength,
+        client_known_main: device2State.local_main
+      },
+      packfile
+    });
+    expect(push.status).toBe('merged');
+
+    const dashboard = await admin.get<{
+      devices: Array<{
+        device_name: string;
+        status_label: string;
+        behind_main: boolean;
+        last_successful_sync_at: string | null;
+      }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+    expect(dashboard.status).toBe(200);
+    expect(dashboard.body.devices.find((device) => device.device_name === 'phone')).toMatchObject({
+      status_label: 'Behind',
+      behind_main: true,
+      last_successful_sync_at: expect.any(String)
+    });
+  });
+
   it('requires recent dashboard authentication for admin account creation', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     await server.store.mutate((db) => {

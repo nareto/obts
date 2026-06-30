@@ -263,8 +263,8 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
             device.device_ref_head !== null && !(await git.isAncestor(vault.vault_id, device.device_ref_head, vault.current_main));
           const behindMain =
             device.status === 'synced' &&
-            device.last_successful_sync_at !== null &&
-            Date.parse(device.last_successful_sync_at) < Date.parse(vault.updated_at);
+            (device.last_successful_sync_at === null ||
+              Date.parse(device.last_successful_sync_at) < Date.parse(vault.updated_at));
           const offline = device.last_seen_at !== null && Date.now() - Date.parse(device.last_seen_at) > 24 * 60 * 60 * 1000;
           return {
             device_id: device.device_id,
@@ -807,7 +807,6 @@ async function rollForwardPreparedOperation(store: MetadataStore, operationId: s
       vault.updated_at = nowIso();
       if (device) {
         device.status = 'synced';
-        device.last_successful_sync_at = nowIso();
       }
       operation.status = 'committed';
       operation.target_commit = targetMain;
