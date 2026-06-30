@@ -521,7 +521,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
   });
 
-  it('records a conflict for same-file Bases edits without a semantic Bases merge', async () => {
+  it('auto-merges safe same-file Bases edits with the semantic Bases merge validator', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const device1Dir = join(root, 'base-merge-device-1');
     const device2Dir = join(root, 'base-merge-device-2');
@@ -553,6 +553,52 @@ describe('Phase 1 sync without conflict resolution', () => {
       join(device2Dir, 'library.base'),
       baseFile.replace('  score: rating * 2', '  score: rating * 3')
     );
+    expect((await plugin1.syncOnce()).status).toBe('Synced');
+
+    const result = await plugin2.syncOnce();
+    expect(result.status).toBe('Synced');
+    await plugin1.syncOnce();
+
+    const db = await server.store.snapshot();
+    expect(db.conflicts).toHaveLength(0);
+    expect(db.sync_operations.at(-1)?.prepared_manifest).toMatchObject({
+      decision: 'merge',
+      validator_results: {
+        native_git_merge: 'clean',
+        conflict_markers: 'absent',
+        overlapping_path_count: 1
+      }
+    });
+    const merged = await readFile(join(device1Dir, 'library.base'), 'utf8');
+    expect(merged).toContain('name: Reading list');
+    expect(merged).toContain('score: rating * 3');
+  });
+
+  it('records a conflict for unsafe concurrent same-field Bases edits', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const device1Dir = join(root, 'base-conflict-device-1');
+    const device2Dir = join(root, 'base-conflict-device-2');
+    await mkdirp(device1Dir);
+    await mkdirp(device2Dir);
+
+    const baseFile = [
+      'filters:',
+      '  and:',
+      '    - status == "open"',
+      'views:',
+      '  - type: table',
+      '    name: Notes',
+      ''
+    ].join('\n');
+    await writeFile(join(device1Dir, 'library.base'), baseFile);
+    const plugin1 = await pairPlugin(admin, device1Dir, 'desktop');
+    await plugin1.syncOnce({ confirmInitialImport: true });
+
+    const plugin2 = await pairPlugin(admin, device2Dir, 'tablet');
+    expect(await readFile(join(device2Dir, 'library.base'), 'utf8')).toBe(baseFile);
+
+    await writeFile(join(device1Dir, 'library.base'), baseFile.replace('status == "open"', 'status == "done"'));
+    await writeFile(join(device2Dir, 'library.base'), baseFile.replace('status == "open"', 'status == "archived"'));
     expect((await plugin1.syncOnce()).status).toBe('Synced');
     const mainBeforeConflict = (await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)
       ?.current_main;
@@ -1185,6 +1231,26 @@ describe('Phase 1 sync without conflict resolution', () => {
 
     await expect(localGit.createLocalCommit('obts: collision')).rejects.toBeInstanceOf(PathPolicyViolation);
     expect(await localGit.resolveRef('refs/heads/local')).toBeNull();
+  });
+
+  it('detects rapid same-size local edits by staged content instead of timestamps', async () => {
+    const deviceDir = join(root, 'rapid-edit-device');
+    await mkdirp(deviceDir);
+    const localGit = new LocalGitEngine(deviceDir, {
+      profile: 'notes_only',
+      syncPlugins: false,
+      attachmentLocation: { mode: 'same_folder_as_note' }
+    });
+    await localGit.initialize();
+
+    await writeFile(join(deviceDir, 'library.base'), 'a: 1\n');
+    const firstCommit = await localGit.createLocalCommit('obts: first same-size edit');
+    expect(firstCommit).toMatch(/^[0-9a-f]{40}$/u);
+
+    await writeFile(join(deviceDir, 'library.base'), 'a: 2\n');
+    const secondCommit = await localGit.createLocalCommit('obts: second same-size edit');
+    expect(secondCommit).toMatch(/^[0-9a-f]{40}$/u);
+    expect(secondCommit).not.toBe(firstCommit);
   });
 
   it('serves an API-backed dashboard shell for Phase 1 workflows', async () => {

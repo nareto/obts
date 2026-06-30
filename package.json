@@ -19,7 +19,8 @@
     "@fastify/multipart": "^9.3.0",
     "@node-rs/argon2": "^2.0.2",
     "fastify": "^5.9.0",
-    "isomorphic-git": "^1.38.5"
+    "isomorphic-git": "^1.38.5",
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@types/node": "^24.0.8",

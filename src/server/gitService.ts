@@ -3,6 +3,8 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { spawn } from 'node:child_process';
 
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
+
 import { assertSyncableTreePaths, PathPolicyViolation } from '../shared/pathPolicy.js';
 import type { ServerConfig } from './config.js';
 
@@ -291,13 +293,17 @@ export class GitService {
 
     try {
       await this.validateTreePathPolicy(vaultId, tree);
-      await this.validateMergedTextPaths(vaultId, {
+      const semanticBaseFiles = await this.validateMergedTextPaths(vaultId, {
         tree,
         base,
         currentMain,
         deviceCommit,
         paths: mergedTextPaths
       });
+      if (semanticBaseFiles.size > 0) {
+        tree = await this.createTreeWithFileContents(vaultId, tree, semanticBaseFiles);
+        await this.validateTreePathPolicy(vaultId, tree);
+      }
     } catch {
       return null;
     }
@@ -355,6 +361,29 @@ export class GitService {
     const repo = this.repoPath(vaultId);
     const { stdout } = await this.exec(repo, ['cat-file', '-s', oid]);
     return Number.parseInt(asText(stdout).trim(), 10);
+  }
+
+  private async createTreeWithFileContents(vaultId: string, sourceTree: string, files: Map<string, Buffer>): Promise<string> {
+    const repo = this.repoPath(vaultId);
+    const tempRoot = join(this.config.tempDir, `semantic-merge-${vaultId}-${randomBytes(8).toString('hex')}`);
+    const workTree = join(tempRoot, 'worktree');
+    const indexFile = join(tempRoot, 'index');
+    await mkdir(workTree, { recursive: true, mode: 0o700 });
+
+    try {
+      const env = { ...process.env, GIT_INDEX_FILE: indexFile };
+      await this.exec(repo, ['read-tree', sourceTree], undefined, env);
+      await this.exec(repo, ['--work-tree', workTree, 'checkout-index', '-a', '-f', '--prefix', `${workTree}/`], undefined, env);
+      for (const [path, content] of files) {
+        const absolutePath = join(workTree, path);
+        await mkdir(dirname(absolutePath), { recursive: true, mode: 0o700 });
+        await writeFile(absolutePath, content);
+      }
+      await this.exec(repo, ['--work-tree', workTree, 'add', '-A', '--', '.'], undefined, env);
+      return asText((await this.exec(repo, ['write-tree'], undefined, env)).stdout).trim();
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
   }
 
   async exec(
@@ -439,7 +468,8 @@ export class GitService {
   private async validateMergedTextPaths(
     vaultId: string,
     input: { tree: string; base: string; currentMain: string; deviceCommit: string; paths: string[] }
-  ): Promise<void> {
+  ): Promise<Map<string, Buffer>> {
+    const semanticBaseFiles = new Map<string, Buffer>();
     for (const path of input.paths) {
       const mergedText = await this.readTextAtPathIfPresent(vaultId, input.tree, path);
       if (mergedText === null) {
@@ -466,7 +496,11 @@ export class GitService {
           );
         }
       }
+      if (path.endsWith('.base') && baseText !== null && currentText !== null && deviceText !== null) {
+        semanticBaseFiles.set(path, Buffer.from(semanticMergeBasesFile(baseText, currentText, deviceText), 'utf8'));
+      }
     }
+    return semanticBaseFiles;
   }
 
   private async readTextAtPathIfPresent(vaultId: string, treeish: string, path: string): Promise<string | null> {
@@ -700,6 +734,367 @@ function assertCanvasOrderMergeAllowed(
   ) {
     throw new GitCommandError(`Canvas ${label} order merge could not be validated.`, '');
   }
+}
+
+type PlainRecord = Record<string, unknown>;
+type FieldState = { present: false } | { present: true; value: unknown };
+type ViewCollection = {
+  present: boolean;
+  byKey: Map<string, PlainRecord>;
+  order: string[];
+};
+
+const BASE_MAP_FIELDS = ['formulas', 'properties', 'summaries'] as const;
+const BASE_TOP_LEVEL_ORDER = ['filters', 'formulas', 'properties', 'summaries', 'views'] as const;
+const VIEW_KEY_SEPARATOR = '\u0000';
+const RESTRICTED_CONCURRENT_VIEW_KEYS = new Set(['type', 'name', 'filters', 'order']);
+const KNOWN_VIEW_KEYS = new Set([
+  'type',
+  'name',
+  'filters',
+  'order',
+  'sort',
+  'limit',
+  'columns',
+  'properties',
+  'formulas',
+  'summaries',
+  'group',
+  'groupBy',
+  'image',
+  'display'
+]);
+
+function semanticMergeBasesFile(baseText: string, currentText: string, deviceText: string): string {
+  const base = parseBasesDocument(baseText);
+  const current = parseBasesDocument(currentText);
+  const device = parseBasesDocument(deviceText);
+  const merged = new Map<string, FieldState>();
+
+  merged.set(
+    'filters',
+    mergeAtomicField(
+      'Bases filters',
+      fieldState(base.root, 'filters'),
+      fieldState(current.root, 'filters'),
+      fieldState(device.root, 'filters')
+    )
+  );
+
+  for (const field of BASE_MAP_FIELDS) {
+    merged.set(field, mergeNamedMapField(field, base.root, current.root, device.root));
+  }
+  merged.set('views', mergeViews(base.views, current.views, device.views));
+
+  const knownTopLevel = new Set<string>(BASE_TOP_LEVEL_ORDER);
+  const otherFields = [...new Set([...Object.keys(base.root), ...Object.keys(current.root), ...Object.keys(device.root)])]
+    .filter((field) => !knownTopLevel.has(field))
+    .sort();
+  for (const field of otherFields) {
+    merged.set(
+      field,
+      mergeAtomicField(
+        `Bases top-level field ${field}`,
+        fieldState(base.root, field),
+        fieldState(current.root, field),
+        fieldState(device.root, field)
+      )
+    );
+  }
+
+  const result: PlainRecord = {};
+  for (const field of [...BASE_TOP_LEVEL_ORDER, ...otherFields]) {
+    const value = merged.get(field);
+    if (value?.present) {
+      result[field] = field === 'views' ? canonicalizeViews(value.value) : canonicalizeForYaml(value.value);
+    }
+  }
+  const output = stringifyYaml(result, { lineWidth: 0 });
+  return output.endsWith('\n') ? output : `${output}\n`;
+}
+
+function parseBasesDocument(text: string): { root: PlainRecord; views: ViewCollection } {
+  let parsed: unknown;
+  try {
+    parsed = parseYaml(text) ?? {};
+  } catch {
+    throw new GitCommandError('Obsidian Bases YAML could not be parsed.', '');
+  }
+  if (!isPlainRecord(parsed)) {
+    throw new GitCommandError('Obsidian Bases YAML must be a mapping.', '');
+  }
+  for (const field of BASE_MAP_FIELDS) {
+    readOptionalPlainMap(parsed, field);
+  }
+  const views = parseViews(parsed);
+  return { root: parsed, views };
+}
+
+function mergeNamedMapField(field: string, base: PlainRecord, current: PlainRecord, device: PlainRecord): FieldState {
+  const baseMap = readOptionalPlainMap(base, field);
+  const currentMap = readOptionalPlainMap(current, field);
+  const deviceMap = readOptionalPlainMap(device, field);
+  if (!baseMap.present && !currentMap.present && !deviceMap.present) {
+    return { present: false };
+  }
+  const result: PlainRecord = {};
+  const keys = [
+    ...new Set([
+      ...Object.keys(fieldMapValue(baseMap)),
+      ...Object.keys(fieldMapValue(currentMap)),
+      ...Object.keys(fieldMapValue(deviceMap))
+    ])
+  ].sort();
+  for (const key of keys) {
+    const merged = mergeMapEntry(
+      `Bases ${field}.${key}`,
+      fieldState(fieldMapValue(baseMap), key),
+      fieldState(fieldMapValue(currentMap), key),
+      fieldState(fieldMapValue(deviceMap), key)
+    );
+    if (merged.present) {
+      result[key] = canonicalizeForYaml(merged.value);
+    }
+  }
+  return { present: true, value: result };
+}
+
+function mergeMapEntry(label: string, base: FieldState, current: FieldState, device: FieldState): FieldState {
+  if (fieldStatesEqual(current, base)) {
+    return device;
+  }
+  if (fieldStatesEqual(device, base)) {
+    return current;
+  }
+  if (fieldStatesEqual(current, device)) {
+    return current;
+  }
+  if (!base.present) {
+    throw new GitCommandError(`${label} concurrent additions require review.`, '');
+  }
+  if (!current.present || !device.present) {
+    throw new GitCommandError(`${label} delete-vs-edit requires review.`, '');
+  }
+  if (isPlainRecord(base.value) && isPlainRecord(current.value) && isPlainRecord(device.value)) {
+    return mergeNestedObject(label, base.value, current.value, device.value);
+  }
+  throw new GitCommandError(`${label} concurrent edits require review.`, '');
+}
+
+function mergeNestedObject(label: string, base: PlainRecord, current: PlainRecord, device: PlainRecord): FieldState {
+  const result: PlainRecord = {};
+  const keys = [...new Set([...Object.keys(base), ...Object.keys(current), ...Object.keys(device)])].sort();
+  for (const key of keys) {
+    const merged = mergeAtomicField(
+      `${label}.${key}`,
+      fieldState(base, key),
+      fieldState(current, key),
+      fieldState(device, key)
+    );
+    if (merged.present) {
+      result[key] = canonicalizeForYaml(merged.value);
+    }
+  }
+  return { present: true, value: result };
+}
+
+function mergeAtomicField(label: string, base: FieldState, current: FieldState, device: FieldState): FieldState {
+  if (fieldStatesEqual(current, base)) {
+    return device;
+  }
+  if (fieldStatesEqual(device, base)) {
+    return current;
+  }
+  if (fieldStatesEqual(current, device)) {
+    return current;
+  }
+  throw new GitCommandError(`${label} concurrent edits require review.`, '');
+}
+
+function parseViews(root: PlainRecord): ViewCollection {
+  const views = fieldState(root, 'views');
+  if (!views.present) {
+    return { present: false, byKey: new Map(), order: [] };
+  }
+  if (!Array.isArray(views.value)) {
+    throw new GitCommandError('Obsidian Bases views must be a sequence.', '');
+  }
+  const byKey = new Map<string, PlainRecord>();
+  const order: string[] = [];
+  for (const value of views.value) {
+    if (!isPlainRecord(value) || typeof value.type !== 'string' || typeof value.name !== 'string') {
+      throw new GitCommandError('Obsidian Bases views must have string type and name fields.', '');
+    }
+    const key = viewKey(value);
+    if (byKey.has(key)) {
+      throw new GitCommandError('Obsidian Bases views must not duplicate a type/name pair.', '');
+    }
+    byKey.set(key, value);
+    order.push(key);
+  }
+  return { present: true, byKey, order };
+}
+
+function mergeViews(base: ViewCollection, current: ViewCollection, device: ViewCollection): FieldState {
+  if (!base.present && !current.present && !device.present) {
+    return { present: false };
+  }
+  assertNoViewReorder(base, current, 'current main');
+  assertNoViewReorder(base, device, 'device commit');
+  const baseKeys = new Set(base.order);
+  const additionKeys = [
+    ...new Set([...current.order, ...device.order].filter((key) => !baseKeys.has(key)))
+  ].sort();
+  const result: PlainRecord[] = [];
+  for (const key of [...base.order, ...additionKeys]) {
+    const merged = mergeViewEntry(
+      key,
+      viewState(base, key),
+      viewState(current, key),
+      viewState(device, key)
+    );
+    if (merged.present) {
+      if (!isPlainRecord(merged.value)) {
+        throw new GitCommandError('Merged Obsidian Bases view must be a mapping.', '');
+      }
+      result.push(canonicalizeView(merged.value));
+    }
+  }
+  return { present: true, value: result };
+}
+
+function mergeViewEntry(key: string, base: FieldState, current: FieldState, device: FieldState): FieldState {
+  if (fieldStatesEqual(current, base)) {
+    return device;
+  }
+  if (fieldStatesEqual(device, base)) {
+    return current;
+  }
+  if (fieldStatesEqual(current, device)) {
+    return current;
+  }
+  if (!base.present) {
+    throw new GitCommandError('Obsidian Bases concurrent view additions require review.', '');
+  }
+  if (!current.present || !device.present) {
+    throw new GitCommandError('Obsidian Bases view delete-vs-edit requires review.', '');
+  }
+  if (isPlainRecord(base.value) && isPlainRecord(current.value) && isPlainRecord(device.value)) {
+    return mergeViewObject(key, base.value, current.value, device.value);
+  }
+  throw new GitCommandError('Obsidian Bases concurrent view edits require review.', '');
+}
+
+function mergeViewObject(key: string, base: PlainRecord, current: PlainRecord, device: PlainRecord): FieldState {
+  const currentChanged = changedFieldKeys(base, current);
+  const deviceChanged = changedFieldKeys(base, device);
+  if (currentChanged.size > 0 && deviceChanged.size > 0) {
+    const changed = new Set([...currentChanged, ...deviceChanged]);
+    for (const field of changed) {
+      if (!KNOWN_VIEW_KEYS.has(field)) {
+        throw new GitCommandError('Obsidian Bases concurrent unknown view-key edits require review.', '');
+      }
+    }
+    for (const field of RESTRICTED_CONCURRENT_VIEW_KEYS) {
+      if (changed.has(field)) {
+        throw new GitCommandError(`Obsidian Bases same-view ${field} edits require review.`, '');
+      }
+    }
+  }
+  return mergeNestedObject(`Obsidian Bases view ${key.replace(VIEW_KEY_SEPARATOR, '/')}`, base, current, device);
+}
+
+function assertNoViewReorder(base: ViewCollection, side: ViewCollection, label: string): void {
+  const baseKeys = new Set(base.order);
+  const expected = base.order.filter((key) => side.byKey.has(key));
+  const actual = side.order.filter((key) => baseKeys.has(key));
+  if (!arraysEqual(expected, actual)) {
+    throw new GitCommandError(`Obsidian Bases ${label} view reorder requires review.`, '');
+  }
+}
+
+function readOptionalPlainMap(root: PlainRecord, field: string): FieldState {
+  const value = fieldState(root, field);
+  if (!value.present) {
+    return value;
+  }
+  if (!isPlainRecord(value.value)) {
+    throw new GitCommandError(`Obsidian Bases ${field} must be a mapping.`, '');
+  }
+  return value;
+}
+
+function fieldMapValue(field: FieldState): PlainRecord {
+  return field.present && isPlainRecord(field.value) ? field.value : {};
+}
+
+function viewState(views: ViewCollection, key: string): FieldState {
+  const value = views.byKey.get(key);
+  return value === undefined ? { present: false } : { present: true, value };
+}
+
+function viewKey(view: PlainRecord): string {
+  return `${String(view.type)}${VIEW_KEY_SEPARATOR}${String(view.name)}`;
+}
+
+function fieldState(record: PlainRecord, field: string): FieldState {
+  return Object.prototype.hasOwnProperty.call(record, field) ? { present: true, value: record[field] } : { present: false };
+}
+
+function fieldStatesEqual(left: FieldState, right: FieldState): boolean {
+  if (!left.present || !right.present) {
+    return left.present === right.present;
+  }
+  return stableJson(left.value) === stableJson(right.value);
+}
+
+function changedFieldKeys(base: PlainRecord, side: PlainRecord): Set<string> {
+  const changed = new Set<string>();
+  for (const key of new Set([...Object.keys(base), ...Object.keys(side)])) {
+    if (!fieldStatesEqual(fieldState(base, key), fieldState(side, key))) {
+      changed.add(key);
+    }
+  }
+  return changed;
+}
+
+function canonicalizeViews(value: unknown): unknown {
+  return Array.isArray(value) ? value.map((entry) => (isPlainRecord(entry) ? canonicalizeView(entry) : canonicalizeForYaml(entry))) : value;
+}
+
+function canonicalizeView(view: PlainRecord): PlainRecord {
+  const ordered: PlainRecord = {};
+  for (const key of ['type', 'name']) {
+    if (Object.prototype.hasOwnProperty.call(view, key)) {
+      ordered[key] = canonicalizeForYaml(view[key]);
+    }
+  }
+  for (const key of Object.keys(view).filter((field) => field !== 'type' && field !== 'name').sort()) {
+    ordered[key] = canonicalizeForYaml(view[key]);
+  }
+  return ordered;
+}
+
+function canonicalizeForYaml(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(canonicalizeForYaml);
+  }
+  if (isPlainRecord(value)) {
+    const ordered: PlainRecord = {};
+    for (const key of Object.keys(value).sort()) {
+      ordered[key] = canonicalizeForYaml(value[key]);
+    }
+    return ordered;
+  }
+  return value;
+}
+
+function isPlainRecord(value: unknown): value is PlainRecord {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function arraysEqual(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function changedObjectKeys(base: Record<string, unknown> | undefined, side: Record<string, unknown>): Set<string> {

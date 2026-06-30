@@ -835,7 +835,7 @@ function changedPathSet(entries: GitDiffEntry[]): Set<string> {
 }
 
 function isNativeTextMergePath(path: string): boolean {
-  return path.endsWith('.md') || path.endsWith('.canvas');
+  return path.endsWith('.md') || path.endsWith('.canvas') || path.endsWith('.base');
 }
 
 function deviceSyncPathPolicy(device: DeviceRow): SyncPathPolicy {

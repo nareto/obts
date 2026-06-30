@@ -108,14 +108,10 @@ export class LocalGitEngine {
       filter: (filepath) => isSyncableVaultPath(filepath, this.policy),
       ignored: false
     });
-    let changed = false;
     const seen = new Set(files);
     for (const [filepath, headStatus, workdirStatus, stageStatus] of matrix) {
       if (!isSyncableVaultPath(filepath, this.policy)) {
         continue;
-      }
-      if (headStatus !== workdirStatus || workdirStatus !== stageStatus) {
-        changed = true;
       }
       if (workdirStatus === 0) {
         await git.remove({ fs, dir: this.vaultDir, gitdir: this.gitdir, filepath });
@@ -125,10 +121,9 @@ export class LocalGitEngine {
       seen.delete(filepath);
     }
     for (const filepath of seen) {
-      changed = true;
       await git.add({ fs, dir: this.vaultDir, gitdir: this.gitdir, filepath });
     }
-    if (!changed) {
+    if (!(await this.hasStagedTreeChanges())) {
       return null;
     }
     return await git.commit({
@@ -145,6 +140,20 @@ export class LocalGitEngine {
         name: 'obts device',
         email: 'device@obts.local'
       }
+    });
+  }
+
+  private async hasStagedTreeChanges(): Promise<boolean> {
+    const matrix = await git.statusMatrix({
+      fs,
+      dir: this.vaultDir,
+      gitdir: this.gitdir,
+      ref: 'refs/heads/local',
+      filter: (filepath) => isSyncableVaultPath(filepath, this.policy),
+      ignored: false
+    });
+    return matrix.some(([filepath, headStatus, _workdirStatus, stageStatus]) => {
+      return isSyncableVaultPath(filepath, this.policy) && headStatus !== stageStatus;
     });
   }
 
