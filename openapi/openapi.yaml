@@ -242,6 +242,8 @@ paths:
       responses:
         "200":
           description: Event page.
+        "410":
+          $ref: "#/components/responses/Error"
         "404":
           $ref: "#/components/responses/Error"
 components:

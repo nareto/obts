@@ -20,7 +20,7 @@ import {
 import { AuthError, AuthService, ownedVaultOrThrow } from './authService.js';
 import { createServerConfig, ensureServerDirectories, type ServerConfig } from './config.js';
 import { GitCommandError, GitService, sha256Hex } from './gitService.js';
-import { MetadataStore, type MetadataDb } from './metadataStore.js';
+import { MetadataStore, type MetadataDb, type SyncOperationRow } from './metadataStore.js';
 import { SyncService } from './syncService.js';
 
 const SESSION_COOKIE = '__Host-obts_session';
@@ -40,6 +40,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   const store = new MetadataStore(config.dataDir);
   await store.initialize();
   const git = new GitService(config);
+  await reconcileStartupOperations(store, git);
   const auth = new AuthService(store);
   const sync = new SyncService(store, git, config.maxUploadBytes);
   const app = Fastify({
@@ -359,6 +360,9 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   app.post('/api/v1/vaults/:vaultId/sync/pull', async (request, reply) => {
     const { vaultId } = pathParams(request);
     const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+    if (deviceAuth.vault.status === 'blocked_integrity') {
+      throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+    }
     const pullRequest = await readPullMultipart(request);
     if (pullRequest.vault_id !== vaultId || pullRequest.device_id !== deviceAuth.device.device_id) {
       throw new AuthError(404, 'not_found', 'Resource not found.');
@@ -416,7 +420,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     };
   });
 
-  app.get('/api/v1/vaults/:vaultId/events', async (request) => {
+  app.get('/api/v1/vaults/:vaultId/events', async (request, reply) => {
     const session = await auth.authenticateSession(request.cookies[SESSION_COOKIE]);
     const { vaultId } = pathParams(request);
     const query = request.query as { after?: string };
@@ -429,9 +433,40 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     }
     const db = await store.snapshot();
     const vault = ownedVaultOrThrow(db, session.user.user_id, vaultId);
+    const vaultEvents = db.events
+      .filter((event) => event.vault_id === vault.vault_id)
+      .sort((left, right) => left.event_seq - right.event_seq);
+    const oldestAvailableEventSeq = vaultEvents[0]?.event_seq;
+    const currentEventSeq = db.event_seq_by_vault[vault.vault_id] ?? 0;
+    if (oldestAvailableEventSeq === undefined && currentEventSeq > 0 && after < currentEventSeq) {
+      return reply.status(410).send({
+        error: {
+          code: 'event_cursor_expired',
+          message: 'Event cursor is no longer available; refresh vault state before polling again.',
+          request_id: request.id,
+          details: {
+            current_event_seq: currentEventSeq,
+            oldest_available_event_seq: currentEventSeq + 1
+          }
+        }
+      });
+    }
+    if (oldestAvailableEventSeq !== undefined && after < oldestAvailableEventSeq - 1) {
+      return reply.status(410).send({
+        error: {
+          code: 'event_cursor_expired',
+          message: 'Event cursor is no longer available; refresh vault state before polling again.',
+          request_id: request.id,
+          details: {
+            current_event_seq: currentEventSeq,
+            oldest_available_event_seq: oldestAvailableEventSeq
+          }
+        }
+      });
+    }
     return {
-      events: db.events.filter((event) => event.vault_id === vault.vault_id && event.event_seq > after),
-      current_event_seq: db.event_seq_by_vault[vault.vault_id] ?? 0
+      events: vaultEvents.filter((event) => event.event_seq > after),
+      current_event_seq: currentEventSeq
     };
   });
 
@@ -607,6 +642,9 @@ async function checkPersistentState(db: MetadataDb, git: GitService): Promise<{ 
     return { ok: false, error: 'metadata schema version is unsupported' };
   }
   for (const vault of db.vaults) {
+    if (vault.status === 'blocked_integrity') {
+      return { ok: false, error: 'vault persistent state is blocked by an integrity failure' };
+    }
     const mainRef = await git.getRef(vault.vault_id, 'refs/heads/main');
     if (mainRef !== vault.current_main) {
       return { ok: false, error: 'vault main ref is inconsistent with metadata' };
@@ -629,6 +667,183 @@ async function checkPersistentState(db: MetadataDb, git: GitService): Promise<{ 
     }
   }
   return { ok: true };
+}
+
+async function reconcileStartupOperations(store: MetadataStore, git: GitService): Promise<void> {
+  const db = await store.snapshot();
+  for (const operation of db.sync_operations) {
+    if (operation.status === 'started' && operation.prepared_manifest === null) {
+      await abortStartupOperation(store, operation.operation_id, 'startup_unprepared_operation');
+    }
+  }
+
+  const latest = await store.snapshot();
+  for (const operation of latest.sync_operations.filter((candidate) => candidate.status === 'prepared')) {
+    const targetRefs = Object.entries(operation.target_refs).filter((entry): entry is [string, string] => {
+      const [, target] = entry;
+      return typeof target === 'string' && /^[0-9a-f]{40}$/u.test(target);
+    });
+    if (targetRefs.length === 0) {
+      await blockVaultIntegrity(store, operation, 'prepared operation does not contain a recoverable target ref');
+      continue;
+    }
+
+    const actualRefs = new Map<string, string | null>();
+    for (const [ref] of targetRefs) {
+      actualRefs.set(ref, await git.getRef(operation.vault_id, ref));
+    }
+
+    const allTargetsAlreadyMoved = targetRefs.every(([ref, target]) => actualRefs.get(ref) === target);
+    if (allTargetsAlreadyMoved) {
+      await rollForwardPreparedOperation(store, operation.operation_id);
+      continue;
+    }
+
+    const allTargetsStillExpected = targetRefs.every(([ref]) => {
+      const expected = operation.expected_refs[ref] ?? null;
+      return actualRefs.get(ref) === expected;
+    });
+    if (allTargetsStillExpected) {
+      await abortStartupOperation(store, operation.operation_id, 'startup_prepared_ref_not_moved');
+      continue;
+    }
+
+    await blockVaultIntegrity(store, operation, 'prepared operation target refs cannot be reconciled');
+  }
+}
+
+async function abortStartupOperation(store: MetadataStore, operationId: string, reason: string): Promise<void> {
+  await store.mutate((db) => {
+    const operation = db.sync_operations.find((candidate) => candidate.operation_id === operationId);
+    if (!operation || operation.status === 'committed') {
+      return;
+    }
+    operation.status = 'aborted';
+    operation.result = { reason };
+    operation.updated_at = nowIso();
+  });
+}
+
+async function blockVaultIntegrity(store: MetadataStore, operation: SyncOperationRow, reason: string): Promise<void> {
+  await store.mutate((db) => {
+    const latestOperation = db.sync_operations.find((candidate) => candidate.operation_id === operation.operation_id);
+    if (latestOperation && latestOperation.status !== 'committed') {
+      latestOperation.result = { reason };
+      latestOperation.updated_at = nowIso();
+    }
+    const vault = db.vaults.find((candidate) => candidate.vault_id === operation.vault_id);
+    if (vault) {
+      vault.status = 'blocked_integrity';
+      vault.updated_at = nowIso();
+    }
+  });
+}
+
+async function rollForwardPreparedOperation(store: MetadataStore, operationId: string): Promise<void> {
+  await store.mutate((db) => {
+    const operation = db.sync_operations.find((candidate) => candidate.operation_id === operationId);
+    if (!operation || operation.status !== 'prepared') {
+      return;
+    }
+    if (operation.operation_type === 'device_push') {
+      const deviceRefEntry = Object.entries(operation.target_refs).find(([ref, target]) => {
+        return ref.startsWith('refs/obts/devices/') && typeof target === 'string';
+      });
+      const device = operation.device_id
+        ? db.devices.find((candidate) => candidate.device_id === operation.device_id)
+        : undefined;
+      if (!deviceRefEntry || !device || typeof deviceRefEntry[1] !== 'string') {
+        operation.result = { reason: 'device_push_reconciliation_failed' };
+        operation.updated_at = nowIso();
+        const vault = db.vaults.find((candidate) => candidate.vault_id === operation.vault_id);
+        if (vault) {
+          vault.status = 'blocked_integrity';
+          vault.updated_at = nowIso();
+        }
+        return;
+      }
+      const targetCommit = deviceRefEntry[1];
+      device.device_ref_head = targetCommit;
+      device.status = 'ahead';
+      device.last_seen_at = nowIso();
+      operation.status = 'committed';
+      operation.result = { device_ref: targetCommit, reconciled_after_startup: true };
+      operation.updated_at = nowIso();
+      const vault = db.vaults.find((candidate) => candidate.vault_id === operation.vault_id);
+      store.appendEvent(db, {
+        event_type: 'device_ref_updated',
+        vault_id: operation.vault_id,
+        resource_ids: { device_id: device.device_id },
+        commit_cursors: {
+          device_ref: targetCommit,
+          main: vault?.current_main ?? null
+        },
+        payload: {
+          device_id: device.device_id,
+          reconciled_after_startup: true
+        }
+      });
+      return;
+    }
+
+    if (operation.operation_type === 'server_merge') {
+      const targetMain = operation.target_refs['refs/heads/main'];
+      const previousMain = operation.expected_refs['refs/heads/main'] ?? null;
+      const vault = db.vaults.find((candidate) => candidate.vault_id === operation.vault_id);
+      if (!vault || typeof targetMain !== 'string') {
+        operation.result = { reason: 'server_merge_reconciliation_failed' };
+        operation.updated_at = nowIso();
+        if (vault) {
+          vault.status = 'blocked_integrity';
+          vault.updated_at = nowIso();
+        }
+        return;
+      }
+      const device = operation.device_id
+        ? db.devices.find((candidate) => candidate.device_id === operation.device_id)
+        : undefined;
+      vault.current_main = targetMain;
+      vault.updated_at = nowIso();
+      if (device) {
+        device.status = 'synced';
+        device.last_successful_sync_at = nowIso();
+      }
+      operation.status = 'committed';
+      operation.target_commit = targetMain;
+      operation.result = {
+        decision: 'merged',
+        merge_commit: targetMain,
+        reconciled_after_startup: true
+      };
+      operation.updated_at = nowIso();
+      const manifest = operation.prepared_manifest ?? {};
+      store.appendEvent(db, {
+        event_type: 'main_advanced',
+        vault_id: operation.vault_id,
+        resource_ids: device ? { device_id: device.device_id } : {},
+        commit_cursors: {
+          previous_main: previousMain,
+          main: targetMain,
+          device_commit: stringValue(manifest.device_commit)
+        },
+        payload: {
+          decision: 'merged',
+          merge_sequence: manifest.merge_sequence ?? null,
+          merge_policy_version: manifest.merge_policy_version ?? null,
+          reconciled_after_startup: true
+        }
+      });
+      return;
+    }
+
+    operation.status = 'aborted';
+    operation.result = { reason: 'startup_prepared_operation_without_ref_mutation' };
+    operation.updated_at = nowIso();
+  });
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
 }
 
 function firstDetail(details: Array<string | null | undefined>): string {

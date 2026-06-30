@@ -4,6 +4,9 @@ import { dirname, join } from 'node:path';
 import { newId, nowIso } from '../shared/ids.js';
 import type { ConflictRecord, EventEnvelope, SyncProfile } from '../shared/types.js';
 
+const EVENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const EVENT_RETENTION_LIMIT = 100_000;
+
 export type PasswordHash = {
   algorithm: 'argon2id';
   hash: string;
@@ -195,6 +198,7 @@ export class MetadataStore {
       ...event
     };
     db.events.push(envelope);
+    this.pruneVaultEvents(db, event.vault_id);
     return envelope;
   }
 
@@ -244,6 +248,19 @@ export class MetadataStore {
         legacyDevice.sync_plugins = false;
       }
     }
+  }
+
+  private pruneVaultEvents(db: MetadataDb, vaultId: string): void {
+    const cutoff = Date.now() - EVENT_RETENTION_MS;
+    const retainedVaultEvents = db.events
+      .filter((event) => event.vault_id === vaultId)
+      .filter((event) => {
+        const createdAt = Date.parse(event.created_at);
+        return Number.isNaN(createdAt) || createdAt >= cutoff;
+      })
+      .slice(-EVENT_RETENTION_LIMIT);
+    const retainedIds = new Set(retainedVaultEvents.map((event) => event.event_id));
+    db.events = db.events.filter((event) => event.vault_id !== vaultId || retainedIds.has(event.event_id));
   }
 }
 

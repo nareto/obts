@@ -21,6 +21,13 @@ export class SyncService {
     manifest: DevicePushManifest,
     packfile: Buffer
   ): Promise<PushResult> {
+    if (auth.vault.status === 'blocked_integrity') {
+      return {
+        status: 'rejected',
+        code: 'blocked_integrity',
+        message: 'Vault persistent state failed integrity checks.'
+      };
+    }
     if (manifest.vault_id !== auth.vault.vault_id || manifest.device_id !== auth.device.device_id) {
       return { status: 'rejected', code: 'not_found', message: 'Resource not found.' };
     }
@@ -317,7 +324,7 @@ export class SyncService {
     });
     let mergeCommit: string;
     try {
-      mergeCommit = await this.git.createOverlayMergeCommit(
+      mergeCommit = await this.git.createOverlayMergeCommitObject(
         vaultId,
         base,
         main,
@@ -325,6 +332,8 @@ export class SyncService {
         deviceChanges,
         mergePreparation.mergeSequence
       );
+      await this.prepareMergeRefUpdate(mergePreparation.operationId, mergeCommit);
+      await this.git.updateRef(vaultId, 'refs/heads/main', mergeCommit, main);
     } catch (error) {
       await this.abortOperation(mergePreparation.operationId, 'merge_git_error');
       throw error;
@@ -443,7 +452,7 @@ export class SyncService {
 
     let mergeCommit: string;
     try {
-      mergeCommit = await this.git.createMergeCommitFromTree({
+      mergeCommit = await this.git.createMergeCommitObjectFromTree({
         vaultId,
         tree: mergeTree.tree,
         base,
@@ -452,6 +461,8 @@ export class SyncService {
         mergeSequence: mergePreparation.mergeSequence,
         strategy: mergeTree.validatorResults.semantic_merge === 'clean' ? 'semantic_clean' : 'native_clean'
       });
+      await this.prepareMergeRefUpdate(mergePreparation.operationId, mergeCommit);
+      await this.git.updateRef(vaultId, 'refs/heads/main', mergeCommit, currentMain);
     } catch (error) {
       await this.abortOperation(mergePreparation.operationId, 'merge_git_error');
       throw error;
@@ -717,6 +728,27 @@ export class SyncService {
         operation.result = { reason };
         operation.updated_at = nowIso();
       }
+    });
+  }
+
+  private async prepareMergeRefUpdate(operationId: string, mergeCommit: string): Promise<void> {
+    await this.store.mutate((db) => {
+      const operation = requireOperation(db, operationId);
+      if (operation.status !== 'prepared') {
+        throw new Error(`Operation cannot prepare merge ref update from status ${operation.status}.`);
+      }
+      operation.target_refs = {
+        'refs/heads/main': mergeCommit
+      };
+      operation.target_commit = mergeCommit;
+      operation.prepared_manifest = {
+        ...(operation.prepared_manifest ?? {}),
+        target_refs: {
+          'refs/heads/main': mergeCommit
+        },
+        target_commit: mergeCommit
+      };
+      operation.updated_at = nowIso();
     });
   }
 

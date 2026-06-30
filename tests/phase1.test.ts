@@ -932,6 +932,103 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(body.checks.persistent_state).toBe(false);
   });
 
+  it('rolls forward a prepared merge operation when startup finds main already advanced', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'reconcile-merge-device');
+    await mkdirp(deviceDir);
+    await writeFile(join(deviceDir, 'reconcile.md'), 'prepared merge target\n');
+    const plugin = await pairPlugin(admin, deviceDir, 'desktop');
+    await plugin.syncOnce({ confirmInitialImport: true });
+
+    const committedDb = await server.store.snapshot();
+    const mergeOperation = committedDb.sync_operations.findLast(
+      (operation) => operation.operation_type === 'server_merge' && operation.status === 'committed'
+    );
+    expect(mergeOperation?.target_commit).toMatch(/^[0-9a-f]{40}$/u);
+    expect(mergeOperation?.target_refs).toMatchObject({
+      'refs/heads/main': mergeOperation?.target_commit
+    });
+    const targetMain = mergeOperation!.target_commit!;
+    const previousMain = mergeOperation!.expected_refs['refs/heads/main'];
+    expect(previousMain).toMatch(/^[0-9a-f]{40}$/u);
+
+    await server.store.mutate((db) => {
+      const operation = db.sync_operations.find((candidate) => candidate.operation_id === mergeOperation!.operation_id);
+      expect(operation).toBeDefined();
+      operation!.status = 'prepared';
+      operation!.result = null;
+      const vault = db.vaults.find((candidate) => candidate.vault_id === admin.vaultId);
+      expect(vault).toBeDefined();
+      vault!.current_main = previousMain!;
+      const device = db.devices.find((candidate) => candidate.device_id === mergeOperation!.device_id);
+      expect(device).toBeDefined();
+      device!.status = 'ahead';
+      device!.last_successful_sync_at = null;
+    });
+
+    await server.app.close();
+    server = await createObtsServer({
+      dataDir: join(root, 'server-data'),
+      publicBaseUrl: 'http://127.0.0.1:0',
+      sessionSecret: 'test-session-secret-with-enough-entropy'
+    });
+    baseUrl = await server.app.listen({ port: 0, host: '127.0.0.1' });
+
+    const ready = await fetch(`${baseUrl}/health/ready`);
+    expect(ready.status).toBe(200);
+    const reconciledDb = await server.store.snapshot();
+    expect(reconciledDb.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(targetMain);
+    const reconciledOperation = reconciledDb.sync_operations.find(
+      (operation) => operation.operation_id === mergeOperation!.operation_id
+    );
+    expect(reconciledOperation).toMatchObject({
+      status: 'committed',
+      result: {
+        decision: 'merged',
+        merge_commit: targetMain,
+        reconciled_after_startup: true
+      }
+    });
+    expect(
+      reconciledDb.events.find((event) => event.event_type === 'main_advanced' && event.payload.reconciled_after_startup === true)
+    ).toBeDefined();
+  });
+
+  it('returns 410 when an event cursor has fallen behind retained event history', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    await server.store.mutate((db) => {
+      for (const event of db.events.filter((candidate) => candidate.vault_id === admin.vaultId)) {
+        event.created_at = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString();
+      }
+      server.store.appendEvent(db, {
+        event_type: 'device_state_changed',
+        vault_id: admin.vaultId,
+        resource_ids: {},
+        commit_cursors: {},
+        payload: { status: 'checking' }
+      });
+    });
+
+    const expired = await admin.get<{
+      error: { code: string; details: { current_event_seq: number; oldest_available_event_seq: number } };
+    }>(`/api/v1/vaults/${admin.vaultId}/events?after=0`);
+    expect(expired.status).toBe(410);
+    expect(expired.body.error).toMatchObject({
+      code: 'event_cursor_expired',
+      details: {
+        current_event_seq: 2,
+        oldest_available_event_seq: 2
+      }
+    });
+
+    const replay = await admin.get<{ events: Array<{ event_seq: number }>; current_event_seq: number }>(
+      `/api/v1/vaults/${admin.vaultId}/events?after=1`
+    );
+    expect(replay.status).toBe(200);
+    expect(replay.body.events.map((event) => event.event_seq)).toEqual([2]);
+    expect(replay.body.current_event_seq).toBe(2);
+  });
+
   it('blocks sync on restart when an incomplete apply journal is present', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'journal-device');

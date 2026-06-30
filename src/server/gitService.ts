@@ -215,9 +215,22 @@ export class GitService {
     deviceChanges: GitDiffEntry[],
     mergeSequence: number
   ): Promise<string> {
+    const commit = await this.createOverlayMergeCommitObject(vaultId, base, currentMain, deviceCommit, deviceChanges, mergeSequence);
+    await this.updateRef(vaultId, 'refs/heads/main', commit, currentMain);
+    return commit;
+  }
+
+  async createOverlayMergeCommitObject(
+    vaultId: string,
+    base: string,
+    currentMain: string,
+    deviceCommit: string,
+    deviceChanges: GitDiffEntry[],
+    mergeSequence: number
+  ): Promise<string> {
     const repo = this.repoPath(vaultId);
     const tree = await this.createOverlayTree(vaultId, currentMain, deviceCommit, deviceChanges, new Map());
-    const commit = asText(
+    return asText(
       await this.exec(
         repo,
         [
@@ -234,8 +247,6 @@ export class GitService {
         serverGitEnv('obts-merge')
       ).then((result) => result.stdout)
     ).trim();
-    await this.updateRef(vaultId, 'refs/heads/main', commit, currentMain);
-    return commit;
   }
 
   private async createOverlayTree(
@@ -354,8 +365,22 @@ export class GitService {
     mergeSequence: number;
     strategy: 'disjoint_overlay' | 'native_clean' | 'semantic_clean';
   }): Promise<string> {
+    const commit = await this.createMergeCommitObjectFromTree(input);
+    await this.updateRef(input.vaultId, 'refs/heads/main', commit, input.currentMain);
+    return commit;
+  }
+
+  async createMergeCommitObjectFromTree(input: {
+    vaultId: string;
+    tree: string;
+    base: string;
+    currentMain: string;
+    deviceCommit: string;
+    mergeSequence: number;
+    strategy: 'disjoint_overlay' | 'native_clean' | 'semantic_clean';
+  }): Promise<string> {
     const repo = this.repoPath(input.vaultId);
-    const commit = asText(
+    return asText(
       await this.exec(
         repo,
         [
@@ -372,8 +397,6 @@ export class GitService {
         serverGitEnv('obts-merge')
       ).then((result) => result.stdout)
     ).trim();
-    await this.updateRef(input.vaultId, 'refs/heads/main', commit, input.currentMain);
-    return commit;
   }
 
   async readBlobAtPath(vaultId: string, commit: string, path: string): Promise<Buffer> {

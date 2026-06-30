@@ -19,6 +19,10 @@ Backups must be point-in-time consistent across metadata and Git stores.
 open conflict still points at existing commits. If a restore loses required Git
 state or metadata, readiness fails closed until operator repair.
 
+Event rows are retained for 30 days or 100,000 events per vault. Clients that
+resume from an older pruned cursor receive `410 event_cursor_expired` and must
+refresh vault state before polling from an available cursor.
+
 Phase 1 does not implement application-level encrypted persistence. Offline
 disclosure protection depends on deployment-managed filesystem, volume,
 snapshot, or database-backup encryption and restrictive permissions. Keep those
