@@ -283,6 +283,10 @@ export class SyncService {
     const deviceChanges = await this.git.changedPaths(vaultId, base, deviceCommit);
     const overlapping = intersectChangedPaths(mainChanges, deviceChanges);
     if (overlapping.length > 0) {
+      const identityMerge = await this.tryIdentityOverlappingMerge(vaultId, deviceId, base, main, deviceCommit, deviceChanges, overlapping);
+      if (identityMerge) {
+        return identityMerge;
+      }
       const cleanMerge = await this.tryCleanOverlappingMerge(vaultId, deviceId, base, main, deviceCommit, deviceChanges, overlapping);
       if (cleanMerge) {
         return cleanMerge;
@@ -400,6 +404,149 @@ export class SyncService {
       merge_commit: mergeCommit,
       event_seq: eventSeq
     };
+  }
+
+  private async tryIdentityOverlappingMerge(
+    vaultId: string,
+    deviceId: string,
+    base: string,
+    currentMain: string,
+    deviceCommit: string,
+    deviceChanges: GitDiffEntry[],
+    overlapping: string[]
+  ): Promise<PushResult | null> {
+    for (const path of overlapping) {
+      const currentContent = await this.readOptionalBlob(vaultId, currentMain, path);
+      const deviceContent = await this.readOptionalBlob(vaultId, deviceCommit, path);
+      if (currentContent === null && deviceContent === null) {
+        continue;
+      }
+      if (currentContent === null || deviceContent === null || !currentContent.equals(deviceContent)) {
+        return null;
+      }
+    }
+
+    const mergePreparation = await this.store.mutate((db) => {
+      const device = requireDevice(db, deviceId);
+      const mergeSequence = this.store.nextMergeSequence(db, vaultId);
+      const operation = this.store.startOperation(db, {
+        vault_id: vaultId,
+        device_id: deviceId,
+        operation_type: 'server_merge',
+        expected_refs: {
+          'refs/heads/main': currentMain,
+          [device.device_ref]: deviceCommit
+        },
+        target_refs: {
+          'refs/heads/main': null
+        },
+        target_commit: null
+      });
+      operation.status = 'prepared';
+      operation.prepared_manifest = {
+        merge_sequence: mergeSequence,
+        merge_policy_version: MERGE_POLICY_VERSION,
+        base_commit: base,
+        current_main: currentMain,
+        device_commit: deviceCommit,
+        decision: 'merge',
+        validator_results: {
+          identity_only_merge: 'ok',
+          overlapping_path_count: overlapping.length
+        }
+      };
+      operation.updated_at = nowIso();
+      return { mergeSequence, operationId: operation.operation_id };
+    });
+
+    let mergeCommit: string;
+    try {
+      mergeCommit = await this.git.createOverlayMergeCommitObject(
+        vaultId,
+        base,
+        currentMain,
+        deviceCommit,
+        deviceChanges,
+        mergePreparation.mergeSequence
+      );
+      await this.prepareMergeRefUpdate(mergePreparation.operationId, mergeCommit);
+      await this.git.updateRef(vaultId, 'refs/heads/main', mergeCommit, currentMain);
+    } catch (error) {
+      await this.abortOperation(mergePreparation.operationId, 'merge_git_error');
+      throw error;
+    }
+
+    const eventSeq = await this.store.mutate((db) => {
+      const operation = requireOperation(db, mergePreparation.operationId);
+      operation.status = 'committed';
+      operation.target_refs = {
+        'refs/heads/main': mergeCommit
+      };
+      operation.target_commit = mergeCommit;
+      operation.result = {
+        decision: 'merged',
+        merge_commit: mergeCommit
+      };
+      operation.updated_at = nowIso();
+      const vault = requireVault(db, vaultId);
+      const device = requireDevice(db, deviceId);
+      vault.current_main = mergeCommit;
+      vault.updated_at = nowIso();
+      device.status = 'synced';
+      device.last_successful_sync_at = nowIso();
+      const event = this.store.appendEvent(db, {
+        event_type: 'main_advanced',
+        vault_id: vaultId,
+        resource_ids: {
+          device_id: deviceId
+        },
+        commit_cursors: {
+          previous_main: currentMain,
+          main: mergeCommit,
+          device_commit: deviceCommit
+        },
+        payload: {
+          decision: 'merged',
+          merge_sequence: mergePreparation.mergeSequence,
+          merge_policy_version: MERGE_POLICY_VERSION,
+          base_commit: base,
+          current_main: currentMain,
+          device_commit: deviceCommit,
+          validator_results: {
+            identity_only_merge: 'ok',
+            overlapping_path_count: overlapping.length
+          },
+          changed_path_count: changedPathSet(deviceChanges).size
+        }
+      });
+      db.audit_log.push({
+        audit_id: newId('aud'),
+        actor_user_id: device.user_id,
+        actor_device_id: deviceId,
+        vault_id: vaultId,
+        action: 'main_advanced',
+        resource_class: 'vault',
+        resource_id: vaultId,
+        created_at: nowIso()
+      });
+      return event.event_seq;
+    });
+
+    return {
+      status: 'merged',
+      device_ref: deviceCommit,
+      main: mergeCommit,
+      merge_commit: mergeCommit,
+      event_seq: eventSeq
+    };
+  }
+
+  private async readOptionalBlob(vaultId: string, commit: string, path: string): Promise<Buffer | null> {
+    try {
+      return await this.git.readBlobAtPath(vaultId, commit, path);
+    } catch {
+      return null;
+    }
   }
 
   private async tryCleanOverlappingMerge(

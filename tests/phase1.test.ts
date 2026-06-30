@@ -15,7 +15,7 @@ import {
   normalizeVaultPath,
   PathPolicyViolation
 } from '../src/shared/pathPolicy.js';
-import { API_VERSION } from '../src/shared/types.js';
+import { API_VERSION, type SyncProfile } from '../src/shared/types.js';
 
 type Json = Record<string, unknown>;
 
@@ -807,6 +807,41 @@ describe('Phase 1 sync without conflict resolution', () => {
         decision: 'conflict',
         reason: 'overlapping_paths',
         path_count: 2
+      }
+    });
+  });
+
+  it('auto-merges same-path binary attachment edits when object identity matches', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const device1Dir = join(root, 'binary-identity-device-1');
+    const device2Dir = join(root, 'binary-identity-device-2');
+    await mkdirp(device1Dir);
+    await mkdirp(device2Dir);
+
+    const plugin1 = await pairPluginWithProfile(admin, device1Dir, 'desktop', 'notes_plus_attachments');
+    const plugin2 = await pairPluginWithProfile(admin, device2Dir, 'tablet', 'notes_plus_attachments');
+    const imageBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01, 0x02, 0x03]);
+    await writeFile(join(device1Dir, 'diagram.png'), imageBytes);
+    await writeFile(join(device2Dir, 'diagram.png'), imageBytes);
+    await writeFile(join(device2Dir, 'tablet.md'), 'device-specific note\n');
+
+    expect((await plugin1.syncOnce()).status).toBe('Synced');
+    expect((await plugin2.syncOnce()).status).toBe('Synced');
+    await plugin1.syncOnce();
+
+    expect(await readFile(join(device1Dir, 'diagram.png'))).toEqual(imageBytes);
+    expect(await readFile(join(device2Dir, 'diagram.png'))).toEqual(imageBytes);
+    expect(await readFile(join(device1Dir, 'tablet.md'), 'utf8')).toBe('device-specific note\n');
+    const db = await server.store.snapshot();
+    expect(db.conflicts).toHaveLength(0);
+    const identityMerge = db.sync_operations.findLast(
+      (operation) => operation.operation_type === 'server_merge' && operation.prepared_manifest?.validator_results !== undefined
+    );
+    expect(identityMerge?.prepared_manifest).toMatchObject({
+      decision: 'merge',
+      validator_results: {
+        identity_only_merge: 'ok',
+        overlapping_path_count: 1
       }
     });
   });
@@ -1677,15 +1712,24 @@ async function setupAdminAndVault(baseUrl: string): Promise<BrowserSession & { v
 }
 
 async function pairPlugin(admin: BrowserSession & { vaultId: string }, vaultDir: string, deviceName: string): Promise<ObtsPluginClient> {
+  return await pairPluginWithProfile(admin, vaultDir, deviceName, 'notes_only');
+}
+
+async function pairPluginWithProfile(
+  admin: BrowserSession & { vaultId: string },
+  vaultDir: string,
+  deviceName: string,
+  syncProfile: SyncProfile
+): Promise<ObtsPluginClient> {
   const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
     device_name: deviceName,
-    sync_profile: 'notes_only'
+    sync_profile: syncProfile
   });
   expect(pairing.status).toBe(201);
   const plugin = new ObtsPluginClient(vaultDir, {
     serverUrl: baseUrlFromAdmin(admin),
     deviceName,
-    syncProfile: 'notes_only',
+    syncProfile,
     syncPlugins: false
   });
   await plugin.pairWithToken(pairing.body.pairing_token);
