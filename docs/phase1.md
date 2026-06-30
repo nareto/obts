@@ -31,6 +31,8 @@ Conflict package rendering, manual resolution, note history, restore, and render
 
 The Vitest suite in `tests/phase1.test.ts` proves:
 
+- first-run setup is one-time, liveness/readiness health endpoints work, and
+  new vaults create a real empty-tree `refs/heads/main` commit immediately;
 - two paired devices sync non-conflicting vault changes through server `main`;
 - dashboard passwords are stored as Argon2id hashes using the PRD v1 minimum parameters;
 - sensitive admin account creation requires recent dashboard authentication;
@@ -54,7 +56,8 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - authenticated sync rejections append redacted `device_sync_rejected` events for dashboard/event polling;
 - uploaded files larger than the configured byte limit are rejected before refs advance;
 - a third device receives the safe current `main` while a conflict remains open;
-- cross-user access to vault main, conflicts, and events returns `404`;
+- cross-user access to vault main, dashboard, conflicts, device sync push/pull,
+  and events returns `404`;
 - restored metadata that points at missing Git state makes `/health/ready` return `503`;
 - prepared sync operations recover deterministically on restart when Git refs already moved or abort safely before ref mutation;
 - event polling returns `410` for expired cursors after retention pruning;

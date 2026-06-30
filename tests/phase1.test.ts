@@ -84,6 +84,45 @@ describe('Phase 1 sync without conflict resolution', () => {
     await rm(root, { recursive: true, force: true });
   });
 
+  it('runs first setup once and initializes vault main to a real empty-tree commit', async () => {
+    const admin = new BrowserSession(baseUrl);
+    const setupBefore = await admin.get<{ setup_complete: boolean }>('/api/v1/setup/status');
+    expect(setupBefore.status).toBe(200);
+    expect(setupBefore.body.setup_complete).toBe(false);
+
+    const live = await fetch(`${baseUrl}/health/live`);
+    expect(live.status).toBe(200);
+
+    const setup = await admin.post<{ user_id: string; csrf_token: string }>('/api/v1/setup', {
+      username: 'admin',
+      password: 'admin-password-1234',
+      display_name: 'Admin'
+    }, false);
+    expect(setup.status).toBe(201);
+
+    const repeat = await admin.post<{ error: { code: string } }>('/api/v1/setup', {
+      username: 'second-admin',
+      password: 'admin-password-5678'
+    }, false);
+    expect(repeat.status).toBe(409);
+    expect(repeat.body.error.code).toBe('setup_complete');
+
+    const setupAfter = await admin.get<{ setup_complete: boolean }>('/api/v1/setup/status');
+    expect(setupAfter.status).toBe(200);
+    expect(setupAfter.body.setup_complete).toBe(true);
+
+    const vault = await admin.post<{ vault_id: string; current_main: string }>('/api/v1/vaults', {
+      display_name: 'Main Vault'
+    });
+    expect(vault.status).toBe(201);
+    expect(vault.body.current_main).toMatch(/^[0-9a-f]{40}$/u);
+    expect(await server.git.getRef(vault.body.vault_id, 'refs/heads/main')).toBe(vault.body.current_main);
+    expect(await server.git.listTreePaths(vault.body.vault_id, vault.body.current_main)).toEqual([]);
+
+    const ready = await fetch(`${baseUrl}/health/ready`);
+    expect(ready.status).toBe(200);
+  });
+
   it('pairs two devices and syncs non-conflicting vault changes through server main', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const device1Dir = join(root, 'device-1');
@@ -1531,6 +1570,7 @@ describe('Phase 1 sync without conflict resolution', () => {
 
     for (const path of [
       `/api/v1/vaults/${admin.vaultId}/main`,
+      `/api/v1/vaults/${admin.vaultId}/dashboard`,
       `/api/v1/vaults/${admin.vaultId}/conflicts?status=open`,
       `/api/v1/vaults/${admin.vaultId}/events`
     ]) {
@@ -1561,6 +1601,33 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(syncResponse.status).toBe(404);
     const syncBody = (await syncResponse.json()) as { error: { code: string } };
     expect(syncBody.error.code).toBe('not_found');
+
+    const pushForm = new FormData();
+    const emptyPackfile = Buffer.alloc(0);
+    pushForm.append(
+      'manifest',
+      JSON.stringify({
+        api_version: API_VERSION,
+        vault_id: admin.vaultId,
+        device_id: otherPluginState.device_id,
+        expected_device_ref: null,
+        target_commit: otherPluginState.local_main,
+        packfile_sha256: sha256(emptyPackfile),
+        packfile_bytes: emptyPackfile.byteLength,
+        client_known_main: otherPluginState.local_main
+      })
+    );
+    pushForm.append('packfile', new Blob([emptyPackfile], { type: 'application/x-git-packed-objects' }), 'push.pack');
+    const pushResponse = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/push`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${otherTokenFile.device_token}`
+      },
+      body: pushForm
+    });
+    expect(pushResponse.status).toBe(404);
+    const pushBody = (await pushResponse.json()) as { error: { code: string } };
+    expect(pushBody.error.code).toBe('not_found');
   });
 
   it('rejects internal and visible Git paths in the shared path policy', () => {
