@@ -9,6 +9,7 @@ import { ObtsPluginClient, PluginBlockedError } from '../src/plugin/client.js';
 import { LocalGitEngine } from '../src/plugin/localGit.js';
 import { TransportClient } from '../src/plugin/transport.js';
 import { createObtsServer, type ObtsServer } from '../src/server/app.js';
+import { MetadataStore } from '../src/server/metadataStore.js';
 import {
   assertSyncableTreePaths,
   isSyncableVaultPath,
@@ -1768,6 +1769,31 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(isSyncableVaultPath('.obsidian/plugins/example/main.js', fullNoPlugins)).toBe(false);
     expect(isSyncableVaultPath('.obsidian/plugins/example/main.js', fullWithPlugins)).toBe(true);
     expect(isSyncableVaultPath('.obsidian/plugins/obts/main.js', fullWithPlugins)).toBe(false);
+  });
+
+  it('serializes metadata snapshots behind in-flight mutations', async () => {
+    const store = new MetadataStore(join(root, 'snapshot-serialization'));
+    await store.initialize();
+    let releaseMutation!: () => void;
+    const mutationCanFinish = new Promise<void>((resolve) => {
+      releaseMutation = resolve;
+    });
+
+    const mutation = store.mutate(async (db) => {
+      db.setup_complete = true;
+      await mutationCanFinish;
+    });
+    let snapshotResolved = false;
+    const snapshot = store.snapshot().then((db) => {
+      snapshotResolved = true;
+      return db;
+    });
+
+    await sleep(10);
+    expect(snapshotResolved).toBe(false);
+    releaseMutation();
+    await mutation;
+    expect((await snapshot).setup_complete).toBe(true);
   });
 });
 

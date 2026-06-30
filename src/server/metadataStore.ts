@@ -151,6 +151,7 @@ export class MetadataStore {
   }
 
   async snapshot(): Promise<MetadataDb> {
+    await this.pending;
     await this.ensureLoaded();
     return clone(this.requireDb());
   }
@@ -161,7 +162,7 @@ export class MetadataStore {
     this.pending = new Promise((resolve) => {
       release = resolve;
     });
-      await previous;
+    await previous;
     try {
       await this.ensureLoaded();
       const result = await fn(this.requireDb());
