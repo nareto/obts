@@ -33,6 +33,10 @@ Implemented runtime pieces:
 - Same-path binary and attachment edits merge automatically only when the accepted server version and uploaded device version have identical blob content; otherwise they remain review-needed conflicts.
 - Merge operations persist the exact target commit and target ref in the prepared operation manifest before advancing `refs/heads/main`; startup reconciliation aborts unprepared writes, rolls forward prepared writes whose Git refs already moved, resumes merged-or-conflicted processing for recovered device ref updates, and marks unreconcilable vault state as `blocked_integrity`.
 - Vault event polling retains 30 days or 100,000 events per vault, returns `410 event_cursor_expired` when a client cursor predates retained history, and includes the current and oldest available event cursors in the redacted error details.
+- Paired devices can poll the same redacted vault event stream through
+  `GET /api/v1/vaults/{vault_id}/sync/events` with their device token, so the
+  plugin can observe `main_advanced`, conflict, rejection, and recovery events
+  without a dashboard session cookie.
 - Plugin-side `.obts/` state with `isomorphic-git`, device token storage, durable watcher change hints, queue state, recovery bundles with file snapshots, text patches, local Git refs packs, and artifact checksums, local apply lock, apply journal, local commit creation, multipart push, multipart pull, safe apply, incomplete-journal blocking, explicit replace-local-with-server recovery, and explicit rebuild from current server `main`.
 - Rebuild classifies repeated, same-device fast-forward, snapshot-only, and divergent local history: fast-forward commits stay queued, snapshot-only edits become a new recovery commit based on rebuilt `main`, and divergent same-device history blocks for export plus reset or re-pair.
 - Plugin sync records server-created conflicts as a local `Review needed` blocking state, so later automatic sync or pull/apply attempts stop before replacing local review content.
@@ -82,6 +86,9 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - retried uploads whose device ref already advanced but whose commit is not yet in `main` resume merge evaluation instead of becoming a false no-op;
 - uploaded commits that introduce paths outside the paired device's sync profile are rejected before refs advance;
 - authenticated sync rejections append redacted `device_sync_rejected` events for dashboard/event polling;
+- paired devices can poll redacted vault events through device-token auth, receive
+  `main_advanced` after another device advances server `main`, and receive the
+  same `410 event_cursor_expired` retained-history signal as dashboard polling;
 - dashboard device status uses acknowledged commit cursors, not `last_successful_sync_at`, to decide whether a device is Behind or Synced;
 - uploaded files larger than the configured byte limit are rejected before refs advance;
 - a third device receives the safe current `main` while a conflict remains open;

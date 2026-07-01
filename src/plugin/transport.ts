@@ -1,4 +1,10 @@
-import { API_VERSION, type DevicePullManifest, type DevicePushManifest, type PushResult } from '../shared/types.js';
+import {
+  API_VERSION,
+  type DevicePullManifest,
+  type DevicePushManifest,
+  type EventEnvelope,
+  type PushResult
+} from '../shared/types.js';
 import { parseDevicePullRequest, parseDevicePushManifest } from '../shared/validators.js';
 
 export type PairConsumeResult = {
@@ -87,6 +93,23 @@ export class TransportClient {
     const contentType = response.headers.get('content-type') ?? '';
     const buffer = Buffer.from(await response.arrayBuffer());
     return parseMultipartPull(contentType, buffer);
+  }
+
+  async pollEvents(input: {
+    vaultId: string;
+    deviceToken: string;
+    after?: number;
+  }): Promise<{ events: EventEnvelope[]; current_event_seq: number }> {
+    const after = input.after ?? 0;
+    if (!Number.isSafeInteger(after) || after < 0) {
+      throw new Error('Event cursor must be a non-negative safe integer.');
+    }
+    const response = await fetch(this.url(`/api/v1/vaults/${input.vaultId}/sync/events?after=${after}`), {
+      headers: {
+        authorization: `Bearer ${input.deviceToken}`
+      }
+    });
+    return await readJsonOrThrow<{ events: EventEnvelope[]; current_event_seq: number }>(response);
   }
 
   private url(path: string): string {

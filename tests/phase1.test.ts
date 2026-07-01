@@ -2202,6 +2202,78 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(replay.body.current_event_seq).toBe(2);
   });
 
+  it('lets paired devices poll redacted vault events without dashboard session cookies', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const device1Dir = join(root, 'device-event-poller-1');
+    const device2Dir = join(root, 'device-event-poller-2');
+    await mkdirp(device1Dir);
+    await mkdirp(device2Dir);
+    await writeFile(join(device1Dir, 'base.md'), 'base\n');
+    const plugin1 = await pairPlugin(admin, device1Dir, 'desktop');
+    await plugin1.syncOnce({ confirmInitialImport: true });
+    const plugin2 = await pairPlugin(admin, device2Dir, 'phone');
+    const token2 = await readDeviceToken(device2Dir);
+    const transport = new TransportClient(baseUrl);
+
+    const initialEvents = await transport.pollEvents({
+      vaultId: admin.vaultId,
+      deviceToken: token2,
+      after: 0
+    });
+    expect(initialEvents.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event_type: 'main_advanced',
+          commit_cursors: expect.objectContaining({
+            main: expect.stringMatching(/^[0-9a-f]{40}$/u)
+          })
+        })
+      ])
+    );
+
+    await writeFile(join(device1Dir, 'from-desktop.md'), 'server event\n');
+    expect((await plugin1.syncOnce()).status).toBe('Synced');
+
+    const afterAdvance = await transport.pollEvents({
+      vaultId: admin.vaultId,
+      deviceToken: token2,
+      after: initialEvents.current_event_seq
+    });
+    expect(afterAdvance.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event_type: 'main_advanced',
+          resource_ids: expect.objectContaining({
+            device_id: (await plugin1.readState()).device_id
+          }),
+          payload: expect.objectContaining({
+            decision: 'merged'
+          })
+        })
+      ])
+    );
+
+    await server.store.mutate((db) => {
+      for (const event of db.events.filter((candidate) => candidate.vault_id === admin.vaultId)) {
+        event.created_at = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString();
+      }
+      server.store.appendEvent(db, {
+        event_type: 'device_state_changed',
+        vault_id: admin.vaultId,
+        resource_ids: {},
+        commit_cursors: {},
+        payload: { status: 'checking' }
+      });
+    });
+    await expect(
+      transport.pollEvents({
+        vaultId: admin.vaultId,
+        deviceToken: token2,
+        after: 0
+      })
+    ).rejects.toMatchObject({ status: 410, code: 'event_cursor_expired' });
+  });
+
   it('blocks sync on restart when an incomplete apply journal is present', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'journal-device');
@@ -2942,6 +3014,15 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(syncResponse.status).toBe(404);
     const syncBody = (await syncResponse.json()) as { error: { code: string } };
     expect(syncBody.error.code).toBe('not_found');
+
+    const eventResponse = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/events?after=0`, {
+      headers: {
+        authorization: `Bearer ${otherTokenFile.device_token}`
+      }
+    });
+    expect(eventResponse.status).toBe(404);
+    const eventBody = (await eventResponse.json()) as { error: { code: string } };
+    expect(eventBody.error.code).toBe('not_found');
 
     const pushForm = new FormData();
     const emptyPackfile = Buffer.alloc(0);

@@ -355,6 +355,29 @@ paths:
           $ref: "#/components/responses/Error"
         "404":
           $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/sync/events:
+    get:
+      summary: Poll redacted vault events using a paired device token.
+      security:
+        - deviceBearer: []
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - name: after
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        "200":
+          description: Redacted device-visible event page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventPage"
+        "404":
+          $ref: "#/components/responses/Error"
+        "410":
+          $ref: "#/components/responses/Error"
   /vaults/{vault_id}/conflicts:
     get:
       summary: List durable conflict records for an owned vault.
@@ -387,6 +410,10 @@ paths:
       responses:
         "200":
           description: Event page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventPage"
         "410":
           $ref: "#/components/responses/Error"
         "404":
@@ -674,6 +701,63 @@ components:
             type: string
         event_seq:
           type: integer
+    EventPage:
+      type: object
+      required: [events, current_event_seq]
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/EventEnvelope"
+        current_event_seq:
+          type: integer
+          minimum: 0
+    EventEnvelope:
+      type: object
+      required:
+        - event_id
+        - event_seq
+        - event_type
+        - vault_id
+        - resource_ids
+        - commit_cursors
+        - payload
+        - created_at
+      properties:
+        event_id:
+          type: string
+          pattern: "^evt_"
+        event_seq:
+          type: integer
+          minimum: 1
+        event_type:
+          type: string
+          enum:
+            - main_advanced
+            - device_ref_updated
+            - device_sync_rejected
+            - device_recovery_required
+            - conflict_created
+            - conflict_resolved
+            - device_state_changed
+        vault_id:
+          type: string
+          pattern: "^vlt_"
+        resource_ids:
+          type: object
+          additionalProperties:
+            type: string
+        commit_cursors:
+          type: object
+          additionalProperties:
+            oneOf:
+              - type: "null"
+              - type: string
+        payload:
+          type: object
+        created_at:
+          type: string
+          format: date-time
     SyncProfile:
       type: string
       enum: [notes_only, notes_plus_attachments, full_vault_config]

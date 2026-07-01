@@ -27,6 +27,7 @@ describe('OpenAPI Phase 1 contract', () => {
       '/pair/consume',
       '/vaults/{vault_id}/sync/push',
       '/vaults/{vault_id}/sync/pull',
+      '/vaults/{vault_id}/sync/events',
       '/vaults/{vault_id}/conflicts',
       '/vaults/{vault_id}/events'
     ]) {
@@ -46,11 +47,18 @@ describe('OpenAPI Phase 1 contract', () => {
 
     const pullSection = contract.slice(
       contract.indexOf('/vaults/{vault_id}/sync/pull'),
-      contract.indexOf('/vaults/{vault_id}/conflicts')
+      contract.indexOf('/vaults/{vault_id}/sync/events')
     );
     expect(pullSection).toContain('multipart/form-data');
     expect(pullSection).toContain('DevicePullRequest');
     expect(pullSection).toContain('packfile');
     expect(pullSection).not.toContain('application/json:');
+
+    const deviceEventsSection = contract.slice(
+      contract.indexOf('/vaults/{vault_id}/sync/events'),
+      contract.indexOf('/vaults/{vault_id}/conflicts')
+    );
+    expect(deviceEventsSection).toContain('deviceBearer');
+    expect(deviceEventsSection).toContain('EventPage');
   });
 });

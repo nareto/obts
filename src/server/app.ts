@@ -473,6 +473,12 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     });
   });
 
+  app.get('/api/v1/vaults/:vaultId/sync/events', async (request, reply) => {
+    const { vaultId } = pathParams(request);
+    const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+    return sendEventPage(reply, request.id, await store.snapshot(), deviceAuth.vault.vault_id, readEventCursor(request));
+  });
+
   app.get('/api/v1/vaults/:vaultId/conflicts', async (request) => {
     const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     const { vaultId } = pathParams(request);
@@ -491,51 +497,9 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   app.get('/api/v1/vaults/:vaultId/events', async (request, reply) => {
     const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     const { vaultId } = pathParams(request);
-    const query = request.query as { after?: string };
-    if (query.after !== undefined && !/^\d+$/u.test(query.after)) {
-      throw new ValidationError('invalid_request', 'Invalid event cursor.');
-    }
-    const after = query.after ? Number.parseInt(query.after, 10) : 0;
-    if (!Number.isSafeInteger(after) || after < 0) {
-      throw new ValidationError('invalid_request', 'Invalid event cursor.');
-    }
     const db = await store.snapshot();
     const vault = ownedVaultOrThrow(db, session.user.user_id, vaultId);
-    const vaultEvents = db.events
-      .filter((event) => event.vault_id === vault.vault_id)
-      .sort((left, right) => left.event_seq - right.event_seq);
-    const oldestAvailableEventSeq = vaultEvents[0]?.event_seq;
-    const currentEventSeq = db.event_seq_by_vault[vault.vault_id] ?? 0;
-    if (oldestAvailableEventSeq === undefined && currentEventSeq > 0 && after < currentEventSeq) {
-      return reply.status(410).send({
-        error: {
-          code: 'event_cursor_expired',
-          message: 'Event cursor is no longer available; refresh vault state before polling again.',
-          request_id: request.id,
-          details: {
-            current_event_seq: currentEventSeq,
-            oldest_available_event_seq: currentEventSeq + 1
-          }
-        }
-      });
-    }
-    if (oldestAvailableEventSeq !== undefined && after < oldestAvailableEventSeq - 1) {
-      return reply.status(410).send({
-        error: {
-          code: 'event_cursor_expired',
-          message: 'Event cursor is no longer available; refresh vault state before polling again.',
-          request_id: request.id,
-          details: {
-            current_event_seq: currentEventSeq,
-            oldest_available_event_seq: oldestAvailableEventSeq
-          }
-        }
-      });
-    }
-    return {
-      events: vaultEvents.filter((event) => event.event_seq > after),
-      current_event_seq: currentEventSeq
-    };
+    return sendEventPage(reply, request.id, db, vault.vault_id, readEventCursor(request));
   });
 
   app.get('/', async (_request, reply) => {
@@ -548,6 +512,62 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   return { app, config, store, git, auth, sync };
+}
+
+function readEventCursor(request: FastifyRequest): number {
+  const query = request.query as { after?: string };
+  if (query.after !== undefined && !/^\d+$/u.test(query.after)) {
+    throw new ValidationError('invalid_request', 'Invalid event cursor.');
+  }
+  const after = query.after ? Number.parseInt(query.after, 10) : 0;
+  if (!Number.isSafeInteger(after) || after < 0) {
+    throw new ValidationError('invalid_request', 'Invalid event cursor.');
+  }
+  return after;
+}
+
+function sendEventPage(
+  reply: FastifyReply,
+  requestId: string,
+  db: MetadataDb,
+  vaultId: string,
+  after: number
+): FastifyReply | { events: MetadataDb['events']; current_event_seq: number } {
+  const vaultEvents = db.events
+    .filter((event) => event.vault_id === vaultId)
+    .sort((left, right) => left.event_seq - right.event_seq);
+  const oldestAvailableEventSeq = vaultEvents[0]?.event_seq;
+  const currentEventSeq = db.event_seq_by_vault[vaultId] ?? 0;
+  if (oldestAvailableEventSeq === undefined && currentEventSeq > 0 && after < currentEventSeq) {
+    return reply.status(410).send({
+      error: {
+        code: 'event_cursor_expired',
+        message: 'Event cursor is no longer available; refresh vault state before polling again.',
+        request_id: requestId,
+        details: {
+          current_event_seq: currentEventSeq,
+          oldest_available_event_seq: currentEventSeq + 1
+        }
+      }
+    });
+  }
+  if (oldestAvailableEventSeq !== undefined && after < oldestAvailableEventSeq - 1) {
+    return reply.status(410).send({
+      error: {
+        code: 'event_cursor_expired',
+        message: 'Event cursor is no longer available; refresh vault state before polling again.',
+        request_id: requestId,
+        details: {
+          current_event_seq: currentEventSeq,
+          oldest_available_event_seq: oldestAvailableEventSeq
+        }
+      }
+    });
+  }
+  return {
+    events: vaultEvents.filter((event) => event.event_seq > after),
+    current_event_seq: currentEventSeq
+  };
 }
 
 function setSessionCookie(reply: FastifyReply, config: ServerConfig, sessionId: string): void {
