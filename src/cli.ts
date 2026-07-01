@@ -26,13 +26,13 @@ const HELP = `obts Phase 1 CLI
 Usage:
   obts serve [--host 0.0.0.0] [--port 3000]
   obts health live|ready [--json]
-  obts setup --username USER --password PASSWORD [--display-name NAME] [--json]
-  obts vault create --username USER --password PASSWORD --display-name NAME [--json]
-  obts pairing-token create --username USER --password PASSWORD --vault-id ID --device-name NAME --sync-profile PROFILE [--sync-plugins] [--json]
-  obts devices list --username USER --password PASSWORD --vault-id ID [--json]
-  obts conflicts list --username USER --password PASSWORD --vault-id ID [--status open|resolved|all] [--json]
+  obts setup --username USER (--password PASSWORD | --password-env ENV) [--display-name NAME] [--json]
+  obts vault create --username USER (--password PASSWORD | --password-env ENV) --display-name NAME [--json]
+  obts pairing-token create --username USER (--password PASSWORD | --password-env ENV) --vault-id ID --device-name NAME --sync-profile PROFILE [--sync-plugins] [--json]
+  obts devices list --username USER (--password PASSWORD | --password-env ENV) --vault-id ID [--json]
+  obts conflicts list --username USER (--password PASSWORD | --password-env ENV) --vault-id ID [--status open|resolved|all] [--json]
   obts admin-recovery create-reset-token --username USER [--enable-user] [--json]
-  obts admin-recovery create-admin --username USER --password PASSWORD [--display-name NAME] [--json]
+  obts admin-recovery create-admin --username USER (--password PASSWORD | --password-env ENV) [--display-name NAME] [--json]
 
 Environment:
   OBTS_DATA_DIR             Persistent state root. Defaults to ./.obts-server.
@@ -87,7 +87,7 @@ export async function runCli(
     if (command === 'setup') {
       const setupInput = {
         username: requiredString(parsed, 'username'),
-        password: requiredString(parsed, 'password')
+        password: requiredPassword(parsed, env)
       };
       const displayName = stringOption(parsed, 'display-name');
       const result = await server.auth.setupInitialAdmin(
@@ -107,7 +107,7 @@ export async function runCli(
     }
 
     if (command === 'vault' && subcommand === 'create') {
-      const user = await loginForCli(server, parsed);
+      const user = await loginForCli(server, parsed, env);
       const displayName = requiredString(parsed, 'display-name');
       const vaultId = newId('vlt');
       const rootCommit = await server.git.initializeVault(vaultId);
@@ -147,7 +147,7 @@ export async function runCli(
     }
 
     if (command === 'pairing-token' && subcommand === 'create') {
-      const user = await loginForCli(server, parsed);
+      const user = await loginForCli(server, parsed, env);
       const syncProfile = readCliSyncProfile(requiredString(parsed, 'sync-profile'));
       const result = await server.auth.createPairingToken({
         userId: user.user_id,
@@ -171,7 +171,7 @@ export async function runCli(
     }
 
     if (command === 'devices' && subcommand === 'list') {
-      const user = await loginForCli(server, parsed);
+      const user = await loginForCli(server, parsed, env);
       const vaultId = requiredString(parsed, 'vault-id');
       const db = await server.store.snapshot();
       ownedVaultOrThrow(db, user.user_id, vaultId);
@@ -194,7 +194,7 @@ export async function runCli(
     }
 
     if (command === 'conflicts' && subcommand === 'list') {
-      const user = await loginForCli(server, parsed);
+      const user = await loginForCli(server, parsed, env);
       const vaultId = requiredString(parsed, 'vault-id');
       const status = stringOption(parsed, 'status') ?? 'open';
       if (!['open', 'resolved', 'all'].includes(status)) {
@@ -270,7 +270,7 @@ export async function runCli(
 
     if (command === 'admin-recovery' && subcommand === 'create-admin') {
       const username = requiredString(parsed, 'username');
-      const password = requiredString(parsed, 'password');
+      const password = requiredPassword(parsed, env);
       if (password.length < 12) {
         throw new CliUsageError('admin recovery password must be at least 12 characters.');
       }
@@ -349,10 +349,10 @@ function configFromEnv(env: CliEnv): Partial<ServerConfig> & { dataDir: string }
   };
 }
 
-async function loginForCli(server: ObtsServer, parsed: ParsedArgs) {
+async function loginForCli(server: ObtsServer, parsed: ParsedArgs, env: CliEnv) {
   const result = await server.auth.login({
     username: requiredString(parsed, 'username'),
-    password: requiredString(parsed, 'password'),
+    password: requiredPassword(parsed, env),
     sourceIp: 'cli'
   });
   return result.user;
@@ -388,6 +388,28 @@ function requiredString(parsed: ParsedArgs, name: string): string {
   const value = stringOption(parsed, name);
   if (!value) {
     throw new CliUsageError(`missing required option --${name}.`);
+  }
+  return value;
+}
+
+function requiredPassword(parsed: ParsedArgs, env: CliEnv): string {
+  const direct = stringOption(parsed, 'password');
+  const envName = stringOption(parsed, 'password-env');
+  if (direct && envName) {
+    throw new CliUsageError('use only one of --password or --password-env.');
+  }
+  if (direct) {
+    return direct;
+  }
+  if (!envName) {
+    throw new CliUsageError('missing required option --password or --password-env.');
+  }
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(envName)) {
+    throw new CliUsageError('--password-env must name an environment variable.');
+  }
+  const value = env[envName];
+  if (!value) {
+    throw new CliUsageError(`password environment variable ${envName} is not set.`);
   }
   return value;
 }

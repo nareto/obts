@@ -139,7 +139,9 @@ describe('Phase 1 sync without conflict resolution', () => {
     const env = {
       OBTS_DATA_DIR: cliDataDir,
       OBTS_PUBLIC_BASE_URL: 'http://sync.example.test',
-      OBTS_SESSION_SECRET: 'cli-test-session-secret-with-enough-entropy'
+      OBTS_SESSION_SECRET: 'cli-test-session-secret-with-enough-entropy',
+      OBTS_ADMIN_PASSWORD: 'admin-password-1234',
+      OBTS_BREAKGLASS_PASSWORD: 'breakglass-password-1234'
     };
     const run = async (args: string[]) => {
       let stdout = '';
@@ -159,8 +161,8 @@ describe('Phase 1 sync without conflict resolution', () => {
       'setup',
       '--username',
       'admin',
-      '--password',
-      'admin-password-1234',
+      '--password-env',
+      'OBTS_ADMIN_PASSWORD',
       '--display-name',
       'Admin',
       '--json'
@@ -173,8 +175,8 @@ describe('Phase 1 sync without conflict resolution', () => {
       'create',
       '--username',
       'admin',
-      '--password',
-      'admin-password-1234',
+      '--password-env',
+      'OBTS_ADMIN_PASSWORD',
       '--display-name',
       'CLI Vault',
       '--json'
@@ -188,8 +190,8 @@ describe('Phase 1 sync without conflict resolution', () => {
       'create',
       '--username',
       'admin',
-      '--password',
-      'admin-password-1234',
+      '--password-env',
+      'OBTS_ADMIN_PASSWORD',
       '--vault-id',
       vaultBody.vault_id,
       '--device-name',
@@ -246,8 +248,8 @@ describe('Phase 1 sync without conflict resolution', () => {
       'list',
       '--username',
       'admin',
-      '--password',
-      'admin-password-1234',
+      '--password-env',
+      'OBTS_ADMIN_PASSWORD',
       '--vault-id',
       vaultBody.vault_id,
       '--json'
@@ -262,8 +264,8 @@ describe('Phase 1 sync without conflict resolution', () => {
       'list',
       '--username',
       'admin',
-      '--password',
-      'admin-password-1234',
+      '--password-env',
+      'OBTS_ADMIN_PASSWORD',
       '--vault-id',
       vaultBody.vault_id,
       '--json'
@@ -306,8 +308,8 @@ describe('Phase 1 sync without conflict resolution', () => {
       'create-admin',
       '--username',
       'breakglass',
-      '--password',
-      'breakglass-password-1234',
+      '--password-env',
+      'OBTS_BREAKGLASS_PASSWORD',
       '--display-name',
       'Break Glass',
       '--json'
