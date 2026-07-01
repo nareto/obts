@@ -1183,27 +1183,74 @@ Dashboard:
 - note history and restore view;
 - maintenance status and persistent-state/health summaries.
 
-### 10.2 Elephant Carpaccio Development Slices
+### 10.2 Deployable Development Phases
 
-Development follows the elephant carpaccio principle at the PRD level: at most three vertical capability slices, each centered on a meaningful user-facing workflow and the scariest remaining product risk. These are software development increments, not deployment stages and not the final task backlog. Each slice may decompose into many smaller implementation tasks, but the top-level development plan should stay focused on these three cuts through the server, plugin, dashboard, storage, and safety paths.
+Development is organized into three deployable vertical phases. A phase is
+complete only when it can be installed on a real self-hosted server, paired
+with an installable Obsidian plugin, and exercised against copied test vaults
+without using test harness code.
 
-#### Phase 1: Sync Without Conflict Resolution
+Every phase must include:
 
-Build the smallest real sync product that can pair devices, move vault changes through Git-backed server state, and safely stop when human judgment is required.
+- a runnable server process with documented configuration, health checks,
+  persistent-state paths, backup/restore notes, and upgrade notes for state
+  introduced in that phase;
+- an OCI image built from this app repo, with environment-specific infrastructure-specific deployment kept
+  outside this app repo;
+- an installable Obsidian plugin artifact for all client behavior required by
+  that phase;
+- a manual smoke-test guide that starts from empty persistent state and verifies
+  the phase's primary user workflow against copied test vaults;
+- automated acceptance tests for the same workflow.
+
+#### Phase 1: Deployable Sync Without Conflict Resolution
+
+Build the smallest deployable sync product. It pairs real Obsidian clients with
+a self-hosted server, moves vault changes through Git-backed server state,
+applies safe server `main` changes locally, and blocks safely when human
+judgment is required.
+
+Phase 1 intentionally has no browser dashboard or frontend. Setup, vault
+creation, pairing-token creation, device listing, conflict listing, and health
+inspection are exposed through server CLI commands. The HTTP API still exists
+for the plugin and for contract testing, but users do not need a dashboard to
+complete the Phase 1 workflow.
 
 Included:
 
-- project/package skeleton, shared TypeScript schemas, committed OpenAPI contract, Git test harness, and contract tests for the APIs introduced in this phase;
-- first-run setup, dashboard login, vault creation, device pairing, token storage, session/CSRF basics, and single-owner vault authorization;
-- server Git store, native `git` CLI readiness, server-authored empty-tree root commit on `main`, device refs, and the durable Git/Postgres write workflow for sync operations;
-- plugin hidden `.obts/` state using `isomorphic-git`, Obsidian filesystem adapter, scanner/watcher, local commit creation for vault change sets, upload queue, retry state, status bar, and first-sync safety;
-- authenticated multipart push/pull using manifest JSON plus Git packfile bytes;
-- server validation of uploaded Git objects, path policy enforcement, device-ref fast-forward/no-op handling, and rejection of malformed or same-device non-fast-forward updates;
-- automatic server merge for safe cases, advancement of `main`, event emission, plugin pull/apply of accepted `main`, and minimal device dashboard state;
-- conflict detection for unsafe or ambiguous merges, with a durable conflict record and dashboard signal that conflicts exist.
+- project/package skeleton, shared TypeScript schemas, committed OpenAPI
+  contract, Git test harness, and contract tests for the APIs introduced in
+  this phase;
+- runnable server entrypoint, OCI image, documented environment configuration,
+  persistent-state documentation, and health/readiness checks;
+- server CLI commands for first-run setup, vault creation, pairing-token
+  creation, device listing, conflict listing, health/readiness inspection, and
+  local admin recovery;
+- first-run setup, vault creation, device pairing, token storage, device-token
+  auth, pairing-token auth, and single-owner vault authorization;
+- server Git store, native `git` CLI readiness, server-authored empty-tree root
+  commit on `main`, device refs, Postgres-backed metadata, migrations, and the
+  durable Git/Postgres write workflow for sync operations;
+- installable Obsidian plugin with settings UI for server URL, pairing token,
+  device name, sync profile, and plugin-sync setting;
+- plugin status surface showing Synced, Ahead, Behind, Uploading, Applying,
+  Review needed, Needs recovery, Unsafe local state, and Blocked;
+- plugin hidden `.obts/` state using `isomorphic-git`, Obsidian filesystem
+  adapter, scanner/watcher, local commit creation for vault change sets, upload
+  queue, retry state, first-sync safety, recovery bundles, apply journal, and
+  safe apply;
+- authenticated multipart push/pull using manifest JSON plus Git packfile
+  bytes;
+- server validation of uploaded Git objects, path policy enforcement,
+  device-ref fast-forward/no-op handling, upload limits, and rejection of
+  malformed or same-device non-fast-forward updates;
+- automatic server merge for safe cases, advancement of `main`, event emission,
+  plugin pull/apply of accepted `main`, and durable conflict records for unsafe
+  or ambiguous merges.
 
 Excluded:
 
+- browser dashboard/frontend;
 - conflict package rendering;
 - source/rendered diff viewers;
 - manual resolution submission;
@@ -1211,55 +1258,94 @@ Excluded:
 
 Acceptance proof:
 
-- two paired devices can sync non-conflicting vault change sets through server `main`;
-- hidden Git state lives under `.obts/`, and no visible vault `.git` is created;
-- unsafe concurrent edits create a conflict record and block further unsafe advancement instead of overwriting content;
-- apply uses the real apply journal/recovery shape before destructive local operations, or blocks before any destructive operation that is not yet safely implemented;
-- cross-user access to vault, device, conflict, sync, and event resources returns `404`.
+- the server is deployed from its OCI image and reaches ready state;
+- the Obsidian plugin is installed into two copied test vaults and paired with
+  the deployed server;
+- two paired devices sync non-conflicting vault change sets through server
+  `main`;
+- hidden Git state lives under `.obts/`, and no visible vault `.git` is
+  created;
+- unsafe concurrent edits create a durable conflict record and block further
+  unsafe advancement instead of overwriting content;
+- the plugin surfaces the blocked or review-needed state without requiring a
+  dashboard;
+- recovery bundles and apply journals exist before destructive local
+  operations;
+- cross-user access to vault, device, conflict, sync, and event resources
+  returns `404`.
 
-#### Phase 2: Conflict Resolution
+#### Phase 2: Deployable Dashboard And Conflict Resolution
 
-Add the human review path for conflicts created by Phase 1.
+Add the browser dashboard and the human review path for conflicts created by
+Phase 1. From this phase onward, dashboard UI is required.
 
 Included:
 
+- authenticated dashboard shell for setup, login, vault overview, device
+  status, pairing-token creation, readiness/health summary, and conflict list;
 - conflict package materialization from authorized Git state;
-- dashboard conflict list, rendered Markdown diff, source diff, affected-path metadata, and resolution editor;
-- resolution choices for accepting current `main`, accepting the device version, keeping both, inserting both blocks, or manually editing the final result;
+- dashboard conflict list, rendered Markdown diff, source diff,
+  affected-path metadata, and resolution editor;
+- resolution choices for accepting current `main`, accepting the device
+  version, keeping both, inserting both blocks, or manually editing the final
+  result;
 - recent-auth verification for resolution submission;
-- `expected_main` stale-review protection, idempotent duplicate submission handling, and resolution commits that descend from current `main`;
-- `conflict_resolved` and `main_advanced` events, client refresh after resolution, and safe local apply of resolved `main`;
-- conflict audit records and redaction checks for logs, errors, diagnostics, and event payloads.
+- `expected_main` stale-review protection, idempotent duplicate submission
+  handling, and resolution commits that descend from current `main`;
+- `conflict_resolved` and `main_advanced` events, client refresh after
+  resolution, and safe local apply of resolved `main`;
+- conflict audit records and redaction checks for logs, errors, diagnostics,
+  and event payloads.
 
 Acceptance proof:
 
+- the Phase 2 server is deployed as an upgrade over Phase 1 state;
+- the owner can create a vault and pair devices through the dashboard;
 - concurrent same-file Markdown edits create a reviewable conflict;
-- the owner can resolve the conflict in the dashboard and advance `main`;
+- the owner resolves the conflict in the dashboard and advances `main`;
 - stale review submissions are rejected without changing `main`;
 - duplicate accepted submissions are idempotent;
-- paired clients apply the resolved state without silently discarding local edits;
+- paired clients apply the resolved state without silently discarding local
+  edits;
 - unauthorized users cannot list, view, or resolve another user's conflicts.
 
-#### Phase 3: Note History
+#### Phase 3: Deployable Note History, Restore, And Maintenance
 
-Add the Git-backed history product on top of the sync and conflict foundations.
+Add the Git-backed history, restore, diagnostics, and maintenance product on
+top of the deployable sync and conflict foundations.
 
 Included:
 
-- derived path/history indexes backed by Git commits, path metadata, rename/delete provenance, and conflict/merge provenance;
-- note history query APIs and dashboard history view for creates, updates, deletes, renames, conflicts, merges, and restores;
-- source and rendered diffs for Markdown versions, plus source diffs for `.canvas` and `.base` versions;
-- metadata-only history for plugin files by default, with explicit owner action required for content-bearing export;
-- note restore through a new Git-backed commit or merge/resolution path, never by rewriting history;
-- persistent-state integrity checks, Git maintenance needed to preserve reachable history, diagnostics export rules, and backup documentation for history-bearing state.
+- derived path/history indexes backed by Git commits, path metadata,
+  rename/delete provenance, and conflict/merge provenance;
+- note history query APIs and dashboard history view for creates, updates,
+  deletes, renames, conflicts, merges, and restores;
+- source and rendered diffs for Markdown versions, plus source diffs for
+  `.canvas` and `.base` versions;
+- metadata-only history for plugin files by default, with explicit owner action
+  required for content-bearing export;
+- note restore through a new Git-backed commit or merge/resolution path, never
+  by rewriting history;
+- persistent-state integrity checks, Git maintenance needed to preserve
+  reachable history, diagnostics export rules, and backup documentation for
+  history-bearing state.
 
 Acceptance proof:
 
-- the owner can inspect prior versions of a note without using raw Git commands;
-- history shows meaningful provenance for normal edits, merges, conflicts, deletes, renames, and restores;
-- restoring a prior version advances `main` through the same safe sync/resolution machinery as other edits;
+- the Phase 3 server is deployed as an upgrade over Phase 2 state;
+- the owner can inspect prior versions of a note without using raw Git
+  commands;
+- history shows meaningful provenance for normal edits, merges, conflicts,
+  deletes, renames, and restores;
+- restoring a prior version advances `main` through the same safe
+  sync/resolution machinery as other edits;
+- paired clients apply restored state safely;
+- diagnostics and logs remain redacted by default;
+- backup/restore testing preserves metadata, Git refs, conflicts, events, and
+  note history consistently;
 - reachable history remains available after Git maintenance;
-- restored or inconsistent persistent state fails readiness closed instead of serving incomplete history.
+- restored or inconsistent persistent state fails readiness closed instead of
+  serving incomplete history.
 
 ## 11. Testing And Proof
 
