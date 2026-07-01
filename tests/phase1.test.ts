@@ -2304,7 +2304,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     ).rejects.toMatchObject({ status: 410, code: 'event_cursor_expired' });
   });
 
-  it('blocks sync on restart when an incomplete apply journal is present', async () => {
+  it('blocks sync on restart when an incomplete apply journal cannot be replayed', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'journal-device');
     await mkdirp(deviceDir);
@@ -2316,7 +2316,7 @@ describe('Phase 1 sync without conflict resolution', () => {
         {
           apply_id: 'apply_test',
           operation_type: 'pull_apply',
-          target_main: state.local_main,
+          target_main: '1111111111111111111111111111111111111111',
           expected_prior_local_main: state.local_main,
           expected_prior_local_device_ref: state.server_device_ref,
           phase: 'writing_files',
@@ -2379,6 +2379,65 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await readFile(join(device2Dir, 'shared.md'), 'utf8')).toBe('base\n');
     expect((await plugin2.readState()).status_label).toBe('Unsafe local state');
     expect(await exists(join(device2Dir, '.obts', 'apply-journal.json'))).toBe(false);
+  });
+
+  it('rolls forward an incomplete apply journal after restart when replay is safe', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const { plugin2, device2Dir } = await preparePullApplyScenario(root, admin, 'journal-device-1', 'journal-device-2');
+    const state = await plugin2.readState();
+    const token = await readDeviceToken(device2Dir);
+    const transport = new TransportClient(baseUrl);
+    const pulled = await transport.pull({
+      vaultId: admin.vaultId,
+      deviceId: state.device_id!,
+      deviceToken: token,
+      currentLocalMain: state.local_main
+    });
+    const localGit = new LocalGitEngine(device2Dir, {
+      profile: 'notes_only',
+      syncPlugins: false,
+      attachmentLocation: { mode: 'same_folder_as_note' }
+    });
+    await localGit.importPack(pulled.packfile);
+    const beforeHash = sha256(Buffer.from(await readFile(join(device2Dir, 'shared.md'))));
+    await writeFile(
+      join(device2Dir, '.obts', 'apply-journal.json'),
+      `${JSON.stringify(
+        {
+          apply_id: 'apply_test_replay',
+          operation_type: 'pull_apply',
+          target_main: pulled.manifest.target_main,
+          expected_prior_local_main: state.local_main,
+          expected_prior_local_device_ref: state.server_device_ref,
+          phase: 'recovery_bundle_written',
+          affected_paths: ['shared.md'],
+          preflight_sha256: { 'shared.md': beforeHash },
+          recovery_bundle_id: 'rec_test_replay',
+          last_completed_step: 'recovery_bundle',
+          redacted_error_category: null
+        },
+        null,
+        2
+      )}\n`
+    );
+
+    const restartedPlugin = new ObtsPluginClient(device2Dir, {
+      serverUrl: baseUrl,
+      deviceName: 'journal-device-2',
+      syncProfile: 'notes_only',
+      syncPlugins: false
+    });
+    await restartedPlugin.initialize();
+
+    expect(await readFile(join(device2Dir, 'shared.md'), 'utf8')).toBe('server update\n');
+    expect(await exists(join(device2Dir, '.obts', 'apply-journal.json'))).toBe(false);
+    expect(await exists(join(device2Dir, '.obts', 'apply.lock'))).toBe(false);
+    expect(await restartedPlugin.readState()).toMatchObject({
+      local_main: pulled.manifest.target_main,
+      local_head: pulled.manifest.target_main,
+      status_label: 'Synced',
+      last_error_code: null
+    });
   });
 
   it('blocks destructive apply if recovery bundle creation fails', async () => {

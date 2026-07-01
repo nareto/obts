@@ -99,6 +99,10 @@ export class ObtsPluginClient {
       await this.writeQueue(await this.readQueue());
       return;
     }
+    if (journal && (await this.recoverIncompleteApplyJournal(journal, state))) {
+      await this.writeQueue(await this.readQueue());
+      return;
+    }
     if (journal) {
       await this.writeState({
         ...state,
@@ -669,36 +673,7 @@ export class ObtsPluginClient {
           await this.block('unsafe_local_state', 'A local file changed during apply preflight.');
         }
       }
-      const assertRecoveredDescendants = async (path: string): Promise<void> => {
-        const descendants = await listLocalDescendantFiles(this.vaultDir, path);
-        if (descendants.some((descendant) => !(descendant in preflight))) {
-          journal.phase = 'blocked_recovery';
-          journal.redacted_error_category = 'preflight_hash_changed';
-          await this.recovery.writeApplyJournal(journal);
-          await this.block('unsafe_local_state', 'A local file changed during apply preflight.');
-        }
-      };
-      const obsoleteLocalPaths = affectedPaths
-        .filter((path) => !targetFiles.has(path))
-        .sort((left, right) => right.length - left.length);
-      for (const path of obsoleteLocalPaths) {
-        if (await pathIsDirectory(join(this.vaultDir, path))) {
-          await assertRecoveredDescendants(path);
-        }
-        await rm(join(this.vaultDir, path), { recursive: true, force: true });
-      }
-      for (const path of affectedPaths.filter((candidate) => targetFiles.has(candidate))) {
-        const targetContent = targetFiles.has(path) ? await this.git.readBlob(targetMain, path) : null;
-        const absolutePath = join(this.vaultDir, path);
-        if (targetContent !== null) {
-          if (await pathIsDirectory(absolutePath)) {
-            await assertRecoveredDescendants(path);
-            await rm(absolutePath, { recursive: true, force: true });
-          }
-          await mkdir(dirname(absolutePath), { recursive: true, mode: 0o700 });
-          await writeFile(absolutePath, targetContent);
-        }
-      }
+      await this.writeTargetFilesFromJournal(journal, targetFiles);
 
       journal.phase = 'verifying';
       journal.last_completed_step = 'files_written';
@@ -720,6 +695,128 @@ export class ObtsPluginClient {
     } finally {
       if (releaseApplyLock) {
         await releaseApplyLock();
+      }
+    }
+  }
+
+  private async recoverIncompleteApplyJournal(journal: ApplyJournal, state: LocalPluginState): Promise<boolean> {
+    if (journal.phase === 'blocked_recovery' || !(await this.git.commitExists(journal.target_main))) {
+      return false;
+    }
+
+    const targetFiles = new Set(await this.materializedTreeFiles(journal.target_main));
+    const canReplayFromCurrentState = await this.applyJournalMatchesCurrentFiles(journal, targetFiles);
+    if (!canReplayFromCurrentState) {
+      return false;
+    }
+
+    let releaseApplyLock: (() => Promise<void>) | null = null;
+    try {
+      await this.recovery.clearApplyLock();
+      releaseApplyLock = await this.recovery.acquireApplyLock(journal.apply_id);
+
+      if (journal.affected_paths.length > 0 && journal.recovery_bundle_id === null) {
+        journal.recovery_bundle_id = await this.recovery.createRecoveryBundle({
+          vaultId: state.vault_id ?? 'unknown',
+          deviceId: state.device_id ?? 'unknown',
+          operationType: journal.operation_type,
+          targetMain: journal.target_main,
+          priorLocalMain: journal.expected_prior_local_main,
+          priorLocalDeviceRef: journal.expected_prior_local_device_ref,
+          affectedPaths: journal.affected_paths,
+          platform: process.platform,
+          pluginVersion: PLUGIN_VERSION,
+          journal,
+          localRefsPack: await this.git.createRecoveryRefsPack()
+        });
+        journal.last_completed_step = 'recovery_bundle';
+        journal.phase = 'recovery_bundle_written';
+        await this.recovery.writeApplyJournal(journal);
+      }
+
+      journal.phase = 'writing_files';
+      journal.redacted_error_category = null;
+      await this.recovery.writeApplyJournal(journal);
+      await this.writeTargetFilesFromJournal(journal, targetFiles);
+
+      journal.phase = 'verifying';
+      journal.last_completed_step = 'files_written';
+      await this.recovery.writeApplyJournal(journal);
+      await this.git.setLocalMain(journal.target_main);
+      await this.git.setLocalHead(journal.target_main);
+      journal.phase = 'committed';
+      journal.last_completed_step = 'refs_updated';
+      await this.recovery.writeApplyJournal(journal);
+      await this.writeState({
+        ...state,
+        local_main: journal.target_main,
+        local_head: journal.target_main,
+        status_label: 'Synced',
+        last_error_code: null,
+        updated_at: nowIso()
+      });
+      await this.recovery.clearApplyJournal();
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (releaseApplyLock) {
+        await releaseApplyLock();
+      }
+    }
+  }
+
+  private async applyJournalMatchesCurrentFiles(journal: ApplyJournal, targetFiles: Set<string>): Promise<boolean> {
+    for (const path of journal.affected_paths) {
+      const currentHash = await sha256File(join(this.vaultDir, path));
+      const preflightHash = journal.preflight_sha256[path] ?? null;
+      if (currentHash === preflightHash) {
+        continue;
+      }
+      if (journal.phase !== 'writing_files' && journal.phase !== 'verifying') {
+        return false;
+      }
+      const targetContent = targetFiles.has(path) ? await this.git.readBlob(journal.target_main, path) : null;
+      const targetHash = targetContent === null ? null : sha256(targetContent);
+      if (currentHash !== targetHash) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private async writeTargetFilesFromJournal(journal: ApplyJournal, targetFiles: Set<string>): Promise<void> {
+    const assertRecoveredDescendants = async (path: string): Promise<void> => {
+      const descendants = await listLocalDescendantFiles(this.vaultDir, path);
+      if (descendants.some((descendant) => !(descendant in journal.preflight_sha256))) {
+        journal.phase = 'blocked_recovery';
+        journal.redacted_error_category = 'preflight_hash_changed';
+        await this.recovery.writeApplyJournal(journal);
+        await this.block('unsafe_local_state', 'A local file changed during apply preflight.');
+      }
+    };
+
+    const obsoleteLocalPaths = journal.affected_paths
+      .filter((path) => !targetFiles.has(path))
+      .sort((left, right) => right.length - left.length);
+    for (const path of obsoleteLocalPaths) {
+      if (await pathIsDirectory(join(this.vaultDir, path))) {
+        await assertRecoveredDescendants(path);
+      }
+      await rm(join(this.vaultDir, path), { recursive: true, force: true });
+    }
+
+    for (const path of journal.affected_paths.filter((candidate) => targetFiles.has(candidate))) {
+      const targetContent = await this.git.readBlob(journal.target_main, path);
+      const absolutePath = join(this.vaultDir, path);
+      if (targetContent !== null) {
+        await removeBlockingMaterializationPaths(this.vaultDir, path);
+        if (await pathIsDirectory(absolutePath)) {
+          await assertRecoveredDescendants(path);
+          await rm(absolutePath, { recursive: true, force: true });
+        }
+        await mkdir(dirname(absolutePath), { recursive: true, mode: 0o700 });
+        await writeFile(absolutePath, targetContent);
       }
     }
   }

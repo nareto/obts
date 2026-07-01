@@ -37,7 +37,7 @@ Implemented runtime pieces:
   `GET /api/v1/vaults/{vault_id}/sync/events` with their device token, so the
   plugin can observe `main_advanced`, conflict, rejection, and recovery events
   without a dashboard session cookie.
-- Plugin-side `.obts/` state with `isomorphic-git`, device token storage, durable watcher change hints, queue state, recovery bundles with file snapshots, text patches, local Git refs packs, and artifact checksums, local apply lock, apply journal, local commit creation, multipart push, multipart pull, safe apply, incomplete-journal blocking, explicit replace-local-with-server recovery, and explicit rebuild from current server `main`.
+- Plugin-side `.obts/` state with `isomorphic-git`, device token storage, durable watcher change hints, queue state, recovery bundles with file snapshots, text patches, local Git refs packs, and artifact checksums, local apply lock, apply journal, local commit creation, multipart push, multipart pull, safe apply, safe incomplete-journal replay with recovery blocking when replay is unsafe, explicit replace-local-with-server recovery, and explicit rebuild from current server `main`.
 - Rebuild classifies repeated, same-device fast-forward, snapshot-only, and divergent local history: fast-forward commits stay queued, snapshot-only edits become a new recovery commit based on rebuilt `main`, and divergent same-device history blocks for export plus reset or re-pair.
 - Plugin sync records server-created conflicts as a local `Review needed` blocking state, so later automatic sync or pull/apply attempts stop before replacing local review content.
 - The sync pull API also rejects devices marked `review_needed` or `blocked_recovery`, so a stale or reset plugin cannot bypass server-known conflict/recovery blocks and apply server state over review content.
@@ -103,7 +103,8 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - restored metadata that points at missing Git state makes `/health/ready` return `503` and surfaces a not-ready dashboard health summary;
 - prepared sync operations recover deterministically on restart when Git refs already moved, resume pending device ref merges, or abort safely before ref mutation;
 - event polling returns `410` for expired cursors after retention pruning;
-- incomplete apply journals block sync on restart instead of attempting an unsafe apply;
+- incomplete apply journals replay idempotently on restart when the target commit is present and affected files still match preflight or target content;
+- unreplayable apply journals block sync on restart instead of attempting an unsafe apply;
 - committed apply journals replay idempotently on restart and clear stale local apply locks;
 - local apply lock contention blocks before a destructive pull apply starts;
 - recovery bundle creation failures leave a blocked apply journal and do not write files;

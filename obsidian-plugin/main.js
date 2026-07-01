@@ -230,6 +230,10 @@ class ObtsObsidianClient {
       }));
       return;
     }
+    if (journal && await this.recoverIncompleteApplyJournal(journal, state)) {
+      await this.writeQueue(await this.readQueue());
+      return;
+    }
     if (journal) {
       await this.writeState(Object.assign({}, state, {
         status_label: "Unsafe local state",
@@ -522,30 +526,7 @@ class ObtsObsidianClient {
           await this.block("unsafe_local_state", "A local file changed during apply preflight.");
         }
       }
-      const assertRecoveredDescendants = async (filePath) => {
-        const descendants = await listLocalDescendantFiles(this.vaultDir, filePath);
-        if (descendants.some((descendant) => !(descendant in journal.preflight_sha256))) {
-          journal.phase = "blocked_recovery";
-          journal.redacted_error_category = "preflight_hash_changed";
-          await writeJson(this.applyJournalPath, journal);
-          await this.block("unsafe_local_state", "A local file changed during apply preflight.");
-        }
-      };
-      for (const filePath of affectedPaths.filter((candidate) => !targetFiles.has(candidate)).sort((left, right) => right.length - left.length)) {
-        if (await pathIsDirectory(path.join(this.vaultDir, filePath))) {
-          await assertRecoveredDescendants(filePath);
-        }
-        await this.adapterRemove(filePath);
-      }
-      for (const filePath of affectedPaths.filter((candidate) => targetFiles.has(candidate))) {
-        const content = await this.readBlob(targetMain, filePath);
-        await removeBlockingMaterializationPaths(this.vaultDir, filePath);
-        if (await pathIsDirectory(path.join(this.vaultDir, filePath))) {
-          await assertRecoveredDescendants(filePath);
-          await fsp.rm(path.join(this.vaultDir, filePath), { recursive: true, force: true });
-        }
-        await this.adapterWriteBinary(filePath, content);
-      }
+      await this.writeTargetFilesFromJournal(journal, targetFiles);
 
       journal.phase = "verifying";
       journal.last_completed_step = "files_written";
@@ -566,6 +547,99 @@ class ObtsObsidianClient {
     } finally {
       this.plugin.isApplying = false;
       await fsp.rm(this.applyLockPath, { force: true });
+    }
+  }
+
+  async recoverIncompleteApplyJournal(journal, state) {
+    if (journal.phase === "blocked_recovery" || !(await this.commitExists(journal.target_main))) {
+      return false;
+    }
+    const targetFiles = new Set(await this.listTreeFiles(journal.target_main));
+    if (!(await this.applyJournalMatchesCurrentFiles(journal, targetFiles))) {
+      return false;
+    }
+    try {
+      await fsp.rm(this.applyLockPath, { force: true });
+      await this.acquireApplyLock(journal.apply_id);
+      this.plugin.isApplying = true;
+      if (journal.affected_paths.length > 0 && journal.recovery_bundle_id === null) {
+        journal.recovery_bundle_id = await this.createRecoveryBundle(journal.operation_type, journal.target_main, journal.affected_paths, journal);
+        journal.last_completed_step = "recovery_bundle";
+        journal.phase = "recovery_bundle_written";
+        await writeJson(this.applyJournalPath, journal);
+      }
+      journal.phase = "writing_files";
+      journal.redacted_error_category = null;
+      await writeJson(this.applyJournalPath, journal);
+      await this.writeTargetFilesFromJournal(journal, targetFiles);
+      journal.phase = "verifying";
+      journal.last_completed_step = "files_written";
+      await writeJson(this.applyJournalPath, journal);
+      await this.updateRef("refs/heads/main", journal.target_main, null, true);
+      await this.updateRef("refs/heads/local", journal.target_main, null, true);
+      journal.phase = "committed";
+      journal.last_completed_step = "refs_updated";
+      await writeJson(this.applyJournalPath, journal);
+      await this.writeState(Object.assign({}, state, {
+        local_main: journal.target_main,
+        local_head: journal.target_main,
+        status_label: "Synced",
+        last_error_code: null,
+        updated_at: nowIso()
+      }));
+      await this.clearApplyState();
+      return true;
+    } catch {
+      return false;
+    } finally {
+      this.plugin.isApplying = false;
+      await fsp.rm(this.applyLockPath, { force: true });
+    }
+  }
+
+  async applyJournalMatchesCurrentFiles(journal, targetFiles) {
+    for (const filePath of journal.affected_paths) {
+      const currentHash = await this.adapterSha256(filePath);
+      const preflightHash = journal.preflight_sha256[filePath] || null;
+      if (currentHash === preflightHash) {
+        continue;
+      }
+      if (journal.phase !== "writing_files" && journal.phase !== "verifying") {
+        return false;
+      }
+      const targetContent = targetFiles.has(filePath) ? await this.readBlob(journal.target_main, filePath) : null;
+      const targetHash = targetContent === null ? null : sha256(targetContent);
+      if (currentHash !== targetHash) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  async writeTargetFilesFromJournal(journal, targetFiles) {
+    const assertRecoveredDescendants = async (filePath) => {
+      const descendants = await listLocalDescendantFiles(this.vaultDir, filePath);
+      if (descendants.some((descendant) => !(descendant in journal.preflight_sha256))) {
+        journal.phase = "blocked_recovery";
+        journal.redacted_error_category = "preflight_hash_changed";
+        await writeJson(this.applyJournalPath, journal);
+        await this.block("unsafe_local_state", "A local file changed during apply preflight.");
+      }
+    };
+    for (const filePath of journal.affected_paths.filter((candidate) => !targetFiles.has(candidate)).sort((left, right) => right.length - left.length)) {
+      if (await pathIsDirectory(path.join(this.vaultDir, filePath))) {
+        await assertRecoveredDescendants(filePath);
+      }
+      await this.adapterRemove(filePath);
+    }
+    for (const filePath of journal.affected_paths.filter((candidate) => targetFiles.has(candidate))) {
+      const content = await this.readBlob(journal.target_main, filePath);
+      await removeBlockingMaterializationPaths(this.vaultDir, filePath);
+      if (await pathIsDirectory(path.join(this.vaultDir, filePath))) {
+        await assertRecoveredDescendants(filePath);
+        await fsp.rm(path.join(this.vaultDir, filePath), { recursive: true, force: true });
+      }
+      await this.adapterWriteBinary(filePath, content);
     }
   }
 
@@ -828,6 +902,15 @@ class ObtsObsidianClient {
       return (await this.git(["rev-parse", "--verify", `${ref}^{commit}`])).trim();
     } catch {
       return null;
+    }
+  }
+
+  async commitExists(commit) {
+    try {
+      await this.git(["cat-file", "-e", `${commit}^{commit}`]);
+      return true;
+    } catch {
+      return false;
     }
   }
 
