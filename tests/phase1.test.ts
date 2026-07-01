@@ -323,6 +323,47 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
   });
 
+  it('marks an active device synced when it acknowledges the current main after a recovered ahead state', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'pull-ack-ahead-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'laptop');
+    const state = await plugin.readState();
+    const token = await readDeviceToken(deviceDir);
+    expect(state.local_main).toMatch(/^[0-9a-f]{40}$/u);
+
+    await server.store.mutate((db) => {
+      const device = db.devices.find((candidate) => candidate.device_id === state.device_id);
+      expect(device).toBeDefined();
+      device!.status = 'ahead';
+      device!.last_successful_sync_at = null;
+    });
+
+    const transport = new TransportClient(baseUrl);
+    const pulled = await transport.pull({
+      vaultId: admin.vaultId,
+      deviceId: state.device_id!,
+      deviceToken: token,
+      currentLocalMain: state.local_main
+    });
+    expect(pulled.manifest.target_main).toBe(state.local_main);
+
+    const dashboard = await admin.get<{
+      devices: Array<{
+        device_name: string;
+        status_label: string;
+        behind_main: boolean;
+        last_successful_sync_at: string | null;
+      }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+    expect(dashboard.status).toBe(200);
+    expect(dashboard.body.devices.find((device) => device.device_name === 'laptop')).toMatchObject({
+      status_label: 'Synced',
+      behind_main: false,
+      last_successful_sync_at: expect.any(String)
+    });
+  });
+
   it('requires recent dashboard authentication for admin account creation', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     await server.store.mutate((db) => {

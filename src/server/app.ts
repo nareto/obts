@@ -367,7 +367,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     if (pullRequest.current_local_main === targetMain) {
       await store.mutate((mutableDb) => {
         const device = mutableDb.devices.find((candidate) => candidate.device_id === deviceAuth.device.device_id);
-        if (device && (device.status === 'paired' || device.status === 'synced')) {
+        if (device && device.status !== 'revoked' && device.status !== 'review_needed' && device.status !== 'blocked_recovery') {
           device.status = 'synced';
           device.last_successful_sync_at = nowIso();
         }
