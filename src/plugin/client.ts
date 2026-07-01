@@ -181,6 +181,7 @@ export class ObtsPluginClient {
         initial_import_confirmed: true,
         updated_at: nowIso()
       });
+      await this.acknowledgeAppliedMain(await this.readState(), result.device_token, pulled.manifest.target_main);
     }
   }
 

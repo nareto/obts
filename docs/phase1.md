@@ -43,6 +43,7 @@ Implemented runtime pieces:
 - The sync pull API also rejects devices marked `review_needed` or `blocked_recovery`, so a stale or reset plugin cannot bypass server-known conflict/recovery blocks and apply server state over review content.
 - API-backed dashboard shell for setup, login, vault creation, overview, device status, events, readiness, and pairing-token creation; the CLI remains the required Phase 1 user workflow, and the dashboard shell is not required for Phase 1 conflict handling.
 - Dashboard device behind/synced state is derived from each device's acknowledged `last_applied_main` commit cursor rather than timestamps; timestamps remain display metadata only.
+- Safe pairing applies and acknowledges the current server `main` immediately, so an empty or already-matching paired device appears Synced before the next manual sync command.
 - Readiness checks that fail closed when metadata, Git refs, conflict commits, writable storage, or native Git readiness are inconsistent.
 
 The Phase 1 server uses a durable JSON metadata adapter in `OBTS_DATA_DIR/metadata/phase1.json` so the product slice can run without requiring a local Postgres service in this repository. The service boundaries are deliberately named around metadata and sync operations so a Postgres adapter can replace the file adapter without changing the Git sync model.
@@ -69,6 +70,8 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - malformed commit IDs in multipart sync manifests are rejected before Git ref mutation;
 - hidden Git state is under `.obts/`, with no visible vault `.git`;
 - first-device import of existing local content creates a recovery bundle and requires confirmation;
+- empty or already-matching paired devices acknowledge the current server `main`
+  immediately and appear Synced without needing a later manual sync;
 - watcher change hints for syncable vault paths survive plugin restart and are consumed by the next normal Git-backed sync scan, while internal `.obts` and visible `.git` paths are ignored;
 - divergent additional-device local content creates a recovery bundle, blocks normal sync, and requires explicit replace-local-with-server before destructive apply, even when current server `main` is still the empty root;
 - pairing tokens are scoped to their issued device name, sync profile, and plugin-sync setting, and cannot be consumed twice;

@@ -377,6 +377,36 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
   });
 
+  it('acknowledges a safe paired main before the first manual sync', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'paired-empty-device');
+    await mkdirp(deviceDir);
+
+    const plugin = await pairPlugin(admin, deviceDir, 'laptop');
+    const state = await plugin.readState();
+    expect(state).toMatchObject({
+      status_label: 'Synced',
+      initial_import_confirmed: true
+    });
+    expect(state.local_main).toMatch(/^[0-9a-f]{40}$/u);
+
+    const dashboard = await admin.get<{
+      vault: { current_main: string };
+      devices: Array<{
+        device_name: string;
+        status_label: string;
+        behind_main: boolean;
+        last_applied_main: string | null;
+      }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+    expect(dashboard.status).toBe(200);
+    expect(dashboard.body.devices.find((device) => device.device_name === 'laptop')).toMatchObject({
+      status_label: 'Synced',
+      behind_main: false,
+      last_applied_main: dashboard.body.vault.current_main
+    });
+  });
+
   it('records local watcher change hints durably and consumes them through normal sync', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'watcher-device');
