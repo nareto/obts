@@ -242,6 +242,10 @@ paths:
       responses:
         "200":
           description: Conflict records.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConflictListResponse"
         "404":
           $ref: "#/components/responses/Error"
   /vaults/{vault_id}/events:
@@ -551,6 +555,79 @@ components:
           minimum: 0
         health:
           $ref: "#/components/schemas/ReadinessSummary"
+    ConflictListResponse:
+      type: object
+      required: [conflicts]
+      properties:
+        conflicts:
+          type: array
+          items:
+            $ref: "#/components/schemas/ConflictRecord"
+    ConflictRecord:
+      type: object
+      required:
+        - conflict_id
+        - vault_id
+        - device_id
+        - status
+        - base_commit
+        - current_main
+        - device_commit
+        - expected_main
+        - affected_paths
+        - affected_path_count
+        - merge_sequence
+        - merge_policy_version
+        - validator_results
+        - validator_summary
+        - created_at
+      properties:
+        conflict_id:
+          type: string
+          pattern: "^conf_"
+        vault_id:
+          type: string
+          pattern: "^vlt_"
+        device_id:
+          type: string
+          pattern: "^dev_"
+        status:
+          type: string
+          enum: [open, resolved]
+        base_commit:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        current_main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        device_commit:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        expected_main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        affected_paths:
+          type: array
+          items:
+            type: string
+        affected_path_count:
+          type: integer
+          minimum: 0
+        merge_sequence:
+          type: integer
+          minimum: 1
+        merge_policy_version:
+          type: string
+        validator_results:
+          type: object
+        validator_summary:
+          type: object
+        created_at:
+          type: string
+          format: date-time
+        resolved_at:
+          type: string
+          format: date-time
     ReadinessSummary:
       type: object
       required: [status, checks, detail, git_version]

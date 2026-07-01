@@ -157,6 +157,7 @@ export type ConflictRecord = {
   affected_path_count: number;
   merge_sequence: number;
   merge_policy_version: string;
+  validator_results: Record<string, unknown>;
   validator_summary: Record<string, unknown>;
   created_at: string;
   resolved_at?: string;

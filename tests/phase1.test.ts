@@ -637,13 +637,54 @@ describe('Phase 1 sync without conflict resolution', () => {
       last_error_code: 'conflict_review_required'
     });
 
-    const conflicts = await admin.get<{ conflicts: Array<{ affected_paths: string[]; status: string }> }>(
-      `/api/v1/vaults/${admin.vaultId}/conflicts?status=open`
-    );
+    const conflicts = await admin.get<{
+      conflicts: Array<{
+        affected_paths: string[];
+        status: string;
+        merge_sequence: number;
+        merge_policy_version: string;
+        base_commit: string;
+        current_main: string;
+        device_commit: string;
+        validator_results: Record<string, unknown>;
+      }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/conflicts?status=open`);
     expect(conflicts.status).toBe(200);
     expect(conflicts.body.conflicts).toHaveLength(1);
-    expect(conflicts.body.conflicts[0]?.status).toBe('open');
-    expect(conflicts.body.conflicts[0]?.affected_paths).toEqual(['shared.md']);
+    const conflict = conflicts.body.conflicts[0]!;
+    expect(conflict).toMatchObject({
+      status: 'open',
+      affected_paths: ['shared.md'],
+      merge_sequence: expect.any(Number),
+      merge_policy_version: 'phase1.disjoint-paths.v1',
+      base_commit: expect.stringMatching(/^[0-9a-f]{40}$/u),
+      current_main: expect.stringMatching(/^[0-9a-f]{40}$/u),
+      device_commit: expect.stringMatching(/^[0-9a-f]{40}$/u),
+      validator_results: {
+        reason: 'overlapping_paths',
+        affected_paths: ['shared.md'],
+        affected_path_count: 1
+      }
+    });
+    const db = await server.store.snapshot();
+    const operation = db.sync_operations.find(
+      (candidate) =>
+        candidate.operation_type === 'conflict_create' &&
+        candidate.result?.conflict_id === result.conflictId
+    );
+    expect(operation?.prepared_manifest).toMatchObject({
+      merge_sequence: conflict.merge_sequence,
+      merge_policy_version: 'phase1.disjoint-paths.v1',
+      base_commit: conflict.base_commit,
+      current_main: conflict.current_main,
+      device_commit: conflict.device_commit,
+      decision: 'conflict',
+      validator_results: {
+        reason: 'overlapping_paths',
+        affected_paths: ['shared.md'],
+        affected_path_count: 1
+      }
+    });
 
     const device3Dir = join(root, 'conflict-device-3');
     await mkdirp(device3Dir);

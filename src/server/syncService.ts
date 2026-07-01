@@ -753,7 +753,8 @@ export class SyncService {
         decision: 'conflict',
         validator_results: {
           reason,
-          affected_paths: affectedPaths
+          affected_paths: affectedPaths,
+          affected_path_count: affectedPaths.length
         }
       };
       operation.result = {
@@ -774,6 +775,11 @@ export class SyncService {
         affected_path_count: affectedPaths.length,
         merge_sequence: mergeSequence,
         merge_policy_version: MERGE_POLICY_VERSION,
+        validator_results: {
+          reason,
+          affected_paths: affectedPaths,
+          affected_path_count: affectedPaths.length
+        },
         validator_summary: {
           decision: 'conflict',
           reason,

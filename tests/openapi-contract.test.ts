@@ -30,6 +30,8 @@ describe('OpenAPI Phase 1 contract', () => {
     expect(contract).toContain('X-OBTS-CSRF');
     expect(contract).toContain('ConsumePairingTokenResponse');
     expect(contract).toContain('is_first_device');
+    expect(contract).toContain('ConflictRecord');
+    expect(contract).toContain('validator_results');
 
     const pullSection = contract.slice(
       contract.indexOf('/vaults/{vault_id}/sync/pull'),

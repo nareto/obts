@@ -253,6 +253,19 @@ export class MetadataStore {
         legacyDevice.last_applied_main = null;
       }
     }
+    for (const conflict of db.conflicts) {
+      const legacyConflict = conflict as ConflictRecord & { validator_results?: Record<string, unknown> };
+      if (!Object.prototype.hasOwnProperty.call(legacyConflict, 'validator_results')) {
+        legacyConflict.validator_results = {
+          reason:
+            typeof legacyConflict.validator_summary.reason === 'string'
+              ? legacyConflict.validator_summary.reason
+              : 'unknown',
+          affected_paths: legacyConflict.affected_paths,
+          affected_path_count: legacyConflict.affected_path_count
+        };
+      }
+    }
   }
 
   private pruneVaultEvents(db: MetadataDb, vaultId: string): void {
