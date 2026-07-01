@@ -446,6 +446,73 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await server.git.listTreePaths(admin.vaultId, main!)).toContain('watched.md');
   });
 
+  it('surfaces Uploading while a queued local commit is being pushed', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'upload-status-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'laptop');
+    await writeFile(join(deviceDir, 'queued.md'), 'queued upload\n');
+
+    let observedUploading = false;
+    const internals = plugin as unknown as {
+      transport: {
+        push: (...args: unknown[]) => Promise<unknown>;
+      };
+    };
+    internals.transport.push = async () => {
+      observedUploading = true;
+      expect(await plugin.readState()).toMatchObject({
+        status_label: 'Uploading',
+        last_error_code: null
+      });
+      throw new Error('stop upload after status observation');
+    };
+
+    await expect(plugin.syncOnce()).rejects.toThrow('stop upload after status observation');
+    expect(observedUploading).toBe(true);
+    expect(await plugin.readQueue()).toMatchObject({
+      status: 'uploading',
+      attempts: 1
+    });
+    expect(await plugin.readState()).toMatchObject({
+      status_label: 'Uploading',
+      last_error_code: null
+    });
+  });
+
+  it('surfaces Applying while pulled server main is being materialized locally', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const device1Dir = join(root, 'apply-status-device-1');
+    const device2Dir = join(root, 'apply-status-device-2');
+    await mkdirp(device1Dir);
+    await mkdirp(device2Dir);
+    const plugin1 = await pairPlugin(admin, device1Dir, 'laptop');
+    const plugin2 = await pairPlugin(admin, device2Dir, 'phone');
+
+    await writeFile(join(device1Dir, 'server.md'), 'server change\n');
+    expect((await plugin1.syncOnce()).status).toBe('Synced');
+
+    let observedApplying = false;
+    const internals = plugin2 as unknown as {
+      recovery: {
+        createRecoveryBundle: (...args: unknown[]) => Promise<string>;
+      };
+    };
+    const createRecoveryBundle = internals.recovery.createRecoveryBundle.bind(internals.recovery);
+    internals.recovery.createRecoveryBundle = async (...args: unknown[]) => {
+      observedApplying = true;
+      expect(await plugin2.readState()).toMatchObject({
+        status_label: 'Applying',
+        last_error_code: null
+      });
+      return await createRecoveryBundle(...args);
+    };
+
+    expect((await plugin2.syncOnce()).status).toBe('Synced');
+    expect(observedApplying).toBe(true);
+    expect(await readFile(join(device2Dir, 'server.md'), 'utf8')).toBe('server change\n');
+  });
+
   it('stores new dashboard passwords with the PRD Argon2id parameters', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const db = await server.store.snapshot();

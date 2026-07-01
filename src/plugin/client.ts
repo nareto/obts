@@ -248,6 +248,12 @@ export class ObtsPluginClient {
         throw new PluginBlockedError('not_paired', 'Device is not paired.');
       }
       await this.writeQueue({ ...queue, status: 'uploading', attempts: queue.attempts + 1, updated_at: nowIso() });
+      await this.writeState({
+        ...currentState,
+        status_label: 'Uploading',
+        last_error_code: null,
+        updated_at: nowIso()
+      });
       const packfile = await this.git.createPackForCommit(queue.pending_commit);
       const manifest: DevicePushManifest = {
         api_version: API_VERSION,
@@ -588,6 +594,12 @@ export class ObtsPluginClient {
       throw error;
     }
     try {
+      await this.writeState({
+        ...state,
+        status_label: 'Applying',
+        last_error_code: null,
+        updated_at: nowIso()
+      });
       const targetFiles = new Set(await this.materializedTreeFiles(targetMain));
       const affected = new Set(changedPaths);
       if (state.local_main) {

@@ -76,6 +76,8 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - empty or already-matching paired devices acknowledge the current server `main`
   immediately and appear Synced without needing a later manual sync;
 - watcher change hints for syncable vault paths survive plugin restart and are consumed by the next normal Git-backed sync scan, while internal `.obts` and visible `.git` paths are ignored;
+- plugin state surfaces `Uploading` during queued push attempts and `Applying`
+  while pulled server `main` is being materialized locally;
 - divergent additional-device local content creates a recovery bundle, blocks normal sync, and requires explicit replace-local-with-server before destructive apply, even when current server `main` is still the empty root;
 - pairing tokens are scoped to their issued device name, sync profile, and plugin-sync setting, and cannot be consumed twice;
 - replace-local-with-server recovers and safely materializes file/directory collisions, including local directories that must be replaced by server files;

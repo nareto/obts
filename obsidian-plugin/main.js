@@ -394,6 +394,12 @@ class ObtsObsidianClient {
     const state = await this.readState();
     const token = await this.readDeviceToken();
     await this.writeQueue(Object.assign({}, queue, { status: "uploading", attempts: queue.attempts + 1, updated_at: nowIso() }));
+    await this.writeState(Object.assign({}, state, {
+      status_label: "Uploading",
+      last_error_code: null,
+      updated_at: nowIso()
+    }));
+    this.plugin.setStatus("Uploading");
     const packfile = await this.createPackForCommit(queue.pending_commit);
     const manifest = {
       api_version: API_VERSION,
@@ -459,6 +465,12 @@ class ObtsObsidianClient {
     const applyId = `apply_${Date.now()}_${crypto.randomBytes(8).toString("hex")}`;
     await this.acquireApplyLock(applyId);
     this.plugin.isApplying = true;
+    await this.writeState(Object.assign({}, state, {
+      status_label: "Applying",
+      last_error_code: null,
+      updated_at: nowIso()
+    }));
+    this.plugin.setStatus("Applying");
     const journal = {
       apply_id: applyId,
       operation_type: "pull_apply",
