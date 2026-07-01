@@ -23,7 +23,7 @@ Implemented runtime pieces:
 - Same-path binary and attachment edits merge automatically only when the accepted server version and uploaded device version have identical blob content; otherwise they remain review-needed conflicts.
 - Merge operations persist the exact target commit and target ref in the prepared operation manifest before advancing `refs/heads/main`; startup reconciliation aborts unprepared writes, rolls forward prepared writes whose Git refs already moved, resumes merged-or-conflicted processing for recovered device ref updates, and marks unreconcilable vault state as `blocked_integrity`.
 - Vault event polling retains 30 days or 100,000 events per vault, returns `410 event_cursor_expired` when a client cursor predates retained history, and includes the current and oldest available event cursors in the redacted error details.
-- Plugin-side `.obts/` state with `isomorphic-git`, device token storage, queue state, recovery bundles with file snapshots, text patches, local Git refs packs, and artifact checksums, local apply lock, apply journal, local commit creation, multipart push, multipart pull, safe apply, incomplete-journal blocking, and explicit replace-local-with-server recovery.
+- Plugin-side `.obts/` state with `isomorphic-git`, device token storage, durable watcher change hints, queue state, recovery bundles with file snapshots, text patches, local Git refs packs, and artifact checksums, local apply lock, apply journal, local commit creation, multipart push, multipart pull, safe apply, incomplete-journal blocking, and explicit replace-local-with-server recovery.
 - Plugin sync records server-created conflicts as a local `Review needed` blocking state, so later automatic sync or pull/apply attempts stop before replacing local review content.
 - The sync pull API also rejects devices marked `review_needed` or `blocked_recovery`, so a stale or reset plugin cannot bypass server-known conflict/recovery blocks and apply server state over review content.
 - API-backed dashboard shell for setup, login, vault creation, overview, device status, events, readiness, and pairing-token creation; the dashboard health summary reuses the same fail-closed readiness checks as `/health/ready`.
@@ -49,6 +49,7 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - malformed commit IDs in multipart sync manifests are rejected before Git ref mutation;
 - hidden Git state is under `.obts/`, with no visible vault `.git`;
 - first-device import of existing local content creates a recovery bundle and requires confirmation;
+- watcher change hints for syncable vault paths survive plugin restart and are consumed by the next normal Git-backed sync scan, while internal `.obts` and visible `.git` paths are ignored;
 - divergent additional-device local content creates a recovery bundle, blocks normal sync, and requires explicit replace-local-with-server before destructive apply, even when current server `main` is still the empty root;
 - pairing tokens are scoped to their issued sync profile and cannot be consumed twice;
 - replace-local-with-server recovers and safely materializes file/directory collisions, including local directories that must be replaced by server files;

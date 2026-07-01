@@ -181,6 +181,45 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
   });
 
+  it('records local watcher change hints durably and consumes them through normal sync', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'watcher-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'laptop');
+
+    await writeFile(join(deviceDir, 'watched.md'), 'from watcher\n');
+    await plugin.recordLocalChangeHint(['watched.md', '.obts/state.json', '.git/config', '../outside.md']);
+    expect(await plugin.readState()).toMatchObject({
+      status_label: 'Ahead',
+      last_error_code: null
+    });
+    expect(await plugin.readQueue()).toMatchObject({
+      pending_commit: null,
+      status: 'queued_local'
+    });
+
+    const restartedPlugin = new ObtsPluginClient(deviceDir, {
+      serverUrl: baseUrl,
+      deviceName: 'laptop',
+      syncProfile: 'notes_only',
+      syncPlugins: false
+    });
+    await restartedPlugin.initialize();
+    expect(await restartedPlugin.readQueue()).toMatchObject({
+      pending_commit: null,
+      status: 'queued_local'
+    });
+
+    const sync = await restartedPlugin.syncOnce();
+    expect(sync.status).toBe('Synced');
+    const finalQueue = await restartedPlugin.readQueue();
+    expect(finalQueue.pending_commit).toBeNull();
+    expect(finalQueue.status).not.toBe('queued_local');
+    const main = (await restartedPlugin.readState()).local_main;
+    expect(main).toMatch(/^[0-9a-f]{40}$/u);
+    expect(await server.git.listTreePaths(admin.vaultId, main!)).toContain('watched.md');
+  });
+
   it('stores new dashboard passwords with the PRD Argon2id parameters', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const db = await server.store.snapshot();

@@ -3,7 +3,7 @@ import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path';
 
 import { newId, nowIso } from '../shared/ids.js';
-import { isSyncableVaultPath, type SyncPathPolicy } from '../shared/pathPolicy.js';
+import { assertSyncableTreePaths, isSyncableVaultPath, normalizeVaultPath, type SyncPathPolicy } from '../shared/pathPolicy.js';
 import { API_VERSION, type DevicePushManifest, type SyncProfile } from '../shared/types.js';
 import { LocalGitEngine } from './localGit.js';
 import { ApplyLockActiveError, type ApplyJournal, RecoveryManager, sha256File } from './recovery.js';
@@ -215,6 +215,19 @@ export class ObtsPluginClient {
       });
     }
 
+    if (!commit) {
+      const existingQueue = await this.readQueue();
+      if (existingQueue.status === 'queued_local' && existingQueue.pending_commit === null) {
+        await this.writeQueue({
+          pending_commit: null,
+          expected_device_ref: state.server_device_ref,
+          status: 'idle',
+          attempts: 0,
+          updated_at: nowIso()
+        });
+      }
+    }
+
     const queue = await this.readQueue();
     if (queue.pending_commit) {
       const token = await this.readDeviceToken();
@@ -334,6 +347,42 @@ export class ObtsPluginClient {
     if (state.local_main !== pulled.manifest.target_main) {
       await this.acknowledgeAppliedMain(state, token, pulled.manifest.target_main);
     }
+  }
+
+  async recordLocalChangeHint(paths: string[]): Promise<void> {
+    await this.initialize();
+    const state = await this.readState();
+    if (!state.vault_id || !state.device_id) {
+      throw new PluginBlockedError('not_paired', 'Device is not paired.');
+    }
+    this.throwIfSyncBlocked(state);
+    const changedPaths = paths
+      .map((path) => normalizeVaultPath(path))
+      .filter((result): result is { ok: true; path: string } => result.ok)
+      .map((result) => result.path)
+      .filter((path) => isSyncableVaultPath(path, this.policy))
+      .sort();
+    const uniqueChangedPaths = [...new Set(changedPaths)];
+    if (uniqueChangedPaths.length === 0) {
+      return;
+    }
+    assertSyncableTreePaths(uniqueChangedPaths);
+    const queue = await this.readQueue();
+    if (!queue.pending_commit) {
+      await this.writeQueue({
+        pending_commit: null,
+        expected_device_ref: state.server_device_ref,
+        status: 'queued_local',
+        attempts: 0,
+        updated_at: nowIso()
+      });
+    }
+    await this.writeState({
+      ...state,
+      status_label: 'Ahead',
+      last_error_code: null,
+      updated_at: nowIso()
+    });
   }
 
   async readState(): Promise<LocalPluginState> {
