@@ -23,6 +23,10 @@ const SESSION_IDLE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const RECENT_AUTH_MS = 15 * 60 * 1000;
 const PAIRING_TTL_MS = 10 * 60 * 1000;
 const PASSWORD_RESET_TTL_MS = 30 * 60 * 1000;
+const LOGIN_FAILURE_WINDOW_MS = 10 * 60 * 1000;
+const LOGIN_FAILURE_LIMIT = 5;
+const LOGIN_BACKOFF_BASE_MS = 60 * 1000;
+const LOGIN_BACKOFF_MAX_MS = 60 * 60 * 1000;
 const ARGON2ID_MEMORY_COST = 19_456;
 const ARGON2ID_TIME_COST = 2;
 const ARGON2ID_PARALLELISM = 1;
@@ -112,14 +116,19 @@ export class AuthService {
   async login(input: {
     username: string;
     password: string;
+    sourceIp?: string;
   }): Promise<{ user: UserRow; csrfToken: string; sessionId: string; recentAuthExpiresAt: string }> {
     return await this.store.mutate(async (db) => {
+      const sourceIp = input.sourceIp ?? 'unknown';
+      enforceLoginBackoff(db, input.username, sourceIp);
       const user = db.users.find((candidate) => candidate.username === input.username);
       if (!user || user.disabled || !(await verifyPassword(input.password, user.password_hash))) {
+        recordFailedLogin(db, input.username, sourceIp, user?.user_id ?? null);
         throw new AuthError(401, 'invalid_credentials', 'Invalid username or password.');
       }
       const timestamp = nowIso();
       user.last_login_at = timestamp;
+      clearLoginFailures(db, input.username, sourceIp);
       const session = createSession(user.user_id);
       db.sessions.push(session);
       db.audit_log.push({
@@ -504,7 +513,12 @@ export class AuthService {
       }
       const tokenSyncProfile = readTokenSyncProfile(token);
       const tokenSyncPlugins = token.metadata.sync_plugins === true;
-      if (input.syncProfile !== tokenSyncProfile || input.syncPlugins !== tokenSyncPlugins) {
+      const tokenDeviceName = typeof token.metadata.device_name === 'string' ? token.metadata.device_name : null;
+      if (
+        input.syncProfile !== tokenSyncProfile ||
+        input.syncPlugins !== tokenSyncPlugins ||
+        (tokenDeviceName !== null && input.deviceName !== tokenDeviceName)
+      ) {
         token.failed_attempts += 1;
         return { ok: false, error: new AuthError(401, 'invalid_pairing_token', 'Pairing token is invalid or expired.') };
       }
@@ -629,7 +643,7 @@ export function hashToken(token: string): { lookupPrefix: string; hash: string }
   return { lookupPrefix: hash.slice(0, 16), hash };
 }
 
-async function hashPassword(password: string): Promise<PasswordHash> {
+export async function hashPassword(password: string): Promise<PasswordHash> {
   const hash = await argonHash(password, {
     algorithm: Algorithm.Argon2id,
     version: Version.V0x13,
@@ -676,6 +690,65 @@ function revokeUserAuth(db: MetadataDb, userId: string): void {
       device.revoked_at = timestamp;
     }
   }
+}
+
+function enforceLoginBackoff(db: MetadataDb, username: string, sourceIp: string): void {
+  const attempt = db.login_attempts.find(
+    (candidate) => candidate.username === username && candidate.source_ip === sourceIp
+  );
+  if (!attempt?.locked_until) {
+    return;
+  }
+  if (Date.parse(attempt.locked_until) > Date.now()) {
+    throw new AuthError(429, 'auth_rate_limited', 'Too many failed login attempts; try again later.');
+  }
+}
+
+function recordFailedLogin(db: MetadataDb, username: string, sourceIp: string, userId: string | null): void {
+  const now = Date.now();
+  const timestamp = new Date(now).toISOString();
+  let attempt = db.login_attempts.find(
+    (candidate) => candidate.username === username && candidate.source_ip === sourceIp
+  );
+  if (!attempt || now - Date.parse(attempt.window_started_at) > LOGIN_FAILURE_WINDOW_MS) {
+    attempt = {
+      username,
+      source_ip: sourceIp,
+      failed_count: 0,
+      window_started_at: timestamp,
+      last_failed_at: timestamp,
+      locked_until: null,
+      updated_at: timestamp
+    };
+    db.login_attempts = db.login_attempts.filter(
+      (candidate) => candidate.username !== username || candidate.source_ip !== sourceIp
+    );
+    db.login_attempts.push(attempt);
+  }
+  attempt.failed_count += 1;
+  attempt.last_failed_at = timestamp;
+  attempt.updated_at = timestamp;
+  if (attempt.failed_count >= LOGIN_FAILURE_LIMIT) {
+    const backoffPower = Math.max(0, attempt.failed_count - LOGIN_FAILURE_LIMIT);
+    const backoffMs = Math.min(LOGIN_BACKOFF_BASE_MS * 2 ** backoffPower, LOGIN_BACKOFF_MAX_MS);
+    attempt.locked_until = new Date(now + backoffMs).toISOString();
+  }
+  db.audit_log.push({
+    audit_id: newId('aud'),
+    actor_user_id: userId,
+    actor_device_id: null,
+    vault_id: null,
+    action: 'login_failed',
+    resource_class: 'session',
+    resource_id: null,
+    created_at: timestamp
+  });
+}
+
+function clearLoginFailures(db: MetadataDb, username: string, sourceIp: string): void {
+  db.login_attempts = db.login_attempts.filter(
+    (candidate) => candidate.username !== username || candidate.source_ip !== sourceIp
+  );
 }
 
 function userSummary(db: MetadataDb, user: UserRow): AdminUserSummary {

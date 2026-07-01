@@ -100,7 +100,8 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const body = requestBody(request);
     const result = await auth.login({
       username: readString(body, 'username'),
-      password: readString(body, 'password')
+      password: readString(body, 'password'),
+      sourceIp: request.ip
     });
     setSessionCookie(reply, config, result.sessionId);
     return {

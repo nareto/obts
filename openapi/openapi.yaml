@@ -46,6 +46,8 @@ paths:
           description: Dashboard session.
         "401":
           $ref: "#/components/responses/Error"
+        "429":
+          $ref: "#/components/responses/Error"
   /auth/session:
     get:
       summary: Return the current dashboard session and CSRF token.

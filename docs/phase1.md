@@ -19,9 +19,9 @@ Implemented runtime pieces:
 - Shared API types, status labels, validation helpers, and vault path policy.
 - Committed OpenAPI 3.1 contract at `openapi/openapi.yaml`.
 - Fastify server with first-run setup, Argon2id password storage, login/logout sessions, CSRF-protected dashboard mutations, admin user creation, vault creation, pairing tokens, device tokens, multipart push, multipart pull, events, conflicts, and health checks.
-- Phase 1 admin lifecycle APIs for redacted account listing, user disable/re-enable, admin grant/revoke with final-admin protection, one-time password reset tokens, and individual device revocation. User disable and device revocation immediately invalidate the affected dashboard sessions, pairing tokens, and device tokens.
+- Phase 1 admin lifecycle APIs for redacted account listing, user disable/re-enable, admin grant/revoke with final-admin protection, one-time password reset tokens, failed-login backoff, and individual device revocation. User disable and device revocation immediately invalidate the affected dashboard sessions, pairing tokens, and device tokens.
 - Dashboard sessions use a browser-compatible `obts_session` cookie for HTTP/dev deployments and the hardened `__Host-obts_session` Secure cookie when `publicBaseUrl` is HTTPS.
-- Recent-auth enforcement covers sensitive Phase 1 dashboard mutations such as pairing token creation and admin account creation.
+- Recent-auth enforcement covers sensitive Phase 1 dashboard mutations such as pairing token creation and admin account creation. Pairing token consumption enforces the issued device name, sync profile, and plugin-sync scope before registering a device.
 - Multipart sync manifests reject non-commit ref strings and malformed SHA-256 packfile digests before Git ref mutation logic runs.
 - Uploaded packfiles and individual Git blobs are checked against the configured upload byte limit before refs advance.
 - Per-vault native Git stores under `OBTS_DATA_DIR/git`, with server-authored empty-tree root commits on `refs/heads/main`.
@@ -52,10 +52,12 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - first-run setup is one-time, liveness/readiness health endpoints work, and
   new vaults create a real empty-tree `refs/heads/main` commit immediately;
 - Phase 1 CLI commands can set up an admin, create a vault, create pairing
-  tokens, list devices, list conflicts, inspect readiness, and create a local
-  admin recovery token from persistent state;
+  tokens, list devices, list conflicts, inspect readiness, create a local
+  admin recovery token from persistent state, and create a recovery admin only
+  when no enabled admin account remains;
 - two paired devices sync non-conflicting vault changes through server `main`;
 - dashboard passwords are stored as Argon2id hashes using the PRD v1 minimum parameters;
+- repeated failed dashboard logins are audited and rate-limited by account plus source IP;
 - sensitive admin account creation requires recent dashboard authentication;
 - admin lifecycle mutations require recent dashboard authentication, preserve one enabled admin, expose only account metadata plus owned-vault counts, and immediately revoke disabled users' auth state;
 - individual device revocation immediately rejects subsequent device-token sync requests;
@@ -65,7 +67,7 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - first-device import of existing local content creates a recovery bundle and requires confirmation;
 - watcher change hints for syncable vault paths survive plugin restart and are consumed by the next normal Git-backed sync scan, while internal `.obts` and visible `.git` paths are ignored;
 - divergent additional-device local content creates a recovery bundle, blocks normal sync, and requires explicit replace-local-with-server before destructive apply, even when current server `main` is still the empty root;
-- pairing tokens are scoped to their issued sync profile and cannot be consumed twice;
+- pairing tokens are scoped to their issued device name, sync profile, and plugin-sync setting, and cannot be consumed twice;
 - replace-local-with-server recovers and safely materializes file/directory collisions, including local directories that must be replaced by server files;
 - partial or already-paired local `.obts/` state blocks pairing before a one-time pairing token is consumed;
 - clean overlapping Markdown edits merge through native Git before conflict creation;

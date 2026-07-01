@@ -5,7 +5,7 @@ import process from 'node:process';
 import { newId, newSecretToken, nowIso } from './shared/ids.js';
 import type { SyncProfile } from './shared/types.js';
 import { readSyncProfile } from './shared/validators.js';
-import { ownedVaultOrThrow, hashToken } from './server/authService.js';
+import { ownedVaultOrThrow, hashPassword, hashToken } from './server/authService.js';
 import { createObtsServer, type ObtsServer } from './server/app.js';
 import type { ServerConfig } from './server/config.js';
 
@@ -32,6 +32,7 @@ Usage:
   obts devices list --username USER --password PASSWORD --vault-id ID [--json]
   obts conflicts list --username USER --password PASSWORD --vault-id ID [--status open|resolved|all] [--json]
   obts admin-recovery create-reset-token --username USER [--enable-user] [--json]
+  obts admin-recovery create-admin --username USER --password PASSWORD [--display-name NAME] [--json]
 
 Environment:
   OBTS_DATA_DIR             Persistent state root. Defaults to ./.obts-server.
@@ -267,6 +268,56 @@ export async function runCli(
       return 0;
     }
 
+    if (command === 'admin-recovery' && subcommand === 'create-admin') {
+      const username = requiredString(parsed, 'username');
+      const password = requiredString(parsed, 'password');
+      if (password.length < 12) {
+        throw new CliUsageError('admin recovery password must be at least 12 characters.');
+      }
+      const displayName = stringOption(parsed, 'display-name') ?? username;
+      const result = await server.store.mutate(async (db) => {
+        if (db.users.some((user) => user.is_admin && !user.disabled)) {
+          throw new CliUsageError('local admin creation is allowed only when no enabled admin account exists.');
+        }
+        if (db.users.some((user) => user.username === username)) {
+          throw new CliUsageError('username already exists.');
+        }
+        const timestamp = nowIso();
+        const user = {
+          user_id: newId('usr'),
+          username,
+          display_name: displayName,
+          password_hash: await hashPassword(password),
+          is_admin: true,
+          disabled: false,
+          created_at: timestamp,
+          last_login_at: null
+        };
+        db.users.push(user);
+        db.setup_complete = true;
+        db.audit_log.push({
+          audit_id: newId('aud'),
+          actor_user_id: null,
+          actor_device_id: null,
+          vault_id: null,
+          action: 'local_admin_recovery_admin_created',
+          resource_class: 'user',
+          resource_id: user.user_id,
+          created_at: timestamp
+        });
+        return {
+          user_id: user.user_id,
+          username: user.username,
+          display_name: user.display_name,
+          is_admin: user.is_admin,
+          disabled: user.disabled,
+          created_at: user.created_at
+        };
+      });
+      writeResult(io, parsed, result, `created recovery admin ${result.username} (${result.user_id})\n`);
+      return 0;
+    }
+
     if (action) {
       throw new CliUsageError(`unknown command: ${command} ${subcommand ?? ''} ${action}`.trim());
     }
@@ -301,7 +352,8 @@ function configFromEnv(env: CliEnv): Partial<ServerConfig> & { dataDir: string }
 async function loginForCli(server: ObtsServer, parsed: ParsedArgs) {
   const result = await server.auth.login({
     username: requiredString(parsed, 'username'),
-    password: requiredString(parsed, 'password')
+    password: requiredString(parsed, 'password'),
+    sourceIp: 'cli'
   });
   return result.user;
 }

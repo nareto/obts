@@ -284,6 +284,41 @@ describe('Phase 1 sync without conflict resolution', () => {
       reset_token: expect.stringMatching(/^obts_reset_/u)
     });
 
+    const disabledAdminServer = await createObtsServer({
+      dataDir: cliDataDir,
+      publicBaseUrl: 'http://sync.example.test',
+      sessionSecret: 'cli-test-session-secret-with-enough-entropy'
+    });
+    try {
+      await disabledAdminServer.store.mutate((db) => {
+        for (const user of db.users) {
+          if (user.is_admin) {
+            user.disabled = true;
+          }
+        }
+      });
+    } finally {
+      await disabledAdminServer.app.close();
+    }
+
+    const recoveredAdmin = await run([
+      'admin-recovery',
+      'create-admin',
+      '--username',
+      'breakglass',
+      '--password',
+      'breakglass-password-1234',
+      '--display-name',
+      'Break Glass',
+      '--json'
+    ]);
+    expect(recoveredAdmin).toMatchObject({ code: 0, stderr: '' });
+    expect(JSON.parse(recoveredAdmin.stdout)).toMatchObject({
+      username: 'breakglass',
+      is_admin: true,
+      disabled: false
+    });
+
     server = await createObtsServer({
       dataDir: join(root, 'server-data'),
       publicBaseUrl: 'http://127.0.0.1:0',
@@ -402,6 +437,44 @@ describe('Phase 1 sync without conflict resolution', () => {
     const session = await admin.get<{ user_id: string; csrf_token: string }>('/api/v1/auth/session');
     expect(session.status).toBe(200);
     expect(session.body.csrf_token).toBe(login.body.csrf_token);
+  });
+
+  it('rate-limits repeated failed dashboard logins by account and source IP', async () => {
+    await setupAdminAndVault(baseUrl);
+
+    for (let index = 0; index < 5; index += 1) {
+      await expect(
+        server.auth.login({
+          username: 'admin',
+          password: 'wrong-password-1234',
+          sourceIp: '203.0.113.10'
+        })
+      ).rejects.toMatchObject({ statusCode: 401, code: 'invalid_credentials' });
+    }
+
+    await expect(
+      server.auth.login({
+        username: 'admin',
+        password: 'wrong-password-1234',
+        sourceIp: '203.0.113.10'
+      })
+    ).rejects.toMatchObject({ statusCode: 429, code: 'auth_rate_limited' });
+
+    await expect(
+      server.auth.login({
+        username: 'admin',
+        password: 'wrong-password-1234',
+        sourceIp: '203.0.113.11'
+      })
+    ).rejects.toMatchObject({ statusCode: 401, code: 'invalid_credentials' });
+
+    const db = await server.store.snapshot();
+    expect(db.login_attempts.find((attempt) => attempt.source_ip === '203.0.113.10')).toMatchObject({
+      username: 'admin',
+      failed_count: 5,
+      locked_until: expect.any(String)
+    });
+    expect(db.audit_log.filter((audit) => audit.action === 'login_failed')).toHaveLength(6);
   });
 
   it('sets a browser-usable dashboard session cookie for HTTP deployments', async () => {
@@ -1098,12 +1171,23 @@ describe('Phase 1 sync without conflict resolution', () => {
       })
     });
     expect(wrongProfile.status).toBe(401);
+    const wrongDeviceName = await fetch(`${baseUrl}/api/v1/pair/consume`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        pairing_token: pairing.body.pairing_token,
+        device_name: 'tablet',
+        sync_profile: 'notes_plus_attachments',
+        sync_plugins: false
+      })
+    });
+    expect(wrongDeviceName.status).toBe(401);
     const persistedAfterWrongProfile = JSON.parse(
       await readFile(join(root, 'server-data', 'metadata', 'phase1.json'), 'utf8')
     ) as { tokens: Array<{ kind: string; failed_attempts: number; consumed_at: string | null }> };
     const persistedPairing = persistedAfterWrongProfile.tokens.find((token) => token.kind === 'pairing');
     expect(persistedPairing).toMatchObject({
-      failed_attempts: 1,
+      failed_attempts: 2,
       consumed_at: null
     });
 

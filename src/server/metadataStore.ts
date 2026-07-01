@@ -87,6 +87,16 @@ export type TokenRow = {
   created_at: string;
 };
 
+export type LoginAttemptRow = {
+  username: string;
+  source_ip: string;
+  failed_count: number;
+  window_started_at: string;
+  last_failed_at: string;
+  locked_until: string | null;
+  updated_at: string;
+};
+
 export type SyncOperationRow = {
   operation_id: string;
   vault_id: string;
@@ -121,6 +131,7 @@ export type MetadataDb = {
   vaults: VaultRow[];
   devices: DeviceRow[];
   tokens: TokenRow[];
+  login_attempts: LoginAttemptRow[];
   sync_operations: SyncOperationRow[];
   conflicts: ConflictRecord[];
   events: EventEnvelope[];
@@ -244,6 +255,10 @@ export class MetadataStore {
   }
 
   private normalizeLoadedDb(db: MetadataDb): void {
+    const legacyDb = db as MetadataDb & { login_attempts?: LoginAttemptRow[] };
+    if (!Array.isArray(legacyDb.login_attempts)) {
+      legacyDb.login_attempts = [];
+    }
     for (const device of db.devices) {
       const legacyDevice = device as DeviceRow & { sync_plugins?: boolean; last_applied_main?: string | null };
       if (legacyDevice.sync_plugins === undefined) {
@@ -291,6 +306,7 @@ function createEmptyDb(): MetadataDb {
     vaults: [],
     devices: [],
     tokens: [],
+    login_attempts: [],
     sync_operations: [],
     conflicts: [],
     events: [],

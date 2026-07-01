@@ -83,6 +83,17 @@ node dist/src/cli.js admin-recovery create-reset-token --username admin
 
 Use the token with `POST /api/v1/auth/password-reset`.
 
+If no enabled admin account remains, local recovery can create a new admin
+account from the server host:
+
+```sh
+node dist/src/cli.js admin-recovery create-admin \
+  --username breakglass \
+  --password 'change-this-password'
+```
+
+The command is rejected while any enabled admin account still exists.
+
 ## OCI Image
 
 Build and run the repository image:
@@ -98,4 +109,3 @@ docker run --rm -p 3000:3000 \
 
 The image includes the native `git` CLI and a readiness healthcheck that runs
 `obts health ready`.
-
