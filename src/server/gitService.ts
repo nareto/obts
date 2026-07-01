@@ -21,6 +21,14 @@ export type MergeTreeResult = {
   validatorResults: Record<string, unknown>;
 };
 
+export type GitObjectReader = {
+  commitExists(vaultId: string, commit: string): Promise<boolean>;
+  validateTreePathPolicy(vaultId: string, commit: string, maxBlobBytes?: number): Promise<void>;
+  isAncestor(vaultId: string, ancestor: string, descendant: string): Promise<boolean>;
+  changedPaths(vaultId: string, base: string, commit: string): Promise<GitDiffEntry[]>;
+  listTreePaths(vaultId: string, commit: string): Promise<string[]>;
+};
+
 type GitTreeEntry = {
   mode: string;
   type: string;
@@ -89,7 +97,10 @@ export class GitService {
   }
 
   async commitExists(vaultId: string, commit: string): Promise<boolean> {
-    const repo = this.repoPath(vaultId);
+    return await this.commitExistsInRepo(this.repoPath(vaultId), commit);
+  }
+
+  private async commitExistsInRepo(repo: string, commit: string): Promise<boolean> {
     try {
       await this.exec(repo, ['cat-file', '-e', `${commit}^{commit}`]);
       return true;
@@ -99,7 +110,10 @@ export class GitService {
   }
 
   async isAncestor(vaultId: string, ancestor: string, descendant: string): Promise<boolean> {
-    const repo = this.repoPath(vaultId);
+    return await this.isAncestorInRepo(this.repoPath(vaultId), ancestor, descendant);
+  }
+
+  private async isAncestorInRepo(repo: string, ancestor: string, descendant: string): Promise<boolean> {
     try {
       await this.exec(repo, ['merge-base', '--is-ancestor', ancestor, descendant]);
       return true;
@@ -123,6 +137,36 @@ export class GitService {
     await this.exec(repo, ['unpack-objects', '-q'], packfile);
   }
 
+  async withQuarantinedPack<T>(
+    vaultId: string,
+    packfile: Buffer,
+    fn: (reader: GitObjectReader) => Promise<T>
+  ): Promise<T> {
+    const durableRepo = this.repoPath(vaultId);
+    const quarantineRoot = join(this.config.tempDir, `quarantine-${vaultId}-${randomBytes(8).toString('hex')}`);
+    const quarantineRepo = join(quarantineRoot, 'repo.git');
+    await mkdir(quarantineRoot, { recursive: true, mode: 0o700 });
+    try {
+      await this.execRaw(['init', '--bare', quarantineRepo]);
+      await mkdir(join(quarantineRepo, 'objects', 'info'), { recursive: true, mode: 0o700 });
+      await writeFile(join(quarantineRepo, 'objects', 'info', 'alternates'), `${join(durableRepo, 'objects')}\n`, {
+        mode: 0o600
+      });
+      await this.exec(quarantineRepo, ['unpack-objects', '-q'], packfile);
+      return await fn({
+        commitExists: async (_vaultId, commit) => await this.commitExistsInRepo(quarantineRepo, commit),
+        validateTreePathPolicy: async (_vaultId, commit, maxBlobBytes) =>
+          await this.validateTreePathPolicyInRepo(quarantineRepo, commit, maxBlobBytes),
+        isAncestor: async (_vaultId, ancestor, descendant) =>
+          await this.isAncestorInRepo(quarantineRepo, ancestor, descendant),
+        changedPaths: async (_vaultId, base, commit) => await this.changedPathsInRepo(quarantineRepo, base, commit),
+        listTreePaths: async (_vaultId, commit) => await this.listTreePathsInRepo(quarantineRepo, commit)
+      });
+    } finally {
+      await rm(quarantineRoot, { recursive: true, force: true });
+    }
+  }
+
   async exportPack(vaultId: string, target: string, have: string | null): Promise<Buffer> {
     const repo = this.repoPath(vaultId);
     const input = have ? `${target}\n^${have}\n` : `${target}\n`;
@@ -134,11 +178,18 @@ export class GitService {
   }
 
   async listTreePaths(vaultId: string, commit: string): Promise<string[]> {
-    return (await this.listTreeEntries(vaultId, commit)).map((entry) => entry.path);
+    return await this.listTreePathsInRepo(this.repoPath(vaultId), commit);
+  }
+
+  private async listTreePathsInRepo(repo: string, commit: string): Promise<string[]> {
+    return (await this.listTreeEntriesInRepo(repo, commit)).map((entry) => entry.path);
   }
 
   async listTreeEntries(vaultId: string, commit: string): Promise<GitTreeEntry[]> {
-    const repo = this.repoPath(vaultId);
+    return await this.listTreeEntriesInRepo(this.repoPath(vaultId), commit);
+  }
+
+  private async listTreeEntriesInRepo(repo: string, commit: string): Promise<GitTreeEntry[]> {
     const { stdout } = await this.exec(repo, ['ls-tree', '-r', '-z', commit], undefined, undefined, {
       encoding: 'buffer'
     });
@@ -160,7 +211,15 @@ export class GitService {
   }
 
   async validateTreePathPolicy(vaultId: string, commit: string, maxBlobBytes = Number.POSITIVE_INFINITY): Promise<void> {
-    const entries = await this.listTreeEntries(vaultId, commit);
+    await this.validateTreePathPolicyInRepo(this.repoPath(vaultId), commit, maxBlobBytes);
+  }
+
+  private async validateTreePathPolicyInRepo(
+    repo: string,
+    commit: string,
+    maxBlobBytes = Number.POSITIVE_INFINITY
+  ): Promise<void> {
+    const entries = await this.listTreeEntriesInRepo(repo, commit);
     assertSyncableTreePaths(entries.map((entry) => entry.path));
     for (const entry of entries) {
       if (entry.type !== 'blob' || entry.mode === '120000' || entry.mode === '160000') {
@@ -169,7 +228,7 @@ export class GitService {
           'Git tree entries must be regular files; symlinks and submodules cannot be synced.'
         );
       }
-      const blobSize = await this.objectSize(vaultId, `${commit}:${entry.path}`);
+      const blobSize = await this.objectSizeInRepo(repo, `${commit}:${entry.path}`);
       if (blobSize > maxBlobBytes) {
         throw new PathPolicyViolation('file_too_large', 'A file exceeds the configured upload byte limit.', {
           max_upload_bytes: maxBlobBytes
@@ -179,7 +238,10 @@ export class GitService {
   }
 
   async changedPaths(vaultId: string, base: string, commit: string): Promise<GitDiffEntry[]> {
-    const repo = this.repoPath(vaultId);
+    return await this.changedPathsInRepo(this.repoPath(vaultId), base, commit);
+  }
+
+  private async changedPathsInRepo(repo: string, base: string, commit: string): Promise<GitDiffEntry[]> {
     const { stdout } = await this.exec(repo, ['diff', '--name-status', '-z', base, commit], undefined, undefined, {
       encoding: 'buffer'
     });
@@ -415,7 +477,10 @@ export class GitService {
   }
 
   async objectSize(vaultId: string, oid: string): Promise<number> {
-    const repo = this.repoPath(vaultId);
+    return await this.objectSizeInRepo(this.repoPath(vaultId), oid);
+  }
+
+  private async objectSizeInRepo(repo: string, oid: string): Promise<number> {
     const { stdout } = await this.exec(repo, ['cat-file', '-s', oid]);
     return Number.parseInt(asText(stdout).trim(), 10);
   }

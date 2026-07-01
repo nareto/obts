@@ -2920,6 +2920,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     const device = db.devices.find((candidate) => candidate.device_id === state.device_id);
     expect(device?.device_ref_head).toBeNull();
     expect(db.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(state.local_main);
+    expect(await server.git.commitExists(admin.vaultId, commit!)).toBe(false);
 
     const events = await admin.get<{ events: Array<{ event_type: string; payload: { reason?: string } }> }>(
       `/api/v1/vaults/${admin.vaultId}/events?after=0`

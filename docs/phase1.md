@@ -23,7 +23,9 @@ Implemented runtime pieces:
 - Dashboard sessions use a browser-compatible `obts_session` cookie for HTTP/dev deployments and the hardened `__Host-obts_session` Secure cookie when `publicBaseUrl` is HTTPS.
 - Recent-auth enforcement covers sensitive Phase 1 dashboard mutations such as pairing token creation and admin account creation. Pairing token consumption enforces the issued device name, sync profile, and plugin-sync scope before registering a device.
 - Multipart sync manifests reject non-commit ref strings and malformed SHA-256 packfile digests before Git ref mutation logic runs.
-- Uploaded packfiles and individual Git blobs are checked against the configured upload byte limit before refs advance.
+- Uploaded packfiles are unpacked into a temporary quarantine repo for commit,
+  path-policy, ancestry, sync-profile, and blob-size validation. Only accepted
+  uploads are imported into the durable per-vault Git store before refs advance.
 - Per-vault native Git stores under `OBTS_DATA_DIR/git`, with server-authored empty-tree root commits on `refs/heads/main`.
 - Protected device refs at `refs/obts/devices/{device_id}` with no-op, fast-forward, stale-ref, malformed-pack, path-policy, and same-device non-fast-forward handling.
 - Pairing stores the device sync profile and plugin-sync setting, and server-side upload validation rejects changed paths outside that paired policy while preserving inherited server tree entries.
