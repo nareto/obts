@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import cookie from '@fastify/cookie';
@@ -500,15 +500,6 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const db = await store.snapshot();
     const vault = ownedVaultOrThrow(db, session.user.user_id, vaultId);
     return sendEventPage(reply, request.id, db, vault.vault_id, readEventCursor(request));
-  });
-
-  app.get('/', async (_request, reply) => {
-    try {
-      const html = await readFile(join(process.cwd(), 'dashboard', 'index.html'), 'utf8');
-      return reply.type('text/html; charset=utf-8').send(html);
-    } catch {
-      return reply.type('text/html; charset=utf-8').send('<!doctype html><title>obts</title><main>obts dashboard</main>');
-    }
   });
 
   return { app, config, store, git, auth, sync };

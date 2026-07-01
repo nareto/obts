@@ -2932,16 +2932,10 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(secondCommit).not.toBe(firstCommit);
   });
 
-  it('serves an API-backed dashboard shell for Phase 1 workflows', async () => {
+  it('does not ship a browser dashboard shell in Phase 1', async () => {
     const response = await fetch(baseUrl);
-    expect(response.status).toBe(200);
-    const html = await response.text();
-    expect(html).toContain('/api/v1/setup/status');
-    expect(html).toContain('/api/v1${path}');
-    expect(html).toContain('Pair Device');
-    expect(html).not.toContain('Use <code>/api/v1');
-    expect(html).not.toContain('later UI work');
-    expect(html).not.toContain('implemented server-side');
+    expect(response.status).toBe(404);
+    expect(response.headers.get('content-type')).not.toContain('text/html');
   });
 
   it('ships an installable Obsidian plugin with Phase 1 sync behavior', async () => {

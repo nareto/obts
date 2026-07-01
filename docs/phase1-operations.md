@@ -1,7 +1,7 @@
 # Phase 1 Operations
 
-Phase 1 can be operated without the browser dashboard. The `obts` CLI exposes
-first-run setup, vault creation, pairing-token creation, device listing,
+Phase 1 intentionally has no browser dashboard or frontend. The `obts` CLI
+exposes first-run setup, vault creation, pairing-token creation, device listing,
 conflict listing, readiness checks, and local admin recovery against the same
 persistent state used by the HTTP API and plugin.
 

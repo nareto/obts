@@ -25,7 +25,6 @@ COPY --from=build /app/package.json /app/package-lock.json ./
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY openapi ./openapi
-COPY dashboard ./dashboard
 COPY docs ./docs
 
 RUN mkdir -p /var/lib/obts \
@@ -37,4 +36,3 @@ VOLUME ["/var/lib/obts"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD node dist/src/cli.js health ready --json >/dev/null || exit 1
 CMD ["node", "dist/src/cli.js", "serve"]
-
