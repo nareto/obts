@@ -612,6 +612,72 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(((await pull.json()) as { error: { code: string } }).error.code).toBe('invalid_request');
   });
 
+  it('rejects multipart sync manifests missing required nullable commit cursors', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'missing-cursor-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'laptop');
+    const state = await plugin.readState();
+    const token = await readDeviceToken(deviceDir);
+    const emptyPack = Buffer.alloc(0);
+
+    const pushForm = new FormData();
+    pushForm.append(
+      'manifest',
+      JSON.stringify({
+        api_version: API_VERSION,
+        vault_id: admin.vaultId,
+        device_id: state.device_id,
+        target_commit: state.local_main,
+        packfile_sha256: sha256(emptyPack),
+        packfile_bytes: emptyPack.byteLength,
+        client_known_main: state.local_main
+      })
+    );
+    pushForm.append('packfile', new Blob([emptyPack], { type: 'application/x-git-packed-objects' }), 'pack.pack');
+    const push = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/push`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`
+      },
+      body: pushForm
+    });
+    expect(push.status).toBe(400);
+    expect(((await push.json()) as { error: { code: string; details: { field?: string } } }).error).toMatchObject({
+      code: 'invalid_request',
+      details: { field: 'expected_device_ref' }
+    });
+
+    const pullForm = new FormData();
+    pullForm.append(
+      'manifest',
+      JSON.stringify({
+        api_version: API_VERSION,
+        vault_id: admin.vaultId,
+        device_id: state.device_id,
+        requested_target: 'latest'
+      })
+    );
+    pullForm.append('packfile', new Blob([new ArrayBuffer(0)], { type: 'application/x-git-packed-objects' }), 'have.pack');
+    const pull = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/pull`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`
+      },
+      body: pullForm
+    });
+    expect(pull.status).toBe(400);
+    expect(((await pull.json()) as { error: { code: string; details: { field?: string } } }).error).toMatchObject({
+      code: 'invalid_request',
+      details: { field: 'current_local_main' }
+    });
+
+    const db = await server.store.snapshot();
+    const device = db.devices.find((candidate) => candidate.device_id === state.device_id);
+    expect(device?.device_ref_head).toBeNull();
+    expect(db.sync_operations).toEqual([]);
+  });
+
   it('enforces pairing token scope and one-time consumption', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {

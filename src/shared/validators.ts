@@ -40,8 +40,11 @@ export function readOptionalString(record: Record<string, unknown>, field: strin
 }
 
 export function readNullableString(record: Record<string, unknown>, field: string): string | null {
+  if (!Object.prototype.hasOwnProperty.call(record, field)) {
+    throw new ValidationError('invalid_request', `Missing field: ${field}.`, { field });
+  }
   const value = record[field];
-  if (value === null || value === undefined || value === '') {
+  if (value === null || value === '') {
     return null;
   }
   if (typeof value !== 'string') {
