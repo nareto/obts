@@ -2758,6 +2758,27 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(html).not.toContain('implemented server-side');
   });
 
+  it('ships an installable Obsidian plugin with Phase 1 sync behavior', async () => {
+    const pluginMain = await readFile(join(process.cwd(), 'obsidian-plugin', 'main.js'), 'utf8');
+    const pluginReadme = await readFile(join(process.cwd(), 'obsidian-plugin', 'README.md'), 'utf8');
+
+    expect(pluginMain).toContain('class ObtsObsidianClient');
+    expect(pluginMain).toContain('/api/v1/pair/consume');
+    expect(pluginMain).toContain('/sync/push');
+    expect(pluginMain).toContain('/sync/pull');
+    expect(pluginMain).toContain('refs/heads/local');
+    expect(pluginMain).toContain('refs/heads/main');
+    expect(pluginMain).toContain('apply-journal.json');
+    expect(pluginMain).toContain('createRecoveryBundle');
+    expect(pluginMain).toContain('this.app.vault.on("modify"');
+    expect(pluginMain).toContain('adapter.writeBinary');
+    expect(pluginMain).not.toContain('packaged TypeScript client');
+    expect(pluginMain).not.toContain('Run the packaged client sync flow');
+
+    expect(pluginReadme).toContain('hidden local history under `.obts/git`');
+    expect(pluginReadme).toContain('No visible vault `.git` directory is created.');
+  });
+
   it('returns 404 for cross-user vault, conflict, sync, and event resources', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const created = await admin.post<{ user_id: string }>('/api/v1/admin/users', {
