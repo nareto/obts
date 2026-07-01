@@ -73,11 +73,11 @@ export type DeviceRow = {
 
 export type TokenRow = {
   token_id: string;
-  kind: 'pairing' | 'device';
+  kind: 'pairing' | 'device' | 'password_reset';
   lookup_prefix: string;
   token_hash: string;
   user_id: string;
-  vault_id: string;
+  vault_id: string | null;
   device_id: string | null;
   expires_at: string | null;
   consumed_at: string | null;

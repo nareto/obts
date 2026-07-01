@@ -507,6 +507,207 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(fresh.body.user_id).toMatch(/^usr_/u);
   });
 
+  it('supports Phase 1 admin user lifecycle without leaking vault metadata', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const user = await admin.post<{
+      user_id: string;
+      username: string;
+      owned_vault_count?: number;
+      vaults?: unknown;
+    }>('/api/v1/admin/users', {
+      username: 'member',
+      password: 'member-password-1234',
+      display_name: 'Member'
+    });
+    expect(user.status).toBe(201);
+    expect(user.body.username).toBe('member');
+    expect(user.body.vaults).toBeUndefined();
+
+    const list = await admin.get<{
+      users: Array<{
+        user_id: string;
+        username: string;
+        is_admin: boolean;
+        disabled: boolean;
+        owned_vault_count: number;
+        vaults?: unknown;
+      }>;
+    }>('/api/v1/admin/users');
+    expect(list.status).toBe(200);
+    const member = list.body.users.find((candidate) => candidate.username === 'member');
+    expect(member).toMatchObject({
+      user_id: user.body.user_id,
+      is_admin: false,
+      disabled: false,
+      owned_vault_count: 0
+    });
+    expect(member?.vaults).toBeUndefined();
+
+    const granted = await admin.post<{ is_admin: boolean }>(`/api/v1/admin/users/${user.body.user_id}/grant-admin`, {});
+    expect(granted.status).toBe(200);
+    expect(granted.body.is_admin).toBe(true);
+
+    const revoked = await admin.post<{ is_admin: boolean }>(`/api/v1/admin/users/${user.body.user_id}/revoke-admin`, {});
+    expect(revoked.status).toBe(200);
+    expect(revoked.body.is_admin).toBe(false);
+
+    const adminUserId = (await server.store.snapshot()).users.find((candidate) => candidate.username === 'admin')?.user_id;
+    expect(adminUserId).toBeDefined();
+    const finalAdminRevoke = await admin.post<{ error: { code: string } }>(
+      `/api/v1/admin/users/${adminUserId}/revoke-admin`,
+      {}
+    );
+    expect(finalAdminRevoke.status).toBe(409);
+    expect(finalAdminRevoke.body.error.code).toBe('final_admin_required');
+  });
+
+  it('disabling a user immediately revokes dashboard sessions, pairing tokens, and device tokens', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const user = await admin.post<{ user_id: string }>('/api/v1/admin/users', {
+      username: 'owner',
+      password: 'owner-password-1234'
+    });
+    expect(user.status).toBe(201);
+
+    const owner = new BrowserSession(baseUrl);
+    const login = await owner.post<{ csrf_token: string }>('/api/v1/auth/login', {
+      username: 'owner',
+      password: 'owner-password-1234'
+    }, false);
+    expect(login.status).toBe(200);
+    const ownerVault = await owner.post<{ vault_id: string }>('/api/v1/vaults', {
+      display_name: 'Owner Vault'
+    });
+    expect(ownerVault.status).toBe(201);
+    const pairing = await owner.post<{ pairing_token: string }>(`/api/v1/vaults/${ownerVault.body.vault_id}/pairing-tokens`, {
+      device_name: 'phone',
+      sync_profile: 'notes_only'
+    });
+    expect(pairing.status).toBe(201);
+
+    const deviceDir = join(root, 'disabled-user-device');
+    await mkdirp(deviceDir);
+    const plugin = new ObtsPluginClient(deviceDir, {
+      serverUrl: baseUrl,
+      deviceName: 'phone',
+      syncProfile: 'notes_only',
+      syncPlugins: false
+    });
+    await plugin.pairWithToken(pairing.body.pairing_token);
+    const state = await plugin.readState();
+    const deviceToken = await readDeviceToken(deviceDir);
+
+    const disable = await admin.post<{ disabled: boolean }>(`/api/v1/admin/users/${user.body.user_id}/disable`, {});
+    expect(disable.status).toBe(200);
+    expect(disable.body.disabled).toBe(true);
+
+    const ownerSession = await owner.get<{ error: { code: string } }>('/api/v1/auth/session');
+    expect(ownerSession.status).toBe(401);
+    expect(ownerSession.body.error.code).toBe('unauthenticated');
+
+    const form = new FormData();
+    form.append(
+      'manifest',
+      JSON.stringify({
+        api_version: API_VERSION,
+        vault_id: ownerVault.body.vault_id,
+        device_id: state.device_id,
+        current_local_main: state.local_main,
+        requested_target: 'latest'
+      })
+    );
+    form.append('packfile', new Blob([new ArrayBuffer(0)], { type: 'application/x-git-packed-objects' }), 'have.pack');
+    const pull = await fetch(`${baseUrl}/api/v1/vaults/${ownerVault.body.vault_id}/sync/pull`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${deviceToken}` },
+      body: form
+    });
+    expect(pull.status).toBe(404);
+
+    const db = await server.store.snapshot();
+    expect(db.tokens.filter((token) => token.user_id === user.body.user_id && token.revoked_at === null)).toEqual([]);
+    expect(db.devices.find((device) => device.device_id === state.device_id)?.status).toBe('revoked');
+  });
+
+  it('revokes individual devices and supports one-time password reset tokens', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'revoked-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'phone');
+    const state = await plugin.readState();
+    const deviceToken = await readDeviceToken(deviceDir);
+
+    const revoke = await admin.post<{ status: string }>(
+      `/api/v1/vaults/${admin.vaultId}/devices/${state.device_id}/revoke`,
+      {}
+    );
+    expect(revoke.status).toBe(200);
+    expect(revoke.body.status).toBe('ok');
+
+    const form = new FormData();
+    form.append(
+      'manifest',
+      JSON.stringify({
+        api_version: API_VERSION,
+        vault_id: admin.vaultId,
+        device_id: state.device_id,
+        current_local_main: state.local_main,
+        requested_target: 'latest'
+      })
+    );
+    form.append('packfile', new Blob([new ArrayBuffer(0)], { type: 'application/x-git-packed-objects' }), 'have.pack');
+    const pull = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/pull`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${deviceToken}` },
+      body: form
+    });
+    expect(pull.status).toBe(404);
+
+    const user = await admin.post<{ user_id: string }>('/api/v1/admin/users', {
+      username: 'reset-user',
+      password: 'reset-password-1234'
+    });
+    expect(user.status).toBe(201);
+    const resetToken = await admin.post<{ reset_token: string; expires_at: string }>(
+      `/api/v1/admin/users/${user.body.user_id}/password-reset-tokens`,
+      {}
+    );
+    expect(resetToken.status).toBe(201);
+    expect(resetToken.body.reset_token).toMatch(/^obts_reset_/u);
+
+    const reset = await fetch(`${baseUrl}/api/v1/auth/password-reset`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        reset_token: resetToken.body.reset_token,
+        new_password: 'new-reset-password-1234'
+      })
+    });
+    expect(reset.status).toBe(200);
+
+    const secondReset = await fetch(`${baseUrl}/api/v1/auth/password-reset`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        reset_token: resetToken.body.reset_token,
+        new_password: 'second-reset-password-1234'
+      })
+    });
+    expect(secondReset.status).toBe(401);
+
+    const login = new BrowserSession(baseUrl);
+    const oldPassword = await login.post<{ error: { code: string } }>('/api/v1/auth/login', {
+      username: 'reset-user',
+      password: 'reset-password-1234'
+    }, false);
+    expect(oldPassword.status).toBe(401);
+    const newPassword = await login.post<{ csrf_token: string }>('/api/v1/auth/login', {
+      username: 'reset-user',
+      password: 'new-reset-password-1234'
+    }, false);
+    expect(newPassword.status).toBe(200);
+  });
+
   it('uses multipart pull requests and rejects legacy JSON pull bodies', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'multipart-device');

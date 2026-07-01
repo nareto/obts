@@ -22,6 +22,7 @@ const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_IDLE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const RECENT_AUTH_MS = 15 * 60 * 1000;
 const PAIRING_TTL_MS = 10 * 60 * 1000;
+const PASSWORD_RESET_TTL_MS = 30 * 60 * 1000;
 const ARGON2ID_MEMORY_COST = 19_456;
 const ARGON2ID_TIME_COST = 2;
 const ARGON2ID_PARALLELISM = 1;
@@ -47,6 +48,17 @@ export type AuthenticatedDevice = {
   vault: VaultRow;
   device: DeviceRow;
   token: TokenRow;
+};
+
+export type AdminUserSummary = {
+  user_id: string;
+  username: string;
+  display_name: string;
+  is_admin: boolean;
+  disabled: boolean;
+  created_at: string;
+  last_login_at: string | null;
+  owned_vault_count: number;
 };
 
 export class AuthService {
@@ -169,6 +181,190 @@ export class AuthService {
         created_at: nowIso()
       });
       return user;
+    });
+  }
+
+  async listUsers(actorUserId: string): Promise<AdminUserSummary[]> {
+    const db = await this.store.snapshot();
+    this.requireAdmin(db, actorUserId);
+    return db.users
+      .map((user) => userSummary(db, user))
+      .sort((left, right) => left.username.localeCompare(right.username) || left.user_id.localeCompare(right.user_id));
+  }
+
+  async setUserDisabled(input: { actorUserId: string; targetUserId: string; disabled: boolean }): Promise<AdminUserSummary> {
+    return await this.store.mutate((db) => {
+      const actor = this.requireAdmin(db, input.actorUserId);
+      const target = requireUser(db, input.targetUserId);
+      if (input.disabled && target.is_admin && enabledAdminCount(db, target.user_id) === 0) {
+        throw new AuthError(409, 'final_admin_required', 'At least one enabled admin account is required.');
+      }
+      target.disabled = input.disabled;
+      if (input.disabled) {
+        revokeUserAuth(db, target.user_id);
+      }
+      db.audit_log.push({
+        audit_id: newId('aud'),
+        actor_user_id: actor.user_id,
+        actor_device_id: null,
+        vault_id: null,
+        action: input.disabled ? 'user_disabled' : 'user_enabled',
+        resource_class: 'user',
+        resource_id: target.user_id,
+        created_at: nowIso()
+      });
+      return userSummary(db, target);
+    });
+  }
+
+  async setUserAdmin(input: { actorUserId: string; targetUserId: string; isAdmin: boolean }): Promise<AdminUserSummary> {
+    return await this.store.mutate((db) => {
+      const actor = this.requireAdmin(db, input.actorUserId);
+      const target = requireUser(db, input.targetUserId);
+      if (!input.isAdmin && target.is_admin && enabledAdminCount(db, target.user_id) === 0) {
+        throw new AuthError(409, 'final_admin_required', 'At least one enabled admin account is required.');
+      }
+      target.is_admin = input.isAdmin;
+      db.audit_log.push({
+        audit_id: newId('aud'),
+        actor_user_id: actor.user_id,
+        actor_device_id: null,
+        vault_id: null,
+        action: input.isAdmin ? 'admin_granted' : 'admin_revoked',
+        resource_class: 'user',
+        resource_id: target.user_id,
+        created_at: nowIso()
+      });
+      return userSummary(db, target);
+    });
+  }
+
+  async createPasswordResetToken(input: { actorUserId: string; targetUserId: string }): Promise<{ token: string; expiresAt: string }> {
+    const resetToken = newSecretToken('obts_reset');
+    const tokenHash = hashToken(resetToken);
+    const expiresAt = new Date(Date.now() + PASSWORD_RESET_TTL_MS).toISOString();
+    await this.store.mutate((db) => {
+      const actor = this.requireAdmin(db, input.actorUserId);
+      const target = requireUser(db, input.targetUserId);
+      const timestamp = nowIso();
+      for (const token of db.tokens) {
+        if (token.kind === 'password_reset' && token.user_id === target.user_id && !token.consumed_at && !token.revoked_at) {
+          token.revoked_at = timestamp;
+        }
+      }
+      db.tokens.push({
+        token_id: newId('tok'),
+        kind: 'password_reset',
+        lookup_prefix: tokenHash.lookupPrefix,
+        token_hash: tokenHash.hash,
+        user_id: target.user_id,
+        vault_id: null,
+        device_id: null,
+        expires_at: expiresAt,
+        consumed_at: null,
+        failed_attempts: 0,
+        revoked_at: null,
+        metadata: {},
+        created_at: timestamp
+      });
+      db.audit_log.push({
+        audit_id: newId('aud'),
+        actor_user_id: actor.user_id,
+        actor_device_id: null,
+        vault_id: null,
+        action: 'password_reset_token_created',
+        resource_class: 'user',
+        resource_id: target.user_id,
+        created_at: timestamp
+      });
+    });
+    return { token: resetToken, expiresAt };
+  }
+
+  async resetPassword(input: { resetToken: string; newPassword: string }): Promise<void> {
+    if (input.newPassword.length < 12) {
+      throw new AuthError(400, 'weak_password', 'Password must be at least 12 characters.');
+    }
+    const tokenHash = hashToken(input.resetToken);
+    await this.store.mutate(async (db) => {
+      const token = db.tokens.find(
+        (candidate) =>
+          candidate.kind === 'password_reset' &&
+          candidate.lookup_prefix === tokenHash.lookupPrefix &&
+          candidate.token_hash === tokenHash.hash
+      );
+      if (
+        !token ||
+        token.revoked_at ||
+        token.consumed_at ||
+        !token.expires_at ||
+        Date.parse(token.expires_at) <= Date.now()
+      ) {
+        throw new AuthError(401, 'invalid_password_reset_token', 'Password reset token is invalid or expired.');
+      }
+      const user = requireUser(db, token.user_id);
+      user.password_hash = await hashPassword(input.newPassword);
+      token.consumed_at = nowIso();
+      for (const session of db.sessions) {
+        if (session.user_id === user.user_id && !session.revoked_at) {
+          session.revoked_at = nowIso();
+        }
+      }
+      db.audit_log.push({
+        audit_id: newId('aud'),
+        actor_user_id: user.user_id,
+        actor_device_id: null,
+        vault_id: null,
+        action: 'password_reset_completed',
+        resource_class: 'user',
+        resource_id: user.user_id,
+        created_at: nowIso()
+      });
+    });
+  }
+
+  async revokeDevice(input: { actorUserId: string; vaultId: string; deviceId: string }): Promise<void> {
+    await this.store.mutate((db) => {
+      const vault = ownedVaultOrThrow(db, input.actorUserId, input.vaultId);
+      const device = db.devices.find(
+        (candidate) =>
+          candidate.device_id === input.deviceId &&
+          candidate.vault_id === vault.vault_id &&
+          candidate.user_id === input.actorUserId
+      );
+      if (!device) {
+        throw new AuthError(404, 'not_found', 'Resource not found.');
+      }
+      const timestamp = nowIso();
+      device.status = 'revoked';
+      device.revoked_at = timestamp;
+      for (const token of db.tokens) {
+        if (token.kind === 'device' && token.device_id === device.device_id && !token.revoked_at) {
+          token.revoked_at = timestamp;
+        }
+      }
+      this.store.appendEvent(db, {
+        event_type: 'device_state_changed',
+        vault_id: vault.vault_id,
+        resource_ids: { device_id: device.device_id },
+        commit_cursors: {
+          main: vault.current_main,
+          device_ref: device.device_ref_head
+        },
+        payload: {
+          status: 'revoked'
+        }
+      });
+      db.audit_log.push({
+        audit_id: newId('aud'),
+        actor_user_id: input.actorUserId,
+        actor_device_id: null,
+        vault_id: vault.vault_id,
+        action: 'device_revoked',
+        resource_class: 'device',
+        resource_id: device.device_id,
+        created_at: timestamp
+      });
     });
   }
 
@@ -410,6 +606,14 @@ export class AuthService {
       return { user, vault, device, token: row };
     });
   }
+
+  private requireAdmin(db: MetadataDb, actorUserId: string): UserRow {
+    const actor = db.users.find((candidate) => candidate.user_id === actorUserId);
+    if (!actor || actor.disabled || !actor.is_admin) {
+      throw new AuthError(403, 'admin_required', 'Admin privileges are required.');
+    }
+    return actor;
+  }
 }
 
 export function ownedVaultOrThrow(db: MetadataDb, userId: string, vaultId: string): VaultRow {
@@ -439,6 +643,51 @@ async function hashPassword(password: string): Promise<PasswordHash> {
     memory_cost: ARGON2ID_MEMORY_COST,
     time_cost: ARGON2ID_TIME_COST,
     parallelism: ARGON2ID_PARALLELISM
+  };
+}
+
+function requireUser(db: MetadataDb, userId: string): UserRow {
+  const user = db.users.find((candidate) => candidate.user_id === userId);
+  if (!user) {
+    throw new AuthError(404, 'not_found', 'Resource not found.');
+  }
+  return user;
+}
+
+function enabledAdminCount(db: MetadataDb, exceptUserId: string | null): number {
+  return db.users.filter((user) => user.is_admin && !user.disabled && user.user_id !== exceptUserId).length;
+}
+
+function revokeUserAuth(db: MetadataDb, userId: string): void {
+  const timestamp = nowIso();
+  for (const session of db.sessions) {
+    if (session.user_id === userId && !session.revoked_at) {
+      session.revoked_at = timestamp;
+    }
+  }
+  for (const token of db.tokens) {
+    if (token.user_id === userId && !token.revoked_at) {
+      token.revoked_at = timestamp;
+    }
+  }
+  for (const device of db.devices) {
+    if (device.user_id === userId && device.status !== 'revoked') {
+      device.status = 'revoked';
+      device.revoked_at = timestamp;
+    }
+  }
+}
+
+function userSummary(db: MetadataDb, user: UserRow): AdminUserSummary {
+  return {
+    user_id: user.user_id,
+    username: user.username,
+    display_name: user.display_name,
+    is_admin: user.is_admin,
+    disabled: user.disabled,
+    created_at: user.created_at,
+    last_login_at: user.last_login_at,
+    owned_vault_count: db.vaults.filter((vault) => vault.owner_user_id === user.user_id).length
   };
 }
 

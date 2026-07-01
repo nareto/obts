@@ -125,6 +125,15 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     return { status: 'ok' };
   });
 
+  app.post('/api/v1/auth/password-reset', async (request) => {
+    const body = requestBody(request);
+    await auth.resetPassword({
+      resetToken: readString(body, 'reset_token'),
+      newPassword: readString(body, 'new_password')
+    });
+    return { status: 'ok' };
+  });
+
   app.post('/api/v1/admin/users', async (request, reply) => {
     const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
@@ -146,7 +155,78 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       is_admin: user.is_admin,
       disabled: user.disabled,
       created_at: user.created_at,
-      last_login_at: user.last_login_at
+      last_login_at: user.last_login_at,
+      owned_vault_count: 0
+    });
+  });
+
+  app.get('/api/v1/admin/users', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    return {
+      users: await auth.listUsers(session.user.user_id)
+    };
+  });
+
+  app.post('/api/v1/admin/users/:userId/disable', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
+    auth.requireRecentAuth(session.session);
+    const { userId } = userPathParams(request);
+    return await auth.setUserDisabled({
+      actorUserId: session.user.user_id,
+      targetUserId: userId,
+      disabled: true
+    });
+  });
+
+  app.post('/api/v1/admin/users/:userId/enable', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
+    auth.requireRecentAuth(session.session);
+    const { userId } = userPathParams(request);
+    return await auth.setUserDisabled({
+      actorUserId: session.user.user_id,
+      targetUserId: userId,
+      disabled: false
+    });
+  });
+
+  app.post('/api/v1/admin/users/:userId/grant-admin', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
+    auth.requireRecentAuth(session.session);
+    const { userId } = userPathParams(request);
+    return await auth.setUserAdmin({
+      actorUserId: session.user.user_id,
+      targetUserId: userId,
+      isAdmin: true
+    });
+  });
+
+  app.post('/api/v1/admin/users/:userId/revoke-admin', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
+    auth.requireRecentAuth(session.session);
+    const { userId } = userPathParams(request);
+    return await auth.setUserAdmin({
+      actorUserId: session.user.user_id,
+      targetUserId: userId,
+      isAdmin: false
+    });
+  });
+
+  app.post('/api/v1/admin/users/:userId/password-reset-tokens', async (request, reply) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
+    auth.requireRecentAuth(session.session);
+    const { userId } = userPathParams(request);
+    const result = await auth.createPasswordResetToken({
+      actorUserId: session.user.user_id,
+      targetUserId: userId
+    });
+    return reply.status(201).send({
+      reset_token: result.token,
+      expires_at: result.expiresAt
     });
   });
 
@@ -285,6 +365,19 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       pairing_url: result.pairingUrl,
       expires_at: result.expiresAt
     });
+  });
+
+  app.post('/api/v1/vaults/:vaultId/devices/:deviceId/revoke', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
+    auth.requireRecentAuth(session.session);
+    const { vaultId, deviceId } = vaultDevicePathParams(request);
+    await auth.revokeDevice({
+      actorUserId: session.user.user_id,
+      vaultId,
+      deviceId
+    });
+    return { status: 'ok' };
   });
 
   app.post('/api/v1/pair/consume', async (request, reply) => {
@@ -485,6 +578,22 @@ function pathParams(request: FastifyRequest): { vaultId: string } {
     throw new ValidationError('invalid_request', 'Missing vault ID.');
   }
   return { vaultId: params.vaultId };
+}
+
+function userPathParams(request: FastifyRequest): { userId: string } {
+  const params = request.params as { userId?: string };
+  if (!params.userId) {
+    throw new ValidationError('invalid_request', 'Missing user ID.');
+  }
+  return { userId: params.userId };
+}
+
+function vaultDevicePathParams(request: FastifyRequest): { vaultId: string; deviceId: string } {
+  const params = request.params as { vaultId?: string; deviceId?: string };
+  if (!params.vaultId || !params.deviceId) {
+    throw new ValidationError('invalid_request', 'Missing vault or device ID.');
+  }
+  return { vaultId: params.vaultId, deviceId: params.deviceId };
 }
 
 async function readPushMultipart(request: FastifyRequest): Promise<{

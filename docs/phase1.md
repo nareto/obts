@@ -9,6 +9,7 @@ Implemented runtime pieces:
 - Shared API types, status labels, validation helpers, and vault path policy.
 - Committed OpenAPI 3.1 contract at `openapi/openapi.yaml`.
 - Fastify server with first-run setup, Argon2id password storage, login/logout sessions, CSRF-protected dashboard mutations, admin user creation, vault creation, pairing tokens, device tokens, multipart push, multipart pull, events, conflicts, and health checks.
+- Phase 1 admin lifecycle APIs for redacted account listing, user disable/re-enable, admin grant/revoke with final-admin protection, one-time password reset tokens, and individual device revocation. User disable and device revocation immediately invalidate the affected dashboard sessions, pairing tokens, and device tokens.
 - Dashboard sessions use a browser-compatible `obts_session` cookie for HTTP/dev deployments and the hardened `__Host-obts_session` Secure cookie when `publicBaseUrl` is HTTPS.
 - Recent-auth enforcement covers sensitive Phase 1 dashboard mutations such as pairing token creation and admin account creation.
 - Multipart sync manifests reject non-commit ref strings and malformed SHA-256 packfile digests before Git ref mutation logic runs.
@@ -42,6 +43,8 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - two paired devices sync non-conflicting vault changes through server `main`;
 - dashboard passwords are stored as Argon2id hashes using the PRD v1 minimum parameters;
 - sensitive admin account creation requires recent dashboard authentication;
+- admin lifecycle mutations require recent dashboard authentication, preserve one enabled admin, expose only account metadata plus owned-vault counts, and immediately revoke disabled users' auth state;
+- individual device revocation immediately rejects subsequent device-token sync requests;
 - device push and pull both use multipart manifests with Git packfile parts;
 - malformed commit IDs in multipart sync manifests are rejected before Git ref mutation;
 - hidden Git state is under `.obts/`, with no visible vault `.git`;

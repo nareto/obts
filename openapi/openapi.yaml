@@ -69,7 +69,37 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatusResponse"
+  /auth/password-reset:
+    post:
+      summary: Consume a one-time password reset token and set a new password.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PasswordResetRequest"
+      responses:
+        "200":
+          description: Password reset completed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "401":
+          $ref: "#/components/responses/Error"
   /admin/users:
+    get:
+      summary: List account metadata visible to admins.
+      responses:
+        "200":
+          description: Redacted account metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminUserListResponse"
+        "403":
+          $ref: "#/components/responses/Error"
     post:
       summary: Create a user account as an admin.
       parameters:
@@ -83,8 +113,81 @@ paths:
       responses:
         "201":
           description: Created user metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminUserSummary"
         "403":
           $ref: "#/components/responses/Error"
+  /admin/users/{user_id}/disable:
+    post:
+      summary: Disable a user and immediately revoke that user's sessions and tokens.
+      parameters:
+        - $ref: "#/components/parameters/UserId"
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "200":
+          description: Updated account metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminUserSummary"
+        "409":
+          $ref: "#/components/responses/Error"
+  /admin/users/{user_id}/enable:
+    post:
+      summary: Re-enable a disabled user account.
+      parameters:
+        - $ref: "#/components/parameters/UserId"
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "200":
+          description: Updated account metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminUserSummary"
+  /admin/users/{user_id}/grant-admin:
+    post:
+      summary: Grant admin status to a user account.
+      parameters:
+        - $ref: "#/components/parameters/UserId"
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "200":
+          description: Updated account metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminUserSummary"
+  /admin/users/{user_id}/revoke-admin:
+    post:
+      summary: Revoke admin status unless that would remove the final enabled admin.
+      parameters:
+        - $ref: "#/components/parameters/UserId"
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "200":
+          description: Updated account metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminUserSummary"
+        "409":
+          $ref: "#/components/responses/Error"
+  /admin/users/{user_id}/password-reset-tokens:
+    post:
+      summary: Create a one-time password reset token for a user.
+      parameters:
+        - $ref: "#/components/parameters/UserId"
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "201":
+          description: One-time password reset token.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PasswordResetTokenResponse"
   /vaults:
     get:
       summary: List vaults owned by the authenticated user.
@@ -143,6 +246,24 @@ paths:
       responses:
         "201":
           description: One-time pairing token and URL.
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/devices/{device_id}/revoke:
+    post:
+      summary: Revoke a paired device and its device tokens after recent dashboard auth.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - $ref: "#/components/parameters/DeviceId"
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "200":
+          description: Device revoked.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
         "403":
           $ref: "#/components/responses/Error"
         "404":
@@ -291,6 +412,20 @@ components:
       schema:
         type: string
         pattern: "^vlt_"
+    UserId:
+      name: user_id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^usr_"
+    DeviceId:
+      name: device_id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^dev_"
     CsrfHeader:
       name: X-OBTS-CSRF
       in: header
@@ -341,6 +476,15 @@ components:
       properties:
         status:
           type: string
+    PasswordResetRequest:
+      type: object
+      required: [reset_token, new_password]
+      properties:
+        reset_token:
+          type: string
+        new_password:
+          type: string
+          minLength: 12
     AdminCreateUserRequest:
       allOf:
         - $ref: "#/components/schemas/SetupRequest"
@@ -348,6 +492,57 @@ components:
           properties:
             is_admin:
               type: boolean
+    AdminUserListResponse:
+      type: object
+      required: [users]
+      properties:
+        users:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminUserSummary"
+    AdminUserSummary:
+      type: object
+      required:
+        - user_id
+        - username
+        - display_name
+        - is_admin
+        - disabled
+        - created_at
+        - last_login_at
+        - owned_vault_count
+      properties:
+        user_id:
+          type: string
+          pattern: "^usr_"
+        username:
+          type: string
+        display_name:
+          type: string
+        is_admin:
+          type: boolean
+        disabled:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        last_login_at:
+          oneOf:
+            - type: "null"
+            - type: string
+              format: date-time
+        owned_vault_count:
+          type: integer
+          minimum: 0
+    PasswordResetTokenResponse:
+      type: object
+      required: [reset_token, expires_at]
+      properties:
+        reset_token:
+          type: string
+        expires_at:
+          type: string
+          format: date-time
     CreateVaultRequest:
       type: object
       required: [display_name]

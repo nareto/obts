@@ -13,9 +13,17 @@ describe('OpenAPI Phase 1 contract', () => {
       '/auth/login',
       '/auth/session',
       '/auth/logout',
+      '/auth/password-reset',
+      '/admin/users',
+      '/admin/users/{user_id}/disable',
+      '/admin/users/{user_id}/enable',
+      '/admin/users/{user_id}/grant-admin',
+      '/admin/users/{user_id}/revoke-admin',
+      '/admin/users/{user_id}/password-reset-tokens',
       '/vaults',
       '/vaults/{vault_id}/main',
       '/vaults/{vault_id}/pairing-tokens',
+      '/vaults/{vault_id}/devices/{device_id}/revoke',
       '/pair/consume',
       '/vaults/{vault_id}/sync/push',
       '/vaults/{vault_id}/sync/pull',
@@ -32,6 +40,9 @@ describe('OpenAPI Phase 1 contract', () => {
     expect(contract).toContain('is_first_device');
     expect(contract).toContain('ConflictRecord');
     expect(contract).toContain('validator_results');
+    expect(contract).toContain('AdminUserSummary');
+    expect(contract).toContain('PasswordResetTokenResponse');
+    expect(contract).toContain('final enabled admin');
 
     const pullSection = contract.slice(
       contract.indexOf('/vaults/{vault_id}/sync/pull'),
