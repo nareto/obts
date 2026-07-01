@@ -125,10 +125,10 @@ module.exports = class ObtsPlugin extends Plugin {
       }
     });
 
-    this.registerEvent(this.app.vault.on("create", () => this.queueSyncFromWatcher()));
-    this.registerEvent(this.app.vault.on("modify", () => this.queueSyncFromWatcher()));
-    this.registerEvent(this.app.vault.on("delete", () => this.queueSyncFromWatcher()));
-    this.registerEvent(this.app.vault.on("rename", () => this.queueSyncFromWatcher()));
+    this.registerEvent(this.app.vault.on("create", (file) => this.queueSyncFromWatcher(file && file.path)));
+    this.registerEvent(this.app.vault.on("modify", (file) => this.queueSyncFromWatcher(file && file.path)));
+    this.registerEvent(this.app.vault.on("delete", (file) => this.queueSyncFromWatcher(file && file.path)));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.queueSyncFromWatcher([file && file.path, oldPath])));
 
     if (this.settings.autoSync) {
       this.registerInterval(
@@ -149,13 +149,13 @@ module.exports = class ObtsPlugin extends Plugin {
     }
   }
 
-  queueSyncFromWatcher() {
+  queueSyncFromWatcher(paths) {
     if (this.isApplying) {
       return;
     }
     this.syncQueued = true;
     this.setStatus("Ahead");
-    void this.client.recordLocalChangeHint().catch(() => undefined);
+    void this.client.recordLocalChangeHint(paths).catch(() => undefined);
     if (this.settings.autoSync) {
       window.setTimeout(() => {
         void this.runQueuedSync();
@@ -358,10 +358,20 @@ class ObtsObsidianClient {
     return { status: "Synced", main: pulled.manifest.target_main };
   }
 
-  async recordLocalChangeHint() {
+  async recordLocalChangeHint(paths) {
     const state = await this.readState();
     if (!state.vault_id || !state.device_id || state.last_error_code) {
       return;
+    }
+    if (paths !== undefined) {
+      const changedPaths = (Array.isArray(paths) ? paths : [paths])
+        .filter((filePath) => typeof filePath === "string" && filePath.length > 0)
+        .map((filePath) => normalizePath(filePath))
+        .filter((filePath) => isSyncableVaultPath(filePath, this.plugin.settings));
+      if (changedPaths.length === 0) {
+        return;
+      }
+      assertNoCaseCollisions(changedPaths);
     }
     const queue = await this.readQueue();
     if (!queue.pending_commit) {
@@ -471,6 +481,10 @@ class ObtsObsidianClient {
       for (const localPath of extraAffectedPaths) {
         affected.add(localPath);
       }
+      const localVaultFiles = await listLocalVaultFiles(this.vaultDir);
+      for (const conflictPath of materializationConflictFiles(new Set([...targetFiles, ...affected]), localVaultFiles)) {
+        affected.add(conflictPath);
+      }
       const affectedPaths = Array.from(affected).filter((filePath) => isRecoverableApplyPath(filePath, this.plugin.settings)).sort();
       journal.affected_paths = affectedPaths;
       for (const filePath of affectedPaths) {
@@ -508,11 +522,28 @@ class ObtsObsidianClient {
           await this.block("unsafe_local_state", "A local file changed during apply preflight.");
         }
       }
+      const assertRecoveredDescendants = async (filePath) => {
+        const descendants = await listLocalDescendantFiles(this.vaultDir, filePath);
+        if (descendants.some((descendant) => !(descendant in journal.preflight_sha256))) {
+          journal.phase = "blocked_recovery";
+          journal.redacted_error_category = "preflight_hash_changed";
+          await writeJson(this.applyJournalPath, journal);
+          await this.block("unsafe_local_state", "A local file changed during apply preflight.");
+        }
+      };
       for (const filePath of affectedPaths.filter((candidate) => !targetFiles.has(candidate)).sort((left, right) => right.length - left.length)) {
+        if (await pathIsDirectory(path.join(this.vaultDir, filePath))) {
+          await assertRecoveredDescendants(filePath);
+        }
         await this.adapterRemove(filePath);
       }
       for (const filePath of affectedPaths.filter((candidate) => targetFiles.has(candidate))) {
         const content = await this.readBlob(targetMain, filePath);
+        await removeBlockingMaterializationPaths(this.vaultDir, filePath);
+        if (await pathIsDirectory(path.join(this.vaultDir, filePath))) {
+          await assertRecoveredDescendants(filePath);
+          await fsp.rm(path.join(this.vaultDir, filePath), { recursive: true, force: true });
+        }
         await this.adapterWriteBinary(filePath, content);
       }
 
@@ -617,16 +648,24 @@ class ObtsObsidianClient {
     const bundleDir = path.join(this.obtsDir, "recovery", bundleId);
     await fsp.mkdir(path.join(bundleDir, "files"), { recursive: true, mode: 0o700 });
     await fsp.mkdir(path.join(bundleDir, "git"), { recursive: true, mode: 0o700 });
+    await fsp.mkdir(path.join(bundleDir, "patches"), { recursive: true, mode: 0o700 });
     await fsp.mkdir(path.join(bundleDir, "journal"), { recursive: true, mode: 0o700 });
+    const snapshotChecksums = [];
     for (const filePath of affectedPaths) {
       if (filePath.startsWith(".obts/")) {
         continue;
       }
       const content = await this.adapterReadBinary(filePath);
-      if (content) {
+      if (content !== null) {
         const target = path.join(bundleDir, "files", filePath);
         await fsp.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
         await fsp.writeFile(target, content, { mode: 0o600 });
+        snapshotChecksums.push(`${sha256(content)}  files/${filePath}`);
+        if (isTextPatchPath(filePath)) {
+          await writeTextSnapshotPatch(bundleDir, filePath, content);
+        }
+      } else {
+        snapshotChecksums.push(`missing  files/${filePath}`);
       }
     }
     const manifest = {
@@ -640,7 +679,8 @@ class ObtsObsidianClient {
       prior_local_device_ref: state.server_device_ref,
       affected_paths: affectedPaths,
       platform: os.platform(),
-      plugin_version: PLUGIN_VERSION
+      plugin_version: PLUGIN_VERSION,
+      checksum_manifest: snapshotChecksums
     };
     await writeJson(path.join(bundleDir, "manifest.json"), manifest);
     if (journal) {
@@ -648,6 +688,7 @@ class ObtsObsidianClient {
     }
     const pack = await this.createRecoveryRefsPack();
     await fsp.writeFile(path.join(bundleDir, "git", "local-refs.pack"), pack, { mode: 0o600 });
+    await fsp.writeFile(path.join(bundleDir, "checksums.sha256"), `${(await bundleChecksums(bundleDir)).join("\n")}\n`, { mode: 0o600 });
     return bundleId;
   }
 
@@ -757,6 +798,7 @@ class ObtsObsidianClient {
     if (await exists(this.authPath)) {
       await this.block("local_state_already_paired", "A device token already exists for this vault.");
     }
+    await this.block("partial_local_state", "Local .obts state is partially initialized and requires reset or recovery.");
   }
 
   async acquireApplyLock(applyId) {
@@ -1130,6 +1172,111 @@ async function walk(root, visitFile) {
   }
 }
 
+async function listLocalVaultFiles(root) {
+  const files = [];
+  await walk(root, async (absolutePath) => {
+    files.push(normalizePath(path.relative(root, absolutePath)));
+  });
+  return files.sort();
+}
+
+async function listLocalDescendantFiles(root, relativePath) {
+  const absolutePath = path.join(root, relativePath);
+  if (!(await pathIsDirectory(absolutePath))) {
+    return [];
+  }
+  const files = [];
+  await walk(absolutePath, async (descendantPath) => {
+    files.push(normalizePath(path.relative(root, descendantPath)));
+  });
+  return files.sort();
+}
+
+function materializationConflictFiles(targetFiles, localVaultFiles) {
+  const conflicts = new Set();
+  for (const targetFile of targetFiles) {
+    for (const localFile of localVaultFiles) {
+      if (localFile.startsWith(`${targetFile}/`)) {
+        conflicts.add(localFile);
+      }
+    }
+    for (const prefix of directoryPrefixes(targetFile)) {
+      if (localVaultFiles.includes(prefix)) {
+        conflicts.add(prefix);
+      }
+    }
+  }
+  return Array.from(conflicts).sort();
+}
+
+function directoryPrefixes(filePath) {
+  const segments = filePath.split("/");
+  const prefixes = [];
+  for (let index = 1; index < segments.length; index += 1) {
+    prefixes.push(segments.slice(0, index).join("/"));
+  }
+  return prefixes;
+}
+
+async function removeBlockingMaterializationPaths(root, relativePath) {
+  for (const prefix of directoryPrefixes(relativePath)) {
+    const absolutePrefix = path.join(root, prefix);
+    if ((await exists(absolutePrefix)) && !(await pathIsDirectory(absolutePrefix))) {
+      await fsp.rm(absolutePrefix, { force: true });
+    }
+  }
+}
+
+async function pathIsDirectory(filePath) {
+  try {
+    return (await fsp.stat(filePath)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+async function writeTextSnapshotPatch(bundleDir, filePath, content) {
+  const patchPath = path.join(bundleDir, "patches", `${filePath.replaceAll("/", "__")}.patch`);
+  await fsp.mkdir(path.dirname(patchPath), { recursive: true, mode: 0o700 });
+  const body = [
+    `diff --git a/${filePath} b/${filePath}`,
+    "new file mode 100644",
+    "--- /dev/null",
+    `+++ b/${filePath}`,
+    "@@ -0,0 +1 @@",
+    ...content.toString("utf8").split("\n").map((line) => `+${line}`)
+  ].join("\n");
+  await fsp.writeFile(patchPath, `${body}\n`, { mode: 0o600 });
+}
+
+async function bundleChecksums(bundleDir) {
+  const entries = [];
+  await walkBundleFiles(bundleDir, async (absolutePath) => {
+    const relativePath = normalizePath(path.relative(bundleDir, absolutePath));
+    if (relativePath === "checksums.sha256") {
+      return;
+    }
+    entries.push(`${sha256(await fsp.readFile(absolutePath))}  ${relativePath}`);
+  });
+  return entries.sort();
+}
+
+async function walkBundleFiles(root, visitFile) {
+  const entries = await fsp.readdir(root, { withFileTypes: true });
+  for (const entry of entries) {
+    const absolutePath = path.join(root, entry.name);
+    if (entry.isDirectory()) {
+      await walkBundleFiles(absolutePath, visitFile);
+    } else if (entry.isFile()) {
+      await visitFile(absolutePath);
+    }
+  }
+}
+
+function isTextPatchPath(filePath) {
+  return new Set([".md", ".canvas", ".base", ".json", ".css", ".txt", ".yaml", ".yml"]).has(path.posix.extname(filePath).toLowerCase());
+}
+
 function isSyncableVaultPath(filePath, settings) {
   const normalized = normalizePath(filePath);
   if (!isValidVaultPath(normalized)) {
@@ -1162,7 +1309,7 @@ function isSyncableVaultPath(filePath, settings) {
 }
 
 function isRecoverableApplyPath(filePath, settings) {
-  return isSyncableVaultPath(filePath, settings) || (!filePath.startsWith(".obts/") && !filePath.startsWith(".git/"));
+  return isSyncableVaultPath(filePath, settings) || (filePath !== ".obts" && !filePath.startsWith(".obts/") && filePath !== ".git" && !filePath.startsWith(".git/") && !filePath.includes("/.git/"));
 }
 
 function normalizePath(filePath) {

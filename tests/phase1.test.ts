@@ -2854,6 +2854,11 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('refs/heads/main');
     expect(pluginMain).toContain('apply-journal.json');
     expect(pluginMain).toContain('createRecoveryBundle');
+    expect(pluginMain).toContain('partial_local_state');
+    expect(pluginMain).toContain('materializationConflictFiles');
+    expect(pluginMain).toContain('removeBlockingMaterializationPaths');
+    expect(pluginMain).toContain('checksums.sha256');
+    expect(pluginMain).toContain('writeTextSnapshotPatch');
     expect(pluginMain).toContain('this.app.vault.on("modify"');
     expect(pluginMain).toContain('adapter.writeBinary');
     expect(pluginMain).not.toContain('packaged TypeScript client');

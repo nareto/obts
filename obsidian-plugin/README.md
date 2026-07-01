@@ -9,6 +9,11 @@ commits to the server device ref, pulls accepted server `main`, writes recovery
 bundles and apply journals under `.obts/`, and applies server changes through
 Obsidian's vault adapter.
 
+Recovery bundles include affected-file snapshots, text patch artifacts for text
+files, local Git refs packs, and checksum manifests. Pairing intentionally
+blocks when an existing `.obts/` directory contains partial or prior device
+state so the owner can recover or reset it explicitly.
+
 Commands:
 
 - `Pair device`
