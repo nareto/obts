@@ -234,10 +234,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         .map(async (device) => {
           const aheadOfMain =
             device.device_ref_head !== null && !(await git.isAncestor(vault.vault_id, device.device_ref_head, vault.current_main));
-          const behindMain =
-            device.status === 'synced' &&
-            (device.last_successful_sync_at === null ||
-              Date.parse(device.last_successful_sync_at) < Date.parse(vault.updated_at));
+          const behindMain = device.status === 'synced' && device.last_applied_main !== vault.current_main;
           const offline = device.last_seen_at !== null && Date.now() - Date.parse(device.last_seen_at) > 24 * 60 * 60 * 1000;
           return {
             device_id: device.device_id,
@@ -248,6 +245,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
             sync_profile: device.sync_profile,
             sync_plugins: device.sync_plugins,
             device_ref_head: device.device_ref_head,
+            last_applied_main: device.last_applied_main,
             last_successful_sync_at: device.last_successful_sync_at,
             ahead_of_main: aheadOfMain,
             behind_main: behindMain,
@@ -369,6 +367,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         const device = mutableDb.devices.find((candidate) => candidate.device_id === deviceAuth.device.device_id);
         if (device && device.status !== 'revoked' && device.status !== 'review_needed' && device.status !== 'blocked_recovery') {
           device.status = 'synced';
+          device.last_applied_main = targetMain;
           device.last_successful_sync_at = nowIso();
         }
       });
@@ -690,6 +689,9 @@ async function checkPersistentState(db: MetadataDb, git: GitService): Promise<{ 
       const deviceRef = await git.getRef(vault.vault_id, device.device_ref);
       if ((device.device_ref_head ?? null) !== deviceRef) {
         return { ok: false, error: 'device ref is inconsistent with metadata' };
+      }
+      if (device.last_applied_main !== null && !(await git.commitExists(vault.vault_id, device.last_applied_main))) {
+        return { ok: false, error: 'device applied main cursor is missing from the Git store' };
       }
     }
     for (const conflict of db.conflicts.filter((candidate) => candidate.vault_id === vault.vault_id)) {

@@ -498,6 +498,7 @@ components:
               - sync_profile
               - sync_plugins
               - device_ref_head
+              - last_applied_main
               - last_successful_sync_at
               - ahead_of_main
               - behind_main
@@ -523,6 +524,11 @@ components:
               sync_plugins:
                 type: boolean
               device_ref_head:
+                oneOf:
+                  - type: "null"
+                  - type: string
+                    pattern: "^[0-9a-f]{40}$"
+              last_applied_main:
                 oneOf:
                   - type: "null"
                   - type: string

@@ -233,6 +233,62 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
   });
 
+  it('uses acknowledged main commits, not timestamps, for dashboard behind state', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const device1Dir = join(root, 'cursor-device-1');
+    const device2Dir = join(root, 'cursor-device-2');
+    await mkdirp(device1Dir);
+    await mkdirp(device2Dir);
+    await writeFile(join(device1Dir, 'shared.md'), 'base\n');
+    const plugin1 = await pairPlugin(admin, device1Dir, 'desktop');
+    await plugin1.syncOnce({ confirmInitialImport: true });
+
+    const plugin2 = await pairPlugin(admin, device2Dir, 'phone');
+    expect((await plugin2.syncOnce()).status).toBe('Synced');
+    const oldAppliedMain = (await plugin2.readState()).local_main;
+    expect(oldAppliedMain).toMatch(/^[0-9a-f]{40}$/u);
+
+    await writeFile(join(device1Dir, 'shared.md'), 'advanced\n');
+    expect((await plugin1.syncOnce()).status).toBe('Synced');
+    const newMain = (await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main;
+    expect(newMain).toMatch(/^[0-9a-f]{40}$/u);
+    expect(newMain).not.toBe(oldAppliedMain);
+
+    await server.store.mutate((db) => {
+      const device = db.devices.find((candidate) => candidate.device_name === 'phone');
+      expect(device).toBeDefined();
+      device!.last_successful_sync_at = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    });
+
+    const dashboard = await admin.get<{
+      devices: Array<{
+        device_name: string;
+        status_label: string;
+        behind_main: boolean;
+        last_applied_main: string | null;
+        last_successful_sync_at: string | null;
+      }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+    expect(dashboard.status).toBe(200);
+    expect(dashboard.body.devices.find((device) => device.device_name === 'phone')).toMatchObject({
+      status_label: 'Behind',
+      behind_main: true,
+      last_applied_main: oldAppliedMain,
+      last_successful_sync_at: expect.any(String)
+    });
+
+    expect((await plugin2.syncOnce()).status).toBe('Synced');
+    const afterApply = await admin.get<{
+      devices: Array<{ device_name: string; status_label: string; behind_main: boolean; last_applied_main: string | null }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+    expect(afterApply.status).toBe(200);
+    expect(afterApply.body.devices.find((device) => device.device_name === 'phone')).toMatchObject({
+      status_label: 'Synced',
+      behind_main: false,
+      last_applied_main: newMain
+    });
+  });
+
   it('surfaces persistent-state readiness failures in the dashboard summary', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     await server.store.mutate((db) => {

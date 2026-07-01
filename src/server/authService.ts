@@ -325,6 +325,7 @@ export class AuthService {
         device_ref: '',
         device_ref_head: null,
         status: 'paired',
+        last_applied_main: null,
         last_seen_at: nowIso(),
         last_successful_sync_at: null,
         created_at: nowIso(),

@@ -64,6 +64,7 @@ export type DeviceRow = {
   device_ref: string;
   device_ref_head: string | null;
   status: 'paired' | 'synced' | 'ahead' | 'review_needed' | 'blocked_recovery' | 'revoked';
+  last_applied_main: string | null;
   last_seen_at: string | null;
   last_successful_sync_at: string | null;
   created_at: string;
@@ -244,9 +245,12 @@ export class MetadataStore {
 
   private normalizeLoadedDb(db: MetadataDb): void {
     for (const device of db.devices) {
-      const legacyDevice = device as DeviceRow & { sync_plugins?: boolean };
+      const legacyDevice = device as DeviceRow & { sync_plugins?: boolean; last_applied_main?: string | null };
       if (legacyDevice.sync_plugins === undefined) {
         legacyDevice.sync_plugins = false;
+      }
+      if (!Object.prototype.hasOwnProperty.call(legacyDevice, 'last_applied_main')) {
+        legacyDevice.last_applied_main = null;
       }
     }
   }

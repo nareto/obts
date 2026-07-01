@@ -24,6 +24,7 @@ Implemented runtime pieces:
 - Plugin-side `.obts/` state with `isomorphic-git`, device token storage, queue state, recovery bundles with file snapshots, text patches, local Git refs packs, and artifact checksums, local apply lock, apply journal, local commit creation, multipart push, multipart pull, safe apply, incomplete-journal blocking, and explicit replace-local-with-server recovery.
 - Plugin sync records server-created conflicts as a local `Review needed` blocking state, so later automatic sync or pull/apply attempts stop before replacing local review content.
 - API-backed dashboard shell for setup, login, vault creation, overview, device status, events, readiness, and pairing-token creation; the dashboard health summary reuses the same fail-closed readiness checks as `/health/ready`.
+- Dashboard device behind/synced state is derived from each device's acknowledged `last_applied_main` commit cursor rather than timestamps; timestamps remain display metadata only.
 - Readiness checks that fail closed when metadata, Git refs, conflict commits, writable storage, or native Git readiness are inconsistent.
 
 The Phase 1 server uses a durable JSON metadata adapter in `OBTS_DATA_DIR/metadata/phase1.json` so the product slice can run without requiring a local Postgres service in this repository. The service boundaries are deliberately named around metadata and sync operations so a Postgres adapter can replace the file adapter without changing the Git sync model.
@@ -59,6 +60,7 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - retried uploads whose device ref already advanced but whose commit is not yet in `main` resume merge evaluation instead of becoming a false no-op;
 - uploaded commits that introduce paths outside the paired device's sync profile are rejected before refs advance;
 - authenticated sync rejections append redacted `device_sync_rejected` events for dashboard/event polling;
+- dashboard device status uses acknowledged commit cursors, not `last_successful_sync_at`, to decide whether a device is Behind or Synced;
 - uploaded files larger than the configured byte limit are rejected before refs advance;
 - a third device receives the safe current `main` while a conflict remains open;
 - cross-user access to vault main, dashboard, conflicts, device sync push/pull,
