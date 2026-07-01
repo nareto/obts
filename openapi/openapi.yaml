@@ -57,6 +57,17 @@ paths:
                 $ref: "#/components/schemas/LoginResponse"
         "401":
           $ref: "#/components/responses/Error"
+  /auth/logout:
+    post:
+      summary: Revoke the current dashboard session.
+      security: []
+      responses:
+        "200":
+          description: Session revoked or already absent.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
   /admin/users:
     post:
       summary: Create a user account as an admin.
@@ -311,6 +322,12 @@ components:
         recent_auth_expires_at:
           type: string
           format: date-time
+    StatusResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
     AdminCreateUserRequest:
       allOf:
         - $ref: "#/components/schemas/SetupRequest"

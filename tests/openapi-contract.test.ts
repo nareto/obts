@@ -12,6 +12,7 @@ describe('OpenAPI Phase 1 contract', () => {
       '/setup',
       '/auth/login',
       '/auth/session',
+      '/auth/logout',
       '/vaults',
       '/vaults/{vault_id}/main',
       '/vaults/{vault_id}/pairing-tokens',
