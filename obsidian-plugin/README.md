@@ -20,5 +20,6 @@ Commands:
 - `Sync once`
 - `Confirm initial import and sync`
 - `Replace local with server state`
+- `Rebuild from server main`
 
 No visible vault `.git` directory is created.

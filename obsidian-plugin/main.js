@@ -125,6 +125,17 @@ module.exports = class ObtsPlugin extends Plugin {
       }
     });
 
+    this.addCommand({
+      id: "obts-rebuild-from-server-main",
+      name: "Rebuild from server main",
+      callback: async () => {
+        await this.runUserAction(async () => {
+          const result = await this.client.rebuildFromServerMain();
+          new Notice(`obts: ${result.status}`);
+        });
+      }
+    });
+
     this.registerEvent(this.app.vault.on("create", (file) => this.queueSyncFromWatcher(file && file.path)));
     this.registerEvent(this.app.vault.on("modify", (file) => this.queueSyncFromWatcher(file && file.path)));
     this.registerEvent(this.app.vault.on("delete", (file) => this.queueSyncFromWatcher(file && file.path)));
@@ -355,6 +366,97 @@ class ObtsObsidianClient {
     await this.writeQueue({ pending_commit: null, expected_device_ref: state.server_device_ref, status: "idle", attempts: 0, updated_at: nowIso() });
     await this.writeState(Object.assign({}, await this.readState(), {
       initial_import_confirmed: true,
+      status_label: "Synced",
+      last_error_code: null,
+      updated_at: nowIso()
+    }));
+    return { status: "Synced", main: pulled.manifest.target_main };
+  }
+
+  async rebuildFromServerMain() {
+    await this.initialize();
+    const state = await this.readState();
+    if (!state.vault_id || !state.device_id) {
+      throw new ObtsBlockedError("not_paired", "Device is not paired.");
+    }
+    if (state.last_error_code === "conflict_review_required") {
+      throw new ObtsBlockedError("conflict_review_required", "A server conflict requires review before local rebuild can continue.");
+    }
+    if (state.last_error_code === "replace_local_with_server_required") {
+      throw new ObtsBlockedError("replace_local_with_server_required", "Use Replace local with server state for first-pairing divergence.");
+    }
+
+    const token = await this.readDeviceToken();
+    const queue = await this.readQueue();
+    const localFiles = await this.scanSyncableFiles();
+    const localSnapshot = await this.readFileSnapshot(localFiles);
+    const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main);
+    await this.importPack(pulled.packfile);
+    const priorLocalFiles = state.local_main ? await this.listTreeFiles(state.local_main) : [];
+    const pendingClassification = await this.classifyPendingCommit(queue.pending_commit, state.server_device_ref, pulled.manifest.target_main);
+
+    await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true, localFiles);
+    if (state.local_main !== pulled.manifest.target_main) {
+      await this.acknowledgeAppliedMain(pulled.manifest.target_main);
+    }
+
+    if (pendingClassification === "divergent") {
+      await this.createRecoveryBundle("rebuild_from_server", pulled.manifest.target_main, localFiles);
+      await this.writeQueue(Object.assign({}, queue, {
+        status: "blocked_recovery",
+        updated_at: nowIso()
+      }));
+      await this.block("same_device_non_fast_forward", "Divergent same-device history requires export and reset or re-pair.");
+    }
+
+    if (pendingClassification === "fast_forward" && queue.pending_commit) {
+      await this.updateRef("refs/heads/local", pulled.manifest.target_main, null, true);
+      await this.writeQueue(Object.assign({}, queue, {
+        status: "queued_local",
+        updated_at: nowIso()
+      }));
+      await this.writeState(Object.assign({}, await this.readState(), {
+        local_head: pulled.manifest.target_main,
+        status_label: "Ahead",
+        last_error_code: null,
+        updated_at: nowIso()
+      }));
+      return { status: "Ahead", main: pulled.manifest.target_main, preservedPendingCommit: queue.pending_commit };
+    }
+
+    if (pendingClassification === "repeat") {
+      await this.writeQueue({ pending_commit: null, expected_device_ref: state.server_device_ref, status: "idle", attempts: 0, updated_at: nowIso() });
+      await this.writeState(Object.assign({}, await this.readState(), {
+        status_label: "Synced",
+        last_error_code: null,
+        updated_at: nowIso()
+      }));
+      return { status: "Synced", main: pulled.manifest.target_main };
+    }
+
+    if (!(await this.localSnapshotMatchesTree(localSnapshot, pulled.manifest.target_main))) {
+      await this.restoreFileSnapshot(localSnapshot, priorLocalFiles);
+      const recoveryCommit = await this.createLocalCommit("obts: rebuild preserved local edits");
+      if (recoveryCommit) {
+        await this.writeQueue({
+          pending_commit: recoveryCommit,
+          expected_device_ref: state.server_device_ref,
+          status: "queued_local",
+          attempts: 0,
+          updated_at: nowIso()
+        });
+        await this.writeState(Object.assign({}, await this.readState(), {
+          local_head: recoveryCommit,
+          status_label: "Ahead",
+          last_error_code: null,
+          updated_at: nowIso()
+        }));
+        return { status: "Ahead", main: pulled.manifest.target_main, recoveryCommit };
+      }
+    }
+
+    await this.writeQueue({ pending_commit: null, expected_device_ref: state.server_device_ref, status: "idle", attempts: 0, updated_at: nowIso() });
+    await this.writeState(Object.assign({}, await this.readState(), {
       status_label: "Synced",
       last_error_code: null,
       updated_at: nowIso()
@@ -728,6 +830,73 @@ class ObtsObsidianClient {
     return true;
   }
 
+  async localSnapshotMatchesTree(snapshot, targetMain) {
+    const serverFiles = await this.listTreeFiles(targetMain);
+    if (snapshot.size !== serverFiles.length) {
+      return false;
+    }
+    for (const filePath of serverFiles) {
+      const localContent = snapshot.get(filePath);
+      const serverContent = await this.readBlob(targetMain, filePath);
+      if (!localContent || !serverContent || sha256(localContent) !== sha256(serverContent)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  async classifyPendingCommit(pendingCommit, serverDeviceRef, targetMain) {
+    if (!pendingCommit) {
+      return "none";
+    }
+    if (!(await this.commitExists(pendingCommit))) {
+      return "divergent";
+    }
+    if (await this.isAncestor(pendingCommit, targetMain)) {
+      return "repeat";
+    }
+    if (serverDeviceRef) {
+      if (await this.isAncestor(pendingCommit, serverDeviceRef)) {
+        return "repeat";
+      }
+      if (await this.isAncestor(serverDeviceRef, pendingCommit)) {
+        return "fast_forward";
+      }
+      return "divergent";
+    }
+    if (await this.isAncestor(targetMain, pendingCommit)) {
+      return "fast_forward";
+    }
+    return "divergent";
+  }
+
+  async readFileSnapshot(files) {
+    const snapshot = new Map();
+    for (const filePath of files) {
+      const content = await this.adapterReadBinary(filePath);
+      if (content !== null) {
+        snapshot.set(filePath, content);
+      }
+    }
+    return snapshot;
+  }
+
+  async restoreFileSnapshot(snapshot, priorLocalFiles) {
+    for (const filePath of priorLocalFiles.sort((left, right) => right.length - left.length)) {
+      if (!snapshot.has(filePath)) {
+        await this.adapterRemove(filePath);
+      }
+    }
+    for (const [filePath, content] of Array.from(snapshot.entries()).sort(([left], [right]) => left.localeCompare(right))) {
+      await removeBlockingMaterializationPaths(this.vaultDir, filePath);
+      const absolutePath = path.join(this.vaultDir, filePath);
+      if (await pathIsDirectory(absolutePath)) {
+        await fsp.rm(absolutePath, { recursive: true, force: true });
+      }
+      await this.adapterWriteBinary(filePath, content);
+    }
+  }
+
   async createRecoveryBundle(operationType, targetMain, affectedPaths, journal = null) {
     const state = await this.readState();
     const bundleId = `rec_${Date.now()}_${crypto.randomBytes(8).toString("hex")}`;
@@ -920,6 +1089,18 @@ class ObtsObsidianClient {
   async commitExists(commit) {
     try {
       await this.git(["cat-file", "-e", `${commit}^{commit}`]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async isAncestor(ancestor, descendant) {
+    if (ancestor === descendant) {
+      return true;
+    }
+    try {
+      await this.git(["merge-base", "--is-ancestor", ancestor, descendant]);
       return true;
     } catch {
       return false;

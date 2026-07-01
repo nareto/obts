@@ -3076,6 +3076,9 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('refs/heads/main');
     expect(pluginMain).toContain('apply-journal.json');
     expect(pluginMain).toContain('createRecoveryBundle');
+    expect(pluginMain).toContain('rebuildFromServerMain');
+    expect(pluginMain).toContain('obts-rebuild-from-server-main');
+    expect(pluginMain).toContain('classifyPendingCommit');
     expect(pluginMain).toContain('partial_local_state');
     expect(pluginMain).toContain('materializationConflictFiles');
     expect(pluginMain).toContain('removeBlockingMaterializationPaths');
@@ -3087,6 +3090,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).not.toContain('Run the packaged client sync flow');
 
     expect(pluginReadme).toContain('hidden local history under `.obts/git`');
+    expect(pluginReadme).toContain('Rebuild from server main');
     expect(pluginReadme).toContain('No visible vault `.git` directory is created.');
   });
 
