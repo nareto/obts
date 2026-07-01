@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "description": "Obsidian True Sync Phase 1 implementation.",
+  "bin": {
+    "obts": "./dist/src/cli.js"
+  },
   "engines": {
     "node": ">=24"
   },

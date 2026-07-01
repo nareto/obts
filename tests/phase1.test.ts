@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ObtsPluginClient, PluginBlockedError } from '../src/plugin/client.js';
 import { LocalGitEngine } from '../src/plugin/localGit.js';
 import { TransportClient } from '../src/plugin/transport.js';
+import { runCli } from '../src/cli.js';
 import { createObtsServer, type ObtsServer } from '../src/server/app.js';
 import { MetadataStore } from '../src/server/metadataStore.js';
 import {
@@ -130,6 +131,166 @@ describe('Phase 1 sync without conflict resolution', () => {
 
     const ready = await fetch(`${baseUrl}/health/ready`);
     expect(ready.status).toBe(200);
+  });
+
+  it('supports Phase 1 CLI setup, vault, pairing, devices, conflicts, health, and local admin recovery', async () => {
+    await server.app.close();
+    const cliDataDir = join(root, 'cli-server-data');
+    const env = {
+      OBTS_DATA_DIR: cliDataDir,
+      OBTS_PUBLIC_BASE_URL: 'http://sync.example.test',
+      OBTS_SESSION_SECRET: 'cli-test-session-secret-with-enough-entropy'
+    };
+    const run = async (args: string[]) => {
+      let stdout = '';
+      let stderr = '';
+      const code = await runCli(args, env, {
+        stdout: (text) => {
+          stdout += text;
+        },
+        stderr: (text) => {
+          stderr += text;
+        }
+      });
+      return { code, stdout, stderr };
+    };
+
+    const setup = await run([
+      'setup',
+      '--username',
+      'admin',
+      '--password',
+      'admin-password-1234',
+      '--display-name',
+      'Admin',
+      '--json'
+    ]);
+    expect(setup).toMatchObject({ code: 0, stderr: '' });
+    expect(JSON.parse(setup.stdout)).toMatchObject({ user_id: expect.stringMatching(/^usr_/u) });
+
+    const vault = await run([
+      'vault',
+      'create',
+      '--username',
+      'admin',
+      '--password',
+      'admin-password-1234',
+      '--display-name',
+      'CLI Vault',
+      '--json'
+    ]);
+    expect(vault).toMatchObject({ code: 0, stderr: '' });
+    const vaultBody = JSON.parse(vault.stdout) as { vault_id: string; current_main: string };
+    expect(vaultBody.current_main).toMatch(/^[0-9a-f]{40}$/u);
+
+    const pairing = await run([
+      'pairing-token',
+      'create',
+      '--username',
+      'admin',
+      '--password',
+      'admin-password-1234',
+      '--vault-id',
+      vaultBody.vault_id,
+      '--device-name',
+      'cli-laptop',
+      '--sync-profile',
+      'notes_only',
+      '--json'
+    ]);
+    expect(pairing).toMatchObject({ code: 0, stderr: '' });
+    const pairingBody = JSON.parse(pairing.stdout) as { pairing_token: string; pairing_url: string };
+    expect(pairingBody.pairing_token).toMatch(/^obts_pair_/u);
+    expect(pairingBody.pairing_url).toContain(encodeURIComponent(pairingBody.pairing_token));
+
+    const cliServer = await createObtsServer({
+      dataDir: cliDataDir,
+      publicBaseUrl: 'http://sync.example.test',
+      sessionSecret: 'cli-test-session-secret-with-enough-entropy'
+    });
+    try {
+      await cliServer.auth.consumePairingToken({
+        pairingToken: pairingBody.pairing_token,
+        deviceName: 'cli-laptop',
+        syncProfile: 'notes_only',
+        syncPlugins: false
+      });
+      const db = await cliServer.store.snapshot();
+      const device = db.devices.find((candidate) => candidate.vault_id === vaultBody.vault_id);
+      expect(device).toBeDefined();
+      await cliServer.store.mutate((mutableDb) => {
+        mutableDb.conflicts.push({
+          conflict_id: 'conf_cli_test',
+          vault_id: vaultBody.vault_id,
+          device_id: device!.device_id,
+          status: 'open',
+          base_commit: vaultBody.current_main,
+          current_main: vaultBody.current_main,
+          device_commit: vaultBody.current_main,
+          expected_main: vaultBody.current_main,
+          affected_paths: ['note.md'],
+          affected_path_count: 1,
+          merge_sequence: 1,
+          merge_policy_version: 'phase1.disjoint-paths.v1',
+          validator_results: { reason: 'test' },
+          validator_summary: { decision: 'conflict' },
+          created_at: new Date().toISOString()
+        });
+      });
+    } finally {
+      await cliServer.app.close();
+    }
+
+    const devices = await run([
+      'devices',
+      'list',
+      '--username',
+      'admin',
+      '--password',
+      'admin-password-1234',
+      '--vault-id',
+      vaultBody.vault_id,
+      '--json'
+    ]);
+    expect(devices).toMatchObject({ code: 0, stderr: '' });
+    expect(JSON.parse(devices.stdout)).toMatchObject({
+      devices: [expect.objectContaining({ device_name: 'cli-laptop', status: 'paired' })]
+    });
+
+    const conflicts = await run([
+      'conflicts',
+      'list',
+      '--username',
+      'admin',
+      '--password',
+      'admin-password-1234',
+      '--vault-id',
+      vaultBody.vault_id,
+      '--json'
+    ]);
+    expect(conflicts).toMatchObject({ code: 0, stderr: '' });
+    expect(JSON.parse(conflicts.stdout)).toMatchObject({
+      conflicts: [expect.objectContaining({ conflict_id: 'conf_cli_test', status: 'open' })]
+    });
+
+    const ready = await run(['health', 'ready', '--json']);
+    expect(ready).toMatchObject({ code: 0, stderr: '' });
+    expect(JSON.parse(ready.stdout)).toMatchObject({ status: 'ready' });
+
+    const recovery = await run(['admin-recovery', 'create-reset-token', '--username', 'admin', '--json']);
+    expect(recovery).toMatchObject({ code: 0, stderr: '' });
+    expect(JSON.parse(recovery.stdout)).toMatchObject({
+      username: 'admin',
+      reset_token: expect.stringMatching(/^obts_reset_/u)
+    });
+
+    server = await createObtsServer({
+      dataDir: join(root, 'server-data'),
+      publicBaseUrl: 'http://127.0.0.1:0',
+      sessionSecret: 'test-session-secret-with-enough-entropy'
+    });
+    const address = await server.app.listen({ port: 0, host: '127.0.0.1' });
+    baseUrl = address;
   });
 
   it('pairs two devices and syncs non-conflicting vault changes through server main', async () => {

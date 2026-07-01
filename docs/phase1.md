@@ -6,6 +6,16 @@ Sync Without Conflict Resolution.
 Implemented runtime pieces:
 
 - TypeScript package with build, type-check, and Vitest commands.
+- `obts` CLI entrypoint for first-run setup, vault creation, pairing-token
+  creation, device listing, conflict listing, readiness checks, serving the API,
+  and local admin password-reset recovery.
+- OCI image definition with native `git`, persistent-state volume, readiness
+  healthcheck, and `obts serve` startup command.
+- Manual operations and smoke-test guides in `docs/phase1-operations.md` and
+  `docs/phase1-smoke-test.md`.
+- Installable Obsidian plugin package scaffold in `obsidian-plugin/` for the
+  Phase 1 settings/status surface; the tested sync engine lives in
+  `src/plugin/`.
 - Shared API types, status labels, validation helpers, and vault path policy.
 - Committed OpenAPI 3.1 contract at `openapi/openapi.yaml`.
 - Fastify server with first-run setup, Argon2id password storage, login/logout sessions, CSRF-protected dashboard mutations, admin user creation, vault creation, pairing tokens, device tokens, multipart push, multipart pull, events, conflicts, and health checks.
@@ -27,7 +37,7 @@ Implemented runtime pieces:
 - Rebuild classifies repeated, same-device fast-forward, snapshot-only, and divergent local history: fast-forward commits stay queued, snapshot-only edits become a new recovery commit based on rebuilt `main`, and divergent same-device history blocks for export plus reset or re-pair.
 - Plugin sync records server-created conflicts as a local `Review needed` blocking state, so later automatic sync or pull/apply attempts stop before replacing local review content.
 - The sync pull API also rejects devices marked `review_needed` or `blocked_recovery`, so a stale or reset plugin cannot bypass server-known conflict/recovery blocks and apply server state over review content.
-- API-backed dashboard shell for setup, login, vault creation, overview, device status, events, readiness, and pairing-token creation; the dashboard health summary reuses the same fail-closed readiness checks as `/health/ready`.
+- API-backed dashboard shell for setup, login, vault creation, overview, device status, events, readiness, and pairing-token creation; the CLI remains the required Phase 1 user workflow, and the dashboard shell is not required for Phase 1 conflict handling.
 - Dashboard device behind/synced state is derived from each device's acknowledged `last_applied_main` commit cursor rather than timestamps; timestamps remain display metadata only.
 - Readiness checks that fail closed when metadata, Git refs, conflict commits, writable storage, or native Git readiness are inconsistent.
 
@@ -41,6 +51,9 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 
 - first-run setup is one-time, liveness/readiness health endpoints work, and
   new vaults create a real empty-tree `refs/heads/main` commit immediately;
+- Phase 1 CLI commands can set up an admin, create a vault, create pairing
+  tokens, list devices, list conflicts, inspect readiness, and create a local
+  admin recovery token from persistent state;
 - two paired devices sync non-conflicting vault changes through server `main`;
 - dashboard passwords are stored as Argon2id hashes using the PRD v1 minimum parameters;
 - sensitive admin account creation requires recent dashboard authentication;
