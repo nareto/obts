@@ -1,8 +1,8 @@
 import * as fs from 'node:fs';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, relative } from 'node:path';
 
-import git from 'isomorphic-git';
+import git, { type TreeEntry } from 'isomorphic-git';
 
 import {
   assertSyncableTreePaths,
@@ -99,38 +99,51 @@ export class LocalGitEngine {
   }
 
   async createLocalCommit(message: string): Promise<string | null> {
+    const baseCommit = await this.resolveRef('refs/heads/local');
+    const baseEntries = baseCommit ? await this.flattenTree(baseCommit) : new Map<string, TreeEntry>();
     const files = await this.scanSyncableFiles();
-    const matrix = await git.statusMatrix({
-      fs,
-      dir: this.vaultDir,
-      gitdir: this.gitdir,
-      ref: 'refs/heads/local',
-      filter: (filepath) => isSyncableVaultPath(filepath, this.policy),
-      ignored: false
-    });
-    const seen = new Set(files);
-    for (const [filepath, headStatus, workdirStatus, stageStatus] of matrix) {
-      if (!isSyncableVaultPath(filepath, this.policy)) {
-        continue;
+    const fileSet = new Set(files);
+    const nextEntries = new Map(baseEntries);
+
+    for (const path of baseEntries.keys()) {
+      if (isSyncableVaultPath(path, this.policy) && !fileSet.has(path)) {
+        nextEntries.delete(path);
       }
-      if (workdirStatus === 0) {
-        await git.remove({ fs, dir: this.vaultDir, gitdir: this.gitdir, filepath });
-      } else {
-        await git.add({ fs, dir: this.vaultDir, gitdir: this.gitdir, filepath });
+    }
+
+    for (const filepath of files) {
+      const blob = await readFile(join(this.vaultDir, filepath));
+      const oid = await git.writeBlob({
+        fs,
+        dir: this.vaultDir,
+        gitdir: this.gitdir,
+        blob
+      });
+      nextEntries.set(filepath, {
+        mode: '100644',
+        path: filepath,
+        oid,
+        type: 'blob'
+      });
+    }
+
+    const tree = await this.writeTreeFromEntries(nextEntries);
+    if (baseCommit) {
+      const { commit } = await git.readCommit({ fs, dir: this.vaultDir, gitdir: this.gitdir, oid: baseCommit });
+      if (commit.tree === tree) {
+        return null;
       }
-      seen.delete(filepath);
-    }
-    for (const filepath of seen) {
-      await git.add({ fs, dir: this.vaultDir, gitdir: this.gitdir, filepath });
-    }
-    if (!(await this.hasStagedTreeChanges())) {
+    } else if (nextEntries.size === 0) {
       return null;
     }
+
     return await git.commit({
       fs,
       dir: this.vaultDir,
       gitdir: this.gitdir,
       ref: 'refs/heads/local',
+      parent: baseCommit ? [baseCommit] : [],
+      tree,
       message,
       author: {
         name: 'obts device',
@@ -140,20 +153,6 @@ export class LocalGitEngine {
         name: 'obts device',
         email: 'device@obts.local'
       }
-    });
-  }
-
-  private async hasStagedTreeChanges(): Promise<boolean> {
-    const matrix = await git.statusMatrix({
-      fs,
-      dir: this.vaultDir,
-      gitdir: this.gitdir,
-      ref: 'refs/heads/local',
-      filter: (filepath) => isSyncableVaultPath(filepath, this.policy),
-      ignored: false
-    });
-    return matrix.some(([filepath, headStatus, _workdirStatus, stageStatus]) => {
-      return isSyncableVaultPath(filepath, this.policy) && headStatus !== stageStatus;
     });
   }
 
@@ -260,10 +259,74 @@ export class LocalGitEngine {
     }
   }
 
+  private async flattenTree(commit: string): Promise<Map<string, TreeEntry>> {
+    const entries = new Map<string, TreeEntry>();
+    await this.walkTree(commit, '', async (entryPath, entry) => {
+      if (entry.type === 'blob') {
+        entries.set(entryPath, {
+          mode: entry.mode,
+          path: entryPath,
+          oid: entry.oid,
+          type: 'blob'
+        });
+      }
+    });
+    return entries;
+  }
+
+  private async writeTreeFromEntries(entries: Map<string, TreeEntry>): Promise<string> {
+    const root: TreeNode = { blobs: new Map(), trees: new Map() };
+    for (const [path, entry] of entries) {
+      const segments = path.split('/');
+      let node = root;
+      for (const segment of segments.slice(0, -1)) {
+        let child = node.trees.get(segment);
+        if (!child) {
+          child = { blobs: new Map(), trees: new Map() };
+          node.trees.set(segment, child);
+        }
+        node = child;
+      }
+      const basename = segments.at(-1);
+      if (!basename) {
+        continue;
+      }
+      node.blobs.set(basename, {
+        mode: entry.mode,
+        path: basename,
+        oid: entry.oid,
+        type: 'blob'
+      });
+    }
+    return await this.writeTreeNode(root);
+  }
+
+  private async writeTreeNode(node: TreeNode): Promise<string> {
+    const tree: TreeEntry[] = [];
+    for (const [name, child] of [...node.trees.entries()].sort(compareByName)) {
+      tree.push({
+        mode: '040000',
+        path: name,
+        oid: await this.writeTreeNode(child),
+        type: 'tree'
+      });
+    }
+    for (const [name, entry] of [...node.blobs.entries()].sort(compareByName)) {
+      tree.push(entry);
+    }
+    tree.sort((left, right) => left.path.localeCompare(right.path));
+    return await git.writeTree({
+      fs,
+      dir: this.vaultDir,
+      gitdir: this.gitdir,
+      tree
+    });
+  }
+
   private async walkTree(
     treeish: string,
     prefix: string,
-    visit: (path: string, entry: { oid: string; type: string }) => Promise<void>
+    visit: (path: string, entry: { oid: string; mode: string; type: string }) => Promise<void>
   ): Promise<void> {
     let treeOid = treeish;
     if (prefix === '') {
@@ -283,6 +346,15 @@ export class LocalGitEngine {
       }
     }
   }
+}
+
+type TreeNode = {
+  blobs: Map<string, TreeEntry>;
+  trees: Map<string, TreeNode>;
+};
+
+function compareByName(left: [string, unknown], right: [string, unknown]): number {
+  return left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0;
 }
 
 async function walk(root: string, visitFile: (path: string) => Promise<void>): Promise<void> {

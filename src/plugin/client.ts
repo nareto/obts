@@ -144,7 +144,7 @@ export class ObtsPluginClient {
     });
     await this.git.importPack(pulled.packfile);
     const localFiles = await this.git.scanSyncableFiles();
-    const serverFiles = await this.git.listTreeFiles(pulled.manifest.target_main);
+    const serverFiles = await this.materializedTreeFiles(pulled.manifest.target_main);
     const localAlreadyMatchesServer =
       localFiles.length > 0 && serverFiles.length > 0
         ? await this.localContentMatchesTree(localFiles, pulled.manifest.target_main)
@@ -390,10 +390,10 @@ export class ObtsPluginClient {
       throw error;
     }
     try {
-      const targetFiles = new Set(await this.git.listTreeFiles(targetMain));
+      const targetFiles = new Set(await this.materializedTreeFiles(targetMain));
       const affected = new Set(changedPaths);
       if (state.local_main) {
-        for (const path of await this.git.listTreeFiles(state.local_main)) {
+        for (const path of await this.materializedTreeFiles(state.local_main)) {
           if (!targetFiles.has(path)) {
             affected.add(path);
           }
@@ -572,7 +572,7 @@ export class ObtsPluginClient {
   }
 
   private async localContentMatchesTree(localFiles: string[], targetMain: string): Promise<boolean> {
-    const serverFiles = await this.git.listTreeFiles(targetMain);
+    const serverFiles = await this.materializedTreeFiles(targetMain);
     if (localFiles.length !== serverFiles.length) {
       return false;
     }
@@ -588,6 +588,10 @@ export class ObtsPluginClient {
       }
     }
     return true;
+  }
+
+  private async materializedTreeFiles(commit: string): Promise<string[]> {
+    return (await this.git.listTreeFiles(commit)).filter((path) => isSyncableVaultPath(path, this.policy));
   }
 
   private throwIfSyncBlocked(state: LocalPluginState): void {

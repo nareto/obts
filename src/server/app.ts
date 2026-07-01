@@ -6,6 +6,7 @@ import multipart from '@fastify/multipart';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 
 import { newId, nowIso } from '../shared/ids.js';
+import { isSyncableVaultPath, type SyncPathPolicy } from '../shared/pathPolicy.js';
 import { API_VERSION, type DevicePullManifest, type DevicePullRequest } from '../shared/types.js';
 import {
   assertRecord,
@@ -377,10 +378,12 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       pullRequest.current_local_main && (await git.commitExists(vaultId, pullRequest.current_local_main))
         ? pullRequest.current_local_main
         : null;
-    const changedPaths =
+    const allChangedPaths =
       have === null
         ? await git.listTreePaths(vaultId, targetMain)
         : (await git.changedPaths(vaultId, have, targetMain)).map((entry) => entry.path);
+    const devicePolicy = deviceSyncPathPolicy(deviceAuth.device);
+    const changedPaths = allChangedPaths.filter((path) => isSyncableVaultPath(path, devicePolicy));
     const db = await store.snapshot();
     const manifest: DevicePullManifest = {
       api_version: API_VERSION,
@@ -881,6 +884,14 @@ function dashboardDeviceStatusLabel(
     return 'Behind';
   }
   return deviceStatusLabel(status);
+}
+
+function deviceSyncPathPolicy(device: { sync_profile: SyncPathPolicy['profile']; sync_plugins: boolean }): SyncPathPolicy {
+  return {
+    profile: device.sync_profile,
+    syncPlugins: device.sync_plugins,
+    attachmentLocation: { mode: 'same_folder_as_note' }
+  };
 }
 
 function isMultipartLimitError(error: Error): boolean {

@@ -1650,6 +1650,35 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(db.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(state.local_main);
   });
 
+  it('materializes only paths allowed by the paired device sync profile while preserving server tree entries', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const fullDeviceDir = join(root, 'full-profile-device');
+    const notesOnlyDeviceDir = join(root, 'notes-only-profile-device');
+    await mkdirp(fullDeviceDir);
+    await mkdirp(join(fullDeviceDir, '.obsidian', 'plugins', 'example'));
+    await mkdirp(notesOnlyDeviceDir);
+    await writeFile(join(fullDeviceDir, 'note.md'), '# Note\n');
+    await writeFile(join(fullDeviceDir, 'photo.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    await writeFile(join(fullDeviceDir, '.obsidian', 'plugins', 'example', 'main.js'), 'module.exports = {};\n');
+
+    const fullPlugin = await pairPluginWithProfile(admin, fullDeviceDir, 'desktop', 'full_vault_config', true);
+    expect((await fullPlugin.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+
+    const notesOnlyPlugin = await pairPlugin(admin, notesOnlyDeviceDir, 'phone');
+    expect(await readFile(join(notesOnlyDeviceDir, 'note.md'), 'utf8')).toBe('# Note\n');
+    expect(await exists(join(notesOnlyDeviceDir, 'photo.png'))).toBe(false);
+    expect(await exists(join(notesOnlyDeviceDir, '.obsidian', 'plugins', 'example', 'main.js'))).toBe(false);
+
+    await writeFile(join(notesOnlyDeviceDir, 'phone.md'), 'notes-only change\n');
+    expect((await notesOnlyPlugin.syncOnce()).status).toBe('Synced');
+
+    const main = (await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main;
+    expect(main).toMatch(/^[0-9a-f]{40}$/u);
+    expect(await server.git.listTreePaths(admin.vaultId, main!)).toEqual(
+      expect.arrayContaining(['note.md', 'phone.md', 'photo.png', '.obsidian/plugins/example/main.js'])
+    );
+  });
+
   it('rejects non-regular Git tree entries before they can be synced', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const repo = server.git.repoPath(admin.vaultId);
@@ -1911,18 +1940,20 @@ async function pairPluginWithProfile(
   admin: BrowserSession & { vaultId: string },
   vaultDir: string,
   deviceName: string,
-  syncProfile: SyncProfile
+  syncProfile: SyncProfile,
+  syncPlugins = false
 ): Promise<ObtsPluginClient> {
   const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
     device_name: deviceName,
-    sync_profile: syncProfile
+    sync_profile: syncProfile,
+    sync_plugins: syncPlugins
   });
   expect(pairing.status).toBe(201);
   const plugin = new ObtsPluginClient(vaultDir, {
     serverUrl: baseUrlFromAdmin(admin),
     deviceName,
     syncProfile,
-    syncPlugins: false
+    syncPlugins
   });
   await plugin.pairWithToken(pairing.body.pairing_token);
   return plugin;
