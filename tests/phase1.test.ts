@@ -513,6 +513,26 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await readFile(join(device2Dir, 'server.md'), 'utf8')).toBe('server change\n');
   });
 
+  it('keeps the installable Obsidian artifact on adapter APIs for visible-vault apply', async () => {
+    const artifact = await readFile(join(process.cwd(), 'obsidian-plugin', 'main.js'), 'utf8');
+    const applyWriter = sourceSection(artifact, 'async writeTargetFilesFromJournal', 'async createLocalCommit');
+    expect(applyWriter).toContain('this.adapterRemove');
+    expect(applyWriter).toContain('this.adapterWriteBinary');
+    expect(applyWriter).toContain('this.removeBlockingMaterializationPaths');
+    expect(applyWriter).not.toContain('fsp.rm');
+    expect(applyWriter).not.toContain('path.join(this.vaultDir');
+
+    const scanner = sourceSection(artifact, 'async scanSyncableFiles', 'async localContentMatchesTree');
+    expect(scanner).toContain('this.listLocalVaultFiles()');
+    expect(scanner).not.toContain('walk(');
+    expect(scanner).not.toContain('path.relative');
+
+    const adapterRemove = sourceSection(artifact, 'async adapterRemove', 'async adapterSha256');
+    expect(adapterRemove).not.toContain('fsp.rm');
+    expect(adapterRemove).toContain('this.adapter.rmdir');
+    expect(adapterRemove).toContain('this.adapter.remove');
+  });
+
   it('stores new dashboard passwords with the PRD Argon2id parameters', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const db = await server.store.snapshot();
@@ -3394,4 +3414,12 @@ function sha256(data: Buffer): string {
 
 function asText(value: string | Buffer): string {
   return Buffer.isBuffer(value) ? value.toString('utf8') : value;
+}
+
+function sourceSection(source: string, startMarker: string, endMarker: string): string {
+  const start = source.indexOf(startMarker);
+  const end = source.indexOf(endMarker, start + startMarker.length);
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  return source.slice(start, end);
 }

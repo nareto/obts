@@ -599,7 +599,7 @@ class ObtsObsidianClient {
       for (const localPath of extraAffectedPaths) {
         affected.add(localPath);
       }
-      const localVaultFiles = await listLocalVaultFiles(this.vaultDir);
+      const localVaultFiles = await this.listLocalVaultFiles();
       for (const conflictPath of materializationConflictFiles(new Set([...targetFiles, ...affected]), localVaultFiles)) {
         affected.add(conflictPath);
       }
@@ -732,7 +732,7 @@ class ObtsObsidianClient {
 
   async writeTargetFilesFromJournal(journal, targetFiles) {
     const assertRecoveredDescendants = async (filePath) => {
-      const descendants = await listLocalDescendantFiles(this.vaultDir, filePath);
+      const descendants = await this.listLocalDescendantFiles(filePath);
       if (descendants.some((descendant) => !(descendant in journal.preflight_sha256))) {
         journal.phase = "blocked_recovery";
         journal.redacted_error_category = "preflight_hash_changed";
@@ -741,17 +741,17 @@ class ObtsObsidianClient {
       }
     };
     for (const filePath of journal.affected_paths.filter((candidate) => !targetFiles.has(candidate)).sort((left, right) => right.length - left.length)) {
-      if (await pathIsDirectory(path.join(this.vaultDir, filePath))) {
+      if (await this.adapterIsDirectory(filePath)) {
         await assertRecoveredDescendants(filePath);
       }
       await this.adapterRemove(filePath);
     }
     for (const filePath of journal.affected_paths.filter((candidate) => targetFiles.has(candidate))) {
       const content = await this.readBlob(journal.target_main, filePath);
-      await removeBlockingMaterializationPaths(this.vaultDir, filePath);
-      if (await pathIsDirectory(path.join(this.vaultDir, filePath))) {
+      await this.removeBlockingMaterializationPaths(filePath);
+      if (await this.adapterIsDirectory(filePath)) {
         await assertRecoveredDescendants(filePath);
-        await fsp.rm(path.join(this.vaultDir, filePath), { recursive: true, force: true });
+        await this.adapterRemove(filePath);
       }
       await this.adapterWriteBinary(filePath, content);
     }
@@ -801,13 +801,7 @@ class ObtsObsidianClient {
   }
 
   async scanSyncableFiles() {
-    const result = [];
-    await walk(this.vaultDir, async (absolutePath) => {
-      const rel = normalizePath(path.relative(this.vaultDir, absolutePath));
-      if (isSyncableVaultPath(rel, this.plugin.settings)) {
-        result.push(rel);
-      }
-    });
+    const result = (await this.listLocalVaultFiles()).filter((filePath) => isSyncableVaultPath(filePath, this.plugin.settings));
     return assertNoCaseCollisions(result.sort());
   }
 
@@ -888,10 +882,9 @@ class ObtsObsidianClient {
       }
     }
     for (const [filePath, content] of Array.from(snapshot.entries()).sort(([left], [right]) => left.localeCompare(right))) {
-      await removeBlockingMaterializationPaths(this.vaultDir, filePath);
-      const absolutePath = path.join(this.vaultDir, filePath);
-      if (await pathIsDirectory(absolutePath)) {
-        await fsp.rm(absolutePath, { recursive: true, force: true });
+      await this.removeBlockingMaterializationPaths(filePath);
+      if (await this.adapterIsDirectory(filePath)) {
+        await this.adapterRemove(filePath);
       }
       await this.adapterWriteBinary(filePath, content);
     }
@@ -1211,15 +1204,100 @@ class ObtsObsidianClient {
 
   async adapterRemove(filePath) {
     try {
-      await this.adapter.remove(filePath);
+      if (await this.adapterIsDirectory(filePath)) {
+        if (typeof this.adapter.rmdir === "function") {
+          await this.adapter.rmdir(filePath, true);
+        } else {
+          await this.adapter.remove(filePath);
+        }
+      } else {
+        await this.adapter.remove(filePath);
+      }
     } catch {
-      await fsp.rm(path.join(this.vaultDir, filePath), { recursive: true, force: true });
+      // The target may already be absent after an interrupted or repeated apply.
     }
   }
 
   async adapterSha256(filePath) {
     const data = await this.adapterReadBinary(filePath);
     return data ? sha256(data) : null;
+  }
+
+  async adapterExists(filePath) {
+    if (!filePath || filePath === ".") {
+      return true;
+    }
+    try {
+      if (typeof this.adapter.exists === "function") {
+        return await this.adapter.exists(filePath);
+      }
+      await this.adapter.stat(filePath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async adapterIsDirectory(filePath) {
+    if (!filePath || filePath === ".") {
+      return true;
+    }
+    try {
+      if (typeof this.adapter.stat === "function") {
+        const stat = await this.adapter.stat(filePath);
+        if (stat && stat.type === "folder") {
+          return true;
+        }
+        if (stat && stat.type === "file") {
+          return false;
+        }
+      }
+      await this.adapter.list(filePath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async listLocalVaultFiles() {
+    const result = [];
+    await this.walkAdapterFiles("", result);
+    return result.sort();
+  }
+
+  async listLocalDescendantFiles(filePath) {
+    if (!(await this.adapterIsDirectory(filePath))) {
+      return [];
+    }
+    const result = [];
+    await this.walkAdapterFiles(filePath, result);
+    return result.sort();
+  }
+
+  async walkAdapterFiles(dir, result) {
+    const listing = await this.adapter.list(dir);
+    for (const folder of listing.folders || []) {
+      const normalizedFolder = normalizePath(folder);
+      if (normalizedFolder === ".obts" || normalizedFolder.startsWith(".obts/") || normalizedFolder === ".git" || normalizedFolder.startsWith(".git/")) {
+        continue;
+      }
+      await this.walkAdapterFiles(normalizedFolder, result);
+    }
+    for (const filePath of listing.files || []) {
+      const normalizedFile = normalizePath(filePath);
+      if (normalizedFile === ".obts" || normalizedFile.startsWith(".obts/") || normalizedFile === ".git" || normalizedFile.startsWith(".git/")) {
+        continue;
+      }
+      result.push(normalizedFile);
+    }
+  }
+
+  async removeBlockingMaterializationPaths(filePath) {
+    for (const prefix of directoryPrefixes(filePath)) {
+      if ((await this.adapterExists(prefix)) && !(await this.adapterIsDirectory(prefix))) {
+        await this.adapterRemove(prefix);
+      }
+    }
   }
 
   url(route) {
@@ -1433,41 +1511,6 @@ async function ensureAdapterDir(adapter, dir) {
   }
 }
 
-async function walk(root, visitFile) {
-  const entries = await fsp.readdir(root, { withFileTypes: true });
-  for (const entry of entries) {
-    if (entry.name === ".obts" || entry.name === ".git") {
-      continue;
-    }
-    const absolutePath = path.join(root, entry.name);
-    if (entry.isDirectory()) {
-      await walk(absolutePath, visitFile);
-    } else if (entry.isFile()) {
-      await visitFile(absolutePath);
-    }
-  }
-}
-
-async function listLocalVaultFiles(root) {
-  const files = [];
-  await walk(root, async (absolutePath) => {
-    files.push(normalizePath(path.relative(root, absolutePath)));
-  });
-  return files.sort();
-}
-
-async function listLocalDescendantFiles(root, relativePath) {
-  const absolutePath = path.join(root, relativePath);
-  if (!(await pathIsDirectory(absolutePath))) {
-    return [];
-  }
-  const files = [];
-  await walk(absolutePath, async (descendantPath) => {
-    files.push(normalizePath(path.relative(root, descendantPath)));
-  });
-  return files.sort();
-}
-
 function materializationConflictFiles(targetFiles, localVaultFiles) {
   const conflicts = new Set();
   for (const targetFile of targetFiles) {
@@ -1492,23 +1535,6 @@ function directoryPrefixes(filePath) {
     prefixes.push(segments.slice(0, index).join("/"));
   }
   return prefixes;
-}
-
-async function removeBlockingMaterializationPaths(root, relativePath) {
-  for (const prefix of directoryPrefixes(relativePath)) {
-    const absolutePrefix = path.join(root, prefix);
-    if ((await exists(absolutePrefix)) && !(await pathIsDirectory(absolutePrefix))) {
-      await fsp.rm(absolutePrefix, { force: true });
-    }
-  }
-}
-
-async function pathIsDirectory(filePath) {
-  try {
-    return (await fsp.stat(filePath)).isDirectory();
-  } catch {
-    return false;
-  }
 }
 
 async function writeTextSnapshotPatch(bundleDir, filePath, content) {
