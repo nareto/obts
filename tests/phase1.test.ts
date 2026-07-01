@@ -2110,6 +2110,131 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(checksums).toContain('  git/local-refs.pack');
   });
 
+  it('rebuilds from server main and turns snapshot-only local edits into a recovery commit', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const device1Dir = join(root, 'rebuild-snapshot-device-1');
+    const device2Dir = join(root, 'rebuild-snapshot-device-2');
+    await mkdirp(device1Dir);
+    await mkdirp(device2Dir);
+    await writeFile(join(device1Dir, 'base.md'), 'base\n');
+    const plugin1 = await pairPlugin(admin, device1Dir, 'desktop');
+    await plugin1.syncOnce({ confirmInitialImport: true });
+    const plugin2 = await pairPlugin(admin, device2Dir, 'phone');
+
+    await writeFile(join(device2Dir, 'local-only.md'), 'preserve after rebuild\n');
+    await writeFile(join(device1Dir, 'server-next.md'), 'server current\n');
+    expect((await plugin1.syncOnce()).status).toBe('Synced');
+
+    const rebuilt = await plugin2.rebuildFromServerMain();
+    expect(rebuilt).toMatchObject({
+      status: 'Ahead',
+      recoveryCommit: expect.stringMatching(/^[0-9a-f]{40}$/u)
+    });
+    expect(await readFile(join(device2Dir, 'server-next.md'), 'utf8')).toBe('server current\n');
+    expect(await readFile(join(device2Dir, 'local-only.md'), 'utf8')).toBe('preserve after rebuild\n');
+    expect(await recoveryBundleContains(device2Dir, 'local-only.md')).toBe(true);
+
+    expect((await plugin2.syncOnce()).status).toBe('Synced');
+    await plugin1.syncOnce();
+    expect(await readFile(join(device1Dir, 'local-only.md'), 'utf8')).toBe('preserve after rebuild\n');
+  });
+
+  it('rebuilds from server main while preserving queued fast-forward local commits', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const device1Dir = join(root, 'rebuild-pending-device-1');
+    const device2Dir = join(root, 'rebuild-pending-device-2');
+    await mkdirp(device1Dir);
+    await mkdirp(device2Dir);
+    await writeFile(join(device1Dir, 'base.md'), 'base\n');
+    const plugin1 = await pairPlugin(admin, device1Dir, 'desktop');
+    await plugin1.syncOnce({ confirmInitialImport: true });
+    const plugin2 = await pairPlugin(admin, device2Dir, 'phone');
+
+    await writeFile(join(device2Dir, 'phone-base.md'), 'phone device ref\n');
+    expect((await plugin2.syncOnce()).status).toBe('Synced');
+    const syncedState = await plugin2.readState();
+    expect(syncedState.server_device_ref).toMatch(/^[0-9a-f]{40}$/u);
+
+    await writeFile(join(device2Dir, 'pending.md'), 'queued pending history\n');
+    const localGit = new LocalGitEngine(device2Dir, {
+      profile: 'notes_only',
+      syncPlugins: false,
+      attachmentLocation: { mode: 'same_folder_as_note' }
+    });
+    const pendingCommit = await localGit.createLocalCommit('obts: queued before rebuild');
+    expect(pendingCommit).toMatch(/^[0-9a-f]{40}$/u);
+    await writeQueueFile(device2Dir, {
+      pending_commit: pendingCommit,
+      expected_device_ref: syncedState.server_device_ref,
+      status: 'queued_local',
+      attempts: 1,
+      updated_at: new Date().toISOString()
+    });
+
+    await writeFile(join(device1Dir, 'server-next.md'), 'server current\n');
+    expect((await plugin1.syncOnce()).status).toBe('Synced');
+
+    const rebuilt = await plugin2.rebuildFromServerMain();
+    expect(rebuilt).toMatchObject({
+      status: 'Ahead',
+      preservedPendingCommit: pendingCommit
+    });
+    expect(await exists(join(device2Dir, 'pending.md'))).toBe(false);
+    expect(await plugin2.readQueue()).toMatchObject({
+      pending_commit: pendingCommit,
+      expected_device_ref: syncedState.server_device_ref,
+      status: 'queued_local'
+    });
+
+    expect((await plugin2.syncOnce()).status).toBe('Synced');
+    expect(await readFile(join(device2Dir, 'pending.md'), 'utf8')).toBe('queued pending history\n');
+    await plugin1.syncOnce();
+    expect(await readFile(join(device1Dir, 'pending.md'), 'utf8')).toBe('queued pending history\n');
+  });
+
+  it('blocks rebuild when queued same-device history is divergent', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'rebuild-divergent-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'laptop');
+    const pairedState = await plugin.readState();
+    expect(pairedState.local_main).toMatch(/^[0-9a-f]{40}$/u);
+
+    await writeFile(join(deviceDir, 'accepted.md'), 'accepted device history\n');
+    expect((await plugin.syncOnce()).status).toBe('Synced');
+    const syncedState = await plugin.readState();
+    expect(syncedState.server_device_ref).toMatch(/^[0-9a-f]{40}$/u);
+
+    const localGit = new LocalGitEngine(deviceDir, {
+      profile: 'notes_only',
+      syncPlugins: false,
+      attachmentLocation: { mode: 'same_folder_as_note' }
+    });
+    await localGit.setLocalHead(pairedState.local_main!);
+    await writeFile(join(deviceDir, 'divergent.md'), 'divergent local history\n');
+    const divergentCommit = await localGit.createLocalCommit('obts: divergent queued before rebuild');
+    expect(divergentCommit).toMatch(/^[0-9a-f]{40}$/u);
+    await writeQueueFile(deviceDir, {
+      pending_commit: divergentCommit,
+      expected_device_ref: syncedState.server_device_ref,
+      status: 'queued_local',
+      attempts: 1,
+      updated_at: new Date().toISOString()
+    });
+
+    await expect(plugin.rebuildFromServerMain()).rejects.toMatchObject({ code: 'same_device_non_fast_forward' });
+    expect(await exists(join(deviceDir, 'divergent.md'))).toBe(false);
+    expect(await recoveryBundleContains(deviceDir, 'divergent.md')).toBe(true);
+    expect(await plugin.readQueue()).toMatchObject({
+      pending_commit: divergentCommit,
+      status: 'blocked_recovery'
+    });
+    expect(await plugin.readState()).toMatchObject({
+      status_label: 'Needs recovery',
+      last_error_code: 'same_device_non_fast_forward'
+    });
+  });
+
   it('resumes merge evaluation when a retry finds the device ref already advanced', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'retry-device');
@@ -2747,6 +2872,10 @@ async function latestRecoveryBundle(vaultDir: string): Promise<string> {
   );
   bundles.sort((left, right) => right.mtimeMs - left.mtimeMs || right.bundleId.localeCompare(left.bundleId));
   return join(recoveryDir, bundles[0]!.bundleId);
+}
+
+async function writeQueueFile(vaultDir: string, queue: Json): Promise<void> {
+  await writeFile(join(vaultDir, '.obts', 'queue.json'), `${JSON.stringify(queue, null, 2)}\n`);
 }
 
 async function sleep(milliseconds: number): Promise<void> {

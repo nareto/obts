@@ -6,7 +6,7 @@ import { newId, nowIso } from '../shared/ids.js';
 
 export type ApplyJournal = {
   apply_id: string;
-  operation_type: 'pull_apply' | 'initial_import' | 'replace_local_with_server';
+  operation_type: 'pull_apply' | 'initial_import' | 'replace_local_with_server' | 'rebuild_from_server';
   target_main: string;
   expected_prior_local_main: string | null;
   expected_prior_local_device_ref: string | null;

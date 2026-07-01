@@ -84,6 +84,33 @@ export class LocalGitEngine {
     }
   }
 
+  async commitExists(commit: string): Promise<boolean> {
+    try {
+      await git.readCommit({ fs, dir: this.vaultDir, gitdir: this.gitdir, oid: commit });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async isAncestor(ancestor: string, descendant: string): Promise<boolean> {
+    if (ancestor === descendant) {
+      return true;
+    }
+    try {
+      return await git.isDescendent({
+        fs,
+        dir: this.vaultDir,
+        gitdir: this.gitdir,
+        oid: descendant,
+        ancestor,
+        depth: -1
+      });
+    } catch {
+      return false;
+    }
+  }
+
   async scanSyncableFiles(): Promise<string[]> {
     const files: string[] = [];
     await walk(this.vaultDir, async (absolutePath) => {

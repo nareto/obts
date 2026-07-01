@@ -42,6 +42,13 @@ export type QueueState = {
   updated_at: string;
 };
 
+export type RebuildResult = {
+  status: string;
+  main: string;
+  recoveryCommit?: string;
+  preservedPendingCommit?: string;
+};
+
 export class PluginBlockedError extends Error {
   constructor(
     readonly code: string,
@@ -322,6 +329,141 @@ export class ObtsPluginClient {
     await this.writeState({
       ...(await this.readState()),
       initial_import_confirmed: true,
+      status_label: 'Synced',
+      last_error_code: null,
+      updated_at: nowIso()
+    });
+    return { status: 'Synced', main: pulled.manifest.target_main };
+  }
+
+  async rebuildFromServerMain(): Promise<RebuildResult> {
+    await this.initialize();
+    const state = await this.readState();
+    if (!state.vault_id || !state.device_id) {
+      throw new PluginBlockedError('not_paired', 'Device is not paired.');
+    }
+    if (state.last_error_code === 'conflict_review_required') {
+      throw new PluginBlockedError(
+        'conflict_review_required',
+        'A server conflict requires dashboard review before local rebuild can continue.'
+      );
+    }
+    if (state.last_error_code === 'replace_local_with_server_required') {
+      throw new PluginBlockedError(
+        'replace_local_with_server_required',
+        'Use replace-local-with-server for first pairing divergence.'
+      );
+    }
+
+    const token = await this.readDeviceToken();
+    const queue = await this.readQueue();
+    const localFiles = await this.git.scanSyncableFiles();
+    const localSnapshot = await readFileSnapshot(this.vaultDir, localFiles);
+    const pulled = await this.transport.pull({
+      vaultId: state.vault_id,
+      deviceId: state.device_id,
+      deviceToken: token,
+      currentLocalMain: state.local_main
+    });
+    await this.git.importPack(pulled.packfile);
+    const priorLocalFiles = state.local_main ? await this.materializedTreeFiles(state.local_main) : [];
+
+    const pendingClassification = await this.classifyPendingCommit(
+      queue.pending_commit,
+      state.server_device_ref,
+      pulled.manifest.target_main
+    );
+
+    await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true, {
+      extraAffectedPaths: localFiles
+    });
+    if (state.local_main !== pulled.manifest.target_main) {
+      await this.acknowledgeAppliedMain(state, token, pulled.manifest.target_main);
+    }
+
+    if (pendingClassification === 'divergent') {
+      await this.createLocalRecoveryBundle('rebuild_from_server', pulled.manifest.target_main, localFiles);
+      await this.writeQueue({
+        pending_commit: queue.pending_commit,
+        expected_device_ref: state.server_device_ref,
+        status: 'blocked_recovery',
+        attempts: queue.attempts,
+        updated_at: nowIso()
+      });
+      await this.block('same_device_non_fast_forward', 'Divergent same-device history requires export and reset or re-pair.');
+    }
+
+    if (pendingClassification === 'fast_forward' && queue.pending_commit) {
+      await this.git.setLocalHead(pulled.manifest.target_main);
+      await this.writeQueue({
+        pending_commit: queue.pending_commit,
+        expected_device_ref: state.server_device_ref,
+        status: 'queued_local',
+        attempts: queue.attempts,
+        updated_at: nowIso()
+      });
+      await this.writeState({
+        ...(await this.readState()),
+        local_head: pulled.manifest.target_main,
+        status_label: 'Ahead',
+        last_error_code: null,
+        updated_at: nowIso()
+      });
+      return {
+        status: 'Ahead',
+        main: pulled.manifest.target_main,
+        preservedPendingCommit: queue.pending_commit
+      };
+    }
+
+    if (pendingClassification === 'repeat') {
+      await this.writeQueue({
+        pending_commit: null,
+        expected_device_ref: state.server_device_ref,
+        status: 'idle',
+        attempts: 0,
+        updated_at: nowIso()
+      });
+      await this.writeState({
+        ...(await this.readState()),
+        status_label: 'Synced',
+        last_error_code: null,
+        updated_at: nowIso()
+      });
+      return { status: 'Synced', main: pulled.manifest.target_main };
+    }
+
+    if (!(await this.localSnapshotMatchesTree(localSnapshot, pulled.manifest.target_main))) {
+      await restoreFileSnapshot(this.vaultDir, localSnapshot, priorLocalFiles);
+      const recoveryCommit = await this.git.createLocalCommit('obts: rebuild preserved local edits');
+      if (recoveryCommit) {
+        await this.writeQueue({
+          pending_commit: recoveryCommit,
+          expected_device_ref: state.server_device_ref,
+          status: 'queued_local',
+          attempts: 0,
+          updated_at: nowIso()
+        });
+        await this.writeState({
+          ...(await this.readState()),
+          local_head: recoveryCommit,
+          status_label: 'Ahead',
+          last_error_code: null,
+          updated_at: nowIso()
+        });
+        return { status: 'Ahead', main: pulled.manifest.target_main, recoveryCommit };
+      }
+    }
+
+    await this.writeQueue({
+      pending_commit: null,
+      expected_device_ref: state.server_device_ref,
+      status: 'idle',
+      attempts: 0,
+      updated_at: nowIso()
+    });
+    await this.writeState({
+      ...(await this.readState()),
       status_label: 'Synced',
       last_error_code: null,
       updated_at: nowIso()
@@ -641,6 +783,50 @@ export class ObtsPluginClient {
     return true;
   }
 
+  private async localSnapshotMatchesTree(snapshot: Map<string, Buffer>, targetMain: string): Promise<boolean> {
+    const serverFiles = await this.materializedTreeFiles(targetMain);
+    if (snapshot.size !== serverFiles.length) {
+      return false;
+    }
+    for (const path of serverFiles) {
+      const localContent = snapshot.get(path);
+      const serverContent = await this.git.readBlob(targetMain, path);
+      if (!localContent || !serverContent || !localContent.equals(serverContent)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private async classifyPendingCommit(
+    pendingCommit: string | null,
+    serverDeviceRef: string | null,
+    targetMain: string
+  ): Promise<'none' | 'repeat' | 'fast_forward' | 'divergent'> {
+    if (!pendingCommit) {
+      return 'none';
+    }
+    if (!(await this.git.commitExists(pendingCommit))) {
+      return 'divergent';
+    }
+    if (await this.git.isAncestor(pendingCommit, targetMain)) {
+      return 'repeat';
+    }
+    if (serverDeviceRef) {
+      if (await this.git.isAncestor(pendingCommit, serverDeviceRef)) {
+        return 'repeat';
+      }
+      if (await this.git.isAncestor(serverDeviceRef, pendingCommit)) {
+        return 'fast_forward';
+      }
+      return 'divergent';
+    }
+    if (await this.git.isAncestor(targetMain, pendingCommit)) {
+      return 'fast_forward';
+    }
+    return 'divergent';
+  }
+
   private async materializedTreeFiles(commit: string): Promise<string[]> {
     return (await this.git.listTreeFiles(commit)).filter((path) => isSyncableVaultPath(path, this.policy));
   }
@@ -835,6 +1021,40 @@ async function listLocalDescendantFiles(root: string, relativePath: string): Pro
   const files: string[] = [];
   await walkVaultFiles(root, absolutePath, files);
   return files.sort();
+}
+
+async function readFileSnapshot(root: string, files: string[]): Promise<Map<string, Buffer>> {
+  const snapshot = new Map<string, Buffer>();
+  for (const path of files) {
+    snapshot.set(path, await readFile(join(root, path)));
+  }
+  return snapshot;
+}
+
+async function restoreFileSnapshot(root: string, snapshot: Map<string, Buffer>, priorLocalFiles: string[]): Promise<void> {
+  for (const path of priorLocalFiles.sort((left, right) => right.length - left.length)) {
+    if (!snapshot.has(path)) {
+      await rm(join(root, path), { recursive: true, force: true });
+    }
+  }
+  for (const [path, content] of [...snapshot.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+    await removeBlockingMaterializationPaths(root, path);
+    const absolutePath = join(root, path);
+    if (await pathIsDirectory(absolutePath)) {
+      await rm(absolutePath, { recursive: true, force: true });
+    }
+    await mkdir(dirname(absolutePath), { recursive: true, mode: 0o700 });
+    await writeFile(absolutePath, content);
+  }
+}
+
+async function removeBlockingMaterializationPaths(root: string, relativePath: string): Promise<void> {
+  for (const prefix of directoryPrefixes(relativePath)) {
+    const absolutePrefix = join(root, prefix);
+    if ((await exists(absolutePrefix)) && !(await pathIsDirectory(absolutePrefix))) {
+      await rm(absolutePrefix, { force: true });
+    }
+  }
 }
 
 async function walkVaultFiles(root: string, current: string, files: string[]): Promise<void> {
