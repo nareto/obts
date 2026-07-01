@@ -247,6 +247,7 @@ export class ObtsPluginClient {
           ...currentState,
           server_device_ref: result.device_ref,
           status_label: 'Review needed',
+          last_error_code: 'conflict_review_required',
           updated_at: nowIso()
         });
         return { status: 'Review needed', conflictId: result.conflict_id, main: result.main };
@@ -320,6 +321,7 @@ export class ObtsPluginClient {
     if (!state.vault_id || !state.device_id) {
       return;
     }
+    this.throwIfSyncBlocked(state);
     const token = await this.readDeviceToken();
     const pulled = await this.transport.pull({
       vaultId: state.vault_id,
@@ -595,6 +597,12 @@ export class ObtsPluginClient {
   }
 
   private throwIfSyncBlocked(state: LocalPluginState): void {
+    if (state.last_error_code === 'conflict_review_required') {
+      throw new PluginBlockedError(
+        'conflict_review_required',
+        'A server conflict requires dashboard review before normal sync can continue.'
+      );
+    }
     if (state.last_error_code === 'replace_local_with_server_required') {
       throw new PluginBlockedError(
         'replace_local_with_server_required',
@@ -716,6 +724,9 @@ function sha256(data: Buffer): string {
 function blockStatusLabel(code: string): string {
   if (code === 'initial_import_confirmation_required') {
     return 'Blocked';
+  }
+  if (code === 'conflict_review_required') {
+    return 'Review needed';
   }
   if (
     code === 'replace_local_with_server_required' ||

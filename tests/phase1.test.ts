@@ -576,6 +576,10 @@ describe('Phase 1 sync without conflict resolution', () => {
     const result = await plugin2.syncOnce();
     expect(result.status).toBe('Review needed');
     expect(result.conflictId).toMatch(/^conf_/u);
+    await expect(awaitState(plugin2)).resolves.toMatchObject({
+      status_label: 'Review needed',
+      last_error_code: 'conflict_review_required'
+    });
 
     const conflicts = await admin.get<{ conflicts: Array<{ affected_paths: string[]; status: string }> }>(
       `/api/v1/vaults/${admin.vaultId}/conflicts?status=open`
@@ -591,7 +595,31 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await readFile(join(device3Dir, 'shared.md'), 'utf8')).toBe('device one\n');
 
     await writeFile(join(device2Dir, 'after-conflict.md'), 'still blocked\n');
-    await expect(plugin2.syncOnce()).rejects.toMatchObject({ code: 'device_blocked' });
+    await expect(plugin2.syncOnce()).rejects.toMatchObject({ code: 'conflict_review_required' });
+  });
+
+  it('blocks pull apply on a device with an open conflict instead of replacing local review content', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const device1Dir = join(root, 'conflict-pull-device-1');
+    const device2Dir = join(root, 'conflict-pull-device-2');
+    await mkdirp(device1Dir);
+    await mkdirp(device2Dir);
+
+    const plugin1 = await pairPlugin(admin, device1Dir, 'desktop');
+    await writeFile(join(device1Dir, 'shared.md'), 'base\n');
+    await plugin1.syncOnce();
+
+    const plugin2 = await pairPlugin(admin, device2Dir, 'tablet');
+    await writeFile(join(device1Dir, 'shared.md'), 'server version\n');
+    await writeFile(join(device2Dir, 'shared.md'), 'device review version\n');
+    await plugin1.syncOnce();
+    expect((await plugin2.syncOnce()).status).toBe('Review needed');
+
+    await expect(plugin2.pullAndApply({ allowDestructive: true })).rejects.toMatchObject({
+      code: 'conflict_review_required'
+    });
+    expect(await readFile(join(device2Dir, 'shared.md'), 'utf8')).toBe('device review version\n');
+    expect(await exists(join(device2Dir, '.obts', 'apply-journal.json'))).toBe(false);
   });
 
   it('auto-merges clean overlapping Markdown edits through native Git before creating conflicts', async () => {
