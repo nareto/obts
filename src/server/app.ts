@@ -24,8 +24,6 @@ import { GitCommandError, GitService, sha256Hex } from './gitService.js';
 import { MetadataStore, type MetadataDb, type SyncOperationRow } from './metadataStore.js';
 import { SyncService } from './syncService.js';
 
-const SESSION_COOKIE = '__Host-obts_session';
-
 export type ObtsServer = {
   app: FastifyInstance;
   config: ServerConfig;
@@ -90,7 +88,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const result = await auth.setupInitialAdmin(
       typeof body.display_name === 'string' ? { ...setupInput, displayName: body.display_name } : setupInput
     );
-    setSessionCookie(reply, result.sessionId);
+    setSessionCookie(reply, config, result.sessionId);
     return reply.status(201).send({
       user_id: result.user.user_id,
       csrf_token: result.csrfToken,
@@ -104,7 +102,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       username: readString(body, 'username'),
       password: readString(body, 'password')
     });
-    setSessionCookie(reply, result.sessionId);
+    setSessionCookie(reply, config, result.sessionId);
     return {
       user_id: result.user.user_id,
       csrf_token: result.csrfToken,
@@ -113,7 +111,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.get('/api/v1/auth/session', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[SESSION_COOKIE]);
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     return {
       user_id: session.user.user_id,
       csrf_token: session.session.csrf_token,
@@ -122,13 +120,13 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.post('/api/v1/auth/logout', async (request, reply) => {
-    await auth.logout(request.cookies[SESSION_COOKIE]);
-    reply.clearCookie(SESSION_COOKIE, { path: '/' });
+    await auth.logout(request.cookies[config.sessionCookieName]);
+    reply.clearCookie(config.sessionCookieName, cookieOptions(config));
     return { status: 'ok' };
   });
 
   app.post('/api/v1/admin/users', async (request, reply) => {
-    const session = await auth.authenticateSession(request.cookies[SESSION_COOKIE]);
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     auth.requireRecentAuth(session.session);
     const body = requestBody(request);
@@ -153,7 +151,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.get('/api/v1/vaults', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[SESSION_COOKIE]);
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     const db = await store.snapshot();
     return {
       vaults: db.vaults
@@ -171,7 +169,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.post('/api/v1/vaults', async (request, reply) => {
-    const session = await auth.authenticateSession(request.cookies[SESSION_COOKIE]);
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     const body = requestBody(request);
     const displayName = readString(body, 'display_name');
@@ -212,7 +210,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.get('/api/v1/vaults/:vaultId/main', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[SESSION_COOKIE]);
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     const { vaultId } = pathParams(request);
     const db = await store.snapshot();
     const vault = ownedVaultOrThrow(db, session.user.user_id, vaultId);
@@ -224,7 +222,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.get('/api/v1/vaults/:vaultId/dashboard', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[SESSION_COOKIE]);
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     const { vaultId } = pathParams(request);
     const db = await store.snapshot();
     const vault = ownedVaultOrThrow(db, session.user.user_id, vaultId);
@@ -269,7 +267,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.post('/api/v1/vaults/:vaultId/pairing-tokens', async (request, reply) => {
-    const session = await auth.authenticateSession(request.cookies[SESSION_COOKIE]);
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     auth.requireRecentAuth(session.session);
     const { vaultId } = pathParams(request);
@@ -379,7 +377,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.get('/api/v1/vaults/:vaultId/conflicts', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[SESSION_COOKIE]);
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     const { vaultId } = pathParams(request);
     const query = request.query as { status?: string };
     const db = await store.snapshot();
@@ -394,7 +392,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.get('/api/v1/vaults/:vaultId/events', async (request, reply) => {
-    const session = await auth.authenticateSession(request.cookies[SESSION_COOKIE]);
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     const { vaultId } = pathParams(request);
     const query = request.query as { after?: string };
     if (query.after !== undefined && !/^\d+$/u.test(query.after)) {
@@ -455,13 +453,21 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   return { app, config, store, git, auth, sync };
 }
 
-function setSessionCookie(reply: FastifyReply, sessionId: string): void {
-  reply.setCookie(SESSION_COOKIE, sessionId, {
+function setSessionCookie(reply: FastifyReply, config: ServerConfig, sessionId: string): void {
+  reply.setCookie(config.sessionCookieName, sessionId, {
     httpOnly: true,
-    secure: true,
+    secure: config.sessionCookieSecure,
     sameSite: 'strict',
     path: '/'
   });
+}
+
+function cookieOptions(config: ServerConfig): { path: string; secure: boolean; sameSite: 'strict' } {
+  return {
+    path: '/',
+    secure: config.sessionCookieSecure,
+    sameSite: 'strict'
+  };
 }
 
 function requestBody(request: FastifyRequest): Record<string, unknown> {

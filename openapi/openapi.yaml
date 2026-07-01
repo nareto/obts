@@ -7,6 +7,7 @@ servers:
   - url: /api/v1
 security:
   - dashboardSession: []
+  - dashboardSessionHttps: []
 paths:
   /setup/status:
     get:
@@ -270,7 +271,13 @@ components:
     dashboardSession:
       type: apiKey
       in: cookie
+      name: obts_session
+      description: Default HTTP/dev dashboard session cookie.
+    dashboardSessionHttps:
+      type: apiKey
+      in: cookie
       name: __Host-obts_session
+      description: Secure dashboard session cookie used when the public base URL is HTTPS.
     deviceBearer:
       type: http
       scheme: bearer

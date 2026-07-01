@@ -9,6 +9,7 @@ Implemented runtime pieces:
 - Shared API types, status labels, validation helpers, and vault path policy.
 - Committed OpenAPI 3.1 contract at `openapi/openapi.yaml`.
 - Fastify server with first-run setup, Argon2id password storage, login/logout sessions, CSRF-protected dashboard mutations, admin user creation, vault creation, pairing tokens, device tokens, multipart push, multipart pull, events, conflicts, and health checks.
+- Dashboard sessions use a browser-compatible `obts_session` cookie for HTTP/dev deployments and the hardened `__Host-obts_session` Secure cookie when `publicBaseUrl` is HTTPS.
 - Recent-auth enforcement covers sensitive Phase 1 dashboard mutations such as pairing token creation and admin account creation.
 - Multipart sync manifests reject non-commit ref strings and malformed SHA-256 packfile digests before Git ref mutation logic runs.
 - Uploaded packfiles and individual Git blobs are checked against the configured upload byte limit before refs advance.

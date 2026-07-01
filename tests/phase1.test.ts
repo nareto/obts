@@ -64,6 +64,14 @@ class BrowserSession {
   }
 }
 
+function firstSetCookie(response: Response): string {
+  const headers = response.headers as Headers & { getSetCookie?: () => string[] };
+  const setCookies = headers.getSetCookie?.() ?? (response.headers.get('set-cookie') ? [response.headers.get('set-cookie')!] : []);
+  const first = setCookies[0];
+  expect(first).toBeDefined();
+  return first!;
+}
+
 describe('Phase 1 sync without conflict resolution', () => {
   let root: string;
   let server: ObtsServer;
@@ -194,6 +202,57 @@ describe('Phase 1 sync without conflict resolution', () => {
     const session = await admin.get<{ user_id: string; csrf_token: string }>('/api/v1/auth/session');
     expect(session.status).toBe(200);
     expect(session.body.csrf_token).toBe(login.body.csrf_token);
+  });
+
+  it('sets a browser-usable dashboard session cookie for HTTP deployments', async () => {
+    const response = await fetch(`${baseUrl}/api/v1/setup`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        username: 'admin',
+        password: 'admin-password-1234'
+      })
+    });
+    expect(response.status).toBe(201);
+    const setCookie = firstSetCookie(response);
+    expect(setCookie).toMatch(/^obts_session=/u);
+    expect(setCookie).toContain('HttpOnly');
+    expect(setCookie).toContain('SameSite=Strict');
+    expect(setCookie).not.toContain('Secure');
+    expect(setCookie).not.toMatch(/^__Host-/u);
+
+    const cookie = setCookie.split(';')[0]!;
+    const session = await fetch(`${baseUrl}/api/v1/auth/session`, {
+      headers: { cookie }
+    });
+    expect(session.status).toBe(200);
+  });
+
+  it('uses a secure __Host dashboard session cookie for HTTPS deployments', async () => {
+    const httpsServer = await createObtsServer({
+      dataDir: join(root, 'https-server-data'),
+      publicBaseUrl: 'https://obts.example.test',
+      sessionSecret: 'test-session-secret-with-enough-entropy'
+    });
+    try {
+      const httpsBaseUrl = await httpsServer.app.listen({ port: 0, host: '127.0.0.1' });
+      const response = await fetch(`${httpsBaseUrl}/api/v1/setup`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          username: 'admin',
+          password: 'admin-password-1234'
+        })
+      });
+      expect(response.status).toBe(201);
+      const setCookie = firstSetCookie(response);
+      expect(setCookie).toMatch(/^__Host-obts_session=/u);
+      expect(setCookie).toContain('Secure');
+      expect(setCookie).toContain('HttpOnly');
+      expect(setCookie).toContain('SameSite=Strict');
+    } finally {
+      await httpsServer.app.close();
+    }
   });
 
   it('reports devices behind current main in the dashboard summary', async () => {
