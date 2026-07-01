@@ -724,12 +724,13 @@ async function reconcileStartupOperations(store: MetadataStore, git: GitService)
 
   const latest = await store.snapshot();
   for (const operation of latest.sync_operations.filter((candidate) => candidate.status === 'prepared')) {
-    const targetRefs = Object.entries(operation.target_refs).filter((entry): entry is [string, string] => {
-      const [, target] = entry;
-      return typeof target === 'string' && /^[0-9a-f]{40}$/u.test(target);
-    });
+    const targetRefs = recoverableTargetRefs(operation);
     if (targetRefs.length === 0) {
-      await blockVaultIntegrity(store, operation, 'prepared operation does not contain a recoverable target ref');
+      if (await expectedRefsStillCurrent(git, operation)) {
+        await abortStartupOperation(store, operation.operation_id, 'startup_prepared_ref_not_moved');
+      } else {
+        await blockVaultIntegrity(store, operation, 'prepared operation does not contain a recoverable target ref');
+      }
       continue;
     }
 
@@ -755,6 +756,51 @@ async function reconcileStartupOperations(store: MetadataStore, git: GitService)
 
     await blockVaultIntegrity(store, operation, 'prepared operation target refs cannot be reconciled');
   }
+}
+
+function recoverableTargetRefs(operation: SyncOperationRow): Array<[string, string]> {
+  const refs = new Map<string, string>();
+  addTargetRefs(refs, operation.target_refs);
+
+  const manifestTargetRefs =
+    operation.prepared_manifest && typeof operation.prepared_manifest.target_refs === 'object'
+      ? operation.prepared_manifest.target_refs
+      : null;
+  if (manifestTargetRefs !== null) {
+    addTargetRefs(refs, manifestTargetRefs as Record<string, unknown>);
+  }
+
+  if (
+    operation.operation_type === 'server_merge' &&
+    typeof operation.target_commit === 'string' &&
+    /^[0-9a-f]{40}$/u.test(operation.target_commit) &&
+    !refs.has('refs/heads/main')
+  ) {
+    refs.set('refs/heads/main', operation.target_commit);
+  }
+
+  return [...refs.entries()];
+}
+
+function addTargetRefs(refs: Map<string, string>, targetRefs: Record<string, unknown>): void {
+  for (const [ref, target] of Object.entries(targetRefs)) {
+    if (typeof target === 'string' && /^[0-9a-f]{40}$/u.test(target)) {
+      refs.set(ref, target);
+    }
+  }
+}
+
+async function expectedRefsStillCurrent(git: GitService, operation: SyncOperationRow): Promise<boolean> {
+  const expectedRefs = Object.entries(operation.expected_refs);
+  if (expectedRefs.length === 0) {
+    return true;
+  }
+  for (const [ref, expected] of expectedRefs) {
+    if ((await git.getRef(operation.vault_id, ref)) !== expected) {
+      return false;
+    }
+  }
+  return true;
 }
 
 async function abortStartupOperation(store: MetadataStore, operationId: string, reason: string): Promise<void> {

@@ -1474,6 +1474,138 @@ describe('Phase 1 sync without conflict resolution', () => {
     ).toBeDefined();
   });
 
+  it('aborts a prepared merge operation on startup when no target ref was recorded and refs did not move', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'abort-prepared-merge-device');
+    await mkdirp(deviceDir);
+    await writeFile(join(deviceDir, 'pre-target.md'), 'prepared before target ref\n');
+    const plugin = await pairPlugin(admin, deviceDir, 'desktop');
+    await plugin.syncOnce({ confirmInitialImport: true });
+
+    const committedDb = await server.store.snapshot();
+    const mergeOperation = committedDb.sync_operations.findLast(
+      (operation) => operation.operation_type === 'server_merge' && operation.status === 'committed'
+    );
+    const devicePush = committedDb.sync_operations.find(
+      (operation) => operation.operation_type === 'device_push' && operation.status === 'committed'
+    );
+    expect(mergeOperation?.target_commit).toMatch(/^[0-9a-f]{40}$/u);
+    expect(devicePush?.target_commit).toMatch(/^[0-9a-f]{40}$/u);
+    const previousMain = mergeOperation!.expected_refs['refs/heads/main'];
+    expect(previousMain).toMatch(/^[0-9a-f]{40}$/u);
+
+    await server.git.updateRef(admin.vaultId, 'refs/heads/main', previousMain!, mergeOperation!.target_commit);
+    await server.store.mutate((db) => {
+      const operation = db.sync_operations.find((candidate) => candidate.operation_id === mergeOperation!.operation_id);
+      expect(operation).toBeDefined();
+      operation!.status = 'prepared';
+      operation!.target_refs = { 'refs/heads/main': null };
+      operation!.target_commit = null;
+      operation!.result = null;
+      operation!.prepared_manifest = {
+        merge_sequence: operation!.prepared_manifest?.merge_sequence,
+        merge_policy_version: operation!.prepared_manifest?.merge_policy_version,
+        base_commit: operation!.prepared_manifest?.base_commit,
+        current_main: operation!.prepared_manifest?.current_main,
+        device_commit: operation!.prepared_manifest?.device_commit,
+        decision: 'merge',
+        validator_results: operation!.prepared_manifest?.validator_results
+      };
+      const vault = db.vaults.find((candidate) => candidate.vault_id === admin.vaultId);
+      expect(vault).toBeDefined();
+      vault!.current_main = previousMain!;
+      vault!.status = 'active';
+      const device = db.devices.find((candidate) => candidate.device_id === mergeOperation!.device_id);
+      expect(device).toBeDefined();
+      device!.status = 'ahead';
+    });
+
+    await server.app.close();
+    server = await createObtsServer({
+      dataDir: join(root, 'server-data'),
+      publicBaseUrl: 'http://127.0.0.1:0',
+      sessionSecret: 'test-session-secret-with-enough-entropy'
+    });
+    baseUrl = await server.app.listen({ port: 0, host: '127.0.0.1' });
+
+    const ready = await fetch(`${baseUrl}/health/ready`);
+    expect(ready.status).toBe(200);
+    const reconciledDb = await server.store.snapshot();
+    const originalOperation = reconciledDb.sync_operations.find(
+      (operation) => operation.operation_id === mergeOperation!.operation_id
+    );
+    expect(originalOperation).toMatchObject({
+      status: 'aborted',
+      result: {
+        reason: 'startup_prepared_ref_not_moved'
+      }
+    });
+    expect(reconciledDb.vaults.find((vault) => vault.vault_id === admin.vaultId)?.status).toBe('active');
+    expect(reconciledDb.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toMatch(
+      /^[0-9a-f]{40}$/u
+    );
+  });
+
+  it('fails readiness closed when a prepared operation has no target ref and refs already moved', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'unknown-prepared-merge-device');
+    await mkdirp(deviceDir);
+    await writeFile(join(deviceDir, 'unknown-target.md'), 'prepared unknown target ref\n');
+    const plugin = await pairPlugin(admin, deviceDir, 'desktop');
+    await plugin.syncOnce({ confirmInitialImport: true });
+
+    const committedDb = await server.store.snapshot();
+    const mergeOperation = committedDb.sync_operations.findLast(
+      (operation) => operation.operation_type === 'server_merge' && operation.status === 'committed'
+    );
+    expect(mergeOperation?.target_commit).toMatch(/^[0-9a-f]{40}$/u);
+    const previousMain = mergeOperation!.expected_refs['refs/heads/main'];
+    expect(previousMain).toMatch(/^[0-9a-f]{40}$/u);
+
+    await server.store.mutate((db) => {
+      const operation = db.sync_operations.find((candidate) => candidate.operation_id === mergeOperation!.operation_id);
+      expect(operation).toBeDefined();
+      operation!.status = 'prepared';
+      operation!.target_refs = { 'refs/heads/main': null };
+      operation!.target_commit = null;
+      operation!.result = null;
+      operation!.prepared_manifest = {
+        merge_sequence: operation!.prepared_manifest?.merge_sequence,
+        merge_policy_version: operation!.prepared_manifest?.merge_policy_version,
+        base_commit: operation!.prepared_manifest?.base_commit,
+        current_main: operation!.prepared_manifest?.current_main,
+        device_commit: operation!.prepared_manifest?.device_commit,
+        decision: 'merge',
+        validator_results: operation!.prepared_manifest?.validator_results
+      };
+      const vault = db.vaults.find((candidate) => candidate.vault_id === admin.vaultId);
+      expect(vault).toBeDefined();
+      vault!.current_main = previousMain!;
+      vault!.status = 'active';
+    });
+
+    await server.app.close();
+    server = await createObtsServer({
+      dataDir: join(root, 'server-data'),
+      publicBaseUrl: 'http://127.0.0.1:0',
+      sessionSecret: 'test-session-secret-with-enough-entropy'
+    });
+    baseUrl = await server.app.listen({ port: 0, host: '127.0.0.1' });
+
+    const ready = await fetch(`${baseUrl}/health/ready`);
+    expect(ready.status).toBe(503);
+    const body = (await ready.json()) as { detail: string; checks: { persistent_state: boolean } };
+    expect(body.detail).toBe('vault persistent state is blocked by an integrity failure');
+    expect(body.checks.persistent_state).toBe(false);
+    const reconciledDb = await server.store.snapshot();
+    expect(reconciledDb.vaults.find((vault) => vault.vault_id === admin.vaultId)?.status).toBe('blocked_integrity');
+    expect(
+      reconciledDb.sync_operations.find((operation) => operation.operation_id === mergeOperation!.operation_id)?.result
+    ).toMatchObject({
+      reason: 'prepared operation does not contain a recoverable target ref'
+    });
+  });
+
   it('resumes a reconciled device ref update and merges it on startup', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'reconcile-device-push-device');
