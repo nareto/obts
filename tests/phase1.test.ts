@@ -233,6 +233,33 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
   });
 
+  it('surfaces persistent-state readiness failures in the dashboard summary', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    await server.store.mutate((db) => {
+      const vault = db.vaults.find((candidate) => candidate.vault_id === admin.vaultId);
+      if (!vault) {
+        throw new Error('test vault not found');
+      }
+      vault.current_main = '0000000000000000000000000000000000000000';
+    });
+
+    const dashboard = await admin.get<{
+      health: {
+        status: string;
+        checks: { persistent_state: boolean };
+        detail: string | null;
+      };
+    }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+    expect(dashboard.status).toBe(200);
+    expect(dashboard.body.health).toMatchObject({
+      status: 'not_ready',
+      checks: {
+        persistent_state: false
+      },
+      detail: 'vault main ref is inconsistent with metadata'
+    });
+  });
+
   it('keeps an uploading device behind until it acknowledges applying the merge commit', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const device1Dir = join(root, 'merge-ack-device-1');

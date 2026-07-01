@@ -110,6 +110,10 @@ paths:
       responses:
         "200":
           description: Device, conflict, and health summary.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DashboardSummary"
         "404":
           $ref: "#/components/responses/Error"
   /vaults/{vault_id}/pairing-tokens:
@@ -446,6 +450,125 @@ components:
     SyncProfile:
       type: string
       enum: [notes_only, notes_plus_attachments, full_vault_config]
+    DashboardSummary:
+      type: object
+      required: [vault, devices, unresolved_conflict_count, health]
+      properties:
+        vault:
+          type: object
+          required: [vault_id, display_name, current_main, status]
+          properties:
+            vault_id:
+              type: string
+            display_name:
+              type: string
+            current_main:
+              type: string
+              pattern: "^[0-9a-f]{40}$"
+            status:
+              type: string
+              enum: [active, blocked_integrity]
+        devices:
+          type: array
+          items:
+            type: object
+            required:
+              - device_id
+              - device_name
+              - status
+              - status_label
+              - last_seen_at
+              - sync_profile
+              - sync_plugins
+              - device_ref_head
+              - last_successful_sync_at
+              - ahead_of_main
+              - behind_main
+              - blocked
+              - offline
+            properties:
+              device_id:
+                type: string
+              device_name:
+                type: string
+              status:
+                type: string
+                enum: [paired, synced, ahead, review_needed, blocked_recovery, revoked]
+              status_label:
+                type: string
+              last_seen_at:
+                oneOf:
+                  - type: "null"
+                  - type: string
+                    format: date-time
+              sync_profile:
+                $ref: "#/components/schemas/SyncProfile"
+              sync_plugins:
+                type: boolean
+              device_ref_head:
+                oneOf:
+                  - type: "null"
+                  - type: string
+                    pattern: "^[0-9a-f]{40}$"
+              last_successful_sync_at:
+                oneOf:
+                  - type: "null"
+                  - type: string
+                    format: date-time
+              ahead_of_main:
+                type: boolean
+              behind_main:
+                type: boolean
+              blocked:
+                type: boolean
+              offline:
+                type: boolean
+        unresolved_conflict_count:
+          type: integer
+          minimum: 0
+        health:
+          $ref: "#/components/schemas/ReadinessSummary"
+    ReadinessSummary:
+      type: object
+      required: [status, checks, detail, git_version]
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready]
+        checks:
+          type: object
+          required:
+            - metadata
+            - metadata_store
+            - git
+            - setup_complete
+            - migrations
+            - git_store
+            - temp_workspace
+            - persistent_state
+          properties:
+            metadata:
+              type: boolean
+            metadata_store:
+              type: boolean
+            git:
+              type: boolean
+            setup_complete:
+              type: boolean
+            migrations:
+              type: boolean
+            git_store:
+              type: boolean
+            temp_workspace:
+              type: boolean
+            persistent_state:
+              type: boolean
+        detail:
+          oneOf:
+            - type: "null"
+            - type: string
+        git_version:
+          type: string
     ErrorEnvelope:
       type: object
       required: [error]

@@ -22,7 +22,7 @@ Implemented runtime pieces:
 - Merge operations persist the exact target commit and target ref in the prepared operation manifest before advancing `refs/heads/main`; startup reconciliation aborts unprepared writes, rolls forward prepared writes whose Git refs already moved, resumes merged-or-conflicted processing for recovered device ref updates, and marks unreconcilable vault state as `blocked_integrity`.
 - Vault event polling retains 30 days or 100,000 events per vault, returns `410 event_cursor_expired` when a client cursor predates retained history, and includes the current and oldest available event cursors in the redacted error details.
 - Plugin-side `.obts/` state with `isomorphic-git`, device token storage, queue state, recovery bundles with file snapshots, text patches, local Git refs packs, and artifact checksums, local apply lock, apply journal, local commit creation, multipart push, multipart pull, safe apply, incomplete-journal blocking, and explicit replace-local-with-server recovery.
-- API-backed dashboard shell for setup, login, vault creation, overview, device status, events, readiness, and pairing-token creation.
+- API-backed dashboard shell for setup, login, vault creation, overview, device status, events, readiness, and pairing-token creation; the dashboard health summary reuses the same fail-closed readiness checks as `/health/ready`.
 - Readiness checks that fail closed when metadata, Git refs, conflict commits, writable storage, or native Git readiness are inconsistent.
 
 The Phase 1 server uses a durable JSON metadata adapter in `OBTS_DATA_DIR/metadata/phase1.json` so the product slice can run without requiring a local Postgres service in this repository. The service boundaries are deliberately named around metadata and sync operations so a Postgres adapter can replace the file adapter without changing the Git sync model.
@@ -61,7 +61,7 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - a third device receives the safe current `main` while a conflict remains open;
 - cross-user access to vault main, dashboard, conflicts, device sync push/pull,
   and events returns `404`;
-- restored metadata that points at missing Git state makes `/health/ready` return `503`;
+- restored metadata that points at missing Git state makes `/health/ready` return `503` and surfaces a not-ready dashboard health summary;
 - prepared sync operations recover deterministically on restart when Git refs already moved, resume pending device ref merges, or abort safely before ref mutation;
 - event polling returns `410` for expired cursors after retention pruning;
 - incomplete apply journals block sync on restart instead of attempting an unsafe apply;

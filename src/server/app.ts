@@ -65,43 +65,15 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   app.get('/health/live', async () => ({ status: 'ok' }));
 
   app.get('/health/ready', async (_request, reply) => {
-    const gitReady = await git.checkReady();
-    const db = await store.snapshot();
-    const metadataStoreReady = await checkWritableDirectory(join(config.dataDir, 'metadata'));
-    const gitStoreReady = await checkWritableDirectory(config.gitStoreDir);
-    const tempWorkspaceReady = await checkWritableDirectory(config.tempDir);
-    const persistentState = await checkPersistentState(db, git);
-    const checks = {
-      metadata: true,
-      metadata_store: metadataStoreReady.ok,
-      git: gitReady.ok,
-      setup_complete: db.setup_complete,
-      migrations: db.schema_version === 1,
-      git_store: gitStoreReady.ok,
-      temp_workspace: tempWorkspaceReady.ok,
-      persistent_state: persistentState.ok
-    };
-    const ready =
-      checks.metadata_store &&
-      checks.git &&
-      checks.migrations &&
-      checks.git_store &&
-      checks.temp_workspace &&
-      checks.persistent_state;
-    if (!ready) {
+    const readiness = await buildReadinessSummary(config, store, git);
+    if (readiness.status !== 'ready') {
       return reply.status(503).send({
-        status: 'not_ready',
-        checks,
-        detail: firstDetail([
-          gitReady.ok ? null : gitReady.error,
-          readinessError(metadataStoreReady),
-          readinessError(gitStoreReady),
-          readinessError(tempWorkspaceReady),
-          readinessError(persistentState)
-        ])
+        status: readiness.status,
+        checks: readiness.checks,
+        detail: readiness.detail
       });
     }
-    return { status: 'ready', checks, git_version: gitReady.ok ? gitReady.version : 'unknown' };
+    return { status: readiness.status, checks: readiness.checks, git_version: readiness.git_version };
   });
 
   app.get('/api/v1/setup/status', async () => {
@@ -294,9 +266,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       },
       devices,
       unresolved_conflict_count: conflicts.length,
-      health: {
-        status: 'ready'
-      }
+      health: await buildReadinessSummary(config, store, git)
     };
   });
 
@@ -639,6 +609,66 @@ async function checkWritableDirectory(path: string): Promise<{ ok: true } | { ok
   } catch {
     return { ok: false, error: 'persistent directory is not writable' };
   }
+}
+
+type ReadinessSummary = {
+  status: 'ready' | 'not_ready';
+  checks: {
+    metadata: boolean;
+    metadata_store: boolean;
+    git: boolean;
+    setup_complete: boolean;
+    migrations: boolean;
+    git_store: boolean;
+    temp_workspace: boolean;
+    persistent_state: boolean;
+  };
+  detail: string | null;
+  git_version: string;
+};
+
+async function buildReadinessSummary(
+  config: ServerConfig,
+  store: MetadataStore,
+  git: GitService
+): Promise<ReadinessSummary> {
+  const gitReady = await git.checkReady();
+  const db = await store.snapshot();
+  const metadataStoreReady = await checkWritableDirectory(join(config.dataDir, 'metadata'));
+  const gitStoreReady = await checkWritableDirectory(config.gitStoreDir);
+  const tempWorkspaceReady = await checkWritableDirectory(config.tempDir);
+  const persistentState = await checkPersistentState(db, git);
+  const checks = {
+    metadata: true,
+    metadata_store: metadataStoreReady.ok,
+    git: gitReady.ok,
+    setup_complete: db.setup_complete,
+    migrations: db.schema_version === 1,
+    git_store: gitStoreReady.ok,
+    temp_workspace: tempWorkspaceReady.ok,
+    persistent_state: persistentState.ok
+  };
+  const ready =
+    checks.metadata_store &&
+    checks.git &&
+    checks.migrations &&
+    checks.git_store &&
+    checks.temp_workspace &&
+    checks.persistent_state;
+  return {
+    status: ready ? 'ready' : 'not_ready',
+    checks,
+    detail: ready
+      ? null
+      : firstDetail([
+          gitReady.ok ? null : gitReady.error,
+          readinessError(metadataStoreReady),
+          readinessError(gitStoreReady),
+          readinessError(tempWorkspaceReady),
+          readinessError(persistentState)
+        ]),
+    git_version: gitReady.ok ? gitReady.version : 'unknown'
+  };
 }
 
 async function checkPersistentState(db: MetadataDb, git: GitService): Promise<{ ok: true } | { ok: false; error: string }> {
