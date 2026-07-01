@@ -771,6 +771,30 @@ describe('Phase 1 sync without conflict resolution', () => {
     await plugin1.syncOnce();
     expect((await plugin2.syncOnce()).status).toBe('Review needed');
 
+    const conflictedState = await plugin2.readState();
+    const conflictedToken = await readDeviceToken(device2Dir);
+    const serverPull = new FormData();
+    serverPull.append(
+      'manifest',
+      JSON.stringify({
+        api_version: API_VERSION,
+        vault_id: admin.vaultId,
+        device_id: conflictedState.device_id,
+        current_local_main: conflictedState.local_main,
+        requested_target: 'latest'
+      })
+    );
+    serverPull.append('packfile', new Blob([new ArrayBuffer(0)], { type: 'application/x-git-packed-objects' }), 'have.pack');
+    const serverPullResponse = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/pull`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${conflictedToken}`
+      },
+      body: serverPull
+    });
+    expect(serverPullResponse.status).toBe(409);
+    expect(((await serverPullResponse.json()) as { error: { code: string } }).error.code).toBe('device_blocked');
+
     await expect(plugin2.pullAndApply({ allowDestructive: true })).rejects.toMatchObject({
       code: 'conflict_review_required'
     });

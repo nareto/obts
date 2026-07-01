@@ -331,6 +331,9 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     if (deviceAuth.vault.status === 'blocked_integrity') {
       throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
     }
+    if (deviceAuth.device.status === 'review_needed' || deviceAuth.device.status === 'blocked_recovery') {
+      throw new AuthError(409, 'device_blocked', 'Device requires review or recovery before pulling server state.');
+    }
     const pullRequest = await readPullMultipart(request);
     if (pullRequest.vault_id !== vaultId || pullRequest.device_id !== deviceAuth.device.device_id) {
       throw new AuthError(404, 'not_found', 'Resource not found.');
