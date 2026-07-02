@@ -1218,7 +1218,6 @@ class ObtsObsidianClient {
     if (
       (await exists(this.applyJournalPath)) ||
       (await exists(this.applyLockPath)) ||
-      (await exists(path.join(this.obtsDir, "recovery"))) ||
       !(await exists(this.queuePath))
     ) {
       return false;
@@ -1540,7 +1539,12 @@ class ObtsSettingTab extends PluginSettingTab {
         })
       );
 
-    containerEl.createEl("h3", { text: paired ? "Device" : "Pair Device" });
+    const sectionHeader = containerEl.createDiv({ cls: "obts-settings-section-header" });
+    sectionHeader.createEl("h3", { text: paired ? "Device" : "Pair Device" });
+    sectionHeader.createEl("span", {
+      cls: paired ? "obts-status-pill obts-status-pill--ok" : "obts-status-pill",
+      text: paired ? "Paired" : "Not paired"
+    });
     if (paired) {
       new Setting(containerEl)
         .setName("Device")
@@ -1554,7 +1558,6 @@ class ObtsSettingTab extends PluginSettingTab {
       new Setting(containerEl)
         .setName("Status")
         .setDesc(state.last_error_code ? blockStatusLabel(state.last_error_code) : state.status_label || "Checking");
-      const actionStatus = containerEl.createEl("p", { text: "" });
       new Setting(containerEl)
         .setName("Actions")
         .addButton((button) =>
@@ -1563,15 +1566,15 @@ class ObtsSettingTab extends PluginSettingTab {
             .setCta()
             .onClick(async () => {
               button.setDisabled(true);
-              actionStatus.setText("Syncing...");
+              setFeedback(actionFeedback, "Syncing...", "muted");
               try {
                 const result = await this.plugin.client.syncOnce({ confirmInitialImport: false });
                 this.plugin.setStatus((await this.plugin.client.readState()).status_label);
-                actionStatus.setText(`Synced: ${result.status}`);
+                setFeedback(actionFeedback, `Synced: ${result.status}`, "success");
                 new Notice(`obts: ${result.status}`);
                 await this.display();
               } catch (error) {
-                actionStatus.setText(error instanceof Error ? error.message : "Sync failed.");
+                setFeedback(actionFeedback, error instanceof Error ? error.message : "Sync failed.", "error");
               } finally {
                 button.setDisabled(false);
               }
@@ -1585,7 +1588,7 @@ class ObtsSettingTab extends PluginSettingTab {
                 return;
               }
               button.setDisabled(true);
-              actionStatus.setText("Unpairing...");
+              setFeedback(actionFeedback, "Unpairing...", "muted");
               try {
                 await this.plugin.client.unpairCurrentDevice();
                 this.plugin.settings.pairingToken = "";
@@ -1594,7 +1597,7 @@ class ObtsSettingTab extends PluginSettingTab {
                 new Notice("obts unpaired this device.");
                 await this.display();
               } catch (error) {
-                actionStatus.setText(error instanceof Error ? error.message : "Unpair failed.");
+                setFeedback(actionFeedback, error instanceof Error ? error.message : "Unpair failed.", "error");
               } finally {
                 button.setDisabled(false);
               }
@@ -1603,8 +1606,11 @@ class ObtsSettingTab extends PluginSettingTab {
             button.setWarning();
           }
         });
+      const actionFeedback = containerEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
     } else {
-      const pairingStatus = containerEl.createEl("p", { text: "Not paired" });
+      new Setting(containerEl)
+        .setName("Status")
+        .setDesc("Ready to pair this vault");
       new Setting(containerEl)
         .setName("Device name")
         .addText((text) =>
@@ -1656,7 +1662,7 @@ class ObtsSettingTab extends PluginSettingTab {
             .setCta()
             .onClick(async () => {
               button.setDisabled(true);
-              pairingStatus.setText("Pairing...");
+              setFeedback(pairingFeedback, "Pairing...", "muted");
               try {
                 if (!this.plugin.settings.pairingToken) {
                   throw new ObtsBlockedError("missing_pairing_token", "Enter a pairing token.");
@@ -1668,12 +1674,13 @@ class ObtsSettingTab extends PluginSettingTab {
                 new Notice("obts paired this device.");
                 await this.display();
               } catch (error) {
-                pairingStatus.setText(error instanceof Error ? error.message : "Pairing failed.");
+                setFeedback(pairingFeedback, error instanceof Error ? error.message : "Pairing failed.", "error");
               } finally {
                 button.setDisabled(false);
               }
             })
         );
+      const pairingFeedback = containerEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
     }
 
     new Setting(containerEl)
@@ -1695,6 +1702,11 @@ function syncProfileLabel(profile) {
     return "Full vault config";
   }
   return "Notes only";
+}
+
+function setFeedback(element, message, tone) {
+  element.className = `obts-feedback obts-feedback--${tone}`;
+  element.textContent = message;
 }
 
 class ObtsBlockedError extends Error {

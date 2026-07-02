@@ -982,7 +982,6 @@ export class ObtsPluginClient {
     if (
       (await exists(join(this.vaultDir, '.obts', 'apply-journal.json'))) ||
       (await exists(join(this.vaultDir, '.obts', 'apply.lock'))) ||
-      (await exists(join(this.vaultDir, '.obts', 'recovery'))) ||
       !(await exists(this.queuePath))
     ) {
       return false;

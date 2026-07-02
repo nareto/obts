@@ -1170,6 +1170,19 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(dashboard.body.devices.find((device) => device.device_name === 'phone')).toMatchObject({
       status_label: 'Revoked'
     });
+
+    await mkdirp(join(deviceDir, '.obts', 'recovery', 'rec_retained_after_unpair'));
+    await writeFile(join(deviceDir, '.obts', 'recovery', 'rec_retained_after_unpair', 'manifest.json'), '{}\n');
+    const rePairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
+      device_name: 'phone',
+      sync_profile: 'notes_only'
+    });
+    expect(rePairing.status).toBe(201);
+    await plugin.pairWithToken(rePairing.body.pairing_token);
+    const rePairedState = await plugin.readState();
+    expect(rePairedState.vault_id).toBe(admin.vaultId);
+    expect(rePairedState.device_id).toMatch(/^dev_/u);
+    expect(rePairedState.device_id).not.toBe(state.device_id);
   });
 
   it('uses multipart pull requests and rejects legacy JSON pull bodies', async () => {
@@ -3209,7 +3222,10 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('pollRemoteEventsAndApply()');
     expect(pluginMain).toContain('/sync/events?after=');
     expect(pluginMain).toContain('this.setStatus("Offline")');
-    expect(pluginMain).toContain('containerEl.createEl("h3", { text: paired ? "Device" : "Pair Device" })');
+    expect(pluginMain).toContain('obts-settings-section-header');
+    expect(pluginMain).toContain('obts-status-pill');
+    expect(pluginMain).toContain('obts-feedback');
+    expect(pluginMain).toContain('setFeedback(pairingFeedback');
     expect(pluginMain).toContain('setButtonText("Pair")');
     expect(pluginMain).toContain('setButtonText("Sync now")');
     expect(pluginMain).toContain('setButtonText("Unpair...")');

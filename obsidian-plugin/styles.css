@@ -2,3 +2,45 @@
   font-size: 13px;
 }
 
+.obts-settings-section-header {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  margin: 24px 0 4px;
+}
+
+.obts-settings-section-header h3 {
+  margin: 0;
+}
+
+.obts-status-pill {
+  background: var(--background-modifier-border);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 5px 8px;
+  white-space: nowrap;
+}
+
+.obts-status-pill--ok {
+  background: var(--background-modifier-success);
+  color: var(--text-normal);
+}
+
+.obts-feedback {
+  color: var(--text-muted);
+  font-size: 13px;
+  margin: 6px 0 12px;
+  min-height: 18px;
+}
+
+.obts-feedback--success {
+  color: var(--text-success);
+}
+
+.obts-feedback--error {
+  color: var(--text-error);
+}
