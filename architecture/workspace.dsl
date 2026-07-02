@@ -16,11 +16,12 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
       server = container "Server API and CLI" "PRD-specified Node/Fastify service that authenticates users/devices, stores vault content encrypted at rest, performs server-side merge/conflict workflows, serves the dashboard, and provides operator commands." "TypeScript, Node.js, Fastify" {
         authService = component "AuthService" "Authenticates dashboard sessions, device tokens, and one-time pairing tokens while storing only token hashes." "TypeScript"
         vaultService = component "VaultService" "Creates vaults, manages owner isolation, and coordinates initial per-vault data key creation." "TypeScript"
-        deviceService = component "DeviceService" "Registers, tracks, and revokes paired devices and their server-known state." "TypeScript"
+        deviceService = component "DeviceService" "Registers, tracks, revokes, and updates paired devices and their server-known state." "TypeScript"
+        deviceScopeService = component "DeviceScopeService" "Records dynamic device profiles, derives the vault effective scope from active devices, validates changed paths, and requests scope-prune commits." "TypeScript"
         keyManager = component "AtRestKeyManager" "Loads server master key material, creates and wraps per-vault data keys, unwraps keys in memory, and rewraps keys during rotation." "TypeScript, Node crypto"
         contentStoreService = component "ContentStoreService" "Encrypts/decrypts vault content at persistence boundaries and maintains content catalog metadata." "TypeScript"
         proposalService = component "ProposalService" "Receives idempotent per-device proposals and records their lifecycle." "TypeScript"
-        historyService = component "HistoryService" "Maintains canonical main, commit graph, manifests, refs, and merge provenance." "TypeScript"
+        historyService = component "HistoryService" "Maintains canonical main, commit graph, manifests, refs, scope-prune commits, and merge provenance." "TypeScript"
         mergeCoordinator = component "MergeCoordinator" "Runs server-side merge and resolution transactions, advancing main or routing ambiguous changes to conflicts." "TypeScript"
         semanticMergeService = component "SemanticMergeService" "Performs conservative text, Markdown, frontmatter, and block-aware merge in a server temp workspace." "TypeScript"
         conflictService = component "ConflictService" "Creates, lists, renders, and resolves structured conflict records." "TypeScript"
@@ -32,7 +33,7 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
 
       web = container "Dashboard SPA" "PRD-specified browser UI for setup, device state, conflict review, resolution, and maintenance after normal dashboard login." "TypeScript, static SPA" {
         authSession = component "AuthSession" "Manages dashboard session state." "TypeScript"
-        deviceDashboard = component "DeviceDashboard" "Shows paired devices, last-seen state, server main, and stale/offline status." "TypeScript"
+        deviceDashboard = component "DeviceDashboard" "Shows paired devices, current profiles, effective vault scope, server main, and stale/offline status." "TypeScript"
         conflictList = component "ConflictList" "Lists unresolved conflicts and opens review workflows." "TypeScript"
         markdownDiffViewer = component "MarkdownDiffViewer" "Renders Markdown conflict variants and merge previews returned by server APIs." "TypeScript"
         sourceDiffViewer = component "SourceDiffViewer" "Shows source-level conflict diffs without writing raw conflict markers into notes." "TypeScript"
@@ -40,7 +41,7 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
       }
 
       plugin = container "Obsidian plugin" "PRD-specified Obsidian community plugin that watches local vault changes, snapshots edits, uploads proposals, applies server main, and exposes sync status." "TypeScript, Obsidian Plugin API" {
-        settingsView = component "SettingsView" "Collects server URL, pairing token/login, device name, and sync profile." "TypeScript"
+        settingsView = component "SettingsView" "Collects server URL, pairing token/login, device name, current local sync profile, and plugin-sync setting." "TypeScript"
         statusBar = component "StatusBar" "Displays Synced, Ahead, Behind, Uploading, Applying, Offline, Blocked, Unsafe local error, and Needs recovery states." "TypeScript"
         vaultWatcher = component "VaultWatcher" "Observes local vault changes through Obsidian APIs." "TypeScript, Obsidian Vault API"
         periodicScanner = component "PeriodicScanner" "Finds missed changes and supports recovery after watcher or client crashes." "TypeScript"
@@ -48,8 +49,8 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
         snapshotEngine = component "SnapshotEngine" "Persists local edits as durable proposals before upload or destructive apply operations." "TypeScript"
         localQueue = component "LocalQueue" "Stores pending proposal, retry, cache, recovery, lock, diagnostic, and managed-config state under .obts." "TypeScript"
         localContentCache = component "LocalContentCache" "Caches content needed for retry, pull, apply, and recovery." "TypeScript"
-        transportClient = component "TransportClient" "Calls server APIs, uploads content/proposals, pulls diffs, and subscribes to events with polling fallback." "TypeScript"
-        applyEngine = component "ApplyEngine" "Applies accepted server main changes to the vault after creating local recovery snapshots." "TypeScript, Obsidian Vault API"
+        transportClient = component "TransportClient" "Calls server APIs, reports profile changes, uploads scoped content/proposals, pulls diffs, and subscribes to events with polling fallback." "TypeScript"
+        applyEngine = component "ApplyEngine" "Applies accepted server main changes inside the current local profile after creating local recovery snapshots." "TypeScript, Obsidian Vault API"
         diagnosticsExporter = component "DiagnosticsExporter" "Exports redacted diagnostics for support and recovery workflows." "TypeScript"
       }
 
@@ -225,6 +226,28 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
         "ops" "read,write"
         "protocol" "SQL"
         "data" "devices,api_tokens"
+      }
+    }
+
+    obts.server.deviceService -> obts.server.deviceScopeService "Delegates dynamic profile updates and effective-scope recalculation." "TypeScript calls" {
+      properties {
+        "ops" "read,write"
+        "protocol" "in-process"
+      }
+    }
+
+    obts.server.deviceScopeService -> obts.postgres "Stores current device profiles, plugin-sync settings, and scope policy epochs." "SQL" {
+      properties {
+        "ops" "read,write"
+        "protocol" "SQL"
+        "data" "devices,audit_log,event_log"
+      }
+    }
+
+    obts.server.deviceScopeService -> obts.server.historyService "Requests server-authored scope-prune commits when the active device union narrows." "TypeScript calls" {
+      properties {
+        "ops" "write"
+        "protocol" "in-process"
       }
     }
 
@@ -424,11 +447,11 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
       }
     }
 
-    obts.plugin.settingsView -> obts.server "Consumes pairing tokens and stores device registration metadata locally." "HTTPS" {
+    obts.plugin.settingsView -> obts.server "Consumes pairing tokens, reports post-pairing profile changes, and stores device registration metadata locally." "HTTPS" {
       properties {
         "ops" "write"
         "protocol" "HTTPS"
-        "data" "pairing token, device capabilities, device token response"
+        "data" "pairing token, device capabilities, current profile, policy epoch, device token response"
       }
     }
 
@@ -483,11 +506,11 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
       }
     }
 
-    obts.plugin.transportClient -> obts.server "Uploads content and proposals, pulls diffs, lists conflict state, and subscribes to events." "HTTPS/WSS" {
+    obts.plugin.transportClient -> obts.server "Uploads scoped content and proposals, pulls profile-filtered diffs, lists conflict state, and subscribes to events." "HTTPS/WSS" {
       properties {
         "ops" "read,write,consume"
         "protocol" "HTTPS,WSS"
-        "data" "vault content, proposals, diffs, events over TLS"
+        "data" "vault content, scoped proposals, diffs, events over TLS"
       }
     }
 
@@ -528,11 +551,11 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
       }
     }
 
-    obts.web.deviceDashboard -> obts.server "Reads authorized device state, server main status, and maintenance summaries." "HTTPS" {
+    obts.web.deviceDashboard -> obts.server "Reads authorized device profiles, effective vault scope, server main status, and maintenance summaries." "HTTPS" {
       properties {
         "ops" "read"
         "protocol" "HTTPS"
-        "data" "device metadata, main IDs, maintenance status"
+        "data" "device metadata, scope metadata, main IDs, maintenance status"
       }
     }
 

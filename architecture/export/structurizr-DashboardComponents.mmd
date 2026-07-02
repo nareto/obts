@@ -4,24 +4,24 @@ graph LR
 
     subgraph 6 ["Obsidian True Sync"]
 
-      subgraph 22 ["Dashboard SPA"]
+      subgraph 23 ["Dashboard SPA"]
 
-        23["AuthSession [Component: TypeScript]"]
-        24["DeviceDashboard [Component: TypeScript]"]
-        25["ConflictList [Component: TypeScript]"]
-        26["MarkdownDiffViewer [Component: TypeScript]"]
-        27["SourceDiffViewer [Component: TypeScript]"]
-        28["ResolutionEditor [Component: TypeScript]"]
+        24["AuthSession [Component: TypeScript]"]
+        25["DeviceDashboard [Component: TypeScript]"]
+        26["ConflictList [Component: TypeScript]"]
+        27["MarkdownDiffViewer [Component: TypeScript]"]
+        28["SourceDiffViewer [Component: TypeScript]"]
+        29["ResolutionEditor [Component: TypeScript]"]
       end
 
       7["Server API and CLI [Container: TypeScript, Node.js, Fastify]"]
     end
 
-    23-. "Authenticates dashboard sessions and calls setup/admin APIs. [HTTPS]" .->7
-    24-. "Reads authorized device state, server main status, and maintenance summaries. [HTTPS]" .->7
-    25-. "Lists unresolved conflicts and fetches authorized conflict review content. [HTTPS]" .->7
-    26-. "Fetches Markdown conflict variants and merge previews for rendering. [HTTPS]" .->7
-    27-. "Fetches source-level conflict diffs for review. [HTTPS]" .->7
-    28-. "Submits selected or manually edited resolution content for server persistence and main advancement. [HTTPS]" .->7
+    24-. "Authenticates dashboard sessions and calls setup/admin APIs. [HTTPS]" .->7
+    25-. "Reads authorized device profiles, effective vault scope, server main status, and maintenance summaries. [HTTPS]" .->7
+    26-. "Lists unresolved conflicts and fetches authorized conflict review content. [HTTPS]" .->7
+    27-. "Fetches Markdown conflict variants and merge previews for rendering. [HTTPS]" .->7
+    28-. "Fetches source-level conflict diffs for review. [HTTPS]" .->7
+    29-. "Submits selected or manually edited resolution content for server persistence and main advancement. [HTTPS]" .->7
 
   end
