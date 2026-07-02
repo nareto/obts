@@ -154,7 +154,7 @@ Behavior:
 
 Acceptance criteria:
 
-- Pairing token is one-time, scoped, and short-lived.
+- Pairing token is one-time, short-lived, and scoped to one owning user, one vault, and the issued device display name.
 - Device token is scoped to one user and one vault.
 - No vault passphrase is required.
 - No visible `.git` directory is created inside the vault.
@@ -444,7 +444,7 @@ Columns, in order:
 2. Status;
 3. Last seen;
 4. Ahead/behind;
-5. Device ref;
+5. Applied version;
 6. Last successful sync;
 7. Actions.
 
@@ -693,9 +693,10 @@ Rules:
 
 - canonical vault-relative paths use `/`, reject absolute paths, reject traversal, and reject empty path segments;
 - `.obts/` is always excluded from vault sync, Git worktree content, and manifest/path scanning;
-- `.git/` directories inside visible vault content are rejected rather than synced;
+- `.git/` directories inside visible vault content are sync-blocking errors rather than synced content;
 - client and server use the same path validation library and test corpus;
 - hard exclusions are enforced consistently before commit, upload, merge, and apply;
+- client scans silently omit only documented runtime hard exclusions and OS/editor metadata; visible `.git` directories, invalid path names, symlinks, unsupported file modes, and case-fold collisions block sync with a clear error;
 - Unicode normalization and case-fold collision detection are mandatory before commit, upload, merge, and apply;
 - cross-platform-invalid names, Windows reserved device names, trailing spaces/dots, NUL/control characters, and configured path length limits block sync with a clear error;
 - path collisions are sync-blocking conflicts requiring user rename, not automatic overwrites;
@@ -788,7 +789,7 @@ Auth requirements:
 - cookie-authenticated mutation APIs require a CSRF token bound to the session and submitted in the `X-OBTS-CSRF` header;
 - dashboard bearer tokens are not supported in v1;
 - device and pairing tokens are opaque, contain at least 256 bits of entropy, and are stored server-side only as hashes with a non-secret lookup prefix;
-- pairing tokens are one-time, scoped to one owning user and vault, expire after 10 minutes, allow at most 10 failed consume attempts, and are rate-limited by source IP;
+- pairing tokens are one-time, scoped to one owning user, one vault, and the issued device display name, expire after 10 minutes, allow at most 10 failed consume attempts, and are rate-limited by source IP;
 - device tokens are scoped to one user, one vault, and one device;
 - token rotation and device revocation take effect without waiting for client reconnect;
 - login, pairing, failed auth, token rotation, and revocation write redacted audit records;
@@ -1028,13 +1029,13 @@ When a device unpairs or is locally disconnected from a vault, the plugin must r
 Rules:
 
 - `.obts/` is always excluded from vault sync, Git worktree content, and manifest/path scanning.
-- Visible `.git/` directories are rejected rather than synced.
-- `.obsidian/cache/**`, `.obsidian/workspace.json`, `.obsidian/workspace-mobile.json`, and `.obsidian/plugins/obts/**` are excluded.
-- `.trash/**`, attachments, community plugin files outside `.obsidian/plugins/obts/**`, and all other `.obsidian/**` files are normal vault content.
+- Visible `.git/` directories are sync-blocking errors rather than synced content.
+- `.obsidian/cache`, `.obsidian/cache/**`, `.obsidian/workspace.json`, `.obsidian/workspace-mobile.json`, `.obsidian/plugins/obts`, and `.obsidian/plugins/obts/**` are excluded.
+- `.trash/**`, attachments, community plugin files outside `.obsidian/plugins/obts` and `.obsidian/plugins/obts/**`, and all other `.obsidian/**` files are normal vault content.
 - The server enforces a documented maximum upload byte limit through `OBTS_MAX_UPLOAD_BYTES`; files larger than that limit block upload/apply for the affected file with a clear error.
 - Plugin files are executable/sensitive content. When synced, they are Git-backed vault state and participate in file-level history, recovery, and conflict handling. Diagnostics exports and note-history UI redact plugin file content by default.
 - Already-loaded plugin code may continue to run until Obsidian or the plugin reloads; `obts` does not force that reload as part of sync.
-- `obts` must not update its own running plugin code through normal plugin sync.
+- `obts` must not update its own running plugin code through normal vault sync.
 
 ### 8.2 Note History And Restore
 
@@ -1080,14 +1081,14 @@ Every recovery bundle contains:
 - `manifest.json` with bundle ID, vault ID, device ID, created timestamp, operation type, target `main`, prior local `main`, prior local device ref, affected paths, platform, plugin version, and checksum manifest;
 - `files/` with pre-apply snapshots of every file that will be deleted, overwritten, or renamed;
 - `git/local-refs.pack` with local commits and refs needed to recover pending local history;
-  - `patches/` with text patch series for changed Markdown, `.canvas`, `.base`, and text configuration files;
+- `patches/` with text patch series for changed Markdown, `.canvas`, `.base`, and text configuration files;
 - `journal/apply-journal.json` with the apply journal state at bundle creation;
 - `checksums.sha256` covering every file in the bundle.
 
 Local apply/recovery rules:
 
 - destructive apply and rebuild operations require a recovery bundle first;
-- recovery bundles are created before file deletes, overwrites, renames, or profile changes that remove local content;
+- recovery bundles are created before file deletes, overwrites, renames, replace-local, rebuild, reset, or any operation that removes or overwrites local content;
 - recovery bundle creation failure blocks the destructive operation;
 - recovery bundles are retained until the user explicitly deletes them;
 - diagnostics exports must redact or omit recovery bundle content unless the owner explicitly requests a content-bearing export.
@@ -1096,8 +1097,8 @@ Local apply/recovery rules:
 
 v1 platform support:
 
-- **Desktop Linux/macOS/Windows:** supported target platforms for file watching, periodic scanning, hidden local Git state, local recovery bundles, `.obts/auth/device-token.json` token storage, plugin settings, and plugin sync when enabled.
-- **Android/iOS:** supported v1 target platforms for foreground sync, periodic scanning, hidden local Git state, local recovery bundles, `.obts/auth/device-token.json` token storage protected by the Obsidian app sandbox, plugin settings, safe apply, and plugin sync when enabled.
+- **Desktop Linux/macOS/Windows:** supported target platforms for file watching, periodic scanning, hidden local Git state, local recovery bundles, `.obts/auth/device-token.json` token storage, plugin settings, full-vault sync, community plugin-file sync, and running-plugin self-exclusion.
+- **Android/iOS:** supported v1 target platforms for foreground sync, periodic scanning, hidden local Git state, local recovery bundles, `.obts/auth/device-token.json` token storage protected by the Obsidian app sandbox, plugin settings, safe apply, full-vault sync, community plugin-file sync, and running-plugin self-exclusion.
 - **Client Git implementation:** the Obsidian plugin uses `isomorphic-git` for client-side Git operations on every supported platform.
 - **Client storage:** the plugin stores hidden Git state under `.obts/` through an `isomorphic-git` filesystem adapter backed by Obsidian's `DataAdapter`, including mobile `CapacitorAdapter`.
 - **Server Git implementation:** the server uses the native `git` CLI for repository validation, packfile import/export, ref updates, merge-base, merge, diff, history, maintenance, and conflict workflows.
@@ -1431,7 +1432,7 @@ Rejected for v1. Obsidian vaults are file-oriented and include binary attachment
 
 ### 12.7 Typed Managed Config Materializers
 
-Rejected for v1. Typed handlers for every Obsidian and plugin setting would turn configuration sync into a separate configuration-management product. v1 instead uses an explicit `.obsidian` file policy with plugin sync controlled by one user setting.
+Rejected for v1. Typed handlers for every Obsidian and plugin setting would turn configuration sync into a separate configuration-management product. v1 instead uses one explicit full-vault hard-exclusion policy that syncs community plugin files as normal vault content while always excluding the running `obts` plugin path.
 
 ### 12.8 App-Managed Backup Product
 
@@ -1454,7 +1455,7 @@ Rejected for v1. v1 promises Git-backed note history and recovery, so reachable 
 - Do not add environment-specific infrastructure-specific deployment files, organization-specific image repository names, deployment secret store paths, or private hostnames to this app repo.
 - Do not create `.git` directories inside visible vault content.
 - Keep `.obts/` excluded from vault sync, Git worktree content, and manifest/path scanning.
-- Keep `.obsidian/plugins/**` ignored by default; include it only when the user enables plugin sync.
+- Keep community plugin files synced as normal vault content, except `.obsidian/plugins/obts` and `.obsidian/plugins/obts/**` are always excluded.
 - Do not log or print secret values, passwords, tokens, Git pack contents, raw blobs, plugin settings, or full note bodies.
 - Treat `architecture/workspace.dsl` as the authored architecture source. Treat `architecture/DIAGRAMS.md` and `architecture/export/*` as generated.
 - If implementation later contradicts this PRD, refresh the architecture from code and executable config first.

@@ -1477,16 +1477,21 @@ class ObtsObsidianClient {
     const listing = await this.adapter.list(dir);
     for (const folder of listing.folders || []) {
       const normalizedFolder = normalizePath(folder);
-      if (normalizedFolder === ".obts" || normalizedFolder.startsWith(".obts/") || normalizedFolder === ".git" || normalizedFolder.startsWith(".git/")) {
+      if (normalizedFolder === ".obts" || normalizedFolder.startsWith(".obts/")) {
+        continue;
+      }
+      assertValidLocalVaultPath(normalizedFolder);
+      if (!isSyncableVaultPath(normalizedFolder)) {
         continue;
       }
       await this.walkAdapterFiles(normalizedFolder, result);
     }
     for (const filePath of listing.files || []) {
       const normalizedFile = normalizePath(filePath);
-      if (normalizedFile === ".obts" || normalizedFile.startsWith(".obts/") || normalizedFile === ".git" || normalizedFile.startsWith(".git/")) {
+      if (normalizedFile === ".obts" || normalizedFile.startsWith(".obts/")) {
         continue;
       }
+      assertValidLocalVaultPath(normalizedFile);
       result.push(normalizedFile);
     }
   }
@@ -1874,10 +1879,10 @@ function isSyncableVaultPath(filePath) {
   if (normalized === ".obsidian/workspace.json" || normalized === ".obsidian/workspace-mobile.json") {
     return false;
   }
-  if (normalized.startsWith(".obsidian/cache/")) {
+  if (normalized === ".obsidian/cache" || normalized.startsWith(".obsidian/cache/")) {
     return false;
   }
-  if (normalized.startsWith(".obsidian/plugins/obts/")) {
+  if (normalized === ".obsidian/plugins/obts" || normalized.startsWith(".obsidian/plugins/obts/")) {
     return false;
   }
   return true;
@@ -1909,6 +1914,12 @@ function isValidVaultPath(filePath) {
     }
   }
   return segments[0] !== ".obts" && !segments.includes(".git");
+}
+
+function assertValidLocalVaultPath(filePath) {
+  if (!isValidVaultPath(filePath)) {
+    throw new ObtsBlockedError("invalid_path", "Vault path is invalid or cannot be synced.");
+  }
 }
 
 function isOsOrEditorMetadata(filePath) {

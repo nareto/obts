@@ -3040,14 +3040,18 @@ describe('Phase 1 sync without conflict resolution', () => {
   });
 
   it('rejects excluded full-vault paths in the shared path policy', () => {
+    expect(() => assertSyncableTreePaths(['.obsidian/cache'])).toThrow(PathPolicyViolation);
     expect(() => assertSyncableTreePaths(['.obsidian/cache/cache.json'])).toThrow(PathPolicyViolation);
     expect(() => assertSyncableTreePaths(['.obsidian/workspace.json'])).toThrow(PathPolicyViolation);
     expect(() => assertSyncableTreePaths(['.obsidian/workspace-mobile.json'])).toThrow(PathPolicyViolation);
+    expect(() => assertSyncableTreePaths(['.obsidian/plugins/obts'])).toThrow(PathPolicyViolation);
     expect(() => assertSyncableTreePaths(['.obsidian/plugins/obts/main.js'])).toThrow(PathPolicyViolation);
     expect(isSyncableVaultPath('.trash/deleted.md')).toBe(true);
     expect(isSyncableVaultPath('.obsidian/plugins/example/main.js')).toBe(true);
+    expect(isSyncableVaultPath('.obsidian/cache')).toBe(false);
     expect(isSyncableVaultPath('.obsidian/cache/cache.json')).toBe(false);
     expect(isSyncableVaultPath('.obsidian/workspace.json')).toBe(false);
+    expect(isSyncableVaultPath('.obsidian/plugins/obts')).toBe(false);
     expect(isSyncableVaultPath('.obsidian/plugins/obts/main.js')).toBe(false);
   });
 
@@ -3182,6 +3186,18 @@ describe('Phase 1 sync without conflict resolution', () => {
 
     await expect(localGit.createLocalCommit('obts: collision')).rejects.toBeInstanceOf(PathPolicyViolation);
     expect(await localGit.resolveRef('refs/heads/local')).toBeNull();
+  });
+
+  it('blocks local scans when visible Git directories are present', async () => {
+    const deviceDir = join(root, 'visible-git-device');
+    await mkdirp(join(deviceDir, '.git'));
+    await writeFile(join(deviceDir, '.git', 'config'), '[core]\n');
+    const localGit = new LocalGitEngine(deviceDir);
+    await localGit.initialize();
+
+    await expect(localGit.createLocalCommit('obts: visible git')).rejects.toMatchObject({
+      code: 'excluded_git_path'
+    });
   });
 
   it('detects rapid same-size local edits by staged content instead of timestamps', async () => {
@@ -3388,7 +3404,9 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(isSyncableVaultPath('.obsidian/snippets/theme.css')).toBe(true);
     expect(isSyncableVaultPath('.obsidian/plugins/example/main.js')).toBe(true);
     expect(isSyncableVaultPath('.obsidian/plugins/example/data.json')).toBe(true);
+    expect(isSyncableVaultPath('.obsidian/plugins/obts')).toBe(false);
     expect(isSyncableVaultPath('.obsidian/plugins/obts/main.js')).toBe(false);
+    expect(isSyncableVaultPath('.obsidian/cache')).toBe(false);
     expect(isSyncableVaultPath('.obsidian/cache/cache.json')).toBe(false);
     expect(isSyncableVaultPath('.obsidian/workspace.json')).toBe(false);
     expect(isSyncableVaultPath('.obsidian/workspace-mobile.json')).toBe(false);

@@ -7,7 +7,8 @@ import git, { type TreeEntry } from 'isomorphic-git';
 import {
   assertSyncableTreePaths,
   isSyncableVaultPath,
-  normalizeVaultPath
+  normalizeVaultPath,
+  PathPolicyViolation
 } from '../shared/pathPolicy.js';
 
 export type LocalGitState = {
@@ -109,10 +110,13 @@ export class LocalGitEngine {
 
   async scanSyncableFiles(): Promise<string[]> {
     const files: string[] = [];
-    await walk(this.vaultDir, async (absolutePath) => {
+    await walk(this.vaultDir, this.vaultDir, async (absolutePath) => {
       const rel = relative(this.vaultDir, absolutePath).replaceAll('\\', '/');
       const normalized = normalizeVaultPath(rel);
-      if (normalized.ok && isSyncableVaultPath(normalized.path)) {
+      if (!normalized.ok) {
+        throw new PathPolicyViolation(normalized.code, normalized.message, normalized.details);
+      }
+      if (isSyncableVaultPath(normalized.path)) {
         files.push(normalized.path);
       }
     });
@@ -380,17 +384,29 @@ function compareByName(left: [string, unknown], right: [string, unknown]): numbe
   return left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0;
 }
 
-async function walk(root: string, visitFile: (path: string) => Promise<void>): Promise<void> {
-  const entries = await fs.promises.readdir(root, { withFileTypes: true });
+async function walk(root: string, current: string, visitFile: (path: string) => Promise<void>): Promise<void> {
+  const entries = await fs.promises.readdir(current, { withFileTypes: true });
   for (const entry of entries) {
-    if (entry.name === '.obts' || entry.name === '.git') {
+    if (entry.name === '.obts') {
       continue;
     }
-    const absolutePath = join(root, entry.name);
+    const absolutePath = join(current, entry.name);
+    const rel = relative(root, absolutePath).replaceAll('\\', '/');
+    const normalized = normalizeVaultPath(rel);
+    if (!normalized.ok) {
+      throw new PathPolicyViolation(normalized.code, normalized.message, normalized.details);
+    }
     if (entry.isDirectory()) {
-      await walk(absolutePath, visitFile);
+      if (isSyncableVaultPath(normalized.path)) {
+        await walk(root, absolutePath, visitFile);
+      }
     } else if (entry.isFile()) {
       await visitFile(absolutePath);
+    } else {
+      throw new PathPolicyViolation(
+        'unsupported_file_mode',
+        'Local vault entries must be regular files or directories; symlinks and special files cannot be synced.'
+      );
     }
   }
 }

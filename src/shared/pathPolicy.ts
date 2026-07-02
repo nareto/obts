@@ -90,10 +90,10 @@ export function isSyncableVaultPath(path: string): boolean {
   if (cleanPath === '.obsidian/workspace.json' || cleanPath === '.obsidian/workspace-mobile.json') {
     return false;
   }
-  if (cleanPath.startsWith('.obsidian/cache/')) {
+  if (cleanPath === '.obsidian/cache' || cleanPath.startsWith('.obsidian/cache/')) {
     return false;
   }
-  if (cleanPath.startsWith('.obsidian/plugins/obts/')) {
+  if (cleanPath === '.obsidian/plugins/obts' || cleanPath.startsWith('.obsidian/plugins/obts/')) {
     return false;
   }
   return true;
