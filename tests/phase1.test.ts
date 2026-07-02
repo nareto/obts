@@ -1224,7 +1224,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(repairedState.last_error_code).toBeNull();
   });
 
-  it('blocks re-pair when local files changed after unpair', async () => {
+  it('uploads changed re-pair content as a proposal from the detached baseline', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const desktopDir = join(root, 'dirty-repair-desktop');
     await mkdirp(desktopDir);
@@ -1246,10 +1246,12 @@ describe('Phase 1 sync without conflict resolution', () => {
       device_name: 'desktop',
     });
     expect(rePairing.status).toBe(201);
-    await expect(desktop.pairWithToken(rePairing.body.pairing_token)).rejects.toMatchObject({
-      code: 'replace_local_with_server_required'
-    });
+    await desktop.pairWithToken(rePairing.body.pairing_token);
     expect(await readFile(join(desktopDir, 'shared.md'), 'utf8')).toBe('local unpaired edit\n');
+    const result = await desktop.syncOnce();
+    expect(result.status).toBe('Review needed');
+    expect(result.conflictId).toMatch(/^conf_/u);
+    expect((await desktop.readState()).last_error_code).toBe('conflict_review_required');
   });
 
   it('uses multipart pull requests and rejects legacy JSON pull bodies', async () => {
@@ -1990,9 +1992,9 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
   });
 
-  it('blocks divergent additional-device content until explicit replace-local-with-server', async () => {
+  it('uploads divergent additional-device content as a device proposal', async () => {
     const admin = await setupAdminAndVault(baseUrl);
-    const device1Dir = join(root, 'replace-device-1');
+    const device1Dir = join(root, 'proposal-device-1');
     await mkdirp(device1Dir);
     await writeFile(join(device1Dir, 'server.md'), 'server state\n');
 
@@ -2000,8 +2002,9 @@ describe('Phase 1 sync without conflict resolution', () => {
     await expect(plugin1.syncOnce()).rejects.toMatchObject({ code: 'initial_import_confirmation_required' });
     await plugin1.syncOnce({ confirmInitialImport: true });
 
-    const device2Dir = join(root, 'replace-device-2');
+    const device2Dir = join(root, 'proposal-device-2');
     await mkdirp(device2Dir);
+    await writeFile(join(device2Dir, 'server.md'), 'server state\n');
     await writeFile(join(device2Dir, 'local-only.md'), 'do not discard silently\n');
     const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
       device_name: 'phone',
@@ -2012,27 +2015,18 @@ describe('Phase 1 sync without conflict resolution', () => {
       deviceName: 'phone',
     });
 
-    await expect(plugin2.pairWithToken(pairing.body.pairing_token)).rejects.toMatchObject({
-      code: 'replace_local_with_server_required'
+    await plugin2.pairWithToken(pairing.body.pairing_token);
+    expect(await plugin2.readState()).toMatchObject({
+      status_label: 'Ahead',
+      initial_import_confirmed: true,
+      server_device_ref: null
     });
     expect(await readFile(join(device2Dir, 'local-only.md'), 'utf8')).toBe('do not discard silently\n');
-    expect((await readdir(join(device2Dir, '.obts', 'recovery'))).length).toBeGreaterThan(0);
-    await expect(plugin2.syncOnce()).rejects.toMatchObject({ code: 'replace_local_with_server_required' });
 
-    const replaced = await plugin2.replaceLocalWithServer();
-    expect(replaced.status).toBe('Synced');
-    expect(await readFile(join(device2Dir, 'server.md'), 'utf8')).toBe('server state\n');
-    expect(await exists(join(device2Dir, 'local-only.md'))).toBe(false);
-    expect((await awaitState(plugin2)).initial_import_confirmed).toBe(true);
-    const dashboard = await admin.get<{
-      devices: Array<{ device_name: string; status_label: string; behind_main: boolean }>;
-    }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
-    expect(dashboard.status).toBe(200);
-    expect(dashboard.body.devices.find((device) => device.device_name === 'phone')).toMatchObject({
-      status_label: 'Synced',
-      behind_main: false
-    });
     expect((await plugin2.syncOnce()).status).toBe('Synced');
+    expect(await readFile(join(device1Dir, 'local-only.md'), 'utf8').catch(() => '')).toBe('');
+    await plugin1.syncOnce();
+    expect(await readFile(join(device1Dir, 'local-only.md'), 'utf8')).toBe('do not discard silently\n');
   });
 
   it('recovers and replaces local file-directory collisions during replace-local-with-server', async () => {
@@ -2045,20 +2039,18 @@ describe('Phase 1 sync without conflict resolution', () => {
     await plugin1.syncOnce({ confirmInitialImport: true });
 
     const device2Dir = join(root, 'replace-collision-device-2');
+    const plugin2 = await pairPlugin(admin, device2Dir, 'phone');
+    await rm(join(device2Dir, 'topic.md'), { force: true });
     await mkdirp(join(device2Dir, 'topic.md'));
     await writeFile(join(device2Dir, 'topic.md', 'child.md'), 'local directory content\n');
-    const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
-      device_name: 'phone',
-    });
-    expect(pairing.status).toBe(201);
-    const plugin2 = new ObtsPluginClient(device2Dir, {
-      serverUrl: baseUrlFromAdmin(admin),
-      deviceName: 'phone',
-    });
+    const state = await plugin2.readState();
+    await writeFile(join(device2Dir, '.obts', 'state.json'), JSON.stringify({
+      ...state,
+      local_main: null,
+      last_error_code: 'replace_local_with_server_required',
+      status_label: 'Needs recovery'
+    }));
 
-    await expect(plugin2.pairWithToken(pairing.body.pairing_token)).rejects.toMatchObject({
-      code: 'replace_local_with_server_required'
-    });
     const replaced = await plugin2.replaceLocalWithServer();
     expect(replaced.status).toBe('Synced');
     expect(await readFile(join(device2Dir, 'topic.md'), 'utf8')).toBe('server file wins\n');
@@ -2066,7 +2058,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await recoveryBundleContains(device2Dir, 'topic.md/child.md')).toBe(true);
   });
 
-  it('blocks additional-device local content even when server main is still empty', async () => {
+  it('uploads additional-device local content even when server main is still empty', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const device1Dir = join(root, 'empty-server-device-1');
     await mkdirp(device1Dir);
@@ -2075,7 +2067,7 @@ describe('Phase 1 sync without conflict resolution', () => {
 
     const device2Dir = join(root, 'empty-server-device-2');
     await mkdirp(device2Dir);
-    await writeFile(join(device2Dir, 'local-only.md'), 'should not become initial import\n');
+    await writeFile(join(device2Dir, 'local-only.md'), 'should become device proposal\n');
     const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
       device_name: 'phone',
     });
@@ -2085,17 +2077,12 @@ describe('Phase 1 sync without conflict resolution', () => {
       deviceName: 'phone',
     });
 
-    await expect(plugin2.pairWithToken(pairing.body.pairing_token)).rejects.toMatchObject({
-      code: 'replace_local_with_server_required'
-    });
-    expect(await readFile(join(device2Dir, 'local-only.md'), 'utf8')).toBe('should not become initial import\n');
-    expect((await readdir(join(device2Dir, '.obts', 'recovery'))).length).toBeGreaterThan(0);
-    await expect(plugin2.syncOnce()).rejects.toMatchObject({ code: 'replace_local_with_server_required' });
-
-    const replaced = await plugin2.replaceLocalWithServer();
-    expect(replaced.status).toBe('Synced');
-    expect(await exists(join(device2Dir, 'local-only.md'))).toBe(false);
+    await plugin2.pairWithToken(pairing.body.pairing_token);
+    expect(await readFile(join(device2Dir, 'local-only.md'), 'utf8')).toBe('should become device proposal\n');
     expect((await plugin2.syncOnce()).status).toBe('Synced');
+
+    await plugin1.syncOnce();
+    expect(await readFile(join(device1Dir, 'local-only.md'), 'utf8')).toBe('should become device proposal\n');
   });
 
   it('blocks pairing on partial local .obts state without consuming the pairing token', async () => {
@@ -3045,6 +3032,81 @@ describe('Phase 1 sync without conflict resolution', () => {
     const db = await server.store.snapshot();
     expect(db.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(result.main);
     expect(await server.git.isAncestor(admin.vaultId, commit!, result.main)).toBe(true);
+  });
+
+  it('rejects attempts to adopt another device ref as the actor device cursor', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'adopt-ref-desktop');
+    await mkdirp(desktopDir);
+    await writeFile(join(desktopDir, 'desktop.md'), 'desktop\n');
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await desktop.syncOnce({ confirmInitialImport: true });
+    const desktopState = await desktop.readState();
+    expect(desktopState.server_device_ref).toMatch(/^[0-9a-f]{40}$/u);
+
+    const phoneDir = join(root, 'adopt-ref-phone');
+    const phone = await pairPlugin(admin, phoneDir, 'phone');
+    await writeFile(join(phoneDir, 'phone.md'), 'phone\n');
+    const phoneGit = new LocalGitEngine(phoneDir);
+    const phoneCommit = await phoneGit.createLocalCommit('obts: phone proposal');
+    expect(phoneCommit).toMatch(/^[0-9a-f]{40}$/u);
+    const phonePack = await phoneGit.createPackForCommit(phoneCommit!);
+    const phoneState = await phone.readState();
+    const phoneAuth = await server.auth.authenticateDevice(`Bearer ${await readDeviceToken(phoneDir)}`, admin.vaultId);
+
+    const rejected = await server.sync.pushDeviceCommit(
+      phoneAuth,
+      {
+        api_version: API_VERSION,
+        vault_id: admin.vaultId,
+        device_id: phoneState.device_id!,
+        expected_device_ref: desktopState.server_device_ref,
+        target_commit: phoneCommit!,
+        packfile_sha256: sha256(phonePack),
+        packfile_bytes: phonePack.byteLength,
+        client_known_main: phoneState.local_main,
+        base_commit: phoneState.local_main
+      },
+      phonePack
+    );
+    expect(rejected).toMatchObject({ status: 'rejected', code: 'stale_device_ref' });
+    const db = await server.store.snapshot();
+    const phoneRow = db.devices.find((device) => device.device_id === phoneState.device_id);
+    expect(phoneRow?.device_ref_head).toBeNull();
+  });
+
+  it('rejects untrusted proposal base commits without advancing refs', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'untrusted-base-device');
+    const plugin = await pairPlugin(admin, deviceDir, 'laptop');
+    await writeFile(join(deviceDir, 'local.md'), 'local\n');
+    const localGit = new LocalGitEngine(deviceDir);
+    const commit = await localGit.createLocalCommit('obts: untrusted base test');
+    expect(commit).toMatch(/^[0-9a-f]{40}$/u);
+    const packfile = await localGit.createPackForCommit(commit!);
+    const state = await plugin.readState();
+    const auth = await server.auth.authenticateDevice(`Bearer ${await readDeviceToken(deviceDir)}`, admin.vaultId);
+
+    const rejected = await server.sync.pushDeviceCommit(
+      auth,
+      {
+        api_version: API_VERSION,
+        vault_id: admin.vaultId,
+        device_id: state.device_id!,
+        expected_device_ref: null,
+        target_commit: commit!,
+        packfile_sha256: sha256(packfile),
+        packfile_bytes: packfile.byteLength,
+        client_known_main: state.local_main,
+        base_commit: '0123456789012345678901234567890123456789'
+      },
+      packfile
+    );
+    expect(rejected).toMatchObject({ status: 'rejected', code: 'untrusted_base_commit' });
+    const db = await server.store.snapshot();
+    const device = db.devices.find((candidate) => candidate.device_id === state.device_id);
+    expect(device?.device_ref_head).toBeNull();
+    expect(db.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(state.local_main);
   });
 
   it('keeps same-device non-fast-forward blocks active until recovery', async () => {

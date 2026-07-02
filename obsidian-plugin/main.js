@@ -340,9 +340,27 @@ class ObtsObsidianClient {
         await this.acknowledgeAppliedMain(pulled.manifest.target_main);
         return;
       }
-      await this.createRecoveryBundle("replace_local_with_server", pulled.manifest.target_main, localFiles);
-      await this.writeQueue({ pending_commit: null, expected_device_ref: null, status: "blocked_recovery", attempts: 0, updated_at: nowIso() });
-      await this.block("replace_local_with_server_required", "Local content differs from server main. Use Replace local with server state after reviewing the recovery bundle.");
+      const proposalBase = rePairBaseline && await this.commitExists(rePairBaseline.main) ? rePairBaseline.main : pulled.manifest.target_main;
+      await this.updateRef("refs/heads/main", proposalBase, null, true);
+      await this.updateRef("refs/heads/local", proposalBase, null, true);
+      await this.writeState(Object.assign({}, await this.readState(), {
+        local_main: proposalBase,
+        local_head: proposalBase,
+        initial_import_confirmed: true,
+        status_label: "Ahead",
+        last_error_code: null,
+        updated_at: nowIso()
+      }));
+      const proposalCommit = await this.createLocalCommit("obts: local vault changes");
+      await this.writeQueue({ pending_commit: proposalCommit, expected_device_ref: null, status: proposalCommit ? "queued_local" : "idle", attempts: 0, updated_at: nowIso() });
+      if (proposalCommit) {
+        await this.writeState(Object.assign({}, await this.readState(), {
+          local_head: proposalCommit,
+          status_label: "Ahead",
+          updated_at: nowIso()
+        }));
+      }
+      return;
     }
     await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true);
     if (localFiles.length === 0 || localAlreadyMatchesServer) {
@@ -555,6 +573,7 @@ class ObtsObsidianClient {
       packfile_sha256: sha256(packfile),
       packfile_bytes: packfile.byteLength,
       client_known_main: state.local_main,
+      ...(queue.expected_device_ref === null && state.local_main ? { base_commit: state.local_main } : {}),
       attempt_id: `sync_${Date.now()}_${crypto.randomBytes(8).toString("hex")}`
     };
     const result = await this.push(state.vault_id, token, manifest, packfile);

@@ -80,7 +80,7 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - watcher change hints for syncable vault paths survive plugin restart and are consumed by the next normal Git-backed sync scan, while internal `.obts` and visible `.git` paths are ignored;
 - plugin state surfaces `Uploading` during queued push attempts and `Applying`
   while pulled server `main` is being materialized locally;
-- divergent additional-device local content creates a recovery bundle, blocks normal sync, and requires explicit replace-local-with-server before destructive apply, even when current server `main` is still the empty root;
+- divergent additional-device local content is committed as that actor device's proposal, optionally using current server `main` as `base_commit`, and the server either merges it or records a conflict without adopting another device ref;
 - pairing tokens are scoped to their issued device name and cannot be consumed twice;
 - replace-local-with-server recovers and safely materializes file/directory collisions, including local directories that must be replaced by server files;
 - partial or already-paired local `.obts/` state blocks pairing before a one-time pairing token is consumed;

@@ -120,8 +120,15 @@ export function parseDevicePushManifest(value: unknown): DevicePushManifest {
     packfile_bytes: readNonNegativeInteger(value, 'packfile_bytes'),
     client_known_main: readNullableCommitId(value, 'client_known_main')
   };
+  const baseCommit = Object.prototype.hasOwnProperty.call(value, 'base_commit')
+    ? readNullableCommitId(value, 'base_commit')
+    : undefined;
   const attemptId = readOptionalString(value, 'attempt_id');
-  return attemptId === undefined ? manifest : { ...manifest, attempt_id: attemptId };
+  return {
+    ...manifest,
+    ...(baseCommit === undefined ? {} : { base_commit: baseCommit }),
+    ...(attemptId === undefined ? {} : { attempt_id: attemptId })
+  };
 }
 
 export function parseDevicePullRequest(value: unknown): DevicePullRequest {

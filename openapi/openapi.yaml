@@ -728,6 +728,12 @@ components:
             - type: "null"
             - type: string
               pattern: "^[0-9a-f]{40}$"
+        base_commit:
+          description: Trusted vault commit used as the proposal merge base; it never transfers device identity.
+          oneOf:
+            - type: "null"
+            - type: string
+              pattern: "^[0-9a-f]{40}$"
         attempt_id:
           type: string
     DevicePullRequest:

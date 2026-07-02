@@ -28,7 +28,7 @@ graph LR
     7-. "Serves static dashboard assets. [HTTP]" .->22
     22-. "Calls setup, dashboard, conflict, resolution, key rewrap, compact, and health APIs. [HTTPS]" .->7
     29-. "Uses vault, workspace, settings, status bar, command, and request APIs. [Obsidian Plugin API]" .->4
-    29-. "Pairs devices, rehydrates identity/ref metadata, uploads content and proposals, pulls diffs, receives conflict state, and subscribes to events. [HTTPS/WSS]" .->7
+    29-. "Pairs devices, rehydrates identity/ref metadata, uploads actor-device proposals with optional trusted base_commit metadata, pulls diffs, receives conflict state, and subscribes to events. [HTTPS/WSS]" .->7
     29-. "Reads local vault content as the device source of truth and applies accepted server main changes after local recovery snapshots. [Obsidian Vault API]" .->42
     29-. "Persists local Git journal, recoverable metadata, durable local proposals, content cache, recovery bundles, cursors, diagnostics, and device token state. [Local filesystem and platform secure storage]" .->43
     7-. "Loads server master key material for per-vault data key unwrap and rewrap operations. [Environment variable, secret mount, or KMS API]" .->5

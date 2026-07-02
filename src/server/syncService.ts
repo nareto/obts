@@ -105,6 +105,10 @@ export class SyncService {
         operationId = operation.operation_id;
 
         const currentDeviceRef = await this.git.getRef(auth.vault.vault_id, auth.device.device_ref);
+        const currentMain = await this.git.getRef(auth.vault.vault_id, 'refs/heads/main');
+        if (!currentMain) {
+          return await this.rejectDevicePush(auth, operation.operation_id, 'missing_main', 'Server main is missing.');
+        }
         const deviceBlock = await this.deviceBlockRejection(auth.device.device_id);
         if (deviceBlock?.deviceStatus === 'blocked_recovery') {
           return await this.rejectDevicePush(auth, operation.operation_id, deviceBlock.code, deviceBlock.message);
@@ -129,7 +133,8 @@ export class SyncService {
           operation,
           manifest,
           packfile,
-          currentDeviceRef
+          currentDeviceRef,
+          currentMain
         );
         if (quarantineResult !== null) {
           return quarantineResult;
@@ -147,7 +152,8 @@ export class SyncService {
               object_integrity: 'ok',
               path_policy: 'ok',
               changed_path_policy: 'ok',
-              fast_forward: 'ok'
+              fast_forward: 'ok',
+              base_commit: manifest.base_commit ?? null
             }
           };
           op.updated_at = nowIso();
@@ -180,7 +186,14 @@ export class SyncService {
           return event.event_seq;
         });
 
-        return await this.mergeDeviceCommit(auth.vault.vault_id, auth.device.device_id, manifest.target_commit, refEventSeq);
+        return await this.mergeDeviceCommit(
+          auth.vault.vault_id,
+          auth.device.device_id,
+          manifest.target_commit,
+          refEventSeq,
+          manifest.base_commit ?? null,
+          currentDeviceRef === null && manifest.base_commit !== undefined && manifest.base_commit !== null
+        );
       } catch (error) {
         if (operationId) {
           await this.abortOperation(operationId, 'unexpected_error');
@@ -236,7 +249,8 @@ export class SyncService {
     operation: SyncOperationRow,
     manifest: DevicePushManifest,
     packfile: Buffer,
-    currentDeviceRef: string | null
+    currentDeviceRef: string | null,
+    currentMain: string
   ): Promise<PushResult | null> {
     try {
       return await this.git.withQuarantinedPack(auth.vault.vault_id, packfile, async (reader) => {
@@ -262,6 +276,17 @@ export class SyncService {
         if (currentDeviceRef && !(await reader.isAncestor(auth.vault.vault_id, currentDeviceRef, manifest.target_commit))) {
           return await this.blockDeviceForRecovery(auth, operation, currentDeviceRef, manifest.target_commit);
         }
+        if (manifest.base_commit) {
+          if (!(await reader.commitExists(auth.vault.vault_id, manifest.base_commit))) {
+            return await this.rejectDevicePush(auth, operation.operation_id, 'untrusted_base_commit', 'Proposal base is not trusted vault history.');
+          }
+          if (!(await reader.isAncestor(auth.vault.vault_id, manifest.base_commit, currentMain))) {
+            return await this.rejectDevicePush(auth, operation.operation_id, 'untrusted_base_commit', 'Proposal base is not trusted vault history.');
+          }
+          if (!(await reader.isAncestor(auth.vault.vault_id, manifest.base_commit, manifest.target_commit))) {
+            return await this.rejectDevicePush(auth, operation.operation_id, 'invalid_base_commit', 'Proposal base is not an ancestor of the uploaded commit.');
+          }
+        }
         return null;
       });
     } catch {
@@ -273,7 +298,9 @@ export class SyncService {
     vaultId: string,
     deviceId: string,
     deviceCommit: string,
-    fallbackEventSeq: number
+    fallbackEventSeq: number,
+    proposalBase: string | null = null,
+    detachedProposal = false
   ): Promise<PushResult> {
     const main = await this.git.getRef(vaultId, 'refs/heads/main');
     if (!main) {
@@ -299,13 +326,35 @@ export class SyncService {
       };
     }
 
-    const base = await this.git.mergeBase(vaultId, main, deviceCommit);
+    let base = proposalBase;
+    if (base) {
+      const baseIsValid =
+        (await this.git.commitExists(vaultId, base)) &&
+        (await this.git.isAncestor(vaultId, base, main)) &&
+        (await this.git.isAncestor(vaultId, base, deviceCommit));
+      if (!baseIsValid) {
+        return await this.createConflict(vaultId, deviceId, '', main, deviceCommit, [], 'invalid_proposal_base');
+      }
+    } else {
+      base = await this.git.mergeBase(vaultId, main, deviceCommit);
+    }
     if (!base) {
       return await this.createConflict(vaultId, deviceId, '', main, deviceCommit, [], 'no_merge_base');
     }
 
     const mainChanges = await this.git.changedPaths(vaultId, base, main);
     const deviceChanges = await this.git.changedPaths(vaultId, base, deviceCommit);
+    if (detachedProposal && hasDestructiveChanges(deviceChanges)) {
+      return await this.createConflict(
+        vaultId,
+        deviceId,
+        base,
+        main,
+        deviceCommit,
+        destructiveChangedPaths(deviceChanges),
+        'detached_proposal_deletes'
+      );
+    }
     const overlapping = intersectChangedPaths(mainChanges, deviceChanges);
     if (overlapping.length > 0) {
       const identityMerge = await this.tryIdentityOverlappingMerge(vaultId, deviceId, base, main, deviceCommit, deviceChanges, overlapping);
@@ -1031,6 +1080,24 @@ function changedPathSet(entries: GitDiffEntry[]): Set<string> {
     }
   }
   return paths;
+}
+
+function hasDestructiveChanges(entries: GitDiffEntry[]): boolean {
+  return entries.some((entry) => entry.status.startsWith('D') || entry.status.startsWith('R'));
+}
+
+function destructiveChangedPaths(entries: GitDiffEntry[]): string[] {
+  const paths = new Set<string>();
+  for (const entry of entries) {
+    if (entry.status.startsWith('D')) {
+      paths.add(entry.path);
+    }
+    if (entry.status.startsWith('R')) {
+      paths.add(entry.oldPath ?? entry.path);
+      paths.add(entry.path);
+    }
+  }
+  return [...paths].sort();
 }
 
 function isNativeTextMergePath(path: string): boolean {

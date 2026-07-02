@@ -19,7 +19,7 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
         deviceService = component "DeviceService" "Registers, tracks, revokes, and updates paired devices and their server-known state." "TypeScript"
         keyManager = component "AtRestKeyManager" "Loads server master key material, creates and wraps per-vault data keys, unwraps keys in memory, and rewraps keys during rotation." "TypeScript, Node crypto"
         contentStoreService = component "ContentStoreService" "Encrypts/decrypts vault content at persistence boundaries and maintains content catalog metadata." "TypeScript"
-        proposalService = component "ProposalService" "Receives idempotent per-device proposals and records their lifecycle." "TypeScript"
+        proposalService = component "ProposalService" "Receives idempotent per-device proposals, validates actor device refs separately from proposal base commits, and records their lifecycle." "TypeScript"
         historyService = component "HistoryService" "Maintains canonical main, commit graph, manifests, refs, and merge provenance." "TypeScript"
         mergeCoordinator = component "MergeCoordinator" "Runs server-side merge and resolution transactions, advancing main or routing ambiguous changes to conflicts." "TypeScript"
         semanticMergeService = component "SemanticMergeService" "Performs conservative text, Markdown, frontmatter, and block-aware merge in a server temp workspace." "TypeScript"
@@ -39,7 +39,7 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
         resolutionEditor = component "ResolutionEditor" "Lets the owner accept server, accept device, keep both, or author a manual merged result." "TypeScript"
       }
 
-      plugin = container "Obsidian plugin" "Obsidian community plugin that treats visible vault files as the device source of truth, journals them in local Git, rehydrates recoverable metadata, uploads device refs, applies server main, and exposes sync status." "TypeScript, Obsidian Plugin API" {
+      plugin = container "Obsidian plugin" "Obsidian community plugin that treats visible vault files as the device source of truth, journals them in local Git, rehydrates recoverable metadata, uploads actor-device proposals with optional base commits, applies server main, and exposes sync status." "TypeScript, Obsidian Plugin API" {
         settingsView = component "SettingsView" "Collects server URL, pairing token/login, and device name." "TypeScript"
         statusBar = component "StatusBar" "Displays Synced, Ahead, Behind, Uploading, Applying, Offline, Blocked, Unsafe local error, and Needs recovery states." "TypeScript"
         vaultWatcher = component "VaultWatcher" "Observes local vault changes through Obsidian APIs." "TypeScript, Obsidian Vault API"
@@ -133,7 +133,7 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
       }
     }
 
-    obts.plugin -> obts.server "Pairs devices, rehydrates identity/ref metadata, uploads content and proposals, pulls diffs, receives conflict state, and subscribes to events." "HTTPS/WSS" {
+    obts.plugin -> obts.server "Pairs devices, rehydrates identity/ref metadata, uploads actor-device proposals with optional trusted base_commit metadata, pulls diffs, receives conflict state, and subscribes to events." "HTTPS/WSS" {
       properties {
         "ops" "read,write,consume"
         "protocol" "HTTPS,WSS"
@@ -275,7 +275,7 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
       }
     }
 
-    obts.server.proposalService -> obts.server.mergeCoordinator "Submits proposal manifests for server-side merge or conflict routing." "TypeScript calls" {
+    obts.server.proposalService -> obts.server.mergeCoordinator "Submits actor-device proposal manifests for server-side merge or conflict routing without adopting another device ref." "TypeScript calls" {
       properties {
         "ops" "write"
         "protocol" "in-process"
@@ -500,7 +500,7 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
       }
     }
 
-    obts.plugin.transportClient -> obts.server "Calls device self metadata repair, uploads full-vault content and proposals, pulls diffs, lists conflict state, and subscribes to events." "HTTPS/WSS" {
+    obts.plugin.transportClient -> obts.server "Calls device self metadata repair, uploads full-vault content and actor-device proposals with base_commit metadata, pulls diffs, lists conflict state, and subscribes to events." "HTTPS/WSS" {
       properties {
         "ops" "read,write,consume"
         "protocol" "HTTPS,WSS"

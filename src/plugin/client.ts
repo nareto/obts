@@ -189,18 +189,35 @@ export class ObtsPluginClient {
         await this.acknowledgeAppliedMain(await this.readState(), result.device_token, pulled.manifest.target_main);
         return;
       }
-      await this.createLocalRecoveryBundle('replace_local_with_server', pulled.manifest.target_main, localFiles);
+      const proposalBase = rePairBaseline && (await this.git.commitExists(rePairBaseline.main)) ? rePairBaseline.main : pulled.manifest.target_main;
+      await this.git.setLocalMain(proposalBase);
+      await this.git.setLocalHead(proposalBase);
+      await this.writeState({
+        ...(await this.readState()),
+        local_main: proposalBase,
+        local_head: proposalBase,
+        initial_import_confirmed: true,
+        status_label: 'Ahead',
+        last_error_code: null,
+        updated_at: nowIso()
+      });
+      const proposalCommit = await this.git.createLocalCommit('obts: local vault changes');
       await this.writeQueue({
-        pending_commit: null,
+        pending_commit: proposalCommit,
         expected_device_ref: null,
-        status: 'blocked_recovery',
+        status: proposalCommit ? 'queued_local' : 'idle',
         attempts: 0,
         updated_at: nowIso()
       });
-      await this.block(
-        'replace_local_with_server_required',
-        'Additional device has local content that differs from server main.'
-      );
+      if (proposalCommit) {
+        await this.writeState({
+          ...(await this.readState()),
+          local_head: proposalCommit,
+          status_label: 'Ahead',
+          updated_at: nowIso()
+        });
+      }
+      return;
     }
     await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true);
     if (localFiles.length === 0 || localAlreadyMatchesServer) {
@@ -288,6 +305,7 @@ export class ObtsPluginClient {
         packfile_sha256: sha256(packfile),
         packfile_bytes: packfile.byteLength,
         client_known_main: currentState.local_main,
+        ...(queue.expected_device_ref === null && currentState.local_main ? { base_commit: currentState.local_main } : {}),
         attempt_id: newId('sync')
       };
       const result = await this.pushOrBlock(currentState, queue, token, manifest, packfile);

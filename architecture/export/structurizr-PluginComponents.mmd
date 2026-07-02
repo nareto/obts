@@ -36,7 +36,7 @@ graph LR
     37-. "Caches content required for retry, pull, apply, and recovery. [Filesystem]" .->43
     38-. "Reads device token and local Git refs, then rewrites recoverable state.json metadata after server rehydration. [Filesystem]" .->43
     38-. "Requests device self metadata without needing a vault ID from state.json. [TypeScript calls]" .->39
-    39-. "Calls device self metadata repair, uploads full-vault content and proposals, pulls diffs, lists conflict state, and subscribes to events. [HTTPS/WSS]" .->7
+    39-. "Calls device self metadata repair, uploads full-vault content and actor-device proposals with base_commit metadata, pulls diffs, lists conflict state, and subscribes to events. [HTTPS/WSS]" .->7
     40-. "Requires local recovery snapshot before applying destructive server changes. [TypeScript calls]" .->35
     40-. "Materializes accepted server main entries into vault files and managed Obsidian configuration targets. [Obsidian Vault API]" .->42
     31-. "Reads local queue state to show ahead, blocked, retry, and recovery statuses. [TypeScript calls]" .->36

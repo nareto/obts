@@ -35,7 +35,7 @@ graph LR
     7-. "Serves static dashboard assets. [HTTP]" .->22
     22-. "Calls setup, dashboard, conflict, resolution, key rewrap, compact, and health APIs. [HTTPS]" .->7
     29-. "Uses vault, workspace, settings, status bar, command, and request APIs. [Obsidian Plugin API]" .->4
-    29-. "Pairs devices, rehydrates identity/ref metadata, uploads content and proposals, pulls diffs, receives conflict state, and subscribes to events. [HTTPS/WSS]" .->7
+    29-. "Pairs devices, rehydrates identity/ref metadata, uploads actor-device proposals with optional trusted base_commit metadata, pulls diffs, receives conflict state, and subscribes to events. [HTTPS/WSS]" .->7
     29-. "Reads local vault content as the device source of truth and applies accepted server main changes after local recovery snapshots. [Obsidian Vault API]" .->42
     29-. "Persists local Git journal, recoverable metadata, durable local proposals, content cache, recovery bundles, cursors, diagnostics, and device token state. [Local filesystem and platform secure storage]" .->43
     7-. "Loads server master key material for per-vault data key unwrap and rewrap operations. [Environment variable, secret mount, or KMS API]" .->5
@@ -123,7 +123,7 @@ graph LR
     37-. "Caches content required for retry, pull, apply, and recovery. [Filesystem]" .->43
     38-. "Reads device token and local Git refs, then rewrites recoverable state.json metadata after server rehydration. [Filesystem]" .->43
     38-. "Requests device self metadata without needing a vault ID from state.json. [TypeScript calls]" .->39
-    39-. "Calls device self metadata repair, uploads full-vault content and proposals, pulls diffs, lists conflict state, and subscribes to events. [HTTPS/WSS]" .->7
+    39-. "Calls device self metadata repair, uploads full-vault content and actor-device proposals with base_commit metadata, pulls diffs, lists conflict state, and subscribes to events. [HTTPS/WSS]" .->7
     40-. "Requires local recovery snapshot before applying destructive server changes. [TypeScript calls]" .->35
     40-. "Materializes accepted server main entries into vault files and managed Obsidian configuration targets. [Obsidian Vault API]" .->42
     31-. "Reads local queue state to show ahead, blocked, retry, and recovery statuses. [TypeScript calls]" .->36
@@ -180,7 +180,7 @@ graph LR
     12-. "Writes encrypted-at-rest content bytes and reads them for authorized workflows. [Filesystem]" .->45
     12-. "Records content catalog metadata, hashes, sizes, and storage refs. [SQL]" .->44
     13-. "Persists uploaded content before accepting proposals. [TypeScript calls]" .->12
-    13-. "Submits proposal manifests for server-side merge or conflict routing. [TypeScript calls]" .->15
+    13-. "Submits actor-device proposal manifests for server-side merge or conflict routing without adopting another device ref. [TypeScript calls]" .->15
     14-. "Reads and writes commit graph, manifests, refs, and merge provenance. [Filesystem]" .->46
     14-. "Records main refs, commit indexes, and transaction state. [SQL]" .->44
     15-. "Reads base/current/proposed manifests and advances main after clean merge or resolution. [TypeScript calls]" .->14

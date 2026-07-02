@@ -104,6 +104,7 @@ export type DevicePushManifest = {
   packfile_sha256: string;
   packfile_bytes: number;
   client_known_main: string | null;
+  base_commit?: string | null;
   attempt_id?: string;
 };
 

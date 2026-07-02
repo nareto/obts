@@ -58,6 +58,7 @@ describe('OpenAPI Phase 1 contract', () => {
     expect(pullSection).toContain('packfile');
     expect(pullSection).not.toContain('application/json:');
     expect(contract).toContain('current_local_main_is_ancestor');
+    expect(contract).toContain('base_commit');
 
     const deviceEventsSection = contract.slice(
       contract.indexOf('/vaults/{vault_id}/sync/events'),

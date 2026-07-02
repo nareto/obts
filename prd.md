@@ -149,7 +149,7 @@ Behavior:
 12. If this is an additional paired device and the local vault contains user content that differs from server `main`, the plugin first checks whether the local vault is a clean stale copy of a detached unpaired baseline for the same vault.
 13. A clean stale copy may fast-forward during re-pair when all of the following are true: the detached baseline vault ID matches the newly paired vault; the local visible syncable files exactly match the baseline commit tree under the full-vault path policy; the baseline commit is available in local hidden Git state; and the baseline commit is an ancestor of current server `main` after the plugin imports the server pull pack.
 14. When the clean stale-copy checks pass, the plugin applies current server `main` through the normal apply journal and recovery-bundle protections, records the new device as synced, and does not require replace-local-with-server.
-15. When the clean stale-copy checks fail, additional-device pairing with local content that differs from server `main` creates a recovery bundle, shows a local-vs-server summary, blocks normal sync, and requires an explicit replace-local-with-server command before applying server state. The original local content remains recoverable only from the recovery bundle after replacement.
+15. When the clean stale-copy checks fail, additional-device pairing with local content that differs from server `main` does not adopt another device's identity or force replace-local. The plugin records the visible filesystem as this device's own proposal commit, using current server `main` as a trusted proposal base when no safer same-device baseline exists, then uploads it through this device's ref for normal server merge or conflict handling.
 16. If local `.obts/` Git state belongs to another vault or is partially initialized beyond the detached-baseline case, pairing blocks until the owner runs a recovery or reset flow.
 
 Acceptance criteria:
@@ -161,7 +161,7 @@ Acceptance criteria:
 - Server `main` exists immediately after vault creation and points to a real empty-tree root commit, not an empty or unborn ref.
 - First sync never silently discards local content.
 - First-device import of non-empty local content requires a recovery bundle and explicit owner confirmation before upload.
-- Additional-device pairing of non-empty divergent local content blocks normal sync until the owner explicitly replaces local content with server state after recovery bundle creation.
+- Additional-device pairing of non-empty divergent local content commits and uploads the local filesystem as that device's proposal instead of requiring replace-local-with-server.
 - Re-pairing a previously synced device whose local files still exactly match an old server `main` commit safely fast-forwards to current server `main` without replace-local-with-server.
 - Re-pairing blocks instead of fast-forwarding when the detached baseline is missing, belongs to another vault, is not an ancestor of current server `main`, or no longer matches visible local files.
 
@@ -559,7 +559,8 @@ Behavior:
 
 1. If a device token exists but local coordination metadata is missing, corrupt, or incomplete, the plugin calls the device-authenticated self endpoint to recover vault ID, device ID, device ref, current server device ref, current server `main`, and event cursor metadata.
 2. When recovered local Git refs are present, the plugin commits any visible filesystem differences, then uploads the resulting local head through the device ref if the server accepts the update as a repeat or fast-forward.
-3. Plugin stops normal sync only when token auth fails, local Git state is missing/corrupt, path-policy validation fails, destructive apply is unsafe, or same-device ancestry cannot be proven safe against the server device ref.
+3. When a reset or re-paired device has no trusted same-device cursor but has valid local content, the plugin may create a new device proposal using current server `main` as `base_commit`; the server must keep actor device identity separate from proposal base identity.
+4. Plugin stops normal sync only when token auth fails, local Git state is missing/corrupt, path-policy validation fails, destructive apply is unsafe, or same-device ancestry cannot be proven safe against the server device ref.
 4. Plugin snapshots local pending edits and relevant hidden Git state into a recovery bundle before destructive rebuild/reset operations.
 5. Plugin pulls current server `main`.
 6. Plugin applies server state to local vault.
@@ -573,6 +574,7 @@ Acceptance criteria:
 - Recovery never silently discards local edits.
 - Valid device token plus intact local Git state repairs lost `state.json` automatically and does not force replace-local-with-server.
 - Filesystem edits made while metadata was missing become local Git commits and are uploaded to the server device ref before any destructive pull/apply.
+- Device identity, actor device ref, and proposal merge base remain separate; a device may use a trusted vault commit as `base_commit` but never adopts another device's ref as its own cursor.
 - Recovery bundles are available before destructive apply or rebuild operations.
 - Recovery can distinguish repeated commits, new commits, and divergent same-device history using Git ancestry.
 - Recovery never uploads same-device divergent history through a non-fast-forward device ref update.
@@ -586,17 +588,18 @@ Acceptance criteria:
 3. Local `state.json` is recoverable coordination metadata and must not be treated as authoritative content state.
 4. `refs/heads/main` is the only published server state for a vault.
 5. Each paired device uploads through a protected server-side device ref such as `refs/obts/devices/{device_id}`; device refs are internal merge candidates, not user-visible Git branches.
-6. Clients commit locally; only server merge/resolution transactions advance `main`.
-7. Git commit hashes identify immutable commits; parent links define ancestry; timestamps are display metadata only.
-8. The server uses the native `git` CLI as the authoritative server-side Git implementation.
-9. The Obsidian plugin uses `isomorphic-git` for client-side Git operations.
-10. Persistent server-side Git state is protected by deployment-managed storage controls in v1.
-11. Authorization is enforced at every vault-scoped boundary, and v1 vaults are single-owner in a multi-tenant instance.
-12. No `.git` directory appears in the visible Obsidian vault.
-13. Local commits, recovery snapshots, and recovery bundles are durable before destructive operations.
-14. Obsidian configuration sync uses an explicit file policy; `.obts/` is always excluded.
-15. Every paired device syncs the same full-vault content set.
-16. Hard path exclusions are global and deterministic: `.obts/**` is never synced, visible `.git/**` paths are rejected, `.obsidian/cache/**`, `.obsidian/workspace.json`, `.obsidian/workspace-mobile.json`, and `.obsidian/plugins/obts/**` are excluded, while `.trash/**` and other `.obsidian/**` paths are normal vault content.
+6. Device identity and proposal merge base are separate. A push may name a trusted vault commit as `base_commit`, but this never transfers ownership of another device ref or bypasses the actor device's ref checks.
+7. Clients commit locally; only server merge/resolution transactions advance `main`.
+8. Git commit hashes identify immutable commits; parent links define ancestry; timestamps are display metadata only.
+9. The server uses the native `git` CLI as the authoritative server-side Git implementation.
+10. The Obsidian plugin uses `isomorphic-git` for client-side Git operations.
+11. Persistent server-side Git state is protected by deployment-managed storage controls in v1.
+12. Authorization is enforced at every vault-scoped boundary, and v1 vaults are single-owner in a multi-tenant instance.
+13. No `.git` directory appears in the visible Obsidian vault.
+14. Local commits, recovery snapshots, and recovery bundles are durable before destructive operations.
+15. Obsidian configuration sync uses an explicit file policy; `.obts/` is always excluded.
+16. Every paired device syncs the same full-vault content set.
+17. Hard path exclusions are global and deterministic: `.obts/**` is never synced, visible `.git/**` paths are rejected, `.obsidian/cache/**`, `.obsidian/workspace.json`, `.obsidian/workspace-mobile.json`, and `.obsidian/plugins/obts/**` are excluded, while `.trash/**` and other `.obsidian/**` paths are normal vault content.
 
 ### 4.2 Containers
 
@@ -824,8 +827,9 @@ Device push manifest fields:
 
 - `vault_id`;
 - `device_id`;
-- expected current device ref or empty-ref marker;
+- expected current actor device ref or empty-ref marker;
 - target commit ID;
+- optional trusted proposal `base_commit`, used only as merge base and never as device identity;
 - packfile SHA-256 and byte length;
 - client-known `main` commit for merge context;
 - sync attempt metadata and timestamps for diagnostics only.
@@ -945,7 +949,7 @@ Conflict review lifecycle:
 - `POST /api/v1/pair/consume`: consume a pairing token and register a device.
 - `GET /api/v1/device/self`: authenticate a device token without a vault ID in the URL and return non-secret identity/ref metadata for local metadata repair.
 - `GET /api/v1/vaults/{vault_id}/main`: return current `main` metadata and authorized summary.
-- `POST /api/v1/vaults/{vault_id}/sync/push`: upload a push manifest and Git packfile, then request a device ref update.
+- `POST /api/v1/vaults/{vault_id}/sync/push`: upload a push manifest and Git packfile, optionally naming a trusted `base_commit`, then request an actor device ref update.
 - `POST /api/v1/vaults/{vault_id}/sync/pull`: request a target `main` and receive a pull manifest plus Git packfile needed to reach it.
 - `POST /api/v1/vaults/{vault_id}/history/query`: list note history for an authorized path supplied in a redacted request body.
 - `POST /api/v1/vaults/{vault_id}/history/version`: fetch a historical note version or diff source for a commit/path supplied in a redacted request body.
@@ -1376,6 +1380,7 @@ Acceptance proof:
 - new commit advances the device ref;
 - same-device non-fast-forward update blocks and requires recovery;
 - lost `state.json` with a valid device token and intact local Git refs rehydrates automatically, then uploads filesystem edits through the device ref;
+- reset/re-paired additional-device content uploads as the actor device's proposal and either merges safely or becomes a server conflict without adopting another device's ref;
 - concurrent disjoint edits auto-merge;
 - concurrent same-file Markdown edits merge when safe;
 - concurrent same-file `.canvas` edits merge when the JSON Canvas semantic merge contract accepts them;
@@ -1385,7 +1390,7 @@ Acceptance proof:
 - note history shows prior versions and restores one note through a new Git commit;
 - non-empty local vault join creates a recovery bundle and never silently discards local content;
 - first-device non-empty local vault import creates a recovery bundle, requires owner confirmation, uploads an initial device commit, and merges through server `main`;
-- additional-device non-empty divergent vault pairing creates a recovery bundle and blocks normal sync until explicit replace-local-with-server;
+- additional-device non-empty divergent vault pairing uploads the visible filesystem as that actor device's proposal and preserves local content if the server records a conflict;
 - full-vault sync includes `.trash/**`, attachments, `.obsidian/**`, and community plugin files except hard exclusions;
 - full-vault sync excludes `.obsidian/cache/**`, `.obsidian/workspace.json`, `.obsidian/workspace-mobile.json`, and `.obsidian/plugins/obts/**`;
 - destructive history compaction API is absent in v1;

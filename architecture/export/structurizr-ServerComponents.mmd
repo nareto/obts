@@ -41,7 +41,7 @@ graph LR
     12-. "Writes encrypted-at-rest content bytes and reads them for authorized workflows. [Filesystem]" .->45
     12-. "Records content catalog metadata, hashes, sizes, and storage refs. [SQL]" .->44
     13-. "Persists uploaded content before accepting proposals. [TypeScript calls]" .->12
-    13-. "Submits proposal manifests for server-side merge or conflict routing. [TypeScript calls]" .->15
+    13-. "Submits actor-device proposal manifests for server-side merge or conflict routing without adopting another device ref. [TypeScript calls]" .->15
     14-. "Reads and writes commit graph, manifests, refs, and merge provenance. [Filesystem]" .->46
     14-. "Records main refs, commit indexes, and transaction state. [SQL]" .->44
     15-. "Reads base/current/proposed manifests and advances main after clean merge or resolution. [TypeScript calls]" .->14
