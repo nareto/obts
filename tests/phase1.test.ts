@@ -103,6 +103,32 @@ describe('Phase 1 sync without conflict resolution', () => {
     const live = await fetch(`${baseUrl}/health/live`);
     expect(live.status).toBe(200);
 
+    const pairPreflight = await fetch(`${baseUrl}/api/v1/pair/consume`, {
+      method: 'OPTIONS',
+      headers: {
+        origin: 'app://obsidian.md',
+        'access-control-request-method': 'POST',
+        'access-control-request-headers': 'content-type'
+      }
+    });
+    expect(pairPreflight.status).toBe(204);
+    expect(pairPreflight.headers.get('access-control-allow-origin')).toBe('*');
+    expect(pairPreflight.headers.get('access-control-allow-methods')).toContain('POST');
+    expect(pairPreflight.headers.get('access-control-allow-headers')).toContain('content-type');
+
+    const invalidPair = await fetch(`${baseUrl}/api/v1/pair/consume`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'app://obsidian.md' },
+      body: JSON.stringify({
+        pairing_token: 'obts_pair_invalid',
+        device_name: 'browser-plugin',
+        sync_profile: 'notes_only',
+        sync_plugins: false
+      })
+    });
+    expect(invalidPair.status).toBe(401);
+    expect(invalidPair.headers.get('access-control-allow-origin')).toBe('*');
+
     const setup = await admin.post<{ user_id: string; csrf_token: string }>('/api/v1/setup', {
       username: 'admin',
       password: 'admin-password-1234',

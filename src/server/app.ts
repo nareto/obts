@@ -56,9 +56,15 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
   await sync.resumePendingMerges();
 
+  app.addHook('onRequest', async (request, reply) => {
+    setApiCorsHeaders(request, reply);
+  });
+
   app.setErrorHandler((error, request, reply) => {
     void sendError(error instanceof Error ? error : new Error('Unknown error'), request, reply);
   });
+
+  app.options('/api/v1/*', async (_request, reply) => reply.status(204).send());
 
   app.get('/health/live', async () => ({ status: 'ok' }));
 
@@ -568,6 +574,16 @@ function setSessionCookie(reply: FastifyReply, config: ServerConfig, sessionId: 
     sameSite: 'strict',
     path: '/'
   });
+}
+
+function setApiCorsHeaders(request: FastifyRequest, reply: FastifyReply): void {
+  if (!request.url.startsWith('/api/v1/')) {
+    return;
+  }
+  reply.header('access-control-allow-origin', '*');
+  reply.header('access-control-allow-methods', 'GET, POST, OPTIONS');
+  reply.header('access-control-allow-headers', 'authorization, content-type, x-obts-csrf');
+  reply.header('access-control-max-age', '600');
 }
 
 function cookieOptions(config: ServerConfig): { path: string; secure: boolean; sameSite: 'strict' } {
