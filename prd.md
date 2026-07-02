@@ -146,8 +146,11 @@ Behavior:
 9. If the local vault is empty and server `main` contains only the server-authored empty-tree root commit, the client records itself as synced to current `main`.
 10. If the local vault is empty and server `main` contains user content, the plugin applies server `main` through the normal apply journal and records itself as synced after apply succeeds.
 11. If this is the first paired device for a newly created vault and the local vault contains user content, the plugin creates a recovery bundle, asks the owner to confirm initial import, commits the local content as the initial device commit, and uploads that commit through the device ref.
-12. If this is an additional paired device and the local vault contains user content that differs from server `main`, the plugin creates a recovery bundle, shows a local-vs-server summary, blocks normal sync, and requires an explicit replace-local-with-server command before applying server state. The original local content remains recoverable only from the recovery bundle after replacement.
-13. If local `.obts/` Git state belongs to another device/vault or is partially initialized, pairing blocks until the owner runs a recovery or reset flow.
+12. If this is an additional paired device and the local vault contains user content that differs from server `main`, the plugin first checks whether the local vault is a clean stale copy of a detached unpaired baseline for the same vault and same sync scope.
+13. A clean stale copy may fast-forward during re-pair when all of the following are true: the detached baseline vault ID matches the newly paired vault; the baseline sync profile and plugin-sync scope match the new pairing scope; the local visible syncable files exactly match the baseline commit tree under the effective path policy; the baseline commit is available in local hidden Git state; and the baseline commit is an ancestor of current server `main` after the plugin imports the server pull pack.
+14. When the clean stale-copy checks pass, the plugin applies current server `main` through the normal apply journal and recovery-bundle protections, records the new device as synced, and does not require replace-local-with-server.
+15. When the clean stale-copy checks fail, additional-device pairing with local content that differs from server `main` creates a recovery bundle, shows a local-vs-server summary, blocks normal sync, and requires an explicit replace-local-with-server command before applying server state. The original local content remains recoverable only from the recovery bundle after replacement.
+16. If local `.obts/` Git state belongs to another vault or is partially initialized beyond the detached-baseline case, pairing blocks until the owner runs a recovery or reset flow.
 
 Acceptance criteria:
 
@@ -159,6 +162,8 @@ Acceptance criteria:
 - First sync never silently discards local content.
 - First-device import of non-empty local content requires a recovery bundle and explicit owner confirmation before upload.
 - Additional-device pairing of non-empty divergent local content blocks normal sync until the owner explicitly replaces local content with server state after recovery bundle creation.
+- Re-pairing a previously synced device whose local files still exactly match an old server `main` commit safely fast-forwards to current server `main` without replace-local-with-server.
+- Re-pairing blocks instead of fast-forwarding when the detached baseline is missing, belongs to another vault, uses a different sync scope, is not an ancestor of current server `main`, or no longer matches visible local files.
 
 ### 3.4 Local Edit Sync
 
@@ -822,7 +827,7 @@ Device pull request fields:
 Device pull response:
 
 - content type: `multipart/form-data`;
-- `manifest` part: JSON metadata with target `main`, required apply summary, changed-path metadata, and event cursor;
+- `manifest` part: JSON metadata with target `main`, required apply summary, changed-path metadata, event cursor, and whether the request's current local `main` is an ancestor of the target when the server can determine that relationship;
 - `packfile` part: Git packfile bytes required to reach the target `main`.
 
 Supported committed operations:
@@ -851,6 +856,7 @@ Rules:
 - A device ref update is accepted only if it is a fast-forward from the current device ref or exactly repeats the current head.
 - A same-device non-fast-forward update blocks sync and requires recovery; it must not silently overwrite the device ref.
 - A stale client-known `main` triggers merge evaluation; it must not overwrite current `main` directly.
+- A re-pairing client may use an imported pull pack plus Git ancestry checks to treat a detached baseline as a safe stale server copy only when that baseline is reachable from current server `main`.
 - Malformed Git transfers are rejected without advancing device refs or `main`.
 - Git timestamps are never used to order sync or determine whether a change is new.
 
@@ -1006,6 +1012,8 @@ interface ObtsPluginSettings {
 `syncPlugins` defaults to `false`. When `false`, `.obsidian/plugins/**` is ignored completely. When `true`, `.obsidian/plugins/**` is included in sync like other selected vault state, including plugin code and settings, except `.obsidian/plugins/obts/**`.
 
 The plugin stores the device token at `.obts/auth/device-token.json`. The token file is never synced as vault content, never committed to hidden Git state, never included in recovery bundle file snapshots, and never included in diagnostics or content-bearing exports. Server-side token revocation and rotation are authoritative even when the local token file remains present.
+
+When a device unpairs or is locally disconnected from a vault, the plugin must remove local authentication material and clear active device identity, but it must not discard safe non-secret history needed to distinguish a stale clean copy from unreviewed local edits. The plugin preserves a detached unpaired baseline containing the previous vault ID, last applied server `main`, effective sync profile, plugin-sync scope, and enough hidden Git state to verify the visible vault tree against that baseline. This detached baseline is not authorization, cannot sync without a new pairing token, and is ignored if the owner explicitly resets local OBTS state.
 
 ## 8. Required v1 Feature Designs
 
