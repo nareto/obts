@@ -1207,6 +1207,10 @@ describe('Phase 1 sync without conflict resolution', () => {
     await desktop.syncOnce({ confirmInitialImport: true });
     const oldDesktopState = await desktop.readState();
     expect(oldDesktopState.local_main).toMatch(/^[0-9a-f]{40}$/u);
+    await writeFile(
+      join(desktopDir, '.obts', 'state.json'),
+      `${JSON.stringify({ ...oldDesktopState, local_main: null }, null, 2)}\n`
+    );
 
     await desktop.unpairCurrentDevice();
     const unpairedState = await desktop.readState();

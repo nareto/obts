@@ -675,6 +675,7 @@ class ObtsObsidianClient {
     }
     const token = await this.readDeviceToken();
     await this.unpairDevice(state.vault_id, token);
+    const baselineMain = state.local_main || await this.resolveRef("refs/heads/main");
     await fsp.rm(this.authPath, { force: true });
     await this.writeQueue({
       pending_commit: null,
@@ -699,7 +700,7 @@ class ObtsObsidianClient {
       last_error_code: null,
       last_event_seq: 0,
       unpaired_baseline_vault_id: state.vault_id,
-      unpaired_baseline_main: state.local_main,
+      unpaired_baseline_main: baselineMain,
       unpaired_baseline_sync_profile: state.sync_profile || this.plugin.settings.syncProfile,
       unpaired_baseline_sync_plugins: Object.prototype.hasOwnProperty.call(state, "sync_plugins") ? state.sync_plugins : this.plugin.settings.syncPlugins,
       updated_at: nowIso()

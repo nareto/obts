@@ -611,6 +611,7 @@ export class ObtsPluginClient {
       vaultId: state.vault_id,
       deviceToken: token
     });
+    const baselineMain = state.local_main ?? (await this.git.resolveRef('refs/heads/main'));
     await rm(join(this.vaultDir, '.obts', 'auth', 'device-token.json'), { force: true });
     await this.writeQueue({
       pending_commit: null,
@@ -635,7 +636,7 @@ export class ObtsPluginClient {
       last_error_code: null,
       last_event_seq: 0,
       unpaired_baseline_vault_id: state.vault_id,
-      unpaired_baseline_main: state.local_main,
+      unpaired_baseline_main: baselineMain,
       unpaired_baseline_sync_profile: state.sync_profile ?? this.settings.syncProfile,
       unpaired_baseline_sync_plugins: state.sync_plugins ?? this.settings.syncPlugins,
       updated_at: nowIso()
