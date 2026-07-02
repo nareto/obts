@@ -2138,6 +2138,58 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect((await awaitState(initializedPlugin)).device_id).toMatch(/^dev_/u);
   });
 
+  it('blocks token-only local state until explicit reset and re-pair', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'token-only-device');
+    await mkdirp(join(deviceDir, '.obts', 'auth'));
+    await writeFile(join(deviceDir, 'local.md'), 'preserve before reset\n');
+    await writeFile(join(deviceDir, '.obts', 'auth', 'device-token.json'), JSON.stringify({ device_token: 'obts_dev_local_test' }));
+    await writeFile(
+      join(deviceDir, '.obts', 'state.json'),
+      `${JSON.stringify({
+        user_id: null,
+        vault_id: null,
+        device_id: null,
+        device_name: null,
+        device_ref: null,
+        server_device_ref: null,
+        local_main: null,
+        local_head: null,
+        initial_import_confirmed: false,
+        status_label: 'Checking',
+        last_error_code: null,
+        last_event_seq: 0,
+        updated_at: new Date().toISOString()
+      })}\n`
+    );
+
+    const plugin = new ObtsPluginClient(deviceDir, {
+      serverUrl: baseUrlFromAdmin(admin),
+      deviceName: 'phone',
+    });
+    await plugin.initialize();
+    expect(await plugin.readState()).toMatchObject({
+      status_label: 'Needs recovery',
+      last_error_code: 'local_state_incomplete'
+    });
+
+    const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
+      device_name: 'phone',
+    });
+    expect(pairing.status).toBe(201);
+    await expect(plugin.pairWithToken(pairing.body.pairing_token)).rejects.toMatchObject({
+      code: 'local_state_already_paired'
+    });
+
+    const reset = await plugin.resetLocalPairingState();
+    expect(reset.status).toBe('Not paired');
+    expect(await exists(join(deviceDir, '.obts', 'auth', 'device-token.json'))).toBe(false);
+    expect(await recoveryBundleContains(deviceDir, 'local.md')).toBe(true);
+
+    await plugin.pairWithToken(pairing.body.pairing_token);
+    expect((await plugin.readState()).device_id).toMatch(/^dev_/u);
+  });
+
   it('fails readiness closed when metadata points at missing Git state', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const before = await fetch(`${baseUrl}/health/ready`);

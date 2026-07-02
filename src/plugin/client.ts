@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { newId, nowIso } from '../shared/ids.js';
@@ -658,8 +658,16 @@ export class ObtsPluginClient {
 
   async readState(): Promise<LocalPluginState> {
     try {
-      return JSON.parse(await readFile(this.statePath, 'utf8')) as LocalPluginState;
+      const state = JSON.parse(await readFile(this.statePath, 'utf8')) as LocalPluginState;
+      if (await this.hasActiveTokenWithoutIdentity(state)) {
+        return (await this.readBackupState()) ?? this.localStateIncomplete(state);
+      }
+      return state;
     } catch {
+      if (await exists(join(this.vaultDir, '.obts', 'auth', 'device-token.json'))) {
+        const backupState = await this.readBackupState();
+        return backupState ?? this.localStateIncomplete(null);
+      }
       return {
         user_id: null,
         vault_id: this.settings.vaultId ?? null,
@@ -678,6 +686,38 @@ export class ObtsPluginClient {
         updated_at: nowIso()
       };
     }
+  }
+
+  async resetLocalPairingState(): Promise<{ status: 'Not paired'; recoveryBundleId: string | null }> {
+    const state = await this.readState();
+    const localFiles = await listLocalVaultFiles(this.vaultDir);
+    const recoveryBundleId = localFiles.length > 0 ? await this.createLocalRecoveryBundle('rebuild_from_server', state.local_main, localFiles) : null;
+    await rm(join(this.vaultDir, '.obts', 'auth', 'device-token.json'), { force: true });
+    await this.writeQueue({
+      pending_commit: null,
+      expected_device_ref: null,
+      status: 'idle',
+      attempts: 0,
+      updated_at: nowIso()
+    });
+    await this.writeState({
+      user_id: null,
+      vault_id: null,
+      device_id: null,
+      device_name: null,
+      device_ref: null,
+      server_device_ref: null,
+      local_main: null,
+      local_head: null,
+      initial_import_confirmed: false,
+      status_label: 'Not paired',
+      last_error_code: null,
+      last_event_seq: 0,
+      unpaired_baseline_vault_id: null,
+      unpaired_baseline_main: null,
+      updated_at: nowIso()
+    });
+    return { status: 'Not paired', recoveryBundleId };
   }
 
   async readQueue(): Promise<QueueState> {
@@ -1161,7 +1201,8 @@ export class ObtsPluginClient {
     if (
       state.last_error_code === 'same_device_non_fast_forward' ||
       state.last_error_code === 'stale_device_ref' ||
-      state.last_error_code === 'device_blocked'
+      state.last_error_code === 'device_blocked' ||
+      state.last_error_code === 'local_state_incomplete'
     ) {
       throw new PluginBlockedError(state.last_error_code, 'Device sync is blocked until recovery completes.');
     }
@@ -1244,7 +1285,55 @@ export class ObtsPluginClient {
   }
 
   private async writeState(state: LocalPluginState): Promise<void> {
+    await this.backupExistingState();
     await writeJson(this.statePath, state);
+  }
+
+  private async backupExistingState(): Promise<void> {
+    try {
+      const state = JSON.parse(await readFile(this.statePath, 'utf8')) as LocalPluginState;
+      if (state.vault_id && state.device_id) {
+        await copyFile(this.statePath, `${this.statePath}.bak`);
+      }
+    } catch {
+      // Keep any existing backup when the primary state file is unreadable.
+    }
+  }
+
+  private async readBackupState(): Promise<LocalPluginState | null> {
+    try {
+      const state = JSON.parse(await readFile(`${this.statePath}.bak`, 'utf8')) as LocalPluginState;
+      if (state.vault_id && state.device_id) {
+        return state;
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  }
+
+  private async hasActiveTokenWithoutIdentity(state: LocalPluginState): Promise<boolean> {
+    return Boolean((!state.vault_id || !state.device_id) && (await exists(join(this.vaultDir, '.obts', 'auth', 'device-token.json'))));
+  }
+
+  private localStateIncomplete(state: LocalPluginState | null): LocalPluginState {
+    return {
+      user_id: state?.user_id ?? null,
+      vault_id: state?.vault_id ?? null,
+      device_id: state?.device_id ?? null,
+      device_name: state?.device_name ?? null,
+      device_ref: state?.device_ref ?? null,
+      server_device_ref: state?.server_device_ref ?? null,
+      local_main: state?.local_main ?? null,
+      local_head: state?.local_head ?? null,
+      initial_import_confirmed: state?.initial_import_confirmed ?? false,
+      status_label: 'Needs recovery',
+      last_error_code: 'local_state_incomplete',
+      last_event_seq: state?.last_event_seq ?? 0,
+      unpaired_baseline_vault_id: state?.unpaired_baseline_vault_id ?? null,
+      unpaired_baseline_main: state?.unpaired_baseline_main ?? null,
+      updated_at: nowIso()
+    };
   }
 
   private async writeQueue(queue: QueueState): Promise<void> {
@@ -1275,7 +1364,8 @@ function blockStatusLabel(code: string): string {
     code === 'replace_local_with_server_required' ||
     code === 'same_device_non_fast_forward' ||
     code === 'stale_device_ref' ||
-    code === 'device_blocked'
+    code === 'device_blocked' ||
+    code === 'local_state_incomplete'
   ) {
     return 'Needs recovery';
   }
@@ -1403,5 +1493,13 @@ async function exists(path: string): Promise<boolean> {
 
 async function writeJson(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  const temporaryPath = `${path}.tmp-${process.pid}-${Date.now()}`;
+  const handle = await open(temporaryPath, 'w', 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await rename(temporaryPath, path);
 }

@@ -94,6 +94,20 @@ module.exports = class ObtsPlugin extends Plugin {
       }
     });
 
+    this.addCommand({
+      id: "obts-reset-local-pairing-state",
+      name: "Reset local pairing state",
+      callback: async () => {
+        await this.runUserAction(async () => {
+          if (!window.confirm("Reset local obts pairing state? This removes local sync credentials after writing a recovery bundle when local files exist. Re-pair this device afterwards.")) {
+            return;
+          }
+          const result = await this.client.resetLocalPairingState();
+          new Notice(`obts: ${result.status}`);
+        });
+      }
+    });
+
     this.registerEvent(this.app.vault.on("create", (file) => this.queueSyncFromWatcher(file && file.path)));
     this.registerEvent(this.app.vault.on("modify", (file) => this.queueSyncFromWatcher(file && file.path)));
     this.registerEvent(this.app.vault.on("delete", (file) => this.queueSyncFromWatcher(file && file.path)));
@@ -654,6 +668,38 @@ class ObtsObsidianClient {
       updated_at: nowIso()
     });
     return { status: "Not paired" };
+  }
+
+  async resetLocalPairingState() {
+    const state = await this.readState();
+    const localFiles = await this.scanSyncableFiles();
+    const recoveryBundleId = localFiles.length > 0 ? await this.createRecoveryBundle("rebuild_from_server", state.local_main, localFiles) : null;
+    await fsp.rm(this.authPath, { force: true });
+    await this.writeQueue({
+      pending_commit: null,
+      expected_device_ref: null,
+      status: "idle",
+      attempts: 0,
+      updated_at: nowIso()
+    });
+    await this.writeState({
+      user_id: null,
+      vault_id: null,
+      device_id: null,
+      device_name: null,
+      device_ref: null,
+      server_device_ref: null,
+      local_main: null,
+      local_head: null,
+      initial_import_confirmed: false,
+      status_label: "Not paired",
+      last_error_code: null,
+      last_event_seq: 0,
+      unpaired_baseline_vault_id: null,
+      unpaired_baseline_main: null,
+      updated_at: nowIso()
+    });
+    return { status: "Not paired", recoveryBundleId };
   }
 
   async applyTargetMain(targetMain, changedPaths, allowDestructive, extraAffectedPaths = []) {
@@ -1342,27 +1388,87 @@ class ObtsObsidianClient {
   }
 
   async readState() {
-    return await readJson(this.statePath, {
-      user_id: null,
-      vault_id: null,
-      device_id: null,
-      device_name: null,
-      device_ref: null,
-      server_device_ref: null,
-      local_main: null,
-      local_head: null,
-      initial_import_confirmed: false,
-      status_label: "Checking",
-      last_error_code: null,
-      last_event_seq: 0,
-      unpaired_baseline_vault_id: null,
-      unpaired_baseline_main: null,
-      updated_at: nowIso()
-    });
+    try {
+      const state = JSON.parse(await fsp.readFile(this.statePath, "utf8"));
+      if (await this.hasActiveTokenWithoutIdentity(state)) {
+        return await this.readBackupState() || this.localStateIncomplete(state);
+      }
+      return state;
+    } catch {
+      if (await exists(this.authPath)) {
+        const backupState = await this.readBackupState();
+        return backupState || this.localStateIncomplete(null);
+      }
+      return {
+        user_id: null,
+        vault_id: null,
+        device_id: null,
+        device_name: null,
+        device_ref: null,
+        server_device_ref: null,
+        local_main: null,
+        local_head: null,
+        initial_import_confirmed: false,
+        status_label: "Checking",
+        last_error_code: null,
+        last_event_seq: 0,
+        unpaired_baseline_vault_id: null,
+        unpaired_baseline_main: null,
+        updated_at: nowIso()
+      };
+    }
   }
 
   async writeState(state) {
+    await this.backupExistingState();
     await writeJson(this.statePath, state);
+  }
+
+  async backupExistingState() {
+    try {
+      const state = JSON.parse(await fsp.readFile(this.statePath, "utf8"));
+      if (state.vault_id && state.device_id) {
+        await fsp.copyFile(this.statePath, `${this.statePath}.bak`);
+      }
+    } catch {
+      // Keep any existing backup when the primary state file is unreadable.
+    }
+  }
+
+  async readBackupState() {
+    try {
+      const state = JSON.parse(await fsp.readFile(`${this.statePath}.bak`, "utf8"));
+      if (state.vault_id && state.device_id) {
+        return state;
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  }
+
+  async hasActiveTokenWithoutIdentity(state) {
+    return Boolean((!state.vault_id || !state.device_id) && await exists(this.authPath));
+  }
+
+  localStateIncomplete(state) {
+    return {
+      user_id: state && state.user_id || null,
+      vault_id: state && state.vault_id || null,
+      device_id: state && state.device_id || null,
+      device_name: state && state.device_name || null,
+      device_ref: state && state.device_ref || null,
+      server_device_ref: state && state.server_device_ref || null,
+      local_main: state && state.local_main || null,
+      local_head: state && state.local_head || null,
+      initial_import_confirmed: state && state.initial_import_confirmed || false,
+      status_label: "Needs recovery",
+      last_error_code: "local_state_incomplete",
+      last_event_seq: state && state.last_event_seq || 0,
+      unpaired_baseline_vault_id: state && state.unpaired_baseline_vault_id || null,
+      unpaired_baseline_main: state && state.unpaired_baseline_main || null,
+      updated_at: nowIso()
+    };
   }
 
   async readQueue() {
@@ -1518,7 +1624,7 @@ class ObtsObsidianClient {
     if (state.last_error_code === "apply_journal_recovery_required") {
       throw new ObtsBlockedError("apply_journal_recovery_required", "An incomplete apply journal requires recovery before sync can continue.");
     }
-    if (state.last_error_code === "same_device_non_fast_forward" || state.last_error_code === "stale_device_ref" || state.last_error_code === "device_blocked") {
+    if (state.last_error_code === "same_device_non_fast_forward" || state.last_error_code === "stale_device_ref" || state.last_error_code === "device_blocked" || state.last_error_code === "local_state_incomplete") {
       throw new ObtsBlockedError(state.last_error_code, "Device sync is blocked until recovery completes.");
     }
   }
@@ -1549,6 +1655,7 @@ class ObtsSettingTab extends PluginSettingTab {
     containerEl.createEl("h2", { text: "Obsidian True Sync" });
     const state = await this.plugin.client.readState();
     const paired = Boolean(state.vault_id && state.device_id);
+    const recoveryBlocked = state.last_error_code === "local_state_incomplete";
     const deviceName = state.device_name || this.plugin.settings.deviceName || "Obsidian device";
 
     new Setting(containerEl)
@@ -1561,10 +1668,10 @@ class ObtsSettingTab extends PluginSettingTab {
       );
 
     const sectionHeader = containerEl.createDiv({ cls: "obts-settings-section-header" });
-    sectionHeader.createEl("h3", { text: paired ? "Device" : "Pair Device" });
+    sectionHeader.createEl("h3", { text: recoveryBlocked ? "Recovery required" : paired ? "Device" : "Pair Device" });
     sectionHeader.createEl("span", {
       cls: paired ? "obts-status-pill obts-status-pill--ok" : "obts-status-pill",
-      text: paired ? "Paired" : "Not paired"
+      text: recoveryBlocked ? "Needs recovery" : paired ? "Paired" : "Not paired"
     });
     if (paired) {
       new Setting(containerEl)
@@ -1622,6 +1729,39 @@ class ObtsSettingTab extends PluginSettingTab {
           }
         });
       const actionFeedback = containerEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
+    } else if (recoveryBlocked) {
+      new Setting(containerEl)
+        .setName("Status")
+        .setDesc("Local sync metadata is incomplete. The device token is still present, so normal sync and pairing are blocked until you reset and re-pair.");
+      new Setting(containerEl)
+        .setName("Recovery")
+        .addButton((button) => {
+          button
+            .setButtonText("Reset local pairing state")
+            .onClick(async () => {
+              if (!window.confirm("Reset local obts pairing state? This removes local sync credentials after writing a recovery bundle when local files exist. Re-pair this device afterwards.")) {
+                return;
+              }
+              button.setDisabled(true);
+              setFeedback(recoveryFeedback, "Resetting...", "muted");
+              try {
+                await this.plugin.client.resetLocalPairingState();
+                this.plugin.settings.pairingToken = "";
+                await this.plugin.saveSettings();
+                this.plugin.setStatus("Not paired");
+                new Notice("obts reset local pairing state. Re-pair this device to resume sync.");
+                await this.display();
+              } catch (error) {
+                setFeedback(recoveryFeedback, error instanceof Error ? error.message : "Reset failed.", "error");
+              } finally {
+                button.setDisabled(false);
+              }
+            });
+          if (typeof button.setWarning === "function") {
+            button.setWarning();
+          }
+        });
+      const recoveryFeedback = containerEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
     } else {
       new Setting(containerEl)
         .setName("Status")
@@ -1952,7 +2092,7 @@ function blockStatusLabel(code) {
   if (code === "conflict_review_required") {
     return "Review needed";
   }
-  if (code === "replace_local_with_server_required" || code === "device_blocked" || code === "stale_device_ref" || code === "same_device_non_fast_forward") {
+  if (code === "replace_local_with_server_required" || code === "device_blocked" || code === "stale_device_ref" || code === "same_device_non_fast_forward" || code === "local_state_incomplete") {
     return "Needs recovery";
   }
   if (code === "initial_import_confirmation_required") {
@@ -1971,7 +2111,15 @@ async function readJson(filePath, fallback) {
 
 async function writeJson(filePath, value) {
   await fsp.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  await fsp.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  const temporaryPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+  const handle = await fsp.open(temporaryPath, "w", 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await fsp.rename(temporaryPath, filePath);
 }
 
 async function exists(filePath) {
