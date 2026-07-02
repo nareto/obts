@@ -398,6 +398,23 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     });
   });
 
+  app.get('/api/v1/device/self', async (request) => {
+    const deviceAuth = await auth.authenticateDeviceAnyVault(request.headers.authorization);
+    const db = await store.snapshot();
+    return {
+      user_id: deviceAuth.user.user_id,
+      vault_id: deviceAuth.vault.vault_id,
+      device_id: deviceAuth.device.device_id,
+      device_name: deviceAuth.device.device_name,
+      device_ref: deviceAuth.device.device_ref,
+      server_device_ref: deviceAuth.device.device_ref_head,
+      current_main: deviceAuth.vault.current_main,
+      status: deviceAuth.device.status,
+      last_applied_main: deviceAuth.device.last_applied_main,
+      event_seq: db.event_seq_by_vault[deviceAuth.vault.vault_id] ?? 0
+    };
+  });
+
   app.post('/api/v1/vaults/:vaultId/sync/push', async (request, reply) => {
     const { vaultId } = pathParams(request);
     const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);

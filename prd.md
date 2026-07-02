@@ -167,11 +167,13 @@ Acceptance criteria:
 
 ### 3.4 Local Edit Sync
 
-When a user edits local vault files, the plugin records the edit as one or more hidden Git commits under `.obts/`, uploads Git packfiles over authenticated HTTPS, and keeps retry state durable.
+When a user edits local vault files, the visible local filesystem is the device's source of truth. The plugin records filesystem differences as one or more hidden Git commits under `.obts/`, uploads Git packfiles over authenticated HTTPS, and keeps retry state durable. Local `state.json` is recoverable coordination metadata, not authoritative content state.
 
 Acceptance criteria:
 
 - Local edits are durably committed or recoverably snapshotted before upload.
+- On startup and before sync decisions, the scanner commits visible filesystem differences to the local Git journal when path policy validation passes.
+- If `state.json` is missing, corrupt, or incomplete but the device token and local Git journal are intact, the plugin rehydrates non-secret identity/ref metadata from the server and resumes normal commit/upload behavior without reset or re-pair.
 - `.obts/` is excluded from vault sync, Git worktree content, and manifest/path scanning.
 - Retrying an upload of the same Git commit is idempotent.
 - A new local edit creates a new Git commit with normal Git ancestry.
@@ -551,15 +553,17 @@ Acceptance criteria:
 
 ### 3.11 Recovery And Rebuild
 
-If a client loses local state or apply fails, it can rebuild from server `main`.
+If a client loses authoritative local Git state or apply fails, it can rebuild from server `main`. Losing only local coordination metadata such as `state.json` is not a rebuild case when the device token and local Git journal remain intact; the plugin repairs metadata automatically and keeps the visible filesystem as the device source of truth.
 
 Behavior:
 
-1. Plugin stops normal sync.
-2. Plugin snapshots local pending edits and relevant hidden Git state into a recovery bundle.
-3. Plugin pulls current server `main`.
-4. Plugin applies server state to local vault.
-5. Plugin classifies preserved local state before resuming sync:
+1. If a device token exists but local coordination metadata is missing, corrupt, or incomplete, the plugin calls the device-authenticated self endpoint to recover vault ID, device ID, device ref, current server device ref, current server `main`, and event cursor metadata.
+2. When recovered local Git refs are present, the plugin commits any visible filesystem differences, then uploads the resulting local head through the device ref if the server accepts the update as a repeat or fast-forward.
+3. Plugin stops normal sync only when token auth fails, local Git state is missing/corrupt, path-policy validation fails, destructive apply is unsafe, or same-device ancestry cannot be proven safe against the server device ref.
+4. Plugin snapshots local pending edits and relevant hidden Git state into a recovery bundle before destructive rebuild/reset operations.
+5. Plugin pulls current server `main`.
+6. Plugin applies server state to local vault.
+7. Plugin classifies preserved local state before resuming sync:
    - pending fast-forward local commits whose ancestry descends from the current server device ref remain queued and are uploaded normally after rebuild;
    - uncommitted or snapshot-only local edits become one new local recovery commit based on the rebuilt local `main`, then enter the normal upload queue;
    - divergent same-device history that does not descend from the current server device ref remains only in the recovery bundle, the device enters `blocked_recovery`, and normal sync stays blocked until the owner exports the bundle and resets or re-pairs the device.
@@ -567,6 +571,8 @@ Behavior:
 Acceptance criteria:
 
 - Recovery never silently discards local edits.
+- Valid device token plus intact local Git state repairs lost `state.json` automatically and does not force replace-local-with-server.
+- Filesystem edits made while metadata was missing become local Git commits and are uploaded to the server device ref before any destructive pull/apply.
 - Recovery bundles are available before destructive apply or rebuild operations.
 - Recovery can distinguish repeated commits, new commits, and divergent same-device history using Git ancestry.
 - Recovery never uploads same-device divergent history through a non-fast-forward device ref update.
@@ -576,25 +582,27 @@ Acceptance criteria:
 ### 4.1 System Principles
 
 1. Git is the authoritative internal history engine for vault content.
-2. `refs/heads/main` is the only published server state for a vault.
-3. Each paired device uploads through a protected server-side device ref such as `refs/obts/devices/{device_id}`; device refs are internal merge candidates, not user-visible Git branches.
-4. Clients commit locally; only server merge/resolution transactions advance `main`.
-5. Git commit hashes identify immutable commits; parent links define ancestry; timestamps are display metadata only.
-6. The server uses the native `git` CLI as the authoritative server-side Git implementation.
-7. The Obsidian plugin uses `isomorphic-git` for client-side Git operations.
-8. Persistent server-side Git state is protected by deployment-managed storage controls in v1.
-9. Authorization is enforced at every vault-scoped boundary, and v1 vaults are single-owner in a multi-tenant instance.
-10. No `.git` directory appears in the visible Obsidian vault.
-11. Local commits, recovery snapshots, and recovery bundles are durable before destructive operations.
-12. Obsidian configuration sync uses an explicit file policy; `.obts/` is always excluded.
-13. Every paired device syncs the same full-vault content set.
-14. Hard path exclusions are global and deterministic: `.obts/**` is never synced, visible `.git/**` paths are rejected, `.obsidian/cache/**`, `.obsidian/workspace.json`, `.obsidian/workspace-mobile.json`, and `.obsidian/plugins/obts/**` are excluded, while `.trash/**` and other `.obsidian/**` paths are normal vault content.
+2. The visible local filesystem is the paired device's source of truth; local `.obts/git` is the durable journal/cache that must catch up to it automatically.
+3. Local `state.json` is recoverable coordination metadata and must not be treated as authoritative content state.
+4. `refs/heads/main` is the only published server state for a vault.
+5. Each paired device uploads through a protected server-side device ref such as `refs/obts/devices/{device_id}`; device refs are internal merge candidates, not user-visible Git branches.
+6. Clients commit locally; only server merge/resolution transactions advance `main`.
+7. Git commit hashes identify immutable commits; parent links define ancestry; timestamps are display metadata only.
+8. The server uses the native `git` CLI as the authoritative server-side Git implementation.
+9. The Obsidian plugin uses `isomorphic-git` for client-side Git operations.
+10. Persistent server-side Git state is protected by deployment-managed storage controls in v1.
+11. Authorization is enforced at every vault-scoped boundary, and v1 vaults are single-owner in a multi-tenant instance.
+12. No `.git` directory appears in the visible Obsidian vault.
+13. Local commits, recovery snapshots, and recovery bundles are durable before destructive operations.
+14. Obsidian configuration sync uses an explicit file policy; `.obts/` is always excluded.
+15. Every paired device syncs the same full-vault content set.
+16. Hard path exclusions are global and deterministic: `.obts/**` is never synced, visible `.git/**` paths are rejected, `.obsidian/cache/**`, `.obsidian/workspace.json`, `.obsidian/workspace-mobile.json`, and `.obsidian/plugins/obts/**` are excluded, while `.trash/**` and other `.obsidian/**` paths are normal vault content.
 
 ### 4.2 Containers
 
 - **Server API and CLI:** TypeScript/Node/Fastify service for auth, vaults, devices, Git sync, merge, conflicts, note history, persistent-state checks, and health.
 - **Dashboard SPA:** browser UI served by the server for setup, device dashboard, conflict review, and maintenance.
-- **Obsidian plugin:** TypeScript plugin that watches local vaults, records hidden Git commits with `isomorphic-git`, uploads device ref updates, pulls `main`, and applies accepted state.
+- **Obsidian plugin:** TypeScript plugin that watches the visible local filesystem as the device source of truth, records hidden Git commits with `isomorphic-git`, rehydrates recoverable metadata from device-token auth, uploads device ref updates, pulls `main`, and applies accepted state.
 - **Postgres:** control-plane metadata for users, single-owner vaults, devices, token hashes, durable sync operations, derived indexes, conflict workflow records, event log rows, sync attempts, and audit records. Postgres does not own the authoritative commit graph, tree manifests, blobs, or refs.
 - **Server Git store:** per-vault internal Git repositories, object databases, packs, refs, trees, commits, blobs, and history state stored outside visible vaults.
 - **Temporary Git workspace:** ephemeral plaintext bare repos and working trees for sync, merge, history, conflict review, restore, and maintenance transactions; cleaned after transaction.
@@ -935,6 +943,7 @@ Conflict review lifecycle:
 ### 6.5 Main APIs
 
 - `POST /api/v1/pair/consume`: consume a pairing token and register a device.
+- `GET /api/v1/device/self`: authenticate a device token without a vault ID in the URL and return non-secret identity/ref metadata for local metadata repair.
 - `GET /api/v1/vaults/{vault_id}/main`: return current `main` metadata and authorized summary.
 - `POST /api/v1/vaults/{vault_id}/sync/push`: upload a push manifest and Git packfile, then request a device ref update.
 - `POST /api/v1/vaults/{vault_id}/sync/pull`: request a target `main` and receive a pull manifest plus Git packfile needed to reach it.
@@ -1352,7 +1361,7 @@ Acceptance proof:
 - note history indexing and restore commit creation;
 - conflict creation and resolution;
 - stale conflict review and idempotent duplicate resolution submission;
-- local queue, fixed apply journal schema, fixed recovery bundle schema, and Git state crash recovery.
+- local queue, fixed apply journal schema, fixed recovery bundle schema, metadata rehydration, and Git state crash recovery.
 
 ### 11.2 Integration Tests
 
@@ -1366,6 +1375,7 @@ Acceptance proof:
 - repeated push of the same commit is idempotent;
 - new commit advances the device ref;
 - same-device non-fast-forward update blocks and requires recovery;
+- lost `state.json` with a valid device token and intact local Git refs rehydrates automatically, then uploads filesystem edits through the device ref;
 - concurrent disjoint edits auto-merge;
 - concurrent same-file Markdown edits merge when safe;
 - concurrent same-file `.canvas` edits merge when the JSON Canvas semantic merge contract accepts them;

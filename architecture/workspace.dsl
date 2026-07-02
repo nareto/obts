@@ -39,7 +39,7 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
         resolutionEditor = component "ResolutionEditor" "Lets the owner accept server, accept device, keep both, or author a manual merged result." "TypeScript"
       }
 
-      plugin = container "Obsidian plugin" "PRD-specified Obsidian community plugin that watches local vault changes, snapshots edits, uploads proposals, applies server main, and exposes sync status." "TypeScript, Obsidian Plugin API" {
+      plugin = container "Obsidian plugin" "Obsidian community plugin that treats visible vault files as the device source of truth, journals them in local Git, rehydrates recoverable metadata, uploads device refs, applies server main, and exposes sync status." "TypeScript, Obsidian Plugin API" {
         settingsView = component "SettingsView" "Collects server URL, pairing token/login, and device name." "TypeScript"
         statusBar = component "StatusBar" "Displays Synced, Ahead, Behind, Uploading, Applying, Offline, Blocked, Unsafe local error, and Needs recovery states." "TypeScript"
         vaultWatcher = component "VaultWatcher" "Observes local vault changes through Obsidian APIs." "TypeScript, Obsidian Vault API"
@@ -48,13 +48,14 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
         snapshotEngine = component "SnapshotEngine" "Persists local edits as durable proposals before upload or destructive apply operations." "TypeScript"
         localQueue = component "LocalQueue" "Stores pending proposal, retry, cache, recovery, lock, diagnostic, and managed-config state under .obts." "TypeScript"
         localContentCache = component "LocalContentCache" "Caches content needed for retry, pull, apply, and recovery." "TypeScript"
-        transportClient = component "TransportClient" "Calls server APIs, uploads full-vault content/proposals, pulls diffs, and subscribes to events with polling fallback." "TypeScript"
+        metadataRepair = component "MetadataRepair" "Uses device-token auth and local Git refs to rehydrate lost state.json metadata before normal sync decisions." "TypeScript"
+        transportClient = component "TransportClient" "Calls server APIs, rehydrates device identity metadata, uploads full-vault content/proposals, pulls diffs, and subscribes to events with polling fallback." "TypeScript"
         applyEngine = component "ApplyEngine" "Applies accepted server main changes inside the full-vault path policy after creating local recovery snapshots." "TypeScript, Obsidian Vault API"
         diagnosticsExporter = component "DiagnosticsExporter" "Exports redacted diagnostics for support and recovery workflows." "TypeScript"
       }
 
-      localVault = container "User-visible vault files" "Local Obsidian vault content on a paired device. The plugin reads/writes this through Obsidian APIs; it must not place a .git directory here." "Obsidian Vault API and local filesystem" "File System"
-      localStore = container ".obts local store" "Client-local queue, cache, proposals, recovery bundles, locks, diagnostics, and device token state. It is excluded from sync scanning and manifest creation." "Local filesystem and platform secure storage" "File System"
+      localVault = container "User-visible vault files" "Local Obsidian vault content on a paired device. This visible filesystem is the device source of truth; the plugin reads/writes it through Obsidian APIs and must not place a .git directory here." "Obsidian Vault API and local filesystem" "File System"
+      localStore = container ".obts local store" "Client-local Git journal, recoverable state.json metadata, queue, cache, recovery bundles, locks, diagnostics, and device token state. It is excluded from sync scanning and manifest creation." "Local filesystem and platform secure storage" "File System"
       postgres = container "Server metadata database" "Stores users, vaults, wrapped data keys, devices, token hashes, content catalog, commits, manifest entries, proposals, conflicts, and audit records." "PostgreSQL" "Database"
       contentStore = container "Encrypted-at-rest content store" "Stores vault file bytes, attachments, conflict payloads, recovery bundles, and compacted snapshots encrypted with per-vault data keys." "Local filesystem" "File System"
       historyStore = container "Internal history store" "Stores immutable commit graph, branch-like refs, manifests, and merge provenance. Content bytes are persisted through the encrypted content store." "Git-compatible local filesystem" "File System"
@@ -132,15 +133,15 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
       }
     }
 
-    obts.plugin -> obts.server "Pairs devices, uploads content and proposals, pulls diffs, receives conflict state, and subscribes to events." "HTTPS/WSS" {
+    obts.plugin -> obts.server "Pairs devices, rehydrates identity/ref metadata, uploads content and proposals, pulls diffs, receives conflict state, and subscribes to events." "HTTPS/WSS" {
       properties {
         "ops" "read,write,consume"
         "protocol" "HTTPS,WSS"
-        "data" "vault paths, content, proposals, diffs, events over TLS"
+        "data" "non-secret device metadata, vault paths, content, proposals, diffs, events over TLS"
       }
     }
 
-    obts.plugin -> obts.localVault "Reads local vault content and applies accepted server main changes after local recovery snapshots." "Obsidian Vault API" {
+    obts.plugin -> obts.localVault "Reads local vault content as the device source of truth and applies accepted server main changes after local recovery snapshots." "Obsidian Vault API" {
       properties {
         "ops" "read,write"
         "protocol" "Obsidian Vault API"
@@ -148,7 +149,7 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
       }
     }
 
-    obts.plugin -> obts.localStore "Persists durable local proposals, content cache, recovery bundles, cursors, diagnostics, and device token state." "Local filesystem and platform secure storage" {
+    obts.plugin -> obts.localStore "Persists local Git journal, recoverable metadata, durable local proposals, content cache, recovery bundles, cursors, diagnostics, and device token state." "Local filesystem and platform secure storage" {
       properties {
         "ops" "read,write"
         "protocol" "filesystem,secure-storage"
@@ -439,7 +440,7 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
       }
     }
 
-    obts.plugin.periodicScanner -> obts.localVault "Scans vault files to detect missed watcher events and crash recovery work." "Obsidian Vault API" {
+    obts.plugin.periodicScanner -> obts.localVault "Scans vault files to detect missed watcher events, commit filesystem differences, and drive crash recovery work." "Obsidian Vault API" {
       properties {
         "ops" "read"
         "protocol" "Obsidian Vault API"
@@ -483,11 +484,27 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
       }
     }
 
-    obts.plugin.transportClient -> obts.server "Uploads full-vault content and proposals, pulls diffs, lists conflict state, and subscribes to events." "HTTPS/WSS" {
+    obts.plugin.metadataRepair -> obts.localStore "Reads device token and local Git refs, then rewrites recoverable state.json metadata after server rehydration." "Filesystem" {
+      properties {
+        "ops" "read,write"
+        "protocol" "filesystem"
+        "data" "device token presence, Git refs, state metadata"
+        "write-surface" ".obts/"
+      }
+    }
+
+    obts.plugin.metadataRepair -> obts.plugin.transportClient "Requests device self metadata without needing a vault ID from state.json." "TypeScript calls" {
+      properties {
+        "ops" "read"
+        "protocol" "in-process"
+      }
+    }
+
+    obts.plugin.transportClient -> obts.server "Calls device self metadata repair, uploads full-vault content and proposals, pulls diffs, lists conflict state, and subscribes to events." "HTTPS/WSS" {
       properties {
         "ops" "read,write,consume"
         "protocol" "HTTPS,WSS"
-        "data" "vault content, scoped proposals, diffs, events over TLS"
+        "data" "non-secret device metadata, vault content, scoped proposals, diffs, events over TLS"
       }
     }
 

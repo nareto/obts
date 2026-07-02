@@ -82,6 +82,19 @@ export type ConsumePairingTokenResponse = {
   is_first_device: boolean;
 };
 
+export type DeviceSelfResponse = {
+  user_id: string;
+  vault_id: string;
+  device_id: string;
+  device_name: string;
+  device_ref: string;
+  server_device_ref: string | null;
+  current_main: string;
+  status: 'paired' | 'synced' | 'ahead' | 'review_needed' | 'blocked_recovery' | 'revoked';
+  last_applied_main: string | null;
+  event_seq: number;
+};
+
 export type DevicePushManifest = {
   api_version: typeof API_VERSION;
   vault_id: string;

@@ -571,6 +571,17 @@ export class AuthService {
   }
 
   async authenticateDevice(authorizationHeader: string | undefined, vaultId: string): Promise<AuthenticatedDevice> {
+    return await this.authenticateDeviceToken(authorizationHeader, vaultId);
+  }
+
+  async authenticateDeviceAnyVault(authorizationHeader: string | undefined): Promise<AuthenticatedDevice> {
+    return await this.authenticateDeviceToken(authorizationHeader, null);
+  }
+
+  private async authenticateDeviceToken(
+    authorizationHeader: string | undefined,
+    expectedVaultId: string | null
+  ): Promise<AuthenticatedDevice> {
     const token = parseBearer(authorizationHeader);
     const tokenHash = hashToken(token);
     return await this.store.mutate((db) => {
@@ -580,7 +591,7 @@ export class AuthService {
           candidate.lookup_prefix === tokenHash.lookupPrefix &&
           candidate.token_hash === tokenHash.hash
       );
-      if (!row || row.revoked_at || !row.device_id || row.vault_id !== vaultId) {
+      if (!row || row.revoked_at || !row.device_id || (expectedVaultId !== null && row.vault_id !== expectedVaultId)) {
         throw new AuthError(404, 'not_found', 'Resource not found.');
       }
       const user = db.users.find((candidate) => candidate.user_id === row.user_id);
@@ -590,7 +601,7 @@ export class AuthService {
         !user ||
         user.disabled ||
         !vault ||
-        vault.vault_id !== vaultId ||
+        (expectedVaultId !== null && vault.vault_id !== expectedVaultId) ||
         vault.owner_user_id !== user.user_id ||
         !device ||
         device.revoked_at ||

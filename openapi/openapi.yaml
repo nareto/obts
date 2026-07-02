@@ -289,6 +289,20 @@ paths:
                 $ref: "#/components/schemas/ConsumePairingTokenResponse"
         "401":
           $ref: "#/components/responses/Error"
+  /device/self:
+    get:
+      summary: Return non-secret identity and ref metadata for the current device token.
+      security:
+        - deviceBearer: []
+      responses:
+        "200":
+          description: Current paired device metadata for metadata repair.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceSelfResponse"
+        "404":
+          $ref: "#/components/responses/Error"
   /vaults/{vault_id}/sync/push:
     post:
       summary: Upload a device commit pack and request a protected device-ref update.
@@ -634,6 +648,49 @@ components:
           pattern: "^[0-9a-f]{40}$"
         is_first_device:
           type: boolean
+    DeviceSelfResponse:
+      type: object
+      required:
+        - user_id
+        - vault_id
+        - device_id
+        - device_name
+        - device_ref
+        - server_device_ref
+        - current_main
+        - status
+        - last_applied_main
+        - event_seq
+      properties:
+        user_id:
+          type: string
+        vault_id:
+          type: string
+        device_id:
+          type: string
+        device_name:
+          type: string
+        device_ref:
+          type: string
+        server_device_ref:
+          oneOf:
+            - type: "null"
+            - type: string
+              pattern: "^[0-9a-f]{40}$"
+        current_main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        status:
+          type: string
+          enum: [paired, synced, ahead, review_needed, blocked_recovery, revoked]
+        last_applied_main:
+          oneOf:
+            - type: "null"
+            - type: string
+              pattern: "^[0-9a-f]{40}$"
+        event_seq:
+          type: integer
+          minimum: 0
     DevicePushManifest:
       type: object
       required:

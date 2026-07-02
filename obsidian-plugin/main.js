@@ -248,8 +248,8 @@ class ObtsObsidianClient {
     await this.git(["init"]);
     await fsp.mkdir(path.join(this.gitdir, "info"), { recursive: true, mode: 0o700 });
     await fsp.writeFile(path.join(this.gitdir, "info", "exclude"), ".obts/\n.git/\n", { mode: 0o600 });
+    const state = await this.repairLocalStateIfNeeded(await this.readState());
     const journal = await readJson(this.applyJournalPath, null);
-    const state = await this.readState();
     if (journal && journal.phase === "committed") {
       await this.updateRef("refs/heads/main", journal.target_main, null, true);
       await this.updateRef("refs/heads/local", journal.target_main, null, true);
@@ -1129,6 +1129,16 @@ class ObtsObsidianClient {
     return await this.gitBuffer(["show", `${commit}:${filePath}`], undefined, { maxBuffer: 512 * 1024 * 1024 });
   }
 
+  async getDeviceSelf(token) {
+    const response = await fetch(this.url("/api/v1/device/self"), {
+      headers: { authorization: `Bearer ${token}` }
+    });
+    if (!response.ok) {
+      await throwResponseError(response);
+    }
+    return await response.json();
+  }
+
   async pull(vaultId, deviceId, token, currentLocalMain, requestedTarget = "latest") {
     const form = new FormData();
     form.append("manifest", JSON.stringify({
@@ -1422,6 +1432,64 @@ class ObtsObsidianClient {
   async writeState(state) {
     await this.backupExistingState();
     await writeJson(this.statePath, state);
+  }
+
+  async repairLocalStateIfNeeded(state) {
+    if (state.last_error_code !== "local_state_incomplete") {
+      return state;
+    }
+    let token;
+    try {
+      token = await this.readDeviceToken();
+    } catch {
+      return state;
+    }
+    try {
+      const self = await this.getDeviceSelf(token);
+      const localMain = await this.resolveRef("refs/heads/main");
+      const localHead = await this.resolveRef("refs/heads/local");
+      if (!localMain && !localHead) {
+        return this.localStateIncomplete(Object.assign({}, state, {
+          user_id: self.user_id,
+          vault_id: self.vault_id,
+          device_id: self.device_id,
+          device_name: self.device_name,
+          device_ref: self.device_ref,
+          server_device_ref: self.server_device_ref
+        }));
+      }
+      await this.importCurrentServerMain(self.vault_id, self.device_id, token, localMain);
+      const repaired = {
+        user_id: self.user_id,
+        vault_id: self.vault_id,
+        device_id: self.device_id,
+        device_name: self.device_name,
+        device_ref: self.device_ref,
+        server_device_ref: self.server_device_ref,
+        local_main: localMain,
+        local_head: localHead || localMain,
+        initial_import_confirmed: true,
+        status_label: self.status === "review_needed" || self.status === "blocked_recovery" ? "Needs recovery" : "Checking",
+        last_error_code: self.status === "review_needed" || self.status === "blocked_recovery" ? "device_blocked" : null,
+        last_event_seq: self.event_seq,
+        unpaired_baseline_vault_id: null,
+        unpaired_baseline_main: null,
+        updated_at: nowIso()
+      };
+      await this.writeState(repaired);
+      return repaired;
+    } catch {
+      return state;
+    }
+  }
+
+  async importCurrentServerMain(vaultId, deviceId, token, localMain) {
+    try {
+      const pulled = await this.pull(vaultId, deviceId, token, localMain, "latest");
+      await this.importPack(pulled.packfile);
+    } catch {
+      // Metadata repair can continue without fresh main objects; sync will retry and block safely if needed.
+    }
   }
 
   async backupExistingState() {

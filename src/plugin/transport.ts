@@ -2,6 +2,7 @@ import {
   API_VERSION,
   type DevicePullManifest,
   type DevicePushManifest,
+  type DeviceSelfResponse,
   type EventEnvelope,
   type PushResult
 } from '../shared/types.js';
@@ -33,6 +34,15 @@ export class TransportClient {
       })
     });
     return await readJsonOrThrow<PairConsumeResult>(response);
+  }
+
+  async getDeviceSelf(deviceToken: string): Promise<DeviceSelfResponse> {
+    const response = await fetch(this.url('/api/v1/device/self'), {
+      headers: {
+        authorization: `Bearer ${deviceToken}`
+      }
+    });
+    return await readJsonOrThrow<DeviceSelfResponse>(response);
   }
 
   async push(input: {

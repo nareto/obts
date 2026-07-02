@@ -25,6 +25,7 @@ describe('OpenAPI Phase 1 contract', () => {
       '/vaults/{vault_id}/pairing-tokens',
       '/vaults/{vault_id}/devices/{device_id}/revoke',
       '/pair/consume',
+      '/device/self',
       '/vaults/{vault_id}/sync/push',
       '/vaults/{vault_id}/sync/pull',
       '/vaults/{vault_id}/sync/events',
@@ -39,6 +40,8 @@ describe('OpenAPI Phase 1 contract', () => {
     expect(contract).toContain('__Host-obts_session');
     expect(contract).toContain('X-OBTS-CSRF');
     expect(contract).toContain('ConsumePairingTokenResponse');
+    expect(contract).toContain('DeviceSelfResponse');
+    expect(contract).toContain('server_device_ref');
     expect(contract).toContain('is_first_device');
     expect(contract).toContain('ConflictRecord');
     expect(contract).toContain('validator_results');

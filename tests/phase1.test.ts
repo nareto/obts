@@ -2190,6 +2190,97 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect((await plugin.readState()).device_id).toMatch(/^dev_/u);
   });
 
+  it('repairs lost local metadata and uploads filesystem edits through the device ref', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'repaired-laptop');
+    const plugin = await pairPlugin(admin, deviceDir, 'laptop');
+    const pairedState = await plugin.readState();
+    await writeFile(join(deviceDir, 'laptop-only.md'), 'written while metadata was lost\n');
+    await writeFile(
+      join(deviceDir, '.obts', 'state.json'),
+      `${JSON.stringify({
+        user_id: null,
+        vault_id: null,
+        device_id: null,
+        device_name: null,
+        device_ref: null,
+        server_device_ref: null,
+        local_main: null,
+        local_head: null,
+        initial_import_confirmed: false,
+        status_label: 'Checking',
+        last_error_code: null,
+        last_event_seq: 0,
+        updated_at: new Date().toISOString()
+      })}\n`
+    );
+    await rm(join(deviceDir, '.obts', 'state.json.bak'), { force: true });
+
+    const repaired = new ObtsPluginClient(deviceDir, {
+      serverUrl: baseUrlFromAdmin(admin),
+      deviceName: 'laptop',
+    });
+    await repaired.initialize();
+    expect(await repaired.readState()).toMatchObject({
+      vault_id: pairedState.vault_id,
+      device_id: pairedState.device_id,
+      last_error_code: null
+    });
+
+    expect((await repaired.syncOnce()).status).toBe('Synced');
+    const secondDir = join(root, 'repaired-phone');
+    const second = await pairPlugin(admin, secondDir, 'phone');
+    expect((await second.readState()).status_label).toBe('Synced');
+    expect(await readFile(join(secondDir, 'laptop-only.md'), 'utf8')).toBe('written while metadata was lost\n');
+  });
+
+  it('uploads repaired local edits into server conflict state instead of requiring replace-local', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'repair-conflict-desktop');
+    const laptopDir = join(root, 'repair-conflict-laptop');
+    await mkdirp(desktopDir);
+    await mkdirp(laptopDir);
+    await writeFile(join(desktopDir, 'shared.md'), 'base\n');
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await desktop.syncOnce({ confirmInitialImport: true });
+    await pairPlugin(admin, laptopDir, 'laptop');
+    expect(await readFile(join(laptopDir, 'shared.md'), 'utf8')).toBe('base\n');
+
+    await writeFile(join(laptopDir, 'shared.md'), 'laptop edit while metadata was lost\n');
+    await writeFile(
+      join(laptopDir, '.obts', 'state.json'),
+      `${JSON.stringify({
+        user_id: null,
+        vault_id: null,
+        device_id: null,
+        device_name: null,
+        device_ref: null,
+        server_device_ref: null,
+        local_main: null,
+        local_head: null,
+        initial_import_confirmed: false,
+        status_label: 'Checking',
+        last_error_code: null,
+        last_event_seq: 0,
+        updated_at: new Date().toISOString()
+      })}\n`
+    );
+    await rm(join(laptopDir, '.obts', 'state.json.bak'), { force: true });
+
+    await writeFile(join(desktopDir, 'shared.md'), 'desktop edit reaches main first\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const repairedLaptop = new ObtsPluginClient(laptopDir, {
+      serverUrl: baseUrlFromAdmin(admin),
+      deviceName: 'laptop',
+    });
+    const result = await repairedLaptop.syncOnce();
+    expect(result.status).toBe('Review needed');
+    expect(result.conflictId).toMatch(/^conf_/u);
+    expect((await repairedLaptop.readState()).last_error_code).toBe('conflict_review_required');
+    expect(await readFile(join(laptopDir, 'shared.md'), 'utf8')).toBe('laptop edit while metadata was lost\n');
+  });
+
   it('fails readiness closed when metadata points at missing Git state', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const before = await fetch(`${baseUrl}/health/ready`);

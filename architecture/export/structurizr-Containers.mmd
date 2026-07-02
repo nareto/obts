@@ -12,12 +12,12 @@ graph LR
 
       22["Dashboard SPA [Container: TypeScript, static SPA]"]
       29["Obsidian plugin [Container: TypeScript, Obsidian Plugin API]"]
-      41["User-visible vault files [Container: Obsidian Vault API and local filesystem]"]
-      42[".obts local store [Container: Local filesystem and platform secure storage]"]
-      43[("Server metadata database [Container: PostgreSQL]")]
-      44["Encrypted-at-rest content store [Container: Local filesystem]"]
-      45["Internal history store [Container: Git-compatible local filesystem]"]
-      46["Temporary merge workspace [Container: Local filesystem]"]
+      42["User-visible vault files [Container: Obsidian Vault API and local filesystem]"]
+      43[".obts local store [Container: Local filesystem and platform secure storage]"]
+      44[("Server metadata database [Container: PostgreSQL]")]
+      45["Encrypted-at-rest content store [Container: Local filesystem]"]
+      46["Internal history store [Container: Git-compatible local filesystem]"]
+      47["Temporary merge workspace [Container: Local filesystem]"]
       7["Server API and CLI [Container: TypeScript, Node.js, Fastify]"]
     end
 
@@ -28,14 +28,14 @@ graph LR
     7-. "Serves static dashboard assets. [HTTP]" .->22
     22-. "Calls setup, dashboard, conflict, resolution, key rewrap, compact, and health APIs. [HTTPS]" .->7
     29-. "Uses vault, workspace, settings, status bar, command, and request APIs. [Obsidian Plugin API]" .->4
-    29-. "Pairs devices, uploads content and proposals, pulls diffs, receives conflict state, and subscribes to events. [HTTPS/WSS]" .->7
-    29-. "Reads local vault content and applies accepted server main changes after local recovery snapshots. [Obsidian Vault API]" .->41
-    29-. "Persists durable local proposals, content cache, recovery bundles, cursors, diagnostics, and device token state. [Local filesystem and platform secure storage]" .->42
+    29-. "Pairs devices, rehydrates identity/ref metadata, uploads content and proposals, pulls diffs, receives conflict state, and subscribes to events. [HTTPS/WSS]" .->7
+    29-. "Reads local vault content as the device source of truth and applies accepted server main changes after local recovery snapshots. [Obsidian Vault API]" .->42
+    29-. "Persists local Git journal, recoverable metadata, durable local proposals, content cache, recovery bundles, cursors, diagnostics, and device token state. [Local filesystem and platform secure storage]" .->43
     7-. "Loads server master key material for per-vault data key unwrap and rewrap operations. [Environment variable, secret mount, or KMS API]" .->5
-    7-. "Reads and writes account, vault, wrapped key, device, token, content catalog, proposal, conflict, audit, and history metadata. [SQL]" .->43
-    7-. "Stores and reads vault content encrypted at rest. [Filesystem]" .->44
-    7-. "Maintains canonical main refs, immutable commit graph, manifests, and merge provenance. [Git-compatible local filesystem]" .->45
-    7-. "Uses ephemeral plaintext working trees for server-side merge transactions. [Filesystem]" .->46
+    7-. "Reads and writes account, vault, wrapped key, device, token, content catalog, proposal, conflict, audit, and history metadata. [SQL]" .->44
+    7-. "Stores and reads vault content encrypted at rest. [Filesystem]" .->45
+    7-. "Maintains canonical main refs, immutable commit graph, manifests, and merge provenance. [Git-compatible local filesystem]" .->46
+    7-. "Uses ephemeral plaintext working trees for server-side merge transactions. [Filesystem]" .->47
     7-. "Emits main advancement, conflict, device state, and maintenance events. [WebSocket]" .->29
 
   end

@@ -82,7 +82,7 @@ export class ObtsPluginClient {
   async initialize(): Promise<void> {
     await mkdir(join(this.vaultDir, '.obts', 'auth'), { recursive: true, mode: 0o700 });
     await this.git.initialize();
-    const state = await this.readState();
+    const state = await this.repairLocalStateIfNeeded(await this.readState());
     const journal = await this.recovery.readApplyJournal();
     if (journal && journal.phase === 'committed') {
       await this.git.setLocalMain(journal.target_main);
@@ -1287,6 +1287,76 @@ export class ObtsPluginClient {
   private async writeState(state: LocalPluginState): Promise<void> {
     await this.backupExistingState();
     await writeJson(this.statePath, state);
+  }
+
+  private async repairLocalStateIfNeeded(state: LocalPluginState): Promise<LocalPluginState> {
+    if (state.last_error_code !== 'local_state_incomplete') {
+      return state;
+    }
+    let token: string;
+    try {
+      token = await this.readDeviceToken();
+    } catch {
+      return state;
+    }
+    try {
+      const self = await this.transport.getDeviceSelf(token);
+      const localMain = await this.git.resolveRef('refs/heads/main');
+      const localHead = await this.git.resolveRef('refs/heads/local');
+      if (!localMain && !localHead) {
+        return this.localStateIncomplete({
+          ...state,
+          user_id: self.user_id,
+          vault_id: self.vault_id,
+          device_id: self.device_id,
+          device_name: self.device_name,
+          device_ref: self.device_ref,
+          server_device_ref: self.server_device_ref
+        });
+      }
+      await this.importCurrentServerMain(self.vault_id, self.device_id, token, localMain);
+      const repaired: LocalPluginState = {
+        user_id: self.user_id,
+        vault_id: self.vault_id,
+        device_id: self.device_id,
+        device_name: self.device_name,
+        device_ref: self.device_ref,
+        server_device_ref: self.server_device_ref,
+        local_main: localMain,
+        local_head: localHead ?? localMain,
+        initial_import_confirmed: true,
+        status_label: self.status === 'review_needed' || self.status === 'blocked_recovery' ? 'Needs recovery' : 'Checking',
+        last_error_code: self.status === 'review_needed' || self.status === 'blocked_recovery' ? 'device_blocked' : null,
+        last_event_seq: self.event_seq,
+        unpaired_baseline_vault_id: null,
+        unpaired_baseline_main: null,
+        updated_at: nowIso()
+      };
+      await this.writeState(repaired);
+      return repaired;
+    } catch {
+      return state;
+    }
+  }
+
+  private async importCurrentServerMain(
+    vaultId: string,
+    deviceId: string,
+    token: string,
+    localMain: string | null
+  ): Promise<void> {
+    try {
+      const pulled = await this.transport.pull({
+        vaultId,
+        deviceId,
+        deviceToken: token,
+        currentLocalMain: localMain,
+        requestedTarget: 'latest'
+      });
+      await this.git.importPack(pulled.packfile);
+    } catch {
+      // Metadata repair can continue without fresh main objects; sync will retry and block safely if needed.
+    }
   }
 
   private async backupExistingState(): Promise<void> {
