@@ -1197,6 +1197,75 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(rePairedState.device_id).not.toBe(state.device_id);
   });
 
+  it('fast-forwards a clean re-pair from a detached unpaired baseline', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'clean-repair-desktop');
+    await mkdirp(desktopDir);
+    await writeFile(join(desktopDir, 'shared.md'), 'old server state\n');
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await expect(desktop.syncOnce()).rejects.toMatchObject({ code: 'initial_import_confirmation_required' });
+    await desktop.syncOnce({ confirmInitialImport: true });
+    const oldDesktopState = await desktop.readState();
+    expect(oldDesktopState.local_main).toMatch(/^[0-9a-f]{40}$/u);
+
+    await desktop.unpairCurrentDevice();
+    const unpairedState = await desktop.readState();
+    expect(unpairedState.unpaired_baseline_vault_id).toBe(admin.vaultId);
+    expect(unpairedState.unpaired_baseline_main).toBe(oldDesktopState.local_main);
+
+    const laptopDir = join(root, 'clean-repair-laptop');
+    await mkdirp(laptopDir);
+    const laptop = await pairPlugin(admin, laptopDir, 'laptop');
+    expect(await readFile(join(laptopDir, 'shared.md'), 'utf8')).toBe('old server state\n');
+    await writeFile(join(laptopDir, 'shared.md'), 'new server state\n');
+    expect((await laptop.syncOnce()).status).toBe('Synced');
+    const newLaptopState = await laptop.readState();
+    expect(newLaptopState.local_main).toMatch(/^[0-9a-f]{40}$/u);
+    expect(newLaptopState.local_main).not.toBe(oldDesktopState.local_main);
+
+    const rePairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
+      device_name: 'desktop',
+      sync_profile: 'notes_only'
+    });
+    expect(rePairing.status).toBe(201);
+    await desktop.pairWithToken(rePairing.body.pairing_token);
+
+    expect(await readFile(join(desktopDir, 'shared.md'), 'utf8')).toBe('new server state\n');
+    const repairedState = await desktop.readState();
+    expect(repairedState.local_main).toBe(newLaptopState.local_main);
+    expect(repairedState.initial_import_confirmed).toBe(true);
+    expect(repairedState.last_error_code).toBeNull();
+  });
+
+  it('blocks re-pair when local files changed after unpair', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'dirty-repair-desktop');
+    await mkdirp(desktopDir);
+    await writeFile(join(desktopDir, 'shared.md'), 'old server state\n');
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await expect(desktop.syncOnce()).rejects.toMatchObject({ code: 'initial_import_confirmation_required' });
+    await desktop.syncOnce({ confirmInitialImport: true });
+
+    await desktop.unpairCurrentDevice();
+    await writeFile(join(desktopDir, 'shared.md'), 'local unpaired edit\n');
+
+    const laptopDir = join(root, 'dirty-repair-laptop');
+    await mkdirp(laptopDir);
+    const laptop = await pairPlugin(admin, laptopDir, 'laptop');
+    await writeFile(join(laptopDir, 'shared.md'), 'new server state\n');
+    expect((await laptop.syncOnce()).status).toBe('Synced');
+
+    const rePairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
+      device_name: 'desktop',
+      sync_profile: 'notes_only'
+    });
+    expect(rePairing.status).toBe(201);
+    await expect(desktop.pairWithToken(rePairing.body.pairing_token)).rejects.toMatchObject({
+      code: 'replace_local_with_server_required'
+    });
+    expect(await readFile(join(desktopDir, 'shared.md'), 'utf8')).toBe('local unpaired edit\n');
+  });
+
   it('uses multipart pull requests and rejects legacy JSON pull bodies', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'multipart-device');

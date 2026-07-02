@@ -24,15 +24,29 @@ export type LocalPluginState = {
   user_id: string | null;
   vault_id: string | null;
   device_id: string | null;
+  device_name?: string | null;
   device_ref: string | null;
   server_device_ref: string | null;
   local_main: string | null;
   local_head: string | null;
   initial_import_confirmed: boolean;
+  sync_profile?: SyncProfile | null;
+  sync_plugins?: boolean | null;
   status_label: string;
   last_error_code: string | null;
   last_event_seq: number;
+  unpaired_baseline_vault_id?: string | null;
+  unpaired_baseline_main?: string | null;
+  unpaired_baseline_sync_profile?: SyncProfile | null;
+  unpaired_baseline_sync_plugins?: boolean | null;
   updated_at: string;
+};
+
+type DetachedBaseline = {
+  vaultId: string;
+  main: string;
+  syncProfile: SyncProfile;
+  syncPlugins: boolean;
 };
 
 export type QueueState = {
@@ -124,12 +138,14 @@ export class ObtsPluginClient {
 
   async pairWithToken(pairingToken: string): Promise<void> {
     await this.assertPairingCanStart();
+    const baseline = this.detachedBaselineFromState(await this.readExistingState());
     const result = await this.transport.consumePairingToken({
       pairingToken,
       deviceName: this.settings.deviceName,
       syncProfile: this.settings.syncProfile,
       syncPlugins: this.settings.syncPlugins
     });
+    const rePairBaseline = this.baselineForPairing(baseline, result.vault_id);
     await this.initialize();
     await writeJson(join(this.vaultDir, '.obts', 'auth', 'device-token.json'), {
       device_token: result.device_token,
@@ -139,21 +155,28 @@ export class ObtsPluginClient {
       user_id: result.user_id,
       vault_id: result.vault_id,
       device_id: result.device_id,
+      device_name: this.settings.deviceName,
       device_ref: result.device_ref,
       server_device_ref: null,
       local_main: null,
       local_head: null,
       initial_import_confirmed: false,
+      sync_profile: this.settings.syncProfile,
+      sync_plugins: this.settings.syncPlugins,
       status_label: 'Checking',
       last_error_code: null,
       last_event_seq: 0,
+      unpaired_baseline_vault_id: null,
+      unpaired_baseline_main: null,
+      unpaired_baseline_sync_profile: null,
+      unpaired_baseline_sync_plugins: null,
       updated_at: nowIso()
     });
     const pulled = await this.transport.pull({
       vaultId: result.vault_id,
       deviceId: result.device_id,
       deviceToken: result.device_token,
-      currentLocalMain: null
+      currentLocalMain: rePairBaseline?.main ?? null
     });
     await this.git.importPack(pulled.packfile);
     const localFiles = await this.git.scanSyncableFiles();
@@ -167,6 +190,25 @@ export class ObtsPluginClient {
       !localAlreadyMatchesServer &&
       (!result.is_first_device || serverFiles.length > 0);
     if (divergentLocalContent) {
+      if (rePairBaseline && (await this.canFastForwardCleanRePair(rePairBaseline, localFiles, pulled.manifest))) {
+        await this.writeState({
+          ...(await this.readState()),
+          local_main: rePairBaseline.main,
+          local_head: rePairBaseline.main,
+          initial_import_confirmed: true,
+          updated_at: nowIso()
+        });
+        await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true);
+        await this.writeState({
+          ...(await this.readState()),
+          initial_import_confirmed: true,
+          status_label: 'Synced',
+          last_error_code: null,
+          updated_at: nowIso()
+        });
+        await this.acknowledgeAppliedMain(await this.readState(), result.device_token, pulled.manifest.target_main);
+        return;
+      }
       await this.createLocalRecoveryBundle('replace_local_with_server', pulled.manifest.target_main, localFiles);
       await this.writeQueue({
         pending_commit: null,
@@ -581,14 +623,21 @@ export class ObtsPluginClient {
       user_id: null,
       vault_id: null,
       device_id: null,
+      device_name: null,
       device_ref: null,
       server_device_ref: null,
       local_main: null,
       local_head: null,
       initial_import_confirmed: false,
+      sync_profile: null,
+      sync_plugins: null,
       status_label: 'Not paired',
       last_error_code: null,
       last_event_seq: 0,
+      unpaired_baseline_vault_id: state.vault_id,
+      unpaired_baseline_main: state.local_main,
+      unpaired_baseline_sync_profile: state.sync_profile ?? this.settings.syncProfile,
+      unpaired_baseline_sync_plugins: state.sync_plugins ?? this.settings.syncPlugins,
       updated_at: nowIso()
     });
     return { status: 'Not paired' };
@@ -638,14 +687,21 @@ export class ObtsPluginClient {
         user_id: null,
         vault_id: this.settings.vaultId ?? null,
         device_id: this.settings.deviceId ?? null,
+        device_name: null,
         device_ref: null,
         server_device_ref: null,
         local_main: null,
         local_head: null,
         initial_import_confirmed: false,
+        sync_profile: null,
+        sync_plugins: null,
         status_label: 'Checking',
         last_error_code: null,
         last_event_seq: 0,
+        unpaired_baseline_vault_id: null,
+        unpaired_baseline_main: null,
+        unpaired_baseline_sync_profile: null,
+        unpaired_baseline_sync_plugins: null,
         updated_at: nowIso()
       };
     }
@@ -993,6 +1049,53 @@ export class ObtsPluginClient {
       queue.status === 'idle' &&
       queue.attempts === 0
     );
+  }
+
+  private detachedBaselineFromState(state: LocalPluginState | null): DetachedBaseline | null {
+    if (
+      !state?.unpaired_baseline_vault_id ||
+      !state.unpaired_baseline_main ||
+      !state.unpaired_baseline_sync_profile ||
+      typeof state.unpaired_baseline_sync_plugins !== 'boolean'
+    ) {
+      return null;
+    }
+    return {
+      vaultId: state.unpaired_baseline_vault_id,
+      main: state.unpaired_baseline_main,
+      syncProfile: state.unpaired_baseline_sync_profile,
+      syncPlugins: state.unpaired_baseline_sync_plugins
+    };
+  }
+
+  private baselineForPairing(baseline: DetachedBaseline | null, vaultId: string): DetachedBaseline | null {
+    if (!baseline) {
+      return null;
+    }
+    if (baseline.vaultId !== vaultId) {
+      return null;
+    }
+    if (baseline.syncProfile !== this.settings.syncProfile || baseline.syncPlugins !== this.settings.syncPlugins) {
+      return null;
+    }
+    return baseline;
+  }
+
+  private async canFastForwardCleanRePair(
+    baseline: DetachedBaseline,
+    localFiles: string[],
+    manifest: { target_main: string; current_local_main_is_ancestor?: boolean | null }
+  ): Promise<boolean> {
+    if (manifest.current_local_main_is_ancestor === false) {
+      return false;
+    }
+    if (!(await this.git.commitExists(baseline.main))) {
+      return false;
+    }
+    if (!(await this.localContentMatchesTree(localFiles, baseline.main))) {
+      return false;
+    }
+    return await this.git.isAncestor(baseline.main, manifest.target_main);
   }
 
   private async readExistingState(): Promise<LocalPluginState | null> {

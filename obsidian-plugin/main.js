@@ -312,12 +312,14 @@ class ObtsObsidianClient {
 
   async pairWithToken(pairingToken) {
     await this.assertPairingCanStart();
+    const baseline = this.detachedBaselineFromState(await readJson(this.statePath, null));
     const result = await postJson(this.url("/api/v1/pair/consume"), {
       pairing_token: pairingToken,
       device_name: this.plugin.settings.deviceName || "Obsidian device",
       sync_profile: this.plugin.settings.syncProfile,
       sync_plugins: this.plugin.settings.syncPlugins
     });
+    const rePairBaseline = this.baselineForPairing(baseline, result.vault_id);
     await this.initialize();
     await writeJson(this.authPath, { device_token: result.device_token, created_at: nowIso() });
     await this.writeState({
@@ -335,10 +337,14 @@ class ObtsObsidianClient {
       status_label: "Checking",
       last_error_code: null,
       last_event_seq: 0,
+      unpaired_baseline_vault_id: null,
+      unpaired_baseline_main: null,
+      unpaired_baseline_sync_profile: null,
+      unpaired_baseline_sync_plugins: null,
       updated_at: nowIso()
     });
 
-    const pulled = await this.pull(result.vault_id, result.device_id, result.device_token, null);
+    const pulled = await this.pull(result.vault_id, result.device_id, result.device_token, rePairBaseline ? rePairBaseline.main : null);
     await this.importPack(pulled.packfile);
     const localFiles = await this.scanSyncableFiles();
     const serverFiles = await this.listTreeFiles(pulled.manifest.target_main);
@@ -351,6 +357,23 @@ class ObtsObsidianClient {
       !localAlreadyMatchesServer &&
       (!result.is_first_device || serverFiles.length > 0);
     if (divergentLocalContent) {
+      if (rePairBaseline && await this.canFastForwardCleanRePair(rePairBaseline, localFiles, pulled.manifest)) {
+        await this.writeState(Object.assign({}, await this.readState(), {
+          local_main: rePairBaseline.main,
+          local_head: rePairBaseline.main,
+          initial_import_confirmed: true,
+          updated_at: nowIso()
+        }));
+        await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true);
+        await this.writeState(Object.assign({}, await this.readState(), {
+          initial_import_confirmed: true,
+          status_label: "Synced",
+          last_error_code: null,
+          updated_at: nowIso()
+        }));
+        await this.acknowledgeAppliedMain(pulled.manifest.target_main);
+        return;
+      }
       await this.createRecoveryBundle("replace_local_with_server", pulled.manifest.target_main, localFiles);
       await this.writeQueue({ pending_commit: null, expected_device_ref: null, status: "blocked_recovery", attempts: 0, updated_at: nowIso() });
       await this.block("replace_local_with_server_required", "Local content differs from server main. Use Replace local with server state after reviewing the recovery bundle.");
@@ -675,6 +698,10 @@ class ObtsObsidianClient {
       status_label: "Not paired",
       last_error_code: null,
       last_event_seq: 0,
+      unpaired_baseline_vault_id: state.vault_id,
+      unpaired_baseline_main: state.local_main,
+      unpaired_baseline_sync_profile: state.sync_profile || this.plugin.settings.syncProfile,
+      unpaired_baseline_sync_plugins: Object.prototype.hasOwnProperty.call(state, "sync_plugins") ? state.sync_plugins : this.plugin.settings.syncPlugins,
       updated_at: nowIso()
     });
     return { status: "Not paired" };
@@ -1231,6 +1258,50 @@ class ObtsObsidianClient {
     );
   }
 
+  detachedBaselineFromState(state) {
+    if (
+      !state ||
+      !state.unpaired_baseline_vault_id ||
+      !state.unpaired_baseline_main ||
+      !state.unpaired_baseline_sync_profile ||
+      typeof state.unpaired_baseline_sync_plugins !== "boolean"
+    ) {
+      return null;
+    }
+    return {
+      vaultId: state.unpaired_baseline_vault_id,
+      main: state.unpaired_baseline_main,
+      syncProfile: state.unpaired_baseline_sync_profile,
+      syncPlugins: state.unpaired_baseline_sync_plugins
+    };
+  }
+
+  baselineForPairing(baseline, vaultId) {
+    if (!baseline) {
+      return null;
+    }
+    if (baseline.vaultId !== vaultId) {
+      return null;
+    }
+    if (baseline.syncProfile !== this.plugin.settings.syncProfile || baseline.syncPlugins !== this.plugin.settings.syncPlugins) {
+      return null;
+    }
+    return baseline;
+  }
+
+  async canFastForwardCleanRePair(baseline, localFiles, manifest) {
+    if (manifest.current_local_main_is_ancestor === false) {
+      return false;
+    }
+    if (!(await this.commitExists(baseline.main))) {
+      return false;
+    }
+    if (!(await this.localContentMatchesTree(localFiles, baseline.main))) {
+      return false;
+    }
+    return await this.isAncestor(baseline.main, manifest.target_main);
+  }
+
   async acquireApplyLock(applyId) {
     await fsp.mkdir(path.dirname(this.applyLockPath), { recursive: true, mode: 0o700 });
     try {
@@ -1333,14 +1404,21 @@ class ObtsObsidianClient {
       user_id: null,
       vault_id: null,
       device_id: null,
+      device_name: null,
       device_ref: null,
       server_device_ref: null,
       local_main: null,
       local_head: null,
       initial_import_confirmed: false,
+      sync_profile: null,
+      sync_plugins: null,
       status_label: "Checking",
       last_error_code: null,
       last_event_seq: 0,
+      unpaired_baseline_vault_id: null,
+      unpaired_baseline_main: null,
+      unpaired_baseline_sync_profile: null,
+      unpaired_baseline_sync_plugins: null,
       updated_at: nowIso()
     });
   }

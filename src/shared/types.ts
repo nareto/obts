@@ -141,6 +141,7 @@ export type DevicePullManifest = {
   device_id: string;
   target_main: string;
   changed_paths: string[];
+  current_local_main_is_ancestor: boolean | null;
   event_seq: number;
 };
 

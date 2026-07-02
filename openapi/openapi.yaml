@@ -700,7 +700,7 @@ components:
               pattern: "^[0-9a-f]{40}$"
     DevicePullManifest:
       type: object
-      required: [api_version, vault_id, device_id, target_main, changed_paths, event_seq]
+      required: [api_version, vault_id, device_id, target_main, changed_paths, current_local_main_is_ancestor, event_seq]
       properties:
         api_version:
           const: 2026-06-29.phase1
@@ -715,6 +715,10 @@ components:
           type: array
           items:
             type: string
+        current_local_main_is_ancestor:
+          oneOf:
+            - type: "null"
+            - type: boolean
         event_seq:
           type: integer
     EventPage:

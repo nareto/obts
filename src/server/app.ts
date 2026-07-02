@@ -443,10 +443,13 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     if (targetMain !== deviceAuth.vault.current_main) {
       throw new AuthError(404, 'not_found', 'Resource not found.');
     }
-    const have =
-      pullRequest.current_local_main && (await git.commitExists(vaultId, pullRequest.current_local_main))
-        ? pullRequest.current_local_main
+    const currentLocalMainExists =
+      pullRequest.current_local_main !== null && (await git.commitExists(vaultId, pullRequest.current_local_main));
+    const currentLocalMainIsAncestor =
+      pullRequest.current_local_main !== null && currentLocalMainExists
+        ? await git.isAncestor(vaultId, pullRequest.current_local_main, targetMain)
         : null;
+    const have = currentLocalMainExists ? pullRequest.current_local_main : null;
     const allChangedPaths =
       have === null
         ? await git.listTreePaths(vaultId, targetMain)
@@ -460,6 +463,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       device_id: deviceAuth.device.device_id,
       target_main: targetMain,
       changed_paths: [...new Set(changedPaths)].sort(),
+      current_local_main_is_ancestor: currentLocalMainIsAncestor,
       event_seq: db.event_seq_by_vault[vaultId] ?? 0
     };
     const packfile = await git.exportPack(vaultId, targetMain, have);
