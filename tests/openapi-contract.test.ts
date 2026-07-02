@@ -28,6 +28,7 @@ describe('OpenAPI Phase 1 contract', () => {
       '/vaults/{vault_id}/sync/push',
       '/vaults/{vault_id}/sync/pull',
       '/vaults/{vault_id}/sync/events',
+      '/vaults/{vault_id}/sync/unpair',
       '/vaults/{vault_id}/conflicts',
       '/vaults/{vault_id}/events'
     ]) {
@@ -56,9 +57,16 @@ describe('OpenAPI Phase 1 contract', () => {
 
     const deviceEventsSection = contract.slice(
       contract.indexOf('/vaults/{vault_id}/sync/events'),
-      contract.indexOf('/vaults/{vault_id}/conflicts')
+      contract.indexOf('/vaults/{vault_id}/sync/unpair')
     );
     expect(deviceEventsSection).toContain('deviceBearer');
     expect(deviceEventsSection).toContain('EventPage');
+
+    const deviceUnpairSection = contract.slice(
+      contract.indexOf('/vaults/{vault_id}/sync/unpair'),
+      contract.indexOf('/vaults/{vault_id}/conflicts')
+    );
+    expect(deviceUnpairSection).toContain('deviceBearer');
+    expect(deviceUnpairSection).toContain('StatusResponse');
   });
 });

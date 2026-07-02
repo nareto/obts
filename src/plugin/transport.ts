@@ -112,6 +112,16 @@ export class TransportClient {
     return await readJsonOrThrow<{ events: EventEnvelope[]; current_event_seq: number }>(response);
   }
 
+  async unpairDevice(input: { vaultId: string; deviceToken: string }): Promise<{ status: string }> {
+    const response = await fetch(this.url(`/api/v1/vaults/${input.vaultId}/sync/unpair`), {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${input.deviceToken}`
+      }
+    });
+    return await readJsonOrThrow<{ status: string }>(response);
+  }
+
   private url(path: string): string {
     return `${this.serverUrl.replace(/\/+$/u, '')}${path}`;
   }
@@ -127,21 +137,24 @@ async function readJsonOrThrow<T>(response: Response): Promise<T> {
 async function throwResponseError(response: Response): Promise<never> {
   let code = 'http_error';
   let message = `HTTP ${response.status}`;
+  let details: Record<string, unknown> | undefined;
   try {
-    const body = (await response.json()) as { error?: { code?: string; message?: string } };
+    const body = (await response.json()) as { error?: { code?: string; message?: string; details?: Record<string, unknown> } };
     code = body.error?.code ?? code;
     message = body.error?.message ?? message;
+    details = body.error?.details;
   } catch {
     // Keep redacted HTTP status-only error.
   }
-  throw new TransportError(response.status, code, message);
+  throw new TransportError(response.status, code, message, details);
 }
 
 export class TransportError extends Error {
   constructor(
     readonly status: number,
     readonly code: string,
-    message: string
+    message: string,
+    readonly details?: Record<string, unknown>
   ) {
     super(message);
   }

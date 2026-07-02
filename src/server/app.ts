@@ -485,6 +485,17 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     return sendEventPage(reply, request.id, await store.snapshot(), deviceAuth.vault.vault_id, readEventCursor(request));
   });
 
+  app.post('/api/v1/vaults/:vaultId/sync/unpair', async (request) => {
+    const { vaultId } = pathParams(request);
+    const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+    await auth.revokeDevice({
+      actorUserId: deviceAuth.user.user_id,
+      vaultId: deviceAuth.vault.vault_id,
+      deviceId: deviceAuth.device.device_id
+    });
+    return { status: 'ok' };
+  });
+
   app.get('/api/v1/vaults/:vaultId/conflicts', async (request) => {
     const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     const { vaultId } = pathParams(request);
@@ -1093,6 +1104,9 @@ function deviceStatusLabel(status: string): string {
   }
   if (status === 'paired') {
     return 'Checking';
+  }
+  if (status === 'revoked') {
+    return 'Revoked';
   }
   return 'Ahead';
 }

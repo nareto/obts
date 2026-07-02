@@ -378,6 +378,22 @@ paths:
           $ref: "#/components/responses/Error"
         "410":
           $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/sync/unpair:
+    post:
+      summary: Revoke the current paired device and invalidate its device token.
+      security:
+        - deviceBearer: []
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+      responses:
+        "200":
+          description: Device unpaired.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "404":
+          $ref: "#/components/responses/Error"
   /vaults/{vault_id}/conflicts:
     get:
       summary: List durable conflict records for an owned vault.

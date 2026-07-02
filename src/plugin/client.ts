@@ -31,6 +31,7 @@ export type LocalPluginState = {
   initial_import_confirmed: boolean;
   status_label: string;
   last_error_code: string | null;
+  last_event_seq: number;
   updated_at: string;
 };
 
@@ -145,6 +146,7 @@ export class ObtsPluginClient {
       initial_import_confirmed: false,
       status_label: 'Checking',
       last_error_code: null,
+      last_event_seq: 0,
       updated_at: nowIso()
     });
     const pulled = await this.transport.pull({
@@ -502,6 +504,96 @@ export class ObtsPluginClient {
     }
   }
 
+  async pollRemoteEventsAndApply(): Promise<{ applied: boolean; status: string }> {
+    const state = await this.readState();
+    if (!state.vault_id || !state.device_id) {
+      throw new PluginBlockedError('not_paired', 'Device is not paired.');
+    }
+    this.throwIfSyncBlocked(state);
+    const token = await this.readDeviceToken();
+    const after = Number.isSafeInteger(state.last_event_seq) && state.last_event_seq >= 0 ? state.last_event_seq : 0;
+    let page: Awaited<ReturnType<TransportClient['pollEvents']>>;
+    try {
+      page = await this.transport.pollEvents({
+        vaultId: state.vault_id,
+        deviceToken: token,
+        after
+      });
+    } catch (error) {
+      if (error instanceof TransportError && error.code === 'event_cursor_expired') {
+        const currentEventSeq =
+          typeof error.details?.current_event_seq === 'number' && Number.isSafeInteger(error.details.current_event_seq)
+            ? error.details.current_event_seq
+            : after;
+        await this.writeState({
+          ...(await this.readState()),
+          last_event_seq: currentEventSeq,
+          updated_at: nowIso()
+        });
+        await this.pullAndApply({ allowDestructive: true });
+        const refreshed = await this.readState();
+        return { applied: true, status: refreshed.status_label };
+      }
+      throw error;
+    }
+
+    await this.writeState({
+      ...(await this.readState()),
+      last_event_seq: page.current_event_seq,
+      updated_at: nowIso()
+    });
+    const currentState = await this.readState();
+    const shouldPull = page.events.some((event) => {
+      const main = event.commit_cursors.main;
+      return (
+        (event.event_type === 'main_advanced' || event.event_type === 'conflict_resolved') &&
+        typeof main === 'string' &&
+        main !== currentState.local_main
+      );
+    });
+    if (!shouldPull) {
+      return { applied: false, status: currentState.status_label };
+    }
+    await this.pullAndApply({ allowDestructive: true });
+    const finalState = await this.readState();
+    return { applied: true, status: finalState.status_label };
+  }
+
+  async unpairCurrentDevice(): Promise<{ status: string }> {
+    const state = await this.readState();
+    if (!state.vault_id || !state.device_id) {
+      throw new PluginBlockedError('not_paired', 'Device is not paired.');
+    }
+    const token = await this.readDeviceToken();
+    await this.transport.unpairDevice({
+      vaultId: state.vault_id,
+      deviceToken: token
+    });
+    await rm(join(this.vaultDir, '.obts', 'auth', 'device-token.json'), { force: true });
+    await this.writeQueue({
+      pending_commit: null,
+      expected_device_ref: null,
+      status: 'idle',
+      attempts: 0,
+      updated_at: nowIso()
+    });
+    await this.writeState({
+      user_id: null,
+      vault_id: null,
+      device_id: null,
+      device_ref: null,
+      server_device_ref: null,
+      local_main: null,
+      local_head: null,
+      initial_import_confirmed: false,
+      status_label: 'Not paired',
+      last_error_code: null,
+      last_event_seq: 0,
+      updated_at: nowIso()
+    });
+    return { status: 'Not paired' };
+  }
+
   async recordLocalChangeHint(paths: string[]): Promise<void> {
     await this.initialize();
     const state = await this.readState();
@@ -553,6 +645,7 @@ export class ObtsPluginClient {
         initial_import_confirmed: false,
         status_label: 'Checking',
         last_error_code: null,
+        last_event_seq: 0,
         updated_at: nowIso()
       };
     }

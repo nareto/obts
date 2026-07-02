@@ -1126,6 +1126,52 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(newPassword.status).toBe(200);
   });
 
+  it('lets a paired plugin unpair itself and revoke its device token', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'self-unpair-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'phone');
+    const state = await plugin.readState();
+    const deviceToken = await readDeviceToken(deviceDir);
+
+    const unpaired = await plugin.unpairCurrentDevice();
+    expect(unpaired.status).toBe('Not paired');
+    await expect(readDeviceToken(deviceDir)).rejects.toThrow();
+    await expect(plugin.syncOnce()).rejects.toMatchObject({ code: 'not_paired' });
+    expect(await plugin.readState()).toMatchObject({
+      vault_id: null,
+      device_id: null,
+      status_label: 'Not paired',
+      last_error_code: null
+    });
+
+    const form = new FormData();
+    form.append(
+      'manifest',
+      JSON.stringify({
+        api_version: API_VERSION,
+        vault_id: admin.vaultId,
+        device_id: state.device_id,
+        current_local_main: state.local_main,
+        requested_target: 'latest'
+      })
+    );
+    form.append('packfile', new Blob([new ArrayBuffer(0)], { type: 'application/x-git-packed-objects' }), 'have.pack');
+    const pull = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/pull`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${deviceToken}` },
+      body: form
+    });
+    expect(pull.status).toBe(404);
+
+    const dashboard = await admin.get<{ devices: Array<{ device_name: string; status_label: string }> }>(
+      `/api/v1/vaults/${admin.vaultId}/dashboard`
+    );
+    expect(dashboard.body.devices.find((device) => device.device_name === 'phone')).toMatchObject({
+      status_label: 'Revoked'
+    });
+  });
+
   it('uses multipart pull requests and rejects legacy JSON pull bodies', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'multipart-device');
@@ -2414,6 +2460,11 @@ describe('Phase 1 sync without conflict resolution', () => {
         })
       ])
     );
+    expect(await exists(join(device2Dir, 'from-desktop.md'))).toBe(false);
+    const polledApply = await plugin2.pollRemoteEventsAndApply();
+    expect(polledApply).toMatchObject({ applied: true, status: 'Synced' });
+    expect(await readFile(join(device2Dir, 'from-desktop.md'), 'utf8')).toBe('server event\n');
+    expect((await plugin2.readState()).last_event_seq).toEqual(expect.any(Number));
 
     await server.store.mutate((db) => {
       for (const event of db.events.filter((candidate) => candidate.vault_id === admin.vaultId)) {
@@ -3152,6 +3203,26 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('writeTextSnapshotPatch');
     expect(pluginMain).toContain('this.app.vault.on("modify"');
     expect(pluginMain).toContain('adapter.writeBinary');
+    expect(pluginMain).toContain('BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000');
+    expect(pluginMain).toContain('runBackgroundSync()');
+    expect(pluginMain).toContain('runAutomaticSync()');
+    expect(pluginMain).toContain('pollRemoteEventsAndApply()');
+    expect(pluginMain).toContain('/sync/events?after=');
+    expect(pluginMain).toContain('this.setStatus("Offline")');
+    expect(pluginMain).toContain('containerEl.createEl("h3", { text: paired ? "Device" : "Pair Device" })');
+    expect(pluginMain).toContain('setButtonText("Pair")');
+    expect(pluginMain).toContain('setButtonText("Sync now")');
+    expect(pluginMain).toContain('setButtonText("Unpair...")');
+    expect(pluginMain).toContain('setWarning');
+    expect(pluginMain).toContain('/sync/unpair');
+    expect(pluginMain).toContain('text.inputEl.type = "password"');
+    expect(pluginMain).toContain('device_name: this.plugin.settings.deviceName || "Obsidian device"');
+    expect(pluginMain).toContain('throwIfSyncBlocked(state)');
+    expect(pluginMain).toContain('state.last_error_code === "replace_local_with_server_required"');
+    expect(pluginMain).not.toContain('Automatic sync');
+    expect(pluginMain).not.toContain('autoSync');
+    expect(pluginMain).not.toContain('throwIfBlocked(state)');
+    expect(pluginMain).not.toContain('Sync is blocked until recovery or review completes.');
     expect(pluginMain).not.toContain('packaged TypeScript client');
     expect(pluginMain).not.toContain('Run the packaged client sync flow');
 

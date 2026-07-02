@@ -50,6 +50,8 @@ const OBSIDIAN_ALLOWLIST = new Set([
   ".obsidian/types.json"
 ]);
 const WINDOWS_RESERVED = new Set(["con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"]);
+const SYNC_DEBOUNCE_MS = 1500;
+const BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000;
 
 const DEFAULT_SETTINGS = {
   serverUrl: "http://127.0.0.1:3000",
@@ -57,8 +59,6 @@ const DEFAULT_SETTINGS = {
   deviceName: "",
   syncProfile: "notes_only",
   syncPlugins: false,
-  autoSync: false,
-  syncIntervalSeconds: 60,
   gitBinary: "git"
 };
 
@@ -141,13 +141,11 @@ module.exports = class ObtsPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("delete", (file) => this.queueSyncFromWatcher(file && file.path)));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.queueSyncFromWatcher([file && file.path, oldPath])));
 
-    if (this.settings.autoSync) {
-      this.registerInterval(
-        window.setInterval(() => {
-          void this.runQueuedSync();
-        }, Math.max(15, this.settings.syncIntervalSeconds) * 1000)
-      );
-    }
+    this.registerInterval(
+      window.setInterval(() => {
+        void this.runBackgroundSync();
+      }, BACKGROUND_SYNC_INTERVAL_MS)
+    );
   }
 
   async saveSettings() {
@@ -167,21 +165,73 @@ module.exports = class ObtsPlugin extends Plugin {
     this.syncQueued = true;
     this.setStatus("Ahead");
     void this.client.recordLocalChangeHint(paths).catch(() => undefined);
-    if (this.settings.autoSync) {
-      window.setTimeout(() => {
-        void this.runQueuedSync();
-      }, 1500);
-    }
+    window.setTimeout(() => {
+      void this.runQueuedSync();
+    }, SYNC_DEBOUNCE_MS);
   }
 
   async runQueuedSync() {
-    if (!this.syncQueued || this.syncRunning) {
+    if (!this.syncQueued) {
       return;
     }
     this.syncQueued = false;
-    await this.runUserAction(async () => {
+    await this.runAutomaticSync();
+  }
+
+  async runBackgroundSync() {
+    if (this.syncQueued) {
+      await this.runQueuedSync();
+      return;
+    }
+    if (this.syncRunning) {
+      return;
+    }
+    const state = await this.client.readState();
+    if (!state.vault_id || !state.device_id || state.last_error_code) {
+      return;
+    }
+    const queue = await this.client.readQueue();
+    if (queue.pending_commit || queue.status === "queued_local") {
+      await this.runAutomaticSync();
+      return;
+    }
+    this.syncRunning = true;
+    try {
+      await this.client.pollRemoteEventsAndApply();
+      this.setStatus((await this.client.readState()).status_label);
+    } catch (error) {
+      await this.handleAutomaticSyncError(error);
+    } finally {
+      this.syncRunning = false;
+    }
+  }
+
+  async runAutomaticSync() {
+    if (this.syncRunning) {
+      return;
+    }
+    const state = await this.client.readState();
+    if (!state.vault_id || !state.device_id || state.last_error_code) {
+      return;
+    }
+    this.syncRunning = true;
+    try {
       await this.client.syncOnce({ confirmInitialImport: false });
-    }, false);
+      this.setStatus((await this.client.readState()).status_label);
+    } catch (error) {
+      await this.handleAutomaticSyncError(error);
+    } finally {
+      this.syncRunning = false;
+    }
+  }
+
+  async handleAutomaticSyncError(error) {
+    if (error instanceof ObtsBlockedError) {
+      await this.client.markBlocked(error.code);
+      this.setStatus((await this.client.readState()).status_label);
+      return;
+    }
+    this.setStatus("Offline");
   }
 
   async runUserAction(fn, showNotice = true) {
@@ -274,13 +324,17 @@ class ObtsObsidianClient {
       user_id: result.user_id,
       vault_id: result.vault_id,
       device_id: result.device_id,
+      device_name: this.plugin.settings.deviceName || "Obsidian device",
       device_ref: result.device_ref,
       server_device_ref: null,
       local_main: null,
       local_head: null,
       initial_import_confirmed: false,
+      sync_profile: this.plugin.settings.syncProfile,
+      sync_plugins: this.plugin.settings.syncPlugins,
       status_label: "Checking",
       last_error_code: null,
+      last_event_seq: 0,
       updated_at: nowIso()
     });
 
@@ -314,7 +368,7 @@ class ObtsObsidianClient {
     if (!state.vault_id || !state.device_id) {
       throw new ObtsBlockedError("not_paired", "Device is not paired.");
     }
-    this.throwIfBlocked(state);
+    this.throwIfSyncBlocked(state);
 
     const localFiles = await this.scanSyncableFiles();
     if (localFiles.length > 0 && !state.initial_import_confirmed && state.server_device_ref === null) {
@@ -548,7 +602,7 @@ class ObtsObsidianClient {
     if (!state.vault_id || !state.device_id) {
       return;
     }
-    this.throwIfBlocked(state);
+    this.throwIfSyncBlocked(state);
     const token = await this.readDeviceToken();
     const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main);
     await this.importPack(pulled.packfile);
@@ -556,6 +610,74 @@ class ObtsObsidianClient {
     if (state.local_main !== pulled.manifest.target_main) {
       await this.acknowledgeAppliedMain(pulled.manifest.target_main);
     }
+  }
+
+  async pollRemoteEventsAndApply() {
+    const state = await this.readState();
+    if (!state.vault_id || !state.device_id) {
+      return false;
+    }
+    this.throwIfSyncBlocked(state);
+    const after = Number.isSafeInteger(state.last_event_seq) && state.last_event_seq >= 0 ? state.last_event_seq : 0;
+    const token = await this.readDeviceToken();
+    let page;
+    try {
+      page = await this.pollEvents(state.vault_id, token, after);
+    } catch (error) {
+      if (error instanceof ObtsTransportError && error.code === "event_cursor_expired") {
+        const currentEventSeq = error.details && Number.isSafeInteger(error.details.current_event_seq) ? error.details.current_event_seq : after;
+        await this.writeState(Object.assign({}, await this.readState(), { last_event_seq: currentEventSeq, updated_at: nowIso() }));
+        await this.pullAndApply(true);
+        return true;
+      }
+      throw error;
+    }
+    await this.writeState(Object.assign({}, await this.readState(), { last_event_seq: page.current_event_seq, updated_at: nowIso() }));
+    const currentState = await this.readState();
+    const shouldPull = page.events.some((event) => {
+      const main = event && event.commit_cursors ? event.commit_cursors.main : null;
+      return (event.event_type === "main_advanced" || event.event_type === "conflict_resolved") && typeof main === "string" && main !== currentState.local_main;
+    });
+    if (!shouldPull) {
+      return false;
+    }
+    await this.pullAndApply(true);
+    return true;
+  }
+
+  async unpairCurrentDevice() {
+    const state = await this.readState();
+    if (!state.vault_id || !state.device_id) {
+      throw new ObtsBlockedError("not_paired", "Device is not paired.");
+    }
+    const token = await this.readDeviceToken();
+    await this.unpairDevice(state.vault_id, token);
+    await fsp.rm(this.authPath, { force: true });
+    await this.writeQueue({
+      pending_commit: null,
+      expected_device_ref: null,
+      status: "idle",
+      attempts: 0,
+      updated_at: nowIso()
+    });
+    await this.writeState({
+      user_id: null,
+      vault_id: null,
+      device_id: null,
+      device_name: null,
+      device_ref: null,
+      server_device_ref: null,
+      local_main: null,
+      local_head: null,
+      initial_import_confirmed: false,
+      sync_profile: null,
+      sync_plugins: null,
+      status_label: "Not paired",
+      last_error_code: null,
+      last_event_seq: 0,
+      updated_at: nowIso()
+    });
+    return { status: "Not paired" };
   }
 
   async applyTargetMain(targetMain, changedPaths, allowDestructive, extraAffectedPaths = []) {
@@ -1021,6 +1143,30 @@ class ObtsObsidianClient {
     return await response.json();
   }
 
+  async pollEvents(vaultId, token, after) {
+    if (!Number.isSafeInteger(after) || after < 0) {
+      throw new Error("Event cursor must be a non-negative safe integer.");
+    }
+    const response = await fetch(this.url(`/api/v1/vaults/${vaultId}/sync/events?after=${after}`), {
+      headers: { authorization: `Bearer ${token}` }
+    });
+    if (!response.ok) {
+      await throwResponseError(response);
+    }
+    return await response.json();
+  }
+
+  async unpairDevice(vaultId, token) {
+    const response = await fetch(this.url(`/api/v1/vaults/${vaultId}/sync/unpair`), {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` }
+    });
+    if (!response.ok) {
+      await throwResponseError(response);
+    }
+    return await response.json();
+  }
+
   async acknowledgeAppliedMain(targetMain) {
     const state = await this.readState();
     if (!state.vault_id || !state.device_id) {
@@ -1195,6 +1341,7 @@ class ObtsObsidianClient {
       initial_import_confirmed: false,
       status_label: "Checking",
       last_error_code: null,
+      last_event_seq: 0,
       updated_at: nowIso()
     });
   }
@@ -1341,9 +1488,18 @@ class ObtsObsidianClient {
     return `${this.plugin.settings.serverUrl.replace(/\/+$/u, "")}${route}`;
   }
 
-  throwIfBlocked(state) {
-    if (state.last_error_code) {
-      throw new ObtsBlockedError(state.last_error_code, "Sync is blocked until recovery or review completes.");
+  throwIfSyncBlocked(state) {
+    if (state.last_error_code === "conflict_review_required") {
+      throw new ObtsBlockedError("conflict_review_required", "A server conflict requires review before normal sync can continue.");
+    }
+    if (state.last_error_code === "replace_local_with_server_required") {
+      throw new ObtsBlockedError("replace_local_with_server_required", "Replace local content with server state before normal sync can continue.");
+    }
+    if (state.last_error_code === "apply_journal_recovery_required") {
+      throw new ObtsBlockedError("apply_journal_recovery_required", "An incomplete apply journal requires recovery before sync can continue.");
+    }
+    if (state.last_error_code === "same_device_non_fast_forward" || state.last_error_code === "stale_device_ref" || state.last_error_code === "device_blocked") {
+      throw new ObtsBlockedError(state.last_error_code, "Device sync is blocked until recovery completes.");
     }
   }
 
@@ -1367,10 +1523,13 @@ class ObtsSettingTab extends PluginSettingTab {
     this.plugin = plugin;
   }
 
-  display() {
+  async display() {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "Obsidian True Sync" });
+    const state = await this.plugin.client.readState();
+    const paired = Boolean(state.vault_id && state.device_id);
+    const deviceName = state.device_name || this.plugin.settings.deviceName || "Obsidian device";
 
     new Setting(containerEl)
       .setName("Server URL")
@@ -1381,55 +1540,141 @@ class ObtsSettingTab extends PluginSettingTab {
         })
       );
 
-    new Setting(containerEl)
-      .setName("Pairing token")
-      .addText((text) =>
-        text.setValue(this.plugin.settings.pairingToken).onChange(async (value) => {
-          this.plugin.settings.pairingToken = value.trim();
-          await this.plugin.saveSettings();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName("Device name")
-      .addText((text) =>
-        text.setValue(this.plugin.settings.deviceName).onChange(async (value) => {
-          this.plugin.settings.deviceName = value.trim();
-          await this.plugin.saveSettings();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName("Sync profile")
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOption("notes_only", "Notes only")
-          .addOption("notes_plus_attachments", "Notes plus attachments")
-          .addOption("full_vault_config", "Full vault config")
-          .setValue(this.plugin.settings.syncProfile)
-          .onChange(async (value) => {
-            this.plugin.settings.syncProfile = value;
+    containerEl.createEl("h3", { text: paired ? "Device" : "Pair Device" });
+    if (paired) {
+      new Setting(containerEl)
+        .setName("Device")
+        .setDesc(`${deviceName} · ${state.device_id}`);
+      new Setting(containerEl)
+        .setName("Sync profile")
+        .setDesc(syncProfileLabel(state.sync_profile || this.plugin.settings.syncProfile));
+      new Setting(containerEl)
+        .setName("Community plugin settings")
+        .setDesc((Object.prototype.hasOwnProperty.call(state, "sync_plugins") ? state.sync_plugins : this.plugin.settings.syncPlugins) ? "Included" : "Not included");
+      new Setting(containerEl)
+        .setName("Status")
+        .setDesc(state.last_error_code ? blockStatusLabel(state.last_error_code) : state.status_label || "Checking");
+      const actionStatus = containerEl.createEl("p", { text: "" });
+      new Setting(containerEl)
+        .setName("Actions")
+        .addButton((button) =>
+          button
+            .setButtonText("Sync now")
+            .setCta()
+            .onClick(async () => {
+              button.setDisabled(true);
+              actionStatus.setText("Syncing...");
+              try {
+                const result = await this.plugin.client.syncOnce({ confirmInitialImport: false });
+                this.plugin.setStatus((await this.plugin.client.readState()).status_label);
+                actionStatus.setText(`Synced: ${result.status}`);
+                new Notice(`obts: ${result.status}`);
+                await this.display();
+              } catch (error) {
+                actionStatus.setText(error instanceof Error ? error.message : "Sync failed.");
+              } finally {
+                button.setDisabled(false);
+              }
+            })
+        )
+        .addButton((button) => {
+          button
+            .setButtonText("Unpair...")
+            .onClick(async () => {
+              if (!window.confirm("Unpair this device? The server device will be revoked and local sync credentials will be removed.")) {
+                return;
+              }
+              button.setDisabled(true);
+              actionStatus.setText("Unpairing...");
+              try {
+                await this.plugin.client.unpairCurrentDevice();
+                this.plugin.settings.pairingToken = "";
+                await this.plugin.saveSettings();
+                this.plugin.setStatus("Not paired");
+                new Notice("obts unpaired this device.");
+                await this.display();
+              } catch (error) {
+                actionStatus.setText(error instanceof Error ? error.message : "Unpair failed.");
+              } finally {
+                button.setDisabled(false);
+              }
+            });
+          if (typeof button.setWarning === "function") {
+            button.setWarning();
+          }
+        });
+    } else {
+      const pairingStatus = containerEl.createEl("p", { text: "Not paired" });
+      new Setting(containerEl)
+        .setName("Device name")
+        .addText((text) =>
+          text.setValue(this.plugin.settings.deviceName).onChange(async (value) => {
+            this.plugin.settings.deviceName = value.trim();
             await this.plugin.saveSettings();
           })
-      );
+        );
 
-    new Setting(containerEl)
-      .setName("Sync community plugin settings")
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.syncPlugins).onChange(async (value) => {
-          this.plugin.settings.syncPlugins = value;
-          await this.plugin.saveSettings();
-        })
-      );
+      new Setting(containerEl)
+        .setName("Sync profile")
+        .addDropdown((dropdown) =>
+          dropdown
+            .addOption("notes_only", "Notes only")
+            .addOption("notes_plus_attachments", "Notes plus attachments")
+            .addOption("full_vault_config", "Full vault config")
+            .setValue(this.plugin.settings.syncProfile)
+            .onChange(async (value) => {
+              this.plugin.settings.syncProfile = value;
+              await this.plugin.saveSettings();
+            })
+        );
 
-    new Setting(containerEl)
-      .setName("Automatic sync")
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.autoSync).onChange(async (value) => {
-          this.plugin.settings.autoSync = value;
-          await this.plugin.saveSettings();
-        })
-      );
+      new Setting(containerEl)
+        .setName("Sync community plugin settings")
+        .addToggle((toggle) =>
+          toggle.setValue(this.plugin.settings.syncPlugins).onChange(async (value) => {
+            this.plugin.settings.syncPlugins = value;
+            await this.plugin.saveSettings();
+          })
+        );
+
+      new Setting(containerEl)
+        .setName("Pairing token")
+        .addText((text) => {
+          text.setPlaceholder("obts_pair_...");
+          text.inputEl.type = "password";
+          text.setValue(this.plugin.settings.pairingToken).onChange(async (value) => {
+            this.plugin.settings.pairingToken = value.trim();
+            await this.plugin.saveSettings();
+          });
+        });
+
+      new Setting(containerEl)
+        .setName("Pairing")
+        .addButton((button) =>
+          button
+            .setButtonText("Pair")
+            .setCta()
+            .onClick(async () => {
+              button.setDisabled(true);
+              pairingStatus.setText("Pairing...");
+              try {
+                if (!this.plugin.settings.pairingToken) {
+                  throw new ObtsBlockedError("missing_pairing_token", "Enter a pairing token.");
+                }
+                await this.plugin.client.pairWithToken(this.plugin.settings.pairingToken);
+                this.plugin.settings.pairingToken = "";
+                await this.plugin.saveSettings();
+                this.plugin.setStatus((await this.plugin.client.readState()).status_label);
+                new Notice("obts paired this device.");
+                await this.display();
+              } catch (error) {
+                pairingStatus.setText(error instanceof Error ? error.message : "Pairing failed.");
+              } finally {
+                button.setDisabled(false);
+              }
+            })
+        );
+    }
 
     new Setting(containerEl)
       .setName("Git binary")
@@ -1442,6 +1687,16 @@ class ObtsSettingTab extends PluginSettingTab {
   }
 }
 
+function syncProfileLabel(profile) {
+  if (profile === "notes_plus_attachments") {
+    return "Notes plus attachments";
+  }
+  if (profile === "full_vault_config") {
+    return "Full vault config";
+  }
+  return "Notes only";
+}
+
 class ObtsBlockedError extends Error {
   constructor(code, message) {
     super(message);
@@ -1450,10 +1705,11 @@ class ObtsBlockedError extends Error {
 }
 
 class ObtsTransportError extends Error {
-  constructor(status, code, message) {
+  constructor(status, code, message, details = undefined) {
     super(message);
     this.status = status;
     this.code = code;
+    this.details = details;
   }
 }
 
@@ -1472,14 +1728,16 @@ async function postJson(url, body) {
 async function throwResponseError(response) {
   let code = "http_error";
   let message = `HTTP ${response.status}`;
+  let details = undefined;
   try {
     const body = await response.json();
     code = body.error && body.error.code ? body.error.code : code;
     message = body.error && body.error.message ? body.error.message : message;
+    details = body.error ? body.error.details : undefined;
   } catch {
     // Keep status-only transport errors redacted.
   }
-  throw new ObtsTransportError(response.status, code, message);
+  throw new ObtsTransportError(response.status, code, message, details);
 }
 
 function parseMultipartPull(contentType, data) {
