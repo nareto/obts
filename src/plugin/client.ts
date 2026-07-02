@@ -3,8 +3,8 @@ import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path';
 
 import { newId, nowIso } from '../shared/ids.js';
-import { assertSyncableTreePaths, isSyncableVaultPath, normalizeVaultPath, type SyncPathPolicy } from '../shared/pathPolicy.js';
-import { API_VERSION, type DevicePushManifest, type SyncProfile } from '../shared/types.js';
+import { assertSyncableTreePaths, isSyncableVaultPath, normalizeVaultPath } from '../shared/pathPolicy.js';
+import { API_VERSION, type DevicePushManifest } from '../shared/types.js';
 import { LocalGitEngine } from './localGit.js';
 import { ApplyLockActiveError, type ApplyJournal, RecoveryManager, sha256File } from './recovery.js';
 import { TransportClient, TransportError } from './transport.js';
@@ -16,8 +16,6 @@ export type ObtsPluginSettings = {
   deviceId?: string;
   vaultId?: string;
   deviceName: string;
-  syncProfile: SyncProfile;
-  syncPlugins: boolean;
 };
 
 export type LocalPluginState = {
@@ -30,23 +28,17 @@ export type LocalPluginState = {
   local_main: string | null;
   local_head: string | null;
   initial_import_confirmed: boolean;
-  sync_profile?: SyncProfile | null;
-  sync_plugins?: boolean | null;
   status_label: string;
   last_error_code: string | null;
   last_event_seq: number;
   unpaired_baseline_vault_id?: string | null;
   unpaired_baseline_main?: string | null;
-  unpaired_baseline_sync_profile?: SyncProfile | null;
-  unpaired_baseline_sync_plugins?: boolean | null;
   updated_at: string;
 };
 
 type DetachedBaseline = {
   vaultId: string;
   main: string;
-  syncProfile: SyncProfile;
-  syncPlugins: boolean;
 };
 
 export type QueueState = {
@@ -77,19 +69,13 @@ export class ObtsPluginClient {
   private readonly transport: TransportClient;
   private readonly git: LocalGitEngine;
   private readonly recovery: RecoveryManager;
-  private readonly policy: SyncPathPolicy;
 
   constructor(
     private readonly vaultDir: string,
     private readonly settings: ObtsPluginSettings
   ) {
-    this.policy = {
-      profile: settings.syncProfile,
-      syncPlugins: settings.syncPlugins,
-      attachmentLocation: { mode: 'same_folder_as_note' }
-    };
     this.transport = new TransportClient(settings.serverUrl);
-    this.git = new LocalGitEngine(vaultDir, this.policy);
+    this.git = new LocalGitEngine(vaultDir);
     this.recovery = new RecoveryManager(vaultDir);
   }
 
@@ -141,9 +127,7 @@ export class ObtsPluginClient {
     const baseline = this.detachedBaselineFromState(await this.readExistingState());
     const result = await this.transport.consumePairingToken({
       pairingToken,
-      deviceName: this.settings.deviceName,
-      syncProfile: this.settings.syncProfile,
-      syncPlugins: this.settings.syncPlugins
+      deviceName: this.settings.deviceName
     });
     const rePairBaseline = this.baselineForPairing(baseline, result.vault_id);
     await this.initialize();
@@ -161,15 +145,11 @@ export class ObtsPluginClient {
       local_main: null,
       local_head: null,
       initial_import_confirmed: false,
-      sync_profile: this.settings.syncProfile,
-      sync_plugins: this.settings.syncPlugins,
       status_label: 'Checking',
       last_error_code: null,
       last_event_seq: 0,
       unpaired_baseline_vault_id: null,
       unpaired_baseline_main: null,
-      unpaired_baseline_sync_profile: null,
-      unpaired_baseline_sync_plugins: null,
       updated_at: nowIso()
     });
     const pulled = await this.transport.pull({
@@ -630,15 +610,11 @@ export class ObtsPluginClient {
       local_main: null,
       local_head: null,
       initial_import_confirmed: false,
-      sync_profile: null,
-      sync_plugins: null,
       status_label: 'Not paired',
       last_error_code: null,
       last_event_seq: 0,
       unpaired_baseline_vault_id: state.vault_id,
       unpaired_baseline_main: baselineMain,
-      unpaired_baseline_sync_profile: state.sync_profile ?? this.settings.syncProfile,
-      unpaired_baseline_sync_plugins: state.sync_plugins ?? this.settings.syncPlugins,
       updated_at: nowIso()
     });
     return { status: 'Not paired' };
@@ -655,7 +631,7 @@ export class ObtsPluginClient {
       .map((path) => normalizeVaultPath(path))
       .filter((result): result is { ok: true; path: string } => result.ok)
       .map((result) => result.path)
-      .filter((path) => isSyncableVaultPath(path, this.policy))
+      .filter((path) => isSyncableVaultPath(path))
       .sort();
     const uniqueChangedPaths = [...new Set(changedPaths)];
     if (uniqueChangedPaths.length === 0) {
@@ -694,15 +670,11 @@ export class ObtsPluginClient {
         local_main: null,
         local_head: null,
         initial_import_confirmed: false,
-        sync_profile: null,
-        sync_plugins: null,
         status_label: 'Checking',
         last_error_code: null,
         last_event_seq: 0,
         unpaired_baseline_vault_id: null,
         unpaired_baseline_main: null,
-        unpaired_baseline_sync_profile: null,
-        unpaired_baseline_sync_plugins: null,
         updated_at: nowIso()
       };
     }
@@ -766,7 +738,7 @@ export class ObtsPluginClient {
       for (const path of materializationConflictFiles(new Set([...targetFiles, ...affected]), localVaultFiles)) {
         affected.add(path);
       }
-      const affectedPaths = [...affected].filter((path) => isRecoverableApplyPath(path, this.policy)).sort();
+      const affectedPaths = [...affected].filter((path) => isRecoverableApplyPath(path)).sort();
       const preflight: Record<string, string | null> = {};
       for (const path of affectedPaths) {
         preflight[path] = await sha256File(join(this.vaultDir, path));
@@ -1055,17 +1027,13 @@ export class ObtsPluginClient {
   private detachedBaselineFromState(state: LocalPluginState | null): DetachedBaseline | null {
     if (
       !state?.unpaired_baseline_vault_id ||
-      !state.unpaired_baseline_main ||
-      !state.unpaired_baseline_sync_profile ||
-      typeof state.unpaired_baseline_sync_plugins !== 'boolean'
+      !state.unpaired_baseline_main
     ) {
       return null;
     }
     return {
       vaultId: state.unpaired_baseline_vault_id,
-      main: state.unpaired_baseline_main,
-      syncProfile: state.unpaired_baseline_sync_profile,
-      syncPlugins: state.unpaired_baseline_sync_plugins
+      main: state.unpaired_baseline_main
     };
   }
 
@@ -1074,9 +1042,6 @@ export class ObtsPluginClient {
       return null;
     }
     if (baseline.vaultId !== vaultId) {
-      return null;
-    }
-    if (baseline.syncProfile !== this.settings.syncProfile || baseline.syncPlugins !== this.settings.syncPlugins) {
       return null;
     }
     return baseline;
@@ -1171,7 +1136,7 @@ export class ObtsPluginClient {
   }
 
   private async materializedTreeFiles(commit: string): Promise<string[]> {
-    return (await this.git.listTreeFiles(commit)).filter((path) => isSyncableVaultPath(path, this.policy));
+    return (await this.git.listTreeFiles(commit)).filter((path) => isSyncableVaultPath(path));
   }
 
   private throwIfSyncBlocked(state: LocalPluginState): void {
@@ -1317,9 +1282,9 @@ function blockStatusLabel(code: string): string {
   return 'Unsafe local state';
 }
 
-function isRecoverableApplyPath(path: string, policy: SyncPathPolicy): boolean {
+function isRecoverableApplyPath(path: string): boolean {
   return (
-    isSyncableVaultPath(path, policy) ||
+    isSyncableVaultPath(path) ||
     (path !== '.obts' && !path.startsWith('.obts/') && path !== '.git' && !path.startsWith('.git/') && !path.includes('/.git/'))
   );
 }

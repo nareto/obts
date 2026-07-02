@@ -12,15 +12,13 @@ adapter under `OBTS_DATA_DIR/metadata/phase1.json`; the service boundary is
 kept narrow so a Postgres adapter can replace it without changing the sync
 model.
 
-The product model treats device sync profiles as dynamic local scope. Server
-`main` contains the union of active paired device scopes, while each device ref
-remains a whole-tree Git ref. Narrow devices may carry inherited out-of-profile
-tree entries unchanged, but server validation rejects uploads that add, modify,
-or delete paths outside the device's current profile. When the active device
-union narrows, the server advances `main` with a server-authored scope-prune
-commit rather than rewriting history. A vault with no non-revoked devices keeps
-its last effective scope and current `main` until another device pairs or an
-owner runs explicit maintenance.
+The product model syncs the full vault for every paired device. Server `main`
+contains the canonical full-vault state, while each device ref remains a
+whole-tree Git ref for that device's last accepted state. The shared hard path
+policy excludes `.obts/**`, visible `.git/**`, `.obsidian/cache/**`,
+`.obsidian/workspace.json`, `.obsidian/workspace-mobile.json`, and
+`.obsidian/plugins/obts/**`; `.trash/**`, attachments, community plugin files,
+and other `.obsidian/**` files are normal synced vault content.
 
 At-rest protection follows the current PRD: persistent server state is normal
 sensitive application state protected by deployment-managed storage controls.
@@ -30,8 +28,8 @@ Key architectural constraints:
 
 - The server maintains the canonical `main` vault state.
 - Clients upload device commits and never advance `main` directly.
-- Device profiles control local materialization and allowed changed paths; the
-  vault effective scope is derived from active paired devices.
+- Every paired device syncs the same full-vault content set after hard
+  exclusions.
 - The server is trusted to read vault content for sync, merge, conflict
   signaling, backup, and recovery.
 - Deployment-managed permissions, disk/volume encryption, snapshots, and backup

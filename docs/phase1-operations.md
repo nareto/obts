@@ -52,8 +52,7 @@ node dist/src/cli.js pairing-token create \
   --username admin \
   --password 'change-this-password' \
   --vault-id vlt_... \
-  --device-name "Laptop" \
-  --sync-profile notes_only
+  --device-name "Laptop"
 
 node dist/src/cli.js devices list \
   --username admin \

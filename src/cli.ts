@@ -3,8 +3,6 @@ import { join } from 'node:path';
 import process from 'node:process';
 
 import { newId, newSecretToken, nowIso } from './shared/ids.js';
-import type { SyncProfile } from './shared/types.js';
-import { readSyncProfile } from './shared/validators.js';
 import { ownedVaultOrThrow, hashPassword, hashToken } from './server/authService.js';
 import { createObtsServer, type ObtsServer } from './server/app.js';
 import type { ServerConfig } from './server/config.js';
@@ -28,7 +26,7 @@ Usage:
   obts health live|ready [--json]
   obts setup --username USER (--password PASSWORD | --password-env ENV) [--display-name NAME] [--json]
   obts vault create --username USER (--password PASSWORD | --password-env ENV) --display-name NAME [--json]
-  obts pairing-token create --username USER (--password PASSWORD | --password-env ENV) --vault-id ID --device-name NAME --sync-profile PROFILE [--sync-plugins] [--json]
+  obts pairing-token create --username USER (--password PASSWORD | --password-env ENV) --vault-id ID --device-name NAME [--json]
   obts devices list --username USER (--password PASSWORD | --password-env ENV) --vault-id ID [--json]
   obts conflicts list --username USER (--password PASSWORD | --password-env ENV) --vault-id ID [--status open|resolved|all] [--json]
   obts admin-recovery create-reset-token --username USER [--enable-user] [--json]
@@ -148,13 +146,10 @@ export async function runCli(
 
     if (command === 'pairing-token' && subcommand === 'create') {
       const user = await loginForCli(server, parsed, env);
-      const syncProfile = readCliSyncProfile(requiredString(parsed, 'sync-profile'));
       const result = await server.auth.createPairingToken({
         userId: user.user_id,
         vaultId: requiredString(parsed, 'vault-id'),
         deviceName: requiredString(parsed, 'device-name'),
-        syncProfile,
-        syncPlugins: booleanOption(parsed, 'sync-plugins'),
         publicBaseUrl: server.config.publicBaseUrl
       });
       writeResult(
@@ -181,15 +176,13 @@ export async function runCli(
           device_id: device.device_id,
           device_name: device.device_name,
           status: device.status,
-          sync_profile: device.sync_profile,
-          sync_plugins: device.sync_plugins,
           device_ref_head: device.device_ref_head,
           last_applied_main: device.last_applied_main,
           last_seen_at: device.last_seen_at,
           last_successful_sync_at: device.last_successful_sync_at,
           revoked_at: device.revoked_at
         }));
-      writeResult(io, parsed, { devices }, table(devices, ['device_name', 'status', 'sync_profile', 'last_seen_at', 'device_id']));
+      writeResult(io, parsed, { devices }, table(devices, ['device_name', 'status', 'last_seen_at', 'device_id']));
       return 0;
     }
 
@@ -448,10 +441,6 @@ function parseInteger(value: string, name: string): number {
     throw new CliUsageError(`${name} must be a positive integer.`);
   }
   return parsed;
-}
-
-function readCliSyncProfile(value: string): SyncProfile {
-  return readSyncProfile({ sync_profile: value }, 'sync_profile');
 }
 
 function writeResult(io: CliIo, parsed: ParsedArgs, json: unknown, text: string): void {

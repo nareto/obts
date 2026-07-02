@@ -1,8 +1,8 @@
 import { newId, nowIso } from '../shared/ids.js';
-import { assertChangedPathsAllowedByPolicy, PathPolicyViolation, type SyncPathPolicy } from '../shared/pathPolicy.js';
+import { PathPolicyViolation } from '../shared/pathPolicy.js';
 import type { ConflictRecord, DevicePushManifest, PushResult } from '../shared/types.js';
 import type { AuthenticatedDevice } from './authService.js';
-import { GitCommandError, GitService, sha256Hex, type GitDiffEntry, type GitObjectReader } from './gitService.js';
+import { GitCommandError, GitService, sha256Hex, type GitDiffEntry } from './gitService.js';
 import type { DeviceRow, MetadataDb, MetadataStore, SyncOperationRow } from './metadataStore.js';
 
 const MERGE_POLICY_VERSION = 'phase1.disjoint-paths.v1';
@@ -231,32 +231,6 @@ export class SyncService {
     };
   }
 
-  private async changedPathsForUploadPolicy(
-    vaultId: string,
-    currentDeviceRef: string | null,
-    targetCommit: string,
-    clientKnownMain: string | null,
-    reader: GitObjectReader = this.git
-  ): Promise<string[]> {
-    const currentMain = await this.git.getRef(vaultId, 'refs/heads/main');
-    let base = currentDeviceRef;
-    if (
-      base === null &&
-      clientKnownMain &&
-      currentMain &&
-      clientKnownMain !== targetCommit &&
-      (await this.git.commitExists(vaultId, clientKnownMain)) &&
-      (await reader.isAncestor(vaultId, clientKnownMain, targetCommit)) &&
-      (await this.git.isAncestor(vaultId, clientKnownMain, currentMain))
-    ) {
-      base = clientKnownMain;
-    }
-    if (!base) {
-      return await reader.listTreePaths(vaultId, targetCommit);
-    }
-    return [...changedPathSet(await reader.changedPaths(vaultId, base, targetCommit))].sort();
-  }
-
   private async validateQuarantinedUpload(
     auth: AuthenticatedDevice,
     operation: SyncOperationRow,
@@ -287,24 +261,6 @@ export class SyncService {
         }
         if (currentDeviceRef && !(await reader.isAncestor(auth.vault.vault_id, currentDeviceRef, manifest.target_commit))) {
           return await this.blockDeviceForRecovery(auth, operation, currentDeviceRef, manifest.target_commit);
-        }
-        try {
-          const changedPaths = await this.changedPathsForUploadPolicy(
-            auth.vault.vault_id,
-            currentDeviceRef,
-            manifest.target_commit,
-            manifest.client_known_main,
-            reader
-          );
-          assertChangedPathsAllowedByPolicy(changedPaths, deviceSyncPathPolicy(auth.device));
-        } catch (error) {
-          const code = error instanceof PathPolicyViolation ? error.code : 'path_policy_rejected';
-          return await this.rejectDevicePush(
-            auth,
-            operation.operation_id,
-            code,
-            'Uploaded commit changes paths outside the device sync profile.'
-          );
         }
         return null;
       });
@@ -1079,12 +1035,4 @@ function changedPathSet(entries: GitDiffEntry[]): Set<string> {
 
 function isNativeTextMergePath(path: string): boolean {
   return path.endsWith('.md') || path.endsWith('.canvas') || path.endsWith('.base');
-}
-
-function deviceSyncPathPolicy(device: DeviceRow): SyncPathPolicy {
-  return {
-    profile: device.sync_profile,
-    syncPlugins: device.sync_plugins,
-    attachmentLocation: { mode: 'same_folder_as_note' }
-  };
 }

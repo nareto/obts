@@ -21,16 +21,16 @@ Implemented runtime pieces:
 - Fastify server with first-run setup, Argon2id password storage, login/logout sessions, CSRF-protected dashboard mutations, admin user creation, vault creation, pairing tokens, device tokens, multipart push, multipart pull, events, conflicts, and health checks.
 - Phase 1 admin lifecycle APIs for redacted account listing, user disable/re-enable, admin grant/revoke with final-admin protection, one-time password reset tokens, failed-login backoff, and individual device revocation. User disable and device revocation immediately invalidate the affected dashboard sessions, pairing tokens, and device tokens.
 - Dashboard sessions use a browser-compatible `obts_session` cookie for HTTP/dev deployments and the hardened `__Host-obts_session` Secure cookie when `publicBaseUrl` is HTTPS.
-- Recent-auth enforcement covers sensitive Phase 1 dashboard mutations such as pairing token creation and admin account creation. Pairing token consumption enforces the issued device name, sync profile, and plugin-sync scope before registering a device.
+- Recent-auth enforcement covers sensitive Phase 1 dashboard mutations such as pairing token creation and admin account creation. Pairing token consumption enforces the issued device name before registering a device.
 - Multipart sync manifests reject non-commit ref strings and malformed SHA-256 packfile digests before Git ref mutation logic runs.
 - Uploaded packfiles are unpacked into a temporary quarantine repo for commit,
-  path-policy, ancestry, sync-profile, and blob-size validation. Only accepted
+  path-policy, ancestry, and blob-size validation. Only accepted
   uploads are imported into the durable per-vault Git store before refs advance.
 - Per-vault native Git stores under `OBTS_DATA_DIR/git`, with server-authored empty-tree root commits on `refs/heads/main`.
 - Protected device refs at `refs/obts/devices/{device_id}` with no-op, fast-forward, stale-ref, malformed-pack, path-policy, and same-device non-fast-forward handling.
-- Pairing stores the device sync profile and plugin-sync setting, and server-side upload validation rejects changed paths outside that paired policy while preserving inherited server tree entries.
-- Pull manifests and local apply materialize only paths allowed by the paired device's sync profile; the hidden local Git refs still track the full server `main` so out-of-profile server files are preserved on later uploads.
-- Shared client/server path policy rejects internal state, visible Git directories, traversal, empty path segments, cross-platform-invalid names, case-fold collisions, unsupported Git tree modes, and `.obsidian` files outside the explicit sync profile.
+- Every paired device syncs the same full-vault content set after hard exclusions.
+- Shared client/server path policy rejects internal state, visible Git directories, traversal, empty path segments, cross-platform-invalid names, case-fold collisions, unsupported Git tree modes, and hard-excluded paths such as `.obsidian/cache/**`, workspace files, and `.obsidian/plugins/obts/**`.
+- Full-vault sync includes `.trash/**`, attachments, community plugin files, and other `.obsidian/**` state that passes the hard path policy.
 - Server-side automatic merge for disjoint path changes, clean native Git merges of overlapping Markdown, and conservative semantic merges for safe overlapping JSON Canvas and Obsidian Bases files even when line-based Git merge cannot cleanly merge the compact source text. Merge decisions include deterministic Canvas JSON output, deterministic Bases YAML output, durable operation records, blocked-device rejection, and durable conflict records with validator results for unsafe overlapping or file/directory hierarchy-collision changes.
 - Same-path binary and attachment edits merge automatically only when the accepted server version and uploaded device version have identical blob content; otherwise they remain review-needed conflicts.
 - Merge operations persist the exact target commit and target ref in the prepared operation manifest before advancing `refs/heads/main`; startup reconciliation aborts unprepared writes, rolls forward prepared writes whose Git refs already moved, resumes merged-or-conflicted processing for recovered device ref updates, and marks unreconcilable vault state as `blocked_integrity`.
@@ -81,7 +81,7 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - plugin state surfaces `Uploading` during queued push attempts and `Applying`
   while pulled server `main` is being materialized locally;
 - divergent additional-device local content creates a recovery bundle, blocks normal sync, and requires explicit replace-local-with-server before destructive apply, even when current server `main` is still the empty root;
-- pairing tokens are scoped to their issued device name, sync profile, and plugin-sync setting, and cannot be consumed twice;
+- pairing tokens are scoped to their issued device name and cannot be consumed twice;
 - replace-local-with-server recovers and safely materializes file/directory collisions, including local directories that must be replaced by server files;
 - partial or already-paired local `.obts/` state blocks pairing before a one-time pairing token is consumed;
 - clean overlapping Markdown edits merge through native Git before conflict creation;
@@ -94,7 +94,7 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - a device with an open server conflict blocks subsequent local sync and pull/apply before local review content is replaced;
 - devices with open conflicts cannot upload newer commits until recovery or conflict review is completed;
 - retried uploads whose device ref already advanced but whose commit is not yet in `main` resume merge evaluation instead of becoming a false no-op;
-- uploaded commits that introduce paths outside the paired device's sync profile are rejected before refs advance;
+- uploaded commits that introduce invalid or hard-excluded paths are rejected before refs advance;
 - authenticated sync rejections append redacted `device_sync_rejected` events for dashboard/event polling;
 - paired devices can poll redacted vault events through device-token auth, receive
   `main_advanced` after another device advances server `main`, and receive the

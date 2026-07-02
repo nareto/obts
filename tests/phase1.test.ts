@@ -17,7 +17,7 @@ import {
   normalizeVaultPath,
   PathPolicyViolation
 } from '../src/shared/pathPolicy.js';
-import { API_VERSION, type SyncProfile } from '../src/shared/types.js';
+import { API_VERSION } from '../src/shared/types.js';
 
 type Json = Record<string, unknown>;
 
@@ -122,8 +122,6 @@ describe('Phase 1 sync without conflict resolution', () => {
       body: JSON.stringify({
         pairing_token: 'obts_pair_invalid',
         device_name: 'browser-plugin',
-        sync_profile: 'notes_only',
-        sync_plugins: false
       })
     });
     expect(invalidPair.status).toBe(401);
@@ -222,8 +220,6 @@ describe('Phase 1 sync without conflict resolution', () => {
       vaultBody.vault_id,
       '--device-name',
       'cli-laptop',
-      '--sync-profile',
-      'notes_only',
       '--json'
     ]);
     expect(pairing).toMatchObject({ code: 0, stderr: '' });
@@ -240,8 +236,6 @@ describe('Phase 1 sync without conflict resolution', () => {
       await cliServer.auth.consumePairingToken({
         pairingToken: pairingBody.pairing_token,
         deviceName: 'cli-laptop',
-        syncProfile: 'notes_only',
-        syncPlugins: false
       });
       const db = await cliServer.store.snapshot();
       const device = db.devices.find((candidate) => candidate.vault_id === vaultBody.vault_id);
@@ -455,8 +449,6 @@ describe('Phase 1 sync without conflict resolution', () => {
     const restartedPlugin = new ObtsPluginClient(deviceDir, {
       serverUrl: baseUrl,
       deviceName: 'laptop',
-      syncProfile: 'notes_only',
-      syncPlugins: false
     });
     await restartedPlugin.initialize();
     expect(await restartedPlugin.readQueue()).toMatchObject({
@@ -813,11 +805,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect((await plugin1.syncOnce()).status).toBe('Synced');
 
     await writeFile(join(device2Dir, 'phone.md'), 'uploading device change\n');
-    const localGit = new LocalGitEngine(device2Dir, {
-      profile: 'notes_only',
-      syncPlugins: false,
-      attachmentLocation: { mode: 'same_folder_as_note' }
-    });
+    const localGit = new LocalGitEngine(device2Dir);
     const phoneCommit = await localGit.createLocalCommit('obts: phone change before applying latest main');
     expect(phoneCommit).toMatch(/^[0-9a-f]{40}$/u);
     const packfile = await localGit.createPackForCommit(phoneCommit!);
@@ -999,7 +987,6 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(ownerVault.status).toBe(201);
     const pairing = await owner.post<{ pairing_token: string }>(`/api/v1/vaults/${ownerVault.body.vault_id}/pairing-tokens`, {
       device_name: 'phone',
-      sync_profile: 'notes_only'
     });
     expect(pairing.status).toBe(201);
 
@@ -1008,8 +995,6 @@ describe('Phase 1 sync without conflict resolution', () => {
     const plugin = new ObtsPluginClient(deviceDir, {
       serverUrl: baseUrl,
       deviceName: 'phone',
-      syncProfile: 'notes_only',
-      syncPlugins: false
     });
     await plugin.pairWithToken(pairing.body.pairing_token);
     const state = await plugin.readState();
@@ -1187,7 +1172,6 @@ describe('Phase 1 sync without conflict resolution', () => {
     );
     const rePairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
       device_name: 'phone',
-      sync_profile: 'notes_only'
     });
     expect(rePairing.status).toBe(201);
     await plugin.pairWithToken(rePairing.body.pairing_token);
@@ -1229,7 +1213,6 @@ describe('Phase 1 sync without conflict resolution', () => {
 
     const rePairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
       device_name: 'desktop',
-      sync_profile: 'notes_only'
     });
     expect(rePairing.status).toBe(201);
     await desktop.pairWithToken(rePairing.body.pairing_token);
@@ -1261,7 +1244,6 @@ describe('Phase 1 sync without conflict resolution', () => {
 
     const rePairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
       device_name: 'desktop',
-      sync_profile: 'notes_only'
     });
     expect(rePairing.status).toBe(201);
     await expect(desktop.pairWithToken(rePairing.body.pairing_token)).rejects.toMatchObject({
@@ -1445,38 +1427,24 @@ describe('Phase 1 sync without conflict resolution', () => {
     const admin = await setupAdminAndVault(baseUrl);
     const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
       device_name: 'phone',
-      sync_profile: 'notes_plus_attachments'
     });
     expect(pairing.status).toBe(201);
 
-    const wrongProfile = await fetch(`${baseUrl}/api/v1/pair/consume`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        pairing_token: pairing.body.pairing_token,
-        device_name: 'phone',
-        sync_profile: 'notes_only',
-        sync_plugins: false
-      })
-    });
-    expect(wrongProfile.status).toBe(401);
     const wrongDeviceName = await fetch(`${baseUrl}/api/v1/pair/consume`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         pairing_token: pairing.body.pairing_token,
-        device_name: 'tablet',
-        sync_profile: 'notes_plus_attachments',
-        sync_plugins: false
+        device_name: 'tablet'
       })
     });
     expect(wrongDeviceName.status).toBe(401);
-    const persistedAfterWrongProfile = JSON.parse(
+    const persistedAfterWrongDeviceName = JSON.parse(
       await readFile(join(root, 'server-data', 'metadata', 'phase1.json'), 'utf8')
     ) as { tokens: Array<{ kind: string; failed_attempts: number; consumed_at: string | null }> };
-    const persistedPairing = persistedAfterWrongProfile.tokens.find((token) => token.kind === 'pairing');
+    const persistedPairing = persistedAfterWrongDeviceName.tokens.find((token) => token.kind === 'pairing');
     expect(persistedPairing).toMatchObject({
-      failed_attempts: 2,
+      failed_attempts: 1,
       consumed_at: null
     });
 
@@ -1485,9 +1453,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         pairing_token: pairing.body.pairing_token,
-        device_name: 'phone',
-        sync_profile: 'notes_plus_attachments',
-        sync_plugins: false
+        device_name: 'phone'
       })
     });
     expect(consumed.status).toBe(201);
@@ -1498,9 +1464,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         pairing_token: pairing.body.pairing_token,
-        device_name: 'phone',
-        sync_profile: 'notes_plus_attachments',
-        sync_plugins: false
+        device_name: 'phone'
       })
     });
     expect(replay.status).toBe(401);
@@ -1998,8 +1962,8 @@ describe('Phase 1 sync without conflict resolution', () => {
     await mkdirp(device1Dir);
     await mkdirp(device2Dir);
 
-    const plugin1 = await pairPluginWithProfile(admin, device1Dir, 'desktop', 'notes_plus_attachments');
-    const plugin2 = await pairPluginWithProfile(admin, device2Dir, 'tablet', 'notes_plus_attachments');
+    const plugin1 = await pairPlugin(admin, device1Dir, 'desktop');
+    const plugin2 = await pairPlugin(admin, device2Dir, 'tablet');
     const imageBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01, 0x02, 0x03]);
     await writeFile(join(device1Dir, 'diagram.png'), imageBytes);
     await writeFile(join(device2Dir, 'diagram.png'), imageBytes);
@@ -2041,14 +2005,11 @@ describe('Phase 1 sync without conflict resolution', () => {
     await writeFile(join(device2Dir, 'local-only.md'), 'do not discard silently\n');
     const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
       device_name: 'phone',
-      sync_profile: 'notes_only'
     });
     expect(pairing.status).toBe(201);
     const plugin2 = new ObtsPluginClient(device2Dir, {
       serverUrl: baseUrlFromAdmin(admin),
       deviceName: 'phone',
-      syncProfile: 'notes_only',
-      syncPlugins: false
     });
 
     await expect(plugin2.pairWithToken(pairing.body.pairing_token)).rejects.toMatchObject({
@@ -2088,14 +2049,11 @@ describe('Phase 1 sync without conflict resolution', () => {
     await writeFile(join(device2Dir, 'topic.md', 'child.md'), 'local directory content\n');
     const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
       device_name: 'phone',
-      sync_profile: 'notes_only'
     });
     expect(pairing.status).toBe(201);
     const plugin2 = new ObtsPluginClient(device2Dir, {
       serverUrl: baseUrlFromAdmin(admin),
       deviceName: 'phone',
-      syncProfile: 'notes_only',
-      syncPlugins: false
     });
 
     await expect(plugin2.pairWithToken(pairing.body.pairing_token)).rejects.toMatchObject({
@@ -2120,14 +2078,11 @@ describe('Phase 1 sync without conflict resolution', () => {
     await writeFile(join(device2Dir, 'local-only.md'), 'should not become initial import\n');
     const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
       device_name: 'phone',
-      sync_profile: 'notes_only'
     });
     expect(pairing.status).toBe(201);
     const plugin2 = new ObtsPluginClient(device2Dir, {
       serverUrl: baseUrlFromAdmin(admin),
       deviceName: 'phone',
-      syncProfile: 'notes_only',
-      syncPlugins: false
     });
 
     await expect(plugin2.pairWithToken(pairing.body.pairing_token)).rejects.toMatchObject({
@@ -2149,14 +2104,11 @@ describe('Phase 1 sync without conflict resolution', () => {
     await mkdirp(join(partialDir, '.obts', 'git'));
     const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
       device_name: 'phone',
-      sync_profile: 'notes_only'
     });
     expect(pairing.status).toBe(201);
     const partialPlugin = new ObtsPluginClient(partialDir, {
       serverUrl: baseUrlFromAdmin(admin),
       deviceName: 'phone',
-      syncProfile: 'notes_only',
-      syncPlugins: false
     });
     await expect(partialPlugin.pairWithToken(pairing.body.pairing_token)).rejects.toMatchObject({
       code: 'partial_local_state'
@@ -2167,15 +2119,12 @@ describe('Phase 1 sync without conflict resolution', () => {
     const cleanPlugin = new ObtsPluginClient(cleanDir, {
       serverUrl: baseUrlFromAdmin(admin),
       deviceName: 'phone',
-      syncProfile: 'notes_only',
-      syncPlugins: false
     });
     await cleanPlugin.pairWithToken(pairing.body.pairing_token);
     expect((await awaitState(cleanPlugin)).device_id).toMatch(/^dev_/u);
 
     const initializedPairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
       device_name: 'initialized-phone',
-      sync_profile: 'notes_only'
     });
     expect(initializedPairing.status).toBe(201);
     const initializedDir = join(root, 'initialized-device');
@@ -2183,8 +2132,6 @@ describe('Phase 1 sync without conflict resolution', () => {
     const initializedPlugin = new ObtsPluginClient(initializedDir, {
       serverUrl: baseUrlFromAdmin(admin),
       deviceName: 'initialized-phone',
-      syncProfile: 'notes_only',
-      syncPlugins: false
     });
     await initializedPlugin.initialize();
     await initializedPlugin.pairWithToken(initializedPairing.body.pairing_token);
@@ -2674,11 +2621,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       deviceToken: token,
       currentLocalMain: state.local_main
     });
-    const localGit = new LocalGitEngine(device2Dir, {
-      profile: 'notes_only',
-      syncPlugins: false,
-      attachmentLocation: { mode: 'same_folder_as_note' }
-    });
+    const localGit = new LocalGitEngine(device2Dir);
     await localGit.importPack(pulled.packfile);
     const beforeHash = sha256(Buffer.from(await readFile(join(device2Dir, 'shared.md'))));
     await writeFile(
@@ -2705,8 +2648,6 @@ describe('Phase 1 sync without conflict resolution', () => {
     const restartedPlugin = new ObtsPluginClient(device2Dir, {
       serverUrl: baseUrl,
       deviceName: 'journal-device-2',
-      syncProfile: 'notes_only',
-      syncPlugins: false
     });
     await restartedPlugin.initialize();
 
@@ -2843,11 +2784,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(syncedState.server_device_ref).toMatch(/^[0-9a-f]{40}$/u);
 
     await writeFile(join(device2Dir, 'pending.md'), 'queued pending history\n');
-    const localGit = new LocalGitEngine(device2Dir, {
-      profile: 'notes_only',
-      syncPlugins: false,
-      attachmentLocation: { mode: 'same_folder_as_note' }
-    });
+    const localGit = new LocalGitEngine(device2Dir);
     const pendingCommit = await localGit.createLocalCommit('obts: queued before rebuild');
     expect(pendingCommit).toMatch(/^[0-9a-f]{40}$/u);
     await writeQueueFile(device2Dir, {
@@ -2892,11 +2829,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     const syncedState = await plugin.readState();
     expect(syncedState.server_device_ref).toMatch(/^[0-9a-f]{40}$/u);
 
-    const localGit = new LocalGitEngine(deviceDir, {
-      profile: 'notes_only',
-      syncPlugins: false,
-      attachmentLocation: { mode: 'same_folder_as_note' }
-    });
+    const localGit = new LocalGitEngine(deviceDir);
     await localGit.setLocalHead(pairedState.local_main!);
     await writeFile(join(deviceDir, 'divergent.md'), 'divergent local history\n');
     const divergentCommit = await localGit.createLocalCommit('obts: divergent queued before rebuild');
@@ -2931,11 +2864,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(state.local_main).toMatch(/^[0-9a-f]{40}$/u);
 
     await writeFile(join(deviceDir, 'retry.md'), 'commit survived server restart\n');
-    const localGit = new LocalGitEngine(deviceDir, {
-      profile: 'notes_only',
-      syncPlugins: false,
-      attachmentLocation: { mode: 'same_folder_as_note' }
-    });
+    const localGit = new LocalGitEngine(deviceDir);
     const commit = await localGit.createLocalCommit('obts: retry test commit');
     expect(commit).toMatch(/^[0-9a-f]{40}$/u);
     const packfile = await localGit.createPackForCommit(commit!);
@@ -2984,11 +2913,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     const pairedState = await plugin.readState();
     expect(pairedState.local_main).toMatch(/^[0-9a-f]{40}$/u);
 
-    const localGit = new LocalGitEngine(deviceDir, {
-      profile: 'notes_only',
-      syncPlugins: false,
-      attachmentLocation: { mode: 'same_folder_as_note' }
-    });
+    const localGit = new LocalGitEngine(deviceDir);
     const token = await readDeviceToken(deviceDir);
     const auth = await server.auth.authenticateDevice(`Bearer ${token}`, admin.vaultId);
 
@@ -3072,62 +2997,58 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
   });
 
-  it('rejects uploaded changes outside the paired device sync profile before refs advance', async () => {
+  it('accepts full-vault attachment uploads through normal device refs', async () => {
     const admin = await setupAdminAndVault(baseUrl);
-    const deviceDir = join(root, 'profile-device');
+    const deviceDir = join(root, 'full-sync-attachment-device');
     await mkdirp(deviceDir);
     const plugin = await pairPlugin(admin, deviceDir, 'laptop');
     const state = await plugin.readState();
     const token = await readDeviceToken(deviceDir);
 
     await writeFile(join(deviceDir, 'photo.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
-    const permissiveGit = new LocalGitEngine(deviceDir, {
-      profile: 'notes_plus_attachments',
-      syncPlugins: false,
-      attachmentLocation: { mode: 'vault_folder' }
-    });
-    const commit = await permissiveGit.createLocalCommit('obts: out-of-profile attachment');
+    const localGit = new LocalGitEngine(deviceDir);
+    const commit = await localGit.createLocalCommit('obts: full-vault attachment');
     expect(commit).toMatch(/^[0-9a-f]{40}$/u);
-    const packfile = await permissiveGit.createPackForCommit(commit!);
+    const packfile = await localGit.createPackForCommit(commit!);
 
     const transport = new TransportClient(baseUrl);
-    await expect(
-      transport.push({
-        vaultId: admin.vaultId,
-        deviceId: state.device_id!,
-        deviceToken: token,
-        manifest: {
-          api_version: API_VERSION,
-          vault_id: admin.vaultId,
-          device_id: state.device_id!,
-          expected_device_ref: state.server_device_ref,
-          target_commit: commit!,
-          packfile_sha256: sha256(packfile),
-          packfile_bytes: packfile.byteLength,
-          client_known_main: state.local_main
-        },
-        packfile
-      })
-    ).rejects.toMatchObject({ status: 409, code: 'profile_path_rejected' });
+    const result = await transport.push({
+      vaultId: admin.vaultId,
+      deviceId: state.device_id!,
+      deviceToken: token,
+      manifest: {
+        api_version: API_VERSION,
+        vault_id: admin.vaultId,
+        device_id: state.device_id!,
+        expected_device_ref: state.server_device_ref,
+        target_commit: commit!,
+        packfile_sha256: sha256(packfile),
+        packfile_bytes: packfile.byteLength,
+        client_known_main: state.local_main
+      },
+      packfile
+    });
+    expect(result.status).toBe('merged');
 
     const db = await server.store.snapshot();
     const device = db.devices.find((candidate) => candidate.device_id === state.device_id);
-    expect(device?.device_ref_head).toBeNull();
-    expect(db.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(state.local_main);
-    expect(await server.git.commitExists(admin.vaultId, commit!)).toBe(false);
+    expect(device?.device_ref_head).toBe(commit);
+    const main = db.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main;
+    expect(main).toMatch(/^[0-9a-f]{40}$/u);
+    expect(await server.git.listTreePaths(admin.vaultId, main!)).toEqual(expect.arrayContaining(['photo.png']));
+    expect(await server.git.commitExists(admin.vaultId, commit!)).toBe(true);
+  });
 
-    const events = await admin.get<{ events: Array<{ event_type: string; payload: { reason?: string } }> }>(
-      `/api/v1/vaults/${admin.vaultId}/events?after=0`
-    );
-    expect(events.status).toBe(200);
-    expect(events.body.events).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          event_type: 'device_sync_rejected',
-          payload: { reason: 'profile_path_rejected' }
-        })
-      ])
-    );
+  it('rejects excluded full-vault paths in the shared path policy', () => {
+    expect(() => assertSyncableTreePaths(['.obsidian/cache/cache.json'])).toThrow(PathPolicyViolation);
+    expect(() => assertSyncableTreePaths(['.obsidian/workspace.json'])).toThrow(PathPolicyViolation);
+    expect(() => assertSyncableTreePaths(['.obsidian/workspace-mobile.json'])).toThrow(PathPolicyViolation);
+    expect(() => assertSyncableTreePaths(['.obsidian/plugins/obts/main.js'])).toThrow(PathPolicyViolation);
+    expect(isSyncableVaultPath('.trash/deleted.md')).toBe(true);
+    expect(isSyncableVaultPath('.obsidian/plugins/example/main.js')).toBe(true);
+    expect(isSyncableVaultPath('.obsidian/cache/cache.json')).toBe(false);
+    expect(isSyncableVaultPath('.obsidian/workspace.json')).toBe(false);
+    expect(isSyncableVaultPath('.obsidian/plugins/obts/main.js')).toBe(false);
   });
 
   it('rejects uploaded files larger than the configured byte limit before refs advance', async () => {
@@ -3140,11 +3061,7 @@ describe('Phase 1 sync without conflict resolution', () => {
 
     const content = Buffer.from(`# Big note\n\n${'a'.repeat(10_000)}\n`);
     await writeFile(join(deviceDir, 'big.md'), content);
-    const localGit = new LocalGitEngine(deviceDir, {
-      profile: 'notes_only',
-      syncPlugins: false,
-      attachmentLocation: { mode: 'same_folder_as_note' }
-    });
+    const localGit = new LocalGitEngine(deviceDir);
     const commit = await localGit.createLocalCommit('obts: oversized file');
     expect(commit).toMatch(/^[0-9a-f]{40}$/u);
     const packfile = await localGit.createPackForCommit(commit!);
@@ -3177,32 +3094,50 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(db.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(state.local_main);
   });
 
-  it('materializes only paths allowed by the paired device sync profile while preserving server tree entries', async () => {
+  it('materializes full-vault content while excluding cache, workspace, and obts plugin files', async () => {
     const admin = await setupAdminAndVault(baseUrl);
-    const fullDeviceDir = join(root, 'full-profile-device');
-    const notesOnlyDeviceDir = join(root, 'notes-only-profile-device');
+    const fullDeviceDir = join(root, 'full-sync-device');
+    const secondDeviceDir = join(root, 'second-full-sync-device');
     await mkdirp(fullDeviceDir);
     await mkdirp(join(fullDeviceDir, '.obsidian', 'plugins', 'example'));
-    await mkdirp(notesOnlyDeviceDir);
+    await mkdirp(join(fullDeviceDir, '.obsidian', 'plugins', 'obts'));
+    await mkdirp(join(fullDeviceDir, '.obsidian', 'cache'));
+    await mkdirp(join(fullDeviceDir, '.trash'));
+    await mkdirp(secondDeviceDir);
     await writeFile(join(fullDeviceDir, 'note.md'), '# Note\n');
     await writeFile(join(fullDeviceDir, 'photo.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
     await writeFile(join(fullDeviceDir, '.obsidian', 'plugins', 'example', 'main.js'), 'module.exports = {};\n');
+    await writeFile(join(fullDeviceDir, '.obsidian', 'plugins', 'obts', 'main.js'), 'excluded self plugin\n');
+    await writeFile(join(fullDeviceDir, '.obsidian', 'cache', 'cache.json'), '{}\n');
+    await writeFile(join(fullDeviceDir, '.obsidian', 'workspace.json'), '{}\n');
+    await writeFile(join(fullDeviceDir, '.trash', 'deleted.md'), 'trash syncs\n');
 
-    const fullPlugin = await pairPluginWithProfile(admin, fullDeviceDir, 'desktop', 'full_vault_config', true);
-    expect((await fullPlugin.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+    const firstPlugin = await pairPlugin(admin, fullDeviceDir, 'desktop');
+    expect((await firstPlugin.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
 
-    const notesOnlyPlugin = await pairPlugin(admin, notesOnlyDeviceDir, 'phone');
-    expect(await readFile(join(notesOnlyDeviceDir, 'note.md'), 'utf8')).toBe('# Note\n');
-    expect(await exists(join(notesOnlyDeviceDir, 'photo.png'))).toBe(false);
-    expect(await exists(join(notesOnlyDeviceDir, '.obsidian', 'plugins', 'example', 'main.js'))).toBe(false);
+    const secondPlugin = await pairPlugin(admin, secondDeviceDir, 'phone');
+    expect(await readFile(join(secondDeviceDir, 'note.md'), 'utf8')).toBe('# Note\n');
+    expect(await readFile(join(secondDeviceDir, 'photo.png'))).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    expect(await readFile(join(secondDeviceDir, '.obsidian', 'plugins', 'example', 'main.js'), 'utf8')).toBe('module.exports = {};\n');
+    expect(await readFile(join(secondDeviceDir, '.trash', 'deleted.md'), 'utf8')).toBe('trash syncs\n');
+    expect(await exists(join(secondDeviceDir, '.obsidian', 'plugins', 'obts', 'main.js'))).toBe(false);
+    expect(await exists(join(secondDeviceDir, '.obsidian', 'cache', 'cache.json'))).toBe(false);
+    expect(await exists(join(secondDeviceDir, '.obsidian', 'workspace.json'))).toBe(false);
 
-    await writeFile(join(notesOnlyDeviceDir, 'phone.md'), 'notes-only change\n');
-    expect((await notesOnlyPlugin.syncOnce()).status).toBe('Synced');
+    await writeFile(join(secondDeviceDir, 'phone.md'), 'full-sync change\n');
+    expect((await secondPlugin.syncOnce()).status).toBe('Synced');
 
     const main = (await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main;
     expect(main).toMatch(/^[0-9a-f]{40}$/u);
     expect(await server.git.listTreePaths(admin.vaultId, main!)).toEqual(
-      expect.arrayContaining(['note.md', 'phone.md', 'photo.png', '.obsidian/plugins/example/main.js'])
+      expect.arrayContaining(['note.md', 'phone.md', 'photo.png', '.obsidian/plugins/example/main.js', '.trash/deleted.md'])
+    );
+    expect(await server.git.listTreePaths(admin.vaultId, main!)).not.toEqual(
+      expect.arrayContaining([
+        '.obsidian/plugins/obts/main.js',
+        '.obsidian/cache/cache.json',
+        '.obsidian/workspace.json'
+      ])
     );
   });
 
@@ -3242,11 +3177,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     await mkdirp(join(deviceDir, 'notes'));
     await writeFile(join(deviceDir, 'Notes', 'A.md'), 'upper\n');
     await writeFile(join(deviceDir, 'notes', 'a.md'), 'lower\n');
-    const localGit = new LocalGitEngine(deviceDir, {
-      profile: 'notes_only',
-      syncPlugins: false,
-      attachmentLocation: { mode: 'same_folder_as_note' }
-    });
+    const localGit = new LocalGitEngine(deviceDir);
     await localGit.initialize();
 
     await expect(localGit.createLocalCommit('obts: collision')).rejects.toBeInstanceOf(PathPolicyViolation);
@@ -3256,11 +3187,7 @@ describe('Phase 1 sync without conflict resolution', () => {
   it('detects rapid same-size local edits by staged content instead of timestamps', async () => {
     const deviceDir = join(root, 'rapid-edit-device');
     await mkdirp(deviceDir);
-    const localGit = new LocalGitEngine(deviceDir, {
-      profile: 'notes_only',
-      syncPlugins: false,
-      attachmentLocation: { mode: 'same_folder_as_note' }
-    });
+    const localGit = new LocalGitEngine(deviceDir);
     await localGit.initialize();
 
     await writeFile(join(deviceDir, 'library.base'), 'a: 1\n');
@@ -3357,15 +3284,12 @@ describe('Phase 1 sync without conflict resolution', () => {
       `/api/v1/vaults/${otherVault.body.vault_id}/pairing-tokens`,
       {
         device_name: 'other-device',
-        sync_profile: 'notes_only'
       }
     );
     expect(otherPairing.status).toBe(201);
     const otherPlugin = new ObtsPluginClient(otherDir, {
       serverUrl: baseUrl,
       deviceName: 'other-device',
-      syncProfile: 'notes_only',
-      syncPlugins: false
     });
     await otherPlugin.pairWithToken(otherPairing.body.pairing_token);
     const otherPluginState = await otherPlugin.readState();
@@ -3455,22 +3379,19 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(normalizeVaultPath('notes/trailing.').ok).toBe(false);
   });
 
-  it('applies the explicit Obsidian config and plugin path policy before note-extension shortcuts', () => {
-    const notesOnly = { profile: 'notes_only' as const, syncPlugins: false, attachmentLocation: { mode: 'same_folder_as_note' as const } };
-    const fullNoPlugins = {
-      profile: 'full_vault_config' as const,
-      syncPlugins: false,
-      attachmentLocation: { mode: 'same_folder_as_note' as const }
-    };
-    const fullWithPlugins = { ...fullNoPlugins, syncPlugins: true };
-
-    expect(isSyncableVaultPath('.obsidian/readme.md', notesOnly)).toBe(false);
-    expect(isSyncableVaultPath('.obsidian/readme.md', fullNoPlugins)).toBe(false);
-    expect(isSyncableVaultPath('.obsidian/app.json', fullNoPlugins)).toBe(true);
-    expect(isSyncableVaultPath('.obsidian/snippets/theme.css', fullNoPlugins)).toBe(true);
-    expect(isSyncableVaultPath('.obsidian/plugins/example/main.js', fullNoPlugins)).toBe(false);
-    expect(isSyncableVaultPath('.obsidian/plugins/example/main.js', fullWithPlugins)).toBe(true);
-    expect(isSyncableVaultPath('.obsidian/plugins/obts/main.js', fullWithPlugins)).toBe(false);
+  it('syncs the full vault except hard exclusions', () => {
+    expect(isSyncableVaultPath('notes/readme.md')).toBe(true);
+    expect(isSyncableVaultPath('attachments/photo.png')).toBe(true);
+    expect(isSyncableVaultPath('.trash/deleted.md')).toBe(true);
+    expect(isSyncableVaultPath('.obsidian/readme.md')).toBe(true);
+    expect(isSyncableVaultPath('.obsidian/app.json')).toBe(true);
+    expect(isSyncableVaultPath('.obsidian/snippets/theme.css')).toBe(true);
+    expect(isSyncableVaultPath('.obsidian/plugins/example/main.js')).toBe(true);
+    expect(isSyncableVaultPath('.obsidian/plugins/example/data.json')).toBe(true);
+    expect(isSyncableVaultPath('.obsidian/plugins/obts/main.js')).toBe(false);
+    expect(isSyncableVaultPath('.obsidian/cache/cache.json')).toBe(false);
+    expect(isSyncableVaultPath('.obsidian/workspace.json')).toBe(false);
+    expect(isSyncableVaultPath('.obsidian/workspace-mobile.json')).toBe(false);
   });
 
   it('serializes metadata snapshots behind in-flight mutations', async () => {
@@ -3516,27 +3437,13 @@ async function setupAdminAndVault(baseUrl: string): Promise<BrowserSession & { v
 }
 
 async function pairPlugin(admin: BrowserSession & { vaultId: string }, vaultDir: string, deviceName: string): Promise<ObtsPluginClient> {
-  return await pairPluginWithProfile(admin, vaultDir, deviceName, 'notes_only');
-}
-
-async function pairPluginWithProfile(
-  admin: BrowserSession & { vaultId: string },
-  vaultDir: string,
-  deviceName: string,
-  syncProfile: SyncProfile,
-  syncPlugins = false
-): Promise<ObtsPluginClient> {
   const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
-    device_name: deviceName,
-    sync_profile: syncProfile,
-    sync_plugins: syncPlugins
+    device_name: deviceName
   });
   expect(pairing.status).toBe(201);
   const plugin = new ObtsPluginClient(vaultDir, {
     serverUrl: baseUrlFromAdmin(admin),
-    deviceName,
-    syncProfile,
-    syncPlugins
+    deviceName
   });
   await plugin.pairWithToken(pairing.body.pairing_token);
   return plugin;

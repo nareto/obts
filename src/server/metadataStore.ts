@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { newId, nowIso } from '../shared/ids.js';
-import type { ConflictRecord, EventEnvelope, SyncProfile } from '../shared/types.js';
+import type { ConflictRecord, EventEnvelope } from '../shared/types.js';
 
 const EVENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const EVENT_RETENTION_LIMIT = 100_000;
@@ -59,8 +59,6 @@ export type DeviceRow = {
   vault_id: string;
   user_id: string;
   device_name: string;
-  sync_profile: SyncProfile;
-  sync_plugins: boolean;
   device_ref: string;
   device_ref_head: string | null;
   status: 'paired' | 'synced' | 'ahead' | 'review_needed' | 'blocked_recovery' | 'revoked';
@@ -260,10 +258,7 @@ export class MetadataStore {
       legacyDb.login_attempts = [];
     }
     for (const device of db.devices) {
-      const legacyDevice = device as DeviceRow & { sync_plugins?: boolean; last_applied_main?: string | null };
-      if (legacyDevice.sync_plugins === undefined) {
-        legacyDevice.sync_plugins = false;
-      }
+      const legacyDevice = device as DeviceRow & { last_applied_main?: string | null };
       if (!Object.prototype.hasOwnProperty.call(legacyDevice, 'last_applied_main')) {
         legacyDevice.last_applied_main = null;
       }

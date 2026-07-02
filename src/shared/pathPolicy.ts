@@ -1,63 +1,7 @@
-import { extname } from 'node:path';
-
-import type { SyncProfile } from './types.js';
-
 export type PathPolicyResult =
   | { ok: true; path: string }
   | { ok: false; code: string; message: string; details?: Record<string, unknown> };
 
-export type SyncPathPolicy = {
-  profile: SyncProfile;
-  syncPlugins: boolean;
-  attachmentLocation?:
-    | { mode: 'vault_folder' }
-    | { mode: 'specified_folder'; folder: string }
-    | { mode: 'same_folder_as_note' }
-    | { mode: 'subfolder_under_note_folder'; subfolder: string };
-};
-
-const NOTE_EXTENSIONS = new Set(['.md', '.canvas', '.base']);
-const ATTACHMENT_EXTENSIONS = new Set([
-  '.avif',
-  '.bmp',
-  '.gif',
-  '.jpeg',
-  '.jpg',
-  '.png',
-  '.svg',
-  '.webp',
-  '.flac',
-  '.m4a',
-  '.mp3',
-  '.ogg',
-  '.wav',
-  '.webm',
-  '.3gp',
-  '.mkv',
-  '.mov',
-  '.mp4',
-  '.ogv',
-  '.pdf'
-]);
-const OBSIDIAN_ALLOWLIST = new Set([
-  '.obsidian/app.json',
-  '.obsidian/appearance.json',
-  '.obsidian/backlinks.json',
-  '.obsidian/bookmarks.json',
-  '.obsidian/command-palette.json',
-  '.obsidian/core-plugins.json',
-  '.obsidian/core-plugins-migration.json',
-  '.obsidian/daily-notes.json',
-  '.obsidian/editor.json',
-  '.obsidian/graph.json',
-  '.obsidian/hotkeys.json',
-  '.obsidian/outgoing-link.json',
-  '.obsidian/page-preview.json',
-  '.obsidian/properties.json',
-  '.obsidian/switcher.json',
-  '.obsidian/templates.json',
-  '.obsidian/types.json'
-]);
 const WINDOWS_RESERVED = new Set([
   'con',
   'prn',
@@ -133,43 +77,26 @@ export function normalizeVaultPath(input: string): PathPolicyResult {
   return { ok: true, path: trimmedPrefix };
 }
 
-export function isSyncableVaultPath(path: string, policy: SyncPathPolicy): boolean {
+export function isSyncableVaultPath(path: string): boolean {
   const normalized = normalizeVaultPath(path);
   if (!normalized.ok) {
     return false;
   }
   const cleanPath = normalized.path;
-  const firstSegment = cleanPath.split('/')[0] ?? '';
-  const extension = extname(cleanPath).toLowerCase();
 
-  if (firstSegment === '.trash') {
-    return false;
-  }
   if (isOsOrEditorMetadata(cleanPath)) {
     return false;
   }
-  if (firstSegment === '.obsidian') {
-    if (cleanPath.startsWith('.obsidian/plugins/')) {
-      return policy.profile === 'full_vault_config' && policy.syncPlugins && !cleanPath.startsWith('.obsidian/plugins/obts/');
-    }
-    if (policy.profile !== 'full_vault_config') {
-      return false;
-    }
-    if (cleanPath.startsWith('.obsidian/snippets/') && cleanPath.endsWith('.css')) {
-      return true;
-    }
-    return OBSIDIAN_ALLOWLIST.has(cleanPath);
-  }
-  if (NOTE_EXTENSIONS.has(extension)) {
-    return true;
-  }
-  if (policy.profile === 'notes_only') {
+  if (cleanPath === '.obsidian/workspace.json' || cleanPath === '.obsidian/workspace-mobile.json') {
     return false;
   }
-  if (policy.profile === 'notes_plus_attachments') {
-    return isAttachmentPath(cleanPath, policy);
+  if (cleanPath.startsWith('.obsidian/cache/')) {
+    return false;
   }
-  return isAttachmentPath(cleanPath, policy);
+  if (cleanPath.startsWith('.obsidian/plugins/obts/')) {
+    return false;
+  }
+  return true;
 }
 
 export function assertSyncableTreePaths(paths: string[]): void {
@@ -179,6 +106,9 @@ export function assertSyncableTreePaths(paths: string[]): void {
     if (!normalized.ok) {
       throw new PathPolicyViolation(normalized.code, normalized.message, normalized.details);
     }
+    if (!isSyncableVaultPath(normalized.path)) {
+      throw new PathPolicyViolation('excluded_path', 'Vault path is excluded from full-vault sync.');
+    }
     const collisionKey = normalized.path.normalize('NFC').toLocaleLowerCase('en-US');
     const existing = seen.get(collisionKey);
     if (existing !== undefined && existing !== normalized.path) {
@@ -187,20 +117,6 @@ export function assertSyncableTreePaths(paths: string[]): void {
       });
     }
     seen.set(collisionKey, normalized.path);
-  }
-}
-
-export function assertChangedPathsAllowedByPolicy(paths: string[], policy: SyncPathPolicy): void {
-  for (const path of paths) {
-    const normalized = normalizeVaultPath(path);
-    if (!normalized.ok) {
-      throw new PathPolicyViolation(normalized.code, normalized.message, normalized.details);
-    }
-    if (!isSyncableVaultPath(normalized.path, policy)) {
-      throw new PathPolicyViolation('profile_path_rejected', 'Vault path is outside the device sync profile.', {
-        profile: policy.profile
-      });
-    }
   }
 }
 
@@ -215,25 +131,6 @@ export class PathPolicyViolation extends Error {
       this.details = details;
     }
   }
-}
-
-function isAttachmentPath(path: string, policy: SyncPathPolicy): boolean {
-  const extension = extname(path).toLowerCase();
-  if (!ATTACHMENT_EXTENSIONS.has(extension)) {
-    return false;
-  }
-  if (!policy.attachmentLocation || policy.attachmentLocation.mode === 'vault_folder') {
-    return !path.includes('/');
-  }
-  if (policy.attachmentLocation.mode === 'specified_folder') {
-    const folder = policy.attachmentLocation.folder.replaceAll('\\', '/').replace(/\/+$/u, '');
-    return path.startsWith(`${folder}/`);
-  }
-  if (policy.attachmentLocation.mode === 'same_folder_as_note') {
-    return true;
-  }
-  const subfolder = policy.attachmentLocation.subfolder.replaceAll('\\', '/').replace(/^\/+|\/+$/gu, '');
-  return path.split('/').includes(subfolder);
 }
 
 function isOsOrEditorMetadata(path: string): boolean {

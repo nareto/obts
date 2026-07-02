@@ -1,6 +1,4 @@
-export const API_VERSION = '2026-06-29.phase1';
-
-export type SyncProfile = 'notes_only' | 'notes_plus_attachments' | 'full_vault_config';
+export const API_VERSION = '2026-07-02.full-sync';
 
 export type StatusLabel =
   | 'Synced'
@@ -60,8 +58,6 @@ export type VaultSummary = {
 
 export type CreatePairingTokenRequest = {
   device_name: string;
-  sync_profile: SyncProfile;
-  sync_plugins?: boolean;
 };
 
 export type PairingTokenResponse = {
@@ -73,8 +69,6 @@ export type PairingTokenResponse = {
 export type ConsumePairingTokenRequest = {
   pairing_token: string;
   device_name: string;
-  sync_profile: SyncProfile;
-  sync_plugins?: boolean;
   client_name?: string;
 };
 

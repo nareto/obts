@@ -7,8 +7,7 @@ import git, { type TreeEntry } from 'isomorphic-git';
 import {
   assertSyncableTreePaths,
   isSyncableVaultPath,
-  normalizeVaultPath,
-  type SyncPathPolicy
+  normalizeVaultPath
 } from '../shared/pathPolicy.js';
 
 export type LocalGitState = {
@@ -20,10 +19,7 @@ export type LocalGitState = {
 export class LocalGitEngine {
   readonly gitdir: string;
 
-  constructor(
-    readonly vaultDir: string,
-    readonly policy: SyncPathPolicy
-  ) {
+  constructor(readonly vaultDir: string) {
     this.gitdir = join(vaultDir, '.obts', 'git');
   }
 
@@ -116,7 +112,7 @@ export class LocalGitEngine {
     await walk(this.vaultDir, async (absolutePath) => {
       const rel = relative(this.vaultDir, absolutePath).replaceAll('\\', '/');
       const normalized = normalizeVaultPath(rel);
-      if (normalized.ok && isSyncableVaultPath(normalized.path, this.policy)) {
+      if (normalized.ok && isSyncableVaultPath(normalized.path)) {
         files.push(normalized.path);
       }
     });
@@ -133,7 +129,7 @@ export class LocalGitEngine {
     const nextEntries = new Map(baseEntries);
 
     for (const path of baseEntries.keys()) {
-      if (isSyncableVaultPath(path, this.policy) && !fileSet.has(path)) {
+      if (!isSyncableVaultPath(path) || !fileSet.has(path)) {
         nextEntries.delete(path);
       }
     }

@@ -6,38 +6,38 @@ graph LR
 
     subgraph 6 ["Obsidian True Sync"]
 
-      subgraph 30 ["Obsidian plugin"]
+      subgraph 29 ["Obsidian plugin"]
 
-        31["SettingsView [Component: TypeScript]"]
-        32["StatusBar [Component: TypeScript]"]
-        33["VaultWatcher [Component: TypeScript, Obsidian Vault API]"]
-        34["PeriodicScanner [Component: TypeScript]"]
-        35["PathNormalizer [Component: TypeScript]"]
-        36["SnapshotEngine [Component: TypeScript]"]
-        37["LocalQueue [Component: TypeScript]"]
-        38["LocalContentCache [Component: TypeScript]"]
-        39["TransportClient [Component: TypeScript]"]
-        40["ApplyEngine [Component: TypeScript, Obsidian Vault API]"]
-        41["DiagnosticsExporter [Component: TypeScript]"]
+        30["SettingsView [Component: TypeScript]"]
+        31["StatusBar [Component: TypeScript]"]
+        32["VaultWatcher [Component: TypeScript, Obsidian Vault API]"]
+        33["PeriodicScanner [Component: TypeScript]"]
+        34["PathNormalizer [Component: TypeScript]"]
+        35["SnapshotEngine [Component: TypeScript]"]
+        36["LocalQueue [Component: TypeScript]"]
+        37["LocalContentCache [Component: TypeScript]"]
+        38["TransportClient [Component: TypeScript]"]
+        39["ApplyEngine [Component: TypeScript, Obsidian Vault API]"]
+        40["DiagnosticsExporter [Component: TypeScript]"]
       end
 
-      42["User-visible vault files [Container: Obsidian Vault API and local filesystem]"]
-      43[".obts local store [Container: Local filesystem and platform secure storage]"]
+      41["User-visible vault files [Container: Obsidian Vault API and local filesystem]"]
+      42[".obts local store [Container: Local filesystem and platform secure storage]"]
       7["Server API and CLI [Container: TypeScript, Node.js, Fastify]"]
     end
 
-    31-. "Consumes pairing tokens, reports post-pairing profile changes, and stores device registration metadata locally. [HTTPS]" .->7
-    33-. "Receives vault change notifications through supported APIs. [Obsidian Vault API]" .->4
-    34-. "Scans vault files to detect missed watcher events and crash recovery work. [Obsidian Vault API]" .->42
-    36-. "Canonicalizes vault-relative paths before proposal creation. [TypeScript calls]" .->35
-    36-. "Reads changed content before enqueueing proposal data. [Obsidian Vault API]" .->42
-    36-. "Persists proposal state before upload or destructive local apply. [TypeScript calls]" .->37
-    37-. "Stores queue state, proposal payloads, recovery bundles, locks, and diagnostics under .obts. [Filesystem]" .->43
-    38-. "Caches content required for retry, pull, apply, and recovery. [Filesystem]" .->43
-    39-. "Uploads scoped content and proposals, pulls profile-filtered diffs, lists conflict state, and subscribes to events. [HTTPS/WSS]" .->7
-    40-. "Requires local recovery snapshot before applying destructive server changes. [TypeScript calls]" .->36
-    40-. "Materializes accepted server main entries into vault files and managed Obsidian configuration targets. [Obsidian Vault API]" .->42
-    32-. "Reads local queue state to show ahead, blocked, retry, and recovery statuses. [TypeScript calls]" .->37
-    41-. "Reads local state and writes redacted diagnostic bundles. [Filesystem]" .->43
+    33-. "Scans vault files to detect missed watcher events and crash recovery work. [Obsidian Vault API]" .->41
+    35-. "Canonicalizes vault-relative paths before proposal creation. [TypeScript calls]" .->34
+    35-. "Reads changed content before enqueueing proposal data. [Obsidian Vault API]" .->41
+    35-. "Persists proposal state before upload or destructive local apply. [TypeScript calls]" .->36
+    36-. "Stores queue state, proposal payloads, recovery bundles, locks, and diagnostics under .obts. [Filesystem]" .->42
+    37-. "Caches content required for retry, pull, apply, and recovery. [Filesystem]" .->42
+    38-. "Uploads full-vault content and proposals, pulls diffs, lists conflict state, and subscribes to events. [HTTPS/WSS]" .->7
+    39-. "Requires local recovery snapshot before applying destructive server changes. [TypeScript calls]" .->35
+    39-. "Materializes accepted server main entries into vault files and managed Obsidian configuration targets. [Obsidian Vault API]" .->41
+    31-. "Reads local queue state to show ahead, blocked, retry, and recovery statuses. [TypeScript calls]" .->36
+    40-. "Reads local state and writes redacted diagnostic bundles. [Filesystem]" .->42
+    30-. "Consumes pairing tokens and stores device registration metadata locally. [HTTPS]" .->7
+    32-. "Receives vault change notifications through supported APIs. [Obsidian Vault API]" .->4
 
   end

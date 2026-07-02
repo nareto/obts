@@ -43,14 +43,12 @@ Phase 1 workflow without using test harness code.
      --username admin \
      --password 'change-this-password' \
      --vault-id vlt_... \
-     --device-name "Laptop" \
-     --sync-profile notes_only
+     --device-name "Laptop"
    ```
 
 5. Install the Obsidian plugin package from `obsidian-plugin/` into the copied
    test vault's `.obsidian/plugins/obts/` directory. Enter the server URL,
-   pairing token, device name, sync profile, and plugin-sync setting in the
-   plugin settings, then pair the device.
+   pairing token, and device name in the plugin settings, then pair the device.
 
 6. Repeat pairing for a second copied test vault.
 
@@ -86,4 +84,3 @@ Phase 1 workflow without using test harness code.
     docker rm -f obts-smoke
     docker volume rm obts-smoke-data
     ```
-

@@ -4,7 +4,6 @@ import { promisify } from 'node:util';
 import { Algorithm, hash as argonHash, verify as argonVerify, Version } from '@node-rs/argon2';
 
 import { newId, newSecretToken, nowIso } from '../shared/ids.js';
-import type { SyncProfile } from '../shared/types.js';
 import type {
   DeviceRow,
   LegacyPasswordHash,
@@ -431,8 +430,6 @@ export class AuthService {
     userId: string;
     vaultId: string;
     deviceName: string;
-    syncProfile: SyncProfile;
-    syncPlugins: boolean;
     publicBaseUrl: string;
   }): Promise<{ token: string; expiresAt: string; pairingUrl: string }> {
     const token = newSecretToken('obts_pair');
@@ -453,9 +450,7 @@ export class AuthService {
         failed_attempts: 0,
         revoked_at: null,
         metadata: {
-          device_name: input.deviceName,
-          sync_profile: input.syncProfile,
-          sync_plugins: input.syncPlugins
+          device_name: input.deviceName
         },
         created_at: nowIso()
       });
@@ -480,8 +475,6 @@ export class AuthService {
   async consumePairingToken(input: {
     pairingToken: string;
     deviceName: string;
-    syncProfile: SyncProfile;
-    syncPlugins: boolean;
   }): Promise<{ user: UserRow; vault: VaultRow; device: DeviceRow; deviceToken: string; isFirstDevice: boolean }> {
     const tokenHash = hashToken(input.pairingToken);
     const deviceToken = newSecretToken('obts_dev');
@@ -511,14 +504,8 @@ export class AuthService {
       if (!user || user.disabled || !vault || vault.owner_user_id !== user.user_id) {
         throw new AuthError(401, 'invalid_pairing_token', 'Pairing token is invalid or expired.');
       }
-      const tokenSyncProfile = readTokenSyncProfile(token);
-      const tokenSyncPlugins = token.metadata.sync_plugins === true;
       const tokenDeviceName = typeof token.metadata.device_name === 'string' ? token.metadata.device_name : null;
-      if (
-        input.syncProfile !== tokenSyncProfile ||
-        input.syncPlugins !== tokenSyncPlugins ||
-        (tokenDeviceName !== null && input.deviceName !== tokenDeviceName)
-      ) {
+      if (tokenDeviceName !== null && input.deviceName !== tokenDeviceName) {
         token.failed_attempts += 1;
         return { ok: false, error: new AuthError(401, 'invalid_pairing_token', 'Pairing token is invalid or expired.') };
       }
@@ -530,8 +517,6 @@ export class AuthService {
         vault_id: vault.vault_id,
         user_id: user.user_id,
         device_name: input.deviceName,
-        sync_profile: tokenSyncProfile,
-        sync_plugins: tokenSyncPlugins,
         device_ref: '',
         device_ref_head: null,
         status: 'paired',
@@ -557,9 +542,7 @@ export class AuthService {
         failed_attempts: 0,
         revoked_at: null,
         metadata: {
-          device_name: input.deviceName,
-          sync_profile: tokenSyncProfile,
-          sync_plugins: tokenSyncPlugins
+          device_name: input.deviceName
         },
         created_at: nowIso()
       });
@@ -786,14 +769,6 @@ function createSession(userId: string): SessionRow {
     recent_auth_at: new Date(now).toISOString(),
     revoked_at: null
   };
-}
-
-function readTokenSyncProfile(token: TokenRow): SyncProfile {
-  const value = token.metadata.sync_profile;
-  if (value === 'notes_only' || value === 'notes_plus_attachments' || value === 'full_vault_config') {
-    return value;
-  }
-  throw new AuthError(401, 'invalid_pairing_token', 'Pairing token is invalid or expired.');
 }
 
 function parseBearer(header: string | undefined): string {

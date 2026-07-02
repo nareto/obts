@@ -5,50 +5,8 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 
-const API_VERSION = "2026-06-29.phase1";
+const API_VERSION = "2026-07-02.full-sync";
 const PLUGIN_VERSION = "0.1.0-phase1";
-const NOTE_EXTENSIONS = new Set([".md", ".canvas", ".base"]);
-const ATTACHMENT_EXTENSIONS = new Set([
-  ".avif",
-  ".bmp",
-  ".gif",
-  ".jpeg",
-  ".jpg",
-  ".png",
-  ".svg",
-  ".webp",
-  ".flac",
-  ".m4a",
-  ".mp3",
-  ".ogg",
-  ".wav",
-  ".webm",
-  ".3gp",
-  ".mkv",
-  ".mov",
-  ".mp4",
-  ".ogv",
-  ".pdf"
-]);
-const OBSIDIAN_ALLOWLIST = new Set([
-  ".obsidian/app.json",
-  ".obsidian/appearance.json",
-  ".obsidian/backlinks.json",
-  ".obsidian/bookmarks.json",
-  ".obsidian/command-palette.json",
-  ".obsidian/core-plugins.json",
-  ".obsidian/core-plugins-migration.json",
-  ".obsidian/daily-notes.json",
-  ".obsidian/editor.json",
-  ".obsidian/graph.json",
-  ".obsidian/hotkeys.json",
-  ".obsidian/outgoing-link.json",
-  ".obsidian/page-preview.json",
-  ".obsidian/properties.json",
-  ".obsidian/switcher.json",
-  ".obsidian/templates.json",
-  ".obsidian/types.json"
-]);
 const WINDOWS_RESERVED = new Set(["con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"]);
 const SYNC_DEBOUNCE_MS = 1500;
 const BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000;
@@ -57,14 +15,14 @@ const DEFAULT_SETTINGS = {
   serverUrl: "http://127.0.0.1:3000",
   pairingToken: "",
   deviceName: "",
-  syncProfile: "notes_only",
-  syncPlugins: false,
   gitBinary: "git"
 };
 
 module.exports = class ObtsPlugin extends Plugin {
   async onload() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    delete this.settings.syncProfile;
+    delete this.settings.syncPlugins;
     this.status = this.addStatusBarItem();
     this.syncQueued = false;
     this.syncRunning = false;
@@ -315,9 +273,7 @@ class ObtsObsidianClient {
     const baseline = this.detachedBaselineFromState(await readJson(this.statePath, null));
     const result = await postJson(this.url("/api/v1/pair/consume"), {
       pairing_token: pairingToken,
-      device_name: this.plugin.settings.deviceName || "Obsidian device",
-      sync_profile: this.plugin.settings.syncProfile,
-      sync_plugins: this.plugin.settings.syncPlugins
+      device_name: this.plugin.settings.deviceName || "Obsidian device"
     });
     const rePairBaseline = this.baselineForPairing(baseline, result.vault_id);
     await this.initialize();
@@ -332,15 +288,11 @@ class ObtsObsidianClient {
       local_main: null,
       local_head: null,
       initial_import_confirmed: false,
-      sync_profile: this.plugin.settings.syncProfile,
-      sync_plugins: this.plugin.settings.syncPlugins,
       status_label: "Checking",
       last_error_code: null,
       last_event_seq: 0,
       unpaired_baseline_vault_id: null,
       unpaired_baseline_main: null,
-      unpaired_baseline_sync_profile: null,
-      unpaired_baseline_sync_plugins: null,
       updated_at: nowIso()
     });
 
@@ -550,7 +502,7 @@ class ObtsObsidianClient {
       const changedPaths = (Array.isArray(paths) ? paths : [paths])
         .filter((filePath) => typeof filePath === "string" && filePath.length > 0)
         .map((filePath) => normalizePath(filePath))
-        .filter((filePath) => isSyncableVaultPath(filePath, this.plugin.settings));
+        .filter((filePath) => isSyncableVaultPath(filePath));
       if (changedPaths.length === 0) {
         return;
       }
@@ -694,15 +646,11 @@ class ObtsObsidianClient {
       local_main: null,
       local_head: null,
       initial_import_confirmed: false,
-      sync_profile: null,
-      sync_plugins: null,
       status_label: "Not paired",
       last_error_code: null,
       last_event_seq: 0,
       unpaired_baseline_vault_id: state.vault_id,
       unpaired_baseline_main: baselineMain,
-      unpaired_baseline_sync_profile: state.sync_profile || this.plugin.settings.syncProfile,
-      unpaired_baseline_sync_plugins: Object.prototype.hasOwnProperty.call(state, "sync_plugins") ? state.sync_plugins : this.plugin.settings.syncPlugins,
       updated_at: nowIso()
     });
     return { status: "Not paired" };
@@ -753,7 +701,7 @@ class ObtsObsidianClient {
       for (const conflictPath of materializationConflictFiles(new Set([...targetFiles, ...affected]), localVaultFiles)) {
         affected.add(conflictPath);
       }
-      const affectedPaths = Array.from(affected).filter((filePath) => isRecoverableApplyPath(filePath, this.plugin.settings)).sort();
+      const affectedPaths = Array.from(affected).filter((filePath) => isRecoverableApplyPath(filePath)).sort();
       journal.affected_paths = affectedPaths;
       for (const filePath of affectedPaths) {
         journal.preflight_sha256[filePath] = await this.adapterSha256(filePath);
@@ -918,7 +866,7 @@ class ObtsObsidianClient {
     const localFiles = await this.scanSyncableFiles();
     const localSet = new Set(localFiles);
     for (const filePath of tracked) {
-      if (isSyncableVaultPath(filePath, this.plugin.settings) && !localSet.has(filePath)) {
+      if (!isSyncableVaultPath(filePath) || !localSet.has(filePath)) {
         await this.git(["update-index", "--remove", "--", filePath], { allowFailure: true });
       }
     }
@@ -951,7 +899,7 @@ class ObtsObsidianClient {
   }
 
   async scanSyncableFiles() {
-    const result = (await this.listLocalVaultFiles()).filter((filePath) => isSyncableVaultPath(filePath, this.plugin.settings));
+    const result = (await this.listLocalVaultFiles()).filter((filePath) => isSyncableVaultPath(filePath));
     return assertNoCaseCollisions(result.sort());
   }
 
@@ -1128,7 +1076,7 @@ class ObtsObsidianClient {
       return [];
     }
     const output = await this.git(["ls-tree", "-r", "-z", "--name-only", commit]);
-    return output.split("\0").filter(Boolean).filter((filePath) => isSyncableVaultPath(filePath, this.plugin.settings)).sort();
+    return output.split("\0").filter(Boolean).filter((filePath) => isSyncableVaultPath(filePath)).sort();
   }
 
   async readBlob(commit, filePath) {
@@ -1263,17 +1211,13 @@ class ObtsObsidianClient {
     if (
       !state ||
       !state.unpaired_baseline_vault_id ||
-      !state.unpaired_baseline_main ||
-      !state.unpaired_baseline_sync_profile ||
-      typeof state.unpaired_baseline_sync_plugins !== "boolean"
+      !state.unpaired_baseline_main
     ) {
       return null;
     }
     return {
       vaultId: state.unpaired_baseline_vault_id,
-      main: state.unpaired_baseline_main,
-      syncProfile: state.unpaired_baseline_sync_profile,
-      syncPlugins: state.unpaired_baseline_sync_plugins
+      main: state.unpaired_baseline_main
     };
   }
 
@@ -1282,9 +1226,6 @@ class ObtsObsidianClient {
       return null;
     }
     if (baseline.vaultId !== vaultId) {
-      return null;
-    }
-    if (baseline.syncProfile !== this.plugin.settings.syncProfile || baseline.syncPlugins !== this.plugin.settings.syncPlugins) {
       return null;
     }
     return baseline;
@@ -1411,15 +1352,11 @@ class ObtsObsidianClient {
       local_main: null,
       local_head: null,
       initial_import_confirmed: false,
-      sync_profile: null,
-      sync_plugins: null,
       status_label: "Checking",
       last_error_code: null,
       last_event_seq: 0,
       unpaired_baseline_vault_id: null,
       unpaired_baseline_main: null,
-      unpaired_baseline_sync_profile: null,
-      unpaired_baseline_sync_plugins: null,
       updated_at: nowIso()
     });
   }
@@ -1629,12 +1566,6 @@ class ObtsSettingTab extends PluginSettingTab {
         .setName("Device")
         .setDesc(`${deviceName} · ${state.device_id}`);
       new Setting(containerEl)
-        .setName("Sync profile")
-        .setDesc(syncProfileLabel(state.sync_profile || this.plugin.settings.syncProfile));
-      new Setting(containerEl)
-        .setName("Community plugin settings")
-        .setDesc((Object.prototype.hasOwnProperty.call(state, "sync_plugins") ? state.sync_plugins : this.plugin.settings.syncPlugins) ? "Included" : "Not included");
-      new Setting(containerEl)
         .setName("Status")
         .setDesc(state.last_error_code ? blockStatusLabel(state.last_error_code) : state.status_label || "Checking");
       new Setting(containerEl)
@@ -1700,29 +1631,6 @@ class ObtsSettingTab extends PluginSettingTab {
         );
 
       new Setting(containerEl)
-        .setName("Sync profile")
-        .addDropdown((dropdown) =>
-          dropdown
-            .addOption("notes_only", "Notes only")
-            .addOption("notes_plus_attachments", "Notes plus attachments")
-            .addOption("full_vault_config", "Full vault config")
-            .setValue(this.plugin.settings.syncProfile)
-            .onChange(async (value) => {
-              this.plugin.settings.syncProfile = value;
-              await this.plugin.saveSettings();
-            })
-        );
-
-      new Setting(containerEl)
-        .setName("Sync community plugin settings")
-        .addToggle((toggle) =>
-          toggle.setValue(this.plugin.settings.syncPlugins).onChange(async (value) => {
-            this.plugin.settings.syncPlugins = value;
-            await this.plugin.saveSettings();
-          })
-        );
-
-      new Setting(containerEl)
         .setName("Pairing token")
         .addText((text) => {
           text.setPlaceholder("obts_pair_...");
@@ -1771,16 +1679,6 @@ class ObtsSettingTab extends PluginSettingTab {
         })
       );
   }
-}
-
-function syncProfileLabel(profile) {
-  if (profile === "notes_plus_attachments") {
-    return "Notes plus attachments";
-  }
-  if (profile === "full_vault_config") {
-    return "Full vault config";
-  }
-  return "Notes only";
 }
 
 function setFeedback(element, message, tone) {
@@ -1965,39 +1863,28 @@ function isTextPatchPath(filePath) {
   return new Set([".md", ".canvas", ".base", ".json", ".css", ".txt", ".yaml", ".yml"]).has(path.posix.extname(filePath).toLowerCase());
 }
 
-function isSyncableVaultPath(filePath, settings) {
+function isSyncableVaultPath(filePath) {
   const normalized = normalizePath(filePath);
   if (!isValidVaultPath(normalized)) {
     return false;
   }
-  const firstSegment = normalized.split("/")[0] || "";
-  const extension = path.posix.extname(normalized).toLowerCase();
-  if (firstSegment === ".trash" || isOsOrEditorMetadata(normalized)) {
+  if (isOsOrEditorMetadata(normalized)) {
     return false;
   }
-  if (firstSegment === ".obsidian") {
-    if (normalized.startsWith(".obsidian/plugins/")) {
-      return settings.syncProfile === "full_vault_config" && Boolean(settings.syncPlugins) && !normalized.startsWith(".obsidian/plugins/obts/");
-    }
-    if (settings.syncProfile !== "full_vault_config") {
-      return false;
-    }
-    if (normalized.startsWith(".obsidian/snippets/") && normalized.endsWith(".css")) {
-      return true;
-    }
-    return OBSIDIAN_ALLOWLIST.has(normalized);
-  }
-  if (NOTE_EXTENSIONS.has(extension)) {
-    return true;
-  }
-  if (settings.syncProfile === "notes_only") {
+  if (normalized === ".obsidian/workspace.json" || normalized === ".obsidian/workspace-mobile.json") {
     return false;
   }
-  return ATTACHMENT_EXTENSIONS.has(extension);
+  if (normalized.startsWith(".obsidian/cache/")) {
+    return false;
+  }
+  if (normalized.startsWith(".obsidian/plugins/obts/")) {
+    return false;
+  }
+  return true;
 }
 
-function isRecoverableApplyPath(filePath, settings) {
-  return isSyncableVaultPath(filePath, settings) || (filePath !== ".obts" && !filePath.startsWith(".obts/") && filePath !== ".git" && !filePath.startsWith(".git/") && !filePath.includes("/.git/"));
+function isRecoverableApplyPath(filePath) {
+  return isSyncableVaultPath(filePath) || (filePath !== ".obts" && !filePath.startsWith(".obts/") && filePath !== ".git" && !filePath.startsWith(".git/") && !filePath.includes("/.git/"));
 }
 
 function normalizePath(filePath) {

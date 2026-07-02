@@ -596,15 +596,10 @@ components:
           type: string
     CreatePairingTokenRequest:
       type: object
-      required: [device_name, sync_profile]
+      required: [device_name]
       properties:
         device_name:
           type: string
-        sync_profile:
-          $ref: "#/components/schemas/SyncProfile"
-        sync_plugins:
-          type: boolean
-          default: false
     ConsumePairingTokenRequest:
       allOf:
         - $ref: "#/components/schemas/CreatePairingTokenRequest"
@@ -652,7 +647,7 @@ components:
         - client_known_main
       properties:
         api_version:
-          const: 2026-06-29.phase1
+          const: 2026-07-02.full-sync
         vault_id:
           type: string
         device_id:
@@ -683,7 +678,7 @@ components:
       required: [api_version, vault_id, device_id, current_local_main, requested_target]
       properties:
         api_version:
-          const: 2026-06-29.phase1
+          const: 2026-07-02.full-sync
         vault_id:
           type: string
         device_id:
@@ -703,7 +698,7 @@ components:
       required: [api_version, vault_id, device_id, target_main, changed_paths, current_local_main_is_ancestor, event_seq]
       properties:
         api_version:
-          const: 2026-06-29.phase1
+          const: 2026-07-02.full-sync
         vault_id:
           type: string
         device_id:
@@ -778,9 +773,6 @@ components:
         created_at:
           type: string
           format: date-time
-    SyncProfile:
-      type: string
-      enum: [notes_only, notes_plus_attachments, full_vault_config]
     DashboardSummary:
       type: object
       required: [vault, devices, unresolved_conflict_count, health]
@@ -809,8 +801,6 @@ components:
               - status
               - status_label
               - last_seen_at
-              - sync_profile
-              - sync_plugins
               - device_ref_head
               - last_applied_main
               - last_successful_sync_at
@@ -833,10 +823,6 @@ components:
                   - type: "null"
                   - type: string
                     format: date-time
-              sync_profile:
-                $ref: "#/components/schemas/SyncProfile"
-              sync_plugins:
-                type: boolean
               device_ref_head:
                 oneOf:
                   - type: "null"

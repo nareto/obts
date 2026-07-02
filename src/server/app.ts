@@ -6,16 +6,14 @@ import multipart from '@fastify/multipart';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 
 import { newId, nowIso } from '../shared/ids.js';
-import { isSyncableVaultPath, type SyncPathPolicy } from '../shared/pathPolicy.js';
+import { isSyncableVaultPath } from '../shared/pathPolicy.js';
 import { API_VERSION, type DevicePullManifest, type DevicePullRequest } from '../shared/types.js';
 import {
   assertRecord,
   parseDevicePullRequest,
   parseDevicePushManifest,
   parseJsonObject,
-  readOptionalBoolean,
   readString,
-  readSyncProfile,
   ValidationError
 } from '../shared/validators.js';
 import { AuthError, AuthService, ownedVaultOrThrow } from './authService.js';
@@ -327,8 +325,6 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
             status: device.status,
             status_label: dashboardDeviceStatusLabel(device.status, { behindMain, offline }),
             last_seen_at: device.last_seen_at,
-            sync_profile: device.sync_profile,
-            sync_plugins: device.sync_plugins,
             device_ref_head: device.device_ref_head,
             last_applied_main: device.last_applied_main,
             last_successful_sync_at: device.last_successful_sync_at,
@@ -363,8 +359,6 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       userId: session.user.user_id,
       vaultId,
       deviceName: readString(body, 'device_name'),
-      syncProfile: readSyncProfile(body, 'sync_profile'),
-      syncPlugins: readOptionalBoolean(body, 'sync_plugins') ?? false,
       publicBaseUrl: config.publicBaseUrl
     });
     return reply.status(201).send({
@@ -391,9 +385,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const body = requestBody(request);
     const result = await auth.consumePairingToken({
       pairingToken: readString(body, 'pairing_token'),
-      deviceName: readString(body, 'device_name'),
-      syncProfile: readSyncProfile(body, 'sync_profile'),
-      syncPlugins: readOptionalBoolean(body, 'sync_plugins') ?? false
+      deviceName: readString(body, 'device_name')
     });
     return reply.status(201).send({
       user_id: result.user.user_id,
@@ -454,8 +446,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       have === null
         ? await git.listTreePaths(vaultId, targetMain)
         : (await git.changedPaths(vaultId, have, targetMain)).map((entry) => entry.path);
-    const devicePolicy = deviceSyncPathPolicy(deviceAuth.device);
-    const changedPaths = allChangedPaths.filter((path) => isSyncableVaultPath(path, devicePolicy));
+    const changedPaths = allChangedPaths.filter((path) => isSyncableVaultPath(path));
     const db = await store.snapshot();
     const manifest: DevicePullManifest = {
       api_version: API_VERSION,
@@ -1126,14 +1117,6 @@ function dashboardDeviceStatusLabel(
     return 'Behind';
   }
   return deviceStatusLabel(status);
-}
-
-function deviceSyncPathPolicy(device: { sync_profile: SyncPathPolicy['profile']; sync_plugins: boolean }): SyncPathPolicy {
-  return {
-    profile: device.sync_profile,
-    syncPlugins: device.sync_plugins,
-    attachmentLocation: { mode: 'same_folder_as_note' }
-  };
 }
 
 function isMultipartLimitError(error: Error): boolean {

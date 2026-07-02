@@ -1,4 +1,4 @@
-import { API_VERSION, type DevicePullRequest, type DevicePushManifest, type SyncProfile } from './types.js';
+import { API_VERSION, type DevicePullRequest, type DevicePushManifest } from './types.js';
 
 const COMMIT_ID_PATTERN = /^[0-9a-f]{40}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
@@ -76,14 +76,6 @@ export function readOptionalBoolean(record: Record<string, unknown>, field: stri
   }
   if (typeof value !== 'boolean') {
     throw new ValidationError('invalid_request', `Invalid field: ${field}.`, { field });
-  }
-  return value;
-}
-
-export function readSyncProfile(record: Record<string, unknown>, field: string): SyncProfile {
-  const value = readString(record, field);
-  if (value !== 'notes_only' && value !== 'notes_plus_attachments' && value !== 'full_vault_config') {
-    throw new ValidationError('invalid_request', `Invalid sync profile: ${field}.`, { field });
   }
   return value;
 }

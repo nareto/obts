@@ -4,7 +4,7 @@
 
 `obts` is a self-hosted, Git-backed sync system for Obsidian vaults. It preserves local-first editing, central canonical state, recoverable history, conflict review, and clear device status without exposing Git workflows to note authors and without putting a normal `.git` directory in the visible vault.
 
-Git is the internal history engine for v1. Local edits become hidden Git commits, device uploads advance protected per-device Git refs that act as internal merge candidates, and the server advances canonical `main` through Git-backed merge or explicit conflict resolution. Device sync profiles are dynamic: a device profile controls which paths that device materializes and may change, while server `main` contains the union of active paired device scopes. `obts` adds the Obsidian-specific product layer around Git: pairing, authorization, deployment-managed storage protection, safe local apply, recovery bundles, dashboard conflict review, note history, and maintenance.
+Git is the internal history engine for v1. Local edits become hidden Git commits, device uploads advance protected per-device Git refs that act as internal merge candidates, and the server advances canonical `main` through Git-backed merge or explicit conflict resolution. Paired devices sync the full vault subject to hard safety exclusions for `obts` internal state, visible Git repositories, Obsidian cache/workspace files, and the running `obts` plugin directory. `obts` adds the Obsidian-specific product layer around Git: pairing, authorization, deployment-managed storage protection, safe local apply, recovery bundles, dashboard conflict review, note history, and maintenance.
 
 v1 uses a trusted self-hosted server model. The server is authorized to read vault content, internal Git state, and sensitive metadata for sync, merge, conflict review, note history, maintenance, and recovery. v1 is multi-tenant: it supports multiple user accounts, but each vault belongs to exactly one owner and other users must not be able to see that vault through the application.
 
@@ -28,7 +28,7 @@ Git provides commit identity, ancestry, merge bases, diffs, rename detection sup
 
 ### 1.3 Goals
 
-- Sync notes and selected Obsidian configuration between paired devices.
+- Sync full vault content between paired devices subject to hard safety exclusions.
 - Preserve local-first editing and offline commits.
 - Use Git as the authoritative internal history, ancestry, diff, and merge backbone.
 - Maintain a single server `main` Git ref per vault.
@@ -37,7 +37,7 @@ Git provides commit identity, ancestry, merge bases, diffs, rename detection sup
 - Support deployment-managed at-rest protection through documented storage, permission, and backup requirements.
 - Enforce strict account and vault authorization for every API and event stream.
 - Avoid `.git` directories inside visible Obsidian vaults.
-- Keep plugin UX simple: server URL, login/pairing, device name, and dynamic local sync profile.
+- Keep plugin UX simple: server URL, login/pairing, and device name.
 - Document the app persistent-state backup contract without embedding deployment-specific backup automation.
 
 ### 1.4 Non-Goals
@@ -49,7 +49,7 @@ Git provides commit identity, ancestry, merge bases, diffs, rename detection sup
 - Shared real-time collaborative editing, cursors, CRDT/OT sessions, or presence.
 - Reinventing Git commit graph, tree, diff, merge-base, object identity, or ref semantics in custom database tables.
 - Exposing raw Git commands, Git remotes, branches, or conflict markers as the normal user experience.
-- Syncing every `.obsidian/` file blindly.
+- Syncing `obts` internal state, visible Git repositories, Obsidian cache/workspace files, or the running `obts` plugin directory.
 - Storing a normal Git repository in the visible vault.
 - Implementing an application-level encrypted Git store, per-vault data keys, or app-managed content key rotation in v1.
 - App-managed backup scheduling, offsite backup storage, or deployment-specific restore orchestration.
@@ -139,15 +139,15 @@ Behavior:
 2. Server initializes per-vault Git state.
 3. Server creates a server-authored empty-tree root commit on `refs/heads/main`.
 4. Dashboard issues a one-time pairing token or URL after recent-auth verification.
-5. Plugin consumes the pairing token, registers device metadata with the pairing profile as the device's initial local sync profile, and stores a device token locally.
+5. Plugin consumes the pairing token, registers device metadata, and stores a device token locally.
 6. Plugin initializes hidden Git state under `.obts/` without creating a visible vault `.git`.
 7. Plugin performs an initial scan of the local vault and local `.obts/` state.
 8. Plugin imports the current server `main` root as its base.
 9. If the local vault is empty and server `main` contains only the server-authored empty-tree root commit, the client records itself as synced to current `main`.
 10. If the local vault is empty and server `main` contains user content, the plugin applies server `main` through the normal apply journal and records itself as synced after apply succeeds.
 11. If this is the first paired device for a newly created vault and the local vault contains user content, the plugin creates a recovery bundle, asks the owner to confirm initial import, commits the local content as the initial device commit, and uploads that commit through the device ref.
-12. If this is an additional paired device and the local vault contains user content that differs from server `main`, the plugin first checks whether the local vault is a clean stale copy of a detached unpaired baseline for the same vault and same sync scope.
-13. A clean stale copy may fast-forward during re-pair when all of the following are true: the detached baseline vault ID matches the newly paired vault; the baseline sync profile and plugin-sync scope match the new pairing scope; the local visible syncable files exactly match the baseline commit tree under the effective path policy; the baseline commit is available in local hidden Git state; and the baseline commit is an ancestor of current server `main` after the plugin imports the server pull pack.
+12. If this is an additional paired device and the local vault contains user content that differs from server `main`, the plugin first checks whether the local vault is a clean stale copy of a detached unpaired baseline for the same vault.
+13. A clean stale copy may fast-forward during re-pair when all of the following are true: the detached baseline vault ID matches the newly paired vault; the local visible syncable files exactly match the baseline commit tree under the full-vault path policy; the baseline commit is available in local hidden Git state; and the baseline commit is an ancestor of current server `main` after the plugin imports the server pull pack.
 14. When the clean stale-copy checks pass, the plugin applies current server `main` through the normal apply journal and recovery-bundle protections, records the new device as synced, and does not require replace-local-with-server.
 15. When the clean stale-copy checks fail, additional-device pairing with local content that differs from server `main` creates a recovery bundle, shows a local-vs-server summary, blocks normal sync, and requires an explicit replace-local-with-server command before applying server state. The original local content remains recoverable only from the recovery bundle after replacement.
 16. If local `.obts/` Git state belongs to another vault or is partially initialized beyond the detached-baseline case, pairing blocks until the owner runs a recovery or reset flow.
@@ -163,33 +163,7 @@ Acceptance criteria:
 - First-device import of non-empty local content requires a recovery bundle and explicit owner confirmation before upload.
 - Additional-device pairing of non-empty divergent local content blocks normal sync until the owner explicitly replaces local content with server state after recovery bundle creation.
 - Re-pairing a previously synced device whose local files still exactly match an old server `main` commit safely fast-forwards to current server `main` without replace-local-with-server.
-- Re-pairing blocks instead of fast-forwarding when the detached baseline is missing, belongs to another vault, uses a different sync scope, is not an ancestor of current server `main`, or no longer matches visible local files.
-
-#### 3.3.1 Change Device Sync Scope
-
-A paired device can change its local sync profile after pairing. The pairing profile is the initial device profile, not a permanent vault policy.
-
-Behavior:
-
-1. The plugin lets the paired device choose a current local sync profile and plugin-sync setting from the same supported scope options used at pairing.
-2. The plugin reports profile changes to the server with device-token authentication, the previous profile it believes is active, and its last known scope policy epoch.
-3. The server records the device's current declared profile and derives the vault effective scope as the union of active, non-revoked paired device scopes. If a vault has no non-revoked paired devices, the last effective scope and current `main` remain unchanged until another device pairs or an owner runs an explicit maintenance action.
-4. Server `main` HEAD contains paths inside the current effective vault scope. If any active device includes attachments, allowed attachments may be present in `main`; if any active device includes full vault config, allowed config paths may be present in `main`; if all active devices are `notes_only`, `main` converges to note paths only.
-5. Device refs remain normal whole-tree Git commits. Out-of-device-profile paths may exist in a device ref only as inherited unchanged entries from the current server tree. Missing local out-of-profile files are not interpreted as deletes.
-6. On device upload, the server validates changed paths, not mere tree presence. A device may add, modify, or delete only paths inside its current device profile and the global hard path policy. The server rejects out-of-profile changed paths before advancing the device ref.
-7. When a device widens scope, newly in-scope local files are scanned and uploaded as normal local changes. Newly in-scope server files are materialized by pull/apply for that device. Divergent same-path content uses the normal merge, conflict, and recovery rules.
-8. When a device narrows scope, the plugin stops scanning, uploading, and applying newly out-of-scope paths. Local out-of-scope files remain on disk by default. Any explicit remove-local-out-of-scope command must create a recovery bundle before deleting local files.
-9. When the vault effective scope narrows because no active device still covers a path class, the server creates a server-authored scope-prune commit on `main` that removes paths now outside the effective scope from `main` HEAD. Existing Git history and backups may still contain those blobs until a separate destructive history compaction feature is implemented.
-10. If the server rejects a stale or buggy upload because it changes out-of-profile paths or uses an old scope policy epoch, the client stops retrying that commit, pulls current `main`, rebuilds hidden Git state from the server tree, stages only in-profile local changes, preserves excluded local files, and creates a recovery bundle first if pending excluded changes would otherwise be lost.
-
-Acceptance criteria:
-
-- Post-pairing changes among `notes_only`, `notes_plus_attachments`, `full_vault_config`, and `syncPlugins` toggles are supported. Plugin paths enter scope only when `full_vault_config` and `syncPlugins=true` are both active.
-- The vault effective scope is deterministic from active non-revoked devices and does not require manual dashboard migration for ordinary profile changes.
-- No device can add, modify, or delete paths outside its current device profile, even if those paths are present unchanged in its hidden Git tree.
-- Narrowing scope never silently deletes local files.
-- Widening scope never silently overwrites divergent local files; existing recovery bundle and conflict safeguards apply.
-- Server-side scope-prune commits change current `main` but do not promise historical object erasure.
+- Re-pairing blocks instead of fast-forwarding when the detached baseline is missing, belongs to another vault, is not an ancestor of current server `main`, or no longer matches visible local files.
 
 ### 3.4 Local Edit Sync
 
@@ -470,7 +444,7 @@ Columns, in order:
 2. Status;
 3. Last seen;
 4. Ahead/behind;
-5. Sync profile;
+5. Device ref;
 6. Last successful sync;
 7. Actions.
 
@@ -549,7 +523,7 @@ whether maintenance is recommended; it requires recent authentication.
 Dialog requirements:
 
 - width: `520px` on desktop;
-- first step asks for device display name and intended sync profile;
+- first step asks for device display name;
 - second step shows the one-time pairing URL/token, expiration countdown, and
   copy button;
 - the token/URL is shown only after recent authentication succeeds;
@@ -613,8 +587,8 @@ Acceptance criteria:
 10. No `.git` directory appears in the visible Obsidian vault.
 11. Local commits, recovery snapshots, and recovery bundles are durable before destructive operations.
 12. Obsidian configuration sync uses an explicit file policy; `.obts/` is always excluded.
-13. Device profiles control which paths a device may change; the vault effective scope is the union of active paired device profiles.
-14. Server upload validation rejects out-of-profile changed paths while allowing inherited unchanged tree entries outside the uploading device's profile.
+13. Every paired device syncs the same full-vault content set.
+14. Hard path exclusions are global and deterministic: `.obts/**` is never synced, visible `.git/**` paths are rejected, `.obsidian/cache/**`, `.obsidian/workspace.json`, `.obsidian/workspace-mobile.json`, and `.obsidian/plugins/obts/**` are excluded, while `.trash/**` and other `.obsidian/**` paths are normal vault content.
 
 ### 4.2 Containers
 
@@ -630,10 +604,10 @@ Acceptance criteria:
 
 - **AuthService:** authenticates dashboard sessions, device tokens, and pairing tokens.
 - **VaultService:** creates vaults, enforces owner isolation, and coordinates initial Git state creation.
-- **DeviceService:** registers, tracks, revokes, and updates paired devices and their current local sync profiles.
+- **DeviceService:** registers, tracks, and revokes paired devices.
 - **ServerGitStoreService:** manages per-vault server Git repositories and verifies store integrity.
 - **GitRepositoryService:** invokes the native `git` CLI to materialize authorized temporary Git repos, import/export packfiles, update refs, compute diffs, and read history.
-- **PathPolicyService:** validates canonical vault-relative paths, collision rules, platform-safe materialization rules, per-device changed-path scope, and derived vault effective scope.
+- **PathPolicyService:** validates canonical vault-relative paths, collision rules, platform-safe materialization rules, and hard full-vault sync exclusions.
 - **SyncService:** accepts authenticated device Git uploads, enforces device ref fast-forward rules, records sync attempts, and submits eligible updates to merge.
 - **HistoryService:** exposes Git-backed canonical `main`, refs, provenance, integrity checks, and maintenance operations.
 - **NoteHistoryService:** resolves authorized note/path history from Git plus derived metadata, diffs versions, and creates restore commits.
@@ -647,7 +621,7 @@ Acceptance criteria:
 
 ### 4.4 Plugin Components
 
-- **SettingsView:** collects server URL, login/pairing token, device name, current local sync profile, and plugin-sync setting.
+- **SettingsView:** collects server URL, login/pairing token, and device name.
 - **StatusBar:** displays Synced, Ahead, Behind, Uploading, Applying, Offline, Blocked, Unsafe local error, and Needs recovery.
 - **VaultWatcher:** observes local vault changes through Obsidian APIs.
 - **PeriodicScanner:** detects missed watcher events and crash recovery work.
@@ -658,7 +632,7 @@ Acceptance criteria:
 - **LocalQueue:** stores pending sync work, retry state, cache, recovery, lock, diagnostic, and config-sync state.
 - **LocalContentCache:** caches pulled/uploaded content needed for retry, apply, and recovery.
 - **TransportClient:** calls server APIs and subscribes to events with polling fallback.
-- **ApplyEngine:** applies accepted server `main` changes inside the device's current local profile, including selected `.obsidian` state, to the vault after local recovery snapshots.
+- **ApplyEngine:** applies accepted server `main` changes inside the full-vault path policy to the vault after local recovery snapshots.
 - **DiagnosticsExporter:** exports redacted diagnostics for support and recovery.
 
 ### 4.5 Web UI Components
@@ -690,7 +664,7 @@ Acceptance criteria:
 
 - `users`: account identity and password hash.
 - `vaults`: owner user ID, display name, status, current main cursor, created timestamp, and updated timestamp.
-- `devices`: vault-scoped paired devices, owning user ID, device ref name, current local sync profile, plugin-sync setting, scope policy epoch, and server-known state.
+- `devices`: vault-scoped paired devices, owning user ID, device ref name, and server-known state.
 - `api_tokens`: hashed dashboard, device, and pairing tokens.
 - `sync_operations`: durable per-vault write workflow rows with operation type, expected refs, target refs, target commit, lifecycle status, validation summary, and reconciliation state.
 - `sync_attempts`: authenticated device push/pull attempts, lifecycle, expected ref metadata, result state, and redacted error category.
@@ -705,9 +679,9 @@ Postgres must not become the authoritative store for Git commits, trees, blobs, 
 
 The server receives Git packfiles over authenticated HTTPS. After authorization and validation, `GitRepositoryService` imports packfiles with the native `git` CLI into quarantine, `SyncService` validates ref update rules, and `ServerGitStoreService` persists updated per-vault Git state through the durable Git/Postgres write workflow. Git bundles and alternate object-transfer formats are outside v1.
 
-Plugin settings and selected `.obsidian` files are treated as vault content inside Git for history, conflict, and logging rules when they are inside the current effective vault scope.
+Plugin settings and `.obsidian` files that pass the hard full-vault path policy are treated as vault content inside Git for history, conflict, and logging rules.
 
-Device refs are whole-tree Git refs. A narrow-scope device may carry inherited out-of-profile tree entries unchanged so Git ancestry and merge bases remain ordinary whole-tree commits. Out-of-profile tree presence is not an upload violation by itself; adding, modifying, or deleting an out-of-profile path is.
+Device refs are whole-tree Git refs that mirror the last accepted full-vault state reported by each device.
 
 Reads materialize Git state only for authorized server workflows and return content only to authorized clients over HTTPS.
 
@@ -721,7 +695,7 @@ Rules:
 - `.obts/` is always excluded from vault sync, Git worktree content, and manifest/path scanning;
 - `.git/` directories inside visible vault content are rejected rather than synced;
 - client and server use the same path validation library and test corpus;
-- profile-specific validation is based on changed paths, not complete Git tree membership;
+- hard exclusions are enforced consistently before commit, upload, merge, and apply;
 - Unicode normalization and case-fold collision detection are mandatory before commit, upload, merge, and apply;
 - cross-platform-invalid names, Windows reserved device names, trailing spaces/dots, NUL/control characters, and configured path length limits block sync with a clear error;
 - path collisions are sync-blocking conflicts requiring user rename, not automatic overwrites;
@@ -867,9 +841,8 @@ Supported committed operations:
 - update file;
 - delete file;
 - rename file;
-- create/update/delete selected `.obsidian` config file;
-- create/update/delete selected plugin file when plugin sync is enabled;
-- change a paired device's current local sync profile and plugin-sync setting.
+- create/update/delete `.obsidian` files allowed by the hard full-vault path policy;
+- create/update/delete community plugin files except `.obsidian/plugins/obts/**`.
 
 Sync lifecycle:
 
@@ -890,8 +863,7 @@ Rules:
 - A stale client-known `main` triggers merge evaluation; it must not overwrite current `main` directly.
 - A re-pairing client may use an imported pull pack plus Git ancestry checks to treat a detached baseline as a safe stale server copy only when that baseline is reachable from current server `main`.
 - Malformed Git transfers are rejected without advancing device refs or `main`.
-- Uploaded commits that change paths outside the device's current profile are rejected without advancing device refs or `main`; the client must rebuild from current server `main` and restage only allowed local changes before retrying.
-- When the derived vault effective scope narrows, the server advances `main` through a server-authored scope-prune commit that removes now-out-of-scope paths from the current tree while preserving normal Git history.
+- Uploaded commits containing invalid or hard-excluded paths are rejected without advancing device refs or `main`.
 - Git timestamps are never used to order sync or determine whether a change is new.
 
 ### 6.4 Merge Policy Contract
@@ -910,7 +882,7 @@ Policy:
 - rename-vs-edit auto-merges only when one side renames and the other side edits content without path collision;
 - rename-vs-rename conflicts unless both sides produce the same target path;
 - binary and attachment changes auto-merge only when Git/object identity is identical or paths are disjoint;
-- selected `.obsidian` config and plugin files use file-level rules in v1; semantic config/plugin merge handlers are outside v1;
+- `.obsidian` config and plugin files use file-level rules in v1; semantic config/plugin merge handlers are outside v1;
 - unsafe, unsupported, or ambiguous cases create structured conflicts with base/current/device variants and provenance.
 
 JSON Canvas semantic merge contract:
@@ -965,7 +937,6 @@ Conflict review lifecycle:
 - `GET /api/v1/vaults/{vault_id}/main`: return current `main` metadata and authorized summary.
 - `POST /api/v1/vaults/{vault_id}/sync/push`: upload a push manifest and Git packfile, then request a device ref update.
 - `POST /api/v1/vaults/{vault_id}/sync/pull`: request a target `main` and receive a pull manifest plus Git packfile needed to reach it.
-- Future device-management APIs must let a paired device report its current local sync profile and receive the resulting scope policy epoch.
 - `POST /api/v1/vaults/{vault_id}/history/query`: list note history for an authorized path supplied in a redacted request body.
 - `POST /api/v1/vaults/{vault_id}/history/version`: fetch a historical note version or diff source for a commit/path supplied in a redacted request body.
 - `POST /api/v1/vaults/{vault_id}/history/restore`: restore a historical note version through a new Git-backed merge/resolution commit.
@@ -1039,63 +1010,28 @@ interface ObtsPluginSettings {
   deviceId?: string;
   vaultId?: string;
   deviceName: string;
-  syncProfile: 'notes_only' | 'notes_plus_attachments' | 'full_vault_config';
-  syncPlugins: boolean;
 }
 ```
 
-`syncProfile` and `syncPlugins` are the device's desired current local scope. The pairing token sets their initial values, and a paired plugin may update them later by reporting the new desired scope to the server. The server accepts the change by updating the device scope policy epoch, recalculating the vault effective scope from active devices, and returning the active policy to the client.
-
-`syncPlugins` defaults to `false`. When `false`, `.obsidian/plugins/**` is outside the device profile and is ignored for local scan/upload/apply. When `true` with `full_vault_config`, `.obsidian/plugins/**` is included in sync like other selected vault state, including plugin code and settings, except `.obsidian/plugins/obts/**`. Plugin paths still sync only when they are inside both the device profile and the derived vault effective scope. With `notes_only` or `notes_plus_attachments`, `.obsidian/plugins/**` remains out of scope even if the local setting is true.
+There is no v1 device-level scope setting. A paired device syncs the full vault according to the hard path policy.
 
 The plugin stores the device token at `.obts/auth/device-token.json`. The token file is never synced as vault content, never committed to hidden Git state, never included in recovery bundle file snapshots, and never included in diagnostics or content-bearing exports. Server-side token revocation and rotation are authoritative even when the local token file remains present.
 
-When a device unpairs or is locally disconnected from a vault, the plugin must remove local authentication material and clear active device identity, but it must not discard safe non-secret history needed to distinguish a stale clean copy from unreviewed local edits. The plugin preserves a detached unpaired baseline containing the previous vault ID, last applied server `main`, effective sync profile, plugin-sync scope, and enough hidden Git state to verify the visible vault tree against that baseline. This detached baseline is not authorization, cannot sync without a new pairing token, and is ignored if the owner explicitly resets local OBTS state.
+When a device unpairs or is locally disconnected from a vault, the plugin must remove local authentication material and clear active device identity, but it must not discard safe non-secret history needed to distinguish a stale clean copy from unreviewed local edits. The plugin preserves a detached unpaired baseline containing the previous vault ID, last applied server `main`, and enough hidden Git state to verify the visible vault tree against that baseline. This detached baseline is not authorization, cannot sync without a new pairing token, and is ignored if the owner explicitly resets local OBTS state.
 
 ## 8. Required v1 Feature Designs
 
 ### 8.1 Obsidian Configuration Sync
 
-`obts` syncs selected `.obsidian` state through an explicit file policy. It does not require typed materializers for v1.
+`obts` syncs the full vault through an explicit hard-exclusion policy. It does not require typed materializers for v1.
 
 Rules:
 
 - `.obts/` is always excluded from vault sync, Git worktree content, and manifest/path scanning.
-- v1 note file types are `.md`, `.canvas`, and `.base`.
-- The `notes_only` profile syncs Obsidian note files and excludes attachment files, `.obsidian/**`, `.obts/**`, `.git/**`, `.trash/**`, editor temp files, Obsidian runtime/cache files, and OS metadata files.
-- The `notes_plus_attachments` profile syncs notes plus Obsidian-supported attachment files located according to the active Obsidian **Default location for new attachments** setting, and excludes `.obsidian/**`.
-- v1 supports the documented Obsidian attachment-location modes:
-  - **Vault folder:** supported attachment files at the vault root;
-  - **In the folder specified below:** supported attachment files under the configured folder;
-  - **Same folder as current file:** supported attachment files in folders that contain synced note files;
-  - **In subfolder under current folder:** supported attachment files under the configured subfolder name beside synced note files.
-- v1 attachment file types are Obsidian-supported non-note files: images (`.avif`, `.bmp`, `.gif`, `.jpeg`, `.jpg`, `.png`, `.svg`, `.webp`), audio (`.flac`, `.m4a`, `.mp3`, `.ogg`, `.wav`, `.webm`, `.3gp`), video (`.mkv`, `.mov`, `.mp4`, `.ogv`, `.webm`), and PDFs (`.pdf`).
-- Unknown, unreadable, or invalid attachment-location settings block sync with a clear error instead of guessing.
+- Visible `.git/` directories are rejected rather than synced.
+- `.obsidian/cache/**`, `.obsidian/workspace.json`, `.obsidian/workspace-mobile.json`, and `.obsidian/plugins/obts/**` are excluded.
+- `.trash/**`, attachments, community plugin files outside `.obsidian/plugins/obts/**`, and all other `.obsidian/**` files are normal vault content.
 - The server enforces a documented maximum upload byte limit through `OBTS_MAX_UPLOAD_BYTES`; files larger than that limit block upload/apply for the affected file with a clear error.
-- The `full_vault_config` profile syncs notes, attachments, and only these `.obsidian` files by default:
-  - `.obsidian/app.json`;
-  - `.obsidian/appearance.json`;
-  - `.obsidian/backlinks.json`;
-  - `.obsidian/bookmarks.json`;
-  - `.obsidian/command-palette.json`;
-  - `.obsidian/core-plugins.json`;
-  - `.obsidian/core-plugins-migration.json`;
-  - `.obsidian/daily-notes.json`;
-  - `.obsidian/editor.json`;
-  - `.obsidian/graph.json`;
-  - `.obsidian/hotkeys.json`;
-  - `.obsidian/outgoing-link.json`;
-  - `.obsidian/page-preview.json`;
-  - `.obsidian/properties.json`;
-  - `.obsidian/switcher.json`;
-  - `.obsidian/templates.json`;
-  - `.obsidian/types.json`;
-  - `.obsidian/snippets/*.css`.
-- `full_vault_config` always excludes `.obsidian/workspace.json`, `.obsidian/workspace-mobile.json`, `.obsidian/cache/**`, `.obsidian/trash/**`, `.obsidian/plugins/**` unless `syncPlugins` is `true`, and every `.obsidian` path not listed in the allowlist above.
-- `.obsidian/plugins/**` is controlled by the combination of `full_vault_config` and `syncPlugins`.
-- When `syncPlugins` is `false`, `.obsidian/plugins/**` is completely ignored.
-- When `syncPlugins` is `true` with `full_vault_config`, the full `.obsidian/plugins/**` directory is synced as normal vault state, including `manifest.json`, `main.js`, `styles.css`, `data.json`, and any plugin-owned files, except `.obsidian/plugins/obts/**`.
-- Changing `syncPlugins` takes effect after the paired device reports the new desired scope to the server and receives the updated scope policy epoch. No Obsidian restart is required.
 - Plugin files are executable/sensitive content. When synced, they are Git-backed vault state and participate in file-level history, recovery, and conflict handling. Diagnostics exports and note-history UI redact plugin file content by default.
 - Already-loaded plugin code may continue to run until Obsidian or the plugin reloads; `obts` does not force that reload as part of sync.
 - `obts` must not update its own running plugin code through normal plugin sync.
@@ -1144,7 +1080,7 @@ Every recovery bundle contains:
 - `manifest.json` with bundle ID, vault ID, device ID, created timestamp, operation type, target `main`, prior local `main`, prior local device ref, affected paths, platform, plugin version, and checksum manifest;
 - `files/` with pre-apply snapshots of every file that will be deleted, overwritten, or renamed;
 - `git/local-refs.pack` with local commits and refs needed to recover pending local history;
-- `patches/` with text patch series for changed Markdown, `.canvas`, `.base`, and selected text configuration files;
+  - `patches/` with text patch series for changed Markdown, `.canvas`, `.base`, and text configuration files;
 - `journal/apply-journal.json` with the apply journal state at bundle creation;
 - `checksums.sha256` covering every file in the bundle.
 
@@ -1217,8 +1153,8 @@ Plugin:
 - local apply journal and recovery bundle workflow;
 - upload device ref updates and pull/apply `main`;
 - status bar and commands;
-- `.obsidian` file-policy sync;
-- plugin sync setting and safeguards.
+- full-vault file-policy sync;
+- running-plugin self-update safeguards.
 
 Dashboard:
 
@@ -1277,7 +1213,7 @@ Included:
   commit on `main`, device refs, Postgres-backed metadata, migrations, and the
   durable Git/Postgres write workflow for sync operations;
 - installable Obsidian plugin with settings UI for server URL, pairing token,
-  device name, sync profile, and plugin-sync setting;
+  and device name;
 - plugin status surface showing Synced, Ahead, Behind, Uploading, Applying,
   Review needed, Needs recovery, Unsafe local state, and Blocked;
 - plugin hidden `.obts/` state using `isomorphic-git`, Obsidian filesystem
@@ -1439,8 +1375,8 @@ Acceptance proof:
 - non-empty local vault join creates a recovery bundle and never silently discards local content;
 - first-device non-empty local vault import creates a recovery bundle, requires owner confirmation, uploads an initial device commit, and merges through server `main`;
 - additional-device non-empty divergent vault pairing creates a recovery bundle and blocks normal sync until explicit replace-local-with-server;
-- plugin sync disabled ignores `.obsidian/plugins/**`;
-- plugin sync enabled includes `.obsidian/plugins/**` and blocks self-update of `obts`;
+- full-vault sync includes `.trash/**`, attachments, `.obsidian/**`, and community plugin files except hard exclusions;
+- full-vault sync excludes `.obsidian/cache/**`, `.obsidian/workspace.json`, `.obsidian/workspace-mobile.json`, and `.obsidian/plugins/obts/**`;
 - destructive history compaction API is absent in v1;
 - unauthorized user cannot access another user's vault resources;
 - restored persistent state with missing Git state, missing database state, missing migrations, bad filesystem permissions, or missing native `git` CLI fails readiness.
@@ -1463,7 +1399,7 @@ Acceptance proof:
 - server-side merge works for simple Markdown conflicts;
 - note history can compare and restore an earlier note version;
 - recovery after failed local apply preserves edits;
-- plugin sync setting behaves as documented;
+- full-vault hard exclusions behave as documented;
 - Android and iOS foreground sync pass the same data-safety acceptance cases as desktop within documented mobile limits;
 - advertised desktop/mobile platform support matches observed behavior.
 
