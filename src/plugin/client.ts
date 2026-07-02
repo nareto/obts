@@ -975,7 +975,7 @@ export class ObtsPluginClient {
       existingState.local_main ||
       existingState.local_head ||
       existingState.initial_import_confirmed ||
-      existingState.last_error_code
+      (existingState.last_error_code && existingState.last_error_code !== 'partial_local_state')
     ) {
       return false;
     }

@@ -1173,6 +1173,18 @@ describe('Phase 1 sync without conflict resolution', () => {
 
     await mkdirp(join(deviceDir, '.obts', 'recovery', 'rec_retained_after_unpair'));
     await writeFile(join(deviceDir, '.obts', 'recovery', 'rec_retained_after_unpair', 'manifest.json'), '{}\n');
+    await writeFile(
+      join(deviceDir, '.obts', 'state.json'),
+      `${JSON.stringify(
+        {
+          ...(await plugin.readState()),
+          status_label: 'Unsafe local state',
+          last_error_code: 'partial_local_state'
+        },
+        null,
+        2
+      )}\n`
+    );
     const rePairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
       device_name: 'phone',
       sync_profile: 'notes_only'
