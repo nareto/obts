@@ -2002,6 +2002,23 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
     await cleanPlugin.pairWithToken(pairing.body.pairing_token);
     expect((await awaitState(cleanPlugin)).device_id).toMatch(/^dev_/u);
+
+    const initializedPairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
+      device_name: 'initialized-phone',
+      sync_profile: 'notes_only'
+    });
+    expect(initializedPairing.status).toBe(201);
+    const initializedDir = join(root, 'initialized-device');
+    await mkdirp(initializedDir);
+    const initializedPlugin = new ObtsPluginClient(initializedDir, {
+      serverUrl: baseUrlFromAdmin(admin),
+      deviceName: 'initialized-phone',
+      syncProfile: 'notes_only',
+      syncPlugins: false
+    });
+    await initializedPlugin.initialize();
+    await initializedPlugin.pairWithToken(initializedPairing.body.pairing_token);
+    expect((await awaitState(initializedPlugin)).device_id).toMatch(/^dev_/u);
   });
 
   it('fails readiness closed when metadata points at missing Git state', async () => {

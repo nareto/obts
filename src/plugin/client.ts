@@ -863,7 +863,44 @@ export class ObtsPluginClient {
     if (existingState?.vault_id || existingState?.device_id || hasDeviceToken) {
       await this.block('local_state_already_paired', 'Local .obts state already belongs to a paired device.');
     }
+    if (await this.isCleanUnpairedScaffold(existingState)) {
+      return;
+    }
     await this.block('partial_local_state', 'Local .obts state is partially initialized and requires reset or recovery.');
+  }
+
+  private async isCleanUnpairedScaffold(existingState: LocalPluginState | null): Promise<boolean> {
+    if (!existingState) {
+      return false;
+    }
+    if (
+      existingState.user_id ||
+      existingState.vault_id ||
+      existingState.device_id ||
+      existingState.device_ref ||
+      existingState.server_device_ref ||
+      existingState.local_main ||
+      existingState.local_head ||
+      existingState.initial_import_confirmed ||
+      existingState.last_error_code
+    ) {
+      return false;
+    }
+    if (
+      (await exists(join(this.vaultDir, '.obts', 'apply-journal.json'))) ||
+      (await exists(join(this.vaultDir, '.obts', 'apply.lock'))) ||
+      (await exists(join(this.vaultDir, '.obts', 'recovery'))) ||
+      !(await exists(this.queuePath))
+    ) {
+      return false;
+    }
+    const queue = await this.readQueue();
+    return (
+      queue.pending_commit === null &&
+      queue.expected_device_ref === null &&
+      queue.status === 'idle' &&
+      queue.attempts === 0
+    );
   }
 
   private async readExistingState(): Promise<LocalPluginState | null> {

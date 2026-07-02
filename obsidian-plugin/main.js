@@ -1046,7 +1046,44 @@ class ObtsObsidianClient {
     if (await exists(this.authPath)) {
       await this.block("local_state_already_paired", "A device token already exists for this vault.");
     }
+    if (await this.isCleanUnpairedScaffold(existingState)) {
+      return;
+    }
     await this.block("partial_local_state", "Local .obts state is partially initialized and requires reset or recovery.");
+  }
+
+  async isCleanUnpairedScaffold(existingState) {
+    if (!existingState) {
+      return false;
+    }
+    if (
+      existingState.user_id ||
+      existingState.vault_id ||
+      existingState.device_id ||
+      existingState.device_ref ||
+      existingState.server_device_ref ||
+      existingState.local_main ||
+      existingState.local_head ||
+      existingState.initial_import_confirmed ||
+      existingState.last_error_code
+    ) {
+      return false;
+    }
+    if (
+      (await exists(this.applyJournalPath)) ||
+      (await exists(this.applyLockPath)) ||
+      (await exists(path.join(this.obtsDir, "recovery"))) ||
+      !(await exists(this.queuePath))
+    ) {
+      return false;
+    }
+    const queue = await this.readQueue();
+    return (
+      queue.pending_commit === null &&
+      queue.expected_device_ref === null &&
+      queue.status === "idle" &&
+      queue.attempts === 0
+    );
   }
 
   async acquireApplyLock(applyId) {
