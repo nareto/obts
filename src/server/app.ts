@@ -572,22 +572,36 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const body = requestBody(request);
     const path = readVaultContentPath(body, 'path');
     const limit = readHistoryLimit(body);
-    const versions = await Promise.all(
-      (await git.historyForPath(vault.vault_id, vault.current_main, path, limit)).map(async (commit) => {
-        return {
-          commit: commit.commit,
-          parent_commit: commit.parentCommit,
-          tree: commit.tree,
-          path,
-          operation_type: await classifyHistoryOperation(git, vault.vault_id, commit.commit, commit.parentCommit, path, commit.subject, commit.body),
-          timestamp: commit.authorDate,
-          author_name: commit.authorName,
-          author_email: commit.authorEmail,
-          subject: commit.subject,
-          ...historyProvenance(commit.body)
-        };
-      })
-    );
+    const historyCommits = await git.historyForPath(vault.vault_id, vault.current_main, path, limit);
+    const versions = [];
+    let pathAtCommit = path;
+    for (const commit of historyCommits) {
+      const classification = await classifyHistoryOperation(
+        git,
+        vault.vault_id,
+        commit.commit,
+        commit.parentCommit,
+        pathAtCommit,
+        commit.subject,
+        commit.body
+      );
+      versions.push({
+        commit: commit.commit,
+        parent_commit: commit.parentCommit,
+        tree: commit.tree,
+        path: classification.path,
+        operation_type: classification.operationType,
+        timestamp: commit.authorDate,
+        author_name: commit.authorName,
+        author_email: commit.authorEmail,
+        subject: commit.subject,
+        ...(classification.previousPath ? { previous_path: classification.previousPath } : {}),
+        ...historyProvenance(commit.body)
+      });
+      if (classification.previousPath) {
+        pathAtCommit = classification.previousPath;
+      }
+    }
     return {
       path,
       current_main: vault.current_main,
@@ -952,28 +966,39 @@ async function classifyHistoryOperation(
   path: string,
   subject: string,
   body: string
-): Promise<'create' | 'update' | 'delete' | 'rename' | 'restore' | 'merge' | 'conflict_resolution'> {
+): Promise<{
+  operationType: 'create' | 'update' | 'delete' | 'rename' | 'restore' | 'merge' | 'conflict_resolution';
+  path: string;
+  previousPath: string | null;
+}> {
   if (body.includes('conflict_id=') || subject.includes('resolve conflict')) {
-    return 'conflict_resolution';
+    return { operationType: 'conflict_resolution', path, previousPath: null };
   }
   if (body.includes('source_commit=') || subject.startsWith('obts: restore ')) {
-    return 'restore';
+    return { operationType: 'restore', path, previousPath: null };
   }
-  if (subject.includes('merge device changes')) {
-    return 'merge';
-  }
+  const isMergeCommit = subject.includes('merge device changes');
   const current = await git.readBlobAtPathIfPresent(vaultId, commit, path);
   if (parentCommit === null) {
-    return current === null ? 'delete' : 'create';
+    return { operationType: current === null ? 'delete' : 'create', path, previousPath: null };
+  }
+  const rename = (await git.changedPaths(vaultId, parentCommit, commit)).find((entry) => {
+    return entry.status.startsWith('R') && (entry.path === path || entry.oldPath === path);
+  });
+  if (rename?.oldPath) {
+    return { operationType: 'rename', path: rename.path, previousPath: rename.oldPath };
+  }
+  if (isMergeCommit) {
+    return { operationType: 'merge', path, previousPath: null };
   }
   const previous = await git.readBlobAtPathIfPresent(vaultId, parentCommit, path);
   if (previous === null && current !== null) {
-    return 'create';
+    return { operationType: 'create', path, previousPath: null };
   }
   if (previous !== null && current === null) {
-    return 'delete';
+    return { operationType: 'delete', path, previousPath: null };
   }
-  return 'update';
+  return { operationType: 'update', path, previousPath: null };
 }
 
 function historyProvenance(body: string): { device_id?: string; conflict_id?: string; merge_sequence?: number } {

@@ -223,7 +223,7 @@
   async function loadHistoryVersion(version: NoteHistoryVersion) {
     if (!vaultId || !history) return;
     selectedHistory = version;
-    historyVersion = await api.historyVersion(vaultId, history.path, version.commit);
+    historyVersion = await api.historyVersion(vaultId, version.path, version.commit);
   }
 
   async function restoreSelectedVersion() {
@@ -472,6 +472,7 @@
                 <button class:active={selectedHistory?.commit === version.commit} on:click={() => loadHistoryVersion(version)}>
                   <span>{version.operation_type}</span>
                   <small>{new Date(version.timestamp).toLocaleString()}</small>
+                  {#if version.previous_path}<small>{version.previous_path} → {version.path}</small>{/if}
                   <code>{shortId(version.commit)}</code>
                 </button>
               {:else}

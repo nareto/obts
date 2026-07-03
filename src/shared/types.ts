@@ -227,6 +227,7 @@ export type NoteHistoryVersion = {
   author_name: string;
   author_email: string;
   subject: string;
+  previous_path?: string;
   device_id?: string;
   conflict_id?: string;
   merge_sequence?: number;

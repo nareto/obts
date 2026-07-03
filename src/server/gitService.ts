@@ -20,6 +20,8 @@ export type GitHistoryCommit = {
   commit: string;
   parentCommit: string | null;
   tree: string;
+  path: string;
+  previousPath: string | null;
   authorName: string;
   authorEmail: string;
   authorDate: string;
@@ -253,7 +255,7 @@ export class GitService {
   }
 
   private async changedPathsInRepo(repo: string, base: string, commit: string): Promise<GitDiffEntry[]> {
-    const { stdout } = await this.exec(repo, ['diff', '--name-status', '-z', base, commit], undefined, undefined, {
+    const { stdout } = await this.exec(repo, ['diff', '--name-status', '-M', '-z', base, commit], undefined, undefined, {
       encoding: 'buffer'
     });
     const parts = splitNul(Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout)).filter((entry) => entry.length > 0);
@@ -566,6 +568,8 @@ export class GitService {
           commit: hash,
           parentCommit: parents ? parents.split(/\s+/u)[0] ?? null : null,
           tree,
+          path,
+          previousPath: null,
           authorName: authorName ?? '',
           authorEmail: authorEmail ?? '',
           authorDate,

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -408,6 +408,46 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(maintenance.status).toBe(200);
     expect(maintenance.body).toMatchObject({ status: 'completed' });
     expect(maintenance.body.detail).toContain('completed');
+  });
+
+  it('shows rename provenance in note history and previews historical paths', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'desktop-rename-history');
+    await mkdir(desktopDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await writeFile(join(desktopDir, 'old-name.md'), 'rename me\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    await rename(join(desktopDir, 'old-name.md'), join(desktopDir, 'new-name.md'));
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const history = await admin.post<{
+      versions: Array<{ commit: string; path: string; previous_path?: string; operation_type: string }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/history/query`, {
+      path: 'new-name.md',
+      limit: 20
+    });
+    expect(history.status).toBe(200);
+    expect(history.body.versions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          operation_type: 'rename',
+          path: 'new-name.md',
+          previous_path: 'old-name.md'
+        }),
+        expect.objectContaining({
+          path: 'old-name.md'
+        })
+      ])
+    );
+
+    const oldVersion = history.body.versions.find((version) => version.path === 'old-name.md');
+    expect(oldVersion).toBeDefined();
+    const preview = await admin.post<{ content: string | null }>(`/api/v1/vaults/${admin.vaultId}/history/version`, {
+      path: oldVersion!.path,
+      commit: oldVersion!.commit
+    });
+    expect(preview.status).toBe(200);
+    expect(preview.body.content).toBe('rename me\n');
   });
 });
 

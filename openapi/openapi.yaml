@@ -1284,6 +1284,8 @@ components:
           type: string
         subject:
           type: string
+        previous_path:
+          type: string
         device_id:
           type: string
         conflict_id:

@@ -328,9 +328,16 @@ pre {
 }
 
 .status i {
-  width: 10px;
-  height: 10px;
+  display: inline-grid;
+  width: 16px;
+  height: 16px;
+  place-items: center;
   border-radius: 50%;
+  color: #ffffff;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 700;
+  line-height: 16px;
   background: var(--neutral);
 }
 
