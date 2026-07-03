@@ -190,6 +190,173 @@ describe('Phase 2 dashboard conflict resolution', () => {
     );
   });
 
+  it('rejects stale, cross-user, and non-recent conflict resolution submissions', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'desktop-stale');
+    const tabletDir = join(root, 'tablet-stale');
+    await mkdir(desktopDir, { recursive: true });
+    await mkdir(tabletDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await writeFile(join(desktopDir, 'shared.md'), 'base\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const tablet = await pairPlugin(admin, tabletDir, 'tablet');
+    await writeFile(join(desktopDir, 'shared.md'), 'server version\n');
+    await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const result = await tablet.syncOnce();
+    expect(result.status).toBe('Review needed');
+
+    const review = await admin.get<{
+      conflict: { conflict_id: string };
+      expected_main: string;
+      current_main: string;
+    }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`);
+    expect(review.status).toBe(200);
+
+    const intruder = new BrowserSession(baseUrl);
+    const user = await admin.post<{ reset_token: string }>('/api/v1/admin/users', {
+      username: 'intruder',
+      password: 'intruder-password-1234'
+    });
+    expect(user.status).toBe(201);
+    const login = await intruder.post<{ csrf_token: string }>('/api/v1/auth/login', {
+      username: 'intruder',
+      password: 'intruder-password-1234'
+    }, false);
+    expect(login.status).toBe(200);
+
+    const hiddenList = await intruder.get<{ error: { code: string } }>(`/api/v1/vaults/${admin.vaultId}/conflicts`);
+    expect(hiddenList.status).toBe(404);
+    const hiddenReview = await intruder.get<{ error: { code: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`
+    );
+    expect(hiddenReview.status).toBe(404);
+    const hiddenResolve = await intruder.post<{ error: { code: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
+      {
+        expected_main: review.body.expected_main,
+        resolution_kind: 'keep_server'
+      }
+    );
+    expect(hiddenResolve.status).toBe(404);
+
+    await server.store.mutate((db) => {
+      const sessionId = admin.cookie.match(/(?:^|;\s*)[^=]+=([^;]+)/u)?.[1];
+      const session = db.sessions.find((candidate) => candidate.session_id === sessionId);
+      expect(session).toBeDefined();
+      session!.recent_auth_at = new Date(Date.now() - 16 * 60 * 1000).toISOString();
+    });
+    const oldMain = review.body.current_main;
+    const notRecent = await admin.post<{ error: { code: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
+      {
+        expected_main: review.body.expected_main,
+        resolution_kind: 'keep_server'
+      }
+    );
+    expect(notRecent.status).toBe(403);
+    expect(notRecent.body.error.code).toBe('recent_auth_required');
+    expect((await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(oldMain);
+
+    await admin.post<{ csrf_token: string }>('/api/v1/auth/login', {
+      username: 'admin',
+      password: 'admin-password-1234'
+    }, false);
+    await writeFile(join(desktopDir, 'unrelated.md'), 'accepted while review is open\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const stale = await admin.post<{ error: { code: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
+      {
+        expected_main: review.body.expected_main,
+        resolution_kind: 'keep_server'
+      }
+    );
+    expect(stale.status).toBe(409);
+    expect(stale.body.error.code).toBe('stale_conflict_review');
+    expect((await server.store.snapshot()).conflicts.find((conflict) => conflict.conflict_id === result.conflictId)?.status).toBe('open');
+  });
+
+  it('supports keep-both, insert-both, and manual conflict resolutions as merge commits', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    for (const [index, resolutionKind] of (['keep_both_files', 'insert_both_blocks', 'manual'] as const).entries()) {
+      if (index > 0) {
+        const vault = await admin.post<{ vault_id: string }>(
+          '/api/v1/vaults',
+          {
+            display_name: `Vault ${resolutionKind}`
+          }
+        );
+        expect(vault.status).toBe(201);
+        admin.vaultId = vault.body.vault_id;
+      }
+      const desktopDir = join(root, `desktop-${resolutionKind}`);
+      const tabletDir = join(root, `tablet-${resolutionKind}`);
+      await mkdir(desktopDir, { recursive: true });
+      await mkdir(tabletDir, { recursive: true });
+      const desktop = await pairPlugin(admin, desktopDir, `desktop-${resolutionKind}`);
+      await writeFile(join(desktopDir, 'shared.md'), 'base\n');
+      expect((await desktop.syncOnce()).status).toBe('Synced');
+
+      const tablet = await pairPlugin(admin, tabletDir, `tablet-${resolutionKind}`);
+      await writeFile(join(desktopDir, 'shared.md'), 'server version\n');
+      await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
+      expect((await desktop.syncOnce()).status).toBe('Synced');
+      const result = await tablet.syncOnce();
+      expect(result.status).toBe('Review needed');
+
+      const review = await admin.get<{
+        conflict: { conflict_id: string; expected_main: string; device_commit: string; device_id: string };
+        files: Array<{ path: string }>;
+      }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`);
+      expect(review.status).toBe(200);
+
+      const body =
+        resolutionKind === 'manual'
+          ? {
+              expected_main: review.body.conflict.expected_main,
+              resolution_kind: resolutionKind,
+              manual_files: { 'shared.md': 'manual result\n' }
+            }
+          : {
+              expected_main: review.body.conflict.expected_main,
+              resolution_kind: resolutionKind
+            };
+      const resolved = await admin.post<{ resolution_commit: string }>(
+        `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
+        body
+      );
+      expect(resolved.status).toBe(200);
+
+      const parents = (
+        await server.git.exec(server.git.repoPath(admin.vaultId), ['show', '-s', '--format=%P', resolved.body.resolution_commit])
+      ).stdout.toString().trim().split(/\s+/u);
+      expect(parents).toEqual([review.body.conflict.expected_main, review.body.conflict.device_commit]);
+
+      if (resolutionKind === 'keep_both_files') {
+        expect((await server.git.readBlobAtPath(admin.vaultId, resolved.body.resolution_commit, 'shared.md')).toString('utf8')).toBe(
+          'server version\n'
+        );
+        const paths = await server.git.listTreePaths(admin.vaultId, resolved.body.resolution_commit);
+        const copyPath = paths.find((path) => path.startsWith('shared.device-') && path.endsWith('.md'));
+        expect(copyPath).toBeDefined();
+        expect((await server.git.readBlobAtPath(admin.vaultId, resolved.body.resolution_commit, copyPath!)).toString('utf8')).toBe(
+          'device version\n'
+        );
+      } else if (resolutionKind === 'insert_both_blocks') {
+        const content = (await server.git.readBlobAtPath(admin.vaultId, resolved.body.resolution_commit, 'shared.md')).toString('utf8');
+        expect(content).toContain('## Server version');
+        expect(content).toContain('server version\n');
+        expect(content).toContain('## Device version');
+        expect(content).toContain('device version\n');
+      } else {
+        expect((await server.git.readBlobAtPath(admin.vaultId, resolved.body.resolution_commit, 'shared.md')).toString('utf8')).toBe(
+          'manual result\n'
+        );
+      }
+    }
+  });
+
   it('serves note history, restores a version, and runs owner-scoped maintenance', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const desktopDir = join(root, 'desktop-history');
@@ -244,15 +411,15 @@ describe('Phase 2 dashboard conflict resolution', () => {
   });
 });
 
-async function setupAdminAndVault(baseUrl: string): Promise<BrowserSession> {
+async function setupAdminAndVault(baseUrl: string, username = 'admin', vaultName = 'Main Vault'): Promise<BrowserSession> {
   const admin = new BrowserSession(baseUrl);
   const setup = await admin.post<{ csrf_token: string }>('/api/v1/setup', {
-    username: 'admin',
+    username,
     password: 'admin-password-1234'
   }, false);
   expect(setup.status).toBe(201);
   const vault = await admin.post<{ vault_id: string }>('/api/v1/vaults', {
-    display_name: 'Main Vault'
+    display_name: vaultName
   });
   expect(vault.status).toBe(201);
   admin.vaultId = vault.body.vault_id;

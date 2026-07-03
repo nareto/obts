@@ -1,12 +1,15 @@
 # Persistent State And Backup Contract
 
-Phase 1 persistent state lives under `OBTS_DATA_DIR` unless a deployment sets
-separate directories in server configuration.
+Phase 2 persistent state lives under `OBTS_DATA_DIR` unless a deployment sets
+separate directories in server configuration. Phase 2 upgrades Phase 1 state in
+place and continues to use the same file-backed metadata adapter in this
+repository.
 
 Back up these paths atomically:
 
 - `OBTS_DATA_DIR/metadata/phase1.json`: users, sessions, vaults, devices,
-  token hashes, sync operations, conflicts, events, and audit rows.
+  token hashes, sync operations, conflict workflow records, dashboard events,
+  and audit rows.
 - `OBTS_DATA_DIR/git/*.git`: per-vault native Git repositories containing
   canonical `refs/heads/main`, protected device refs, commits, trees, blobs,
   and packs.
@@ -23,7 +26,7 @@ Event rows are retained for 30 days or 100,000 events per vault. Clients that
 resume from an older pruned cursor receive `410 event_cursor_expired` and must
 refresh vault state before polling from an available cursor.
 
-Phase 1 does not implement application-level encrypted persistence. Offline
+Phase 2 does not implement application-level encrypted persistence. Offline
 disclosure protection depends on deployment-managed filesystem, volume,
 snapshot, or database-backup encryption and restrictive permissions. Keep those
 encryption keys and storage credentials outside this repository and outside the
