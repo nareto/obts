@@ -6,7 +6,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 
 const API_VERSION = "2026-07-02.full-sync";
-const PLUGIN_VERSION = "0.1.0-phase1";
+const PLUGIN_VERSION = "0.1.0-phase2";
 const WINDOWS_RESERVED = new Set(["con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"]);
 const SYNC_DEBOUNCE_MS = 1500;
 const BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000;
@@ -2013,7 +2013,7 @@ function requireDesktopVaultPath(adapter) {
   if (adapter && typeof adapter.getBasePath === "function") {
     return adapter.getBasePath();
   }
-  throw new Error("obts Phase 1 requires the desktop FileSystemAdapter.");
+  throw new Error("obts requires the desktop FileSystemAdapter.");
 }
 
 async function ensureAdapterDir(adapter, dir) {

@@ -3,8 +3,7 @@
   "name": "Obsidian True Sync",
   "version": "0.1.0",
   "minAppVersion": "1.5.0",
-  "description": "Phase 1 Git-backed sync client for a self-hosted obts server.",
+  "description": "Git-backed sync client for a self-hosted obts server.",
   "author": "obts",
   "isDesktopOnly": true
 }
-

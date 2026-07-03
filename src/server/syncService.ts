@@ -15,7 +15,7 @@ import { AuthError, type AuthenticatedDevice } from './authService.js';
 import { GitCommandError, GitService, sha256Hex, type GitDiffEntry } from './gitService.js';
 import type { DeviceRow, MetadataDb, MetadataStore, SyncOperationRow } from './metadataStore.js';
 
-const MERGE_POLICY_VERSION = 'phase1.disjoint-paths.v1';
+const MERGE_POLICY_VERSION = 'phase2.semantic-merge.v1';
 
 export class SyncService {
   private readonly locks = new Map<string, Promise<void>>();

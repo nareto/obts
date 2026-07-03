@@ -19,7 +19,7 @@ type ParsedArgs = {
   options: Record<string, string | boolean>;
 };
 
-const HELP = `obts Phase 1 CLI
+const HELP = `obts CLI
 
 Usage:
   obts serve [--host 0.0.0.0] [--port 3000]

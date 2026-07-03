@@ -253,7 +253,7 @@ describe('Phase 1 sync without conflict resolution', () => {
           affected_paths: ['note.md'],
           affected_path_count: 1,
           merge_sequence: 1,
-          merge_policy_version: 'phase1.disjoint-paths.v1',
+          merge_policy_version: 'phase2.semantic-merge.v1',
           validator_results: { reason: 'test' },
           validator_summary: { decision: 'conflict' },
           created_at: new Date().toISOString()
@@ -390,7 +390,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(mergeOperations.length).toBeGreaterThanOrEqual(2);
     expect(mergeOperations.at(-1)?.status).toBe('committed');
     expect(mergeOperations.at(-1)?.prepared_manifest).toMatchObject({
-      merge_policy_version: 'phase1.disjoint-paths.v1',
+      merge_policy_version: 'phase2.semantic-merge.v1',
       decision: 'merge',
       validator_results: {
         disjoint_paths: 'ok',
@@ -1521,7 +1521,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       status: 'open',
       affected_paths: ['shared.md'],
       merge_sequence: expect.any(Number),
-      merge_policy_version: 'phase1.disjoint-paths.v1',
+      merge_policy_version: 'phase2.semantic-merge.v1',
       base_commit: expect.stringMatching(/^[0-9a-f]{40}$/u),
       current_main: expect.stringMatching(/^[0-9a-f]{40}$/u),
       device_commit: expect.stringMatching(/^[0-9a-f]{40}$/u),
@@ -1539,7 +1539,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     );
     expect(operation?.prepared_manifest).toMatchObject({
       merge_sequence: conflict.merge_sequence,
-      merge_policy_version: 'phase1.disjoint-paths.v1',
+      merge_policy_version: 'phase2.semantic-merge.v1',
       base_commit: conflict.base_commit,
       current_main: conflict.current_main,
       device_commit: conflict.device_commit,
