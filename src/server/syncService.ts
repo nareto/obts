@@ -996,6 +996,11 @@ export class SyncService {
       if (manualFiles === undefined || Object.keys(manualFiles).length === 0) {
         throw new AuthError(400, 'invalid_resolution', 'Manual resolution requires final file content.');
       }
+      const allowedPaths = new Set(conflict.affected_paths);
+      const unexpectedPaths = Object.keys(manualFiles).filter((path) => !allowedPaths.has(path));
+      if (unexpectedPaths.length > 0) {
+        throw new AuthError(400, 'invalid_resolution', 'Manual resolution can only edit affected conflict paths.');
+      }
       assertSyncableTreePaths(Object.keys(manualFiles));
       for (const [path, content] of Object.entries(manualFiles)) {
         if (content === null) {

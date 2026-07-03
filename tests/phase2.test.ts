@@ -391,6 +391,64 @@ describe('Phase 2 dashboard conflict resolution', () => {
     }
   });
 
+  it('rejects manual conflict resolutions that edit paths outside the conflict package', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'desktop-manual-boundary');
+    const tabletDir = join(root, 'tablet-manual-boundary');
+    await mkdir(desktopDir, { recursive: true });
+    await mkdir(tabletDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await writeFile(join(desktopDir, 'shared.md'), 'base\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const tablet = await pairPlugin(admin, tabletDir, 'tablet');
+    await writeFile(join(desktopDir, 'shared.md'), 'server version\n');
+    await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const result = await tablet.syncOnce();
+    expect(result.status).toBe('Review needed');
+
+    const review = await admin.get<{
+      conflict: { conflict_id: string; expected_main: string };
+      files: Array<{ path: string }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`);
+    expect(review.status).toBe(200);
+    expect(review.body.files.map((file) => file.path)).toEqual(['shared.md']);
+
+    const rejected = await admin.post<{ error: { code: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
+      {
+        expected_main: review.body.conflict.expected_main,
+        resolution_kind: 'manual',
+        manual_files: {
+          'shared.md': 'manual result\n',
+          'unrelated.md': 'should not be accepted\n'
+        }
+      }
+    );
+    expect(rejected.status).toBe(400);
+    expect(rejected.body.error.code).toBe('invalid_resolution');
+    expect((await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(
+      review.body.conflict.expected_main
+    );
+
+    const accepted = await admin.post<{ resolution_commit: string }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
+      {
+        expected_main: review.body.conflict.expected_main,
+        resolution_kind: 'manual',
+        manual_files: {
+          'shared.md': 'manual result\n'
+        }
+      }
+    );
+    expect(accepted.status).toBe(200);
+    expect((await server.git.readBlobAtPath(admin.vaultId, accepted.body.resolution_commit, 'shared.md')).toString('utf8')).toBe(
+      'manual result\n'
+    );
+    expect(await server.git.readBlobAtPathIfPresent(admin.vaultId, accepted.body.resolution_commit, 'unrelated.md')).toBeNull();
+  });
+
   it('serves note history, restores a version, and runs owner-scoped maintenance', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const desktopDir = join(root, 'desktop-history');
