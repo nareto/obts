@@ -2221,6 +2221,88 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await readFile(join(secondDir, 'laptop-only.md'), 'utf8')).toBe('written while metadata was lost\n');
   });
 
+  it('repairs lost metadata without local refs by proposing visible files from server main', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'missing-local-refs-desktop');
+    const laptopDir = join(root, 'missing-local-refs-laptop');
+    await mkdirp(desktopDir);
+    await writeFile(join(desktopDir, 'server.md'), 'server state\n');
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await desktop.syncOnce({ confirmInitialImport: true });
+
+    const laptop = await pairPlugin(admin, laptopDir, 'laptop');
+    expect(await readFile(join(laptopDir, 'server.md'), 'utf8')).toBe('server state\n');
+    await rm(join(laptopDir, '.obts', 'git'), { recursive: true, force: true });
+    await writeFile(join(laptopDir, 'laptop-only.md'), 'written after local refs vanished\n');
+    await writeFile(
+      join(laptopDir, '.obts', 'state.json'),
+      `${JSON.stringify({
+        user_id: null,
+        vault_id: null,
+        device_id: null,
+        device_name: null,
+        device_ref: null,
+        server_device_ref: null,
+        local_main: null,
+        local_head: null,
+        initial_import_confirmed: false,
+        status_label: 'Checking',
+        last_error_code: null,
+        last_event_seq: 0,
+        updated_at: new Date().toISOString()
+      })}\n`
+    );
+    await rm(join(laptopDir, '.obts', 'state.json.bak'), { force: true });
+
+    const repairedLaptop = new ObtsPluginClient(laptopDir, {
+      serverUrl: baseUrlFromAdmin(admin),
+      deviceName: 'laptop',
+    });
+    expect((await repairedLaptop.syncOnce()).status).toBe('Synced');
+    await desktop.syncOnce();
+    expect(await readFile(join(desktopDir, 'laptop-only.md'), 'utf8')).toBe('written after local refs vanished\n');
+  });
+
+  it('re-pairs lost-state first devices as proposals when local Git history survives', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'repair-first-device-local-history');
+    const plugin = await pairPlugin(admin, deviceDir, 'laptop');
+    const pairedState = await plugin.readState();
+    expect(pairedState.local_main).toMatch(/^[0-9a-f]{40}$/u);
+    await writeFile(
+      join(deviceDir, '.obts', 'state.json'),
+      `${JSON.stringify({
+        user_id: null,
+        vault_id: null,
+        device_id: null,
+        device_name: null,
+        device_ref: null,
+        server_device_ref: null,
+        local_main: null,
+        local_head: null,
+        initial_import_confirmed: false,
+        status_label: 'Checking',
+        last_error_code: null,
+        last_event_seq: 0,
+        updated_at: new Date().toISOString()
+      })}\n`
+    );
+    await rm(join(deviceDir, '.obts', 'state.json.bak'), { force: true });
+    expect((await plugin.resetLocalPairingState()).status).toBe('Not paired');
+    await writeFile(join(deviceDir, 'laptop-only.md'), 'first-device re-pair data\n');
+
+    const rePairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
+      device_name: 'laptop',
+    });
+    expect(rePairing.status).toBe(201);
+    await plugin.pairWithToken(rePairing.body.pairing_token);
+    expect(await readFile(join(deviceDir, 'laptop-only.md'), 'utf8')).toBe('first-device re-pair data\n');
+    const repairedState = await plugin.readState();
+    expect(repairedState.initial_import_confirmed).toBe(true);
+    expect(repairedState.status_label).toBe('Ahead');
+    expect((await plugin.syncOnce()).status).toBe('Synced');
+  });
+
   it('uploads repaired local edits into server conflict state instead of requiring replace-local', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const desktopDir = join(root, 'repair-conflict-desktop');

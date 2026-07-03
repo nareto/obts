@@ -41,6 +41,11 @@ type DetachedBaseline = {
   main: string;
 };
 
+type PairingRepairContext = {
+  baseline: DetachedBaseline | null;
+  hasLocalGitHistory: boolean;
+};
+
 export type QueueState = {
   pending_commit: string | null;
   expected_device_ref: string | null;
@@ -124,12 +129,12 @@ export class ObtsPluginClient {
 
   async pairWithToken(pairingToken: string): Promise<void> {
     await this.assertPairingCanStart();
-    const baseline = this.detachedBaselineFromState(await this.readExistingState());
+    const pairingRepair = await this.discoverPairingRepairContext(await this.readExistingState());
     const result = await this.transport.consumePairingToken({
       pairingToken,
       deviceName: this.settings.deviceName
     });
-    const rePairBaseline = this.baselineForPairing(baseline, result.vault_id);
+    const rePairBaseline = this.baselineForPairing(pairingRepair.baseline, result.vault_id);
     await this.initialize();
     await writeJson(join(this.vaultDir, '.obts', 'auth', 'device-token.json'), {
       device_token: result.device_token,
@@ -165,11 +170,11 @@ export class ObtsPluginClient {
       localFiles.length > 0 && serverFiles.length > 0
         ? await this.localContentMatchesTree(localFiles, pulled.manifest.target_main)
         : false;
-    const divergentLocalContent =
+    const shouldProposeLocalContent =
       localFiles.length > 0 &&
       !localAlreadyMatchesServer &&
-      (!result.is_first_device || serverFiles.length > 0);
-    if (divergentLocalContent) {
+      (!result.is_first_device || serverFiles.length > 0 || pairingRepair.hasLocalGitHistory);
+    if (shouldProposeLocalContent) {
       if (rePairBaseline && (await this.canFastForwardCleanRePair(rePairBaseline, localFiles, pulled.manifest))) {
         await this.writeState({
           ...(await this.readState()),
@@ -1082,6 +1087,22 @@ export class ObtsPluginClient {
     );
   }
 
+  private async discoverPairingRepairContext(state: LocalPluginState | null): Promise<PairingRepairContext> {
+    const localMain = await this.git.resolveRef('refs/heads/main');
+    const localHead = await this.git.resolveRef('refs/heads/local');
+    const detached = this.detachedBaselineFromState(state);
+    const stateMain = state?.vault_id && state.local_main && (await this.git.commitExists(state.local_main))
+      ? { vaultId: state.vault_id, main: state.local_main }
+      : null;
+    const localMainBaseline = state?.vault_id && localMain
+      ? { vaultId: state.vault_id, main: localMain }
+      : null;
+    return {
+      baseline: detached ?? stateMain ?? localMainBaseline,
+      hasLocalGitHistory: Boolean(detached ?? stateMain ?? localMain ?? localHead)
+    };
+  }
+
   private detachedBaselineFromState(state: LocalPluginState | null): DetachedBaseline | null {
     if (
       !state?.unpaired_baseline_vault_id ||
@@ -1321,18 +1342,18 @@ export class ObtsPluginClient {
       const self = await this.transport.getDeviceSelf(token);
       const localMain = await this.git.resolveRef('refs/heads/main');
       const localHead = await this.git.resolveRef('refs/heads/local');
-      if (!localMain && !localHead) {
-        return this.localStateIncomplete({
-          ...state,
-          user_id: self.user_id,
-          vault_id: self.vault_id,
-          device_id: self.device_id,
-          device_name: self.device_name,
-          device_ref: self.device_ref,
-          server_device_ref: self.server_device_ref
-        });
-      }
       await this.importCurrentServerMain(self.vault_id, self.device_id, token, localMain);
+      let repairedLocalMain = localMain;
+      let repairedLocalHead = localHead ?? localMain;
+      if (!localMain && !localHead) {
+        const localFiles = await this.git.scanSyncableFiles();
+        if (localFiles.length > 0 && (await this.git.commitExists(self.current_main))) {
+          repairedLocalMain = self.current_main;
+          repairedLocalHead = self.current_main;
+          await this.git.setLocalMain(self.current_main);
+          await this.git.setLocalHead(self.current_main);
+        }
+      }
       const repaired: LocalPluginState = {
         user_id: self.user_id,
         vault_id: self.vault_id,
@@ -1340,8 +1361,8 @@ export class ObtsPluginClient {
         device_name: self.device_name,
         device_ref: self.device_ref,
         server_device_ref: self.server_device_ref,
-        local_main: localMain,
-        local_head: localHead ?? localMain,
+        local_main: repairedLocalMain,
+        local_head: repairedLocalHead,
         initial_import_confirmed: true,
         status_label: self.status === 'review_needed' || self.status === 'blocked_recovery' ? 'Needs recovery' : 'Checking',
         last_error_code: self.status === 'review_needed' || self.status === 'blocked_recovery' ? 'device_blocked' : null,
