@@ -162,20 +162,7 @@ module.exports = class ObtsPlugin extends Plugin {
     if (!state.vault_id || !state.device_id || state.last_error_code) {
       return;
     }
-    const queue = await this.client.readQueue();
-    if (queue.pending_commit || queue.status === "queued_local") {
-      await this.runAutomaticSync();
-      return;
-    }
-    this.syncRunning = true;
-    try {
-      await this.client.pollRemoteEventsAndApply();
-      this.setStatus((await this.client.readState()).status_label);
-    } catch (error) {
-      await this.handleAutomaticSyncError(error);
-    } finally {
-      this.syncRunning = false;
-    }
+    await this.runAutomaticSync();
   }
 
   async runAutomaticSync() {

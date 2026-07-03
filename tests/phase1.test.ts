@@ -3334,7 +3334,11 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(() => assertSyncableTreePaths(['.obsidian/plugins/obts'])).toThrow(PathPolicyViolation);
     expect(() => assertSyncableTreePaths(['.obsidian/plugins/obts/main.js'])).toThrow(PathPolicyViolation);
     expect(isSyncableVaultPath('.trash/deleted.md')).toBe(true);
+    expect(isSyncableVaultPath('.obsidian/hotkeys.json')).toBe(true);
+    expect(isSyncableVaultPath('.obsidian/app.json')).toBe(true);
+    expect(isSyncableVaultPath('.obsidian/snippets/theme.css')).toBe(true);
     expect(isSyncableVaultPath('.obsidian/plugins/example/main.js')).toBe(true);
+    expect(isSyncableVaultPath('.obsidian/plugins/example/data.json')).toBe(true);
     expect(isSyncableVaultPath('.obsidian/cache')).toBe(false);
     expect(isSyncableVaultPath('.obsidian/cache/cache.json')).toBe(false);
     expect(isSyncableVaultPath('.obsidian/workspace.json')).toBe(false);
@@ -3534,6 +3538,9 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000');
     expect(pluginMain).toContain('runBackgroundSync()');
     expect(pluginMain).toContain('runAutomaticSync()');
+    const backgroundSync = sourceSection(pluginMain, 'async runBackgroundSync()', 'async runAutomaticSync()');
+    expect(backgroundSync).toContain('await this.runAutomaticSync();');
+    expect(backgroundSync).not.toContain('pollRemoteEventsAndApply');
     expect(pluginMain).toContain('pollRemoteEventsAndApply()');
     expect(pluginMain).toContain('/sync/events?after=');
     expect(pluginMain).toContain('this.setStatus("Offline")');
