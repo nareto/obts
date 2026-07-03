@@ -7,11 +7,15 @@
   import Status from './components/Status.svelte';
   import Summary from './components/Summary.svelte';
   import type {
-    ConflictRecord,
+    DashboardConflict,
     ConflictResolutionKind,
     ConflictReviewPackage,
     DashboardDevice,
     DashboardSummary,
+    MaintenanceRow,
+    NoteHistoryQueryResponse,
+    NoteHistoryVersion,
+    NoteHistoryVersionResponse,
     Session,
     StatusLabel,
     VaultSummary
@@ -30,17 +34,24 @@
   let mobileNavOpen = false;
   let vaults: VaultSummary[] = [];
   let vaultId = '';
+  let newVaultName = '';
   let dashboard: DashboardSummary | null = null;
-  let conflicts: ConflictRecord[] = [];
+  let conflicts: DashboardConflict[] = [];
   let selectedConflictId = '';
   let review: ConflictReviewPackage | null = null;
   let resolutionKind: ConflictResolutionKind = 'keep_server';
   let manualText = '';
+  let diffTab: 'rendered' | 'source' = 'source';
   let pairOpen = false;
   let pairDeviceName = '';
   let pairing: { pairing_token: string; pairing_url: string; expires_at: string } | null = null;
   let reauthOpen = false;
   let reauthAction: (() => Promise<void>) | null = null;
+  let historyPath = '';
+  let history: NoteHistoryQueryResponse | null = null;
+  let selectedHistory: NoteHistoryVersion | null = null;
+  let historyVersion: NoteHistoryVersionResponse | null = null;
+  let maintenanceDetailOpen = false;
   let busy = false;
   let notice = '';
   let lastRefreshed: string | null = null;
@@ -118,12 +129,23 @@
     lastRefreshed = new Date().toLocaleTimeString();
   }
 
+  async function createVault() {
+    if (!newVaultName.trim()) return;
+    const created = await api.createVault(newVaultName.trim());
+    vaults = [...vaults, created];
+    vaultId = created.vault_id;
+    newVaultName = '';
+    notice = 'Vault created.';
+    await refreshVault();
+  }
+
   async function loadReview(conflictId: string) {
     if (!vaultId) return;
     selectedConflictId = conflictId;
     review = await api.conflict(vaultId, conflictId);
     resolutionKind = 'keep_server';
     manualText = review.files[0]?.server_content ?? '';
+    diffTab = review.files[0]?.rendered_markdown_diff ? 'rendered' : 'source';
   }
 
   function withRecentAuth(action: () => Promise<void>) {
@@ -170,6 +192,45 @@
     });
   }
 
+  async function searchHistory() {
+    if (!vaultId || !historyPath.trim()) return;
+    history = await api.historyQuery(vaultId, historyPath.trim());
+    selectedHistory = history.versions[0] ?? null;
+    historyVersion = null;
+    if (selectedHistory) {
+      await loadHistoryVersion(selectedHistory);
+    }
+  }
+
+  async function loadHistoryVersion(version: NoteHistoryVersion) {
+    if (!vaultId || !history) return;
+    selectedHistory = version;
+    historyVersion = await api.historyVersion(vaultId, history.path, version.commit);
+  }
+
+  async function restoreSelectedVersion() {
+    if (!vaultId || !history || !selectedHistory) return;
+    withRecentAuth(async () => {
+      await api.restoreHistoryVersion(vaultId, history!.path, selectedHistory!.commit, history!.current_main);
+      notice = 'Note restored.';
+      await refreshVault();
+      await searchHistory();
+    });
+  }
+
+  function handleMaintenanceAction(action: NonNullable<MaintenanceRow['action']>) {
+    if (action === 'view_backup_contract') {
+      maintenanceDetailOpen = !maintenanceDetailOpen;
+      return;
+    }
+    if (!vaultId) return;
+    withRecentAuth(async () => {
+      const result = await api.startGitMaintenance(vaultId);
+      notice = result.detail;
+      await refreshVault();
+    });
+  }
+
   async function logout() {
     await api.logout();
     session = null;
@@ -179,6 +240,21 @@
 
   function shortId(value: string | null | undefined) {
     return value ? `${value.slice(0, 10)}...` : '-';
+  }
+
+  function choiceLabel(choice: ConflictResolutionKind) {
+    switch (choice) {
+      case 'keep_server':
+        return 'Keep server version';
+      case 'use_device':
+        return 'Use device version';
+      case 'keep_both_files':
+        return 'Keep both files';
+      case 'insert_both_blocks':
+        return 'Insert both blocks';
+      case 'manual':
+        return 'Manually edit final result';
+    }
   }
 
 </script>
@@ -227,12 +303,22 @@
         </div>
         <span class="refresh">Refreshed {lastRefreshed ?? '-'}</span>
         <button class="secondary" on:click={refreshVault}>Refresh</button>
-        {#if page === 'Overview'}<button class="primary" on:click={() => (pairOpen = true)}>Pair device</button>{/if}
+        {#if page === 'Overview' && vaultId}<button class="primary" on:click={() => (pairOpen = true)}>Pair device</button>{/if}
       </header>
 
       {#if notice}<p class="notice">{notice}</p>{/if}
 
-      {#if page === 'Overview' && dashboard}
+      {#if vaults.length === 0}
+        <main class="page">
+          <section class="panel full">
+            <h2>Create vault</h2>
+            <form class="inline-form" on:submit|preventDefault={createVault}>
+              <label>Vault name<input bind:value={newVaultName} /></label>
+              <button class="primary">Create vault</button>
+            </form>
+          </section>
+        </main>
+      {:else if page === 'Overview' && dashboard}
         <main class="grid">
           <Summary title="Sync status" value={dashboard.vault.status === 'active' ? 'Synced' : 'Integrity failure'} role={dashboard.vault.status === 'active' ? 'success' : 'danger'} detail={shortId(dashboard.vault.current_main)} />
           <Summary title="Unresolved conflicts" value={String(unresolvedCount)} role={unresolvedCount ? 'warning' : 'success'} detail="Review queue" />
@@ -248,11 +334,25 @@
           </section>
           <section class="panel wide">
             <h2>Recent activity</h2>
-            <p class="muted">Main {shortId(dashboard.vault.current_main)} is the current server version.</p>
+            <table>
+              <thead><tr><th>Event</th><th>When</th><th>Main</th><th>Resource</th></tr></thead>
+              <tbody>
+                {#each dashboard.recent_activity as event}
+                  <tr>
+                    <td>{event.label}</td>
+                    <td>{new Date(event.created_at).toLocaleString()}</td>
+                    <td class="mono">{shortId(event.main)}</td>
+                    <td class="mono">{shortId(event.conflict_id ?? event.device_id)}</td>
+                  </tr>
+                {:else}
+                  <tr><td colspan="4" class="muted">No activity yet.</td></tr>
+                {/each}
+              </tbody>
+            </table>
           </section>
           <section class="panel narrow">
             <h2>Maintenance and backup</h2>
-            <Checklist health={dashboard.health} />
+            <Checklist health={dashboard.health} rows={dashboard.maintenance} onAction={handleMaintenanceAction} />
           </section>
         </main>
       {:else if page === 'Devices' && dashboard}
@@ -267,15 +367,19 @@
           <section class="panel list">
             <h2>Conflict center</h2>
             <table>
-              <thead><tr><th>Path</th><th>Device</th><th>Status</th><th>Action</th></tr></thead>
+              <thead><tr><th>Path</th><th>Device</th><th>Conflict type</th><th>Created</th><th>Status</th><th>Action</th></tr></thead>
               <tbody>
                 {#each conflicts as conflict}
                   <tr>
                     <td>{conflict.affected_paths[0] ?? '-'}</td>
-                    <td class="mono">{shortId(conflict.device_id)}</td>
-                    <td><Status label={conflict.status === 'open' ? 'Review needed' : 'Synced'} /></td>
-                    <td><button class="secondary" on:click={() => loadReview(conflict.conflict_id)}>Open</button></td>
+                    <td>{conflict.device_name}</td>
+                    <td>{conflict.conflict_type}</td>
+                    <td>{new Date(conflict.created_at).toLocaleString()}</td>
+                    <td><Status label={conflict.status_label} /></td>
+                    <td><button class="secondary" on:click={() => loadReview(conflict.conflict_id)}>{conflict.stale ? 'Refresh' : 'Open'}</button></td>
                   </tr>
+                {:else}
+                  <tr><td colspan="6" class="muted">No conflicts.</td></tr>
                 {/each}
               </tbody>
             </table>
@@ -287,14 +391,22 @@
                 <p class="muted">Device {review.device_name}</p>
                 <p class="mono">Server {shortId(review.expected_main)}</p>
                 <p class="mono">Device {shortId(review.conflict.device_commit)}</p>
+                <p>{selectedConflict?.conflict_type ?? 'Path overlap'}</p>
                 <Status label={review.stale ? 'Stale review' : 'Review needed'} />
               </aside>
               <section class="diff">
                 {#if review.stale}
                   <p class="warning">This review is stale. Refresh before submitting a resolution.</p>
                 {/if}
-                <h2>Source diff</h2>
-                <pre>{review.files[0]?.source_diff ?? 'No file selected.'}</pre>
+                <div class="tabs">
+                  <button class:active={diffTab === 'rendered'} disabled={!review.files[0]?.rendered_markdown_diff} on:click={() => (diffTab = 'rendered')}>Rendered</button>
+                  <button class:active={diffTab === 'source'} on:click={() => (diffTab = 'source')}>Source</button>
+                </div>
+                {#if diffTab === 'rendered' && review.files[0]?.rendered_markdown_diff}
+                  <div class="rendered">{@html review.files[0].rendered_markdown_diff}</div>
+                {:else}
+                  <pre>{review.files[0]?.source_diff ?? 'No file selected.'}</pre>
+                {/if}
                 {#if resolutionKind === 'manual'}
                   <textarea bind:value={manualText} aria-label="Manual final result"></textarea>
                 {/if}
@@ -302,8 +414,9 @@
               <aside class="rail right">
                 <h2>Resolution</h2>
                 {#each review.choices as choice}
-                  <label class="radio"><input type="radio" bind:group={resolutionKind} value={choice} /> {choice.replaceAll('_', ' ')}</label>
+                  <label class="radio"><input type="radio" bind:group={resolutionKind} value={choice} /> {choiceLabel(choice)}</label>
                 {/each}
+                {#if review.stale}<p class="muted">Refresh review before submitting.</p>{/if}
                 <button class="primary" disabled={review.stale} on:click={submitResolution}>Submit resolution</button>
               </aside>
             </section>
@@ -311,15 +424,57 @@
             <section class="panel full"><p class="muted">No conflict selected.</p></section>
           {/if}
         </main>
+      {:else if page === 'History'}
+        <main class="history-layout">
+          <section class="panel history-search">
+            <h2>Note history</h2>
+            <form class="inline-form" on:submit|preventDefault={searchHistory}>
+              <label>Path<input bind:value={historyPath} placeholder="notes/example.md" /></label>
+              <button class="primary">Search</button>
+            </form>
+            {#if history}
+              <p class="muted">Current main <code>{shortId(history.current_main)}</code></p>
+            {/if}
+          </section>
+          <section class="timeline">
+            <h2>Versions</h2>
+            {#if history}
+              {#each history.versions as version}
+                <button class:active={selectedHistory?.commit === version.commit} on:click={() => loadHistoryVersion(version)}>
+                  <span>{version.operation_type}</span>
+                  <small>{new Date(version.timestamp).toLocaleString()}</small>
+                  <code>{shortId(version.commit)}</code>
+                </button>
+              {:else}
+                <p class="muted">No versions found for this path.</p>
+              {/each}
+            {:else}
+              <p class="muted">Search for a vault path to inspect its versions.</p>
+            {/if}
+          </section>
+          <section class="preview">
+            <h2>Preview</h2>
+            {#if historyVersion}
+              <p class="mono">{shortId(historyVersion.commit)} / {historyVersion.path}</p>
+              <pre>{historyVersion.source_diff || historyVersion.content || 'The selected version deletes this path.'}</pre>
+              <button class="primary" disabled={!selectedHistory} on:click={restoreSelectedVersion}>Restore version</button>
+            {:else}
+              <p class="muted">Select a version to preview it.</p>
+            {/if}
+          </section>
+        </main>
       {:else if page === 'Maintenance' && dashboard}
         <main class="page">
           <section class="panel full">
             <h2>Maintenance</h2>
-            <Checklist health={dashboard.health} />
+            <Checklist health={dashboard.health} rows={dashboard.maintenance} onAction={handleMaintenanceAction} />
+            {#if maintenanceDetailOpen}
+              <p class="muted">Backups must cover metadata and the server Git store at the same point in time, and deployment storage controls are responsible for at-rest protection.</p>
+            {/if}
           </section>
         </main>
       {:else}
-        <main class="page"><section class="panel full"><p class="muted">This page is ready for the next Phase 2 slice.</p></section></main>
+        <main class="page"><section class="panel full"><p class="muted">Settings are managed through deployment configuration and account administration in this release.</p></section></main>
       {/if}
     </section>
   </div>

@@ -217,6 +217,51 @@ export type ResolveConflictResponse = {
   idempotent: boolean;
 };
 
+export type NoteHistoryVersion = {
+  commit: string;
+  parent_commit: string | null;
+  tree: string;
+  path: string;
+  operation_type: 'create' | 'update' | 'delete' | 'rename' | 'restore' | 'merge' | 'conflict_resolution';
+  timestamp: string;
+  author_name: string;
+  author_email: string;
+  subject: string;
+  device_id?: string;
+  conflict_id?: string;
+  merge_sequence?: number;
+};
+
+export type NoteHistoryQueryResponse = {
+  path: string;
+  current_main: string;
+  versions: NoteHistoryVersion[];
+};
+
+export type NoteHistoryVersionResponse = {
+  path: string;
+  commit: string;
+  content: string | null;
+  source_diff: string;
+  rendered_markdown_diff: string | null;
+};
+
+export type NoteRestoreResponse = {
+  status: 'restored';
+  path: string;
+  source_commit: string;
+  main: string;
+  restore_commit: string;
+  event_seq: number;
+};
+
+export type MaintenanceStartResponse = {
+  status: 'completed';
+  event_seq: number;
+  started_event_seq: number;
+  detail: string;
+};
+
 export type EventEnvelope = {
   event_id: string;
   event_seq: number;
@@ -227,7 +272,10 @@ export type EventEnvelope = {
     | 'device_recovery_required'
     | 'conflict_created'
     | 'conflict_resolved'
-    | 'device_state_changed';
+    | 'note_restored'
+    | 'device_state_changed'
+    | 'vault_maintenance_started'
+    | 'vault_maintenance_finished';
   vault_id: string;
   resource_ids: Record<string, string>;
   commit_cursors: Record<string, string | null>;

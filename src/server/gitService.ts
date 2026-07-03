@@ -16,6 +16,17 @@ export type GitDiffEntry = {
   oldPath?: string;
 };
 
+export type GitHistoryCommit = {
+  commit: string;
+  parentCommit: string | null;
+  tree: string;
+  authorName: string;
+  authorEmail: string;
+  authorDate: string;
+  subject: string;
+  body: string;
+};
+
 export type MergeTreeResult = {
   tree: string;
   validatorResults: Record<string, unknown>;
@@ -506,6 +517,88 @@ export class GitService {
       maxBuffer: 512 * 1024 * 1024
     });
     return Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
+  }
+
+  async readBlobAtPathIfPresent(vaultId: string, commit: string, path: string): Promise<Buffer | null> {
+    try {
+      return await this.readBlobAtPath(vaultId, commit, path);
+    } catch {
+      return null;
+    }
+  }
+
+  async sourceDiffForPath(vaultId: string, leftCommit: string | null, rightCommit: string, path: string): Promise<string> {
+    const repo = this.repoPath(vaultId);
+    const args =
+      leftCommit === null
+        ? ['show', '--format=', '--no-ext-diff', rightCommit, '--', path]
+        : ['diff', '--no-ext-diff', leftCommit, rightCommit, '--', path];
+    try {
+      const { stdout } = await this.exec(repo, args, undefined, undefined, {
+        maxBuffer: 16 * 1024 * 1024
+      });
+      return asText(stdout);
+    } catch {
+      return '';
+    }
+  }
+
+  async historyForPath(vaultId: string, commit: string, path: string, limit: number): Promise<GitHistoryCommit[]> {
+    const repo = this.repoPath(vaultId);
+    const format = '%H%x1f%P%x1f%T%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%b%x1e';
+    const { stdout } = await this.exec(
+      repo,
+      ['log', '--follow', `--max-count=${limit}`, `--format=${format}`, commit, '--', path],
+      undefined,
+      undefined,
+      { maxBuffer: 16 * 1024 * 1024 }
+    );
+    return asText(stdout)
+      .split('\x1e')
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+      .map((entry) => {
+        const [hash, parents, tree, authorName, authorEmail, authorDate, subject, body = ''] = entry.split('\x1f');
+        if (!hash || !tree || !authorDate) {
+          throw new GitCommandError('Malformed git history output.', '');
+        }
+        return {
+          commit: hash,
+          parentCommit: parents ? parents.split(/\s+/u)[0] ?? null : null,
+          tree,
+          authorName: authorName ?? '',
+          authorEmail: authorEmail ?? '',
+          authorDate,
+          subject: subject ?? '',
+          body
+        };
+      });
+  }
+
+  async createMainCommitFromTree(input: {
+    vaultId: string;
+    tree: string;
+    parentMain: string;
+    subject: string;
+    body: string;
+    actor: string;
+  }): Promise<string> {
+    const repo = this.repoPath(input.vaultId);
+    return asText(
+      await this.exec(
+        repo,
+        ['commit-tree', input.tree, '-p', input.parentMain, '-m', `${input.subject}\n\n${input.body}`],
+        undefined,
+        serverGitEnv(input.actor)
+      ).then((result) => result.stdout)
+    ).trim();
+  }
+
+  async runMaintenance(vaultId: string): Promise<string> {
+    const repo = this.repoPath(vaultId);
+    await this.exec(repo, ['fsck', '--strict'], undefined, undefined, { maxBuffer: 16 * 1024 * 1024 });
+    await this.exec(repo, ['gc', '--prune=now'], undefined, undefined, { maxBuffer: 16 * 1024 * 1024 });
+    return 'Git fsck and garbage collection completed.';
   }
 
   async treeHash(vaultId: string, commit: string): Promise<string> {

@@ -468,6 +468,90 @@ paths:
           $ref: "#/components/responses/Error"
         "404":
           $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/history/query:
+    post:
+      summary: List Git-backed note history for an owned vault path.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NoteHistoryQueryRequest"
+      responses:
+        "200":
+          description: Note history versions.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NoteHistoryQueryResponse"
+        "404":
+          $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/history/version:
+    post:
+      summary: Return source content and diff for one historical note version.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NoteHistoryVersionRequest"
+      responses:
+        "200":
+          description: Historical note version.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NoteHistoryVersionResponse"
+        "404":
+          $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/history/restore:
+    post:
+      summary: Restore a historical note version after recent dashboard authentication.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - $ref: "#/components/parameters/CsrfHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NoteRestoreRequest"
+      responses:
+        "200":
+          description: Restore commit.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NoteRestoreResponse"
+        "403":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/maintenance/git-gc/start:
+    post:
+      summary: Run owner-confirmed Git verification and garbage collection.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "200":
+          description: Maintenance completion.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MaintenanceStartResponse"
+        "403":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
   /vaults/{vault_id}/events:
     get:
       summary: Poll redacted vault-scoped events after a cursor.
@@ -865,7 +949,10 @@ components:
             - device_recovery_required
             - conflict_created
             - conflict_resolved
+            - note_restored
             - device_state_changed
+            - vault_maintenance_started
+            - vault_maintenance_finished
         vault_id:
           type: string
           pattern: "^vlt_"
@@ -886,7 +973,7 @@ components:
           format: date-time
     DashboardSummary:
       type: object
-      required: [vault, devices, unresolved_conflict_count, health]
+      required: [vault, devices, unresolved_conflict_count, conflicts, recent_activity, maintenance, health]
       properties:
         vault:
           type: object
@@ -960,8 +1047,75 @@ components:
         unresolved_conflict_count:
           type: integer
           minimum: 0
+        conflicts:
+          type: array
+          items:
+            $ref: "#/components/schemas/DashboardConflict"
+        recent_activity:
+          type: array
+          items:
+            $ref: "#/components/schemas/DashboardActivity"
+        maintenance:
+          type: array
+          items:
+            $ref: "#/components/schemas/MaintenanceRow"
         health:
           $ref: "#/components/schemas/ReadinessSummary"
+    DashboardConflict:
+      allOf:
+        - $ref: "#/components/schemas/ConflictRecord"
+        - type: object
+          required: [device_name, conflict_type, stale, status_label]
+          properties:
+            device_name:
+              type: string
+            conflict_type:
+              type: string
+            stale:
+              type: boolean
+            status_label:
+              type: string
+    DashboardActivity:
+      type: object
+      required: [event_id, event_seq, event_type, label, created_at]
+      properties:
+        event_id:
+          type: string
+        event_seq:
+          type: integer
+        event_type:
+          type: string
+        label:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        device_id:
+          type: string
+        conflict_id:
+          type: string
+        main:
+          oneOf:
+            - type: "null"
+            - type: string
+    MaintenanceRow:
+      type: object
+      required: [key, label, status_label, last_checked_at, detail]
+      properties:
+        key:
+          type: string
+        label:
+          type: string
+        status_label:
+          type: string
+        last_checked_at:
+          type: string
+          format: date-time
+        detail:
+          type: string
+        action:
+          type: string
+          enum: [start_git_maintenance, view_backup_contract]
     ConflictListResponse:
       type: object
       required: [conflicts]
@@ -969,7 +1123,7 @@ components:
         conflicts:
           type: array
           items:
-            $ref: "#/components/schemas/ConflictRecord"
+            $ref: "#/components/schemas/DashboardConflict"
     ConflictResolutionKind:
       type: string
       enum: [keep_server, use_device, keep_both_files, insert_both_blocks, manual]
@@ -1057,6 +1211,137 @@ components:
           minimum: 0
         idempotent:
           type: boolean
+    NoteHistoryQueryRequest:
+      type: object
+      required: [path]
+      properties:
+        path:
+          type: string
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 200
+    NoteHistoryVersionRequest:
+      type: object
+      required: [path, commit]
+      properties:
+        path:
+          type: string
+        commit:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+    NoteRestoreRequest:
+      type: object
+      required: [path, source_commit]
+      properties:
+        path:
+          type: string
+        source_commit:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        expected_main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+    NoteHistoryQueryResponse:
+      type: object
+      required: [path, current_main, versions]
+      properties:
+        path:
+          type: string
+        current_main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        versions:
+          type: array
+          items:
+            $ref: "#/components/schemas/NoteHistoryVersion"
+    NoteHistoryVersion:
+      type: object
+      required: [commit, parent_commit, tree, path, operation_type, timestamp, author_name, author_email, subject]
+      properties:
+        commit:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        parent_commit:
+          oneOf:
+            - type: "null"
+            - type: string
+              pattern: "^[0-9a-f]{40}$"
+        tree:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        path:
+          type: string
+        operation_type:
+          type: string
+          enum: [create, update, delete, rename, restore, merge, conflict_resolution]
+        timestamp:
+          type: string
+          format: date-time
+        author_name:
+          type: string
+        author_email:
+          type: string
+        subject:
+          type: string
+        device_id:
+          type: string
+        conflict_id:
+          type: string
+        merge_sequence:
+          type: integer
+    NoteHistoryVersionResponse:
+      type: object
+      required: [path, commit, content, source_diff, rendered_markdown_diff]
+      properties:
+        path:
+          type: string
+        commit:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        content:
+          oneOf:
+            - type: "null"
+            - type: string
+        source_diff:
+          type: string
+        rendered_markdown_diff:
+          oneOf:
+            - type: "null"
+            - type: string
+    NoteRestoreResponse:
+      type: object
+      required: [status, path, source_commit, main, restore_commit, event_seq]
+      properties:
+        status:
+          type: string
+          enum: [restored]
+        path:
+          type: string
+        source_commit:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        restore_commit:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        event_seq:
+          type: integer
+    MaintenanceStartResponse:
+      type: object
+      required: [status, event_seq, started_event_seq, detail]
+      properties:
+        status:
+          type: string
+          enum: [completed]
+        event_seq:
+          type: integer
+        started_event_seq:
+          type: integer
+        detail:
+          type: string
     ConflictRecord:
       type: object
       required:

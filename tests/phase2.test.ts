@@ -147,6 +147,59 @@ describe('Phase 2 dashboard conflict resolution', () => {
     });
     expect(db.events.find((event) => event.event_type === 'main_advanced' && event.resource_ids.conflict_id === result.conflictId)).toBeDefined();
   });
+
+  it('serves note history, restores a version, and runs owner-scoped maintenance', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'desktop-history');
+    await mkdir(desktopDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await writeFile(join(desktopDir, 'history.md'), 'first version\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    await writeFile(join(desktopDir, 'history.md'), 'second version\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const history = await admin.post<{
+      current_main: string;
+      versions: Array<{ commit: string; operation_type: string }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/history/query`, {
+      path: 'history.md',
+      limit: 20
+    });
+    expect(history.status).toBe(200);
+    expect(history.body.versions.length).toBeGreaterThanOrEqual(2);
+
+    let firstVersionCommit = '';
+    for (const version of history.body.versions) {
+      const content = await admin.post<{ content: string | null }>(`/api/v1/vaults/${admin.vaultId}/history/version`, {
+        path: 'history.md',
+        commit: version.commit
+      });
+      if (content.body.content === 'first version\n') {
+        firstVersionCommit = version.commit;
+        break;
+      }
+    }
+    expect(firstVersionCommit).toMatch(/^[0-9a-f]{40}$/u);
+
+    const restored = await admin.post<{ status: string; restore_commit: string }>(`/api/v1/vaults/${admin.vaultId}/history/restore`, {
+      path: 'history.md',
+      source_commit: firstVersionCommit,
+      expected_main: history.body.current_main
+    });
+    expect(restored.status).toBe(200);
+    expect(restored.body.status).toBe('restored');
+    expect((await server.git.readBlobAtPath(admin.vaultId, restored.body.restore_commit, 'history.md')).toString('utf8')).toBe(
+      'first version\n'
+    );
+
+    const maintenance = await admin.post<{ status: string; detail: string }>(
+      `/api/v1/vaults/${admin.vaultId}/maintenance/git-gc/start`,
+      {}
+    );
+    expect(maintenance.status).toBe(200);
+    expect(maintenance.body).toMatchObject({ status: 'completed' });
+    expect(maintenance.body.detail).toContain('completed');
+  });
 });
 
 async function setupAdminAndVault(baseUrl: string): Promise<BrowserSession> {

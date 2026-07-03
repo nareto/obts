@@ -391,15 +391,19 @@ pre {
 
 .checklist > div {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: 1fr auto auto;
   gap: 4px 12px;
   padding: 8px 0;
   border-bottom: 1px solid var(--border);
 }
 
 .checklist small {
-  grid-column: 1 / -1;
+  grid-column: 1 / 3;
   color: var(--muted);
+}
+
+.row-action {
+  grid-row: span 2;
 }
 
 .conflict-layout {
@@ -432,6 +436,79 @@ pre {
 
 .radio input {
   min-height: auto;
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.tabs button.active {
+  color: #ffffff;
+  background: var(--primary);
+  border-color: var(--primary);
+}
+
+.rendered {
+  min-height: 220px;
+  padding: 12px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.inline-form {
+  display: flex;
+  align-items: end;
+  gap: 12px;
+  max-width: 640px;
+}
+
+.inline-form label {
+  flex: 1;
+  margin-bottom: 0;
+}
+
+.history-layout {
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr);
+  gap: 16px;
+  padding: 24px;
+}
+
+.history-search {
+  grid-column: 1 / -1;
+}
+
+.timeline,
+.preview {
+  min-width: 0;
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.timeline {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+}
+
+.timeline button {
+  display: grid;
+  gap: 2px;
+  justify-items: start;
+  height: auto;
+  min-height: 52px;
+  padding: 8px;
+  text-align: left;
+  background: transparent;
+}
+
+.timeline button.active {
+  background: var(--raised);
 }
 
 .modal {
@@ -527,5 +604,16 @@ pre {
 
   .workbench {
     grid-template-columns: 1fr;
+  }
+
+  .inline-form,
+  .history-layout {
+    display: grid;
+    grid-template-columns: 1fr;
+    padding: 16px;
+  }
+
+  .history-search {
+    grid-column: auto;
   }
 }

@@ -1,4 +1,13 @@
-import type { ConflictReviewPackage, ConflictResolutionKind, DashboardSummary, Session, VaultSummary } from './types';
+import type {
+  ConflictReviewPackage,
+  ConflictResolutionKind,
+  DashboardSummary,
+  DashboardConflict,
+  NoteHistoryQueryResponse,
+  NoteHistoryVersionResponse,
+  Session,
+  VaultSummary
+} from './types';
 
 export class ApiError extends Error {
   constructor(
@@ -50,11 +59,19 @@ export class DashboardApi {
     return await this.request('/vaults');
   }
 
+  async createVault(displayName: string): Promise<VaultSummary> {
+    return await this.request('/vaults', {
+      method: 'POST',
+      csrf: true,
+      body: { display_name: displayName }
+    });
+  }
+
   async dashboard(vaultId: string): Promise<DashboardSummary> {
     return await this.request(`/vaults/${vaultId}/dashboard`);
   }
 
-  async conflicts(vaultId: string): Promise<{ conflicts: ConflictReviewPackage['conflict'][] }> {
+  async conflicts(vaultId: string): Promise<{ conflicts: DashboardConflict[] }> {
     return await this.request(`/vaults/${vaultId}/conflicts?status=all`);
   }
 
@@ -93,6 +110,40 @@ export class DashboardApi {
         resolution_kind: input.resolutionKind,
         ...(input.manualFiles ? { manual_files: input.manualFiles } : {})
       }
+    });
+  }
+
+  async historyQuery(vaultId: string, path: string): Promise<NoteHistoryQueryResponse> {
+    return await this.request(`/vaults/${vaultId}/history/query`, {
+      method: 'POST',
+      body: { path, limit: 100 }
+    });
+  }
+
+  async historyVersion(vaultId: string, path: string, commit: string): Promise<NoteHistoryVersionResponse> {
+    return await this.request(`/vaults/${vaultId}/history/version`, {
+      method: 'POST',
+      body: { path, commit }
+    });
+  }
+
+  async restoreHistoryVersion(vaultId: string, path: string, sourceCommit: string, expectedMain: string): Promise<{ restore_commit: string; main: string }> {
+    return await this.request(`/vaults/${vaultId}/history/restore`, {
+      method: 'POST',
+      csrf: true,
+      body: {
+        path,
+        source_commit: sourceCommit,
+        expected_main: expectedMain
+      }
+    });
+  }
+
+  async startGitMaintenance(vaultId: string): Promise<{ status: string; detail: string; event_seq: number }> {
+    return await this.request(`/vaults/${vaultId}/maintenance/git-gc/start`, {
+      method: 'POST',
+      csrf: true,
+      body: {}
     });
   }
 

@@ -99,7 +99,7 @@ export type SyncOperationRow = {
   operation_id: string;
   vault_id: string;
   device_id: string | null;
-  operation_type: 'device_push' | 'server_merge' | 'conflict_create' | 'conflict_resolve';
+  operation_type: 'device_push' | 'server_merge' | 'conflict_create' | 'conflict_resolve' | 'note_restore' | 'git_maintenance';
   expected_refs: Record<string, string | null>;
   target_refs: Record<string, string | null>;
   target_commit: string | null;

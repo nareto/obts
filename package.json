@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Obsidian True Sync Phase 1 implementation.",
+  "description": "Obsidian True Sync deployable dashboard and conflict resolution implementation.",
   "bin": {
     "obts": "./dist/src/cli.js"
   },

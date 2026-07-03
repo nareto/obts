@@ -46,10 +46,40 @@ export type DashboardDevice = {
   offline: boolean;
 };
 
+export type DashboardConflict = ConflictRecord & {
+  device_name: string;
+  conflict_type: string;
+  stale: boolean;
+  status_label: StatusLabel;
+};
+
+export type DashboardActivity = {
+  event_id: string;
+  event_seq: number;
+  event_type: string;
+  label: string;
+  created_at: string;
+  device_id?: string;
+  conflict_id?: string;
+  main?: string | null;
+};
+
+export type MaintenanceRow = {
+  key: string;
+  label: string;
+  status_label: StatusLabel;
+  last_checked_at: string;
+  detail: string;
+  action?: 'start_git_maintenance' | 'view_backup_contract';
+};
+
 export type DashboardSummary = {
   vault: Pick<VaultSummary, 'vault_id' | 'display_name' | 'current_main' | 'status'>;
   devices: DashboardDevice[];
   unresolved_conflict_count: number;
+  conflicts: DashboardConflict[];
+  recent_activity: DashboardActivity[];
+  maintenance: MaintenanceRow[];
   health: {
     status: 'ready' | 'not_ready';
     checks: Record<string, boolean>;
@@ -103,4 +133,33 @@ export type ConflictReviewPackage = {
   device_name: string;
   files: ConflictReviewFile[];
   choices: ConflictResolutionKind[];
+};
+
+export type NoteHistoryVersion = {
+  commit: string;
+  parent_commit: string | null;
+  tree: string;
+  path: string;
+  operation_type: 'create' | 'update' | 'delete' | 'rename' | 'restore' | 'merge' | 'conflict_resolution';
+  timestamp: string;
+  author_name: string;
+  author_email: string;
+  subject: string;
+  device_id?: string;
+  conflict_id?: string;
+  merge_sequence?: number;
+};
+
+export type NoteHistoryQueryResponse = {
+  path: string;
+  current_main: string;
+  versions: NoteHistoryVersion[];
+};
+
+export type NoteHistoryVersionResponse = {
+  path: string;
+  commit: string;
+  content: string | null;
+  source_diff: string;
+  rendered_markdown_diff: string | null;
 };
