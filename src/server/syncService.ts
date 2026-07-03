@@ -857,12 +857,30 @@ export class SyncService {
     if (resolutionKind === 'keep_server') {
       return await this.git.treeHash(conflict.vault_id, conflict.expected_main);
     }
-    if (resolutionKind === 'use_device') {
-      return await this.git.treeHash(conflict.vault_id, conflict.device_commit);
-    }
 
     const writes = new Map<string, Buffer>();
     const deletes: string[] = [];
+
+    if (resolutionKind === 'use_device') {
+      if (conflict.affected_paths.length === 0) {
+        return await this.git.treeHash(conflict.vault_id, conflict.device_commit);
+      }
+      for (const path of conflict.affected_paths) {
+        const deviceBlob = await this.readOptionalBlob(conflict.vault_id, conflict.device_commit, path);
+        if (deviceBlob === null) {
+          deletes.push(path);
+        } else {
+          writes.set(path, deviceBlob);
+        }
+      }
+      return await this.git.createTreeFromCommitWithChanges({
+        vaultId: conflict.vault_id,
+        sourceCommit: conflict.expected_main,
+        writes,
+        deletes
+      });
+    }
+
     if (resolutionKind === 'keep_both_files') {
       for (const path of conflict.affected_paths) {
         const deviceBlob = await this.readOptionalBlob(conflict.vault_id, conflict.device_commit, path);
