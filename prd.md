@@ -270,6 +270,16 @@ The dashboard shows:
 The dashboard must be implemented as a compact authenticated application shell,
 not as a landing page, marketing site, or decorative analytics dashboard.
 
+Dashboard frontend stack:
+
+- use Svelte, Vite, and TypeScript;
+- implement the dashboard as a client-rendered SPA built to static assets served
+  by the Fastify server;
+- do not add SvelteKit server routes, SSR, or a second application server;
+- keep dashboard source under `frontend/dashboard/`;
+- keep dashboard API client and generated OpenAPI types under
+  `frontend/dashboard/src/api/`.
+
 #### 3.9.1 App Shell
 
 Desktop layout:
@@ -604,7 +614,7 @@ Acceptance criteria:
 ### 4.2 Containers
 
 - **Server API and CLI:** TypeScript/Node/Fastify service for auth, vaults, devices, Git sync, merge, conflicts, note history, persistent-state checks, and health.
-- **Dashboard SPA:** browser UI served by the server for setup, device dashboard, conflict review, and maintenance.
+- **Dashboard SPA:** Svelte + Vite + TypeScript browser UI served by the server for setup, device dashboard, conflict review, and maintenance.
 - **Obsidian plugin:** TypeScript plugin that watches the visible local filesystem as the device source of truth, records hidden Git commits with `isomorphic-git`, rehydrates recoverable metadata from device-token auth, uploads device ref updates, pulls `main`, and applies accepted state.
 - **Postgres:** control-plane metadata for users, single-owner vaults, devices, token hashes, durable sync operations, derived indexes, conflict workflow records, event log rows, sync attempts, and audit records. Postgres does not own the authoritative commit graph, tree manifests, blobs, or refs.
 - **Server Git store:** per-vault internal Git repositories, object databases, packs, refs, trees, commits, blobs, and history state stored outside visible vaults.
