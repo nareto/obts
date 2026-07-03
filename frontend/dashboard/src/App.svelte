@@ -39,8 +39,9 @@
   let conflicts: DashboardConflict[] = [];
   let selectedConflictId = '';
   let review: ConflictReviewPackage | null = null;
+  let selectedReviewPath = '';
   let resolutionKind: ConflictResolutionKind = 'keep_server';
-  let manualText = '';
+  let manualTextByPath: Record<string, string> = {};
   let diffTab: 'rendered' | 'source' = 'source';
   let pairOpen = false;
   let pairDeviceName = '';
@@ -59,6 +60,7 @@
   $: selectedVault = vaults.find((vault) => vault.vault_id === vaultId) ?? null;
   $: unresolvedCount = conflicts.filter((conflict) => conflict.status === 'open').length || dashboard?.unresolved_conflict_count || 0;
   $: selectedConflict = conflicts.find((conflict) => conflict.conflict_id === selectedConflictId) ?? null;
+  $: selectedReviewFile = review?.files.find((file) => file.path === selectedReviewPath) ?? review?.files[0] ?? null;
   $: recentAuthValid = session ? Date.parse(session.recent_auth_expires_at) > Date.now() : false;
 
   onMount(async () => {
@@ -144,8 +146,22 @@
     selectedConflictId = conflictId;
     review = await api.conflict(vaultId, conflictId);
     resolutionKind = 'keep_server';
-    manualText = review.files[0]?.server_content ?? '';
+    selectedReviewPath = review.files[0]?.path ?? '';
+    manualTextByPath = Object.fromEntries(
+      review.files.map((file) => [file.path, file.server_content ?? file.device_content ?? ''])
+    );
     diffTab = review.files[0]?.rendered_markdown_diff ? 'rendered' : 'source';
+  }
+
+  function selectReviewPath(path: string) {
+    selectedReviewPath = path;
+    const file = review?.files.find((candidate) => candidate.path === path);
+    diffTab = file?.rendered_markdown_diff ? 'rendered' : 'source';
+  }
+
+  function updateManualText(path: string, event: Event) {
+    const target = event.currentTarget as HTMLTextAreaElement;
+    manualTextByPath = { ...manualTextByPath, [path]: target.value };
   }
 
   function withRecentAuth(action: () => Promise<void>) {
@@ -178,8 +194,10 @@
   async function submitResolution() {
     if (!vaultId || !review || review.stale) return;
     withRecentAuth(async () => {
-      const firstPath = review?.files[0]?.path;
-      const manualFiles = resolutionKind === 'manual' && firstPath ? { [firstPath]: manualText } : undefined;
+      const manualFiles =
+        resolutionKind === 'manual'
+          ? Object.fromEntries(review!.files.map((file) => [file.path, manualTextByPath[file.path] ?? '']))
+          : undefined;
       await api.resolveConflict({
         vaultId,
         conflictId: review!.conflict.conflict_id,
@@ -387,28 +405,39 @@
           {#if review}
             <section class="workbench">
               <aside class="rail">
-                <h2>{review.conflict.affected_paths[0] ?? 'Conflict'}</h2>
+                <h2>{selectedReviewFile?.path ?? 'Conflict'}</h2>
                 <p class="muted">Device {review.device_name}</p>
                 <p class="mono">Server {shortId(review.expected_main)}</p>
                 <p class="mono">Device {shortId(review.conflict.device_commit)}</p>
                 <p>{selectedConflict?.conflict_type ?? 'Path overlap'}</p>
                 <Status label={review.stale ? 'Stale review' : 'Review needed'} />
+                <div class="path-list" aria-label="Affected paths">
+                  {#each review.files as file}
+                    <button class:active={selectedReviewPath === file.path} on:click={() => selectReviewPath(file.path)}>
+                      <span>{file.path}</span>
+                    </button>
+                  {/each}
+                </div>
               </aside>
               <section class="diff">
                 {#if review.stale}
                   <p class="warning">This review is stale. Refresh before submitting a resolution.</p>
                 {/if}
                 <div class="tabs">
-                  <button class:active={diffTab === 'rendered'} disabled={!review.files[0]?.rendered_markdown_diff} on:click={() => (diffTab = 'rendered')}>Rendered</button>
+                  <button class:active={diffTab === 'rendered'} disabled={!selectedReviewFile?.rendered_markdown_diff} on:click={() => (diffTab = 'rendered')}>Rendered</button>
                   <button class:active={diffTab === 'source'} on:click={() => (diffTab = 'source')}>Source</button>
                 </div>
-                {#if diffTab === 'rendered' && review.files[0]?.rendered_markdown_diff}
-                  <div class="rendered">{@html review.files[0].rendered_markdown_diff}</div>
+                {#if diffTab === 'rendered' && selectedReviewFile?.rendered_markdown_diff}
+                  <div class="rendered">{@html selectedReviewFile.rendered_markdown_diff}</div>
                 {:else}
-                  <pre>{review.files[0]?.source_diff ?? 'No file selected.'}</pre>
+                  <pre>{selectedReviewFile?.source_diff ?? 'No file selected.'}</pre>
                 {/if}
-                {#if resolutionKind === 'manual'}
-                  <textarea bind:value={manualText} aria-label="Manual final result"></textarea>
+                {#if resolutionKind === 'manual' && selectedReviewFile}
+                  <textarea
+                    value={manualTextByPath[selectedReviewFile.path] ?? ''}
+                    on:input={(event) => updateManualText(selectedReviewFile!.path, event)}
+                    aria-label={`Manual final result for ${selectedReviewFile.path}`}
+                  ></textarea>
                 {/if}
               </section>
               <aside class="rail right">

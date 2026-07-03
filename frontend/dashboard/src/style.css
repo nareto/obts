@@ -426,6 +426,26 @@ pre {
   border-radius: 6px;
 }
 
+.path-list {
+  display: grid;
+  gap: 6px;
+  margin-top: 16px;
+}
+
+.path-list button {
+  display: block;
+  overflow: hidden;
+  width: 100%;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: transparent;
+}
+
+.path-list button.active {
+  background: var(--raised);
+}
+
 .radio {
   display: flex;
   grid-template-columns: auto 1fr;

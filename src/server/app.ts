@@ -1,5 +1,6 @@
 import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { extname, join, resolve } from 'node:path';
+import { dirname, extname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import cookie from '@fastify/cookie';
 import multipart from '@fastify/multipart';
@@ -31,6 +32,8 @@ export type ObtsServer = {
   auth: AuthService;
   sync: SyncService;
 };
+
+let dashboardRootPromise: Promise<string> | null = null;
 
 export async function createObtsServer(overrides: Partial<ServerConfig> & { dataDir: string }): Promise<ObtsServer> {
   const config = createServerConfig(overrides);
@@ -1223,7 +1226,7 @@ function sendMultipart(reply: FastifyReply, input: { manifest: DevicePullManifes
 }
 
 async function sendDashboardStatic(request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> {
-  const dashboardRoot = resolve(process.cwd(), 'dist', 'frontend', 'dashboard');
+  const dashboardRoot = await dashboardStaticRoot();
   const url = new URL(request.url, 'http://obts.local');
   const pathname = decodeURIComponent(url.pathname);
   const relativePath =
@@ -1262,6 +1265,47 @@ async function sendDashboardStatic(request: FastifyRequest, reply: FastifyReply)
         details: {}
       }
     });
+  }
+}
+
+async function dashboardStaticRoot(): Promise<string> {
+  dashboardRootPromise ??= findDashboardStaticRoot();
+  return await dashboardRootPromise;
+}
+
+async function findDashboardStaticRoot(): Promise<string> {
+  const moduleRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'frontend', 'dashboard');
+  const cwdBuildRoot = resolve(process.cwd(), 'dist', 'frontend', 'dashboard');
+  const roots = [...new Set([moduleRoot, cwdBuildRoot])];
+  const builtRoot = await firstRootMatching(roots, async (root) => (await isFile(join(root, 'index.html'))) && (await isDirectory(join(root, 'assets'))));
+  if (builtRoot) {
+    return builtRoot;
+  }
+  return (await firstRootMatching(roots, async (root) => await isFile(join(root, 'index.html')))) ?? moduleRoot;
+}
+
+async function firstRootMatching(roots: string[], predicate: (root: string) => Promise<boolean>): Promise<string | null> {
+  for (const root of roots) {
+    if (await predicate(root)) {
+      return root;
+    }
+  }
+  return null;
+}
+
+async function isFile(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function isDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch {
+    return false;
   }
 }
 

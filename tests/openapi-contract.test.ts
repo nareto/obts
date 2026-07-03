@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 
 import { API_VERSION } from '../src/shared/types.js';
 
-describe('OpenAPI Phase 1 contract', () => {
+describe('OpenAPI Phase 2 contract', () => {
   it('commits the endpoints and version used by the server and plugin', async () => {
     const contract = await readFile(join(process.cwd(), 'openapi', 'openapi.yaml'), 'utf8');
     for (const path of [
@@ -22,6 +22,7 @@ describe('OpenAPI Phase 1 contract', () => {
       '/admin/users/{user_id}/password-reset-tokens',
       '/vaults',
       '/vaults/{vault_id}/main',
+      '/vaults/{vault_id}/dashboard',
       '/vaults/{vault_id}/pairing-tokens',
       '/vaults/{vault_id}/devices/{device_id}/revoke',
       '/pair/consume',
@@ -33,6 +34,10 @@ describe('OpenAPI Phase 1 contract', () => {
       '/vaults/{vault_id}/conflicts',
       '/vaults/{vault_id}/conflicts/{conflict_id}',
       '/vaults/{vault_id}/conflicts/{conflict_id}/resolve',
+      '/vaults/{vault_id}/history/query',
+      '/vaults/{vault_id}/history/version',
+      '/vaults/{vault_id}/history/restore',
+      '/vaults/{vault_id}/maintenance/git-gc/start',
       '/vaults/{vault_id}/events'
     ]) {
       expect(contract).toContain(path);
@@ -50,6 +55,10 @@ describe('OpenAPI Phase 1 contract', () => {
     expect(contract).toContain('ResolveConflictRequest');
     expect(contract).toContain('ResolveConflictResponse');
     expect(contract).toContain('keep_server');
+    expect(contract).toContain('insert_both_blocks');
+    expect(contract).toContain('DashboardSummary');
+    expect(contract).toContain('NoteHistoryQueryResponse');
+    expect(contract).toContain('MaintenanceStartResponse');
     expect(contract).toContain('validator_results');
     expect(contract).toContain('AdminUserSummary');
     expect(contract).toContain('PasswordResetTokenResponse');

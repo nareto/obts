@@ -221,7 +221,7 @@ paths:
           $ref: "#/components/responses/Error"
   /vaults/{vault_id}/dashboard:
     get:
-      summary: Return minimal Phase 1 dashboard state.
+      summary: Return deployable dashboard state for devices, conflicts, activity, and health.
       parameters:
         - $ref: "#/components/parameters/VaultId"
       responses:
@@ -417,7 +417,7 @@ paths:
           in: query
           schema:
             type: string
-            enum: [open, resolved]
+            enum: [open, resolved, all]
       responses:
         "200":
           description: Conflict records.
