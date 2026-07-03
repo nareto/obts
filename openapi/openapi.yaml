@@ -442,6 +442,24 @@ paths:
                 $ref: "#/components/schemas/ConflictReviewPackage"
         "404":
           $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/conflicts/{conflict_id}/refresh:
+    post:
+      summary: Refresh a stale conflict review package against the current server main.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - $ref: "#/components/parameters/ConflictId"
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "200":
+          description: Refreshed conflict review package.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConflictReviewPackage"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
   /vaults/{vault_id}/conflicts/{conflict_id}/resolve:
     post:
       summary: Resolve a conflict after recent dashboard authentication.
@@ -948,6 +966,7 @@ components:
             - device_sync_rejected
             - device_recovery_required
             - conflict_created
+            - conflict_review_refreshed
             - conflict_resolved
             - note_restored
             - device_state_changed

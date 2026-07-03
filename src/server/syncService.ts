@@ -249,6 +249,70 @@ export class SyncService {
     };
   }
 
+  async refreshConflictReviewPackage(input: {
+    actorUserId: string;
+    vaultId: string;
+    conflictId: string;
+  }): Promise<ConflictReviewPackage> {
+    await this.withVaultLock(input.vaultId, async () => {
+      await this.store.mutate((db) => {
+        const vault = requireVault(db, input.vaultId);
+        const conflict = db.conflicts.find(
+          (candidate) => candidate.vault_id === input.vaultId && candidate.conflict_id === input.conflictId
+        );
+        if (!conflict) {
+          throw new AuthError(404, 'not_found', 'Resource not found.');
+        }
+        if (conflict.status !== 'open') {
+          return;
+        }
+        if (conflict.expected_main === vault.current_main && conflict.current_main === vault.current_main) {
+          return;
+        }
+        const previousExpectedMain = conflict.expected_main;
+        conflict.current_main = vault.current_main;
+        conflict.expected_main = vault.current_main;
+        conflict.validator_results = {
+          ...conflict.validator_results,
+          review_refreshed_from: previousExpectedMain,
+          review_refreshed_at: nowIso()
+        };
+        conflict.validator_summary = {
+          ...conflict.validator_summary,
+          stale: false,
+          refreshed_from: previousExpectedMain
+        };
+        this.store.appendEvent(db, {
+          event_type: 'conflict_review_refreshed',
+          vault_id: input.vaultId,
+          resource_ids: {
+            conflict_id: input.conflictId,
+            device_id: conflict.device_id
+          },
+          commit_cursors: {
+            previous_main: previousExpectedMain,
+            main: vault.current_main,
+            device_commit: conflict.device_commit
+          },
+          payload: {
+            conflict_id: input.conflictId
+          }
+        });
+        db.audit_log.push({
+          audit_id: newId('aud'),
+          actor_user_id: input.actorUserId,
+          actor_device_id: null,
+          vault_id: input.vaultId,
+          action: 'conflict_review_refreshed',
+          resource_class: 'conflict',
+          resource_id: input.conflictId,
+          created_at: nowIso()
+        });
+      });
+    });
+    return await this.getConflictReviewPackage(input.vaultId, input.conflictId);
+  }
+
   async resolveConflict(input: {
     actorUserId: string;
     vaultId: string;

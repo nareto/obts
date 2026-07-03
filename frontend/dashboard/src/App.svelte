@@ -56,15 +56,21 @@
   let busy = false;
   let notice = '';
   let lastRefreshed: string | null = null;
+  let nowMs = Date.now();
 
   $: selectedVault = vaults.find((vault) => vault.vault_id === vaultId) ?? null;
   $: unresolvedCount = conflicts.filter((conflict) => conflict.status === 'open').length || dashboard?.unresolved_conflict_count || 0;
   $: selectedConflict = conflicts.find((conflict) => conflict.conflict_id === selectedConflictId) ?? null;
   $: selectedReviewFile = review?.files.find((file) => file.path === selectedReviewPath) ?? review?.files[0] ?? null;
-  $: recentAuthValid = session ? Date.parse(session.recent_auth_expires_at) > Date.now() : false;
+  $: recentAuthValid = session ? Date.parse(session.recent_auth_expires_at) > nowMs : false;
+  $: pairingExpiresIn = pairing ? formatCountdown(Date.parse(pairing.expires_at) - nowMs) : '';
 
-  onMount(async () => {
-    await bootstrap();
+  onMount(() => {
+    void bootstrap();
+    const interval = window.setInterval(() => {
+      nowMs = Date.now();
+    }, 1000);
+    return () => window.clearInterval(interval);
   });
 
   async function bootstrap() {
@@ -144,13 +150,24 @@
   async function loadReview(conflictId: string) {
     if (!vaultId) return;
     selectedConflictId = conflictId;
-    review = await api.conflict(vaultId, conflictId);
+    setReview(await api.conflict(vaultId, conflictId));
+  }
+
+  function setReview(nextReview: ConflictReviewPackage) {
+    review = nextReview;
     resolutionKind = 'keep_server';
     selectedReviewPath = review.files[0]?.path ?? '';
     manualTextByPath = Object.fromEntries(
       review.files.map((file) => [file.path, file.server_content ?? file.device_content ?? ''])
     );
     diffTab = review.files[0]?.rendered_markdown_diff ? 'rendered' : 'source';
+  }
+
+  async function refreshReview() {
+    if (!vaultId || !review) return;
+    setReview(await api.refreshConflict(vaultId, review.conflict.conflict_id));
+    conflicts = sortConflicts((await api.conflicts(vaultId)).conflicts);
+    notice = 'Conflict review refreshed.';
   }
 
   function selectReviewPath(path: string) {
@@ -260,6 +277,21 @@
     return value ? `${value.slice(0, 10)}...` : '-';
   }
 
+  function sortConflicts(items: DashboardConflict[]) {
+    return [...items].sort((left, right) => {
+      if (left.status !== right.status) return left.status === 'open' ? -1 : 1;
+      return right.created_at.localeCompare(left.created_at);
+    });
+  }
+
+  function formatCountdown(milliseconds: number) {
+    if (milliseconds <= 0) return 'expired';
+    const seconds = Math.ceil(milliseconds / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+    return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
+  }
+
   function choiceLabel(choice: ConflictResolutionKind) {
     switch (choice) {
       case 'keep_server':
@@ -314,7 +346,9 @@
 
     <section class="content">
       <header>
-        <button class="icon" title="Open navigation" on:click={() => (mobileNavOpen = !mobileNavOpen)}>Menu</button>
+        <button class="icon" title="Open navigation" aria-label="Open navigation" on:click={() => (mobileNavOpen = !mobileNavOpen)}>
+          <span aria-hidden="true">☰</span>
+        </button>
         <div>
           <h1>{page}</h1>
           <p>{selectedVault?.display_name ?? 'No vault selected'}{dashboard ? ` / ${dashboard.vault.status}` : ''}</p>
@@ -446,7 +480,11 @@
                   <label class="radio"><input type="radio" bind:group={resolutionKind} value={choice} /> {choiceLabel(choice)}</label>
                 {/each}
                 {#if review.stale}<p class="muted">Refresh review before submitting.</p>{/if}
-                <button class="primary" disabled={review.stale} on:click={submitResolution}>Submit resolution</button>
+                {#if review.stale}
+                  <button class="primary" on:click={refreshReview}>Refresh review</button>
+                {:else}
+                  <button class="primary" on:click={submitResolution}>Submit resolution</button>
+                {/if}
               </aside>
             </section>
           {:else}
@@ -516,8 +554,19 @@
       <h2>Pair device</h2>
       <label>Device display name<input bind:value={pairDeviceName} /></label>
       {#if pairing}
-        <p class="muted">Expires {new Date(pairing.expires_at).toLocaleString()}</p>
-        <div class="copy"><code>{pairing.pairing_url}</code><button type="button" class="secondary" on:click={() => navigator.clipboard.writeText(pairing!.pairing_url)}>Copy</button></div>
+        <p class="muted">Expires in {pairingExpiresIn} at {new Date(pairing.expires_at).toLocaleString()}</p>
+        <div class="copy">
+          <code>{pairing.pairing_url}</code>
+          <button
+            type="button"
+            class="icon-button"
+            title="Copy pairing URL"
+            aria-label="Copy pairing URL"
+            on:click={() => navigator.clipboard.writeText(pairing!.pairing_url)}
+          >
+            <span aria-hidden="true">⧉</span>
+          </button>
+        </div>
       {/if}
       <div class="actions">
         <button type="button" class="secondary" on:click={() => { pairOpen = false; pairing = null; }}>Close</button>

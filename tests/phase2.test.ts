@@ -232,6 +232,11 @@ describe('Phase 2 dashboard conflict resolution', () => {
       `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`
     );
     expect(hiddenReview.status).toBe(404);
+    const hiddenRefresh = await intruder.post<{ error: { code: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/refresh`,
+      {}
+    );
+    expect(hiddenRefresh.status).toBe(404);
     const hiddenResolve = await intruder.post<{ error: { code: string } }>(
       `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
       {
@@ -275,6 +280,35 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(stale.status).toBe(409);
     expect(stale.body.error.code).toBe('stale_conflict_review');
     expect((await server.store.snapshot()).conflicts.find((conflict) => conflict.conflict_id === result.conflictId)?.status).toBe('open');
+
+    const refreshed = await admin.post<{
+      stale: boolean;
+      expected_main: string;
+      current_main: string;
+      files: Array<{ path: string; server_content: string | null; device_content: string | null }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/refresh`, {});
+    expect(refreshed.status).toBe(200);
+    expect(refreshed.body.stale).toBe(false);
+    expect(refreshed.body.expected_main).toBe(refreshed.body.current_main);
+    expect(refreshed.body.expected_main).not.toBe(review.body.expected_main);
+    expect(refreshed.body.files[0]).toMatchObject({
+      path: 'shared.md',
+      server_content: 'server version\n',
+      device_content: 'device version\n'
+    });
+
+    const refreshedResolved = await admin.post<{ status: string; resolution_commit: string }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
+      {
+        expected_main: refreshed.body.expected_main,
+        resolution_kind: 'keep_server'
+      }
+    );
+    expect(refreshedResolved.status).toBe(200);
+    expect(refreshedResolved.body.status).toBe('resolved');
+    expect((await server.git.readBlobAtPath(admin.vaultId, refreshedResolved.body.resolution_commit, 'unrelated.md')).toString('utf8')).toBe(
+      'accepted while review is open\n'
+    );
   });
 
   it('supports keep-both, insert-both, and manual conflict resolutions as merge commits', async () => {

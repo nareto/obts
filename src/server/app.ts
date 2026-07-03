@@ -544,6 +544,19 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     return await sync.getConflictReviewPackage(vaultId, conflictId);
   });
 
+  app.post('/api/v1/vaults/:vaultId/conflicts/:conflictId/refresh', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
+    const { vaultId, conflictId } = vaultConflictPathParams(request);
+    const db = await store.snapshot();
+    ownedVaultOrThrow(db, session.user.user_id, vaultId);
+    return await sync.refreshConflictReviewPackage({
+      actorUserId: session.user.user_id,
+      vaultId,
+      conflictId
+    });
+  });
+
   app.post('/api/v1/vaults/:vaultId/conflicts/:conflictId/resolve', async (request) => {
     const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
@@ -893,6 +906,8 @@ function activityLabel(eventType: string): string {
       return 'Device changes uploaded';
     case 'conflict_created':
       return 'Conflict created';
+    case 'conflict_review_refreshed':
+      return 'Conflict review refreshed';
     case 'conflict_resolved':
       return 'Conflict resolved';
     case 'note_restored':

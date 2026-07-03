@@ -272,6 +272,7 @@ export type EventEnvelope = {
     | 'device_sync_rejected'
     | 'device_recovery_required'
     | 'conflict_created'
+    | 'conflict_review_refreshed'
     | 'conflict_resolved'
     | 'note_restored'
     | 'device_state_changed'

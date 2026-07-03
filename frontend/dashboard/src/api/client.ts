@@ -79,6 +79,14 @@ export class DashboardApi {
     return await this.request(`/vaults/${vaultId}/conflicts/${conflictId}`);
   }
 
+  async refreshConflict(vaultId: string, conflictId: string): Promise<ConflictReviewPackage> {
+    return await this.request(`/vaults/${vaultId}/conflicts/${conflictId}/refresh`, {
+      method: 'POST',
+      csrf: true,
+      body: {}
+    });
+  }
+
   async createPairingToken(vaultId: string, deviceName: string): Promise<{ pairing_token: string; pairing_url: string; expires_at: string }> {
     return await this.request(`/vaults/${vaultId}/pairing-tokens`, {
       method: 'POST',

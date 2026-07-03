@@ -215,6 +215,16 @@ header p {
   display: none;
 }
 
+.icon-button {
+  display: inline-flex;
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  padding: 0;
+  align-items: center;
+  justify-content: center;
+}
+
 .grid {
   display: grid;
   grid-template-columns: repeat(12, minmax(0, 1fr));
@@ -379,6 +389,36 @@ pre {
 
 .neutral {
   color: var(--neutral);
+}
+
+.action-cell {
+  position: relative;
+  width: 48px;
+  text-align: right;
+}
+
+.action-cell .icon-button {
+  display: inline-flex;
+}
+
+.action-menu {
+  position: absolute;
+  right: 8px;
+  z-index: 3;
+  display: grid;
+  min-width: 148px;
+  padding: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgb(15 17 23 / 14%);
+}
+
+.action-menu button {
+  display: flex;
+  justify-content: flex-start;
+  width: 100%;
+  text-align: left;
 }
 
 .attention,
@@ -572,6 +612,12 @@ pre {
     min-height: 40px;
   }
 
+  .icon-button {
+    width: 40px;
+    min-width: 40px;
+    height: 40px;
+  }
+
   .shell {
     grid-template-columns: 1fr;
   }
@@ -602,6 +648,9 @@ pre {
   .icon {
     display: inline-flex;
     align-items: center;
+    justify-content: center;
+    width: 40px;
+    padding: 0;
   }
 
   .refresh {
