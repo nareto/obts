@@ -31,6 +31,8 @@ describe('OpenAPI Phase 1 contract', () => {
       '/vaults/{vault_id}/sync/events',
       '/vaults/{vault_id}/sync/unpair',
       '/vaults/{vault_id}/conflicts',
+      '/vaults/{vault_id}/conflicts/{conflict_id}',
+      '/vaults/{vault_id}/conflicts/{conflict_id}/resolve',
       '/vaults/{vault_id}/events'
     ]) {
       expect(contract).toContain(path);
@@ -44,6 +46,10 @@ describe('OpenAPI Phase 1 contract', () => {
     expect(contract).toContain('server_device_ref');
     expect(contract).toContain('is_first_device');
     expect(contract).toContain('ConflictRecord');
+    expect(contract).toContain('ConflictReviewPackage');
+    expect(contract).toContain('ResolveConflictRequest');
+    expect(contract).toContain('ResolveConflictResponse');
+    expect(contract).toContain('keep_server');
     expect(contract).toContain('validator_results');
     expect(contract).toContain('AdminUserSummary');
     expect(contract).toContain('PasswordResetTokenResponse');

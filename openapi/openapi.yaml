@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
-  title: Obsidian True Sync Phase 1 API
+  title: Obsidian True Sync Phase 2 API
   version: 0.1.0
-  summary: Sync without conflict resolution.
+  summary: Deployable dashboard and conflict resolution.
 servers:
   - url: /api/v1
 security:
@@ -427,6 +427,47 @@ paths:
                 $ref: "#/components/schemas/ConflictListResponse"
         "404":
           $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/conflicts/{conflict_id}:
+    get:
+      summary: Return a conflict review package with source and rendered Markdown diffs.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - $ref: "#/components/parameters/ConflictId"
+      responses:
+        "200":
+          description: Conflict review package.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConflictReviewPackage"
+        "404":
+          $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/conflicts/{conflict_id}/resolve:
+    post:
+      summary: Resolve a conflict after recent dashboard authentication.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - $ref: "#/components/parameters/ConflictId"
+        - $ref: "#/components/parameters/CsrfHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResolveConflictRequest"
+      responses:
+        "200":
+          description: Resolution merge commit.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResolveConflictResponse"
+        "403":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
   /vaults/{vault_id}/events:
     get:
       summary: Poll redacted vault-scoped events after a cursor.
@@ -485,6 +526,13 @@ components:
       schema:
         type: string
         pattern: "^dev_"
+    ConflictId:
+      name: conflict_id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^conf_"
     CsrfHeader:
       name: X-OBTS-CSRF
       in: header
@@ -922,6 +970,93 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ConflictRecord"
+    ConflictResolutionKind:
+      type: string
+      enum: [keep_server, use_device, keep_both_files, insert_both_blocks, manual]
+    ConflictReviewFile:
+      type: object
+      required: [path, base_content, server_content, device_content, source_diff, rendered_markdown_diff]
+      properties:
+        path:
+          type: string
+        base_content:
+          oneOf:
+            - type: "null"
+            - type: string
+        server_content:
+          oneOf:
+            - type: "null"
+            - type: string
+        device_content:
+          oneOf:
+            - type: "null"
+            - type: string
+        source_diff:
+          type: string
+        rendered_markdown_diff:
+          oneOf:
+            - type: "null"
+            - type: string
+    ConflictReviewPackage:
+      type: object
+      required: [conflict, stale, expected_main, current_main, device_name, files, choices]
+      properties:
+        conflict:
+          $ref: "#/components/schemas/ConflictRecord"
+        stale:
+          type: boolean
+        expected_main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        current_main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        device_name:
+          type: string
+        files:
+          type: array
+          items:
+            $ref: "#/components/schemas/ConflictReviewFile"
+        choices:
+          type: array
+          items:
+            $ref: "#/components/schemas/ConflictResolutionKind"
+    ResolveConflictRequest:
+      type: object
+      required: [expected_main, resolution_kind]
+      properties:
+        expected_main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        resolution_kind:
+          $ref: "#/components/schemas/ConflictResolutionKind"
+        manual_files:
+          type: object
+          additionalProperties:
+            oneOf:
+              - type: string
+              - type: "null"
+    ResolveConflictResponse:
+      type: object
+      required: [status, conflict_id, main, resolution_commit, event_seq, idempotent]
+      properties:
+        status:
+          type: string
+          enum: [resolved]
+        conflict_id:
+          type: string
+          pattern: "^conf_"
+        main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        resolution_commit:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        event_seq:
+          type: integer
+          minimum: 0
+        idempotent:
+          type: boolean
     ConflictRecord:
       type: object
       required:

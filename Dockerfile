@@ -6,6 +6,7 @@ RUN npm ci
 COPY tsconfig.json ./
 COPY src ./src
 COPY tests ./tests
+COPY frontend ./frontend
 RUN npm run build
 RUN npm prune --omit=dev
 

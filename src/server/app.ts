@@ -1,5 +1,5 @@
-import { mkdir, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { extname, join, resolve } from 'node:path';
 
 import cookie from '@fastify/cookie';
 import multipart from '@fastify/multipart';
@@ -10,6 +10,7 @@ import { isSyncableVaultPath } from '../shared/pathPolicy.js';
 import { API_VERSION, type DevicePullManifest, type DevicePullRequest } from '../shared/types.js';
 import {
   assertRecord,
+  readCommitId,
   parseDevicePullRequest,
   parseDevicePushManifest,
   parseJsonObject,
@@ -523,6 +524,34 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     };
   });
 
+  app.get('/api/v1/vaults/:vaultId/conflicts/:conflictId', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const { vaultId, conflictId } = vaultConflictPathParams(request);
+    const db = await store.snapshot();
+    ownedVaultOrThrow(db, session.user.user_id, vaultId);
+    return await sync.getConflictReviewPackage(vaultId, conflictId);
+  });
+
+  app.post('/api/v1/vaults/:vaultId/conflicts/:conflictId/resolve', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
+    auth.requireRecentAuth(session.session);
+    const { vaultId, conflictId } = vaultConflictPathParams(request);
+    const db = await store.snapshot();
+    ownedVaultOrThrow(db, session.user.user_id, vaultId);
+    const body = requestBody(request);
+    const resolutionKind = readConflictResolutionKind(body);
+    const manualFiles = readManualResolutionFiles(body);
+    return await sync.resolveConflict({
+      actorUserId: session.user.user_id,
+      vaultId,
+      conflictId,
+      expectedMain: readCommitId(body, 'expected_main'),
+      resolutionKind,
+      ...(manualFiles === undefined ? {} : { manualFiles })
+    });
+  });
+
   app.get('/api/v1/vaults/:vaultId/events', async (request, reply) => {
     const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     const { vaultId } = pathParams(request);
@@ -530,6 +559,11 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const vault = ownedVaultOrThrow(db, session.user.user_id, vaultId);
     return sendEventPage(reply, request.id, db, vault.vault_id, readEventCursor(request));
   });
+
+  app.get('/', async (request, reply) => sendDashboardStatic(request, reply));
+  app.get('/dashboard', async (request, reply) => sendDashboardStatic(request, reply));
+  app.get('/dashboard/*', async (request, reply) => sendDashboardStatic(request, reply));
+  app.get('/assets/*', async (request, reply) => sendDashboardStatic(request, reply));
 
   return { app, config, store, git, auth, sync };
 }
@@ -647,6 +681,48 @@ function vaultDevicePathParams(request: FastifyRequest): { vaultId: string; devi
   return { vaultId: params.vaultId, deviceId: params.deviceId };
 }
 
+function vaultConflictPathParams(request: FastifyRequest): { vaultId: string; conflictId: string } {
+  const params = request.params as { vaultId?: string; conflictId?: string };
+  if (!params.vaultId || !params.conflictId) {
+    throw new ValidationError('invalid_request', 'Missing vault or conflict ID.');
+  }
+  return { vaultId: params.vaultId, conflictId: params.conflictId };
+}
+
+function readConflictResolutionKind(
+  record: Record<string, unknown>
+): 'keep_server' | 'use_device' | 'keep_both_files' | 'insert_both_blocks' | 'manual' {
+  const value = readString(record, 'resolution_kind');
+  if (
+    value !== 'keep_server' &&
+    value !== 'use_device' &&
+    value !== 'keep_both_files' &&
+    value !== 'insert_both_blocks' &&
+    value !== 'manual'
+  ) {
+    throw new ValidationError('invalid_request', 'Invalid conflict resolution kind.', { field: 'resolution_kind' });
+  }
+  return value;
+}
+
+function readManualResolutionFiles(record: Record<string, unknown>): Record<string, string | null> | undefined {
+  const value = record.manual_files;
+  if (value === undefined) {
+    return undefined;
+  }
+  assertRecord(value);
+  const files: Record<string, string | null> = {};
+  for (const [path, content] of Object.entries(value)) {
+    if (typeof content !== 'string' && content !== null) {
+      throw new ValidationError('invalid_request', 'Manual resolution file values must be strings or null.', {
+        field: 'manual_files'
+      });
+    }
+    files[path] = content;
+  }
+  return files;
+}
+
 async function readPushMultipart(request: FastifyRequest): Promise<{
   manifest: ReturnType<typeof parseDevicePushManifest>;
   packfile: Buffer;
@@ -707,6 +783,68 @@ function sendMultipart(reply: FastifyReply, input: { manifest: DevicePullManifes
     Buffer.from(`\r\n--${boundary}--\r\n`)
   ];
   return reply.header('content-type', `multipart/form-data; boundary=${boundary}`).send(Buffer.concat(chunks));
+}
+
+async function sendDashboardStatic(request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> {
+  const dashboardRoot = resolve(process.cwd(), 'dist', 'frontend', 'dashboard');
+  const url = new URL(request.url, 'http://obts.local');
+  const pathname = decodeURIComponent(url.pathname);
+  const relativePath =
+    pathname === '/' || pathname === '/dashboard' || pathname.startsWith('/dashboard/')
+      ? 'index.html'
+      : pathname.replace(/^\/+/u, '');
+  const absolutePath = resolve(dashboardRoot, relativePath);
+  if (!absolutePath.startsWith(`${dashboardRoot}/`) && absolutePath !== dashboardRoot) {
+    return reply.status(404).send({
+      error: {
+        code: 'not_found',
+        message: 'Resource not found.',
+        request_id: request.id,
+        details: {}
+      }
+    });
+  }
+  try {
+    const fileStat = await stat(absolutePath);
+    if (!fileStat.isFile()) {
+      throw new Error('not a file');
+    }
+    return reply.header('content-type', contentTypeForPath(absolutePath)).send(await readFile(absolutePath));
+  } catch {
+    if (relativePath === 'index.html') {
+      return reply
+        .header('content-type', 'text/html; charset=utf-8')
+        .status(503)
+        .send('<!doctype html><title>obts dashboard unavailable</title><p>Dashboard assets have not been built.</p>');
+    }
+    return reply.status(404).send({
+      error: {
+        code: 'not_found',
+        message: 'Resource not found.',
+        request_id: request.id,
+        details: {}
+      }
+    });
+  }
+}
+
+function contentTypeForPath(path: string): string {
+  switch (extname(path)) {
+    case '.html':
+      return 'text/html; charset=utf-8';
+    case '.js':
+      return 'text/javascript; charset=utf-8';
+    case '.css':
+      return 'text/css; charset=utf-8';
+    case '.json':
+      return 'application/json; charset=utf-8';
+    case '.svg':
+      return 'image/svg+xml';
+    case '.png':
+      return 'image/png';
+    default:
+      return 'application/octet-stream';
+  }
 }
 
 async function sendError(error: Error, request: FastifyRequest, reply: FastifyReply): Promise<void> {
@@ -931,7 +1069,7 @@ function recoverableTargetRefs(operation: SyncOperationRow): Array<[string, stri
   }
 
   if (
-    operation.operation_type === 'server_merge' &&
+    (operation.operation_type === 'server_merge' || operation.operation_type === 'conflict_resolve') &&
     typeof operation.target_commit === 'string' &&
     /^[0-9a-f]{40}$/u.test(operation.target_commit) &&
     !refs.has('refs/heads/main')
@@ -1037,7 +1175,7 @@ async function rollForwardPreparedOperation(store: MetadataStore, operationId: s
       return;
     }
 
-    if (operation.operation_type === 'server_merge') {
+    if (operation.operation_type === 'server_merge' || operation.operation_type === 'conflict_resolve') {
       const targetMain = operation.target_refs['refs/heads/main'];
       const previousMain = operation.expected_refs['refs/heads/main'] ?? null;
       const vault = db.vaults.find((candidate) => candidate.vault_id === operation.vault_id);
@@ -1058,26 +1196,57 @@ async function rollForwardPreparedOperation(store: MetadataStore, operationId: s
       if (device) {
         device.status = 'synced';
       }
+      const manifest = operation.prepared_manifest ?? {};
+      const conflictId = stringValue(manifest.conflict_id);
+      if (operation.operation_type === 'conflict_resolve' && conflictId) {
+        const conflict = db.conflicts.find(
+          (candidate) => candidate.vault_id === operation.vault_id && candidate.conflict_id === conflictId
+        );
+        if (conflict) {
+          conflict.status = 'resolved';
+          conflict.resolved_at = nowIso();
+          const resolutionKind =
+            manifest.resolution_kind === 'keep_server' ||
+            manifest.resolution_kind === 'use_device' ||
+            manifest.resolution_kind === 'keep_both_files' ||
+            manifest.resolution_kind === 'insert_both_blocks' ||
+            manifest.resolution_kind === 'manual'
+              ? manifest.resolution_kind
+              : undefined;
+          if (resolutionKind !== undefined) {
+            conflict.resolution_kind = resolutionKind;
+          }
+          conflict.resolution_commit = targetMain;
+          const requestHash = stringValue(manifest.resolution_request_hash);
+          if (requestHash !== null) {
+            conflict.resolution_request_hash = requestHash;
+          }
+        }
+      }
       operation.status = 'committed';
       operation.target_commit = targetMain;
       operation.result = {
-        decision: 'merged',
-        merge_commit: targetMain,
+        decision: operation.operation_type === 'conflict_resolve' ? 'resolved' : 'merged',
+        ...(operation.operation_type === 'conflict_resolve'
+          ? { conflict_id: conflictId, resolution_commit: targetMain }
+          : { merge_commit: targetMain }),
         reconciled_after_startup: true
       };
       operation.updated_at = nowIso();
-      const manifest = operation.prepared_manifest ?? {};
       store.appendEvent(db, {
         event_type: 'main_advanced',
         vault_id: operation.vault_id,
-        resource_ids: device ? { device_id: device.device_id } : {},
+        resource_ids: {
+          ...(device ? { device_id: device.device_id } : {}),
+          ...(conflictId ? { conflict_id: conflictId } : {})
+        },
         commit_cursors: {
           previous_main: previousMain,
           main: targetMain,
           device_commit: stringValue(manifest.device_commit)
         },
         payload: {
-          decision: 'merged',
+          decision: operation.operation_type === 'conflict_resolve' ? 'resolved' : 'merged',
           merge_sequence: manifest.merge_sequence ?? null,
           merge_policy_version: manifest.merge_policy_version ?? null,
           reconciled_after_startup: true

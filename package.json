@@ -11,10 +11,11 @@
     "node": ">=24"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "check": "tsc -p tsconfig.json --noEmit",
+    "build": "npm run build:dashboard && tsc -p tsconfig.json",
+    "build:dashboard": "vite build --config frontend/dashboard/vite.config.ts",
+    "check": "tsc -p tsconfig.json --noEmit && vite build --config frontend/dashboard/vite.config.ts --mode check",
     "lint": "npm run check",
-    "test": "vitest run",
+    "test": "npm run build:dashboard && vitest run",
     "test:watch": "vitest"
   },
   "dependencies": {
@@ -26,8 +27,11 @@
     "yaml": "^2.9.0"
   },
   "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^6.2.4",
     "@types/node": "^24.0.8",
+    "svelte": "^5.56.4",
     "typescript": "^5.9.2",
+    "vite": "^7.3.6",
     "vitest": "^3.2.4"
   }
 }

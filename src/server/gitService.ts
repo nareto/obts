@@ -461,6 +461,44 @@ export class GitService {
     ).trim();
   }
 
+  async createTreeFromCommitWithChanges(input: {
+    vaultId: string;
+    sourceCommit: string;
+    writes: Map<string, Buffer>;
+    deletes?: string[];
+  }): Promise<string> {
+    const sourceTree = await this.treeHash(input.vaultId, input.sourceCommit);
+    return await this.createTreeWithFileContents(input.vaultId, sourceTree, input.writes, input.deletes ?? []);
+  }
+
+  async createResolutionMergeCommitObject(input: {
+    vaultId: string;
+    tree: string;
+    expectedMain: string;
+    deviceCommit: string;
+    conflictId: string;
+    resolutionKind: string;
+  }): Promise<string> {
+    const repo = this.repoPath(input.vaultId);
+    return asText(
+      await this.exec(
+        repo,
+        [
+          'commit-tree',
+          input.tree,
+          '-p',
+          input.expectedMain,
+          '-p',
+          input.deviceCommit,
+          '-m',
+          `obts: resolve conflict ${input.conflictId}\n\nconflict_id=${input.conflictId}\nresolution=${input.resolutionKind}`
+        ],
+        undefined,
+        serverGitEnv('obts-resolution')
+      ).then((result) => result.stdout)
+    ).trim();
+  }
+
   async readBlobAtPath(vaultId: string, commit: string, path: string): Promise<Buffer> {
     const repo = this.repoPath(vaultId);
     const { stdout } = await this.exec(repo, ['show', `${commit}:${path}`], undefined, undefined, {
@@ -485,7 +523,12 @@ export class GitService {
     return Number.parseInt(asText(stdout).trim(), 10);
   }
 
-  private async createTreeWithFileContents(vaultId: string, sourceTree: string, files: Map<string, Buffer>): Promise<string> {
+  private async createTreeWithFileContents(
+    vaultId: string,
+    sourceTree: string,
+    files: Map<string, Buffer>,
+    deletes: string[] = []
+  ): Promise<string> {
     const repo = this.repoPath(vaultId);
     const tempRoot = join(this.config.tempDir, `semantic-merge-${vaultId}-${randomBytes(8).toString('hex')}`);
     const workTree = join(tempRoot, 'worktree');
@@ -496,6 +539,9 @@ export class GitService {
       const env = { ...process.env, GIT_INDEX_FILE: indexFile };
       await this.exec(repo, ['read-tree', sourceTree], undefined, env);
       await this.exec(repo, ['--work-tree', workTree, 'checkout-index', '-a', '-f', '--prefix', `${workTree}/`], undefined, env);
+      for (const path of deletes) {
+        await rm(join(workTree, path), { recursive: true, force: true });
+      }
       for (const [path, content] of files) {
         const absolutePath = join(workTree, path);
         await mkdir(dirname(absolutePath), { recursive: true, mode: 0o700 });

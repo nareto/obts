@@ -3507,10 +3507,11 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(secondCommit).not.toBe(firstCommit);
   });
 
-  it('does not ship a browser dashboard shell in Phase 1', async () => {
+  it('serves the Phase 2 browser dashboard shell', async () => {
     const response = await fetch(baseUrl);
-    expect(response.status).toBe(404);
-    expect(response.headers.get('content-type')).not.toContain('text/html');
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('text/html');
+    expect(await response.text()).toContain('<div id="app"></div>');
   });
 
   it('ships an installable Obsidian plugin with Phase 1 sync behavior', async () => {

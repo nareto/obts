@@ -1,7 +1,17 @@
+import { posix } from 'node:path';
+
 import { newId, nowIso } from '../shared/ids.js';
-import { PathPolicyViolation } from '../shared/pathPolicy.js';
-import type { ConflictRecord, DevicePushManifest, PushResult } from '../shared/types.js';
-import type { AuthenticatedDevice } from './authService.js';
+import { assertSyncableTreePaths, PathPolicyViolation } from '../shared/pathPolicy.js';
+import type {
+  ConflictRecord,
+  ConflictResolutionKind,
+  ConflictReviewFile,
+  ConflictReviewPackage,
+  DevicePushManifest,
+  PushResult,
+  ResolveConflictResponse
+} from '../shared/types.js';
+import { AuthError, type AuthenticatedDevice } from './authService.js';
 import { GitCommandError, GitService, sha256Hex, type GitDiffEntry } from './gitService.js';
 import type { DeviceRow, MetadataDb, MetadataStore, SyncOperationRow } from './metadataStore.js';
 
@@ -203,6 +213,219 @@ export class SyncService {
         }
         throw error;
       }
+    });
+  }
+
+  async getConflictReviewPackage(vaultId: string, conflictId: string): Promise<ConflictReviewPackage> {
+    const db = await this.store.snapshot();
+    const vault = requireVault(db, vaultId);
+    const conflict = db.conflicts.find((candidate) => candidate.vault_id === vaultId && candidate.conflict_id === conflictId);
+    if (!conflict) {
+      throw new AuthError(404, 'not_found', 'Resource not found.');
+    }
+    const device = requireDevice(db, conflict.device_id);
+    const files: ConflictReviewFile[] = [];
+    for (const path of conflict.affected_paths) {
+      const baseContent = await this.readOptionalTextBlob(vaultId, conflict.base_commit, path);
+      const serverContent = await this.readOptionalTextBlob(vaultId, conflict.current_main, path);
+      const deviceContent = await this.readOptionalTextBlob(vaultId, conflict.device_commit, path);
+      files.push({
+        path,
+        base_content: baseContent,
+        server_content: serverContent,
+        device_content: deviceContent,
+        source_diff: buildSourceDiff(serverContent, deviceContent),
+        rendered_markdown_diff: path.endsWith('.md') ? buildMarkdownReview(serverContent, deviceContent) : null
+      });
+    }
+    return {
+      conflict,
+      stale: conflict.status === 'open' && vault.current_main !== conflict.expected_main,
+      expected_main: conflict.expected_main,
+      current_main: vault.current_main,
+      device_name: device.device_name,
+      files,
+      choices: ['keep_server', 'use_device', 'keep_both_files', 'insert_both_blocks', 'manual']
+    };
+  }
+
+  async resolveConflict(input: {
+    actorUserId: string;
+    vaultId: string;
+    conflictId: string;
+    expectedMain: string;
+    resolutionKind: ConflictResolutionKind;
+    manualFiles?: Record<string, string | null>;
+  }): Promise<ResolveConflictResponse> {
+    const requestHash = resolutionRequestHash(input);
+    return await this.withVaultLock(input.vaultId, async () => {
+      const snapshot = await this.store.snapshot();
+      const vault = requireVault(snapshot, input.vaultId);
+      const conflict = snapshot.conflicts.find(
+        (candidate) => candidate.vault_id === input.vaultId && candidate.conflict_id === input.conflictId
+      );
+      if (!conflict) {
+        throw new AuthError(404, 'not_found', 'Resource not found.');
+      }
+      if (conflict.status === 'resolved') {
+        if (conflict.resolution_request_hash === requestHash && conflict.resolution_commit) {
+          return {
+            status: 'resolved',
+            conflict_id: conflict.conflict_id,
+            main: conflict.resolution_commit,
+            resolution_commit: conflict.resolution_commit,
+            event_seq: this.latestEventSeq(input.vaultId, snapshot),
+            idempotent: true
+          };
+        }
+        throw new AuthError(409, 'conflict_already_resolved', 'Conflict has already been resolved.');
+      }
+      if (conflict.expected_main !== input.expectedMain || vault.current_main !== input.expectedMain) {
+        throw new AuthError(409, 'stale_conflict_review', 'Conflict review is stale; refresh before resolving.');
+      }
+
+      const tree = await this.buildResolutionTree(conflict, input.resolutionKind, input.manualFiles);
+      await this.git.validateTreePathPolicy(input.vaultId, tree, this.maxUploadBytes);
+
+      const preparation = await this.store.mutate((db) => {
+        const device = requireDevice(db, conflict.device_id);
+        const operation = this.store.startOperation(db, {
+          vault_id: input.vaultId,
+          device_id: conflict.device_id,
+          operation_type: 'conflict_resolve',
+          expected_refs: {
+            'refs/heads/main': input.expectedMain,
+            [device.device_ref]: conflict.device_commit
+          },
+          target_refs: {
+            'refs/heads/main': null
+          },
+          target_commit: null
+        });
+        operation.status = 'prepared';
+        operation.prepared_manifest = {
+          merge_sequence: conflict.merge_sequence,
+          merge_policy_version: conflict.merge_policy_version,
+          base_commit: conflict.base_commit,
+          current_main: input.expectedMain,
+          device_commit: conflict.device_commit,
+          conflict_id: conflict.conflict_id,
+          decision: 'resolved',
+          resolution_kind: input.resolutionKind,
+          resolution_request_hash: requestHash,
+          validator_results: {
+            accepted_tree: tree,
+            expected_main_matches: true
+          }
+        };
+        operation.updated_at = nowIso();
+        return { operationId: operation.operation_id };
+      });
+
+      let resolutionCommit: string;
+      try {
+        resolutionCommit = await this.git.createResolutionMergeCommitObject({
+          vaultId: input.vaultId,
+          tree,
+          expectedMain: input.expectedMain,
+          deviceCommit: conflict.device_commit,
+          conflictId: conflict.conflict_id,
+          resolutionKind: input.resolutionKind
+        });
+        await this.prepareConflictResolutionRefUpdate(preparation.operationId, resolutionCommit);
+        await this.git.updateRef(input.vaultId, 'refs/heads/main', resolutionCommit, input.expectedMain);
+      } catch (error) {
+        await this.abortOperation(preparation.operationId, 'resolution_git_error');
+        throw error;
+      }
+
+      const eventSeq = await this.store.mutate((db) => {
+        const operation = requireOperation(db, preparation.operationId);
+        operation.status = 'committed';
+        operation.target_refs = {
+          'refs/heads/main': resolutionCommit
+        };
+        operation.target_commit = resolutionCommit;
+        operation.result = {
+          decision: 'resolved',
+          conflict_id: conflict.conflict_id,
+          resolution_kind: input.resolutionKind,
+          resolution_commit: resolutionCommit
+        };
+        operation.updated_at = nowIso();
+
+        const mutableVault = requireVault(db, input.vaultId);
+        const mutableConflict = requireConflict(db, input.vaultId, input.conflictId);
+        const device = requireDevice(db, mutableConflict.device_id);
+        mutableVault.current_main = resolutionCommit;
+        mutableVault.updated_at = nowIso();
+        mutableConflict.status = 'resolved';
+        mutableConflict.resolved_at = nowIso();
+        mutableConflict.resolved_by_user_id = input.actorUserId;
+        mutableConflict.resolution_kind = input.resolutionKind;
+        mutableConflict.resolution_commit = resolutionCommit;
+        mutableConflict.resolution_request_hash = requestHash;
+        if (device.status !== 'revoked') {
+          device.status = 'synced';
+          device.last_successful_sync_at = nowIso();
+        }
+        const mainEvent = this.store.appendEvent(db, {
+          event_type: 'main_advanced',
+          vault_id: input.vaultId,
+          resource_ids: {
+            conflict_id: input.conflictId,
+            device_id: mutableConflict.device_id
+          },
+          commit_cursors: {
+            previous_main: input.expectedMain,
+            main: resolutionCommit,
+            device_commit: mutableConflict.device_commit
+          },
+          payload: {
+            decision: 'resolved',
+            conflict_id: input.conflictId,
+            resolution_kind: input.resolutionKind,
+            merge_sequence: mutableConflict.merge_sequence,
+            merge_policy_version: mutableConflict.merge_policy_version
+          }
+        });
+        this.store.appendEvent(db, {
+          event_type: 'conflict_resolved',
+          vault_id: input.vaultId,
+          resource_ids: {
+            conflict_id: input.conflictId,
+            device_id: mutableConflict.device_id
+          },
+          commit_cursors: {
+            main: resolutionCommit,
+            previous_main: input.expectedMain,
+            device_commit: mutableConflict.device_commit
+          },
+          payload: {
+            resolution_kind: input.resolutionKind
+          }
+        });
+        db.audit_log.push({
+          audit_id: newId('aud'),
+          actor_user_id: input.actorUserId,
+          actor_device_id: null,
+          vault_id: input.vaultId,
+          action: 'conflict_resolved',
+          resource_class: 'conflict',
+          resource_id: input.conflictId,
+          created_at: nowIso()
+        });
+        return mainEvent.event_seq;
+      });
+
+      return {
+        status: 'resolved',
+        conflict_id: input.conflictId,
+        main: resolutionCommit,
+        resolution_commit: resolutionCommit,
+        event_seq: eventSeq,
+        idempotent: false
+      };
     });
   }
 
@@ -621,6 +844,95 @@ export class SyncService {
     }
   }
 
+  private async readOptionalTextBlob(vaultId: string, commit: string, path: string): Promise<string | null> {
+    const blob = await this.readOptionalBlob(vaultId, commit, path);
+    return blob === null ? null : blob.toString('utf8');
+  }
+
+  private async buildResolutionTree(
+    conflict: ConflictRecord,
+    resolutionKind: ConflictResolutionKind,
+    manualFiles: Record<string, string | null> | undefined
+  ): Promise<string> {
+    if (resolutionKind === 'keep_server') {
+      return await this.git.treeHash(conflict.vault_id, conflict.expected_main);
+    }
+    if (resolutionKind === 'use_device') {
+      return await this.git.treeHash(conflict.vault_id, conflict.device_commit);
+    }
+
+    const writes = new Map<string, Buffer>();
+    const deletes: string[] = [];
+    if (resolutionKind === 'keep_both_files') {
+      for (const path of conflict.affected_paths) {
+        const deviceBlob = await this.readOptionalBlob(conflict.vault_id, conflict.device_commit, path);
+        if (deviceBlob !== null) {
+          writes.set(conflictCopyPath(path, conflict.conflict_id, conflict.device_id), deviceBlob);
+        }
+      }
+      assertSyncableTreePaths([...writes.keys()]);
+      return await this.git.createTreeFromCommitWithChanges({
+        vaultId: conflict.vault_id,
+        sourceCommit: conflict.expected_main,
+        writes
+      });
+    }
+
+    if (resolutionKind === 'insert_both_blocks') {
+      for (const path of conflict.affected_paths) {
+        const serverText = await this.readOptionalTextBlob(conflict.vault_id, conflict.expected_main, path);
+        const deviceText = await this.readOptionalTextBlob(conflict.vault_id, conflict.device_commit, path);
+        if (serverText === null && deviceText === null) {
+          deletes.push(path);
+          continue;
+        }
+        writes.set(
+          path,
+          Buffer.from(
+            [
+              `## Server version (${conflict.expected_main.slice(0, 12)})`,
+              '',
+              serverText ?? '',
+              '',
+              `## Device version (${conflict.device_commit.slice(0, 12)})`,
+              '',
+              deviceText ?? ''
+            ].join('\n'),
+            'utf8'
+          )
+        );
+      }
+      return await this.git.createTreeFromCommitWithChanges({
+        vaultId: conflict.vault_id,
+        sourceCommit: conflict.expected_main,
+        writes,
+        deletes
+      });
+    }
+
+    if (resolutionKind === 'manual') {
+      if (manualFiles === undefined || Object.keys(manualFiles).length === 0) {
+        throw new AuthError(400, 'invalid_resolution', 'Manual resolution requires final file content.');
+      }
+      assertSyncableTreePaths(Object.keys(manualFiles));
+      for (const [path, content] of Object.entries(manualFiles)) {
+        if (content === null) {
+          deletes.push(path);
+        } else {
+          writes.set(path, Buffer.from(content, 'utf8'));
+        }
+      }
+      return await this.git.createTreeFromCommitWithChanges({
+        vaultId: conflict.vault_id,
+        sourceCommit: conflict.expected_main,
+        writes,
+        deletes
+      });
+    }
+
+    throw new AuthError(400, 'invalid_resolution', 'Unsupported conflict resolution kind.');
+  }
+
   private async tryCleanOverlappingMerge(
     vaultId: string,
     deviceId: string,
@@ -976,6 +1288,27 @@ export class SyncService {
     });
   }
 
+  private async prepareConflictResolutionRefUpdate(operationId: string, resolutionCommit: string): Promise<void> {
+    await this.store.mutate((db) => {
+      const operation = requireOperation(db, operationId);
+      if (operation.status !== 'prepared') {
+        throw new Error(`Operation cannot prepare resolution ref update from status ${operation.status}.`);
+      }
+      operation.target_refs = {
+        'refs/heads/main': resolutionCommit
+      };
+      operation.target_commit = resolutionCommit;
+      operation.prepared_manifest = {
+        ...(operation.prepared_manifest ?? {}),
+        target_refs: {
+          'refs/heads/main': resolutionCommit
+        },
+        target_commit: resolutionCommit
+      };
+      operation.updated_at = nowIso();
+    });
+  }
+
   private async rejectDevicePush(
     auth: AuthenticatedDevice,
     operationId: string,
@@ -1044,6 +1377,16 @@ function requireDevice(db: MetadataDb, deviceId: string): DeviceRow {
   return device;
 }
 
+function requireConflict(db: MetadataDb, vaultId: string, conflictId: string): ConflictRecord {
+  const conflict = db.conflicts.find(
+    (candidate) => candidate.vault_id === vaultId && candidate.conflict_id === conflictId
+  );
+  if (!conflict) {
+    throw new Error(`Conflict not found: ${conflictId}`);
+  }
+  return conflict;
+}
+
 function requireOperation(db: MetadataDb, operationId: string): SyncOperationRow {
   const operation = db.sync_operations.find((candidate) => candidate.operation_id === operationId);
   if (!operation) {
@@ -1102,4 +1445,64 @@ function destructiveChangedPaths(entries: GitDiffEntry[]): string[] {
 
 function isNativeTextMergePath(path: string): boolean {
   return path.endsWith('.md') || path.endsWith('.canvas') || path.endsWith('.base');
+}
+
+function conflictCopyPath(path: string, conflictId: string, deviceId: string): string {
+  const parsed = posix.parse(path);
+  const suffix = `device-${deviceId.slice(-8)}-${conflictId.slice(-8)}`;
+  const fileName = parsed.ext ? `${parsed.name}.${suffix}${parsed.ext}` : `${parsed.base}.${suffix}`;
+  return parsed.dir ? posix.join(parsed.dir, fileName) : fileName;
+}
+
+function buildSourceDiff(serverContent: string | null, deviceContent: string | null): string {
+  const serverLines = (serverContent ?? '').split('\n');
+  const deviceLines = (deviceContent ?? '').split('\n');
+  const rows = ['--- server', '+++ device'];
+  const max = Math.max(serverLines.length, deviceLines.length);
+  for (let index = 0; index < max; index += 1) {
+    const left = serverLines[index];
+    const right = deviceLines[index];
+    if (left === right) {
+      if (left !== undefined) {
+        rows.push(` ${left}`);
+      }
+      continue;
+    }
+    if (left !== undefined) {
+      rows.push(`-${left}`);
+    }
+    if (right !== undefined) {
+      rows.push(`+${right}`);
+    }
+  }
+  return rows.join('\n');
+}
+
+function buildMarkdownReview(serverContent: string | null, deviceContent: string | null): string {
+  return [
+    '### Server version',
+    '',
+    serverContent ?? '_File absent_',
+    '',
+    '### Device version',
+    '',
+    deviceContent ?? '_File absent_'
+  ].join('\n');
+}
+
+function resolutionRequestHash(input: {
+  expectedMain: string;
+  resolutionKind: ConflictResolutionKind;
+  manualFiles?: Record<string, string | null>;
+}): string {
+  return sha256Hex(
+    JSON.stringify({
+      expected_main: input.expectedMain,
+      resolution_kind: input.resolutionKind,
+      manual_files:
+        input.manualFiles === undefined
+          ? null
+          : Object.fromEntries(Object.entries(input.manualFiles).sort(([left], [right]) => left.localeCompare(right)))
+    })
+  );
 }

@@ -170,6 +170,51 @@ export type ConflictRecord = {
   validator_summary: Record<string, unknown>;
   created_at: string;
   resolved_at?: string;
+  resolved_by_user_id?: string;
+  resolution_kind?: ConflictResolutionKind;
+  resolution_commit?: string;
+  resolution_request_hash?: string;
+};
+
+export type ConflictResolutionKind =
+  | 'keep_server'
+  | 'use_device'
+  | 'keep_both_files'
+  | 'insert_both_blocks'
+  | 'manual';
+
+export type ConflictReviewFile = {
+  path: string;
+  base_content: string | null;
+  server_content: string | null;
+  device_content: string | null;
+  source_diff: string;
+  rendered_markdown_diff: string | null;
+};
+
+export type ConflictReviewPackage = {
+  conflict: ConflictRecord;
+  stale: boolean;
+  expected_main: string;
+  current_main: string;
+  device_name: string;
+  files: ConflictReviewFile[];
+  choices: ConflictResolutionKind[];
+};
+
+export type ResolveConflictRequest = {
+  expected_main: string;
+  resolution_kind: ConflictResolutionKind;
+  manual_files?: Record<string, string | null>;
+};
+
+export type ResolveConflictResponse = {
+  status: 'resolved';
+  conflict_id: string;
+  main: string;
+  resolution_commit: string;
+  event_seq: number;
+  idempotent: boolean;
 };
 
 export type EventEnvelope = {
