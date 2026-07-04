@@ -93,16 +93,20 @@
     authError = '';
     busy = true;
     try {
-      session = setupComplete ? await api.login(username, password) : await api.setup(username, password);
-      setupComplete = true;
-      username = '';
-      password = '';
-      await refreshAll();
-      if (reauthAction) {
+      if (reauthAction && session) {
+        session = await api.reauthenticate(username, password);
         const action = reauthAction;
+        username = '';
+        password = '';
         reauthAction = null;
         reauthOpen = false;
         await action();
+      } else {
+        session = setupComplete ? await api.login(username, password) : await api.setup(username, password);
+        setupComplete = true;
+        username = '';
+        password = '';
+        await refreshAll();
       }
     } catch (error) {
       authError = error instanceof Error ? error.message : 'Authentication failed.';
@@ -200,6 +204,7 @@
       void action();
       return;
     }
+    authError = '';
     reauthAction = action;
     reauthOpen = true;
   }
@@ -598,7 +603,7 @@
       <label>Password<input bind:value={password} type="password" autocomplete="current-password" /></label>
       {#if authError}<p class="error">{authError}</p>{/if}
       <div class="actions">
-        <button type="button" class="secondary" on:click={() => (reauthOpen = false)}>Cancel</button>
+        <button type="button" class="secondary" on:click={() => { reauthOpen = false; reauthAction = null; }}>Cancel</button>
         <button class="primary">Continue</button>
       </div>
     </form>

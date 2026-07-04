@@ -294,10 +294,14 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(notRecent.body.error.code).toBe('recent_auth_required');
     expect((await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(oldMain);
 
-    await admin.post<{ csrf_token: string }>('/api/v1/auth/login', {
+    const previousCookie = admin.cookie;
+    const reauth = await admin.post<{ csrf_token: string; recent_auth_expires_at: string }>('/api/v1/auth/reauthenticate', {
       username: 'admin',
       password: 'admin-password-1234'
-    }, false);
+    });
+    expect(reauth.status).toBe(200);
+    expect(admin.cookie).toBe(previousCookie);
+    expect(Date.parse(reauth.body.recent_auth_expires_at)).toBeGreaterThan(Date.now());
     await writeFile(join(desktopDir, 'unrelated.md'), 'accepted while review is open\n');
     expect((await desktop.syncOnce()).status).toBe('Synced');
     const stale = await admin.post<{ error: { code: string } }>(

@@ -40,6 +40,16 @@ export class DashboardApi {
     return session;
   }
 
+  async reauthenticate(username: string, password: string): Promise<Session> {
+    const session = await this.request<Session>('/auth/reauthenticate', {
+      method: 'POST',
+      csrf: true,
+      body: { username, password }
+    });
+    this.csrfToken = session.csrf_token;
+    return session;
+  }
+
   async session(): Promise<Session> {
     const session = await this.request<Session>('/auth/session');
     this.csrfToken = session.csrf_token;

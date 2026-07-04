@@ -11,6 +11,7 @@ describe('OpenAPI Phase 2 contract', () => {
     for (const path of [
       '/setup',
       '/auth/login',
+      '/auth/reauthenticate',
       '/auth/session',
       '/auth/logout',
       '/auth/password-reset',

@@ -119,6 +119,23 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     };
   });
 
+  app.post('/api/v1/auth/reauthenticate', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
+    const body = requestBody(request);
+    const result = await auth.reauthenticateSession({
+      sessionId: request.cookies[config.sessionCookieName],
+      username: readString(body, 'username'),
+      password: readString(body, 'password'),
+      sourceIp: request.ip
+    });
+    return {
+      user_id: result.user.user_id,
+      csrf_token: result.csrfToken,
+      recent_auth_expires_at: result.recentAuthExpiresAt
+    };
+  });
+
   app.get('/api/v1/auth/session', async (request) => {
     const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     return {

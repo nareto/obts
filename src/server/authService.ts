@@ -149,6 +149,62 @@ export class AuthService {
     });
   }
 
+  async reauthenticateSession(input: {
+    sessionId: string | undefined;
+    username: string;
+    password: string;
+    sourceIp?: string;
+  }): Promise<{ user: UserRow; csrfToken: string; recentAuthExpiresAt: string }> {
+    if (!input.sessionId) {
+      throw new AuthError(401, 'unauthenticated', 'Authentication required.');
+    }
+    return await this.store.mutate(async (db) => {
+      const sourceIp = input.sourceIp ?? 'unknown';
+      enforceLoginBackoff(db, input.username, sourceIp);
+      const session = db.sessions.find((candidate) => candidate.session_id === input.sessionId);
+      const now = Date.now();
+      if (
+        !session ||
+        session.revoked_at ||
+        Date.parse(session.expires_at) <= now ||
+        Date.parse(session.idle_expires_at) <= now
+      ) {
+        throw new AuthError(401, 'unauthenticated', 'Authentication required.');
+      }
+      const user = db.users.find((candidate) => candidate.user_id === session.user_id);
+      if (
+        !user ||
+        user.disabled ||
+        user.username !== input.username ||
+        !(await verifyPassword(input.password, user.password_hash))
+      ) {
+        recordFailedLogin(db, input.username, sourceIp, user?.user_id ?? null);
+        throw new AuthError(401, 'invalid_credentials', 'Invalid username or password.');
+      }
+      const timestamp = nowIso();
+      clearLoginFailures(db, input.username, sourceIp);
+      user.last_login_at = timestamp;
+      session.last_seen_at = timestamp;
+      session.idle_expires_at = new Date(now + SESSION_IDLE_TTL_MS).toISOString();
+      session.recent_auth_at = timestamp;
+      db.audit_log.push({
+        audit_id: newId('aud'),
+        actor_user_id: user.user_id,
+        actor_device_id: null,
+        vault_id: null,
+        action: 'session_reauthenticated',
+        resource_class: 'session',
+        resource_id: null,
+        created_at: timestamp
+      });
+      return {
+        user,
+        csrfToken: session.csrf_token,
+        recentAuthExpiresAt: new Date(Date.parse(session.recent_auth_at) + RECENT_AUTH_MS).toISOString()
+      };
+    });
+  }
+
   async createUser(input: {
     actorUserId: string;
     username: string;
