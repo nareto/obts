@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { ApiError, DashboardApi } from './api/client';
   import Attention from './components/Attention.svelte';
+  import type { AttentionItem } from './components/Attention.svelte';
   import Checklist from './components/Checklist.svelte';
   import DeviceTable from './components/DeviceTable.svelte';
   import Status from './components/Status.svelte';
@@ -62,6 +63,8 @@
   $: unresolvedCount = conflicts.filter((conflict) => conflict.status === 'open').length || dashboard?.unresolved_conflict_count || 0;
   $: selectedConflict = conflicts.find((conflict) => conflict.conflict_id === selectedConflictId) ?? null;
   $: selectedReviewFile = review?.files.find((file) => file.path === selectedReviewPath) ?? review?.files[0] ?? null;
+  $: reviewResolved = review?.conflict.status === 'resolved';
+  $: reviewStatusLabel = reviewResolved ? 'Synced' : review?.stale ? 'Stale review' : 'Review needed';
   $: recentAuthValid = session ? Date.parse(session.recent_auth_expires_at) > nowMs : false;
   $: pairingExpiresIn = pairing ? formatCountdown(Date.parse(pairing.expires_at) - nowMs) : '';
 
@@ -132,11 +135,18 @@
       if (left.status !== right.status) return left.status === 'open' ? -1 : 1;
       return right.created_at.localeCompare(left.created_at);
     });
-    if (!selectedConflictId && conflicts[0]) {
-      selectedConflictId = conflicts[0].conflict_id;
+    const currentConflictExists = conflicts.some((conflict) => conflict.conflict_id === selectedConflictId);
+    if (!currentConflictExists) {
+      selectedConflictId = '';
+      review = null;
+    }
+    if (!selectedConflictId) {
+      selectedConflictId = conflicts.find((conflict) => conflict.status === 'open')?.conflict_id ?? '';
     }
     if (selectedConflictId) {
       await loadReview(selectedConflictId);
+    } else {
+      review = null;
     }
     lastRefreshed = new Date().toLocaleTimeString();
   }
@@ -186,6 +196,23 @@
       return;
     }
     await loadReview(conflict.conflict_id);
+  }
+
+  async function handleAttentionAction(item: AttentionItem) {
+    if (item.kind === 'maintenance') {
+      page = 'Maintenance';
+      return;
+    }
+    if (item.kind === 'devices') {
+      page = 'Devices';
+      return;
+    }
+    page = 'Conflicts';
+    if (item.kind === 'stale_conflict') {
+      await refreshConflictReview(item.conflictId);
+      return;
+    }
+    await loadReview(item.conflictId);
   }
 
   function selectReviewPath(path: string) {
@@ -242,6 +269,8 @@
         manualFiles
       });
       notice = 'Conflict resolved.';
+      selectedConflictId = '';
+      review = null;
       await refreshVault();
     });
   }
@@ -401,7 +430,7 @@
           </section>
           <section class="panel narrow">
             <h2>Attention</h2>
-            <Attention {dashboard} {conflicts} />
+            <Attention {dashboard} {conflicts} onAction={handleAttentionAction} />
           </section>
           <section class="panel wide">
             <h2>Recent activity</h2>
@@ -463,7 +492,7 @@
                 <p class="mono">Server {shortId(review.expected_main)}</p>
                 <p class="mono">Device {shortId(review.conflict.device_commit)}</p>
                 <p>{selectedConflict?.conflict_type ?? 'Path overlap'}</p>
-                <Status label={review.stale ? 'Stale review' : 'Review needed'} />
+                <Status label={reviewStatusLabel} />
                 <div class="path-list" aria-label="Affected paths">
                   {#each review.files as file}
                     <button class:active={selectedReviewPath === file.path} on:click={() => selectReviewPath(file.path)}>
@@ -495,13 +524,19 @@
               </section>
               <aside class="rail right">
                 <h2>Resolution</h2>
-                {#each review.choices as choice}
-                  <label class="radio"><input type="radio" bind:group={resolutionKind} value={choice} /> {choiceLabel(choice)}</label>
-                {/each}
-                {#if review.stale}<p class="muted">Refresh review before submitting.</p>{/if}
+                {#if reviewResolved}
+                  <p class="muted">Resolved {review.conflict.resolved_at ? new Date(review.conflict.resolved_at).toLocaleString() : ''}</p>
+                  {#if review.conflict.resolution_kind}<p>{choiceLabel(review.conflict.resolution_kind)}</p>{/if}
+                  {#if review.conflict.resolution_commit}<p class="mono">{shortId(review.conflict.resolution_commit)}</p>{/if}
+                {:else}
+                  {#each review.choices as choice}
+                    <label class="radio"><input type="radio" bind:group={resolutionKind} value={choice} /> {choiceLabel(choice)}</label>
+                  {/each}
+                  {#if review.stale}<p class="muted">Refresh review before submitting.</p>{/if}
+                {/if}
                 {#if review.stale}
                   <button class="primary" on:click={refreshReview}>Refresh review</button>
-                {:else}
+                {:else if !reviewResolved}
                   <button class="primary" on:click={submitResolution}>Submit resolution</button>
                 {/if}
               </aside>

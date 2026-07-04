@@ -430,10 +430,23 @@ pre {
 }
 
 .attention li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   list-style: none;
   padding: 8px;
   background: var(--raised);
   border-radius: 6px;
+}
+
+.attention span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.attention button {
+  flex: 0 0 auto;
 }
 
 .checklist > div {
