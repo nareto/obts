@@ -1321,21 +1321,19 @@ function sendMultipart(reply: FastifyReply, input: { manifest: DevicePullManifes
 async function sendDashboardStatic(request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> {
   const dashboardRoot = await dashboardStaticRoot();
   const url = new URL(request.url, 'http://obts.local');
-  const pathname = decodeURIComponent(url.pathname);
+  let pathname: string;
+  try {
+    pathname = decodeURIComponent(url.pathname);
+  } catch {
+    return sendStaticNotFound(reply, request.id);
+  }
   const relativePath =
     pathname === '/' || pathname === '/dashboard' || pathname.startsWith('/dashboard/')
       ? 'index.html'
       : pathname.replace(/^\/+/u, '');
   const absolutePath = resolve(dashboardRoot, relativePath);
   if (!absolutePath.startsWith(`${dashboardRoot}/`) && absolutePath !== dashboardRoot) {
-    return reply.status(404).send({
-      error: {
-        code: 'not_found',
-        message: 'Resource not found.',
-        request_id: request.id,
-        details: {}
-      }
-    });
+    return sendStaticNotFound(reply, request.id);
   }
   try {
     const fileStat = await stat(absolutePath);
@@ -1350,14 +1348,7 @@ async function sendDashboardStatic(request: FastifyRequest, reply: FastifyReply)
         .status(503)
         .send('<!doctype html><title>obts dashboard unavailable</title><p>Dashboard assets have not been built.</p>');
     }
-    return reply.status(404).send({
-      error: {
-        code: 'not_found',
-        message: 'Resource not found.',
-        request_id: request.id,
-        details: {}
-      }
-    });
+    return sendStaticNotFound(reply, request.id);
   }
 }
 
@@ -1367,14 +1358,27 @@ async function dashboardStaticRoot(): Promise<string> {
 }
 
 async function findDashboardStaticRoot(): Promise<string> {
-  const moduleRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'frontend', 'dashboard');
+  const moduleDir = dirname(fileURLToPath(import.meta.url));
+  const moduleRoot = resolve(moduleDir, '..', '..', 'frontend', 'dashboard');
   const cwdBuildRoot = resolve(process.cwd(), 'dist', 'frontend', 'dashboard');
   const roots = [...new Set([moduleRoot, cwdBuildRoot])];
   const builtRoot = await firstRootMatching(roots, async (root) => (await isFile(join(root, 'index.html'))) && (await isDirectory(join(root, 'assets'))));
   if (builtRoot) {
     return builtRoot;
   }
-  return (await firstRootMatching(roots, async (root) => await isFile(join(root, 'index.html')))) ?? moduleRoot;
+  const runningFromSource = moduleDir.endsWith('/src/server') || moduleDir.endsWith('\\src\\server');
+  return runningFromSource ? cwdBuildRoot : moduleRoot;
+}
+
+function sendStaticNotFound(reply: FastifyReply, requestId: string): FastifyReply {
+  return reply.status(404).send({
+    error: {
+      code: 'not_found',
+      message: 'Resource not found.',
+      request_id: requestId,
+      details: {}
+    }
+  });
 }
 
 async function firstRootMatching(roots: string[], predicate: (root: string) => Promise<boolean>): Promise<string | null> {

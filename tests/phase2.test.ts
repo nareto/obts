@@ -73,6 +73,21 @@ describe('Phase 2 dashboard conflict resolution', () => {
     await rm(root, { recursive: true, force: true });
   });
 
+  it('serves the built dashboard shell and returns a normal 404 for missing static assets', async () => {
+    const dashboard = await fetch(`${baseUrl}/dashboard`);
+    expect(dashboard.status).toBe(200);
+    expect(dashboard.headers.get('content-type')).toContain('text/html');
+    expect(await dashboard.text()).toContain('/assets/');
+
+    const missing = await fetch(`${baseUrl}/assets/missing-dashboard-asset.js`);
+    expect(missing.status).toBe(404);
+    expect(await missing.json()).toMatchObject({
+      error: {
+        code: 'not_found'
+      }
+    });
+  });
+
   it('reviews and resolves a conflict with a same-tree server-version merge commit idempotently', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const desktopDir = join(root, 'desktop');
