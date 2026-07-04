@@ -598,6 +598,40 @@ export class GitService {
     ).trim();
   }
 
+  async createHistoryRestoreMergeCommitObject(input: {
+    vaultId: string;
+    tree: string;
+    expectedMain: string;
+    sourceCommit: string;
+    path: string;
+    sourcePath: string;
+  }): Promise<string> {
+    const repo = this.repoPath(input.vaultId);
+    return asText(
+      await this.exec(
+        repo,
+        [
+          'commit-tree',
+          input.tree,
+          '-p',
+          input.expectedMain,
+          '-p',
+          input.sourceCommit,
+          '-m',
+          [
+            `obts: restore ${input.path}`,
+            '',
+            `source_commit=${input.sourceCommit}`,
+            `path=${input.path}`,
+            `source_path=${input.sourcePath}`
+          ].join('\n')
+        ],
+        undefined,
+        serverGitEnv('obts-history')
+      ).then((result) => result.stdout)
+    ).trim();
+  }
+
   async runMaintenance(vaultId: string): Promise<string> {
     const repo = this.repoPath(vaultId);
     await this.exec(repo, ['fsck', '--strict'], undefined, undefined, { maxBuffer: 16 * 1024 * 1024 });

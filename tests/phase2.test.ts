@@ -625,6 +625,10 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect((await server.git.readBlobAtPath(admin.vaultId, restored.body.restore_commit, 'history.md')).toString('utf8')).toBe(
       'first version\n'
     );
+    const restoreParents = (
+      await server.git.exec(server.git.repoPath(admin.vaultId), ['show', '-s', '--format=%P', restored.body.restore_commit])
+    ).stdout.toString().trim().split(/\s+/u);
+    expect(restoreParents).toEqual([history.body.current_main, firstVersionCommit]);
 
     const maintenance = await admin.post<{ status: string; detail: string }>(
       `/api/v1/vaults/${admin.vaultId}/maintenance/git-gc/start`,

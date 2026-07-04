@@ -423,7 +423,7 @@
           <Summary title="Sync status" value={dashboard.vault.status === 'active' ? 'Synced' : 'Integrity failure'} role={dashboard.vault.status === 'active' ? 'success' : 'danger'} detail={shortId(dashboard.vault.current_main)} />
           <Summary title="Unresolved conflicts" value={String(unresolvedCount)} role={unresolvedCount ? 'warning' : 'success'} detail="Review queue" />
           <Summary title="Paired devices" value={String(dashboard.devices.length)} role="neutral" detail="Registered devices" />
-          <Summary title="Health/readiness" value={dashboard.health.status === 'ready' ? 'Ready' : 'Not ready'} role={dashboard.health.status === 'ready' ? 'success' : 'danger'} detail={dashboard.health.detail ?? dashboard.health.git_version} />
+          <Summary title="Health/readiness" value={dashboard.health.status === 'ready' ? 'Synced' : 'Integrity failure'} role={dashboard.health.status === 'ready' ? 'success' : 'danger'} detail={dashboard.health.detail ?? dashboard.health.git_version} />
           <section class="panel wide">
             <h2>Devices</h2>
             <DeviceTable devices={dashboard.devices} onRevoke={revokeDevice} />

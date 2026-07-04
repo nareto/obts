@@ -1475,6 +1475,8 @@ components:
             - migrations
             - git_store
             - temp_workspace
+            - filesystem_permissions
+            - event_delivery
             - persistent_state
           properties:
             metadata:
@@ -1490,6 +1492,10 @@ components:
             git_store:
               type: boolean
             temp_workspace:
+              type: boolean
+            filesystem_permissions:
+              type: boolean
+            event_delivery:
               type: boolean
             persistent_state:
               type: boolean

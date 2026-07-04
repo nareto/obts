@@ -17,8 +17,8 @@
     ['temp_workspace', 'Temp workspace'],
     ['migrations', 'Migrations'],
     ['git', 'Native git'],
-    ['metadata_store', 'Filesystem permissions'],
-    ['persistent_state', 'Event delivery'],
+    ['filesystem_permissions', 'Filesystem permissions'],
+    ['event_delivery', 'Event delivery'],
     ['persistent_state', 'Persistent-state backup contract']
   ] as const;
 

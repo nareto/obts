@@ -5,15 +5,15 @@
   $: icon = statusIcon(label);
 
   function statusRole(value: string) {
-    if (value === 'Synced' || value === 'Ready' || value === 'Completed') return 'success';
+    if (value === 'Synced') return 'success';
     if (['Uploading', 'Applying', 'Checking', 'Merging'].includes(value)) return 'info';
     if (['Ahead', 'Behind', 'Offline', 'Review needed', 'Stale review'].includes(value)) return 'warning';
-    if (['Blocked', 'Needs recovery', 'Unsafe local state', 'Integrity failure', 'Not ready'].includes(value)) return 'danger';
+    if (['Blocked', 'Needs recovery', 'Unsafe local state', 'Integrity failure'].includes(value)) return 'danger';
     return 'neutral';
   }
 
   function statusIcon(value: string) {
-    if (value === 'Synced' || value === 'Ready' || value === 'Completed') return '✓';
+    if (value === 'Synced') return '✓';
     if (value === 'Uploading') return '↑';
     if (value === 'Applying') return '↓';
     if (value === 'Checking') return '…';
@@ -22,7 +22,7 @@
     if (value === 'Behind') return '↓';
     if (value === 'Offline') return '○';
     if (value === 'Review needed' || value === 'Stale review') return '!';
-    if (value === 'Blocked' || value === 'Needs recovery' || value === 'Unsafe local state' || value === 'Integrity failure' || value === 'Not ready') return '×';
+    if (value === 'Blocked' || value === 'Needs recovery' || value === 'Unsafe local state' || value === 'Integrity failure') return '×';
     return '•';
   }
 </script>

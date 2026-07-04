@@ -257,9 +257,51 @@ header p {
 }
 
 .summary strong {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   margin: 8px 0;
   font-size: 24px;
   line-height: 32px;
+}
+
+.summary strong i {
+  display: inline-grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border-radius: 50%;
+  color: #ffffff;
+  font-size: 12px;
+  font-style: normal;
+  line-height: 20px;
+}
+
+.summary strong.success i {
+  background: var(--success);
+}
+
+.summary strong.info i {
+  background: var(--info);
+}
+
+.summary strong.warning i {
+  background: var(--warning);
+}
+
+.summary strong.danger i {
+  background: var(--danger);
+}
+
+.summary strong.neutral i {
+  background: var(--neutral);
+}
+
+.summary code {
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .wide {

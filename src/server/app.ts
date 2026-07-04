@@ -721,14 +721,15 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     });
     let restoreCommit: string;
     try {
-      restoreCommit = await git.createMainCommitFromTree({
+      restoreCommit = await git.createHistoryRestoreMergeCommitObject({
         vaultId: vault.vault_id,
         tree,
-        parentMain: operation.current_main,
-        subject: `obts: restore ${path}`,
-        body: `source_commit=${sourceCommit}\npath=${path}`,
-        actor: 'obts-history'
+        expectedMain: operation.current_main,
+        sourceCommit,
+        path,
+        sourcePath
       });
+      await prepareRouteRefUpdate(store, operation.operation_id, 'refs/heads/main', restoreCommit);
       await git.updateRef(vault.vault_id, 'refs/heads/main', restoreCommit, operation.current_main);
     } catch (error) {
       await abortOperationForRoute(store, operation.operation_id, 'history_restore_git_error');
@@ -741,7 +742,13 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         op.status = 'committed';
         op.target_refs = { 'refs/heads/main': restoreCommit };
         op.target_commit = restoreCommit;
-        op.result = { restore_commit: restoreCommit, source_commit: sourceCommit, path, source_path: sourcePath };
+        op.result = {
+          restore_commit: restoreCommit,
+          source_commit: sourceCommit,
+          path,
+          source_path: sourcePath,
+          decision: 'note_restored'
+        };
         op.updated_at = nowIso();
       }
       mutableVault.current_main = restoreCommit;
@@ -964,8 +971,8 @@ function buildMaintenanceRows(health: Awaited<ReturnType<typeof buildReadinessSu
     ['temp_workspace', 'Temp workspace', 'Temporary workspace is writable.'],
     ['migrations', 'Migrations', 'Metadata schema is current.'],
     ['git', 'Native git', health.git_version],
-    ['git_store', 'Filesystem permissions', 'Persistent directories are writable.'],
-    ['persistent_state', 'Event delivery', 'Event log is available.'],
+    ['filesystem_permissions', 'Filesystem permissions', 'Persistent and temporary directories are writable.'],
+    ['event_delivery', 'Event delivery', 'Event log cursors are internally consistent.'],
     ['persistent_state', 'Persistent-state backup contract', 'Protect and back up metadata plus the Git store together.']
   ] as const;
   return rows.map(([key, label, okDetail]) => ({
@@ -1098,6 +1105,26 @@ async function abortOperationForRoute(store: MetadataStore, operationId: string,
       operation.result = { reason };
       operation.updated_at = nowIso();
     }
+  });
+}
+
+async function prepareRouteRefUpdate(
+  store: MetadataStore,
+  operationId: string,
+  ref: string,
+  targetCommit: string
+): Promise<void> {
+  await store.mutate((db) => {
+    const operation = db.sync_operations.find((candidate) => candidate.operation_id === operationId);
+    if (!operation || operation.status === 'committed') {
+      return;
+    }
+    operation.target_refs = {
+      ...operation.target_refs,
+      [ref]: targetCommit
+    };
+    operation.target_commit = targetCommit;
+    operation.updated_at = nowIso();
   });
 }
 
@@ -1505,6 +1532,8 @@ type ReadinessSummary = {
     migrations: boolean;
     git_store: boolean;
     temp_workspace: boolean;
+    filesystem_permissions: boolean;
+    event_delivery: boolean;
     persistent_state: boolean;
   };
   detail: string | null;
@@ -1522,6 +1551,8 @@ async function buildReadinessSummary(
   const gitStoreReady = await checkWritableDirectory(config.gitStoreDir);
   const tempWorkspaceReady = await checkWritableDirectory(config.tempDir);
   const persistentState = await checkPersistentState(db, git);
+  const eventDelivery = checkEventDelivery(db);
+  const filesystemPermissions = metadataStoreReady.ok && gitStoreReady.ok && tempWorkspaceReady.ok;
   const checks = {
     metadata: true,
     metadata_store: metadataStoreReady.ok,
@@ -1530,6 +1561,8 @@ async function buildReadinessSummary(
     migrations: db.schema_version === 1,
     git_store: gitStoreReady.ok,
     temp_workspace: tempWorkspaceReady.ok,
+    filesystem_permissions: filesystemPermissions,
+    event_delivery: eventDelivery.ok,
     persistent_state: persistentState.ok
   };
   const ready =
@@ -1538,6 +1571,8 @@ async function buildReadinessSummary(
     checks.migrations &&
     checks.git_store &&
     checks.temp_workspace &&
+    checks.filesystem_permissions &&
+    checks.event_delivery &&
     checks.persistent_state;
   return {
     status: ready ? 'ready' : 'not_ready',
@@ -1549,10 +1584,30 @@ async function buildReadinessSummary(
           readinessError(metadataStoreReady),
           readinessError(gitStoreReady),
           readinessError(tempWorkspaceReady),
+          readinessError(eventDelivery),
           readinessError(persistentState)
         ]),
     git_version: gitReady.ok ? gitReady.version : 'unknown'
   };
+}
+
+function checkEventDelivery(db: MetadataDb): { ok: true } | { ok: false; error: string } {
+  for (const [vaultId, currentSeq] of Object.entries(db.event_seq_by_vault)) {
+    const vaultEvents = db.events
+      .filter((event) => event.vault_id === vaultId)
+      .sort((left, right) => left.event_seq - right.event_seq);
+    if (vaultEvents.some((event) => event.event_seq > currentSeq)) {
+      return { ok: false, error: 'event log contains a cursor beyond the recorded vault cursor' };
+    }
+    for (let index = 1; index < vaultEvents.length; index += 1) {
+      const previous = vaultEvents[index - 1];
+      const current = vaultEvents[index];
+      if (previous && current && current.event_seq <= previous.event_seq) {
+        return { ok: false, error: 'event log cursors are not strictly increasing' };
+      }
+    }
+  }
+  return { ok: true };
 }
 
 async function checkPersistentState(db: MetadataDb, git: GitService): Promise<{ ok: true } | { ok: false; error: string }> {
