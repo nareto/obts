@@ -554,7 +554,10 @@ export class ObtsPluginClient {
     if (!state.vault_id || !state.device_id) {
       throw new PluginBlockedError('not_paired', 'Device is not paired.');
     }
-    this.throwIfSyncBlocked(state);
+    const wasConflictBlocked = state.last_error_code === 'conflict_review_required';
+    if (!wasConflictBlocked) {
+      this.throwIfSyncBlocked(state);
+    }
     const token = await this.readDeviceToken();
     const after = Number.isSafeInteger(state.last_event_seq) && state.last_event_seq >= 0 ? state.last_event_seq : 0;
     let page: Awaited<ReturnType<TransportClient['pollEvents']>>;
@@ -570,11 +573,22 @@ export class ObtsPluginClient {
           typeof error.details?.current_event_seq === 'number' && Number.isSafeInteger(error.details.current_event_seq)
             ? error.details.current_event_seq
             : after;
-        await this.writeState({
-          ...(await this.readState()),
-          last_event_seq: currentEventSeq,
-          updated_at: nowIso()
-        });
+        const nextState = await this.readState();
+        if (nextState.last_error_code === 'conflict_review_required') {
+          await this.writeState({
+            ...nextState,
+            last_error_code: null,
+            status_label: 'Behind',
+            last_event_seq: currentEventSeq,
+            updated_at: nowIso()
+          });
+        } else {
+          await this.writeState({
+            ...nextState,
+            last_event_seq: currentEventSeq,
+            updated_at: nowIso()
+          });
+        }
         await this.pullAndApply({ allowDestructive: true });
         const refreshed = await this.readState();
         return { applied: true, status: refreshed.status_label };
@@ -598,6 +612,14 @@ export class ObtsPluginClient {
     });
     if (!shouldPull) {
       return { applied: false, status: currentState.status_label };
+    }
+    if (wasConflictBlocked && currentState.last_error_code === 'conflict_review_required') {
+      await this.writeState({
+        ...currentState,
+        last_error_code: null,
+        status_label: 'Behind',
+        updated_at: nowIso()
+      });
     }
     await this.pullAndApply({ allowDestructive: true });
     const finalState = await this.readState();
