@@ -165,9 +165,23 @@
 
   async function refreshReview() {
     if (!vaultId || !review) return;
-    setReview(await api.refreshConflict(vaultId, review.conflict.conflict_id));
+    await refreshConflictReview(review.conflict.conflict_id);
+  }
+
+  async function refreshConflictReview(conflictId: string) {
+    if (!vaultId) return;
+    selectedConflictId = conflictId;
+    setReview(await api.refreshConflict(vaultId, conflictId));
     conflicts = sortConflicts((await api.conflicts(vaultId)).conflicts);
     notice = 'Conflict review refreshed.';
+  }
+
+  async function openConflictFromList(conflict: DashboardConflict) {
+    if (conflict.stale) {
+      await refreshConflictReview(conflict.conflict_id);
+      return;
+    }
+    await loadReview(conflict.conflict_id);
   }
 
   function selectReviewPath(path: string) {
@@ -246,7 +260,7 @@
   async function restoreSelectedVersion() {
     if (!vaultId || !history || !selectedHistory) return;
     withRecentAuth(async () => {
-      await api.restoreHistoryVersion(vaultId, history!.path, selectedHistory!.commit, history!.current_main);
+      await api.restoreHistoryVersion(vaultId, history!.path, selectedHistory!.commit, history!.current_main, selectedHistory!.path);
       notice = 'Note restored.';
       await refreshVault();
       await searchHistory();
@@ -428,7 +442,7 @@
                     <td>{conflict.conflict_type}</td>
                     <td>{new Date(conflict.created_at).toLocaleString()}</td>
                     <td><Status label={conflict.status_label} /></td>
-                    <td><button class="secondary" on:click={() => loadReview(conflict.conflict_id)}>{conflict.stale ? 'Refresh' : 'Open'}</button></td>
+                    <td><button class="secondary" on:click={() => openConflictFromList(conflict)}>{conflict.stale ? 'Refresh' : 'Open'}</button></td>
                   </tr>
                 {:else}
                   <tr><td colspan="6" class="muted">No conflicts.</td></tr>

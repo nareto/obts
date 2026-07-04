@@ -1001,6 +1001,10 @@ export class SyncService {
       if (unexpectedPaths.length > 0) {
         throw new AuthError(400, 'invalid_resolution', 'Manual resolution can only edit affected conflict paths.');
       }
+      const missingPaths = conflict.affected_paths.filter((path) => !Object.prototype.hasOwnProperty.call(manualFiles, path));
+      if (missingPaths.length > 0) {
+        throw new AuthError(400, 'invalid_resolution', 'Manual resolution must include every affected conflict path.');
+      }
       assertSyncableTreePaths(Object.keys(manualFiles));
       for (const [path, content] of Object.entries(manualFiles)) {
         if (content === null) {

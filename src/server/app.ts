@@ -652,6 +652,9 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const { vaultId } = pathParams(request);
     const body = requestBody(request);
     const path = readVaultContentPath(body, 'path');
+    const explicitSourcePath = Object.prototype.hasOwnProperty.call(body, 'source_path')
+      ? readVaultContentPath(body, 'source_path')
+      : null;
     const sourceCommit = readCommitId(body, 'source_commit');
     const expectedMain = Object.prototype.hasOwnProperty.call(body, 'expected_main')
       ? readCommitId(body, 'expected_main')
@@ -664,7 +667,9 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     if (!(await git.commitExists(vault.vault_id, sourceCommit)) || !(await git.isAncestor(vault.vault_id, sourceCommit, vault.current_main))) {
       throw new AuthError(404, 'not_found', 'Resource not found.');
     }
-    const sourceContent = await git.readBlobAtPathIfPresent(vault.vault_id, sourceCommit, path);
+    const sourcePath =
+      explicitSourcePath ?? (await inferHistorySourcePath(git, vault.vault_id, vault.current_main, path, sourceCommit)) ?? path;
+    const sourceContent = await git.readBlobAtPathIfPresent(vault.vault_id, sourceCommit, sourcePath);
     const tree = await git.createTreeFromCommitWithChanges({
       vaultId: vault.vault_id,
       sourceCommit: vault.current_main,
@@ -689,6 +694,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       op.prepared_manifest = {
         operation_type: 'note_restore',
         path,
+        source_path: sourcePath,
         source_commit: sourceCommit,
         current_main: currentVault.current_main,
         accepted_tree: tree
@@ -718,7 +724,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         op.status = 'committed';
         op.target_refs = { 'refs/heads/main': restoreCommit };
         op.target_commit = restoreCommit;
-        op.result = { restore_commit: restoreCommit, source_commit: sourceCommit, path };
+        op.result = { restore_commit: restoreCommit, source_commit: sourceCommit, path, source_path: sourcePath };
         op.updated_at = nowIso();
       }
       mutableVault.current_main = restoreCommit;
@@ -728,14 +734,14 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         vault_id: vault.vault_id,
         resource_ids: { vault_id: vault.vault_id },
         commit_cursors: { previous_main: operation.current_main, main: restoreCommit, source_commit: sourceCommit },
-        payload: { decision: 'note_restored' }
+        payload: { decision: 'note_restored', path, source_path: sourcePath }
       });
       store.appendEvent(mutableDb, {
         event_type: 'note_restored',
         vault_id: vault.vault_id,
         resource_ids: { vault_id: vault.vault_id },
         commit_cursors: { previous_main: operation.current_main, main: restoreCommit, source_commit: sourceCommit },
-        payload: { path, source_commit: sourceCommit }
+        payload: { path, source_path: sourcePath, source_commit: sourceCommit }
       });
       mutableDb.audit_log.push({
         audit_id: newId('aud'),
@@ -752,6 +758,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     return {
       status: 'restored',
       path,
+      source_path: sourcePath,
       source_commit: sourceCommit,
       main: restoreCommit,
       restore_commit: restoreCommit,
@@ -1014,6 +1021,35 @@ async function classifyHistoryOperation(
     return { operationType: 'delete', path, previousPath: null };
   }
   return { operationType: 'update', path, previousPath: null };
+}
+
+async function inferHistorySourcePath(
+  git: GitService,
+  vaultId: string,
+  currentMain: string,
+  targetPath: string,
+  sourceCommit: string
+): Promise<string | null> {
+  const historyCommits = await git.historyForPath(vaultId, currentMain, targetPath, 1000);
+  let pathAtCommit = targetPath;
+  for (const commit of historyCommits) {
+    const classification = await classifyHistoryOperation(
+      git,
+      vaultId,
+      commit.commit,
+      commit.parentCommit,
+      pathAtCommit,
+      commit.subject,
+      commit.body
+    );
+    if (commit.commit === sourceCommit) {
+      return classification.path;
+    }
+    if (classification.previousPath) {
+      pathAtCommit = classification.previousPath;
+    }
+  }
+  return null;
 }
 
 function historyProvenance(body: string): { device_id?: string; conflict_id?: string; merge_sequence?: number } {

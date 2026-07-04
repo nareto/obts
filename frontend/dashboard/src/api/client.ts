@@ -135,12 +135,19 @@ export class DashboardApi {
     });
   }
 
-  async restoreHistoryVersion(vaultId: string, path: string, sourceCommit: string, expectedMain: string): Promise<{ restore_commit: string; main: string }> {
+  async restoreHistoryVersion(
+    vaultId: string,
+    path: string,
+    sourceCommit: string,
+    expectedMain: string,
+    sourcePath = path
+  ): Promise<{ restore_commit: string; main: string; source_path: string }> {
     return await this.request(`/vaults/${vaultId}/history/restore`, {
       method: 'POST',
       csrf: true,
       body: {
         path,
+        source_path: sourcePath,
         source_commit: sourceCommit,
         expected_main: expectedMain
       }

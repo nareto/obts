@@ -250,6 +250,7 @@ export type NoteHistoryVersionResponse = {
 export type NoteRestoreResponse = {
   status: 'restored';
   path: string;
+  source_path: string;
   source_commit: string;
   main: string;
   restore_commit: string;

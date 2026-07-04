@@ -449,6 +449,47 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(await server.git.readBlobAtPathIfPresent(admin.vaultId, accepted.body.resolution_commit, 'unrelated.md')).toBeNull();
   });
 
+  it('rejects manual conflict resolutions that omit affected paths', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'desktop-manual-complete');
+    const tabletDir = join(root, 'tablet-manual-complete');
+    await mkdir(desktopDir, { recursive: true });
+    await mkdir(tabletDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await writeFile(join(desktopDir, 'one.md'), 'one base\n');
+    await writeFile(join(desktopDir, 'two.md'), 'two base\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const tablet = await pairPlugin(admin, tabletDir, 'tablet');
+    await writeFile(join(desktopDir, 'one.md'), 'one server\n');
+    await writeFile(join(desktopDir, 'two.md'), 'two server\n');
+    await writeFile(join(tabletDir, 'one.md'), 'one device\n');
+    await writeFile(join(tabletDir, 'two.md'), 'two device\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const result = await tablet.syncOnce();
+    expect(result.status).toBe('Review needed');
+
+    const review = await admin.get<{
+      conflict: { conflict_id: string; expected_main: string };
+      files: Array<{ path: string }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`);
+    expect(review.status).toBe(200);
+    expect(review.body.files.map((file) => file.path).sort()).toEqual(['one.md', 'two.md']);
+
+    const rejected = await admin.post<{ error: { code: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
+      {
+        expected_main: review.body.conflict.expected_main,
+        resolution_kind: 'manual',
+        manual_files: {
+          'one.md': 'one manual\n'
+        }
+      }
+    );
+    expect(rejected.status).toBe(400);
+    expect(rejected.body.error.code).toBe('invalid_resolution');
+  });
+
   it('serves note history, restores a version, and runs owner-scoped maintenance', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const desktopDir = join(root, 'desktop-history');
@@ -540,6 +581,24 @@ describe('Phase 2 dashboard conflict resolution', () => {
     });
     expect(preview.status).toBe(200);
     expect(preview.body.content).toBe('rename me\n');
+
+    await writeFile(join(desktopDir, 'new-name.md'), 'renamed content changed\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const latestMain = (await admin.get<{ current_main: string }>(`/api/v1/vaults/${admin.vaultId}/main`)).body.current_main;
+    const restored = await admin.post<{ status: string; restore_commit: string; source_path: string }>(
+      `/api/v1/vaults/${admin.vaultId}/history/restore`,
+      {
+        path: 'new-name.md',
+        source_commit: oldVersion!.commit,
+        expected_main: latestMain
+      }
+    );
+    expect(restored.status).toBe(200);
+    expect(restored.body).toMatchObject({ status: 'restored', source_path: 'old-name.md' });
+    expect((await server.git.readBlobAtPath(admin.vaultId, restored.body.restore_commit, 'new-name.md')).toString('utf8')).toBe(
+      'rename me\n'
+    );
+    expect(await server.git.readBlobAtPathIfPresent(admin.vaultId, restored.body.restore_commit, 'old-name.md')).toBeNull();
   });
 });
 

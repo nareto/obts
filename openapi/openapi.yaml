@@ -1255,6 +1255,10 @@ components:
       properties:
         path:
           type: string
+          description: Target vault path to restore into.
+        source_path:
+          type: string
+          description: Historical path to read from source_commit when restoring across a rename.
         source_commit:
           type: string
           pattern: "^[0-9a-f]{40}$"
@@ -1332,12 +1336,14 @@ components:
             - type: string
     NoteRestoreResponse:
       type: object
-      required: [status, path, source_commit, main, restore_commit, event_seq]
+      required: [status, path, source_path, source_commit, main, restore_commit, event_seq]
       properties:
         status:
           type: string
           enum: [restored]
         path:
+          type: string
+        source_path:
           type: string
         source_commit:
           type: string
