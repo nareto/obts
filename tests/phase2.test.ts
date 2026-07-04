@@ -345,6 +345,49 @@ describe('Phase 2 dashboard conflict resolution', () => {
     );
   });
 
+  it('refreshes a stale conflict package to include newly overlapping paths', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'desktop-refresh-paths');
+    const tabletDir = join(root, 'tablet-refresh-paths');
+    await mkdir(desktopDir, { recursive: true });
+    await mkdir(tabletDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await writeFile(join(desktopDir, 'one.md'), 'one base\n');
+    await writeFile(join(desktopDir, 'two.md'), 'two base\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const tablet = await pairPlugin(admin, tabletDir, 'tablet');
+    await writeFile(join(desktopDir, 'one.md'), 'one server\n');
+    await writeFile(join(tabletDir, 'one.md'), 'one device\n');
+    await writeFile(join(tabletDir, 'two.md'), 'two device\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const result = await tablet.syncOnce();
+    expect(result.status).toBe('Review needed');
+
+    const review = await admin.get<{
+      conflict: { conflict_id: string; expected_main: string };
+      files: Array<{ path: string }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`);
+    expect(review.status).toBe(200);
+    expect(review.body.files.map((file) => file.path)).toEqual(['one.md']);
+
+    await writeFile(join(desktopDir, 'two.md'), 'two server later\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const refreshed = await admin.post<{
+      conflict: { affected_paths: string[]; affected_path_count: number };
+      files: Array<{ path: string; server_content: string | null; device_content: string | null }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/refresh`, {});
+    expect(refreshed.status).toBe(200);
+    expect(refreshed.body.conflict.affected_paths).toEqual(['one.md', 'two.md']);
+    expect(refreshed.body.conflict.affected_path_count).toBe(2);
+    expect(refreshed.body.files.map((file) => file.path)).toEqual(['one.md', 'two.md']);
+    expect(refreshed.body.files.find((file) => file.path === 'two.md')).toMatchObject({
+      server_content: 'two server later\n',
+      device_content: 'two device\n'
+    });
+  });
+
   it('supports keep-both, insert-both, and manual conflict resolutions as merge commits', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     for (const [index, resolutionKind] of (['keep_both_files', 'insert_both_blocks', 'manual'] as const).entries()) {

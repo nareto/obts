@@ -255,6 +255,20 @@ export class SyncService {
     conflictId: string;
   }): Promise<ConflictReviewPackage> {
     await this.withVaultLock(input.vaultId, async () => {
+      const snapshot = await this.store.snapshot();
+      const snapshotVault = requireVault(snapshot, input.vaultId);
+      const snapshotConflict = snapshot.conflicts.find(
+        (candidate) => candidate.vault_id === input.vaultId && candidate.conflict_id === input.conflictId
+      );
+      if (!snapshotConflict) {
+        throw new AuthError(404, 'not_found', 'Resource not found.');
+      }
+      const needsRefresh =
+        snapshotConflict.status === 'open' &&
+        (snapshotConflict.expected_main !== snapshotVault.current_main || snapshotConflict.current_main !== snapshotVault.current_main);
+      const refreshedAffectedPaths = needsRefresh
+        ? await this.refreshedAffectedPaths(snapshotConflict, snapshotVault.current_main)
+        : snapshotConflict.affected_paths;
       await this.store.mutate((db) => {
         const vault = requireVault(db, input.vaultId);
         const conflict = db.conflicts.find(
@@ -272,15 +286,20 @@ export class SyncService {
         const previousExpectedMain = conflict.expected_main;
         conflict.current_main = vault.current_main;
         conflict.expected_main = vault.current_main;
+        conflict.affected_paths = refreshedAffectedPaths;
+        conflict.affected_path_count = refreshedAffectedPaths.length;
         conflict.validator_results = {
           ...conflict.validator_results,
           review_refreshed_from: previousExpectedMain,
-          review_refreshed_at: nowIso()
+          review_refreshed_at: nowIso(),
+          affected_paths: refreshedAffectedPaths,
+          affected_path_count: refreshedAffectedPaths.length
         };
         conflict.validator_summary = {
           ...conflict.validator_summary,
           stale: false,
-          refreshed_from: previousExpectedMain
+          refreshed_from: previousExpectedMain,
+          path_count: refreshedAffectedPaths.length
         };
         this.store.appendEvent(db, {
           event_type: 'conflict_review_refreshed',
@@ -311,6 +330,19 @@ export class SyncService {
       });
     });
     return await this.getConflictReviewPackage(input.vaultId, input.conflictId);
+  }
+
+  private async refreshedAffectedPaths(conflict: ConflictRecord, currentMain: string): Promise<string[]> {
+    if (
+      !(await this.git.commitExists(conflict.vault_id, conflict.base_commit)) ||
+      !(await this.git.commitExists(conflict.vault_id, currentMain)) ||
+      !(await this.git.commitExists(conflict.vault_id, conflict.device_commit))
+    ) {
+      return conflict.affected_paths;
+    }
+    const mainChanges = await this.git.changedPaths(conflict.vault_id, conflict.base_commit, currentMain);
+    const deviceChanges = await this.git.changedPaths(conflict.vault_id, conflict.base_commit, conflict.device_commit);
+    return [...new Set([...conflict.affected_paths, ...intersectChangedPaths(mainChanges, deviceChanges)])].sort();
   }
 
   async resolveConflict(input: {
