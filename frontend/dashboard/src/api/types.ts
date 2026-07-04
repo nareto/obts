@@ -12,8 +12,7 @@ export type StatusLabel =
   | 'Blocked'
   | 'Needs recovery'
   | 'Unsafe local state'
-  | 'Integrity failure'
-  | 'Revoked';
+  | 'Integrity failure';
 
 export type Session = {
   user_id: string;

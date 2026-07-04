@@ -1153,7 +1153,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       `/api/v1/vaults/${admin.vaultId}/dashboard`
     );
     expect(dashboard.body.devices.find((device) => device.device_name === 'phone')).toMatchObject({
-      status_label: 'Revoked'
+      status_label: 'Blocked'
     });
 
     await mkdirp(join(deviceDir, '.obts', 'recovery', 'rec_retained_after_unpair'));

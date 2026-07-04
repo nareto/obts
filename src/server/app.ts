@@ -1844,7 +1844,7 @@ function deviceStatusLabel(status: string): string {
     return 'Checking';
   }
   if (status === 'revoked') {
-    return 'Revoked';
+    return 'Blocked';
   }
   return 'Ahead';
 }
