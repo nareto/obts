@@ -1571,14 +1571,41 @@ function buildSourceDiff(serverContent: string | null, deviceContent: string | n
 
 function buildMarkdownReview(serverContent: string | null, deviceContent: string | null): string {
   return [
-    '### Server version',
-    '',
-    serverContent ?? '_File absent_',
-    '',
-    '### Device version',
-    '',
-    deviceContent ?? '_File absent_'
-  ].join('\n');
+    '<section class="markdown-review-version">',
+    '<h3>Server version</h3>',
+    markdownReviewBody(serverContent),
+    '</section>',
+    '<section class="markdown-review-version">',
+    '<h3>Device version</h3>',
+    markdownReviewBody(deviceContent),
+    '</section>'
+  ].join('');
+}
+
+function markdownReviewBody(content: string | null): string {
+  if (content === null) {
+    return '<p><em>File absent</em></p>';
+  }
+  return `<pre>${escapeHtml(content)}</pre>`;
+}
+
+function escapeHtml(content: string): string {
+  return content.replace(/[&<>"']/gu, (char) => {
+    switch (char) {
+      case '&':
+        return '&amp;';
+      case '<':
+        return '&lt;';
+      case '>':
+        return '&gt;';
+      case '"':
+        return '&quot;';
+      case "'":
+        return '&#39;';
+      default:
+        return char;
+    }
+  });
 }
 
 function resolutionRequestHash(input: {

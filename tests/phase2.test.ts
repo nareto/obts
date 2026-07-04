@@ -190,6 +190,36 @@ describe('Phase 2 dashboard conflict resolution', () => {
     );
   });
 
+  it('escapes rendered Markdown conflict review content before the dashboard renders it as HTML', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'desktop-rendered-safety');
+    const tabletDir = join(root, 'tablet-rendered-safety');
+    await mkdir(desktopDir, { recursive: true });
+    await mkdir(tabletDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await writeFile(join(desktopDir, 'shared.md'), 'base\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const tablet = await pairPlugin(admin, tabletDir, 'tablet');
+    await writeFile(join(desktopDir, 'shared.md'), '<img src=x onerror=alert(1)>\n');
+    await writeFile(join(tabletDir, 'shared.md'), '<script>alert(2)</script>\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const result = await tablet.syncOnce();
+    expect(result.status).toBe('Review needed');
+
+    const review = await admin.get<{
+      files: Array<{ rendered_markdown_diff: string | null; server_content: string; device_content: string }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`);
+    expect(review.status).toBe(200);
+    expect(review.body.files[0]?.server_content).toBe('<img src=x onerror=alert(1)>\n');
+    expect(review.body.files[0]?.device_content).toBe('<script>alert(2)</script>\n');
+    const rendered = review.body.files[0]?.rendered_markdown_diff ?? '';
+    expect(rendered).toContain('&lt;img src=x onerror=alert(1)&gt;');
+    expect(rendered).toContain('&lt;script&gt;alert(2)&lt;/script&gt;');
+    expect(rendered).not.toContain('<img src=x');
+    expect(rendered).not.toContain('<script>');
+  });
+
   it('rejects stale, cross-user, and non-recent conflict resolution submissions', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const desktopDir = join(root, 'desktop-stale');
