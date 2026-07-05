@@ -466,6 +466,59 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await server.git.listTreePaths(admin.vaultId, main!)).toContain('watched.md');
   });
 
+  it('does not apply remote main over local edits that appear during pull', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const fixtureADir = join(root, 'race-fixtureA');
+    const fixtureBDir = join(root, 'race-fixtureB');
+    await mkdirp(fixtureADir);
+    await mkdirp(fixtureBDir);
+    await writeFile(join(fixtureADir, 'shared.md'), 'base\n');
+    const fixtureA = await pairPlugin(admin, fixtureADir, 'fixtureA');
+    await fixtureA.syncOnce({ confirmInitialImport: true });
+    const fixtureB = await pairPlugin(admin, fixtureBDir, 'fixtureB');
+    expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('base\n');
+
+    await writeFile(join(fixtureADir, 'shared.md'), 'fixtureA accepted\n');
+    expect((await fixtureA.syncOnce()).status).toBe('Synced');
+
+    const internals = fixtureB as unknown as {
+      transport: {
+        pull: (input: { requestedTarget?: string }) => Promise<unknown>;
+      };
+    };
+    const originalPull = internals.transport.pull.bind(internals.transport);
+    let injectedLocalEdit = false;
+    internals.transport.pull = async (input) => {
+      const result = await originalPull(input);
+      if (!injectedLocalEdit && input.requestedTarget === undefined) {
+        injectedLocalEdit = true;
+        await writeFile(join(fixtureBDir, 'shared.md'), 'fixtureB must survive\n');
+      }
+      return result;
+    };
+
+    const firstFixtureBSync = await fixtureB.syncOnce();
+    expect(firstFixtureBSync.status).toBe('Ahead');
+    expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('fixtureB must survive\n');
+    expect(await fixtureB.readQueue()).toMatchObject({
+      pending_commit: null,
+      status: 'queued_local'
+    });
+
+    const secondFixtureBSync = await fixtureB.syncOnce();
+    expect(secondFixtureBSync.status).toBe('Review needed');
+    expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('fixtureB must survive\n');
+    const conflicts = await admin.get<{ conflicts: Array<{ status: string; affected_paths: string[] }> }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts?status=open`
+    );
+    expect(conflicts.body.conflicts).toEqual([
+      expect.objectContaining({
+        status: 'open',
+        affected_paths: ['shared.md']
+      })
+    ]);
+  });
+
   it('surfaces Uploading while a queued local commit is being pushed', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'upload-status-device');
@@ -3539,6 +3592,12 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000');
     expect(pluginMain).toContain('runBackgroundSync()');
     expect(pluginMain).toContain('runAutomaticSync()');
+    expect(pluginMain).toContain('flushOpenMarkdownEditorsToDisk');
+    expect(pluginMain).toContain('ensureNoLocalChangesBeforeApply');
+    expect(pluginMain).toContain('visibleVaultMatchesLocalHead');
+    const queuedSync = sourceSection(pluginMain, 'async runQueuedSync()', 'async flushOpenMarkdownEditorsToDisk()');
+    expect(queuedSync).toContain('if (this.syncRunning)');
+    expect(queuedSync).toContain('void this.runQueuedSync();');
     const backgroundSync = sourceSection(pluginMain, 'async runBackgroundSync()', 'async runAutomaticSync()');
     expect(backgroundSync).toContain('await this.runAutomaticSync();');
     expect(backgroundSync).not.toContain('pollRemoteEventsAndApply');

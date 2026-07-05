@@ -146,8 +146,51 @@ module.exports = class ObtsPlugin extends Plugin {
     if (!this.syncQueued) {
       return;
     }
+    if (this.syncRunning) {
+      window.setTimeout(() => {
+        void this.runQueuedSync();
+      }, SYNC_DEBOUNCE_MS);
+      return;
+    }
     this.syncQueued = false;
     await this.runAutomaticSync();
+    if (this.syncQueued) {
+      window.setTimeout(() => {
+        void this.runQueuedSync();
+      }, 0);
+    }
+  }
+
+  async flushOpenMarkdownEditorsToDisk() {
+    const workspace = this.app && this.app.workspace;
+    const vault = this.app && this.app.vault;
+    if (!workspace || !vault || typeof workspace.getLeavesOfType !== "function" || typeof vault.read !== "function" || typeof vault.modify !== "function") {
+      return [];
+    }
+    const flushed = [];
+    for (const leaf of workspace.getLeavesOfType("markdown") || []) {
+      const view = leaf && leaf.view;
+      const file = view && view.file;
+      const editor = view && view.editor;
+      if (!file || typeof file.path !== "string" || !editor || typeof editor.getValue !== "function") {
+        continue;
+      }
+      if (!isSyncableVaultPath(file.path)) {
+        continue;
+      }
+      const editorText = editor.getValue();
+      let diskText;
+      try {
+        diskText = await vault.read(file);
+      } catch {
+        continue;
+      }
+      if (editorText !== diskText) {
+        await vault.modify(file, editorText);
+        flushed.push(file.path);
+      }
+    }
+    return flushed;
   }
 
   async runBackgroundSync() {
@@ -181,6 +224,11 @@ module.exports = class ObtsPlugin extends Plugin {
       await this.handleAutomaticSyncError(error);
     } finally {
       this.syncRunning = false;
+      if (this.syncQueued) {
+        window.setTimeout(() => {
+          void this.runQueuedSync();
+        }, 0);
+      }
     }
   }
 
@@ -364,6 +412,7 @@ class ObtsObsidianClient {
       throw new ObtsBlockedError("not_paired", "Device is not paired.");
     }
     this.throwIfSyncBlocked(state);
+    await this.flushEditorBuffersToDisk();
 
     const localFiles = await this.scanSyncableFiles();
     if (localFiles.length > 0 && !state.initial_import_confirmed && state.server_device_ref === null) {
@@ -594,18 +643,28 @@ class ObtsObsidianClient {
   }
 
   async pullAndApply(allowDestructive) {
-    const state = await this.readState();
+    let state = await this.readState();
     if (!state.vault_id || !state.device_id) {
-      return;
+      return false;
     }
     this.throwIfSyncBlocked(state);
+    if (!(await this.ensureNoLocalChangesBeforeApply(state))) {
+      return false;
+    }
+    state = await this.readState();
     const token = await this.readDeviceToken();
     const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main);
     await this.importPack(pulled.packfile);
-    await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, allowDestructive);
+    state = await this.readState();
+    if (!(await this.ensureNoLocalChangesBeforeApply(state))) {
+      return false;
+    }
+    await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, allowDestructive, [], true);
     if (state.local_main !== pulled.manifest.target_main) {
       await this.acknowledgeAppliedMain(pulled.manifest.target_main);
     }
+    await this.clearResolvedConflictQueue();
+    return true;
   }
 
   async pollRemoteEventsAndApply() {
@@ -623,8 +682,7 @@ class ObtsObsidianClient {
       if (error instanceof ObtsTransportError && error.code === "event_cursor_expired") {
         const currentEventSeq = error.details && Number.isSafeInteger(error.details.current_event_seq) ? error.details.current_event_seq : after;
         await this.writeState(Object.assign({}, await this.readState(), { last_event_seq: currentEventSeq, updated_at: nowIso() }));
-        await this.pullAndApply(true);
-        return true;
+        return await this.pullAndApply(true);
       }
       throw error;
     }
@@ -637,8 +695,7 @@ class ObtsObsidianClient {
     if (!shouldPull) {
       return false;
     }
-    await this.pullAndApply(true);
-    return true;
+    return await this.pullAndApply(true);
   }
 
   async unpairCurrentDevice() {
@@ -709,10 +766,13 @@ class ObtsObsidianClient {
     return { status: "Not paired", recoveryBundleId };
   }
 
-  async applyTargetMain(targetMain, changedPaths, allowDestructive, extraAffectedPaths = []) {
+  async applyTargetMain(targetMain, changedPaths, allowDestructive, extraAffectedPaths = [], requireCleanVisibleState = false) {
     const state = await this.readState();
     if (state.local_main === targetMain && extraAffectedPaths.length === 0) {
       await this.writeState(Object.assign({}, state, { status_label: "Synced", updated_at: nowIso() }));
+      return;
+    }
+    if (requireCleanVisibleState && !(await this.ensureNoLocalChangesBeforeApply(state))) {
       return;
     }
     const applyId = `apply_${Date.now()}_${crypto.randomBytes(8).toString("hex")}`;
@@ -796,6 +856,15 @@ class ObtsObsidianClient {
       journal.phase = "verifying";
       journal.last_completed_step = "files_written";
       await writeJson(this.applyJournalPath, journal);
+      if (requireCleanVisibleState) {
+        await this.flushEditorBuffersToDisk();
+        if (!(await this.localContentMatchesTree(await this.scanSyncableFiles(), targetMain))) {
+          journal.phase = "blocked_recovery";
+          journal.redacted_error_category = "local_changed_during_apply";
+          await writeJson(this.applyJournalPath, journal);
+          await this.block("unsafe_local_state", "Local content changed during apply; server state was not acknowledged.");
+        }
+      }
       await this.updateRef("refs/heads/main", targetMain, null, true);
       await this.updateRef("refs/heads/local", targetMain, null, true);
       journal.phase = "committed";
@@ -1218,6 +1287,76 @@ class ObtsObsidianClient {
         throw error;
       }
     }
+  }
+
+  async ensureNoLocalChangesBeforeApply(state) {
+    await this.flushEditorBuffersToDisk();
+    const queue = await this.readQueue();
+    if (queue.pending_commit && queue.status !== "conflicted") {
+      await this.deferApplyForLocalChanges(state);
+      return false;
+    }
+    if (await this.visibleVaultMatchesLocalHead(state)) {
+      return true;
+    }
+    await this.deferApplyForLocalChanges(state);
+    return false;
+  }
+
+  async visibleVaultMatchesLocalHead(state) {
+    const expectedLocalHead = state.local_head || state.local_main;
+    const localFiles = await this.scanSyncableFiles();
+    if (!expectedLocalHead) {
+      return localFiles.length === 0;
+    }
+    if (!(await this.commitExists(expectedLocalHead))) {
+      return false;
+    }
+    if (await this.localContentMatchesTree(localFiles, expectedLocalHead)) {
+      return true;
+    }
+    return state.local_main && state.local_main !== expectedLocalHead
+      ? await this.localContentMatchesTree(localFiles, state.local_main)
+      : false;
+  }
+
+  async clearResolvedConflictQueue() {
+    const queue = await this.readQueue();
+    if (queue.status !== "conflicted") {
+      return;
+    }
+    await this.writeQueue({
+      pending_commit: null,
+      expected_device_ref: (await this.readState()).server_device_ref,
+      status: "idle",
+      attempts: 0,
+      updated_at: nowIso()
+    });
+  }
+
+  async deferApplyForLocalChanges(state) {
+    const queue = await this.readQueue();
+    if (!queue.pending_commit) {
+      await this.writeQueue({
+        pending_commit: null,
+        expected_device_ref: state.server_device_ref,
+        status: "queued_local",
+        attempts: 0,
+        updated_at: nowIso()
+      });
+    }
+    await this.writeState(Object.assign({}, await this.readState(), {
+      status_label: "Ahead",
+      last_error_code: null,
+      updated_at: nowIso()
+    }));
+  }
+
+  async flushEditorBuffersToDisk() {
+    if (!this.plugin.flushOpenMarkdownEditorsToDisk) {
+      return;
+    }
+    await this.plugin.flushOpenMarkdownEditorsToDisk();
   }
 
   async assertPairingCanStart() {

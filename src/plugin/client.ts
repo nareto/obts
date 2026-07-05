@@ -242,6 +242,7 @@ export class ObtsPluginClient {
       throw new PluginBlockedError('not_paired', 'Device is not paired.');
     }
     this.throwIfSyncBlocked(state);
+    await this.flushEditorBuffersToDisk();
     const localFiles = await this.git.scanSyncableFiles();
     if (localFiles.length > 0 && !state.initial_import_confirmed && state.server_device_ref === null) {
       await this.createLocalRecoveryBundle('initial_import', state.local_main, localFiles);
@@ -275,7 +276,11 @@ export class ObtsPluginClient {
 
     if (!commit) {
       const existingQueue = await this.readQueue();
-      if (existingQueue.status === 'queued_local' && existingQueue.pending_commit === null) {
+      if (
+        existingQueue.status === 'queued_local' &&
+        existingQueue.pending_commit === null &&
+        (await this.visibleVaultMatchesLocalHead(await this.readState()))
+      ) {
         await this.writeQueue({
           pending_commit: null,
           expected_device_ref: state.server_device_ref,
@@ -529,12 +534,19 @@ export class ObtsPluginClient {
     return { status: 'Synced', main: pulled.manifest.target_main };
   }
 
-  async pullAndApply(options: { allowDestructive: boolean }): Promise<void> {
-    const state = await this.readState();
+  async pullAndApply(options: { allowDestructive: boolean }): Promise<boolean> {
+    let state = await this.readState();
     if (!state.vault_id || !state.device_id) {
-      return;
+      return false;
     }
     this.throwIfSyncBlocked(state);
+    if (!(await this.ensureNoLocalChangesBeforeApply(state))) {
+      return false;
+    }
+    state = await this.readState();
+    if (!state.vault_id || !state.device_id) {
+      return false;
+    }
     const token = await this.readDeviceToken();
     const pulled = await this.transport.pull({
       vaultId: state.vault_id,
@@ -543,10 +555,18 @@ export class ObtsPluginClient {
       currentLocalMain: state.local_main
     });
     await this.git.importPack(pulled.packfile);
-    await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, options.allowDestructive);
+    state = await this.readState();
+    if (!(await this.ensureNoLocalChangesBeforeApply(state))) {
+      return false;
+    }
+    await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, options.allowDestructive, {
+      requireCleanVisibleState: true
+    });
     if (state.local_main !== pulled.manifest.target_main) {
       await this.acknowledgeAppliedMain(state, token, pulled.manifest.target_main);
     }
+    await this.clearResolvedConflictQueue();
+    return true;
   }
 
   async pollRemoteEventsAndApply(): Promise<{ applied: boolean; status: string }> {
@@ -589,9 +609,9 @@ export class ObtsPluginClient {
             updated_at: nowIso()
           });
         }
-        await this.pullAndApply({ allowDestructive: true });
+        const applied = await this.pullAndApply({ allowDestructive: true });
         const refreshed = await this.readState();
-        return { applied: true, status: refreshed.status_label };
+        return { applied, status: refreshed.status_label };
       }
       throw error;
     }
@@ -621,9 +641,9 @@ export class ObtsPluginClient {
         updated_at: nowIso()
       });
     }
-    await this.pullAndApply({ allowDestructive: true });
+    const applied = await this.pullAndApply({ allowDestructive: true });
     const finalState = await this.readState();
-    return { applied: true, status: finalState.status_label };
+    return { applied, status: finalState.status_label };
   }
 
   async unpairCurrentDevice(): Promise<{ status: string }> {
@@ -783,11 +803,14 @@ export class ObtsPluginClient {
     targetMain: string,
     changedPaths: string[],
     allowDestructive: boolean,
-    options: { extraAffectedPaths?: string[] } = {}
+    options: { extraAffectedPaths?: string[]; requireCleanVisibleState?: boolean } = {}
   ): Promise<void> {
     const state = await this.readState();
     if (state.local_main === targetMain && (options.extraAffectedPaths?.length ?? 0) === 0) {
       await this.writeState({ ...state, status_label: 'Synced', updated_at: nowIso() });
+      return;
+    }
+    if (options.requireCleanVisibleState && !(await this.ensureNoLocalChangesBeforeApply(state))) {
       return;
     }
     const applyId = newId('apply');
@@ -897,6 +920,15 @@ export class ObtsPluginClient {
       journal.phase = 'verifying';
       journal.last_completed_step = 'files_written';
       await this.recovery.writeApplyJournal(journal);
+      if (options.requireCleanVisibleState) {
+        await this.flushEditorBuffersToDisk();
+        if (!(await this.localContentMatchesTree(await this.git.scanSyncableFiles(), targetMain))) {
+          journal.phase = 'blocked_recovery';
+          journal.redacted_error_category = 'local_changed_during_apply';
+          await this.recovery.writeApplyJournal(journal);
+          await this.block('unsafe_local_state', 'Local content changed during apply; server state was not acknowledged.');
+        }
+      }
       await this.git.setLocalMain(targetMain);
       await this.git.setLocalHead(targetMain);
       journal.phase = 'committed';
@@ -1163,6 +1195,74 @@ export class ObtsPluginClient {
       return false;
     }
     return await this.git.isAncestor(baseline.main, manifest.target_main);
+  }
+
+  private async ensureNoLocalChangesBeforeApply(state: LocalPluginState): Promise<boolean> {
+    await this.flushEditorBuffersToDisk();
+    const queue = await this.readQueue();
+    if (queue.pending_commit && queue.status !== 'conflicted') {
+      await this.deferApplyForLocalChanges(state);
+      return false;
+    }
+    if (await this.visibleVaultMatchesLocalHead(state)) {
+      return true;
+    }
+    await this.deferApplyForLocalChanges(state);
+    return false;
+  }
+
+  private async visibleVaultMatchesLocalHead(state: LocalPluginState): Promise<boolean> {
+    const expectedLocalHead = state.local_head ?? state.local_main;
+    const localFiles = await this.git.scanSyncableFiles();
+    if (expectedLocalHead === null) {
+      return localFiles.length === 0;
+    }
+    if (!(await this.git.commitExists(expectedLocalHead))) {
+      return false;
+    }
+    if (await this.localContentMatchesTree(localFiles, expectedLocalHead)) {
+      return true;
+    }
+    return state.local_main !== null && state.local_main !== expectedLocalHead
+      ? await this.localContentMatchesTree(localFiles, state.local_main)
+      : false;
+  }
+
+  private async clearResolvedConflictQueue(): Promise<void> {
+    const queue = await this.readQueue();
+    if (queue.status !== 'conflicted') {
+      return;
+    }
+    await this.writeQueue({
+      pending_commit: null,
+      expected_device_ref: (await this.readState()).server_device_ref,
+      status: 'idle',
+      attempts: 0,
+      updated_at: nowIso()
+    });
+  }
+
+  private async deferApplyForLocalChanges(state: LocalPluginState): Promise<void> {
+    const queue = await this.readQueue();
+    if (!queue.pending_commit) {
+      await this.writeQueue({
+        pending_commit: null,
+        expected_device_ref: state.server_device_ref,
+        status: 'queued_local',
+        attempts: 0,
+        updated_at: nowIso()
+      });
+    }
+    await this.writeState({
+      ...(await this.readState()),
+      status_label: 'Ahead',
+      last_error_code: null,
+      updated_at: nowIso()
+    });
+  }
+
+  private async flushEditorBuffersToDisk(): Promise<void> {
+    // The Node test client has no active editor buffers to flush.
   }
 
   private async readExistingState(): Promise<LocalPluginState | null> {
