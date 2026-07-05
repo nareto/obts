@@ -6,7 +6,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 
 const API_VERSION = "2026-07-02.full-sync";
-const PLUGIN_VERSION = "0.1.4-phase2";
+const PLUGIN_VERSION = "0.1.5-phase2";
 const WINDOWS_RESERVED = new Set(["con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"]);
 const SYNC_DEBOUNCE_MS = 1500;
 const BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000;
@@ -55,7 +55,7 @@ module.exports = class ObtsPlugin extends Plugin {
       name: "Sync once",
       callback: async () => {
         await this.runUserAction(async () => {
-          const result = await this.client.syncOnce({ confirmInitialImport: false });
+          const result = await this.syncOnceOrPollResolvedConflict({ confirmInitialImport: false });
           new Notice(`obts: ${result.status}`);
         });
       }
@@ -142,6 +142,14 @@ module.exports = class ObtsPlugin extends Plugin {
     }, SYNC_DEBOUNCE_MS);
   }
 
+  async syncOnceOrPollResolvedConflict(options) {
+    const state = await this.client.readState();
+    if (state.last_error_code === "conflict_review_required") {
+      return await this.client.pollRemoteEventsAndApply();
+    }
+    return await this.client.syncOnce(options);
+  }
+
   async runQueuedSync() {
     if (!this.syncQueued) {
       return;
@@ -202,7 +210,10 @@ module.exports = class ObtsPlugin extends Plugin {
       return;
     }
     const state = await this.client.readState();
-    if (!state.vault_id || !state.device_id || state.last_error_code) {
+    if (!state.vault_id || !state.device_id) {
+      return;
+    }
+    if (state.last_error_code && state.last_error_code !== "conflict_review_required") {
       return;
     }
     await this.runAutomaticSync();
@@ -213,12 +224,15 @@ module.exports = class ObtsPlugin extends Plugin {
       return;
     }
     const state = await this.client.readState();
-    if (!state.vault_id || !state.device_id || state.last_error_code) {
+    if (!state.vault_id || !state.device_id) {
+      return;
+    }
+    if (state.last_error_code && state.last_error_code !== "conflict_review_required") {
       return;
     }
     this.syncRunning = true;
     try {
-      await this.client.syncOnce({ confirmInitialImport: false });
+      await this.syncOnceOrPollResolvedConflict({ confirmInitialImport: false });
       this.setStatus((await this.client.readState()).status_label);
     } catch (error) {
       await this.handleAutomaticSyncError(error);
@@ -670,9 +684,12 @@ class ObtsObsidianClient {
   async pollRemoteEventsAndApply() {
     const state = await this.readState();
     if (!state.vault_id || !state.device_id) {
-      return false;
+      return { applied: false, status: "Not paired" };
     }
-    this.throwIfSyncBlocked(state);
+    const wasConflictBlocked = state.last_error_code === "conflict_review_required";
+    if (!wasConflictBlocked) {
+      this.throwIfSyncBlocked(state);
+    }
     const after = Number.isSafeInteger(state.last_event_seq) && state.last_event_seq >= 0 ? state.last_event_seq : 0;
     const token = await this.readDeviceToken();
     let page;
@@ -681,8 +698,33 @@ class ObtsObsidianClient {
     } catch (error) {
       if (error instanceof ObtsTransportError && error.code === "event_cursor_expired") {
         const currentEventSeq = error.details && Number.isSafeInteger(error.details.current_event_seq) ? error.details.current_event_seq : after;
-        await this.writeState(Object.assign({}, await this.readState(), { last_event_seq: currentEventSeq, updated_at: nowIso() }));
-        return await this.pullAndApply(true);
+        const nextState = await this.readState();
+        if (nextState.last_error_code === "conflict_review_required") {
+          await this.writeState(Object.assign({}, nextState, {
+            last_error_code: null,
+            status_label: "Behind",
+            last_event_seq: currentEventSeq,
+            updated_at: nowIso()
+          }));
+        } else {
+          await this.writeState(Object.assign({}, nextState, { last_event_seq: currentEventSeq, updated_at: nowIso() }));
+        }
+        try {
+          const applied = await this.pullAndApply(true);
+          const refreshed = await this.readState();
+          return { applied, status: refreshed.status_label };
+        } catch (pullError) {
+          if (wasConflictBlocked && pullError instanceof ObtsTransportError && pullError.code === "device_blocked") {
+            await this.writeState(Object.assign({}, await this.readState(), {
+              last_error_code: "conflict_review_required",
+              status_label: "Review needed",
+              last_event_seq: currentEventSeq,
+              updated_at: nowIso()
+            }));
+            return { applied: false, status: "Review needed" };
+          }
+          throw pullError;
+        }
       }
       throw error;
     }
@@ -690,12 +732,25 @@ class ObtsObsidianClient {
     const currentState = await this.readState();
     const shouldPull = page.events.some((event) => {
       const main = event && event.commit_cursors ? event.commit_cursors.main : null;
-      return (event.event_type === "main_advanced" || event.event_type === "conflict_resolved") && typeof main === "string" && main !== currentState.local_main;
+      const hasNewMain = typeof main === "string" && main !== currentState.local_main;
+      if (wasConflictBlocked) {
+        return event.event_type === "conflict_resolved" && hasNewMain;
+      }
+      return (event.event_type === "main_advanced" || event.event_type === "conflict_resolved") && hasNewMain;
     });
     if (!shouldPull) {
-      return false;
+      return { applied: false, status: currentState.status_label };
     }
-    return await this.pullAndApply(true);
+    if (wasConflictBlocked && currentState.last_error_code === "conflict_review_required") {
+      await this.writeState(Object.assign({}, currentState, {
+        last_error_code: null,
+        status_label: "Behind",
+        updated_at: nowIso()
+      }));
+    }
+    const applied = await this.pullAndApply(true);
+    const finalState = await this.readState();
+    return { applied, status: finalState.status_label };
   }
 
   async unpairCurrentDevice() {
@@ -1942,7 +1997,7 @@ class ObtsSettingTab extends PluginSettingTab {
               button.setDisabled(true);
               setFeedback(actionFeedback, "Syncing...", "muted");
               try {
-                const result = await this.plugin.client.syncOnce({ confirmInitialImport: false });
+                const result = await this.plugin.syncOnceOrPollResolvedConflict({ confirmInitialImport: false });
                 this.plugin.setStatus((await this.plugin.client.readState()).status_label);
                 setFeedback(actionFeedback, `Synced: ${result.status}`, "success");
                 new Notice(`obts: ${result.status}`);

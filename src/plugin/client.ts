@@ -9,7 +9,7 @@ import { LocalGitEngine } from './localGit.js';
 import { ApplyLockActiveError, type ApplyJournal, RecoveryManager, sha256File } from './recovery.js';
 import { TransportClient, TransportError } from './transport.js';
 
-const PLUGIN_VERSION = '0.1.4-phase2';
+const PLUGIN_VERSION = '0.1.5-phase2';
 
 export type ObtsPluginSettings = {
   serverUrl: string;
@@ -609,9 +609,23 @@ export class ObtsPluginClient {
             updated_at: nowIso()
           });
         }
-        const applied = await this.pullAndApply({ allowDestructive: true });
-        const refreshed = await this.readState();
-        return { applied, status: refreshed.status_label };
+        try {
+          const applied = await this.pullAndApply({ allowDestructive: true });
+          const refreshed = await this.readState();
+          return { applied, status: refreshed.status_label };
+        } catch (pullError) {
+          if (wasConflictBlocked && pullError instanceof TransportError && pullError.code === 'device_blocked') {
+            await this.writeState({
+              ...(await this.readState()),
+              last_error_code: 'conflict_review_required',
+              status_label: 'Review needed',
+              last_event_seq: currentEventSeq,
+              updated_at: nowIso()
+            });
+            return { applied: false, status: 'Review needed' };
+          }
+          throw pullError;
+        }
       }
       throw error;
     }
@@ -624,11 +638,11 @@ export class ObtsPluginClient {
     const currentState = await this.readState();
     const shouldPull = page.events.some((event) => {
       const main = event.commit_cursors.main;
-      return (
-        (event.event_type === 'main_advanced' || event.event_type === 'conflict_resolved') &&
-        typeof main === 'string' &&
-        main !== currentState.local_main
-      );
+      const hasNewMain = typeof main === 'string' && main !== currentState.local_main;
+      if (wasConflictBlocked) {
+        return event.event_type === 'conflict_resolved' && hasNewMain;
+      }
+      return (event.event_type === 'main_advanced' || event.event_type === 'conflict_resolved') && hasNewMain;
     });
     if (!shouldPull) {
       return { applied: false, status: currentState.status_label };

@@ -582,6 +582,35 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(rejected.body.error.code).toBe('invalid_resolution');
   });
 
+  it('keeps a conflict-blocked device blocked when unrelated main advances', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'desktop-unrelated-main');
+    const tabletDir = join(root, 'tablet-unrelated-main');
+    const phoneDir = join(root, 'phone-unrelated-main');
+    await mkdir(desktopDir, { recursive: true });
+    await mkdir(tabletDir, { recursive: true });
+    await mkdir(phoneDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await writeFile(join(desktopDir, 'shared.md'), 'base\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const tablet = await pairPlugin(admin, tabletDir, 'tablet');
+    const phone = await pairPlugin(admin, phoneDir, 'phone');
+    await writeFile(join(desktopDir, 'shared.md'), 'server version\n');
+    await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    expect((await tablet.syncOnce()).status).toBe('Review needed');
+    expect((await tablet.readState()).last_error_code).toBe('conflict_review_required');
+
+    await writeFile(join(phoneDir, 'other.md'), 'unrelated accepted edit\n');
+    expect((await phone.syncOnce()).status).toBe('Synced');
+
+    const polled = await tablet.pollRemoteEventsAndApply();
+    expect(polled).toMatchObject({ applied: false, status: 'Review needed' });
+    expect((await tablet.readState()).last_error_code).toBe('conflict_review_required');
+    expect(await readFile(join(tabletDir, 'shared.md'), 'utf8')).toBe('device version\n');
+  });
+
   it('allows a blocked device to poll events, detect conflict resolution, and apply the resolved main', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const desktopDir = join(root, 'desktop-event-resolution');

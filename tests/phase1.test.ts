@@ -3678,9 +3678,17 @@ describe('Phase 1 sync without conflict resolution', () => {
     const queuedSync = sourceSection(pluginMain, 'async runQueuedSync()', 'async flushOpenMarkdownEditorsToDisk()');
     expect(queuedSync).toContain('if (this.syncRunning)');
     expect(queuedSync).toContain('void this.runQueuedSync();');
+    expect(pluginMain).toContain('syncOnceOrPollResolvedConflict');
     const backgroundSync = sourceSection(pluginMain, 'async runBackgroundSync()', 'async runAutomaticSync()');
+    expect(backgroundSync).toContain('state.last_error_code !== "conflict_review_required"');
     expect(backgroundSync).toContain('await this.runAutomaticSync();');
-    expect(backgroundSync).not.toContain('pollRemoteEventsAndApply');
+    const automaticSync = sourceSection(pluginMain, 'async runAutomaticSync()', 'async handleAutomaticSyncError');
+    expect(automaticSync).toContain('syncOnceOrPollResolvedConflict');
+    const eventPoll = sourceSection(pluginMain, 'async pollRemoteEventsAndApply()', 'async unpairCurrentDevice()');
+    expect(eventPoll).toContain('wasConflictBlocked');
+    expect(eventPoll).toContain('if (!wasConflictBlocked)');
+    expect(eventPoll).toContain('event.event_type === "conflict_resolved"');
+    expect(eventPoll).toContain('last_error_code: null');
     expect(pluginMain).toContain('pollRemoteEventsAndApply()');
     expect(pluginMain).toContain('/sync/events?after=');
     expect(pluginMain).toContain('this.setStatus("Offline")');
