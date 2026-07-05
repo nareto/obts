@@ -6,7 +6,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 
 const API_VERSION = "2026-07-02.full-sync";
-const PLUGIN_VERSION = "0.1.3-phase2";
+const PLUGIN_VERSION = "0.1.4-phase2";
 const WINDOWS_RESERVED = new Set(["con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"]);
 const SYNC_DEBOUNCE_MS = 1500;
 const BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000;
@@ -1739,11 +1739,28 @@ class ObtsObsidianClient {
 
   async adapterWriteBinary(filePath, content) {
     await ensureAdapterDir(this.adapter, path.posix.dirname(filePath));
+    const vault = this.plugin.app && this.plugin.app.vault;
+    const existing = vault && typeof vault.getAbstractFileByPath === "function" ? vault.getAbstractFileByPath(filePath) : null;
+    const arrayBuffer = toArrayBuffer(content);
+    if (existing && typeof vault.modifyBinary === "function" && !existing.children) {
+      await vault.modifyBinary(existing, arrayBuffer);
+      return;
+    }
+    if (!existing && typeof vault.createBinary === "function") {
+      await vault.createBinary(filePath, arrayBuffer);
+      return;
+    }
     await this.adapter.writeBinary(filePath, content);
   }
 
   async adapterRemove(filePath) {
     try {
+      const vault = this.plugin.app && this.plugin.app.vault;
+      const existing = vault && typeof vault.getAbstractFileByPath === "function" ? vault.getAbstractFileByPath(filePath) : null;
+      if (existing && typeof vault.delete === "function") {
+        await vault.delete(existing, true);
+        return;
+      }
       if (await this.adapterIsDirectory(filePath)) {
         if (typeof this.adapter.rmdir === "function") {
           await this.adapter.rmdir(filePath, true);
@@ -2368,6 +2385,11 @@ async function exists(filePath) {
 
 function sha256(data) {
   return crypto.createHash("sha256").update(data).digest("hex");
+}
+
+function toArrayBuffer(data) {
+  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
 }
 
 function nowIso() {

@@ -665,7 +665,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await readFile(join(device2Dir, 'server.md'), 'utf8')).toBe('server change\n');
   });
 
-  it('keeps the installable Obsidian artifact on adapter APIs for visible-vault apply', async () => {
+  it('keeps the installable Obsidian artifact on Obsidian APIs for visible-vault apply', async () => {
     const artifact = await readFile(join(process.cwd(), 'obsidian-plugin', 'main.js'), 'utf8');
     const applyWriter = sourceSection(artifact, 'async writeTargetFilesFromJournal', 'async createLocalCommit');
     expect(applyWriter).toContain('this.adapterRemove');
@@ -679,8 +679,14 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(scanner).not.toContain('walk(');
     expect(scanner).not.toContain('path.relative');
 
+    const adapterWrite = sourceSection(artifact, 'async adapterWriteBinary', 'async adapterRemove');
+    expect(adapterWrite).toContain('vault.modifyBinary');
+    expect(adapterWrite).toContain('vault.createBinary');
+    expect(adapterWrite).toContain('this.adapter.writeBinary');
+
     const adapterRemove = sourceSection(artifact, 'async adapterRemove', 'async adapterSha256');
     expect(adapterRemove).not.toContain('fsp.rm');
+    expect(adapterRemove).toContain('vault.delete');
     expect(adapterRemove).toContain('this.adapter.rmdir');
     expect(adapterRemove).toContain('this.adapter.remove');
   });
