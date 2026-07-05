@@ -9,7 +9,7 @@ import { LocalGitEngine } from './localGit.js';
 import { ApplyLockActiveError, type ApplyJournal, RecoveryManager, sha256File } from './recovery.js';
 import { TransportClient, TransportError } from './transport.js';
 
-const PLUGIN_VERSION = '0.1.1-phase2';
+const PLUGIN_VERSION = '0.1.2-phase2';
 
 export type ObtsPluginSettings = {
   serverUrl: string;
@@ -847,6 +847,16 @@ export class ObtsPluginClient {
         affected.add(path);
       }
       const affectedPaths = [...affected].filter((path) => isRecoverableApplyPath(path)).sort();
+      if (options.requireCleanVisibleState && (await this.applyTouchesOpenMarkdownEditor(affectedPaths))) {
+        await this.flushEditorBuffersToDisk();
+        const currentState = await this.readState();
+        if (await this.visibleVaultMatchesLocalHead(currentState)) {
+          await this.deferApplyForOpenEditors(currentState);
+        } else {
+          await this.deferApplyForLocalChanges(currentState);
+        }
+        return;
+      }
       const preflight: Record<string, string | null> = {};
       for (const path of affectedPaths) {
         preflight[path] = await sha256File(join(this.vaultDir, path));
@@ -1242,6 +1252,27 @@ export class ObtsPluginClient {
       expected_device_ref: (await this.readState()).server_device_ref,
       status: 'idle',
       attempts: 0,
+      updated_at: nowIso()
+    });
+  }
+
+  private async applyTouchesOpenMarkdownEditor(affectedPaths: string[]): Promise<boolean> {
+    if (affectedPaths.length === 0) {
+      return false;
+    }
+    const openPaths = new Set(await this.openSyncableMarkdownPaths());
+    return affectedPaths.some((path) => openPaths.has(path));
+  }
+
+  private async openSyncableMarkdownPaths(): Promise<string[]> {
+    return [];
+  }
+
+  private async deferApplyForOpenEditors(state: LocalPluginState): Promise<void> {
+    await this.writeState({
+      ...(await this.readState()),
+      status_label: 'Behind',
+      last_error_code: null,
       updated_at: nowIso()
     });
   }

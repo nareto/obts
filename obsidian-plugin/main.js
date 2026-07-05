@@ -6,7 +6,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 
 const API_VERSION = "2026-07-02.full-sync";
-const PLUGIN_VERSION = "0.1.1-phase2";
+const PLUGIN_VERSION = "0.1.2-phase2";
 const WINDOWS_RESERVED = new Set(["con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"]);
 const SYNC_DEBOUNCE_MS = 1500;
 const BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000;
@@ -191,6 +191,21 @@ module.exports = class ObtsPlugin extends Plugin {
       }
     }
     return flushed;
+  }
+
+  async openSyncableMarkdownPaths() {
+    const workspace = this.app && this.app.workspace;
+    if (!workspace || typeof workspace.getLeavesOfType !== "function") {
+      return [];
+    }
+    const paths = [];
+    for (const leaf of workspace.getLeavesOfType("markdown") || []) {
+      const filePath = leaf && leaf.view && leaf.view.file && leaf.view.file.path;
+      if (typeof filePath === "string" && filePath.endsWith(".md") && isSyncableVaultPath(filePath)) {
+        paths.push(filePath);
+      }
+    }
+    return [...new Set(paths)].sort();
   }
 
   async runBackgroundSync() {
@@ -815,6 +830,16 @@ class ObtsObsidianClient {
         affected.add(conflictPath);
       }
       const affectedPaths = Array.from(affected).filter((filePath) => isRecoverableApplyPath(filePath)).sort();
+      if (requireCleanVisibleState && (await this.applyTouchesOpenMarkdownEditor(affectedPaths))) {
+        await this.flushEditorBuffersToDisk();
+        const currentState = await this.readState();
+        if (await this.visibleVaultMatchesLocalHead(currentState)) {
+          await this.deferApplyForOpenEditors(currentState);
+        } else {
+          await this.deferApplyForLocalChanges(currentState);
+        }
+        return;
+      }
       journal.affected_paths = affectedPaths;
       for (const filePath of affectedPaths) {
         journal.preflight_sha256[filePath] = await this.adapterSha256(filePath);
@@ -1336,6 +1361,29 @@ class ObtsObsidianClient {
       attempts: 0,
       updated_at: nowIso()
     });
+  }
+
+  async applyTouchesOpenMarkdownEditor(affectedPaths) {
+    if (affectedPaths.length === 0) {
+      return false;
+    }
+    const openPaths = new Set(await this.openSyncableMarkdownPaths());
+    return affectedPaths.some((filePath) => openPaths.has(filePath));
+  }
+
+  async openSyncableMarkdownPaths() {
+    if (!this.plugin.openSyncableMarkdownPaths) {
+      return [];
+    }
+    return await this.plugin.openSyncableMarkdownPaths();
+  }
+
+  async deferApplyForOpenEditors(state) {
+    await this.writeState(Object.assign({}, await this.readState(), {
+      status_label: "Behind",
+      last_error_code: null,
+      updated_at: nowIso()
+    }));
   }
 
   async deferApplyForLocalChanges(state) {
