@@ -9,7 +9,7 @@ import { LocalGitEngine } from './localGit.js';
 import { ApplyLockActiveError, type ApplyJournal, RecoveryManager, sha256File } from './recovery.js';
 import { TransportClient, TransportError } from './transport.js';
 
-const PLUGIN_VERSION = '0.1.0-phase2';
+const PLUGIN_VERSION = '0.1.1-phase2';
 
 export type ObtsPluginSettings = {
   serverUrl: string;
@@ -904,6 +904,10 @@ export class ObtsPluginClient {
         await this.recovery.writeApplyJournal(journal);
       }
 
+      if (options.requireCleanVisibleState && !(await this.ensureNoLocalChangesBeforeApply(state))) {
+        await this.recovery.clearApplyJournal();
+        return;
+      }
       journal.phase = 'writing_files';
       await this.recovery.writeApplyJournal(journal);
       for (const path of affectedPaths) {

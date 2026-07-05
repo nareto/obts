@@ -519,6 +519,51 @@ describe('Phase 1 sync without conflict resolution', () => {
     ]);
   });
 
+  it('does not apply remote main over local edits that appear during apply preparation', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const fixtureADir = join(root, 'prep-race-fixtureA');
+    const fixtureBDir = join(root, 'prep-race-fixtureB');
+    await mkdirp(fixtureADir);
+    await mkdirp(fixtureBDir);
+    await writeFile(join(fixtureADir, 'shared.md'), 'base\n');
+    const fixtureA = await pairPlugin(admin, fixtureADir, 'fixtureA-prep');
+    await fixtureA.syncOnce({ confirmInitialImport: true });
+    const fixtureB = await pairPlugin(admin, fixtureBDir, 'fixtureB-prep');
+    expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('base\n');
+
+    await writeFile(join(fixtureADir, 'shared.md'), 'fixtureA accepted\n');
+    expect((await fixtureA.syncOnce()).status).toBe('Synced');
+
+    const internals = fixtureB as unknown as {
+      recovery: {
+        createRecoveryBundle: (...args: unknown[]) => Promise<string>;
+      };
+    };
+    const originalCreateRecoveryBundle = internals.recovery.createRecoveryBundle.bind(internals.recovery);
+    let injectedLocalEdit = false;
+    internals.recovery.createRecoveryBundle = async (...args) => {
+      const bundleId = await originalCreateRecoveryBundle(...args);
+      if (!injectedLocalEdit) {
+        injectedLocalEdit = true;
+        await writeFile(join(fixtureBDir, 'shared.md'), 'fixtureB during apply prep\n');
+      }
+      return bundleId;
+    };
+
+    const firstFixtureBSync = await fixtureB.syncOnce();
+    expect(firstFixtureBSync.status).toBe('Ahead');
+    expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('fixtureB during apply prep\n');
+    expect(await exists(join(fixtureBDir, '.obts', 'apply-journal.json'))).toBe(false);
+    expect(await fixtureB.readQueue()).toMatchObject({
+      pending_commit: null,
+      status: 'queued_local'
+    });
+
+    const secondFixtureBSync = await fixtureB.syncOnce();
+    expect(secondFixtureBSync.status).toBe('Review needed');
+    expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('fixtureB during apply prep\n');
+  });
+
   it('surfaces Uploading while a queued local commit is being pushed', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'upload-status-device');
@@ -2950,7 +2995,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
   });
 
-  it('blocks destructive apply if an affected file changes after preflight', async () => {
+  it('defers destructive apply if an affected file changes after preflight', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const { plugin2, device2Dir } = await preparePullApplyScenario(root, admin, 'preflight-device-1', 'preflight-device-2');
     const internal = plugin2 as unknown as { recovery: { createRecoveryBundle(input: unknown): Promise<string> } };
@@ -2961,19 +3006,14 @@ describe('Phase 1 sync without conflict resolution', () => {
       return bundleId;
     };
 
-    await expect(plugin2.syncOnce()).rejects.toMatchObject({ code: 'unsafe_local_state' });
+    expect((await plugin2.syncOnce()).status).toBe('Ahead');
     expect(await readFile(join(device2Dir, 'shared.md'), 'utf8')).toBe('changed after preflight\n');
     expect(await exists(join(device2Dir, '.obts', 'apply.lock'))).toBe(false);
-    const journal = JSON.parse(await readFile(join(device2Dir, '.obts', 'apply-journal.json'), 'utf8')) as {
-      phase: string;
-      redacted_error_category: string;
-      recovery_bundle_id: string | null;
-      affected_paths: string[];
-    };
-    expect(journal.phase).toBe('blocked_recovery');
-    expect(journal.redacted_error_category).toBe('preflight_hash_changed');
-    expect(journal.recovery_bundle_id).toMatch(/^rec_/u);
-    expect(journal.affected_paths).toEqual(['shared.md']);
+    expect(await exists(join(device2Dir, '.obts', 'apply-journal.json'))).toBe(false);
+    expect(await plugin2.readQueue()).toMatchObject({
+      pending_commit: null,
+      status: 'queued_local'
+    });
   });
 
   it('writes recovery bundle snapshots, patches, local refs pack, and artifact checksums before apply', async () => {
