@@ -519,7 +519,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     ]);
   });
 
-  it('does not apply remote main into an open affected note', async () => {
+  it('flushes dirty open editor content before applying remote main', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const fixtureADir = join(root, 'open-note-fixtureA');
     const fixtureBDir = join(root, 'open-note-fixtureB');
@@ -530,24 +530,26 @@ describe('Phase 1 sync without conflict resolution', () => {
     await fixtureA.syncOnce({ confirmInitialImport: true });
     const fixtureB = await pairPlugin(admin, fixtureBDir, 'fixtureB-open');
     const internals = fixtureB as unknown as {
-      openSyncableMarkdownPaths: () => Promise<string[]>;
+      flushEditorBuffersToDisk: () => Promise<void>;
     };
-    internals.openSyncableMarkdownPaths = async () => ['shared.md'];
+    let flushedDirtyEditor = false;
+    internals.flushEditorBuffersToDisk = async () => {
+      if (!flushedDirtyEditor) {
+        flushedDirtyEditor = true;
+        await writeFile(join(fixtureBDir, 'shared.md'), 'fixtureB open edit\n');
+      }
+    };
 
     await writeFile(join(fixtureADir, 'shared.md'), 'fixtureA accepted\n');
     expect((await fixtureA.syncOnce()).status).toBe('Synced');
 
-    const deferred = await fixtureB.syncOnce();
-    expect(deferred.status).toBe('Behind');
-    expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('base\n');
-    expect(await fixtureB.readQueue()).toMatchObject({
-      pending_commit: null,
-      status: 'idle'
-    });
-
-    await writeFile(join(fixtureBDir, 'shared.md'), 'fixtureB open edit\n');
     const conflicted = await fixtureB.syncOnce();
     expect(conflicted.status).toBe('Review needed');
+    expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('fixtureB open edit\n');
+    expect(await fixtureB.readQueue()).toMatchObject({
+      status: 'conflicted'
+    });
+
     expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('fixtureB open edit\n');
   });
 
@@ -3665,8 +3667,6 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('runBackgroundSync()');
     expect(pluginMain).toContain('runAutomaticSync()');
     expect(pluginMain).toContain('flushOpenMarkdownEditorsToDisk');
-    expect(pluginMain).toContain('openSyncableMarkdownPaths');
-    expect(pluginMain).toContain('applyTouchesOpenMarkdownEditor');
     expect(pluginMain).toContain('ensureNoLocalChangesBeforeApply');
     expect(pluginMain).toContain('visibleVaultMatchesLocalHead');
     const queuedSync = sourceSection(pluginMain, 'async runQueuedSync()', 'async flushOpenMarkdownEditorsToDisk()');
