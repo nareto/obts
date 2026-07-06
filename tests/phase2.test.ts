@@ -163,6 +163,53 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(db.events.find((event) => event.event_type === 'main_advanced' && event.resource_ids.conflict_id === result.conflictId)).toBeDefined();
   });
 
+  it('keeps the server version without discarding unrelated device-side changes', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'desktop-server-resolution');
+    const tabletDir = join(root, 'tablet-server-resolution');
+    const readerDir = join(root, 'reader-server-resolution');
+    await mkdir(desktopDir, { recursive: true });
+    await mkdir(tabletDir, { recursive: true });
+    await mkdir(readerDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await writeFile(join(desktopDir, 'shared.md'), 'base\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const tablet = await pairPlugin(admin, tabletDir, 'tablet');
+    await writeFile(join(desktopDir, 'shared.md'), 'server version\n');
+    await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
+    await writeFile(join(tabletDir, 'device-only.md'), 'created while resolving another note\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const result = await tablet.syncOnce();
+    expect(result.status).toBe('Review needed');
+
+    const review = await admin.get<{
+      conflict: { conflict_id: string; expected_main: string };
+      files: Array<{ path: string }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`);
+    expect(review.status).toBe(200);
+    expect(review.body.files.map((file) => file.path)).toEqual(['shared.md']);
+
+    const resolved = await admin.post<{ resolution_commit: string }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
+      {
+        expected_main: review.body.conflict.expected_main,
+        resolution_kind: 'keep_server'
+      }
+    );
+    expect(resolved.status).toBe(200);
+    expect((await server.git.readBlobAtPath(admin.vaultId, resolved.body.resolution_commit, 'shared.md')).toString('utf8')).toBe(
+      'server version\n'
+    );
+    expect((await server.git.readBlobAtPath(admin.vaultId, resolved.body.resolution_commit, 'device-only.md')).toString('utf8')).toBe(
+      'created while resolving another note\n'
+    );
+
+    const reader = await pairPlugin(admin, readerDir, 'reader');
+    expect((await reader.readState()).status_label).toBe('Synced');
+    expect(await readFile(join(readerDir, 'device-only.md'), 'utf8')).toBe('created while resolving another note\n');
+  });
+
   it('resolves with the device version without discarding unrelated server-side changes', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const desktopDir = join(root, 'desktop-device-resolution');

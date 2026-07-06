@@ -484,6 +484,24 @@ export class GitService {
     return await this.createTreeWithFileContents(input.vaultId, sourceTree, input.writes, input.deletes ?? []);
   }
 
+  async createTreeFromCommitWithOverlayChanges(input: {
+    vaultId: string;
+    sourceCommit: string;
+    deviceCommit: string;
+    deviceChanges: GitDiffEntry[];
+  }): Promise<string> {
+    return await this.createOverlayTree(input.vaultId, input.sourceCommit, input.deviceCommit, input.deviceChanges, new Map());
+  }
+
+  async createTreeFromTreeWithChanges(input: {
+    vaultId: string;
+    sourceTree: string;
+    writes: Map<string, Buffer>;
+    deletes?: string[];
+  }): Promise<string> {
+    return await this.createTreeWithFileContents(input.vaultId, input.sourceTree, input.writes, input.deletes ?? []);
+  }
+
   async createResolutionMergeCommitObject(input: {
     vaultId: string;
     tree: string;

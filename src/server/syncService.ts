@@ -950,8 +950,9 @@ export class SyncService {
     resolutionKind: ConflictResolutionKind,
     manualFiles: Record<string, string | null> | undefined
   ): Promise<string> {
+    const sourceTree = await this.resolutionSourceTree(conflict);
     if (resolutionKind === 'keep_server') {
-      return await this.git.treeHash(conflict.vault_id, conflict.expected_main);
+      return sourceTree;
     }
 
     const writes = new Map<string, Buffer>();
@@ -969,9 +970,9 @@ export class SyncService {
           writes.set(path, deviceBlob);
         }
       }
-      return await this.git.createTreeFromCommitWithChanges({
+      return await this.git.createTreeFromTreeWithChanges({
         vaultId: conflict.vault_id,
-        sourceCommit: conflict.expected_main,
+        sourceTree,
         writes,
         deletes
       });
@@ -985,9 +986,9 @@ export class SyncService {
         }
       }
       assertSyncableTreePaths([...writes.keys()]);
-      return await this.git.createTreeFromCommitWithChanges({
+      return await this.git.createTreeFromTreeWithChanges({
         vaultId: conflict.vault_id,
-        sourceCommit: conflict.expected_main,
+        sourceTree,
         writes
       });
     }
@@ -1016,9 +1017,9 @@ export class SyncService {
           )
         );
       }
-      return await this.git.createTreeFromCommitWithChanges({
+      return await this.git.createTreeFromTreeWithChanges({
         vaultId: conflict.vault_id,
-        sourceCommit: conflict.expected_main,
+        sourceTree,
         writes,
         deletes
       });
@@ -1045,15 +1046,32 @@ export class SyncService {
           writes.set(path, Buffer.from(content, 'utf8'));
         }
       }
-      return await this.git.createTreeFromCommitWithChanges({
+      return await this.git.createTreeFromTreeWithChanges({
         vaultId: conflict.vault_id,
-        sourceCommit: conflict.expected_main,
+        sourceTree,
         writes,
         deletes
       });
     }
 
     throw new AuthError(400, 'invalid_resolution', 'Unsupported conflict resolution kind.');
+  }
+
+  private async resolutionSourceTree(conflict: ConflictRecord): Promise<string> {
+    if (conflict.affected_paths.length === 0 || !(await this.git.commitExists(conflict.vault_id, conflict.base_commit))) {
+      return await this.git.treeHash(conflict.vault_id, conflict.expected_main);
+    }
+    const deviceChanges = await this.git.changedPaths(conflict.vault_id, conflict.base_commit, conflict.device_commit);
+    const nonConflictingDeviceChanges = changesOutsideAffectedPaths(deviceChanges, conflict.affected_paths);
+    if (nonConflictingDeviceChanges.length === 0) {
+      return await this.git.treeHash(conflict.vault_id, conflict.expected_main);
+    }
+    return await this.git.createTreeFromCommitWithOverlayChanges({
+      vaultId: conflict.vault_id,
+      sourceCommit: conflict.expected_main,
+      deviceCommit: conflict.device_commit,
+      deviceChanges: nonConflictingDeviceChanges
+    });
   }
 
   private async tryCleanOverlappingMerge(
@@ -1546,6 +1564,13 @@ function changedPathSet(entries: GitDiffEntry[]): Set<string> {
     }
   }
   return paths;
+}
+
+function changesOutsideAffectedPaths(entries: GitDiffEntry[], affectedPaths: string[]): GitDiffEntry[] {
+  return entries.filter((entry) => {
+    const entryPaths = entry.oldPath ? [entry.path, entry.oldPath] : [entry.path];
+    return !entryPaths.some((entryPath) => affectedPaths.some((affectedPath) => changedPathsConflict(entryPath, affectedPath)));
+  });
 }
 
 function hasDestructiveChanges(entries: GitDiffEntry[]): boolean {
