@@ -6,7 +6,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 
 const API_VERSION = "2026-07-02.full-sync";
-const PLUGIN_VERSION = "0.1.6-phase2";
+const PLUGIN_VERSION = "0.1.7-phase2";
 const WINDOWS_RESERVED = new Set(["con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"]);
 const SYNC_DEBOUNCE_MS = 1500;
 const BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000;
@@ -311,6 +311,10 @@ class ObtsObsidianClient {
         last_error_code: null,
         updated_at: nowIso()
       }));
+      return;
+    }
+    if (journal && await this.recoverBlockedApplyWithPreservedLocalChanges(journal, state)) {
+      await this.writeQueue(await this.readQueue());
       return;
     }
     if (journal && await this.recoverIncompleteApplyJournal(journal, state)) {
@@ -711,7 +715,7 @@ class ObtsObsidianClient {
         }
         try {
           const applied = await this.pullAndApply(true);
-          const refreshed = await this.readState();
+          const refreshed = await this.uploadAutoPreservedChanges(applied);
           return { applied, status: refreshed.status_label };
         } catch (pullError) {
           if (wasConflictBlocked && pullError instanceof ObtsTransportError && pullError.code === "device_blocked") {
@@ -749,8 +753,18 @@ class ObtsObsidianClient {
       }));
     }
     const applied = await this.pullAndApply(true);
-    const finalState = await this.readState();
+    const finalState = await this.uploadAutoPreservedChanges(applied);
     return { applied, status: finalState.status_label };
+  }
+
+  async uploadAutoPreservedChanges(applied) {
+    let state = await this.readState();
+    const queue = await this.readQueue();
+    if (applied && queue.status === "queued_local" && queue.pending_commit && state.last_error_code === null) {
+      await this.syncOnce({ confirmInitialImport: false });
+      state = await this.readState();
+    }
+    return state;
   }
 
   async unpairCurrentDevice() {
@@ -915,13 +929,18 @@ class ObtsObsidianClient {
       journal.phase = "verifying";
       journal.last_completed_step = "files_written";
       await writeJson(this.applyJournalPath, journal);
+      let preservedLocalChangePaths = [];
       if (requireCleanVisibleState) {
         await this.flushEditorBuffersToDisk();
-        if (!(await this.localContentMatchesTree(await this.scanSyncableFiles(), targetMain))) {
+        preservedLocalChangePaths = await this.classifySafeResidualLocalChanges(state, journal, targetMain);
+        if (preservedLocalChangePaths.length === 0 && !(await this.localContentMatchesTree(await this.scanSyncableFiles(), targetMain))) {
           journal.phase = "blocked_recovery";
           journal.redacted_error_category = "local_changed_during_apply";
           await writeJson(this.applyJournalPath, journal);
           await this.block("unsafe_local_state", "Local content changed during apply; server state was not acknowledged.");
+        }
+        if (preservedLocalChangePaths.length > 0) {
+          await this.createRecoveryBundle("rebuild_from_server", targetMain, preservedLocalChangePaths);
         }
       }
       await this.updateRef("refs/heads/main", targetMain, null, true);
@@ -937,6 +956,50 @@ class ObtsObsidianClient {
         updated_at: nowIso()
       }));
       await this.clearApplyState();
+      if (preservedLocalChangePaths.length > 0) {
+        await this.queuePreservedLocalChanges(targetMain, state.server_device_ref);
+      }
+    } finally {
+      this.plugin.isApplying = false;
+      await fsp.rm(this.applyLockPath, { force: true });
+    }
+  }
+
+  async recoverBlockedApplyWithPreservedLocalChanges(journal, state) {
+    if (journal.phase !== "blocked_recovery" || journal.redacted_error_category !== "local_changed_during_apply" || !(await this.commitExists(journal.target_main))) {
+      return false;
+    }
+    const targetFiles = new Set(await this.listTreeFiles(journal.target_main));
+    if (!(await this.affectedApplyPathsMatchTarget(journal, targetFiles))) {
+      return false;
+    }
+    const preservedLocalChangePaths = await this.classifySafeResidualLocalChanges(state, journal, journal.target_main);
+    if (preservedLocalChangePaths.length === 0) {
+      return false;
+    }
+    try {
+      await fsp.rm(this.applyLockPath, { force: true });
+      await this.acquireApplyLock(journal.apply_id);
+      this.plugin.isApplying = true;
+      await this.createRecoveryBundle("rebuild_from_server", journal.target_main, preservedLocalChangePaths);
+      await this.updateRef("refs/heads/main", journal.target_main, null, true);
+      await this.updateRef("refs/heads/local", journal.target_main, null, true);
+      journal.phase = "committed";
+      journal.last_completed_step = "refs_updated";
+      journal.redacted_error_category = null;
+      await writeJson(this.applyJournalPath, journal);
+      await this.writeState(Object.assign({}, state, {
+        local_main: journal.target_main,
+        local_head: journal.target_main,
+        status_label: "Synced",
+        last_error_code: null,
+        updated_at: nowIso()
+      }));
+      await this.clearApplyState();
+      await this.queuePreservedLocalChanges(journal.target_main, state.server_device_ref);
+      return true;
+    } catch {
+      return false;
     } finally {
       this.plugin.isApplying = false;
       await fsp.rm(this.applyLockPath, { force: true });
@@ -988,6 +1051,74 @@ class ObtsObsidianClient {
       this.plugin.isApplying = false;
       await fsp.rm(this.applyLockPath, { force: true });
     }
+  }
+
+  async affectedApplyPathsMatchTarget(journal, targetFiles) {
+    for (const filePath of journal.affected_paths) {
+      const currentHash = await this.adapterSha256(filePath);
+      const targetContent = targetFiles.has(filePath) ? await this.readBlob(journal.target_main, filePath) : null;
+      const targetHash = targetContent === null ? null : sha256(targetContent);
+      if (currentHash !== targetHash) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  async classifySafeResidualLocalChanges(state, journal, targetMain) {
+    if (await this.localContentMatchesTree(await this.scanSyncableFiles(), targetMain)) {
+      return [];
+    }
+    const queue = await this.readQueue();
+    const pendingCommit = queue.status === "conflicted" ? queue.pending_commit : null;
+    if (!pendingCommit || !(await this.commitExists(pendingCommit))) {
+      return [];
+    }
+    const localFiles = new Set(await this.scanSyncableFiles());
+    const targetFiles = new Set(await this.listTreeFiles(targetMain));
+    const candidatePaths = Array.from(new Set([...localFiles, ...targetFiles])).sort();
+    const preservedPaths = [];
+    for (const filePath of candidatePaths) {
+      const localContent = localFiles.has(filePath) ? await this.adapterReadBinary(filePath) : null;
+      const targetContent = targetFiles.has(filePath) ? await this.readBlob(targetMain, filePath) : null;
+      if (buffersEqual(localContent, targetContent)) {
+        continue;
+      }
+      if (journal.affected_paths.some((affectedPath) => changedPathsConflict(filePath, affectedPath))) {
+        return [];
+      }
+      const pendingContent = await this.readBlobIfPresent(pendingCommit, filePath);
+      if (!buffersEqual(localContent, pendingContent)) {
+        return [];
+      }
+      const priorContent = state.local_main ? await this.readBlobIfPresent(state.local_main, filePath) : null;
+      if (buffersEqual(pendingContent, priorContent)) {
+        return [];
+      }
+      preservedPaths.push(filePath);
+    }
+    return preservedPaths;
+  }
+
+  async queuePreservedLocalChanges(targetMain, expectedDeviceRef) {
+    const preservedCommit = await this.createLocalCommit("obts: preserve local changes after conflict resolution");
+    if (!preservedCommit) {
+      return;
+    }
+    await this.writeQueue({
+      pending_commit: preservedCommit,
+      expected_device_ref: expectedDeviceRef,
+      status: "queued_local",
+      attempts: 0,
+      updated_at: nowIso()
+    });
+    await this.writeState(Object.assign({}, await this.readState(), {
+      local_main: targetMain,
+      local_head: preservedCommit,
+      status_label: "Ahead",
+      last_error_code: null,
+      updated_at: nowIso()
+    }));
   }
 
   async applyJournalMatchesCurrentFiles(journal, targetFiles) {
@@ -1262,6 +1393,14 @@ class ObtsObsidianClient {
 
   async readBlob(commit, filePath) {
     return await this.gitBuffer(["show", `${commit}:${filePath}`], undefined, { maxBuffer: 512 * 1024 * 1024 });
+  }
+
+  async readBlobIfPresent(commit, filePath) {
+    try {
+      return await this.readBlob(commit, filePath);
+    } catch {
+      return null;
+    }
   }
 
   async getDeviceSelf(token) {
@@ -2393,6 +2532,17 @@ function chunks(items, size) {
     result.push(items.slice(index, index + size));
   }
   return result;
+}
+
+function buffersEqual(left, right) {
+  if (left === null || right === null) {
+    return left === right;
+  }
+  return Buffer.compare(left, right) === 0;
+}
+
+function changedPathsConflict(left, right) {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
 }
 
 function blockStatusLabel(code) {

@@ -9,7 +9,7 @@ import { LocalGitEngine } from './localGit.js';
 import { ApplyLockActiveError, type ApplyJournal, RecoveryManager, sha256File } from './recovery.js';
 import { TransportClient, TransportError } from './transport.js';
 
-const PLUGIN_VERSION = '0.1.6-phase2';
+const PLUGIN_VERSION = '0.1.7-phase2';
 
 export type ObtsPluginSettings = {
   serverUrl: string;
@@ -102,6 +102,10 @@ export class ObtsPluginClient {
       });
       await this.recovery.clearApplyLock();
       await this.recovery.clearApplyJournal();
+      await this.writeQueue(await this.readQueue());
+      return;
+    }
+    if (journal && (await this.recoverBlockedApplyWithPreservedLocalChanges(journal, state))) {
       await this.writeQueue(await this.readQueue());
       return;
     }
@@ -611,7 +615,7 @@ export class ObtsPluginClient {
         }
         try {
           const applied = await this.pullAndApply({ allowDestructive: true });
-          const refreshed = await this.readState();
+          const refreshed = await this.uploadAutoPreservedChanges(applied);
           return { applied, status: refreshed.status_label };
         } catch (pullError) {
           if (wasConflictBlocked && pullError instanceof TransportError && pullError.code === 'device_blocked') {
@@ -656,8 +660,18 @@ export class ObtsPluginClient {
       });
     }
     const applied = await this.pullAndApply({ allowDestructive: true });
-    const finalState = await this.readState();
+    const finalState = await this.uploadAutoPreservedChanges(applied);
     return { applied, status: finalState.status_label };
+  }
+
+  private async uploadAutoPreservedChanges(applied: boolean): Promise<LocalPluginState> {
+    let state = await this.readState();
+    const queue = await this.readQueue();
+    if (applied && queue.status === 'queued_local' && queue.pending_commit && state.last_error_code === null) {
+      await this.syncOnce();
+      state = await this.readState();
+    }
+    return state;
   }
 
   async unpairCurrentDevice(): Promise<{ status: string }> {
@@ -938,13 +952,18 @@ export class ObtsPluginClient {
       journal.phase = 'verifying';
       journal.last_completed_step = 'files_written';
       await this.recovery.writeApplyJournal(journal);
+      let preservedLocalChangePaths: string[] = [];
       if (options.requireCleanVisibleState) {
         await this.flushEditorBuffersToDisk();
-        if (!(await this.localContentMatchesTree(await this.git.scanSyncableFiles(), targetMain))) {
+        preservedLocalChangePaths = await this.classifySafeResidualLocalChanges(state, journal, targetMain);
+        if (preservedLocalChangePaths.length === 0 && !(await this.localContentMatchesTree(await this.git.scanSyncableFiles(), targetMain))) {
           journal.phase = 'blocked_recovery';
           journal.redacted_error_category = 'local_changed_during_apply';
           await this.recovery.writeApplyJournal(journal);
           await this.block('unsafe_local_state', 'Local content changed during apply; server state was not acknowledged.');
+        }
+        if (preservedLocalChangePaths.length > 0) {
+          await this.createLocalRecoveryBundle('rebuild_from_server', targetMain, preservedLocalChangePaths);
         }
       }
       await this.git.setLocalMain(targetMain);
@@ -961,6 +980,58 @@ export class ObtsPluginClient {
         updated_at: nowIso()
       });
       await this.recovery.clearApplyJournal();
+      if (preservedLocalChangePaths.length > 0) {
+        await this.queuePreservedLocalChanges(targetMain, state.server_device_ref);
+      }
+    } finally {
+      if (releaseApplyLock) {
+        await releaseApplyLock();
+      }
+    }
+  }
+
+  private async recoverBlockedApplyWithPreservedLocalChanges(journal: ApplyJournal, state: LocalPluginState): Promise<boolean> {
+    if (
+      journal.phase !== 'blocked_recovery' ||
+      journal.redacted_error_category !== 'local_changed_during_apply' ||
+      !(await this.git.commitExists(journal.target_main))
+    ) {
+      return false;
+    }
+
+    const targetFiles = new Set(await this.materializedTreeFiles(journal.target_main));
+    if (!(await this.affectedApplyPathsMatchTarget(journal, targetFiles))) {
+      return false;
+    }
+    const preservedLocalChangePaths = await this.classifySafeResidualLocalChanges(state, journal, journal.target_main);
+    if (preservedLocalChangePaths.length === 0) {
+      return false;
+    }
+
+    let releaseApplyLock: (() => Promise<void>) | null = null;
+    try {
+      await this.recovery.clearApplyLock();
+      releaseApplyLock = await this.recovery.acquireApplyLock(journal.apply_id);
+      await this.createLocalRecoveryBundle('rebuild_from_server', journal.target_main, preservedLocalChangePaths);
+      await this.git.setLocalMain(journal.target_main);
+      await this.git.setLocalHead(journal.target_main);
+      journal.phase = 'committed';
+      journal.last_completed_step = 'refs_updated';
+      journal.redacted_error_category = null;
+      await this.recovery.writeApplyJournal(journal);
+      await this.writeState({
+        ...state,
+        local_main: journal.target_main,
+        local_head: journal.target_main,
+        status_label: 'Synced',
+        last_error_code: null,
+        updated_at: nowIso()
+      });
+      await this.recovery.clearApplyJournal();
+      await this.queuePreservedLocalChanges(journal.target_main, state.server_device_ref);
+      return true;
+    } catch {
+      return false;
     } finally {
       if (releaseApplyLock) {
         await releaseApplyLock();
@@ -1033,6 +1104,79 @@ export class ObtsPluginClient {
         await releaseApplyLock();
       }
     }
+  }
+
+  private async affectedApplyPathsMatchTarget(journal: ApplyJournal, targetFiles: Set<string>): Promise<boolean> {
+    for (const path of journal.affected_paths) {
+      const currentHash = await sha256File(join(this.vaultDir, path));
+      const targetContent = targetFiles.has(path) ? await this.git.readBlob(journal.target_main, path) : null;
+      const targetHash = targetContent === null ? null : sha256(targetContent);
+      if (currentHash !== targetHash) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private async classifySafeResidualLocalChanges(
+    state: LocalPluginState,
+    journal: ApplyJournal,
+    targetMain: string
+  ): Promise<string[]> {
+    if (!(await this.localContentMatchesTree(await this.git.scanSyncableFiles(), targetMain))) {
+      const queue = await this.readQueue();
+      const pendingCommit = queue.status === 'conflicted' ? queue.pending_commit : null;
+      if (!pendingCommit || !(await this.git.commitExists(pendingCommit))) {
+        return [];
+      }
+      const localFiles = new Set(await this.git.scanSyncableFiles());
+      const targetFiles = new Set(await this.materializedTreeFiles(targetMain));
+      const candidatePaths = [...new Set([...localFiles, ...targetFiles])].sort();
+      const preservedPaths: string[] = [];
+      for (const path of candidatePaths) {
+        const localContent = localFiles.has(path) ? await readFile(join(this.vaultDir, path)) : null;
+        const targetContent = targetFiles.has(path) ? await this.git.readBlob(targetMain, path) : null;
+        if (buffersEqual(localContent, targetContent)) {
+          continue;
+        }
+        if (journal.affected_paths.some((affectedPath) => changedPathsConflict(path, affectedPath))) {
+          return [];
+        }
+        const pendingContent = await this.git.readBlob(pendingCommit, path);
+        if (!buffersEqual(localContent, pendingContent)) {
+          return [];
+        }
+        const priorContent = state.local_main ? await this.git.readBlob(state.local_main, path) : null;
+        if (buffersEqual(pendingContent, priorContent)) {
+          return [];
+        }
+        preservedPaths.push(path);
+      }
+      return preservedPaths;
+    }
+    return [];
+  }
+
+  private async queuePreservedLocalChanges(targetMain: string, expectedDeviceRef: string | null): Promise<void> {
+    const preservedCommit = await this.git.createLocalCommit('obts: preserve local changes after conflict resolution');
+    if (!preservedCommit) {
+      return;
+    }
+    await this.writeQueue({
+      pending_commit: preservedCommit,
+      expected_device_ref: expectedDeviceRef,
+      status: 'queued_local',
+      attempts: 0,
+      updated_at: nowIso()
+    });
+    await this.writeState({
+      ...(await this.readState()),
+      local_main: targetMain,
+      local_head: preservedCommit,
+      status_label: 'Ahead',
+      last_error_code: null,
+      updated_at: nowIso()
+    });
   }
 
   private async applyJournalMatchesCurrentFiles(journal: ApplyJournal, targetFiles: Set<string>): Promise<boolean> {
@@ -1600,6 +1744,17 @@ export class ObtsPluginClient {
 
 function sha256(data: Buffer): string {
   return createHash('sha256').update(data).digest('hex');
+}
+
+function buffersEqual(left: Buffer | null, right: Buffer | null): boolean {
+  if (left === null || right === null) {
+    return left === right;
+  }
+  return left.equals(right);
+}
+
+function changedPathsConflict(left: string, right: string): boolean {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
 }
 
 function blockStatusLabel(code: string): string {

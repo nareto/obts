@@ -210,6 +210,79 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(await readFile(join(readerDir, 'device-only.md'), 'utf8')).toBe('created while resolving another note\n');
   });
 
+  it('auto-preserves safe local-only changes from a legacy server-only conflict resolution', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'desktop-legacy-server-resolution');
+    const tabletDir = join(root, 'tablet-legacy-server-resolution');
+    const readerDir = join(root, 'reader-legacy-server-resolution');
+    await mkdir(desktopDir, { recursive: true });
+    await mkdir(tabletDir, { recursive: true });
+    await mkdir(readerDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await writeFile(join(desktopDir, 'shared.md'), 'base\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const tablet = await pairPlugin(admin, tabletDir, 'tablet');
+    await writeFile(join(desktopDir, 'shared.md'), 'server version\n');
+    await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
+    await writeFile(join(tabletDir, 'device-only.md'), 'created while the conflict was open\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const result = await tablet.syncOnce();
+    expect(result.status).toBe('Review needed');
+    const conflictedState = await tablet.readState();
+
+    const resolutionCommit = await forceLegacyKeepServerResolution(server, admin.vaultId, result.conflictId!);
+    await importServerMainIntoClient(tablet, tabletDir, admin.vaultId, conflictedState.device_id!, conflictedState.local_main);
+    await writeFile(join(tabletDir, 'shared.md'), 'server version\n');
+    await writeFile(
+      join(tabletDir, '.obts', 'apply-journal.json'),
+      `${JSON.stringify(
+        {
+          apply_id: 'apply_legacy_server_only_resolution',
+          operation_type: 'pull_apply',
+          target_main: resolutionCommit,
+          expected_prior_local_main: conflictedState.local_main,
+          expected_prior_local_device_ref: conflictedState.server_device_ref,
+          phase: 'blocked_recovery',
+          affected_paths: ['shared.md'],
+          preflight_sha256: { 'shared.md': null },
+          recovery_bundle_id: 'rec_legacy_server_only_resolution',
+          last_completed_step: 'files_written',
+          redacted_error_category: 'local_changed_during_apply'
+        },
+        null,
+        2
+      )}\n`
+    );
+    await writeFile(
+      join(tabletDir, '.obts', 'state.json'),
+      `${JSON.stringify(
+        {
+          ...conflictedState,
+          status_label: 'Unsafe local state',
+          last_error_code: 'unsafe_local_state',
+          updated_at: new Date().toISOString()
+        },
+        null,
+        2
+      )}\n`
+    );
+
+    const restartedTablet = new ObtsPluginClient(tabletDir, {
+      serverUrl: admin.baseUrl,
+      deviceName: 'tablet'
+    });
+    await restartedTablet.initialize();
+    expect(await readFile(join(tabletDir, 'device-only.md'), 'utf8')).toBe('created while the conflict was open\n');
+    expect(await readFile(join(tabletDir, 'shared.md'), 'utf8')).toBe('server version\n');
+    expect(await restartedTablet.readQueue()).toMatchObject({ status: 'queued_local' });
+    expect((await restartedTablet.readState()).status_label).toBe('Ahead');
+
+    expect((await restartedTablet.syncOnce()).status).toBe('Synced');
+    const reader = await pairPlugin(admin, readerDir, 'reader');
+    expect(await readFile(join(readerDir, 'device-only.md'), 'utf8')).toBe('created while the conflict was open\n');
+  });
+
   it('resolves with the device version without discarding unrelated server-side changes', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const desktopDir = join(root, 'desktop-device-resolution');
@@ -816,6 +889,106 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(await server.git.readBlobAtPathIfPresent(admin.vaultId, restored.body.restore_commit, 'old-name.md')).toBeNull();
   });
 });
+
+async function forceLegacyKeepServerResolution(server: ObtsServer, vaultId: string, conflictId: string): Promise<string> {
+  const snapshot = await server.store.snapshot();
+  const conflict = snapshot.conflicts.find((candidate) => candidate.vault_id === vaultId && candidate.conflict_id === conflictId);
+  if (!conflict) {
+    throw new Error(`Conflict not found: ${conflictId}`);
+  }
+  const tree = await server.git.treeHash(vaultId, conflict.expected_main);
+  const resolutionCommit = await server.git.createResolutionMergeCommitObject({
+    vaultId,
+    tree,
+    expectedMain: conflict.expected_main,
+    deviceCommit: conflict.device_commit,
+    conflictId,
+    resolutionKind: 'keep_server'
+  });
+  await server.git.updateRef(vaultId, 'refs/heads/main', resolutionCommit, conflict.expected_main);
+  await server.store.mutate((db) => {
+    const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
+    const mutableConflict = db.conflicts.find((candidate) => candidate.vault_id === vaultId && candidate.conflict_id === conflictId);
+    if (!vault || !mutableConflict) {
+      throw new Error(`Conflict not found: ${conflictId}`);
+    }
+    const device = db.devices.find((candidate) => candidate.device_id === mutableConflict.device_id);
+    const timestamp = new Date().toISOString();
+    vault.current_main = resolutionCommit;
+    vault.updated_at = timestamp;
+    mutableConflict.status = 'resolved';
+    mutableConflict.resolved_at = timestamp;
+    mutableConflict.resolution_kind = 'keep_server';
+    mutableConflict.resolution_commit = resolutionCommit;
+    if (device && device.status !== 'revoked') {
+      device.status = 'synced';
+      device.last_successful_sync_at = timestamp;
+    }
+    server.store.appendEvent(db, {
+      event_type: 'main_advanced',
+      vault_id: vaultId,
+      resource_ids: {
+        conflict_id: conflictId,
+        device_id: mutableConflict.device_id
+      },
+      commit_cursors: {
+        previous_main: conflict.expected_main,
+        main: resolutionCommit,
+        device_commit: mutableConflict.device_commit
+      },
+      payload: {
+        decision: 'resolved',
+        conflict_id: conflictId,
+        resolution_kind: 'keep_server'
+      }
+    });
+    server.store.appendEvent(db, {
+      event_type: 'conflict_resolved',
+      vault_id: vaultId,
+      resource_ids: {
+        conflict_id: conflictId,
+        device_id: mutableConflict.device_id
+      },
+      commit_cursors: {
+        main: resolutionCommit,
+        previous_main: conflict.expected_main,
+        device_commit: mutableConflict.device_commit
+      },
+      payload: {
+        resolution_kind: 'keep_server'
+      }
+    });
+  });
+  return resolutionCommit;
+}
+
+async function importServerMainIntoClient(
+  client: ObtsPluginClient,
+  vaultDir: string,
+  vaultId: string,
+  deviceId: string,
+  currentLocalMain: string | null
+): Promise<void> {
+  const token = JSON.parse(await readFile(join(vaultDir, '.obts', 'auth', 'device-token.json'), 'utf8')) as { device_token: string };
+  const internals = client as unknown as {
+    transport: {
+      pull(input: {
+        vaultId: string;
+        deviceId: string;
+        deviceToken: string;
+        currentLocalMain: string | null;
+      }): Promise<{ packfile: Buffer }>;
+    };
+    git: { importPack(packfile: Buffer): Promise<void> };
+  };
+  const pulled = await internals.transport.pull({
+    vaultId,
+    deviceId,
+    deviceToken: token.device_token,
+    currentLocalMain
+  });
+  await internals.git.importPack(pulled.packfile);
+}
 
 async function setupAdminAndVault(baseUrl: string, username = 'admin', vaultName = 'Main Vault'): Promise<BrowserSession> {
   const admin = new BrowserSession(baseUrl);

@@ -242,13 +242,15 @@ Behavior:
 8. Server accepts the resolution only if current `main` still matches the expected commit.
 9. If `main` advanced, the review package is marked stale and the dashboard must refresh or regenerate it before resolution.
 10. Server writes the accepted resolution as a merge commit. Parent 1 is `expected_main`, parent 2 is the conflicted device commit, and the resulting tree is exactly the accepted final state.
-11. Server persists updated Git state, advances `main` to the resolution merge commit, and marks the conflict resolved.
+11. Conflict choices apply only to the affected review paths. Non-conflicting additions, edits, and deletes from the conflicted device commit are preserved in the accepted final state unless they are explicitly included in the reviewed conflict paths.
+12. Server persists updated Git state, advances `main` to the resolution merge commit, and marks the conflict resolved.
 
 Acceptance criteria:
 
 - Unauthorized users cannot list, view, or resolve conflicts for another vault.
 - Resolution commits are merge commits that reference the conflict they resolved.
-- Accepting current `main` creates a same-tree merge commit with parent 1 set to `expected_main` and parent 2 set to the conflicted device commit.
+- Accepting current `main` keeps the server version only for affected review paths and preserves non-conflicting device-side changes from the same device commit.
+- When there are no non-conflicting device-side changes to preserve, accepting current `main` creates a same-tree merge commit with parent 1 set to `expected_main` and parent 2 set to the conflicted device commit.
 - Duplicate submission of the same accepted resolution is idempotent.
 - All clients receive a `main_advanced` event after resolution.
 - Conflict resolution submission requires dashboard re-authentication within the previous 15 minutes.
@@ -576,6 +578,7 @@ Behavior:
 6. Plugin applies server state to local vault.
 7. Plugin classifies preserved local state before resuming sync:
    - pending fast-forward local commits whose ancestry descends from the current server device ref remain queued and are uploaded normally after rebuild;
+   - local visible differences that are provably outside the resolved conflict paths and match this device's pending conflicted commit are automatically snapshotted into a recovery bundle, recommitted on top of current server `main`, and uploaded through the normal device ref path;
    - uncommitted or snapshot-only local edits become one new local recovery commit based on the rebuilt local `main`, then enter the normal upload queue;
    - divergent same-device history that does not descend from the current server device ref remains only in the recovery bundle, the device enters `blocked_recovery`, and normal sync stays blocked until the owner exports the bundle and resets or re-pairs the device.
 
@@ -586,7 +589,8 @@ Acceptance criteria:
 - Filesystem edits made while metadata was missing become local Git commits and are uploaded to the server device ref before any destructive pull/apply.
 - Device identity, actor device ref, and proposal merge base remain separate; a device may use a trusted vault commit as `base_commit` but never adopts another device's ref as its own cursor.
 - Recovery bundles are available before destructive apply or rebuild operations.
-- Recovery can distinguish repeated commits, new commits, and divergent same-device history using Git ancestry.
+- Recovery can distinguish repeated commits, new commits, divergent same-device history, and tree/content differences caused by prior conflict resolutions; ancestry alone is not sufficient when deciding whether visible local content was preserved.
+- Recovery automatically resumes after a resolved conflict when all remaining visible local differences are outside the reviewed conflict paths and match this device's pending conflicted commit.
 - Recovery never uploads same-device divergent history through a non-fast-forward device ref update.
 
 ## 4. Technical Design
