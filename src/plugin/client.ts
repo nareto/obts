@@ -1030,7 +1030,10 @@ export class ObtsPluginClient {
       await this.recovery.clearApplyJournal();
       await this.queuePreservedLocalChanges(journal.target_main, state.server_device_ref);
       return true;
-    } catch {
+    } catch (error) {
+      journal.redacted_error_category = categorizeRecoveryError(error);
+      journal.last_completed_step = journal.last_completed_step ?? 'recovery_bundle';
+      await this.recovery.writeApplyJournal(journal);
       return false;
     } finally {
       if (releaseApplyLock) {
@@ -1040,13 +1043,19 @@ export class ObtsPluginClient {
   }
 
   private async recoverIncompleteApplyJournal(journal: ApplyJournal, state: LocalPluginState): Promise<boolean> {
-    if (journal.phase === 'blocked_recovery' || !(await this.git.commitExists(journal.target_main))) {
+    if (journal.phase === 'blocked_recovery' && journal.redacted_error_category === 'local_changed_during_apply') {
+      return false;
+    }
+    if (!(await this.git.commitExists(journal.target_main))) {
       return false;
     }
 
     const targetFiles = new Set(await this.materializedTreeFiles(journal.target_main));
-    const canReplayFromCurrentState = await this.applyJournalMatchesCurrentFiles(journal, targetFiles);
-    if (!canReplayFromCurrentState) {
+    if (!(await this.applyJournalMatchesCurrentFiles(journal, targetFiles))) {
+      journal.phase = 'blocked_recovery';
+      journal.redacted_error_category = 'local_files_diverge_from_journal';
+      journal.last_completed_step = journal.last_completed_step ?? 'recovery_bundle';
+      await this.recovery.writeApplyJournal(journal);
       return false;
     }
 
@@ -1097,7 +1106,10 @@ export class ObtsPluginClient {
       });
       await this.recovery.clearApplyJournal();
       return true;
-    } catch {
+    } catch (error) {
+      journal.redacted_error_category = categorizeRecoveryError(error);
+      journal.last_completed_step = journal.last_completed_step ?? 'recovery_bundle';
+      await this.recovery.writeApplyJournal(journal);
       return false;
     } finally {
       if (releaseApplyLock) {
@@ -1893,6 +1905,28 @@ async function exists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+function categorizeRecoveryError(error: unknown): string {
+  if (error instanceof ApplyLockActiveError) {
+    return 'apply_lock_active';
+  }
+  if (error instanceof PluginBlockedError) {
+    return error.code === 'unsafe_local_state' ? 'preflight_hash_changed' : error.code;
+  }
+  if (error instanceof Error) {
+    const message = error.message;
+    if (message.includes('git ') && (message.includes('show') || message.includes('cat-file'))) {
+      return 'blob_read_failed';
+    }
+    if (message.includes('ENOENT') || message.includes('EACCES') || message.includes('EPERM')) {
+      return 'adapter_io_failed';
+    }
+    if (message.includes('EEXIST')) {
+      return 'apply_lock_active';
+    }
+  }
+  return 'recovery_unexpected_error';
 }
 
 async function writeJson(path: string, value: unknown): Promise<void> {

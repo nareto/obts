@@ -998,7 +998,10 @@ class ObtsObsidianClient {
       await this.clearApplyState();
       await this.queuePreservedLocalChanges(journal.target_main, state.server_device_ref);
       return true;
-    } catch {
+    } catch (error) {
+      journal.redacted_error_category = categorizeRecoveryError(error);
+      journal.last_completed_step = journal.last_completed_step || "recovery_bundle";
+      await writeJson(this.applyJournalPath, journal);
       return false;
     } finally {
       this.plugin.isApplying = false;
@@ -1007,11 +1010,18 @@ class ObtsObsidianClient {
   }
 
   async recoverIncompleteApplyJournal(journal, state) {
-    if (journal.phase === "blocked_recovery" || !(await this.commitExists(journal.target_main))) {
+    if (journal.phase === "blocked_recovery" && journal.redacted_error_category === "local_changed_during_apply") {
+      return false;
+    }
+    if (!(await this.commitExists(journal.target_main))) {
       return false;
     }
     const targetFiles = new Set(await this.listTreeFiles(journal.target_main));
     if (!(await this.applyJournalMatchesCurrentFiles(journal, targetFiles))) {
+      journal.phase = "blocked_recovery";
+      journal.redacted_error_category = "local_files_diverge_from_journal";
+      journal.last_completed_step = journal.last_completed_step || "recovery_bundle";
+      await writeJson(this.applyJournalPath, journal);
       return false;
     }
     try {
@@ -1045,7 +1055,10 @@ class ObtsObsidianClient {
       }));
       await this.clearApplyState();
       return true;
-    } catch {
+    } catch (error) {
+      journal.redacted_error_category = categorizeRecoveryError(error);
+      journal.last_completed_step = journal.last_completed_step || "recovery_bundle";
+      await writeJson(this.applyJournalPath, journal);
       return false;
     } finally {
       this.plugin.isApplying = false;
@@ -1056,7 +1069,7 @@ class ObtsObsidianClient {
   async affectedApplyPathsMatchTarget(journal, targetFiles) {
     for (const filePath of journal.affected_paths) {
       const currentHash = await this.adapterSha256(filePath);
-      const targetContent = targetFiles.has(filePath) ? await this.readBlob(journal.target_main, filePath) : null;
+      const targetContent = targetFiles.has(filePath) ? await this.readBlobIfPresent(journal.target_main, filePath) : null;
       const targetHash = targetContent === null ? null : sha256(targetContent);
       if (currentHash !== targetHash) {
         return false;
@@ -1131,7 +1144,7 @@ class ObtsObsidianClient {
       if (journal.phase !== "writing_files" && journal.phase !== "verifying") {
         return false;
       }
-      const targetContent = targetFiles.has(filePath) ? await this.readBlob(journal.target_main, filePath) : null;
+      const targetContent = targetFiles.has(filePath) ? await this.readBlobIfPresent(journal.target_main, filePath) : null;
       const targetHash = targetContent === null ? null : sha256(targetContent);
       if (currentHash !== targetHash) {
         return false;
@@ -1157,13 +1170,15 @@ class ObtsObsidianClient {
       await this.adapterRemove(filePath);
     }
     for (const filePath of journal.affected_paths.filter((candidate) => targetFiles.has(candidate))) {
-      const content = await this.readBlob(journal.target_main, filePath);
-      await this.removeBlockingMaterializationPaths(filePath);
-      if (await this.adapterIsDirectory(filePath)) {
-        await assertRecoveredDescendants(filePath);
-        await this.adapterRemove(filePath);
+      const content = await this.readBlobIfPresent(journal.target_main, filePath);
+      if (content !== null) {
+        await this.removeBlockingMaterializationPaths(filePath);
+        if (await this.adapterIsDirectory(filePath)) {
+          await assertRecoveredDescendants(filePath);
+          await this.adapterRemove(filePath);
+        }
+        await this.adapterWriteBinary(filePath, content);
       }
-      await this.adapterWriteBinary(filePath, content);
     }
   }
 
@@ -1936,13 +1951,18 @@ class ObtsObsidianClient {
     const vault = this.plugin.app && this.plugin.app.vault;
     const existing = vault && typeof vault.getAbstractFileByPath === "function" ? vault.getAbstractFileByPath(filePath) : null;
     const arrayBuffer = toArrayBuffer(content);
-    if (existing && typeof vault.modifyBinary === "function" && !existing.children) {
-      await vault.modifyBinary(existing, arrayBuffer);
-      return;
-    }
-    if (!existing && typeof vault.createBinary === "function") {
-      await vault.createBinary(filePath, arrayBuffer);
-      return;
+    try {
+      if (existing && typeof vault.modifyBinary === "function" && !existing.children) {
+        await vault.modifyBinary(existing, arrayBuffer);
+        return;
+      }
+      if (!existing && typeof vault.createBinary === "function") {
+        await vault.createBinary(filePath, arrayBuffer);
+        return;
+      }
+    } catch {
+      // Vault API may reject writes to system paths such as .trash.
+      // Fall through to the raw adapter below.
     }
     await this.adapter.writeBinary(filePath, content);
   }
@@ -2586,6 +2606,39 @@ async function exists(filePath) {
   } catch {
     return false;
   }
+}
+
+function categorizeRecoveryError(error) {
+  if (error instanceof ObtsBlockedError) {
+    if (error.code === "unsafe_local_state") {
+      return "preflight_hash_changed";
+    }
+    if (error.code === "apply_lock_active") {
+      return "apply_lock_active";
+    }
+    return error.code;
+  }
+  if (error instanceof Error) {
+    const message = error.message;
+    if (message.includes("git ") && (message.includes("show") || message.includes("cat-file"))) {
+      return "blob_read_failed";
+    }
+    if (message.includes("ENOENT") || message.includes("EACCES") || message.includes("EPERM")) {
+      return "adapter_io_failed";
+    }
+    if (error.code === "EEXIST") {
+      return "apply_lock_active";
+    }
+    const code = typeof error.code === "string" ? error.code : "";
+    const name = error.constructor && error.constructor.name ? error.constructor.name : "";
+    if (code) {
+      return `unexpected_${code}`;
+    }
+    if (name && name !== "Error") {
+      return `unexpected_${name}`;
+    }
+  }
+  return "recovery_unexpected_error";
 }
 
 function sha256(data) {

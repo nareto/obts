@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { ObtsPluginClient } from '../src/plugin/client.js';
+import type { ApplyJournal } from '../src/plugin/recovery.js';
 import { createObtsServer, type ObtsServer } from '../src/server/app.js';
 
 type Json = Record<string, unknown>;
@@ -887,6 +888,129 @@ describe('Phase 2 dashboard conflict resolution', () => {
       'rename me\n'
     );
     expect(await server.git.readBlobAtPathIfPresent(admin.vaultId, restored.body.restore_commit, 'old-name.md')).toBeNull();
+  });
+
+  describe('apply journal recovery', () => {
+    it('recovers an incomplete apply journal when current files match preflight or target', async () => {
+      const admin = await setupAdminAndVault(baseUrl);
+      const vaultDir = join(root, 'recovery-success');
+      await mkdir(vaultDir, { recursive: true });
+      await writeFile(join(vaultDir, 'note.md'), 'initial content\n');
+      const plugin = await pairPlugin(admin, vaultDir, 'device-recovery');
+      const pairState = await plugin.readState();
+      await writeFile(
+        join(vaultDir, '.obts', 'state.json'),
+        JSON.stringify({ ...pairState, initial_import_confirmed: true }, null, 2)
+      );
+      const client1 = new ObtsPluginClient(vaultDir, {
+        serverUrl: admin.baseUrl,
+        deviceName: 'device-recovery'
+      });
+      expect((await client1.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+
+      const state = await client1.readState();
+      if (!state.vault_id || !state.device_id) throw new Error('missing identity');
+
+      await writeFile(join(vaultDir, 'note.md'), 'updated content\n');
+      const syncResult = await plugin.syncOnce();
+      expect(syncResult.status).toBe('Synced');
+      const afterState = await plugin.readState();
+
+      const journal: ApplyJournal = {
+        apply_id: 'apply_test_recovery',
+        operation_type: 'pull_apply',
+        target_main: afterState.local_main!,
+        expected_prior_local_main: state.local_main,
+        expected_prior_local_device_ref: state.server_device_ref,
+        phase: 'writing_files',
+        affected_paths: ['note.md'],
+        preflight_sha256: { 'note.md': null },
+        recovery_bundle_id: 'rec_test_recovery',
+        last_completed_step: 'recovery_bundle',
+        redacted_error_category: null
+      };
+      await writeFile(
+        join(vaultDir, '.obts', 'apply-journal.json'),
+        `${JSON.stringify(journal, null, 2)}\n`
+      );
+
+      const client = new ObtsPluginClient(vaultDir, {
+        serverUrl: admin.baseUrl,
+        deviceName: 'device-recovery'
+      });
+      await client.initialize();
+
+      const recoveredState = await client.readState();
+      expect(recoveredState.last_error_code).toBeNull();
+      expect(recoveredState.status_label).toBe('Synced');
+      expect(recoveredState.local_main).toBe(afterState.local_main);
+      await expect(
+        readFile(join(vaultDir, '.obts', 'apply-journal.json'), 'utf8')
+      ).rejects.toThrow();
+    });
+
+    it('fails recovery and writes error category when an affected file was externally modified', async () => {
+      const admin = await setupAdminAndVault(baseUrl);
+      const vaultDir = join(root, 'recovery-modified');
+      await mkdir(vaultDir, { recursive: true });
+      await writeFile(join(vaultDir, 'note.md'), 'initial content\n');
+      const plugin = await pairPlugin(admin, vaultDir, 'device-recovery-mod');
+      const pairState = await plugin.readState();
+      await writeFile(
+        join(vaultDir, '.obts', 'state.json'),
+        JSON.stringify({ ...pairState, initial_import_confirmed: true }, null, 2)
+      );
+      const client1 = new ObtsPluginClient(vaultDir, {
+        serverUrl: admin.baseUrl,
+        deviceName: 'device-recovery-mod'
+      });
+      expect((await client1.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+
+      const state = await client1.readState();
+      if (!state.vault_id || !state.device_id) throw new Error('missing identity');
+
+      await writeFile(join(vaultDir, 'note.md'), 'updated content\n');
+      await writeFile(join(vaultDir, 'other.md'), 'other content\n');
+      const syncResult = await plugin.syncOnce();
+      expect(syncResult.status).toBe('Synced');
+      const afterState = await plugin.readState();
+
+      const journal: ApplyJournal = {
+        apply_id: 'apply_test_recovery_modified',
+        operation_type: 'pull_apply',
+        target_main: afterState.local_main!,
+        expected_prior_local_main: state.local_main,
+        expected_prior_local_device_ref: state.server_device_ref,
+        phase: 'writing_files',
+        affected_paths: ['note.md', 'other.md'],
+        preflight_sha256: { 'note.md': null, 'other.md': null },
+        recovery_bundle_id: 'rec_test_recovery_modified',
+        last_completed_step: 'recovery_bundle',
+        redacted_error_category: null
+      };
+      await writeFile(
+        join(vaultDir, '.obts', 'apply-journal.json'),
+        `${JSON.stringify(journal, null, 2)}\n`
+      );
+
+      await writeFile(join(vaultDir, 'other.md'), 'externally modified content\n');
+
+      const client = new ObtsPluginClient(vaultDir, {
+        serverUrl: admin.baseUrl,
+        deviceName: 'device-recovery-mod'
+      });
+      await client.initialize();
+
+      const recoveredState = await client.readState();
+      expect(recoveredState.last_error_code).toBe('apply_journal_recovery_required');
+      expect(recoveredState.status_label).toBe('Unsafe local state');
+
+      const savedJournal = JSON.parse(
+        await readFile(join(vaultDir, '.obts', 'apply-journal.json'), 'utf8')
+      ) as ApplyJournal;
+      expect(savedJournal.phase).toBe('blocked_recovery');
+      expect(savedJournal.redacted_error_category).toBe('local_files_diverge_from_journal');
+    });
   });
 });
 
