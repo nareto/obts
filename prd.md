@@ -238,7 +238,7 @@ Behavior:
 4. Server returns conflict metadata and content needed for review over HTTPS.
 5. Dashboard displays rendered Markdown diff, source diff, affected paths, path/title variants for structural conflicts, and available merge choices.
 6. User accepts current `main`, accepts device version, keeps both, inserts both blocks, or manually edits a final result. For path/title conflicts such as rename-vs-rename, manual resolution includes the final vault path plus final file content, not only body text at existing affected paths.
-7. Dashboard verifies recent authentication and submits the selected resolution with the conflict ID and expected current `main`.
+7. Dashboard submits the selected resolution with the conflict ID, CSRF token, and expected current `main`; a normal authenticated session is sufficient.
 8. Server accepts the resolution only if current `main` still matches the expected commit.
 9. If `main` advanced, the review package is marked stale and the dashboard must refresh or regenerate it before resolution.
 10. Server writes the accepted resolution as a merge commit. Parent 1 is `expected_main`, parent 2 is the conflicted device commit, and the resulting tree is exactly the accepted final state.
@@ -254,7 +254,7 @@ Acceptance criteria:
 - When there are no non-conflicting device-side changes to preserve, accepting current `main` creates a same-tree merge commit with parent 1 set to `expected_main` and parent 2 set to the conflicted device commit.
 - Duplicate submission of the same accepted resolution is idempotent.
 - All clients receive a `main_advanced` event after resolution.
-- Conflict resolution submission requires dashboard re-authentication within the previous 15 minutes.
+- Conflict resolution submission requires a valid dashboard session and CSRF token, but does not require password re-authentication beyond the normal session.
 
 ### 3.8 Device Dashboard
 
@@ -496,8 +496,8 @@ Manual edit opens an editor below the diff area spanning the center region. If
 the review package is stale, show a blocking warning banner above the workbench,
 disable Submit resolution, and show Refresh review as the primary action.
 
-Submit resolution requires recent authentication when the session has not been
-reauthenticated within the required window.
+Submit resolution uses the current dashboard session and CSRF token; it must not
+interrupt review with a password re-authentication prompt.
 
 #### 3.9.8 History Page Wireframe
 
@@ -813,7 +813,7 @@ Auth requirements:
 - login attempts are rate-limited by account and source IP: 5 failed attempts in 10 minutes triggers exponential backoff starting at 1 minute and capped at 1 hour;
 - dashboard auth uses a server-side cookie session named `__Host-obts_session` with at least 128 bits of entropy, `HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/`, and no `Domain` attribute;
 - dashboard sessions have a 30-day absolute TTL and a 7-day idle TTL, refreshed on authenticated dashboard use;
-- sensitive dashboard operations require password re-authentication within the previous 15 minutes: pairing token creation, device revocation, conflict resolution submission, note restore, content-bearing recovery export, Git maintenance start, password change, and admin account management;
+- sensitive dashboard operations require password re-authentication within the previous 15 minutes: pairing token creation, device revocation, note restore, content-bearing recovery export, Git maintenance start, password change, and admin account management. Conflict resolution is protected by session auth, CSRF, stale-review checks, and audit logging, but does not require re-authentication;
 - logout and account/device revocation invalidate matching server-side sessions immediately;
 - cookie-authenticated mutation APIs require a CSRF token bound to the session and submitted in the `X-OBTS-CSRF` header;
 - dashboard bearer tokens are not supported in v1;
@@ -1303,7 +1303,7 @@ Included:
 - resolution choices for accepting current `main`, accepting the device
   version, keeping both, inserting both blocks, or manually editing the final
   result, including custom final title/path resolution for path conflicts;
-- recent-auth verification for resolution submission;
+- session-authenticated resolution submission without a password re-authentication prompt;
 - `expected_main` stale-review protection, idempotent duplicate submission
   handling, and resolution commits that descend from current `main`;
 - `conflict_resolved` and `main_advanced` events, client refresh after

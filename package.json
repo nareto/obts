@@ -1,6 +1,6 @@
 {
   "name": "obts",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "private": true,
   "type": "module",
   "description": "Obsidian True Sync deployable dashboard and conflict resolution implementation.",

@@ -447,7 +447,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(rendered).not.toContain('<script>');
   });
 
-  it('rejects stale, cross-user, and non-recent conflict resolution submissions', async () => {
+  it('rejects stale and cross-user conflict resolution submissions without requiring recent auth', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const desktopDir = join(root, 'desktop-stale');
     const tabletDir = join(root, 'tablet-stale');
@@ -509,26 +509,6 @@ describe('Phase 2 dashboard conflict resolution', () => {
       expect(session).toBeDefined();
       session!.recent_auth_at = new Date(Date.now() - 16 * 60 * 1000).toISOString();
     });
-    const oldMain = review.body.current_main;
-    const notRecent = await admin.post<{ error: { code: string } }>(
-      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
-      {
-        expected_main: review.body.expected_main,
-        resolution_kind: 'keep_server'
-      }
-    );
-    expect(notRecent.status).toBe(403);
-    expect(notRecent.body.error.code).toBe('recent_auth_required');
-    expect((await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(oldMain);
-
-    const previousCookie = admin.cookie;
-    const reauth = await admin.post<{ csrf_token: string; recent_auth_expires_at: string }>('/api/v1/auth/reauthenticate', {
-      username: 'admin',
-      password: 'admin-password-1234'
-    });
-    expect(reauth.status).toBe(200);
-    expect(admin.cookie).toBe(previousCookie);
-    expect(Date.parse(reauth.body.recent_auth_expires_at)).toBeGreaterThan(Date.now());
     await writeFile(join(desktopDir, 'unrelated.md'), 'accepted while review is open\n');
     expect((await desktop.syncOnce()).status).toBe('Synced');
     const stale = await admin.post<{ error: { code: string } }>(

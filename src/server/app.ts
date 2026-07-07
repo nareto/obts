@@ -577,7 +577,6 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   app.post('/api/v1/vaults/:vaultId/conflicts/:conflictId/resolve', async (request) => {
     const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
-    auth.requireRecentAuth(session.session);
     const { vaultId, conflictId } = vaultConflictPathParams(request);
     const db = await store.snapshot();
     ownedVaultOrThrow(db, session.user.user_id, vaultId);

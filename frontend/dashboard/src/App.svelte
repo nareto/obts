@@ -315,26 +315,24 @@
 
   async function submitResolution() {
     if (!vaultId || !review || review.stale) return;
-    withRecentAuth(async () => {
-      const hasTitleConflict = review!.path_conflicts.some(pathConflictHasTitleChange);
-      const manualFiles =
-        resolutionKind === 'manual' && !hasTitleConflict
-          ? Object.fromEntries(review!.files.map((file) => [file.path, manualTextByPath[file.path] ?? '']))
-          : undefined;
-      const manualFilePlan = resolutionKind === 'manual' && hasTitleConflict ? buildManualFilePlan(review!) : undefined;
-      await api.resolveConflict({
-        vaultId,
-        conflictId: review!.conflict.conflict_id,
-        expectedMain: review!.expected_main,
-        resolutionKind,
-        manualFiles,
-        manualFilePlan
-      });
-      notice = 'Conflict resolved.';
-      selectedConflictId = '';
-      review = null;
-      await refreshVault();
+    const hasTitleConflict = review.path_conflicts.some(pathConflictHasTitleChange);
+    const manualFiles =
+      resolutionKind === 'manual' && !hasTitleConflict
+        ? Object.fromEntries(review.files.map((file) => [file.path, manualTextByPath[file.path] ?? '']))
+        : undefined;
+    const manualFilePlan = resolutionKind === 'manual' && hasTitleConflict ? buildManualFilePlan(review) : undefined;
+    await api.resolveConflict({
+      vaultId,
+      conflictId: review.conflict.conflict_id,
+      expectedMain: review.expected_main,
+      resolutionKind,
+      manualFiles,
+      manualFilePlan
     });
+    notice = 'Conflict resolved.';
+    selectedConflictId = '';
+    review = null;
+    await refreshVault();
   }
 
   async function searchHistory() {
