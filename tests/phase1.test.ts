@@ -467,6 +467,98 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await server.git.listTreePaths(admin.vaultId, main!)).toContain('watched.md');
   });
 
+  it('syncs Obsidian-valid punctuation paths and large markdown directories', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const fixtureADir = join(root, 'fixtureA-punctuation-large');
+    const fixtureBDir = join(root, 'fixtureB-punctuation-large');
+    await mkdirp(fixtureADir);
+    await mkdirp(fixtureBDir);
+    const fixtureA = await pairPlugin(admin, fixtureADir, 'fixtureA');
+    const fixtureB = await pairPlugin(admin, fixtureBDir, 'fixtureB');
+
+    const punctuationPaths = [
+      'Notes/is there a way to have local claude code connect to docker on remote-host?.md',
+      'Notes/Projects/Vision -> Checklist.md'
+    ];
+    for (const filePath of punctuationPaths) {
+      await mkdirp(join(fixtureADir, filePath.split('/').slice(0, -1).join('/')));
+      await writeFile(join(fixtureADir, filePath), `${filePath}\n`);
+    }
+    await mkdirp(join(fixtureADir, 'bulk'));
+    for (let index = 0; index < 240; index += 1) {
+      await writeFile(join(fixtureADir, 'bulk', `note-${String(index).padStart(3, '0')}.md`), `bulk ${index}\n`);
+    }
+
+    expect((await fixtureA.syncOnce()).status).toBe('Synced');
+    expect((await fixtureB.syncOnce()).status).toBe('Synced');
+    for (const filePath of punctuationPaths) {
+      expect(await readFile(join(fixtureBDir, filePath), 'utf8')).toBe(`${filePath}\n`);
+    }
+    expect(await readFile(join(fixtureBDir, 'bulk', 'note-239.md'), 'utf8')).toBe('bulk 239\n');
+    expect((await server.git.listTreePaths(admin.vaultId, (await fixtureA.readState()).local_main!)).length).toBeGreaterThanOrEqual(242);
+  });
+
+  it('reports local plugin block state to the dashboard', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'status-report-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'laptop');
+    const statePath = join(deviceDir, '.obts', 'state.json');
+    const state = JSON.parse(await readFile(statePath, 'utf8')) as Json;
+    await writeFile(statePath, `${JSON.stringify({
+      ...state,
+      status_label: 'Unsafe local state',
+      last_error_code: 'invalid_path',
+      updated_at: new Date().toISOString()
+    }, null, 2)}\n`);
+
+    await plugin.reportDeviceStatus();
+    const dashboard = await admin.get<{
+      devices: Array<{ device_name: string; status_label: string; local_error_code: string | null; blocked: boolean }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+    expect(dashboard.status).toBe(200);
+    expect(dashboard.body.devices.find((device) => device.device_name === 'laptop')).toMatchObject({
+      status_label: 'Unsafe local state',
+      local_error_code: 'invalid_path',
+      blocked: true
+    });
+  });
+
+  it('requeues stranded local commits when queue metadata is lost', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'stranded-commit-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'laptop');
+    await writeFile(join(deviceDir, 'base.md'), 'base\n');
+    expect((await plugin.syncOnce()).status).toBe('Synced');
+
+    await writeFile(join(deviceDir, 'stranded.md'), 'stranded\n');
+    const localGit = new LocalGitEngine(deviceDir);
+    await localGit.initialize();
+    const strandedCommit = await localGit.createLocalCommit('obts: stranded local change');
+    const statePath = join(deviceDir, '.obts', 'state.json');
+    const queuePath = join(deviceDir, '.obts', 'queue.json');
+    const state = JSON.parse(await readFile(statePath, 'utf8')) as Json;
+    await writeFile(statePath, `${JSON.stringify({
+      ...state,
+      local_head: strandedCommit,
+      status_label: 'Ahead',
+      last_error_code: null,
+      updated_at: new Date().toISOString()
+    }, null, 2)}\n`);
+    await writeFile(queuePath, `${JSON.stringify({
+      pending_commit: null,
+      expected_device_ref: state.server_device_ref,
+      status: 'idle',
+      attempts: 0,
+      updated_at: new Date().toISOString()
+    }, null, 2)}\n`);
+
+    expect((await plugin.syncOnce()).status).toBe('Synced');
+    const main = (await plugin.readState()).local_main!;
+    expect(await server.git.listTreePaths(admin.vaultId, main)).toContain('stranded.md');
+  });
+
   it('does not apply remote main over local edits that appear during pull', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const fixtureADir = join(root, 'race-fixtureA');
@@ -3781,8 +3873,8 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
   });
 
-  it('rejects local case-fold path collisions before creating a hidden Git commit', async () => {
-    const deviceDir = join(root, 'local-collision-device');
+  it('allows case-distinct Obsidian paths on case-sensitive vault filesystems', async () => {
+    const deviceDir = join(root, 'local-case-distinct-device');
     await mkdirp(join(deviceDir, 'Notes'));
     await mkdirp(join(deviceDir, 'notes'));
     await writeFile(join(deviceDir, 'Notes', 'A.md'), 'upper\n');
@@ -3790,8 +3882,9 @@ describe('Phase 1 sync without conflict resolution', () => {
     const localGit = new LocalGitEngine(deviceDir);
     await localGit.initialize();
 
-    await expect(localGit.createLocalCommit('obts: collision')).rejects.toBeInstanceOf(PathPolicyViolation);
-    expect(await localGit.resolveRef('refs/heads/local')).toBeNull();
+    const commit = await localGit.createLocalCommit('obts: case-distinct paths');
+    expect(commit).toMatch(/^[0-9a-f]{40}$/u);
+    expect(await localGit.listTreeFiles(commit!)).toEqual(['Notes/A.md', 'notes/a.md']);
   });
 
   it('blocks local scans when visible Git directories are present', async () => {
@@ -3804,6 +3897,25 @@ describe('Phase 1 sync without conflict resolution', () => {
     await expect(localGit.createLocalCommit('obts: visible git')).rejects.toMatchObject({
       code: 'excluded_git_path'
     });
+  });
+
+  it('creates incremental upload packs against known server/device bases', async () => {
+    const deviceDir = join(root, 'incremental-pack-device');
+    await mkdirp(join(deviceDir, 'base'));
+    const localGit = new LocalGitEngine(deviceDir);
+    await localGit.initialize();
+    for (let index = 0; index < 100; index += 1) {
+      await writeFile(join(deviceDir, 'base', `note-${index}.md`), `base ${index}\n`);
+    }
+    const baseCommit = await localGit.createLocalCommit('obts: base pack content');
+    expect(baseCommit).toMatch(/^[0-9a-f]{40}$/u);
+
+    await writeFile(join(deviceDir, 'delta.md'), 'delta\n');
+    const deltaCommit = await localGit.createLocalCommit('obts: delta pack content');
+    expect(deltaCommit).toMatch(/^[0-9a-f]{40}$/u);
+    const fullPack = await localGit.createPackForCommit(deltaCommit!);
+    const incrementalPack = await localGit.createPackForCommit(deltaCommit!, [baseCommit!]);
+    expect(incrementalPack.byteLength).toBeLessThan(fullPack.byteLength);
   });
 
   it('detects rapid same-size local edits by staged content instead of timestamps', async () => {
@@ -3862,7 +3974,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(queuedSync).toContain('void this.runQueuedSync();');
     expect(pluginMain).toContain('syncOnceOrPollResolvedConflict');
     const backgroundSync = sourceSection(pluginMain, 'async runBackgroundSync()', 'async runAutomaticSync()');
-    expect(backgroundSync).toContain('state.last_error_code !== "conflict_review_required"');
+    expect(backgroundSync).toContain('isRetryableLocalError(state.last_error_code)');
     expect(backgroundSync).toContain('await this.runAutomaticSync();');
     const automaticSync = sourceSection(pluginMain, 'async runAutomaticSync()', 'async handleAutomaticSyncError');
     expect(automaticSync).toContain('syncOnceOrPollResolvedConflict');
@@ -3873,6 +3985,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(eventPoll).toContain('last_error_code: null');
     expect(pluginMain).toContain('pollRemoteEventsAndApply()');
     expect(pluginMain).toContain('/sync/events?after=');
+    expect(pluginMain).toContain('/sync/device-status');
     expect(pluginMain).toContain('this.setStatus("Offline")');
     expect(pluginMain).toContain('obts-settings-section-header');
     expect(pluginMain).toContain('obts-status-pill');
@@ -4011,12 +4124,14 @@ describe('Phase 1 sync without conflict resolution', () => {
   it('rejects internal and visible Git paths in the shared path policy', () => {
     expect(() => assertSyncableTreePaths(['notes/a.md', '.obts/state.json'])).toThrow(PathPolicyViolation);
     expect(() => assertSyncableTreePaths(['notes/a.md', '.git/config'])).toThrow(PathPolicyViolation);
-    expect(() => assertSyncableTreePaths(['Notes/A.md', 'notes/a.md'])).toThrow(PathPolicyViolation);
+    expect(() => assertSyncableTreePaths(['Notes/A.md', 'notes/a.md'])).not.toThrow();
     expect(normalizeVaultPath('notes//a.md').ok).toBe(false);
     expect(normalizeVaultPath('notes/../a.md').ok).toBe(false);
     expect(normalizeVaultPath('notes/./a.md').ok).toBe(false);
-    expect(normalizeVaultPath('notes/bad:name.md').ok).toBe(false);
-    expect(normalizeVaultPath('notes/trailing.').ok).toBe(false);
+    expect(normalizeVaultPath('notes/bad:name.md').ok).toBe(true);
+    expect(normalizeVaultPath('notes/trailing.').ok).toBe(true);
+    expect(normalizeVaultPath('Notes/Projects/Vision -> Checklist.md').ok).toBe(true);
+    expect(normalizeVaultPath('Notes/is there a way to have local claude code connect to docker on remote-host?.md').ok).toBe(true);
   });
 
   it('syncs the full vault except hard exclusions', () => {

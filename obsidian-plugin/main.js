@@ -6,8 +6,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 
 const API_VERSION = "2026-07-02.full-sync";
-const PLUGIN_VERSION = "0.1.10-phase2";
-const WINDOWS_RESERVED = new Set(["con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"]);
+const PLUGIN_VERSION = "0.1.11-phase2";
 const SYNC_DEBOUNCE_MS = 1500;
 const BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000;
 
@@ -213,7 +212,8 @@ module.exports = class ObtsPlugin extends Plugin {
     if (!state.vault_id || !state.device_id) {
       return;
     }
-    if (state.last_error_code && state.last_error_code !== "conflict_review_required") {
+    if (state.last_error_code && state.last_error_code !== "conflict_review_required" && !isRetryableLocalError(state.last_error_code)) {
+      await this.client.reportDeviceStatus().catch(() => undefined);
       return;
     }
     await this.runAutomaticSync();
@@ -227,13 +227,15 @@ module.exports = class ObtsPlugin extends Plugin {
     if (!state.vault_id || !state.device_id) {
       return;
     }
-    if (state.last_error_code && state.last_error_code !== "conflict_review_required") {
+    if (state.last_error_code && state.last_error_code !== "conflict_review_required" && !isRetryableLocalError(state.last_error_code)) {
+      await this.client.reportDeviceStatus().catch(() => undefined);
       return;
     }
     this.syncRunning = true;
     try {
       await this.syncOnceOrPollResolvedConflict({ confirmInitialImport: false });
       this.setStatus((await this.client.readState()).status_label);
+      await this.client.reportDeviceStatus().catch(() => undefined);
     } catch (error) {
       await this.handleAutomaticSyncError(error);
     } finally {
@@ -248,8 +250,9 @@ module.exports = class ObtsPlugin extends Plugin {
 
   async handleAutomaticSyncError(error) {
     if (error instanceof ObtsBlockedError) {
-      await this.client.markBlocked(error.code);
+      await this.client.markBlocked(error.code, error.details);
       this.setStatus((await this.client.readState()).status_label);
+      await this.client.reportDeviceStatus().catch(() => undefined);
       return;
     }
     this.setStatus("Offline");
@@ -267,8 +270,9 @@ module.exports = class ObtsPlugin extends Plugin {
     } catch (error) {
       const code = error instanceof ObtsBlockedError ? error.code : "sync_error";
       const message = error instanceof Error ? error.message : "obts sync failed.";
-      await this.client.markBlocked(code);
+      await this.client.markBlocked(code, error instanceof ObtsBlockedError ? error.details : undefined);
       this.setStatus((await this.client.readState()).status_label);
+      await this.client.reportDeviceStatus().catch(() => undefined);
       if (showNotice) {
         new Notice(message);
       }
@@ -431,6 +435,7 @@ class ObtsObsidianClient {
     }
     this.throwIfSyncBlocked(state);
     await this.flushEditorBuffersToDisk();
+    await this.reconcileQueueWithLocalHead(await this.readState());
 
     const localFiles = await this.scanSyncableFiles();
     if (localFiles.length > 0 && !state.initial_import_confirmed && state.server_device_ref === null) {
@@ -461,6 +466,7 @@ class ObtsObsidianClient {
 
     await this.pullAndApply(true);
     const finalState = await this.readState();
+    await this.reportDeviceStatus().catch(() => undefined);
     return { status: finalState.status_label, main: finalState.local_main || undefined };
   }
 
@@ -582,7 +588,7 @@ class ObtsObsidianClient {
 
   async recordLocalChangeHint(paths) {
     const state = await this.readState();
-    if (!state.vault_id || !state.device_id || state.last_error_code) {
+    if (!state.vault_id || !state.device_id || (state.last_error_code && !isRetryableLocalError(state.last_error_code))) {
       return;
     }
     if (paths !== undefined) {
@@ -618,7 +624,7 @@ class ObtsObsidianClient {
       updated_at: nowIso()
     }));
     this.plugin.setStatus("Uploading");
-    const packfile = await this.createPackForCommit(queue.pending_commit);
+    const packfile = await this.createPackForCommit(queue.pending_commit, [queue.expected_device_ref, state.local_main].filter(Boolean));
     const manifest = {
       api_version: API_VERSION,
       vault_id: state.vault_id,
@@ -838,7 +844,7 @@ class ObtsObsidianClient {
   async applyTargetMain(targetMain, changedPaths, allowDestructive, extraAffectedPaths = [], requireCleanVisibleState = false) {
     const state = await this.readState();
     if (state.local_main === targetMain && extraAffectedPaths.length === 0) {
-      await this.writeState(Object.assign({}, state, { status_label: "Synced", updated_at: nowIso() }));
+      await this.writeState(Object.assign({}, state, { status_label: "Synced", last_error_code: null, updated_at: nowIso() }));
       return;
     }
     if (requireCleanVisibleState && !(await this.ensureNoLocalChangesBeforeApply(state))) {
@@ -1379,8 +1385,14 @@ class ObtsObsidianClient {
     return await this.packObjects(refs);
   }
 
-  async createPackForCommit(commit) {
-    return await this.packObjects([commit]);
+  async createPackForCommit(commit, excludeCommits = []) {
+    const revs = [commit];
+    for (const exclude of excludeCommits) {
+      if (await this.commitExists(exclude)) {
+        revs.push(`^${exclude}`);
+      }
+    }
+    return await this.packObjects(revs);
   }
 
   async packObjects(revs) {
@@ -1462,6 +1474,44 @@ class ObtsObsidianClient {
       await throwResponseError(response);
     }
     return await response.json();
+  }
+
+  async reportDeviceStatus() {
+    const state = await this.readState();
+    if (!state.vault_id || !state.device_id) {
+      return;
+    }
+    let token;
+    try {
+      token = await this.readDeviceToken();
+    } catch {
+      return;
+    }
+    const queue = await this.readQueue();
+    await fetch(this.url(`/api/v1/vaults/${state.vault_id}/sync/device-status`), {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        plugin_version: PLUGIN_VERSION,
+        local_status_label: state.status_label || "Checking",
+        local_error_code: state.last_error_code,
+        local_error_details: state.last_error_code ? state.last_error_details || null : null,
+        local_queue_status: queue.status,
+        local_main: state.local_main,
+        local_head: state.local_head,
+        path_capabilities: {
+          adapter: "obsidian-desktop",
+          platform: process.platform
+        }
+      })
+    }).then(async (response) => {
+      if (!response.ok) {
+        await throwResponseError(response);
+      }
+    });
   }
 
   async pollEvents(vaultId, token, after) {
@@ -1673,6 +1723,43 @@ class ObtsObsidianClient {
       return false;
     }
     return await this.isAncestor(baseline.main, manifest.target_main);
+  }
+
+  async reconcileQueueWithLocalHead(state) {
+    const queue = await this.readQueue();
+    if (queue.pending_commit || !state.local_head || !(await this.commitExists(state.local_head))) {
+      return;
+    }
+    if (state.local_main && state.local_head === state.local_main) {
+      return;
+    }
+    if (state.local_main && await this.isAncestor(state.local_head, state.local_main)) {
+      await this.writeState(Object.assign({}, state, {
+        local_head: state.local_main,
+        status_label: "Synced",
+        last_error_code: null,
+        updated_at: nowIso()
+      }));
+      return;
+    }
+    const descendsFromDeviceRef = state.server_device_ref ? await this.isAncestor(state.server_device_ref, state.local_head) : false;
+    const descendsFromLocalMain = state.local_main ? await this.isAncestor(state.local_main, state.local_head) : false;
+    if (descendsFromDeviceRef || descendsFromLocalMain || (!state.server_device_ref && !state.local_main)) {
+      await this.writeQueue({
+        pending_commit: state.local_head,
+        expected_device_ref: state.server_device_ref,
+        status: "queued_local",
+        attempts: 0,
+        updated_at: nowIso()
+      });
+      await this.writeState(Object.assign({}, state, {
+        status_label: "Ahead",
+        last_error_code: null,
+        updated_at: nowIso()
+      }));
+      return;
+    }
+    await this.block("same_device_non_fast_forward", "Local Git history diverged from this device ref and requires recovery.");
   }
 
   async acquireApplyLock(applyId) {
@@ -2095,17 +2182,19 @@ class ObtsObsidianClient {
     }
   }
 
-  async block(code, message) {
-    await this.markBlocked(code);
-    throw new ObtsBlockedError(code, message);
+  async block(code, message, details = undefined) {
+    await this.markBlocked(code, details);
+    throw new ObtsBlockedError(code, message, details);
   }
 
-  async markBlocked(code) {
+  async markBlocked(code, details = undefined) {
     await this.writeState(Object.assign({}, await this.readState(), {
       status_label: blockStatusLabel(code),
       last_error_code: code,
+      last_error_details: details || null,
       updated_at: nowIso()
     }));
+    await this.reportDeviceStatus().catch(() => undefined);
   }
 }
 
@@ -2298,9 +2387,10 @@ function setFeedback(element, message, tone) {
 }
 
 class ObtsBlockedError extends Error {
-  constructor(code, message) {
+  constructor(code, message, details = undefined) {
     super(message);
     this.code = code;
+    this.details = details;
   }
 }
 
@@ -2511,11 +2601,7 @@ function isValidVaultPath(filePath) {
   }
   const segments = filePath.split("/");
   for (const segment of segments) {
-    if (!segment || segment === "." || segment === ".." || /[<>:"|?*]/u.test(segment) || segment.endsWith(" ") || segment.endsWith(".")) {
-      return false;
-    }
-    const withoutExtension = (segment.split(".")[0] || "").toLowerCase();
-    if (WINDOWS_RESERVED.has(withoutExtension)) {
+    if (!segment || segment === "." || segment === "..") {
       return false;
     }
   }
@@ -2524,7 +2610,7 @@ function isValidVaultPath(filePath) {
 
 function assertValidLocalVaultPath(filePath) {
   if (!isValidVaultPath(filePath)) {
-    throw new ObtsBlockedError("invalid_path", "Vault path is invalid or cannot be synced.");
+    throw new ObtsBlockedError("invalid_path", "Vault path is invalid or cannot be synced.", { path: filePath });
   }
 }
 
@@ -2534,15 +2620,6 @@ function isOsOrEditorMetadata(filePath) {
 }
 
 function assertNoCaseCollisions(paths) {
-  const seen = new Map();
-  for (const filePath of paths) {
-    const key = filePath.normalize("NFC").toLocaleLowerCase("en-US");
-    const existing = seen.get(key);
-    if (existing !== undefined && existing !== filePath) {
-      throw new ObtsBlockedError("path_collision", "Vault paths collide on case-insensitive filesystems.");
-    }
-    seen.set(key, filePath);
-  }
   return paths;
 }
 
@@ -2563,6 +2640,10 @@ function buffersEqual(left, right) {
 
 function changedPathsConflict(left, right) {
   return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
+
+function isRetryableLocalError(code) {
+  return code === "invalid_path" || code === "path_collision" || code === "excluded_git_path" || code === "excluded_internal_path" || code === "excluded_path" || code === "unsupported_file_mode";
 }
 
 function blockStatusLabel(code) {

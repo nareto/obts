@@ -29,7 +29,7 @@ Implemented runtime pieces:
 - Per-vault native Git stores under `OBTS_DATA_DIR/git`, with server-authored empty-tree root commits on `refs/heads/main`.
 - Protected device refs at `refs/obts/devices/{device_id}` with no-op, fast-forward, stale-ref, malformed-pack, path-policy, and same-device non-fast-forward handling.
 - Every paired device syncs the same full-vault content set after hard exclusions.
-- Shared client/server path policy rejects internal state, visible Git directories, traversal, empty path segments, cross-platform-invalid names, case-fold collisions, unsupported Git tree modes, and hard-excluded paths such as `.obsidian/cache/**`, workspace files, and `.obsidian/plugins/obts/**`.
+- Shared client/server path policy rejects internal state, visible Git directories, traversal, empty path segments, NUL/control characters, unsupported Git tree modes, and hard-excluded paths such as `.obsidian/cache/**`, workspace files, and `.obsidian/plugins/obts/**`. OS-specific filename limits are treated as device capability issues instead of global server rejections.
 - Full-vault sync includes `.trash/**`, attachments, community plugin files, and other `.obsidian/**` state that passes the hard path policy.
 - Server-side automatic merge for disjoint path changes, clean native Git merges of overlapping Markdown, and conservative semantic merges for safe overlapping JSON Canvas and Obsidian Bases files even when line-based Git merge cannot cleanly merge the compact source text. Merge decisions include deterministic Canvas JSON output, deterministic Bases YAML output, durable operation records, blocked-device rejection, and durable conflict records with validator results for unsafe overlapping or file/directory hierarchy-collision changes.
 - Same-path binary and attachment edits merge automatically only when the accepted server version and uploaded device version have identical blob content; otherwise they remain review-needed conflicts.
@@ -88,7 +88,7 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - Markdown merges with concurrent same-key frontmatter edits are rejected as conflicts even when Git can produce a clean text merge;
 - compact same-file JSON Canvas edits with disjoint semantic fields merge deterministically when native Git reports a text conflict, while same-field Canvas edits create a durable conflict;
 - lost `state.json` with a valid device token and intact local Git refs is repaired automatically, preserving filesystem-as-source-of-truth semantics and uploading edits through the device ref;
-- local path collisions are rejected before local hidden Git commits are created;
+- Git-safe Obsidian paths with punctuation or case distinctions are synced when the local adapter can represent them;
 - safe same-file Obsidian Bases edits merge through the semantic Bases validator, including compact YAML that native Git cannot merge cleanly, while unsafe same-field Bases edits create a durable conflict;
 - same-path binary attachment edits auto-merge only when object identity matches;
 - unsafe concurrent same-path edits and file/directory hierarchy collisions create a durable conflict record and do not overwrite current `main`;
@@ -116,4 +116,4 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - recovery bundles written before destructive apply contain affected file snapshots, text patch artifacts, local Git refs packs, and checksums for generated artifacts;
 - rebuild from server `main` preserves queued fast-forward commits, turns snapshot-only local edits into a recovery commit, and refuses to upload divergent same-device history;
 - files changed after apply preflight block before overwrite;
-- shared path policy rejects `.obts/`, visible `.git`, traversal, empty path segments, cross-platform-invalid names, case-fold collisions, unapproved `.obsidian` files, and non-regular Git tree entries.
+- shared path policy rejects `.obts/`, visible `.git`, traversal, empty path segments, NUL/control characters, unapproved `.obsidian` files, and non-regular Git tree entries while leaving OS-specific filename limits to device capability handling.

@@ -723,12 +723,13 @@ Rules:
 - canonical vault-relative paths use `/`, reject absolute paths, reject traversal, and reject empty path segments;
 - `.obts/` is always excluded from vault sync, Git worktree content, and manifest/path scanning;
 - `.git/` directories inside visible vault content are sync-blocking errors rather than synced content;
-- client and server use the same path validation library and test corpus;
+- client and server use the same global safety validation library and test corpus;
 - hard exclusions are enforced consistently before commit, upload, merge, and apply;
-- client scans silently omit only documented runtime hard exclusions and OS/editor metadata; visible `.git` directories, invalid path names, symlinks, unsupported file modes, and case-fold collisions block sync with a clear error;
-- Unicode normalization and case-fold collision detection are mandatory before commit, upload, merge, and apply;
-- cross-platform-invalid names, Windows reserved device names, trailing spaces/dots, NUL/control characters, and configured path length limits block sync with a clear error;
-- path collisions are sync-blocking conflicts requiring user rename, not automatic overwrites;
+- client scans silently omit only documented runtime hard exclusions and OS/editor metadata; visible `.git` directories, NUL/control characters, traversal, symlinks, unsupported file modes, and configured path length limits block sync with a clear error;
+- Unicode NFC normalization is mandatory before commit, upload, merge, and apply;
+- Git-safe names accepted by the active Obsidian adapter/filesystem are valid vault content by default, even when they are not portable to every supported operating system;
+- Windows-reserved names, Windows-invalid punctuation, trailing spaces/dots, and case-fold collisions are device capability concerns, not global server rejections; a device that cannot materialize a server path blocks locally with a clear `unsupported_path_on_device`-style status and offending-path details;
+- path materialization collisions on a specific device are sync-blocking conflicts requiring user rename, not automatic overwrites;
 - symlinks are not followed or synced in v1;
 - file mode bits, executable bits, mtimes, and extended attributes are ignored except where the Obsidian vault API exposes required data for safe write checks;
 - audit logs include resource classes and opaque IDs, but not note bodies, Git pack contents, raw blobs, plugin settings, or full content payloads.
@@ -1366,7 +1367,7 @@ Acceptance proof:
 ### 11.1 Unit Tests
 
 - canonical path normalization;
-- canonical path collision and platform-invalid-name handling;
+- global path-safety validation and device-specific path capability handling;
 - `isomorphic-git` local Git engine commit/import behavior;
 - Obsidian `DataAdapter` filesystem adapter behavior;
 - server Git store persistence and materialization boundaries;

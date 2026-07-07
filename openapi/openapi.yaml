@@ -393,6 +393,28 @@ paths:
           $ref: "#/components/responses/Error"
         "404":
           $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/sync/device-status:
+    post:
+      summary: Report current local plugin status for dashboard diagnostics.
+      security:
+        - deviceBearer: []
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceStatusReport"
+      responses:
+        "200":
+          description: Device status recorded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "404":
+          $ref: "#/components/responses/Error"
   /vaults/{vault_id}/sync/events:
     get:
       summary: Poll redacted vault events using a paired device token.
@@ -865,6 +887,50 @@ components:
         event_seq:
           type: integer
           minimum: 0
+    DeviceStatusReport:
+      type: object
+      required:
+        - plugin_version
+        - local_status_label
+        - local_error_code
+        - local_queue_status
+        - local_main
+        - local_head
+      properties:
+        plugin_version:
+          type: string
+          maxLength: 80
+        local_status_label:
+          type: string
+          maxLength: 80
+        local_error_code:
+          oneOf:
+            - type: "null"
+            - type: string
+              maxLength: 120
+        local_error_details:
+          oneOf:
+            - type: "null"
+            - type: object
+        local_queue_status:
+          oneOf:
+            - type: "null"
+            - type: string
+              maxLength: 80
+        local_main:
+          oneOf:
+            - type: "null"
+            - type: string
+              pattern: "^[0-9a-f]{40}$"
+        local_head:
+          oneOf:
+            - type: "null"
+            - type: string
+              pattern: "^[0-9a-f]{40}$"
+        path_capabilities:
+          oneOf:
+            - type: "null"
+            - type: object
     DevicePushManifest:
       type: object
       required:
@@ -1045,6 +1111,15 @@ components:
               - device_ref_head
               - last_applied_main
               - last_successful_sync_at
+              - local_status_label
+              - local_error_code
+              - local_error_details
+              - local_queue_status
+              - local_main
+              - local_head
+              - plugin_version
+              - path_capabilities
+              - last_status_report_at
               - ahead_of_main
               - behind_main
               - blocked
@@ -1075,6 +1150,45 @@ components:
                   - type: string
                     pattern: "^[0-9a-f]{40}$"
               last_successful_sync_at:
+                oneOf:
+                  - type: "null"
+                  - type: string
+                    format: date-time
+              local_status_label:
+                oneOf:
+                  - type: "null"
+                  - type: string
+              local_error_code:
+                oneOf:
+                  - type: "null"
+                  - type: string
+              local_error_details:
+                oneOf:
+                  - type: "null"
+                  - type: object
+              local_queue_status:
+                oneOf:
+                  - type: "null"
+                  - type: string
+              local_main:
+                oneOf:
+                  - type: "null"
+                  - type: string
+                    pattern: "^[0-9a-f]{40}$"
+              local_head:
+                oneOf:
+                  - type: "null"
+                  - type: string
+                    pattern: "^[0-9a-f]{40}$"
+              plugin_version:
+                oneOf:
+                  - type: "null"
+                  - type: string
+              path_capabilities:
+                oneOf:
+                  - type: "null"
+                  - type: object
+              last_status_report_at:
                 oneOf:
                   - type: "null"
                   - type: string

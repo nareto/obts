@@ -42,9 +42,6 @@
           }) satisfies AttentionItem
       ),
     ...dashboard.devices
-      .filter((device) => device.status_label === 'Unsafe local state')
-      .map((device) => ({ kind: 'devices', label: `Unsafe local state: ${device.device_name}`, action: 'Open devices' }) satisfies AttentionItem),
-    ...dashboard.devices
       .filter((device) => device.offline)
       .map((device) => ({ kind: 'devices', label: `Offline device: ${device.device_name}`, action: 'Open devices' }) satisfies AttentionItem)
   ] satisfies AttentionItem[];

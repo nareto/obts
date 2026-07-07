@@ -65,6 +65,15 @@ export type DeviceRow = {
   last_applied_main: string | null;
   last_seen_at: string | null;
   last_successful_sync_at: string | null;
+  local_status_label: string | null;
+  local_error_code: string | null;
+  local_error_details: Record<string, unknown> | null;
+  local_queue_status: string | null;
+  local_main: string | null;
+  local_head: string | null;
+  plugin_version: string | null;
+  path_capabilities: Record<string, unknown> | null;
+  last_status_report_at: string | null;
   created_at: string;
   revoked_at: string | null;
 };
@@ -258,10 +267,30 @@ export class MetadataStore {
       legacyDb.login_attempts = [];
     }
     for (const device of db.devices) {
-      const legacyDevice = device as DeviceRow & { last_applied_main?: string | null };
+      const legacyDevice = device as DeviceRow & {
+        last_applied_main?: string | null;
+        local_status_label?: string | null;
+        local_error_code?: string | null;
+        local_error_details?: Record<string, unknown> | null;
+        local_queue_status?: string | null;
+        local_main?: string | null;
+        local_head?: string | null;
+        plugin_version?: string | null;
+        path_capabilities?: Record<string, unknown> | null;
+        last_status_report_at?: string | null;
+      };
       if (!Object.prototype.hasOwnProperty.call(legacyDevice, 'last_applied_main')) {
         legacyDevice.last_applied_main = null;
       }
+      legacyDevice.local_status_label ??= null;
+      legacyDevice.local_error_code ??= null;
+      legacyDevice.local_error_details ??= null;
+      legacyDevice.local_queue_status ??= null;
+      legacyDevice.local_main ??= null;
+      legacyDevice.local_head ??= null;
+      legacyDevice.plugin_version ??= null;
+      legacyDevice.path_capabilities ??= null;
+      legacyDevice.last_status_report_at ??= null;
     }
     for (const conflict of db.conflicts) {
       const legacyConflict = conflict as ConflictRecord & { validator_results?: Record<string, unknown> };

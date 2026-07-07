@@ -30,6 +30,7 @@ describe('OpenAPI Phase 2 contract', () => {
       '/device/self',
       '/vaults/{vault_id}/sync/push',
       '/vaults/{vault_id}/sync/pull',
+      '/vaults/{vault_id}/sync/device-status',
       '/vaults/{vault_id}/sync/events',
       '/vaults/{vault_id}/sync/unpair',
       '/vaults/{vault_id}/conflicts',
@@ -49,6 +50,7 @@ describe('OpenAPI Phase 2 contract', () => {
     expect(contract).toContain('X-OBTS-CSRF');
     expect(contract).toContain('ConsumePairingTokenResponse');
     expect(contract).toContain('DeviceSelfResponse');
+    expect(contract).toContain('DeviceStatusReport');
     expect(contract).toContain('server_device_ref');
     expect(contract).toContain('is_first_device');
     expect(contract).toContain('ConflictRecord');
@@ -67,7 +69,7 @@ describe('OpenAPI Phase 2 contract', () => {
 
     const pullSection = contract.slice(
       contract.indexOf('/vaults/{vault_id}/sync/pull'),
-      contract.indexOf('/vaults/{vault_id}/sync/events')
+      contract.indexOf('/vaults/{vault_id}/sync/device-status')
     );
     expect(pullSection).toContain('multipart/form-data');
     expect(pullSection).toContain('DevicePullRequest');

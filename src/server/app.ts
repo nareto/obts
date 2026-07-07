@@ -340,18 +340,30 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
             device.device_ref_head !== null && !(await git.isAncestor(vault.vault_id, device.device_ref_head, vault.current_main));
           const behindMain = device.status === 'synced' && device.last_applied_main !== vault.current_main;
           const offline = device.last_seen_at !== null && Date.now() - Date.parse(device.last_seen_at) > 24 * 60 * 60 * 1000;
+          const localStatusFresh = isFreshDeviceStatus(device.last_status_report_at);
+          const localStatusLabel = localStatusFresh ? device.local_status_label : null;
+          const localErrorCode = localStatusFresh ? device.local_error_code : null;
           return {
             device_id: device.device_id,
             device_name: device.device_name,
             status: device.status,
-            status_label: dashboardDeviceStatusLabel(device.status, { behindMain, offline }),
+            status_label: dashboardDeviceStatusLabel(device.status, { behindMain, offline, localStatusLabel, localErrorCode }),
             last_seen_at: device.last_seen_at,
             device_ref_head: device.device_ref_head,
             last_applied_main: device.last_applied_main,
             last_successful_sync_at: device.last_successful_sync_at,
+            local_status_label: localStatusLabel,
+            local_error_code: localErrorCode,
+            local_error_details: localStatusFresh ? device.local_error_details : null,
+            local_queue_status: localStatusFresh ? device.local_queue_status : null,
+            local_main: localStatusFresh ? device.local_main : null,
+            local_head: localStatusFresh ? device.local_head : null,
+            plugin_version: localStatusFresh ? device.plugin_version : null,
+            path_capabilities: localStatusFresh ? device.path_capabilities : null,
+            last_status_report_at: device.last_status_report_at,
             ahead_of_main: aheadOfMain,
             behind_main: behindMain,
-            blocked: device.status === 'review_needed' || device.status === 'blocked_recovery',
+            blocked: device.status === 'review_needed' || device.status === 'blocked_recovery' || isBlockingLocalReport(localStatusLabel, localErrorCode),
             offline
           };
         })
@@ -520,6 +532,28 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const { vaultId } = pathParams(request);
     const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
     return sendEventPage(reply, request.id, await store.snapshot(), deviceAuth.vault.vault_id, readEventCursor(request));
+  });
+
+  app.post('/api/v1/vaults/:vaultId/sync/device-status', async (request) => {
+    const { vaultId } = pathParams(request);
+    const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+    const report = readDeviceStatusReport(requestBody(request));
+    await store.mutate((db) => {
+      const device = db.devices.find((candidate) => candidate.device_id === deviceAuth.device.device_id);
+      if (!device || device.status === 'revoked') {
+        throw new AuthError(404, 'not_found', 'Resource not found.');
+      }
+      device.local_status_label = report.localStatusLabel;
+      device.local_error_code = report.localErrorCode;
+      device.local_error_details = report.localErrorDetails;
+      device.local_queue_status = report.localQueueStatus;
+      device.local_main = report.localMain;
+      device.local_head = report.localHead;
+      device.plugin_version = report.pluginVersion;
+      device.path_capabilities = report.pathCapabilities;
+      device.last_status_report_at = nowIso();
+    });
+    return { status: 'ok' };
   });
 
   app.post('/api/v1/vaults/:vaultId/sync/unpair', async (request) => {
@@ -1216,6 +1250,73 @@ function requestBody(request: FastifyRequest): Record<string, unknown> {
   const body: unknown = request.body;
   assertRecord(body);
   return body;
+}
+
+function readDeviceStatusReport(record: Record<string, unknown>): {
+  pluginVersion: string;
+  localStatusLabel: string;
+  localErrorCode: string | null;
+  localErrorDetails: Record<string, unknown> | null;
+  localQueueStatus: string | null;
+  localMain: string | null;
+  localHead: string | null;
+  pathCapabilities: Record<string, unknown> | null;
+} {
+  return {
+    pluginVersion: readBoundedString(record, 'plugin_version', 80),
+    localStatusLabel: readBoundedString(record, 'local_status_label', 80),
+    localErrorCode: readNullableBoundedString(record, 'local_error_code', 120),
+    localErrorDetails: readNullableSmallRecord(record, 'local_error_details'),
+    localQueueStatus: readNullableBoundedString(record, 'local_queue_status', 80),
+    localMain: readNullableCommitId(record, 'local_main'),
+    localHead: readNullableCommitId(record, 'local_head'),
+    pathCapabilities: readNullableSmallRecord(record, 'path_capabilities')
+  };
+}
+
+function readBoundedString(record: Record<string, unknown>, key: string, maxLength: number): string {
+  const value = readString(record, key);
+  if (value.length > maxLength) {
+    throw new ValidationError('invalid_request', `${key} is too long.`);
+  }
+  return value;
+}
+
+function readNullableBoundedString(record: Record<string, unknown>, key: string, maxLength: number): string | null {
+  const value = record[key];
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value !== 'string') {
+    throw new ValidationError('invalid_request', `${key} must be a string or null.`);
+  }
+  if (value.length > maxLength) {
+    throw new ValidationError('invalid_request', `${key} is too long.`);
+  }
+  return value;
+}
+
+function readNullableCommitId(record: Record<string, unknown>, key: string): string | null {
+  const value = record[key];
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value !== 'string') {
+    throw new ValidationError('invalid_request', `${key} must be a commit ID or null.`);
+  }
+  return readCommitId(record, key);
+}
+
+function readNullableSmallRecord(record: Record<string, unknown>, key: string): Record<string, unknown> | null {
+  const value = record[key];
+  if (value === null || value === undefined) {
+    return null;
+  }
+  assertRecord(value);
+  if (JSON.stringify(value).length > 4096) {
+    throw new ValidationError('invalid_request', `${key} is too large.`);
+  }
+  return value;
 }
 
 function pathParams(request: FastifyRequest): { vaultId: string } {
@@ -1949,8 +2050,11 @@ function deviceStatusLabel(status: string): string {
 
 function dashboardDeviceStatusLabel(
   status: string,
-  state: { behindMain: boolean; offline: boolean }
+  state: { behindMain: boolean; offline: boolean; localStatusLabel?: string | null; localErrorCode?: string | null }
 ): string {
+  if (isLocalStatusOverride(state.localStatusLabel ?? null, state.localErrorCode ?? null)) {
+    return state.localStatusLabel || 'Unsafe local state';
+  }
   if (status === 'synced' && state.offline) {
     return 'Offline';
   }
@@ -1958,6 +2062,27 @@ function dashboardDeviceStatusLabel(
     return 'Behind';
   }
   return deviceStatusLabel(status);
+}
+
+function isFreshDeviceStatus(reportedAt: string | null): boolean {
+  return reportedAt !== null && Date.now() - Date.parse(reportedAt) <= 5 * 60 * 1000;
+}
+
+function isLocalStatusOverride(label: string | null, errorCode: string | null): boolean {
+  return Boolean(
+    errorCode ||
+      label === 'Unsafe local state' ||
+      label === 'Needs recovery' ||
+      label === 'Blocked' ||
+      label === 'Uploading' ||
+      label === 'Applying' ||
+      label === 'Ahead' ||
+      label === 'Review needed'
+  );
+}
+
+function isBlockingLocalReport(label: string | null, errorCode: string | null): boolean {
+  return Boolean(errorCode || label === 'Unsafe local state' || label === 'Needs recovery' || label === 'Blocked' || label === 'Review needed');
 }
 
 function isMultipartLimitError(error: Error): boolean {

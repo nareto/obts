@@ -579,6 +579,15 @@ export class AuthService {
         last_applied_main: null,
         last_seen_at: nowIso(),
         last_successful_sync_at: null,
+        local_status_label: null,
+        local_error_code: null,
+        local_error_details: null,
+        local_queue_status: null,
+        local_main: null,
+        local_head: null,
+        plugin_version: null,
+        path_capabilities: null,
+        last_status_report_at: null,
         created_at: nowIso(),
         revoked_at: null
       };

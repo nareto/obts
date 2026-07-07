@@ -114,7 +114,7 @@ export class LocalGitEngine {
       const rel = relative(this.vaultDir, absolutePath).replaceAll('\\', '/');
       const normalized = normalizeVaultPath(rel);
       if (!normalized.ok) {
-        throw new PathPolicyViolation(normalized.code, normalized.message, normalized.details);
+        throw new PathPolicyViolation(normalized.code, normalized.message, { ...(normalized.details ?? {}), path: rel });
       }
       if (isSyncableVaultPath(normalized.path)) {
         files.push(normalized.path);
@@ -183,9 +183,17 @@ export class LocalGitEngine {
     });
   }
 
-  async createPackForCommit(commit: string): Promise<Buffer> {
-    const oids = await this.collectReachableObjects(commit);
-    return await this.packObjects(oids);
+  async createPackForCommit(commit: string, excludeCommits: string[] = []): Promise<Buffer> {
+    const oids = new Set(await this.collectReachableObjects(commit));
+    for (const exclude of excludeCommits) {
+      if (!(await this.commitExists(exclude))) {
+        continue;
+      }
+      for (const oid of await this.collectReachableObjects(exclude)) {
+        oids.delete(oid);
+      }
+    }
+    return await this.packObjects([...oids].sort());
   }
 
   async createRecoveryRefsPack(): Promise<Buffer> {
@@ -394,7 +402,7 @@ async function walk(root: string, current: string, visitFile: (path: string) => 
     const rel = relative(root, absolutePath).replaceAll('\\', '/');
     const normalized = normalizeVaultPath(rel);
     if (!normalized.ok) {
-      throw new PathPolicyViolation(normalized.code, normalized.message, normalized.details);
+      throw new PathPolicyViolation(normalized.code, normalized.message, { ...(normalized.details ?? {}), path: rel });
     }
     if (entry.isDirectory()) {
       if (isSyncableVaultPath(normalized.path)) {

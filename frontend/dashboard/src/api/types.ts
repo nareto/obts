@@ -39,6 +39,15 @@ export type DashboardDevice = {
   device_ref_head: string | null;
   last_applied_main: string | null;
   last_successful_sync_at: string | null;
+  local_status_label: StatusLabel | null;
+  local_error_code: string | null;
+  local_error_details: Record<string, unknown> | null;
+  local_queue_status: string | null;
+  local_main: string | null;
+  local_head: string | null;
+  plugin_version: string | null;
+  path_capabilities: Record<string, unknown> | null;
+  last_status_report_at: string | null;
   ahead_of_main: boolean;
   behind_main: boolean;
   blocked: boolean;

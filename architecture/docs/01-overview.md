@@ -14,11 +14,13 @@ model.
 
 The product model syncs the full vault for every paired device. Server `main`
 contains the canonical full-vault state, while each device ref remains a
-whole-tree Git ref for that device's last accepted state. The shared hard path
-policy excludes `.obts/**`, visible `.git/**`, `.obsidian/cache/**`,
+whole-tree Git ref for that device's last accepted state. The shared global
+safety policy excludes `.obts/**`, visible `.git/**`, `.obsidian/cache/**`,
 `.obsidian/workspace.json`, `.obsidian/workspace-mobile.json`, and
 `.obsidian/plugins/obts/**`; `.trash/**`, attachments, community plugin files,
-and other `.obsidian/**` files are normal synced vault content.
+and other `.obsidian/**` files are normal synced vault content. OS-specific
+filename limits are handled as device capability/apply problems instead of
+server-wide vault rejections.
 
 At-rest protection follows the current PRD: persistent server state is normal
 sensitive application state protected by deployment-managed storage controls.

@@ -3,6 +3,7 @@ import {
   type DevicePullManifest,
   type DevicePushManifest,
   type DeviceSelfResponse,
+  type DeviceStatusReport,
   type EventEnvelope,
   type PushResult
 } from '../shared/types.js';
@@ -43,6 +44,22 @@ export class TransportClient {
       }
     });
     return await readJsonOrThrow<DeviceSelfResponse>(response);
+  }
+
+  async reportDeviceStatus(input: {
+    vaultId: string;
+    deviceToken: string;
+    report: DeviceStatusReport;
+  }): Promise<{ status: string }> {
+    const response = await fetch(this.url(`/api/v1/vaults/${input.vaultId}/sync/device-status`), {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${input.deviceToken}`,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify(input.report)
+    });
+    return await readJsonOrThrow<{ status: string }>(response);
   }
 
   async push(input: {

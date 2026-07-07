@@ -3,13 +3,13 @@ import { copyFile, mkdir, open, readFile, readdir, rename, rm, stat, writeFile }
 import { dirname, join } from 'node:path';
 
 import { newId, nowIso } from '../shared/ids.js';
-import { assertSyncableTreePaths, isSyncableVaultPath, normalizeVaultPath } from '../shared/pathPolicy.js';
+import { assertSyncableTreePaths, isSyncableVaultPath, normalizeVaultPath, PathPolicyViolation } from '../shared/pathPolicy.js';
 import { API_VERSION, type DevicePushManifest } from '../shared/types.js';
 import { LocalGitEngine } from './localGit.js';
 import { ApplyLockActiveError, type ApplyJournal, RecoveryManager, sha256File } from './recovery.js';
 import { TransportClient, TransportError } from './transport.js';
 
-const PLUGIN_VERSION = '0.1.10-phase2';
+const PLUGIN_VERSION = '0.1.11-phase2';
 
 export type ObtsPluginSettings = {
   serverUrl: string;
@@ -30,6 +30,7 @@ export type LocalPluginState = {
   initial_import_confirmed: boolean;
   status_label: string;
   last_error_code: string | null;
+  last_error_details?: Record<string, unknown> | null;
   last_event_seq: number;
   unpaired_baseline_vault_id?: string | null;
   unpaired_baseline_main?: string | null;
@@ -247,7 +248,16 @@ export class ObtsPluginClient {
     }
     this.throwIfSyncBlocked(state);
     await this.flushEditorBuffersToDisk();
-    const localFiles = await this.git.scanSyncableFiles();
+    await this.reconcileQueueWithLocalHead(await this.readState());
+    let localFiles: string[];
+    try {
+      localFiles = await this.git.scanSyncableFiles();
+    } catch (error) {
+      if (error instanceof PathPolicyViolation) {
+        await this.block(error.code, error.message, error.details);
+      }
+      throw error;
+    }
     if (localFiles.length > 0 && !state.initial_import_confirmed && state.server_device_ref === null) {
       await this.createLocalRecoveryBundle('initial_import', state.local_main, localFiles);
       if (!options.confirmInitialImport) {
@@ -261,7 +271,15 @@ export class ObtsPluginClient {
       });
     }
 
-    const commit = await this.git.createLocalCommit('obts: local vault changes');
+    let commit: string | null;
+    try {
+      commit = await this.git.createLocalCommit('obts: local vault changes');
+    } catch (error) {
+      if (error instanceof PathPolicyViolation) {
+        await this.block(error.code, error.message, error.details);
+      }
+      throw error;
+    }
     if (commit) {
       await this.writeQueue({
         pending_commit: commit,
@@ -309,7 +327,10 @@ export class ObtsPluginClient {
         last_error_code: null,
         updated_at: nowIso()
       });
-      const packfile = await this.git.createPackForCommit(queue.pending_commit);
+      const packfile = await this.git.createPackForCommit(
+        queue.pending_commit,
+        [queue.expected_device_ref, currentState.local_main].filter((commit): commit is string => typeof commit === 'string')
+      );
       const manifest: DevicePushManifest = {
         api_version: API_VERSION,
         vault_id: currentState.vault_id,
@@ -359,6 +380,7 @@ export class ObtsPluginClient {
 
     await this.pullAndApply({ allowDestructive: true });
     const finalState = await this.readState();
+    await this.reportDeviceStatus().catch(() => undefined);
     return finalState.local_main
       ? { status: finalState.status_label, main: finalState.local_main }
       : { status: finalState.status_label };
@@ -749,6 +771,37 @@ export class ObtsPluginClient {
     });
   }
 
+  async reportDeviceStatus(): Promise<void> {
+    const state = await this.readState();
+    if (!state.vault_id || !state.device_id) {
+      return;
+    }
+    let token: string;
+    try {
+      token = await this.readDeviceToken();
+    } catch {
+      return;
+    }
+    const queue = await this.readQueue();
+    await this.transport.reportDeviceStatus({
+      vaultId: state.vault_id,
+      deviceToken: token,
+      report: {
+        plugin_version: PLUGIN_VERSION,
+        local_status_label: state.status_label || 'Checking',
+        local_error_code: state.last_error_code,
+        local_error_details: state.last_error_code ? state.last_error_details ?? null : null,
+        local_queue_status: queue.status,
+        local_main: state.local_main,
+        local_head: state.local_head,
+        path_capabilities: {
+          adapter: 'node-fs',
+          platform: process.platform
+        }
+      }
+    });
+  }
+
   async readState(): Promise<LocalPluginState> {
     try {
       const state = JSON.parse(await readFile(this.statePath, 'utf8')) as LocalPluginState;
@@ -835,7 +888,7 @@ export class ObtsPluginClient {
   ): Promise<void> {
     const state = await this.readState();
     if (state.local_main === targetMain && (options.extraAffectedPaths?.length ?? 0) === 0) {
-      await this.writeState({ ...state, status_label: 'Synced', updated_at: nowIso() });
+      await this.writeState({ ...state, status_label: 'Synced', last_error_code: null, updated_at: nowIso() });
       return;
     }
     if (options.requireCleanVisibleState && !(await this.ensureNoLocalChangesBeforeApply(state))) {
@@ -1514,6 +1567,36 @@ export class ObtsPluginClient {
     return (await this.git.listTreeFiles(commit)).filter((path) => isSyncableVaultPath(path));
   }
 
+  private async reconcileQueueWithLocalHead(state: LocalPluginState): Promise<void> {
+    const queue = await this.readQueue();
+    if (queue.pending_commit || !state.local_head || !(await this.git.commitExists(state.local_head))) {
+      return;
+    }
+    if (state.local_main && state.local_head === state.local_main) {
+      return;
+    }
+    if (state.local_main && (await this.git.isAncestor(state.local_head, state.local_main))) {
+      await this.writeState({ ...state, local_head: state.local_main, status_label: 'Synced', last_error_code: null, updated_at: nowIso() });
+      return;
+    }
+    const descendsFromDeviceRef = state.server_device_ref
+      ? await this.git.isAncestor(state.server_device_ref, state.local_head)
+      : false;
+    const descendsFromLocalMain = state.local_main ? await this.git.isAncestor(state.local_main, state.local_head) : false;
+    if (descendsFromDeviceRef || descendsFromLocalMain || (!state.server_device_ref && !state.local_main)) {
+      await this.writeQueue({
+        pending_commit: state.local_head,
+        expected_device_ref: state.server_device_ref,
+        status: 'queued_local',
+        attempts: 0,
+        updated_at: nowIso()
+      });
+      await this.writeState({ ...state, status_label: 'Ahead', last_error_code: null, updated_at: nowIso() });
+      return;
+    }
+    await this.block('same_device_non_fast_forward', 'Local Git history diverged from this device ref and requires recovery.');
+  }
+
   private throwIfSyncBlocked(state: LocalPluginState): void {
     if (state.last_error_code === 'conflict_review_required') {
       throw new PluginBlockedError(
@@ -1599,13 +1682,15 @@ export class ObtsPluginClient {
     }
   }
 
-  private async block(code: string, message: string): Promise<never> {
+  private async block(code: string, message: string, details: Record<string, unknown> | undefined = undefined): Promise<never> {
     await this.writeState({
       ...(await this.readState()),
       status_label: blockStatusLabel(code),
       last_error_code: code,
+      last_error_details: details ?? null,
       updated_at: nowIso()
     });
+    await this.reportDeviceStatus().catch(() => undefined);
     throw new PluginBlockedError(code, message);
   }
 

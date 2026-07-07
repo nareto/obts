@@ -95,6 +95,17 @@ export type DeviceSelfResponse = {
   event_seq: number;
 };
 
+export type DeviceStatusReport = {
+  plugin_version: string;
+  local_status_label: string;
+  local_error_code: string | null;
+  local_error_details?: Record<string, unknown> | null;
+  local_queue_status: string | null;
+  local_main: string | null;
+  local_head: string | null;
+  path_capabilities?: Record<string, unknown> | null;
+};
+
 export type DevicePushManifest = {
   api_version: typeof API_VERSION;
   vault_id: string;
