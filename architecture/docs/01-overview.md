@@ -22,6 +22,13 @@ and other `.obsidian/**` files are normal synced vault content. OS-specific
 filename limits are handled as device capability/apply problems instead of
 server-wide vault rejections.
 
+Empty directories are represented outside Git. The plugin records explicit
+Obsidian directory intents under `.obts/directory-state.json`; accepted uploads
+carry those intents with the device proposal, and the server stores the current
+explicit-directory set in metadata. Pull/apply receives directory deltas and the
+current explicit set, creates missing empty folders, and removes tombstoned
+folders only when they are empty after file materialization.
+
 At-rest protection follows the current PRD: persistent server state is normal
 sensitive application state protected by deployment-managed storage controls.
 The implementation does not claim app-level encrypted persistence.

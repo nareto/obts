@@ -9,6 +9,7 @@ import type {
   ConflictReviewPackage,
   ConflictReviewPath,
   DevicePushManifest,
+  DirectoryIntent,
   ManualFilePlanEntry,
   PushResult,
   ResolveConflictResponse
@@ -247,7 +248,8 @@ export class SyncService {
           manifest.target_commit,
           refEventSeq,
           manifest.base_commit ?? null,
-          detachedProposal
+          detachedProposal,
+          manifest.directory_intents ?? []
         );
       } catch (error) {
         if (operationId) {
@@ -667,7 +669,8 @@ export class SyncService {
     deviceCommit: string,
     fallbackEventSeq: number,
     proposalBase: string | null = null,
-    detachedProposal = false
+    detachedProposal = false,
+    directoryIntents: DirectoryIntent[] = []
   ): Promise<PushResult> {
     const main = await this.git.getRef(vaultId, 'refs/heads/main');
     if (!main) {
@@ -743,11 +746,29 @@ export class SyncService {
     }
     const overlapping = intersectChangedPaths(mainChanges, deviceChanges);
     if (overlapping.length > 0) {
-      const identityMerge = await this.tryIdentityOverlappingMerge(vaultId, deviceId, base, main, deviceCommit, deviceChanges, overlapping);
+      const identityMerge = await this.tryIdentityOverlappingMerge(
+        vaultId,
+        deviceId,
+        base,
+        main,
+        deviceCommit,
+        deviceChanges,
+        overlapping,
+        directoryIntents
+      );
       if (identityMerge) {
         return identityMerge;
       }
-      const cleanMerge = await this.tryCleanOverlappingMerge(vaultId, deviceId, base, main, deviceCommit, deviceChanges, overlapping);
+      const cleanMerge = await this.tryCleanOverlappingMerge(
+        vaultId,
+        deviceId,
+        base,
+        main,
+        deviceCommit,
+        deviceChanges,
+        overlapping,
+        directoryIntents
+      );
       if (cleanMerge) {
         return cleanMerge;
       }
@@ -841,9 +862,11 @@ export class SyncService {
             disjoint_paths: 'ok',
             overlapping_path_count: 0
           },
-          changed_path_count: changedPathSet(deviceChanges).size
+          changed_path_count: changedPathSet(deviceChanges).size,
+          directory_intents: directoryIntents
         }
       });
+      applyDirectoryIntents(db, vaultId, directoryIntents, event.event_seq);
       db.audit_log.push({
         audit_id: newId('aud'),
         actor_user_id: device.user_id,
@@ -957,7 +980,8 @@ export class SyncService {
     currentMain: string,
     deviceCommit: string,
     deviceChanges: GitDiffEntry[],
-    overlapping: string[]
+    overlapping: string[],
+    directoryIntents: DirectoryIntent[] = []
   ): Promise<PushResult | null> {
     for (const path of overlapping) {
       const currentContent = await this.readOptionalBlob(vaultId, currentMain, path);
@@ -1059,9 +1083,11 @@ export class SyncService {
             identity_only_merge: 'ok',
             overlapping_path_count: overlapping.length
           },
-          changed_path_count: changedPathSet(deviceChanges).size
+          changed_path_count: changedPathSet(deviceChanges).size,
+          directory_intents: directoryIntents
         }
       });
+      applyDirectoryIntents(db, vaultId, directoryIntents, event.event_seq);
       db.audit_log.push({
         audit_id: newId('aud'),
         actor_user_id: device.user_id,
@@ -1283,7 +1309,8 @@ export class SyncService {
     currentMain: string,
     deviceCommit: string,
     deviceChanges: GitDiffEntry[],
-    overlapping: string[]
+    overlapping: string[],
+    directoryIntents: DirectoryIntent[] = []
   ): Promise<PushResult | null> {
     if (!overlapping.every(isNativeTextMergePath)) {
       return null;
@@ -1378,9 +1405,11 @@ export class SyncService {
           current_main: currentMain,
           device_commit: deviceCommit,
           validator_results: mergeTree.validatorResults,
-          changed_path_count: changedPathSet(deviceChanges).size
+          changed_path_count: changedPathSet(deviceChanges).size,
+          directory_intents: directoryIntents
         }
       });
+      applyDirectoryIntents(db, vaultId, directoryIntents, event.event_seq);
       db.audit_log.push({
         audit_id: newId('aud'),
         actor_user_id: device.user_id,
@@ -2290,6 +2319,78 @@ function intersectChangedPaths(left: GitDiffEntry[], right: GitDiffEntry[]): str
 
 function changedPathsConflict(left: string, right: string): boolean {
   return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
+
+function applyDirectoryIntents(db: MetadataDb, vaultId: string, intents: DirectoryIntent[], eventSeq: number): void {
+  if (intents.length === 0) {
+    return;
+  }
+  const existing = db.directory_state_by_vault[vaultId] ?? { explicit_dirs: [], updated_at: nowIso(), last_event_seq: 0 };
+  const explicitDirs = new Set(existing.explicit_dirs);
+  for (const intent of intents) {
+    if (intent.op === 'delete') {
+      for (const path of [...explicitDirs]) {
+        if (path === intent.path || path.startsWith(`${intent.path}/`)) {
+          explicitDirs.delete(path);
+        }
+      }
+      continue;
+    }
+    for (const prefix of directoryPrefixes(intent.path)) {
+      explicitDirs.add(prefix);
+    }
+    explicitDirs.add(intent.path);
+  }
+  db.directory_state_by_vault[vaultId] = {
+    explicit_dirs: [...explicitDirs].sort(),
+    updated_at: nowIso(),
+    last_event_seq: eventSeq
+  };
+}
+
+function directoryPrefixes(path: string): string[] {
+  const segments = path.split('/');
+  const prefixes: string[] = [];
+  for (let index = 1; index < segments.length; index += 1) {
+    prefixes.push(segments.slice(0, index).join('/'));
+  }
+  return prefixes;
+}
+
+function directoryIntentsFromEvents(events: Array<{ payload: Record<string, unknown> }>): DirectoryIntent[] {
+  const intents: DirectoryIntent[] = [];
+  for (const event of events) {
+    const rawIntents = event.payload.directory_intents;
+    if (!Array.isArray(rawIntents)) {
+      continue;
+    }
+    for (const rawIntent of rawIntents) {
+      if (typeof rawIntent !== 'object' || rawIntent === null || Array.isArray(rawIntent)) {
+        continue;
+      }
+      const op = (rawIntent as { op?: unknown }).op;
+      const path = (rawIntent as { path?: unknown }).path;
+      if ((op === 'create' || op === 'delete') && typeof path === 'string') {
+        intents.push({ op, path });
+      }
+    }
+  }
+  return compactDirectoryIntents(intents);
+}
+
+function compactDirectoryIntents(intents: DirectoryIntent[]): DirectoryIntent[] {
+  const byPath = new Map<string, DirectoryIntent>();
+  for (const intent of intents) {
+    if (intent.op === 'delete') {
+      for (const path of [...byPath.keys()]) {
+        if (path === intent.path || path.startsWith(`${intent.path}/`)) {
+          byPath.delete(path);
+        }
+      }
+    }
+    byPath.set(intent.path, intent);
+  }
+  return [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path) || left.op.localeCompare(right.op));
 }
 
 function changedPathSet(entries: GitDiffEntry[]): Set<string> {

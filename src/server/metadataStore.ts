@@ -130,6 +130,12 @@ export type AuditRow = {
   created_at: string;
 };
 
+export type DirectoryStateRow = {
+  explicit_dirs: string[];
+  updated_at: string;
+  last_event_seq: number;
+};
+
 export type MetadataDb = {
   schema_version: 1;
   setup_complete: boolean;
@@ -145,6 +151,7 @@ export type MetadataDb = {
   audit_log: AuditRow[];
   event_seq_by_vault: Record<string, number>;
   merge_sequence_by_vault: Record<string, number>;
+  directory_state_by_vault: Record<string, DirectoryStateRow>;
 };
 
 export class MetadataStore {
@@ -262,10 +269,14 @@ export class MetadataStore {
   }
 
   private normalizeLoadedDb(db: MetadataDb): void {
-    const legacyDb = db as MetadataDb & { login_attempts?: LoginAttemptRow[] };
+    const legacyDb = db as MetadataDb & {
+      login_attempts?: LoginAttemptRow[];
+      directory_state_by_vault?: Record<string, DirectoryStateRow>;
+    };
     if (!Array.isArray(legacyDb.login_attempts)) {
       legacyDb.login_attempts = [];
     }
+    legacyDb.directory_state_by_vault ??= {};
     for (const device of db.devices) {
       const legacyDevice = device as DeviceRow & {
         last_applied_main?: string | null;
@@ -336,7 +347,8 @@ function createEmptyDb(): MetadataDb {
     events: [],
     audit_log: [],
     event_seq_by_vault: {},
-    merge_sequence_by_vault: {}
+    merge_sequence_by_vault: {},
+    directory_state_by_vault: {}
   };
 }
 

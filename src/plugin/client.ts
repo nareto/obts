@@ -4,12 +4,12 @@ import { dirname, join } from 'node:path';
 
 import { newId, nowIso } from '../shared/ids.js';
 import { assertSyncableTreePaths, isSyncableVaultPath, normalizeVaultPath, PathPolicyViolation } from '../shared/pathPolicy.js';
-import { API_VERSION, type DevicePushManifest } from '../shared/types.js';
+import { API_VERSION, type DevicePushManifest, type DirectoryIntent } from '../shared/types.js';
 import { LocalGitEngine } from './localGit.js';
 import { ApplyLockActiveError, type ApplyJournal, RecoveryManager, sha256File } from './recovery.js';
 import { TransportClient, TransportError } from './transport.js';
 
-const PLUGIN_VERSION = '0.1.14-phase2';
+const PLUGIN_VERSION = '0.1.15-phase2';
 
 export type ObtsPluginSettings = {
   serverUrl: string;
@@ -52,6 +52,13 @@ export type QueueState = {
   expected_device_ref: string | null;
   status: 'idle' | 'queued_local' | 'uploading' | 'uploaded' | 'merged' | 'conflicted' | 'blocked_recovery';
   attempts: number;
+  updated_at: string;
+};
+
+type DirectorySyncState = {
+  observed_dirs: string[];
+  explicit_empty_dirs: string[];
+  pending_intents: DirectoryIntent[];
   updated_at: string;
 };
 
@@ -166,7 +173,8 @@ export class ObtsPluginClient {
       vaultId: result.vault_id,
       deviceId: result.device_id,
       deviceToken: result.device_token,
-      currentLocalMain: rePairBaseline?.main ?? null
+      currentLocalMain: rePairBaseline?.main ?? null,
+      currentEventSeq: 0
     });
     await this.git.importPack(pulled.packfile);
     const localFiles = await this.git.scanSyncableFiles();
@@ -188,7 +196,11 @@ export class ObtsPluginClient {
           initial_import_confirmed: true,
           updated_at: nowIso()
         });
-        await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true);
+        await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true, {
+          directoryIntents: pulled.manifest.directory_intents ?? [],
+          explicitDirectories: pulled.manifest.explicit_directories ?? [],
+          eventSeq: pulled.manifest.event_seq
+        });
         await this.writeState({
           ...(await this.readState()),
           initial_import_confirmed: true,
@@ -229,7 +241,11 @@ export class ObtsPluginClient {
       }
       return;
     }
-    await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true);
+    await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true, {
+      directoryIntents: pulled.manifest.directory_intents ?? [],
+      explicitDirectories: pulled.manifest.explicit_directories ?? [],
+      eventSeq: pulled.manifest.event_seq
+    });
     if (localFiles.length === 0 || localAlreadyMatchesServer) {
       await this.writeState({
         ...(await this.readState()),
@@ -249,6 +265,7 @@ export class ObtsPluginClient {
     this.throwIfSyncBlocked(state);
     await this.flushEditorBuffersToDisk();
     await this.reconcileQueueWithLocalHead(await this.readState());
+    let pendingDirectoryIntents = await this.reconcileDirectoryState();
     let localFiles: string[];
     try {
       localFiles = await this.git.scanSyncableFiles();
@@ -280,6 +297,9 @@ export class ObtsPluginClient {
       }
       throw error;
     }
+    if (!commit && pendingDirectoryIntents.length > 0) {
+      commit = await this.git.createMetadataCommit('obts: local directory changes');
+    }
     if (commit) {
       await this.writeQueue({
         pending_commit: commit,
@@ -301,6 +321,7 @@ export class ObtsPluginClient {
       if (
         existingQueue.status === 'queued_local' &&
         existingQueue.pending_commit === null &&
+        pendingDirectoryIntents.length === 0 &&
         (await this.visibleVaultMatchesLocalHead(await this.readState()))
       ) {
         await this.writeQueue({
@@ -331,6 +352,7 @@ export class ObtsPluginClient {
         queue.pending_commit,
         [queue.expected_device_ref, currentState.local_main].filter((commit): commit is string => typeof commit === 'string')
       );
+      pendingDirectoryIntents = (await this.readDirectoryState()).pending_intents;
       const manifest: DevicePushManifest = {
         api_version: API_VERSION,
         vault_id: currentState.vault_id,
@@ -341,6 +363,7 @@ export class ObtsPluginClient {
         packfile_bytes: packfile.byteLength,
         client_known_main: currentState.local_main,
         ...(queue.expected_device_ref === null && currentState.local_main ? { base_commit: currentState.local_main } : {}),
+        ...(pendingDirectoryIntents.length > 0 ? { directory_intents: pendingDirectoryIntents } : {}),
         attempt_id: newId('sync')
       };
       const result = await this.pushOrBlock(currentState, queue, token, manifest, packfile);
@@ -373,8 +396,10 @@ export class ObtsPluginClient {
           server_device_ref: result.device_ref,
           local_head: queue.pending_commit,
           status_label: result.status === 'merged' ? 'Behind' : 'Synced',
+          last_event_seq: Math.max(currentState.last_event_seq, result.event_seq),
           updated_at: nowIso()
         });
+        await this.clearPendingDirectoryIntents();
       }
     }
 
@@ -401,11 +426,15 @@ export class ObtsPluginClient {
       vaultId: state.vault_id,
       deviceId: state.device_id,
       deviceToken: token,
-      currentLocalMain: state.local_main
+      currentLocalMain: state.local_main,
+      currentEventSeq: state.last_event_seq
     });
     await this.git.importPack(pulled.packfile);
     await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true, {
-      extraAffectedPaths: localFiles
+      extraAffectedPaths: localFiles,
+      directoryIntents: pulled.manifest.directory_intents ?? [],
+      explicitDirectories: pulled.manifest.explicit_directories ?? [],
+      eventSeq: pulled.manifest.event_seq
     });
     await this.acknowledgeAppliedMain(state, token, pulled.manifest.target_main);
     await this.writeQueue({
@@ -452,7 +481,8 @@ export class ObtsPluginClient {
       vaultId: state.vault_id,
       deviceId: state.device_id,
       deviceToken: token,
-      currentLocalMain: state.local_main
+      currentLocalMain: state.local_main,
+      currentEventSeq: state.last_event_seq
     });
     await this.git.importPack(pulled.packfile);
     const priorLocalFiles = state.local_main ? await this.materializedTreeFiles(state.local_main) : [];
@@ -464,7 +494,10 @@ export class ObtsPluginClient {
     );
 
     await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true, {
-      extraAffectedPaths: localFiles
+      extraAffectedPaths: localFiles,
+      directoryIntents: pulled.manifest.directory_intents ?? [],
+      explicitDirectories: pulled.manifest.explicit_directories ?? [],
+      eventSeq: pulled.manifest.event_seq
     });
     if (state.local_main !== pulled.manifest.target_main) {
       await this.acknowledgeAppliedMain(state, token, pulled.manifest.target_main);
@@ -578,7 +611,8 @@ export class ObtsPluginClient {
       vaultId: state.vault_id,
       deviceId: state.device_id,
       deviceToken: token,
-      currentLocalMain: state.local_main
+      currentLocalMain: state.local_main,
+      currentEventSeq: state.last_event_seq
     });
     await this.git.importPack(pulled.packfile);
     state = await this.readState();
@@ -586,7 +620,10 @@ export class ObtsPluginClient {
       return false;
     }
     await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, options.allowDestructive, {
-      requireCleanVisibleState: true
+      requireCleanVisibleState: true,
+      directoryIntents: pulled.manifest.directory_intents ?? [],
+      explicitDirectories: pulled.manifest.explicit_directories ?? [],
+      eventSeq: pulled.manifest.event_seq
     });
     if (state.local_main !== pulled.manifest.target_main) {
       await this.acknowledgeAppliedMain(state, token, pulled.manifest.target_main);
@@ -880,15 +917,105 @@ export class ObtsPluginClient {
     }
   }
 
+  private async readDirectoryState(): Promise<DirectorySyncState> {
+    try {
+      const state = JSON.parse(await readFile(this.directoryStatePath, 'utf8')) as DirectorySyncState;
+      return {
+        observed_dirs: Array.isArray(state.observed_dirs) ? state.observed_dirs : [],
+        explicit_empty_dirs: Array.isArray(state.explicit_empty_dirs) ? state.explicit_empty_dirs : [],
+        pending_intents: compactDirectoryIntents(Array.isArray(state.pending_intents) ? state.pending_intents : []),
+        updated_at: typeof state.updated_at === 'string' ? state.updated_at : nowIso()
+      };
+    } catch {
+      return { observed_dirs: [], explicit_empty_dirs: [], pending_intents: [], updated_at: nowIso() };
+    }
+  }
+
+  private async writeDirectoryState(state: DirectorySyncState): Promise<void> {
+    await writeJson(this.directoryStatePath, {
+      observed_dirs: [...new Set(state.observed_dirs)].sort(),
+      explicit_empty_dirs: [...new Set(state.explicit_empty_dirs)].sort(),
+      pending_intents: compactDirectoryIntents(state.pending_intents),
+      updated_at: state.updated_at
+    });
+  }
+
+  private async reconcileDirectoryState(): Promise<DirectoryIntent[]> {
+    const previous = await this.readDirectoryState();
+    const currentDirs = await listLocalVaultDirectories(this.vaultDir);
+    const currentFiles = await this.git.scanSyncableFiles();
+    const explicitDirs = explicitEmptyDirectories(currentDirs, currentFiles);
+    const previousDirs = new Set(previous.observed_dirs);
+    const previousExplicitDirs = new Set(previous.explicit_empty_dirs);
+    const currentDirSet = new Set(currentDirs);
+    const createdIntents = explicitDirs
+      .filter((path) => !previousDirs.has(path) || !previousExplicitDirs.has(path))
+      .map((path): DirectoryIntent => ({ op: 'create', path }));
+    const deletedIntents = topmostDirectories(previous.observed_dirs.filter((path) => !currentDirSet.has(path))).map(
+      (path): DirectoryIntent => ({ op: 'delete', path })
+    );
+    const pendingIntents = compactDirectoryIntents([...previous.pending_intents, ...createdIntents, ...deletedIntents]);
+    await this.writeDirectoryState({
+      observed_dirs: currentDirs,
+      explicit_empty_dirs: explicitDirs,
+      pending_intents: pendingIntents,
+      updated_at: nowIso()
+    });
+    return pendingIntents;
+  }
+
+  private async clearPendingDirectoryIntents(): Promise<void> {
+    await this.refreshDirectoryStateFromDisk([]);
+  }
+
+  private async refreshDirectoryStateFromDisk(pendingIntents?: DirectoryIntent[]): Promise<void> {
+    const previous = await this.readDirectoryState();
+    const currentDirs = await listLocalVaultDirectories(this.vaultDir);
+    const currentFiles = await this.git.scanSyncableFiles();
+    await this.writeDirectoryState({
+      observed_dirs: currentDirs,
+      explicit_empty_dirs: explicitEmptyDirectories(currentDirs, currentFiles),
+      pending_intents: pendingIntents ?? previous.pending_intents,
+      updated_at: nowIso()
+    });
+  }
+
+  private async applyDirectoryChanges(directoryIntents: DirectoryIntent[], explicitDirectories: string[]): Promise<void> {
+    for (const intent of directoryIntents.filter((entry) => entry.op === 'delete').sort((left, right) => right.path.length - left.path.length)) {
+      const absolutePath = join(this.vaultDir, intent.path);
+      if ((await pathIsDirectory(absolutePath)) && (await directoryIsEmpty(absolutePath))) {
+        await rm(absolutePath, { recursive: true, force: true });
+      }
+    }
+    for (const path of explicitDirectories.sort((left, right) => left.length - right.length)) {
+      await mkdir(join(this.vaultDir, path), { recursive: true, mode: 0o700 });
+    }
+  }
+
   private async applyTargetMain(
     targetMain: string,
     changedPaths: string[],
     allowDestructive: boolean,
-    options: { extraAffectedPaths?: string[]; requireCleanVisibleState?: boolean } = {}
+    options: {
+      extraAffectedPaths?: string[];
+      requireCleanVisibleState?: boolean;
+      directoryIntents?: DirectoryIntent[];
+      explicitDirectories?: string[];
+      eventSeq?: number;
+    } = {}
   ): Promise<void> {
     const state = await this.readState();
-    if (state.local_main === targetMain && (options.extraAffectedPaths?.length ?? 0) === 0) {
-      await this.writeState({ ...state, status_label: 'Synced', last_error_code: null, updated_at: nowIso() });
+    const directoryIntents = compactDirectoryIntents(options.directoryIntents ?? []);
+    const explicitDirectories = [...new Set(options.explicitDirectories ?? [])].sort();
+    const hasDirectoryWork = directoryIntents.length > 0 || explicitDirectories.length > 0;
+    if (state.local_main === targetMain && (options.extraAffectedPaths?.length ?? 0) === 0 && !hasDirectoryWork) {
+      await this.writeState({
+        ...state,
+        status_label: 'Synced',
+        last_error_code: null,
+        last_event_seq: Math.max(state.last_event_seq, options.eventSeq ?? state.last_event_seq),
+        updated_at: nowIso()
+      });
       return;
     }
     if (options.requireCleanVisibleState && !(await this.ensureNoLocalChangesBeforeApply(state))) {
@@ -1001,6 +1128,7 @@ export class ObtsPluginClient {
         }
       }
       await this.writeTargetFilesFromJournal(journal, targetFiles);
+      await this.applyDirectoryChanges(directoryIntents, explicitDirectories);
 
       journal.phase = 'verifying';
       journal.last_completed_step = 'files_written';
@@ -1034,8 +1162,10 @@ export class ObtsPluginClient {
         local_head: targetMain,
         status_label: 'Synced',
         last_error_code: null,
+        last_event_seq: Math.max(state.last_event_seq, options.eventSeq ?? state.last_event_seq),
         updated_at: nowIso()
       });
+      await this.refreshDirectoryStateFromDisk();
       await this.recovery.clearApplyJournal();
       if (preservedLocalChangePaths.length > 0) {
         await this.queuePreservedLocalChanges(targetMain, state.server_device_ref);
@@ -1745,7 +1875,8 @@ export class ObtsPluginClient {
         deviceId: state.device_id,
         deviceToken: token,
         currentLocalMain: targetMain,
-        requestedTarget: targetMain
+        requestedTarget: targetMain,
+        currentEventSeq: state.last_event_seq
       });
     } catch (error) {
       if (error instanceof TransportError && error.status === 404 && error.code === 'not_found') {
@@ -1929,7 +2060,8 @@ export class ObtsPluginClient {
         deviceId,
         deviceToken: token,
         currentLocalMain: localMain,
-        requestedTarget: 'latest'
+        requestedTarget: 'latest',
+        currentEventSeq: 0
       });
       await this.git.importPack(pulled.packfile);
     } catch {
@@ -1994,6 +2126,10 @@ export class ObtsPluginClient {
 
   private get queuePath(): string {
     return join(this.vaultDir, '.obts', 'queue.json');
+  }
+
+  private get directoryStatePath(): string {
+    return join(this.vaultDir, '.obts', 'directory-state.json');
   }
 }
 
@@ -2070,6 +2206,45 @@ async function listLocalVaultFiles(root: string): Promise<string[]> {
   return files.sort();
 }
 
+async function listLocalVaultDirectories(root: string): Promise<string[]> {
+  const directories: string[] = [];
+  await walkVaultDirectories(root, root, directories);
+  return directories.sort();
+}
+
+function explicitEmptyDirectories(directories: string[], files: string[]): string[] {
+  return directories.filter((directory) => !files.some((file) => file.startsWith(`${directory}/`))).sort();
+}
+
+function topmostDirectories(directories: string[]): string[] {
+  const sorted = [...new Set(directories)].sort((left, right) => left.length - right.length || left.localeCompare(right));
+  const result: string[] = [];
+  for (const directory of sorted) {
+    if (!result.some((parent) => directory === parent || directory.startsWith(`${parent}/`))) {
+      result.push(directory);
+    }
+  }
+  return result;
+}
+
+function compactDirectoryIntents(intents: DirectoryIntent[]): DirectoryIntent[] {
+  const byPath = new Map<string, DirectoryIntent>();
+  for (const intent of intents) {
+    if ((intent.op !== 'create' && intent.op !== 'delete') || !isSyncableVaultPath(intent.path)) {
+      continue;
+    }
+    if (intent.op === 'delete') {
+      for (const path of [...byPath.keys()]) {
+        if (path === intent.path || path.startsWith(`${intent.path}/`)) {
+          byPath.delete(path);
+        }
+      }
+    }
+    byPath.set(intent.path, intent);
+  }
+  return [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path) || left.op.localeCompare(right.op));
+}
+
 async function listLocalDescendantFiles(root: string, relativePath: string): Promise<string[]> {
   const absolutePath = join(root, relativePath);
   if (!(await pathIsDirectory(absolutePath))) {
@@ -2129,6 +2304,25 @@ async function walkVaultFiles(root: string, current: string, files: string[]): P
   }
 }
 
+async function walkVaultDirectories(root: string, current: string, directories: string[]): Promise<void> {
+  const entries = await readdir(current, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.name === '.obts' || entry.name === '.git') {
+      continue;
+    }
+    const absolutePath = join(current, entry.name);
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    const relativePath = relativeVaultPath(root, absolutePath);
+    if (!isSyncableVaultPath(relativePath)) {
+      continue;
+    }
+    directories.push(relativePath);
+    await walkVaultDirectories(root, absolutePath, directories);
+  }
+}
+
 function relativeVaultPath(root: string, absolutePath: string): string {
   return absolutePath.slice(root.length + 1).replaceAll('\\', '/');
 }
@@ -2136,6 +2330,14 @@ function relativeVaultPath(root: string, absolutePath: string): string {
 async function pathIsDirectory(path: string): Promise<boolean> {
   try {
     return (await stat(path)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+async function directoryIsEmpty(path: string): Promise<boolean> {
+  try {
+    return (await readdir(path)).length === 0;
   } catch {
     return false;
   }

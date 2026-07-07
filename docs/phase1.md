@@ -39,7 +39,7 @@ Implemented runtime pieces:
   `GET /api/v1/vaults/{vault_id}/sync/events` with their device token, so the
   plugin can observe `main_advanced`, conflict, rejection, and recovery events
   without a dashboard session cookie.
-- Plugin-side `.obts/` state with `isomorphic-git`, device token storage, durable watcher change hints, queue state, recovery bundles with file snapshots, text patches, local Git refs packs, and artifact checksums, local apply lock, apply journal, local commit creation, device-token metadata rehydration when `state.json` is lost, multipart push, multipart pull, safe apply, safe incomplete-journal replay with recovery blocking when replay is unsafe, explicit replace-local-with-server recovery, and explicit rebuild from current server `main`.
+- Plugin-side `.obts/` state with `isomorphic-git`, device token storage, durable watcher change hints, queue state, explicit directory-intent state for empty folder creation/deletion, recovery bundles with file snapshots, text patches, local Git refs packs, and artifact checksums, local apply lock, apply journal, local commit creation, device-token metadata rehydration when `state.json` is lost, multipart push, multipart pull, safe apply, safe incomplete-journal replay with recovery blocking when replay is unsafe, explicit replace-local-with-server recovery, and explicit rebuild from current server `main`.
 - Rebuild classifies repeated, same-device fast-forward, snapshot-only, and divergent local history: fast-forward commits stay queued, snapshot-only edits become a new recovery commit based on rebuilt `main`, and divergent same-device history blocks for export plus reset or re-pair.
 - Plugin sync records server-created conflicts as a local `Review needed` blocking state, so later automatic sync or pull/apply attempts stop before replacing local review content.
 - The sync pull API also rejects devices marked `review_needed` or `blocked_recovery`, so a stale or reset plugin cannot bypass server-known conflict/recovery blocks and apply server state over review content.
@@ -77,7 +77,7 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - first-device import of existing local content creates a recovery bundle and requires confirmation;
 - empty or already-matching paired devices acknowledge the current server `main`
   immediately and appear Synced without needing a later manual sync;
-- watcher change hints for syncable vault paths survive plugin restart and are consumed by the next normal Git-backed sync scan, while internal `.obts` and visible `.git` paths are ignored;
+- watcher change hints and directory-intent scans for syncable vault paths survive plugin restart and are consumed by the next normal Git-backed sync scan, while internal `.obts` and visible `.git` paths are ignored;
 - plugin state surfaces `Uploading` during queued push attempts and `Applying`
   while pulled server `main` is being materialized locally;
 - divergent additional-device local content is committed as that actor device's proposal, optionally using current server `main` as `base_commit`, and the server either merges it or records a conflict without adopting another device ref;
@@ -89,6 +89,7 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - compact same-file JSON Canvas edits with disjoint semantic fields merge deterministically when native Git reports a text conflict, while same-field Canvas edits create a durable conflict;
 - lost `state.json` with a valid device token and intact local Git refs is repaired automatically, preserving filesystem-as-source-of-truth semantics and uploading edits through the device ref;
 - Git-safe Obsidian paths with punctuation or case distinctions are synced when the local adapter can represent them;
+- explicit empty folder creation and folder delete tombstones sync as Obsidian directory metadata outside the Git file tree; tombstones remove only empty remote directories and never recursively delete non-empty local content;
 - safe same-file Obsidian Bases edits merge through the semantic Bases validator, including compact YAML that native Git cannot merge cleanly, while unsafe same-field Bases edits create a durable conflict;
 - same-path binary attachment edits auto-merge only when object identity matches;
 - unsafe concurrent same-path edits and file/directory hierarchy collisions create a durable conflict record and do not overwrite current `main`;

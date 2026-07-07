@@ -6,9 +6,11 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 
 const API_VERSION = "2026-07-02.full-sync";
-const PLUGIN_VERSION = "0.1.14-phase2";
+const PLUGIN_VERSION = "0.1.15-phase2";
 const SYNC_DEBOUNCE_MS = 1500;
 const BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000;
+const SYNC_STALE_MS = 2 * 60 * 1000;
+const NETWORK_TIMEOUT_MS = 60 * 1000;
 
 const DEFAULT_SETTINGS = {
   serverUrl: "http://127.0.0.1:3000",
@@ -25,6 +27,7 @@ module.exports = class ObtsPlugin extends Plugin {
     this.status = this.addStatusBarItem();
     this.syncQueued = false;
     this.syncRunning = false;
+    this.syncRunningSince = null;
     this.isApplying = false;
     this.setStatus("Checking");
     this.client = new ObtsObsidianClient(this);
@@ -153,7 +156,7 @@ module.exports = class ObtsPlugin extends Plugin {
     if (!this.syncQueued) {
       return;
     }
-    if (this.syncRunning) {
+    if (this.isSyncInProgress()) {
       window.setTimeout(() => {
         void this.runQueuedSync();
       }, SYNC_DEBOUNCE_MS);
@@ -205,7 +208,7 @@ module.exports = class ObtsPlugin extends Plugin {
       await this.runQueuedSync();
       return;
     }
-    if (this.syncRunning) {
+    if (this.isSyncInProgress()) {
       return;
     }
     const state = await this.client.readState();
@@ -220,10 +223,10 @@ module.exports = class ObtsPlugin extends Plugin {
   }
 
   async runAutomaticSync() {
-    if (this.syncRunning) {
+    if (this.isSyncInProgress()) {
       return;
     }
-    this.syncRunning = true;
+    this.beginSync();
     try {
       const state = await this.client.readState();
       if (!state.vault_id || !state.device_id) {
@@ -239,7 +242,7 @@ module.exports = class ObtsPlugin extends Plugin {
     } catch (error) {
       await this.handleAutomaticSyncError(error);
     } finally {
-      this.syncRunning = false;
+      this.endSync();
       if (this.syncQueued) {
         window.setTimeout(() => {
           void this.runQueuedSync();
@@ -259,10 +262,10 @@ module.exports = class ObtsPlugin extends Plugin {
   }
 
   async runUserAction(fn, showNotice = true) {
-    if (this.syncRunning) {
+    if (this.isSyncInProgress()) {
       return;
     }
-    this.syncRunning = true;
+    this.beginSync();
     try {
       const result = await fn();
       this.setStatus((await this.client.readState()).status_label);
@@ -277,8 +280,32 @@ module.exports = class ObtsPlugin extends Plugin {
         new Notice(message);
       }
     } finally {
-      this.syncRunning = false;
+      this.endSync();
     }
+  }
+
+  isSyncInProgress() {
+    if (!this.syncRunning) {
+      return false;
+    }
+    if (this.syncRunningSince && Date.now() - this.syncRunningSince > SYNC_STALE_MS) {
+      this.syncRunning = false;
+      this.syncRunningSince = null;
+      this.isApplying = false;
+      this.setStatus("Offline");
+      return false;
+    }
+    return true;
+  }
+
+  beginSync() {
+    this.syncRunning = true;
+    this.syncRunningSince = Date.now();
+  }
+
+  endSync() {
+    this.syncRunning = false;
+    this.syncRunningSince = null;
   }
 };
 
@@ -292,6 +319,7 @@ class ObtsObsidianClient {
     this.authPath = path.join(this.obtsDir, "auth", "device-token.json");
     this.statePath = path.join(this.obtsDir, "state.json");
     this.queuePath = path.join(this.obtsDir, "queue.json");
+    this.directoryStatePath = path.join(this.obtsDir, "directory-state.json");
     this.applyJournalPath = path.join(this.obtsDir, "apply-journal.json");
     this.applyLockPath = path.join(this.obtsDir, "apply.lock");
   }
@@ -368,7 +396,7 @@ class ObtsObsidianClient {
       updated_at: nowIso()
     });
 
-    const pulled = await this.pull(result.vault_id, result.device_id, result.device_token, rePairBaseline ? rePairBaseline.main : null);
+    const pulled = await this.pull(result.vault_id, result.device_id, result.device_token, rePairBaseline ? rePairBaseline.main : null, "latest", 0);
     await this.importPack(pulled.packfile);
     const localFiles = await this.scanSyncableFiles();
     const serverFiles = await this.listTreeFiles(pulled.manifest.target_main);
@@ -388,7 +416,16 @@ class ObtsObsidianClient {
           initial_import_confirmed: true,
           updated_at: nowIso()
         }));
-        await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true);
+        await this.applyTargetMain(
+          pulled.manifest.target_main,
+          pulled.manifest.changed_paths,
+          true,
+          [],
+          false,
+          pulled.manifest.directory_intents || [],
+          pulled.manifest.explicit_directories || [],
+          pulled.manifest.event_seq
+        );
         await this.writeState(Object.assign({}, await this.readState(), {
           initial_import_confirmed: true,
           status_label: "Synced",
@@ -420,7 +457,16 @@ class ObtsObsidianClient {
       }
       return;
     }
-    await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true);
+    await this.applyTargetMain(
+      pulled.manifest.target_main,
+      pulled.manifest.changed_paths,
+      true,
+      [],
+      false,
+      pulled.manifest.directory_intents || [],
+      pulled.manifest.explicit_directories || [],
+      pulled.manifest.event_seq
+    );
     if (localFiles.length === 0 || localAlreadyMatchesServer) {
       await this.writeState(Object.assign({}, await this.readState(), { initial_import_confirmed: true, updated_at: nowIso() }));
       await this.acknowledgeAppliedMain(pulled.manifest.target_main);
@@ -436,6 +482,7 @@ class ObtsObsidianClient {
     this.throwIfSyncBlocked(state);
     await this.flushEditorBuffersToDisk();
     await this.reconcileQueueWithLocalHead(await this.readState());
+    let pendingDirectoryIntents = await this.reconcileDirectoryState();
 
     const localFiles = await this.scanSyncableFiles();
     if (localFiles.length > 0 && !state.initial_import_confirmed && state.server_device_ref === null) {
@@ -446,7 +493,10 @@ class ObtsObsidianClient {
       await this.writeState(Object.assign({}, state, { initial_import_confirmed: true, status_label: "Ahead", updated_at: nowIso() }));
     }
 
-    const commit = await this.createLocalCommit("obts: local vault changes");
+    let commit = await this.createLocalCommit("obts: local vault changes");
+    if (!commit && pendingDirectoryIntents.length > 0) {
+      commit = await this.createMetadataCommit("obts: local directory changes");
+    }
     if (commit) {
       const currentState = await this.readState();
       await this.writeQueue({
@@ -481,9 +531,18 @@ class ObtsObsidianClient {
     }
     const token = await this.readDeviceToken();
     const localFiles = await this.scanSyncableFiles();
-    const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main);
+    const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main, "latest", state.last_event_seq || 0);
     await this.importPack(pulled.packfile);
-    await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true, localFiles);
+    await this.applyTargetMain(
+      pulled.manifest.target_main,
+      pulled.manifest.changed_paths,
+      true,
+      localFiles,
+      false,
+      pulled.manifest.directory_intents || [],
+      pulled.manifest.explicit_directories || [],
+      pulled.manifest.event_seq
+    );
     await this.acknowledgeAppliedMain(pulled.manifest.target_main);
     await this.writeQueue({ pending_commit: null, expected_device_ref: state.server_device_ref, status: "idle", attempts: 0, updated_at: nowIso() });
     await this.writeState(Object.assign({}, await this.readState(), {
@@ -512,12 +571,21 @@ class ObtsObsidianClient {
     const queue = await this.readQueue();
     const localFiles = await this.scanSyncableFiles();
     const localSnapshot = await this.readFileSnapshot(localFiles);
-    const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main);
+    const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main, "latest", state.last_event_seq || 0);
     await this.importPack(pulled.packfile);
     const priorLocalFiles = state.local_main ? await this.listTreeFiles(state.local_main) : [];
     const pendingClassification = await this.classifyPendingCommit(queue.pending_commit, state.server_device_ref, pulled.manifest.target_main);
 
-    await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true, localFiles);
+    await this.applyTargetMain(
+      pulled.manifest.target_main,
+      pulled.manifest.changed_paths,
+      true,
+      localFiles,
+      false,
+      pulled.manifest.directory_intents || [],
+      pulled.manifest.explicit_directories || [],
+      pulled.manifest.event_seq
+    );
     if (state.local_main !== pulled.manifest.target_main) {
       await this.acknowledgeAppliedMain(pulled.manifest.target_main);
     }
@@ -625,6 +693,7 @@ class ObtsObsidianClient {
     }));
     this.plugin.setStatus("Uploading");
     const packfile = await this.createPackForCommit(queue.pending_commit, [queue.expected_device_ref, state.local_main].filter(Boolean));
+    const pendingDirectoryIntents = (await this.readDirectoryState()).pending_intents;
     const manifest = {
       api_version: API_VERSION,
       vault_id: state.vault_id,
@@ -635,6 +704,7 @@ class ObtsObsidianClient {
       packfile_bytes: packfile.byteLength,
       client_known_main: state.local_main,
       ...(queue.expected_device_ref === null && state.local_main ? { base_commit: state.local_main } : {}),
+      ...(pendingDirectoryIntents.length > 0 ? { directory_intents: pendingDirectoryIntents } : {}),
       attempt_id: `sync_${Date.now()}_${crypto.randomBytes(8).toString("hex")}`
     };
     let result;
@@ -672,8 +742,10 @@ class ObtsObsidianClient {
         local_head: queue.pending_commit,
         status_label: result.status === "merged" ? "Behind" : "Synced",
         last_error_code: null,
+        last_event_seq: Math.max(state.last_event_seq || 0, result.event_seq || 0),
         updated_at: nowIso()
       }));
+      await this.clearPendingDirectoryIntents();
     }
   }
 
@@ -710,13 +782,22 @@ class ObtsObsidianClient {
     }
     state = await this.readState();
     const token = await this.readDeviceToken();
-    const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main);
+    const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main, "latest", state.last_event_seq || 0);
     await this.importPack(pulled.packfile);
     state = await this.readState();
     if (!(await this.ensureNoLocalChangesBeforeApply(state))) {
       return false;
     }
-    await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, allowDestructive, [], true);
+    await this.applyTargetMain(
+      pulled.manifest.target_main,
+      pulled.manifest.changed_paths,
+      allowDestructive,
+      [],
+      true,
+      pulled.manifest.directory_intents || [],
+      pulled.manifest.explicit_directories || [],
+      pulled.manifest.event_seq
+    );
     if (state.local_main !== pulled.manifest.target_main) {
       await this.acknowledgeAppliedMain(pulled.manifest.target_main);
     }
@@ -874,10 +955,27 @@ class ObtsObsidianClient {
     return { status: "Not paired", recoveryBundleId };
   }
 
-  async applyTargetMain(targetMain, changedPaths, allowDestructive, extraAffectedPaths = [], requireCleanVisibleState = false) {
+  async applyTargetMain(
+    targetMain,
+    changedPaths,
+    allowDestructive,
+    extraAffectedPaths = [],
+    requireCleanVisibleState = false,
+    directoryIntents = [],
+    explicitDirectories = [],
+    eventSeq = undefined
+  ) {
     const state = await this.readState();
-    if (state.local_main === targetMain && extraAffectedPaths.length === 0) {
-      await this.writeState(Object.assign({}, state, { status_label: "Synced", last_error_code: null, updated_at: nowIso() }));
+    const compactedDirectoryIntents = compactDirectoryIntents(directoryIntents);
+    const explicitDirectorySet = Array.from(new Set(explicitDirectories)).sort();
+    const hasDirectoryWork = compactedDirectoryIntents.length > 0 || explicitDirectorySet.length > 0;
+    if (state.local_main === targetMain && extraAffectedPaths.length === 0 && !hasDirectoryWork) {
+      await this.writeState(Object.assign({}, state, {
+        status_label: "Synced",
+        last_error_code: null,
+        last_event_seq: Math.max(state.last_event_seq || 0, eventSeq || 0),
+        updated_at: nowIso()
+      }));
       return;
     }
     if (requireCleanVisibleState && !(await this.ensureNoLocalChangesBeforeApply(state))) {
@@ -964,6 +1062,7 @@ class ObtsObsidianClient {
         }
       }
       await this.writeTargetFilesFromJournal(journal, targetFiles);
+      await this.applyDirectoryChanges(compactedDirectoryIntents, explicitDirectorySet);
 
       journal.phase = "verifying";
       journal.last_completed_step = "files_written";
@@ -996,8 +1095,10 @@ class ObtsObsidianClient {
         local_head: targetMain,
         status_label: "Synced",
         last_error_code: null,
+        last_event_seq: Math.max(state.last_event_seq || 0, eventSeq || 0),
         updated_at: nowIso()
       }));
+      await this.refreshDirectoryStateFromDisk();
       await this.clearApplyState();
       if (preservedLocalChangePaths.length > 0) {
         await this.queuePreservedLocalChanges(targetMain, state.server_device_ref);
@@ -1276,6 +1377,19 @@ class ObtsObsidianClient {
     } else if (localFiles.length === 0) {
       return null;
     }
+    return await this.commitTree(tree, base, message);
+  }
+
+  async createMetadataCommit(message) {
+    const base = await this.resolveRef("refs/heads/local");
+    if (!base) {
+      return null;
+    }
+    const tree = (await this.git(["show", "-s", "--format=%T", base])).trim();
+    return await this.commitTree(tree, base, message);
+  }
+
+  async commitTree(tree, base, message) {
     const args = ["commit-tree", tree, "-m", message];
     if (base) {
       args.splice(2, 0, "-p", base);
@@ -1492,7 +1606,7 @@ class ObtsObsidianClient {
   }
 
   async getDeviceSelf(token) {
-    const response = await fetch(this.url("/api/v1/device/self"), {
+    const response = await fetchWithTimeout(this.url("/api/v1/device/self"), {
       headers: { authorization: `Bearer ${token}` }
     });
     if (!response.ok) {
@@ -1501,17 +1615,18 @@ class ObtsObsidianClient {
     return await response.json();
   }
 
-  async pull(vaultId, deviceId, token, currentLocalMain, requestedTarget = "latest") {
+  async pull(vaultId, deviceId, token, currentLocalMain, requestedTarget = "latest", currentEventSeq = undefined) {
     const form = new FormData();
     form.append("manifest", JSON.stringify({
       api_version: API_VERSION,
       vault_id: vaultId,
       device_id: deviceId,
       current_local_main: currentLocalMain,
-      requested_target: requestedTarget
+      requested_target: requestedTarget,
+      ...(currentEventSeq === undefined ? {} : { current_event_seq: currentEventSeq })
     }));
     form.append("packfile", new Blob([new ArrayBuffer(0)], { type: "application/x-git-packed-objects" }), "have.pack");
-    const response = await fetch(this.url(`/api/v1/vaults/${vaultId}/sync/pull`), {
+    const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${vaultId}/sync/pull`), {
       method: "POST",
       headers: { authorization: `Bearer ${token}` },
       body: form
@@ -1526,7 +1641,7 @@ class ObtsObsidianClient {
     const form = new FormData();
     form.append("manifest", JSON.stringify(manifest));
     form.append("packfile", new Blob([packfile], { type: "application/x-git-packed-objects" }), "pack.pack");
-    const response = await fetch(this.url(`/api/v1/vaults/${vaultId}/sync/push`), {
+    const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${vaultId}/sync/push`), {
       method: "POST",
       headers: { authorization: `Bearer ${token}` },
       body: form
@@ -1549,7 +1664,7 @@ class ObtsObsidianClient {
       return;
     }
     const queue = await this.readQueue();
-    await fetch(this.url(`/api/v1/vaults/${state.vault_id}/sync/device-status`), {
+    await fetchWithTimeout(this.url(`/api/v1/vaults/${state.vault_id}/sync/device-status`), {
       method: "POST",
       headers: {
         authorization: `Bearer ${token}`,
@@ -1579,7 +1694,7 @@ class ObtsObsidianClient {
     if (!Number.isSafeInteger(after) || after < 0) {
       throw new Error("Event cursor must be a non-negative safe integer.");
     }
-    const response = await fetch(this.url(`/api/v1/vaults/${vaultId}/sync/events?after=${after}`), {
+    const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${vaultId}/sync/events?after=${after}`), {
       headers: { authorization: `Bearer ${token}` }
     });
     if (!response.ok) {
@@ -1589,7 +1704,7 @@ class ObtsObsidianClient {
   }
 
   async unpairDevice(vaultId, token) {
-    const response = await fetch(this.url(`/api/v1/vaults/${vaultId}/sync/unpair`), {
+    const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${vaultId}/sync/unpair`), {
       method: "POST",
       headers: { authorization: `Bearer ${token}` }
     });
@@ -1605,7 +1720,7 @@ class ObtsObsidianClient {
       return;
     }
     try {
-      await this.pull(state.vault_id, state.device_id, await this.readDeviceToken(), targetMain, targetMain);
+      await this.pull(state.vault_id, state.device_id, await this.readDeviceToken(), targetMain, targetMain, state.last_event_seq || 0);
     } catch (error) {
       if (!(error instanceof ObtsTransportError && error.status === 404)) {
         throw error;
@@ -2091,7 +2206,7 @@ class ObtsObsidianClient {
 
   async importCurrentServerMain(vaultId, deviceId, token, localMain) {
     try {
-      const pulled = await this.pull(vaultId, deviceId, token, localMain, "latest");
+      const pulled = await this.pull(vaultId, deviceId, token, localMain, "latest", 0);
       await this.importPack(pulled.packfile);
     } catch {
       // Metadata repair can continue without fresh main objects; sync will retry and block safely if needed.
@@ -2157,6 +2272,78 @@ class ObtsObsidianClient {
 
   async writeQueue(queue) {
     await writeJson(this.queuePath, queue);
+  }
+
+  async readDirectoryState() {
+    const state = await readJson(this.directoryStatePath, null);
+    if (!state) {
+      return { observed_dirs: [], explicit_empty_dirs: [], pending_intents: [], updated_at: nowIso() };
+    }
+    return {
+      observed_dirs: Array.isArray(state.observed_dirs) ? state.observed_dirs : [],
+      explicit_empty_dirs: Array.isArray(state.explicit_empty_dirs) ? state.explicit_empty_dirs : [],
+      pending_intents: compactDirectoryIntents(Array.isArray(state.pending_intents) ? state.pending_intents : []),
+      updated_at: typeof state.updated_at === "string" ? state.updated_at : nowIso()
+    };
+  }
+
+  async writeDirectoryState(state) {
+    await writeJson(this.directoryStatePath, {
+      observed_dirs: Array.from(new Set(state.observed_dirs)).sort(),
+      explicit_empty_dirs: Array.from(new Set(state.explicit_empty_dirs)).sort(),
+      pending_intents: compactDirectoryIntents(state.pending_intents),
+      updated_at: state.updated_at
+    });
+  }
+
+  async reconcileDirectoryState() {
+    const previous = await this.readDirectoryState();
+    const currentDirs = await this.listLocalVaultDirectories();
+    const currentFiles = await this.scanSyncableFiles();
+    const explicitDirs = explicitEmptyDirectories(currentDirs, currentFiles);
+    const previousDirs = new Set(previous.observed_dirs);
+    const previousExplicitDirs = new Set(previous.explicit_empty_dirs);
+    const currentDirSet = new Set(currentDirs);
+    const createdIntents = explicitDirs
+      .filter((dirPath) => !previousDirs.has(dirPath) || !previousExplicitDirs.has(dirPath))
+      .map((dirPath) => ({ op: "create", path: dirPath }));
+    const deletedIntents = topmostDirectories(previous.observed_dirs.filter((dirPath) => !currentDirSet.has(dirPath)))
+      .map((dirPath) => ({ op: "delete", path: dirPath }));
+    const pendingIntents = compactDirectoryIntents([...previous.pending_intents, ...createdIntents, ...deletedIntents]);
+    await this.writeDirectoryState({
+      observed_dirs: currentDirs,
+      explicit_empty_dirs: explicitDirs,
+      pending_intents: pendingIntents,
+      updated_at: nowIso()
+    });
+    return pendingIntents;
+  }
+
+  async clearPendingDirectoryIntents() {
+    await this.refreshDirectoryStateFromDisk([]);
+  }
+
+  async refreshDirectoryStateFromDisk(pendingIntents = undefined) {
+    const previous = await this.readDirectoryState();
+    const currentDirs = await this.listLocalVaultDirectories();
+    const currentFiles = await this.scanSyncableFiles();
+    await this.writeDirectoryState({
+      observed_dirs: currentDirs,
+      explicit_empty_dirs: explicitEmptyDirectories(currentDirs, currentFiles),
+      pending_intents: pendingIntents === undefined ? previous.pending_intents : pendingIntents,
+      updated_at: nowIso()
+    });
+  }
+
+  async applyDirectoryChanges(directoryIntents, explicitDirectories) {
+    for (const intent of directoryIntents.filter((entry) => entry.op === "delete").sort((left, right) => right.path.length - left.path.length)) {
+      if ((await this.adapterIsDirectory(intent.path)) && (await this.adapterDirectoryIsEmpty(intent.path))) {
+        await this.adapterRemove(intent.path);
+      }
+    }
+    for (const dirPath of Array.from(new Set(explicitDirectories)).sort((left, right) => left.length - right.length)) {
+      await ensureAdapterDir(this.adapter, dirPath);
+    }
   }
 
   async readDeviceToken() {
@@ -2260,9 +2447,24 @@ class ObtsObsidianClient {
     }
   }
 
+  async adapterDirectoryIsEmpty(filePath) {
+    try {
+      const listing = await this.adapter.list(filePath);
+      return (listing.files || []).length === 0 && (listing.folders || []).length === 0;
+    } catch {
+      return false;
+    }
+  }
+
   async listLocalVaultFiles() {
     const result = [];
     await this.walkAdapterFiles("", result);
+    return result.sort();
+  }
+
+  async listLocalVaultDirectories() {
+    const result = [];
+    await this.walkAdapterDirectories("", result);
     return result.sort();
   }
 
@@ -2295,6 +2497,22 @@ class ObtsObsidianClient {
       }
       assertValidLocalVaultPath(normalizedFile);
       result.push(normalizedFile);
+    }
+  }
+
+  async walkAdapterDirectories(dir, result) {
+    const listing = await this.adapter.list(dir);
+    for (const folder of listing.folders || []) {
+      const normalizedFolder = normalizePath(folder);
+      if (normalizedFolder === ".obts" || normalizedFolder.startsWith(".obts/")) {
+        continue;
+      }
+      assertValidLocalVaultPath(normalizedFolder);
+      if (!isSyncableVaultPath(normalizedFolder)) {
+        continue;
+      }
+      result.push(normalizedFolder);
+      await this.walkAdapterDirectories(normalizedFolder, result);
     }
   }
 
@@ -2554,7 +2772,7 @@ class ObtsTransportError extends Error {
 }
 
 async function postJson(url, body) {
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body)
@@ -2781,6 +2999,39 @@ function chunks(items, size) {
   return result;
 }
 
+function explicitEmptyDirectories(directories, files) {
+  return directories.filter((directory) => !files.some((filePath) => filePath.startsWith(`${directory}/`))).sort();
+}
+
+function topmostDirectories(directories) {
+  const sorted = Array.from(new Set(directories)).sort((left, right) => left.length - right.length || left.localeCompare(right));
+  const result = [];
+  for (const directory of sorted) {
+    if (!result.some((parent) => directory === parent || directory.startsWith(`${parent}/`))) {
+      result.push(directory);
+    }
+  }
+  return result;
+}
+
+function compactDirectoryIntents(intents) {
+  const byPath = new Map();
+  for (const intent of intents) {
+    if (!intent || (intent.op !== "create" && intent.op !== "delete") || !isSyncableVaultPath(intent.path)) {
+      continue;
+    }
+    if (intent.op === "delete") {
+      for (const dirPath of Array.from(byPath.keys())) {
+        if (dirPath === intent.path || dirPath.startsWith(`${intent.path}/`)) {
+          byPath.delete(dirPath);
+        }
+      }
+    }
+    byPath.set(intent.path, intent);
+  }
+  return Array.from(byPath.values()).sort((left, right) => left.path.localeCompare(right.path) || left.op.localeCompare(right.op));
+}
+
 function buffersEqual(left, right) {
   if (left === null || right === null) {
     return left === right;
@@ -2887,6 +3138,16 @@ function categorizeRecoveryError(error) {
 
 function sha256(data) {
   return crypto.createHash("sha256").update(data).digest("hex");
+}
+
+async function fetchWithTimeout(url, options = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), NETWORK_TIMEOUT_MS);
+  try {
+    return await fetch(url, Object.assign({}, options, { signal: controller.signal }));
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function toArrayBuffer(data) {

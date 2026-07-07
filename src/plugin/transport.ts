@@ -9,6 +9,8 @@ import {
 } from '../shared/types.js';
 import { parseDevicePullRequest, parseDevicePushManifest } from '../shared/validators.js';
 
+const NETWORK_TIMEOUT_MS = 60_000;
+
 export type PairConsumeResult = {
   user_id: string;
   vault_id: string;
@@ -26,7 +28,7 @@ export class TransportClient {
     pairingToken: string;
     deviceName: string;
   }): Promise<PairConsumeResult> {
-    const response = await fetch(this.url('/api/v1/pair/consume'), {
+    const response = await fetchWithTimeout(this.url('/api/v1/pair/consume'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -38,7 +40,7 @@ export class TransportClient {
   }
 
   async getDeviceSelf(deviceToken: string): Promise<DeviceSelfResponse> {
-    const response = await fetch(this.url('/api/v1/device/self'), {
+    const response = await fetchWithTimeout(this.url('/api/v1/device/self'), {
       headers: {
         authorization: `Bearer ${deviceToken}`
       }
@@ -51,7 +53,7 @@ export class TransportClient {
     deviceToken: string;
     report: DeviceStatusReport;
   }): Promise<{ status: string }> {
-    const response = await fetch(this.url(`/api/v1/vaults/${input.vaultId}/sync/device-status`), {
+    const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${input.vaultId}/sync/device-status`), {
       method: 'POST',
       headers: {
         authorization: `Bearer ${input.deviceToken}`,
@@ -75,7 +77,7 @@ export class TransportClient {
     const packArrayBuffer = new ArrayBuffer(input.packfile.byteLength);
     new Uint8Array(packArrayBuffer).set(input.packfile);
     form.append('packfile', new Blob([packArrayBuffer], { type: 'application/x-git-packed-objects' }), 'pack.pack');
-    const response = await fetch(this.url(`/api/v1/vaults/${input.vaultId}/sync/push`), {
+    const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${input.vaultId}/sync/push`), {
       method: 'POST',
       headers: {
         authorization: `Bearer ${input.deviceToken}`
@@ -91,19 +93,21 @@ export class TransportClient {
     deviceToken: string;
     currentLocalMain: string | null;
     requestedTarget?: 'latest' | string;
+    currentEventSeq?: number;
   }): Promise<{ manifest: DevicePullManifest; packfile: Buffer }> {
     const manifest = {
       api_version: API_VERSION,
       vault_id: input.vaultId,
       device_id: input.deviceId,
       current_local_main: input.currentLocalMain,
-      requested_target: input.requestedTarget ?? 'latest'
+      requested_target: input.requestedTarget ?? 'latest',
+      ...(input.currentEventSeq === undefined ? {} : { current_event_seq: input.currentEventSeq })
     } as const;
     parseDevicePullRequest(manifest);
     const form = new FormData();
     form.append('manifest', JSON.stringify(manifest));
     form.append('packfile', new Blob([new ArrayBuffer(0)], { type: 'application/x-git-packed-objects' }), 'have.pack');
-    const response = await fetch(this.url(`/api/v1/vaults/${input.vaultId}/sync/pull`), {
+    const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${input.vaultId}/sync/pull`), {
       method: 'POST',
       headers: {
         authorization: `Bearer ${input.deviceToken}`
@@ -127,7 +131,7 @@ export class TransportClient {
     if (!Number.isSafeInteger(after) || after < 0) {
       throw new Error('Event cursor must be a non-negative safe integer.');
     }
-    const response = await fetch(this.url(`/api/v1/vaults/${input.vaultId}/sync/events?after=${after}`), {
+    const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${input.vaultId}/sync/events?after=${after}`), {
       headers: {
         authorization: `Bearer ${input.deviceToken}`
       }
@@ -136,7 +140,7 @@ export class TransportClient {
   }
 
   async unpairDevice(input: { vaultId: string; deviceToken: string }): Promise<{ status: string }> {
-    const response = await fetch(this.url(`/api/v1/vaults/${input.vaultId}/sync/unpair`), {
+    const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${input.vaultId}/sync/unpair`), {
       method: 'POST',
       headers: {
         authorization: `Bearer ${input.deviceToken}`
@@ -147,6 +151,16 @@ export class TransportClient {
 
   private url(path: string): string {
     return `${this.serverUrl.replace(/\/+$/u, '')}${path}`;
+  }
+}
+
+async function fetchWithTimeout(url: string, options: RequestInit = {}): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), NETWORK_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
   }
 }
 

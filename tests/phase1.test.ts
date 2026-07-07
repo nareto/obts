@@ -590,6 +590,70 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await server.git.listTreePaths(admin.vaultId, finalState.local_main!)).toContain('after-stale.md');
   });
 
+  it('syncs explicit empty folder creation to another device', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'empty-folder-desktop');
+    const phoneDir = join(root, 'empty-folder-phone');
+    await mkdirp(desktopDir);
+    await mkdirp(phoneDir);
+    await writeFile(join(desktopDir, 'base.md'), 'base\n');
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    expect((await desktop.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+    const phone = await pairPlugin(admin, phoneDir, 'phone');
+
+    await mkdirp(join(desktopDir, 'Empty Folder'));
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    expect((await phone.syncOnce()).status).toBe('Synced');
+
+    expect(await isDirectory(join(phoneDir, 'Empty Folder'))).toBe(true);
+  });
+
+  it('syncs folder delete tombstones without pruning individually emptied folders', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'folder-delete-desktop');
+    const phoneDir = join(root, 'folder-delete-phone');
+    await mkdirp(desktopDir);
+    await mkdirp(phoneDir);
+    await mkdirp(join(desktopDir, 'Delete Me'));
+    await mkdirp(join(desktopDir, 'Keep Shell'));
+    await writeFile(join(desktopDir, 'Delete Me', 'note.md'), 'delete me\n');
+    await writeFile(join(desktopDir, 'Keep Shell', 'note.md'), 'keep shell\n');
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    expect((await desktop.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+    const phone = await pairPlugin(admin, phoneDir, 'phone');
+
+    await rm(join(desktopDir, 'Delete Me'), { recursive: true, force: true });
+    await rm(join(desktopDir, 'Keep Shell', 'note.md'));
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    expect((await phone.syncOnce()).status).toBe('Synced');
+
+    expect(await exists(join(phoneDir, 'Delete Me'))).toBe(false);
+    expect(await isDirectory(join(phoneDir, 'Keep Shell'))).toBe(true);
+    expect(await exists(join(phoneDir, 'Keep Shell', 'note.md'))).toBe(false);
+  });
+
+  it('does not apply an empty-folder tombstone over non-empty local content', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'nonempty-tombstone-desktop');
+    const phoneDir = join(root, 'nonempty-tombstone-phone');
+    await mkdirp(desktopDir);
+    await mkdirp(phoneDir);
+    await writeFile(join(desktopDir, 'base.md'), 'base\n');
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    expect((await desktop.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+    const phone = await pairPlugin(admin, phoneDir, 'phone');
+
+    await mkdirp(join(desktopDir, 'Scratch'));
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    expect((await phone.syncOnce()).status).toBe('Synced');
+    await writeFile(join(phoneDir, 'Scratch', 'local.md'), 'local content\n');
+    await rm(join(desktopDir, 'Scratch'), { recursive: true, force: true });
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    expect((await phone.syncOnce()).status).toBe('Synced');
+    expect(await readFile(join(phoneDir, 'Scratch', 'local.md'), 'utf8')).toBe('local content\n');
+  });
+
   it('recovers a newer same-device state backup after a stale primary overwrite', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'newer-backup-state');
@@ -4169,6 +4233,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('refs/heads/local');
     expect(pluginMain).toContain('refs/heads/main');
     expect(pluginMain).toContain('apply-journal.json');
+    expect(pluginMain).toContain('directory-state.json');
     expect(pluginMain).toContain('createRecoveryBundle');
     expect(pluginMain).toContain('rebuildFromServerMain');
     expect(pluginMain).toContain('obts-rebuild-from-server-main');
@@ -4187,7 +4252,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('ensureNoLocalChangesBeforeApply');
     expect(pluginMain).toContain('visibleVaultMatchesLocalHead');
     const queuedSync = sourceSection(pluginMain, 'async runQueuedSync()', 'async flushOpenMarkdownEditorsToDisk()');
-    expect(queuedSync).toContain('if (this.syncRunning)');
+    expect(queuedSync).toContain('if (this.isSyncInProgress())');
     expect(queuedSync).toContain('void this.runQueuedSync();');
     expect(pluginMain).toContain('syncOnceOrPollResolvedConflict');
     const backgroundSync = sourceSection(pluginMain, 'async runBackgroundSync()', 'async runAutomaticSync()');
@@ -4195,6 +4260,8 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(backgroundSync).toContain('await this.runAutomaticSync();');
     const automaticSync = sourceSection(pluginMain, 'async runAutomaticSync()', 'async handleAutomaticSyncError');
     expect(automaticSync).toContain('syncOnceOrPollResolvedConflict');
+    expect(pluginMain).toContain('SYNC_STALE_MS');
+    expect(pluginMain).toContain('fetchWithTimeout');
     const eventPoll = sourceSection(pluginMain, 'async pollRemoteEventsAndApply()', 'async unpairCurrentDevice()');
     expect(eventPoll).toContain('wasConflictBlocked');
     expect(eventPoll).toContain('if (!wasConflictBlocked)');
@@ -4486,6 +4553,14 @@ async function exists(path: string): Promise<boolean> {
   try {
     await stat(path);
     return true;
+  } catch {
+    return false;
+  }
+}
+
+async function isDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
   } catch {
     return false;
   }

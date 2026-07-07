@@ -1,4 +1,5 @@
-import { API_VERSION, type DevicePullRequest, type DevicePushManifest } from './types.js';
+import { isSyncableVaultPath, normalizeVaultPath } from './pathPolicy.js';
+import { API_VERSION, type DevicePullRequest, type DevicePushManifest, type DirectoryIntent } from './types.js';
 
 const COMMIT_ID_PATTERN = /^[0-9a-f]{40}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
@@ -124,11 +125,55 @@ export function parseDevicePushManifest(value: unknown): DevicePushManifest {
     ? readNullableCommitId(value, 'base_commit')
     : undefined;
   const attemptId = readOptionalString(value, 'attempt_id');
+  const directoryIntents = readOptionalDirectoryIntents(value, 'directory_intents');
   return {
     ...manifest,
     ...(baseCommit === undefined ? {} : { base_commit: baseCommit }),
-    ...(attemptId === undefined ? {} : { attempt_id: attemptId })
+    ...(attemptId === undefined ? {} : { attempt_id: attemptId }),
+    ...(directoryIntents === undefined ? {} : { directory_intents: directoryIntents })
   };
+}
+
+function readOptionalDirectoryIntents(record: Record<string, unknown>, field: string): DirectoryIntent[] | undefined {
+  const value = record[field];
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value)) {
+    throw new ValidationError('invalid_request', `Invalid field: ${field}.`, { field });
+  }
+  if (value.length > 5000) {
+    throw new ValidationError('invalid_request', `Too many directory intents: ${field}.`, { field });
+  }
+  const intents: DirectoryIntent[] = [];
+  for (const item of value) {
+    assertRecord(item);
+    const op = readString(item, 'op');
+    if (op !== 'create' && op !== 'delete') {
+      throw new ValidationError('invalid_request', 'Invalid directory intent operation.', { field: 'op' });
+    }
+    const normalized = normalizeVaultPath(readString(item, 'path'));
+    if (!normalized.ok || !isSyncableVaultPath(normalized.path)) {
+      throw new ValidationError('invalid_request', 'Invalid directory intent path.', { field: 'path' });
+    }
+    intents.push({ op, path: normalized.path });
+  }
+  return compactDirectoryIntents(intents);
+}
+
+function compactDirectoryIntents(intents: DirectoryIntent[]): DirectoryIntent[] {
+  const byPath = new Map<string, DirectoryIntent>();
+  for (const intent of intents) {
+    if (intent.op === 'delete') {
+      for (const path of [...byPath.keys()]) {
+        if (path === intent.path || path.startsWith(`${intent.path}/`)) {
+          byPath.delete(path);
+        }
+      }
+    }
+    byPath.set(intent.path, intent);
+  }
+  return [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path) || left.op.localeCompare(right.op));
 }
 
 export function parseDevicePullRequest(value: unknown): DevicePullRequest {
@@ -141,12 +186,16 @@ export function parseDevicePullRequest(value: unknown): DevicePullRequest {
   if (requested !== 'latest' && !COMMIT_ID_PATTERN.test(requested)) {
     throw new ValidationError('invalid_request', 'Invalid requested target.', { field: 'requested_target' });
   }
+  const currentEventSeq = Object.prototype.hasOwnProperty.call(value, 'current_event_seq')
+    ? readNonNegativeInteger(value, 'current_event_seq')
+    : undefined;
   return {
     api_version: API_VERSION,
     vault_id: readString(value, 'vault_id'),
     device_id: readString(value, 'device_id'),
     current_local_main: readNullableCommitId(value, 'current_local_main'),
-    requested_target: requested
+    requested_target: requested,
+    ...(currentEventSeq === undefined ? {} : { current_event_seq: currentEventSeq })
   };
 }
 

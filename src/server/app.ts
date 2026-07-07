@@ -8,7 +8,7 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 
 import { newId, nowIso } from '../shared/ids.js';
 import { isSyncableVaultPath } from '../shared/pathPolicy.js';
-import { API_VERSION, type DevicePullManifest, type DevicePullRequest, type ManualFilePlanEntry } from '../shared/types.js';
+import { API_VERSION, type DevicePullManifest, type DevicePullRequest, type DirectoryIntent, type ManualFilePlanEntry } from '../shared/types.js';
 import {
   assertRecord,
   readCommitId,
@@ -502,6 +502,9 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         : (await git.changedPaths(vaultId, have, targetMain)).map((entry) => entry.path);
     const changedPaths = allChangedPaths.filter((path) => isSyncableVaultPath(path));
     const db = await store.snapshot();
+    const currentEventSeq = Number.isSafeInteger(pullRequest.current_event_seq) ? pullRequest.current_event_seq ?? 0 : 0;
+    const directoryEvents = db.events.filter((event) => event.vault_id === vaultId && event.event_seq > currentEventSeq);
+    const directoryState = db.directory_state_by_vault[vaultId];
     const manifest: DevicePullManifest = {
       api_version: API_VERSION,
       vault_id: vaultId,
@@ -509,7 +512,9 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       target_main: targetMain,
       changed_paths: [...new Set(changedPaths)].sort(),
       current_local_main_is_ancestor: currentLocalMainIsAncestor,
-      event_seq: db.event_seq_by_vault[vaultId] ?? 0
+      event_seq: db.event_seq_by_vault[vaultId] ?? 0,
+      directory_intents: directoryIntentsFromEvents(directoryEvents),
+      explicit_directories: directoryState?.explicit_dirs ?? []
     };
     const packfile = await git.exportPack(vaultId, targetMain, have);
     if (pullRequest.current_local_main === targetMain) {
@@ -1173,6 +1178,42 @@ function readEventCursor(request: FastifyRequest): number {
     throw new ValidationError('invalid_request', 'Invalid event cursor.');
   }
   return after;
+}
+
+function directoryIntentsFromEvents(events: Array<{ payload: Record<string, unknown> }>): DirectoryIntent[] {
+  const intents: DirectoryIntent[] = [];
+  for (const event of events) {
+    const rawIntents = event.payload.directory_intents;
+    if (!Array.isArray(rawIntents)) {
+      continue;
+    }
+    for (const rawIntent of rawIntents) {
+      if (typeof rawIntent !== 'object' || rawIntent === null || Array.isArray(rawIntent)) {
+        continue;
+      }
+      const op = (rawIntent as { op?: unknown }).op;
+      const path = (rawIntent as { path?: unknown }).path;
+      if ((op === 'create' || op === 'delete') && typeof path === 'string') {
+        intents.push({ op, path });
+      }
+    }
+  }
+  return compactDirectoryIntents(intents);
+}
+
+function compactDirectoryIntents(intents: DirectoryIntent[]): DirectoryIntent[] {
+  const byPath = new Map<string, DirectoryIntent>();
+  for (const intent of intents) {
+    if (intent.op === 'delete') {
+      for (const path of [...byPath.keys()]) {
+        if (path === intent.path || path.startsWith(`${intent.path}/`)) {
+          byPath.delete(path);
+        }
+      }
+    }
+    byPath.set(intent.path, intent);
+  }
+  return [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path) || left.op.localeCompare(right.op));
 }
 
 function sendEventPage(

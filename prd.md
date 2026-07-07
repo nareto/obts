@@ -199,7 +199,29 @@ Acceptance criteria:
 - The plugin has one v1 apply behavior: automatically pull and apply server `main` after preflight, apply journal creation, recovery bundle creation, and watcher suppression setup succeed.
 - If automatic apply cannot proceed safely, the plugin blocks sync, preserves local state, surfaces the blocked status, and directs the owner to the dashboard conflict or recovery workflow.
 
-### 3.6 Concurrent Edits And Merge
+### 3.6 Directory Intent Sync
+
+Git tracks files but not empty directories, while Obsidian exposes folders as user-visible vault objects. `obts` therefore treats directory state as an Obsidian product-layer metadata stream attached to the Git-backed device proposal.
+
+Behavior:
+
+1. The plugin tracks observed syncable directories separately from the Git file tree.
+2. Explicit empty-folder creation records a `create` directory intent, even when no file content changed.
+3. Folder deletion records a `delete` directory tombstone, including when the deleted folder previously contained files.
+4. Deleting files individually while leaving the folder present records the folder as explicit empty-directory state, not as a folder-delete tombstone.
+5. Accepted directory intents are stored in server metadata and emitted with the accepted `main` event and pull manifest.
+6. Remote apply materializes explicit empty directories after file writes/deletes.
+7. Remote apply removes a tombstoned directory only when it is empty after file apply; non-empty local directories are never recursively removed by a directory tombstone.
+8. Historical states that predate directory intents cannot infer right-click folder-delete intent from the Git file tree alone.
+
+Acceptance criteria:
+
+- Empty folder creation syncs to other devices.
+- Right-click folder deletion removes the empty folder shell on other devices after file deletes are applied.
+- Individually emptying a folder preserves that empty folder on other devices.
+- A remote folder tombstone never deletes non-empty local content.
+
+### 3.7 Concurrent Edits And Merge
 
 The server receives Git updates from multiple devices and advances `main` only through a merge or resolution transaction.
 

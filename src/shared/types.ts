@@ -106,6 +106,11 @@ export type DeviceStatusReport = {
   path_capabilities?: Record<string, unknown> | null;
 };
 
+export type DirectoryIntent = {
+  op: 'create' | 'delete';
+  path: string;
+};
+
 export type DevicePushManifest = {
   api_version: typeof API_VERSION;
   vault_id: string;
@@ -117,6 +122,7 @@ export type DevicePushManifest = {
   client_known_main: string | null;
   base_commit?: string | null;
   attempt_id?: string;
+  directory_intents?: DirectoryIntent[];
 };
 
 export type PushResult =
@@ -152,6 +158,7 @@ export type DevicePullRequest = {
   device_id: string;
   current_local_main: string | null;
   requested_target: 'latest' | string;
+  current_event_seq?: number;
 };
 
 export type DevicePullManifest = {
@@ -162,6 +169,8 @@ export type DevicePullManifest = {
   changed_paths: string[];
   current_local_main_is_ancestor: boolean | null;
   event_seq: number;
+  directory_intents?: DirectoryIntent[];
+  explicit_directories?: string[];
 };
 
 export type ConflictRecord = {

@@ -164,6 +164,19 @@ export class LocalGitEngine {
       return null;
     }
 
+    return await this.commitTree(message, tree, baseCommit);
+  }
+
+  async createMetadataCommit(message: string): Promise<string | null> {
+    const baseCommit = await this.resolveRef('refs/heads/local');
+    if (!baseCommit) {
+      return null;
+    }
+    const { commit } = await git.readCommit({ fs, dir: this.vaultDir, gitdir: this.gitdir, oid: baseCommit });
+    return await this.commitTree(message, commit.tree, baseCommit);
+  }
+
+  private async commitTree(message: string, tree: string, baseCommit: string | null): Promise<string> {
     return await git.commit({
       fs,
       dir: this.vaultDir,

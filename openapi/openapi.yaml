@@ -976,6 +976,10 @@ components:
               pattern: "^[0-9a-f]{40}$"
         attempt_id:
           type: string
+        directory_intents:
+          type: array
+          items:
+            $ref: "#/components/schemas/DirectoryIntent"
     DevicePullRequest:
       type: object
       required: [api_version, vault_id, device_id, current_local_main, requested_target]
@@ -996,6 +1000,9 @@ components:
             - const: latest
             - type: string
               pattern: "^[0-9a-f]{40}$"
+        current_event_seq:
+          type: integer
+          minimum: 0
     DevicePullManifest:
       type: object
       required: [api_version, vault_id, device_id, target_main, changed_paths, current_local_main_is_ancestor, event_seq]
@@ -1019,6 +1026,22 @@ components:
             - type: boolean
         event_seq:
           type: integer
+        directory_intents:
+          type: array
+          items:
+            $ref: "#/components/schemas/DirectoryIntent"
+        explicit_directories:
+          type: array
+          items:
+            type: string
+    DirectoryIntent:
+      type: object
+      required: [op, path]
+      properties:
+        op:
+          enum: [create, delete]
+        path:
+          type: string
     EventPage:
       type: object
       required: [events, current_event_seq]
