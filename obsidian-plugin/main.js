@@ -2297,6 +2297,10 @@ class ObtsObsidianClient {
   }
 
   async reconcileDirectoryState() {
+    if (!(await exists(this.directoryStatePath))) {
+      await this.refreshDirectoryStateFromDisk([]);
+      return [];
+    }
     const previous = await this.readDirectoryState();
     const currentDirs = await this.listLocalVaultDirectories();
     const currentFiles = await this.scanSyncableFiles();

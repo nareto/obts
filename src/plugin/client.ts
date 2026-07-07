@@ -941,6 +941,10 @@ export class ObtsPluginClient {
   }
 
   private async reconcileDirectoryState(): Promise<DirectoryIntent[]> {
+    if (!(await exists(this.directoryStatePath))) {
+      await this.refreshDirectoryStateFromDisk([]);
+      return [];
+    }
     const previous = await this.readDirectoryState();
     const currentDirs = await listLocalVaultDirectories(this.vaultDir);
     const currentFiles = await this.git.scanSyncableFiles();
