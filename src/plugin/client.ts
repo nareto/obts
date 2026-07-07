@@ -9,7 +9,7 @@ import { LocalGitEngine } from './localGit.js';
 import { ApplyLockActiveError, type ApplyJournal, RecoveryManager, sha256File } from './recovery.js';
 import { TransportClient, TransportError } from './transport.js';
 
-const PLUGIN_VERSION = '0.1.11-phase2';
+const PLUGIN_VERSION = '0.1.12-phase2';
 
 export type ObtsPluginSettings = {
   serverUrl: string;
@@ -1645,11 +1645,15 @@ export class ObtsPluginClient {
         packfile
       });
     } catch (error) {
+      if (error instanceof TransportError && error.code === 'stale_device_ref') {
+        const recovered = await this.retryPushAfterStaleDeviceRef(currentState, queue, token, manifest, packfile);
+        if (recovered) {
+          return recovered;
+        }
+      }
       if (
         error instanceof TransportError &&
-        (error.code === 'same_device_non_fast_forward' ||
-          error.code === 'stale_device_ref' ||
-          error.code === 'device_blocked')
+        (error.code === 'same_device_non_fast_forward' || error.code === 'stale_device_ref' || error.code === 'device_blocked')
       ) {
         await this.writeQueue({
           ...queue,
@@ -1660,6 +1664,47 @@ export class ObtsPluginClient {
       }
       throw error;
     }
+  }
+
+  private async retryPushAfterStaleDeviceRef(
+    currentState: LocalPluginState,
+    queue: QueueState,
+    token: string,
+    manifest: DevicePushManifest,
+    packfile: Buffer
+  ) {
+    if (!currentState.vault_id) {
+      return null;
+    }
+    const self = await this.transport.getDeviceSelf(token);
+    const recoveredRef = self.server_device_ref;
+    if (!recoveredRef || recoveredRef === queue.expected_device_ref || !(await this.git.isAncestor(recoveredRef, queue.pending_commit!))) {
+      return null;
+    }
+    const recoveredQueue = {
+      ...queue,
+      expected_device_ref: recoveredRef,
+      status: 'uploading' as const,
+      updated_at: nowIso()
+    };
+    await this.writeQueue(recoveredQueue);
+    await this.writeState({
+      ...currentState,
+      server_device_ref: recoveredRef,
+      status_label: 'Uploading',
+      last_error_code: null,
+      updated_at: nowIso()
+    });
+    return await this.transport.push({
+      vaultId: currentState.vault_id,
+      deviceId: currentState.device_id!,
+      deviceToken: token,
+      manifest: {
+        ...manifest,
+        expected_device_ref: recoveredRef
+      },
+      packfile
+    });
   }
 
   private async acknowledgeAppliedMain(state: LocalPluginState, token: string, targetMain: string): Promise<void> {

@@ -6,7 +6,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 
 const API_VERSION = "2026-07-02.full-sync";
-const PLUGIN_VERSION = "0.1.11-phase2";
+const PLUGIN_VERSION = "0.1.12-phase2";
 const SYNC_DEBOUNCE_MS = 1500;
 const BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000;
 
@@ -637,7 +637,18 @@ class ObtsObsidianClient {
       ...(queue.expected_device_ref === null && state.local_main ? { base_commit: state.local_main } : {}),
       attempt_id: `sync_${Date.now()}_${crypto.randomBytes(8).toString("hex")}`
     };
-    const result = await this.push(state.vault_id, token, manifest, packfile);
+    let result;
+    try {
+      result = await this.push(state.vault_id, token, manifest, packfile);
+    } catch (error) {
+      if (!(error instanceof ObtsTransportError && error.code === "stale_device_ref")) {
+        throw error;
+      }
+      result = await this.retryPushAfterStaleDeviceRef(state, queue, token, manifest, packfile);
+      if (!result) {
+        throw error;
+      }
+    }
     if (result.status === "conflicted") {
       await this.writeQueue(Object.assign({}, queue, { status: "conflicted", updated_at: nowIso() }));
       await this.writeState(Object.assign({}, state, {
@@ -664,6 +675,28 @@ class ObtsObsidianClient {
         updated_at: nowIso()
       }));
     }
+  }
+
+  async retryPushAfterStaleDeviceRef(state, queue, token, manifest, packfile) {
+    const self = await this.getDeviceSelf(token);
+    const recoveredRef = self.server_device_ref;
+    if (!recoveredRef || recoveredRef === queue.expected_device_ref || !(await this.isAncestor(recoveredRef, queue.pending_commit))) {
+      return null;
+    }
+    await this.writeQueue(Object.assign({}, queue, {
+      expected_device_ref: recoveredRef,
+      status: "uploading",
+      updated_at: nowIso()
+    }));
+    await this.writeState(Object.assign({}, state, {
+      server_device_ref: recoveredRef,
+      status_label: "Uploading",
+      last_error_code: null,
+      updated_at: nowIso()
+    }));
+    return await this.push(state.vault_id, token, Object.assign({}, manifest, {
+      expected_device_ref: recoveredRef
+    }), packfile);
   }
 
   async pullAndApply(allowDestructive) {

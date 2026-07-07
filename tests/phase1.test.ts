@@ -559,6 +559,37 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await server.git.listTreePaths(admin.vaultId, main)).toContain('stranded.md');
   });
 
+  it('refreshes a stale local device ref after a previously accepted upload', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'stale-local-device-ref');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'laptop');
+    await writeFile(join(deviceDir, 'base.md'), 'base\n');
+    expect((await plugin.syncOnce()).status).toBe('Synced');
+    const staleDeviceRef = (await plugin.readState()).server_device_ref;
+    expect(staleDeviceRef).toMatch(/^[0-9a-f]{40}$/u);
+
+    await writeFile(join(deviceDir, 'accepted.md'), 'accepted\n');
+    expect((await plugin.syncOnce()).status).toBe('Synced');
+    const currentDeviceRef = (await plugin.readState()).server_device_ref;
+    expect(currentDeviceRef).toMatch(/^[0-9a-f]{40}$/u);
+    expect(currentDeviceRef).not.toBe(staleDeviceRef);
+
+    const statePath = join(deviceDir, '.obts', 'state.json');
+    const staleState = JSON.parse(await readFile(statePath, 'utf8')) as Json;
+    await writeFile(statePath, `${JSON.stringify({
+      ...staleState,
+      server_device_ref: staleDeviceRef,
+      updated_at: new Date().toISOString()
+    }, null, 2)}\n`);
+    await writeFile(join(deviceDir, 'after-stale.md'), 'after stale\n');
+
+    expect((await plugin.syncOnce()).status).toBe('Synced');
+    const finalState = await plugin.readState();
+    expect(finalState.server_device_ref).not.toBe(staleDeviceRef);
+    expect(await server.git.listTreePaths(admin.vaultId, finalState.local_main!)).toContain('after-stale.md');
+  });
+
   it('does not apply remote main over local edits that appear during pull', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const fixtureADir = join(root, 'race-fixtureA');
