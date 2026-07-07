@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -11,6 +11,7 @@ import { TransportClient } from '../src/plugin/transport.js';
 import { runCli } from '../src/cli.js';
 import { createObtsServer, type ObtsServer } from '../src/server/app.js';
 import { MetadataStore } from '../src/server/metadataStore.js';
+import { __syncServiceTestInternals } from '../src/server/syncService.js';
 import {
   assertSyncableTreePaths,
   isSyncableVaultPath,
@@ -1696,6 +1697,187 @@ describe('Phase 1 sync without conflict resolution', () => {
 
     await writeFile(join(device2Dir, 'after-conflict.md'), 'still blocked\n');
     await expect(plugin2.syncOnce()).rejects.toMatchObject({ code: 'conflict_review_required' });
+  });
+
+  it('detects delete+add rename candidates when Git does not emit rename records', async () => {
+    const readBlob = async (): Promise<Buffer | null> => null;
+    const baseBlobs = new Map([['Old.md', 'blob-old']]);
+    const left = await __syncServiceTestInternals.summarizeStructuralChanges({
+      baseCommit: 'base',
+      targetCommit: 'left',
+      changes: [
+        { status: 'D', path: 'Old.md' },
+        { status: 'A', path: 'Title A.md' }
+      ],
+      baseBlobs,
+      targetBlobs: new Map([['Title A.md', 'blob-old']]),
+      readBlob
+    });
+    const right = await __syncServiceTestInternals.summarizeStructuralChanges({
+      baseCommit: 'base',
+      targetCommit: 'right',
+      changes: [
+        { status: 'D', path: 'Old.md' },
+        { status: 'A', path: 'Title B.md' }
+      ],
+      baseBlobs,
+      targetBlobs: new Map([['Title B.md', 'blob-old']]),
+      readBlob
+    });
+
+    expect(__syncServiceTestInternals.structuralMergeConflict(left, right)).toEqual({
+      reason: 'rename_rename_conflict',
+      affectedPaths: ['Old.md', 'Title A.md', 'Title B.md']
+    });
+
+    const similarBlobs = new Map([
+      ['base:Old.md', Buffer.from('alpha beta gamma delta epsilon zeta eta theta iota kappa\n')],
+      ['left:Title A.md', Buffer.from('alpha beta gamma delta epsilon zeta eta theta iota kappa left\n')],
+      ['right:Title B.md', Buffer.from('alpha beta gamma delta epsilon zeta eta theta iota kappa right\n')]
+    ]);
+    const readSimilarBlob = async (commit: string, path: string): Promise<Buffer | null> =>
+      similarBlobs.get(`${commit}:${path}`) ?? null;
+    const similarLeft = await __syncServiceTestInternals.summarizeStructuralChanges({
+      baseCommit: 'base',
+      targetCommit: 'left',
+      changes: [
+        { status: 'D', path: 'Old.md' },
+        { status: 'A', path: 'Title A.md' }
+      ],
+      baseBlobs,
+      targetBlobs: new Map([['Title A.md', 'blob-left']]),
+      readBlob: readSimilarBlob
+    });
+    const similarRight = await __syncServiceTestInternals.summarizeStructuralChanges({
+      baseCommit: 'base',
+      targetCommit: 'right',
+      changes: [
+        { status: 'D', path: 'Old.md' },
+        { status: 'A', path: 'Title B.md' }
+      ],
+      baseBlobs,
+      targetBlobs: new Map([['Title B.md', 'blob-right']]),
+      readBlob: readSimilarBlob
+    });
+    expect(__syncServiceTestInternals.structuralMergeConflict(similarLeft, similarRight)).toEqual({
+      reason: 'rename_rename_conflict',
+      affectedPaths: ['Old.md', 'Title A.md', 'Title B.md']
+    });
+  });
+
+  it('creates a conflict when concurrent renames move the same note to different paths', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const { desktop, desktopDir, tablet, tabletDir } = await prepareStructuralMergeDevices(root, admin, 'rename-different');
+
+    await rename(join(desktopDir, 'Old.md'), join(desktopDir, 'Title A.md'));
+    await rename(join(tabletDir, 'Old.md'), join(tabletDir, 'Title B.md'));
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const mainBeforeConflict = (await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)
+      ?.current_main;
+
+    const result = await tablet.syncOnce();
+    expect(result.status).toBe('Review needed');
+
+    const db = await server.store.snapshot();
+    expect(db.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(mainBeforeConflict);
+    const conflict = db.conflicts.find((candidate) => candidate.conflict_id === result.conflictId);
+    expect(conflict).toMatchObject({
+      status: 'open',
+      affected_paths: ['Old.md', 'Title A.md', 'Title B.md'],
+      validator_summary: {
+        decision: 'conflict',
+        reason: 'rename_rename_conflict',
+        path_count: 3
+      }
+    });
+    expect(await server.git.listTreePaths(admin.vaultId, mainBeforeConflict!)).toEqual([
+      'Title A.md',
+      'rename-different-tablet-ref.md'
+    ]);
+  });
+
+  it('auto-merges concurrent renames to the same target path when content is otherwise safe', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const { desktop, desktopDir, tablet, tabletDir } = await prepareStructuralMergeDevices(root, admin, 'rename-same');
+
+    await rename(join(desktopDir, 'Old.md'), join(desktopDir, 'Unified.md'));
+    await rename(join(tabletDir, 'Old.md'), join(tabletDir, 'Unified.md'));
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    expect((await tablet.syncOnce()).status).toBe('Synced');
+    await desktop.syncOnce();
+
+    const db = await server.store.snapshot();
+    expect(db.conflicts).toHaveLength(0);
+    const paths = await server.git.listTreePaths(admin.vaultId, db.vaults.find((vault) => vault.vault_id === admin.vaultId)!.current_main);
+    expect(paths).toEqual(['Unified.md', 'rename-same-tablet-ref.md']);
+    expect(await readFile(join(desktopDir, 'Unified.md'), 'utf8')).toBe('base\n');
+    await expect(readFile(join(tabletDir, 'Old.md'), 'utf8')).rejects.toThrow();
+  });
+
+  it('auto-merges rename-vs-edit when the rename target does not collide with another path', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const { desktop, desktopDir, tablet, tabletDir } = await prepareStructuralMergeDevices(root, admin, 'rename-edit');
+
+    await rename(join(desktopDir, 'Old.md'), join(desktopDir, 'Renamed.md'));
+    await writeFile(join(tabletDir, 'Old.md'), 'base\nedited on tablet\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    expect((await tablet.syncOnce()).status).toBe('Synced');
+    await desktop.syncOnce();
+
+    const db = await server.store.snapshot();
+    expect(db.conflicts).toHaveLength(0);
+    const main = db.vaults.find((vault) => vault.vault_id === admin.vaultId)!.current_main;
+    expect(await server.git.listTreePaths(admin.vaultId, main)).toEqual(['Renamed.md', 'rename-edit-tablet-ref.md']);
+    expect((await server.git.readBlobAtPath(admin.vaultId, main, 'Renamed.md')).toString('utf8')).toBe(
+      'base\nedited on tablet\n'
+    );
+  });
+
+  it('creates a conflict for rename-vs-delete of the same base path', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const { desktop, desktopDir, tablet, tabletDir } = await prepareStructuralMergeDevices(root, admin, 'rename-delete');
+
+    await rename(join(desktopDir, 'Old.md'), join(desktopDir, 'Renamed.md'));
+    await rm(join(tabletDir, 'Old.md'));
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const result = await tablet.syncOnce();
+    expect(result.status).toBe('Review needed');
+
+    const db = await server.store.snapshot();
+    const conflict = db.conflicts.find((candidate) => candidate.conflict_id === result.conflictId);
+    expect(conflict).toMatchObject({
+      status: 'open',
+      affected_paths: ['Old.md', 'Renamed.md'],
+      validator_summary: {
+        decision: 'conflict',
+        reason: 'rename_delete_conflict',
+        path_count: 2
+      }
+    });
+  });
+
+  it('creates a conflict when rename-vs-edit also collides with the rename target path', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const { desktop, desktopDir, tablet, tabletDir } = await prepareStructuralMergeDevices(root, admin, 'rename-collision');
+
+    await rename(join(desktopDir, 'Old.md'), join(desktopDir, 'Renamed.md'));
+    await writeFile(join(tabletDir, 'Old.md'), 'base\nedited on tablet\n');
+    await writeFile(join(tabletDir, 'Renamed.md'), 'tablet-created collision\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const result = await tablet.syncOnce();
+    expect(result.status).toBe('Review needed');
+
+    const db = await server.store.snapshot();
+    const conflict = db.conflicts.find((candidate) => candidate.conflict_id === result.conflictId);
+    expect(conflict).toMatchObject({
+      status: 'open',
+      affected_paths: ['Old.md', 'Renamed.md'],
+      validator_summary: {
+        decision: 'conflict',
+        reason: 'rename_path_collision',
+        path_count: 2
+      }
+    });
   });
 
   it('blocks pull apply on a device with an open conflict instead of replacing local review content', async () => {
@@ -3879,6 +4061,35 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect((await snapshot).setup_complete).toBe(true);
   });
 });
+
+async function prepareStructuralMergeDevices(
+  root: string,
+  admin: BrowserSession & { vaultId: string },
+  prefix: string
+): Promise<{
+  desktop: ObtsPluginClient;
+  desktopDir: string;
+  tablet: ObtsPluginClient;
+  tabletDir: string;
+}> {
+  const desktopDir = join(root, `${prefix}-desktop`);
+  const tabletDir = join(root, `${prefix}-tablet`);
+  await mkdirp(desktopDir);
+  await mkdirp(tabletDir);
+
+  const desktop = await pairPlugin(admin, desktopDir, `${prefix}-desktop`);
+  await writeFile(join(desktopDir, 'Old.md'), 'base\n');
+  expect((await desktop.syncOnce()).status).toBe('Synced');
+
+  const tablet = await pairPlugin(admin, tabletDir, `${prefix}-tablet`);
+  expect(await readFile(join(tabletDir, 'Old.md'), 'utf8')).toBe('base\n');
+  await writeFile(join(tabletDir, `${prefix}-tablet-ref.md`), 'tablet ref\n');
+  expect((await tablet.syncOnce()).status).toBe('Synced');
+  expect((await desktop.syncOnce()).status).toBe('Synced');
+  expect(await readFile(join(desktopDir, `${prefix}-tablet-ref.md`), 'utf8')).toBe('tablet ref\n');
+
+  return { desktop, desktopDir, tablet, tabletDir };
+}
 
 async function setupAdminAndVault(baseUrl: string): Promise<BrowserSession & { vaultId: string }> {
   const admin = new BrowserSession(baseUrl) as BrowserSession & { vaultId: string };

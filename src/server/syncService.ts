@@ -16,6 +16,39 @@ import { GitCommandError, GitService, sha256Hex, type GitDiffEntry } from './git
 import type { DeviceRow, MetadataDb, MetadataStore, SyncOperationRow } from './metadataStore.js';
 
 const MERGE_POLICY_VERSION = 'phase2.semantic-merge.v1';
+const SIMILAR_RENAME_THRESHOLD = 0.72;
+const SIMILAR_RENAME_MAX_BYTES = 256 * 1024;
+
+type RenameConfidence = 'git' | 'exact_blob' | 'similar_content';
+
+type StructuralActionKind = 'add' | 'edit' | 'delete' | 'rename';
+
+type StructuralAction = {
+  kind: StructuralActionKind;
+  basePath: string | null;
+  targetPath: string | null;
+  baseOid: string | null;
+  targetOid: string | null;
+  renameConfidence: RenameConfidence | null;
+};
+
+type StructuralSummary = {
+  actions: StructuralAction[];
+  byBasePath: Map<string, StructuralAction>;
+  addsByPath: Map<string, StructuralAction>;
+  renameCandidatesByBasePath: Map<string, Set<string>>;
+};
+
+type StructuralConflict = {
+  reason: string;
+  affectedPaths: string[];
+};
+
+type RenamePair = {
+  basePath: string;
+  targetPath: string;
+  confidence: RenameConfidence;
+};
 
 export class SyncService {
   private readonly locks = new Map<string, Promise<void>>();
@@ -674,6 +707,25 @@ export class SyncService {
         'detached_proposal_deletes'
       );
     }
+    const structuralConflict = await this.classifyStructuralMergeConflict(
+      vaultId,
+      base,
+      main,
+      deviceCommit,
+      mainChanges,
+      deviceChanges
+    );
+    if (structuralConflict) {
+      return await this.createConflict(
+        vaultId,
+        deviceId,
+        base,
+        main,
+        deviceCommit,
+        structuralConflict.affectedPaths,
+        structuralConflict.reason
+      );
+    }
     const overlapping = intersectChangedPaths(mainChanges, deviceChanges);
     if (overlapping.length > 0) {
       const identityMerge = await this.tryIdentityOverlappingMerge(vaultId, deviceId, base, main, deviceCommit, deviceChanges, overlapping);
@@ -796,6 +848,45 @@ export class SyncService {
       merge_commit: mergeCommit,
       event_seq: eventSeq
     };
+  }
+
+  private async classifyStructuralMergeConflict(
+    vaultId: string,
+    base: string,
+    currentMain: string,
+    deviceCommit: string,
+    mainChanges: GitDiffEntry[],
+    deviceChanges: GitDiffEntry[]
+  ): Promise<StructuralConflict | null> {
+    const [baseBlobs, currentBlobs, deviceBlobs] = await Promise.all([
+      this.blobOidMap(vaultId, base),
+      this.blobOidMap(vaultId, currentMain),
+      this.blobOidMap(vaultId, deviceCommit)
+    ]);
+    const readBlob = async (commit: string, path: string): Promise<Buffer | null> =>
+      await this.readOptionalBlob(vaultId, commit, path);
+    const mainSummary = await summarizeStructuralChanges({
+      baseCommit: base,
+      targetCommit: currentMain,
+      changes: mainChanges,
+      baseBlobs,
+      targetBlobs: currentBlobs,
+      readBlob
+    });
+    const deviceSummary = await summarizeStructuralChanges({
+      baseCommit: base,
+      targetCommit: deviceCommit,
+      changes: deviceChanges,
+      baseBlobs,
+      targetBlobs: deviceBlobs,
+      readBlob
+    });
+    return structuralMergeConflict(mainSummary, deviceSummary);
+  }
+
+  private async blobOidMap(vaultId: string, commit: string): Promise<Map<string, string>> {
+    const entries = await this.git.listTreeEntries(vaultId, commit);
+    return new Map(entries.filter((entry) => entry.type === 'blob').map((entry) => [entry.path, entry.oid]));
   }
 
   private async tryIdentityOverlappingMerge(
@@ -1536,6 +1627,412 @@ function requireOperation(db: MetadataDb, operationId: string): SyncOperationRow
   return operation;
 }
 
+async function summarizeStructuralChanges(input: {
+  baseCommit: string;
+  targetCommit: string;
+  changes: GitDiffEntry[];
+  baseBlobs: Map<string, string>;
+  targetBlobs: Map<string, string>;
+  readBlob: (commit: string, path: string) => Promise<Buffer | null>;
+}): Promise<StructuralSummary> {
+  const explicitRenames: RenamePair[] = [];
+  const deletePaths = new Set<string>();
+  const addPaths = new Set<string>();
+  const editPaths = new Set<string>();
+  const renameCandidatesByBasePath = new Map<string, Set<string>>();
+
+  for (const entry of input.changes) {
+    const status = entry.status[0] ?? '';
+    if (entry.status.startsWith('R') && entry.oldPath && entry.oldPath !== entry.path) {
+      explicitRenames.push({ basePath: entry.oldPath, targetPath: entry.path, confidence: 'git' });
+      recordRenameCandidate(renameCandidatesByBasePath, entry.oldPath, entry.path);
+      continue;
+    }
+    if (status === 'D') {
+      deletePaths.add(entry.path);
+      continue;
+    }
+    if (status === 'A' || status === 'C') {
+      addPaths.add(entry.path);
+      continue;
+    }
+    if (input.baseBlobs.has(entry.path) && input.targetBlobs.has(entry.path)) {
+      editPaths.add(entry.path);
+    } else if (input.baseBlobs.has(entry.path)) {
+      deletePaths.add(entry.path);
+    } else if (input.targetBlobs.has(entry.path)) {
+      addPaths.add(entry.path);
+    }
+  }
+
+  const exactRenames = inferExactRenamePairs(deletePaths, addPaths, input.baseBlobs, input.targetBlobs, renameCandidatesByBasePath);
+  for (const pair of exactRenames) {
+    deletePaths.delete(pair.basePath);
+    addPaths.delete(pair.targetPath);
+  }
+  const similarRenames = await inferSimilarRenamePairs({
+    baseCommit: input.baseCommit,
+    targetCommit: input.targetCommit,
+    deletePaths,
+    addPaths,
+    readBlob: input.readBlob,
+    renameCandidatesByBasePath
+  });
+  for (const pair of similarRenames) {
+    deletePaths.delete(pair.basePath);
+    addPaths.delete(pair.targetPath);
+  }
+
+  const actions: StructuralAction[] = [];
+  const byBasePath = new Map<string, StructuralAction>();
+  const addsByPath = new Map<string, StructuralAction>();
+  const addAction = (action: StructuralAction): void => {
+    actions.push(action);
+    if (action.basePath !== null) {
+      byBasePath.set(action.basePath, action);
+    }
+    if (action.kind === 'add' && action.targetPath !== null) {
+      addsByPath.set(action.targetPath, action);
+    }
+  };
+
+  for (const pair of [...explicitRenames, ...exactRenames, ...similarRenames]) {
+    addAction({
+      kind: 'rename',
+      basePath: pair.basePath,
+      targetPath: pair.targetPath,
+      baseOid: input.baseBlobs.get(pair.basePath) ?? null,
+      targetOid: input.targetBlobs.get(pair.targetPath) ?? null,
+      renameConfidence: pair.confidence
+    });
+  }
+  for (const path of [...editPaths].sort()) {
+    addAction({
+      kind: 'edit',
+      basePath: path,
+      targetPath: path,
+      baseOid: input.baseBlobs.get(path) ?? null,
+      targetOid: input.targetBlobs.get(path) ?? null,
+      renameConfidence: null
+    });
+  }
+  for (const path of [...deletePaths].sort()) {
+    addAction({
+      kind: 'delete',
+      basePath: path,
+      targetPath: null,
+      baseOid: input.baseBlobs.get(path) ?? null,
+      targetOid: null,
+      renameConfidence: null
+    });
+  }
+  for (const path of [...addPaths].sort()) {
+    addAction({
+      kind: 'add',
+      basePath: null,
+      targetPath: path,
+      baseOid: null,
+      targetOid: input.targetBlobs.get(path) ?? null,
+      renameConfidence: null
+    });
+  }
+
+  return { actions, byBasePath, addsByPath, renameCandidatesByBasePath };
+}
+
+function inferExactRenamePairs(
+  deletePaths: Set<string>,
+  addPaths: Set<string>,
+  baseBlobs: Map<string, string>,
+  targetBlobs: Map<string, string>,
+  renameCandidatesByBasePath: Map<string, Set<string>>
+): RenamePair[] {
+  const deletesByOid = groupPathsByOid(deletePaths, baseBlobs);
+  const addsByOid = groupPathsByOid(addPaths, targetBlobs);
+  const pairs: RenamePair[] = [];
+  for (const [oid, deleted] of deletesByOid) {
+    const added = addsByOid.get(oid) ?? [];
+    for (const basePath of deleted) {
+      for (const targetPath of added) {
+        recordRenameCandidate(renameCandidatesByBasePath, basePath, targetPath);
+      }
+    }
+    if (deleted.length === 1 && added.length === 1) {
+      pairs.push({ basePath: deleted[0]!, targetPath: added[0]!, confidence: 'exact_blob' });
+    }
+  }
+  return pairs;
+}
+
+async function inferSimilarRenamePairs(input: {
+  baseCommit: string;
+  targetCommit: string;
+  deletePaths: Set<string>;
+  addPaths: Set<string>;
+  readBlob: (commit: string, path: string) => Promise<Buffer | null>;
+  renameCandidatesByBasePath: Map<string, Set<string>>;
+}): Promise<RenamePair[]> {
+  const candidatesByBase = new Map<string, Array<{ targetPath: string; score: number }>>();
+  const candidatesByTarget = new Map<string, string[]>();
+  const baseBlobCache = new Map<string, Buffer | null>();
+  const targetBlobCache = new Map<string, Buffer | null>();
+  const readBase = async (path: string): Promise<Buffer | null> => {
+    if (!baseBlobCache.has(path)) {
+      baseBlobCache.set(path, await input.readBlob(input.baseCommit, path));
+    }
+    return baseBlobCache.get(path) ?? null;
+  };
+  const readTarget = async (path: string): Promise<Buffer | null> => {
+    if (!targetBlobCache.has(path)) {
+      targetBlobCache.set(path, await input.readBlob(input.targetCommit, path));
+    }
+    return targetBlobCache.get(path) ?? null;
+  };
+
+  for (const basePath of input.deletePaths) {
+    for (const targetPath of input.addPaths) {
+      if (!sameRenameExtension(basePath, targetPath)) {
+        continue;
+      }
+      const baseBlob = await readBase(basePath);
+      const targetBlob = await readTarget(targetPath);
+      const score = baseBlob && targetBlob ? contentSimilarity(baseBlob, targetBlob) : 0;
+      if (score < SIMILAR_RENAME_THRESHOLD) {
+        continue;
+      }
+      recordRenameCandidate(input.renameCandidatesByBasePath, basePath, targetPath);
+      const baseCandidates = candidatesByBase.get(basePath) ?? [];
+      baseCandidates.push({ targetPath, score });
+      candidatesByBase.set(basePath, baseCandidates);
+      const targetCandidates = candidatesByTarget.get(targetPath) ?? [];
+      targetCandidates.push(basePath);
+      candidatesByTarget.set(targetPath, targetCandidates);
+    }
+  }
+
+  const pairs: RenamePair[] = [];
+  for (const [basePath, candidates] of candidatesByBase) {
+    if (candidates.length !== 1) {
+      continue;
+    }
+    const targetPath = candidates[0]!.targetPath;
+    if ((candidatesByTarget.get(targetPath) ?? []).length === 1) {
+      pairs.push({ basePath, targetPath, confidence: 'similar_content' });
+    }
+  }
+  return pairs;
+}
+
+function structuralMergeConflict(left: StructuralSummary, right: StructuralSummary): StructuralConflict | null {
+  for (const [basePath, leftAction] of left.byBasePath) {
+    const rightAction = right.byBasePath.get(basePath);
+    if (!rightAction) {
+      continue;
+    }
+    const conflict = structuralBasePathConflict(basePath, leftAction, rightAction, left, right);
+    if (conflict) {
+      return conflict;
+    }
+  }
+  return renameTargetCollision(left, right) ?? renameTargetCollision(right, left);
+}
+
+function structuralBasePathConflict(
+  basePath: string,
+  leftAction: StructuralAction,
+  rightAction: StructuralAction,
+  left: StructuralSummary,
+  right: StructuralSummary
+): StructuralConflict | null {
+  if (leftAction.kind === 'rename' && rightAction.kind === 'rename') {
+    return leftAction.targetPath === rightAction.targetPath
+      ? null
+      : structuralConflict('rename_rename_conflict', structuralActionPaths(leftAction, rightAction));
+  }
+  if (leftAction.kind === 'rename' && rightAction.kind === 'delete') {
+    return structuralConflict('rename_delete_conflict', structuralActionPaths(leftAction, rightAction));
+  }
+  if (leftAction.kind === 'delete' && rightAction.kind === 'rename') {
+    return structuralConflict('rename_delete_conflict', structuralActionPaths(leftAction, rightAction));
+  }
+  if (leftAction.kind === 'delete' && rightAction.kind === 'edit') {
+    return structuralConflict('delete_edit_conflict', structuralActionPaths(leftAction, rightAction));
+  }
+  if (leftAction.kind === 'edit' && rightAction.kind === 'delete') {
+    return structuralConflict('delete_edit_conflict', structuralActionPaths(leftAction, rightAction));
+  }
+  if (leftAction.kind === 'rename' && rightAction.kind === 'edit') {
+    return renameEditPathCollision(basePath, leftAction, right) ?? null;
+  }
+  if (leftAction.kind === 'edit' && rightAction.kind === 'rename') {
+    return renameEditPathCollision(basePath, rightAction, left) ?? null;
+  }
+  if (leftAction.kind === 'delete' && rightAction.kind === 'delete') {
+    const leftTargets = left.renameCandidatesByBasePath.get(basePath) ?? new Set<string>();
+    const rightTargets = right.renameCandidatesByBasePath.get(basePath) ?? new Set<string>();
+    if (leftTargets.size === 0 && rightTargets.size === 0) {
+      return null;
+    }
+    if (singleSamePath(leftTargets, rightTargets)) {
+      return null;
+    }
+    return structuralConflict('ambiguous_rename_conflict', [basePath, ...leftTargets, ...rightTargets]);
+  }
+  return null;
+}
+
+function renameEditPathCollision(
+  basePath: string,
+  renameAction: StructuralAction,
+  editingSide: StructuralSummary
+): StructuralConflict | null {
+  if (!renameAction.targetPath) {
+    return null;
+  }
+  for (const action of editingSide.actions) {
+    if (action.basePath === basePath) {
+      continue;
+    }
+    if (actionTouchesPath(action, renameAction.targetPath)) {
+      return structuralConflict('rename_path_collision', structuralActionPaths(renameAction, action));
+    }
+  }
+  return null;
+}
+
+function renameTargetCollision(left: StructuralSummary, right: StructuralSummary): StructuralConflict | null {
+  for (const renameAction of left.actions.filter((action) => action.kind === 'rename')) {
+    if (!renameAction.targetPath) {
+      continue;
+    }
+    for (const otherAction of right.actions) {
+      if (
+        otherAction.kind === 'rename' &&
+        otherAction.basePath === renameAction.basePath &&
+        otherAction.targetPath === renameAction.targetPath
+      ) {
+        continue;
+      }
+      if (actionTouchesPath(otherAction, renameAction.targetPath)) {
+        return structuralConflict('rename_path_collision', structuralActionPaths(renameAction, otherAction));
+      }
+    }
+  }
+  return null;
+}
+
+function actionTouchesPath(action: StructuralAction, path: string): boolean {
+  if (action.targetPath && changedPathsConflict(action.targetPath, path)) {
+    return true;
+  }
+  return action.kind === 'delete' && action.basePath !== null && changedPathsConflict(action.basePath, path);
+}
+
+function structuralActionPaths(...actions: StructuralAction[]): string[] {
+  const paths = new Set<string>();
+  for (const action of actions) {
+    if (action.basePath) {
+      paths.add(action.basePath);
+    }
+    if (action.targetPath) {
+      paths.add(action.targetPath);
+    }
+  }
+  return [...paths].sort();
+}
+
+function structuralConflict(reason: string, paths: Iterable<string>): StructuralConflict {
+  return { reason, affectedPaths: [...new Set(paths)].sort() };
+}
+
+function recordRenameCandidate(candidates: Map<string, Set<string>>, basePath: string, targetPath: string): void {
+  const paths = candidates.get(basePath) ?? new Set<string>();
+  paths.add(targetPath);
+  candidates.set(basePath, paths);
+}
+
+function groupPathsByOid(paths: Set<string>, oidByPath: Map<string, string>): Map<string, string[]> {
+  const groups = new Map<string, string[]>();
+  for (const path of paths) {
+    const oid = oidByPath.get(path);
+    if (!oid) {
+      continue;
+    }
+    const group = groups.get(oid) ?? [];
+    group.push(path);
+    groups.set(oid, group);
+  }
+  return groups;
+}
+
+function sameRenameExtension(left: string, right: string): boolean {
+  return posix.extname(left).toLocaleLowerCase() === posix.extname(right).toLocaleLowerCase();
+}
+
+function contentSimilarity(left: Buffer, right: Buffer): number {
+  const leftText = similarityText(left);
+  const rightText = similarityText(right);
+  if (leftText === null || rightText === null) {
+    return 0;
+  }
+  if (leftText === rightText) {
+    return 1;
+  }
+  const leftTokens = similarityTokens(leftText);
+  const rightTokens = similarityTokens(rightText);
+  if (leftTokens.length === 0 || rightTokens.length === 0) {
+    return 0;
+  }
+  const counts = new Map<string, number>();
+  for (const token of leftTokens) {
+    counts.set(token, (counts.get(token) ?? 0) + 1);
+  }
+  let intersection = 0;
+  for (const token of rightTokens) {
+    const count = counts.get(token) ?? 0;
+    if (count > 0) {
+      intersection += 1;
+      counts.set(token, count - 1);
+    }
+  }
+  return (2 * intersection) / (leftTokens.length + rightTokens.length);
+}
+
+function similarityText(blob: Buffer): string | null {
+  if (blob.length > SIMILAR_RENAME_MAX_BYTES || blob.includes(0)) {
+    return null;
+  }
+  const text = blob.toString('utf8');
+  return text.includes('\uFFFD') ? null : text;
+}
+
+function similarityTokens(text: string): string[] {
+  const normalized = text.toLocaleLowerCase().replace(/\s+/gu, ' ').trim();
+  if (!normalized) {
+    return [];
+  }
+  const words = normalized.match(/[\p{L}\p{N}_-]+/gu) ?? [];
+  if (words.length >= 8) {
+    return words;
+  }
+  const chars = [...normalized];
+  if (chars.length <= 3) {
+    return [normalized];
+  }
+  const grams: string[] = [];
+  for (let index = 0; index <= chars.length - 3; index += 1) {
+    grams.push(chars.slice(index, index + 3).join(''));
+  }
+  return grams;
+}
+
+function singleSamePath(left: Set<string>, right: Set<string>): boolean {
+  if (left.size !== 1 || right.size !== 1) {
+    return false;
+  }
+  return left.values().next().value === right.values().next().value;
+}
+
 function intersectChangedPaths(left: GitDiffEntry[], right: GitDiffEntry[]): string[] {
   const leftPaths = [...changedPathSet(left)];
   const rightPaths = [...changedPathSet(right)];
@@ -1664,6 +2161,11 @@ function escapeHtml(content: string): string {
     }
   });
 }
+
+export const __syncServiceTestInternals = {
+  summarizeStructuralChanges,
+  structuralMergeConflict
+};
 
 function resolutionRequestHash(input: {
   expectedMain: string;
