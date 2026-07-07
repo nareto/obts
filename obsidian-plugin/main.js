@@ -6,7 +6,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 
 const API_VERSION = "2026-07-02.full-sync";
-const PLUGIN_VERSION = "0.1.8-phase2";
+const PLUGIN_VERSION = "0.1.9-phase2";
 const WINDOWS_RESERVED = new Set(["con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"]);
 const SYNC_DEBOUNCE_MS = 1500;
 const BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000;

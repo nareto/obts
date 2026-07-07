@@ -1,6 +1,7 @@
 import type {
   ConflictReviewPackage,
   ConflictResolutionKind,
+  ManualFilePlanEntry,
   DashboardSummary,
   DashboardConflict,
   NoteHistoryQueryResponse,
@@ -119,6 +120,7 @@ export class DashboardApi {
     expectedMain: string;
     resolutionKind: ConflictResolutionKind;
     manualFiles?: Record<string, string | null>;
+    manualFilePlan?: ManualFilePlanEntry[];
   }): Promise<{ resolution_commit: string; main: string; idempotent: boolean }> {
     return await this.request(`/vaults/${input.vaultId}/conflicts/${input.conflictId}/resolve`, {
       method: 'POST',
@@ -126,7 +128,8 @@ export class DashboardApi {
       body: {
         expected_main: input.expectedMain,
         resolution_kind: input.resolutionKind,
-        ...(input.manualFiles ? { manual_files: input.manualFiles } : {})
+        ...(input.manualFiles ? { manual_files: input.manualFiles } : {}),
+        ...(input.manualFilePlan ? { manual_file_plan: input.manualFilePlan } : {})
       }
     });
   }

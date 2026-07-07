@@ -560,6 +560,42 @@ pre {
   min-height: auto;
 }
 
+.path-review {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 12px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.path-review.path-warning {
+  border-color: var(--warning);
+}
+
+.path-review div {
+  min-width: 0;
+}
+
+.path-review span,
+.path-review small {
+  display: block;
+  color: var(--muted);
+}
+
+.path-review code {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.manual-title {
+  margin-top: 12px;
+}
+
 .tabs {
   display: flex;
   gap: 4px;
@@ -733,7 +769,8 @@ pre {
     overflow-x: auto;
   }
 
-  .workbench {
+  .workbench,
+  .path-review {
     grid-template-columns: 1fr;
   }
 

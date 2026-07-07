@@ -115,6 +115,18 @@ export type ConflictRecord = {
   resolution_commit?: string;
 };
 
+export type ConflictPathOperation = 'absent' | 'unchanged' | 'added' | 'modified' | 'deleted' | 'renamed';
+
+export type ConflictReviewPath = {
+  kind: 'same_path' | 'rename_rename' | 'rename_delete' | 'rename_edit' | 'delete_edit' | 'path_collision' | 'path_overlap';
+  base_path: string | null;
+  server_path: string | null;
+  device_path: string | null;
+  server_operation: ConflictPathOperation;
+  device_operation: ConflictPathOperation;
+  affected_paths: string[];
+};
+
 export type ConflictReviewFile = {
   path: string;
   base_content: string | null;
@@ -130,8 +142,14 @@ export type ConflictReviewPackage = {
   expected_main: string;
   current_main: string;
   device_name: string;
+  path_conflicts: ConflictReviewPath[];
   files: ConflictReviewFile[];
   choices: ConflictResolutionKind[];
+};
+
+export type ManualFilePlanEntry = {
+  path: string;
+  content: string | null;
 };
 
 export type NoteHistoryVersion = {

@@ -236,8 +236,8 @@ Behavior:
 2. Server authorizes the user for the vault.
 3. Server materializes the relevant Git state in a temporary workspace.
 4. Server returns conflict metadata and content needed for review over HTTPS.
-5. Dashboard displays rendered Markdown diff, source diff, affected paths, and available merge choices.
-6. User accepts current `main`, accepts device version, keeps both, inserts both blocks, or manually edits a final result.
+5. Dashboard displays rendered Markdown diff, source diff, affected paths, path/title variants for structural conflicts, and available merge choices.
+6. User accepts current `main`, accepts device version, keeps both, inserts both blocks, or manually edits a final result. For path/title conflicts such as rename-vs-rename, manual resolution includes the final vault path plus final file content, not only body text at existing affected paths.
 7. Dashboard verifies recent authentication and submits the selected resolution with the conflict ID and expected current `main`.
 8. Server accepts the resolution only if current `main` still matches the expected commit.
 9. If `main` advanced, the review package is marked stale and the dashboard must refresh or regenerate it before resolution.
@@ -248,6 +248,7 @@ Behavior:
 Acceptance criteria:
 
 - Unauthorized users cannot list, view, or resolve conflicts for another vault.
+- Conflict review packages include path/title metadata for structural conflicts: base path, current server path, device path, per-side path operation, and affected paths.
 - Resolution commits are merge commits that reference the conflict they resolved.
 - Accepting current `main` keeps the server version only for affected review paths and preserves non-conflicting device-side changes from the same device commit.
 - When there are no non-conflicting device-side changes to preserve, accepting current `main` creates a same-tree merge commit with parent 1 set to `expected_main` and parent 2 set to the conflicted device commit.
@@ -478,7 +479,10 @@ Conflict detail view uses a three-region workbench:
 - left rail: `280px` wide, with affected paths, provenance summary, current
   server version, device name, conflict type, and stale status;
 - center region: tabbed diff area with Rendered and Source tabs;
-- right rail: `320px` wide, with resolution choices and submit controls.
+- right rail: `320px` wide, with resolution choices and submit controls;
+- structural conflicts add a path/title review card showing Base, Server, and
+  Device paths. Manual resolution for these conflicts exposes a custom final
+  title/path field and final content editor.
 
 Resolution choices are radio options:
 
@@ -1294,10 +1298,11 @@ Included:
   status, pairing-token creation, readiness/health summary, and conflict list;
 - conflict package materialization from authorized Git state;
 - dashboard conflict list, rendered Markdown diff, source diff,
-  affected-path metadata, and resolution editor;
+  affected-path metadata, path/title metadata for structural conflicts, and
+  resolution editor;
 - resolution choices for accepting current `main`, accepting the device
   version, keeping both, inserting both blocks, or manually editing the final
-  result;
+  result, including custom final title/path resolution for path conflicts;
 - recent-auth verification for resolution submission;
 - `expected_main` stale-review protection, idempotent duplicate submission
   handling, and resolution commits that descend from current `main`;

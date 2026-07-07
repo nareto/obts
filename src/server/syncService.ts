@@ -7,7 +7,9 @@ import type {
   ConflictResolutionKind,
   ConflictReviewFile,
   ConflictReviewPackage,
+  ConflictReviewPath,
   DevicePushManifest,
+  ManualFilePlanEntry,
   PushResult,
   ResolveConflictResponse
 } from '../shared/types.js';
@@ -257,6 +259,7 @@ export class SyncService {
       throw new AuthError(404, 'not_found', 'Resource not found.');
     }
     const device = requireDevice(db, conflict.device_id);
+    const pathConflicts = await this.conflictReviewPaths(conflict);
     const files: ConflictReviewFile[] = [];
     for (const path of conflict.affected_paths) {
       const baseContent = await this.readOptionalTextBlob(vaultId, conflict.base_commit, path);
@@ -277,6 +280,7 @@ export class SyncService {
       expected_main: conflict.expected_main,
       current_main: vault.current_main,
       device_name: device.device_name,
+      path_conflicts: pathConflicts,
       files,
       choices: ['keep_server', 'use_device', 'keep_both_files', 'insert_both_blocks', 'manual']
     };
@@ -385,6 +389,7 @@ export class SyncService {
     expectedMain: string;
     resolutionKind: ConflictResolutionKind;
     manualFiles?: Record<string, string | null>;
+    manualFilePlan?: ManualFilePlanEntry[];
   }): Promise<ResolveConflictResponse> {
     const requestHash = resolutionRequestHash(input);
     return await this.withVaultLock(input.vaultId, async () => {
@@ -413,7 +418,7 @@ export class SyncService {
         throw new AuthError(409, 'stale_conflict_review', 'Conflict review is stale; refresh before resolving.');
       }
 
-      const tree = await this.buildResolutionTree(conflict, input.resolutionKind, input.manualFiles);
+      const tree = await this.buildResolutionTree(conflict, input.resolutionKind, input.manualFiles, input.manualFilePlan);
       await this.git.validateTreePathPolicy(input.vaultId, tree, this.maxUploadBytes);
 
       const preparation = await this.store.mutate((db) => {
@@ -850,6 +855,52 @@ export class SyncService {
     };
   }
 
+  private async conflictReviewPaths(conflict: ConflictRecord): Promise<ConflictReviewPath[]> {
+    if (
+      !(await this.git.commitExists(conflict.vault_id, conflict.base_commit)) ||
+      !(await this.git.commitExists(conflict.vault_id, conflict.current_main)) ||
+      !(await this.git.commitExists(conflict.vault_id, conflict.device_commit))
+    ) {
+      return fallbackConflictReviewPaths(conflict.affected_paths, new Map(), new Map(), new Map());
+    }
+    const [baseBlobs, currentBlobs, deviceBlobs] = await Promise.all([
+      this.blobOidMap(conflict.vault_id, conflict.base_commit),
+      this.blobOidMap(conflict.vault_id, conflict.current_main),
+      this.blobOidMap(conflict.vault_id, conflict.device_commit)
+    ]);
+    const [mainChanges, deviceChanges] = await Promise.all([
+      this.git.changedPaths(conflict.vault_id, conflict.base_commit, conflict.current_main),
+      this.git.changedPaths(conflict.vault_id, conflict.base_commit, conflict.device_commit)
+    ]);
+    const readBlob = async (commit: string, path: string): Promise<Buffer | null> =>
+      await this.readOptionalBlob(conflict.vault_id, commit, path);
+    const mainSummary = await summarizeStructuralChanges({
+      baseCommit: conflict.base_commit,
+      targetCommit: conflict.current_main,
+      changes: mainChanges,
+      baseBlobs,
+      targetBlobs: currentBlobs,
+      readBlob
+    });
+    const deviceSummary = await summarizeStructuralChanges({
+      baseCommit: conflict.base_commit,
+      targetCommit: conflict.device_commit,
+      changes: deviceChanges,
+      baseBlobs,
+      targetBlobs: deviceBlobs,
+      readBlob
+    });
+    return buildConflictReviewPaths({
+      reason: typeof conflict.validator_results.reason === 'string' ? conflict.validator_results.reason : 'overlapping_paths',
+      affectedPaths: conflict.affected_paths,
+      baseBlobs,
+      currentBlobs,
+      deviceBlobs,
+      mainSummary,
+      deviceSummary
+    });
+  }
+
   private async classifyStructuralMergeConflict(
     vaultId: string,
     base: string,
@@ -1039,7 +1090,8 @@ export class SyncService {
   private async buildResolutionTree(
     conflict: ConflictRecord,
     resolutionKind: ConflictResolutionKind,
-    manualFiles: Record<string, string | null> | undefined
+    manualFiles: Record<string, string | null> | undefined,
+    manualFilePlan: ManualFilePlanEntry[] | undefined
   ): Promise<string> {
     const sourceTree = await this.resolutionSourceTree(conflict);
     if (resolutionKind === 'keep_server') {
@@ -1073,7 +1125,8 @@ export class SyncService {
       for (const path of conflict.affected_paths) {
         const deviceBlob = await this.readOptionalBlob(conflict.vault_id, conflict.device_commit, path);
         if (deviceBlob !== null) {
-          writes.set(conflictCopyPath(path, conflict.conflict_id, conflict.device_id), deviceBlob);
+          const sourceBlob = await this.readOptionalBlob(conflict.vault_id, sourceTree, path);
+          writes.set(sourceBlob === null ? path : conflictCopyPath(path, conflict.conflict_id, conflict.device_id), deviceBlob);
         }
       }
       assertSyncableTreePaths([...writes.keys()]);
@@ -1117,6 +1170,12 @@ export class SyncService {
     }
 
     if (resolutionKind === 'manual') {
+      if (manualFiles !== undefined && manualFilePlan !== undefined) {
+        throw new AuthError(400, 'invalid_resolution', 'Manual resolution must use either manual_files or manual_file_plan.');
+      }
+      if (manualFilePlan !== undefined) {
+        return await this.buildManualFilePlanTree(conflict, sourceTree, manualFilePlan);
+      }
       if (manualFiles === undefined || Object.keys(manualFiles).length === 0) {
         throw new AuthError(400, 'invalid_resolution', 'Manual resolution requires final file content.');
       }
@@ -1146,6 +1205,48 @@ export class SyncService {
     }
 
     throw new AuthError(400, 'invalid_resolution', 'Unsupported conflict resolution kind.');
+  }
+
+  private async buildManualFilePlanTree(
+    conflict: ConflictRecord,
+    sourceTree: string,
+    manualFilePlan: ManualFilePlanEntry[]
+  ): Promise<string> {
+    if (manualFilePlan.length === 0) {
+      throw new AuthError(400, 'invalid_resolution', 'Manual file plan requires at least one path.');
+    }
+    const affected = new Set(conflict.affected_paths);
+    const seen = new Set<string>();
+    const writes = new Map<string, Buffer>();
+    const deletes: string[] = [];
+    for (const entry of manualFilePlan) {
+      if (seen.has(entry.path)) {
+        throw new AuthError(400, 'invalid_resolution', 'Manual file plan contains duplicate paths.');
+      }
+      seen.add(entry.path);
+      if (entry.content === null) {
+        if (!affected.has(entry.path)) {
+          throw new AuthError(400, 'invalid_resolution', 'Manual file plan can only delete affected conflict paths.');
+        }
+        deletes.push(entry.path);
+        continue;
+      }
+      if (!affected.has(entry.path) && (await this.readOptionalBlob(conflict.vault_id, sourceTree, entry.path)) !== null) {
+        throw new AuthError(400, 'invalid_resolution', 'Manual file plan target collides with an unrelated path.');
+      }
+      writes.set(entry.path, Buffer.from(entry.content, 'utf8'));
+    }
+    const missingPaths = conflict.affected_paths.filter((path) => !seen.has(path));
+    if (missingPaths.length > 0) {
+      throw new AuthError(400, 'invalid_resolution', 'Manual file plan must include every affected conflict path.');
+    }
+    assertSyncableTreePaths([...seen]);
+    return await this.git.createTreeFromTreeWithChanges({
+      vaultId: conflict.vault_id,
+      sourceTree,
+      writes,
+      deletes
+    });
   }
 
   private async resolutionSourceTree(conflict: ConflictRecord): Promise<string> {
@@ -2033,6 +2134,135 @@ function singleSamePath(left: Set<string>, right: Set<string>): boolean {
   return left.values().next().value === right.values().next().value;
 }
 
+function buildConflictReviewPaths(input: {
+  reason: string;
+  affectedPaths: string[];
+  baseBlobs: Map<string, string>;
+  currentBlobs: Map<string, string>;
+  deviceBlobs: Map<string, string>;
+  mainSummary: StructuralSummary;
+  deviceSummary: StructuralSummary;
+}): ConflictReviewPath[] {
+  const groups: ConflictReviewPath[] = [];
+  const groupedPaths = new Set<string>();
+  const basePaths = new Set([...input.mainSummary.byBasePath.keys(), ...input.deviceSummary.byBasePath.keys()]);
+  for (const basePath of [...basePaths].sort()) {
+    const mainAction = input.mainSummary.byBasePath.get(basePath);
+    const deviceAction = input.deviceSummary.byBasePath.get(basePath);
+    const server = reviewSide(basePath, mainAction);
+    const device = reviewSide(basePath, deviceAction);
+    const affectedPaths = affectedPathsForReviewGroup(input.affectedPaths, [basePath, server.path, device.path]);
+    if (affectedPaths.length === 0) {
+      continue;
+    }
+    for (const path of affectedPaths) {
+      groupedPaths.add(path);
+    }
+    groups.push({
+      kind: reviewPathKind(input.reason, mainAction, deviceAction, basePath, server.path, device.path),
+      base_path: basePath,
+      server_path: server.path,
+      device_path: device.path,
+      server_operation: server.operation,
+      device_operation: device.operation,
+      affected_paths: affectedPaths
+    });
+  }
+  const fallbackPaths = input.affectedPaths.filter((path) => !groupedPaths.has(path));
+  groups.push(...fallbackConflictReviewPaths(fallbackPaths, input.baseBlobs, input.currentBlobs, input.deviceBlobs));
+  return groups;
+}
+
+function reviewSide(
+  basePath: string,
+  action: StructuralAction | undefined
+): { path: string | null; operation: ConflictReviewPath['server_operation'] } {
+  if (!action) {
+    return { path: basePath, operation: 'unchanged' };
+  }
+  switch (action.kind) {
+    case 'rename':
+      return { path: action.targetPath, operation: 'renamed' };
+    case 'delete':
+      return { path: null, operation: 'deleted' };
+    case 'edit':
+      return { path: action.targetPath ?? action.basePath, operation: 'modified' };
+    case 'add':
+      return { path: action.targetPath, operation: 'added' };
+  }
+}
+
+function fallbackConflictReviewPaths(
+  affectedPaths: string[],
+  baseBlobs: Map<string, string>,
+  currentBlobs: Map<string, string>,
+  deviceBlobs: Map<string, string>
+): ConflictReviewPath[] {
+  return affectedPaths.map((path) => {
+    const baseOid = baseBlobs.get(path) ?? null;
+    const serverOid = currentBlobs.get(path) ?? null;
+    const deviceOid = deviceBlobs.get(path) ?? null;
+    const basePath = baseOid === null ? null : path;
+    const serverPath = serverOid === null ? null : path;
+    const devicePath = deviceOid === null ? null : path;
+    return {
+      kind: basePath === serverPath && basePath === devicePath ? 'same_path' : 'path_overlap',
+      base_path: basePath,
+      server_path: serverPath,
+      device_path: devicePath,
+      server_operation: reviewOperation(baseOid, serverOid),
+      device_operation: reviewOperation(baseOid, deviceOid),
+      affected_paths: [path]
+    };
+  });
+}
+
+function reviewOperation(baseOid: string | null, targetOid: string | null): ConflictReviewPath['server_operation'] {
+  if (baseOid === null && targetOid === null) {
+    return 'absent';
+  }
+  if (baseOid === null) {
+    return 'added';
+  }
+  if (targetOid === null) {
+    return 'deleted';
+  }
+  return baseOid === targetOid ? 'unchanged' : 'modified';
+}
+
+function reviewPathKind(
+  reason: string,
+  mainAction: StructuralAction | undefined,
+  deviceAction: StructuralAction | undefined,
+  basePath: string,
+  serverPath: string | null,
+  devicePath: string | null
+): ConflictReviewPath['kind'] {
+  if (reason === 'rename_rename_conflict') {
+    return 'rename_rename';
+  }
+  if (reason === 'rename_delete_conflict') {
+    return 'rename_delete';
+  }
+  if (reason === 'delete_edit_conflict') {
+    return 'delete_edit';
+  }
+  if (reason === 'rename_path_collision' || reason === 'ambiguous_rename_conflict') {
+    return 'path_collision';
+  }
+  if (mainAction?.kind === 'rename' || deviceAction?.kind === 'rename') {
+    return 'rename_edit';
+  }
+  return basePath === serverPath && basePath === devicePath ? 'same_path' : 'path_overlap';
+}
+
+function affectedPathsForReviewGroup(affectedPaths: string[], anchors: Array<string | null>): string[] {
+  const concreteAnchors = anchors.filter((path): path is string => path !== null);
+  return affectedPaths
+    .filter((path) => concreteAnchors.some((anchor) => changedPathsConflict(path, anchor)))
+    .sort();
+}
+
 function intersectChangedPaths(left: GitDiffEntry[], right: GitDiffEntry[]): string[] {
   const leftPaths = [...changedPathSet(left)];
   const rightPaths = [...changedPathSet(right)];
@@ -2171,6 +2401,7 @@ function resolutionRequestHash(input: {
   expectedMain: string;
   resolutionKind: ConflictResolutionKind;
   manualFiles?: Record<string, string | null>;
+  manualFilePlan?: ManualFilePlanEntry[];
 }): string {
   return sha256Hex(
     JSON.stringify({
@@ -2179,7 +2410,11 @@ function resolutionRequestHash(input: {
       manual_files:
         input.manualFiles === undefined
           ? null
-          : Object.fromEntries(Object.entries(input.manualFiles).sort(([left], [right]) => left.localeCompare(right)))
+          : Object.fromEntries(Object.entries(input.manualFiles).sort(([left], [right]) => left.localeCompare(right))),
+      manual_file_plan:
+        input.manualFilePlan === undefined
+          ? null
+          : [...input.manualFilePlan].sort((left, right) => left.path.localeCompare(right.path))
     })
   );
 }

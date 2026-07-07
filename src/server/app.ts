@@ -8,7 +8,7 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 
 import { newId, nowIso } from '../shared/ids.js';
 import { isSyncableVaultPath } from '../shared/pathPolicy.js';
-import { API_VERSION, type DevicePullManifest, type DevicePullRequest } from '../shared/types.js';
+import { API_VERSION, type DevicePullManifest, type DevicePullRequest, type ManualFilePlanEntry } from '../shared/types.js';
 import {
   assertRecord,
   readCommitId,
@@ -584,13 +584,15 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const body = requestBody(request);
     const resolutionKind = readConflictResolutionKind(body);
     const manualFiles = readManualResolutionFiles(body);
+    const manualFilePlan = readManualFilePlan(body);
     return await sync.resolveConflict({
       actorUserId: session.user.user_id,
       vaultId,
       conflictId,
       expectedMain: readCommitId(body, 'expected_main'),
       resolutionKind,
-      ...(manualFiles === undefined ? {} : { manualFiles })
+      ...(manualFiles === undefined ? {} : { manualFiles }),
+      ...(manualFilePlan === undefined ? {} : { manualFilePlan })
     });
   });
 
@@ -1281,6 +1283,27 @@ function readManualResolutionFiles(record: Record<string, unknown>): Record<stri
     files[path] = content;
   }
   return files;
+}
+
+function readManualFilePlan(record: Record<string, unknown>): ManualFilePlanEntry[] | undefined {
+  const value = record.manual_file_plan;
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value)) {
+    throw new ValidationError('invalid_request', 'Manual file plan must be an array.', { field: 'manual_file_plan' });
+  }
+  return value.map((entry, index) => {
+    assertRecord(entry);
+    const path = readVaultContentPath(entry, 'path');
+    const content = entry.content;
+    if (typeof content !== 'string' && content !== null) {
+      throw new ValidationError('invalid_request', 'Manual file plan content values must be strings or null.', {
+        field: `manual_file_plan.${index}.content`
+      });
+    }
+    return { path, content };
+  });
 }
 
 async function readPushMultipart(request: FastifyRequest): Promise<{

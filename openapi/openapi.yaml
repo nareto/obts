@@ -453,7 +453,7 @@ paths:
           $ref: "#/components/responses/Error"
   /vaults/{vault_id}/conflicts/{conflict_id}:
     get:
-      summary: Return a conflict review package with source and rendered Markdown diffs.
+      summary: Return a conflict review package with path metadata plus source and rendered Markdown diffs.
       parameters:
         - $ref: "#/components/parameters/VaultId"
         - $ref: "#/components/parameters/ConflictId"
@@ -1170,6 +1170,36 @@ components:
     ConflictResolutionKind:
       type: string
       enum: [keep_server, use_device, keep_both_files, insert_both_blocks, manual]
+    ConflictPathOperation:
+      type: string
+      enum: [absent, unchanged, added, modified, deleted, renamed]
+    ConflictReviewPath:
+      type: object
+      required: [kind, base_path, server_path, device_path, server_operation, device_operation, affected_paths]
+      properties:
+        kind:
+          type: string
+          enum: [same_path, rename_rename, rename_delete, rename_edit, delete_edit, path_collision, path_overlap]
+        base_path:
+          oneOf:
+            - type: "null"
+            - type: string
+        server_path:
+          oneOf:
+            - type: "null"
+            - type: string
+        device_path:
+          oneOf:
+            - type: "null"
+            - type: string
+        server_operation:
+          $ref: "#/components/schemas/ConflictPathOperation"
+        device_operation:
+          $ref: "#/components/schemas/ConflictPathOperation"
+        affected_paths:
+          type: array
+          items:
+            type: string
     ConflictReviewFile:
       type: object
       required: [path, base_content, server_content, device_content, source_diff, rendered_markdown_diff]
@@ -1196,7 +1226,7 @@ components:
             - type: string
     ConflictReviewPackage:
       type: object
-      required: [conflict, stale, expected_main, current_main, device_name, files, choices]
+      required: [conflict, stale, expected_main, current_main, device_name, path_conflicts, files, choices]
       properties:
         conflict:
           $ref: "#/components/schemas/ConflictRecord"
@@ -1210,6 +1240,10 @@ components:
           pattern: "^[0-9a-f]{40}$"
         device_name:
           type: string
+        path_conflicts:
+          type: array
+          items:
+            $ref: "#/components/schemas/ConflictReviewPath"
         files:
           type: array
           items:
@@ -1233,6 +1267,18 @@ components:
             oneOf:
               - type: string
               - type: "null"
+        manual_file_plan:
+          type: array
+          items:
+            type: object
+            required: [path, content]
+            properties:
+              path:
+                type: string
+              content:
+                oneOf:
+                  - type: string
+                  - type: "null"
     ResolveConflictResponse:
       type: object
       required: [status, conflict_id, main, resolution_commit, event_seq, idempotent]

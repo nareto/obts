@@ -164,6 +164,97 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(db.events.find((event) => event.event_type === 'main_advanced' && event.resource_ids.conflict_id === result.conflictId)).toBeDefined();
   });
 
+  it('reviews and resolves a rename title conflict with path-aware choices', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const { result } = await prepareRenameConflict(admin, root, 'rename-review');
+
+    const review = await admin.get<{
+      conflict: { conflict_id: string; expected_main: string };
+      path_conflicts: Array<{
+        kind: string;
+        base_path: string | null;
+        server_path: string | null;
+        device_path: string | null;
+        affected_paths: string[];
+      }>;
+      files: Array<{ path: string; server_content: string | null; device_content: string | null }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`);
+    expect(review.status).toBe(200);
+    expect(review.body.path_conflicts).toEqual([
+      expect.objectContaining({
+        kind: 'rename_rename',
+        base_path: 'Old.md',
+        server_path: 'Title A.md',
+        device_path: 'Title B.md',
+        affected_paths: ['Old.md', 'Title A.md', 'Title B.md']
+      })
+    ]);
+    expect(review.body.files.map((file) => file.path)).toEqual(['Old.md', 'Title A.md', 'Title B.md']);
+
+    const resolved = await admin.post<{ resolution_commit: string }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
+      {
+        expected_main: review.body.conflict.expected_main,
+        resolution_kind: 'keep_both_files'
+      }
+    );
+    expect(resolved.status).toBe(200);
+    expect(await server.git.listTreePaths(admin.vaultId, resolved.body.resolution_commit)).toEqual([
+      'Title A.md',
+      'Title B.md',
+      'rename-review-tablet-ref.md'
+    ]);
+  });
+
+  it('supports custom final title resolution for rename conflicts and rejects unrelated path collisions', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const { result } = await prepareRenameConflict(admin, root, 'rename-manual', { 'Existing.md': 'do not overwrite\n' });
+
+    const review = await admin.get<{
+      conflict: { expected_main: string };
+    }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`);
+    expect(review.status).toBe(200);
+
+    const collision = await admin.post<{ error: { code: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
+      {
+        expected_main: review.body.conflict.expected_main,
+        resolution_kind: 'manual',
+        manual_file_plan: [
+          { path: 'Old.md', content: null },
+          { path: 'Title A.md', content: null },
+          { path: 'Title B.md', content: null },
+          { path: 'Existing.md', content: 'overwrite attempt\n' }
+        ]
+      }
+    );
+    expect(collision.status).toBe(400);
+    expect(collision.body.error.code).toBe('invalid_resolution');
+
+    const resolved = await admin.post<{ resolution_commit: string }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
+      {
+        expected_main: review.body.conflict.expected_main,
+        resolution_kind: 'manual',
+        manual_file_plan: [
+          { path: 'Old.md', content: null },
+          { path: 'Title A.md', content: null },
+          { path: 'Title B.md', content: null },
+          { path: 'Final Title.md', content: 'custom title and body\n' }
+        ]
+      }
+    );
+    expect(resolved.status).toBe(200);
+    expect(await server.git.listTreePaths(admin.vaultId, resolved.body.resolution_commit)).toEqual([
+      'Existing.md',
+      'Final Title.md',
+      'rename-manual-tablet-ref.md'
+    ]);
+    expect((await server.git.readBlobAtPath(admin.vaultId, resolved.body.resolution_commit, 'Final Title.md')).toString('utf8')).toBe(
+      'custom title and body\n'
+    );
+  });
+
   it('keeps the server version without discarding unrelated device-side changes', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const desktopDir = join(root, 'desktop-server-resolution');
@@ -1112,6 +1203,38 @@ async function importServerMainIntoClient(
     currentLocalMain
   });
   await internals.git.importPack(pulled.packfile);
+}
+
+async function prepareRenameConflict(
+  admin: BrowserSession,
+  root: string,
+  prefix: string,
+  extraBaseFiles: Record<string, string> = {}
+): Promise<{ result: Awaited<ReturnType<ObtsPluginClient['syncOnce']>> }> {
+  const desktopDir = join(root, `${prefix}-desktop`);
+  const tabletDir = join(root, `${prefix}-tablet`);
+  await mkdir(desktopDir, { recursive: true });
+  await mkdir(tabletDir, { recursive: true });
+
+  const desktop = await pairPlugin(admin, desktopDir, `${prefix}-desktop`);
+  await writeFile(join(desktopDir, 'Old.md'), 'base\n');
+  for (const [path, content] of Object.entries(extraBaseFiles)) {
+    await writeFile(join(desktopDir, path), content);
+  }
+  expect((await desktop.syncOnce()).status).toBe('Synced');
+
+  const tablet = await pairPlugin(admin, tabletDir, `${prefix}-tablet`);
+  expect(await readFile(join(tabletDir, 'Old.md'), 'utf8')).toBe('base\n');
+  await writeFile(join(tabletDir, `${prefix}-tablet-ref.md`), 'tablet ref\n');
+  expect((await tablet.syncOnce()).status).toBe('Synced');
+  expect((await desktop.syncOnce()).status).toBe('Synced');
+
+  await rename(join(desktopDir, 'Old.md'), join(desktopDir, 'Title A.md'));
+  await rename(join(tabletDir, 'Old.md'), join(tabletDir, 'Title B.md'));
+  expect((await desktop.syncOnce()).status).toBe('Synced');
+  const result = await tablet.syncOnce();
+  expect(result.status).toBe('Review needed');
+  return { result };
 }
 
 async function setupAdminAndVault(baseUrl: string, username = 'admin', vaultName = 'Main Vault'): Promise<BrowserSession> {

@@ -9,7 +9,7 @@ import { LocalGitEngine } from './localGit.js';
 import { ApplyLockActiveError, type ApplyJournal, RecoveryManager, sha256File } from './recovery.js';
 import { TransportClient, TransportError } from './transport.js';
 
-const PLUGIN_VERSION = '0.1.8-phase2';
+const PLUGIN_VERSION = '0.1.9-phase2';
 
 export type ObtsPluginSettings = {
   serverUrl: string;
