@@ -9,7 +9,7 @@ import { LocalGitEngine } from './localGit.js';
 import { ApplyLockActiveError, type ApplyJournal, RecoveryManager, sha256File } from './recovery.js';
 import { TransportClient, TransportError } from './transport.js';
 
-const PLUGIN_VERSION = '0.1.13-phase2';
+const PLUGIN_VERSION = '0.1.14-phase2';
 
 export type ObtsPluginSettings = {
   serverUrl: string;
@@ -808,7 +808,7 @@ export class ObtsPluginClient {
       if (await this.hasActiveTokenWithoutIdentity(state)) {
         return (await this.readBackupState()) ?? this.localStateIncomplete(state);
       }
-      return state;
+      return await this.preferRecoverableBackupState(state);
     } catch {
       if (await exists(join(this.vaultDir, '.obts', 'auth', 'device-token.json'))) {
         const backupState = await this.readBackupState();
@@ -1778,8 +1778,93 @@ export class ObtsPluginClient {
   }
 
   private async writeState(state: LocalPluginState): Promise<void> {
+    const guardedState = await this.guardStateCursorRegression(state);
     await this.backupExistingState();
-    await writeJson(this.statePath, state);
+    await writeJson(this.statePath, guardedState);
+  }
+
+  private async guardStateCursorRegression(nextState: LocalPluginState): Promise<LocalPluginState> {
+    const currentState = await this.readPrimaryState();
+    if (!currentState || !samePairedDeviceState(currentState, nextState)) {
+      return nextState;
+    }
+
+    const guardedState = { ...nextState };
+    let cursorRegressed = false;
+    if (await this.shouldPreserveCurrentCursor(nextState.local_main, currentState.local_main)) {
+      guardedState.local_main = currentState.local_main;
+      cursorRegressed = true;
+    }
+    if (await this.shouldPreserveCurrentCursor(nextState.local_head, currentState.local_head)) {
+      guardedState.local_head = currentState.local_head;
+      cursorRegressed = true;
+    }
+    if (await this.shouldPreserveCurrentCursor(nextState.server_device_ref, currentState.server_device_ref)) {
+      guardedState.server_device_ref = currentState.server_device_ref;
+      cursorRegressed = true;
+    }
+    if (currentState.initial_import_confirmed && !guardedState.initial_import_confirmed) {
+      guardedState.initial_import_confirmed = true;
+    }
+    if (currentState.last_event_seq > guardedState.last_event_seq) {
+      guardedState.last_event_seq = currentState.last_event_seq;
+    }
+    if (cursorRegressed) {
+      guardedState.status_label = currentState.status_label;
+      guardedState.last_error_code = currentState.last_error_code;
+      guardedState.last_error_details = currentState.last_error_details ?? null;
+    }
+    return guardedState;
+  }
+
+  private async preferRecoverableBackupState(primaryState: LocalPluginState): Promise<LocalPluginState> {
+    const backupState = await this.readBackupState();
+    if (!backupState || !samePairedDeviceState(primaryState, backupState)) {
+      return primaryState;
+    }
+    if (await this.backupStateCursorsDescend(primaryState, backupState)) {
+      return backupState;
+    }
+    return primaryState;
+  }
+
+  private async backupStateCursorsDescend(primaryState: LocalPluginState, backupState: LocalPluginState): Promise<boolean> {
+    return (
+      (await this.cursorDescends(primaryState.local_main, backupState.local_main)) ||
+      (await this.cursorDescends(primaryState.local_head, backupState.local_head)) ||
+      (await this.cursorDescends(primaryState.server_device_ref, backupState.server_device_ref))
+    );
+  }
+
+  private async shouldPreserveCurrentCursor(nextCursor: string | null, currentCursor: string | null): Promise<boolean> {
+    if (!currentCursor) {
+      return false;
+    }
+    if (!nextCursor) {
+      return true;
+    }
+    if (nextCursor === currentCursor) {
+      return false;
+    }
+    return await this.cursorDescends(nextCursor, currentCursor);
+  }
+
+  private async cursorDescends(olderCursor: string | null, newerCursor: string | null): Promise<boolean> {
+    if (!olderCursor || !newerCursor || olderCursor === newerCursor) {
+      return false;
+    }
+    if (!(await this.git.commitExists(olderCursor)) || !(await this.git.commitExists(newerCursor))) {
+      return false;
+    }
+    return await this.git.isAncestor(olderCursor, newerCursor);
+  }
+
+  private async readPrimaryState(): Promise<LocalPluginState | null> {
+    try {
+      return JSON.parse(await readFile(this.statePath, 'utf8')) as LocalPluginState;
+    } catch {
+      return null;
+    }
   }
 
   private async repairLocalStateIfNeeded(state: LocalPluginState): Promise<LocalPluginState> {
@@ -2063,6 +2148,17 @@ async function exists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+function samePairedDeviceState(left: LocalPluginState, right: LocalPluginState): boolean {
+  return Boolean(
+    left.vault_id &&
+      left.device_id &&
+      right.vault_id &&
+      right.device_id &&
+      left.vault_id === right.vault_id &&
+      left.device_id === right.device_id
+  );
 }
 
 function categorizeRecoveryError(error: unknown): string {

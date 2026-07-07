@@ -6,7 +6,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 
 const API_VERSION = "2026-07-02.full-sync";
-const PLUGIN_VERSION = "0.1.13-phase2";
+const PLUGIN_VERSION = "0.1.14-phase2";
 const SYNC_DEBOUNCE_MS = 1500;
 const BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000;
 
@@ -223,16 +223,16 @@ module.exports = class ObtsPlugin extends Plugin {
     if (this.syncRunning) {
       return;
     }
-    const state = await this.client.readState();
-    if (!state.vault_id || !state.device_id) {
-      return;
-    }
-    if (state.last_error_code && state.last_error_code !== "conflict_review_required" && !isRetryableLocalError(state.last_error_code)) {
-      await this.client.reportDeviceStatus().catch(() => undefined);
-      return;
-    }
     this.syncRunning = true;
     try {
+      const state = await this.client.readState();
+      if (!state.vault_id || !state.device_id) {
+        return;
+      }
+      if (state.last_error_code && state.last_error_code !== "conflict_review_required" && !isRetryableLocalError(state.last_error_code)) {
+        await this.client.reportDeviceStatus().catch(() => undefined);
+        return;
+      }
       await this.syncOnceOrPollResolvedConflict({ confirmInitialImport: false });
       this.setStatus((await this.client.readState()).status_label);
       await this.client.reportDeviceStatus().catch(() => undefined);
@@ -1926,7 +1926,7 @@ class ObtsObsidianClient {
       if (await this.hasActiveTokenWithoutIdentity(state)) {
         return await this.readBackupState() || this.localStateIncomplete(state);
       }
-      return state;
+      return await this.preferRecoverableBackupState(state);
     } catch {
       if (await exists(this.authPath)) {
         const backupState = await this.readBackupState();
@@ -1953,8 +1953,90 @@ class ObtsObsidianClient {
   }
 
   async writeState(state) {
+    const guardedState = await this.guardStateCursorRegression(state);
     await this.backupExistingState();
-    await writeJson(this.statePath, state);
+    await writeJson(this.statePath, guardedState);
+  }
+
+  async guardStateCursorRegression(nextState) {
+    const currentState = await this.readPrimaryState();
+    if (!currentState || !samePairedDeviceState(currentState, nextState)) {
+      return nextState;
+    }
+    const guardedState = Object.assign({}, nextState);
+    let cursorRegressed = false;
+    if (await this.shouldPreserveCurrentCursor(nextState.local_main, currentState.local_main)) {
+      guardedState.local_main = currentState.local_main;
+      cursorRegressed = true;
+    }
+    if (await this.shouldPreserveCurrentCursor(nextState.local_head, currentState.local_head)) {
+      guardedState.local_head = currentState.local_head;
+      cursorRegressed = true;
+    }
+    if (await this.shouldPreserveCurrentCursor(nextState.server_device_ref, currentState.server_device_ref)) {
+      guardedState.server_device_ref = currentState.server_device_ref;
+      cursorRegressed = true;
+    }
+    if (currentState.initial_import_confirmed && !guardedState.initial_import_confirmed) {
+      guardedState.initial_import_confirmed = true;
+    }
+    if (currentState.last_event_seq > guardedState.last_event_seq) {
+      guardedState.last_event_seq = currentState.last_event_seq;
+    }
+    if (cursorRegressed) {
+      guardedState.status_label = currentState.status_label;
+      guardedState.last_error_code = currentState.last_error_code;
+      guardedState.last_error_details = currentState.last_error_details || null;
+    }
+    return guardedState;
+  }
+
+  async preferRecoverableBackupState(primaryState) {
+    const backupState = await this.readBackupState();
+    if (!backupState || !samePairedDeviceState(primaryState, backupState)) {
+      return primaryState;
+    }
+    if (await this.backupStateCursorsDescend(primaryState, backupState)) {
+      return backupState;
+    }
+    return primaryState;
+  }
+
+  async backupStateCursorsDescend(primaryState, backupState) {
+    return await this.cursorDescends(primaryState.local_main, backupState.local_main) ||
+      await this.cursorDescends(primaryState.local_head, backupState.local_head) ||
+      await this.cursorDescends(primaryState.server_device_ref, backupState.server_device_ref);
+  }
+
+  async shouldPreserveCurrentCursor(nextCursor, currentCursor) {
+    if (!currentCursor) {
+      return false;
+    }
+    if (!nextCursor) {
+      return true;
+    }
+    if (nextCursor === currentCursor) {
+      return false;
+    }
+    return await this.cursorDescends(nextCursor, currentCursor);
+  }
+
+  async cursorDescends(olderCursor, newerCursor) {
+    if (!olderCursor || !newerCursor || olderCursor === newerCursor) {
+      return false;
+    }
+    if (!(await this.commitExists(olderCursor)) || !(await this.commitExists(newerCursor))) {
+      return false;
+    }
+    return await this.isAncestor(olderCursor, newerCursor);
+  }
+
+  async readPrimaryState() {
+    try {
+      return JSON.parse(await fsp.readFile(this.statePath, "utf8"));
+    } catch {
+      return null;
+    }
   }
 
   async repairLocalStateIfNeeded(state) {
@@ -2306,7 +2388,14 @@ class ObtsSettingTab extends PluginSettingTab {
               button.setDisabled(true);
               setFeedback(actionFeedback, "Syncing...", "muted");
               try {
-                const result = await this.plugin.syncOnceOrPollResolvedConflict({ confirmInitialImport: false });
+                const result = await this.plugin.runUserAction(
+                  () => this.plugin.syncOnceOrPollResolvedConflict({ confirmInitialImport: false }),
+                  false
+                );
+                if (!result) {
+                  setFeedback(actionFeedback, "Sync already running.", "muted");
+                  return;
+                }
                 this.plugin.setStatus((await this.plugin.client.readState()).status_label);
                 setFeedback(actionFeedback, `Synced: ${result.status}`, "success");
                 new Notice(`obts: ${result.status}`);
@@ -2705,6 +2794,19 @@ function changedPathsConflict(left, right) {
 
 function isRetryableLocalError(code) {
   return code === "invalid_path" || code === "path_collision" || code === "excluded_git_path" || code === "excluded_internal_path" || code === "excluded_path" || code === "unsupported_file_mode";
+}
+
+function samePairedDeviceState(left, right) {
+  return Boolean(
+    left &&
+      right &&
+      left.vault_id &&
+      left.device_id &&
+      right.vault_id &&
+      right.device_id &&
+      left.vault_id === right.vault_id &&
+      left.device_id === right.device_id
+  );
 }
 
 function blockStatusLabel(code) {

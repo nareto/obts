@@ -590,6 +590,72 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await server.git.listTreePaths(admin.vaultId, finalState.local_main!)).toContain('after-stale.md');
   });
 
+  it('recovers a newer same-device state backup after a stale primary overwrite', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'newer-backup-state');
+    await mkdirp(deviceDir);
+    await writeFile(join(deviceDir, 'base.md'), 'base\n');
+    const plugin = await pairPlugin(admin, deviceDir, 'laptop');
+    expect((await plugin.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+    const staleState = await plugin.readState();
+
+    await writeFile(join(deviceDir, 'next.md'), 'next\n');
+    expect((await plugin.syncOnce()).status).toBe('Synced');
+    const currentState = await plugin.readState();
+    expect(currentState.local_main).not.toBe(staleState.local_main);
+
+    await writeFile(join(deviceDir, '.obts', 'state.json'), `${JSON.stringify({
+      ...staleState,
+      status_label: 'Unsafe local state',
+      last_error_code: 'unsafe_local_state',
+      updated_at: new Date(Date.now() - 60_000).toISOString()
+    }, null, 2)}\n`);
+    await writeFile(join(deviceDir, '.obts', 'state.json.bak'), `${JSON.stringify({
+      ...currentState,
+      updated_at: new Date().toISOString()
+    }, null, 2)}\n`);
+
+    const restartedPlugin = new ObtsPluginClient(deviceDir, { serverUrl: baseUrl, deviceName: 'laptop' });
+    await restartedPlugin.initialize();
+    expect(await restartedPlugin.readState()).toMatchObject({
+      local_main: currentState.local_main,
+      local_head: currentState.local_head,
+      status_label: 'Synced',
+      last_error_code: null
+    });
+  });
+
+  it('does not let stale state writers regress accepted local cursors', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'stale-state-writer');
+    await mkdirp(deviceDir);
+    await writeFile(join(deviceDir, 'base.md'), 'base\n');
+    const plugin = await pairPlugin(admin, deviceDir, 'laptop');
+    expect((await plugin.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+    const staleState = await plugin.readState();
+
+    await writeFile(join(deviceDir, 'next.md'), 'next\n');
+    expect((await plugin.syncOnce()).status).toBe('Synced');
+    const currentState = await plugin.readState();
+    expect(currentState.local_main).not.toBe(staleState.local_main);
+
+    const internals = plugin as unknown as { writeState(state: unknown): Promise<void> };
+    await internals.writeState({
+      ...staleState,
+      status_label: 'Unsafe local state',
+      last_error_code: 'unsafe_local_state',
+      updated_at: new Date().toISOString()
+    });
+
+    expect(await plugin.readState()).toMatchObject({
+      local_main: currentState.local_main,
+      local_head: currentState.local_head,
+      server_device_ref: currentState.server_device_ref,
+      status_label: 'Synced',
+      last_error_code: null
+    });
+  });
+
   it('does not apply remote main over local edits that appear during pull', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const fixtureADir = join(root, 'race-fixtureA');
