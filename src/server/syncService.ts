@@ -231,13 +231,23 @@ export class SyncService {
           return event.event_seq;
         });
 
+        const proposalBaseWasAcknowledged =
+          manifest.base_commit !== undefined &&
+          manifest.base_commit !== null &&
+          (auth.device.last_applied_main === manifest.base_commit ||
+            (auth.device.last_applied_main !== null && manifest.client_known_main === manifest.base_commit));
+        const detachedProposal =
+          currentDeviceRef === null &&
+          manifest.base_commit !== undefined &&
+          manifest.base_commit !== null &&
+          !proposalBaseWasAcknowledged;
         return await this.mergeDeviceCommit(
           auth.vault.vault_id,
           auth.device.device_id,
           manifest.target_commit,
           refEventSeq,
           manifest.base_commit ?? null,
-          currentDeviceRef === null && manifest.base_commit !== undefined && manifest.base_commit !== null
+          detachedProposal
         );
       } catch (error) {
         if (operationId) {

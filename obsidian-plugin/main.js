@@ -6,7 +6,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 
 const API_VERSION = "2026-07-02.full-sync";
-const PLUGIN_VERSION = "0.1.12-phase2";
+const PLUGIN_VERSION = "0.1.13-phase2";
 const SYNC_DEBOUNCE_MS = 1500;
 const BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000;
 
@@ -971,12 +971,16 @@ class ObtsObsidianClient {
       let preservedLocalChangePaths = [];
       if (requireCleanVisibleState) {
         await this.flushEditorBuffersToDisk();
-        preservedLocalChangePaths = await this.classifySafeResidualLocalChanges(state, journal, targetMain);
-        if (preservedLocalChangePaths.length === 0 && !(await this.localContentMatchesTree(await this.scanSyncableFiles(), targetMain))) {
+        try {
+          preservedLocalChangePaths = await this.localChangedPathsFromTree(targetMain);
+        } catch (error) {
           journal.phase = "blocked_recovery";
-          journal.redacted_error_category = "local_changed_during_apply";
+          journal.redacted_error_category = categorizeRecoveryError(error);
           await writeJson(this.applyJournalPath, journal);
-          await this.block("unsafe_local_state", "Local content changed during apply; server state was not acknowledged.");
+          if (error instanceof ObtsBlockedError) {
+            await this.block(error.code, error.message, error.details);
+          }
+          throw error;
         }
         if (preservedLocalChangePaths.length > 0) {
           await this.createRecoveryBundle("rebuild_from_server", targetMain, preservedLocalChangePaths);
@@ -1008,19 +1012,27 @@ class ObtsObsidianClient {
     if (journal.phase !== "blocked_recovery" || journal.redacted_error_category !== "local_changed_during_apply" || !(await this.commitExists(journal.target_main))) {
       return false;
     }
+    const canRecoverFinalVisibleTree = journal.last_completed_step === "files_written" || journal.last_completed_step === "refs_updated";
     const targetFiles = new Set(await this.listTreeFiles(journal.target_main));
-    if (!(await this.affectedApplyPathsMatchTarget(journal, targetFiles))) {
-      return false;
-    }
-    const preservedLocalChangePaths = await this.classifySafeResidualLocalChanges(state, journal, journal.target_main);
-    if (preservedLocalChangePaths.length === 0) {
-      return false;
+    let preservedLocalChangePaths = [];
+    if (canRecoverFinalVisibleTree) {
+      preservedLocalChangePaths = await this.localChangedPathsFromTree(journal.target_main);
+    } else {
+      if (!(await this.affectedApplyPathsMatchTarget(journal, targetFiles))) {
+        return false;
+      }
+      preservedLocalChangePaths = await this.classifySafeResidualLocalChanges(state, journal, journal.target_main);
+      if (preservedLocalChangePaths.length === 0) {
+        return false;
+      }
     }
     try {
       await fsp.rm(this.applyLockPath, { force: true });
       await this.acquireApplyLock(journal.apply_id);
       this.plugin.isApplying = true;
-      await this.createRecoveryBundle("rebuild_from_server", journal.target_main, preservedLocalChangePaths);
+      if (preservedLocalChangePaths.length > 0) {
+        await this.createRecoveryBundle("rebuild_from_server", journal.target_main, preservedLocalChangePaths);
+      }
       await this.updateRef("refs/heads/main", journal.target_main, null, true);
       await this.updateRef("refs/heads/local", journal.target_main, null, true);
       journal.phase = "committed";
@@ -1035,7 +1047,9 @@ class ObtsObsidianClient {
         updated_at: nowIso()
       }));
       await this.clearApplyState();
-      await this.queuePreservedLocalChanges(journal.target_main, state.server_device_ref);
+      if (preservedLocalChangePaths.length > 0) {
+        await this.queuePreservedLocalChanges(journal.target_main, state.server_device_ref);
+      }
       return true;
     } catch (error) {
       journal.redacted_error_category = categorizeRecoveryError(error);
@@ -1115,6 +1129,20 @@ class ObtsObsidianClient {
       }
     }
     return true;
+  }
+
+  async localChangedPathsFromTree(targetMain) {
+    const localFiles = new Set(await this.scanSyncableFiles());
+    const targetFiles = new Set(await this.listTreeFiles(targetMain));
+    const changedPaths = [];
+    for (const filePath of Array.from(new Set([...localFiles, ...targetFiles])).sort()) {
+      const localContent = localFiles.has(filePath) ? await this.adapterReadBinary(filePath) : null;
+      const targetContent = targetFiles.has(filePath) ? await this.readBlobIfPresent(targetMain, filePath) : null;
+      if (!buffersEqual(localContent, targetContent)) {
+        changedPaths.push(filePath);
+      }
+    }
+    return changedPaths;
   }
 
   async classifySafeResidualLocalChanges(state, journal, targetMain) {

@@ -722,6 +722,126 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('fixtureB during apply prep\n');
   });
 
+  it('preserves user folder deletions made while a remote apply is writing files', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const fixtureADir = join(root, 'delete-during-apply-fixtureA');
+    const fixtureBDir = join(root, 'delete-during-apply-fixtureB');
+    await mkdirp(fixtureADir);
+    await mkdirp(fixtureBDir);
+    await writeFile(join(fixtureADir, 'base.md'), 'base\n');
+    const fixtureA = await pairPlugin(admin, fixtureADir, 'fixtureA-delete-during-apply');
+    await fixtureA.syncOnce({ confirmInitialImport: true });
+    const fixtureB = await pairPlugin(admin, fixtureBDir, 'fixtureB-delete-during-apply');
+
+    await mkdirp(join(fixtureADir, 'incoming', 'keep'));
+    await mkdirp(join(fixtureADir, 'incoming', 'remove'));
+    await writeFile(join(fixtureADir, 'incoming', 'keep', 'a.md'), 'keep a\n');
+    await writeFile(join(fixtureADir, 'incoming', 'remove', 'b.md'), 'remove b\n');
+    await writeFile(join(fixtureADir, 'incoming', 'remove', 'c.md'), 'remove c\n');
+    expect((await fixtureA.syncOnce()).status).toBe('Synced');
+
+    const internals = fixtureB as unknown as {
+      writeTargetFilesFromJournal: (...args: unknown[]) => Promise<void>;
+    };
+    const originalWriteTargetFiles = internals.writeTargetFilesFromJournal.bind(internals);
+    let deletedDuringApply = false;
+    internals.writeTargetFilesFromJournal = async (...args) => {
+      await originalWriteTargetFiles(...args);
+      if (!deletedDuringApply) {
+        deletedDuringApply = true;
+        await rm(join(fixtureBDir, 'incoming', 'remove'), { recursive: true, force: true });
+      }
+    };
+
+    const applyResult = await fixtureB.syncOnce();
+    expect(applyResult.status).toBe('Ahead');
+    expect(await readFile(join(fixtureBDir, 'incoming', 'keep', 'a.md'), 'utf8')).toBe('keep a\n');
+    expect(await exists(join(fixtureBDir, 'incoming', 'remove', 'b.md'))).toBe(false);
+    expect(await fixtureB.readQueue()).toMatchObject({ status: 'queued_local' });
+    expect(await exists(join(fixtureBDir, '.obts', 'apply-journal.json'))).toBe(false);
+
+    expect((await fixtureB.syncOnce()).status).toBe('Synced');
+    const main = (await fixtureB.readState()).local_main!;
+    const serverPaths = await server.git.listTreePaths(admin.vaultId, main);
+    expect(serverPaths).toContain('incoming/keep/a.md');
+    expect(serverPaths).not.toContain('incoming/remove/b.md');
+    expect(serverPaths).not.toContain('incoming/remove/c.md');
+  });
+
+  it('recovers blocked apply journals with user deletions after files were written', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const fixtureADir = join(root, 'blocked-delete-recovery-fixtureA');
+    const fixtureBDir = join(root, 'blocked-delete-recovery-fixtureB');
+    await mkdirp(fixtureADir);
+    await mkdirp(fixtureBDir);
+    await writeFile(join(fixtureADir, 'base.md'), 'base\n');
+    const fixtureA = await pairPlugin(admin, fixtureADir, 'fixtureA-blocked-delete');
+    await fixtureA.syncOnce({ confirmInitialImport: true });
+    const fixtureB = await pairPlugin(admin, fixtureBDir, 'fixtureB-blocked-delete');
+    const priorFixtureBState = await fixtureB.readState();
+
+    await mkdirp(join(fixtureADir, 'incoming', 'keep'));
+    await mkdirp(join(fixtureADir, 'incoming', 'remove'));
+    await writeFile(join(fixtureADir, 'incoming', 'keep', 'a.md'), 'keep a\n');
+    await writeFile(join(fixtureADir, 'incoming', 'remove', 'b.md'), 'remove b\n');
+    await writeFile(join(fixtureADir, 'incoming', 'remove', 'c.md'), 'remove c\n');
+    expect((await fixtureA.syncOnce()).status).toBe('Synced');
+    const targetMain = (await fixtureA.readState()).local_main!;
+
+    const tokenFile = JSON.parse(await readFile(join(fixtureBDir, '.obts', 'auth', 'device-token.json'), 'utf8')) as { device_token: string };
+    const internals = fixtureB as unknown as {
+      transport: {
+        pull(input: { vaultId: string; deviceId: string; deviceToken: string; currentLocalMain: string | null }): Promise<{ packfile: Buffer }>;
+      };
+      git: { importPack(packfile: Buffer): Promise<void> };
+    };
+    const pulled = await internals.transport.pull({
+      vaultId: admin.vaultId,
+      deviceId: priorFixtureBState.device_id!,
+      deviceToken: tokenFile.device_token,
+      currentLocalMain: priorFixtureBState.local_main
+    });
+    await internals.git.importPack(pulled.packfile);
+
+    await mkdirp(join(fixtureBDir, 'incoming', 'keep'));
+    await writeFile(join(fixtureBDir, 'incoming', 'keep', 'a.md'), 'keep a\n');
+    await writeFile(join(fixtureBDir, '.obts', 'apply-journal.json'), `${JSON.stringify({
+      apply_id: 'apply_delete_after_files_written',
+      operation_type: 'pull_apply',
+      target_main: targetMain,
+      expected_prior_local_main: priorFixtureBState.local_main,
+      expected_prior_local_device_ref: priorFixtureBState.server_device_ref,
+      phase: 'blocked_recovery',
+      affected_paths: ['incoming/keep/a.md', 'incoming/remove/b.md', 'incoming/remove/c.md'],
+      preflight_sha256: {
+        'incoming/keep/a.md': null,
+        'incoming/remove/b.md': null,
+        'incoming/remove/c.md': null
+      },
+      recovery_bundle_id: 'rec_delete_after_files_written',
+      last_completed_step: 'files_written',
+      redacted_error_category: 'local_changed_during_apply'
+    }, null, 2)}\n`);
+    await writeFile(join(fixtureBDir, '.obts', 'state.json'), `${JSON.stringify({
+      ...priorFixtureBState,
+      status_label: 'Unsafe local state',
+      last_error_code: 'unsafe_local_state',
+      updated_at: new Date().toISOString()
+    }, null, 2)}\n`);
+
+    const restartedFixtureB = new ObtsPluginClient(fixtureBDir, { serverUrl: baseUrl, deviceName: 'fixtureB-blocked-delete' });
+    await restartedFixtureB.initialize();
+    expect(await restartedFixtureB.readQueue()).toMatchObject({ status: 'queued_local' });
+    expect((await restartedFixtureB.readState()).status_label).toBe('Ahead');
+
+    expect((await restartedFixtureB.syncOnce()).status).toBe('Synced');
+    const main = (await restartedFixtureB.readState()).local_main!;
+    const serverPaths = await server.git.listTreePaths(admin.vaultId, main);
+    expect(serverPaths).toContain('incoming/keep/a.md');
+    expect(serverPaths).not.toContain('incoming/remove/b.md');
+    expect(serverPaths).not.toContain('incoming/remove/c.md');
+  });
+
   it('surfaces Uploading while a queued local commit is being pushed', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'upload-status-device');

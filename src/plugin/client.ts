@@ -9,7 +9,7 @@ import { LocalGitEngine } from './localGit.js';
 import { ApplyLockActiveError, type ApplyJournal, RecoveryManager, sha256File } from './recovery.js';
 import { TransportClient, TransportError } from './transport.js';
 
-const PLUGIN_VERSION = '0.1.12-phase2';
+const PLUGIN_VERSION = '0.1.13-phase2';
 
 export type ObtsPluginSettings = {
   serverUrl: string;
@@ -1008,12 +1008,16 @@ export class ObtsPluginClient {
       let preservedLocalChangePaths: string[] = [];
       if (options.requireCleanVisibleState) {
         await this.flushEditorBuffersToDisk();
-        preservedLocalChangePaths = await this.classifySafeResidualLocalChanges(state, journal, targetMain);
-        if (preservedLocalChangePaths.length === 0 && !(await this.localContentMatchesTree(await this.git.scanSyncableFiles(), targetMain))) {
+        try {
+          preservedLocalChangePaths = await this.localChangedPathsFromTree(targetMain);
+        } catch (error) {
           journal.phase = 'blocked_recovery';
-          journal.redacted_error_category = 'local_changed_during_apply';
+          journal.redacted_error_category = categorizeRecoveryError(error);
           await this.recovery.writeApplyJournal(journal);
-          await this.block('unsafe_local_state', 'Local content changed during apply; server state was not acknowledged.');
+          if (error instanceof PathPolicyViolation) {
+            await this.block(error.code, error.message, error.details);
+          }
+          throw error;
         }
         if (preservedLocalChangePaths.length > 0) {
           await this.createLocalRecoveryBundle('rebuild_from_server', targetMain, preservedLocalChangePaths);
@@ -1052,20 +1056,28 @@ export class ObtsPluginClient {
       return false;
     }
 
+    const canRecoverFinalVisibleTree = journal.last_completed_step === 'files_written' || journal.last_completed_step === 'refs_updated';
     const targetFiles = new Set(await this.materializedTreeFiles(journal.target_main));
-    if (!(await this.affectedApplyPathsMatchTarget(journal, targetFiles))) {
-      return false;
-    }
-    const preservedLocalChangePaths = await this.classifySafeResidualLocalChanges(state, journal, journal.target_main);
-    if (preservedLocalChangePaths.length === 0) {
-      return false;
+    let preservedLocalChangePaths: string[] = [];
+    if (canRecoverFinalVisibleTree) {
+      preservedLocalChangePaths = await this.localChangedPathsFromTree(journal.target_main);
+    } else {
+      if (!(await this.affectedApplyPathsMatchTarget(journal, targetFiles))) {
+        return false;
+      }
+      preservedLocalChangePaths = await this.classifySafeResidualLocalChanges(state, journal, journal.target_main);
+      if (preservedLocalChangePaths.length === 0) {
+        return false;
+      }
     }
 
     let releaseApplyLock: (() => Promise<void>) | null = null;
     try {
       await this.recovery.clearApplyLock();
       releaseApplyLock = await this.recovery.acquireApplyLock(journal.apply_id);
-      await this.createLocalRecoveryBundle('rebuild_from_server', journal.target_main, preservedLocalChangePaths);
+      if (preservedLocalChangePaths.length > 0) {
+        await this.createLocalRecoveryBundle('rebuild_from_server', journal.target_main, preservedLocalChangePaths);
+      }
       await this.git.setLocalMain(journal.target_main);
       await this.git.setLocalHead(journal.target_main);
       journal.phase = 'committed';
@@ -1081,7 +1093,9 @@ export class ObtsPluginClient {
         updated_at: nowIso()
       });
       await this.recovery.clearApplyJournal();
-      await this.queuePreservedLocalChanges(journal.target_main, state.server_device_ref);
+      if (preservedLocalChangePaths.length > 0) {
+        await this.queuePreservedLocalChanges(journal.target_main, state.server_device_ref);
+      }
       return true;
     } catch (error) {
       journal.redacted_error_category = categorizeRecoveryError(error);
@@ -1181,6 +1195,20 @@ export class ObtsPluginClient {
       }
     }
     return true;
+  }
+
+  private async localChangedPathsFromTree(targetMain: string): Promise<string[]> {
+    const localFiles = new Set(await this.git.scanSyncableFiles());
+    const targetFiles = new Set(await this.materializedTreeFiles(targetMain));
+    const changedPaths: string[] = [];
+    for (const path of [...new Set([...localFiles, ...targetFiles])].sort()) {
+      const localContent = localFiles.has(path) ? await readFile(join(this.vaultDir, path)) : null;
+      const targetContent = targetFiles.has(path) ? await this.git.readBlob(targetMain, path) : null;
+      if (!buffersEqual(localContent, targetContent)) {
+        changedPaths.push(path);
+      }
+    }
+    return changedPaths;
   }
 
   private async classifySafeResidualLocalChanges(
