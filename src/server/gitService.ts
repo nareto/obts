@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { spawn } from 'node:child_process';
 
@@ -82,6 +82,27 @@ export class GitService {
       return { ok: true };
     } catch {
       return { ok: false, error: 'server Git object integrity check failed' };
+    }
+  }
+
+  async listVaultRepositoryIds(): Promise<string[]> {
+    const entries = await readdir(this.config.gitStoreDir, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isDirectory() && entry.name.endsWith('.git'))
+      .map((entry) => entry.name.slice(0, -'.git'.length))
+      .sort();
+  }
+
+  async checkRepositoryPermissions(vaultId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+    try {
+      const repository = await stat(this.repoPath(vaultId));
+      const requiredDirectoryBits = 0o700;
+      if (!repository.isDirectory() || (repository.mode & requiredDirectoryBits) !== requiredDirectoryBits) {
+        return { ok: false, error: 'server Git repository permissions are not owner-readable, writable, and searchable' };
+      }
+      return { ok: true };
+    } catch {
+      return { ok: false, error: 'server Git repository is missing or inaccessible' };
     }
   }
 
@@ -599,28 +620,26 @@ export class GitService {
       undefined,
       { maxBuffer: 16 * 1024 * 1024 }
     );
-    return asText(stdout)
-      .split('\x1e')
-      .map((entry) => entry.trim())
-      .filter(Boolean)
-      .map((entry) => {
-        const [hash, parents, tree, authorName, authorEmail, authorDate, subject, body = ''] = entry.split('\x1f');
-        if (!hash || !tree || !authorDate) {
-          throw new GitCommandError('Malformed git history output.', '');
-        }
-        return {
-          commit: hash,
-          parentCommit: parents ? parents.split(/\s+/u)[0] ?? null : null,
-          tree,
-          path,
-          previousPath: null,
-          authorName: authorName ?? '',
-          authorEmail: authorEmail ?? '',
-          authorDate,
-          subject: subject ?? '',
-          body
-        };
-      });
+    return parseHistoryOutput(asText(stdout), path);
+  }
+
+  async firstParentHistory(vaultId: string, commit: string): Promise<GitHistoryCommit[]> {
+    const repo = this.repoPath(vaultId);
+    const format = '%H%x1f%P%x1f%T%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%b%x1e';
+    const { stdout } = await this.exec(
+      repo,
+      ['log', '--first-parent', `--format=${format}`, commit],
+      undefined,
+      undefined,
+      { maxBuffer: 64 * 1024 * 1024 }
+    );
+    return parseHistoryOutput(asText(stdout), null);
+  }
+
+  async firstParentOf(vaultId: string, commit: string): Promise<string | null> {
+    const repo = this.repoPath(vaultId);
+    const { stdout } = await this.exec(repo, ['show', '-s', '--format=%P', commit]);
+    return asText(stdout).trim().split(/\s+/u).filter(Boolean)[0] ?? null;
   }
 
   async createMainCommitFromTree(input: {
@@ -912,6 +931,31 @@ function splitNul(data: Buffer): string[] {
 
 function asText(value: string | Buffer): string {
   return Buffer.isBuffer(value) ? value.toString('utf8') : value;
+}
+
+function parseHistoryOutput(output: string, path: string | null): GitHistoryCommit[] {
+  return output
+    .split('\x1e')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const [hash, parents, tree, authorName, authorEmail, authorDate, subject, body = ''] = entry.split('\x1f');
+      if (!hash || !tree || !authorDate) {
+        throw new GitCommandError('Malformed git history output.', '');
+      }
+      return {
+        commit: hash,
+        parentCommit: parents ? parents.split(/\s+/u)[0] ?? null : null,
+        tree,
+        path: path ?? '',
+        previousPath: null,
+        authorName: authorName ?? '',
+        authorEmail: authorEmail ?? '',
+        authorDate,
+        subject: subject ?? '',
+        body
+      };
+    });
 }
 
 function serverGitEnv(actor: string): NodeJS.ProcessEnv {

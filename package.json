@@ -1,9 +1,9 @@
 {
   "name": "obts",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "private": true,
   "type": "module",
-  "description": "Obsidian True Sync deployable dashboard and conflict resolution implementation.",
+  "description": "Obsidian True Sync deployable history, restore, diagnostics, and maintenance implementation.",
   "bin": {
     "obts": "./dist/src/cli.js"
   },

@@ -173,7 +173,9 @@ export class MetadataStore {
     try {
       const raw = await readFile(this.filePath, 'utf8');
       this.db = JSON.parse(raw) as MetadataDb;
-      this.normalizeLoadedDb(this.db);
+      if (this.normalizeLoadedDb(this.db)) {
+        await this.persist();
+      }
     } catch (error) {
       if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') {
         this.db = createEmptyDb();
@@ -276,21 +278,30 @@ export class MetadataStore {
     await rename(tempFile, this.filePath);
   }
 
-  private normalizeLoadedDb(db: MetadataDb): void {
+  private normalizeLoadedDb(db: MetadataDb): boolean {
     const legacyDb = db as MetadataDb & {
       schema_version: 1 | 2;
       login_attempts?: LoginAttemptRow[];
       directory_state_by_vault?: Record<string, DirectoryStateRow>;
       derived_history_by_vault?: Record<string, DerivedHistoryIndexRow[]>;
     };
+    let changed = false;
     if (!Array.isArray(legacyDb.login_attempts)) {
       legacyDb.login_attempts = [];
+      changed = true;
     }
-    legacyDb.directory_state_by_vault ??= {};
-    legacyDb.derived_history_by_vault ??= {};
+    if (legacyDb.directory_state_by_vault === undefined) {
+      legacyDb.directory_state_by_vault = {};
+      changed = true;
+    }
+    if (legacyDb.derived_history_by_vault === undefined) {
+      legacyDb.derived_history_by_vault = {};
+      changed = true;
+    }
     const schema = legacyDb as unknown as { schema_version: number };
     if (schema.schema_version === 1) {
       schema.schema_version = 2;
+      changed = true;
     }
     for (const device of db.devices) {
       const legacyDevice = device as DeviceRow & {
@@ -307,16 +318,24 @@ export class MetadataStore {
       };
       if (!Object.prototype.hasOwnProperty.call(legacyDevice, 'last_applied_main')) {
         legacyDevice.last_applied_main = null;
+        changed = true;
       }
-      legacyDevice.local_status_label ??= null;
-      legacyDevice.local_error_code ??= null;
-      legacyDevice.local_error_details ??= null;
-      legacyDevice.local_queue_status ??= null;
-      legacyDevice.local_main ??= null;
-      legacyDevice.local_head ??= null;
-      legacyDevice.plugin_version ??= null;
-      legacyDevice.path_capabilities ??= null;
-      legacyDevice.last_status_report_at ??= null;
+      for (const key of [
+        'local_status_label',
+        'local_error_code',
+        'local_error_details',
+        'local_queue_status',
+        'local_main',
+        'local_head',
+        'plugin_version',
+        'path_capabilities',
+        'last_status_report_at'
+      ] as const) {
+        if (legacyDevice[key] === undefined) {
+          legacyDevice[key] = null;
+          changed = true;
+        }
+      }
     }
     for (const conflict of db.conflicts) {
       const legacyConflict = conflict as ConflictRecord & { validator_results?: Record<string, unknown> };
@@ -329,8 +348,10 @@ export class MetadataStore {
           affected_paths: legacyConflict.affected_paths,
           affected_path_count: legacyConflict.affected_path_count
         };
+        changed = true;
       }
     }
+    return changed;
   }
 
   private pruneVaultEvents(db: MetadataDb, vaultId: string): void {

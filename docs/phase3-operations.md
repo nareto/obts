@@ -24,7 +24,11 @@ blocked and readiness fails closed.
 ## History And Restore
 
 History queries are owner-scoped, follow renames, and cache derived path history
-against the exact current `main`. Cache entries are rebuildable; Git remains
+against the exact current `main`. The timeline walks canonical `main` through
+its first-parent lineage: proposal-only commits are not presented as published
+note versions, while accepted concurrent merges, conflict resolutions, and
+restores remain explicit provenance entries even when a resolution keeps the
+first-parent file content unchanged. Cache entries are rebuildable; Git remains
 authoritative. Markdown versions expose source and rendered diff views;
 `.canvas` and `.base` versions expose source diffs. Community-plugin files show
 metadata only until the owner explicitly reveals one selected version after
@@ -32,7 +36,10 @@ recent authentication.
 
 Restore requires the reviewed `expected_main`, CSRF protection, and recent
 authentication. It writes a new two-parent Git commit and advances `main` with
-a compare-and-swap ref update. It never rewrites existing history. Paired
+a compare-and-swap ref update. The source commit and historical path must belong
+to the canonical history of the requested target path. Restore and maintenance
+share the same per-vault mutation lock as device sync and conflict resolution.
+They never rewrite existing history. Paired
 clients receive the new `main` through their normal pull/apply path, including
 the existing recovery-bundle and apply-journal protections.
 

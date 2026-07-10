@@ -35,6 +35,13 @@ Git state or metadata, migrations, filesystem access, or native Git, readiness
 fails closed until operator repair; history and restore endpoints also refuse a
 vault marked `blocked_integrity`.
 
+At startup the server also rejects orphan per-vault Git repositories that have
+no matching metadata record and marks a metadata-backed vault
+`blocked_integrity` when its repository, owner access bits, refs, objects,
+conflict protection, or current derived index are inconsistent. This prevents a
+partially restored metadata/Git pair from serving a plausible but incomplete
+history.
+
 Event rows are retained for 30 days or 100,000 events per vault. Clients that
 resume from an older pruned cursor receive `410 event_cursor_expired` and must
 refresh vault state before polling from an available cursor.

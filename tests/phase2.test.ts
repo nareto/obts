@@ -162,6 +162,26 @@ describe('Phase 2 dashboard conflict resolution', () => {
       resolution_commit: resolved.body.resolution_commit
     });
 
+    const history = await admin.post<{
+      versions: Array<{ commit: string; operation_type: string; conflict_id?: string; device_id?: string; user_id?: string }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/history/query`, { path: 'shared.md', limit: 20 });
+    expect(history.status).toBe(200);
+    expect(history.body.versions).toContainEqual(
+      expect.objectContaining({
+        commit: resolved.body.resolution_commit,
+        operation_type: 'conflict_resolution',
+        conflict_id: result.conflictId,
+        device_id: expect.any(String),
+        user_id: expect.any(String)
+      })
+    );
+    const proposalOnlyVersion = await admin.post<{ error: { code: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/history/version`,
+      { path: 'shared.md', commit: review.body.conflict.device_commit }
+    );
+    expect(proposalOnlyVersion.status).toBe(404);
+    expect(proposalOnlyVersion.body.error.code).toBe('not_found');
+
     const db = await server.store.snapshot();
     expect(db.conflicts.find((conflict) => conflict.conflict_id === result.conflictId)).toMatchObject({
       status: 'resolved',
@@ -891,6 +911,9 @@ describe('Phase 2 dashboard conflict resolution', () => {
     });
     expect(history.status).toBe(200);
     expect(history.body.versions.length).toBeGreaterThanOrEqual(2);
+    expect(history.body.versions.map((version) => version.operation_type)).toEqual(
+      expect.arrayContaining(['create', 'update'])
+    );
 
     let firstVersionCommit = '';
     for (const version of history.body.versions) {
@@ -904,6 +927,20 @@ describe('Phase 2 dashboard conflict resolution', () => {
       }
     }
     expect(firstVersionCommit).toMatch(/^[0-9a-f]{40}$/u);
+
+    const emptyRoot = (
+      await server.git.exec(server.git.repoPath(admin.vaultId), ['rev-list', '--max-parents=0', history.body.current_main])
+    ).stdout.toString().trim();
+    const unrelatedRestore = await admin.post<{ error: { code: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/history/restore`,
+      {
+        path: 'history.md',
+        source_commit: emptyRoot,
+        expected_main: history.body.current_main
+      }
+    );
+    expect(unrelatedRestore.status).toBe(404);
+    expect(unrelatedRestore.body.error.code).toBe('not_found');
 
     const restored = await admin.post<{ status: string; restore_commit: string }>(`/api/v1/vaults/${admin.vaultId}/history/restore`, {
       path: 'history.md',
@@ -923,6 +960,17 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(JSON.stringify(restoreEvents)).not.toContain('history.md');
     expect(restoreEvents[0]?.payload.path_id).toMatch(/^path_[0-9a-f]{16}$/u);
 
+    const restoredHistory = await admin.post<{
+      versions: Array<{ commit: string; operation_type: string; user_id?: string }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/history/query`, { path: 'history.md', limit: 20 });
+    expect(restoredHistory.body.versions).toContainEqual(
+      expect.objectContaining({
+        commit: restored.body.restore_commit,
+        operation_type: 'restore',
+        user_id: expect.any(String)
+      })
+    );
+
     const maintenance = await admin.post<{ status: string; detail: string }>(
       `/api/v1/vaults/${admin.vaultId}/maintenance/git-gc/start`,
       {}
@@ -933,6 +981,13 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(await server.git.commitExists(admin.vaultId, firstVersionCommit)).toBe(true);
     expect((await server.git.readBlobAtPath(admin.vaultId, firstVersionCommit, 'history.md')).toString('utf8')).toBe(
       'first version\n'
+    );
+    const maintenanceState = await server.store.snapshot();
+    expect(maintenanceState.events.map((event) => event.event_type)).toEqual(
+      expect.arrayContaining(['vault_maintenance_started', 'vault_maintenance_finished'])
+    );
+    expect(maintenanceState.audit_log.map((entry) => entry.action)).toEqual(
+      expect.arrayContaining(['git_maintenance_started', 'git_maintenance_finished'])
     );
   });
 
@@ -992,6 +1047,55 @@ describe('Phase 2 dashboard conflict resolution', () => {
       'rename me\n'
     );
     expect(await server.git.readBlobAtPathIfPresent(admin.vaultId, restored.body.restore_commit, 'old-name.md')).toBeNull();
+  });
+
+  it('shows canonical create and delete operations without listing proposal-only commits', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'desktop-delete-history');
+    await mkdir(desktopDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await writeFile(join(desktopDir, 'deleted.md'), 'temporary note\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    await rm(join(desktopDir, 'deleted.md'));
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const history = await admin.post<{
+      versions: Array<{ commit: string; operation_type: string; path: string }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/history/query`, { path: 'deleted.md', limit: 20 });
+    expect(history.status).toBe(200);
+    expect(history.body.versions.map((version) => version.operation_type)).toEqual(['delete', 'create']);
+    expect(history.body.versions.every((version) => version.path === 'deleted.md')).toBe(true);
+  });
+
+  it('shows concurrent canonical merges with device and merge-sequence provenance', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'desktop-merge-history');
+    const tabletDir = join(root, 'tablet-merge-history');
+    await mkdir(desktopDir, { recursive: true });
+    await mkdir(tabletDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await writeFile(join(desktopDir, 'target.md'), 'base target\n');
+    await writeFile(join(desktopDir, 'other.md'), 'base other\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const tablet = await pairPlugin(admin, tabletDir, 'tablet');
+
+    await writeFile(join(desktopDir, 'other.md'), 'server advanced elsewhere\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    await writeFile(join(tabletDir, 'target.md'), 'tablet target edit\n');
+    expect((await tablet.syncOnce()).status).toBe('Synced');
+
+    const history = await admin.post<{
+      versions: Array<{ operation_type: string; device_id?: string; user_id?: string; merge_sequence?: number }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/history/query`, { path: 'target.md', limit: 20 });
+    expect(history.status).toBe(200);
+    expect(history.body.versions).toContainEqual(
+      expect.objectContaining({
+        operation_type: 'merge',
+        device_id: expect.any(String),
+        user_id: expect.any(String),
+        merge_sequence: expect.any(Number)
+      })
+    );
   });
 
   it('redacts community plugin history by default and requires an explicit content-bearing request', async () => {

@@ -62,6 +62,10 @@ export class SyncService {
     private readonly maxUploadBytes: number
   ) {}
 
+  async runWithVaultLock<T>(vaultId: string, fn: () => Promise<T>): Promise<T> {
+    return await this.withVaultLock(vaultId, fn);
+  }
+
   async resumePendingMerges(): Promise<void> {
     const db = await this.store.snapshot();
     const candidates = db.sync_operations

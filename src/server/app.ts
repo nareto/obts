@@ -50,6 +50,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   const git = new GitService(config);
   await reconcileStartupOperations(store, git);
   await ensureProtectedConflictRefs(store, git);
+  await markInconsistentVaults(store, git);
   const auth = new AuthService(store);
   const sync = new SyncService(store, git, config.maxUploadBytes);
   const app = Fastify({
@@ -378,6 +379,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     );
     const allConflicts = db.conflicts.filter((conflict) => conflict.vault_id === vault.vault_id);
     const conflicts = allConflicts.filter((conflict) => conflict.status === 'open');
+    const health = await buildReadinessSummary(config, store, git);
     return {
       vault: {
         vault_id: vault.vault_id,
@@ -389,8 +391,8 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       unresolved_conflict_count: conflicts.length,
       conflicts: buildDashboardConflicts(db, vault.vault_id, vault.current_main, allConflicts),
       recent_activity: buildRecentActivity(db, vault.vault_id),
-      maintenance: buildMaintenanceRows(await buildReadinessSummary(config, store, git)),
-      health: await buildReadinessSummary(config, store, git)
+      maintenance: buildMaintenanceRows(health),
+      health
     };
   });
 
@@ -694,8 +696,14 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     if (!(await git.commitExists(vault.vault_id, commit)) || !(await git.isAncestor(vault.vault_id, commit, vault.current_main))) {
       throw new AuthError(404, 'not_found', 'Resource not found.');
     }
+    const canonicalVersion = (
+      await buildNoteHistoryVersions(git, db, vault.vault_id, vault.current_main, path, Number.MAX_SAFE_INTEGER)
+    ).some((version) => version.commit === commit && version.path === path);
+    if (!canonicalVersion) {
+      throw new AuthError(404, 'not_found', 'Resource not found.');
+    }
     const rawContent = (await git.readBlobAtPathIfPresent(vault.vault_id, commit, path))?.toString('utf8') ?? null;
-    const parent = (await git.historyForPath(vault.vault_id, commit, path, 1))[0]?.parentCommit ?? null;
+    const parent = await git.firstParentOf(vault.vault_id, commit);
     const rawSourceDiff = parent === null ? '' : await git.sourceDiffForPath(vault.vault_id, parent, commit, path);
     const contentRedacted = pluginFile && !includeContent;
     if (pluginFile && includeContent) {
@@ -744,121 +752,133 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       : null;
     const sourceCommit = readCommitId(body, 'source_commit');
     const expectedMain = readCommitId(body, 'expected_main');
-    const db = await store.snapshot();
-    const vault = ownedVaultOrThrow(db, session.user.user_id, vaultId);
-    requireHistoryAvailable(vault.status);
-    if (expectedMain !== vault.current_main) {
-      throw new AuthError(409, 'stale_history_review', 'Current main changed; refresh history before restoring.');
-    }
-    if (!(await git.commitExists(vault.vault_id, sourceCommit)) || !(await git.isAncestor(vault.vault_id, sourceCommit, vault.current_main))) {
-      throw new AuthError(404, 'not_found', 'Resource not found.');
-    }
-    const sourcePath =
-      explicitSourcePath ?? (await inferHistorySourcePath(git, vault.vault_id, vault.current_main, path, sourceCommit)) ?? path;
-    const sourceContent = await git.readBlobAtPathIfPresent(vault.vault_id, sourceCommit, sourcePath);
-    const tree = await git.createTreeFromCommitWithChanges({
-      vaultId: vault.vault_id,
-      sourceCommit: vault.current_main,
-      writes: sourceContent === null ? new Map() : new Map([[path, sourceContent]]),
-      deletes: sourceContent === null ? [path] : []
-    });
-    await git.validateTreePathPolicy(vault.vault_id, tree, config.maxUploadBytes);
-    const operation = await store.mutate((mutableDb) => {
-      const currentVault = ownedVaultOrThrow(mutableDb, session.user.user_id, vaultId);
-      if (currentVault.current_main !== expectedMain) {
+    return await sync.runWithVaultLock(vaultId, async () => {
+      const db = await store.snapshot();
+      const vault = ownedVaultOrThrow(db, session.user.user_id, vaultId);
+      requireHistoryAvailable(vault.status);
+      if (expectedMain !== vault.current_main) {
         throw new AuthError(409, 'stale_history_review', 'Current main changed; refresh history before restoring.');
       }
-      const op = store.startOperation(mutableDb, {
-        vault_id: vault.vault_id,
-        device_id: null,
-        operation_type: 'note_restore',
-        expected_refs: { 'refs/heads/main': currentVault.current_main },
-        target_refs: { 'refs/heads/main': null },
-        target_commit: null
+      if (!(await git.commitExists(vault.vault_id, sourceCommit)) || !(await git.isAncestor(vault.vault_id, sourceCommit, vault.current_main))) {
+        throw new AuthError(404, 'not_found', 'Resource not found.');
+      }
+      const inferredSourcePath = await inferHistorySourcePath(
+        git,
+        db,
+        vault.vault_id,
+        vault.current_main,
+        path,
+        sourceCommit
+      );
+      if (inferredSourcePath === null || (explicitSourcePath !== null && explicitSourcePath !== inferredSourcePath)) {
+        throw new AuthError(404, 'not_found', 'Resource not found.');
+      }
+      const sourcePath = explicitSourcePath ?? inferredSourcePath;
+      const sourceContent = await git.readBlobAtPathIfPresent(vault.vault_id, sourceCommit, sourcePath);
+      const tree = await git.createTreeFromCommitWithChanges({
+        vaultId: vault.vault_id,
+        sourceCommit: vault.current_main,
+        writes: sourceContent === null ? new Map() : new Map([[path, sourceContent]]),
+        deletes: sourceContent === null ? [path] : []
       });
-      op.status = 'prepared';
-      op.prepared_manifest = {
-        operation_type: 'note_restore',
+      await git.validateTreePathPolicy(vault.vault_id, tree, config.maxUploadBytes);
+      const operation = await store.mutate((mutableDb) => {
+        const currentVault = ownedVaultOrThrow(mutableDb, session.user.user_id, vaultId);
+        if (currentVault.current_main !== expectedMain) {
+          throw new AuthError(409, 'stale_history_review', 'Current main changed; refresh history before restoring.');
+        }
+        const op = store.startOperation(mutableDb, {
+          vault_id: vault.vault_id,
+          device_id: null,
+          operation_type: 'note_restore',
+          expected_refs: { 'refs/heads/main': currentVault.current_main },
+          target_refs: { 'refs/heads/main': null },
+          target_commit: null
+        });
+        op.status = 'prepared';
+        op.prepared_manifest = {
+          operation_type: 'note_restore',
+          path,
+          source_path: sourcePath,
+          source_commit: sourceCommit,
+          actor_user_id: session.user.user_id,
+          current_main: currentVault.current_main,
+          accepted_tree: tree
+        };
+        op.updated_at = nowIso();
+        return { operation_id: op.operation_id, current_main: currentVault.current_main };
+      });
+      let restoreCommit: string;
+      try {
+        restoreCommit = await git.createHistoryRestoreMergeCommitObject({
+          vaultId: vault.vault_id,
+          tree,
+          expectedMain: operation.current_main,
+          sourceCommit,
+          path,
+          sourcePath,
+          userId: session.user.user_id
+        });
+        await prepareRouteRefUpdate(store, operation.operation_id, 'refs/heads/main', restoreCommit);
+        await git.updateRef(vault.vault_id, 'refs/heads/main', restoreCommit, operation.current_main);
+      } catch (error) {
+        await abortOperationForRoute(store, operation.operation_id, 'history_restore_git_error');
+        throw error;
+      }
+      const eventSeq = await store.mutate((mutableDb) => {
+        const mutableVault = ownedVaultOrThrow(mutableDb, session.user.user_id, vaultId);
+        const op = mutableDb.sync_operations.find((candidate) => candidate.operation_id === operation.operation_id);
+        if (op) {
+          op.status = 'committed';
+          op.target_refs = { 'refs/heads/main': restoreCommit };
+          op.target_commit = restoreCommit;
+          op.result = {
+            restore_commit: restoreCommit,
+            source_commit: sourceCommit,
+            path,
+            source_path: sourcePath,
+            decision: 'note_restored'
+          };
+          op.updated_at = nowIso();
+        }
+        mutableVault.current_main = restoreCommit;
+        mutableVault.updated_at = nowIso();
+        const mainEvent = store.appendEvent(mutableDb, {
+          event_type: 'main_advanced',
+          vault_id: vault.vault_id,
+          resource_ids: { vault_id: vault.vault_id },
+          commit_cursors: { previous_main: operation.current_main, main: restoreCommit, source_commit: sourceCommit },
+          payload: { decision: 'note_restored', path_id: redactedPathId(path) }
+        });
+        store.appendEvent(mutableDb, {
+          event_type: 'note_restored',
+          vault_id: vault.vault_id,
+          resource_ids: { vault_id: vault.vault_id },
+          commit_cursors: { previous_main: operation.current_main, main: restoreCommit, source_commit: sourceCommit },
+          payload: { path_id: redactedPathId(path), source_commit: sourceCommit }
+        });
+        mutableDb.audit_log.push({
+          audit_id: newId('aud'),
+          actor_user_id: session.user.user_id,
+          actor_device_id: null,
+          vault_id: vault.vault_id,
+          action: 'note_restored',
+          resource_class: 'note',
+          resource_id: null,
+          created_at: nowIso()
+        });
+        return mainEvent.event_seq;
+      });
+      return {
+        status: 'restored',
         path,
         source_path: sourcePath,
         source_commit: sourceCommit,
-        actor_user_id: session.user.user_id,
-        current_main: currentVault.current_main,
-        accepted_tree: tree
+        main: restoreCommit,
+        restore_commit: restoreCommit,
+        event_seq: eventSeq
       };
-      op.updated_at = nowIso();
-      return { operation_id: op.operation_id, current_main: currentVault.current_main };
     });
-    let restoreCommit: string;
-    try {
-      restoreCommit = await git.createHistoryRestoreMergeCommitObject({
-        vaultId: vault.vault_id,
-        tree,
-        expectedMain: operation.current_main,
-        sourceCommit,
-        path,
-        sourcePath,
-        userId: session.user.user_id
-      });
-      await prepareRouteRefUpdate(store, operation.operation_id, 'refs/heads/main', restoreCommit);
-      await git.updateRef(vault.vault_id, 'refs/heads/main', restoreCommit, operation.current_main);
-    } catch (error) {
-      await abortOperationForRoute(store, operation.operation_id, 'history_restore_git_error');
-      throw error;
-    }
-    const eventSeq = await store.mutate((mutableDb) => {
-      const mutableVault = ownedVaultOrThrow(mutableDb, session.user.user_id, vaultId);
-      const op = mutableDb.sync_operations.find((candidate) => candidate.operation_id === operation.operation_id);
-      if (op) {
-        op.status = 'committed';
-        op.target_refs = { 'refs/heads/main': restoreCommit };
-        op.target_commit = restoreCommit;
-        op.result = {
-          restore_commit: restoreCommit,
-          source_commit: sourceCommit,
-          path,
-          source_path: sourcePath,
-          decision: 'note_restored'
-        };
-        op.updated_at = nowIso();
-      }
-      mutableVault.current_main = restoreCommit;
-      mutableVault.updated_at = nowIso();
-      const mainEvent = store.appendEvent(mutableDb, {
-        event_type: 'main_advanced',
-        vault_id: vault.vault_id,
-        resource_ids: { vault_id: vault.vault_id },
-        commit_cursors: { previous_main: operation.current_main, main: restoreCommit, source_commit: sourceCommit },
-        payload: { decision: 'note_restored', path_id: redactedPathId(path) }
-      });
-      store.appendEvent(mutableDb, {
-        event_type: 'note_restored',
-        vault_id: vault.vault_id,
-        resource_ids: { vault_id: vault.vault_id },
-        commit_cursors: { previous_main: operation.current_main, main: restoreCommit, source_commit: sourceCommit },
-        payload: { path_id: redactedPathId(path), source_commit: sourceCommit }
-      });
-      mutableDb.audit_log.push({
-        audit_id: newId('aud'),
-        actor_user_id: session.user.user_id,
-        actor_device_id: null,
-        vault_id: vault.vault_id,
-        action: 'note_restored',
-        resource_class: 'note',
-        resource_id: null,
-        created_at: nowIso()
-      });
-      return mainEvent.event_seq;
-    });
-    return {
-      status: 'restored',
-      path,
-      source_path: sourcePath,
-      source_commit: sourceCommit,
-      main: restoreCommit,
-      restore_commit: restoreCommit,
-      event_seq: eventSeq
-    };
   });
 
   app.post('/api/v1/vaults/:vaultId/maintenance/git-gc/start', async (request) => {
@@ -866,18 +886,19 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     auth.requireRecentAuth(session.session);
     const { vaultId } = pathParams(request);
-    const db = await store.snapshot();
-    const vault = ownedVaultOrThrow(db, session.user.user_id, vaultId);
-    if (vault.status === 'blocked_integrity') {
-      throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
-    }
-    await ensureProtectedConflictRefs(store, git, vault.vault_id);
-    const protectedState = await store.snapshot();
-    const protectedVault = ownedVaultOrThrow(protectedState, session.user.user_id, vaultId);
-    if (protectedVault.status === 'blocked_integrity') {
-      throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
-    }
-    const started = await store.mutate((mutableDb) => {
+    return await sync.runWithVaultLock(vaultId, async () => {
+      const db = await store.snapshot();
+      const vault = ownedVaultOrThrow(db, session.user.user_id, vaultId);
+      if (vault.status === 'blocked_integrity') {
+        throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+      }
+      await ensureProtectedConflictRefs(store, git, vault.vault_id);
+      const protectedState = await store.snapshot();
+      const protectedVault = ownedVaultOrThrow(protectedState, session.user.user_id, vaultId);
+      if (protectedVault.status === 'blocked_integrity') {
+        throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+      }
+      const started = await store.mutate((mutableDb) => {
       const op = store.startOperation(mutableDb, {
         vault_id: vault.vault_id,
         device_id: null,
@@ -887,7 +908,11 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         target_commit: null
       });
       op.status = 'prepared';
-      op.prepared_manifest = { operation_type: 'git_maintenance', current_main: vault.current_main };
+      op.prepared_manifest = {
+        operation_type: 'git_maintenance',
+        current_main: vault.current_main,
+        actor_user_id: session.user.user_id
+      };
       op.updated_at = nowIso();
       const event = store.appendEvent(mutableDb, {
         event_type: 'vault_maintenance_started',
@@ -896,53 +921,93 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         commit_cursors: { main: vault.current_main },
         payload: { task: 'git_gc' }
       });
-      return { eventSeq: event.event_seq, operationId: op.operation_id };
-    });
-    let detail: string;
-    try {
-      detail = await git.runMaintenance(vault.vault_id);
-    } catch (error) {
-      await abortOperationForRoute(store, started.operationId, 'git_maintenance_failed');
-      throw error;
-    }
-    const postMaintenanceDb = await store.snapshot();
-    const indexedPaths = [
-      ...new Set((postMaintenanceDb.derived_history_by_vault[vault.vault_id] ?? []).map((entry) => entry.path))
-    ];
-    const refreshedHistory: MetadataDb['derived_history_by_vault'][string] = [];
-    for (const indexedPath of indexedPaths) {
-      refreshedHistory.push({
-        path: indexedPath,
-        current_main: vault.current_main,
-        versions: await buildNoteHistoryVersions(
-          git,
-          postMaintenanceDb,
-          vault.vault_id,
-          vault.current_main,
-          indexedPath,
-          200
-        ),
-        indexed_at: nowIso()
-      });
-    }
-    const eventSeq = await store.mutate((mutableDb) => {
-      const operation = mutableDb.sync_operations.find((candidate) => candidate.operation_id === started.operationId);
-      if (operation) {
-        operation.status = 'committed';
-        operation.result = { detail };
-        operation.updated_at = nowIso();
-      }
-      const event = store.appendEvent(mutableDb, {
-        event_type: 'vault_maintenance_finished',
+      mutableDb.audit_log.push({
+        audit_id: newId('aud'),
+        actor_user_id: session.user.user_id,
+        actor_device_id: null,
         vault_id: vault.vault_id,
-        resource_ids: { vault_id: vault.vault_id },
-        commit_cursors: { main: vault.current_main },
-        payload: { task: 'git_gc', status: 'completed' }
+        action: 'git_maintenance_started',
+        resource_class: 'vault',
+        resource_id: vault.vault_id,
+        created_at: nowIso()
       });
-      mutableDb.derived_history_by_vault[vault.vault_id] = refreshedHistory;
-      return event.event_seq;
+      return { eventSeq: event.event_seq, operationId: op.operation_id };
+      });
+      let detail: string;
+      try {
+        detail = await git.runMaintenance(vault.vault_id);
+      } catch (error) {
+        await abortOperationForRoute(store, started.operationId, 'git_maintenance_failed');
+        await store.mutate((mutableDb) => {
+          store.appendEvent(mutableDb, {
+            event_type: 'vault_maintenance_finished',
+            vault_id: vault.vault_id,
+            resource_ids: { vault_id: vault.vault_id },
+            commit_cursors: { main: vault.current_main },
+            payload: { task: 'git_gc', status: 'failed' }
+          });
+          mutableDb.audit_log.push({
+            audit_id: newId('aud'),
+            actor_user_id: session.user.user_id,
+            actor_device_id: null,
+            vault_id: vault.vault_id,
+            action: 'git_maintenance_failed',
+            resource_class: 'vault',
+            resource_id: vault.vault_id,
+            created_at: nowIso()
+          });
+        });
+        throw error;
+      }
+      const postMaintenanceDb = await store.snapshot();
+      const indexedPaths = [
+        ...new Set((postMaintenanceDb.derived_history_by_vault[vault.vault_id] ?? []).map((entry) => entry.path))
+      ];
+      const refreshedHistory: MetadataDb['derived_history_by_vault'][string] = [];
+      for (const indexedPath of indexedPaths) {
+        refreshedHistory.push({
+          path: indexedPath,
+          current_main: vault.current_main,
+          versions: await buildNoteHistoryVersions(
+            git,
+            postMaintenanceDb,
+            vault.vault_id,
+            vault.current_main,
+            indexedPath,
+            200
+          ),
+          indexed_at: nowIso()
+        });
+      }
+      const eventSeq = await store.mutate((mutableDb) => {
+        const operation = mutableDb.sync_operations.find((candidate) => candidate.operation_id === started.operationId);
+        if (operation) {
+          operation.status = 'committed';
+          operation.result = { detail };
+          operation.updated_at = nowIso();
+        }
+        const event = store.appendEvent(mutableDb, {
+          event_type: 'vault_maintenance_finished',
+          vault_id: vault.vault_id,
+          resource_ids: { vault_id: vault.vault_id },
+          commit_cursors: { main: vault.current_main },
+          payload: { task: 'git_gc', status: 'completed' }
+        });
+        mutableDb.derived_history_by_vault[vault.vault_id] = refreshedHistory;
+        mutableDb.audit_log.push({
+          audit_id: newId('aud'),
+          actor_user_id: session.user.user_id,
+          actor_device_id: null,
+          vault_id: vault.vault_id,
+          action: 'git_maintenance_finished',
+          resource_class: 'vault',
+          resource_id: vault.vault_id,
+          created_at: nowIso()
+        });
+        return event.event_seq;
+      });
+      return { status: 'completed', started_event_seq: started.eventSeq, event_seq: eventSeq, detail };
     });
-    return { status: 'completed', started_event_seq: started.eventSeq, event_seq: eventSeq, detail };
   });
 
   app.get('/api/v1/vaults/:vaultId/events', async (request, reply) => {
@@ -1154,8 +1219,8 @@ function buildRedactedDiagnostics(
         status: device.status,
         last_seen_at: device.last_seen_at,
         last_successful_sync_at: device.last_successful_sync_at,
-        local_status_label: device.local_status_label,
-        local_error_code: device.local_error_code
+        local_status_label: device.local_status_label === null ? null : 'reported',
+        local_error_code: device.local_error_code === null ? null : 'reported_error'
       })),
     conflicts: db.conflicts
       .filter((conflict) => conflict.vault_id === vaultId)
@@ -1190,12 +1255,13 @@ async function buildNoteHistoryVersions(
   path: string,
   limit: number
 ): Promise<NoteHistoryVersion[]> {
-  const historyCommits = await git.historyForPath(vaultId, currentMain, path, limit);
+  const historyCommits = await git.firstParentHistory(vaultId, currentMain);
   const versions: NoteHistoryVersion[] = [];
   let pathAtCommit = path;
   for (const commit of historyCommits) {
     const classification = await classifyHistoryOperation(
       git,
+      db,
       vaultId,
       commit.commit,
       commit.parentCommit,
@@ -1203,6 +1269,9 @@ async function buildNoteHistoryVersions(
       commit.subject,
       commit.body
     );
+    if (classification === null) {
+      continue;
+    }
     const provenance = historyProvenance(commit.body);
     const provenanceDevice = provenance.device_id
       ? db.devices.find((candidate) => candidate.device_id === provenance.device_id)
@@ -1225,12 +1294,16 @@ async function buildNoteHistoryVersions(
     if (classification.previousPath) {
       pathAtCommit = classification.previousPath;
     }
+    if (versions.length >= limit) {
+      break;
+    }
   }
   return versions;
 }
 
 async function classifyHistoryOperation(
   git: GitService,
+  db: MetadataDb,
   vaultId: string,
   commit: string,
   parentCommit: string | null,
@@ -1241,26 +1314,35 @@ async function classifyHistoryOperation(
   operationType: 'create' | 'update' | 'delete' | 'rename' | 'restore' | 'merge' | 'conflict_resolution';
   path: string;
   previousPath: string | null;
-}> {
-  if (body.includes('conflict_id=') || subject.includes('resolve conflict')) {
+} | null> {
+  const resolvedConflict = db.conflicts.find(
+    (candidate) =>
+      candidate.vault_id === vaultId &&
+      candidate.resolution_commit === commit &&
+      candidate.affected_paths.includes(path)
+  );
+  if (resolvedConflict) {
     return { operationType: 'conflict_resolution', path, previousPath: null };
   }
-  if (body.includes('source_commit=') || subject.startsWith('obts: restore ')) {
+  const restorePath = /^path=(.+)$/mu.exec(body)?.[1];
+  if ((body.includes('source_commit=') || subject.startsWith('obts: restore ')) && restorePath === path) {
     return { operationType: 'restore', path, previousPath: null };
   }
-  const isMergeCommit = subject.includes('merge device changes');
   const current = await git.readBlobAtPathIfPresent(vaultId, commit, path);
   if (parentCommit === null) {
-    return { operationType: current === null ? 'delete' : 'create', path, previousPath: null };
+    return current === null ? null : { operationType: 'create', path, previousPath: null };
   }
-  const rename = (await git.changedPaths(vaultId, parentCommit, commit)).find((entry) => {
-    return entry.status.startsWith('R') && (entry.path === path || entry.oldPath === path);
-  });
+  const changes = await git.changedPaths(vaultId, parentCommit, commit);
+  const rename = changes.find((entry) => entry.status.startsWith('R') && entry.path === path);
   if (rename?.oldPath) {
     return { operationType: 'rename', path: rename.path, previousPath: rename.oldPath };
   }
-  if (isMergeCommit) {
-    return { operationType: 'merge', path, previousPath: null };
+  const pathChange = changes.find((entry) => entry.path === path);
+  if (!pathChange) {
+    return null;
+  }
+  if (body.includes('conflict_id=') || subject.includes('resolve conflict')) {
+    return { operationType: 'conflict_resolution', path, previousPath: null };
   }
   const previous = await git.readBlobAtPathIfPresent(vaultId, parentCommit, path);
   if (previous === null && current !== null) {
@@ -1269,36 +1351,23 @@ async function classifyHistoryOperation(
   if (previous !== null && current === null) {
     return { operationType: 'delete', path, previousPath: null };
   }
+  const mergeBase = /^base=([0-9a-f]{40})$/mu.exec(body)?.[1];
+  if (subject.includes('merge device changes') && mergeBase !== parentCommit) {
+    return { operationType: 'merge', path, previousPath: null };
+  }
   return { operationType: 'update', path, previousPath: null };
 }
 
 async function inferHistorySourcePath(
   git: GitService,
+  db: MetadataDb,
   vaultId: string,
   currentMain: string,
   targetPath: string,
   sourceCommit: string
 ): Promise<string | null> {
-  const historyCommits = await git.historyForPath(vaultId, currentMain, targetPath, 1000);
-  let pathAtCommit = targetPath;
-  for (const commit of historyCommits) {
-    const classification = await classifyHistoryOperation(
-      git,
-      vaultId,
-      commit.commit,
-      commit.parentCommit,
-      pathAtCommit,
-      commit.subject,
-      commit.body
-    );
-    if (commit.commit === sourceCommit) {
-      return classification.path;
-    }
-    if (classification.previousPath) {
-      pathAtCommit = classification.previousPath;
-    }
-  }
-  return null;
+  const history = await buildNoteHistoryVersions(git, db, vaultId, currentMain, targetPath, Number.MAX_SAFE_INTEGER);
+  return history.find((version) => version.commit === sourceCommit)?.path ?? null;
 }
 
 function historyProvenance(body: string): {
@@ -1878,6 +1947,10 @@ async function checkWritableDirectory(path: string): Promise<{ ok: true } | { ok
   const probe = join(path, `.obts-ready-${process.pid}-${Date.now()}`);
   try {
     await mkdir(path, { recursive: true, mode: 0o700 });
+    const directory = await stat(path);
+    if (!directory.isDirectory() || (directory.mode & 0o700) !== 0o700) {
+      return { ok: false, error: 'persistent directory permissions do not allow owner read, write, and search access' };
+    }
     await writeFile(probe, 'ok', { mode: 0o600 });
     await rm(probe, { force: true });
     return { ok: true };
@@ -1915,6 +1988,9 @@ async function buildReadinessSummary(
   const gitStoreReady = await checkWritableDirectory(config.gitStoreDir);
   const tempWorkspaceReady = await checkWritableDirectory(config.tempDir);
   const persistentState = await checkPersistentState(db, git);
+  if (!persistentState.ok && persistentState.vaultId) {
+    await blockVaultForIntegrity(store, persistentState.vaultId);
+  }
   const eventDelivery = checkEventDelivery(db);
   const filesystemPermissions = metadataStoreReady.ok && gitStoreReady.ok && tempWorkspaceReady.ok;
   const checks = {
@@ -1974,60 +2050,110 @@ function checkEventDelivery(db: MetadataDb): { ok: true } | { ok: false; error: 
   return { ok: true };
 }
 
-async function checkPersistentState(db: MetadataDb, git: GitService): Promise<{ ok: true } | { ok: false; error: string }> {
+type PersistentStateCheck = { ok: true } | { ok: false; error: string; vaultId?: string };
+
+async function checkPersistentState(db: MetadataDb, git: GitService): Promise<PersistentStateCheck> {
   if (db.schema_version !== 2) {
     return { ok: false, error: 'metadata schema version is unsupported' };
   }
+  try {
+    const metadataVaultIds = new Set(db.vaults.map((vault) => vault.vault_id));
+    const orphanRepository = (await git.listVaultRepositoryIds()).find((vaultId) => !metadataVaultIds.has(vaultId));
+    if (orphanRepository) {
+      return { ok: false, error: 'server Git store contains a vault repository missing from metadata' };
+    }
+  } catch {
+    return { ok: false, error: 'server Git store cannot be enumerated' };
+  }
   for (const vault of db.vaults) {
-    if (vault.status === 'blocked_integrity') {
-      return { ok: false, error: 'vault persistent state is blocked by an integrity failure' };
+    const result = await checkVaultPersistentState(db, vault.vault_id, git);
+    if (!result.ok) {
+      return result;
     }
-    const mainRef = await git.getRef(vault.vault_id, 'refs/heads/main');
-    if (mainRef !== vault.current_main) {
-      return { ok: false, error: 'vault main ref is inconsistent with metadata' };
+  }
+  return { ok: true };
+}
+
+async function checkVaultPersistentState(db: MetadataDb, vaultId: string, git: GitService): Promise<PersistentStateCheck> {
+  const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
+  if (!vault) {
+    return { ok: false, error: 'vault metadata is missing' };
+  }
+  if (vault.status === 'blocked_integrity') {
+    return { ok: false, error: 'vault persistent state is blocked by an integrity failure' };
+  }
+  const permissions = await git.checkRepositoryPermissions(vaultId);
+  if (!permissions.ok) {
+    return { ...permissions, vaultId };
+  }
+  const mainRef = await git.getRef(vaultId, 'refs/heads/main');
+  if (mainRef !== vault.current_main) {
+    return { ok: false, error: 'vault main ref is inconsistent with metadata', vaultId };
+  }
+  if (!(await git.commitExists(vaultId, vault.current_main))) {
+    return { ok: false, error: 'vault main commit is missing from the Git store', vaultId };
+  }
+  const integrity = await git.checkIntegrity(vaultId);
+  if (!integrity.ok) {
+    return { ...integrity, vaultId };
+  }
+  for (const device of db.devices.filter((candidate) => candidate.vault_id === vaultId)) {
+    const deviceRef = await git.getRef(vaultId, device.device_ref);
+    if ((device.device_ref_head ?? null) !== deviceRef) {
+      return { ok: false, error: 'device ref is inconsistent with metadata', vaultId };
     }
-    if (!(await git.commitExists(vault.vault_id, vault.current_main))) {
-      return { ok: false, error: 'vault main commit is missing from the Git store' };
+    if (device.last_applied_main !== null && !(await git.commitExists(vaultId, device.last_applied_main))) {
+      return { ok: false, error: 'device applied main cursor is missing from the Git store', vaultId };
     }
-    const integrity = await git.checkIntegrity(vault.vault_id);
-    if (!integrity.ok) {
-      return integrity;
-    }
-    for (const device of db.devices.filter((candidate) => candidate.vault_id === vault.vault_id)) {
-      const deviceRef = await git.getRef(vault.vault_id, device.device_ref);
-      if ((device.device_ref_head ?? null) !== deviceRef) {
-        return { ok: false, error: 'device ref is inconsistent with metadata' };
+  }
+  for (const conflict of db.conflicts.filter((candidate) => candidate.vault_id === vaultId)) {
+    for (const commit of [conflict.current_main, conflict.device_commit, conflict.base_commit]) {
+      if (commit && !(await git.commitExists(vaultId, commit))) {
+        return { ok: false, error: 'conflict commit is missing from the Git store', vaultId };
       }
-      if (device.last_applied_main !== null && !(await git.commitExists(vault.vault_id, device.last_applied_main))) {
-        return { ok: false, error: 'device applied main cursor is missing from the Git store' };
-      }
     }
-    for (const conflict of db.conflicts.filter((candidate) => candidate.vault_id === vault.vault_id)) {
-      for (const commit of [conflict.current_main, conflict.device_commit, conflict.base_commit]) {
-        if (commit && !(await git.commitExists(vault.vault_id, commit))) {
-          return { ok: false, error: 'conflict commit is missing from the Git store' };
+    if (conflict.status === 'open') {
+      for (const [kind, commit] of conflictProtectedRefs(conflict)) {
+        if ((await git.getRef(vaultId, conflictRef(conflict.conflict_id, kind))) !== commit) {
+          return { ok: false, error: 'unresolved conflict protection ref is inconsistent with metadata', vaultId };
         }
       }
-      if (conflict.status === 'open') {
-        for (const [kind, commit] of conflictProtectedRefs(conflict)) {
-          if ((await git.getRef(vault.vault_id, conflictRef(conflict.conflict_id, kind))) !== commit) {
-            return { ok: false, error: 'unresolved conflict protection ref is inconsistent with metadata' };
-          }
-        }
-      }
     }
-    for (const index of db.derived_history_by_vault[vault.vault_id] ?? []) {
-      if (index.current_main !== vault.current_main) {
-        continue;
-      }
-      for (const version of index.versions) {
-        if (!(await git.commitExists(vault.vault_id, version.commit))) {
-          return { ok: false, error: 'derived note history points at a missing Git commit' };
-        }
+  }
+  for (const index of db.derived_history_by_vault[vaultId] ?? []) {
+    if (index.current_main !== vault.current_main) {
+      continue;
+    }
+    for (const version of index.versions) {
+      if (!(await git.commitExists(vaultId, version.commit))) {
+        return { ok: false, error: 'derived note history points at a missing Git commit', vaultId };
       }
     }
   }
   return { ok: true };
+}
+
+async function markInconsistentVaults(store: MetadataStore, git: GitService): Promise<void> {
+  if (!(await git.checkReady()).ok) {
+    return;
+  }
+  const db = await store.snapshot();
+  for (const vault of db.vaults.filter((candidate) => candidate.status === 'active')) {
+    const result = await checkVaultPersistentState(db, vault.vault_id, git);
+    if (!result.ok) {
+      await blockVaultForIntegrity(store, vault.vault_id);
+    }
+  }
+}
+
+async function blockVaultForIntegrity(store: MetadataStore, vaultId: string): Promise<void> {
+  await store.mutate((db) => {
+    const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
+    if (vault && vault.status !== 'blocked_integrity') {
+      vault.status = 'blocked_integrity';
+      vault.updated_at = nowIso();
+    }
+  });
 }
 
 function conflictRef(conflictId: string, kind: string): string {
@@ -2122,7 +2248,9 @@ function recoverableTargetRefs(operation: SyncOperationRow): Array<[string, stri
   }
 
   if (
-    (operation.operation_type === 'server_merge' || operation.operation_type === 'conflict_resolve') &&
+    (operation.operation_type === 'server_merge' ||
+      operation.operation_type === 'conflict_resolve' ||
+      operation.operation_type === 'note_restore') &&
     typeof operation.target_commit === 'string' &&
     /^[0-9a-f]{40}$/u.test(operation.target_commit) &&
     !refs.has('refs/heads/main')
