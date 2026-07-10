@@ -161,7 +161,26 @@ describe('Phase 2 dashboard conflict resolution', () => {
       resolution_kind: 'keep_server',
       resolution_commit: resolved.body.resolution_commit
     });
-    expect(db.events.find((event) => event.event_type === 'main_advanced' && event.resource_ids.conflict_id === result.conflictId)).toBeDefined();
+    const resolutionEvents = db.events.filter((event) => event.resource_ids.conflict_id === result.conflictId);
+    expect(resolutionEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ event_type: 'main_advanced' }),
+        expect.objectContaining({ event_type: 'conflict_resolved' })
+      ])
+    );
+    expect(JSON.stringify(resolutionEvents)).not.toContain('server version');
+    expect(JSON.stringify(resolutionEvents)).not.toContain('device version');
+    expect(JSON.stringify(resolutionEvents)).not.toContain('shared.md');
+    expect(db.audit_log).toContainEqual(
+      expect.objectContaining({
+        actor_user_id: expect.any(String),
+        actor_device_id: null,
+        vault_id: admin.vaultId,
+        action: 'conflict_resolved',
+        resource_class: 'conflict',
+        resource_id: result.conflictId
+      })
+    );
   });
 
   it('reviews and resolves a rename title conflict with path-aware choices', async () => {

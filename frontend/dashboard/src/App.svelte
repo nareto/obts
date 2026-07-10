@@ -60,6 +60,7 @@
   let maintenanceDetailOpen = false;
   let busy = false;
   let notice = '';
+  let actionError = '';
   let lastRefreshed: string | null = null;
   let nowMs = Date.now();
 
@@ -199,6 +200,7 @@
 
   async function refreshConflictReview(conflictId: string) {
     if (!vaultId) return;
+    actionError = '';
     selectedConflictId = conflictId;
     setReview(await api.refreshConflict(vaultId, conflictId));
     conflicts = sortConflicts((await api.conflicts(vaultId)).conflicts);
@@ -315,24 +317,39 @@
 
   async function submitResolution() {
     if (!vaultId || !review || review.stale) return;
+    actionError = '';
+    notice = '';
+    const conflictId = review.conflict.conflict_id;
     const hasTitleConflict = review.path_conflicts.some(pathConflictHasTitleChange);
     const manualFiles =
       resolutionKind === 'manual' && !hasTitleConflict
         ? Object.fromEntries(review.files.map((file) => [file.path, manualTextByPath[file.path] ?? '']))
         : undefined;
     const manualFilePlan = resolutionKind === 'manual' && hasTitleConflict ? buildManualFilePlan(review) : undefined;
-    await api.resolveConflict({
-      vaultId,
-      conflictId: review.conflict.conflict_id,
-      expectedMain: review.expected_main,
-      resolutionKind,
-      manualFiles,
-      manualFilePlan
-    });
-    notice = 'Conflict resolved.';
-    selectedConflictId = '';
-    review = null;
-    await refreshVault();
+    try {
+      await api.resolveConflict({
+        vaultId,
+        conflictId,
+        expectedMain: review.expected_main,
+        resolutionKind,
+        manualFiles,
+        manualFilePlan
+      });
+      notice = 'Conflict resolved.';
+      selectedConflictId = '';
+      review = null;
+      await refreshVault();
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 'stale_conflict_review' && review?.conflict.conflict_id === conflictId) {
+        review = { ...review, stale: true };
+        conflicts = conflicts.map((conflict) =>
+          conflict.conflict_id === conflictId ? { ...conflict, stale: true, status_label: 'Stale review' } : conflict
+        );
+        actionError = 'This conflict review is stale. Refresh it before submitting a resolution.';
+        return;
+      }
+      actionError = error instanceof Error ? error.message : 'Unable to resolve this conflict.';
+    }
   }
 
   async function searchHistory() {
@@ -467,6 +484,7 @@
       </header>
 
       {#if notice}<p class="notice">{notice}</p>{/if}
+      {#if actionError}<p class="action-error">{actionError}</p>{/if}
 
       {#if vaults.length === 0}
         <main class="page">

@@ -48,8 +48,8 @@ From the dashboard:
 4. Inspect the Overview, Devices, Conflicts, History, and Maintenance pages for
    vault status, device state, unresolved conflicts, readiness, and activity.
 5. Resolve review-needed conflicts from the Conflicts page. Resolution
-   submission requires recent dashboard authentication and the expected current
-   `main` commit from the review package.
+   submission uses the authenticated dashboard session without another password
+   prompt and includes the expected current `main` commit from the review package.
 
 The dashboard offers the Phase 2 conflict choices:
 
@@ -60,8 +60,9 @@ The dashboard offers the Phase 2 conflict choices:
 - manually edit final content.
 
 If server `main` advances while a review is open, resolution submission fails
-with `409 stale_conflict_review`; refresh the conflict package before trying
-again. Duplicate submission of the same accepted resolution is idempotent.
+with `409 stale_conflict_review`; the dashboard marks the review stale so it can
+be refreshed before trying again. Duplicate submission of the same accepted
+resolution is idempotent.
 
 ## Upgrade From Phase 1
 

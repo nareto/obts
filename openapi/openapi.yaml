@@ -508,7 +508,7 @@ paths:
           $ref: "#/components/responses/Error"
   /vaults/{vault_id}/conflicts/{conflict_id}/resolve:
     post:
-      summary: Resolve a conflict after recent dashboard authentication.
+      summary: Resolve a conflict with the current authenticated dashboard session.
       parameters:
         - $ref: "#/components/parameters/VaultId"
         - $ref: "#/components/parameters/ConflictId"

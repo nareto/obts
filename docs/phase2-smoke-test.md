@@ -43,10 +43,11 @@ Phase 2 dashboard conflict-resolution workflow without using test harness code.
    metadata, rendered Markdown diff, source diff, current server commit, device
    commit, and resolution choices are visible.
 
-9. Resolve the conflict. Use one of the available choices and submit after
-   recent authentication. Verify the conflict becomes resolved, the activity
-   list includes conflict resolution and `main_advanced`, and the current server
-   `main` changes.
+9. Resolve the conflict. Use one of the available choices and submit from the
+   existing dashboard session; verify there is no password re-authentication
+   prompt. Verify the conflict becomes resolved, the activity list includes
+   conflict resolution and `main_advanced`, and the current server `main`
+   changes.
 
 10. Sync both paired devices. Verify they apply the resolved server state
     through the normal safe apply flow and do not create a visible `.git`

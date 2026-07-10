@@ -67,6 +67,13 @@ describe('OpenAPI Phase 2 contract', () => {
     expect(contract).toContain('PasswordResetTokenResponse');
     expect(contract).toContain('final enabled admin');
 
+    const conflictResolutionSection = contract.slice(
+      contract.indexOf('/vaults/{vault_id}/conflicts/{conflict_id}/resolve'),
+      contract.indexOf('/vaults/{vault_id}/history/query')
+    );
+    expect(conflictResolutionSection).toContain('current authenticated dashboard session');
+    expect(conflictResolutionSection).not.toContain('recent dashboard authentication');
+
     const pullSection = contract.slice(
       contract.indexOf('/vaults/{vault_id}/sync/pull'),
       contract.indexOf('/vaults/{vault_id}/sync/device-status')

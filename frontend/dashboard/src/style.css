@@ -372,6 +372,11 @@ pre {
   color: var(--success);
 }
 
+.action-error {
+  margin: 12px 24px 0;
+  color: var(--danger);
+}
+
 .status {
   display: inline-flex;
   align-items: center;
