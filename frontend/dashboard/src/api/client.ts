@@ -141,10 +141,16 @@ export class DashboardApi {
     });
   }
 
-  async historyVersion(vaultId: string, path: string, commit: string): Promise<NoteHistoryVersionResponse> {
+  async historyVersion(
+    vaultId: string,
+    path: string,
+    commit: string,
+    includeContent = false
+  ): Promise<NoteHistoryVersionResponse> {
     return await this.request(`/vaults/${vaultId}/history/version`, {
       method: 'POST',
-      body: { path, commit }
+      csrf: includeContent,
+      body: { path, commit, ...(includeContent ? { include_content: true } : {}) }
     });
   }
 

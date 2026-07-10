@@ -173,6 +173,7 @@ export type NoteHistoryVersion = {
   subject: string;
   previous_path?: string;
   device_id?: string;
+  user_id?: string;
   conflict_id?: string;
   merge_sequence?: number;
 };
@@ -189,4 +190,6 @@ export type NoteHistoryVersionResponse = {
   content: string | null;
   source_diff: string;
   rendered_markdown_diff: string | null;
+  metadata_only: boolean;
+  content_redacted: boolean;
 };

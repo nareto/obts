@@ -268,6 +268,7 @@ export type NoteHistoryVersion = {
   subject: string;
   previous_path?: string;
   device_id?: string;
+  user_id?: string;
   conflict_id?: string;
   merge_sequence?: number;
 };
@@ -284,6 +285,41 @@ export type NoteHistoryVersionResponse = {
   content: string | null;
   source_diff: string;
   rendered_markdown_diff: string | null;
+  metadata_only: boolean;
+  content_redacted: boolean;
+};
+
+export type DiagnosticsExport = {
+  generated_at: string;
+  vault: {
+    vault_id: string;
+    status: 'active' | 'blocked_integrity';
+    current_main: string;
+  };
+  devices: Array<{
+    device_id: string;
+    status: string;
+    last_seen_at: string | null;
+    last_successful_sync_at: string | null;
+    local_status_label: string | null;
+    local_error_code: string | null;
+  }>;
+  conflicts: Array<{
+    conflict_id: string;
+    device_id: string;
+    status: 'open' | 'resolved';
+    affected_path_count: number;
+    created_at: string;
+    resolved_at?: string;
+  }>;
+  event_cursor: number;
+  operation_counts: Record<string, number>;
+  health: {
+    status: 'ready' | 'not_ready';
+    checks: Record<string, boolean>;
+    detail: string | null;
+  };
+  redactions: string[];
 };
 
 export type NoteRestoreResponse = {

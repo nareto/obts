@@ -119,6 +119,13 @@ describe('Phase 2 dashboard conflict resolution', () => {
       device_content: 'device version\n'
     });
     expect(review.body.files[0]?.source_diff).toContain('-server version');
+    expect(await server.git.getRef(admin.vaultId, `refs/obts/conflicts/${result.conflictId}/base`)).toBeTruthy();
+    expect(await server.git.getRef(admin.vaultId, `refs/obts/conflicts/${result.conflictId}/current`)).toBe(
+      review.body.conflict.expected_main
+    );
+    expect(await server.git.getRef(admin.vaultId, `refs/obts/conflicts/${result.conflictId}/device`)).toBe(
+      review.body.conflict.device_commit
+    );
     const expectedMainTree = await server.git.treeHash(admin.vaultId, review.body.conflict.expected_main);
 
     const resolved = await admin.post<{
@@ -912,6 +919,9 @@ describe('Phase 2 dashboard conflict resolution', () => {
       await server.git.exec(server.git.repoPath(admin.vaultId), ['show', '-s', '--format=%P', restored.body.restore_commit])
     ).stdout.toString().trim().split(/\s+/u);
     expect(restoreParents).toEqual([history.body.current_main, firstVersionCommit]);
+    const restoreEvents = (await server.store.snapshot()).events.filter((event) => event.event_type === 'note_restored');
+    expect(JSON.stringify(restoreEvents)).not.toContain('history.md');
+    expect(restoreEvents[0]?.payload.path_id).toMatch(/^path_[0-9a-f]{16}$/u);
 
     const maintenance = await admin.post<{ status: string; detail: string }>(
       `/api/v1/vaults/${admin.vaultId}/maintenance/git-gc/start`,
@@ -920,6 +930,10 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(maintenance.status).toBe(200);
     expect(maintenance.body).toMatchObject({ status: 'completed' });
     expect(maintenance.body.detail).toContain('completed');
+    expect(await server.git.commitExists(admin.vaultId, firstVersionCommit)).toBe(true);
+    expect((await server.git.readBlobAtPath(admin.vaultId, firstVersionCommit, 'history.md')).toString('utf8')).toBe(
+      'first version\n'
+    );
   });
 
   it('shows rename provenance in note history and previews historical paths', async () => {
@@ -978,6 +992,90 @@ describe('Phase 2 dashboard conflict resolution', () => {
       'rename me\n'
     );
     expect(await server.git.readBlobAtPathIfPresent(admin.vaultId, restored.body.restore_commit, 'old-name.md')).toBeNull();
+  });
+
+  it('redacts community plugin history by default and requires an explicit content-bearing request', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'desktop-plugin-history');
+    const pluginDir = join(desktopDir, '.obsidian', 'plugins', 'community-example');
+    await mkdir(pluginDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    const pluginPath = '.obsidian/plugins/community-example/data.json';
+    const secretBody = '{"apiKey":"plugin-secret-value"}\n';
+    await writeFile(join(desktopDir, pluginPath), secretBody);
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const history = await admin.post<{ versions: Array<{ commit: string }> }>(
+      `/api/v1/vaults/${admin.vaultId}/history/query`,
+      { path: pluginPath }
+    );
+    expect(history.status).toBe(200);
+    const version = history.body.versions[0];
+    expect(version).toBeDefined();
+
+    const redacted = await admin.post<{
+      content: string | null;
+      source_diff: string;
+      metadata_only: boolean;
+      content_redacted: boolean;
+    }>(`/api/v1/vaults/${admin.vaultId}/history/version`, {
+      path: pluginPath,
+      commit: version!.commit
+    });
+    expect(redacted.body).toMatchObject({
+      content: null,
+      source_diff: '',
+      metadata_only: true,
+      content_redacted: true
+    });
+    expect(JSON.stringify(redacted.body)).not.toContain('plugin-secret-value');
+
+    const revealed = await admin.post<{ content: string; content_redacted: boolean }>(
+      `/api/v1/vaults/${admin.vaultId}/history/version`,
+      { path: pluginPath, commit: version!.commit, include_content: true }
+    );
+    expect(revealed.status).toBe(200);
+    expect(revealed.body).toMatchObject({ content: secretBody, content_redacted: false });
+
+    const db = await server.store.snapshot();
+    expect(db.audit_log).toContainEqual(
+      expect.objectContaining({
+        actor_user_id: expect.any(String),
+        vault_id: admin.vaultId,
+        action: 'plugin_history_content_exported',
+        resource_class: 'note_history',
+        resource_id: null
+      })
+    );
+    expect(db.derived_history_by_vault[admin.vaultId]).toEqual([
+      expect.objectContaining({ path: pluginPath, current_main: expect.any(String), versions: expect.any(Array) })
+    ]);
+  });
+
+  it('exports redacted diagnostics without paths, content, manifests, or device error details', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'desktop-diagnostics');
+    await mkdir(desktopDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await writeFile(join(desktopDir, 'private-note.md'), 'diagnostic-secret-body\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const state = await desktop.readState();
+    await server.store.mutate((db) => {
+      const device = db.devices.find((candidate) => candidate.device_id === state.device_id);
+      if (!device) throw new Error('missing test device');
+      device.local_error_code = 'path_problem';
+      device.local_error_details = { path: 'private-note.md', secret: 'diagnostic-secret-body' };
+    });
+
+    const diagnostics = await admin.get<Record<string, unknown>>(
+      `/api/v1/vaults/${admin.vaultId}/diagnostics/export`
+    );
+    expect(diagnostics.status).toBe(200);
+    const serialized = JSON.stringify(diagnostics.body);
+    expect(serialized).not.toContain('private-note.md');
+    expect(serialized).not.toContain('diagnostic-secret-body');
+    expect(serialized).not.toContain('prepared_manifest');
+    expect(serialized).toContain('raw vault paths');
   });
 
   describe('apply journal recovery', () => {

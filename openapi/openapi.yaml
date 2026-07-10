@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
-  title: Obsidian True Sync Phase 2 API
+  title: Obsidian True Sync Phase 3 API
   version: 0.1.0
-  summary: Deployable dashboard and conflict resolution.
+  summary: Deployable note history, restore, diagnostics, and maintenance.
 servers:
   - url: /api/v1
 security:
@@ -570,6 +570,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NoteHistoryVersionResponse"
+        "403":
+          description: Recent authentication or CSRF verification failed for an explicit plugin-content request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
         "404":
           $ref: "#/components/responses/Error"
   /vaults/{vault_id}/history/restore:
@@ -595,6 +601,20 @@ paths:
           $ref: "#/components/responses/Error"
         "409":
           $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/diagnostics/export:
+    get:
+      summary: Export owner-scoped diagnostics with content, paths, secrets, and operation manifests redacted.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+      responses:
+        "200":
+          description: Redacted diagnostics export.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagnosticsExport"
         "404":
           $ref: "#/components/responses/Error"
   /vaults/{vault_id}/maintenance/git-gc/start:
@@ -1456,9 +1476,13 @@ components:
         commit:
           type: string
           pattern: "^[0-9a-f]{40}$"
+        include_content:
+          type: boolean
+          default: false
+          description: Explicit recently authenticated owner action required for plugin file bodies.
     NoteRestoreRequest:
       type: object
-      required: [path, source_commit]
+      required: [path, source_commit, expected_main]
       properties:
         path:
           type: string
@@ -1518,13 +1542,15 @@ components:
           type: string
         device_id:
           type: string
+        user_id:
+          type: string
         conflict_id:
           type: string
         merge_sequence:
           type: integer
     NoteHistoryVersionResponse:
       type: object
-      required: [path, commit, content, source_diff, rendered_markdown_diff]
+      required: [path, commit, content, source_diff, rendered_markdown_diff, metadata_only, content_redacted]
       properties:
         path:
           type: string
@@ -1541,6 +1567,10 @@ components:
           oneOf:
             - type: "null"
             - type: string
+        metadata_only:
+          type: boolean
+        content_redacted:
+          type: boolean
     NoteRestoreResponse:
       type: object
       required: [status, path, source_path, source_commit, main, restore_commit, event_seq]
@@ -1576,6 +1606,46 @@ components:
           type: integer
         detail:
           type: string
+    DiagnosticsExport:
+      type: object
+      required: [generated_at, vault, devices, conflicts, event_cursor, operation_counts, health, redactions]
+      properties:
+        generated_at:
+          type: string
+          format: date-time
+        vault:
+          type: object
+          required: [vault_id, status, current_main]
+          properties:
+            vault_id:
+              type: string
+            status:
+              type: string
+              enum: [active, blocked_integrity]
+            current_main:
+              type: string
+              pattern: "^[0-9a-f]{40}$"
+        devices:
+          type: array
+          items:
+            type: object
+        conflicts:
+          type: array
+          items:
+            type: object
+        event_cursor:
+          type: integer
+          minimum: 0
+        operation_counts:
+          type: object
+          additionalProperties:
+            type: integer
+        health:
+          type: object
+        redactions:
+          type: array
+          items:
+            type: string
     ConflictRecord:
       type: object
       required:

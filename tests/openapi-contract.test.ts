@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 
 import { API_VERSION } from '../src/shared/types.js';
 
-describe('OpenAPI Phase 2 contract', () => {
+describe('OpenAPI Phase 3 contract', () => {
   it('commits the endpoints and version used by the server and plugin', async () => {
     const contract = await readFile(join(process.cwd(), 'openapi', 'openapi.yaml'), 'utf8');
     for (const path of [
@@ -39,6 +39,7 @@ describe('OpenAPI Phase 2 contract', () => {
       '/vaults/{vault_id}/history/query',
       '/vaults/{vault_id}/history/version',
       '/vaults/{vault_id}/history/restore',
+      '/vaults/{vault_id}/diagnostics/export',
       '/vaults/{vault_id}/maintenance/git-gc/start',
       '/vaults/{vault_id}/events'
     ]) {
@@ -62,6 +63,8 @@ describe('OpenAPI Phase 2 contract', () => {
     expect(contract).toContain('DashboardSummary');
     expect(contract).toContain('NoteHistoryQueryResponse');
     expect(contract).toContain('MaintenanceStartResponse');
+    expect(contract).toContain('DiagnosticsExport');
+    expect(contract).toContain('content_redacted');
     expect(contract).toContain('validator_results');
     expect(contract).toContain('AdminUserSummary');
     expect(contract).toContain('PasswordResetTokenResponse');

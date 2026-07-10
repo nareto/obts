@@ -476,7 +476,9 @@ export class SyncService {
           expectedMain: input.expectedMain,
           deviceCommit: conflict.device_commit,
           conflictId: conflict.conflict_id,
-          resolutionKind: input.resolutionKind
+          resolutionKind: input.resolutionKind,
+          deviceId: conflict.device_id,
+          userId: input.actorUserId
         });
         await this.prepareConflictResolutionRefUpdate(preparation.operationId, resolutionCommit);
         await this.git.updateRef(input.vaultId, 'refs/heads/main', resolutionCommit, input.expectedMain);
@@ -815,7 +817,8 @@ export class SyncService {
         main,
         deviceCommit,
         deviceChanges,
-        mergePreparation.mergeSequence
+        mergePreparation.mergeSequence,
+        deviceId
       );
       await this.prepareMergeRefUpdate(mergePreparation.operationId, mergeCommit);
       await this.git.updateRef(vaultId, 'refs/heads/main', mergeCommit, main);
@@ -1035,7 +1038,8 @@ export class SyncService {
         currentMain,
         deviceCommit,
         deviceChanges,
-        mergePreparation.mergeSequence
+        mergePreparation.mergeSequence,
+        deviceId
       );
       await this.prepareMergeRefUpdate(mergePreparation.operationId, mergeCommit);
       await this.git.updateRef(vaultId, 'refs/heads/main', mergeCommit, currentMain);
@@ -1360,6 +1364,7 @@ export class SyncService {
         currentMain,
         deviceCommit,
         mergeSequence: mergePreparation.mergeSequence,
+        deviceId,
         strategy: mergeTree.validatorResults.semantic_merge === 'clean' ? 'semantic_clean' : 'native_clean'
       });
       await this.prepareMergeRefUpdate(mergePreparation.operationId, mergeCommit);
@@ -1533,6 +1538,18 @@ export class SyncService {
       });
       return event.event_seq;
     });
+    try {
+      await this.git.ensureRef(vaultId, `refs/obts/conflicts/${conflictId}/base`, base);
+      await this.git.ensureRef(vaultId, `refs/obts/conflicts/${conflictId}/current`, currentMain);
+      await this.git.ensureRef(vaultId, `refs/obts/conflicts/${conflictId}/device`, deviceCommit);
+    } catch (error) {
+      await this.store.mutate((db) => {
+        const vault = requireVault(db, vaultId);
+        vault.status = 'blocked_integrity';
+        vault.updated_at = nowIso();
+      });
+      throw error;
+    }
     return {
       status: 'conflicted',
       conflict_id: conflictId,

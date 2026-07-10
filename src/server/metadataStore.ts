@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { newId, nowIso } from '../shared/ids.js';
-import type { ConflictRecord, EventEnvelope } from '../shared/types.js';
+import type { ConflictRecord, EventEnvelope, NoteHistoryVersion } from '../shared/types.js';
 
 const EVENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const EVENT_RETENTION_LIMIT = 100_000;
@@ -136,8 +136,15 @@ export type DirectoryStateRow = {
   last_event_seq: number;
 };
 
+export type DerivedHistoryIndexRow = {
+  path: string;
+  current_main: string;
+  versions: NoteHistoryVersion[];
+  indexed_at: string;
+};
+
 export type MetadataDb = {
-  schema_version: 1;
+  schema_version: 2;
   setup_complete: boolean;
   users: UserRow[];
   sessions: SessionRow[];
@@ -152,6 +159,7 @@ export type MetadataDb = {
   event_seq_by_vault: Record<string, number>;
   merge_sequence_by_vault: Record<string, number>;
   directory_state_by_vault: Record<string, DirectoryStateRow>;
+  derived_history_by_vault: Record<string, DerivedHistoryIndexRow[]>;
 };
 
 export class MetadataStore {
@@ -270,13 +278,20 @@ export class MetadataStore {
 
   private normalizeLoadedDb(db: MetadataDb): void {
     const legacyDb = db as MetadataDb & {
+      schema_version: 1 | 2;
       login_attempts?: LoginAttemptRow[];
       directory_state_by_vault?: Record<string, DirectoryStateRow>;
+      derived_history_by_vault?: Record<string, DerivedHistoryIndexRow[]>;
     };
     if (!Array.isArray(legacyDb.login_attempts)) {
       legacyDb.login_attempts = [];
     }
     legacyDb.directory_state_by_vault ??= {};
+    legacyDb.derived_history_by_vault ??= {};
+    const schema = legacyDb as unknown as { schema_version: number };
+    if (schema.schema_version === 1) {
+      schema.schema_version = 2;
+    }
     for (const device of db.devices) {
       const legacyDevice = device as DeviceRow & {
         last_applied_main?: string | null;
@@ -334,7 +349,7 @@ export class MetadataStore {
 
 function createEmptyDb(): MetadataDb {
   return {
-    schema_version: 1,
+    schema_version: 2,
     setup_complete: false,
     users: [],
     sessions: [],
@@ -348,7 +363,8 @@ function createEmptyDb(): MetadataDb {
     audit_log: [],
     event_seq_by_vault: {},
     merge_sequence_by_vault: {},
-    directory_state_by_vault: {}
+    directory_state_by_vault: {},
+    derived_history_by_vault: {}
   };
 }
 

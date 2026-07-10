@@ -57,6 +57,7 @@
   let history: NoteHistoryQueryResponse | null = null;
   let selectedHistory: NoteHistoryVersion | null = null;
   let historyVersion: NoteHistoryVersionResponse | null = null;
+  let historyDiffTab: 'rendered' | 'source' = 'source';
   let maintenanceDetailOpen = false;
   let busy = false;
   let notice = '';
@@ -366,6 +367,16 @@
     if (!vaultId || !history) return;
     selectedHistory = version;
     historyVersion = await api.historyVersion(vaultId, version.path, version.commit);
+    historyDiffTab = historyVersion.rendered_markdown_diff ? 'rendered' : 'source';
+  }
+
+  function revealPluginHistoryContent() {
+    if (!vaultId || !selectedHistory) return;
+    withRecentAuth(async () => {
+      historyVersion = await api.historyVersion(vaultId, selectedHistory!.path, selectedHistory!.commit, true);
+      historyDiffTab = 'source';
+      notice = 'Sensitive plugin file content revealed for this selected version.';
+    });
   }
 
   async function restoreSelectedVersion() {
@@ -678,6 +689,10 @@
                   <span>{version.operation_type}</span>
                   <small>{new Date(version.timestamp).toLocaleString()}</small>
                   {#if version.previous_path}<small>{version.previous_path} → {version.path}</small>{/if}
+                  {#if version.device_id}<small>Device {shortId(version.device_id)}</small>{/if}
+                  {#if version.user_id}<small>User {shortId(version.user_id)}</small>{/if}
+                  {#if version.conflict_id}<small>Conflict {shortId(version.conflict_id)}</small>{/if}
+                  {#if version.merge_sequence}<small>Merge #{version.merge_sequence}</small>{/if}
                   <code>{shortId(version.commit)}</code>
                 </button>
               {:else}
@@ -691,7 +706,20 @@
             <h2>Preview</h2>
             {#if historyVersion}
               <p class="mono">{shortId(historyVersion.commit)} / {historyVersion.path}</p>
-              <pre>{historyVersion.source_diff || historyVersion.content || 'The selected version deletes this path.'}</pre>
+              {#if historyVersion.content_redacted}
+                <p class="muted">Plugin file content is redacted by default. Revealing it is an explicit, recently authenticated owner action.</p>
+                <button class="secondary" on:click={revealPluginHistoryContent}>Reveal plugin content</button>
+              {:else}
+                <div class="tabs">
+                  <button class:active={historyDiffTab === 'rendered'} disabled={!historyVersion.rendered_markdown_diff} on:click={() => (historyDiffTab = 'rendered')}>Rendered</button>
+                  <button class:active={historyDiffTab === 'source'} on:click={() => (historyDiffTab = 'source')}>Source</button>
+                </div>
+                {#if historyDiffTab === 'rendered' && historyVersion.rendered_markdown_diff}
+                  <div class="rendered">{@html historyVersion.rendered_markdown_diff}</div>
+                {:else}
+                  <pre>{historyVersion.source_diff || historyVersion.content || 'The selected version deletes this path.'}</pre>
+                {/if}
+              {/if}
               <button class="primary" disabled={!selectedHistory} on:click={restoreSelectedVersion}>Restore version</button>
             {:else}
               <p class="muted">Select a version to preview it.</p>

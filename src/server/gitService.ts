@@ -74,6 +74,17 @@ export class GitService {
     }
   }
 
+  async checkIntegrity(vaultId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+    try {
+      await this.exec(this.repoPath(vaultId), ['fsck', '--strict', '--no-dangling'], undefined, undefined, {
+        maxBuffer: 16 * 1024 * 1024
+      });
+      return { ok: true };
+    } catch {
+      return { ok: false, error: 'server Git object integrity check failed' };
+    }
+  }
+
   async initializeVault(vaultId: string): Promise<string> {
     const repo = this.repoPath(vaultId);
     await mkdir(this.config.gitStoreDir, { recursive: true, mode: 0o700 });
@@ -107,6 +118,17 @@ export class GitService {
     const repo = this.repoPath(vaultId);
     const oldValue = expected ?? ZERO_OID;
     await this.exec(repo, ['update-ref', ref, target, oldValue]);
+  }
+
+  async ensureRef(vaultId: string, ref: string, target: string): Promise<void> {
+    const current = await this.getRef(vaultId, ref);
+    if (current === target) {
+      return;
+    }
+    if (current !== null) {
+      throw new GitCommandError('Protected Git ref does not match persistent metadata.', '');
+    }
+    await this.updateRef(vaultId, ref, target, null);
   }
 
   async commitExists(vaultId: string, commit: string): Promise<boolean> {
@@ -301,7 +323,8 @@ export class GitService {
     currentMain: string,
     deviceCommit: string,
     deviceChanges: GitDiffEntry[],
-    mergeSequence: number
+    mergeSequence: number,
+    deviceId?: string
   ): Promise<string> {
     const repo = this.repoPath(vaultId);
     const tree = await this.createOverlayTree(vaultId, currentMain, deviceCommit, deviceChanges, new Map());
@@ -316,7 +339,7 @@ export class GitService {
           '-p',
           deviceCommit,
           '-m',
-          `obts: merge device changes\n\nmerge_sequence=${mergeSequence}\nbase=${base}`
+          `obts: merge device changes\n\nmerge_sequence=${mergeSequence}\nbase=${base}${deviceId ? `\ndevice_id=${deviceId}` : ''}`
         ],
         undefined,
         serverGitEnv('obts-merge')
@@ -452,6 +475,7 @@ export class GitService {
     currentMain: string;
     deviceCommit: string;
     mergeSequence: number;
+    deviceId?: string;
     strategy: 'disjoint_overlay' | 'native_clean' | 'semantic_clean';
   }): Promise<string> {
     const repo = this.repoPath(input.vaultId);
@@ -466,7 +490,7 @@ export class GitService {
           '-p',
           input.deviceCommit,
           '-m',
-          `obts: merge device changes\n\nmerge_sequence=${input.mergeSequence}\nbase=${input.base}\nstrategy=${input.strategy}`
+          `obts: merge device changes\n\nmerge_sequence=${input.mergeSequence}\nbase=${input.base}\nstrategy=${input.strategy}${input.deviceId ? `\ndevice_id=${input.deviceId}` : ''}`
         ],
         undefined,
         serverGitEnv('obts-merge')
@@ -509,6 +533,8 @@ export class GitService {
     deviceCommit: string;
     conflictId: string;
     resolutionKind: string;
+    deviceId?: string;
+    userId?: string;
   }): Promise<string> {
     const repo = this.repoPath(input.vaultId);
     return asText(
@@ -522,7 +548,7 @@ export class GitService {
           '-p',
           input.deviceCommit,
           '-m',
-          `obts: resolve conflict ${input.conflictId}\n\nconflict_id=${input.conflictId}\nresolution=${input.resolutionKind}`
+          `obts: resolve conflict ${input.conflictId}\n\nconflict_id=${input.conflictId}\nresolution=${input.resolutionKind}${input.deviceId ? `\ndevice_id=${input.deviceId}` : ''}${input.userId ? `\nuser_id=${input.userId}` : ''}`
         ],
         undefined,
         serverGitEnv('obts-resolution')
@@ -623,6 +649,7 @@ export class GitService {
     sourceCommit: string;
     path: string;
     sourcePath: string;
+    userId?: string;
   }): Promise<string> {
     const repo = this.repoPath(input.vaultId);
     return asText(
@@ -641,7 +668,8 @@ export class GitService {
             '',
             `source_commit=${input.sourceCommit}`,
             `path=${input.path}`,
-            `source_path=${input.sourcePath}`
+            `source_path=${input.sourcePath}`,
+            ...(input.userId ? [`user_id=${input.userId}`] : [])
           ].join('\n')
         ],
         undefined,
@@ -652,9 +680,11 @@ export class GitService {
 
   async runMaintenance(vaultId: string): Promise<string> {
     const repo = this.repoPath(vaultId);
-    await this.exec(repo, ['fsck', '--strict'], undefined, undefined, { maxBuffer: 16 * 1024 * 1024 });
-    await this.exec(repo, ['gc', '--prune=now'], undefined, undefined, { maxBuffer: 16 * 1024 * 1024 });
-    return 'Git fsck and garbage collection completed.';
+    await this.exec(repo, ['fsck', '--strict', '--no-dangling'], undefined, undefined, { maxBuffer: 16 * 1024 * 1024 });
+    await this.exec(repo, ['repack', '-A', '-d'], undefined, undefined, { maxBuffer: 16 * 1024 * 1024 });
+    await this.exec(repo, ['prune', '--expire=now'], undefined, undefined, { maxBuffer: 16 * 1024 * 1024 });
+    await this.exec(repo, ['fsck', '--strict', '--no-dangling'], undefined, undefined, { maxBuffer: 16 * 1024 * 1024 });
+    return 'Git integrity verification, repack, and unreachable-object pruning completed.';
   }
 
   async treeHash(vaultId: string, commit: string): Promise<string> {
