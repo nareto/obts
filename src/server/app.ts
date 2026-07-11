@@ -2156,6 +2156,42 @@ async function checkVaultPersistentState(db: MetadataDb, vaultId: string, git: G
   return { ok: true };
 }
 
+export async function repairVaultIntegrity(store: MetadataStore, git: GitService, vaultId: string): Promise<void> {
+  await store.mutate(async (mutableDb) => {
+    const mutableVault = mutableDb.vaults.find((candidate) => candidate.vault_id === vaultId);
+    if (!mutableVault) {
+      throw new Error('Vault metadata is missing.');
+    }
+    if (mutableVault.status !== 'blocked_integrity') {
+      throw new Error('Vault is not blocked by an integrity failure.');
+    }
+
+    const candidateDb = structuredClone(mutableDb);
+    const candidateVault = candidateDb.vaults.find((candidate) => candidate.vault_id === vaultId);
+    if (!candidateVault) {
+      throw new Error('Vault metadata is missing.');
+    }
+    candidateVault.status = 'active';
+    const validation = await checkVaultPersistentState(candidateDb, vaultId, git);
+    if (!validation.ok) {
+      throw new Error(`Vault integrity remains inconsistent: ${validation.error}`);
+    }
+
+    mutableVault.status = 'active';
+    mutableVault.updated_at = nowIso();
+    mutableDb.audit_log.push({
+      audit_id: newId('aud'),
+      actor_user_id: null,
+      actor_device_id: null,
+      vault_id: vaultId,
+      action: 'operator_integrity_repaired',
+      resource_class: 'vault',
+      resource_id: vaultId,
+      created_at: nowIso()
+    });
+  });
+}
+
 async function markInconsistentVaults(store: MetadataStore, git: GitService): Promise<void> {
   if (!(await git.checkReady()).ok) {
     return;
@@ -2186,6 +2222,7 @@ function conflictRef(conflictId: string, kind: string): string {
 function conflictProtectedRefs(conflict: MetadataDb['conflicts'][number]): Array<[string, string]> {
   return [
     ['base', conflict.base_commit],
+    ['current', conflict.current_main],
     ['device', conflict.device_commit]
   ];
 }

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { runCli } from '../src/cli.js';
 import { createObtsServer } from '../src/server/app.js';
 import { MetadataStore } from '../src/server/metadataStore.js';
 
@@ -115,6 +116,71 @@ describe('Phase 3 deployable history state', () => {
     } finally {
       await chmod(join(root, 'git', `${vaultId}.git`), 0o700);
       await restored.app.close();
+    }
+  });
+
+  it('keeps an integrity block until the local operator repair command validates repaired state', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'obts-phase3-operator-repair-'));
+    roots.push(root);
+    const server = await createObtsServer({ dataDir: root });
+    const vaultId = 'vlt_operator_repair';
+    const currentMain = await server.git.initializeVault(vaultId);
+    await server.store.mutate((db) => {
+      const timestamp = new Date().toISOString();
+      db.vaults.push({
+        vault_id: vaultId,
+        owner_user_id: 'usr_owner',
+        display_name: 'Operator repair',
+        status: 'active',
+        current_main: currentMain,
+        created_at: timestamp,
+        updated_at: timestamp
+      });
+    });
+    await server.app.close();
+
+    const repository = join(root, 'git', `${vaultId}.git`);
+    await chmod(repository, 0o770);
+    const blocked = await createObtsServer({ dataDir: root });
+    expect((await blocked.store.snapshot()).vaults[0]?.status).toBe('blocked_integrity');
+    await blocked.app.close();
+
+    const invokeRepair = async () => {
+      let stdout = '';
+      let stderr = '';
+      const code = await runCli(
+        ['integrity', 'repair', '--vault-id', vaultId, '--json'],
+        { OBTS_DATA_DIR: root },
+        {
+          stdout: (text) => {
+            stdout += text;
+          },
+          stderr: (text) => {
+            stderr += text;
+          }
+        }
+      );
+      return { code, stdout, stderr };
+    };
+
+    const unsafeRepair = await invokeRepair();
+    expect(unsafeRepair.code).toBe(1);
+    expect(unsafeRepair.stderr).toContain('Vault integrity remains inconsistent');
+
+    await chmod(repository, 0o700);
+    const repaired = await invokeRepair();
+    expect(repaired).toMatchObject({ code: 0, stderr: '' });
+    expect(JSON.parse(repaired.stdout)).toEqual({ vault_id: vaultId, status: 'active' });
+
+    const ready = await createObtsServer({ dataDir: root });
+    try {
+      expect((await ready.store.snapshot()).vaults[0]?.status).toBe('active');
+      expect((await ready.app.inject({ method: 'GET', url: '/health/ready' })).statusCode).toBe(200);
+      expect((await ready.store.snapshot()).audit_log).toContainEqual(
+        expect.objectContaining({ action: 'operator_integrity_repaired', vault_id: vaultId })
+      );
+    } finally {
+      await ready.app.close();
     }
   });
 
@@ -286,6 +352,11 @@ describe('Phase 3 deployable history state', () => {
     await source.app.close();
 
     await cp(sourceDir, restoredDir, { recursive: true, preserveTimestamps: true });
+    await source.git.exec(join(restoredDir, 'git', `${vaultId}.git`), [
+      'update-ref',
+      '-d',
+      `refs/obts/conflicts/${conflictId}/current`
+    ]);
     const restored = await createObtsServer({ dataDir: restoredDir });
     try {
       const readiness = await restored.app.inject({ method: 'GET', url: '/health/ready' });
@@ -296,6 +367,7 @@ describe('Phase 3 deployable history state', () => {
       expect(db.events[0]).toMatchObject({ event_seq: 1, event_type: 'conflict_created' });
       expect(db.derived_history_by_vault[vaultId]?.[0]?.versions[0]).toMatchObject({ commit: main, path: 'note.md' });
       expect(await restored.git.getRef(vaultId, 'refs/heads/main')).toBe(main);
+      expect(await restored.git.getRef(vaultId, `refs/obts/conflicts/${conflictId}/current`)).toBe(main);
       expect(await restored.git.getRef(vaultId, `refs/obts/conflicts/${conflictId}/device`)).toBe(rootCommit);
     } finally {
       await restored.app.close();

@@ -42,6 +42,12 @@ conflict protection, or current derived index are inconsistent. This prevents a
 partially restored metadata/Git pair from serving a plausible but incomplete
 history.
 
+Once the operator has stopped the server and restored or repaired the
+underlying state, run `obts integrity repair --vault-id ID`. This local command
+only validates and clears the block; it never chooses between mismatched refs,
+reconstructs missing objects, or discards metadata. `/health/ready` must pass
+after the command before traffic resumes.
+
 Event rows are retained for 30 days or 100,000 events per vault. Clients that
 resume from an older pruned cursor receive `410 event_cursor_expired` and must
 refresh vault state before polling from an available cursor.

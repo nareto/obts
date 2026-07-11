@@ -21,6 +21,13 @@ No separate migration command is required for the repository's file adapter.
 An inconsistent restore is not auto-healed by discarding history: the vault is
 blocked and readiness fails closed.
 
+After an operator stops the server and repairs the underlying metadata, Git
+refs/objects, ownership, or permissions, validate the repaired vault and clear
+its integrity block with `obts integrity repair --vault-id ID`. The command is
+deliberately local-only: it does not rewrite refs or invent missing state, and
+it refuses to unblock the vault until the metadata-to-Git consistency checks
+pass. Run the readiness check again before allowing clients to resume.
+
 ## History And Restore
 
 History queries are owner-scoped, follow renames, and cache derived path history

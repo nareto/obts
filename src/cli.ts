@@ -4,7 +4,7 @@ import process from 'node:process';
 
 import { newId, newSecretToken, nowIso } from './shared/ids.js';
 import { ownedVaultOrThrow, hashPassword, hashToken } from './server/authService.js';
-import { createObtsServer, type ObtsServer } from './server/app.js';
+import { createObtsServer, repairVaultIntegrity, type ObtsServer } from './server/app.js';
 import type { ServerConfig } from './server/config.js';
 
 type CliIo = {
@@ -29,6 +29,7 @@ Usage:
   obts pairing-token create --username USER (--password PASSWORD | --password-env ENV) --vault-id ID --device-name NAME [--json]
   obts devices list --username USER (--password PASSWORD | --password-env ENV) --vault-id ID [--json]
   obts conflicts list --username USER (--password PASSWORD | --password-env ENV) --vault-id ID [--status open|resolved|all] [--json]
+  obts integrity repair --vault-id ID [--json]
   obts admin-recovery create-reset-token --username USER [--enable-user] [--json]
   obts admin-recovery create-admin --username USER (--password PASSWORD | --password-env ENV) [--display-name NAME] [--json]
 
@@ -208,6 +209,20 @@ export async function runCli(
           created_at: conflict.created_at
         }));
       writeResult(io, parsed, { conflicts }, table(conflicts, ['status', 'created_at', 'device_id', 'conflict_id']));
+      return 0;
+    }
+
+    if (command === 'integrity' && subcommand === 'repair') {
+      const vaultId = requiredString(parsed, 'vault-id');
+      await repairVaultIntegrity(server.store, server.git, vaultId);
+      const db = await server.store.snapshot();
+      const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
+      writeResult(
+        io,
+        parsed,
+        { vault_id: vaultId, status: vault?.status ?? 'missing' },
+        `validated repaired persistent state for ${vaultId}\n`
+      );
       return 0;
     }
 
