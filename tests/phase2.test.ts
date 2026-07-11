@@ -4,8 +4,8 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { ObtsPluginClient } from '../src/plugin/client.js';
-import type { ApplyJournal } from '../src/plugin/recovery.js';
+import { ObtsPluginClient } from '../obsidian-plugin/src/core/client.js';
+import type { ApplyJournal } from '../obsidian-plugin/src/core/recovery.js';
 import { createObtsServer, type ObtsServer } from '../src/server/app.js';
 
 type Json = Record<string, unknown>;

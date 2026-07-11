@@ -7,6 +7,8 @@ COPY tsconfig.json ./
 COPY src ./src
 COPY tests ./tests
 COPY frontend ./frontend
+COPY obsidian-plugin ./obsidian-plugin
+COPY scripts ./scripts
 RUN npm run build
 RUN npm prune --omit=dev
 

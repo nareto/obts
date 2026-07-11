@@ -1,0 +1,70 @@
+name: Plugin release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Enforce plugin release policy
+        env:
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          base="${PUSH_BEFORE:-}"
+          if [[ -z "$base" || "$base" =~ ^0+$ ]]; then
+            base="$(git rev-parse HEAD^)"
+          fi
+          node scripts/check-plugin-release.mjs "$base" HEAD
+
+      - name: Read plugin version
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(node -p 'require("./obsidian-plugin/manifest.json").version')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh release view "$version" >/dev/null 2>&1; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Test release candidate
+        if: steps.version.outputs.needed == 'true'
+        run: npm test
+
+      - name: Create prerelease
+        if: steps.version.outputs.needed == 'true'
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          gh release create "$version" \
+            obsidian-plugin/main.js \
+            obsidian-plugin/manifest.json \
+            obsidian-plugin/styles.css \
+            --target "$GITHUB_SHA" \
+            --title "$version" \
+            --generate-notes \
+            --prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}

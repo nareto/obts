@@ -88,13 +88,15 @@ For anything beyond local evaluation, place the service behind HTTPS and replace
 
 ## Install The Obsidian Plugin
 
-The current plugin artifact is tracked in [`obsidian-plugin/`](obsidian-plugin/).
+The recommended installation path is [BRAT](https://github.com/TfTHacker/obsidian42-brat):
 
-1. Copy that directory to `<vault>/.obsidian/plugins/obts/`.
-2. Enable **Obsidian True Sync** under Obsidian's community plugin settings.
-3. Enter the server URL, device name, and one-time pairing token.
-4. Pair the device and confirm the initial import when appropriate.
+1. Install BRAT from Obsidian's community plugin browser.
+2. Run **BRAT: Add a beta plugin for testing** and enter `nareto/obts`.
+3. Track the latest release, then enable **Obsidian True Sync**.
+4. Enter the server URL, device name, and one-time pairing token.
 5. Pair a second copied vault and complete the [manual smoke test](docs/phase3-smoke-test.md) before using primary data.
+
+The server reports minimum and recommended plugin versions. Compatible older clients continue syncing and receive an update notice; clients below the minimum are blocked with an actionable BRAT update command. For manual installation, copy `main.js`, `manifest.json`, and `styles.css` from a GitHub release into `<vault>/.obsidian/plugins/obts/`.
 
 Plugin commands include:
 
@@ -130,11 +132,14 @@ Useful commands:
 ```sh
 npm run check       # TypeScript and dashboard build checks
 npm test            # Full Vitest suite
-npm run build       # Dashboard and server build
+npm run build       # Dashboard, plugin, and server build
+just plugin-version patch  # Select and build the next plugin release
 just arch           # Render and serve the Structurizr architecture model
 ```
 
 Run `node dist/src/cli.js help` for setup, vault, pairing, device, conflict, health, integrity, and local admin-recovery commands. Password-bearing automation should use `--password-env` rather than command-line values.
+
+Plugin releases use `obsidian-plugin/manifest.json` as their canonical version. Run `just setup-hooks` once per checkout; the pre-push hook prevents plugin changes without a version increase. After `just plugin-version patch` (or an explicit version) reaches GitHub `main`, the release workflow tests the build and publishes the BRAT assets automatically.
 
 ## What Gets Synchronized?
 

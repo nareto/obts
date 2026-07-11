@@ -106,6 +106,11 @@ export type DeviceStatusReport = {
   path_capabilities?: Record<string, unknown> | null;
 };
 
+export type DeviceStatusResponse = {
+  status: 'ok';
+  plugin: import('./pluginCompatibility.js').PluginCompatibility;
+};
+
 export type DirectoryIntent = {
   op: 'create' | 'delete';
   path: string;
@@ -113,6 +118,7 @@ export type DirectoryIntent = {
 
 export type DevicePushManifest = {
   api_version: typeof API_VERSION;
+  plugin_version?: string;
   vault_id: string;
   device_id: string;
   expected_device_ref: string | null;
@@ -154,6 +160,7 @@ export type PushResult =
 
 export type DevicePullRequest = {
   api_version: typeof API_VERSION;
+  plugin_version?: string;
   vault_id: string;
   device_id: string;
   current_local_main: string | null;

@@ -121,6 +121,7 @@ export function parseDevicePushManifest(value: unknown): DevicePushManifest {
     packfile_bytes: readNonNegativeInteger(value, 'packfile_bytes'),
     client_known_main: readNullableCommitId(value, 'client_known_main')
   };
+  const pluginVersion = readOptionalString(value, 'plugin_version');
   const baseCommit = Object.prototype.hasOwnProperty.call(value, 'base_commit')
     ? readNullableCommitId(value, 'base_commit')
     : undefined;
@@ -128,6 +129,7 @@ export function parseDevicePushManifest(value: unknown): DevicePushManifest {
   const directoryIntents = readOptionalDirectoryIntents(value, 'directory_intents');
   return {
     ...manifest,
+    ...(pluginVersion === undefined ? {} : { plugin_version: pluginVersion }),
     ...(baseCommit === undefined ? {} : { base_commit: baseCommit }),
     ...(attemptId === undefined ? {} : { attempt_id: attemptId }),
     ...(directoryIntents === undefined ? {} : { directory_intents: directoryIntents })
@@ -186,11 +188,13 @@ export function parseDevicePullRequest(value: unknown): DevicePullRequest {
   if (requested !== 'latest' && !COMMIT_ID_PATTERN.test(requested)) {
     throw new ValidationError('invalid_request', 'Invalid requested target.', { field: 'requested_target' });
   }
+  const pluginVersion = readOptionalString(value, 'plugin_version');
   const currentEventSeq = Object.prototype.hasOwnProperty.call(value, 'current_event_seq')
     ? readNonNegativeInteger(value, 'current_event_seq')
     : undefined;
   return {
     api_version: API_VERSION,
+    ...(pluginVersion === undefined ? {} : { plugin_version: pluginVersion }),
     vault_id: readString(value, 'vault_id'),
     device_id: readString(value, 'device_id'),
     current_local_main: readNullableCommitId(value, 'current_local_main'),

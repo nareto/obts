@@ -2,14 +2,13 @@ import { createHash } from 'node:crypto';
 import { copyFile, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
-import { newId, nowIso } from '../shared/ids.js';
-import { assertSyncableTreePaths, isSyncableVaultPath, normalizeVaultPath, PathPolicyViolation } from '../shared/pathPolicy.js';
-import { API_VERSION, type DevicePushManifest, type DirectoryIntent } from '../shared/types.js';
+import { newId, nowIso } from '../../../src/shared/ids.js';
+import { assertSyncableTreePaths, isSyncableVaultPath, normalizeVaultPath, PathPolicyViolation } from '../../../src/shared/pathPolicy.js';
+import { API_VERSION, type DevicePushManifest, type DirectoryIntent } from '../../../src/shared/types.js';
+import { PLUGIN_VERSION } from '../version.js';
 import { LocalGitEngine } from './localGit.js';
 import { ApplyLockActiveError, type ApplyJournal, RecoveryManager, sha256File } from './recovery.js';
 import { TransportClient, TransportError } from './transport.js';
-
-const PLUGIN_VERSION = '0.1.17-phase3';
 
 export type ObtsPluginSettings = {
   serverUrl: string;
@@ -355,6 +354,7 @@ export class ObtsPluginClient {
       pendingDirectoryIntents = (await this.readDirectoryState()).pending_intents;
       const manifest: DevicePushManifest = {
         api_version: API_VERSION,
+        plugin_version: PLUGIN_VERSION,
         vault_id: currentState.vault_id,
         device_id: currentState.device_id,
         expected_device_ref: queue.expected_device_ref,

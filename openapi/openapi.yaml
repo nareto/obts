@@ -408,11 +408,11 @@ paths:
               $ref: "#/components/schemas/DeviceStatusReport"
       responses:
         "200":
-          description: Device status recorded.
+          description: Device status recorded with plugin compatibility guidance.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/StatusResponse"
+                $ref: "#/components/schemas/DeviceStatusResponse"
         "404":
           $ref: "#/components/responses/Error"
   /vaults/{vault_id}/sync/events:
@@ -955,6 +955,30 @@ components:
           oneOf:
             - type: "null"
             - type: object
+    DeviceStatusResponse:
+      type: object
+      required: [status, plugin]
+      properties:
+        status:
+          const: ok
+        plugin:
+          $ref: "#/components/schemas/PluginCompatibility"
+    PluginCompatibility:
+      type: object
+      required: [current_version, minimum_version, recommended_version, update_required, update_available, update_url]
+      properties:
+        current_version:
+          type: string
+        minimum_version:
+          type: string
+        recommended_version:
+          type: string
+        update_required:
+          type: boolean
+        update_available:
+          type: boolean
+        update_url:
+          type: string
     DevicePushManifest:
       type: object
       required:
@@ -969,6 +993,8 @@ components:
       properties:
         api_version:
           const: 2026-07-02.full-sync
+        plugin_version:
+          type: string
         vault_id:
           type: string
         device_id:
@@ -1010,6 +1036,8 @@ components:
       properties:
         api_version:
           const: 2026-07-02.full-sync
+        plugin_version:
+          type: string
         vault_id:
           type: string
         device_id:

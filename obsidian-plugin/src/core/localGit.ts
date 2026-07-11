@@ -9,7 +9,7 @@ import {
   isSyncableVaultPath,
   normalizeVaultPath,
   PathPolicyViolation
-} from '../shared/pathPolicy.js';
+} from '../../../src/shared/pathPolicy.js';
 
 export type LocalGitState = {
   localMain: string | null;

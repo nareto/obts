@@ -14,5 +14,5 @@
     "rootDir": ".",
     "types": ["node", "vitest"]
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts"]
+  "include": ["src/**/*.ts", "obsidian-plugin/src/**/*.ts", "tests/**/*.ts"]
 }

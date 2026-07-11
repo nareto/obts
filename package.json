@@ -1,6 +1,6 @@
 {
   "name": "obts",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "private": true,
   "type": "module",
   "description": "Obsidian True Sync deployable history, restore, diagnostics, and maintenance implementation.",
@@ -11,11 +11,13 @@
     "node": ">=24"
   },
   "scripts": {
-    "build": "npm run build:dashboard && tsc -p tsconfig.json",
+    "build": "npm run build:dashboard && npm run build:plugin && tsc -p tsconfig.json",
     "build:dashboard": "vite build --config frontend/dashboard/vite.config.ts",
-    "check": "tsc -p tsconfig.json --noEmit && vite build --config frontend/dashboard/vite.config.ts --mode check",
+    "build:plugin": "node scripts/build-plugin.mjs",
+    "build:plugin:check": "node scripts/build-plugin.mjs --check",
+    "check": "npm run build:plugin:check && tsc -p tsconfig.json --noEmit && vite build --config frontend/dashboard/vite.config.ts --mode check",
     "lint": "npm run check",
-    "test": "npm run build:dashboard && vitest run",
+    "test": "npm run build:dashboard && npm run build:plugin:check && vitest run",
     "test:watch": "vitest"
   },
   "dependencies": {

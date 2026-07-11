@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, extname, join, relative } from 'node:path';
 
-import { newId, nowIso } from '../shared/ids.js';
+import { newId, nowIso } from '../../../src/shared/ids.js';
 
 export type ApplyJournal = {
   apply_id: string;

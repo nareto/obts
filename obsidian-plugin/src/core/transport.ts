@@ -4,10 +4,12 @@ import {
   type DevicePushManifest,
   type DeviceSelfResponse,
   type DeviceStatusReport,
+  type DeviceStatusResponse,
   type EventEnvelope,
   type PushResult
-} from '../shared/types.js';
-import { parseDevicePullRequest, parseDevicePushManifest } from '../shared/validators.js';
+} from '../../../src/shared/types.js';
+import { parseDevicePullRequest, parseDevicePushManifest } from '../../../src/shared/validators.js';
+import { PLUGIN_VERSION } from '../version.js';
 
 const NETWORK_TIMEOUT_MS = 60_000;
 
@@ -52,7 +54,7 @@ export class TransportClient {
     vaultId: string;
     deviceToken: string;
     report: DeviceStatusReport;
-  }): Promise<{ status: string }> {
+  }): Promise<DeviceStatusResponse> {
     const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${input.vaultId}/sync/device-status`), {
       method: 'POST',
       headers: {
@@ -61,7 +63,7 @@ export class TransportClient {
       },
       body: JSON.stringify(input.report)
     });
-    return await readJsonOrThrow<{ status: string }>(response);
+    return await readJsonOrThrow<DeviceStatusResponse>(response);
   }
 
   async push(input: {
@@ -97,6 +99,7 @@ export class TransportClient {
   }): Promise<{ manifest: DevicePullManifest; packfile: Buffer }> {
     const manifest = {
       api_version: API_VERSION,
+      plugin_version: PLUGIN_VERSION,
       vault_id: input.vaultId,
       device_id: input.deviceId,
       current_local_main: input.currentLocalMain,

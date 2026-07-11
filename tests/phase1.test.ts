@@ -5,9 +5,9 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { ObtsPluginClient, PluginBlockedError } from '../src/plugin/client.js';
-import { LocalGitEngine } from '../src/plugin/localGit.js';
-import { TransportClient } from '../src/plugin/transport.js';
+import { ObtsPluginClient, PluginBlockedError } from '../obsidian-plugin/src/core/client.js';
+import { LocalGitEngine } from '../obsidian-plugin/src/core/localGit.js';
+import { TransportClient } from '../obsidian-plugin/src/core/transport.js';
 import { runCli } from '../src/cli.js';
 import { createObtsServer, type ObtsServer } from '../src/server/app.js';
 import { MetadataStore } from '../src/server/metadataStore.js';
@@ -428,6 +428,66 @@ describe('Phase 1 sync without conflict resolution', () => {
       behind_main: false,
       last_applied_main: dashboard.body.vault.current_main
     });
+  });
+
+  it('reports plugin updates and rejects clients below the minimum version', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'plugin-compatibility-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'laptop');
+    const state = await plugin.readState();
+    const token = JSON.parse(await readFile(join(deviceDir, '.obts', 'auth', 'device-token.json'), 'utf8')) as {
+      device_token: string;
+    };
+
+    const statusResponse = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/device-status`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token.device_token}`,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        plugin_version: '0.1.17',
+        local_status_label: 'Synced',
+        local_error_code: null,
+        local_queue_status: 'idle',
+        local_main: state.local_main,
+        local_head: state.local_head
+      })
+    });
+    expect(statusResponse.status).toBe(200);
+    expect(await statusResponse.json()).toMatchObject({
+      status: 'ok',
+      plugin: {
+        current_version: '0.1.17',
+        minimum_version: '0.1.0',
+        recommended_version: '0.1.18',
+        update_required: false,
+        update_available: true
+      }
+    });
+
+    const form = new FormData();
+    form.append(
+      'manifest',
+      JSON.stringify({
+        api_version: API_VERSION,
+        plugin_version: '0.0.1',
+        vault_id: admin.vaultId,
+        device_id: state.device_id,
+        current_local_main: state.local_main,
+        requested_target: 'latest',
+        current_event_seq: state.last_event_seq
+      })
+    );
+    form.append('packfile', new Blob([new ArrayBuffer(0)]), 'have.pack');
+    const pullResponse = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/pull`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token.device_token}` },
+      body: form
+    });
+    expect(pullResponse.status).toBe(409);
+    expect(await pullResponse.json()).toMatchObject({ error: { code: 'plugin_update_required' } });
   });
 
   it('records local watcher change hints durably and consumes them through normal sync', async () => {

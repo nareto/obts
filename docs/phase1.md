@@ -13,9 +13,8 @@ Implemented runtime pieces:
   healthcheck, and `obts serve` startup command.
 - Manual operations and smoke-test guides in `docs/phase1-operations.md` and
   `docs/phase1-smoke-test.md`.
-- Installable Obsidian plugin package scaffold in `obsidian-plugin/` for the
-  Phase 1 settings/status surface; the tested sync engine lives in
-  `src/plugin/`.
+- Installable Obsidian plugin package in `obsidian-plugin/`; its source and
+  tested sync engine live together under `obsidian-plugin/src/`.
 - Shared API types, status labels, validation helpers, and vault path policy.
 - Committed OpenAPI 3.1 contract at `openapi/openapi.yaml`.
 - Fastify server with first-run setup, Argon2id password storage, login/logout sessions, CSRF-protected dashboard mutations, admin user creation, vault creation, pairing tokens, device tokens, multipart push, multipart pull, events, conflicts, and health checks.

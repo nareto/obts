@@ -5,8 +5,8 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 
-const API_VERSION = "2026-07-02.full-sync";
-const PLUGIN_VERSION = "0.1.18";
+const API_VERSION = "__OBTS_API_VERSION__";
+const PLUGIN_VERSION = "__OBTS_PLUGIN_VERSION__";
 const SYNC_DEBOUNCE_MS = 1500;
 const BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000;
 const SYNC_STALE_MS = 2 * 60 * 1000;

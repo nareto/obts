@@ -1,6 +1,18 @@
 default:
     @just --list
 
+plugin-version version:
+    node scripts/plugin-version.mjs "{{version}}"
+
+plugin-build:
+    npm run build:plugin
+
+plugin-check:
+    npm run build:plugin:check
+
+setup-hooks:
+    git config core.hooksPath .githooks
+
 arch port="" verbose="false":
     #!/usr/bin/env bash
     set -euo pipefail

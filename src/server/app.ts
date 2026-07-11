@@ -9,6 +9,11 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import { newId, nowIso } from '../shared/ids.js';
 import { isSyncableVaultPath } from '../shared/pathPolicy.js';
 import {
+  describePluginCompatibility,
+  LEGACY_PLUGIN_VERSION,
+  type PluginCompatibility
+} from '../shared/pluginCompatibility.js';
+import {
   API_VERSION,
   type DevicePullManifest,
   type DevicePullRequest,
@@ -466,6 +471,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const { vaultId } = pathParams(request);
     const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
     const { manifest, packfile } = await readPushMultipart(request);
+    requireCompatiblePlugin(manifest.plugin_version, deviceAuth.device.plugin_version);
     const result = await sync.pushDeviceCommit(deviceAuth, manifest, packfile);
     if (result.status === 'rejected') {
       const status = result.code === 'not_found' ? 404 : result.code === 'malformed_packfile' ? 400 : 409;
@@ -491,6 +497,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       throw new AuthError(409, 'device_blocked', 'Device requires review or recovery before pulling server state.');
     }
     const pullRequest = await readPullMultipart(request);
+    requireCompatiblePlugin(pullRequest.plugin_version, deviceAuth.device.plugin_version);
     if (pullRequest.vault_id !== vaultId || pullRequest.device_id !== deviceAuth.device.device_id) {
       throw new AuthError(404, 'not_found', 'Resource not found.');
     }
@@ -568,7 +575,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       device.path_capabilities = report.pathCapabilities;
       device.last_status_report_at = nowIso();
     });
-    return { status: 'ok' };
+    return { status: 'ok', plugin: describePluginCompatibility(report.pluginVersion) };
   });
 
   app.post('/api/v1/vaults/:vaultId/sync/unpair', async (request) => {
@@ -1883,6 +1890,18 @@ function contentTypeForPath(path: string): string {
     default:
       return 'application/octet-stream';
   }
+}
+
+function requireCompatiblePlugin(reportedVersion: string | undefined, storedVersion: string | null): PluginCompatibility {
+  const compatibility = describePluginCompatibility(reportedVersion ?? storedVersion ?? LEGACY_PLUGIN_VERSION);
+  if (compatibility.update_required) {
+    throw new AuthError(
+      409,
+      'plugin_update_required',
+      `Obsidian True Sync ${compatibility.minimum_version} or newer is required.`
+    );
+  }
+  return compatibility;
 }
 
 async function sendError(error: Error, request: FastifyRequest, reply: FastifyReply): Promise<void> {
