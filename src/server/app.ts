@@ -1951,6 +1951,9 @@ async function checkWritableDirectory(path: string): Promise<{ ok: true } | { ok
     if (!directory.isDirectory() || (directory.mode & 0o700) !== 0o700) {
       return { ok: false, error: 'persistent directory permissions do not allow owner read, write, and search access' };
     }
+    if ((directory.mode & 0o077) !== 0) {
+      return { ok: false, error: 'persistent directory permissions allow group or other access' };
+    }
     await writeFile(probe, 'ok', { mode: 0o600 });
     await rm(probe, { force: true });
     return { ok: true };

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { spawn } from 'node:child_process';
 
@@ -96,9 +96,11 @@ export class GitService {
   async checkRepositoryPermissions(vaultId: string): Promise<{ ok: true } | { ok: false; error: string }> {
     try {
       const repository = await stat(this.repoPath(vaultId));
-      const requiredDirectoryBits = 0o700;
-      if (!repository.isDirectory() || (repository.mode & requiredDirectoryBits) !== requiredDirectoryBits) {
+      if (!repository.isDirectory() || (repository.mode & 0o700) !== 0o700) {
         return { ok: false, error: 'server Git repository permissions are not owner-readable, writable, and searchable' };
+      }
+      if ((repository.mode & 0o077) !== 0) {
+        return { ok: false, error: 'server Git repository permissions allow group or other access' };
       }
       return { ok: true };
     } catch {
@@ -110,6 +112,7 @@ export class GitService {
     const repo = this.repoPath(vaultId);
     await mkdir(this.config.gitStoreDir, { recursive: true, mode: 0o700 });
     await this.execRaw(['init', '--bare', repo]);
+    await chmod(repo, 0o700);
     await this.exec(repo, ['config', 'core.logAllRefUpdates', 'true']);
     const tree = asText((await this.exec(repo, ['mktree'], Buffer.alloc(0))).stdout).trim();
     const rootOutput = (

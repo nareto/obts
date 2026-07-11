@@ -1,4 +1,4 @@
-import { chmod, cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -101,7 +101,7 @@ describe('Phase 3 deployable history state', () => {
       });
     });
     await server.app.close();
-    await chmod(join(root, 'git', `${vaultId}.git`), 0o500);
+    await chmod(join(root, 'git', `${vaultId}.git`), 0o770);
 
     const restored = await createObtsServer({ dataDir: root });
     try {
@@ -114,6 +114,44 @@ describe('Phase 3 deployable history state', () => {
       });
     } finally {
       await chmod(join(root, 'git', `${vaultId}.git`), 0o700);
+      await restored.app.close();
+    }
+  });
+
+  it('fails readiness for restored persistent directories with non-owner access', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'obts-phase3-directory-permissions-'));
+    roots.push(root);
+    const server = await createObtsServer({ dataDir: root });
+    const vaultId = 'vlt_restrictive_permissions';
+    const repository = join(root, 'git', `${vaultId}.git`);
+    const currentMain = await server.git.initializeVault(vaultId);
+    expect((await stat(repository)).mode & 0o777).toBe(0o700);
+    await server.store.mutate((db) => {
+      const timestamp = new Date().toISOString();
+      db.vaults.push({
+        vault_id: vaultId,
+        owner_user_id: 'usr_owner',
+        display_name: 'Restrictive permissions',
+        status: 'active',
+        current_main: currentMain,
+        created_at: timestamp,
+        updated_at: timestamp
+      });
+    });
+    await server.app.close();
+
+    const metadataDir = join(root, 'metadata');
+    await chmod(metadataDir, 0o770);
+    const restored = await createObtsServer({ dataDir: root });
+    try {
+      const readiness = await restored.app.inject({ method: 'GET', url: '/health/ready' });
+      expect(readiness.statusCode).toBe(503);
+      expect(readiness.json()).toMatchObject({
+        status: 'not_ready',
+        checks: { metadata_store: false, filesystem_permissions: false }
+      });
+    } finally {
+      await chmod(metadataDir, 0o700);
       await restored.app.close();
     }
   });
