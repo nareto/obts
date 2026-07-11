@@ -156,6 +156,50 @@ describe('Phase 3 deployable history state', () => {
     }
   });
 
+  it('fails readiness when the restored data root allows group or other access', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'obts-phase3-root-permissions-'));
+    roots.push(root);
+    const dataDir = join(root, 'data');
+    const server = await createObtsServer({ dataDir });
+    await server.app.close();
+
+    await chmod(dataDir, 0o750);
+    const restored = await createObtsServer({ dataDir });
+    try {
+      const readiness = await restored.app.inject({ method: 'GET', url: '/health/ready' });
+      expect(readiness.statusCode).toBe(503);
+      expect(readiness.json()).toMatchObject({
+        status: 'not_ready',
+        checks: { filesystem_permissions: false }
+      });
+    } finally {
+      await chmod(dataDir, 0o700);
+      await restored.app.close();
+    }
+  });
+
+  it('fails readiness when the restored metadata database allows group or other access', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'obts-phase3-metadata-permissions-'));
+    roots.push(root);
+    const server = await createObtsServer({ dataDir: root });
+    await server.app.close();
+
+    const metadataFile = join(root, 'metadata', 'phase1.json');
+    await chmod(metadataFile, 0o640);
+    const restored = await createObtsServer({ dataDir: root });
+    try {
+      const readiness = await restored.app.inject({ method: 'GET', url: '/health/ready' });
+      expect(readiness.statusCode).toBe(503);
+      expect(readiness.json()).toMatchObject({
+        status: 'not_ready',
+        checks: { metadata_store: false, filesystem_permissions: false }
+      });
+    } finally {
+      await chmod(metadataFile, 0o600);
+      await restored.app.close();
+    }
+  });
+
   it('restores metadata, refs, conflicts, events, and derived note history as one consistent state', async () => {
     const root = await mkdtemp(join(tmpdir(), 'obts-phase3-consistent-restore-'));
     roots.push(root);

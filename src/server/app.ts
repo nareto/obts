@@ -1962,6 +1962,21 @@ async function checkWritableDirectory(path: string): Promise<{ ok: true } | { ok
   }
 }
 
+async function checkRestrictedFile(path: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    const file = await stat(path);
+    if (!file.isFile() || (file.mode & 0o600) !== 0o600) {
+      return { ok: false, error: 'persistent metadata permissions do not allow owner read and write access' };
+    }
+    if ((file.mode & 0o077) !== 0) {
+      return { ok: false, error: 'persistent metadata permissions allow group or other access' };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, error: 'persistent metadata file is missing or inaccessible' };
+  }
+}
+
 type ReadinessSummary = {
   status: 'ready' | 'not_ready';
   checks: {
@@ -1987,7 +2002,10 @@ async function buildReadinessSummary(
 ): Promise<ReadinessSummary> {
   const gitReady = await git.checkReady();
   const db = await store.snapshot();
-  const metadataStoreReady = await checkWritableDirectory(join(config.dataDir, 'metadata'));
+  const dataDirectoryReady = await checkWritableDirectory(config.dataDir);
+  const metadataDirectoryReady = await checkWritableDirectory(join(config.dataDir, 'metadata'));
+  const metadataFileReady = await checkRestrictedFile(join(config.dataDir, 'metadata', 'phase1.json'));
+  const metadataStoreReady = metadataDirectoryReady.ok && metadataFileReady.ok;
   const gitStoreReady = await checkWritableDirectory(config.gitStoreDir);
   const tempWorkspaceReady = await checkWritableDirectory(config.tempDir);
   const persistentState = await checkPersistentState(db, git);
@@ -1995,10 +2013,10 @@ async function buildReadinessSummary(
     await blockVaultForIntegrity(store, persistentState.vaultId);
   }
   const eventDelivery = checkEventDelivery(db);
-  const filesystemPermissions = metadataStoreReady.ok && gitStoreReady.ok && tempWorkspaceReady.ok;
+  const filesystemPermissions = dataDirectoryReady.ok && metadataStoreReady && gitStoreReady.ok && tempWorkspaceReady.ok;
   const checks = {
     metadata: true,
-    metadata_store: metadataStoreReady.ok,
+    metadata_store: metadataStoreReady,
     git: gitReady.ok,
     setup_complete: db.setup_complete,
     migrations: db.schema_version === 2,
@@ -2024,7 +2042,9 @@ async function buildReadinessSummary(
       ? null
       : firstDetail([
           gitReady.ok ? null : gitReady.error,
-          readinessError(metadataStoreReady),
+          readinessError(dataDirectoryReady),
+          readinessError(metadataDirectoryReady),
+          readinessError(metadataFileReady),
           readinessError(gitStoreReady),
           readinessError(tempWorkspaceReady),
           readinessError(eventDelivery),
