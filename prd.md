@@ -53,7 +53,7 @@ Git provides commit identity, ancestry, merge bases, diffs, rename detection sup
 - Storing a normal Git repository in the visible vault.
 - Implementing an application-level encrypted Git store, per-vault data keys, or app-managed content key rotation in v1.
 - App-managed backup scheduling, offsite backup storage, or deployment-specific restore orchestration.
-- Building app images or environment-specific infrastructure deployment assumptions into this app repo.
+- Building app images or environment-specific deployment assumptions into this app repo.
 
 ## 2. Security Model
 
@@ -82,7 +82,7 @@ Deployment requirements:
 - make backups point-in-time consistent across Postgres and the server Git store;
 - treat database dumps, server Git stores, recovery exports, diagnostics exports, and backups as sensitive unless deployment encryption already protects them.
 
-`obts` must document the persistent state that deployments must protect and back up, but the app repo must not prescribe private environment-specific infrastructure paths, backup schedules, offsite targets, or secret-store locations.
+`obts` must document the persistent state that deployments must protect and back up, but the app repo must not prescribe environment-specific infrastructure paths, backup schedules, offsite targets, or secret-store locations.
 
 The storage layer must keep a clear repository/store abstraction so application-level encrypted persistence can be added beyond v1 without replacing the sync model.
 
@@ -1107,7 +1107,7 @@ Required behavior:
 
 ### 8.3 Persistent-State Backup Contract
 
-Backup orchestration is a deployment concern. The app repo must not prescribe backup schedules, offsite locations, environment-specific infrastructure paths, or private restore automation.
+Backup orchestration is a deployment concern. The app repo must not prescribe backup schedules, offsite locations, environment-specific paths, or operator-specific restore automation.
 
 `obts` must document the persistent state that deployment backups must capture:
 
@@ -1231,8 +1231,8 @@ Every phase must include:
 - a runnable server process with documented configuration, health checks,
   persistent-state paths, backup/restore notes, and upgrade notes for state
   introduced in that phase;
-- an OCI image built from this app repo, with environment-specific infrastructure-specific deployment kept
-  outside this app repo;
+- an OCI image built from this app repo, with environment-specific deployment
+  kept outside this app repo;
 - an installable Obsidian plugin artifact for all client behavior required by
   that phase;
 - a manual smoke-test guide that starts from empty persistent state and verifies
@@ -1442,7 +1442,7 @@ Acceptance proof:
 ### 11.3 Security Tests
 
 - database dumps, server Git stores, recovery bundles, diagnostics exports, and backups are documented as sensitive app state;
-- deployment-managed backup encryption can be configured without app-specific environment-specific infrastructure assumptions;
+- deployment-managed backup encryption can be configured without app-specific infrastructure assumptions;
 - plaintext Git material exists only in scoped temp workspaces;
 - cross-account Git ref/object/conflict/event access denied;
 - admin accounts cannot access another user's vault content unless they own that vault;
@@ -1509,7 +1509,7 @@ Rejected for v1. v1 promises Git-backed note history and recovery, so reachable 
 - Keep client-side Git on `isomorphic-git` and server-side Git on the native `git` CLI unless the product decision changes.
 - Keep v1 Git transfer on multipart manifests plus Git packfiles; do not add bundles or alternate object transports unless the product decision changes.
 - Do not add destructive history compaction, baseline truncation, or a compact-history API to v1 unless the product decision changes.
-- Do not add environment-specific infrastructure-specific deployment files, organization-specific image repository names, deployment secret store paths, or private hostnames to this app repo.
+- Do not add environment-specific deployment files, organization-specific image repository names, secret-store paths, or non-public hostnames to this app repo.
 - Do not create `.git` directories inside visible vault content.
 - Keep `.obts/` excluded from vault sync, Git worktree content, and manifest/path scanning.
 - Keep community plugin files synced as normal vault content, except `.obsidian/plugins/obts` and `.obsidian/plugins/obts/**` are always excluded.

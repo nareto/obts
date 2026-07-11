@@ -477,8 +477,8 @@ describe('Phase 1 sync without conflict resolution', () => {
     const fixtureB = await pairPlugin(admin, fixtureBDir, 'fixtureB');
 
     const punctuationPaths = [
-      'Notes/is there a way to have local claude code connect to docker on remote-host?.md',
-      'Notes/Projects/Vision -> Checklist.md'
+      'Notes/can local tooling connect to docker on a remote host?.md',
+      'Projects/Launch Plan -> Checklist.md'
     ];
     for (const filePath of punctuationPaths) {
       await mkdirp(join(fixtureADir, filePath.split('/').slice(0, -1).join('/')));
@@ -4414,8 +4414,8 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(normalizeVaultPath('notes/./a.md').ok).toBe(false);
     expect(normalizeVaultPath('notes/bad:name.md').ok).toBe(true);
     expect(normalizeVaultPath('notes/trailing.').ok).toBe(true);
-    expect(normalizeVaultPath('Notes/Projects/Vision -> Checklist.md').ok).toBe(true);
-    expect(normalizeVaultPath('Notes/is there a way to have local claude code connect to docker on remote-host?.md').ok).toBe(true);
+    expect(normalizeVaultPath('Projects/Launch Plan -> Checklist.md').ok).toBe(true);
+    expect(normalizeVaultPath('Notes/can local tooling connect to docker on a remote host?.md').ok).toBe(true);
   });
 
   it('syncs the full vault except hard exclusions', () => {

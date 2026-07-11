@@ -52,8 +52,8 @@ arch port="" verbose="false":
     proxy_name="${STRUCTURIZR_PROXY_NAME:-structurizr-proxy-obts}"
     proxy_conf="${TMPDIR:-/tmp}/${proxy_name}.conf"
     host_name="${STRUCTURIZR_HOST:-$(hostname -f 2>/dev/null || hostname)}"
-    if [[ "${host_name}" != *.* && -n "${STRUCTURIZR_HOST_SUFFIX:-example.test}" ]]; then
-      host_name="${host_name}.${STRUCTURIZR_HOST_SUFFIX:-example.test}"
+    if [[ "${host_name}" != *.* && -n "${STRUCTURIZR_HOST_SUFFIX:-}" ]]; then
+      host_name="${host_name}.${STRUCTURIZR_HOST_SUFFIX}"
     fi
     log_dir="${TMPDIR:-/tmp}/obts-structurizr"
     local_log="${log_dir}/${local_name}.log"
