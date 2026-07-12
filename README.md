@@ -138,7 +138,7 @@ just plugin-version patch  # Select and build the next plugin release
 just arch           # Render and serve the Structurizr architecture model
 ```
 
-Run `node dist/src/cli.js help` for setup, vault, pairing, device, conflict, health, integrity, and local admin-recovery commands. Password-bearing automation should use `--password-env` rather than command-line values.
+Run `node dist/src/cli.js help` for setup, vault, device, conflict, health, integrity, and local admin-recovery commands. Password-bearing automation should use `--password-env` rather than command-line values.
 
 Plugin releases use `obsidian-plugin/manifest.json` as their canonical version. Run `just setup-hooks` once per checkout; the pre-push hook prevents plugin changes without a version increase. After `just plugin-version patch` (or an explicit version) reaches GitHub `main`, the release workflow tests the build and publishes the BRAT assets automatically.
 

@@ -265,6 +265,21 @@ export class AuthService {
       target.disabled = input.disabled;
       if (input.disabled) {
         revokeUserAuth(db, target.user_id);
+        for (const connection of db.connections) {
+          if (connection.approved_user_id === target.user_id && connection.status === 'approved') {
+            connection.status = 'denied';
+            db.audit_log.push({
+              audit_id: newId('aud'),
+              actor_user_id: actor.user_id,
+              actor_device_id: null,
+              vault_id: connection.selected_vault_id,
+              action: 'connection_revoked_user_disabled',
+              resource_class: 'connection',
+              resource_id: connection.connection_id,
+              created_at: nowIso()
+            });
+          }
+        }
       }
       db.audit_log.push({
         audit_id: newId('aud'),

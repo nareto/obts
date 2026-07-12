@@ -53,6 +53,27 @@ type PairingRepairContext = {
   hasLocalGitHistory: boolean;
 };
 
+export type OnboardingStage =
+  | 'awaiting_browser'
+  | 'approved'
+  | 'analyzing'
+  | 'awaiting_confirmation'
+  | 'registering'
+  | 'applying_uploading'
+  | 'awaiting_conflict'
+  | 'complete'
+  | 'blocked';
+
+export type OnboardingJournal = {
+  version: 1;
+  stage: OnboardingStage;
+  connection: Omit<CreateConnectionResponse, 'connection_secret'>;
+  analysis: OnboardingAnalysis | null;
+  selected_mode: 'initialize' | 'use_server' | 'merge' | null;
+  last_error_code: string | null;
+  updated_at: string;
+};
+
 export type OnboardingAnalysis = {
   selection: 'new_vault' | 'existing_vault';
   vaultId: string | null;
@@ -108,6 +129,7 @@ export class ObtsPluginClient {
   private readonly transport: TransportClient;
   private readonly git: LocalGitEngine;
   private readonly recovery: RecoveryManager;
+  private onboardingOperation = false;
 
   constructor(
     private readonly vaultDir: string,
@@ -165,6 +187,22 @@ export class ObtsPluginClient {
     await this.writeQueue(await this.readQueue());
   }
 
+  async readPendingOnboarding(): Promise<{ journal: OnboardingJournal; secret: string } | null> {
+    try {
+      const journal = JSON.parse(await readFile(this.onboardingJournalPath, 'utf8')) as OnboardingJournal;
+      if (journal.stage === 'complete') return null;
+      const pending = JSON.parse(await readFile(this.pendingConnectionPath, 'utf8')) as { connection_secret?: string };
+      if (!pending.connection_secret) return null;
+      return { journal, secret: pending.connection_secret };
+    } catch {
+      return null;
+    }
+  }
+
+  async cancelOnboarding(): Promise<void> {
+    await this.clearPendingOnboarding();
+  }
+
   async startOnboarding(localVaultName: string): Promise<CreateConnectionResponse> {
     await mkdir(this.vaultDir, { recursive: true, mode: 0o700 });
     await this.assertPairingCanStart();
@@ -172,7 +210,7 @@ export class ObtsPluginClient {
     await this.flushEditorBuffersToDisk();
     const summary = await this.localSnapshotSummary();
     const existing = await this.readExistingState();
-    return await this.transport.createConnection({
+    const connection = await this.transport.createConnection({
       plugin_version: PLUGIN_VERSION,
       device_name: this.settings.deviceName,
       local_vault_name: localVaultName,
@@ -183,13 +221,35 @@ export class ObtsPluginClient {
         has_detached_baseline: Boolean(existing?.unpaired_baseline_vault_id && existing.unpaired_baseline_main)
       }
     });
+    await writeJson(this.pendingConnectionPath, { connection_secret: connection.connection_secret, created_at: nowIso() });
+    const { connection_secret: _secret, ...redactedConnection } = connection;
+    await this.writeOnboardingJournal({
+      version: 1,
+      stage: 'awaiting_browser',
+      connection: redactedConnection,
+      analysis: null,
+      selected_mode: null,
+      last_error_code: null,
+      updated_at: nowIso()
+    });
+    return connection;
   }
 
   async pollOnboarding(connectionId: string, secret: string): Promise<ConnectionStatusResponse> {
-    return await this.transport.connectionStatus(connectionId, secret);
+    const status = await this.transport.connectionStatus(connectionId, secret);
+    const pending = await this.readPendingOnboarding();
+    if (pending?.journal.connection.connection_id === connectionId) {
+      if (status.status === 'approved') {
+        await this.writeOnboardingJournal({ ...pending.journal, stage: 'approved', updated_at: nowIso() });
+      } else if (status.status === 'denied' || status.status === 'expired') {
+        await this.clearPendingOnboarding();
+      }
+    }
+    return status;
   }
 
   async analyzeOnboarding(connectionId: string, secret: string): Promise<OnboardingAnalysis> {
+    await this.updateOnboardingStage(connectionId, 'analyzing');
     const status = await this.transport.connectionStatus(connectionId, secret);
     if (status.status !== 'approved') {
       throw new PluginBlockedError('connection_not_approved', 'Approve this connection in the browser first.');
@@ -197,7 +257,7 @@ export class ObtsPluginClient {
     await this.flushEditorBuffersToDisk();
     const local = await this.localSnapshotSummary();
     if (status.selection === 'new_vault') {
-      return {
+      const analysis: OnboardingAnalysis = {
         selection: status.selection,
         vaultId: null,
         vaultName: status.vault_name,
@@ -209,6 +269,8 @@ export class ObtsPluginClient {
         localFileCount: local.fileCount,
         localBytes: local.bytes
       };
+      await this.saveOnboardingAnalysis(connectionId, analysis);
+      return analysis;
     }
 
     const bootstrap = await this.transport.bootstrapConnection(connectionId, secret);
@@ -236,7 +298,7 @@ export class ObtsPluginClient {
             : validBaseline
               ? 'shared_baseline_divergent'
               : 'independent_divergent';
-    return {
+    const analysis: OnboardingAnalysis = {
       selection: status.selection,
       vaultId: bootstrap.manifest.vault_id,
       vaultName: bootstrap.manifest.vault_name,
@@ -248,9 +310,34 @@ export class ObtsPluginClient {
       localFileCount: local.fileCount,
       localBytes: local.bytes
     };
+    await this.saveOnboardingAnalysis(connectionId, analysis);
+    return analysis;
   }
 
   async finishOnboarding(input: {
+    connectionId: string;
+    secret: string;
+    analysis: OnboardingAnalysis;
+    mode: 'initialize' | 'use_server' | 'merge';
+  }): Promise<{ status: string; main?: string; conflictId?: string }> {
+    this.onboardingOperation = true;
+    await this.updateOnboardingStage(input.connectionId, 'registering', input.mode);
+    try {
+      return await this.finishOnboardingInternal(input);
+    } catch (error) {
+      await this.updateOnboardingStage(
+        input.connectionId,
+        'blocked',
+        input.mode,
+        error instanceof PluginBlockedError ? error.code : 'onboarding_failed'
+      );
+      throw error;
+    } finally {
+      this.onboardingOperation = false;
+    }
+  }
+
+  private async finishOnboardingInternal(input: {
     connectionId: string;
     secret: string;
     analysis: OnboardingAnalysis;
@@ -279,6 +366,7 @@ export class ObtsPluginClient {
           : {})
     };
     const result = await this.transport.completeConnection(input.connectionId, input.secret, request);
+    await this.updateOnboardingStage(input.connectionId, 'applying_uploading', input.mode);
     await writeJson(join(this.vaultDir, '.obts', 'auth', 'device-token.json'), {
       device_token: result.device_token,
       created_at: nowIso()
@@ -323,6 +411,7 @@ export class ObtsPluginClient {
         appliedMain: pulled.manifest.target_main
       });
       await this.writeState({ ...(await this.readState()), initial_import_confirmed: true, status_label: 'Synced', updated_at: nowIso() });
+      await this.completePendingOnboarding(input.connectionId);
       return { status: 'Synced', main: pulled.manifest.target_main };
     }
 
@@ -346,6 +435,7 @@ export class ObtsPluginClient {
     });
     const synced = await this.syncOnce();
     if (synced.status === 'Review needed') {
+      await this.updateOnboardingStage(input.connectionId, 'awaiting_conflict', input.mode);
       return synced;
     }
     const finalState = await this.readState();
@@ -357,11 +447,15 @@ export class ObtsPluginClient {
       deviceToken: result.device_token,
       appliedMain: finalState.local_main
     });
+    await this.completePendingOnboarding(input.connectionId);
     return synced;
   }
 
   async syncOnce(options: { confirmInitialImport?: boolean } = {}): Promise<{ status: string; main?: string; conflictId?: string }> {
     await this.initialize();
+    if (!this.onboardingOperation && (await this.readPendingOnboarding())) {
+      throw new PluginBlockedError('onboarding_incomplete', 'Finish or cancel browser onboarding before normal sync.');
+    }
     const state = await this.readState();
     if (!state.vault_id || !state.device_id) {
       throw new PluginBlockedError('not_paired', 'Device is not paired.');
@@ -1568,7 +1662,13 @@ export class ObtsPluginClient {
 
   private async localSnapshotSummary(): Promise<{ fingerprint: string; fileCount: number; bytes: number }> {
     const files = await this.git.scanSyncableFiles();
+    const directories = await listLocalVaultDirectories(this.vaultDir);
     const hash = createHash('sha256');
+    for (const path of directories) {
+      hash.update('dir\0');
+      hash.update(path);
+      hash.update('\0');
+    }
     let bytes = 0;
     for (const path of files) {
       const content = await readFile(join(this.vaultDir, path));
@@ -2240,8 +2340,61 @@ export class ObtsPluginClient {
     };
   }
 
+  private async saveOnboardingAnalysis(connectionId: string, analysis: OnboardingAnalysis): Promise<void> {
+    const pending = await this.readPendingOnboarding();
+    if (!pending || pending.journal.connection.connection_id !== connectionId) return;
+    await this.writeOnboardingJournal({
+      ...pending.journal,
+      stage: 'awaiting_confirmation',
+      analysis,
+      last_error_code: null,
+      updated_at: nowIso()
+    });
+  }
+
+  private async updateOnboardingStage(
+    connectionId: string,
+    stage: OnboardingStage,
+    selectedMode?: 'initialize' | 'use_server' | 'merge',
+    errorCode: string | null = null
+  ): Promise<void> {
+    const pending = await this.readPendingOnboarding();
+    if (!pending || pending.journal.connection.connection_id !== connectionId) return;
+    await this.writeOnboardingJournal({
+      ...pending.journal,
+      stage,
+      selected_mode: selectedMode ?? pending.journal.selected_mode,
+      last_error_code: errorCode,
+      updated_at: nowIso()
+    });
+  }
+
+  private async completePendingOnboarding(connectionId: string): Promise<void> {
+    const pending = await this.readPendingOnboarding();
+    if (!pending || pending.journal.connection.connection_id !== connectionId) return;
+    await this.writeOnboardingJournal({ ...pending.journal, stage: 'complete', last_error_code: null, updated_at: nowIso() });
+    await rm(this.pendingConnectionPath, { force: true });
+  }
+
+  private async clearPendingOnboarding(): Promise<void> {
+    await rm(this.pendingConnectionPath, { force: true });
+    await rm(this.onboardingJournalPath, { force: true });
+  }
+
+  private async writeOnboardingJournal(journal: OnboardingJournal): Promise<void> {
+    await writeJson(this.onboardingJournalPath, journal);
+  }
+
   private async writeQueue(queue: QueueState): Promise<void> {
     await writeJson(this.queuePath, queue);
+  }
+
+  private get onboardingJournalPath(): string {
+    return join(this.vaultDir, '.obts', 'onboarding.json');
+  }
+
+  private get pendingConnectionPath(): string {
+    return join(this.vaultDir, '.obts', 'auth', 'pending-connection.json');
   }
 
   private get statePath(): string {

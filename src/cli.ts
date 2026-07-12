@@ -36,7 +36,7 @@ Environment:
   OBTS_DATA_DIR             Persistent state root. Defaults to ./.obts-server.
   OBTS_GIT_STORE_DIR        Optional Git store override. Defaults to $OBTS_DATA_DIR/git.
   OBTS_TEMP_DIR             Optional temp workspace override. Defaults to $OBTS_DATA_DIR/tmp.
-  OBTS_PUBLIC_BASE_URL      Public server URL used in pairing links.
+  OBTS_PUBLIC_BASE_URL      Public server URL used in dashboard and browser onboarding links.
   OBTS_SESSION_SECRET       Dashboard/API session signing secret.
   OBTS_GIT_BINARY           Native git executable. Defaults to git.
   OBTS_MAX_UPLOAD_BYTES     Upload limit in bytes. Defaults to 104857600.

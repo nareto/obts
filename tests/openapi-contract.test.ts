@@ -2,12 +2,19 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
+import { parse } from 'yaml';
 
 import { API_VERSION } from '../src/shared/types.js';
 
 describe('OpenAPI Phase 3 contract', () => {
   it('commits the endpoints and version used by the server and plugin', async () => {
     const contract = await readFile(join(process.cwd(), 'openapi', 'openapi.yaml'), 'utf8');
+    const document = parse(contract) as {
+      openapi: string;
+      paths: Record<string, Record<string, { security?: Array<Record<string, unknown>>; responses?: Record<string, unknown> }>>;
+      components: { schemas: Record<string, unknown>; securitySchemes: Record<string, unknown> };
+    };
+    expect(document.openapi).toBe('3.1.0');
     for (const path of [
       '/setup',
       '/auth/login',
@@ -24,9 +31,14 @@ describe('OpenAPI Phase 3 contract', () => {
       '/vaults',
       '/vaults/{vault_id}/main',
       '/vaults/{vault_id}/dashboard',
-      '/vaults/{vault_id}/pairing-tokens',
+      '/connections',
+      '/connections/{connection_id}',
+      '/connections/{connection_id}/review',
+      '/connections/{connection_id}/approve',
+      '/connections/{connection_id}/deny',
+      '/connections/{connection_id}/bootstrap',
+      '/connections/{connection_id}/complete',
       '/vaults/{vault_id}/devices/{device_id}/revoke',
-      '/pair/consume',
       '/device/self',
       '/vaults/{vault_id}/sync/push',
       '/vaults/{vault_id}/sync/pull',
@@ -45,15 +57,37 @@ describe('OpenAPI Phase 3 contract', () => {
     ]) {
       expect(contract).toContain(path);
     }
+    for (const path of [
+      '/connections',
+      '/connections/{connection_id}',
+      '/connections/{connection_id}/review',
+      '/connections/{connection_id}/approve',
+      '/connections/{connection_id}/deny',
+      '/connections/{connection_id}/bootstrap',
+      '/connections/{connection_id}/complete'
+    ]) {
+      expect(document.paths[path]).toBeDefined();
+    }
+    expect(document.paths['/connections']?.post?.security).toEqual([]);
+    expect(document.paths['/connections/{connection_id}']?.get?.security).toEqual([{ connectionBearer: [] }]);
+    expect(document.paths['/connections/{connection_id}/bootstrap']?.post?.responses).toHaveProperty('409');
+    expect(document.paths['/connections/{connection_id}/complete']?.post?.responses).toHaveProperty('409');
+    expect(document.components.securitySchemes).toHaveProperty('connectionBearer');
+    expect(document.components.schemas).toHaveProperty('ConnectionStatusResponse');
+    expect(document.components.schemas).toHaveProperty('ConnectionReviewResponse');
+    expect(document.components.schemas).toHaveProperty('ConnectionBootstrapManifest');
     expect(contract).toContain(API_VERSION);
     expect(contract).toContain('ErrorEnvelope');
     expect(contract).toContain('__Host-obts_session');
     expect(contract).toContain('X-OBTS-CSRF');
-    expect(contract).toContain('ConsumePairingTokenResponse');
+    expect(contract).toContain('CreateConnectionResponse');
+    expect(contract).toContain('CompleteConnectionResponse');
+    expect(contract).toContain('connectionBearer');
+    expect(contract).not.toContain('/pair/consume');
+    expect(contract).not.toContain('PairingToken');
     expect(contract).toContain('DeviceSelfResponse');
     expect(contract).toContain('DeviceStatusReport');
     expect(contract).toContain('server_device_ref');
-    expect(contract).toContain('is_first_device');
     expect(contract).toContain('ConflictRecord');
     expect(contract).toContain('ConflictReviewPackage');
     expect(contract).toContain('ResolveConflictRequest');

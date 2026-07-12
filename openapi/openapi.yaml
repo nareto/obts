@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Obsidian True Sync Phase 3 API
-  version: 0.1.0
+  version: 0.2.0
   summary: Deployable note history, restore, diagnostics, and maintenance.
 servers:
   - url: /api/v1
@@ -274,6 +274,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CreateConnectionResponse"
+        "400":
+          $ref: "#/components/responses/Error"
+        "429":
+          $ref: "#/components/responses/Error"
   /connections/{connection_id}:
     get:
       summary: Poll a pending browser-assisted connection.
@@ -284,6 +288,14 @@ paths:
       responses:
         "200":
           description: Current connection status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConnectionStatusResponse"
+        "401":
+          $ref: "#/components/responses/Error"
+        "429":
+          $ref: "#/components/responses/Error"
   /connections/{connection_id}/review:
     get:
       summary: Review a pending connection in an authenticated browser session.
@@ -292,6 +304,12 @@ paths:
       responses:
         "200":
           description: Pending device metadata and owned vault choices.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConnectionReviewResponse"
+        "401":
+          $ref: "#/components/responses/Error"
         "404":
           $ref: "#/components/responses/Error"
   /connections/{connection_id}/approve:
@@ -309,6 +327,20 @@ paths:
       responses:
         "200":
           description: Connection approved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
   /connections/{connection_id}/deny:
     post:
       summary: Deny a pending connection.
@@ -318,6 +350,16 @@ paths:
       responses:
         "200":
           description: Connection denied.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
   /connections/{connection_id}/bootstrap:
     post:
       summary: Fetch approved existing-vault Git state before device registration.
@@ -328,6 +370,21 @@ paths:
       responses:
         "200":
           description: Bootstrap manifest and Git packfile.
+          content:
+            multipart/form-data:
+              schema:
+                type: object
+                required: [manifest, packfile]
+                properties:
+                  manifest:
+                    $ref: "#/components/schemas/ConnectionBootstrapManifest"
+                  packfile:
+                    type: string
+                    contentEncoding: binary
+        "401":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
   /connections/{connection_id}/complete:
     post:
       summary: Register the approved device with an explicit onboarding content mode.
@@ -348,6 +405,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CompleteConnectionResponse"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
   /vaults/{vault_id}/devices/{device_id}/revoke:
     post:
       summary: Revoke a paired device and its device tokens after recent dashboard auth.
@@ -512,6 +575,18 @@ paths:
       responses:
         "200":
           description: Onboarding completed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
   /vaults/{vault_id}/sync/unpair:
     post:
       summary: Revoke the current paired device and invalidate its device token.
@@ -959,6 +1034,113 @@ components:
           format: date-time
         poll_interval_ms:
           type: integer
+    ConnectionStatusResponse:
+      oneOf:
+        - type: object
+          required: [status, expires_at]
+          properties:
+            status:
+              const: pending
+            expires_at:
+              type: string
+              format: date-time
+        - type: object
+          required: [status]
+          properties:
+            status:
+              type: string
+              enum: [denied, expired]
+        - type: object
+          required: [status, selection, vault_id, vault_name, expected_main]
+          properties:
+            status:
+              const: approved
+            selection:
+              type: string
+              enum: [new_vault, existing_vault]
+            vault_id:
+              oneOf:
+                - type: "null"
+                - type: string
+            vault_name:
+              type: string
+            expected_main:
+              oneOf:
+                - type: "null"
+                - type: string
+                  pattern: "^[0-9a-f]{40}$"
+        - type: object
+          required: [status, vault_id, vault_name, device_id]
+          properties:
+            status:
+              const: consumed
+            vault_id:
+              type: string
+            vault_name:
+              type: string
+            device_id:
+              type: string
+    ConnectionReviewResponse:
+      type: object
+      required: [connection_id, verification_code, status, plugin_version, device_name, local_vault_name, local_summary, vaults]
+      properties:
+        connection_id:
+          type: string
+        verification_code:
+          type: string
+        status:
+          type: string
+          enum: [pending, approved, denied, consumed, expired]
+        plugin_version:
+          type: string
+        device_name:
+          type: string
+        local_vault_name:
+          type: string
+        local_summary:
+          $ref: "#/components/schemas/ConnectionLocalSummary"
+        vaults:
+          type: array
+          items:
+            type: object
+            required: [vault_id, display_name, current_main, status]
+            properties:
+              vault_id:
+                type: string
+              display_name:
+                type: string
+              current_main:
+                type: string
+                pattern: "^[0-9a-f]{40}$"
+              status:
+                type: string
+                enum: [active, blocked_integrity]
+    ConnectionBootstrapManifest:
+      type: object
+      required: [api_version, connection_id, vault_id, vault_name, root_commit, target_main, changed_paths, explicit_directories]
+      properties:
+        api_version:
+          const: 2026-07-12.browser-onboarding
+        connection_id:
+          type: string
+        vault_id:
+          type: string
+        vault_name:
+          type: string
+        root_commit:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        target_main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        changed_paths:
+          type: array
+          items:
+            type: string
+        explicit_directories:
+          type: array
+          items:
+            type: string
     ApproveConnectionRequest:
       type: object
       required: [selection]
@@ -1139,7 +1321,7 @@ components:
         - client_known_main
       properties:
         api_version:
-          const: 2026-07-02.full-sync
+          const: 2026-07-12.browser-onboarding
         plugin_version:
           type: string
         vault_id:
@@ -1182,7 +1364,7 @@ components:
       required: [api_version, vault_id, device_id, current_local_main, requested_target]
       properties:
         api_version:
-          const: 2026-07-02.full-sync
+          const: 2026-07-12.browser-onboarding
         plugin_version:
           type: string
         vault_id:
@@ -1207,7 +1389,7 @@ components:
       required: [api_version, vault_id, device_id, target_main, changed_paths, current_local_main_is_ancestor, event_seq]
       properties:
         api_version:
-          const: 2026-07-02.full-sync
+          const: 2026-07-12.browser-onboarding
         vault_id:
           type: string
         device_id:

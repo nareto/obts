@@ -13,8 +13,8 @@ Recovery bundles include affected-file snapshots, text patch artifacts for text
 files, local Git refs packs, and checksum manifests. Onboarding intentionally
 blocks when an existing `.obts/` directory contains partial or active device
 state so the owner can recover or reset it explicitly. Authentication happens
-in the server dashboard; the plugin never stores dashboard credentials or asks
-the user to copy a pairing token.
+in the server dashboard; the plugin stores neither dashboard credentials nor
+connection secrets in plugin settings.
 
 Commands:
 

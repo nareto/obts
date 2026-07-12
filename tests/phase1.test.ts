@@ -398,9 +398,9 @@ describe('Phase 1 sync without conflict resolution', () => {
       status: 'ok',
       plugin: {
         current_version: '0.1.17',
-        minimum_version: '0.1.0',
-        recommended_version: '0.1.18',
-        update_required: false,
+        minimum_version: '0.2.0',
+        recommended_version: '0.2.0',
+        update_required: true,
         update_available: true
       }
     });
@@ -1942,6 +1942,137 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect((await fetch(`${baseUrl}/api/v1/pair/consume`, { method: 'POST' })).status).toBe(404);
     expect((await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/pairing-tokens`, { method: 'POST' })).status).toBe(404);
     expect((await server.store.snapshot()).tokens.every((token) => token.kind !== ('pairing' as never))).toBe(true);
+  });
+
+  it('expires bootstrap access and revokes approved connections when their owner is disabled', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const user = await admin.post<{ user_id: string }>('/api/v1/admin/users', {
+      username: 'connection-owner',
+      password: 'connection-owner-password'
+    });
+    const owner = new BrowserSession(baseUrl);
+    expect((await owner.post('/api/v1/auth/login', {
+      username: 'connection-owner',
+      password: 'connection-owner-password'
+    }, false)).status).toBe(200);
+    const vault = await owner.post<{ vault_id: string }>('/api/v1/vaults', { display_name: 'Owner connection vault' });
+
+    const firstDir = join(root, 'expiring-bootstrap');
+    await mkdirp(firstDir);
+    const first = new ObtsPluginClient(firstDir, { serverUrl: baseUrl, deviceName: 'expiring' });
+    const expiring = await first.startOnboarding('Expiring');
+    expect((await owner.post(`/api/v1/connections/${expiring.connection_id}/approve`, {
+      selection: 'existing_vault',
+      vault_id: vault.body.vault_id
+    })).status).toBe(200);
+    await server.store.mutate((db) => {
+      const row = db.connections.find((candidate) => candidate.connection_id === expiring.connection_id)!;
+      row.expires_at = new Date(Date.now() - 1_000).toISOString();
+    });
+    const bootstrap = await fetch(`${baseUrl}/api/v1/connections/${expiring.connection_id}/bootstrap`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${expiring.connection_secret}` }
+    });
+    expect(bootstrap.status).toBe(409);
+    expect((await server.store.snapshot()).connections.find((row) => row.connection_id === expiring.connection_id)?.status).toBe('expired');
+    const expiredCompletion = await fetch(`${baseUrl}/api/v1/connections/${expiring.connection_id}/complete`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${expiring.connection_secret}`,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({ mode: 'use_server', expected_main: null })
+    });
+    expect(expiredCompletion.status).toBe(409);
+
+    const secondDir = join(root, 'disabled-approved-connection');
+    await mkdirp(secondDir);
+    const second = new ObtsPluginClient(secondDir, { serverUrl: baseUrl, deviceName: 'disabled' });
+    const approved = await second.startOnboarding('Disabled owner');
+    expect((await owner.post(`/api/v1/connections/${approved.connection_id}/approve`, {
+      selection: 'existing_vault',
+      vault_id: vault.body.vault_id
+    })).status).toBe(200);
+    expect((await admin.post(`/api/v1/admin/users/${user.body.user_id}/disable`, {})).status).toBe(200);
+    expect((await second.pollOnboarding(approved.connection_id, approved.connection_secret)).status).toBe('denied');
+    expect((await server.store.snapshot()).audit_log.some((row) => row.action === 'connection_revoked_user_disabled')).toBe(true);
+  });
+
+  it('bounds unauthenticated connection creation and authenticated status polling', async () => {
+    const payload = {
+      plugin_version: '0.2.0',
+      device_name: 'rate-limited',
+      local_vault_name: 'Rate limited',
+      local_summary: { has_content: false, syncable_file_count: 0, syncable_bytes: 0, has_detached_baseline: false }
+    };
+    const created: Array<{ connection_id: string; connection_secret: string }> = [];
+    for (let index = 0; index < 100; index += 1) {
+      const response = await fetch(`${baseUrl}/api/v1/connections`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      expect(response.status).toBe(201);
+      created.push((await response.json()) as { connection_id: string; connection_secret: string });
+    }
+    expect((await fetch(`${baseUrl}/api/v1/connections`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload)
+    })).status).toBe(429);
+
+    const connection = created[0]!;
+    for (let index = 0; index < 10; index += 1) {
+      expect((await fetch(`${baseUrl}/api/v1/connections/${connection.connection_id}`, {
+        headers: { authorization: `Bearer ${connection.connection_secret}` }
+      })).status).toBe(200);
+    }
+    expect((await fetch(`${baseUrl}/api/v1/connections/${connection.connection_id}`, {
+      headers: { authorization: `Bearer ${connection.connection_secret}` }
+    })).status).toBe(429);
+  });
+
+  it('persists owner-only onboarding state across restart and fingerprints explicit directories', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'durable-onboarding');
+    await mkdirp(deviceDir);
+    const plugin = new ObtsPluginClient(deviceDir, { serverUrl: baseUrl, deviceName: 'restart-safe' });
+    const connection = await plugin.startOnboarding('Durable onboarding');
+    const journalPath = join(deviceDir, '.obts', 'onboarding.json');
+    const secretPath = join(deviceDir, '.obts', 'auth', 'pending-connection.json');
+    expect((await stat(journalPath)).mode & 0o777).toBe(0o600);
+    expect((await stat(secretPath)).mode & 0o777).toBe(0o600);
+    expect(await readFile(journalPath, 'utf8')).not.toContain(connection.connection_secret);
+
+    const restarted = new ObtsPluginClient(deviceDir, { serverUrl: baseUrl, deviceName: 'restart-safe' });
+    const pending = await restarted.readPendingOnboarding();
+    expect(pending).toMatchObject({
+      secret: connection.connection_secret,
+      journal: { stage: 'awaiting_browser', connection: { connection_id: connection.connection_id } }
+    });
+    await expect(restarted.syncOnce()).rejects.toMatchObject({ code: 'onboarding_incomplete' });
+
+    expect((await admin.post(`/api/v1/connections/${connection.connection_id}/approve`, {
+      selection: 'new_vault',
+      display_name: 'Durable vault'
+    })).status).toBe(200);
+    const analysis = await restarted.analyzeOnboarding(connection.connection_id, connection.connection_secret);
+    expect((await restarted.readPendingOnboarding())?.journal.stage).toBe('awaiting_confirmation');
+    await mkdirp(join(deviceDir, 'explicit-empty-directory'));
+    await expect(restarted.finishOnboarding({
+      connectionId: connection.connection_id,
+      secret: connection.connection_secret,
+      analysis,
+      mode: 'initialize'
+    })).rejects.toMatchObject({ code: 'onboarding_snapshot_changed' });
+    expect((await restarted.readPendingOnboarding())?.journal).toMatchObject({
+      stage: 'blocked',
+      last_error_code: 'onboarding_snapshot_changed'
+    });
+    await restarted.cancelOnboarding();
+    expect(await restarted.readPendingOnboarding()).toBeNull();
+    await expect(stat(journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(stat(secretPath)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('creates a new server vault from the browser-approved local onboarding snapshot', async () => {

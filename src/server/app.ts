@@ -413,23 +413,26 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const body = requestBody(request);
     const localSummary = body.local_summary;
     assertRecord(localSummary, 'local_summary');
-    const result = await connections.create({
-      plugin_version: readString(body, 'plugin_version'),
-      device_name: readString(body, 'device_name'),
-      local_vault_name: readString(body, 'local_vault_name'),
-      local_summary: {
-        has_content: readRequiredBoolean(localSummary, 'has_content'),
-        syncable_file_count: readNonNegativeInteger(localSummary, 'syncable_file_count'),
-        syncable_bytes: readNonNegativeInteger(localSummary, 'syncable_bytes'),
-        has_detached_baseline: readRequiredBoolean(localSummary, 'has_detached_baseline')
-      }
-    });
+    const result = await connections.create(
+      {
+        plugin_version: readString(body, 'plugin_version'),
+        device_name: readString(body, 'device_name'),
+        local_vault_name: readString(body, 'local_vault_name'),
+        local_summary: {
+          has_content: readRequiredBoolean(localSummary, 'has_content'),
+          syncable_file_count: readNonNegativeInteger(localSummary, 'syncable_file_count'),
+          syncable_bytes: readNonNegativeInteger(localSummary, 'syncable_bytes'),
+          has_detached_baseline: readRequiredBoolean(localSummary, 'has_detached_baseline')
+        }
+      },
+      request.ip
+    );
     return reply.status(201).send(result);
   });
 
   app.get('/api/v1/connections/:connectionId', async (request) => {
     const { connectionId } = connectionPathParams(request);
-    return await connections.status(connectionId, readBearerToken(request.headers.authorization));
+    return await connections.status(connectionId, readBearerToken(request.headers.authorization), request.ip);
   });
 
   app.get('/api/v1/connections/:connectionId/review', async (request) => {
@@ -1309,6 +1312,7 @@ function buildRedactedDiagnostics(
   generated_at: string;
   vault: { vault_id: string; status: 'active' | 'blocked_integrity'; current_main: string };
   devices: Array<Record<string, unknown>>;
+  connection_counts: Record<string, number>;
   conflicts: Array<Record<string, unknown>>;
   event_cursor: number;
   operation_counts: Record<string, number>;
@@ -1338,6 +1342,12 @@ function buildRedactedDiagnostics(
         local_status_label: device.local_status_label === null ? null : 'reported',
         local_error_code: device.local_error_code === null ? null : 'reported_error'
       })),
+    connection_counts: db.connections
+      .filter((connection) => connection.selected_vault_id === vaultId)
+      .reduce<Record<string, number>>((counts, connection) => {
+        counts[connection.status] = (counts[connection.status] ?? 0) + 1;
+        return counts;
+      }, {}),
     conflicts: db.conflicts
       .filter((conflict) => conflict.vault_id === vaultId)
       .map((conflict) => ({
@@ -2278,6 +2288,12 @@ async function checkVaultPersistentState(db: MetadataDb, vaultId: string, git: G
   }
   if (!(await git.commitExists(vaultId, vault.current_main))) {
     return { ok: false, error: 'vault main commit is missing from the Git store', vaultId };
+  }
+  if (!vault.root_commit || !(await git.commitExists(vaultId, vault.root_commit))) {
+    return { ok: false, error: 'vault root commit is missing from the Git store', vaultId };
+  }
+  if (!(await git.isAncestor(vaultId, vault.root_commit, vault.current_main))) {
+    return { ok: false, error: 'vault root commit is not an ancestor of current main', vaultId };
   }
   const integrity = await git.checkIntegrity(vaultId);
   if (!integrity.ok) {

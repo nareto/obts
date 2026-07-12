@@ -6,8 +6,8 @@ Sync Without Conflict Resolution.
 Implemented runtime pieces:
 
 - TypeScript package with build, type-check, and Vitest commands.
-- `obts` CLI entrypoint for first-run setup, vault creation, pairing-token
-  creation, device listing, conflict listing, readiness checks, serving the API,
+- `obts` CLI entrypoint for first-run setup, vault creation, device listing,
+  conflict listing, readiness checks, serving the API,
   and local admin password-reset recovery.
 - OCI image definition with native `git`, persistent-state volume, readiness
   healthcheck, and `obts serve` startup command.
@@ -17,10 +17,10 @@ Implemented runtime pieces:
   tested sync engine live together under `obsidian-plugin/src/`.
 - Shared API types, status labels, validation helpers, and vault path policy.
 - Committed OpenAPI 3.1 contract at `openapi/openapi.yaml`.
-- Fastify server with first-run setup, Argon2id password storage, login/logout sessions, CSRF-protected dashboard mutations, admin user creation, vault creation, pairing tokens, device tokens, multipart push, multipart pull, events, conflicts, and health checks.
-- Phase 1 admin lifecycle APIs for redacted account listing, user disable/re-enable, admin grant/revoke with final-admin protection, one-time password reset tokens, failed-login backoff, and individual device revocation. User disable and device revocation immediately invalidate the affected dashboard sessions, pairing tokens, and device tokens.
+- Fastify server with first-run setup, Argon2id password storage, login/logout sessions, CSRF-protected dashboard mutations, admin user creation, vault creation, browser connection requests, device tokens, multipart push, multipart pull, events, conflicts, and health checks.
+- Phase 1 admin lifecycle APIs for redacted account listing, user disable/re-enable, admin grant/revoke with final-admin protection, one-time password reset tokens, failed-login backoff, and individual device revocation. User disable and device revocation immediately invalidate the affected dashboard sessions, approved connections, and device tokens.
 - Dashboard sessions use a browser-compatible `obts_session` cookie for HTTP/dev deployments and the hardened `__Host-obts_session` Secure cookie when `publicBaseUrl` is HTTPS.
-- Recent-auth enforcement covers sensitive Phase 1 dashboard mutations such as pairing token creation and admin account creation. Pairing token consumption enforces the issued device name before registering a device.
+- Recent-auth enforcement covers sensitive dashboard mutations such as browser connection approval and admin account creation. Connection completion preserves the approved device name and vault selection when registering a device.
 - Multipart sync manifests reject non-commit ref strings and malformed SHA-256 packfile digests before Git ref mutation logic runs.
 - Uploaded packfiles are unpacked into a temporary quarantine repo for commit,
   path-policy, ancestry, and blob-size validation. Only accepted
@@ -39,15 +39,13 @@ Implemented runtime pieces:
   plugin can observe `main_advanced`, conflict, rejection, and recovery events
   without a dashboard session cookie.
 - Plugin-side `.obts/` state with `isomorphic-git`, device token storage, durable watcher change hints, queue state, explicit directory-intent state for empty folder creation/deletion, recovery bundles with file snapshots, text patches, local Git refs packs, and artifact checksums, local apply lock, apply journal, local commit creation, device-token metadata rehydration when `state.json` is lost, multipart push, multipart pull, safe apply, safe incomplete-journal replay with recovery blocking when replay is unsafe, explicit replace-local-with-server recovery, and explicit rebuild from current server `main`.
-- Rebuild classifies repeated, same-device fast-forward, snapshot-only, and divergent local history: fast-forward commits stay queued, snapshot-only edits become a new recovery commit based on rebuilt `main`, and divergent same-device history blocks for export plus reset or re-pair.
+- Rebuild classifies repeated, same-device fast-forward, snapshot-only, and divergent local history: fast-forward commits stay queued, snapshot-only edits become a new recovery commit based on rebuilt `main`, and divergent same-device history blocks for export plus reset or reconnect.
 - Plugin sync records server-created conflicts as a local `Review needed` blocking state, so later automatic sync or pull/apply attempts stop before replacing local review content.
 - The sync pull API also rejects devices marked `review_needed` or `blocked_recovery`, so a stale or reset plugin cannot bypass server-known conflict/recovery blocks and apply server state over review content.
 - Authenticated API status summary for vault/device/conflict health; Phase 1
-  intentionally ships no browser dashboard or frontend, so setup, vault
-  creation, pairing-token creation, device listing, conflict listing, and
-  health inspection remain CLI workflows.
+  exposes browser-assisted onboarding through the dashboard while retaining CLI workflows for setup, vault, device, conflict, and health inspection.
 - Dashboard device behind/synced state is derived from each device's acknowledged `last_applied_main` commit cursor rather than timestamps; timestamps remain display metadata only.
-- Safe pairing applies and acknowledges the current server `main` immediately, so an empty or already-matching paired device appears Synced before the next manual sync command.
+- Safe browser onboarding applies and acknowledges the current server `main` immediately, so an empty or already-matching paired device appears Synced before the next manual sync command.
 - Readiness checks that fail closed when metadata, Git refs, conflict commits, writable storage, or native Git readiness are inconsistent.
 
 The Phase 1 server uses a durable JSON metadata adapter in `OBTS_DATA_DIR/metadata/phase1.json` so the product slice can run without requiring a local Postgres service in this repository. The service boundaries are deliberately named around metadata and sync operations so a Postgres adapter can replace the file adapter without changing the Git sync model.
@@ -60,8 +58,7 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 
 - first-run setup is one-time, liveness/readiness health endpoints work, and
   new vaults create a real empty-tree `refs/heads/main` commit immediately;
-- Phase 1 CLI commands can set up an admin, create a vault, create pairing
-  tokens, list devices, list conflicts, inspect readiness, create a local
+- Phase 1 CLI commands can set up an admin, create a vault, list devices, list conflicts, inspect readiness, create a local
   admin recovery token from persistent state, and create a recovery admin only
   when no enabled admin account remains;
 - two paired devices sync non-conflicting vault changes through server `main`;
@@ -80,9 +77,9 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - plugin state surfaces `Uploading` during queued push attempts and `Applying`
   while pulled server `main` is being materialized locally;
 - divergent additional-device local content is committed as that actor device's proposal, optionally using current server `main` as `base_commit`, and the server either merges it or records a conflict without adopting another device ref;
-- pairing tokens are scoped to their issued device name and cannot be consumed twice;
+- connection secrets are short-lived, scoped to one request, and cannot register multiple devices;
 - replace-local-with-server recovers and safely materializes file/directory collisions, including local directories that must be replaced by server files;
-- partial or already-paired local `.obts/` state blocks pairing before a one-time pairing token is consumed;
+- partial or already-connected local `.obts/` state blocks onboarding before a browser connection is started;
 - clean overlapping Markdown edits merge through native Git before conflict creation;
 - Markdown merges with concurrent same-key frontmatter edits are rejected as conflicts even when Git can produce a clean text merge;
 - compact same-file JSON Canvas edits with disjoint semantic fields merge deterministically when native Git reports a text conflict, while same-field Canvas edits create a durable conflict;

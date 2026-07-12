@@ -170,7 +170,7 @@ Acceptance criteria:
 
 - Local edits are durably committed or recoverably snapshotted before upload.
 - On startup and before sync decisions, the scanner commits visible filesystem differences to the local Git journal when path policy validation passes.
-- If `state.json` is missing, corrupt, or incomplete but the device token and local Git journal are intact, the plugin rehydrates non-secret identity/ref metadata from the server and resumes normal commit/upload behavior without reset or re-pair.
+- If `state.json` is missing, corrupt, or incomplete but the device token and local Git journal are intact, the plugin rehydrates non-secret identity/ref metadata from the server and resumes normal commit/upload behavior without reset or reconnect.
 - `.obts/` is excluded from vault sync, Git worktree content, and manifest/path scanning.
 - Retrying an upload of the same Git commit is idempotent.
 - A new local edit creates a new Git commit with normal Git ancestry.
@@ -434,7 +434,7 @@ Dashboard and plugin status labels must use this shared vocabulary:
 | Review needed | Warning | A conflict requires owner review. |
 | Stale review | Warning | A conflict package must be refreshed before resolution. |
 | Blocked | Danger | Sync is stopped until user or operator action completes. |
-| Needs recovery | Danger | A recovery bundle or reset/re-pair flow is required. |
+| Needs recovery | Danger | A recovery bundle or reset/reconnect flow is required. |
 | Unsafe local state | Danger | Local apply or upload is blocked to avoid data loss. |
 | Integrity failure | Danger | Persistent state is inconsistent and mutations are blocked. |
 
@@ -604,7 +604,7 @@ Behavior:
    - pending fast-forward local commits whose ancestry descends from the current server device ref remain queued and are uploaded normally after rebuild;
    - local visible differences that are provably outside the resolved conflict paths and match this device's pending conflicted commit are automatically snapshotted into a recovery bundle, recommitted on top of current server `main`, and uploaded through the normal device ref path;
    - uncommitted or snapshot-only local edits become one new local recovery commit based on the rebuilt local `main`, then enter the normal upload queue;
-   - divergent same-device history that does not descend from the current server device ref remains only in the recovery bundle, the device enters `blocked_recovery`, and normal sync stays blocked until the owner exports the bundle and resets or re-pairs the device.
+   - divergent same-device history that does not descend from the current server device ref remains only in the recovery bundle, the device enters `blocked_recovery`, and normal sync stays blocked until the owner exports the bundle and resets or reconnects the device.
 
 Acceptance criteria:
 
@@ -916,7 +916,7 @@ Rules:
 - A device ref update is accepted only if it is a fast-forward from the current device ref or exactly repeats the current head.
 - A same-device non-fast-forward update blocks sync and requires recovery; it must not silently overwrite the device ref.
 - A stale client-known `main` triggers merge evaluation; it must not overwrite current `main` directly.
-- A re-pairing client may use an imported pull pack plus Git ancestry checks to treat a detached baseline as a safe stale server copy only when that baseline is reachable from current server `main`.
+- A reconnecting client may use an imported pull pack plus Git ancestry checks to treat a detached baseline as a safe stale server copy only when that baseline is reachable from current server `main`.
 - Malformed Git transfers are rejected without advancing device refs or `main`.
 - Uploaded commits containing invalid or hard-excluded paths are rejected without advancing device refs or `main`.
 - Git timestamps are never used to order sync or determine whether a change is new.
@@ -1419,7 +1419,7 @@ Acceptance proof:
 - new commit advances the device ref;
 - same-device non-fast-forward update blocks and requires recovery;
 - lost `state.json` with a valid device token and intact local Git refs rehydrates automatically, then uploads filesystem edits through the device ref;
-- reset/re-paired additional-device content uploads as the actor device's proposal and either merges safely or becomes a server conflict without adopting another device's ref;
+- reset or reconnected additional-device content uploads as the actor device's proposal and either merges safely or becomes a server conflict without adopting another device's ref;
 - concurrent disjoint edits auto-merge;
 - concurrent same-file Markdown edits merge when safe;
 - concurrent same-file `.canvas` edits merge when the JSON Canvas semantic merge contract accepts them;

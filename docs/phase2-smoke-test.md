@@ -25,12 +25,12 @@ Phase 2 dashboard conflict-resolution workflow without using test harness code.
 3. Open `http://127.0.0.1:3000/`, create the initial admin account, and create
    a vault from the dashboard.
 
-4. Use the dashboard `Pair device` dialog to create a pairing token for the
-   first copied test vault. Install the plugin from `obsidian-plugin/` into the
-   copied vault's `.obsidian/plugins/obts/` directory, then enter the server
-   URL, pairing token, and issued device name in plugin settings.
+4. Install the plugin from `obsidian-plugin/` into the first copied vault's
+   `.obsidian/plugins/obts/` directory. Enter the server URL and device name,
+   choose `Set up sync`, confirm the verification code in the browser, and
+   approve the existing test vault. Return to Obsidian and finish setup.
 
-5. Pair a second copied test vault through the same dashboard flow.
+5. Connect a second copied test vault through the same browser-assisted flow.
 
 6. Create `shared.md` with the same base content on the first device and sync
    it. Let the second device pull and apply that server state.

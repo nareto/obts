@@ -9,7 +9,7 @@ Use the same server configuration as Phase 1:
 
 - `OBTS_DATA_DIR`: persistent state root. Defaults to `./.obts-server` for
   local development and `/var/lib/obts` in the OCI image.
-- `OBTS_PUBLIC_BASE_URL`: public URL used for dashboard links and pairing URLs.
+- `OBTS_PUBLIC_BASE_URL`: public URL used for dashboard and browser onboarding links.
 - `OBTS_SESSION_SECRET`: session signing secret for dashboard sessions.
 - `OBTS_GIT_STORE_DIR`: optional Git store override. Defaults to
   `$OBTS_DATA_DIR/git`.
@@ -39,17 +39,14 @@ node dist/src/cli.js serve --host 0.0.0.0 --port 3000
 Open `http://127.0.0.1:3000/` in a browser. The dashboard is a static Svelte
 SPA served by the Fastify server; there is no second application server.
 
-From the dashboard:
+From the plugin and dashboard:
 
 1. Complete initial setup or sign in.
-2. Create a vault when no vault exists.
-3. Use `Pair device` to create a one-time pairing URL or token. Pairing token
-   creation requires recent dashboard authentication.
-4. Inspect the Overview, Devices, Conflicts, History, and Maintenance pages for
-   vault status, device state, unresolved conflicts, readiness, and activity.
-5. Resolve review-needed conflicts from the Conflicts page. Resolution
-   submission uses the authenticated dashboard session without another password
-   prompt and includes the expected current `main` commit from the review package.
+2. In Obsidian, enter the server URL and device name, then choose `Set up sync`.
+3. Review the matching verification code in the browser and approve either a new vault or an existing owned vault. Approval requires recent dashboard authentication.
+4. Return to Obsidian to review the local/server analysis and confirm use-server, initialize, or merge behavior.
+5. Inspect the Overview, Devices, Conflicts, History, and Maintenance pages for vault status, device state, unresolved conflicts, readiness, and activity.
+6. Resolve review-needed conflicts from the Conflicts page. Resolution submission uses the authenticated dashboard session without another password prompt and includes the expected current `main` commit from the review package.
 
 The dashboard offers the Phase 2 conflict choices:
 

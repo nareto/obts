@@ -326,6 +326,9 @@ class ObtsObsidianClient {
     this.directoryStatePath = path.join(this.obtsDir, "directory-state.json");
     this.applyJournalPath = path.join(this.obtsDir, "apply-journal.json");
     this.applyLockPath = path.join(this.obtsDir, "apply.lock");
+    this.onboardingJournalPath = path.join(this.obtsDir, "onboarding.json");
+    this.pendingConnectionPath = path.join(this.obtsDir, "auth", "pending-connection.json");
+    this.onboardingOperation = false;
   }
 
   async initialize() {
@@ -372,12 +375,45 @@ class ObtsObsidianClient {
     await this.writeQueue(await this.readQueue());
   }
 
+  async readPendingOnboarding() {
+    const journal = await readJson(this.onboardingJournalPath, null);
+    const pending = await readJson(this.pendingConnectionPath, null);
+    if (!journal || journal.stage === "complete" || !pending || !pending.connection_secret) return null;
+    return { journal, secret: pending.connection_secret };
+  }
+
+  async cancelOnboarding() {
+    await fsp.rm(this.pendingConnectionPath, { force: true });
+    await fsp.rm(this.onboardingJournalPath, { force: true });
+  }
+
+  async writeOnboardingJournal(journal) {
+    await writeJson(this.onboardingJournalPath, Object.assign({}, journal, { updated_at: nowIso() }));
+  }
+
+  async updateOnboardingStage(connectionId, stage, selectedMode, errorCode = null) {
+    const pending = await this.readPendingOnboarding();
+    if (!pending || pending.journal.connection.connection_id !== connectionId) return;
+    await this.writeOnboardingJournal(Object.assign({}, pending.journal, {
+      stage,
+      selected_mode: selectedMode || pending.journal.selected_mode,
+      last_error_code: errorCode
+    }));
+  }
+
+  async completePendingOnboarding(connectionId) {
+    const pending = await this.readPendingOnboarding();
+    if (!pending || pending.journal.connection.connection_id !== connectionId) return;
+    await this.writeOnboardingJournal(Object.assign({}, pending.journal, { stage: "complete", last_error_code: null }));
+    await fsp.rm(this.pendingConnectionPath, { force: true });
+  }
+
   async startOnboarding() {
     await this.assertPairingCanStart();
     await this.flushEditorBuffersToDisk();
     const summary = await this.localSnapshotSummary();
     const existing = await readJson(this.statePath, null);
-    return await postJson(this.url("/api/v1/connections"), {
+    const connection = await postJson(this.url("/api/v1/connections"), {
       plugin_version: PLUGIN_VERSION,
       device_name: this.plugin.settings.deviceName || "Obsidian device",
       local_vault_name: this.plugin.app.vault.getName(),
@@ -388,6 +424,18 @@ class ObtsObsidianClient {
         has_detached_baseline: Boolean(existing && existing.unpaired_baseline_vault_id && existing.unpaired_baseline_main)
       }
     });
+    await writeJson(this.pendingConnectionPath, { connection_secret: connection.connection_secret, created_at: nowIso() });
+    const redactedConnection = Object.assign({}, connection);
+    delete redactedConnection.connection_secret;
+    await this.writeOnboardingJournal({
+      version: 1,
+      stage: "awaiting_browser",
+      connection: redactedConnection,
+      analysis: null,
+      selected_mode: null,
+      last_error_code: null
+    });
+    return connection;
   }
 
   async pollOnboarding(connectionId, secret) {
@@ -395,10 +443,17 @@ class ObtsObsidianClient {
       headers: { authorization: `Bearer ${secret}` }
     });
     if (!response.ok) await throwResponseError(response);
-    return await response.json();
+    const status = await response.json();
+    if (status.status === "approved") await this.updateOnboardingStage(connectionId, "approved");
+    if (status.status === "denied" || status.status === "expired") {
+      await fsp.rm(this.pendingConnectionPath, { force: true });
+      await fsp.rm(this.onboardingJournalPath, { force: true });
+    }
+    return status;
   }
 
   async analyzeOnboarding(connectionId, secret) {
+    await this.updateOnboardingStage(connectionId, "analyzing");
     const status = await this.pollOnboarding(connectionId, secret);
     if (status.status !== "approved") {
       throw new ObtsBlockedError("connection_not_approved", "Approve this connection in the browser first.");
@@ -406,7 +461,7 @@ class ObtsObsidianClient {
     await this.flushEditorBuffersToDisk();
     const local = await this.localSnapshotSummary();
     if (status.selection === "new_vault") {
-      return {
+      const analysis = {
         selection: status.selection,
         vaultId: null,
         vaultName: status.vault_name,
@@ -418,6 +473,9 @@ class ObtsObsidianClient {
         localFileCount: local.fileCount,
         localBytes: local.bytes
       };
+      const pending = await this.readPendingOnboarding();
+      if (pending) await this.writeOnboardingJournal(Object.assign({}, pending.journal, { stage: "awaiting_confirmation", analysis }));
+      return analysis;
     }
     const response = await fetchWithTimeout(this.url(`/api/v1/connections/${connectionId}/bootstrap`), {
       method: "POST",
@@ -441,7 +499,7 @@ class ObtsObsidianClient {
           : validBaseline
             ? "shared_baseline_divergent"
             : "independent_divergent";
-    return {
+    const analysis = {
       selection: status.selection,
       vaultId: bootstrap.manifest.vault_id,
       vaultName: bootstrap.manifest.vault_name,
@@ -453,9 +511,25 @@ class ObtsObsidianClient {
       localFileCount: local.fileCount,
       localBytes: local.bytes
     };
+    const pending = await this.readPendingOnboarding();
+    if (pending) await this.writeOnboardingJournal(Object.assign({}, pending.journal, { stage: "awaiting_confirmation", analysis }));
+    return analysis;
   }
 
   async finishOnboarding(connectionId, secret, analysis, mode) {
+    this.onboardingOperation = true;
+    await this.updateOnboardingStage(connectionId, "registering", mode);
+    try {
+      return await this.finishOnboardingInternal(connectionId, secret, analysis, mode);
+    } catch (error) {
+      await this.updateOnboardingStage(connectionId, "blocked", mode, error instanceof ObtsBlockedError ? error.code : "onboarding_failed");
+      throw error;
+    } finally {
+      this.onboardingOperation = false;
+    }
+  }
+
+  async finishOnboardingInternal(connectionId, secret, analysis, mode) {
     const current = await this.localSnapshotSummary();
     if (current.fingerprint !== analysis.localFingerprint) {
       throw new ObtsBlockedError("onboarding_snapshot_changed", "The local vault changed. Review the updated onboarding summary before continuing.");
@@ -471,6 +545,7 @@ class ObtsObsidianClient {
         proposal_base: analysis.proposalBase
       } : {})
     });
+    await this.updateOnboardingStage(connectionId, "applying_uploading", mode);
     await writeJson(this.authPath, { device_token: completion.device_token, created_at: nowIso() });
     await this.writeState({
       user_id: completion.user_id,
@@ -507,6 +582,7 @@ class ObtsObsidianClient {
         applied_main: pulled.manifest.target_main
       });
       await this.writeState(Object.assign({}, await this.readState(), { status_label: "Synced", updated_at: nowIso() }));
+      await this.completePendingOnboarding(connectionId);
       return { status: "Synced", main: pulled.manifest.target_main };
     }
     const proposalBase = mode === "initialize" ? completion.root_commit : analysis.proposalBase;
@@ -517,16 +593,23 @@ class ObtsObsidianClient {
     const proposalCommit = await this.createLocalCommit("obts: onboarding local vault");
     await this.writeQueue({ pending_commit: proposalCommit, expected_device_ref: null, status: proposalCommit ? "queued_local" : "idle", attempts: 0, updated_at: nowIso() });
     const synced = await this.syncOnce({ confirmInitialImport: false });
-    if (synced.status === "Review needed") return synced;
+    if (synced.status === "Review needed") {
+      await this.updateOnboardingStage(connectionId, "awaiting_conflict", mode);
+      return synced;
+    }
     const finalState = await this.readState();
     await postJsonWithBearer(this.url(`/api/v1/vaults/${completion.vault_id}/onboarding/complete`), completion.device_token, {
       applied_main: finalState.local_main
     });
+    await this.completePendingOnboarding(connectionId);
     return synced;
   }
 
   async syncOnce(options) {
     await this.initialize();
+    if (!this.onboardingOperation && await this.readPendingOnboarding()) {
+      throw new ObtsBlockedError("onboarding_incomplete", "Finish or cancel browser onboarding before normal sync.");
+    }
     const state = await this.readState();
     if (!state.vault_id || !state.device_id) {
       throw new ObtsBlockedError("not_paired", "Device is not paired.");
@@ -1466,7 +1549,13 @@ class ObtsObsidianClient {
 
   async localSnapshotSummary() {
     const files = await this.scanSyncableFiles();
+    const directories = await this.listLocalVaultDirectories();
     const hash = crypto.createHash("sha256");
+    for (const directoryPath of directories) {
+      hash.update("dir\0");
+      hash.update(directoryPath);
+      hash.update("\0");
+    }
     let bytes = 0;
     for (const filePath of files) {
       const content = await this.adapterReadBinary(filePath);
@@ -2645,8 +2734,23 @@ class ObtsOnboardingModal extends Modal {
     this.mode = null;
   }
 
-  onOpen() {
-    this.renderStart();
+  async onOpen() {
+    const pending = await this.plugin.client.readPendingOnboarding();
+    if (!pending) {
+      this.renderStart();
+      return;
+    }
+    this.connection = Object.assign({}, pending.journal.connection, { connection_secret: pending.secret });
+    this.analysis = pending.journal.analysis || null;
+    this.mode = pending.journal.selected_mode || null;
+    if (this.analysis && !["awaiting_browser", "approved", "analyzing"].includes(pending.journal.stage)) {
+      this.renderConfirmation();
+      return;
+    }
+    this.renderWaiting();
+    void this.pollUntilApproved().catch((error) => {
+      if (this.waitingFeedback) setFeedback(this.waitingFeedback, error instanceof Error ? error.message : "Unable to resume setup.", "error");
+    });
   }
 
   onClose() {
@@ -2702,7 +2806,10 @@ class ObtsOnboardingModal extends Modal {
     code.createEl("strong", { text: this.connection.verification_code });
     const feedback = contentEl.createDiv({ cls: "obts-feedback obts-feedback--muted", text: "Waiting for approval...", attr: { "aria-live": "polite" } });
     new Setting(contentEl)
-      .addButton((button) => button.setButtonText("Cancel").onClick(() => this.close()))
+      .addButton((button) => button.setButtonText("Cancel").onClick(async () => {
+        await this.plugin.client.cancelOnboarding();
+        this.close();
+      }))
       .addButton((button) => button.setButtonText("Reopen browser").onClick(() => window.open(this.connection.authorization_url)));
     this.waitingFeedback = feedback;
   }
@@ -2769,7 +2876,10 @@ class ObtsOnboardingModal extends Modal {
     const feedback = contentEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
     const actionLabel = this.mode === "initialize" ? "Create vault and upload" : this.mode === "merge" ? "Submit for merge" : "Use server vault";
     new Setting(contentEl)
-      .addButton((button) => button.setButtonText("Cancel").onClick(() => this.close()))
+      .addButton((button) => button.setButtonText("Cancel").onClick(async () => {
+        await this.plugin.client.cancelOnboarding();
+        this.close();
+      }))
       .addButton((button) => button.setButtonText(actionLabel).setCta().onClick(async () => {
         button.setDisabled(true);
         setFeedback(feedback, "Creating recovery bundle and completing setup...", "muted");
@@ -2833,7 +2943,7 @@ class ObtsSettingTab extends PluginSettingTab {
       );
 
     const sectionHeader = containerEl.createDiv({ cls: "obts-settings-section-header" });
-    sectionHeader.createEl("h3", { text: recoveryBlocked ? "Recovery required" : paired ? "Device" : "Pair Device" });
+    sectionHeader.createEl("h3", { text: recoveryBlocked ? "Recovery required" : paired ? "Device" : "Connect Vault" });
     sectionHeader.createEl("span", {
       cls: paired ? "obts-status-pill obts-status-pill--ok" : "obts-status-pill",
       text: recoveryBlocked ? "Needs recovery" : paired ? "Paired" : "Not paired"

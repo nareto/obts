@@ -9,7 +9,7 @@ that operate on the same state:
 
 - `OBTS_DATA_DIR`: persistent state root. Defaults to `./.obts-server` for
   local development and `/var/lib/obts` in the OCI image.
-- `OBTS_PUBLIC_BASE_URL`: public URL used when creating pairing links.
+- `OBTS_PUBLIC_BASE_URL`: public URL used for dashboard and browser onboarding links.
 - `OBTS_SESSION_SECRET`: session signing secret for HTTP sessions.
 - `OBTS_GIT_STORE_DIR`: optional Git store override. Defaults to
   `$OBTS_DATA_DIR/git`.

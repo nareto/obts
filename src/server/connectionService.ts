@@ -14,15 +14,24 @@ import type { ConnectionRequestRow, MetadataStore, UserRow } from './metadataSto
 
 const CONNECTION_TTL_MS = 10 * 60 * 1000;
 const POLL_INTERVAL_MS = 2_000;
+const CREATION_WINDOW_MS = 60_000;
+const MAX_CREATIONS_PER_WINDOW = 100;
+const POLL_WINDOW_MS = 1_000;
+const MAX_POLLS_PER_WINDOW = 10;
+const MAX_RATE_LIMIT_KEYS = 10_000;
 
 export class ConnectionService {
+  private readonly creationLimits = new Map<string, number[]>();
+  private readonly pollLimits = new Map<string, number[]>();
+
   constructor(
     private readonly store: MetadataStore,
     private readonly git: GitService,
     private readonly publicBaseUrl: string
   ) {}
 
-  async create(input: CreateConnectionRequest): Promise<CreateConnectionResponse> {
+  async create(input: CreateConnectionRequest, origin = 'unknown'): Promise<CreateConnectionResponse> {
+    this.enforceCreationLimit(origin);
     const secret = newSecretToken('obts_conn');
     const secretHash = hashToken(secret);
     const connectionId = newId('con');
@@ -65,10 +74,11 @@ export class ConnectionService {
     };
   }
 
-  async status(connectionId: string, secret: string): Promise<ConnectionStatusResponse> {
+  async status(connectionId: string, secret: string, origin = 'unknown'): Promise<ConnectionStatusResponse> {
     return await this.store.mutate((db) => {
       expireConnections(db.connections);
       const connection = authenticatedConnection(db.connections, connectionId, secret);
+      this.enforcePollLimit(`${origin}:${connectionId}`);
       if (connection.status === 'pending') {
         return { status: 'pending', expires_at: connection.expires_at };
       }
@@ -187,8 +197,11 @@ export class ConnectionService {
     explicitDirectories: string[];
     packfile: Buffer;
   }> {
-    const db = await this.store.snapshot();
-    const connection = authenticatedConnection(db.connections, connectionId, secret);
+    const { db, connection } = await this.store.mutate((mutableDb) => {
+      expireConnections(mutableDb.connections);
+      const authenticated = authenticatedConnection(mutableDb.connections, connectionId, secret);
+      return { db: structuredClone(mutableDb), connection: structuredClone(authenticated) };
+    });
     if (connection.status !== 'approved' || connection.selection !== 'existing_vault' || !connection.selected_vault_id) {
       throw new AuthError(409, 'connection_not_bootstrappable', 'Connection does not target an existing vault.');
     }
@@ -379,6 +392,28 @@ export class ConnectionService {
     return responseFor(vault, device, deviceToken, device.onboarding_mode);
   }
 
+  private enforceCreationLimit(origin: string): void {
+    const now = Date.now();
+    const recent = (this.creationLimits.get(origin) ?? []).filter((timestamp) => now - timestamp < CREATION_WINDOW_MS);
+    if (recent.length >= MAX_CREATIONS_PER_WINDOW) {
+      throw new AuthError(429, 'connection_rate_limited', 'Too many connection requests. Try again later.');
+    }
+    recent.push(now);
+    this.creationLimits.set(origin, recent);
+    pruneOldestMapEntries(this.creationLimits, MAX_RATE_LIMIT_KEYS);
+  }
+
+  private enforcePollLimit(key: string): void {
+    const now = Date.now();
+    const recent = (this.pollLimits.get(key) ?? []).filter((timestamp) => now - timestamp < POLL_WINDOW_MS);
+    if (recent.length >= MAX_POLLS_PER_WINDOW) {
+      throw new AuthError(429, 'connection_rate_limited', 'Connection status is being polled too quickly.');
+    }
+    recent.push(now);
+    this.pollLimits.set(key, recent);
+    pruneOldestMapEntries(this.pollLimits, MAX_RATE_LIMIT_KEYS);
+  }
+
   private async validateProposal(
     db: Awaited<ReturnType<MetadataStore['snapshot']>>,
     connection: ConnectionRequestRow,
@@ -431,6 +466,14 @@ function authenticatedConnection(connections: ConnectionRequestRow[], connection
     connection.status = 'expired';
   }
   return connection;
+}
+
+function pruneOldestMapEntries<T>(entries: Map<string, T>, maximum: number): void {
+  while (entries.size > maximum) {
+    const oldest = entries.keys().next().value as string | undefined;
+    if (oldest === undefined) return;
+    entries.delete(oldest);
+  }
 }
 
 function expireConnections(connections: ConnectionRequestRow[]): void {

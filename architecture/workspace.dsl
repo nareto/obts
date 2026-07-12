@@ -2,8 +2,8 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
   !identifiers hierarchical
 
   model {
-    vaultOwner = person "Vault owner" "Installs the self-hosted server, creates vaults, pairs devices, reviews conflicts, and runs maintenance."
-    deviceUser = person "Device user" "Edits notes in Obsidian and observes sync status on paired devices."
+    vaultOwner = person "Vault owner" "Installs the self-hosted server, creates vaults, approves browser-assisted device connections, reviews conflicts, and runs maintenance."
+    deviceUser = person "Device user" "Edits notes in Obsidian and observes sync status on connected devices."
     maintainer = person "Maintainer/operator" "Upgrades the server and plugin, runs backups, rotates server key material, and reviews diagnostics."
 
     obsidian = softwareSystem "Obsidian" "External desktop and mobile note-taking application that hosts the community plugin and owns vault APIs."
@@ -14,7 +14,8 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
       !adrs adrs
 
       server = container "Server API and CLI" "PRD-specified Node/Fastify service that authenticates users/devices, stores vault content encrypted at rest, performs server-side merge/conflict workflows, serves the dashboard, and provides operator commands." "TypeScript, Node.js, Fastify" {
-        authService = component "AuthService" "Authenticates dashboard sessions, device tokens, and one-time pairing tokens while storing only token hashes." "TypeScript"
+        authService = component "AuthService" "Authenticates dashboard sessions and device tokens while storing only token hashes." "TypeScript"
+        connectionService = component "ConnectionService" "Creates short-lived browser onboarding requests, verifies connection secrets, records owner approval, bootstraps existing vaults, and registers devices idempotently." "TypeScript"
         vaultService = component "VaultService" "Creates vaults, manages owner isolation, and coordinates initial per-vault data key creation." "TypeScript"
         deviceService = component "DeviceService" "Registers, tracks, revokes, and updates paired devices and their server-known state." "TypeScript"
         keyManager = component "AtRestKeyManager" "Loads server master key material, creates and wraps per-vault data keys, unwraps keys in memory, and rewraps keys during rotation." "TypeScript, Node crypto"
@@ -32,6 +33,7 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
 
       web = container "Dashboard SPA" "PRD-specified browser UI for setup, device state, conflict review, resolution, and maintenance after normal dashboard login." "TypeScript, static SPA" {
         authSession = component "AuthSession" "Manages dashboard session state." "TypeScript"
+        connectionAuthorizationView = component "ConnectionAuthorizationView" "Reviews verification codes and local-vault summaries, then approves or denies a new or existing-vault connection after recent authentication." "Svelte, TypeScript"
         deviceDashboard = component "DeviceDashboard" "Shows paired devices, server main, and stale/offline status." "TypeScript"
         conflictList = component "ConflictList" "Lists unresolved conflicts and opens review workflows." "TypeScript"
         markdownDiffViewer = component "MarkdownDiffViewer" "Renders Markdown conflict variants and merge previews returned by server APIs." "TypeScript"
@@ -40,7 +42,8 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
       }
 
       plugin = container "Obsidian plugin" "Obsidian community plugin that treats visible vault files as the device source of truth, journals them in local Git, rehydrates recoverable metadata, uploads actor-device proposals with optional base commits, applies server main, and exposes sync status." "TypeScript, Obsidian Plugin API" {
-        settingsView = component "SettingsView" "Collects server URL, pairing token/login, and device name." "TypeScript"
+        settingsView = component "SettingsView" "Collects the server URL and device name and launches the browser-assisted onboarding wizard." "TypeScript"
+        onboardingCoordinator = component "OnboardingCoordinator" "Persists the pending connection secret and onboarding journal, resumes interrupted setup, analyzes local/server state, and coordinates apply or upload completion." "TypeScript"
         statusBar = component "StatusBar" "Displays Synced, Ahead, Behind, Uploading, Applying, Offline, Blocked, Unsafe local error, and Needs recovery states." "TypeScript"
         vaultWatcher = component "VaultWatcher" "Observes local vault changes through Obsidian APIs." "TypeScript, Obsidian Vault API"
         periodicScanner = component "PeriodicScanner" "Finds missed changes and supports recovery after watcher or client crashes." "TypeScript"
@@ -62,14 +65,14 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
       mergeWorkspace = container "Temporary merge workspace" "Ephemeral plaintext working trees used by server merge operations and cleaned after each merge transaction." "Local filesystem" "File System"
     }
 
-    vaultOwner -> obts "Self-hosts, creates vaults, pairs devices, reviews conflicts, and runs maintenance." "HTTPS and Obsidian UI" {
+    vaultOwner -> obts "Self-hosts, creates vaults, approves device connections, reviews conflicts, and runs maintenance." "HTTPS and Obsidian UI" {
       properties {
         "ops" "admin,read,write"
         "protocol" "HTTPS"
       }
     }
 
-    deviceUser -> obts "Edits notes and observes sync status through paired Obsidian clients." "Obsidian UI" {
+    deviceUser -> obts "Edits notes and observes sync status through connected Obsidian clients." "Obsidian UI" {
       properties {
         "ops" "read,write"
         "protocol" "Obsidian UI"
@@ -425,11 +428,33 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
       }
     }
 
-    obts.plugin.settingsView -> obts.server "Consumes pairing tokens and stores device registration metadata locally." "HTTPS" {
+    obts.plugin.settingsView -> obts.plugin.onboardingCoordinator "Starts or resumes browser-assisted setup." "TypeScript calls" {
       properties {
         "ops" "write"
+        "protocol" "in-process"
+      }
+    }
+
+    obts.plugin.onboardingCoordinator -> obts.server.connectionService "Starts and polls connection requests, downloads bootstrap state, completes device registration, and acknowledges onboarding." "HTTPS" {
+      properties {
+        "ops" "read,write"
         "protocol" "HTTPS"
-        "data" "pairing token, device capabilities, device token response"
+        "data" "connection secret, local summary, bootstrap pack, device token response"
+      }
+    }
+
+    obts.web.connectionAuthorizationView -> obts.server.connectionService "Reviews, approves, or denies browser connection requests." "HTTPS" {
+      properties {
+        "ops" "read,write"
+        "protocol" "HTTPS"
+        "data" "verification code, local summary, vault selection"
+      }
+    }
+
+    obts.server.connectionService -> obts.postgres "Stores hashed connection secrets, approval selection, expiry, and onboarding lifecycle state." "Metadata adapter calls" {
+      properties {
+        "ops" "read,write"
+        "protocol" "in-process"
       }
     }
 
