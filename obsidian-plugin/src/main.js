@@ -3,7 +3,7 @@ const git = require("isomorphic-git");
 const { Buffer } = require("buffer");
 const path = require("path-browserify");
 const createSha = require("sha.js");
-const { createDataAdapterFs, createReadOverlayFs } = require("./data-adapter-fs.cjs");
+const { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require("./data-adapter-fs.cjs");
 
 let fsp = null;
 
@@ -1710,7 +1710,14 @@ class ObtsObsidianClient {
     await fsp.writeFile(packPath, packfile, { mode: 0o600 });
     const persistedPack = await this.waitForPersistedBinary(packPath, packfile);
     this.fs.setReadOverlay(packPath, persistedPack);
-    await git.indexPack({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, filepath: path.relative(this.vaultDir, packPath) });
+    const indexingFs = createPackIndexFs(this.fs, persistedPack);
+    try {
+      await git.indexPack({ fs: indexingFs, dir: this.vaultDir, gitdir: this.gitdir, filepath: path.relative(this.vaultDir, packPath) });
+    } catch (error) {
+      const caller = error && error.caller ? ` at ${error.caller}` : "";
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Downloaded Git pack indexing failed${caller}: ${message}`, { cause: error });
+    }
   }
 
   async loadPersistedPackOverlays() {

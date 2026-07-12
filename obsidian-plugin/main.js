@@ -21607,6 +21607,21 @@ var require_data_adapter_fs = __commonJS({
     function toArrayBuffer2(data) {
       return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
     }
+    function createPackIndexFs2(fs, packfile) {
+      const pack = Buffer3.from(packfile);
+      return {
+        promises: {
+          ...fs.promises,
+          async readFile(filePath, options) {
+            if (typeof filePath === "string" && filePath.replaceAll("\\", "/").endsWith(".pack")) {
+              const encoding = typeof options === "string" ? options : options && options.encoding;
+              return encoding ? pack.toString(encoding) : Buffer3.from(pack);
+            }
+            return await fs.promises.readFile(filePath, options);
+          }
+        }
+      };
+    }
     function createReadOverlayFs2(fs, files) {
       const overrides = new Map([...files].map(([filePath, data]) => [adapterPath(filePath), Buffer3.from(data)]));
       return {
@@ -21629,7 +21644,7 @@ var require_data_adapter_fs = __commonJS({
         }
       };
     }
-    module2.exports = { createDataAdapterFs: createDataAdapterFs2, createReadOverlayFs: createReadOverlayFs2, adapterPath };
+    module2.exports = { createDataAdapterFs: createDataAdapterFs2, createPackIndexFs: createPackIndexFs2, createReadOverlayFs: createReadOverlayFs2, adapterPath };
   }
 });
 
@@ -21639,10 +21654,10 @@ var git = (init_isomorphic_git(), __toCommonJS(isomorphic_git_exports));
 var { Buffer: Buffer2 } = require_buffer();
 var path = require_path_browserify();
 var createSha = require_sha2();
-var { createDataAdapterFs, createReadOverlayFs } = require_data_adapter_fs();
+var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var fsp = null;
 var API_VERSION = "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = "0.3.3";
+var PLUGIN_VERSION = "0.3.4";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var SYNC_STALE_MS = 2 * 60 * 1e3;
@@ -23237,7 +23252,14 @@ var ObtsObsidianClient = class {
     await fsp.writeFile(packPath, packfile, { mode: 384 });
     const persistedPack = await this.waitForPersistedBinary(packPath, packfile);
     this.fs.setReadOverlay(packPath, persistedPack);
-    await git.indexPack({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, filepath: path.relative(this.vaultDir, packPath) });
+    const indexingFs = createPackIndexFs(this.fs, persistedPack);
+    try {
+      await git.indexPack({ fs: indexingFs, dir: this.vaultDir, gitdir: this.gitdir, filepath: path.relative(this.vaultDir, packPath) });
+    } catch (error) {
+      const caller = error && error.caller ? ` at ${error.caller}` : "";
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Downloaded Git pack indexing failed${caller}: ${message}`, { cause: error });
+    }
   }
   async loadPersistedPackOverlays() {
     if (!Platform || !Platform.isMobile) return;

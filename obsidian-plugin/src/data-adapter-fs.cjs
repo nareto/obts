@@ -273,6 +273,22 @@ function toArrayBuffer(data) {
   return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
 }
 
+function createPackIndexFs(fs, packfile) {
+  const pack = Buffer.from(packfile);
+  return {
+    promises: {
+      ...fs.promises,
+      async readFile(filePath, options) {
+        if (typeof filePath === "string" && filePath.replaceAll("\\", "/").endsWith(".pack")) {
+          const encoding = typeof options === "string" ? options : options && options.encoding;
+          return encoding ? pack.toString(encoding) : Buffer.from(pack);
+        }
+        return await fs.promises.readFile(filePath, options);
+      }
+    }
+  };
+}
+
 function createReadOverlayFs(fs, files) {
   const overrides = new Map([...files].map(([filePath, data]) => [adapterPath(filePath), Buffer.from(data)]));
   return {
@@ -296,4 +312,4 @@ function createReadOverlayFs(fs, files) {
   };
 }
 
-module.exports = { createDataAdapterFs, createReadOverlayFs, adapterPath };
+module.exports = { createDataAdapterFs, createPackIndexFs, createReadOverlayFs, adapterPath };

@@ -7,8 +7,9 @@ import { describe, expect, it } from 'vitest';
 import { MemoryDataAdapter } from './helpers/memoryDataAdapter.js';
 
 const require = createRequire(import.meta.url);
-const { createDataAdapterFs, createReadOverlayFs } = require('../obsidian-plugin/src/data-adapter-fs.cjs') as {
+const { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require('../obsidian-plugin/src/data-adapter-fs.cjs') as {
   createDataAdapterFs: (adapter: MemoryDataAdapter) => any;
+  createPackIndexFs: (fs: any, packfile: Uint8Array) => any;
   createReadOverlayFs: (fs: any, files: Array<[string, Uint8Array]>) => any;
 };
 
@@ -107,10 +108,11 @@ describe('mobile DataAdapter filesystem', () => {
     };
     const indexingFs = createReadOverlayFs(temporarilyUnreadableFs, []);
     indexingFs.setReadOverlay(oldPackPath, packed.packfile!);
-    indexingFs.setReadOverlay(packPath, packed.packfile!);
     const overlaidDestinationArgs = { ...destinationArgs, fs: indexingFs };
-    await git.indexPack({ ...overlaidDestinationArgs, filepath: '.obts/git/objects/pack/old-attempt.pack' });
-    await git.indexPack({ ...overlaidDestinationArgs, filepath: '.obts/git/objects/pack/import.pack' });
+    const packIndexFs = createPackIndexFs(indexingFs, packed.packfile!);
+    await git.indexPack({ ...overlaidDestinationArgs, fs: packIndexFs, filepath: '.obts/git/objects/pack/old-attempt.pack' });
+    await git.indexPack({ ...overlaidDestinationArgs, fs: packIndexFs, filepath: '.obts/git/objects/pack/import.pack' });
+    indexingFs.setReadOverlay(packPath, packed.packfile!);
     await git.writeRef({ ...overlaidDestinationArgs, ref: 'refs/heads/local', value: commit, force: true });
 
     expect(Buffer.from((await git.readBlob({ ...overlaidDestinationArgs, oid: commit, filepath: 'note.md' })).blob).toString('utf8')).toBe('mobile vault\n');
