@@ -18,6 +18,7 @@ import {
   normalizeVaultPath,
   PathPolicyViolation
 } from '../src/shared/pathPolicy.js';
+import { MINIMUM_PLUGIN_VERSION, RECOMMENDED_PLUGIN_VERSION } from '../src/shared/pluginCompatibility.js';
 import { API_VERSION } from '../src/shared/types.js';
 
 type Json = Record<string, unknown>;
@@ -398,8 +399,8 @@ describe('Phase 1 sync without conflict resolution', () => {
       status: 'ok',
       plugin: {
         current_version: '0.1.17',
-        minimum_version: '0.2.0',
-        recommended_version: '0.2.0',
+        minimum_version: MINIMUM_PLUGIN_VERSION,
+        recommended_version: RECOMMENDED_PLUGIN_VERSION,
         update_required: true,
         update_available: true
       }
@@ -4355,7 +4356,7 @@ describe('Phase 1 sync without conflict resolution', () => {
   });
 
   it('ships an installable Obsidian plugin with Phase 1 sync behavior', async () => {
-    const pluginMain = await readFile(join(process.cwd(), 'obsidian-plugin', 'main.js'), 'utf8');
+    const pluginMain = await readFile(join(process.cwd(), 'obsidian-plugin', 'src', 'main.js'), 'utf8');
     const pluginReadme = await readFile(join(process.cwd(), 'obsidian-plugin', 'README.md'), 'utf8');
 
     expect(pluginMain).toContain('class ObtsObsidianClient');
@@ -4386,7 +4387,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('visibleVaultMatchesLocalHead');
     const queuedSync = sourceSection(pluginMain, 'async runQueuedSync()', 'async flushOpenMarkdownEditorsToDisk()');
     expect(queuedSync).toContain('if (this.isSyncInProgress())');
-    expect(queuedSync).toContain('void this.runQueuedSync();');
+    expect(queuedSync).toContain('this.scheduleQueuedSync(SYNC_DEBOUNCE_MS)');
     expect(pluginMain).toContain('syncOnceOrPollResolvedConflict');
     const backgroundSync = sourceSection(pluginMain, 'async runBackgroundSync()', 'async runAutomaticSync()');
     expect(backgroundSync).toContain('isRetryableLocalError(state.last_error_code)');
@@ -4425,7 +4426,8 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).not.toContain('packaged TypeScript client');
     expect(pluginMain).not.toContain('Run the packaged client sync flow');
 
-    expect(pluginReadme).toContain('hidden local history under `.obts/git`');
+    expect(pluginReadme).toContain('hidden local history under');
+    expect(pluginReadme).toContain('`.obts/git`');
     expect(pluginReadme).toContain('Rebuild from server main');
     expect(pluginReadme).toContain('No visible vault `.git` directory is created.');
   });

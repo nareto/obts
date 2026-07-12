@@ -27,3 +27,27 @@ the note owner.
 
 Do not perform step 9 against the only production copy. Backup schedules,
 destinations, and restore automation remain deployment concerns.
+
+## Mobile Acceptance
+
+Run this section separately on current iOS and Android Obsidian releases using
+copied vaults. Mobile sync is foreground-only; do not expect the operating
+system to keep Obsidian running in the background.
+
+1. Install the release through BRAT and confirm Obsidian allows the plugin to be
+   enabled without a desktop-only warning.
+2. Complete browser-assisted onboarding against an HTTPS server and return to
+   Obsidian. Confirm `.obts/git`, device state, and recovery state survive an app
+   restart.
+3. Sync Markdown, Unicode filenames, a binary attachment, an empty folder, and
+   community-plugin data between mobile and desktop clients.
+4. Edit the same note on mobile and desktop, confirm conflict review is required,
+   resolve it in the dashboard, and apply the result on mobile.
+5. Start with the phone offline, edit notes, restart Obsidian, reconnect, and
+   confirm the queued local commit uploads without losing edits.
+6. Force-close Obsidian during a disposable pull/apply test. Reopen it and
+   confirm journal recovery either completes safely or blocks without replacing
+   unpreserved local content.
+7. Leave Obsidian in the background long enough for mobile timers to suspend,
+   then foreground it and confirm scanning and sync resume without duplicate
+   operations.

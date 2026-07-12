@@ -24,13 +24,17 @@
     "@fastify/cookie": "^11.0.2",
     "@fastify/multipart": "^9.3.0",
     "@node-rs/argon2": "^2.0.2",
+    "buffer": "^6.0.3",
     "fastify": "^5.9.0",
     "isomorphic-git": "^1.38.5",
+    "path-browserify": "^1.0.1",
+    "sha.js": "^2.4.12",
     "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^6.2.4",
     "@types/node": "^24.0.8",
+    "esbuild": "^0.28.1",
     "svelte": "^5.56.4",
     "typescript": "^5.9.2",
     "vite": "^7.3.6",

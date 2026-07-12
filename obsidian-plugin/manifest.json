@@ -1,9 +1,9 @@
 {
   "id": "obts",
   "name": "Obsidian True Sync",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "minAppVersion": "1.5.0",
   "description": "Git-backed sync client for a self-hosted obts server.",
   "author": "obts",
-  "isDesktopOnly": true
+  "isDesktopOnly": false
 }

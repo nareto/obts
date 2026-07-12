@@ -1,22 +1,22 @@
-const { Plugin, PluginSettingTab, Setting, Notice, Modal } = require("obsidian");
-const crypto = require("node:crypto");
-const fsp = require("node:fs/promises");
-const os = require("node:os");
-const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { Plugin, PluginSettingTab, Setting, Notice, Modal, Platform, requestUrl } = require("obsidian");
+const git = require("isomorphic-git");
+const { Buffer } = require("buffer");
+const path = require("path-browserify");
+const createSha = require("sha.js");
+const { createDataAdapterFs } = require("./data-adapter-fs.cjs");
+
+let fsp = null;
 
 const API_VERSION = "__OBTS_API_VERSION__";
 const PLUGIN_VERSION = "__OBTS_PLUGIN_VERSION__";
 const SYNC_DEBOUNCE_MS = 1500;
 const BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000;
 const SYNC_STALE_MS = 2 * 60 * 1000;
-const NETWORK_TIMEOUT_MS = 60 * 1000;
 const PLUGIN_UPDATE_URL = "obsidian://brat?plugin=nareto%2Fobts";
 
 const DEFAULT_SETTINGS = {
   serverUrl: "http://127.0.0.1:3000",
-  deviceName: "",
-  gitBinary: "git"
+  deviceName: ""
 };
 
 module.exports = class ObtsPlugin extends Plugin {
@@ -25,6 +25,7 @@ module.exports = class ObtsPlugin extends Plugin {
     delete this.settings.syncProfile;
     delete this.settings.syncPlugins;
     delete this.settings.pairingToken;
+    delete this.settings.gitBinary;
     this.status = this.addStatusBarItem();
     this.syncQueued = false;
     this.syncRunning = false;
@@ -32,6 +33,8 @@ module.exports = class ObtsPlugin extends Plugin {
     this.isApplying = false;
     this.pluginCompatibilityNoticeKey = null;
     this.pluginUpdateUrl = PLUGIN_UPDATE_URL;
+    this.unloaded = false;
+    this.queuedSyncTimer = null;
     this.setStatus("Checking");
     this.client = new ObtsObsidianClient(this);
     await this.client.initialize();
@@ -110,6 +113,19 @@ module.exports = class ObtsPlugin extends Plugin {
         void this.runBackgroundSync();
       }, BACKGROUND_SYNC_INTERVAL_MS)
     );
+    if (typeof this.registerDomEvent === "function" && typeof document !== "undefined") {
+      this.registerDomEvent(document, "visibilitychange", () => {
+        if (!document.hidden) void this.runBackgroundSync();
+      });
+    }
+  }
+
+  onunload() {
+    this.unloaded = true;
+    if (this.queuedSyncTimer !== null) {
+      window.clearTimeout(this.queuedSyncTimer);
+      this.queuedSyncTimer = null;
+    }
   }
 
   async saveSettings() {
@@ -143,9 +159,7 @@ module.exports = class ObtsPlugin extends Plugin {
     this.syncQueued = true;
     this.setStatus("Ahead");
     void this.client.recordLocalChangeHint(paths).catch(() => undefined);
-    window.setTimeout(() => {
-      void this.runQueuedSync();
-    }, SYNC_DEBOUNCE_MS);
+    this.scheduleQueuedSync(SYNC_DEBOUNCE_MS);
   }
 
   async syncOnceOrPollResolvedConflict(options) {
@@ -156,23 +170,24 @@ module.exports = class ObtsPlugin extends Plugin {
     return await this.client.syncOnce(options);
   }
 
+  scheduleQueuedSync(delay) {
+    if (this.unloaded) return;
+    if (this.queuedSyncTimer !== null) window.clearTimeout(this.queuedSyncTimer);
+    this.queuedSyncTimer = window.setTimeout(() => {
+      this.queuedSyncTimer = null;
+      void this.runQueuedSync();
+    }, delay);
+  }
+
   async runQueuedSync() {
-    if (!this.syncQueued) {
-      return;
-    }
+    if (this.unloaded || !this.syncQueued) return;
     if (this.isSyncInProgress()) {
-      window.setTimeout(() => {
-        void this.runQueuedSync();
-      }, SYNC_DEBOUNCE_MS);
+      this.scheduleQueuedSync(SYNC_DEBOUNCE_MS);
       return;
     }
     this.syncQueued = false;
     await this.runAutomaticSync();
-    if (this.syncQueued) {
-      window.setTimeout(() => {
-        void this.runQueuedSync();
-      }, 0);
-    }
+    if (this.syncQueued) this.scheduleQueuedSync(0);
   }
 
   async flushOpenMarkdownEditorsToDisk() {
@@ -208,6 +223,9 @@ module.exports = class ObtsPlugin extends Plugin {
   }
 
   async runBackgroundSync() {
+    if (this.unloaded || (typeof document !== "undefined" && document.hidden)) {
+      return;
+    }
     if (this.syncQueued) {
       await this.runQueuedSync();
       return;
@@ -227,10 +245,10 @@ module.exports = class ObtsPlugin extends Plugin {
   }
 
   async runAutomaticSync() {
-    if (this.isSyncInProgress()) {
+    if (this.unloaded || (typeof document !== "undefined" && document.hidden) || this.isSyncInProgress()) {
       return;
     }
-    this.beginSync();
+    if (!this.beginSync()) return;
     try {
       const state = await this.client.readState();
       if (!state.vault_id || !state.device_id) {
@@ -247,11 +265,7 @@ module.exports = class ObtsPlugin extends Plugin {
       await this.handleAutomaticSyncError(error);
     } finally {
       this.endSync();
-      if (this.syncQueued) {
-        window.setTimeout(() => {
-          void this.runQueuedSync();
-        }, 0);
-      }
+      if (this.syncQueued) this.scheduleQueuedSync(0);
     }
   }
 
@@ -269,7 +283,7 @@ module.exports = class ObtsPlugin extends Plugin {
     if (this.isSyncInProgress()) {
       return;
     }
-    this.beginSync();
+    if (!this.beginSync()) return;
     try {
       const result = await fn();
       this.setStatus((await this.client.readState()).status_label);
@@ -289,25 +303,25 @@ module.exports = class ObtsPlugin extends Plugin {
   }
 
   isSyncInProgress() {
-    if (!this.syncRunning) {
-      return false;
-    }
-    if (this.syncRunningSince && Date.now() - this.syncRunningSince > SYNC_STALE_MS) {
-      this.syncRunning = false;
-      this.syncRunningSince = null;
-      this.isApplying = false;
-      this.setStatus("Offline");
-      return false;
-    }
+    const owner = operationRegistry().get(this.app.vault.adapter);
+    if (owner && owner !== this) return true;
+    if (!this.syncRunning) return false;
+    if (this.syncRunningSince && Date.now() - this.syncRunningSince > SYNC_STALE_MS) this.setStatus("Offline");
     return true;
   }
 
   beginSync() {
+    const registry = operationRegistry();
+    if (registry.has(this.app.vault.adapter)) return false;
+    registry.set(this.app.vault.adapter, this);
     this.syncRunning = true;
     this.syncRunningSince = Date.now();
+    return true;
   }
 
   endSync() {
+    const registry = operationRegistry();
+    if (registry.get(this.app.vault.adapter) === this) registry.delete(this.app.vault.adapter);
     this.syncRunning = false;
     this.syncRunningSince = null;
   }
@@ -317,7 +331,9 @@ class ObtsObsidianClient {
   constructor(plugin) {
     this.plugin = plugin;
     this.adapter = plugin.app.vault.adapter;
-    this.vaultDir = requireDesktopVaultPath(this.adapter);
+    this.fs = createDataAdapterFs(this.adapter);
+    fsp = this.fs.promises;
+    this.vaultDir = "/";
     this.obtsDir = path.join(this.vaultDir, ".obts");
     this.gitdir = path.join(this.obtsDir, "git");
     this.authPath = path.join(this.obtsDir, "auth", "device-token.json");
@@ -332,9 +348,10 @@ class ObtsObsidianClient {
   }
 
   async initialize() {
+    await fsp.recoverReplacements(this.obtsDir);
     await fsp.mkdir(path.join(this.obtsDir, "auth"), { recursive: true, mode: 0o700 });
-    await this.git(["init"]);
-    await this.git(["symbolic-ref", "HEAD", "refs/heads/local"], { allowFailure: true });
+    await git.init({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, defaultBranch: "local" });
+    await git.writeRef({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, ref: "HEAD", value: "refs/heads/local", symbolic: true, force: true });
     await fsp.mkdir(path.join(this.gitdir, "info"), { recursive: true, mode: 0o700 });
     await fsp.writeFile(path.join(this.gitdir, "info", "exclude"), ".obts/\n.git/\n", { mode: 0o600 });
     const state = await this.repairLocalStateIfNeeded(await this.readState());
@@ -841,7 +858,7 @@ class ObtsObsidianClient {
       client_known_main: state.local_main,
       ...(queue.expected_device_ref === null && state.local_main ? { base_commit: state.local_main } : {}),
       ...(pendingDirectoryIntents.length > 0 ? { directory_intents: pendingDirectoryIntents } : {}),
-      attempt_id: `sync_${Date.now()}_${crypto.randomBytes(8).toString("hex")}`
+      attempt_id: `sync_${Date.now()}_${randomHex(8)}`
     };
     let result;
     try {
@@ -1117,7 +1134,7 @@ class ObtsObsidianClient {
     if (requireCleanVisibleState && !(await this.ensureNoLocalChangesBeforeApply(state))) {
       return;
     }
-    const applyId = `apply_${Date.now()}_${crypto.randomBytes(8).toString("hex")}`;
+    const applyId = `apply_${Date.now()}_${randomHex(8)}`;
     await this.acquireApplyLock(applyId);
     this.plugin.isApplying = true;
     await this.writeState(Object.assign({}, state, {
@@ -1488,29 +1505,24 @@ class ObtsObsidianClient {
 
   async createLocalCommit(message) {
     const base = await this.resolveRef("refs/heads/local");
-    if (base) {
-      await this.git(["read-tree", base]);
-    } else {
-      await this.git(["read-tree", "--empty"]);
-    }
-    const tracked = base ? await this.listTreeFiles(base) : [];
+    const baseEntries = base ? await this.flattenTree(base) : new Map();
     const localFiles = await this.scanSyncableFiles();
     const localSet = new Set(localFiles);
-    for (const filePath of tracked) {
-      if (!isSyncableVaultPath(filePath) || !localSet.has(filePath)) {
-        await this.git(["update-index", "--remove", "--", filePath], { allowFailure: true });
-      }
+    const nextEntries = new Map(baseEntries);
+    for (const filePath of baseEntries.keys()) {
+      if (!isSyncableVaultPath(filePath) || !localSet.has(filePath)) nextEntries.delete(filePath);
     }
-    for (const batch of chunks(localFiles, 100)) {
-      await this.git(["update-index", "--add", "--", ...batch]);
+    for (const filePath of localFiles) {
+      const content = await this.adapterReadBinary(filePath);
+      if (content === null) continue;
+      const oid = await git.writeBlob({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, blob: content });
+      nextEntries.set(filePath, { mode: "100644", path: filePath, oid, type: "blob" });
     }
-    const tree = (await this.git(["write-tree"])).trim();
+    const tree = await this.writeTreeFromEntries(nextEntries);
     if (base) {
-      const baseTree = (await this.git(["show", "-s", "--format=%T", base])).trim();
-      if (baseTree === tree) {
-        return null;
-      }
-    } else if (localFiles.length === 0) {
+      const { commit } = await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: base });
+      if (commit.tree === tree) return null;
+    } else if (nextEntries.size === 0) {
       return null;
     }
     return await this.commitTree(tree, base, message);
@@ -1518,26 +1530,21 @@ class ObtsObsidianClient {
 
   async createMetadataCommit(message) {
     const base = await this.resolveRef("refs/heads/local");
-    if (!base) {
-      return null;
-    }
-    const tree = (await this.git(["show", "-s", "--format=%T", base])).trim();
-    return await this.commitTree(tree, base, message);
+    if (!base) return null;
+    const { commit } = await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: base });
+    return await this.commitTree(commit.tree, base, message);
   }
 
   async commitTree(tree, base, message) {
-    const args = ["commit-tree", tree, "-m", message];
-    if (base) {
-      args.splice(2, 0, "-p", base);
-    }
-    const commit = (await this.git(args, {
-      env: {
-        GIT_AUTHOR_NAME: "obts device",
-        GIT_AUTHOR_EMAIL: "device@obts.local",
-        GIT_COMMITTER_NAME: "obts device",
-        GIT_COMMITTER_EMAIL: "device@obts.local"
-      }
-    })).trim();
+    const timestamp = Math.floor(Date.now() / 1000);
+    const timezoneOffset = new Date().getTimezoneOffset();
+    const identity = { name: "obts device", email: "device@obts.local", timestamp, timezoneOffset };
+    const commit = await git.writeCommit({
+      fs: this.fs,
+      dir: this.vaultDir,
+      gitdir: this.gitdir,
+      commit: { tree, parent: base ? [base] : [], message, author: identity, committer: identity }
+    });
     await this.updateRef("refs/heads/local", commit, base);
     return commit;
   }
@@ -1550,7 +1557,7 @@ class ObtsObsidianClient {
   async localSnapshotSummary() {
     const files = await this.scanSyncableFiles();
     const directories = await this.listLocalVaultDirectories();
-    const hash = crypto.createHash("sha256");
+    const hash = createSha("sha256");
     for (const directoryPath of directories) {
       hash.update("dir\0");
       hash.update(directoryPath);
@@ -1563,7 +1570,7 @@ class ObtsObsidianClient {
       bytes += buffer.byteLength;
       hash.update(filePath);
       hash.update("\0");
-      hash.update(crypto.createHash("sha256").update(buffer).digest());
+      hash.update(createSha("sha256").update(buffer).digest());
       hash.update("\0");
     }
     return { fingerprint: hash.digest("hex"), fileCount: files.length, bytes };
@@ -1571,92 +1578,63 @@ class ObtsObsidianClient {
 
   async localContentMatchesTree(localFiles, targetMain) {
     const serverFiles = await this.listTreeFiles(targetMain);
-    if (localFiles.length !== serverFiles.length) {
-      return false;
-    }
+    if (localFiles.length !== serverFiles.length) return false;
     const localSet = new Set(localFiles);
     for (const filePath of serverFiles) {
-      if (!localSet.has(filePath)) {
-        return false;
-      }
+      if (!localSet.has(filePath)) return false;
       const content = await this.adapterReadBinary(filePath);
       const server = await this.readBlob(targetMain, filePath);
-      if (!content || sha256(content) !== sha256(server)) {
-        return false;
-      }
+      if (!content || sha256(content) !== sha256(server)) return false;
     }
     return true;
   }
 
   async localSnapshotMatchesTree(snapshot, targetMain) {
     const serverFiles = await this.listTreeFiles(targetMain);
-    if (snapshot.size !== serverFiles.length) {
-      return false;
-    }
+    if (snapshot.size !== serverFiles.length) return false;
     for (const filePath of serverFiles) {
       const localContent = snapshot.get(filePath);
       const serverContent = await this.readBlob(targetMain, filePath);
-      if (!localContent || !serverContent || sha256(localContent) !== sha256(serverContent)) {
-        return false;
-      }
+      if (!localContent || !serverContent || sha256(localContent) !== sha256(serverContent)) return false;
     }
     return true;
   }
 
   async classifyPendingCommit(pendingCommit, serverDeviceRef, targetMain) {
-    if (!pendingCommit) {
-      return "none";
-    }
-    if (!(await this.commitExists(pendingCommit))) {
-      return "divergent";
-    }
-    if (await this.isAncestor(pendingCommit, targetMain)) {
-      return "repeat";
-    }
+    if (!pendingCommit) return "none";
+    if (!(await this.commitExists(pendingCommit))) return "divergent";
+    if (await this.isAncestor(pendingCommit, targetMain)) return "repeat";
     if (serverDeviceRef) {
-      if (await this.isAncestor(pendingCommit, serverDeviceRef)) {
-        return "repeat";
-      }
-      if (await this.isAncestor(serverDeviceRef, pendingCommit)) {
-        return "fast_forward";
-      }
+      if (await this.isAncestor(pendingCommit, serverDeviceRef)) return "repeat";
+      if (await this.isAncestor(serverDeviceRef, pendingCommit)) return "fast_forward";
       return "divergent";
     }
-    if (await this.isAncestor(targetMain, pendingCommit)) {
-      return "fast_forward";
-    }
-    return "divergent";
+    return await this.isAncestor(targetMain, pendingCommit) ? "fast_forward" : "divergent";
   }
 
   async readFileSnapshot(files) {
     const snapshot = new Map();
     for (const filePath of files) {
       const content = await this.adapterReadBinary(filePath);
-      if (content !== null) {
-        snapshot.set(filePath, content);
-      }
+      if (content !== null) snapshot.set(filePath, content);
     }
     return snapshot;
   }
 
   async restoreFileSnapshot(snapshot, priorLocalFiles) {
     for (const filePath of priorLocalFiles.sort((left, right) => right.length - left.length)) {
-      if (!snapshot.has(filePath)) {
-        await this.adapterRemove(filePath);
-      }
+      if (!snapshot.has(filePath)) await this.adapterRemove(filePath);
     }
     for (const [filePath, content] of Array.from(snapshot.entries()).sort(([left], [right]) => left.localeCompare(right))) {
       await this.removeBlockingMaterializationPaths(filePath);
-      if (await this.adapterIsDirectory(filePath)) {
-        await this.adapterRemove(filePath);
-      }
+      if (await this.adapterIsDirectory(filePath)) await this.adapterRemove(filePath);
       await this.adapterWriteBinary(filePath, content);
     }
   }
 
   async createRecoveryBundle(operationType, targetMain, affectedPaths, journal = null) {
     const state = await this.readState();
-    const bundleId = `rec_${Date.now()}_${crypto.randomBytes(8).toString("hex")}`;
+    const bundleId = `rec_${Date.now()}_${randomHex(8)}`;
     const bundleDir = path.join(this.obtsDir, "recovery", bundleId);
     await fsp.mkdir(path.join(bundleDir, "files"), { recursive: true, mode: 0o700 });
     await fsp.mkdir(path.join(bundleDir, "git"), { recursive: true, mode: 0o700 });
@@ -1664,18 +1642,14 @@ class ObtsObsidianClient {
     await fsp.mkdir(path.join(bundleDir, "journal"), { recursive: true, mode: 0o700 });
     const snapshotChecksums = [];
     for (const filePath of affectedPaths) {
-      if (filePath.startsWith(".obts/")) {
-        continue;
-      }
+      if (filePath.startsWith(".obts/")) continue;
       const content = await this.adapterReadBinary(filePath);
       if (content !== null) {
         const target = path.join(bundleDir, "files", filePath);
         await fsp.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
         await fsp.writeFile(target, content, { mode: 0o600 });
         snapshotChecksums.push(`${sha256(content)}  files/${filePath}`);
-        if (isTextPatchPath(filePath)) {
-          await writeTextSnapshotPatch(bundleDir, filePath, content);
-        }
+        if (isTextPatchPath(filePath)) await writeTextSnapshotPatch(bundleDir, filePath, content);
       } else {
         snapshotChecksums.push(`missing  files/${filePath}`);
       }
@@ -1690,14 +1664,12 @@ class ObtsObsidianClient {
       prior_local_main: state.local_main,
       prior_local_device_ref: state.server_device_ref,
       affected_paths: affectedPaths,
-      platform: os.platform(),
+      platform: runtimePlatform(),
       plugin_version: PLUGIN_VERSION,
       checksum_manifest: snapshotChecksums
     };
     await writeJson(path.join(bundleDir, "manifest.json"), manifest);
-    if (journal) {
-      await writeJson(path.join(bundleDir, "journal", "apply-journal.json"), journal);
-    }
+    if (journal) await writeJson(path.join(bundleDir, "journal", "apply-journal.json"), journal);
     const pack = await this.createRecoveryRefsPack();
     await fsp.writeFile(path.join(bundleDir, "git", "local-refs.pack"), pack, { mode: 0o600 });
     await fsp.writeFile(path.join(bundleDir, "checksums.sha256"), `${(await bundleChecksums(bundleDir)).join("\n")}\n`, { mode: 0o600 });
@@ -1705,54 +1677,50 @@ class ObtsObsidianClient {
   }
 
   async createRecoveryRefsPack() {
-    const refs = [];
+    const oids = new Set();
     for (const ref of ["refs/heads/local", "refs/heads/main"]) {
-      const oid = await this.resolveRef(ref);
-      if (oid) {
-        refs.push(oid);
-      }
+      const commit = await this.resolveRef(ref);
+      if (!commit) continue;
+      for (const oid of await this.collectReachableObjects(commit)) oids.add(oid);
     }
-    if (refs.length === 0) {
-      return Buffer.alloc(0);
-    }
-    return await this.packObjects(refs);
+    return oids.size ? await this.packObjects([...oids].sort()) : Buffer.alloc(0);
   }
 
   async createPackForCommit(commit, excludeCommits = []) {
-    const revs = [commit];
+    const oids = new Set(await this.collectReachableObjects(commit));
     for (const exclude of excludeCommits) {
-      if (await this.commitExists(exclude)) {
-        revs.push(`^${exclude}`);
-      }
+      if (!(await this.commitExists(exclude))) continue;
+      for (const oid of await this.collectReachableObjects(exclude)) oids.delete(oid);
     }
-    return await this.packObjects(revs);
+    return await this.packObjects([...oids].sort());
   }
 
-  async packObjects(revs) {
-    const input = Buffer.from(`${revs.join("\n")}\n`, "utf8");
-    return await this.gitBuffer(["pack-objects", "--stdout", "--revs"], input, { maxBuffer: 512 * 1024 * 1024 });
+  async packObjects(oids) {
+    const { packfile } = await git.packObjects({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oids });
+    if (!packfile) throw new Error("isomorphic-git did not return a packfile.");
+    return Buffer.from(packfile);
   }
 
   async importPack(packfile) {
-    if (!packfile || packfile.byteLength === 0) {
-      return;
-    }
-    const packPath = path.join(this.gitdir, "objects", "pack", `obts-pull-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.pack`);
+    if (!packfile || packfile.byteLength === 0) return;
+    const packPath = path.join(this.gitdir, "objects", "pack", `obts-pull-${Date.now()}-${randomHex(4)}.pack`);
     await fsp.mkdir(path.dirname(packPath), { recursive: true, mode: 0o700 });
     await fsp.writeFile(packPath, packfile, { mode: 0o600 });
-    await this.git(["index-pack", packPath]);
+    await git.indexPack({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, filepath: path.relative(this.vaultDir, packPath) });
   }
 
   async listTreeFiles(commit) {
-    if (!commit) {
-      return [];
-    }
-    const output = await this.git(["ls-tree", "-r", "-z", "--name-only", commit]);
-    return output.split("\0").filter(Boolean).filter((filePath) => isSyncableVaultPath(filePath)).sort();
+    if (!commit) return [];
+    const result = [];
+    await this.walkTree(commit, "", async (entryPath, entry) => {
+      if (entry.type === "blob" && isSyncableVaultPath(entryPath)) result.push(entryPath);
+    });
+    return result.sort();
   }
 
   async readBlob(commit, filePath) {
-    return await this.gitBuffer(["show", `${commit}:${filePath}`], undefined, { maxBuffer: 512 * 1024 * 1024 });
+    const result = await git.readBlob({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: commit, filepath: filePath });
+    return Buffer.from(result.blob);
   }
 
   async readBlobIfPresent(commit, filePath) {
@@ -1760,6 +1728,83 @@ class ObtsObsidianClient {
       return await this.readBlob(commit, filePath);
     } catch {
       return null;
+    }
+  }
+
+  async collectReachableObjects(commit) {
+    const seen = new Set();
+    const visitCommit = async (oid) => {
+      if (seen.has(oid)) return;
+      seen.add(oid);
+      const { commit: parsed } = await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid });
+      await this.collectTreeObjects(parsed.tree, seen);
+      for (const parent of parsed.parent) await visitCommit(parent);
+    };
+    await visitCommit(commit);
+    return [...seen].sort();
+  }
+
+  async collectTreeObjects(treeOid, seen) {
+    if (seen.has(treeOid)) return;
+    seen.add(treeOid);
+    const { tree } = await git.readTree({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: treeOid });
+    for (const entry of tree) {
+      if (entry.type === "tree") await this.collectTreeObjects(entry.oid, seen);
+      else seen.add(entry.oid);
+    }
+  }
+
+  async flattenTree(commit) {
+    const entries = new Map();
+    await this.walkTree(commit, "", async (entryPath, entry) => {
+      if (entry.type === "blob") entries.set(entryPath, { mode: entry.mode, path: entryPath, oid: entry.oid, type: "blob" });
+    });
+    return entries;
+  }
+
+  async writeTreeFromEntries(entries) {
+    const root = { blobs: new Map(), trees: new Map() };
+    for (const [entryPath, entry] of entries) {
+      const segments = entryPath.split("/");
+      let node = root;
+      for (const segment of segments.slice(0, -1)) {
+        let child = node.trees.get(segment);
+        if (!child) {
+          child = { blobs: new Map(), trees: new Map() };
+          node.trees.set(segment, child);
+        }
+        node = child;
+      }
+      const basename = segments.at(-1);
+      if (basename) node.blobs.set(basename, { mode: entry.mode, path: basename, oid: entry.oid, type: "blob" });
+    }
+    return await this.writeTreeNode(root);
+  }
+
+  async writeTreeNode(node) {
+    const tree = [];
+    for (const [name, child] of [...node.trees.entries()].sort(compareByName)) {
+      tree.push({ mode: "040000", path: name, oid: await this.writeTreeNode(child), type: "tree" });
+    }
+    for (const [, entry] of [...node.blobs.entries()].sort(compareByName)) tree.push(entry);
+    tree.sort((left, right) => left.path.localeCompare(right.path));
+    return await git.writeTree({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, tree });
+  }
+
+  async walkTree(treeish, prefix, visit) {
+    let treeOid = treeish;
+    if (prefix === "") {
+      try {
+        treeOid = (await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: treeish })).commit.tree;
+      } catch {
+        treeOid = treeish;
+      }
+    }
+    const { tree } = await git.readTree({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: treeOid });
+    for (const entry of tree) {
+      const entryPath = prefix ? `${prefix}/${entry.path}` : entry.path;
+      await visit(entryPath, entry);
+      if (entry.type === "tree") await this.walkTree(entry.oid, entryPath, visit);
     }
   }
 
@@ -1774,21 +1819,26 @@ class ObtsObsidianClient {
   }
 
   async pull(vaultId, deviceId, token, currentLocalMain, requestedTarget = "latest", currentEventSeq = undefined) {
-    const form = new FormData();
-    form.append("manifest", JSON.stringify({
-      api_version: API_VERSION,
-      plugin_version: PLUGIN_VERSION,
-      vault_id: vaultId,
-      device_id: deviceId,
-      current_local_main: currentLocalMain,
-      requested_target: requestedTarget,
-      ...(currentEventSeq === undefined ? {} : { current_event_seq: currentEventSeq })
-    }));
-    form.append("packfile", new Blob([new ArrayBuffer(0)], { type: "application/x-git-packed-objects" }), "have.pack");
+    const multipart = createMultipartBody([
+      {
+        name: "manifest",
+        contentType: "application/json",
+        data: Buffer.from(JSON.stringify({
+          api_version: API_VERSION,
+          plugin_version: PLUGIN_VERSION,
+          vault_id: vaultId,
+          device_id: deviceId,
+          current_local_main: currentLocalMain,
+          requested_target: requestedTarget,
+          ...(currentEventSeq === undefined ? {} : { current_event_seq: currentEventSeq })
+        }))
+      },
+      { name: "packfile", filename: "have.pack", contentType: "application/x-git-packed-objects", data: Buffer.alloc(0) }
+    ]);
     const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${vaultId}/sync/pull`), {
       method: "POST",
-      headers: { authorization: `Bearer ${token}` },
-      body: form
+      headers: { authorization: `Bearer ${token}`, "content-type": multipart.contentType },
+      body: multipart.body
     });
     if (!response.ok) {
       await throwResponseError(response);
@@ -1797,13 +1847,14 @@ class ObtsObsidianClient {
   }
 
   async push(vaultId, token, manifest, packfile) {
-    const form = new FormData();
-    form.append("manifest", JSON.stringify(manifest));
-    form.append("packfile", new Blob([packfile], { type: "application/x-git-packed-objects" }), "pack.pack");
+    const multipart = createMultipartBody([
+      { name: "manifest", contentType: "application/json", data: Buffer.from(JSON.stringify(manifest)) },
+      { name: "packfile", filename: "pack.pack", contentType: "application/x-git-packed-objects", data: Buffer.from(packfile) }
+    ]);
     const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${vaultId}/sync/push`), {
       method: "POST",
-      headers: { authorization: `Bearer ${token}` },
-      body: form
+      headers: { authorization: `Bearer ${token}`, "content-type": multipart.contentType },
+      body: multipart.body
     });
     if (!response.ok) {
       await throwResponseError(response);
@@ -1838,8 +1889,8 @@ class ObtsObsidianClient {
         local_main: state.local_main,
         local_head: state.local_head,
         path_capabilities: {
-          adapter: "obsidian-desktop",
-          platform: process.platform
+          adapter: "obsidian-data-adapter",
+          platform: runtimePlatform()
         }
       })
     });
@@ -2117,13 +2168,30 @@ class ObtsObsidianClient {
   }
 
   async updateRef(ref, target, expected, force = false) {
-    const args = force || !expected ? ["update-ref", ref, target] : ["update-ref", ref, target, expected];
-    await this.git(args);
+    const refPath = path.join(this.gitdir, ref);
+    const lockPath = `${refPath}.lock`;
+    await fsp.mkdir(path.dirname(refPath), { recursive: true });
+    try {
+      await fsp.writeFile(lockPath, `${target}\n`, { flag: "wx", mode: 0o600 });
+    } catch (error) {
+      throw new Error(`Local ref ${ref} is locked by another operation.`, { cause: error });
+    }
+    try {
+      if (!force && expected) {
+        const current = await this.resolveRef(ref);
+        if (current !== expected) throw new Error(`Local ref ${ref} changed while updating it.`);
+      }
+      await fsp.rename(lockPath, refPath);
+    } finally {
+      await fsp.rm(lockPath, { force: true }).catch(() => undefined);
+    }
   }
 
   async resolveRef(ref) {
     try {
-      return (await this.git(["rev-parse", "--verify", `${ref}^{commit}`])).trim();
+      const oid = await git.resolveRef({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, ref });
+      await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid });
+      return oid;
     } catch {
       return null;
     }
@@ -2131,7 +2199,7 @@ class ObtsObsidianClient {
 
   async commitExists(commit) {
     try {
-      await this.git(["cat-file", "-e", `${commit}^{commit}`]);
+      await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: commit });
       return true;
     } catch {
       return false;
@@ -2139,61 +2207,12 @@ class ObtsObsidianClient {
   }
 
   async isAncestor(ancestor, descendant) {
-    if (ancestor === descendant) {
-      return true;
-    }
+    if (ancestor === descendant) return true;
     try {
-      await this.git(["merge-base", "--is-ancestor", ancestor, descendant]);
-      return true;
+      return await git.isDescendent({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: descendant, ancestor, depth: -1 });
     } catch {
       return false;
     }
-  }
-
-  async git(args, options = {}) {
-    return (await this.gitRaw(args, undefined, options)).toString("utf8");
-  }
-
-  async gitBuffer(args, input, options = {}) {
-    return await this.gitRaw(args, input, options);
-  }
-
-  async gitRaw(args, input, options = {}) {
-    return await new Promise((resolve, reject) => {
-      const child = spawn(this.plugin.settings.gitBinary || "git", ["--git-dir", this.gitdir, "--work-tree", this.vaultDir, ...args], {
-        env: Object.assign({}, process.env, options.env || {}),
-        stdio: ["pipe", "pipe", "pipe"]
-      });
-      const stdout = [];
-      const stderr = [];
-      let stdoutBytes = 0;
-      const maxBuffer = options.maxBuffer || 64 * 1024 * 1024;
-      child.stdout.on("data", (chunk) => {
-        stdoutBytes += chunk.byteLength;
-        if (stdoutBytes > maxBuffer) {
-          child.kill("SIGKILL");
-          reject(new Error("git output exceeded buffer"));
-          return;
-        }
-        stdout.push(chunk);
-      });
-      child.stderr.on("data", (chunk) => stderr.push(chunk));
-      child.on("error", reject);
-      child.on("close", (code) => {
-        const out = Buffer.concat(stdout);
-        const err = Buffer.concat(stderr).toString("utf8");
-        if (code !== 0 && !options.allowFailure) {
-          reject(new Error(`git ${args.join(" ")} failed: ${err}`));
-          return;
-        }
-        resolve(out);
-      });
-      if (input) {
-        child.stdin.end(input);
-      } else {
-        child.stdin.end();
-      }
-    });
   }
 
   async readState() {
@@ -2546,7 +2565,7 @@ class ObtsObsidianClient {
       // Vault API may reject writes to system paths such as .trash.
       // Fall through to the raw adapter below.
     }
-    await this.adapter.writeBinary(filePath, content);
+    await this.adapter.writeBinary(filePath, arrayBuffer);
   }
 
   async adapterRemove(filePath) {
@@ -2907,7 +2926,7 @@ class ObtsOnboardingModal extends Modal {
     contentEl.createEl("p", {
       text: reviewNeeded
         ? "Your local vault was submitted safely, but overlapping changes require review in the dashboard."
-        : "This vault is connected and normal background sync is active."
+        : "This vault is connected. Sync runs while Obsidian is active."
     });
     new Setting(contentEl)
       .addButton((button) => button.setButtonText("Close").setCta().onClick(() => this.close()))
@@ -3066,14 +3085,6 @@ class ObtsSettingTab extends PluginSettingTab {
         );
     }
 
-    new Setting(containerEl)
-      .setName("Git binary")
-      .addText((text) =>
-        text.setValue(this.plugin.settings.gitBinary).onChange(async (value) => {
-          this.plugin.settings.gitBinary = value.trim() || "git";
-          await this.plugin.saveSettings();
-        })
-      );
   }
 }
 
@@ -3195,13 +3206,6 @@ function parseMultipartPull(contentType, data) {
     manifest: JSON.parse(manifestPart.body.toString("utf8")),
     packfile: packPart.body
   };
-}
-
-function requireDesktopVaultPath(adapter) {
-  if (adapter && typeof adapter.getBasePath === "function") {
-    return adapter.getBasePath();
-  }
-  throw new Error("obts requires the desktop FileSystemAdapter.");
 }
 
 async function ensureAdapterDir(adapter, dir) {
@@ -3347,6 +3351,10 @@ function assertNoCaseCollisions(paths) {
   return paths;
 }
 
+function compareByName(left, right) {
+  return left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0;
+}
+
 function chunks(items, size) {
   const result = [];
   for (let index = 0; index < items.length; index += size) {
@@ -3439,14 +3447,8 @@ async function readJson(filePath, fallback) {
 
 async function writeJson(filePath, value) {
   await fsp.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  const temporaryPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-  const handle = await fsp.open(temporaryPath, "w", 0o600);
-  try {
-    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`);
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
+  const temporaryPath = `${filePath}.tmp-${randomHex(4)}-${Date.now()}`;
+  await fsp.writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
   await fsp.rename(temporaryPath, filePath);
 }
 
@@ -3493,17 +3495,65 @@ function categorizeRecoveryError(error) {
 }
 
 function sha256(data) {
-  return crypto.createHash("sha256").update(data).digest("hex");
+  return createSha("sha256").update(Buffer.from(data)).digest("hex");
+}
+
+function operationRegistry() {
+  const key = "__obtsOperationRegistry";
+  if (!globalThis[key]) globalThis[key] = new Map();
+  return globalThis[key];
+}
+
+function randomHex(bytes) {
+  const value = new Uint8Array(bytes);
+  globalThis.crypto.getRandomValues(value);
+  return Buffer.from(value).toString("hex");
+}
+
+function runtimePlatform() {
+  if (Platform && Platform.isIosApp) return "ios";
+  if (Platform && Platform.isAndroidApp) return "android";
+  if (Platform && Platform.isMacOS) return "darwin";
+  if (Platform && Platform.isWin) return "win32";
+  return "linux";
 }
 
 async function fetchWithTimeout(url, options = {}) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), NETWORK_TIMEOUT_MS);
-  try {
-    return await fetch(url, Object.assign({}, options, { signal: controller.signal }));
-  } finally {
-    clearTimeout(timeout);
+  const response = await requestUrl({
+    url,
+    method: options.method || "GET",
+    headers: options.headers || {},
+    ...(options.body === undefined ? {} : { body: normalizeRequestBody(options.body) }),
+    throw: false
+  });
+  const headers = Object.fromEntries(Object.entries(response.headers || {}).map(([key, value]) => [key.toLowerCase(), value]));
+  return {
+    status: response.status,
+    ok: response.status >= 200 && response.status < 300,
+    headers: { get: (name) => headers[String(name).toLowerCase()] || null },
+    json: async () => response.json !== undefined ? response.json : JSON.parse(response.text),
+    arrayBuffer: async () => response.arrayBuffer,
+    text: async () => response.text
+  };
+}
+
+function createMultipartBody(parts) {
+  const boundary = `----obts-${randomHex(12)}`;
+  const chunks = [];
+  for (const part of parts) {
+    const disposition = `form-data; name="${part.name}"${part.filename ? `; filename="${part.filename}"` : ""}`;
+    chunks.push(Buffer.from(`--${boundary}\r\nContent-Disposition: ${disposition}\r\nContent-Type: ${part.contentType}\r\n\r\n`));
+    chunks.push(Buffer.from(part.data));
+    chunks.push(Buffer.from("\r\n"));
   }
+  chunks.push(Buffer.from(`--${boundary}--\r\n`));
+  return { contentType: `multipart/form-data; boundary=${boundary}`, body: toArrayBuffer(Buffer.concat(chunks)) };
+}
+
+function normalizeRequestBody(body) {
+  if (typeof body === "string" || body instanceof ArrayBuffer) return body;
+  if (ArrayBuffer.isView(body)) return body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength);
+  throw new Error("Unsupported request body type.");
 }
 
 function toArrayBuffer(data) {

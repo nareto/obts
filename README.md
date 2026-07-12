@@ -4,12 +4,12 @@
 
 **Git-backed Obsidian sync with durable conflicts, recoverable local applies, and a history you can inspect.**
 
-Self-hosted server · Desktop plugin · Browser dashboard
+Self-hosted server · Desktop and mobile plugin · Browser dashboard
 
 </div>
 
 > [!IMPORTANT]
-> Obsidian True Sync is under active development. The plugin is desktop-only, requires the native `git` executable, and should be tested with copied vaults before it is trusted with primary data.
+> Obsidian True Sync is under active development and should be tested with copied vaults before it is trusted with primary data. Mobile sync runs while Obsidian is in the foreground; iOS and Android do not guarantee background execution.
 
 ## Why Obsidian True Sync?
 
@@ -31,8 +31,8 @@ Each vault has a canonical Git history on the server. Devices submit their own c
 
 ```mermaid
 flowchart LR
-    A[Obsidian desktop plugin] -->|device commits and events| B[Obsidian True Sync server]
-    C[Obsidian desktop plugin] -->|device commits and events| B
+    A[Obsidian plugin] -->|device commits and events| B[Obsidian True Sync server]
+    C[Obsidian plugin] -->|device commits and events| B
     B --> D[(Canonical Git history)]
     B --> E[(Accounts, devices, conflicts)]
     F[Browser dashboard] -->|review, resolve, restore| B
@@ -59,7 +59,7 @@ See [Persistent State and Backup](docs/persistent-state.md) for the complete bac
 
 ## Quick Start With Docker
 
-Requirements: Docker and a desktop installation of Obsidian.
+Requirements: Docker and an installation of Obsidian on desktop, Android, or iOS.
 
 ```sh
 git clone https://github.com/nareto/obts.git
@@ -174,4 +174,4 @@ Community plugin history is metadata-only by default in the dashboard; revealing
 
 ## Current Boundaries
 
-Obsidian True Sync deliberately does not provide mobile support, shared vault membership, real-time collaborative editing, zero-knowledge storage, or destructive history compaction. These boundaries keep recovery behavior explicit and Git history authoritative while the core sync model matures.
+Obsidian True Sync deliberately does not provide guaranteed background mobile sync, shared vault membership, real-time collaborative editing, zero-knowledge storage, or destructive history compaction. These boundaries keep recovery behavior explicit and Git history authoritative while the core sync model matures.
