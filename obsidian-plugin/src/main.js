@@ -331,8 +331,9 @@ class ObtsObsidianClient {
   constructor(plugin) {
     this.plugin = plugin;
     this.adapter = plugin.app.vault.adapter;
-    this.fs = createDataAdapterFs(this.adapter);
-    fsp = this.fs.promises;
+    this.adapterFs = createDataAdapterFs(this.adapter);
+    this.fs = createReadOverlayFs(this.adapterFs, []);
+    fsp = this.adapterFs.promises;
     this.vaultDir = "/";
     this.obtsDir = path.join(this.vaultDir, ".obts");
     this.gitdir = path.join(this.obtsDir, "git");
@@ -351,6 +352,7 @@ class ObtsObsidianClient {
     await fsp.recoverReplacements(this.obtsDir);
     await fsp.mkdir(path.join(this.obtsDir, "auth"), { recursive: true, mode: 0o700 });
     await git.init({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, defaultBranch: "local" });
+    await this.loadPersistedPackOverlays();
     await git.writeRef({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, ref: "HEAD", value: "refs/heads/local", symbolic: true, force: true });
     await fsp.mkdir(path.join(this.gitdir, "info"), { recursive: true, mode: 0o700 });
     await fsp.writeFile(path.join(this.gitdir, "info", "exclude"), ".obts/\n.git/\n", { mode: 0o600 });
@@ -1707,16 +1709,32 @@ class ObtsObsidianClient {
     await fsp.mkdir(path.dirname(packPath), { recursive: true, mode: 0o700 });
     await fsp.writeFile(packPath, packfile, { mode: 0o600 });
     const persistedPack = await this.waitForPersistedBinary(packPath, packfile);
-    const indexingFs = createReadOverlayFs(this.fs, [[packPath, persistedPack]]);
-    await git.indexPack({ fs: indexingFs, dir: this.vaultDir, gitdir: this.gitdir, filepath: path.relative(this.vaultDir, packPath) });
+    this.fs.setReadOverlay(packPath, persistedPack);
+    await git.indexPack({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, filepath: path.relative(this.vaultDir, packPath) });
   }
 
-  async waitForPersistedBinary(filePath, expected) {
+  async loadPersistedPackOverlays() {
+    if (!Platform || !Platform.isMobile) return;
+    const packDir = path.join(this.gitdir, "objects", "pack");
+    let entries;
+    try {
+      entries = await fsp.readdir(packDir);
+    } catch {
+      return;
+    }
+    for (const entry of entries.filter((name) => name.endsWith(".pack"))) {
+      const packPath = path.join(packDir, entry);
+      const persistedPack = await this.waitForPersistedBinary(packPath);
+      this.fs.setReadOverlay(packPath, persistedPack);
+    }
+  }
+
+  async waitForPersistedBinary(filePath, expected = null) {
     let lastError;
     for (let attempt = 0; attempt < 5; attempt += 1) {
       try {
         const persisted = Buffer.from(await fsp.readFile(filePath));
-        if (buffersEqual(persisted, Buffer.from(expected))) return persisted;
+        if (expected === null || buffersEqual(persisted, Buffer.from(expected))) return persisted;
         lastError = new Error("Persisted bytes did not match the downloaded Git pack.");
       } catch (error) {
         lastError = error;

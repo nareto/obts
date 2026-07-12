@@ -92,22 +92,28 @@ describe('mobile DataAdapter filesystem', () => {
     const destinationArgs = { fs: destinationFs, dir: '/', gitdir: '/.obts/git' };
     await git.init({ ...destinationArgs, defaultBranch: 'local' });
     await destinationFs.promises.mkdir('/.obts/git/objects/pack', { recursive: true });
+    const oldPackPath = '/.obts/git/objects/pack/old-attempt.pack';
     const packPath = '/.obts/git/objects/pack/import.pack';
+    await destinationFs.promises.writeFile(oldPackPath, packed.packfile);
     await destinationFs.promises.writeFile(packPath, packed.packfile);
     const temporarilyUnreadableFs = {
       promises: {
         ...destinationFs.promises,
         async readFile(filePath: string, options: unknown) {
-          if (filePath.replace(/^\/+/, '') === packPath.replace(/^\/+/, '')) throw new Error('simulated mobile read-after-write miss');
+          if (filePath.endsWith('.pack')) throw new Error('simulated mobile pack read miss');
           return await destinationFs.promises.readFile(filePath, options);
         }
       }
     };
-    const indexingFs = createReadOverlayFs(temporarilyUnreadableFs, [[packPath, packed.packfile!]]);
-    await git.indexPack({ ...destinationArgs, fs: indexingFs, filepath: '.obts/git/objects/pack/import.pack' });
-    await git.writeRef({ ...destinationArgs, ref: 'refs/heads/local', value: commit, force: true });
+    const indexingFs = createReadOverlayFs(temporarilyUnreadableFs, []);
+    indexingFs.setReadOverlay(oldPackPath, packed.packfile!);
+    indexingFs.setReadOverlay(packPath, packed.packfile!);
+    const overlaidDestinationArgs = { ...destinationArgs, fs: indexingFs };
+    await git.indexPack({ ...overlaidDestinationArgs, filepath: '.obts/git/objects/pack/old-attempt.pack' });
+    await git.indexPack({ ...overlaidDestinationArgs, filepath: '.obts/git/objects/pack/import.pack' });
+    await git.writeRef({ ...overlaidDestinationArgs, ref: 'refs/heads/local', value: commit, force: true });
 
-    expect(Buffer.from((await git.readBlob({ ...destinationArgs, oid: commit, filepath: 'note.md' })).blob).toString('utf8')).toBe('mobile vault\n');
-    expect(await git.resolveRef({ ...destinationArgs, ref: 'refs/heads/local' })).toBe(commit);
+    expect(Buffer.from((await git.readBlob({ ...overlaidDestinationArgs, oid: commit, filepath: 'note.md' })).blob).toString('utf8')).toBe('mobile vault\n');
+    expect(await git.resolveRef({ ...overlaidDestinationArgs, ref: 'refs/heads/local' })).toBe(commit);
   });
 });

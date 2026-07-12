@@ -276,6 +276,12 @@ function toArrayBuffer(data) {
 function createReadOverlayFs(fs, files) {
   const overrides = new Map([...files].map(([filePath, data]) => [adapterPath(filePath), Buffer.from(data)]));
   return {
+    setReadOverlay(filePath, data) {
+      overrides.set(adapterPath(filePath), Buffer.from(data));
+    },
+    deleteReadOverlay(filePath) {
+      overrides.delete(adapterPath(filePath));
+    },
     promises: {
       ...fs.promises,
       async readFile(filePath, options) {
