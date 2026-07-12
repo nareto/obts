@@ -3,7 +3,7 @@ const git = require("isomorphic-git");
 const { Buffer } = require("buffer");
 const path = require("path-browserify");
 const createSha = require("sha.js");
-const { createDataAdapterFs } = require("./data-adapter-fs.cjs");
+const { createDataAdapterFs, createReadOverlayFs } = require("./data-adapter-fs.cjs");
 
 let fsp = null;
 
@@ -1706,7 +1706,24 @@ class ObtsObsidianClient {
     const packPath = path.join(this.gitdir, "objects", "pack", `obts-pull-${Date.now()}-${randomHex(4)}.pack`);
     await fsp.mkdir(path.dirname(packPath), { recursive: true, mode: 0o700 });
     await fsp.writeFile(packPath, packfile, { mode: 0o600 });
-    await git.indexPack({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, filepath: path.relative(this.vaultDir, packPath) });
+    const persistedPack = await this.waitForPersistedBinary(packPath, packfile);
+    const indexingFs = createReadOverlayFs(this.fs, [[packPath, persistedPack]]);
+    await git.indexPack({ fs: indexingFs, dir: this.vaultDir, gitdir: this.gitdir, filepath: path.relative(this.vaultDir, packPath) });
+  }
+
+  async waitForPersistedBinary(filePath, expected) {
+    let lastError;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        const persisted = Buffer.from(await fsp.readFile(filePath));
+        if (buffersEqual(persisted, Buffer.from(expected))) return persisted;
+        lastError = new Error("Persisted bytes did not match the downloaded Git pack.");
+      } catch (error) {
+        lastError = error;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 100));
+    }
+    throw new Error("Obsidian's vault adapter could not persist the downloaded Git pack.", { cause: lastError });
   }
 
   async listTreeFiles(commit) {

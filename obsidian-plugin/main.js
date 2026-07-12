@@ -21607,7 +21607,23 @@ var require_data_adapter_fs = __commonJS({
     function toArrayBuffer2(data) {
       return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
     }
-    module2.exports = { createDataAdapterFs: createDataAdapterFs2, adapterPath };
+    function createReadOverlayFs2(fs, files) {
+      const overrides = new Map([...files].map(([filePath, data]) => [adapterPath(filePath), Buffer3.from(data)]));
+      return {
+        promises: {
+          ...fs.promises,
+          async readFile(filePath, options) {
+            const override = overrides.get(adapterPath(filePath));
+            if (override) {
+              const encoding = typeof options === "string" ? options : options && options.encoding;
+              return encoding ? override.toString(encoding) : Buffer3.from(override);
+            }
+            return await fs.promises.readFile(filePath, options);
+          }
+        }
+      };
+    }
+    module2.exports = { createDataAdapterFs: createDataAdapterFs2, createReadOverlayFs: createReadOverlayFs2, adapterPath };
   }
 });
 
@@ -21617,10 +21633,10 @@ var git = (init_isomorphic_git(), __toCommonJS(isomorphic_git_exports));
 var { Buffer: Buffer2 } = require_buffer();
 var path = require_path_browserify();
 var createSha = require_sha2();
-var { createDataAdapterFs } = require_data_adapter_fs();
+var { createDataAdapterFs, createReadOverlayFs } = require_data_adapter_fs();
 var fsp = null;
 var API_VERSION = "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = "0.3.1";
+var PLUGIN_VERSION = "0.3.2";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var SYNC_STALE_MS = 2 * 60 * 1e3;
@@ -23211,7 +23227,23 @@ var ObtsObsidianClient = class {
     const packPath = path.join(this.gitdir, "objects", "pack", `obts-pull-${Date.now()}-${randomHex(4)}.pack`);
     await fsp.mkdir(path.dirname(packPath), { recursive: true, mode: 448 });
     await fsp.writeFile(packPath, packfile, { mode: 384 });
-    await git.indexPack({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, filepath: path.relative(this.vaultDir, packPath) });
+    const persistedPack = await this.waitForPersistedBinary(packPath, packfile);
+    const indexingFs = createReadOverlayFs(this.fs, [[packPath, persistedPack]]);
+    await git.indexPack({ fs: indexingFs, dir: this.vaultDir, gitdir: this.gitdir, filepath: path.relative(this.vaultDir, packPath) });
+  }
+  async waitForPersistedBinary(filePath, expected) {
+    let lastError;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        const persisted = Buffer2.from(await fsp.readFile(filePath));
+        if (buffersEqual(persisted, Buffer2.from(expected))) return persisted;
+        lastError = new Error("Persisted bytes did not match the downloaded Git pack.");
+      } catch (error) {
+        lastError = error;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 100));
+    }
+    throw new Error("Obsidian's vault adapter could not persist the downloaded Git pack.", { cause: lastError });
   }
   async listTreeFiles(commit2) {
     if (!commit2) return [];

@@ -273,4 +273,21 @@ function toArrayBuffer(data) {
   return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
 }
 
-module.exports = { createDataAdapterFs, adapterPath };
+function createReadOverlayFs(fs, files) {
+  const overrides = new Map([...files].map(([filePath, data]) => [adapterPath(filePath), Buffer.from(data)]));
+  return {
+    promises: {
+      ...fs.promises,
+      async readFile(filePath, options) {
+        const override = overrides.get(adapterPath(filePath));
+        if (override) {
+          const encoding = typeof options === "string" ? options : options && options.encoding;
+          return encoding ? override.toString(encoding) : Buffer.from(override);
+        }
+        return await fs.promises.readFile(filePath, options);
+      }
+    }
+  };
+}
+
+module.exports = { createDataAdapterFs, createReadOverlayFs, adapterPath };

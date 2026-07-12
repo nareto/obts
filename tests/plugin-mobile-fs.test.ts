@@ -7,8 +7,9 @@ import { describe, expect, it } from 'vitest';
 import { MemoryDataAdapter } from './helpers/memoryDataAdapter.js';
 
 const require = createRequire(import.meta.url);
-const { createDataAdapterFs } = require('../obsidian-plugin/src/data-adapter-fs.cjs') as {
+const { createDataAdapterFs, createReadOverlayFs } = require('../obsidian-plugin/src/data-adapter-fs.cjs') as {
   createDataAdapterFs: (adapter: MemoryDataAdapter) => any;
+  createReadOverlayFs: (fs: any, files: Array<[string, Uint8Array]>) => any;
 };
 
 describe('mobile DataAdapter filesystem', () => {
@@ -91,8 +92,19 @@ describe('mobile DataAdapter filesystem', () => {
     const destinationArgs = { fs: destinationFs, dir: '/', gitdir: '/.obts/git' };
     await git.init({ ...destinationArgs, defaultBranch: 'local' });
     await destinationFs.promises.mkdir('/.obts/git/objects/pack', { recursive: true });
-    await destinationFs.promises.writeFile('/.obts/git/objects/pack/import.pack', packed.packfile);
-    await git.indexPack({ ...destinationArgs, filepath: '.obts/git/objects/pack/import.pack' });
+    const packPath = '/.obts/git/objects/pack/import.pack';
+    await destinationFs.promises.writeFile(packPath, packed.packfile);
+    const temporarilyUnreadableFs = {
+      promises: {
+        ...destinationFs.promises,
+        async readFile(filePath: string, options: unknown) {
+          if (filePath.replace(/^\/+/, '') === packPath.replace(/^\/+/, '')) throw new Error('simulated mobile read-after-write miss');
+          return await destinationFs.promises.readFile(filePath, options);
+        }
+      }
+    };
+    const indexingFs = createReadOverlayFs(temporarilyUnreadableFs, [[packPath, packed.packfile!]]);
+    await git.indexPack({ ...destinationArgs, fs: indexingFs, filepath: '.obts/git/objects/pack/import.pack' });
     await git.writeRef({ ...destinationArgs, ref: 'refs/heads/local', value: commit, force: true });
 
     expect(Buffer.from((await git.readBlob({ ...destinationArgs, oid: commit, filepath: 'note.md' })).blob).toString('utf8')).toBe('mobile vault\n');
