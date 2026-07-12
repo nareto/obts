@@ -1454,14 +1454,26 @@ async function setupAdminAndVault(baseUrl: string, username = 'admin', vaultName
 }
 
 async function pairPlugin(admin: BrowserSession, vaultDir: string, deviceName: string): Promise<ObtsPluginClient> {
-  const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
-    device_name: deviceName
-  });
-  expect(pairing.status).toBe(201);
   const plugin = new ObtsPluginClient(vaultDir, {
     serverUrl: admin.baseUrl,
     deviceName
   });
-  await plugin.pairWithToken(pairing.body.pairing_token);
+  const connection = await plugin.startOnboarding('Test Vault');
+  const approval = await admin.post<{ status: string }>(`/api/v1/connections/${connection.connection_id}/approve`, {
+    selection: 'existing_vault',
+    vault_id: admin.vaultId
+  });
+  expect(approval.status).toBe(200);
+  const analysis = await plugin.analyzeOnboarding(connection.connection_id, connection.connection_secret);
+  const mode =
+    analysis.classification === 'independent_divergent' || analysis.classification === 'shared_baseline_divergent'
+      ? 'merge'
+      : 'use_server';
+  await plugin.finishOnboarding({
+    connectionId: connection.connection_id,
+    secret: connection.connection_secret,
+    analysis,
+    mode
+  });
   return plugin;
 }

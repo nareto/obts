@@ -4,7 +4,14 @@ import { dirname, join } from 'node:path';
 
 import { newId, nowIso } from '../../../src/shared/ids.js';
 import { assertSyncableTreePaths, isSyncableVaultPath, normalizeVaultPath, PathPolicyViolation } from '../../../src/shared/pathPolicy.js';
-import { API_VERSION, type DevicePushManifest, type DirectoryIntent } from '../../../src/shared/types.js';
+import {
+  API_VERSION,
+  type CompleteConnectionRequest,
+  type ConnectionStatusResponse,
+  type CreateConnectionResponse,
+  type DevicePushManifest,
+  type DirectoryIntent
+} from '../../../src/shared/types.js';
 import { PLUGIN_VERSION } from '../version.js';
 import { LocalGitEngine } from './localGit.js';
 import { ApplyLockActiveError, type ApplyJournal, RecoveryManager, sha256File } from './recovery.js';
@@ -44,6 +51,26 @@ type DetachedBaseline = {
 type PairingRepairContext = {
   baseline: DetachedBaseline | null;
   hasLocalGitHistory: boolean;
+};
+
+export type OnboardingAnalysis = {
+  selection: 'new_vault' | 'existing_vault';
+  vaultId: string | null;
+  vaultName: string;
+  expectedMain: string | null;
+  rootCommit: string | null;
+  classification:
+    | 'new_empty'
+    | 'new_with_content'
+    | 'server_to_empty'
+    | 'identical'
+    | 'stale_baseline'
+    | 'shared_baseline_divergent'
+    | 'independent_divergent';
+  proposalBase: string | null;
+  localFingerprint: string;
+  localFileCount: number;
+  localBytes: number;
 };
 
 export type QueueState = {
@@ -138,15 +165,120 @@ export class ObtsPluginClient {
     await this.writeQueue(await this.readQueue());
   }
 
-  async pairWithToken(pairingToken: string): Promise<void> {
+  async startOnboarding(localVaultName: string): Promise<CreateConnectionResponse> {
+    await mkdir(this.vaultDir, { recursive: true, mode: 0o700 });
     await this.assertPairingCanStart();
-    const pairingRepair = await this.discoverPairingRepairContext(await this.readExistingState());
-    const result = await this.transport.consumePairingToken({
-      pairingToken,
-      deviceName: this.settings.deviceName
-    });
-    const rePairBaseline = this.baselineForPairing(pairingRepair.baseline, result.vault_id);
     await this.initialize();
+    await this.flushEditorBuffersToDisk();
+    const summary = await this.localSnapshotSummary();
+    const existing = await this.readExistingState();
+    return await this.transport.createConnection({
+      plugin_version: PLUGIN_VERSION,
+      device_name: this.settings.deviceName,
+      local_vault_name: localVaultName,
+      local_summary: {
+        has_content: summary.fileCount > 0,
+        syncable_file_count: summary.fileCount,
+        syncable_bytes: summary.bytes,
+        has_detached_baseline: Boolean(existing?.unpaired_baseline_vault_id && existing.unpaired_baseline_main)
+      }
+    });
+  }
+
+  async pollOnboarding(connectionId: string, secret: string): Promise<ConnectionStatusResponse> {
+    return await this.transport.connectionStatus(connectionId, secret);
+  }
+
+  async analyzeOnboarding(connectionId: string, secret: string): Promise<OnboardingAnalysis> {
+    const status = await this.transport.connectionStatus(connectionId, secret);
+    if (status.status !== 'approved') {
+      throw new PluginBlockedError('connection_not_approved', 'Approve this connection in the browser first.');
+    }
+    await this.flushEditorBuffersToDisk();
+    const local = await this.localSnapshotSummary();
+    if (status.selection === 'new_vault') {
+      return {
+        selection: status.selection,
+        vaultId: null,
+        vaultName: status.vault_name,
+        expectedMain: null,
+        rootCommit: null,
+        classification: local.fileCount === 0 ? 'new_empty' : 'new_with_content',
+        proposalBase: null,
+        localFingerprint: local.fingerprint,
+        localFileCount: local.fileCount,
+        localBytes: local.bytes
+      };
+    }
+
+    const bootstrap = await this.transport.bootstrapConnection(connectionId, secret);
+    await this.git.importPack(bootstrap.packfile);
+    const localFiles = await this.git.scanSyncableFiles();
+    const matchesServer =
+      localFiles.length === bootstrap.manifest.changed_paths.length &&
+      (await this.localContentMatchesTree(localFiles, bootstrap.manifest.target_main));
+    const repair = await this.discoverPairingRepairContext(await this.readExistingState());
+    const baseline = this.baselineForPairing(repair.baseline, bootstrap.manifest.vault_id);
+    const validBaseline =
+      baseline &&
+      (await this.git.commitExists(baseline.main)) &&
+      (await this.git.isAncestor(baseline.main, bootstrap.manifest.target_main))
+        ? baseline
+        : null;
+    const matchesBaseline = validBaseline ? await this.localContentMatchesTree(localFiles, validBaseline.main) : false;
+    const classification =
+      localFiles.length === 0
+        ? 'server_to_empty'
+        : matchesServer
+          ? 'identical'
+          : validBaseline && matchesBaseline
+            ? 'stale_baseline'
+            : validBaseline
+              ? 'shared_baseline_divergent'
+              : 'independent_divergent';
+    return {
+      selection: status.selection,
+      vaultId: bootstrap.manifest.vault_id,
+      vaultName: bootstrap.manifest.vault_name,
+      expectedMain: bootstrap.manifest.target_main,
+      rootCommit: bootstrap.manifest.root_commit,
+      classification,
+      proposalBase: classification === 'shared_baseline_divergent' ? validBaseline!.main : bootstrap.manifest.root_commit,
+      localFingerprint: local.fingerprint,
+      localFileCount: local.fileCount,
+      localBytes: local.bytes
+    };
+  }
+
+  async finishOnboarding(input: {
+    connectionId: string;
+    secret: string;
+    analysis: OnboardingAnalysis;
+    mode: 'initialize' | 'use_server' | 'merge';
+  }): Promise<{ status: string; main?: string; conflictId?: string }> {
+    const current = await this.localSnapshotSummary();
+    if (current.fingerprint !== input.analysis.localFingerprint) {
+      throw new PluginBlockedError('onboarding_snapshot_changed', 'The local vault changed. Review the updated onboarding summary before continuing.');
+    }
+    const localFiles = await this.git.scanSyncableFiles();
+    const operationType = input.mode === 'use_server' ? 'replace_local_with_server' : 'initial_import';
+    await this.createLocalRecoveryBundle(operationType, input.analysis.expectedMain, localFiles);
+    const request: CompleteConnectionRequest = {
+      mode: input.mode,
+      expected_main: input.analysis.expectedMain,
+      ...(input.mode === 'initialize'
+        ? { proposal_kind: 'new_vault_import' as const }
+        : input.mode === 'merge'
+          ? {
+              proposal_kind:
+                input.analysis.classification === 'shared_baseline_divergent'
+                  ? ('shared_baseline_merge' as const)
+                  : ('independent_vault_merge' as const),
+              proposal_base: input.analysis.proposalBase
+            }
+          : {})
+    };
+    const result = await this.transport.completeConnection(input.connectionId, input.secret, request);
     await writeJson(join(this.vaultDir, '.obts', 'auth', 'device-token.json'), {
       device_token: result.device_token,
       created_at: nowIso()
@@ -160,7 +292,7 @@ export class ObtsPluginClient {
       server_device_ref: null,
       local_main: null,
       local_head: null,
-      initial_import_confirmed: false,
+      initial_import_confirmed: true,
       status_label: 'Checking',
       last_error_code: null,
       last_event_seq: 0,
@@ -172,87 +304,60 @@ export class ObtsPluginClient {
       vaultId: result.vault_id,
       deviceId: result.device_id,
       deviceToken: result.device_token,
-      currentLocalMain: rePairBaseline?.main ?? null,
+      currentLocalMain: null,
       currentEventSeq: 0
     });
     await this.git.importPack(pulled.packfile);
-    const localFiles = await this.git.scanSyncableFiles();
-    const serverFiles = await this.materializedTreeFiles(pulled.manifest.target_main);
-    const localAlreadyMatchesServer =
-      localFiles.length > 0 && serverFiles.length > 0
-        ? await this.localContentMatchesTree(localFiles, pulled.manifest.target_main)
-        : false;
-    const shouldProposeLocalContent =
-      localFiles.length > 0 &&
-      !localAlreadyMatchesServer &&
-      (!result.is_first_device || serverFiles.length > 0 || pairingRepair.hasLocalGitHistory);
-    if (shouldProposeLocalContent) {
-      if (rePairBaseline && (await this.canFastForwardCleanRePair(rePairBaseline, localFiles, pulled.manifest))) {
-        await this.writeState({
-          ...(await this.readState()),
-          local_main: rePairBaseline.main,
-          local_head: rePairBaseline.main,
-          initial_import_confirmed: true,
-          updated_at: nowIso()
-        });
-        await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true, {
-          directoryIntents: pulled.manifest.directory_intents ?? [],
-          explicitDirectories: pulled.manifest.explicit_directories ?? [],
-          eventSeq: pulled.manifest.event_seq
-        });
-        await this.writeState({
-          ...(await this.readState()),
-          initial_import_confirmed: true,
-          status_label: 'Synced',
-          last_error_code: null,
-          updated_at: nowIso()
-        });
-        await this.acknowledgeAppliedMain(await this.readState(), result.device_token, pulled.manifest.target_main);
-        return;
-      }
-      const proposalBase = rePairBaseline && (await this.git.commitExists(rePairBaseline.main)) ? rePairBaseline.main : pulled.manifest.target_main;
-      await this.git.setLocalMain(proposalBase);
-      await this.git.setLocalHead(proposalBase);
-      await this.writeState({
-        ...(await this.readState()),
-        local_main: proposalBase,
-        local_head: proposalBase,
-        initial_import_confirmed: true,
-        status_label: 'Ahead',
-        last_error_code: null,
-        updated_at: nowIso()
-      });
-      const proposalCommit = await this.git.createLocalCommit('obts: local vault changes');
-      await this.writeQueue({
-        pending_commit: proposalCommit,
-        expected_device_ref: null,
-        status: proposalCommit ? 'queued_local' : 'idle',
-        attempts: 0,
-        updated_at: nowIso()
-      });
-      if (proposalCommit) {
-        await this.writeState({
-          ...(await this.readState()),
-          local_head: proposalCommit,
-          status_label: 'Ahead',
-          updated_at: nowIso()
-        });
-      }
-      return;
-    }
-    await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true, {
-      directoryIntents: pulled.manifest.directory_intents ?? [],
-      explicitDirectories: pulled.manifest.explicit_directories ?? [],
-      eventSeq: pulled.manifest.event_seq
-    });
-    if (localFiles.length === 0 || localAlreadyMatchesServer) {
-      await this.writeState({
-        ...(await this.readState()),
-        initial_import_confirmed: true,
-        updated_at: nowIso()
+
+    if (input.mode === 'use_server') {
+      await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true, {
+        extraAffectedPaths: localFiles,
+        directoryIntents: pulled.manifest.directory_intents ?? [],
+        explicitDirectories: pulled.manifest.explicit_directories ?? [],
+        eventSeq: pulled.manifest.event_seq
       });
       await this.acknowledgeAppliedMain(await this.readState(), result.device_token, pulled.manifest.target_main);
+      await this.transport.acknowledgeOnboarding({
+        vaultId: result.vault_id,
+        deviceToken: result.device_token,
+        appliedMain: pulled.manifest.target_main
+      });
+      await this.writeState({ ...(await this.readState()), initial_import_confirmed: true, status_label: 'Synced', updated_at: nowIso() });
+      return { status: 'Synced', main: pulled.manifest.target_main };
     }
+
+    const proposalBase = input.mode === 'initialize' ? result.root_commit : requireOnboardingBase(input.analysis.proposalBase);
+    await this.git.setLocalMain(proposalBase);
+    await this.git.setLocalHead(proposalBase);
+    await this.writeState({
+      ...(await this.readState()),
+      local_main: proposalBase,
+      local_head: proposalBase,
+      status_label: 'Ahead',
+      updated_at: nowIso()
+    });
+    const proposalCommit = await this.git.createLocalCommit('obts: onboarding local vault');
+    await this.writeQueue({
+      pending_commit: proposalCommit,
+      expected_device_ref: null,
+      status: proposalCommit ? 'queued_local' : 'idle',
+      attempts: 0,
+      updated_at: nowIso()
+    });
+    const synced = await this.syncOnce();
+    if (synced.status === 'Review needed') {
+      return synced;
+    }
+    const finalState = await this.readState();
+    if (!finalState.local_main) {
+      throw new PluginBlockedError('onboarding_incomplete', 'Onboarding did not produce an applied server main.');
+    }
+    await this.transport.acknowledgeOnboarding({
+      vaultId: result.vault_id,
+      deviceToken: result.device_token,
+      appliedMain: finalState.local_main
+    });
+    return synced;
   }
 
   async syncOnce(options: { confirmInitialImport?: boolean } = {}): Promise<{ status: string; main?: string; conflictId?: string }> {
@@ -1461,6 +1566,21 @@ export class ObtsPluginClient {
     }
   }
 
+  private async localSnapshotSummary(): Promise<{ fingerprint: string; fileCount: number; bytes: number }> {
+    const files = await this.git.scanSyncableFiles();
+    const hash = createHash('sha256');
+    let bytes = 0;
+    for (const path of files) {
+      const content = await readFile(join(this.vaultDir, path));
+      bytes += content.byteLength;
+      hash.update(path);
+      hash.update('\0');
+      hash.update(createHash('sha256').update(content).digest());
+      hash.update('\0');
+    }
+    return { fingerprint: hash.digest('hex'), fileCount: files.length, bytes };
+  }
+
   private async createLocalRecoveryBundle(
     operationType: ApplyJournal['operation_type'],
     targetMain: string | null,
@@ -2146,6 +2266,13 @@ function buffersEqual(left: Buffer | null, right: Buffer | null): boolean {
     return left === right;
   }
   return left.equals(right);
+}
+
+function requireOnboardingBase(value: string | null): string {
+  if (!value) {
+    throw new PluginBlockedError('invalid_onboarding_base', 'Onboarding proposal base is unavailable.');
+  }
+  return value;
 }
 
 function changedPathsConflict(left: string, right: string): boolean {

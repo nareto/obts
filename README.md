@@ -76,7 +76,7 @@ docker run -d --name obts \
   obts
 ```
 
-Open `http://127.0.0.1:3000`, complete the initial setup, create a vault, and create a pairing token for your first device.
+Open `http://127.0.0.1:3000` and complete the initial account setup. Vaults can be created from the dashboard or directly from the plugin onboarding flow.
 
 Check readiness at any time:
 
@@ -93,16 +93,17 @@ The recommended installation path is [BRAT](https://github.com/TfTHacker/obsidia
 1. Install BRAT from Obsidian's community plugin browser.
 2. Run **BRAT: Add a beta plugin for testing** and enter `nareto/obts`.
 3. Track the latest release, then enable **Obsidian True Sync**.
-4. Enter the server URL, device name, and one-time pairing token.
-5. Pair a second copied vault and complete the [manual smoke test](docs/phase3-smoke-test.md) before using primary data.
+4. Enter the server URL and device name, then run **Set up sync**.
+5. Authenticate in the browser, approve a new or existing vault, and return to Obsidian.
+6. If local and server content differ, explicitly choose **Use the server vault** or **Merge local content** after reviewing the recovery/conflict warning.
+7. Connect a second copied vault and complete the [manual smoke test](docs/phase3-smoke-test.md) before using primary data.
 
 The server reports minimum and recommended plugin versions. Compatible older clients continue syncing and receive an update notice; clients below the minimum are blocked with an actionable BRAT update command. For manual installation, copy `main.js`, `manifest.json`, and `styles.css` from a GitHub release into `<vault>/.obsidian/plugins/obts/`.
 
 Plugin commands include:
 
-- `Pair device`
+- `Set up sync`
 - `Sync once`
-- `Confirm initial import and sync`
 - `Replace local with server state`
 - `Rebuild from server main`
 

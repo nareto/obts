@@ -44,3 +44,38 @@
 .obts-feedback--error {
   color: var(--text-error);
 }
+
+.obts-onboarding {
+  max-width: 640px;
+}
+
+.obts-onboarding-summary,
+.obts-verification-code {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 16px 0;
+  padding: 14px 16px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
+}
+
+.obts-onboarding-summary span,
+.obts-verification-code span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.obts-verification-code strong {
+  font-family: var(--font-monospace);
+  font-size: 20px;
+  letter-spacing: 0.08em;
+}
+
+.obts-onboarding-warning {
+  padding: 12px 14px;
+  border-left: 4px solid var(--color-orange);
+  background: var(--background-modifier-warning);
+}

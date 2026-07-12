@@ -1,4 +1,4 @@
-export const API_VERSION = '2026-07-02.full-sync';
+export const API_VERSION = '2026-07-12.browser-onboarding';
 
 export type StatusLabel =
   | 'Synced'
@@ -56,30 +56,75 @@ export type VaultSummary = {
   updated_at: string;
 };
 
-export type CreatePairingTokenRequest = {
-  device_name: string;
+export type ConnectionLocalSummary = {
+  has_content: boolean;
+  syncable_file_count: number;
+  syncable_bytes: number;
+  has_detached_baseline: boolean;
 };
 
-export type PairingTokenResponse = {
-  pairing_token: string;
+export type CreateConnectionRequest = {
+  plugin_version: string;
+  device_name: string;
+  local_vault_name: string;
+  local_summary: ConnectionLocalSummary;
+};
+
+export type CreateConnectionResponse = {
+  connection_id: string;
+  connection_secret: string;
+  authorization_url: string;
+  verification_code: string;
+  credential_salt: string;
   expires_at: string;
-  pairing_url: string;
+  poll_interval_ms: number;
 };
 
-export type ConsumePairingTokenRequest = {
-  pairing_token: string;
-  device_name: string;
-  client_name?: string;
+export type ConnectionStatusResponse =
+  | { status: 'pending'; expires_at: string }
+  | { status: 'denied' | 'expired' }
+  | {
+      status: 'approved';
+      selection: 'new_vault' | 'existing_vault';
+      vault_id: string | null;
+      vault_name: string;
+      expected_main: string | null;
+    }
+  | {
+      status: 'consumed';
+      vault_id: string;
+      vault_name: string;
+      device_id: string;
+    };
+
+export type ConnectionBootstrapManifest = {
+  api_version: typeof API_VERSION;
+  connection_id: string;
+  vault_id: string;
+  vault_name: string;
+  root_commit: string;
+  target_main: string;
+  changed_paths: string[];
+  explicit_directories: string[];
 };
 
-export type ConsumePairingTokenResponse = {
+export type CompleteConnectionRequest = {
+  mode: 'initialize' | 'use_server' | 'merge';
+  expected_main: string | null;
+  proposal_kind?: 'new_vault_import' | 'independent_vault_merge' | 'shared_baseline_merge';
+  proposal_base?: string | null;
+};
+
+export type CompleteConnectionResponse = {
   user_id: string;
   vault_id: string;
+  vault_name: string;
+  root_commit: string;
+  current_main: string;
   device_id: string;
   device_token: string;
   device_ref: string;
-  current_main: string;
-  is_first_device: boolean;
+  mode: CompleteConnectionRequest['mode'];
 };
 
 export type DeviceSelfResponse = {

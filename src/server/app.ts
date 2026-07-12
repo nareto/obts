@@ -27,10 +27,14 @@ import {
   parseDevicePullRequest,
   parseDevicePushManifest,
   parseJsonObject,
+  readNonNegativeInteger,
+  readOptionalBoolean,
+  readOptionalString,
   readString,
   ValidationError
 } from '../shared/validators.js';
 import { AuthError, AuthService, ownedVaultOrThrow } from './authService.js';
+import { ConnectionService } from './connectionService.js';
 import { createServerConfig, ensureServerDirectories, type ServerConfig } from './config.js';
 import { GitCommandError, GitService, sha256Hex } from './gitService.js';
 import { MetadataStore, type MetadataDb, type SyncOperationRow } from './metadataStore.js';
@@ -42,6 +46,7 @@ export type ObtsServer = {
   store: MetadataStore;
   git: GitService;
   auth: AuthService;
+  connections: ConnectionService;
   sync: SyncService;
 };
 
@@ -53,10 +58,12 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   const store = new MetadataStore(config.dataDir);
   await store.initialize();
   const git = new GitService(config);
+  await populateVaultRootCommits(store, git);
   await reconcileStartupOperations(store, git);
   await ensureProtectedConflictRefs(store, git);
   await markInconsistentVaults(store, git);
   const auth = new AuthService(store);
+  const connections = new ConnectionService(store, git, config.publicBaseUrl);
   const sync = new SyncService(store, git, config.maxUploadBytes);
   const app = Fastify({
     logger: false,
@@ -302,6 +309,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         owner_user_id: session.user.user_id,
         display_name: displayName,
         status: 'active' as const,
+        root_commit: rootCommit,
         current_main: rootCommit,
         created_at: timestamp,
         updated_at: timestamp
@@ -401,23 +409,121 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     };
   });
 
-  app.post('/api/v1/vaults/:vaultId/pairing-tokens', async (request, reply) => {
+  app.post('/api/v1/connections', async (request, reply) => {
+    const body = requestBody(request);
+    const localSummary = body.local_summary;
+    assertRecord(localSummary, 'local_summary');
+    const result = await connections.create({
+      plugin_version: readString(body, 'plugin_version'),
+      device_name: readString(body, 'device_name'),
+      local_vault_name: readString(body, 'local_vault_name'),
+      local_summary: {
+        has_content: readRequiredBoolean(localSummary, 'has_content'),
+        syncable_file_count: readNonNegativeInteger(localSummary, 'syncable_file_count'),
+        syncable_bytes: readNonNegativeInteger(localSummary, 'syncable_bytes'),
+        has_detached_baseline: readRequiredBoolean(localSummary, 'has_detached_baseline')
+      }
+    });
+    return reply.status(201).send(result);
+  });
+
+  app.get('/api/v1/connections/:connectionId', async (request) => {
+    const { connectionId } = connectionPathParams(request);
+    return await connections.status(connectionId, readBearerToken(request.headers.authorization));
+  });
+
+  app.get('/api/v1/connections/:connectionId/review', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const { connectionId } = connectionPathParams(request);
+    const connection = await connections.review(connectionId);
+    const db = await store.snapshot();
+    return {
+      connection_id: connection.connection_id,
+      verification_code: connection.verification_code,
+      status: connection.status,
+      plugin_version: connection.plugin_version,
+      device_name: connection.proposed_device_name,
+      local_vault_name: connection.local_vault_name,
+      local_summary: connection.local_summary,
+      vaults: db.vaults
+        .filter((vault) => vault.owner_user_id === session.user.user_id)
+        .map((vault) => ({
+          vault_id: vault.vault_id,
+          display_name: vault.display_name,
+          current_main: vault.current_main,
+          status: vault.status
+        }))
+    };
+  });
+
+  app.post('/api/v1/connections/:connectionId/approve', async (request) => {
     const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     auth.requireRecentAuth(session.session);
-    const { vaultId } = pathParams(request);
+    const { connectionId } = connectionPathParams(request);
     const body = requestBody(request);
-    const result = await auth.createPairingToken({
-      userId: session.user.user_id,
-      vaultId,
-      deviceName: readString(body, 'device_name'),
-      publicBaseUrl: config.publicBaseUrl
+    const selection = readString(body, 'selection');
+    if (selection !== 'new_vault' && selection !== 'existing_vault') {
+      throw new ValidationError('invalid_request', 'selection must be new_vault or existing_vault.');
+    }
+    await connections.approve({
+      connectionId,
+      user: session.user,
+      selection,
+      ...(selection === 'existing_vault' ? { vaultId: readString(body, 'vault_id') } : { displayName: readString(body, 'display_name') })
     });
-    return reply.status(201).send({
-      pairing_token: result.token,
-      pairing_url: result.pairingUrl,
-      expires_at: result.expiresAt
+    return { status: 'approved' };
+  });
+
+  app.post('/api/v1/connections/:connectionId/deny', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
+    const { connectionId } = connectionPathParams(request);
+    await connections.deny(connectionId, session.user);
+    return { status: 'denied' };
+  });
+
+  app.post('/api/v1/connections/:connectionId/bootstrap', async (request, reply) => {
+    const { connectionId } = connectionPathParams(request);
+    const result = await connections.bootstrap(connectionId, readBearerToken(request.headers.authorization));
+    return sendMultipart(reply, {
+      manifest: {
+        api_version: API_VERSION,
+        connection_id: connectionId,
+        vault_id: result.vaultId,
+        vault_name: result.vaultName,
+        root_commit: result.rootCommit,
+        target_main: result.targetMain,
+        changed_paths: result.changedPaths.filter((path) => isSyncableVaultPath(path)),
+        explicit_directories: result.explicitDirectories
+      },
+      packfile: result.packfile
     });
+  });
+
+  app.post('/api/v1/connections/:connectionId/complete', async (request, reply) => {
+    const { connectionId } = connectionPathParams(request);
+    const body = requestBody(request);
+    const mode = readString(body, 'mode');
+    if (mode !== 'initialize' && mode !== 'use_server' && mode !== 'merge') {
+      throw new ValidationError('invalid_request', 'mode is invalid.');
+    }
+    const proposalKind = readOptionalString(body, 'proposal_kind');
+    if (
+      proposalKind !== undefined &&
+      proposalKind !== 'new_vault_import' &&
+      proposalKind !== 'independent_vault_merge' &&
+      proposalKind !== 'shared_baseline_merge'
+    ) {
+      throw new ValidationError('invalid_request', 'proposal_kind is invalid.');
+    }
+    const result = await connections.complete(connectionId, readBearerToken(request.headers.authorization), {
+      mode,
+      expected_main: readOptionalNullableString(body, 'expected_main'),
+      ...(proposalKind ? { proposal_kind: proposalKind } : {}),
+      proposal_base: readOptionalNullableString(body, 'proposal_base')
+    });
+    return reply.status(201).send(result);
   });
 
   app.post('/api/v1/vaults/:vaultId/devices/:deviceId/revoke', async (request) => {
@@ -431,23 +537,6 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       deviceId
     });
     return { status: 'ok' };
-  });
-
-  app.post('/api/v1/pair/consume', async (request, reply) => {
-    const body = requestBody(request);
-    const result = await auth.consumePairingToken({
-      pairingToken: readString(body, 'pairing_token'),
-      deviceName: readString(body, 'device_name')
-    });
-    return reply.status(201).send({
-      user_id: result.user.user_id,
-      vault_id: result.vault.vault_id,
-      device_id: result.device.device_id,
-      device_token: result.deviceToken,
-      device_ref: result.device.device_ref,
-      current_main: result.vault.current_main,
-      is_first_device: result.isFirstDevice
-    });
   });
 
   app.get('/api/v1/device/self', async (request) => {
@@ -576,6 +665,25 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       device.last_status_report_at = nowIso();
     });
     return { status: 'ok', plugin: describePluginCompatibility(report.pluginVersion) };
+  });
+
+  app.post('/api/v1/vaults/:vaultId/onboarding/complete', async (request) => {
+    const { vaultId } = pathParams(request);
+    const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+    const body = requestBody(request);
+    const appliedMain = readCommitId(body, 'applied_main');
+    if (!(await git.commitExists(vaultId, appliedMain)) || !(await git.isAncestor(vaultId, appliedMain, deviceAuth.vault.current_main))) {
+      throw new AuthError(409, 'invalid_applied_main', 'Applied main is not trusted vault history.');
+    }
+    await connections.markComplete(deviceAuth.device.device_id);
+    await store.mutate((db) => {
+      const device = db.devices.find((candidate) => candidate.device_id === deviceAuth.device.device_id);
+      if (device) {
+        device.last_applied_main = appliedMain;
+        device.status = appliedMain === deviceAuth.vault.current_main ? 'synced' : 'paired';
+      }
+    });
+    return { status: 'ok' };
   });
 
   app.post('/api/v1/vaults/:vaultId/sync/unpair', async (request) => {
@@ -1028,9 +1136,10 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   app.get('/', async (request, reply) => sendDashboardStatic(request, reply));
   app.get('/dashboard', async (request, reply) => sendDashboardStatic(request, reply));
   app.get('/dashboard/*', async (request, reply) => sendDashboardStatic(request, reply));
+  app.get('/connect/:connectionId', async (request, reply) => sendDashboardStatic(request, reply));
   app.get('/assets/*', async (request, reply) => sendDashboardStatic(request, reply));
 
-  return { app, config, store, git, auth, sync };
+  return { app, config, store, git, auth, connections, sync };
 }
 
 function buildDashboardConflicts(
@@ -1636,6 +1745,41 @@ function readNullableSmallRecord(record: Record<string, unknown>, key: string): 
   return value;
 }
 
+function connectionPathParams(request: FastifyRequest): { connectionId: string } {
+  const params = request.params as Record<string, string>;
+  const connectionId = params.connectionId;
+  if (!connectionId) {
+    throw new ValidationError('invalid_request', 'Connection ID is required.');
+  }
+  return { connectionId };
+}
+
+function readBearerToken(header: string | undefined): string {
+  if (!header?.startsWith('Bearer ') || header.length <= 'Bearer '.length) {
+    throw new AuthError(401, 'invalid_connection', 'Connection authorization is invalid or expired.');
+  }
+  return header.slice('Bearer '.length);
+}
+
+function readOptionalNullableString(record: Record<string, unknown>, field: string): string | null {
+  const value = record[field];
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
+  if (typeof value !== 'string') {
+    throw new ValidationError('invalid_request', `Invalid field: ${field}.`, { field });
+  }
+  return value;
+}
+
+function readRequiredBoolean(record: Record<string, unknown>, field: string): boolean {
+  const value = readOptionalBoolean(record, field);
+  if (value === undefined) {
+    throw new ValidationError('invalid_request', `Missing or invalid field: ${field}.`, { field });
+  }
+  return value;
+}
+
 function pathParams(request: FastifyRequest): { vaultId: string } {
   const params = request.params as { vaultId?: string };
   if (!params.vaultId) {
@@ -1770,8 +1914,8 @@ async function readPullMultipart(request: FastifyRequest): Promise<DevicePullReq
   return parseDevicePullRequest(parseJsonObject(manifestText));
 }
 
-function sendMultipart(reply: FastifyReply, input: { manifest: DevicePullManifest; packfile: Buffer }): FastifyReply {
-  const boundary = `obts-${sha256Hex(Buffer.from(`${input.manifest.target_main}:${input.packfile.byteLength}`)).slice(0, 24)}`;
+function sendMultipart(reply: FastifyReply, input: { manifest: object; packfile: Buffer }): FastifyReply {
+  const boundary = `obts-${sha256Hex(Buffer.from(`${JSON.stringify(input.manifest)}:${input.packfile.byteLength}`)).slice(0, 24)}`;
   const manifest = Buffer.from(JSON.stringify(input.manifest), 'utf8');
   const chunks = [
     Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="manifest"\r\nContent-Type: application/json\r\n\r\n`),
@@ -1795,7 +1939,7 @@ async function sendDashboardStatic(request: FastifyRequest, reply: FastifyReply)
     return sendStaticNotFound(reply, request.id);
   }
   const relativePath =
-    pathname === '/' || pathname === '/dashboard' || pathname.startsWith('/dashboard/')
+    pathname === '/' || pathname === '/dashboard' || pathname.startsWith('/dashboard/') || pathname.startsWith('/connect/')
       ? 'index.html'
       : pathname.replace(/^\/+/u, '');
   const absolutePath = resolve(dashboardRoot, relativePath);
@@ -2038,7 +2182,7 @@ async function buildReadinessSummary(
     metadata_store: metadataStoreReady,
     git: gitReady.ok,
     setup_complete: db.setup_complete,
-    migrations: db.schema_version === 2,
+    migrations: db.schema_version === 3,
     git_store: gitStoreReady.ok,
     temp_workspace: tempWorkspaceReady.ok,
     filesystem_permissions: filesystemPermissions,
@@ -2095,7 +2239,7 @@ function checkEventDelivery(db: MetadataDb): { ok: true } | { ok: false; error: 
 type PersistentStateCheck = { ok: true } | { ok: false; error: string; vaultId?: string };
 
 async function checkPersistentState(db: MetadataDb, git: GitService): Promise<PersistentStateCheck> {
-  if (db.schema_version !== 2) {
+  if (db.schema_version !== 3) {
     return { ok: false, error: 'metadata schema version is unsupported' };
   }
   try {
@@ -2268,6 +2412,27 @@ async function ensureProtectedConflictRefs(store: MetadataStore, git: GitService
       });
     }
   }
+}
+
+async function populateVaultRootCommits(store: MetadataStore, git: GitService): Promise<void> {
+  const db = await store.snapshot();
+  const roots = new Map<string, string>();
+  for (const vault of db.vaults) {
+    if (vault.root_commit === null) {
+      roots.set(vault.vault_id, await git.rootCommit(vault.vault_id, vault.current_main));
+    }
+  }
+  if (roots.size === 0) {
+    return;
+  }
+  await store.mutate((mutableDb) => {
+    for (const vault of mutableDb.vaults) {
+      const root = roots.get(vault.vault_id);
+      if (root) {
+        vault.root_commit = root;
+      }
+    }
+  });
 }
 
 async function reconcileStartupOperations(store: MetadataStore, git: GitService): Promise<void> {

@@ -257,25 +257,97 @@ paths:
                 $ref: "#/components/schemas/DashboardSummary"
         "404":
           $ref: "#/components/responses/Error"
-  /vaults/{vault_id}/pairing-tokens:
+  /connections:
     post:
-      summary: Create a one-time pairing token after recent dashboard auth.
+      summary: Start browser-assisted plugin onboarding.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateConnectionRequest"
+      responses:
+        "201":
+          description: Pending connection authorization.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateConnectionResponse"
+  /connections/{connection_id}:
+    get:
+      summary: Poll a pending browser-assisted connection.
+      security:
+        - connectionBearer: []
       parameters:
-        - $ref: "#/components/parameters/VaultId"
+        - $ref: "#/components/parameters/ConnectionId"
+      responses:
+        "200":
+          description: Current connection status.
+  /connections/{connection_id}/review:
+    get:
+      summary: Review a pending connection in an authenticated browser session.
+      parameters:
+        - $ref: "#/components/parameters/ConnectionId"
+      responses:
+        "200":
+          description: Pending device metadata and owned vault choices.
+        "404":
+          $ref: "#/components/responses/Error"
+  /connections/{connection_id}/approve:
+    post:
+      summary: Approve a connection for a new or existing owned vault after recent authentication.
+      parameters:
+        - $ref: "#/components/parameters/ConnectionId"
         - $ref: "#/components/parameters/CsrfHeader"
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/CreatePairingTokenRequest"
+              $ref: "#/components/schemas/ApproveConnectionRequest"
+      responses:
+        "200":
+          description: Connection approved.
+  /connections/{connection_id}/deny:
+    post:
+      summary: Deny a pending connection.
+      parameters:
+        - $ref: "#/components/parameters/ConnectionId"
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "200":
+          description: Connection denied.
+  /connections/{connection_id}/bootstrap:
+    post:
+      summary: Fetch approved existing-vault Git state before device registration.
+      security:
+        - connectionBearer: []
+      parameters:
+        - $ref: "#/components/parameters/ConnectionId"
+      responses:
+        "200":
+          description: Bootstrap manifest and Git packfile.
+  /connections/{connection_id}/complete:
+    post:
+      summary: Register the approved device with an explicit onboarding content mode.
+      security:
+        - connectionBearer: []
+      parameters:
+        - $ref: "#/components/parameters/ConnectionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompleteConnectionRequest"
       responses:
         "201":
-          description: One-time pairing token and URL.
-        "403":
-          $ref: "#/components/responses/Error"
-        "404":
-          $ref: "#/components/responses/Error"
+          description: Idempotent device registration and derived device credential metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompleteConnectionResponse"
   /vaults/{vault_id}/devices/{device_id}/revoke:
     post:
       summary: Revoke a paired device and its device tokens after recent dashboard auth.
@@ -293,25 +365,6 @@ paths:
         "403":
           $ref: "#/components/responses/Error"
         "404":
-          $ref: "#/components/responses/Error"
-  /pair/consume:
-    post:
-      summary: Consume a one-time pairing token and register a device.
-      security: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/ConsumePairingTokenRequest"
-      responses:
-        "201":
-          description: Device token and initial server main.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ConsumePairingTokenResponse"
-        "401":
           $ref: "#/components/responses/Error"
   /device/self:
     get:
@@ -438,6 +491,27 @@ paths:
           $ref: "#/components/responses/Error"
         "410":
           $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/onboarding/complete:
+    post:
+      summary: Mark the registered device onboarding workflow complete after applying server main.
+      security:
+        - deviceBearer: []
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [applied_main]
+              properties:
+                applied_main:
+                  type: string
+                  pattern: "^[0-9a-f]{40}$"
+      responses:
+        "200":
+          description: Onboarding completed.
   /vaults/{vault_id}/sync/unpair:
     post:
       summary: Revoke the current paired device and invalidate its device token.
@@ -676,7 +750,18 @@ components:
     deviceBearer:
       type: http
       scheme: bearer
+    connectionBearer:
+      type: http
+      scheme: bearer
+      description: Short-lived connection secret held only by the onboarding plugin.
   parameters:
+    ConnectionId:
+      name: connection_id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^con_"
     VaultId:
       name: vault_id
       in: path
@@ -828,46 +913,108 @@ components:
       properties:
         display_name:
           type: string
-    CreatePairingTokenRequest:
+    ConnectionLocalSummary:
       type: object
-      required: [device_name]
+      required: [has_content, syncable_file_count, syncable_bytes, has_detached_baseline]
       properties:
+        has_content:
+          type: boolean
+        syncable_file_count:
+          type: integer
+          minimum: 0
+        syncable_bytes:
+          type: integer
+          minimum: 0
+        has_detached_baseline:
+          type: boolean
+    CreateConnectionRequest:
+      type: object
+      required: [plugin_version, device_name, local_vault_name, local_summary]
+      properties:
+        plugin_version:
+          type: string
         device_name:
           type: string
-    ConsumePairingTokenRequest:
-      allOf:
-        - $ref: "#/components/schemas/CreatePairingTokenRequest"
-        - type: object
-          required: [pairing_token]
-          properties:
-            pairing_token:
-              type: string
-    ConsumePairingTokenResponse:
+        local_vault_name:
+          type: string
+        local_summary:
+          $ref: "#/components/schemas/ConnectionLocalSummary"
+    CreateConnectionResponse:
       type: object
-      required:
-        - user_id
-        - vault_id
-        - device_id
-        - device_token
-        - device_ref
-        - current_main
-        - is_first_device
+      required: [connection_id, connection_secret, authorization_url, verification_code, credential_salt, expires_at, poll_interval_ms]
+      properties:
+        connection_id:
+          type: string
+        connection_secret:
+          type: string
+        authorization_url:
+          type: string
+          format: uri
+        verification_code:
+          type: string
+        credential_salt:
+          type: string
+        expires_at:
+          type: string
+          format: date-time
+        poll_interval_ms:
+          type: integer
+    ApproveConnectionRequest:
+      type: object
+      required: [selection]
+      properties:
+        selection:
+          type: string
+          enum: [new_vault, existing_vault]
+        vault_id:
+          type: string
+        display_name:
+          type: string
+    CompleteConnectionRequest:
+      type: object
+      required: [mode, expected_main]
+      properties:
+        mode:
+          type: string
+          enum: [initialize, use_server, merge]
+        expected_main:
+          oneOf:
+            - type: "null"
+            - type: string
+              pattern: "^[0-9a-f]{40}$"
+        proposal_kind:
+          type: string
+          enum: [new_vault_import, independent_vault_merge, shared_baseline_merge]
+        proposal_base:
+          oneOf:
+            - type: "null"
+            - type: string
+              pattern: "^[0-9a-f]{40}$"
+    CompleteConnectionResponse:
+      type: object
+      required: [user_id, vault_id, vault_name, root_commit, current_main, device_id, device_token, device_ref, mode]
       properties:
         user_id:
           type: string
         vault_id:
           type: string
+        vault_name:
+          type: string
+        root_commit:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        current_main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
         device_id:
           type: string
         device_token:
           type: string
         device_ref:
           type: string
-        current_main:
+        mode:
           type: string
-          pattern: "^[0-9a-f]{40}$"
-        is_first_device:
-          type: boolean
+          enum: [initialize, use_server, merge]
     DeviceSelfResponse:
       type: object
       required:

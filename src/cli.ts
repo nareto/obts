@@ -26,7 +26,6 @@ Usage:
   obts health live|ready [--json]
   obts setup --username USER (--password PASSWORD | --password-env ENV) [--display-name NAME] [--json]
   obts vault create --username USER (--password PASSWORD | --password-env ENV) --display-name NAME [--json]
-  obts pairing-token create --username USER (--password PASSWORD | --password-env ENV) --vault-id ID --device-name NAME [--json]
   obts devices list --username USER (--password PASSWORD | --password-env ENV) --vault-id ID [--json]
   obts conflicts list --username USER (--password PASSWORD | --password-env ENV) --vault-id ID [--status open|resolved|all] [--json]
   obts integrity repair --vault-id ID [--json]
@@ -117,6 +116,7 @@ export async function runCli(
           owner_user_id: user.user_id,
           display_name: displayName,
           status: 'active' as const,
+          root_commit: rootCommit,
           current_main: rootCommit,
           created_at: timestamp,
           updated_at: timestamp
@@ -142,27 +142,6 @@ export async function runCli(
         return row;
       });
       writeResult(io, parsed, vault, `created vault ${vault.display_name} (${vault.vault_id}) at ${vault.current_main}\n`);
-      return 0;
-    }
-
-    if (command === 'pairing-token' && subcommand === 'create') {
-      const user = await loginForCli(server, parsed, env);
-      const result = await server.auth.createPairingToken({
-        userId: user.user_id,
-        vaultId: requiredString(parsed, 'vault-id'),
-        deviceName: requiredString(parsed, 'device-name'),
-        publicBaseUrl: server.config.publicBaseUrl
-      });
-      writeResult(
-        io,
-        parsed,
-        {
-          pairing_token: result.token,
-          pairing_url: result.pairingUrl,
-          expires_at: result.expiresAt
-        },
-        `pairing token expires at ${result.expiresAt}\n${result.pairingUrl}\n`
-      );
       return 0;
     }
 

@@ -37,7 +37,7 @@ Git provides commit identity, ancestry, merge bases, diffs, rename detection sup
 - Support deployment-managed at-rest protection through documented storage, permission, and backup requirements.
 - Enforce strict account and vault authorization for every API and event stream.
 - Avoid `.git` directories inside visible Obsidian vaults.
-- Keep plugin UX simple: server URL, login/pairing, and device name.
+- Keep plugin onboarding simple: server URL and device name in Obsidian, followed by browser authentication and explicit content-policy confirmation.
 - Document the app persistent-state backup contract without embedding deployment-specific backup automation.
 
 ### 1.4 Non-Goals
@@ -129,41 +129,38 @@ Acceptance criteria:
 - Missing or inconsistent restored persistent state fails closed.
 - The first admin setup cannot be repeated after setup is complete.
 
-### 3.3 Create Vault And Pair First Device
+### 3.3 Browser-Assisted Vault And Device Onboarding
 
-The owner creates a vault in the dashboard and pairs the first Obsidian plugin device.
+The Obsidian plugin is the primary onboarding entry point. The owner enters only the server URL and device display name. The plugin starts a short-lived connection request, opens the server dashboard in a browser, and polls until the authenticated owner approves creation of a new vault or selection of an existing owned vault. Manual pairing tokens, copied pairing URLs, and plugin-stored account credentials are not supported.
 
 Behavior:
 
-1. Server creates the vault record.
-2. Server initializes per-vault Git state.
-3. Server creates a server-authored empty-tree root commit on `refs/heads/main`.
-4. Dashboard issues a one-time pairing token or URL after recent-auth verification.
-5. Plugin consumes the pairing token, registers device metadata, and stores a device token locally.
-6. Plugin initializes hidden Git state under `.obts/` without creating a visible vault `.git`.
-7. Plugin performs an initial scan of the local vault and local `.obts/` state.
-8. Plugin imports the current server `main` root as its base.
-9. If the local vault is empty and server `main` contains only the server-authored empty-tree root commit, the client records itself as synced to current `main`.
-10. If the local vault is empty and server `main` contains user content, the plugin applies server `main` through the normal apply journal and records itself as synced after apply succeeds.
-11. If this is the first paired device for a newly created vault and the local vault contains user content, the plugin creates a recovery bundle, asks the owner to confirm initial import, commits the local content as the initial device commit, and uploads that commit through the device ref.
-12. If this is an additional paired device and the local vault contains user content that differs from server `main`, the plugin first checks whether the local vault is a clean stale copy of a detached unpaired baseline for the same vault.
-13. A clean stale copy may fast-forward during re-pair when all of the following are true: the detached baseline vault ID matches the newly paired vault; the local visible syncable files exactly match the baseline commit tree under the full-vault path policy; the baseline commit is available in local hidden Git state; and the baseline commit is an ancestor of current server `main` after the plugin imports the server pull pack.
-14. When the clean stale-copy checks pass, the plugin applies current server `main` through the normal apply journal and recovery-bundle protections, records the new device as synced, and does not require replace-local-with-server.
-15. When the clean stale-copy checks fail, additional-device pairing with local content that differs from server `main` does not adopt another device's identity or force replace-local. The plugin records the visible filesystem as this device's own proposal commit, using current server `main` as a trusted proposal base when no safer same-device baseline exists, then uploads it through this device's ref for normal server merge or conflict handling.
-16. If local `.obts/` Git state belongs to another vault or is partially initialized beyond the detached-baseline case, pairing blocks until the owner runs a recovery or reset flow.
+1. The plugin validates local state, flushes editor buffers, scans syncable content, and starts a connection request carrying only redacted counts, byte totals, local vault display name, device name, and plugin version.
+2. The server returns a high-entropy connection secret, verification code, browser authorization URL, expiry, and polling interval. The server stores only the connection-secret hash.
+3. The browser requires normal dashboard login, displays the same verification code and proposed device metadata, and requires recent authentication before approval.
+4. The owner chooses either a new server vault or one existing owned vault. Cross-owner vault choices remain opaque and return `404`.
+5. For an existing vault, the approved connection can bootstrap the empty root, current `main`, directory state, and required Git objects before device registration so the plugin can classify local state safely.
+6. The plugin classifies the local vault as empty, identical, a clean stale same-vault baseline, divergent with shared ancestry, or divergent without trusted shared ancestry.
+7. Empty, identical, and clean-stale cases take the safe server-apply or no-change path. Divergent cases require an explicit choice between **Use the server vault** and **Merge local content**.
+8. Use-server creates a recovery bundle and replaces only syncable local content with the captured server state; hard-excluded local content remains untouched.
+9. Merge with a verified same-vault baseline creates the device proposal from that baseline. Merge without trusted shared ancestry creates the local proposal from the vault's server-authored empty root so remote-only and local-only paths are preserved and differently added same-path content conflicts.
+10. New-vault import creates a recovery bundle, confirms the exact scanned snapshot in the onboarding wizard, creates the server vault and device, and uploads a root-descending initial proposal.
+11. The plugin rescans before confirmation. If the local snapshot fingerprint changed, it refreshes the review instead of applying stale consent.
+12. Device registration is idempotent for one consumed connection and records the approved onboarding mode and first proposal base. Normal background sync remains disabled until onboarding is acknowledged complete.
+13. If local `.obts/` state belongs to an active device or is partially initialized beyond a recoverable detached baseline, onboarding blocks before browser authorization until the owner runs recovery or reset.
 
 Acceptance criteria:
 
-- Pairing token is one-time, short-lived, and scoped to one owning user, one vault, and the issued device display name.
-- Device token is scoped to one user and one vault.
-- No vault passphrase is required.
-- No visible `.git` directory is created inside the vault.
-- Server `main` exists immediately after vault creation and points to a real empty-tree root commit, not an empty or unborn ref.
-- First sync never silently discards local content.
-- First-device import of non-empty local content requires a recovery bundle and explicit owner confirmation before upload.
-- Additional-device pairing of non-empty divergent local content commits and uploads the local filesystem as that device's proposal instead of requiring replace-local-with-server.
-- Re-pairing a previously synced device whose local files still exactly match an old server `main` commit safely fast-forwards to current server `main` without replace-local-with-server.
-- Re-pairing blocks instead of fast-forwarding when the detached baseline is missing, belongs to another vault, is not an ancestor of current server `main`, or no longer matches visible local files.
+- No manual pairing-token endpoint, CLI command, dashboard token dialog, plugin token field, or post-pair initial-import command exists.
+- Connection requests are short-lived, one-time, high-entropy, rate-limited, secret-redacted, and bound to browser approval by the owning user.
+- Browser approval requires session authentication, CSRF protection, matching verification-code review, and recent authentication.
+- Device tokens remain scoped to one user, one vault, and one device and are stored locally only under `.obts/auth/`.
+- No vault passphrase is required and no visible `.git` directory is created inside the vault.
+- Every vault stores a unique server-authored empty root that remains an ancestor of `main`.
+- First sync never silently discards local content; every destructive local action requires a recovery bundle first.
+- Independent-vault merge preserves remote-only and local-only paths and conflicts on differing same-path additions instead of treating local absence as remote deletion.
+- Verified shared-baseline merge preserves meaningful edits and deletions relative to that baseline.
+- Existing fully connected devices retain device-token sync authority after upgrading, while clients below the breaking minimum plugin version are blocked before mutation.
 
 ### 3.4 Local Edit Sync
 
@@ -447,7 +444,7 @@ Header:
 
 - title: `Overview`;
 - subtitle: selected vault name and top-level vault status;
-- primary action: `Pair device`.
+- primary action: `New vault`; device connection is initiated from the Obsidian plugin.
 
 First row: four equal summary panels, each spanning three grid columns and using
 a fixed minimum height of `104px`:
@@ -556,18 +553,19 @@ Each row shows status, last checked, short detail, and one action when
 available. Git maintenance start is a primary or secondary action depending on
 whether maintenance is recommended; it requires recent authentication.
 
-#### 3.9.10 Pair Device Dialog
+#### 3.9.10 Connection Authorization Page
 
-`Pair device` opens a modal dialog, not a separate page.
+`/connect/{connection_id}` is a focused browser authorization page inside the dashboard SPA.
 
-Dialog requirements:
+Requirements:
 
-- width: `520px` on desktop;
-- first step asks for device display name;
-- second step shows the one-time pairing URL/token, expiration countdown, and
-  copy button;
-- the token/URL is shown only after recent authentication succeeds;
-- token values are never shown in logs, event payloads, or diagnostics.
+- unauthenticated visitors sign in and return to the same connection request;
+- the page shows verification code, local vault display name, device display name, plugin version, and redacted local file counts;
+- the owner chooses **Create a new synced vault** or one active existing owned vault;
+- approval requires recent authentication and CSRF protection;
+- integrity-blocked vaults are visible but disabled with an explanation;
+- approval shows a terminal **Return to Obsidian** state and never displays a reusable token;
+- denial and expiry direct the user to restart setup from Obsidian.
 
 ### 3.10 Note History And Restore
 
@@ -597,7 +595,7 @@ Behavior:
 
 1. If a device token exists but local coordination metadata is missing, corrupt, or incomplete, the plugin calls the device-authenticated self endpoint to recover vault ID, device ID, device ref, current server device ref, current server `main`, and event cursor metadata.
 2. When recovered local Git refs are present, the plugin commits any visible filesystem differences, then uploads the resulting local head through the device ref if the server accepts the update as a repeat or fast-forward.
-3. When a reset or re-paired device has no trusted same-device cursor but has valid local content, the plugin may create a new device proposal using current server `main` as `base_commit`; the server must keep actor device identity separate from proposal base identity.
+3. When a reset or reconnecting device has no trusted same-device cursor but has valid local content, the onboarding wizard requires use-server or independent-merge selection. Independent merge uses the vault empty root as `base_commit`; the server keeps actor device identity separate from proposal base identity.
 4. Plugin stops normal sync only when token auth fails, local Git state is missing/corrupt, path-policy validation fails, destructive apply is unsafe, or same-device ancestry cannot be proven safe against the server device ref.
 4. Plugin snapshots local pending edits and relevant hidden Git state into a recovery bundle before destructive rebuild/reset operations.
 5. Plugin pulls current server `main`.
@@ -653,7 +651,8 @@ Acceptance criteria:
 
 ### 4.3 Server Components
 
-- **AuthService:** authenticates dashboard sessions, device tokens, and pairing tokens.
+- **AuthService:** authenticates dashboard sessions and device tokens.
+- **ConnectionService:** creates, approves, bootstraps, consumes, expires, and audits browser-assisted onboarding requests without storing raw connection or device credentials.
 - **VaultService:** creates vaults, enforces owner isolation, and coordinates initial Git state creation.
 - **DeviceService:** registers, tracks, and revokes paired devices.
 - **ServerGitStoreService:** manages per-vault server Git repositories and verifies store integrity.
@@ -672,7 +671,7 @@ Acceptance criteria:
 
 ### 4.4 Plugin Components
 
-- **SettingsView:** collects server URL, login/pairing token, and device name.
+- **SettingsView:** collects server URL and device name, launches the browser-assisted onboarding wizard, and shows resumable onboarding state.
 - **StatusBar:** displays Synced, Ahead, Behind, Uploading, Applying, Offline, Blocked, Unsafe local error, and Needs recovery.
 - **VaultWatcher:** observes local vault changes through Obsidian APIs.
 - **PeriodicScanner:** detects missed watcher events and crash recovery work.
@@ -716,7 +715,8 @@ Acceptance criteria:
 - `users`: account identity and password hash.
 - `vaults`: owner user ID, display name, status, current main cursor, created timestamp, and updated timestamp.
 - `devices`: vault-scoped paired devices, owning user ID, device ref name, and server-known state.
-- `api_tokens`: hashed dashboard, device, and pairing tokens.
+- `api_tokens`: hashed device and password-reset tokens; dashboard authentication uses hashed server-side sessions.
+- `connections`: short-lived browser-onboarding requests containing connection-secret hashes, redacted local summaries, approval scope, lifecycle, and created-device identity.
 - `sync_operations`: durable per-vault write workflow rows with operation type, expected refs, target refs, target commit, lifecycle status, validation summary, and reconciliation state.
 - `sync_attempts`: authenticated device push/pull attempts, lifecycle, expected ref metadata, result state, and redacted error category.
 - `derived_indexes`: path, history, and summary indexes derived from Git for authorized lookup and dashboard performance.
@@ -829,22 +829,23 @@ Auth requirements:
 - admin accounts can create users, disable users, re-enable users, create one-time password-reset tokens, grant admin status, revoke admin status, and view account metadata;
 - account metadata visible to admins includes user ID, username or display name, admin flag, disabled flag, created timestamp, last login timestamp, and owned vault count;
 - account metadata visible to admins excludes vault names, vault paths, note paths, Git refs, conflict contents, note history, diagnostics exports, device tokens, and recovery bundle contents for vaults the admin does not own;
-- disabling a user immediately revokes that user's dashboard sessions, pairing tokens, device tokens, and event streams;
+- disabling a user immediately revokes that user's dashboard sessions, pending/approved connections, device tokens, and event streams;
 - revoking admin status is rejected when it would remove the final enabled admin account;
 - every admin lifecycle action writes a redacted audit event;
 - user passwords require at least 12 characters and are hashed with Argon2id using `m=19456`, `t=2`, and `p=1` as the v1 minimum parameters;
 - login attempts are rate-limited by account and source IP: 5 failed attempts in 10 minutes triggers exponential backoff starting at 1 minute and capped at 1 hour;
 - dashboard auth uses a server-side cookie session named `__Host-obts_session` with at least 128 bits of entropy, `HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/`, and no `Domain` attribute;
 - dashboard sessions have a 30-day absolute TTL and a 7-day idle TTL, refreshed on authenticated dashboard use;
-- sensitive dashboard operations require password re-authentication within the previous 15 minutes: pairing token creation, device revocation, note restore, content-bearing recovery export, Git maintenance start, password change, and admin account management. Conflict resolution is protected by session auth, CSRF, stale-review checks, and audit logging, but does not require re-authentication;
+- sensitive dashboard operations require password re-authentication within the previous 15 minutes: connection approval, device revocation, note restore, content-bearing recovery export, Git maintenance start, password change, and admin account management. Conflict resolution is protected by session auth, CSRF, stale-review checks, and audit logging, but does not require re-authentication;
 - logout and account/device revocation invalidate matching server-side sessions immediately;
 - cookie-authenticated mutation APIs require a CSRF token bound to the session and submitted in the `X-OBTS-CSRF` header;
 - dashboard bearer tokens are not supported in v1;
-- device and pairing tokens are opaque, contain at least 256 bits of entropy, and are stored server-side only as hashes with a non-secret lookup prefix;
-- pairing tokens are one-time, scoped to one owning user, one vault, and the issued device display name, expire after 10 minutes, allow at most 10 failed consume attempts, and are rate-limited by source IP;
+- device tokens and connection secrets are opaque, contain at least 256 bits of entropy, and are stored server-side only as hashes with a non-secret lookup prefix;
+- connection secrets contain at least 256 bits of entropy, are stored server-side only as hashes, expire after 10 minutes, are one-time, and are rate-limited by source IP and connection ID;
+- connection review reveals owned vault choices only through an authenticated dashboard session, while plugin polling and bootstrap require the matching connection secret;
 - device tokens are scoped to one user, one vault, and one device;
 - token rotation and device revocation take effect without waiting for client reconnect;
-- login, pairing, failed auth, token rotation, and revocation write redacted audit records;
+- login, connection approval/completion, failed auth, token rotation, and revocation write redacted audit records;
 - unauthenticated requests return `401`;
 - requests for vault-scoped resources not owned by the authenticated user return `404`;
 - v1 does not ship email password reset;
@@ -987,7 +988,14 @@ Conflict review lifecycle:
 
 ### 6.5 Main APIs
 
-- `POST /api/v1/pair/consume`: consume a pairing token and register a device.
+- `POST /api/v1/connections`: start browser-assisted onboarding and return the short-lived plugin-held connection secret plus browser URL.
+- `GET /api/v1/connections/{connection_id}`: poll pending, approved, denied, expired, or consumed connection status with connection-secret auth.
+- `GET /api/v1/connections/{connection_id}/review`: review one pending request through dashboard session auth.
+- `POST /api/v1/connections/{connection_id}/approve`: approve new-vault creation or an existing owned vault after recent auth.
+- `POST /api/v1/connections/{connection_id}/deny`: deny a pending request.
+- `POST /api/v1/connections/{connection_id}/bootstrap`: fetch approved existing-vault root/current Git state before device registration.
+- `POST /api/v1/connections/{connection_id}/complete`: idempotently register the device with initialize, use-server, or merge policy.
+- `POST /api/v1/vaults/{vault_id}/onboarding/complete`: acknowledge that the registered device has safely applied accepted server state.
 - `GET /api/v1/device/self`: authenticate a device token without a vault ID in the URL and return non-secret identity/ref metadata for local metadata repair.
 - `GET /api/v1/vaults/{vault_id}/main`: return current `main` metadata and authorized summary.
 - `POST /api/v1/vaults/{vault_id}/sync/push`: upload a push manifest and Git packfile, optionally naming a trusted `base_commit`, then request an actor device ref update.
@@ -1066,13 +1074,15 @@ interface ObtsPluginSettings {
   vaultId?: string;
   deviceName: string;
 }
+
+Manual pairing secrets and account passwords are never plugin settings. Pending connection secrets live only under owner-protected `.obts/auth/` state until consumed or expired.
 ```
 
 There is no v1 device-level scope setting. A paired device syncs the full vault according to the hard path policy.
 
 The plugin stores the device token at `.obts/auth/device-token.json`. The token file is never synced as vault content, never committed to hidden Git state, never included in recovery bundle file snapshots, and never included in diagnostics or content-bearing exports. Server-side token revocation and rotation are authoritative even when the local token file remains present.
 
-When a device unpairs or is locally disconnected from a vault, the plugin must remove local authentication material and clear active device identity, but it must not discard safe non-secret history needed to distinguish a stale clean copy from unreviewed local edits. The plugin preserves a detached unpaired baseline containing the previous vault ID, last applied server `main`, and enough hidden Git state to verify the visible vault tree against that baseline. This detached baseline is not authorization, cannot sync without a new pairing token, and is ignored if the owner explicitly resets local OBTS state.
+When a device unpairs or is locally disconnected from a vault, the plugin must remove local authentication material and clear active device identity, but it must not discard safe non-secret history needed to distinguish a stale clean copy from unreviewed local edits. The plugin preserves a detached unpaired baseline containing the previous vault ID, last applied server `main`, and enough hidden Git state to verify the visible vault tree against that baseline. This detached baseline is not authorization, cannot sync without a newly approved browser connection, and is ignored if the owner explicitly resets local OBTS state.
 
 ## 8. Required v1 Feature Designs
 
@@ -1241,16 +1251,9 @@ Every phase must include:
 
 #### Phase 1: Deployable Sync Without Conflict Resolution
 
-Build the smallest deployable sync product. It pairs real Obsidian clients with
-a self-hosted server, moves vault changes through Git-backed server state,
-applies safe server `main` changes locally, and blocks safely when human
-judgment is required.
+Build the smallest deployable sync product. It connects real Obsidian clients to a self-hosted server through browser-assisted authorization, moves vault changes through Git-backed server state, applies safe server `main` changes locally, and blocks safely when human judgment is required.
 
-Phase 1 intentionally has no browser dashboard or frontend. Setup, vault
-creation, pairing-token creation, device listing, conflict listing, and health
-inspection are exposed through server CLI commands. The HTTP API still exists
-for the plugin and for contract testing, but users do not need a dashboard to
-complete the Phase 1 workflow.
+Phase 1 includes the minimum authenticated browser surface required for setup, login, connection approval, and new/existing vault choice. Device listing, conflict listing, health inspection, and local admin recovery also remain available through server CLI commands; no CLI or copied-token device onboarding path exists.
 
 Included:
 
@@ -1259,16 +1262,12 @@ Included:
   this phase;
 - runnable server entrypoint, OCI image, documented environment configuration,
   persistent-state documentation, and health/readiness checks;
-- server CLI commands for first-run setup, vault creation, pairing-token
-  creation, device listing, conflict listing, health/readiness inspection, and
-  local admin recovery;
-- first-run setup, vault creation, device pairing, token storage, device-token
-  auth, pairing-token auth, and single-owner vault authorization;
+- server CLI commands for first-run setup, vault creation, device listing, conflict listing, health/readiness inspection, and local admin recovery;
+- first-run setup, vault creation, browser-assisted device onboarding, connection-secret hashing, device-token storage/auth, and single-owner vault authorization;
 - server Git store, native `git` CLI readiness, server-authored empty-tree root
   commit on `main`, device refs, Postgres-backed metadata, migrations, and the
   durable Git/Postgres write workflow for sync operations;
-- installable Obsidian plugin with settings UI for server URL, pairing token,
-  and device name;
+- installable Obsidian plugin with settings UI for server URL and device name plus browser-assisted onboarding;
 - plugin status surface showing Synced, Ahead, Behind, Uploading, Applying,
   Review needed, Needs recovery, Unsafe local state, and Blocked;
 - plugin hidden `.obts/` state using `isomorphic-git`, Obsidian filesystem
@@ -1312,13 +1311,11 @@ Acceptance proof:
 
 #### Phase 2: Deployable Dashboard And Conflict Resolution
 
-Add the browser dashboard and the human review path for conflicts created by
-Phase 1. From this phase onward, dashboard UI is required.
+Expand the minimal onboarding browser surface into the full dashboard and add the human review path for conflicts created by Phase 1.
 
 Included:
 
-- authenticated dashboard shell for setup, login, vault overview, device
-  status, pairing-token creation, readiness/health summary, and conflict list;
+- authenticated dashboard shell for setup, login, vault overview, device status, connection approval, readiness/health summary, and conflict list;
 - conflict package materialization from authorized Git state;
 - dashboard conflict list, rendered Markdown diff, source diff,
   affected-path metadata, path/title metadata for structural conflicts, and
@@ -1337,7 +1334,7 @@ Included:
 Acceptance proof:
 
 - the Phase 2 server is deployed as an upgrade over Phase 1 state;
-- the owner can create a vault and pair devices through the dashboard;
+- the owner can approve plugin-initiated creation or connection of a vault through the dashboard without copying credentials or tokens;
 - concurrent same-file Markdown edits create a reviewable conflict;
 - the owner resolves the conflict in the dashboard and advances `main`;
 - stale review submissions are rejected without changing `main`;
@@ -1431,8 +1428,10 @@ Acceptance proof:
 - dashboard resolves a conflict and advances `main`;
 - note history shows prior versions and restores one note through a new Git commit;
 - non-empty local vault join creates a recovery bundle and never silently discards local content;
-- first-device non-empty local vault import creates a recovery bundle, requires owner confirmation, uploads an initial device commit, and merges through server `main`;
-- additional-device non-empty divergent vault pairing uploads the visible filesystem as that actor device's proposal and preserves local content if the server records a conflict;
+- new-vault non-empty local import creates a recovery bundle, confirms the exact onboarding snapshot, uploads an empty-root-descending initial device commit, and advances server `main`;
+- independent local/server vault merge uses the empty root, preserves disjoint paths, and creates a dashboard conflict for differing same-path additions;
+- shared-baseline divergent onboarding uses the verified baseline and preserves local content if the server records a conflict;
+- use-server onboarding creates a recovery bundle before replacing syncable local content and leaves hard exclusions untouched;
 - full-vault sync includes `.trash/**`, attachments, `.obsidian/**`, and community plugin files except hard exclusions;
 - full-vault sync excludes `.obsidian/cache/**`, `.obsidian/workspace.json`, `.obsidian/workspace-mobile.json`, and `.obsidian/plugins/obts/**`;
 - destructive history compaction API is absent in v1;

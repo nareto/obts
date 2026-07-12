@@ -22,35 +22,17 @@ Phase 1 workflow without using test harness code.
      obts:phase1
    ```
 
-3. In another shell, create the initial admin and vault:
+3. Open `http://127.0.0.1:3000`, complete initial account setup, and verify readiness:
 
    ```sh
-   docker exec obts-smoke node dist/src/cli.js setup \
-     --username admin \
-     --password 'change-this-password'
-   docker exec obts-smoke node dist/src/cli.js vault create \
-     --username admin \
-     --password 'change-this-password' \
-     --display-name "Smoke Vault" \
-     --json
    docker exec obts-smoke node dist/src/cli.js health ready
    ```
 
-4. Create a pairing token for the first copied test vault:
+4. Install the Obsidian plugin package from `obsidian-plugin/` into the first copied test vault's `.obsidian/plugins/obts/` directory. Enter the server URL and device name, then run **Set up sync**.
 
-   ```sh
-   docker exec obts-smoke node dist/src/cli.js pairing-token create \
-     --username admin \
-     --password 'change-this-password' \
-     --vault-id vlt_... \
-     --device-name "Laptop"
-   ```
+5. In the browser page opened by the plugin, verify the displayed code matches Obsidian, authenticate, choose **Create a new synced vault**, approve, and return to Obsidian. Confirm the exact local file summary and run **Create vault and upload**.
 
-5. Install the Obsidian plugin package from `obsidian-plugin/` into the copied
-   test vault's `.obsidian/plugins/obts/` directory. Enter the server URL,
-   pairing token, and device name in the plugin settings, then pair the device.
-
-6. Repeat pairing for a second copied test vault.
+6. Install the plugin into a second copied test vault and run **Set up sync**. Approve the existing smoke vault. Exercise both divergent choices on disposable copies: **Use the server vault** must create a recovery bundle before replacement; **Merge local content** must preserve disjoint paths and direct overlapping changes to dashboard review.
 
 7. Edit different Markdown files on both devices and run sync. Verify both
    devices converge to the same server `main` and that no visible `.git`

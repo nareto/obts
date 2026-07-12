@@ -1,5 +1,6 @@
 import type {
   ConflictReviewPackage,
+  ConnectionReview,
   ConflictResolutionKind,
   ManualFilePlanEntry,
   DashboardSummary,
@@ -98,11 +99,26 @@ export class DashboardApi {
     });
   }
 
-  async createPairingToken(vaultId: string, deviceName: string): Promise<{ pairing_token: string; pairing_url: string; expires_at: string }> {
-    return await this.request(`/vaults/${vaultId}/pairing-tokens`, {
+  async connectionReview(connectionId: string): Promise<ConnectionReview> {
+    return await this.request(`/connections/${connectionId}/review`);
+  }
+
+  async approveConnection(
+    connectionId: string,
+    input: { selection: 'new_vault'; display_name: string } | { selection: 'existing_vault'; vault_id: string }
+  ): Promise<void> {
+    await this.request(`/connections/${connectionId}/approve`, {
       method: 'POST',
       csrf: true,
-      body: { device_name: deviceName }
+      body: input
+    });
+  }
+
+  async denyConnection(connectionId: string): Promise<void> {
+    await this.request(`/connections/${connectionId}/deny`, {
+      method: 'POST',
+      csrf: true,
+      body: {}
     });
   }
 

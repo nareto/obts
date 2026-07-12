@@ -30,6 +30,22 @@ export type VaultSummary = {
   updated_at: string;
 };
 
+export type ConnectionReview = {
+  connection_id: string;
+  verification_code: string;
+  status: 'pending' | 'approved' | 'consumed' | 'denied' | 'expired';
+  plugin_version: string;
+  device_name: string;
+  local_vault_name: string;
+  local_summary: {
+    has_content: boolean;
+    syncable_file_count: number;
+    syncable_bytes: number;
+    has_detached_baseline: boolean;
+  };
+  vaults: Array<Pick<VaultSummary, 'vault_id' | 'display_name' | 'current_main' | 'status'>>;
+};
+
 export type DashboardDevice = {
   device_id: string;
   device_name: string;

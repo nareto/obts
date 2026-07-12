@@ -128,6 +128,19 @@ export class GitService {
     return root;
   }
 
+  async rootCommit(vaultId: string, commit: string): Promise<string> {
+    const repo = this.repoPath(vaultId);
+    const { stdout } = await this.exec(repo, ['rev-list', '--max-parents=0', commit]);
+    const roots = asText(stdout)
+      .trim()
+      .split(/\s+/u)
+      .filter(Boolean);
+    if (roots.length !== 1 || !roots[0]) {
+      throw new GitCommandError('Vault history does not have exactly one root commit.', '');
+    }
+    return roots[0];
+  }
+
   async getRef(vaultId: string, ref: string): Promise<string | null> {
     const repo = this.repoPath(vaultId);
     try {

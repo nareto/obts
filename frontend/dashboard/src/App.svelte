@@ -9,6 +9,7 @@
   import Summary from './components/Summary.svelte';
   import type {
     DashboardConflict,
+    ConnectionReview,
     ConflictResolutionKind,
     ConflictReviewPackage,
     ConflictReviewPath,
@@ -38,6 +39,7 @@
   let vaults: VaultSummary[] = [];
   let vaultId = '';
   let newVaultName = '';
+  let createVaultOpen = false;
   let dashboard: DashboardSummary | null = null;
   let conflicts: DashboardConflict[] = [];
   let selectedConflictId = '';
@@ -48,9 +50,12 @@
   let manualPathByConflict: Record<string, string> = {};
   let manualContentByConflict: Record<string, string> = {};
   let diffTab: 'rendered' | 'source' = 'source';
-  let pairOpen = false;
-  let pairDeviceName = '';
-  let pairing: { pairing_token: string; pairing_url: string; expires_at: string } | null = null;
+  const connectionId = window.location.pathname.match(/^\/connect\/([^/]+)$/u)?.[1] ?? '';
+  let connectionReview: ConnectionReview | null = null;
+  let connectionSelection: 'new_vault' | 'existing_vault' = 'new_vault';
+  let connectionVaultId = '';
+  let connectionVaultName = '';
+  let connectionApproved = false;
   let reauthOpen = false;
   let reauthAction: (() => Promise<void>) | null = null;
   let historyPath = '';
@@ -77,7 +82,6 @@
   $: reviewResolved = review?.conflict.status === 'resolved';
   $: reviewStatusLabel = reviewResolved ? 'Synced' : review?.stale ? 'Stale review' : 'Review needed';
   $: recentAuthValid = session ? Date.parse(session.recent_auth_expires_at) > nowMs : false;
-  $: pairingExpiresIn = pairing ? formatCountdown(Date.parse(pairing.expires_at) - nowMs) : '';
 
   onMount(() => {
     void bootstrap();
@@ -131,6 +135,12 @@
 
   async function refreshAll() {
     if (!session) return;
+    if (connectionId) {
+      connectionReview = await api.connectionReview(connectionId);
+      connectionVaultName ||= connectionReview.local_vault_name;
+      connectionVaultId ||= connectionReview.vaults.find((vault) => vault.status === 'active')?.vault_id ?? '';
+      return;
+    }
     const listed = await api.vaults();
     vaults = listed.vaults;
     if (!vaultId && vaults[0]) {
@@ -168,6 +178,7 @@
     vaults = [...vaults, created];
     vaultId = created.vault_id;
     newVaultName = '';
+    createVaultOpen = false;
     notice = 'Vault created.';
     await refreshVault();
   }
@@ -298,12 +309,31 @@
     reauthOpen = true;
   }
 
-  async function createPairing() {
-    if (!vaultId || !pairDeviceName.trim()) return;
+  async function approvePendingConnection() {
+    if (!connectionReview) return;
     withRecentAuth(async () => {
-      pairing = await api.createPairingToken(vaultId, pairDeviceName.trim());
-      notice = 'Pairing token created.';
+      actionError = '';
+      if (connectionSelection === 'new_vault') {
+        if (!connectionVaultName.trim()) return;
+        await api.approveConnection(connectionReview!.connection_id, {
+          selection: 'new_vault',
+          display_name: connectionVaultName.trim()
+        });
+      } else {
+        if (!connectionVaultId) return;
+        await api.approveConnection(connectionReview!.connection_id, {
+          selection: 'existing_vault',
+          vault_id: connectionVaultId
+        });
+      }
+      connectionApproved = true;
     });
+  }
+
+  async function denyPendingConnection() {
+    if (!connectionReview) return;
+    await api.denyConnection(connectionReview.connection_id);
+    connectionReview = { ...connectionReview, status: 'denied' };
   }
 
   async function revokeDevice(device: DashboardDevice) {
@@ -420,14 +450,6 @@
     });
   }
 
-  function formatCountdown(milliseconds: number) {
-    if (milliseconds <= 0) return 'expired';
-    const seconds = Math.ceil(milliseconds / 1000);
-    const minutes = Math.floor(seconds / 60);
-    const remainingSeconds = seconds % 60;
-    return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
-  }
-
   function choiceLabel(choice: ConflictResolutionKind) {
     switch (choice) {
       case 'keep_server':
@@ -461,6 +483,62 @@
       <button class="primary" disabled={busy}>{setupComplete ? 'Sign in' : 'Create admin'}</button>
     </form>
   </main>
+{:else if connectionId}
+  <main class="connection-page">
+    <section class="connection-panel">
+      {#if connectionApproved || connectionReview?.status === 'approved' || connectionReview?.status === 'consumed'}
+        <p class="eyebrow">Device authorized</p>
+        <h1>Return to Obsidian</h1>
+        <p>The plugin will compare the local and server vaults and ask how to handle their contents. You can close this browser tab.</p>
+        <div class="connection-code"><span>Verification code</span><strong>{connectionReview?.verification_code}</strong></div>
+      {:else if connectionReview?.status === 'denied' || connectionReview?.status === 'expired'}
+        <p class="eyebrow">Connection {connectionReview.status}</p>
+        <h1>This request cannot continue</h1>
+        <p>Return to Obsidian and start setup again.</p>
+      {:else if connectionReview}
+        <p class="eyebrow">Authorize Obsidian device</p>
+        <h1>Connect {connectionReview.local_vault_name}</h1>
+        <p>Review the identity shown in Obsidian before approving this request.</p>
+        <div class="connection-code"><span>Verification code</span><strong>{connectionReview.verification_code}</strong></div>
+        <dl class="connection-details">
+          <div><dt>Device</dt><dd>{connectionReview.device_name}</dd></div>
+          <div><dt>Plugin</dt><dd>{connectionReview.plugin_version}</dd></div>
+          <div><dt>Local content</dt><dd>{connectionReview.local_summary.syncable_file_count.toLocaleString()} files</dd></div>
+        </dl>
+        <fieldset class="connection-choice">
+          <legend>Server vault</legend>
+          <label>
+            <input type="radio" bind:group={connectionSelection} value="new_vault" />
+            <span><strong>Create a new synced vault</strong><small>The local plugin will confirm its initial upload separately.</small></span>
+          </label>
+          {#if connectionSelection === 'new_vault'}
+            <label>Vault name<input bind:value={connectionVaultName} /></label>
+          {/if}
+          <label>
+            <input type="radio" bind:group={connectionSelection} value="existing_vault" />
+            <span><strong>Connect to an existing vault</strong><small>The plugin will compare content before changing anything.</small></span>
+          </label>
+          {#if connectionSelection === 'existing_vault'}
+            <label>
+              Existing vault
+              <select bind:value={connectionVaultId}>
+                {#each connectionReview.vaults as vault}
+                  <option value={vault.vault_id} disabled={vault.status !== 'active'}>{vault.display_name}{vault.status !== 'active' ? ' — integrity blocked' : ''}</option>
+                {/each}
+              </select>
+            </label>
+          {/if}
+        </fieldset>
+        {#if actionError}<p class="action-error">{actionError}</p>{/if}
+        <div class="actions">
+          <button class="secondary" on:click={denyPendingConnection}>Deny</button>
+          <button class="primary" on:click={approvePendingConnection}>Approve connection</button>
+        </div>
+      {:else}
+        <h1>Loading connection request</h1>
+      {/if}
+    </section>
+  </main>
 {:else}
   <div class="shell">
     <aside class:open={mobileNavOpen}>
@@ -491,13 +569,24 @@
         </div>
         <span class="refresh">Refreshed {lastRefreshed ?? '-'}</span>
         <button class="secondary" on:click={refreshVault}>Refresh</button>
-        {#if page === 'Overview' && vaultId}<button class="primary" on:click={() => (pairOpen = true)}>Pair device</button>{/if}
+        {#if page === 'Overview'}<button class="primary" on:click={() => { createVaultOpen = true; newVaultName = ''; }}>New vault</button>{/if}
       </header>
 
       {#if notice}<p class="notice">{notice}</p>{/if}
       {#if actionError}<p class="action-error">{actionError}</p>{/if}
 
-      {#if vaults.length === 0}
+      {#if createVaultOpen}
+        <main class="page">
+          <section class="panel full">
+            <h2>Create vault</h2>
+            <form class="inline-form" on:submit|preventDefault={createVault}>
+              <label>Vault name<input bind:value={newVaultName} /></label>
+              <button type="button" class="secondary" on:click={() => (createVaultOpen = false)}>Cancel</button>
+              <button class="primary">Create vault</button>
+            </form>
+          </section>
+        </main>
+      {:else if vaults.length === 0}
         <main class="page">
           <section class="panel full">
             <h2>Create vault</h2>
@@ -740,34 +829,6 @@
         <main class="page"><section class="panel full"><p class="muted">Settings are managed through deployment configuration and account administration in this release.</p></section></main>
       {/if}
     </section>
-  </div>
-{/if}
-
-{#if pairOpen}
-  <div class="modal">
-    <form class="dialog" on:submit|preventDefault={createPairing}>
-      <h2>Pair device</h2>
-      <label>Device display name<input bind:value={pairDeviceName} /></label>
-      {#if pairing}
-        <p class="muted">Expires in {pairingExpiresIn} at {new Date(pairing.expires_at).toLocaleString()}</p>
-        <div class="copy">
-          <code>{pairing.pairing_url}</code>
-          <button
-            type="button"
-            class="icon-button"
-            title="Copy pairing URL"
-            aria-label="Copy pairing URL"
-            on:click={() => navigator.clipboard.writeText(pairing!.pairing_url)}
-          >
-            <span aria-hidden="true">⧉</span>
-          </button>
-        </div>
-      {/if}
-      <div class="actions">
-        <button type="button" class="secondary" on:click={() => { pairOpen = false; pairing = null; }}>Close</button>
-        <button class="primary">Create token</button>
-      </div>
-    </form>
   </div>
 {/if}
 

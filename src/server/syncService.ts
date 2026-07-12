@@ -178,6 +178,19 @@ export class SyncService {
           return await this.rejectDevicePush(auth, operation.operation_id, deviceBlock.code, deviceBlock.message);
         }
 
+        if (auth.device.onboarding_status === 'pending') {
+          if (auth.device.onboarding_mode === 'use_server') {
+            return await this.rejectDevicePush(auth, operation.operation_id, 'onboarding_apply_required', 'Apply server state before uploading local changes.');
+          }
+          if (
+            !auth.device.initial_proposal_base ||
+            !auth.device.initial_proposal_kind ||
+            manifest.base_commit !== auth.device.initial_proposal_base
+          ) {
+            return await this.rejectDevicePush(auth, operation.operation_id, 'invalid_onboarding_proposal', 'Initial onboarding proposal does not match the approved base.');
+          }
+        }
+
         const quarantineResult = await this.validateQuarantinedUpload(
           auth,
           operation,
@@ -242,6 +255,7 @@ export class SyncService {
           (auth.device.last_applied_main === manifest.base_commit ||
             (auth.device.last_applied_main !== null && manifest.client_known_main === manifest.base_commit));
         const detachedProposal =
+          auth.device.onboarding_status !== 'pending' &&
           currentDeviceRef === null &&
           manifest.base_commit !== undefined &&
           manifest.base_commit !== null &&

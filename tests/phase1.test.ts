@@ -125,7 +125,7 @@ describe('Phase 1 sync without conflict resolution', () => {
         device_name: 'browser-plugin',
       })
     });
-    expect(invalidPair.status).toBe(401);
+    expect(invalidPair.status).toBe(404);
     expect(invalidPair.headers.get('access-control-allow-origin')).toBe('*');
 
     const setup = await admin.post<{ user_id: string; csrf_token: string }>('/api/v1/setup', {
@@ -158,7 +158,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(ready.status).toBe(200);
   });
 
-  it('supports Phase 1 CLI setup, vault, pairing, devices, conflicts, health, and local admin recovery', async () => {
+  it('supports CLI setup, vault, device/conflict inspection, health, and local admin recovery', async () => {
     await server.app.close();
     const cliDataDir = join(root, 'cli-server-data');
     const env = {
@@ -210,60 +210,6 @@ describe('Phase 1 sync without conflict resolution', () => {
     const vaultBody = JSON.parse(vault.stdout) as { vault_id: string; current_main: string };
     expect(vaultBody.current_main).toMatch(/^[0-9a-f]{40}$/u);
 
-    const pairing = await run([
-      'pairing-token',
-      'create',
-      '--username',
-      'admin',
-      '--password-env',
-      'OBTS_ADMIN_PASSWORD',
-      '--vault-id',
-      vaultBody.vault_id,
-      '--device-name',
-      'cli-laptop',
-      '--json'
-    ]);
-    expect(pairing).toMatchObject({ code: 0, stderr: '' });
-    const pairingBody = JSON.parse(pairing.stdout) as { pairing_token: string; pairing_url: string };
-    expect(pairingBody.pairing_token).toMatch(/^obts_pair_/u);
-    expect(pairingBody.pairing_url).toContain(encodeURIComponent(pairingBody.pairing_token));
-
-    const cliServer = await createObtsServer({
-      dataDir: cliDataDir,
-      publicBaseUrl: 'http://sync.example.test',
-      sessionSecret: 'cli-test-session-secret-with-enough-entropy'
-    });
-    try {
-      await cliServer.auth.consumePairingToken({
-        pairingToken: pairingBody.pairing_token,
-        deviceName: 'cli-laptop',
-      });
-      const db = await cliServer.store.snapshot();
-      const device = db.devices.find((candidate) => candidate.vault_id === vaultBody.vault_id);
-      expect(device).toBeDefined();
-      await cliServer.store.mutate((mutableDb) => {
-        mutableDb.conflicts.push({
-          conflict_id: 'conf_cli_test',
-          vault_id: vaultBody.vault_id,
-          device_id: device!.device_id,
-          status: 'open',
-          base_commit: vaultBody.current_main,
-          current_main: vaultBody.current_main,
-          device_commit: vaultBody.current_main,
-          expected_main: vaultBody.current_main,
-          affected_paths: ['note.md'],
-          affected_path_count: 1,
-          merge_sequence: 1,
-          merge_policy_version: 'phase2.semantic-merge.v1',
-          validator_results: { reason: 'test' },
-          validator_summary: { decision: 'conflict' },
-          created_at: new Date().toISOString()
-        });
-      });
-    } finally {
-      await cliServer.app.close();
-    }
-
     const devices = await run([
       'devices',
       'list',
@@ -276,9 +222,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       '--json'
     ]);
     expect(devices).toMatchObject({ code: 0, stderr: '' });
-    expect(JSON.parse(devices.stdout)).toMatchObject({
-      devices: [expect.objectContaining({ device_name: 'cli-laptop', status: 'paired' })]
-    });
+    expect(JSON.parse(devices.stdout)).toEqual({ devices: [] });
 
     const conflicts = await run([
       'conflicts',
@@ -292,9 +236,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       '--json'
     ]);
     expect(conflicts).toMatchObject({ code: 0, stderr: '' });
-    expect(JSON.parse(conflicts.stdout)).toMatchObject({
-      conflicts: [expect.objectContaining({ conflict_id: 'conf_cli_test', status: 'open' })]
-    });
+    expect(JSON.parse(conflicts.stdout)).toEqual({ conflicts: [] });
 
     const ready = await run(['health', 'ready', '--json']);
     expect(ready).toMatchObject({ code: 0, stderr: '' });
@@ -351,20 +293,16 @@ describe('Phase 1 sync without conflict resolution', () => {
     baseUrl = address;
   });
 
-  it('pairs two devices and syncs non-conflicting vault changes through server main', async () => {
+  it('connects two devices and syncs non-conflicting vault changes through server main', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const device1Dir = join(root, 'device-1');
     await mkdirp(device1Dir);
     await writeFile(join(device1Dir, 'welcome.md'), '# Welcome\n');
 
     const plugin1 = await pairPlugin(admin, device1Dir, 'laptop');
-    await expect(plugin1.syncOnce()).rejects.toMatchObject({ code: 'initial_import_confirmation_required' });
     expect(await exists(join(device1Dir, '.git'))).toBe(false);
     expect(await exists(join(device1Dir, '.obts', 'git'))).toBe(true);
     expect((await readdir(join(device1Dir, '.obts', 'recovery'))).length).toBeGreaterThan(0);
-
-    const firstSync = await plugin1.syncOnce({ confirmInitialImport: true });
-    expect(firstSync.status).toBe('Synced');
 
     const device2Dir = join(root, 'device-2');
     await mkdirp(device2Dir);
@@ -1557,18 +1495,13 @@ describe('Phase 1 sync without conflict resolution', () => {
       display_name: 'Owner Vault'
     });
     expect(ownerVault.status).toBe(201);
-    const pairing = await owner.post<{ pairing_token: string }>(`/api/v1/vaults/${ownerVault.body.vault_id}/pairing-tokens`, {
-      device_name: 'phone',
-    });
-    expect(pairing.status).toBe(201);
-
     const deviceDir = join(root, 'disabled-user-device');
     await mkdirp(deviceDir);
     const plugin = new ObtsPluginClient(deviceDir, {
       serverUrl: baseUrl,
       deviceName: 'phone',
     });
-    await plugin.pairWithToken(pairing.body.pairing_token);
+    await onboardExistingVault(owner, plugin, ownerVault.body.vault_id);
     const state = await plugin.readState();
     const deviceToken = await readDeviceToken(deviceDir);
 
@@ -1742,11 +1675,7 @@ describe('Phase 1 sync without conflict resolution', () => {
         2
       )}\n`
     );
-    const rePairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
-      device_name: 'phone',
-    });
-    expect(rePairing.status).toBe(201);
-    await plugin.pairWithToken(rePairing.body.pairing_token);
+    await onboardExistingVault(admin, plugin, admin.vaultId);
     const rePairedState = await plugin.readState();
     expect(rePairedState.vault_id).toBe(admin.vaultId);
     expect(rePairedState.device_id).toMatch(/^dev_/u);
@@ -1759,8 +1688,6 @@ describe('Phase 1 sync without conflict resolution', () => {
     await mkdirp(desktopDir);
     await writeFile(join(desktopDir, 'shared.md'), 'old server state\n');
     const desktop = await pairPlugin(admin, desktopDir, 'desktop');
-    await expect(desktop.syncOnce()).rejects.toMatchObject({ code: 'initial_import_confirmation_required' });
-    await desktop.syncOnce({ confirmInitialImport: true });
     const oldDesktopState = await desktop.readState();
     expect(oldDesktopState.local_main).toMatch(/^[0-9a-f]{40}$/u);
     await writeFile(
@@ -1783,11 +1710,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(newLaptopState.local_main).toMatch(/^[0-9a-f]{40}$/u);
     expect(newLaptopState.local_main).not.toBe(oldDesktopState.local_main);
 
-    const rePairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
-      device_name: 'desktop',
-    });
-    expect(rePairing.status).toBe(201);
-    await desktop.pairWithToken(rePairing.body.pairing_token);
+    await onboardExistingVault(admin, desktop, admin.vaultId);
 
     expect(await readFile(join(desktopDir, 'shared.md'), 'utf8')).toBe('new server state\n');
     const repairedState = await desktop.readState();
@@ -1802,8 +1725,6 @@ describe('Phase 1 sync without conflict resolution', () => {
     await mkdirp(desktopDir);
     await writeFile(join(desktopDir, 'shared.md'), 'old server state\n');
     const desktop = await pairPlugin(admin, desktopDir, 'desktop');
-    await expect(desktop.syncOnce()).rejects.toMatchObject({ code: 'initial_import_confirmation_required' });
-    await desktop.syncOnce({ confirmInitialImport: true });
 
     await desktop.unpairCurrentDevice();
     await writeFile(join(desktopDir, 'shared.md'), 'local unpaired edit\n');
@@ -1814,13 +1735,8 @@ describe('Phase 1 sync without conflict resolution', () => {
     await writeFile(join(laptopDir, 'shared.md'), 'new server state\n');
     expect((await laptop.syncOnce()).status).toBe('Synced');
 
-    const rePairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
-      device_name: 'desktop',
-    });
-    expect(rePairing.status).toBe(201);
-    await desktop.pairWithToken(rePairing.body.pairing_token);
+    const result = await onboardExistingVault(admin, desktop, admin.vaultId, 'merge');
     expect(await readFile(join(desktopDir, 'shared.md'), 'utf8')).toBe('local unpaired edit\n');
-    const result = await desktop.syncOnce();
     expect(result.status).toBe('Review needed');
     expect(result.conflictId).toMatch(/^conf_/u);
     expect((await desktop.readState()).last_error_code).toBe('conflict_review_required');
@@ -1997,56 +1913,114 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(db.sync_operations).toEqual([]);
   });
 
-  it('enforces pairing token scope and one-time consumption', async () => {
+  it('scopes browser connection authorization and removes legacy pairing endpoints', async () => {
     const admin = await setupAdminAndVault(baseUrl);
-    const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
-      device_name: 'phone',
-    });
-    expect(pairing.status).toBe(201);
+    const deviceDir = join(root, 'connection-auth-device');
+    await mkdirp(deviceDir);
+    const plugin = new ObtsPluginClient(deviceDir, { serverUrl: baseUrl, deviceName: 'phone' });
+    const connection = await plugin.startOnboarding('Connection Auth Vault');
 
-    const wrongDeviceName = await fetch(`${baseUrl}/api/v1/pair/consume`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        pairing_token: pairing.body.pairing_token,
-        device_name: 'tablet'
-      })
+    const invalidStatus = await fetch(`${baseUrl}/api/v1/connections/${connection.connection_id}`, {
+      headers: { authorization: 'Bearer obts_conn_invalid' }
     });
-    expect(wrongDeviceName.status).toBe(401);
-    const persistedAfterWrongDeviceName = JSON.parse(
-      await readFile(join(root, 'server-data', 'metadata', 'phase1.json'), 'utf8')
-    ) as { tokens: Array<{ kind: string; failed_attempts: number; consumed_at: string | null }> };
-    const persistedPairing = persistedAfterWrongDeviceName.tokens.find((token) => token.kind === 'pairing');
-    expect(persistedPairing).toMatchObject({
-      failed_attempts: 1,
-      consumed_at: null
-    });
+    expect(invalidStatus.status).toBe(401);
 
-    const consumed = await fetch(`${baseUrl}/api/v1/pair/consume`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        pairing_token: pairing.body.pairing_token,
-        device_name: 'phone'
-      })
+    const approval = await admin.post<{ status: string }>(`/api/v1/connections/${connection.connection_id}/approve`, {
+      selection: 'existing_vault',
+      vault_id: admin.vaultId
     });
-    expect(consumed.status).toBe(201);
-    expect(((await consumed.json()) as { device_id: string }).device_id).toMatch(/^dev_/u);
-
-    const replay = await fetch(`${baseUrl}/api/v1/pair/consume`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        pairing_token: pairing.body.pairing_token,
-        device_name: 'phone'
-      })
+    expect(approval.status).toBe(200);
+    const analysis = await plugin.analyzeOnboarding(connection.connection_id, connection.connection_secret);
+    await plugin.finishOnboarding({
+      connectionId: connection.connection_id,
+      secret: connection.connection_secret,
+      analysis,
+      mode: 'use_server'
     });
-    expect(replay.status).toBe(401);
+    expect((await plugin.pollOnboarding(connection.connection_id, connection.connection_secret)).status).toBe('consumed');
 
+    expect((await fetch(`${baseUrl}/api/v1/pair/consume`, { method: 'POST' })).status).toBe(404);
+    expect((await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/pairing-tokens`, { method: 'POST' })).status).toBe(404);
+    expect((await server.store.snapshot()).tokens.every((token) => token.kind !== ('pairing' as never))).toBe(true);
+  });
+
+  it('creates a new server vault from the browser-approved local onboarding snapshot', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'new-vault-onboarding-device');
+    await mkdirp(deviceDir);
+    await writeFile(join(deviceDir, 'welcome.md'), '# Browser onboarding\n');
+    const plugin = new ObtsPluginClient(deviceDir, { serverUrl: baseUrl, deviceName: 'desktop' });
+    const connection = await plugin.startOnboarding('Local Browser Vault');
+
+    const review = await admin.get<{
+      verification_code: string;
+      local_vault_name: string;
+      local_summary: { syncable_file_count: number };
+    }>(`/api/v1/connections/${connection.connection_id}/review`);
+    expect(review.status).toBe(200);
+    expect(review.body).toMatchObject({
+      verification_code: connection.verification_code,
+      local_vault_name: 'Local Browser Vault',
+      local_summary: { syncable_file_count: 1 }
+    });
+    const approval = await admin.post<{ status: string }>(`/api/v1/connections/${connection.connection_id}/approve`, {
+      selection: 'new_vault',
+      display_name: 'Browser Created Vault'
+    });
+    expect(approval.status).toBe(200);
+
+    const analysis = await plugin.analyzeOnboarding(connection.connection_id, connection.connection_secret);
+    expect(analysis.classification).toBe('new_with_content');
+    const result = await plugin.finishOnboarding({
+      connectionId: connection.connection_id,
+      secret: connection.connection_secret,
+      analysis,
+      mode: 'initialize'
+    });
+    expect(result.status).toBe('Synced');
+    const state = await plugin.readState();
     const db = await server.store.snapshot();
-    const pairingTokenRows = db.tokens.filter((token) => token.kind === 'pairing');
-    expect(pairingTokenRows).toHaveLength(1);
-    expect(pairingTokenRows[0]?.consumed_at).toEqual(expect.any(String));
+    const created = db.vaults.find((vault) => vault.vault_id === state.vault_id);
+    expect(created).toMatchObject({ display_name: 'Browser Created Vault', root_commit: expect.stringMatching(/^[0-9a-f]{40}$/u) });
+    expect(await server.git.listTreePaths(created!.vault_id, created!.current_main)).toContain('welcome.md');
+  });
+
+  it('uses the empty root for independent-vault merge and conflicts on differing same-path additions', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const serverDir = join(root, 'independent-server-device');
+    await mkdirp(serverDir);
+    await writeFile(join(serverDir, 'server-only.md'), 'remote only\n');
+    await writeFile(join(serverDir, 'same.md'), 'remote version\n');
+    await pairPlugin(admin, serverDir, 'server-device');
+
+    const localDir = join(root, 'independent-local-device');
+    await mkdirp(localDir);
+    await writeFile(join(localDir, 'local-only.md'), 'local only\n');
+    await writeFile(join(localDir, 'same.md'), 'local version\n');
+    const local = new ObtsPluginClient(localDir, { serverUrl: baseUrl, deviceName: 'local-device' });
+    const connection = await local.startOnboarding('Independent Local Vault');
+    expect((await admin.post(`/api/v1/connections/${connection.connection_id}/approve`, {
+      selection: 'existing_vault',
+      vault_id: admin.vaultId
+    })).status).toBe(200);
+    const analysis = await local.analyzeOnboarding(connection.connection_id, connection.connection_secret);
+    expect(analysis).toMatchObject({
+      classification: 'independent_divergent',
+      proposalBase: (await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)!.root_commit
+    });
+    const result = await local.finishOnboarding({
+      connectionId: connection.connection_id,
+      secret: connection.connection_secret,
+      analysis,
+      mode: 'merge'
+    });
+    expect(result.status).toBe('Review needed');
+    expect(await readFile(join(localDir, 'local-only.md'), 'utf8')).toBe('local only\n');
+    const main = (await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)!.current_main;
+    expect(await server.git.listTreePaths(admin.vaultId, main)).toContain('server-only.md');
+    const conflicts = (await server.store.snapshot()).conflicts.filter((conflict) => conflict.vault_id === admin.vaultId && conflict.status === 'open');
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]?.affected_paths).toContain('same.md');
   });
 
   it('records a durable conflict for unsafe concurrent same-path edits and does not overwrite main', async () => {
@@ -2752,31 +2726,23 @@ describe('Phase 1 sync without conflict resolution', () => {
     await writeFile(join(device1Dir, 'server.md'), 'server state\n');
 
     const plugin1 = await pairPlugin(admin, device1Dir, 'desktop');
-    await expect(plugin1.syncOnce()).rejects.toMatchObject({ code: 'initial_import_confirmation_required' });
-    await plugin1.syncOnce({ confirmInitialImport: true });
 
     const device2Dir = join(root, 'proposal-device-2');
     await mkdirp(device2Dir);
     await writeFile(join(device2Dir, 'server.md'), 'server state\n');
     await writeFile(join(device2Dir, 'local-only.md'), 'do not discard silently\n');
-    const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
-      device_name: 'phone',
-    });
-    expect(pairing.status).toBe(201);
     const plugin2 = new ObtsPluginClient(device2Dir, {
       serverUrl: baseUrlFromAdmin(admin),
       deviceName: 'phone',
     });
 
-    await plugin2.pairWithToken(pairing.body.pairing_token);
+    await onboardExistingVault(admin, plugin2, admin.vaultId, 'merge');
     expect(await plugin2.readState()).toMatchObject({
-      status_label: 'Ahead',
-      initial_import_confirmed: true,
-      server_device_ref: null
+      status_label: 'Synced',
+      initial_import_confirmed: true
     });
     expect(await readFile(join(device2Dir, 'local-only.md'), 'utf8')).toBe('do not discard silently\n');
 
-    expect((await plugin2.syncOnce()).status).toBe('Synced');
     expect(await readFile(join(device1Dir, 'local-only.md'), 'utf8').catch(() => '')).toBe('');
     await plugin1.syncOnce();
     expect(await readFile(join(device1Dir, 'local-only.md'), 'utf8')).toBe('do not discard silently\n');
@@ -2788,8 +2754,6 @@ describe('Phase 1 sync without conflict resolution', () => {
     await mkdirp(device1Dir);
     await writeFile(join(device1Dir, 'topic.md'), 'server file wins\n');
     const plugin1 = await pairPlugin(admin, device1Dir, 'desktop');
-    await expect(plugin1.syncOnce()).rejects.toMatchObject({ code: 'initial_import_confirmation_required' });
-    await plugin1.syncOnce({ confirmInitialImport: true });
 
     const device2Dir = join(root, 'replace-collision-device-2');
     const plugin2 = await pairPlugin(admin, device2Dir, 'phone');
@@ -2821,36 +2785,27 @@ describe('Phase 1 sync without conflict resolution', () => {
     const device2Dir = join(root, 'empty-server-device-2');
     await mkdirp(device2Dir);
     await writeFile(join(device2Dir, 'local-only.md'), 'should become device proposal\n');
-    const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
-      device_name: 'phone',
-    });
-    expect(pairing.status).toBe(201);
     const plugin2 = new ObtsPluginClient(device2Dir, {
       serverUrl: baseUrlFromAdmin(admin),
       deviceName: 'phone',
     });
 
-    await plugin2.pairWithToken(pairing.body.pairing_token);
+    await onboardExistingVault(admin, plugin2, admin.vaultId, 'merge');
     expect(await readFile(join(device2Dir, 'local-only.md'), 'utf8')).toBe('should become device proposal\n');
-    expect((await plugin2.syncOnce()).status).toBe('Synced');
 
     await plugin1.syncOnce();
     expect(await readFile(join(device1Dir, 'local-only.md'), 'utf8')).toBe('should become device proposal\n');
   });
 
-  it('blocks pairing on partial local .obts state without consuming the pairing token', async () => {
+  it('blocks onboarding on partial local .obts state before server authorization', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const partialDir = join(root, 'partial-device');
     await mkdirp(join(partialDir, '.obts', 'git'));
-    const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
-      device_name: 'phone',
-    });
-    expect(pairing.status).toBe(201);
     const partialPlugin = new ObtsPluginClient(partialDir, {
       serverUrl: baseUrlFromAdmin(admin),
       deviceName: 'phone',
     });
-    await expect(partialPlugin.pairWithToken(pairing.body.pairing_token)).rejects.toMatchObject({
+    await expect(partialPlugin.startOnboarding('Partial Vault')).rejects.toMatchObject({
       code: 'partial_local_state'
     });
 
@@ -2860,13 +2815,8 @@ describe('Phase 1 sync without conflict resolution', () => {
       serverUrl: baseUrlFromAdmin(admin),
       deviceName: 'phone',
     });
-    await cleanPlugin.pairWithToken(pairing.body.pairing_token);
+    await onboardExistingVault(admin, cleanPlugin, admin.vaultId);
     expect((await awaitState(cleanPlugin)).device_id).toMatch(/^dev_/u);
-
-    const initializedPairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
-      device_name: 'initialized-phone',
-    });
-    expect(initializedPairing.status).toBe(201);
     const initializedDir = join(root, 'initialized-device');
     await mkdirp(initializedDir);
     const initializedPlugin = new ObtsPluginClient(initializedDir, {
@@ -2874,11 +2824,11 @@ describe('Phase 1 sync without conflict resolution', () => {
       deviceName: 'initialized-phone',
     });
     await initializedPlugin.initialize();
-    await initializedPlugin.pairWithToken(initializedPairing.body.pairing_token);
+    await onboardExistingVault(admin, initializedPlugin, admin.vaultId);
     expect((await awaitState(initializedPlugin)).device_id).toMatch(/^dev_/u);
   });
 
-  it('blocks token-only local state until explicit reset and re-pair', async () => {
+  it('blocks token-only local state until explicit reset and reconnect', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'token-only-device');
     await mkdirp(join(deviceDir, '.obts', 'auth'));
@@ -2913,11 +2863,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       last_error_code: 'local_state_incomplete'
     });
 
-    const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
-      device_name: 'phone',
-    });
-    expect(pairing.status).toBe(201);
-    await expect(plugin.pairWithToken(pairing.body.pairing_token)).rejects.toMatchObject({
+    await expect(plugin.startOnboarding('Recovered Vault')).rejects.toMatchObject({
       code: 'local_state_already_paired'
     });
 
@@ -2926,7 +2872,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await exists(join(deviceDir, '.obts', 'auth', 'device-token.json'))).toBe(false);
     expect(await recoveryBundleContains(deviceDir, 'local.md')).toBe(true);
 
-    await plugin.pairWithToken(pairing.body.pairing_token);
+    await onboardExistingVault(admin, plugin, admin.vaultId, 'merge');
     expect((await plugin.readState()).device_id).toMatch(/^dev_/u);
   });
 
@@ -3044,16 +2990,11 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect((await plugin.resetLocalPairingState()).status).toBe('Not paired');
     await writeFile(join(deviceDir, 'laptop-only.md'), 'first-device re-pair data\n');
 
-    const rePairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
-      device_name: 'laptop',
-    });
-    expect(rePairing.status).toBe(201);
-    await plugin.pairWithToken(rePairing.body.pairing_token);
+    await onboardExistingVault(admin, plugin, admin.vaultId, 'merge');
     expect(await readFile(join(deviceDir, 'laptop-only.md'), 'utf8')).toBe('first-device re-pair data\n');
     const repairedState = await plugin.readState();
     expect(repairedState.initial_import_confirmed).toBe(true);
-    expect(repairedState.status_label).toBe('Ahead');
-    expect((await plugin.syncOnce()).status).toBe('Synced');
+    expect(repairedState.status_label).toBe('Synced');
   });
 
   it('uploads repaired local edits into server conflict state instead of requiring replace-local', async () => {
@@ -4287,7 +4228,8 @@ describe('Phase 1 sync without conflict resolution', () => {
     const pluginReadme = await readFile(join(process.cwd(), 'obsidian-plugin', 'README.md'), 'utf8');
 
     expect(pluginMain).toContain('class ObtsObsidianClient');
-    expect(pluginMain).toContain('/api/v1/pair/consume');
+    expect(pluginMain).toContain('/api/v1/connections');
+    expect(pluginMain).not.toContain('/api/v1/pair/consume');
     expect(pluginMain).toContain('/sync/push');
     expect(pluginMain).toContain('/sync/pull');
     expect(pluginMain).toContain('refs/heads/local');
@@ -4334,13 +4276,14 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('obts-settings-section-header');
     expect(pluginMain).toContain('obts-status-pill');
     expect(pluginMain).toContain('obts-feedback');
-    expect(pluginMain).toContain('setFeedback(pairingFeedback');
-    expect(pluginMain).toContain('setButtonText("Pair")');
+    expect(pluginMain).toContain('class ObtsOnboardingModal');
+    expect(pluginMain).toContain('setButtonText("Set up sync")');
+    expect(pluginMain).toContain('Continue in browser');
     expect(pluginMain).toContain('setButtonText("Sync now")');
     expect(pluginMain).toContain('setButtonText("Unpair...")');
     expect(pluginMain).toContain('setWarning');
     expect(pluginMain).toContain('/sync/unpair');
-    expect(pluginMain).toContain('text.inputEl.type = "password"');
+    expect(pluginMain).not.toContain('settings.pairingToken =');
     expect(pluginMain).toContain('device_name: this.plugin.settings.deviceName || "Obsidian device"');
     expect(pluginMain).toContain('throwIfSyncBlocked(state)');
     expect(pluginMain).toContain('state.last_error_code === "replace_local_with_server_required"');
@@ -4377,18 +4320,11 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(otherVault.status).toBe(201);
     const otherDir = join(root, 'other-device');
     await mkdirp(otherDir);
-    const otherPairing = await other.post<{ pairing_token: string }>(
-      `/api/v1/vaults/${otherVault.body.vault_id}/pairing-tokens`,
-      {
-        device_name: 'other-device',
-      }
-    );
-    expect(otherPairing.status).toBe(201);
     const otherPlugin = new ObtsPluginClient(otherDir, {
       serverUrl: baseUrl,
       deviceName: 'other-device',
     });
-    await otherPlugin.pairWithToken(otherPairing.body.pairing_token);
+    await onboardExistingVault(other, otherPlugin, otherVault.body.vault_id);
     const otherPluginState = await otherPlugin.readState();
     const otherTokenFile = JSON.parse(await readFile(join(otherDir, '.obts', 'auth', 'device-token.json'), 'utf8')) as {
       device_token: string;
@@ -4567,16 +4503,38 @@ async function setupAdminAndVault(baseUrl: string): Promise<BrowserSession & { v
 }
 
 async function pairPlugin(admin: BrowserSession & { vaultId: string }, vaultDir: string, deviceName: string): Promise<ObtsPluginClient> {
-  const pairing = await admin.post<{ pairing_token: string }>(`/api/v1/vaults/${admin.vaultId}/pairing-tokens`, {
-    device_name: deviceName
-  });
-  expect(pairing.status).toBe(201);
   const plugin = new ObtsPluginClient(vaultDir, {
     serverUrl: baseUrlFromAdmin(admin),
     deviceName
   });
-  await plugin.pairWithToken(pairing.body.pairing_token);
+  await onboardExistingVault(admin, plugin, admin.vaultId);
   return plugin;
+}
+
+async function onboardExistingVault(
+  admin: BrowserSession,
+  plugin: ObtsPluginClient,
+  vaultId: string,
+  selectedMode?: 'use_server' | 'merge'
+): Promise<{ status: string; main?: string; conflictId?: string }> {
+  const connection = await plugin.startOnboarding('Test Vault');
+  const approval = await admin.post<{ status: string }>(`/api/v1/connections/${connection.connection_id}/approve`, {
+    selection: 'existing_vault',
+    vault_id: vaultId
+  });
+  expect(approval.status).toBe(200);
+  const analysis = await plugin.analyzeOnboarding(connection.connection_id, connection.connection_secret);
+  const mode = selectedMode ?? (
+    analysis.classification === 'independent_divergent' || analysis.classification === 'shared_baseline_divergent'
+      ? 'merge'
+      : 'use_server'
+  );
+  return await plugin.finishOnboarding({
+    connectionId: connection.connection_id,
+    secret: connection.connection_secret,
+    analysis,
+    mode
+  });
 }
 
 async function preparePullApplyScenario(

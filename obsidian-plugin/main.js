@@ -1,12 +1,12 @@
-const { Plugin, PluginSettingTab, Setting, Notice } = require("obsidian");
+const { Plugin, PluginSettingTab, Setting, Notice, Modal } = require("obsidian");
 const crypto = require("node:crypto");
 const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 
-const API_VERSION = "2026-07-02.full-sync";
-const PLUGIN_VERSION = "0.1.18";
+const API_VERSION = "2026-07-12.browser-onboarding";
+const PLUGIN_VERSION = "0.2.0";
 const SYNC_DEBOUNCE_MS = 1500;
 const BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000;
 const SYNC_STALE_MS = 2 * 60 * 1000;
@@ -15,7 +15,6 @@ const PLUGIN_UPDATE_URL = "obsidian://brat?plugin=nareto%2Fobts";
 
 const DEFAULT_SETTINGS = {
   serverUrl: "http://127.0.0.1:3000",
-  pairingToken: "",
   deviceName: "",
   gitBinary: "git"
 };
@@ -25,6 +24,7 @@ module.exports = class ObtsPlugin extends Plugin {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     delete this.settings.syncProfile;
     delete this.settings.syncPlugins;
+    delete this.settings.pairingToken;
     this.status = this.addStatusBarItem();
     this.syncQueued = false;
     this.syncRunning = false;
@@ -40,19 +40,9 @@ module.exports = class ObtsPlugin extends Plugin {
     this.addSettingTab(new ObtsSettingTab(this.app, this));
 
     this.addCommand({
-      id: "obts-pair-device",
-      name: "Pair device",
-      callback: async () => {
-        await this.runUserAction(async () => {
-          if (!this.settings.pairingToken) {
-            throw new ObtsBlockedError("missing_pairing_token", "Enter a pairing token in obts settings first.");
-          }
-          await this.client.pairWithToken(this.settings.pairingToken);
-          this.settings.pairingToken = "";
-          await this.saveSettings();
-          new Notice("obts paired this device.");
-        });
-      }
+      id: "obts-setup-sync",
+      name: "Set up sync",
+      callback: () => new ObtsOnboardingModal(this.app, this).open()
     });
 
     this.addCommand({
@@ -61,17 +51,6 @@ module.exports = class ObtsPlugin extends Plugin {
       callback: async () => {
         await this.runUserAction(async () => {
           const result = await this.syncOnceOrPollResolvedConflict({ confirmInitialImport: false });
-          new Notice(`obts: ${result.status}`);
-        });
-      }
-    });
-
-    this.addCommand({
-      id: "obts-confirm-initial-import",
-      name: "Confirm initial import and sync",
-      callback: async () => {
-        await this.runUserAction(async () => {
-          const result = await this.client.syncOnce({ confirmInitialImport: true });
           new Notice(`obts: ${result.status}`);
         });
       }
@@ -393,26 +372,116 @@ class ObtsObsidianClient {
     await this.writeQueue(await this.readQueue());
   }
 
-  async pairWithToken(pairingToken) {
+  async startOnboarding() {
     await this.assertPairingCanStart();
-    const pairingRepair = await this.discoverPairingRepairContext(await readJson(this.statePath, null));
-    const result = await postJson(this.url("/api/v1/pair/consume"), {
-      pairing_token: pairingToken,
-      device_name: this.plugin.settings.deviceName || "Obsidian device"
-    });
-    const rePairBaseline = this.baselineForPairing(pairingRepair.baseline, result.vault_id);
-    await this.initialize();
-    await writeJson(this.authPath, { device_token: result.device_token, created_at: nowIso() });
-    await this.writeState({
-      user_id: result.user_id,
-      vault_id: result.vault_id,
-      device_id: result.device_id,
+    await this.flushEditorBuffersToDisk();
+    const summary = await this.localSnapshotSummary();
+    const existing = await readJson(this.statePath, null);
+    return await postJson(this.url("/api/v1/connections"), {
+      plugin_version: PLUGIN_VERSION,
       device_name: this.plugin.settings.deviceName || "Obsidian device",
-      device_ref: result.device_ref,
+      local_vault_name: this.plugin.app.vault.getName(),
+      local_summary: {
+        has_content: summary.fileCount > 0,
+        syncable_file_count: summary.fileCount,
+        syncable_bytes: summary.bytes,
+        has_detached_baseline: Boolean(existing && existing.unpaired_baseline_vault_id && existing.unpaired_baseline_main)
+      }
+    });
+  }
+
+  async pollOnboarding(connectionId, secret) {
+    const response = await fetchWithTimeout(this.url(`/api/v1/connections/${connectionId}`), {
+      headers: { authorization: `Bearer ${secret}` }
+    });
+    if (!response.ok) await throwResponseError(response);
+    return await response.json();
+  }
+
+  async analyzeOnboarding(connectionId, secret) {
+    const status = await this.pollOnboarding(connectionId, secret);
+    if (status.status !== "approved") {
+      throw new ObtsBlockedError("connection_not_approved", "Approve this connection in the browser first.");
+    }
+    await this.flushEditorBuffersToDisk();
+    const local = await this.localSnapshotSummary();
+    if (status.selection === "new_vault") {
+      return {
+        selection: status.selection,
+        vaultId: null,
+        vaultName: status.vault_name,
+        expectedMain: null,
+        rootCommit: null,
+        classification: local.fileCount === 0 ? "new_empty" : "new_with_content",
+        proposalBase: null,
+        localFingerprint: local.fingerprint,
+        localFileCount: local.fileCount,
+        localBytes: local.bytes
+      };
+    }
+    const response = await fetchWithTimeout(this.url(`/api/v1/connections/${connectionId}/bootstrap`), {
+      method: "POST",
+      headers: { authorization: `Bearer ${secret}` }
+    });
+    if (!response.ok) await throwResponseError(response);
+    const bootstrap = parseMultipartPull(response.headers.get("content-type") || "", Buffer.from(await response.arrayBuffer()));
+    await this.importPack(bootstrap.packfile);
+    const localFiles = await this.scanSyncableFiles();
+    const matchesServer = localFiles.length === bootstrap.manifest.changed_paths.length && await this.localContentMatchesTree(localFiles, bootstrap.manifest.target_main);
+    const repair = await this.discoverPairingRepairContext(await readJson(this.statePath, null));
+    const baseline = this.baselineForPairing(repair.baseline, bootstrap.manifest.vault_id);
+    const validBaseline = baseline && await this.commitExists(baseline.main) && await this.isAncestor(baseline.main, bootstrap.manifest.target_main) ? baseline : null;
+    const matchesBaseline = validBaseline ? await this.localContentMatchesTree(localFiles, validBaseline.main) : false;
+    const classification = localFiles.length === 0
+      ? "server_to_empty"
+      : matchesServer
+        ? "identical"
+        : validBaseline && matchesBaseline
+          ? "stale_baseline"
+          : validBaseline
+            ? "shared_baseline_divergent"
+            : "independent_divergent";
+    return {
+      selection: status.selection,
+      vaultId: bootstrap.manifest.vault_id,
+      vaultName: bootstrap.manifest.vault_name,
+      expectedMain: bootstrap.manifest.target_main,
+      rootCommit: bootstrap.manifest.root_commit,
+      classification,
+      proposalBase: classification === "shared_baseline_divergent" ? validBaseline.main : bootstrap.manifest.root_commit,
+      localFingerprint: local.fingerprint,
+      localFileCount: local.fileCount,
+      localBytes: local.bytes
+    };
+  }
+
+  async finishOnboarding(connectionId, secret, analysis, mode) {
+    const current = await this.localSnapshotSummary();
+    if (current.fingerprint !== analysis.localFingerprint) {
+      throw new ObtsBlockedError("onboarding_snapshot_changed", "The local vault changed. Review the updated onboarding summary before continuing.");
+    }
+    const localFiles = await this.scanSyncableFiles();
+    await this.createRecoveryBundle(mode === "use_server" ? "replace_local_with_server" : "initial_import", analysis.expectedMain, localFiles);
+    const completion = await postJsonWithBearer(this.url(`/api/v1/connections/${connectionId}/complete`), secret, {
+      mode,
+      expected_main: analysis.expectedMain,
+      ...(mode === "initialize" ? { proposal_kind: "new_vault_import" } : {}),
+      ...(mode === "merge" ? {
+        proposal_kind: analysis.classification === "shared_baseline_divergent" ? "shared_baseline_merge" : "independent_vault_merge",
+        proposal_base: analysis.proposalBase
+      } : {})
+    });
+    await writeJson(this.authPath, { device_token: completion.device_token, created_at: nowIso() });
+    await this.writeState({
+      user_id: completion.user_id,
+      vault_id: completion.vault_id,
+      device_id: completion.device_id,
+      device_name: this.plugin.settings.deviceName || "Obsidian device",
+      device_ref: completion.device_ref,
       server_device_ref: null,
       local_main: null,
       local_head: null,
-      initial_import_confirmed: false,
+      initial_import_confirmed: true,
       status_label: "Checking",
       last_error_code: null,
       last_event_seq: 0,
@@ -420,82 +489,40 @@ class ObtsObsidianClient {
       unpaired_baseline_main: null,
       updated_at: nowIso()
     });
-
-    const pulled = await this.pull(result.vault_id, result.device_id, result.device_token, rePairBaseline ? rePairBaseline.main : null, "latest", 0);
+    const pulled = await this.pull(completion.vault_id, completion.device_id, completion.device_token, null, "latest", 0);
     await this.importPack(pulled.packfile);
-    const localFiles = await this.scanSyncableFiles();
-    const serverFiles = await this.listTreeFiles(pulled.manifest.target_main);
-    const localAlreadyMatchesServer =
-      localFiles.length > 0 && serverFiles.length > 0
-        ? await this.localContentMatchesTree(localFiles, pulled.manifest.target_main)
-        : false;
-    const shouldProposeLocalContent =
-      localFiles.length > 0 &&
-      !localAlreadyMatchesServer &&
-      (!result.is_first_device || serverFiles.length > 0 || pairingRepair.hasLocalGitHistory);
-    if (shouldProposeLocalContent) {
-      if (rePairBaseline && await this.canFastForwardCleanRePair(rePairBaseline, localFiles, pulled.manifest)) {
-        await this.writeState(Object.assign({}, await this.readState(), {
-          local_main: rePairBaseline.main,
-          local_head: rePairBaseline.main,
-          initial_import_confirmed: true,
-          updated_at: nowIso()
-        }));
-        await this.applyTargetMain(
-          pulled.manifest.target_main,
-          pulled.manifest.changed_paths,
-          true,
-          [],
-          false,
-          pulled.manifest.directory_intents || [],
-          pulled.manifest.explicit_directories || [],
-          pulled.manifest.event_seq
-        );
-        await this.writeState(Object.assign({}, await this.readState(), {
-          initial_import_confirmed: true,
-          status_label: "Synced",
-          last_error_code: null,
-          updated_at: nowIso()
-        }));
-        await this.acknowledgeAppliedMain(pulled.manifest.target_main);
-        return;
-      }
-      const proposalBase = rePairBaseline && await this.commitExists(rePairBaseline.main) ? rePairBaseline.main : pulled.manifest.target_main;
-      await this.updateRef("refs/heads/main", proposalBase, null, true);
-      await this.updateRef("refs/heads/local", proposalBase, null, true);
-      await this.writeState(Object.assign({}, await this.readState(), {
-        local_main: proposalBase,
-        local_head: proposalBase,
-        initial_import_confirmed: true,
-        status_label: "Ahead",
-        last_error_code: null,
-        updated_at: nowIso()
-      }));
-      const proposalCommit = await this.createLocalCommit("obts: local vault changes");
-      await this.writeQueue({ pending_commit: proposalCommit, expected_device_ref: null, status: proposalCommit ? "queued_local" : "idle", attempts: 0, updated_at: nowIso() });
-      if (proposalCommit) {
-        await this.writeState(Object.assign({}, await this.readState(), {
-          local_head: proposalCommit,
-          status_label: "Ahead",
-          updated_at: nowIso()
-        }));
-      }
-      return;
-    }
-    await this.applyTargetMain(
-      pulled.manifest.target_main,
-      pulled.manifest.changed_paths,
-      true,
-      [],
-      false,
-      pulled.manifest.directory_intents || [],
-      pulled.manifest.explicit_directories || [],
-      pulled.manifest.event_seq
-    );
-    if (localFiles.length === 0 || localAlreadyMatchesServer) {
-      await this.writeState(Object.assign({}, await this.readState(), { initial_import_confirmed: true, updated_at: nowIso() }));
+    if (mode === "use_server") {
+      await this.applyTargetMain(
+        pulled.manifest.target_main,
+        pulled.manifest.changed_paths,
+        true,
+        localFiles,
+        false,
+        pulled.manifest.directory_intents || [],
+        pulled.manifest.explicit_directories || [],
+        pulled.manifest.event_seq
+      );
       await this.acknowledgeAppliedMain(pulled.manifest.target_main);
+      await postJsonWithBearer(this.url(`/api/v1/vaults/${completion.vault_id}/onboarding/complete`), completion.device_token, {
+        applied_main: pulled.manifest.target_main
+      });
+      await this.writeState(Object.assign({}, await this.readState(), { status_label: "Synced", updated_at: nowIso() }));
+      return { status: "Synced", main: pulled.manifest.target_main };
     }
+    const proposalBase = mode === "initialize" ? completion.root_commit : analysis.proposalBase;
+    if (!proposalBase) throw new ObtsBlockedError("invalid_onboarding_base", "Onboarding proposal base is unavailable.");
+    await this.updateRef("refs/heads/main", proposalBase, null, true);
+    await this.updateRef("refs/heads/local", proposalBase, null, true);
+    await this.writeState(Object.assign({}, await this.readState(), { local_main: proposalBase, local_head: proposalBase, status_label: "Ahead", updated_at: nowIso() }));
+    const proposalCommit = await this.createLocalCommit("obts: onboarding local vault");
+    await this.writeQueue({ pending_commit: proposalCommit, expected_device_ref: null, status: proposalCommit ? "queued_local" : "idle", attempts: 0, updated_at: nowIso() });
+    const synced = await this.syncOnce({ confirmInitialImport: false });
+    if (synced.status === "Review needed") return synced;
+    const finalState = await this.readState();
+    await postJsonWithBearer(this.url(`/api/v1/vaults/${completion.vault_id}/onboarding/complete`), completion.device_token, {
+      applied_main: finalState.local_main
+    });
+    return synced;
   }
 
   async syncOnce(options) {
@@ -1435,6 +1462,22 @@ class ObtsObsidianClient {
   async scanSyncableFiles() {
     const result = (await this.listLocalVaultFiles()).filter((filePath) => isSyncableVaultPath(filePath));
     return assertNoCaseCollisions(result.sort());
+  }
+
+  async localSnapshotSummary() {
+    const files = await this.scanSyncableFiles();
+    const hash = crypto.createHash("sha256");
+    let bytes = 0;
+    for (const filePath of files) {
+      const content = await this.adapterReadBinary(filePath);
+      const buffer = Buffer.from(content || new ArrayBuffer(0));
+      bytes += buffer.byteLength;
+      hash.update(filePath);
+      hash.update("\0");
+      hash.update(crypto.createHash("sha256").update(buffer).digest());
+      hash.update("\0");
+    }
+    return { fingerprint: hash.digest("hex"), fileCount: files.length, bytes };
   }
 
   async localContentMatchesTree(localFiles, targetMain) {
@@ -2592,6 +2635,179 @@ class ObtsObsidianClient {
   }
 }
 
+class ObtsOnboardingModal extends Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+    this.cancelled = false;
+    this.connection = null;
+    this.analysis = null;
+    this.mode = null;
+  }
+
+  onOpen() {
+    this.renderStart();
+  }
+
+  onClose() {
+    this.cancelled = true;
+    this.contentEl.empty();
+  }
+
+  renderStart() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("obts-onboarding");
+    contentEl.createEl("h2", { text: "Set up Obsidian True Sync" });
+    contentEl.createEl("p", { text: "OBTS will open your server in a browser so you can authenticate and choose a vault." });
+    const summary = contentEl.createDiv({ cls: "obts-onboarding-summary" });
+    summary.createEl("strong", { text: this.plugin.app.vault.getName() });
+    summary.createEl("span", { text: this.plugin.settings.serverUrl });
+    new Setting(contentEl)
+      .setName("Device name")
+      .setDesc("This name appears in the server dashboard and conflict history.")
+      .addText((text) => text.setValue(this.plugin.settings.deviceName).onChange(async (value) => {
+        this.plugin.settings.deviceName = value.trim();
+        await this.plugin.saveSettings();
+      }));
+    const feedback = contentEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
+    new Setting(contentEl)
+      .addButton((button) => button.setButtonText("Cancel").onClick(() => this.close()))
+      .addButton((button) => button.setButtonText("Continue in browser").setCta().onClick(async () => {
+        if (!this.plugin.settings.deviceName.trim()) {
+          setFeedback(feedback, "Enter a device name first.", "error");
+          return;
+        }
+        button.setDisabled(true);
+        setFeedback(feedback, "Scanning the local vault...", "muted");
+        try {
+          this.connection = await this.plugin.client.startOnboarding();
+          window.open(this.connection.authorization_url);
+          this.renderWaiting();
+          await this.pollUntilApproved();
+        } catch (error) {
+          button.setDisabled(false);
+          setFeedback(feedback, error instanceof Error ? error.message : "Unable to start setup.", "error");
+        }
+      }));
+  }
+
+  renderWaiting() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Approve in your browser" });
+    contentEl.createEl("p", { text: "Sign in to the OBTS server, choose or create a vault, and approve this device." });
+    const code = contentEl.createDiv({ cls: "obts-verification-code" });
+    code.createEl("span", { text: "Verification code" });
+    code.createEl("strong", { text: this.connection.verification_code });
+    const feedback = contentEl.createDiv({ cls: "obts-feedback obts-feedback--muted", text: "Waiting for approval...", attr: { "aria-live": "polite" } });
+    new Setting(contentEl)
+      .addButton((button) => button.setButtonText("Cancel").onClick(() => this.close()))
+      .addButton((button) => button.setButtonText("Reopen browser").onClick(() => window.open(this.connection.authorization_url)));
+    this.waitingFeedback = feedback;
+  }
+
+  async pollUntilApproved() {
+    while (!this.cancelled && this.connection) {
+      const status = await this.plugin.client.pollOnboarding(this.connection.connection_id, this.connection.connection_secret);
+      if (status.status === "approved") {
+        if (this.waitingFeedback) setFeedback(this.waitingFeedback, "Approved. Comparing local and server vaults...", "success");
+        this.analysis = await this.plugin.client.analyzeOnboarding(this.connection.connection_id, this.connection.connection_secret);
+        this.renderConfirmation();
+        return;
+      }
+      if (status.status === "denied" || status.status === "expired") {
+        throw new ObtsBlockedError(`connection_${status.status}`, `Connection was ${status.status}.`);
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, this.connection.poll_interval_ms || 2000));
+    }
+  }
+
+  renderConfirmation() {
+    const { contentEl } = this;
+    const analysis = this.analysis;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: `Connect to ${analysis.vaultName}` });
+    contentEl.createEl("p", { text: `${analysis.localFileCount.toLocaleString()} syncable files · ${formatBytes(analysis.localBytes)}` });
+    const divergent = analysis.classification === "shared_baseline_divergent" || analysis.classification === "independent_divergent";
+    if (divergent) {
+      contentEl.createEl("p", {
+        cls: "obts-onboarding-warning",
+        text: "The local and server vaults differ. Choose whether to replace local syncable content or submit it for merge. A merge may require conflict review in the dashboard."
+      });
+      if (this.mode !== "merge") this.mode = "use_server";
+      new Setting(contentEl)
+        .setName("Use the server vault")
+        .setDesc("Create a recovery bundle, then replace local syncable content with server main.")
+        .addToggle((toggle) => toggle.setValue(this.mode === "use_server").onChange((value) => {
+          if (value) {
+            this.mode = "use_server";
+            this.renderConfirmation();
+          }
+        }));
+      new Setting(contentEl)
+        .setName("Merge local content")
+        .setDesc("Preserve disjoint local and remote paths; overlapping changes may need dashboard review.")
+        .addToggle((toggle) => toggle.setValue(this.mode === "merge").onChange((value) => {
+          if (value) {
+            this.mode = "merge";
+            this.renderConfirmation();
+          }
+        }));
+    } else if (analysis.classification === "new_with_content") {
+      this.mode = "initialize";
+      contentEl.createEl("p", { text: "This local vault will become the initial server state. A recovery bundle will be created before upload." });
+    } else {
+      this.mode = "use_server";
+      const message = analysis.classification === "identical"
+        ? "Local content already matches the server. OBTS will connect without changing visible files."
+        : analysis.classification === "stale_baseline"
+          ? "This is a clean older copy. OBTS will safely apply the newer server state."
+          : "OBTS will create a recovery bundle and apply the selected server vault locally.";
+      contentEl.createEl("p", { text: message });
+    }
+    const feedback = contentEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
+    const actionLabel = this.mode === "initialize" ? "Create vault and upload" : this.mode === "merge" ? "Submit for merge" : "Use server vault";
+    new Setting(contentEl)
+      .addButton((button) => button.setButtonText("Cancel").onClick(() => this.close()))
+      .addButton((button) => button.setButtonText(actionLabel).setCta().onClick(async () => {
+        button.setDisabled(true);
+        setFeedback(feedback, "Creating recovery bundle and completing setup...", "muted");
+        try {
+          const result = await this.plugin.client.finishOnboarding(
+            this.connection.connection_id,
+            this.connection.connection_secret,
+            this.analysis,
+            this.mode
+          );
+          this.plugin.setStatus((await this.plugin.client.readState()).status_label);
+          this.renderResult(result);
+        } catch (error) {
+          button.setDisabled(false);
+          setFeedback(feedback, error instanceof Error ? error.message : "Setup failed.", "error");
+        }
+      }));
+  }
+
+  renderResult(result) {
+    const { contentEl } = this;
+    contentEl.empty();
+    const reviewNeeded = result.status === "Review needed";
+    contentEl.createEl("h2", { text: reviewNeeded ? "Conflict review needed" : "Sync is ready" });
+    contentEl.createEl("p", {
+      text: reviewNeeded
+        ? "Your local vault was submitted safely, but overlapping changes require review in the dashboard."
+        : "This vault is connected and normal background sync is active."
+    });
+    new Setting(contentEl)
+      .addButton((button) => button.setButtonText("Close").setCta().onClick(() => this.close()))
+      .addButton((button) => {
+        if (reviewNeeded) button.setButtonText("Open dashboard").onClick(() => window.open(`${this.plugin.settings.serverUrl.replace(/\/+$/u, "")}/dashboard`));
+        else button.setDisabled(true).setButtonText("Synced");
+      });
+  }
+}
+
 class ObtsSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -2669,7 +2885,6 @@ class ObtsSettingTab extends PluginSettingTab {
               setFeedback(actionFeedback, "Unpairing...", "muted");
               try {
                 await this.plugin.client.unpairCurrentDevice();
-                this.plugin.settings.pairingToken = "";
                 await this.plugin.saveSettings();
                 this.plugin.setStatus("Not paired");
                 new Notice("obts unpaired this device.");
@@ -2702,7 +2917,6 @@ class ObtsSettingTab extends PluginSettingTab {
               setFeedback(recoveryFeedback, "Resetting...", "muted");
               try {
                 await this.plugin.client.resetLocalPairingState();
-                this.plugin.settings.pairingToken = "";
                 await this.plugin.saveSettings();
                 this.plugin.setStatus("Not paired");
                 new Notice("obts reset local pairing state. Re-pair this device to resume sync.");
@@ -2721,7 +2935,7 @@ class ObtsSettingTab extends PluginSettingTab {
     } else {
       new Setting(containerEl)
         .setName("Status")
-        .setDesc("Ready to pair this vault");
+        .setDesc("Ready to connect this vault");
       new Setting(containerEl)
         .setName("Device name")
         .addText((text) =>
@@ -2732,43 +2946,14 @@ class ObtsSettingTab extends PluginSettingTab {
         );
 
       new Setting(containerEl)
-        .setName("Pairing token")
-        .addText((text) => {
-          text.setPlaceholder("obts_pair_...");
-          text.inputEl.type = "password";
-          text.setValue(this.plugin.settings.pairingToken).onChange(async (value) => {
-            this.plugin.settings.pairingToken = value.trim();
-            await this.plugin.saveSettings();
-          });
-        });
-
-      new Setting(containerEl)
-        .setName("Pairing")
+        .setName("Sync setup")
+        .setDesc("Authenticate in your browser, then choose how this local vault should connect.")
         .addButton((button) =>
           button
-            .setButtonText("Pair")
+            .setButtonText("Set up sync")
             .setCta()
-            .onClick(async () => {
-              button.setDisabled(true);
-              setFeedback(pairingFeedback, "Pairing...", "muted");
-              try {
-                if (!this.plugin.settings.pairingToken) {
-                  throw new ObtsBlockedError("missing_pairing_token", "Enter a pairing token.");
-                }
-                await this.plugin.client.pairWithToken(this.plugin.settings.pairingToken);
-                this.plugin.settings.pairingToken = "";
-                await this.plugin.saveSettings();
-                this.plugin.setStatus((await this.plugin.client.readState()).status_label);
-                new Notice("obts paired this device.");
-                await this.display();
-              } catch (error) {
-                setFeedback(pairingFeedback, error instanceof Error ? error.message : "Pairing failed.", "error");
-              } finally {
-                button.setDisabled(false);
-              }
-            })
+            .onClick(() => new ObtsOnboardingModal(this.app, this.plugin).open())
         );
-      const pairingFeedback = containerEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
     }
 
     new Setting(containerEl)
@@ -2780,6 +2965,19 @@ class ObtsSettingTab extends PluginSettingTab {
         })
       );
   }
+}
+
+function formatBytes(value) {
+  if (value < 1024) return `${value} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let amount = value;
+  let unit = "B";
+  for (const next of units) {
+    amount /= 1024;
+    unit = next;
+    if (amount < 1024) break;
+  }
+  return `${amount.toFixed(amount >= 10 ? 1 : 2)} ${unit}`;
 }
 
 function setFeedback(element, message, tone) {
@@ -2808,6 +3006,21 @@ async function postJson(url, body) {
   const response = await fetchWithTimeout(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!response.ok) {
+    await throwResponseError(response);
+  }
+  return await response.json();
+}
+
+async function postJsonWithBearer(url, token, body) {
+  const response = await fetchWithTimeout(url, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json"
+    },
     body: JSON.stringify(body)
   });
   if (!response.ok) {

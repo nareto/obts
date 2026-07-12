@@ -1,5 +1,11 @@
 import {
   API_VERSION,
+  type CompleteConnectionRequest,
+  type CompleteConnectionResponse,
+  type ConnectionBootstrapManifest,
+  type ConnectionStatusResponse,
+  type CreateConnectionRequest,
+  type CreateConnectionResponse,
   type DevicePullManifest,
   type DevicePushManifest,
   type DeviceSelfResponse,
@@ -13,32 +19,68 @@ import { PLUGIN_VERSION } from '../version.js';
 
 const NETWORK_TIMEOUT_MS = 60_000;
 
-export type PairConsumeResult = {
-  user_id: string;
-  vault_id: string;
-  device_id: string;
-  device_token: string;
-  device_ref: string;
-  current_main: string;
-  is_first_device: boolean;
-};
-
 export class TransportClient {
   constructor(private readonly serverUrl: string) {}
 
-  async consumePairingToken(input: {
-    pairingToken: string;
-    deviceName: string;
-  }): Promise<PairConsumeResult> {
-    const response = await fetchWithTimeout(this.url('/api/v1/pair/consume'), {
+  async createConnection(input: CreateConnectionRequest): Promise<CreateConnectionResponse> {
+    const response = await fetchWithTimeout(this.url('/api/v1/connections'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        pairing_token: input.pairingToken,
-        device_name: input.deviceName
-      })
+      body: JSON.stringify(input)
     });
-    return await readJsonOrThrow<PairConsumeResult>(response);
+    return await readJsonOrThrow<CreateConnectionResponse>(response);
+  }
+
+  async connectionStatus(connectionId: string, secret: string): Promise<ConnectionStatusResponse> {
+    const response = await fetchWithTimeout(this.url(`/api/v1/connections/${connectionId}`), {
+      headers: { authorization: `Bearer ${secret}` }
+    });
+    return await readJsonOrThrow<ConnectionStatusResponse>(response);
+  }
+
+  async bootstrapConnection(
+    connectionId: string,
+    secret: string
+  ): Promise<{ manifest: ConnectionBootstrapManifest; packfile: Buffer }> {
+    const response = await fetchWithTimeout(this.url(`/api/v1/connections/${connectionId}/bootstrap`), {
+      method: 'POST',
+      headers: { authorization: `Bearer ${secret}` }
+    });
+    if (!response.ok) {
+      await throwResponseError(response);
+    }
+    return parseMultipart<ConnectionBootstrapManifest>(
+      response.headers.get('content-type') ?? '',
+      Buffer.from(await response.arrayBuffer())
+    );
+  }
+
+  async completeConnection(
+    connectionId: string,
+    secret: string,
+    input: CompleteConnectionRequest
+  ): Promise<CompleteConnectionResponse> {
+    const response = await fetchWithTimeout(this.url(`/api/v1/connections/${connectionId}/complete`), {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${secret}`,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify(input)
+    });
+    return await readJsonOrThrow<CompleteConnectionResponse>(response);
+  }
+
+  async acknowledgeOnboarding(input: { vaultId: string; deviceToken: string; appliedMain: string }): Promise<void> {
+    const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${input.vaultId}/onboarding/complete`), {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${input.deviceToken}`,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({ applied_main: input.appliedMain })
+    });
+    await readJsonOrThrow(response);
   }
 
   async getDeviceSelf(deviceToken: string): Promise<DeviceSelfResponse> {
@@ -122,7 +164,7 @@ export class TransportClient {
     }
     const contentType = response.headers.get('content-type') ?? '';
     const buffer = Buffer.from(await response.arrayBuffer());
-    return parseMultipartPull(contentType, buffer);
+    return parseMultipart<DevicePullManifest>(contentType, buffer);
   }
 
   async pollEvents(input: {
@@ -200,7 +242,7 @@ export class TransportError extends Error {
   }
 }
 
-function parseMultipartPull(contentType: string, data: Buffer): { manifest: DevicePullManifest; packfile: Buffer } {
+function parseMultipart<T>(contentType: string, data: Buffer): { manifest: T; packfile: Buffer } {
   const boundaryMatch = /boundary=([^;]+)/iu.exec(contentType);
   if (!boundaryMatch?.[1]) {
     throw new Error('Pull response did not include a multipart boundary.');
@@ -238,7 +280,7 @@ function parseMultipartPull(contentType: string, data: Buffer): { manifest: Devi
     throw new Error('Pull response did not include manifest and packfile parts.');
   }
   return {
-    manifest: JSON.parse(manifestPart.body.toString('utf8')) as DevicePullManifest,
+    manifest: JSON.parse(manifestPart.body.toString('utf8')) as T,
     packfile: packPart.body
   };
 }

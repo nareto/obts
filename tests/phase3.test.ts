@@ -49,7 +49,7 @@ describe('Phase 3 deployable history state', () => {
     const store = new MetadataStore(root);
     await store.initialize();
     const upgraded = await store.snapshot();
-    expect(upgraded.schema_version).toBe(2);
+    expect(upgraded.schema_version).toBe(3);
     expect(upgraded.derived_history_by_vault).toEqual({});
 
     expect(JSON.parse(await readFile(join(metadataDir, 'phase1.json'), 'utf8'))).toMatchObject({

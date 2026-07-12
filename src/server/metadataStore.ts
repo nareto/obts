@@ -49,6 +49,7 @@ export type VaultRow = {
   owner_user_id: string;
   display_name: string;
   status: 'active' | 'blocked_integrity';
+  root_commit?: string | null;
   current_main: string;
   created_at: string;
   updated_at: string;
@@ -74,13 +75,47 @@ export type DeviceRow = {
   plugin_version: string | null;
   path_capabilities: Record<string, unknown> | null;
   last_status_report_at: string | null;
+  onboarding_status: 'pending' | 'complete' | null;
+  onboarding_mode: 'initialize' | 'use_server' | 'merge' | null;
+  initial_proposal_kind: 'new_vault_import' | 'independent_vault_merge' | 'shared_baseline_merge' | null;
+  initial_proposal_base: string | null;
+  onboarding_connection_id: string | null;
+  onboarding_completed_at: string | null;
   created_at: string;
   revoked_at: string | null;
 };
 
+export type ConnectionRequestRow = {
+  connection_id: string;
+  secret_lookup_prefix: string;
+  secret_hash: string;
+  credential_salt: string;
+  verification_code: string;
+  status: 'pending' | 'approved' | 'consumed' | 'denied' | 'expired';
+  plugin_version: string;
+  proposed_device_name: string;
+  local_vault_name: string;
+  local_summary: {
+    has_content: boolean;
+    syncable_file_count: number;
+    syncable_bytes: number;
+    has_detached_baseline: boolean;
+  };
+  approved_user_id: string | null;
+  selection: 'new_vault' | 'existing_vault' | null;
+  selected_vault_id: string | null;
+  new_vault_display_name: string | null;
+  expected_main: string | null;
+  created_device_id: string | null;
+  created_at: string;
+  approved_at: string | null;
+  consumed_at: string | null;
+  expires_at: string;
+};
+
 export type TokenRow = {
   token_id: string;
-  kind: 'pairing' | 'device' | 'password_reset';
+  kind: 'device' | 'password_reset';
   lookup_prefix: string;
   token_hash: string;
   user_id: string;
@@ -144,12 +179,13 @@ export type DerivedHistoryIndexRow = {
 };
 
 export type MetadataDb = {
-  schema_version: 2;
+  schema_version: 3;
   setup_complete: boolean;
   users: UserRow[];
   sessions: SessionRow[];
   vaults: VaultRow[];
   devices: DeviceRow[];
+  connections: ConnectionRequestRow[];
   tokens: TokenRow[];
   login_attempts: LoginAttemptRow[];
   sync_operations: SyncOperationRow[];
@@ -280,12 +316,23 @@ export class MetadataStore {
 
   private normalizeLoadedDb(db: MetadataDb): boolean {
     const legacyDb = db as MetadataDb & {
-      schema_version: 1 | 2;
+      schema_version: 1 | 2 | 3;
+      connections?: ConnectionRequestRow[];
       login_attempts?: LoginAttemptRow[];
       directory_state_by_vault?: Record<string, DirectoryStateRow>;
       derived_history_by_vault?: Record<string, DerivedHistoryIndexRow[]>;
     };
     let changed = false;
+    if (!Array.isArray(legacyDb.connections)) {
+      legacyDb.connections = [];
+      changed = true;
+    }
+    const legacyTokens = legacyDb.tokens as unknown as Array<TokenRow & { kind: string }>;
+    const retainedTokens = legacyTokens.filter((token: { kind: string }) => token.kind !== 'pairing') as TokenRow[];
+    if (retainedTokens.length !== legacyTokens.length) {
+      legacyDb.tokens = retainedTokens;
+      changed = true;
+    }
     if (!Array.isArray(legacyDb.login_attempts)) {
       legacyDb.login_attempts = [];
       changed = true;
@@ -299,9 +346,15 @@ export class MetadataStore {
       changed = true;
     }
     const schema = legacyDb as unknown as { schema_version: number };
-    if (schema.schema_version === 1) {
-      schema.schema_version = 2;
+    if (schema.schema_version < 3) {
+      schema.schema_version = 3;
       changed = true;
+    }
+    for (const vault of db.vaults) {
+      if (!Object.prototype.hasOwnProperty.call(vault, 'root_commit')) {
+        vault.root_commit = null;
+        changed = true;
+      }
     }
     for (const device of db.devices) {
       const legacyDevice = device as DeviceRow & {
@@ -315,6 +368,12 @@ export class MetadataStore {
         plugin_version?: string | null;
         path_capabilities?: Record<string, unknown> | null;
         last_status_report_at?: string | null;
+        onboarding_status?: 'pending' | 'complete' | null;
+        onboarding_mode?: 'initialize' | 'use_server' | 'merge' | null;
+        initial_proposal_kind?: 'new_vault_import' | 'independent_vault_merge' | 'shared_baseline_merge' | null;
+        initial_proposal_base?: string | null;
+        onboarding_connection_id?: string | null;
+        onboarding_completed_at?: string | null;
       };
       if (!Object.prototype.hasOwnProperty.call(legacyDevice, 'last_applied_main')) {
         legacyDevice.last_applied_main = null;
@@ -329,7 +388,13 @@ export class MetadataStore {
         'local_head',
         'plugin_version',
         'path_capabilities',
-        'last_status_report_at'
+        'last_status_report_at',
+        'onboarding_status',
+        'onboarding_mode',
+        'initial_proposal_kind',
+        'initial_proposal_base',
+        'onboarding_connection_id',
+        'onboarding_completed_at'
       ] as const) {
         if (legacyDevice[key] === undefined) {
           legacyDevice[key] = null;
@@ -370,12 +435,13 @@ export class MetadataStore {
 
 function createEmptyDb(): MetadataDb {
   return {
-    schema_version: 2,
+    schema_version: 3,
     setup_complete: false,
     users: [],
     sessions: [],
     vaults: [],
     devices: [],
+    connections: [],
     tokens: [],
     login_attempts: [],
     sync_operations: [],
