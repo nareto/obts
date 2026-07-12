@@ -2767,9 +2767,7 @@ class ObtsOnboardingModal extends Modal {
       return;
     }
     this.renderWaiting();
-    void this.pollUntilApproved().catch((error) => {
-      if (this.waitingFeedback) setFeedback(this.waitingFeedback, error instanceof Error ? error.message : "Unable to resume setup.", "error");
-    });
+    void this.pollUntilApproved().catch((error) => this.showWaitingError(error, "Unable to resume setup."));
   }
 
   onClose() {
@@ -2807,10 +2805,11 @@ class ObtsOnboardingModal extends Modal {
           this.connection = await this.plugin.client.startOnboarding();
           window.open(this.connection.authorization_url);
           this.renderWaiting();
+          await waitForMobileBrowserReturn();
           await this.pollUntilApproved();
         } catch (error) {
           button.setDisabled(false);
-          setFeedback(feedback, error instanceof Error ? error.message : "Unable to start setup.", "error");
+          this.showWaitingError(error, "Unable to start setup.");
         }
       }));
   }
@@ -2831,6 +2830,12 @@ class ObtsOnboardingModal extends Modal {
       }))
       .addButton((button) => button.setButtonText("Reopen browser").onClick(() => window.open(this.connection.authorization_url)));
     this.waitingFeedback = feedback;
+  }
+
+  showWaitingError(error, fallback) {
+    const message = error instanceof Error ? error.message : fallback;
+    if (this.waitingFeedback) setFeedback(this.waitingFeedback, message, "error");
+    else new Notice(`obts: ${message}`, 15000);
   }
 
   async pollUntilApproved() {
@@ -3496,6 +3501,25 @@ function categorizeRecoveryError(error) {
 
 function sha256(data) {
   return createSha("sha256").update(Buffer.from(data)).digest("hex");
+}
+
+async function waitForMobileBrowserReturn() {
+  if (!Platform || !Platform.isMobile || typeof document === "undefined") return;
+  await new Promise((resolve) => {
+    let sawHidden = document.hidden;
+    let timer;
+    const finish = () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.clearTimeout(timer);
+      resolve();
+    };
+    const onVisibilityChange = () => {
+      if (document.hidden) sawHidden = true;
+      else if (sawHidden) finish();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    timer = window.setTimeout(finish, 1500);
+  });
 }
 
 function operationRegistry() {

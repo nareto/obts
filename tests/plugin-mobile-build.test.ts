@@ -10,6 +10,7 @@ describe('mobile plugin artifact', () => {
   it('is advertised for mobile and contains no unresolved desktop runtime dependencies', async () => {
     const manifest = JSON.parse(await readFile('obsidian-plugin/manifest.json', 'utf8')) as { isDesktopOnly: boolean };
     const artifact = await readFile('obsidian-plugin/main.js', 'utf8');
+    const source = await readFile('obsidian-plugin/src/main.js', 'utf8');
 
     expect(manifest.isDesktopOnly).toBe(false);
     expect(artifact).not.toMatch(/require\(["'](?:node:|fs["']|path["']|crypto["']|child_process["']|os["'])/u);
@@ -18,6 +19,11 @@ describe('mobile plugin artifact', () => {
 
     const unresolvedRequires = [...artifact.matchAll(/require\(["']([^"']+)["']\)/gu)].map((match) => match[1]);
     expect([...new Set(unresolvedRequires)]).toEqual(['obsidian']);
+
+    const browserHandoff = source.slice(source.indexOf('setButtonText("Continue in browser")'), source.indexOf('renderWaiting() {'));
+    expect(browserHandoff).toContain('await waitForMobileBrowserReturn();');
+    expect(browserHandoff).toContain('this.showWaitingError(error, "Unable to start setup.")');
+    expect(browserHandoff).not.toContain('setFeedback(feedback, error instanceof Error');
   });
 
   it('loads with only the Obsidian API external and browser globals', async () => {

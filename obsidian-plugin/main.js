@@ -21620,7 +21620,7 @@ var createSha = require_sha2();
 var { createDataAdapterFs } = require_data_adapter_fs();
 var fsp = null;
 var API_VERSION = "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = "0.3.0";
+var PLUGIN_VERSION = "0.3.1";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var SYNC_STALE_MS = 2 * 60 * 1e3;
@@ -24158,9 +24158,7 @@ var ObtsOnboardingModal = class extends Modal {
       return;
     }
     this.renderWaiting();
-    void this.pollUntilApproved().catch((error) => {
-      if (this.waitingFeedback) setFeedback(this.waitingFeedback, error instanceof Error ? error.message : "Unable to resume setup.", "error");
-    });
+    void this.pollUntilApproved().catch((error) => this.showWaitingError(error, "Unable to resume setup."));
   }
   onClose() {
     this.cancelled = true;
@@ -24191,10 +24189,11 @@ var ObtsOnboardingModal = class extends Modal {
         this.connection = await this.plugin.client.startOnboarding();
         window.open(this.connection.authorization_url);
         this.renderWaiting();
+        await waitForMobileBrowserReturn();
         await this.pollUntilApproved();
       } catch (error) {
         button.setDisabled(false);
-        setFeedback(feedback, error instanceof Error ? error.message : "Unable to start setup.", "error");
+        this.showWaitingError(error, "Unable to start setup.");
       }
     }));
   }
@@ -24212,6 +24211,11 @@ var ObtsOnboardingModal = class extends Modal {
       this.close();
     })).addButton((button) => button.setButtonText("Reopen browser").onClick(() => window.open(this.connection.authorization_url)));
     this.waitingFeedback = feedback;
+  }
+  showWaitingError(error, fallback) {
+    const message = error instanceof Error ? error.message : fallback;
+    if (this.waitingFeedback) setFeedback(this.waitingFeedback, message, "error");
+    else new Notice(`obts: ${message}`, 15e3);
   }
   async pollUntilApproved() {
     while (!this.cancelled && this.connection) {
@@ -24772,6 +24776,24 @@ function categorizeRecoveryError(error) {
 }
 function sha256(data) {
   return createSha("sha256").update(Buffer2.from(data)).digest("hex");
+}
+async function waitForMobileBrowserReturn() {
+  if (!Platform || !Platform.isMobile || typeof document === "undefined") return;
+  await new Promise((resolve) => {
+    let sawHidden = document.hidden;
+    let timer;
+    const finish = () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.clearTimeout(timer);
+      resolve();
+    };
+    const onVisibilityChange = () => {
+      if (document.hidden) sawHidden = true;
+      else if (sawHidden) finish();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    timer = window.setTimeout(finish, 1500);
+  });
 }
 function operationRegistry() {
   const key = "__obtsOperationRegistry";
