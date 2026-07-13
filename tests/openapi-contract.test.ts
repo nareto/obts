@@ -88,6 +88,7 @@ describe('OpenAPI Phase 3 contract', () => {
     expect(document.paths['/connections/{connection_id}/diagnostic-events']?.post?.security).toEqual([{ connectionBearer: [] }]);
     expect(document.paths['/device/diagnostic-events']?.post?.security).toEqual([{ deviceBearer: [] }]);
     expect(contract).not.toContain('local_error_details');
+    expect(contract).toContain('missing_buffer_dependency');
     expect(contract).toContain(API_VERSION);
     expect(contract).toContain('ErrorEnvelope');
     expect(contract).toContain('__Host-obts_session');

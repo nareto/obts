@@ -1,6 +1,7 @@
 const { Plugin, PluginSettingTab, Setting, Notice, Modal, Platform, requestUrl, apiVersion } = require("obsidian");
-const git = require("isomorphic-git");
 const { Buffer } = require("buffer");
+if (typeof globalThis.Buffer === "undefined") globalThis.Buffer = Buffer;
+const git = require("isomorphic-git");
 const path = require("path-browserify");
 const createSha = require("sha.js");
 const { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require("./data-adapter-fs.cjs");
@@ -1881,7 +1882,11 @@ class ObtsObsidianClient {
       annotateDiagnosticError(wrapped, {
         flow: diagnosticFlow,
         stage: "pack_index",
-        failureCode: message.includes("pack.slice") ? "null_pack_slice" : "pack_index_failed",
+        failureCode: message.includes("Missing Buffer dependency")
+          ? "missing_buffer_dependency"
+          : message.includes("pack.slice")
+            ? "null_pack_slice"
+            : "pack_index_failed",
         breadcrumbs
       });
       throw wrapped;
@@ -3828,9 +3833,11 @@ function buildDiagnosticReport(error) {
   const blocked = error instanceof ObtsBlockedError;
   const failureCode = context && context.failureCode
     ? context.failureCode
-    : message.includes("pack.slice")
-      ? "null_pack_slice"
-      : transport
+    : message.includes("Missing Buffer dependency")
+      ? "missing_buffer_dependency"
+      : message.includes("pack.slice")
+        ? "null_pack_slice"
+        : transport
         ? "request_failed"
         : blocked
           ? "sync_failed"

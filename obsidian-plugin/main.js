@@ -42,271 +42,6 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 ));
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
-// node_modules/async-lock/lib/index.js
-var require_lib = __commonJS({
-  "node_modules/async-lock/lib/index.js"(exports2, module2) {
-    "use strict";
-    var AsyncLock2 = function(opts) {
-      opts = opts || {};
-      this.Promise = opts.Promise || Promise;
-      this.queues = /* @__PURE__ */ Object.create(null);
-      this.domainReentrant = opts.domainReentrant || false;
-      if (this.domainReentrant) {
-        if (typeof process === "undefined" || typeof process.domain === "undefined") {
-          throw new Error(
-            "Domain-reentrant locks require `process.domain` to exist. Please flip `opts.domainReentrant = false`, use a NodeJS version that still implements Domain, or install a browser polyfill."
-          );
-        }
-        this.domains = /* @__PURE__ */ Object.create(null);
-      }
-      this.timeout = opts.timeout || AsyncLock2.DEFAULT_TIMEOUT;
-      this.maxOccupationTime = opts.maxOccupationTime || AsyncLock2.DEFAULT_MAX_OCCUPATION_TIME;
-      this.maxExecutionTime = opts.maxExecutionTime || AsyncLock2.DEFAULT_MAX_EXECUTION_TIME;
-      if (opts.maxPending === Infinity || Number.isInteger(opts.maxPending) && opts.maxPending >= 0) {
-        this.maxPending = opts.maxPending;
-      } else {
-        this.maxPending = AsyncLock2.DEFAULT_MAX_PENDING;
-      }
-    };
-    AsyncLock2.DEFAULT_TIMEOUT = 0;
-    AsyncLock2.DEFAULT_MAX_OCCUPATION_TIME = 0;
-    AsyncLock2.DEFAULT_MAX_EXECUTION_TIME = 0;
-    AsyncLock2.DEFAULT_MAX_PENDING = 1e3;
-    AsyncLock2.prototype.acquire = function(key, fn, cb, opts) {
-      if (Array.isArray(key)) {
-        return this._acquireBatch(key, fn, cb, opts);
-      }
-      if (typeof fn !== "function") {
-        throw new Error("You must pass a function to execute");
-      }
-      var deferredResolve = null;
-      var deferredReject = null;
-      var deferred = null;
-      if (typeof cb !== "function") {
-        opts = cb;
-        cb = null;
-        deferred = new this.Promise(function(resolve, reject) {
-          deferredResolve = resolve;
-          deferredReject = reject;
-        });
-      }
-      opts = opts || {};
-      var resolved = false;
-      var timer = null;
-      var occupationTimer = null;
-      var executionTimer = null;
-      var self = this;
-      var done = function(locked, err, ret) {
-        if (occupationTimer) {
-          clearTimeout(occupationTimer);
-          occupationTimer = null;
-        }
-        if (executionTimer) {
-          clearTimeout(executionTimer);
-          executionTimer = null;
-        }
-        if (locked) {
-          if (!!self.queues[key] && self.queues[key].length === 0) {
-            delete self.queues[key];
-          }
-          if (self.domainReentrant) {
-            delete self.domains[key];
-          }
-        }
-        if (!resolved) {
-          if (!deferred) {
-            if (typeof cb === "function") {
-              cb(err, ret);
-            }
-          } else {
-            if (err) {
-              deferredReject(err);
-            } else {
-              deferredResolve(ret);
-            }
-          }
-          resolved = true;
-        }
-        if (locked) {
-          if (!!self.queues[key] && self.queues[key].length > 0) {
-            self.queues[key].shift()();
-          }
-        }
-      };
-      var exec = function(locked) {
-        if (resolved) {
-          return done(locked);
-        }
-        if (timer) {
-          clearTimeout(timer);
-          timer = null;
-        }
-        if (self.domainReentrant && locked) {
-          self.domains[key] = process.domain;
-        }
-        var maxExecutionTime = opts.maxExecutionTime || self.maxExecutionTime;
-        if (maxExecutionTime) {
-          executionTimer = setTimeout(function() {
-            if (!!self.queues[key]) {
-              done(locked, new Error("Maximum execution time is exceeded " + key));
-            }
-          }, maxExecutionTime);
-        }
-        if (fn.length === 1) {
-          var called = false;
-          try {
-            fn(function(err, ret) {
-              if (!called) {
-                called = true;
-                done(locked, err, ret);
-              }
-            });
-          } catch (err) {
-            if (!called) {
-              called = true;
-              done(locked, err);
-            }
-          }
-        } else {
-          self._promiseTry(function() {
-            return fn();
-          }).then(function(ret) {
-            done(locked, void 0, ret);
-          }, function(error) {
-            done(locked, error);
-          });
-        }
-      };
-      if (self.domainReentrant && !!process.domain) {
-        exec = process.domain.bind(exec);
-      }
-      var maxPending = opts.maxPending || self.maxPending;
-      if (!self.queues[key]) {
-        self.queues[key] = [];
-        exec(true);
-      } else if (self.domainReentrant && !!process.domain && process.domain === self.domains[key]) {
-        exec(false);
-      } else if (self.queues[key].length >= maxPending) {
-        done(false, new Error("Too many pending tasks in queue " + key));
-      } else {
-        var taskFn = function() {
-          exec(true);
-        };
-        if (opts.skipQueue) {
-          self.queues[key].unshift(taskFn);
-        } else {
-          self.queues[key].push(taskFn);
-        }
-        var timeout = opts.timeout || self.timeout;
-        if (timeout) {
-          timer = setTimeout(function() {
-            timer = null;
-            done(false, new Error("async-lock timed out in queue " + key));
-          }, timeout);
-        }
-      }
-      var maxOccupationTime = opts.maxOccupationTime || self.maxOccupationTime;
-      if (maxOccupationTime) {
-        occupationTimer = setTimeout(function() {
-          if (!!self.queues[key]) {
-            done(false, new Error("Maximum occupation time is exceeded in queue " + key));
-          }
-        }, maxOccupationTime);
-      }
-      if (deferred) {
-        return deferred;
-      }
-    };
-    AsyncLock2.prototype._acquireBatch = function(keys, fn, cb, opts) {
-      if (typeof cb !== "function") {
-        opts = cb;
-        cb = null;
-      }
-      var self = this;
-      var getFn = function(key, fn2) {
-        return function(cb2) {
-          self.acquire(key, fn2, cb2, opts);
-        };
-      };
-      var fnx = keys.reduceRight(function(prev, key) {
-        return getFn(key, prev);
-      }, fn);
-      if (typeof cb === "function") {
-        fnx(cb);
-      } else {
-        return new this.Promise(function(resolve, reject) {
-          if (fnx.length === 1) {
-            fnx(function(err, ret) {
-              if (err) {
-                reject(err);
-              } else {
-                resolve(ret);
-              }
-            });
-          } else {
-            resolve(fnx());
-          }
-        });
-      }
-    };
-    AsyncLock2.prototype.isBusy = function(key) {
-      if (!key) {
-        return Object.keys(this.queues).length > 0;
-      } else {
-        return !!this.queues[key];
-      }
-    };
-    AsyncLock2.prototype._promiseTry = function(fn) {
-      try {
-        return this.Promise.resolve(fn());
-      } catch (e) {
-        return this.Promise.reject(e);
-      }
-    };
-    module2.exports = AsyncLock2;
-  }
-});
-
-// node_modules/async-lock/index.js
-var require_async_lock = __commonJS({
-  "node_modules/async-lock/index.js"(exports2, module2) {
-    "use strict";
-    module2.exports = require_lib();
-  }
-});
-
-// node_modules/inherits/inherits_browser.js
-var require_inherits_browser = __commonJS({
-  "node_modules/inherits/inherits_browser.js"(exports2, module2) {
-    if (typeof Object.create === "function") {
-      module2.exports = function inherits(ctor, superCtor) {
-        if (superCtor) {
-          ctor.super_ = superCtor;
-          ctor.prototype = Object.create(superCtor.prototype, {
-            constructor: {
-              value: ctor,
-              enumerable: false,
-              writable: true,
-              configurable: true
-            }
-          });
-        }
-      };
-    } else {
-      module2.exports = function inherits(ctor, superCtor) {
-        if (superCtor) {
-          ctor.super_ = superCtor;
-          var TempCtor = function() {
-          };
-          TempCtor.prototype = superCtor.prototype;
-          ctor.prototype = new TempCtor();
-          ctor.prototype.constructor = ctor;
-        }
-      };
-    }
-  }
-});
-
 // node_modules/base64-js/index.js
 var require_base64_js = __commonJS({
   "node_modules/base64-js/index.js"(exports2) {
@@ -2079,6 +1814,271 @@ var require_buffer = __commonJS({
     }
     function BufferBigIntNotDefined() {
       throw new Error("BigInt not supported");
+    }
+  }
+});
+
+// node_modules/async-lock/lib/index.js
+var require_lib = __commonJS({
+  "node_modules/async-lock/lib/index.js"(exports2, module2) {
+    "use strict";
+    var AsyncLock2 = function(opts) {
+      opts = opts || {};
+      this.Promise = opts.Promise || Promise;
+      this.queues = /* @__PURE__ */ Object.create(null);
+      this.domainReentrant = opts.domainReentrant || false;
+      if (this.domainReentrant) {
+        if (typeof process === "undefined" || typeof process.domain === "undefined") {
+          throw new Error(
+            "Domain-reentrant locks require `process.domain` to exist. Please flip `opts.domainReentrant = false`, use a NodeJS version that still implements Domain, or install a browser polyfill."
+          );
+        }
+        this.domains = /* @__PURE__ */ Object.create(null);
+      }
+      this.timeout = opts.timeout || AsyncLock2.DEFAULT_TIMEOUT;
+      this.maxOccupationTime = opts.maxOccupationTime || AsyncLock2.DEFAULT_MAX_OCCUPATION_TIME;
+      this.maxExecutionTime = opts.maxExecutionTime || AsyncLock2.DEFAULT_MAX_EXECUTION_TIME;
+      if (opts.maxPending === Infinity || Number.isInteger(opts.maxPending) && opts.maxPending >= 0) {
+        this.maxPending = opts.maxPending;
+      } else {
+        this.maxPending = AsyncLock2.DEFAULT_MAX_PENDING;
+      }
+    };
+    AsyncLock2.DEFAULT_TIMEOUT = 0;
+    AsyncLock2.DEFAULT_MAX_OCCUPATION_TIME = 0;
+    AsyncLock2.DEFAULT_MAX_EXECUTION_TIME = 0;
+    AsyncLock2.DEFAULT_MAX_PENDING = 1e3;
+    AsyncLock2.prototype.acquire = function(key, fn, cb, opts) {
+      if (Array.isArray(key)) {
+        return this._acquireBatch(key, fn, cb, opts);
+      }
+      if (typeof fn !== "function") {
+        throw new Error("You must pass a function to execute");
+      }
+      var deferredResolve = null;
+      var deferredReject = null;
+      var deferred = null;
+      if (typeof cb !== "function") {
+        opts = cb;
+        cb = null;
+        deferred = new this.Promise(function(resolve, reject) {
+          deferredResolve = resolve;
+          deferredReject = reject;
+        });
+      }
+      opts = opts || {};
+      var resolved = false;
+      var timer = null;
+      var occupationTimer = null;
+      var executionTimer = null;
+      var self = this;
+      var done = function(locked, err, ret) {
+        if (occupationTimer) {
+          clearTimeout(occupationTimer);
+          occupationTimer = null;
+        }
+        if (executionTimer) {
+          clearTimeout(executionTimer);
+          executionTimer = null;
+        }
+        if (locked) {
+          if (!!self.queues[key] && self.queues[key].length === 0) {
+            delete self.queues[key];
+          }
+          if (self.domainReentrant) {
+            delete self.domains[key];
+          }
+        }
+        if (!resolved) {
+          if (!deferred) {
+            if (typeof cb === "function") {
+              cb(err, ret);
+            }
+          } else {
+            if (err) {
+              deferredReject(err);
+            } else {
+              deferredResolve(ret);
+            }
+          }
+          resolved = true;
+        }
+        if (locked) {
+          if (!!self.queues[key] && self.queues[key].length > 0) {
+            self.queues[key].shift()();
+          }
+        }
+      };
+      var exec = function(locked) {
+        if (resolved) {
+          return done(locked);
+        }
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        if (self.domainReentrant && locked) {
+          self.domains[key] = process.domain;
+        }
+        var maxExecutionTime = opts.maxExecutionTime || self.maxExecutionTime;
+        if (maxExecutionTime) {
+          executionTimer = setTimeout(function() {
+            if (!!self.queues[key]) {
+              done(locked, new Error("Maximum execution time is exceeded " + key));
+            }
+          }, maxExecutionTime);
+        }
+        if (fn.length === 1) {
+          var called = false;
+          try {
+            fn(function(err, ret) {
+              if (!called) {
+                called = true;
+                done(locked, err, ret);
+              }
+            });
+          } catch (err) {
+            if (!called) {
+              called = true;
+              done(locked, err);
+            }
+          }
+        } else {
+          self._promiseTry(function() {
+            return fn();
+          }).then(function(ret) {
+            done(locked, void 0, ret);
+          }, function(error) {
+            done(locked, error);
+          });
+        }
+      };
+      if (self.domainReentrant && !!process.domain) {
+        exec = process.domain.bind(exec);
+      }
+      var maxPending = opts.maxPending || self.maxPending;
+      if (!self.queues[key]) {
+        self.queues[key] = [];
+        exec(true);
+      } else if (self.domainReentrant && !!process.domain && process.domain === self.domains[key]) {
+        exec(false);
+      } else if (self.queues[key].length >= maxPending) {
+        done(false, new Error("Too many pending tasks in queue " + key));
+      } else {
+        var taskFn = function() {
+          exec(true);
+        };
+        if (opts.skipQueue) {
+          self.queues[key].unshift(taskFn);
+        } else {
+          self.queues[key].push(taskFn);
+        }
+        var timeout = opts.timeout || self.timeout;
+        if (timeout) {
+          timer = setTimeout(function() {
+            timer = null;
+            done(false, new Error("async-lock timed out in queue " + key));
+          }, timeout);
+        }
+      }
+      var maxOccupationTime = opts.maxOccupationTime || self.maxOccupationTime;
+      if (maxOccupationTime) {
+        occupationTimer = setTimeout(function() {
+          if (!!self.queues[key]) {
+            done(false, new Error("Maximum occupation time is exceeded in queue " + key));
+          }
+        }, maxOccupationTime);
+      }
+      if (deferred) {
+        return deferred;
+      }
+    };
+    AsyncLock2.prototype._acquireBatch = function(keys, fn, cb, opts) {
+      if (typeof cb !== "function") {
+        opts = cb;
+        cb = null;
+      }
+      var self = this;
+      var getFn = function(key, fn2) {
+        return function(cb2) {
+          self.acquire(key, fn2, cb2, opts);
+        };
+      };
+      var fnx = keys.reduceRight(function(prev, key) {
+        return getFn(key, prev);
+      }, fn);
+      if (typeof cb === "function") {
+        fnx(cb);
+      } else {
+        return new this.Promise(function(resolve, reject) {
+          if (fnx.length === 1) {
+            fnx(function(err, ret) {
+              if (err) {
+                reject(err);
+              } else {
+                resolve(ret);
+              }
+            });
+          } else {
+            resolve(fnx());
+          }
+        });
+      }
+    };
+    AsyncLock2.prototype.isBusy = function(key) {
+      if (!key) {
+        return Object.keys(this.queues).length > 0;
+      } else {
+        return !!this.queues[key];
+      }
+    };
+    AsyncLock2.prototype._promiseTry = function(fn) {
+      try {
+        return this.Promise.resolve(fn());
+      } catch (e) {
+        return this.Promise.reject(e);
+      }
+    };
+    module2.exports = AsyncLock2;
+  }
+});
+
+// node_modules/async-lock/index.js
+var require_async_lock = __commonJS({
+  "node_modules/async-lock/index.js"(exports2, module2) {
+    "use strict";
+    module2.exports = require_lib();
+  }
+});
+
+// node_modules/inherits/inherits_browser.js
+var require_inherits_browser = __commonJS({
+  "node_modules/inherits/inherits_browser.js"(exports2, module2) {
+    if (typeof Object.create === "function") {
+      module2.exports = function inherits(ctor, superCtor) {
+        if (superCtor) {
+          ctor.super_ = superCtor;
+          ctor.prototype = Object.create(superCtor.prototype, {
+            constructor: {
+              value: ctor,
+              enumerable: false,
+              writable: true,
+              configurable: true
+            }
+          });
+        }
+      };
+    } else {
+      module2.exports = function inherits(ctor, superCtor) {
+        if (superCtor) {
+          ctor.super_ = superCtor;
+          var TempCtor = function() {
+          };
+          TempCtor.prototype = superCtor.prototype;
+          ctor.prototype = new TempCtor();
+          ctor.prototype.constructor = ctor;
+        }
+      };
     }
   }
 });
@@ -21712,14 +21712,15 @@ var require_data_adapter_fs = __commonJS({
 
 // obsidian-plugin/src/main.js
 var { Plugin, PluginSettingTab, Setting, Notice, Modal, Platform, requestUrl, apiVersion } = require("obsidian");
-var git = (init_isomorphic_git(), __toCommonJS(isomorphic_git_exports));
 var { Buffer: Buffer2 } = require_buffer();
+if (typeof globalThis.Buffer === "undefined") globalThis.Buffer = Buffer2;
+var git = (init_isomorphic_git(), __toCommonJS(isomorphic_git_exports));
 var path = require_path_browserify();
 var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var fsp = null;
 var API_VERSION = "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = "0.4.0";
+var PLUGIN_VERSION = "0.4.1";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var SYNC_STALE_MS = 2 * 60 * 1e3;
@@ -23465,7 +23466,7 @@ var ObtsObsidianClient = class {
       annotateDiagnosticError(wrapped, {
         flow: diagnosticFlow,
         stage: "pack_index",
-        failureCode: message.includes("pack.slice") ? "null_pack_slice" : "pack_index_failed",
+        failureCode: message.includes("Missing Buffer dependency") ? "missing_buffer_dependency" : message.includes("pack.slice") ? "null_pack_slice" : "pack_index_failed",
         breadcrumbs
       });
       throw wrapped;
@@ -25161,7 +25162,7 @@ function buildDiagnosticReport(error) {
   const message = error instanceof Error ? error.message : "";
   const transport = error instanceof ObtsTransportError;
   const blocked = error instanceof ObtsBlockedError;
-  const failureCode = context && context.failureCode ? context.failureCode : message.includes("pack.slice") ? "null_pack_slice" : transport ? "request_failed" : blocked ? "sync_failed" : "unknown";
+  const failureCode = context && context.failureCode ? context.failureCode : message.includes("Missing Buffer dependency") ? "missing_buffer_dependency" : message.includes("pack.slice") ? "null_pack_slice" : transport ? "request_failed" : blocked ? "sync_failed" : "unknown";
   return {
     schema_version: 1,
     event_id: `dgr_${randomHex(16)}`,

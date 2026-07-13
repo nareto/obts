@@ -14,7 +14,7 @@ const report = {
   platform_family: 'ios',
   flow: 'onboarding',
   stage: 'pack_index',
-  failure_code: 'null_pack_slice',
+  failure_code: 'missing_buffer_dependency',
   error_class: 'type_error',
   retryable: false,
   breadcrumbs: [

@@ -1,10 +1,18 @@
+import { Buffer } from 'node:buffer';
 import { webcrypto } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import vm from 'node:vm';
 
+import git from 'isomorphic-git';
 import { describe, expect, it } from 'vitest';
 
 import { MemoryDataAdapter } from './helpers/memoryDataAdapter.js';
+
+const require = createRequire(import.meta.url);
+const { createDataAdapterFs } = require('../obsidian-plugin/src/data-adapter-fs.cjs') as {
+  createDataAdapterFs: (adapter: MemoryDataAdapter) => any;
+};
 
 describe('mobile plugin artifact', () => {
   it('is advertised for mobile and contains no unresolved desktop runtime dependencies', async () => {
@@ -89,6 +97,7 @@ describe('mobile plugin artifact', () => {
 
     new vm.Script(artifact, { filename: 'obsidian-plugin/main.js' }).runInContext(context);
     expect(typeof module.exports).toBe('function');
+    expect(typeof (context as any).Buffer).toBe('function');
 
     const adapter = new MemoryDataAdapter();
     const PluginClass = module.exports as new () => Plugin;
@@ -106,6 +115,27 @@ describe('mobile plugin artifact', () => {
     expect(await adapter.exists('.obts/git/HEAD')).toBe(true);
     expect(await adapter.exists('.obts/state.json')).toBe(true);
     expect(await adapter.exists('.obts/queue.json')).toBe(true);
+
+    const sourceAdapter = new MemoryDataAdapter();
+    const sourceFs = createDataAdapterFs(sourceAdapter);
+    const sourceArgs = { fs: sourceFs, dir: '/', gitdir: '/.obts/git' };
+    await git.init({ ...sourceArgs, defaultBranch: 'local' });
+    const blob = await git.writeBlob({ ...sourceArgs, blob: Buffer.from('mobile bundle pack\n') });
+    const tree = await git.writeTree({
+      ...sourceArgs,
+      tree: [{ mode: '100644', path: 'note.md', oid: blob, type: 'blob' }]
+    });
+    const commit = await git.commit({
+      ...sourceArgs,
+      ref: 'refs/heads/local',
+      tree,
+      message: 'mobile bundle pack',
+      author: { name: 'obts test', email: 'test@obts.local' },
+      committer: { name: 'obts test', email: 'test@obts.local' }
+    });
+    const packed = await git.packObjects({ ...sourceArgs, oids: [blob, tree, commit] });
+    await expect((plugin as any).client.importPack(packed.packfile)).resolves.toBeUndefined();
+    expect((await adapter.list('.obts/git/objects/pack')).files.some((file) => file.endsWith('.idx'))).toBe(true);
 
     const diagnosticError = vm.runInContext(
       "new TypeError(\"null is not an object (evaluating 'pack.slice') private-note.md obts_dev_secret\")",
@@ -130,7 +160,7 @@ describe('mobile plugin artifact', () => {
     const diagnosticBody = JSON.parse(String(requests[0]?.body)) as Record<string, unknown>;
     expect(diagnosticBody).toMatchObject({
       schema_version: 1,
-      plugin_version: '0.4.0',
+      plugin_version: '0.4.1',
       obsidian_version: '1.9.12',
       platform_family: 'ios',
       failure_code: 'null_pack_slice',
@@ -139,6 +169,16 @@ describe('mobile plugin artifact', () => {
     expect(JSON.stringify(diagnosticBody)).not.toContain('private-note.md');
     expect(JSON.stringify(diagnosticBody)).not.toContain('obts_dev_secret');
     expect(JSON.stringify(diagnosticBody)).not.toContain('obts_conn_private');
+
+    const missingBufferError = vm.runInContext("new Error('Missing Buffer dependency')", context) as Error;
+    await (plugin as any).reportOnboardingError(missingBufferError, {
+      connection_id: 'con_safe',
+      connection_secret: 'obts_conn_private'
+    });
+    expect(requests).toHaveLength(2);
+    const missingBufferBody = JSON.parse(String(requests[1]?.body)) as Record<string, unknown>;
+    expect(missingBufferBody.failure_code).toBe('missing_buffer_dependency');
+    expect(JSON.stringify(missingBufferBody)).not.toContain('Missing Buffer dependency');
 
     const originalReadState = (plugin as any).client.readState.bind((plugin as any).client);
     const currentState = await originalReadState();
@@ -153,7 +193,7 @@ describe('mobile plugin artifact', () => {
     resolveState(currentState);
     await racedReport;
     (plugin as any).client.readState = originalReadState;
-    expect(requests).toHaveLength(1);
+    expect(requests).toHaveLength(2);
     expect((plugin as any).diagnosticSharingEnabled()).toBe(false);
     expect(savedSettings.length).toBeGreaterThan(0);
 
