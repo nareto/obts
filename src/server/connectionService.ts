@@ -304,7 +304,6 @@ export class ConnectionService {
         last_successful_sync_at: null,
         local_status_label: null,
         local_error_code: null,
-        local_error_details: null,
         local_queue_status: null,
         local_main: null,
         local_head: null,
@@ -341,6 +340,12 @@ export class ConnectionService {
       mutableConnection.expected_main = vault.current_main;
       mutableConnection.created_device_id = device.device_id;
       mutableConnection.consumed_at = timestamp;
+      for (const diagnostic of db.diagnostic_events) {
+        if (diagnostic.connection_id === mutableConnection.connection_id) {
+          diagnostic.vault_id = vault.vault_id;
+          diagnostic.device_id = device.device_id;
+        }
+      }
       db.audit_log.push({
         audit_id: newId('aud'),
         actor_user_id: vault.owner_user_id,
@@ -354,6 +359,23 @@ export class ConnectionService {
       return { vault, device };
     });
     return responseFor(result.vault, result.device, deviceToken, request.mode);
+  }
+
+  async authenticateDiagnostics(connectionId: string, secret: string): Promise<{
+    connection: ConnectionRequestRow;
+    user: UserRow;
+  }> {
+    return await this.store.mutate((db) => {
+      const connection = authenticatedConnection(db.connections, connectionId, secret);
+      if (connection.status !== 'approved' || !connection.approved_user_id) {
+        throw new AuthError(404, 'not_found', 'Resource not found.');
+      }
+      const user = db.users.find((candidate) => candidate.user_id === connection.approved_user_id);
+      if (!user || user.disabled) {
+        throw new AuthError(404, 'not_found', 'Resource not found.');
+      }
+      return { connection: structuredClone(connection), user: structuredClone(user) };
+    });
   }
 
   async markComplete(deviceId: string): Promise<void> {

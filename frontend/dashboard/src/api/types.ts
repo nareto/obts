@@ -57,7 +57,6 @@ export type DashboardDevice = {
   last_successful_sync_at: string | null;
   local_status_label: StatusLabel | null;
   local_error_code: string | null;
-  local_error_details: Record<string, unknown> | null;
   local_queue_status: string | null;
   local_main: string | null;
   local_head: string | null;
@@ -95,6 +94,36 @@ export type MaintenanceRow = {
   last_checked_at: string;
   detail: string;
   action?: 'start_git_maintenance' | 'view_backup_contract';
+};
+
+export type DiagnosticBreadcrumb = {
+  point: string;
+  outcome: string;
+  value_kind: string;
+  size_bucket: string;
+  error_code: string;
+};
+
+export type DiagnosticEvent = {
+  schema_version: 1;
+  event_id: string;
+  plugin_version: string;
+  obsidian_version: string;
+  platform_family: string;
+  flow: string;
+  stage: string;
+  failure_code: string;
+  error_class: string;
+  retryable: boolean;
+  breadcrumbs: DiagnosticBreadcrumb[];
+  received_at: string;
+};
+
+export type DiagnosticEventsResponse = {
+  ingestion_enabled: boolean;
+  retention_days: number;
+  events: DiagnosticEvent[];
+  next_cursor: string | null;
 };
 
 export type DashboardSummary = {

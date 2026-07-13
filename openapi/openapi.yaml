@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Obsidian True Sync Phase 3 API
-  version: 0.2.0
+  version: 0.3.0
   summary: Deployable note history, restore, diagnostics, and maintenance.
 servers:
   - url: /api/v1
@@ -385,6 +385,40 @@ paths:
           $ref: "#/components/responses/Error"
         "409":
           $ref: "#/components/responses/Error"
+  /connections/{connection_id}/diagnostic-events:
+    post:
+      summary: Accept one opted-in sanitized failure report from an approved onboarding connection.
+      security:
+        - connectionBearer: []
+      parameters:
+        - $ref: "#/components/parameters/ConnectionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DiagnosticEvent"
+      responses:
+        "202":
+          description: Diagnostic event accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagnosticIngestResponse"
+        "200":
+          description: Duplicate diagnostic event acknowledged.
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "413":
+          $ref: "#/components/responses/Error"
+        "429":
+          $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/Error"
   /connections/{connection_id}/complete:
     post:
       summary: Register the approved device with an explicit onboarding content mode.
@@ -429,6 +463,38 @@ paths:
           $ref: "#/components/responses/Error"
         "404":
           $ref: "#/components/responses/Error"
+  /diagnostic-events:
+    get:
+      summary: List sanitized diagnostic events owned by the current dashboard user.
+      parameters:
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+      responses:
+        "200":
+          description: Owner-scoped diagnostic event page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagnosticEventsResponse"
+        "401":
+          $ref: "#/components/responses/Error"
+    delete:
+      summary: Delete all diagnostic events owned by the current dashboard user after recent authentication.
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "200":
+          description: Owner diagnostic events deleted.
+        "403":
+          $ref: "#/components/responses/Error"
   /device/self:
     get:
       summary: Return non-secret identity and ref metadata for the current device token.
@@ -442,6 +508,36 @@ paths:
               schema:
                 $ref: "#/components/schemas/DeviceSelfResponse"
         "404":
+          $ref: "#/components/responses/Error"
+  /device/diagnostic-events:
+    post:
+      summary: Accept one opted-in sanitized failure report from a paired device.
+      security:
+        - deviceBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DiagnosticEvent"
+      responses:
+        "202":
+          description: Diagnostic event accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagnosticIngestResponse"
+        "200":
+          description: Duplicate diagnostic event acknowledged.
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "413":
+          $ref: "#/components/responses/Error"
+        "429":
+          $ref: "#/components/responses/Error"
+        "503":
           $ref: "#/components/responses/Error"
   /vaults/{vault_id}/sync/push:
     post:
@@ -1240,6 +1336,105 @@ components:
         event_seq:
           type: integer
           minimum: 0
+    DiagnosticBreadcrumb:
+      type: object
+      additionalProperties: false
+      required: [point, outcome, value_kind, size_bucket, error_code]
+      properties:
+        point:
+          type: string
+          enum: [onboarding_approved, bootstrap_response, multipart_pack, pack_persist_write, pack_persist_read, index_fs_stat, index_fs_read_file, index_fs_read, index_fs_write, index_pack, sync_request, apply, recovery]
+        outcome:
+          type: string
+          enum: [started, returned, succeeded, failed]
+        value_kind:
+          type: string
+          enum: [buffer, uint8array, arraybuffer, string, "null", other, unknown]
+        size_bucket:
+          type: string
+          enum: [empty, under_64k, under_1m, under_16m, under_64m, over_64m, unknown]
+        error_code:
+          type: string
+          enum: [none, enoent, eexist, eisdir, enotdir, enotempty, eacces, eperm, eio, invalid_type, unknown]
+    DiagnosticEventFields:
+      type: object
+      required: [schema_version, event_id, plugin_version, obsidian_version, platform_family, flow, stage, failure_code, error_class, retryable, breadcrumbs]
+      properties:
+        schema_version:
+          const: 1
+        event_id:
+          type: string
+          pattern: "^dgr_[0-9a-f]{32}$"
+        plugin_version:
+          type: string
+          maxLength: 80
+        obsidian_version:
+          type: string
+          maxLength: 80
+        platform_family:
+          type: string
+          enum: [ios, android, desktop, unknown]
+        flow:
+          type: string
+          enum: [onboarding, sync, apply, recovery, rebuild, plugin]
+        stage:
+          type: string
+          enum: [browser_handoff, approval_poll, bootstrap_request, multipart_parse, pack_persist, pack_index, tree_read, sync_request, apply, recovery, plugin_lifecycle, unknown]
+        failure_code:
+          type: string
+          enum: [null_pack_slice, pack_index_failed, adapter_read_failed, adapter_write_failed, adapter_stat_failed, multipart_parse_failed, request_failed, onboarding_failed, sync_failed, recovery_failed, unknown]
+        error_class:
+          type: string
+          enum: [type_error, transport_error, blocked_error, error, unknown]
+        retryable:
+          type: boolean
+        breadcrumbs:
+          type: array
+          maxItems: 16
+          items:
+            $ref: "#/components/schemas/DiagnosticBreadcrumb"
+    DiagnosticEvent:
+      allOf:
+        - $ref: "#/components/schemas/DiagnosticEventFields"
+      unevaluatedProperties: false
+    DiagnosticIngestResponse:
+      type: object
+      additionalProperties: false
+      required: [status, event_id]
+      properties:
+        status:
+          type: string
+          enum: [accepted, duplicate]
+        event_id:
+          type: string
+          pattern: "^dgr_[0-9a-f]{32}$"
+    DiagnosticEventView:
+      allOf:
+        - $ref: "#/components/schemas/DiagnosticEventFields"
+        - type: object
+          required: [received_at]
+          properties:
+            received_at:
+              type: string
+              format: date-time
+      unevaluatedProperties: false
+    DiagnosticEventsResponse:
+      type: object
+      additionalProperties: false
+      required: [ingestion_enabled, retention_days, events, next_cursor]
+      properties:
+        ingestion_enabled:
+          type: boolean
+        retention_days:
+          type: integer
+          minimum: 1
+          maximum: 90
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiagnosticEventView"
+        next_cursor:
+          oneOf: [{type: "null"}, {type: string}]
     DeviceStatusReport:
       type: object
       required:
@@ -1261,10 +1456,6 @@ components:
             - type: "null"
             - type: string
               maxLength: 120
-        local_error_details:
-          oneOf:
-            - type: "null"
-            - type: object
         local_queue_status:
           oneOf:
             - type: "null"
@@ -1517,7 +1708,6 @@ components:
               - last_successful_sync_at
               - local_status_label
               - local_error_code
-              - local_error_details
               - local_queue_status
               - local_main
               - local_head
@@ -1566,10 +1756,6 @@ components:
                 oneOf:
                   - type: "null"
                   - type: string
-              local_error_details:
-                oneOf:
-                  - type: "null"
-                  - type: object
               local_queue_status:
                 oneOf:
                   - type: "null"

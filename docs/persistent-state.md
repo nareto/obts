@@ -13,7 +13,8 @@ Back up these paths atomically:
 - all of `OBTS_DATA_DIR`, including metadata and any durable recovery residue;
 - `OBTS_DATA_DIR/metadata/phase1.json`: users, sessions, vaults, devices,
   token hashes, sync operations, conflict workflow records, dashboard events,
-  audit rows, and rebuildable derived note-history indexes.
+  audit rows, opted-in sanitized error diagnostics, and rebuildable derived
+  note-history indexes.
 - `OBTS_DATA_DIR/git/*.git`: per-vault native Git repositories containing
   canonical `refs/heads/main`, protected device refs, commits, trees, blobs,
   packs, and refs protecting unresolved conflict history.
@@ -60,8 +61,11 @@ application state being protected.
 
 Default diagnostics exports omit note bodies, raw paths, plugin settings and
 file bodies, tokens, credentials, Git packs/blobs, recovery bundle content, and
-operation manifests. Treat even redacted diagnostics as sensitive application
-state. Community-plugin file history is metadata-only by default; revealing a
+operation manifests. Opted-in plugin error diagnostics use a closed schema,
+expire after 14 days by default, and can be deleted by their owner from the
+Settings page. Expired or deleted records can remain in historical backups until
+backup rotation removes them. Treat even redacted diagnostics as sensitive
+application state. Community-plugin file history is metadata-only by default; revealing a
 selected body is an explicit owner action protected by recent authentication.
 
 Git maintenance verifies object integrity before and after repacking and prunes

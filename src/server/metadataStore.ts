@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { newId, nowIso } from '../shared/ids.js';
+import type { DiagnosticEventV1 } from '../shared/diagnostics.js';
 import type { ConflictRecord, EventEnvelope, NoteHistoryVersion } from '../shared/types.js';
 
 const EVENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -68,7 +69,6 @@ export type DeviceRow = {
   last_successful_sync_at: string | null;
   local_status_label: string | null;
   local_error_code: string | null;
-  local_error_details: Record<string, unknown> | null;
   local_queue_status: string | null;
   local_main: string | null;
   local_head: string | null;
@@ -165,6 +165,15 @@ export type AuditRow = {
   created_at: string;
 };
 
+export type DiagnosticEventRow = DiagnosticEventV1 & {
+  owner_user_id: string;
+  connection_id: string | null;
+  vault_id: string | null;
+  device_id: string | null;
+  received_at: string;
+  expires_at: string;
+};
+
 export type DirectoryStateRow = {
   explicit_dirs: string[];
   updated_at: string;
@@ -179,7 +188,7 @@ export type DerivedHistoryIndexRow = {
 };
 
 export type MetadataDb = {
-  schema_version: 3;
+  schema_version: 4;
   setup_complete: boolean;
   users: UserRow[];
   sessions: SessionRow[];
@@ -192,6 +201,7 @@ export type MetadataDb = {
   conflicts: ConflictRecord[];
   events: EventEnvelope[];
   audit_log: AuditRow[];
+  diagnostic_events: DiagnosticEventRow[];
   event_seq_by_vault: Record<string, number>;
   merge_sequence_by_vault: Record<string, number>;
   directory_state_by_vault: Record<string, DirectoryStateRow>;
@@ -316,9 +326,10 @@ export class MetadataStore {
 
   private normalizeLoadedDb(db: MetadataDb): boolean {
     const legacyDb = db as MetadataDb & {
-      schema_version: 1 | 2 | 3;
+      schema_version: 1 | 2 | 3 | 4;
       connections?: ConnectionRequestRow[];
       login_attempts?: LoginAttemptRow[];
+      diagnostic_events?: DiagnosticEventRow[];
       directory_state_by_vault?: Record<string, DirectoryStateRow>;
       derived_history_by_vault?: Record<string, DerivedHistoryIndexRow[]>;
     };
@@ -337,6 +348,10 @@ export class MetadataStore {
       legacyDb.login_attempts = [];
       changed = true;
     }
+    if (!Array.isArray(legacyDb.diagnostic_events)) {
+      legacyDb.diagnostic_events = [];
+      changed = true;
+    }
     if (legacyDb.directory_state_by_vault === undefined) {
       legacyDb.directory_state_by_vault = {};
       changed = true;
@@ -346,8 +361,8 @@ export class MetadataStore {
       changed = true;
     }
     const schema = legacyDb as unknown as { schema_version: number };
-    if (schema.schema_version < 3) {
-      schema.schema_version = 3;
+    if (schema.schema_version < 4) {
+      schema.schema_version = 4;
       changed = true;
     }
     for (const vault of db.vaults) {
@@ -379,10 +394,13 @@ export class MetadataStore {
         legacyDevice.last_applied_main = null;
         changed = true;
       }
+      if (Object.prototype.hasOwnProperty.call(legacyDevice, 'local_error_details')) {
+        delete legacyDevice.local_error_details;
+        changed = true;
+      }
       for (const key of [
         'local_status_label',
         'local_error_code',
-        'local_error_details',
         'local_queue_status',
         'local_main',
         'local_head',
@@ -435,7 +453,7 @@ export class MetadataStore {
 
 function createEmptyDb(): MetadataDb {
   return {
-    schema_version: 3,
+    schema_version: 4,
     setup_complete: false,
     users: [],
     sessions: [],
@@ -448,6 +466,7 @@ function createEmptyDb(): MetadataDb {
     conflicts: [],
     events: [],
     audit_log: [],
+    diagnostic_events: [],
     event_seq_by_vault: {},
     merge_sequence_by_vault: {},
     directory_state_by_vault: {},

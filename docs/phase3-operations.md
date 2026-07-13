@@ -8,8 +8,10 @@ Git maintenance to the deployable Phase 2 server and dashboard.
 1. Stop the Phase 2 server and take a point-in-time-consistent backup of the
    metadata file and every per-vault Git repository.
 2. Deploy the Phase 3 image or build output without replacing `OBTS_DATA_DIR`.
-3. Start the server. The file-backed metadata adapter upgrades schema version 1
-   to version 2 and initializes rebuildable derived-history indexes. Existing
+3. Start the server. The file-backed metadata adapter upgrades existing state
+   to schema version 4, initializes rebuildable derived-history indexes, creates
+   the bounded diagnostic-event store, and deletes legacy unrestricted device
+   error-detail objects. Existing
    unresolved conflicts receive internal protection refs without changing
    `main` or any device ref.
 4. Require `GET /health/ready` (or `obts health ready`) to return `ready` before
@@ -56,6 +58,16 @@ the existing recovery-bundle and apply-journal protections.
 redacted JSON export. It excludes content, raw paths, sensitive plugin data,
 tokens, Git object payloads, recovery content, device error details, and
 operation manifests. The endpoint never provides cross-owner visibility.
+
+The server accepts fixed-schema plugin failure reports only when
+`OBTS_DIAGNOSTIC_INGEST_ENABLED=true`. Client sharing remains independently off
+by default and is bound to the configured backend URL. Approved onboarding
+connections and paired devices authenticate to separate ingestion routes. The
+server rejects unknown payload fields, enforces byte/rate/quota limits, retains
+reports for `OBTS_DIAGNOSTIC_RETENTION_DAYS` (14 by default, 90 maximum), and
+never persists request credentials. Owners inspect and delete their reports on
+the dashboard Settings page. Deletion requires CSRF protection and recent
+authentication; backup rotation governs residual copies.
 
 Git maintenance requires recent owner authentication. It verifies Git objects,
 ensures unresolved-conflict protection refs exist, repacks reachable objects,

@@ -703,6 +703,102 @@ pre {
   white-space: nowrap;
 }
 
+.diagnostics-panel {
+  display: grid;
+  gap: 20px;
+}
+
+.diagnostics-heading,
+.diagnostic-card-heading,
+.diagnostics-actions {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.eyebrow {
+  margin: 0 0 4px;
+  color: var(--primary);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.diagnostic-status {
+  flex: 0 0 auto;
+  padding: 5px 9px;
+  color: var(--muted);
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 12px;
+}
+
+.diagnostic-status.status-enabled {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 45%, var(--border));
+}
+
+.empty-diagnostics {
+  padding: 28px;
+  text-align: center;
+  background: var(--raised);
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+}
+
+.diagnostic-list {
+  display: grid;
+  gap: 12px;
+}
+
+.diagnostic-card {
+  padding: 16px;
+  background: linear-gradient(135deg, var(--surface), var(--raised));
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--danger);
+  border-radius: 8px;
+}
+
+.diagnostic-card-heading div,
+.diagnostic-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+}
+
+.diagnostic-card-heading strong {
+  text-transform: capitalize;
+}
+
+.diagnostic-card-heading span,
+.diagnostic-card-heading time,
+.diagnostic-facts span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.diagnostic-trace {
+  display: grid;
+  gap: 6px;
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.diagnostic-trace li {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) repeat(4, auto);
+  gap: 10px;
+  padding: 7px 9px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  font-size: 12px;
+}
+
 @media (max-width: 899px) {
   button {
     min-height: 40px;
@@ -892,6 +988,16 @@ pre {
 }
 
 @media (max-width: 600px) {
+  .diagnostics-heading,
+  .diagnostic-card-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .diagnostic-trace li {
+    grid-template-columns: 1fr 1fr;
+  }
+
   .connection-panel {
     padding: 20px;
   }

@@ -40,6 +40,10 @@ Environment:
   OBTS_SESSION_SECRET       Dashboard/API session signing secret.
   OBTS_GIT_BINARY           Native git executable. Defaults to git.
   OBTS_MAX_UPLOAD_BYTES     Upload limit in bytes. Defaults to 104857600.
+  OBTS_DIAGNOSTIC_INGEST_ENABLED
+                            Accept opted-in plugin error reports. Defaults to false.
+  OBTS_DIAGNOSTIC_RETENTION_DAYS
+                            Error report retention in days (1-90). Defaults to 14.
   OBTS_HOST                 Serve host. Defaults to 0.0.0.0.
   OBTS_PORT                 Serve port. Defaults to 3000.
 `;
@@ -332,7 +336,13 @@ function configFromEnv(env: CliEnv): Partial<ServerConfig> & { dataDir: string }
     ...(env.OBTS_PUBLIC_BASE_URL ? { publicBaseUrl: env.OBTS_PUBLIC_BASE_URL } : {}),
     ...(env.OBTS_SESSION_SECRET ? { sessionSecret: env.OBTS_SESSION_SECRET } : {}),
     ...(env.OBTS_GIT_BINARY ? { gitBinary: env.OBTS_GIT_BINARY } : {}),
-    ...(env.OBTS_MAX_UPLOAD_BYTES ? { maxUploadBytes: parseInteger(env.OBTS_MAX_UPLOAD_BYTES, 'OBTS_MAX_UPLOAD_BYTES') } : {})
+    ...(env.OBTS_MAX_UPLOAD_BYTES ? { maxUploadBytes: parseInteger(env.OBTS_MAX_UPLOAD_BYTES, 'OBTS_MAX_UPLOAD_BYTES') } : {}),
+    ...(env.OBTS_DIAGNOSTIC_INGEST_ENABLED
+      ? { diagnosticIngestEnabled: parseBoolean(env.OBTS_DIAGNOSTIC_INGEST_ENABLED, 'OBTS_DIAGNOSTIC_INGEST_ENABLED') }
+      : {}),
+    ...(env.OBTS_DIAGNOSTIC_RETENTION_DAYS
+      ? { diagnosticRetentionDays: parseInteger(env.OBTS_DIAGNOSTIC_RETENTION_DAYS, 'OBTS_DIAGNOSTIC_RETENTION_DAYS') }
+      : {})
   };
 }
 
@@ -424,6 +434,13 @@ function integerOption(parsed: ParsedArgs, name: string): number | undefined {
 
 function integerEnv(value: string | undefined, name: string): number | undefined {
   return value === undefined ? undefined : parseInteger(value, name);
+}
+
+function parseBoolean(value: string, name: string): boolean {
+  if (value !== 'true' && value !== 'false') {
+    throw new CliUsageError(`${name} must be true or false.`);
+  }
+  return value === 'true';
 }
 
 function parseInteger(value: string, name: string): number {

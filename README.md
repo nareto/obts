@@ -72,6 +72,7 @@ docker run -d --name obts \
   -p 3000:3000 \
   -e OBTS_PUBLIC_BASE_URL=http://127.0.0.1:3000 \
   -e OBTS_SESSION_SECRET=replace-with-a-long-random-value \
+  -e OBTS_DIAGNOSTIC_INGEST_ENABLED=false \
   -v obts-data:/var/lib/obts \
   obts
 ```
@@ -93,7 +94,7 @@ The recommended installation path is [BRAT](https://github.com/TfTHacker/obsidia
 1. Install BRAT from Obsidian's community plugin browser.
 2. Run **BRAT: Add a beta plugin for testing** and enter `nareto/obts`.
 3. Track the latest release, then enable **Obsidian True Sync**.
-4. Enter the server URL and device name, then run **Set up sync**.
+4. Enter the server URL and device name. Optionally enable **Share error diagnostics with this obts server**, then run **Set up sync**.
 5. Authenticate in the browser, approve a new or existing vault, and return to Obsidian.
 6. If local and server content differ, explicitly choose **Use the server vault** or **Merge local content** after reviewing the recovery/conflict warning.
 7. Connect a second copied vault and complete the [manual smoke test](docs/phase3-smoke-test.md) before using primary data.
@@ -108,6 +109,8 @@ Plugin commands include:
 - `Rebuild from server main`
 
 Local runtime state and hidden client history live under `.obts/`, which is never synchronized as vault content.
+
+Error diagnostics are separate from sync status and are off by default. When enabled, the plugin sends failures only to the configured obts backend using a closed, sanitized schema; it never sends note content, vault or file names, paths, credentials, Git objects, packfiles, stacks, or raw logs. Changing the backend URL disables consent. Owners can inspect and delete retained reports from the dashboard Settings page.
 
 ## Develop From Source
 

@@ -5,6 +5,7 @@ import type {
   ManualFilePlanEntry,
   DashboardSummary,
   DashboardConflict,
+  DiagnosticEventsResponse,
   NoteHistoryQueryResponse,
   NoteHistoryVersionResponse,
   Session,
@@ -81,6 +82,17 @@ export class DashboardApi {
 
   async dashboard(vaultId: string): Promise<DashboardSummary> {
     return await this.request(`/vaults/${vaultId}/dashboard`);
+  }
+
+  async diagnosticEvents(cursor: string | null = null): Promise<DiagnosticEventsResponse> {
+    return await this.request(`/diagnostic-events${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`);
+  }
+
+  async deleteDiagnosticEvents(): Promise<{ deleted_count: number }> {
+    return await this.request('/diagnostic-events', {
+      method: 'DELETE',
+      csrf: true
+    });
   }
 
   async conflicts(vaultId: string): Promise<{ conflicts: DashboardConflict[] }> {

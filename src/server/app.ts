@@ -6,6 +6,7 @@ import cookie from '@fastify/cookie';
 import multipart from '@fastify/multipart';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 
+import { DIAGNOSTIC_MAX_BODY_BYTES } from '../shared/diagnostics.js';
 import { newId, nowIso } from '../shared/ids.js';
 import { isSyncableVaultPath } from '../shared/pathPolicy.js';
 import {
@@ -36,6 +37,7 @@ import {
 import { AuthError, AuthService, ownedVaultOrThrow } from './authService.js';
 import { ConnectionService } from './connectionService.js';
 import { createServerConfig, ensureServerDirectories, type ServerConfig } from './config.js';
+import { DiagnosticService } from './diagnosticService.js';
 import { GitCommandError, GitService, sha256Hex } from './gitService.js';
 import { MetadataStore, type MetadataDb, type SyncOperationRow } from './metadataStore.js';
 import { SyncService } from './syncService.js';
@@ -47,6 +49,7 @@ export type ObtsServer = {
   git: GitService;
   auth: AuthService;
   connections: ConnectionService;
+  diagnostics: DiagnosticService;
   sync: SyncService;
 };
 
@@ -64,6 +67,8 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   await markInconsistentVaults(store, git);
   const auth = new AuthService(store);
   const connections = new ConnectionService(store, git, config.publicBaseUrl);
+  const diagnostics = new DiagnosticService(store, config);
+  await diagnostics.initialize();
   const sync = new SyncService(store, git, config.maxUploadBytes);
   const app = Fastify({
     logger: false,
@@ -295,6 +300,24 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     };
   });
 
+  app.get('/api/v1/diagnostic-events', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const query = request.query as Record<string, unknown>;
+    const cursor = typeof query.cursor === 'string' && query.cursor.length > 0 ? query.cursor : null;
+    const requestedLimit = typeof query.limit === 'string' ? Number(query.limit) : 50;
+    if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 100) {
+      throw new ValidationError('invalid_request', 'limit must be an integer from 1 to 100.');
+    }
+    return await diagnostics.list(session.user.user_id, cursor, requestedLimit);
+  });
+
+  app.delete('/api/v1/diagnostic-events', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
+    auth.requireRecentAuth(session.session);
+    return { status: 'ok', deleted_count: await diagnostics.deleteOwnerEvents(session.user.user_id) };
+  });
+
   app.post('/api/v1/vaults', async (request, reply) => {
     const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
@@ -376,7 +399,6 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
             last_successful_sync_at: device.last_successful_sync_at,
             local_status_label: localStatusLabel,
             local_error_code: localErrorCode,
-            local_error_details: localStatusFresh ? device.local_error_details : null,
             local_queue_status: localStatusFresh ? device.local_queue_status : null,
             local_main: localStatusFresh ? device.local_main : null,
             local_head: localStatusFresh ? device.local_head : null,
@@ -504,6 +526,16 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     });
   });
 
+  app.post('/api/v1/connections/:connectionId/diagnostic-events', { bodyLimit: DIAGNOSTIC_MAX_BODY_BYTES }, async (request, reply) => {
+    const { connectionId } = connectionPathParams(request);
+    const connectionAuth = await connections.authenticateDiagnostics(
+      connectionId,
+      readBearerToken(request.headers.authorization)
+    );
+    const result = await diagnostics.ingestConnection(connectionAuth, request.body, request.ip);
+    return reply.status(result.status === 'accepted' ? 202 : 200).send(result);
+  });
+
   app.post('/api/v1/connections/:connectionId/complete', async (request, reply) => {
     const { connectionId } = connectionPathParams(request);
     const body = requestBody(request);
@@ -557,6 +589,12 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       last_applied_main: deviceAuth.device.last_applied_main,
       event_seq: db.event_seq_by_vault[deviceAuth.vault.vault_id] ?? 0
     };
+  });
+
+  app.post('/api/v1/device/diagnostic-events', { bodyLimit: DIAGNOSTIC_MAX_BODY_BYTES }, async (request, reply) => {
+    const deviceAuth = await auth.authenticateDeviceAnyVault(request.headers.authorization);
+    const result = await diagnostics.ingestDevice(deviceAuth, request.body, request.ip);
+    return reply.status(result.status === 'accepted' ? 202 : 200).send(result);
   });
 
   app.post('/api/v1/vaults/:vaultId/sync/push', async (request, reply) => {
@@ -659,7 +697,6 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       }
       device.local_status_label = report.localStatusLabel;
       device.local_error_code = report.localErrorCode;
-      device.local_error_details = report.localErrorDetails;
       device.local_queue_status = report.localQueueStatus;
       device.local_main = report.localMain;
       device.local_head = report.localHead;
@@ -1142,7 +1179,13 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   app.get('/connect/:connectionId', async (request, reply) => sendDashboardStatic(request, reply));
   app.get('/assets/*', async (request, reply) => sendDashboardStatic(request, reply));
 
-  return { app, config, store, git, auth, connections, sync };
+  const diagnosticPruneTimer = setInterval(() => {
+    void diagnostics.prune().catch(() => undefined);
+  }, 24 * 60 * 60 * 1000);
+  diagnosticPruneTimer.unref();
+  app.addHook('onClose', async () => clearInterval(diagnosticPruneTimer));
+
+  return { app, config, store, git, auth, connections, diagnostics, sync };
 }
 
 function buildDashboardConflicts(
@@ -1669,7 +1712,7 @@ function setApiCorsHeaders(request: FastifyRequest, reply: FastifyReply): void {
     return;
   }
   reply.header('access-control-allow-origin', '*');
-  reply.header('access-control-allow-methods', 'GET, POST, OPTIONS');
+  reply.header('access-control-allow-methods', 'GET, POST, DELETE, OPTIONS');
   reply.header('access-control-allow-headers', 'authorization, content-type, x-obts-csrf');
   reply.header('access-control-max-age', '600');
 }
@@ -1692,7 +1735,6 @@ function readDeviceStatusReport(record: Record<string, unknown>): {
   pluginVersion: string;
   localStatusLabel: string;
   localErrorCode: string | null;
-  localErrorDetails: Record<string, unknown> | null;
   localQueueStatus: string | null;
   localMain: string | null;
   localHead: string | null;
@@ -1702,7 +1744,6 @@ function readDeviceStatusReport(record: Record<string, unknown>): {
     pluginVersion: readBoundedString(record, 'plugin_version', 80),
     localStatusLabel: readBoundedString(record, 'local_status_label', 80),
     localErrorCode: readNullableBoundedString(record, 'local_error_code', 120),
-    localErrorDetails: readNullableSmallRecord(record, 'local_error_details'),
     localQueueStatus: readNullableBoundedString(record, 'local_queue_status', 80),
     localMain: readNullableCommitId(record, 'local_main'),
     localHead: readNullableCommitId(record, 'local_head'),
@@ -2192,7 +2233,7 @@ async function buildReadinessSummary(
     metadata_store: metadataStoreReady,
     git: gitReady.ok,
     setup_complete: db.setup_complete,
-    migrations: db.schema_version === 3,
+    migrations: db.schema_version === 4,
     git_store: gitStoreReady.ok,
     temp_workspace: tempWorkspaceReady.ok,
     filesystem_permissions: filesystemPermissions,
@@ -2249,7 +2290,7 @@ function checkEventDelivery(db: MetadataDb): { ok: true } | { ok: false; error: 
 type PersistentStateCheck = { ok: true } | { ok: false; error: string; vaultId?: string };
 
 async function checkPersistentState(db: MetadataDb, git: GitService): Promise<PersistentStateCheck> {
-  if (db.schema_version !== 3) {
+  if (db.schema_version !== 4) {
     return { ok: false, error: 'metadata schema version is unsupported' };
   }
   try {

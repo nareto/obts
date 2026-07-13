@@ -1026,7 +1026,6 @@ export class ObtsPluginClient {
         plugin_version: PLUGIN_VERSION,
         local_status_label: state.status_label || 'Checking',
         local_error_code: state.last_error_code,
-        local_error_details: state.last_error_code ? state.last_error_details ?? null : null,
         local_queue_status: queue.status,
         local_main: state.local_main,
         local_head: state.local_head,

@@ -273,29 +273,88 @@ function toArrayBuffer(data) {
   return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
 }
 
-function createPackIndexFs(fs, packfile) {
+function createPackIndexFs(fs, packfile, observer = undefined) {
   const pack = Buffer.from(packfile);
   let packReadPending = true;
+  const observe = (event) => {
+    try {
+      if (typeof observer === "function") observer(event);
+    } catch {
+      // Diagnostics must not alter filesystem behavior.
+    }
+  };
+  const observedCall = async (point, fn) => {
+    try {
+      const value = await fn();
+      observe({ point, outcome: "returned", valueKind: diagnosticValueKind(value), sizeBucket: diagnosticSizeBucket(value), errorCode: "none" });
+      return value;
+    } catch (error) {
+      observe({ point, outcome: "failed", valueKind: "unknown", sizeBucket: "unknown", errorCode: diagnosticIoCode(error) });
+      throw error;
+    }
+  };
   return {
     // Skip isomorphic-git's generic fs wrapper, which converts every read error to null.
     _original_unwrapped_fs: fs,
-    _stat: fs.promises.stat.bind(fs.promises),
-    _readFile: fs.promises.readFile.bind(fs.promises),
+    async _stat(filePath, options) {
+      return await observedCall("index_fs_stat", () => fs.promises.stat(filePath, options));
+    },
+    async _readFile(filePath, options) {
+      return await observedCall("index_fs_read_file", () => fs.promises.readFile(filePath, options));
+    },
     async read(filePath, options) {
       if (packReadPending) {
         packReadPending = false;
+        observe({ point: "index_fs_read", outcome: "returned", valueKind: "buffer", sizeBucket: diagnosticSizeBucket(pack), errorCode: "none" });
         return pack;
       }
       try {
-        return await fs.promises.readFile(filePath, options);
-      } catch {
+        const value = await fs.promises.readFile(filePath, options);
+        observe({ point: "index_fs_read", outcome: "returned", valueKind: diagnosticValueKind(value), sizeBucket: diagnosticSizeBucket(value), errorCode: "none" });
+        return value;
+      } catch (error) {
+        observe({ point: "index_fs_read", outcome: "failed", valueKind: "null", sizeBucket: "unknown", errorCode: diagnosticIoCode(error) });
         return null;
       }
     },
     async write(filePath, data, options) {
-      await fs.promises.writeFile(filePath, data, options);
+      observe({ point: "index_fs_write", outcome: "started", valueKind: diagnosticValueKind(data), sizeBucket: diagnosticSizeBucket(data), errorCode: "none" });
+      try {
+        await fs.promises.writeFile(filePath, data, options);
+        observe({ point: "index_fs_write", outcome: "succeeded", valueKind: diagnosticValueKind(data), sizeBucket: diagnosticSizeBucket(data), errorCode: "none" });
+      } catch (error) {
+        observe({ point: "index_fs_write", outcome: "failed", valueKind: diagnosticValueKind(data), sizeBucket: diagnosticSizeBucket(data), errorCode: diagnosticIoCode(error) });
+        throw error;
+      }
     }
   };
+}
+
+function diagnosticValueKind(value) {
+  if (value === null || value === undefined) return "null";
+  if (Buffer.isBuffer(value)) return "buffer";
+  if (value instanceof Uint8Array) return "uint8array";
+  if (value instanceof ArrayBuffer) return "arraybuffer";
+  if (typeof value === "string") return "string";
+  return "other";
+}
+
+function diagnosticSizeBucket(value) {
+  const size = typeof value === "string" ? value.length : value && typeof value.byteLength === "number" ? value.byteLength : null;
+  if (size === null) return "unknown";
+  if (size === 0) return "empty";
+  if (size < 64 * 1024) return "under_64k";
+  if (size < 1024 * 1024) return "under_1m";
+  if (size < 16 * 1024 * 1024) return "under_16m";
+  if (size < 64 * 1024 * 1024) return "under_64m";
+  return "over_64m";
+}
+
+function diagnosticIoCode(error) {
+  const code = error && typeof error.code === "string" ? error.code.toLowerCase() : "unknown";
+  return new Set(["enoent", "eexist", "eisdir", "enotdir", "enotempty", "eacces", "eperm", "eio"]).has(code)
+    ? code
+    : "unknown";
 }
 
 function createReadOverlayFs(fs, files) {

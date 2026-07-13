@@ -12,8 +12,7 @@
   }
 
   function localDetail(device: DashboardDevice) {
-    const count = typeof device.local_error_details?.path_count === 'number' ? ` (${device.local_error_details.path_count} paths)` : '';
-    if (device.local_error_code) return `${device.local_error_code}${count}`;
+    if (device.local_error_code) return device.local_error_code;
     if (device.local_queue_status) return `queue: ${device.local_queue_status}`;
     return '-';
   }

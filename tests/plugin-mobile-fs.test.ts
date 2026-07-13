@@ -9,7 +9,7 @@ import { MemoryDataAdapter } from './helpers/memoryDataAdapter.js';
 const require = createRequire(import.meta.url);
 const { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require('../obsidian-plugin/src/data-adapter-fs.cjs') as {
   createDataAdapterFs: (adapter: MemoryDataAdapter) => any;
-  createPackIndexFs: (fs: any, packfile: Uint8Array) => any;
+  createPackIndexFs: (fs: any, packfile: Uint8Array, observer?: (event: Record<string, unknown>) => void) => any;
   createReadOverlayFs: (fs: any, files: Array<[string, Uint8Array]>) => any;
 };
 
@@ -60,6 +60,37 @@ describe('mobile DataAdapter filesystem', () => {
     const fs = createDataAdapterFs(adapter);
     await fs.promises.writeFile('/parent', 'file');
     await expect(fs.promises.mkdir('/parent/child', { recursive: true })).rejects.toMatchObject({ code: 'ENOTDIR' });
+  });
+
+  it('observes the hidden pack read failure without exposing its path or message', async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const fs = createPackIndexFs(
+      {
+        promises: {
+          async stat() { return { isFile: () => true }; },
+          async readFile() {
+            const error = new Error('private-note.md diagnostic-secret-body') as Error & { code: string };
+            error.code = 'EIO';
+            throw error;
+          },
+          async writeFile() {}
+        }
+      },
+      Buffer.from('PACKdata'),
+      (event) => events.push(event)
+    );
+
+    expect(Buffer.from(await fs.read('/secret/current.pack')).toString()).toBe('PACKdata');
+    expect(await fs.read('/secret/prior.pack')).toBeNull();
+    expect(events).toContainEqual(expect.objectContaining({
+      point: 'index_fs_read',
+      outcome: 'failed',
+      valueKind: 'null',
+      errorCode: 'eio'
+    }));
+    expect(JSON.stringify(events)).not.toContain('private-note.md');
+    expect(JSON.stringify(events)).not.toContain('/secret/');
+    expect(JSON.stringify(events)).not.toContain('diagnostic-secret-body');
   });
 
   it('supports isomorphic-git init, object storage, refs, packs, and reopen', async () => {
@@ -114,11 +145,19 @@ describe('mobile DataAdapter filesystem', () => {
       fs: createPackIndexFs(indexingFs, packed.packfile!),
       filepath: '.obts/git/objects/pack/old-attempt.pack'
     });
+    const diagnosticEvents: Array<Record<string, unknown>> = [];
     await git.indexPack({
       ...overlaidDestinationArgs,
-      fs: createPackIndexFs(indexingFs, packed.packfile!),
+      fs: createPackIndexFs(indexingFs, packed.packfile!, (event) => diagnosticEvents.push(event)),
       filepath: '.obts/git/objects/pack/import.pack'
     });
+    expect(diagnosticEvents).toContainEqual(expect.objectContaining({
+      point: 'index_fs_read',
+      outcome: 'returned',
+      valueKind: 'buffer'
+    }));
+    expect(JSON.stringify(diagnosticEvents)).not.toContain('old-attempt.pack');
+    expect(JSON.stringify(diagnosticEvents)).not.toContain('import.pack');
     indexingFs.setReadOverlay(packPath, packed.packfile!);
     await git.writeRef({ ...overlaidDestinationArgs, ref: 'refs/heads/local', value: commit, force: true });
 

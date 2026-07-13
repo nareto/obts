@@ -11,11 +11,17 @@ export type ServerConfig = {
   sessionCookieSecure: boolean;
   gitBinary: string;
   maxUploadBytes: number;
+  diagnosticIngestEnabled: boolean;
+  diagnosticRetentionDays: number;
 };
 
 export function createServerConfig(overrides: Partial<ServerConfig> & { dataDir: string }): ServerConfig {
   const publicBaseUrl = overrides.publicBaseUrl ?? 'http://127.0.0.1:0';
   const sessionCookieSecure = overrides.sessionCookieSecure ?? publicBaseUrl.startsWith('https://');
+  const diagnosticRetentionDays = overrides.diagnosticRetentionDays ?? 14;
+  if (!Number.isSafeInteger(diagnosticRetentionDays) || diagnosticRetentionDays < 1 || diagnosticRetentionDays > 90) {
+    throw new Error('Diagnostic retention must be an integer from 1 to 90 days.');
+  }
   return {
     dataDir: overrides.dataDir,
     gitStoreDir: overrides.gitStoreDir ?? join(overrides.dataDir, 'git'),
@@ -25,7 +31,9 @@ export function createServerConfig(overrides: Partial<ServerConfig> & { dataDir:
     sessionCookieName: overrides.sessionCookieName ?? (sessionCookieSecure ? '__Host-obts_session' : 'obts_session'),
     sessionCookieSecure,
     gitBinary: overrides.gitBinary ?? 'git',
-    maxUploadBytes: overrides.maxUploadBytes ?? 104_857_600
+    maxUploadBytes: overrides.maxUploadBytes ?? 104_857_600,
+    diagnosticIngestEnabled: overrides.diagnosticIngestEnabled ?? false,
+    diagnosticRetentionDays
   };
 }
 

@@ -1168,7 +1168,10 @@ describe('Phase 2 dashboard conflict resolution', () => {
       const device = db.devices.find((candidate) => candidate.device_id === state.device_id);
       if (!device) throw new Error('missing test device');
       device.local_error_code = 'path_problem';
-      device.local_error_details = { path: 'private-note.md', secret: 'diagnostic-secret-body' };
+      (device as unknown as { local_error_details: Record<string, unknown> }).local_error_details = {
+        path: 'private-note.md',
+        secret: 'diagnostic-secret-body'
+      };
     });
 
     const diagnostics = await admin.get<Record<string, unknown>>(

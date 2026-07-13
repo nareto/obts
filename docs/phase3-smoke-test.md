@@ -51,3 +51,12 @@ system to keep Obsidian running in the background.
 7. Leave Obsidian in the background long enough for mobile timers to suspend,
    then foreground it and confirm scanning and sync resume without duplicate
    operations.
+8. With diagnostic sharing still off, trigger a disposable error and confirm no
+   diagnostic request or server record is created. Enable **Share error
+   diagnostics with this obts server**, reproduce one failure, and confirm one
+   sanitized report appears on the owner Settings page.
+9. Confirm the report contains only fixed operation checkpoints and coarse
+   runtime values, with no note content, vault/file names, paths, credentials,
+   commit IDs, Git objects, pack bytes, messages, or stacks. Change the server
+   URL and confirm sharing turns off. Delete all reports through recent
+   authentication and confirm the list is empty.

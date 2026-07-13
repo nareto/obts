@@ -5,6 +5,7 @@
   import type { AttentionItem } from './components/Attention.svelte';
   import Checklist from './components/Checklist.svelte';
   import DeviceTable from './components/DeviceTable.svelte';
+  import Diagnostics from './components/Diagnostics.svelte';
   import Status from './components/Status.svelte';
   import Summary from './components/Summary.svelte';
   import type {
@@ -15,6 +16,7 @@
     ConflictReviewPath,
     DashboardDevice,
     DashboardSummary,
+    DiagnosticEventsResponse,
     MaintenanceRow,
     ManualFilePlanEntry,
     NoteHistoryQueryResponse,
@@ -41,6 +43,7 @@
   let newVaultName = '';
   let createVaultOpen = false;
   let dashboard: DashboardSummary | null = null;
+  let diagnostics: DiagnosticEventsResponse | null = null;
   let conflicts: DashboardConflict[] = [];
   let selectedConflictId = '';
   let review: ConflictReviewPackage | null = null;
@@ -146,7 +149,40 @@
     if (!vaultId && vaults[0]) {
       vaultId = vaults[0].vault_id;
     }
-    await refreshVault();
+    await Promise.all([refreshVault(), refreshDiagnostics()]);
+  }
+
+  async function refreshDiagnostics() {
+    diagnostics = await api.diagnosticEvents();
+  }
+
+  async function loadMoreDiagnostics() {
+    if (!diagnostics?.next_cursor) return;
+    busy = true;
+    try {
+      const next = await api.diagnosticEvents(diagnostics.next_cursor);
+      diagnostics = { ...next, events: [...diagnostics.events, ...next.events] };
+    } catch (error) {
+      actionError = error instanceof Error ? error.message : 'Unable to load more diagnostics.';
+    } finally {
+      busy = false;
+    }
+  }
+
+  function deleteDiagnostics() {
+    withRecentAuth(async () => {
+      if (!confirm('Delete all error diagnostics shared with this server?')) return;
+      busy = true;
+      try {
+        const result = await api.deleteDiagnosticEvents();
+        notice = `Deleted ${result.deleted_count} error diagnostic${result.deleted_count === 1 ? '' : 's'}.`;
+        await refreshDiagnostics();
+      } catch (error) {
+        actionError = error instanceof Error ? error.message : 'Unable to delete diagnostics.';
+      } finally {
+        busy = false;
+      }
+    });
   }
 
   async function refreshVault() {
@@ -436,6 +472,7 @@
     await api.logout();
     session = null;
     dashboard = null;
+    diagnostics = null;
     vaults = [];
   }
 
@@ -826,7 +863,18 @@
           </section>
         </main>
       {:else}
-        <main class="page"><section class="panel full"><p class="muted">Settings are managed through deployment configuration and account administration in this release.</p></section></main>
+        <main class="page">
+          {#if diagnostics}
+            <Diagnostics
+              {diagnostics}
+              {busy}
+              onLoadMore={() => void loadMoreDiagnostics()}
+              onDelete={deleteDiagnostics}
+            />
+          {:else}
+            <section class="panel full"><p class="muted">Loading error diagnostics...</p></section>
+          {/if}
+        </main>
       {/if}
     </section>
   </div>

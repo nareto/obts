@@ -37,9 +37,12 @@ describe('OpenAPI Phase 3 contract', () => {
       '/connections/{connection_id}/approve',
       '/connections/{connection_id}/deny',
       '/connections/{connection_id}/bootstrap',
+      '/connections/{connection_id}/diagnostic-events',
       '/connections/{connection_id}/complete',
+      '/diagnostic-events',
       '/vaults/{vault_id}/devices/{device_id}/revoke',
       '/device/self',
+      '/device/diagnostic-events',
       '/vaults/{vault_id}/sync/push',
       '/vaults/{vault_id}/sync/pull',
       '/vaults/{vault_id}/sync/device-status',
@@ -76,6 +79,15 @@ describe('OpenAPI Phase 3 contract', () => {
     expect(document.components.schemas).toHaveProperty('ConnectionStatusResponse');
     expect(document.components.schemas).toHaveProperty('ConnectionReviewResponse');
     expect(document.components.schemas).toHaveProperty('ConnectionBootstrapManifest');
+    expect(document.components.schemas).toHaveProperty('DiagnosticEvent');
+    expect(document.components.schemas).toHaveProperty('DiagnosticEventFields');
+    expect(document.components.schemas).toHaveProperty('DiagnosticEventView');
+    expect(document.components.schemas).toHaveProperty('DiagnosticEventsResponse');
+    expect(document.components.schemas.DiagnosticEvent).toMatchObject({ unevaluatedProperties: false });
+    expect(document.components.schemas.DiagnosticEventView).toMatchObject({ unevaluatedProperties: false });
+    expect(document.paths['/connections/{connection_id}/diagnostic-events']?.post?.security).toEqual([{ connectionBearer: [] }]);
+    expect(document.paths['/device/diagnostic-events']?.post?.security).toEqual([{ deviceBearer: [] }]);
+    expect(contract).not.toContain('local_error_details');
     expect(contract).toContain(API_VERSION);
     expect(contract).toContain('ErrorEnvelope');
     expect(contract).toContain('__Host-obts_session');

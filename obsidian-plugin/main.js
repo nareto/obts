@@ -21607,29 +21607,82 @@ var require_data_adapter_fs = __commonJS({
     function toArrayBuffer2(data) {
       return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
     }
-    function createPackIndexFs2(fs, packfile) {
+    function createPackIndexFs2(fs, packfile, observer = void 0) {
       const pack = Buffer3.from(packfile);
       let packReadPending = true;
+      const observe = (event) => {
+        try {
+          if (typeof observer === "function") observer(event);
+        } catch {
+        }
+      };
+      const observedCall = async (point, fn) => {
+        try {
+          const value = await fn();
+          observe({ point, outcome: "returned", valueKind: diagnosticValueKind2(value), sizeBucket: diagnosticSizeBucket2(value), errorCode: "none" });
+          return value;
+        } catch (error) {
+          observe({ point, outcome: "failed", valueKind: "unknown", sizeBucket: "unknown", errorCode: diagnosticIoCode2(error) });
+          throw error;
+        }
+      };
       return {
         // Skip isomorphic-git's generic fs wrapper, which converts every read error to null.
         _original_unwrapped_fs: fs,
-        _stat: fs.promises.stat.bind(fs.promises),
-        _readFile: fs.promises.readFile.bind(fs.promises),
+        async _stat(filePath, options) {
+          return await observedCall("index_fs_stat", () => fs.promises.stat(filePath, options));
+        },
+        async _readFile(filePath, options) {
+          return await observedCall("index_fs_read_file", () => fs.promises.readFile(filePath, options));
+        },
         async read(filePath, options) {
           if (packReadPending) {
             packReadPending = false;
+            observe({ point: "index_fs_read", outcome: "returned", valueKind: "buffer", sizeBucket: diagnosticSizeBucket2(pack), errorCode: "none" });
             return pack;
           }
           try {
-            return await fs.promises.readFile(filePath, options);
-          } catch {
+            const value = await fs.promises.readFile(filePath, options);
+            observe({ point: "index_fs_read", outcome: "returned", valueKind: diagnosticValueKind2(value), sizeBucket: diagnosticSizeBucket2(value), errorCode: "none" });
+            return value;
+          } catch (error) {
+            observe({ point: "index_fs_read", outcome: "failed", valueKind: "null", sizeBucket: "unknown", errorCode: diagnosticIoCode2(error) });
             return null;
           }
         },
         async write(filePath, data, options) {
-          await fs.promises.writeFile(filePath, data, options);
+          observe({ point: "index_fs_write", outcome: "started", valueKind: diagnosticValueKind2(data), sizeBucket: diagnosticSizeBucket2(data), errorCode: "none" });
+          try {
+            await fs.promises.writeFile(filePath, data, options);
+            observe({ point: "index_fs_write", outcome: "succeeded", valueKind: diagnosticValueKind2(data), sizeBucket: diagnosticSizeBucket2(data), errorCode: "none" });
+          } catch (error) {
+            observe({ point: "index_fs_write", outcome: "failed", valueKind: diagnosticValueKind2(data), sizeBucket: diagnosticSizeBucket2(data), errorCode: diagnosticIoCode2(error) });
+            throw error;
+          }
         }
       };
+    }
+    function diagnosticValueKind2(value) {
+      if (value === null || value === void 0) return "null";
+      if (Buffer3.isBuffer(value)) return "buffer";
+      if (value instanceof Uint8Array) return "uint8array";
+      if (value instanceof ArrayBuffer) return "arraybuffer";
+      if (typeof value === "string") return "string";
+      return "other";
+    }
+    function diagnosticSizeBucket2(value) {
+      const size = typeof value === "string" ? value.length : value && typeof value.byteLength === "number" ? value.byteLength : null;
+      if (size === null) return "unknown";
+      if (size === 0) return "empty";
+      if (size < 64 * 1024) return "under_64k";
+      if (size < 1024 * 1024) return "under_1m";
+      if (size < 16 * 1024 * 1024) return "under_16m";
+      if (size < 64 * 1024 * 1024) return "under_64m";
+      return "over_64m";
+    }
+    function diagnosticIoCode2(error) {
+      const code = error && typeof error.code === "string" ? error.code.toLowerCase() : "unknown";
+      return (/* @__PURE__ */ new Set(["enoent", "eexist", "eisdir", "enotdir", "enotempty", "eacces", "eperm", "eio"])).has(code) ? code : "unknown";
     }
     function createReadOverlayFs2(fs, files) {
       const overrides = new Map([...files].map(([filePath, data]) => [adapterPath(filePath), Buffer3.from(data)]));
@@ -21658,7 +21711,7 @@ var require_data_adapter_fs = __commonJS({
 });
 
 // obsidian-plugin/src/main.js
-var { Plugin, PluginSettingTab, Setting, Notice, Modal, Platform, requestUrl } = require("obsidian");
+var { Plugin, PluginSettingTab, Setting, Notice, Modal, Platform, requestUrl, apiVersion } = require("obsidian");
 var git = (init_isomorphic_git(), __toCommonJS(isomorphic_git_exports));
 var { Buffer: Buffer2 } = require_buffer();
 var path = require_path_browserify();
@@ -21666,14 +21719,19 @@ var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var fsp = null;
 var API_VERSION = "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = "0.3.6";
+var PLUGIN_VERSION = "0.4.0";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var SYNC_STALE_MS = 2 * 60 * 1e3;
 var PLUGIN_UPDATE_URL = "obsidian://brat?plugin=nareto%2Fobts";
+var DIAGNOSTIC_CONSENT_VERSION = 1;
+var DIAGNOSTIC_CONTEXT = /* @__PURE__ */ Symbol("obtsDiagnosticContext");
 var DEFAULT_SETTINGS = {
   serverUrl: "http://127.0.0.1:3000",
-  deviceName: ""
+  deviceName: "",
+  shareErrorDiagnostics: false,
+  diagnosticConsentServer: "",
+  diagnosticConsentVersion: 0
 };
 module.exports = class ObtsPlugin extends Plugin {
   async onload() {
@@ -21682,6 +21740,12 @@ module.exports = class ObtsPlugin extends Plugin {
     delete this.settings.syncPlugins;
     delete this.settings.pairingToken;
     delete this.settings.gitBinary;
+    if (this.settings.shareErrorDiagnostics && !this.diagnosticSharingEnabled()) {
+      this.settings.shareErrorDiagnostics = false;
+      this.settings.diagnosticConsentServer = "";
+      this.settings.diagnosticConsentVersion = 0;
+      await this.saveData(this.settings);
+    }
     this.status = this.addStatusBarItem();
     this.syncQueued = false;
     this.syncRunning = false;
@@ -21691,6 +21755,8 @@ module.exports = class ObtsPlugin extends Plugin {
     this.pluginUpdateUrl = PLUGIN_UPDATE_URL;
     this.unloaded = false;
     this.queuedSyncTimer = null;
+    this.reportedDiagnosticErrors = /* @__PURE__ */ new WeakSet();
+    this.diagnosticNoticeShown = false;
     this.setStatus("Checking");
     this.client = new ObtsObsidianClient(this);
     await this.client.initialize();
@@ -21775,6 +21841,80 @@ module.exports = class ObtsPlugin extends Plugin {
   }
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+  async updateServerUrl(value) {
+    const previous = normalizedServerDestination(this.settings.serverUrl);
+    const nextValue = value.trim();
+    const next = normalizedServerDestination(nextValue);
+    this.settings.serverUrl = nextValue;
+    if (previous !== next || this.settings.shareErrorDiagnostics && this.settings.diagnosticConsentServer !== next) {
+      this.settings.shareErrorDiagnostics = false;
+      this.settings.diagnosticConsentServer = "";
+      this.settings.diagnosticConsentVersion = 0;
+    }
+    await this.saveSettings();
+  }
+  async setDiagnosticSharing(enabled) {
+    const destination = normalizedServerDestination(this.settings.serverUrl);
+    if (enabled && !destination) {
+      this.settings.shareErrorDiagnostics = false;
+      await this.saveSettings();
+      throw new Error("Enter a valid server URL before sharing error diagnostics.");
+    }
+    this.settings.shareErrorDiagnostics = Boolean(enabled);
+    this.settings.diagnosticConsentServer = enabled ? destination : "";
+    this.settings.diagnosticConsentVersion = enabled ? DIAGNOSTIC_CONSENT_VERSION : 0;
+    await this.saveSettings();
+  }
+  diagnosticSharingEnabled() {
+    const destination = normalizedServerDestination(this.settings.serverUrl);
+    return Boolean(
+      this.settings.shareErrorDiagnostics && destination && this.settings.diagnosticConsentServer === destination && this.settings.diagnosticConsentVersion === DIAGNOSTIC_CONSENT_VERSION
+    );
+  }
+  async reportOnboardingError(error, connection) {
+    await this.reportErrorDiagnostic(error, connection ? {
+      kind: "connection",
+      connectionId: connection.connection_id,
+      token: connection.connection_secret
+    } : null);
+  }
+  async reportDeviceError(error) {
+    await this.reportErrorDiagnostic(error, null);
+  }
+  async reportErrorDiagnostic(error, connectionAuth) {
+    if (this.unloaded || !this.diagnosticSharingEnabled()) return;
+    const consentDestination = this.settings.diagnosticConsentServer;
+    if (error && typeof error === "object") {
+      if (this.reportedDiagnosticErrors.has(error)) return;
+      this.reportedDiagnosticErrors.add(error);
+    }
+    const report = buildDiagnosticReport(error);
+    let route;
+    let token;
+    try {
+      const state = await this.client.readState();
+      if (state.vault_id && state.device_id) {
+        token = await this.client.readDeviceToken();
+        route = "/api/v1/device/diagnostic-events";
+      } else if (connectionAuth && connectionAuth.kind === "connection" && connectionAuth.connectionId && connectionAuth.token) {
+        token = connectionAuth.token;
+        route = `/api/v1/connections/${connectionAuth.connectionId}/diagnostic-events`;
+      } else {
+        return;
+      }
+      if (this.unloaded || !this.diagnosticSharingEnabled() || this.settings.diagnosticConsentServer !== consentDestination) return;
+      const response = await fetchWithTimeout(`${consentDestination}${route}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify(report)
+      });
+      if (response.ok && !this.unloaded && this.diagnosticSharingEnabled() && this.settings.diagnosticConsentServer === consentDestination && !this.diagnosticNoticeShown) {
+        this.diagnosticNoticeShown = true;
+        new Notice(`obts sent a sanitized error diagnostic to ${consentDestination}.`);
+      }
+    } catch {
+    }
   }
   handlePluginCompatibility(compatibility) {
     if (!compatibility || !compatibility.update_available) {
@@ -21905,6 +22045,7 @@ module.exports = class ObtsPlugin extends Plugin {
     }
   }
   async handleAutomaticSyncError(error) {
+    void this.reportDeviceError(error);
     if (error instanceof ObtsBlockedError) {
       await this.client.markBlocked(error.code, error.details);
       this.setStatus((await this.client.readState()).status_label);
@@ -21923,6 +22064,7 @@ module.exports = class ObtsPlugin extends Plugin {
       this.setStatus((await this.client.readState()).status_label);
       return result;
     } catch (error) {
+      void this.reportDeviceError(error);
       const code = error instanceof ObtsBlockedError ? error.code : "sync_error";
       const message = error instanceof Error ? error.message : "obts sync failed.";
       await this.client.markBlocked(code, error instanceof ObtsBlockedError ? error.details : void 0);
@@ -22122,8 +22264,28 @@ var ObtsObsidianClient = class {
       headers: { authorization: `Bearer ${secret}` }
     });
     if (!response.ok) await throwResponseError(response);
-    const bootstrap = parseMultipartPull(response.headers.get("content-type") || "", Buffer2.from(await response.arrayBuffer()));
-    await this.importPack(bootstrap.packfile);
+    const responseBody = Buffer2.from(await response.arrayBuffer());
+    let bootstrap;
+    try {
+      bootstrap = parseMultipartPull(response.headers.get("content-type") || "", responseBody);
+    } catch (error) {
+      annotateDiagnosticError(error, {
+        flow: "onboarding",
+        stage: "multipart_parse",
+        failureCode: "multipart_parse_failed",
+        breadcrumbs: [makeDiagnosticBreadcrumb("bootstrap_response", "returned", responseBody)]
+      });
+      throw error;
+    }
+    await this.importPack(bootstrap.packfile, "onboarding", [
+      makeDiagnosticBreadcrumb("onboarding_approved", "succeeded"),
+      makeDiagnosticBreadcrumb("bootstrap_response", "returned", responseBody),
+      makeDiagnosticBreadcrumb(
+        "multipart_pack",
+        Buffer2.from(bootstrap.packfile).subarray(0, 4).toString("ascii") === "PACK" ? "succeeded" : "failed",
+        bootstrap.packfile
+      )
+    ]);
     const localFiles = await this.scanSyncableFiles();
     const matchesServer = localFiles.length === bootstrap.manifest.changed_paths.length && await this.localContentMatchesTree(localFiles, bootstrap.manifest.target_main);
     const repair = await this.discoverPairingRepairContext(await readJson(this.statePath, null));
@@ -23254,20 +23416,59 @@ var ObtsObsidianClient = class {
     if (!packfile) throw new Error("isomorphic-git did not return a packfile.");
     return Buffer2.from(packfile);
   }
-  async importPack(packfile) {
+  async importPack(packfile, diagnosticFlow = "sync", initialBreadcrumbs = []) {
     if (!packfile || packfile.byteLength === 0) return;
+    const breadcrumbs = initialBreadcrumbs.slice(0, 16);
     const packPath = path.join(this.gitdir, "objects", "pack", `obts-pull-${Date.now()}-${randomHex(4)}.pack`);
-    await fsp.mkdir(path.dirname(packPath), { recursive: true, mode: 448 });
-    await fsp.writeFile(packPath, packfile, { mode: 384 });
-    const persistedPack = await this.waitForPersistedBinary(packPath, packfile);
+    try {
+      await fsp.mkdir(path.dirname(packPath), { recursive: true, mode: 448 });
+      breadcrumbs.push(makeDiagnosticBreadcrumb("pack_persist_write", "started", packfile));
+      await fsp.writeFile(packPath, packfile, { mode: 384 });
+      breadcrumbs.push(makeDiagnosticBreadcrumb("pack_persist_write", "succeeded", packfile));
+    } catch (error) {
+      breadcrumbs.push(makeDiagnosticBreadcrumb("pack_persist_write", "failed", packfile, diagnosticIoCode(error)));
+      const wrapped = new Error("Obsidian's vault adapter could not write the downloaded Git pack.", { cause: error });
+      annotateDiagnosticError(wrapped, {
+        flow: diagnosticFlow,
+        stage: "pack_persist",
+        failureCode: "adapter_write_failed",
+        breadcrumbs
+      });
+      throw wrapped;
+    }
+    let persistedPack;
+    try {
+      persistedPack = await this.waitForPersistedBinary(packPath, packfile);
+      breadcrumbs.push(makeDiagnosticBreadcrumb("pack_persist_read", "returned", persistedPack));
+    } catch (error) {
+      breadcrumbs.push(makeDiagnosticBreadcrumb("pack_persist_read", "failed", void 0, diagnosticIoCode(error)));
+      annotateDiagnosticError(error, {
+        flow: diagnosticFlow,
+        stage: "pack_persist",
+        failureCode: "adapter_read_failed",
+        breadcrumbs
+      });
+      throw error;
+    }
     this.fs.setReadOverlay(packPath, persistedPack);
-    const indexingFs = createPackIndexFs(this.fs, persistedPack);
+    const indexingFs = createPackIndexFs(this.fs, persistedPack, (event) => {
+      if (breadcrumbs.length < 16) breadcrumbs.push(normalizeDiagnosticBreadcrumb(event));
+    });
+    breadcrumbs.push(makeDiagnosticBreadcrumb("index_pack", "started", persistedPack));
     try {
       await git.indexPack({ fs: indexingFs, dir: this.vaultDir, gitdir: this.gitdir, filepath: path.relative(this.vaultDir, packPath) });
     } catch (error) {
+      if (breadcrumbs.length < 16) breadcrumbs.push(makeDiagnosticBreadcrumb("index_pack", "failed"));
       const caller = error && error.caller ? ` at ${error.caller}` : "";
       const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`Downloaded Git pack indexing failed${caller}: ${message}`, { cause: error });
+      const wrapped = new Error(`Downloaded Git pack indexing failed${caller}: ${message}`, { cause: error });
+      annotateDiagnosticError(wrapped, {
+        flow: diagnosticFlow,
+        stage: "pack_index",
+        failureCode: message.includes("pack.slice") ? "null_pack_slice" : "pack_index_failed",
+        breadcrumbs
+      });
+      throw wrapped;
     }
   }
   async loadPersistedPackOverlays() {
@@ -23462,7 +23663,6 @@ var ObtsObsidianClient = class {
         plugin_version: PLUGIN_VERSION,
         local_status_label: state.status_label || "Checking",
         local_error_code: state.last_error_code,
-        local_error_details: state.last_error_code ? state.last_error_details || null : null,
         local_queue_status: queue.status,
         local_main: state.local_main,
         local_head: state.local_head,
@@ -24263,6 +24463,14 @@ var ObtsOnboardingModal = class extends Modal {
       this.plugin.settings.deviceName = value.trim();
       await this.plugin.saveSettings();
     }));
+    new Setting(contentEl).setName("Share error diagnostics with this obts server").setDesc(diagnosticSharingDescription(this.plugin.settings.serverUrl)).addToggle((toggle) => toggle.setValue(this.plugin.diagnosticSharingEnabled()).onChange(async (value) => {
+      try {
+        await this.plugin.setDiagnosticSharing(value);
+      } catch (error) {
+        new Notice(error instanceof Error ? error.message : "Unable to update diagnostic sharing.");
+        this.renderStart();
+      }
+    }));
     const feedback = contentEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
     new Setting(contentEl).addButton((button) => button.setButtonText("Cancel").onClick(() => this.close())).addButton((button) => button.setButtonText("Continue in browser").setCta().onClick(async () => {
       if (!this.plugin.settings.deviceName.trim()) {
@@ -24299,6 +24507,7 @@ var ObtsOnboardingModal = class extends Modal {
     this.waitingFeedback = feedback;
   }
   showWaitingError(error, fallback) {
+    void this.plugin.reportOnboardingError(error, this.connection);
     const message = error instanceof Error ? error.message : fallback;
     if (this.waitingFeedback) setFeedback(this.waitingFeedback, message, "error");
     else new Notice(`obts: ${message}`, 15e3);
@@ -24369,6 +24578,7 @@ var ObtsOnboardingModal = class extends Modal {
         this.plugin.setStatus((await this.plugin.client.readState()).status_label);
         this.renderResult(result);
       } catch (error) {
+        void this.plugin.reportOnboardingError(error, this.connection);
         button.setDisabled(false);
         setFeedback(feedback, error instanceof Error ? error.message : "Setup failed.", "error");
       }
@@ -24403,10 +24613,17 @@ var ObtsSettingTab = class extends PluginSettingTab {
     const deviceName = state.device_name || this.plugin.settings.deviceName || "Obsidian device";
     new Setting(containerEl).setName("Server URL").addText(
       (text) => text.setValue(this.plugin.settings.serverUrl).onChange(async (value) => {
-        this.plugin.settings.serverUrl = value.trim();
-        await this.plugin.saveSettings();
+        await this.plugin.updateServerUrl(value);
       })
     );
+    new Setting(containerEl).setName("Share error diagnostics with this obts server").setDesc(diagnosticSharingDescription(this.plugin.settings.serverUrl)).addToggle((toggle) => toggle.setValue(this.plugin.diagnosticSharingEnabled()).onChange(async (value) => {
+      try {
+        await this.plugin.setDiagnosticSharing(value);
+      } catch (error) {
+        new Notice(error instanceof Error ? error.message : "Unable to update diagnostic sharing.");
+      }
+      await this.display();
+    }));
     const sectionHeader = containerEl.createDiv({ cls: "obts-settings-section-header" });
     sectionHeader.createEl("h3", { text: recoveryBlocked ? "Recovery required" : paired ? "Device" : "Connect Vault" });
     sectionHeader.createEl("span", {
@@ -24503,6 +24720,10 @@ var ObtsSettingTab = class extends PluginSettingTab {
     }
   }
 };
+function diagnosticSharingDescription(serverUrl) {
+  const destination = normalizedServerDestination(serverUrl) || "the configured obts backend";
+  return `When obts fails, send a small sanitized technical report to ${destination}. Reports include plugin and platform versions, the failing operation, fixed error codes, and diagnostic checkpoints. They never include note content, vault or file names, paths, credentials, Git objects, packfiles, or raw logs.`;
+}
 function formatBytes(value) {
   if (value < 1024) return `${value} B`;
   const units = ["KB", "MB", "GB", "TB"];
@@ -24897,6 +25118,113 @@ function runtimePlatform() {
   if (Platform && Platform.isMacOS) return "darwin";
   if (Platform && Platform.isWin) return "win32";
   return "linux";
+}
+function normalizedServerDestination(value) {
+  try {
+    const parsed = new URL(String(value).trim());
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+    parsed.username = "";
+    parsed.password = "";
+    parsed.search = "";
+    parsed.hash = "";
+    parsed.pathname = parsed.pathname.replace(/\/+$/u, "");
+    return parsed.toString().replace(/\/$/u, "");
+  } catch {
+    return "";
+  }
+}
+function annotateDiagnosticError(error, context) {
+  if (!error || typeof error !== "object") return;
+  try {
+    Object.defineProperty(error, DIAGNOSTIC_CONTEXT, {
+      value: {
+        flow: context.flow,
+        stage: context.stage,
+        failureCode: context.failureCode,
+        breadcrumbs: (context.breadcrumbs || []).slice(0, 16)
+      },
+      configurable: true
+    });
+  } catch {
+  }
+}
+function diagnosticContextForError(error) {
+  let current = error;
+  for (let depth = 0; depth < 5 && current && typeof current === "object"; depth += 1) {
+    if (current[DIAGNOSTIC_CONTEXT]) return current[DIAGNOSTIC_CONTEXT];
+    current = current.cause;
+  }
+  return null;
+}
+function buildDiagnosticReport(error) {
+  const context = diagnosticContextForError(error);
+  const message = error instanceof Error ? error.message : "";
+  const transport = error instanceof ObtsTransportError;
+  const blocked = error instanceof ObtsBlockedError;
+  const failureCode = context && context.failureCode ? context.failureCode : message.includes("pack.slice") ? "null_pack_slice" : transport ? "request_failed" : blocked ? "sync_failed" : "unknown";
+  return {
+    schema_version: 1,
+    event_id: `dgr_${randomHex(16)}`,
+    plugin_version: PLUGIN_VERSION,
+    obsidian_version: typeof apiVersion === "string" && apiVersion ? apiVersion : "unknown",
+    platform_family: Platform && Platform.isIosApp ? "ios" : Platform && Platform.isAndroidApp ? "android" : "desktop",
+    flow: context && context.flow ? context.flow : blocked || transport ? "sync" : "plugin",
+    stage: context && context.stage ? context.stage : transport ? "sync_request" : "unknown",
+    failure_code: failureCode,
+    error_class: transport ? "transport_error" : blocked ? "blocked_error" : error instanceof TypeError ? "type_error" : error instanceof Error ? "error" : "unknown",
+    retryable: transport ? error.status >= 500 : false,
+    breadcrumbs: context && Array.isArray(context.breadcrumbs) ? context.breadcrumbs.slice(0, 16).map(normalizeDiagnosticBreadcrumb) : []
+  };
+}
+function makeDiagnosticBreadcrumb(point, outcome, value = void 0, errorCode = "none") {
+  return normalizeDiagnosticBreadcrumb({
+    point,
+    outcome,
+    valueKind: diagnosticValueKind(value),
+    sizeBucket: diagnosticSizeBucket(value),
+    errorCode
+  });
+}
+function normalizeDiagnosticBreadcrumb(event) {
+  const points = /* @__PURE__ */ new Set(["onboarding_approved", "bootstrap_response", "multipart_pack", "pack_persist_write", "pack_persist_read", "index_fs_stat", "index_fs_read_file", "index_fs_read", "index_fs_write", "index_pack", "sync_request", "apply", "recovery"]);
+  const outcomes = /* @__PURE__ */ new Set(["started", "returned", "succeeded", "failed"]);
+  const valueKinds = /* @__PURE__ */ new Set(["buffer", "uint8array", "arraybuffer", "string", "null", "other", "unknown"]);
+  const sizeBuckets = /* @__PURE__ */ new Set(["empty", "under_64k", "under_1m", "under_16m", "under_64m", "over_64m", "unknown"]);
+  const errorCodes = /* @__PURE__ */ new Set(["none", "enoent", "eexist", "eisdir", "enotdir", "enotempty", "eacces", "eperm", "eio", "invalid_type", "unknown"]);
+  return {
+    point: points.has(event && event.point) ? event.point : "index_pack",
+    outcome: outcomes.has(event && event.outcome) ? event.outcome : "failed",
+    value_kind: valueKinds.has(event && (event.valueKind || event.value_kind)) ? event.valueKind || event.value_kind : "unknown",
+    size_bucket: sizeBuckets.has(event && (event.sizeBucket || event.size_bucket)) ? event.sizeBucket || event.size_bucket : "unknown",
+    error_code: errorCodes.has(event && (event.errorCode || event.error_code)) ? event.errorCode || event.error_code : "unknown"
+  };
+}
+function diagnosticValueKind(value) {
+  if (value === void 0 || value === null) return "null";
+  if (Buffer2.isBuffer(value)) return "buffer";
+  if (value instanceof Uint8Array) return "uint8array";
+  if (value instanceof ArrayBuffer) return "arraybuffer";
+  if (typeof value === "string") return "string";
+  return "other";
+}
+function diagnosticSizeBucket(value) {
+  const size = typeof value === "string" ? value.length : value && typeof value.byteLength === "number" ? value.byteLength : null;
+  if (size === null) return "unknown";
+  if (size === 0) return "empty";
+  if (size < 64 * 1024) return "under_64k";
+  if (size < 1024 * 1024) return "under_1m";
+  if (size < 16 * 1024 * 1024) return "under_16m";
+  if (size < 64 * 1024 * 1024) return "under_64m";
+  return "over_64m";
+}
+function diagnosticIoCode(error) {
+  let current = error;
+  for (let depth = 0; depth < 5 && current && typeof current === "object"; depth += 1) {
+    const code = typeof current.code === "string" ? current.code.toLowerCase() : "";
+    if ((/* @__PURE__ */ new Set(["enoent", "eexist", "eisdir", "enotdir", "enotempty", "eacces", "eperm", "eio"])).has(code)) return code;
+    current = current.cause;
+  }
+  return "unknown";
 }
 async function fetchWithTimeout(url, options = {}) {
   const response = await requestUrl({

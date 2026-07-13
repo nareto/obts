@@ -1,3 +1,5 @@
+import type { DiagnosticEventV1 } from './diagnostics.js';
+
 export const API_VERSION = '2026-07-12.browser-onboarding';
 
 export type StatusLabel =
@@ -144,7 +146,6 @@ export type DeviceStatusReport = {
   plugin_version: string;
   local_status_label: string;
   local_error_code: string | null;
-  local_error_details?: Record<string, unknown> | null;
   local_queue_status: string | null;
   local_main: string | null;
   local_head: string | null;
@@ -154,6 +155,17 @@ export type DeviceStatusReport = {
 export type DeviceStatusResponse = {
   status: 'ok';
   plugin: import('./pluginCompatibility.js').PluginCompatibility;
+};
+
+export type DiagnosticEventView = DiagnosticEventV1 & {
+  received_at: string;
+};
+
+export type DiagnosticEventsResponse = {
+  ingestion_enabled: boolean;
+  retention_days: number;
+  events: DiagnosticEventView[];
+  next_cursor: string | null;
 };
 
 export type DirectoryIntent = {
