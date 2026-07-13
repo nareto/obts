@@ -21609,13 +21609,14 @@ var require_data_adapter_fs = __commonJS({
     }
     function createPackIndexFs2(fs, packfile) {
       const pack = Buffer3.from(packfile);
+      let packReadPending = true;
       return {
         promises: {
           ...fs.promises,
           async readFile(filePath, options) {
-            if (typeof filePath === "string" && filePath.replaceAll("\\", "/").endsWith(".pack")) {
-              const encoding = typeof options === "string" ? options : options && options.encoding;
-              return encoding ? pack.toString(encoding) : Buffer3.from(pack);
+            if (filePath !== void 0 && packReadPending) {
+              packReadPending = false;
+              return pack;
             }
             return await fs.promises.readFile(filePath, options);
           }
@@ -21657,7 +21658,7 @@ var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var fsp = null;
 var API_VERSION = "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = "0.3.4";
+var PLUGIN_VERSION = "0.3.5";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var SYNC_STALE_MS = 2 * 60 * 1e3;

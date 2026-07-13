@@ -275,13 +275,15 @@ function toArrayBuffer(data) {
 
 function createPackIndexFs(fs, packfile) {
   const pack = Buffer.from(packfile);
+  let packReadPending = true;
   return {
     promises: {
       ...fs.promises,
       async readFile(filePath, options) {
-        if (typeof filePath === "string" && filePath.replaceAll("\\", "/").endsWith(".pack")) {
-          const encoding = typeof options === "string" ? options : options && options.encoding;
-          return encoding ? pack.toString(encoding) : Buffer.from(pack);
+        // isomorphic-git probes readFile() without a path before the real pack read.
+        if (filePath !== undefined && packReadPending) {
+          packReadPending = false;
+          return pack;
         }
         return await fs.promises.readFile(filePath, options);
       }

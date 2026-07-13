@@ -109,9 +109,16 @@ describe('mobile DataAdapter filesystem', () => {
     const indexingFs = createReadOverlayFs(temporarilyUnreadableFs, []);
     indexingFs.setReadOverlay(oldPackPath, packed.packfile!);
     const overlaidDestinationArgs = { ...destinationArgs, fs: indexingFs };
-    const packIndexFs = createPackIndexFs(indexingFs, packed.packfile!);
-    await git.indexPack({ ...overlaidDestinationArgs, fs: packIndexFs, filepath: '.obts/git/objects/pack/old-attempt.pack' });
-    await git.indexPack({ ...overlaidDestinationArgs, fs: packIndexFs, filepath: '.obts/git/objects/pack/import.pack' });
+    await git.indexPack({
+      ...overlaidDestinationArgs,
+      fs: createPackIndexFs(indexingFs, packed.packfile!),
+      filepath: '.obts/git/objects/pack/old-attempt.pack'
+    });
+    await git.indexPack({
+      ...overlaidDestinationArgs,
+      fs: createPackIndexFs(indexingFs, packed.packfile!),
+      filepath: '.obts/git/objects/pack/import.pack'
+    });
     indexingFs.setReadOverlay(packPath, packed.packfile!);
     await git.writeRef({ ...overlaidDestinationArgs, ref: 'refs/heads/local', value: commit, force: true });
 
