@@ -277,16 +277,23 @@ function createPackIndexFs(fs, packfile) {
   const pack = Buffer.from(packfile);
   let packReadPending = true;
   return {
-    promises: {
-      ...fs.promises,
-      async readFile(filePath, options) {
-        // isomorphic-git probes readFile() without a path before the real pack read.
-        if (filePath !== undefined && packReadPending) {
-          packReadPending = false;
-          return pack;
-        }
-        return await fs.promises.readFile(filePath, options);
+    // Skip isomorphic-git's generic fs wrapper, which converts every read error to null.
+    _original_unwrapped_fs: fs,
+    _stat: fs.promises.stat.bind(fs.promises),
+    _readFile: fs.promises.readFile.bind(fs.promises),
+    async read(filePath, options) {
+      if (packReadPending) {
+        packReadPending = false;
+        return pack;
       }
+      try {
+        return await fs.promises.readFile(filePath, options);
+      } catch {
+        return null;
+      }
+    },
+    async write(filePath, data, options) {
+      await fs.promises.writeFile(filePath, data, options);
     }
   };
 }

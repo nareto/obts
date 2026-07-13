@@ -21611,15 +21611,23 @@ var require_data_adapter_fs = __commonJS({
       const pack = Buffer3.from(packfile);
       let packReadPending = true;
       return {
-        promises: {
-          ...fs.promises,
-          async readFile(filePath, options) {
-            if (filePath !== void 0 && packReadPending) {
-              packReadPending = false;
-              return pack;
-            }
-            return await fs.promises.readFile(filePath, options);
+        // Skip isomorphic-git's generic fs wrapper, which converts every read error to null.
+        _original_unwrapped_fs: fs,
+        _stat: fs.promises.stat.bind(fs.promises),
+        _readFile: fs.promises.readFile.bind(fs.promises),
+        async read(filePath, options) {
+          if (packReadPending) {
+            packReadPending = false;
+            return pack;
           }
+          try {
+            return await fs.promises.readFile(filePath, options);
+          } catch {
+            return null;
+          }
+        },
+        async write(filePath, data, options) {
+          await fs.promises.writeFile(filePath, data, options);
         }
       };
     }
@@ -21658,7 +21666,7 @@ var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var fsp = null;
 var API_VERSION = "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = "0.3.5";
+var PLUGIN_VERSION = "0.3.6";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var SYNC_STALE_MS = 2 * 60 * 1e3;
