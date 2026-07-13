@@ -66,7 +66,12 @@ describe('opt-in error diagnostics backend', () => {
     expect((await duplicate.json()).status).toBe('duplicate');
 
     const completion = await completeConnection(fixture.baseUrl, pending.connection_id, pending.connection_secret);
-    const deviceReport = { ...report, event_id: 'dgr_fedcba9876543210fedcba9876543210', flow: 'sync' };
+    const deviceReport = {
+      ...report,
+      event_id: 'dgr_fedcba9876543210fedcba9876543210',
+      flow: 'sync',
+      failure_code: 'invalid_json'
+    };
     expect((await postDiagnostic(`${fixture.baseUrl}/api/v1/device/diagnostic-events`, completion.device_token, deviceReport)).status).toBe(202);
 
     const listed = await fixture.adminGet('/api/v1/diagnostic-events');

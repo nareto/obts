@@ -1925,21 +1925,21 @@ async function readPushMultipart(request: FastifyRequest): Promise<{
   if (!request.isMultipart()) {
     throw new ValidationError('invalid_content_type', 'Expected multipart/form-data.');
   }
-  let manifestText: string | null = null;
+  let manifestValue: unknown = null;
   let packfile: Buffer | null = null;
   for await (const part of request.parts()) {
     if (part.type === 'field' && part.fieldname === 'manifest') {
-      manifestText = String(part.value);
+      manifestValue = part.value;
     }
     if (part.type === 'file' && part.fieldname === 'packfile') {
       packfile = await part.toBuffer();
     }
   }
-  if (!manifestText || packfile === null) {
+  if (manifestValue === null || packfile === null) {
     throw new ValidationError('invalid_request', 'Push requires manifest and packfile parts.');
   }
   return {
-    manifest: parseDevicePushManifest(parseJsonObject(manifestText)),
+    manifest: parseDevicePushManifest(readMultipartJsonObject(manifestValue)),
     packfile
   };
 }
@@ -1948,21 +1948,29 @@ async function readPullMultipart(request: FastifyRequest): Promise<DevicePullReq
   if (!request.isMultipart()) {
     throw new ValidationError('invalid_content_type', 'Expected multipart/form-data.');
   }
-  let manifestText: string | null = null;
+  let manifestValue: unknown = null;
   let sawPackfilePart = false;
   for await (const part of request.parts()) {
     if (part.type === 'field' && part.fieldname === 'manifest') {
-      manifestText = String(part.value);
+      manifestValue = part.value;
     }
     if (part.type === 'file' && part.fieldname === 'packfile') {
       await part.toBuffer();
       sawPackfilePart = true;
     }
   }
-  if (!manifestText || !sawPackfilePart) {
+  if (manifestValue === null || !sawPackfilePart) {
     throw new ValidationError('invalid_request', 'Pull requires manifest and packfile parts.');
   }
-  return parseDevicePullRequest(parseJsonObject(manifestText));
+  return parseDevicePullRequest(readMultipartJsonObject(manifestValue));
+}
+
+function readMultipartJsonObject(value: unknown): Record<string, unknown> {
+  if (typeof value === 'string') {
+    return parseJsonObject(value);
+  }
+  assertRecord(value);
+  return value;
 }
 
 function sendMultipart(reply: FastifyReply, input: { manifest: object; packfile: Buffer }): FastifyReply {
@@ -2101,6 +2109,17 @@ function requireCompatiblePlugin(reportedVersion: string | undefined, storedVers
 
 async function sendError(error: Error, request: FastifyRequest, reply: FastifyReply): Promise<void> {
   if (reply.sent) {
+    return;
+  }
+  if (isMultipartInvalidJsonError(error)) {
+    await reply.status(400).send({
+      error: {
+        code: 'invalid_json',
+        message: 'Expected valid JSON.',
+        request_id: request.id,
+        details: {}
+      }
+    });
     return;
   }
   if (isMultipartLimitError(error)) {
@@ -2856,6 +2875,10 @@ function isLocalStatusOverride(label: string | null, errorCode: string | null): 
 
 function isBlockingLocalReport(label: string | null, errorCode: string | null): boolean {
   return Boolean(errorCode || label === 'Unsafe local state' || label === 'Needs recovery' || label === 'Blocked' || label === 'Review needed');
+}
+
+function isMultipartInvalidJsonError(error: Error): boolean {
+  return 'code' in error && error.code === 'FST_INVALID_JSON_FIELD_ERROR';
 }
 
 function isMultipartLimitError(error: Error): boolean {

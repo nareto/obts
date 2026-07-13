@@ -21,6 +21,7 @@ export const diagnosticStages = [
   'unknown'
 ] as const;
 export const diagnosticFailureCodes = [
+  'invalid_json',
   'missing_buffer_dependency',
   'null_pack_slice',
   'pack_index_failed',

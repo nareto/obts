@@ -21720,7 +21720,7 @@ var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var fsp = null;
 var API_VERSION = "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = "0.4.1";
+var PLUGIN_VERSION = "0.4.2";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var SYNC_STALE_MS = 2 * 60 * 1e3;
@@ -25160,9 +25160,10 @@ function diagnosticContextForError(error) {
 function buildDiagnosticReport(error) {
   const context = diagnosticContextForError(error);
   const message = error instanceof Error ? error.message : "";
+  const safeErrorCode = error && typeof error === "object" && typeof error.code === "string" ? error.code : "";
   const transport = error instanceof ObtsTransportError;
   const blocked = error instanceof ObtsBlockedError;
-  const failureCode = context && context.failureCode ? context.failureCode : message.includes("Missing Buffer dependency") ? "missing_buffer_dependency" : message.includes("pack.slice") ? "null_pack_slice" : transport ? "request_failed" : blocked ? "sync_failed" : "unknown";
+  const failureCode = context && context.failureCode ? context.failureCode : safeErrorCode === "invalid_json" ? "invalid_json" : message.includes("Missing Buffer dependency") ? "missing_buffer_dependency" : message.includes("pack.slice") ? "null_pack_slice" : transport ? "request_failed" : blocked ? "sync_failed" : "unknown";
   return {
     schema_version: 1,
     event_id: `dgr_${randomHex(16)}`,

@@ -3829,11 +3829,14 @@ function diagnosticContextForError(error) {
 function buildDiagnosticReport(error) {
   const context = diagnosticContextForError(error);
   const message = error instanceof Error ? error.message : "";
+  const safeErrorCode = error && typeof error === "object" && typeof error.code === "string" ? error.code : "";
   const transport = error instanceof ObtsTransportError;
   const blocked = error instanceof ObtsBlockedError;
   const failureCode = context && context.failureCode
     ? context.failureCode
-    : message.includes("Missing Buffer dependency")
+    : safeErrorCode === "invalid_json"
+      ? "invalid_json"
+      : message.includes("Missing Buffer dependency")
       ? "missing_buffer_dependency"
       : message.includes("pack.slice")
         ? "null_pack_slice"

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Obsidian True Sync Phase 3 API
-  version: 0.3.1
+  version: 0.3.2
   summary: Deployable note history, restore, diagnostics, and maintenance.
 servers:
   - url: /api/v1
@@ -559,6 +559,9 @@ paths:
                 packfile:
                   type: string
                   contentEncoding: binary
+            encoding:
+              manifest:
+                contentType: application/json
       responses:
         "200":
           description: Push result.
@@ -588,6 +591,9 @@ paths:
                 packfile:
                   type: string
                   contentEncoding: binary
+            encoding:
+              manifest:
+                contentType: application/json
       responses:
         "200":
           description: Multipart manifest and packfile.
@@ -1382,7 +1388,7 @@ components:
           enum: [browser_handoff, approval_poll, bootstrap_request, multipart_parse, pack_persist, pack_index, tree_read, sync_request, apply, recovery, plugin_lifecycle, unknown]
         failure_code:
           type: string
-          enum: [missing_buffer_dependency, null_pack_slice, pack_index_failed, adapter_read_failed, adapter_write_failed, adapter_stat_failed, multipart_parse_failed, request_failed, onboarding_failed, sync_failed, recovery_failed, unknown]
+          enum: [invalid_json, missing_buffer_dependency, null_pack_slice, pack_index_failed, adapter_read_failed, adapter_write_failed, adapter_stat_failed, multipart_parse_failed, request_failed, onboarding_failed, sync_failed, recovery_failed, unknown]
         error_class:
           type: string
           enum: [type_error, transport_error, blocked_error, error, unknown]

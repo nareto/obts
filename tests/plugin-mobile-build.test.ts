@@ -160,7 +160,7 @@ describe('mobile plugin artifact', () => {
     const diagnosticBody = JSON.parse(String(requests[0]?.body)) as Record<string, unknown>;
     expect(diagnosticBody).toMatchObject({
       schema_version: 1,
-      plugin_version: '0.4.1',
+      plugin_version: '0.4.2',
       obsidian_version: '1.9.12',
       platform_family: 'ios',
       failure_code: 'null_pack_slice',
@@ -180,6 +180,20 @@ describe('mobile plugin artifact', () => {
     expect(missingBufferBody.failure_code).toBe('missing_buffer_dependency');
     expect(JSON.stringify(missingBufferBody)).not.toContain('Missing Buffer dependency');
 
+    const invalidJsonError = vm.runInContext(
+      "Object.assign(new Error('Expected valid JSON private-note.md'), { code: 'invalid_json' })",
+      context
+    ) as Error;
+    await (plugin as any).reportOnboardingError(invalidJsonError, {
+      connection_id: 'con_safe',
+      connection_secret: 'obts_conn_private'
+    });
+    expect(requests).toHaveLength(3);
+    const invalidJsonBody = JSON.parse(String(requests[2]?.body)) as Record<string, unknown>;
+    expect(invalidJsonBody.failure_code).toBe('invalid_json');
+    expect(JSON.stringify(invalidJsonBody)).not.toContain('Expected valid JSON');
+    expect(JSON.stringify(invalidJsonBody)).not.toContain('private-note.md');
+
     const originalReadState = (plugin as any).client.readState.bind((plugin as any).client);
     const currentState = await originalReadState();
     let resolveState!: (value: unknown) => void;
@@ -193,7 +207,7 @@ describe('mobile plugin artifact', () => {
     resolveState(currentState);
     await racedReport;
     (plugin as any).client.readState = originalReadState;
-    expect(requests).toHaveLength(2);
+    expect(requests).toHaveLength(3);
     expect((plugin as any).diagnosticSharingEnabled()).toBe(false);
     expect(savedSettings.length).toBeGreaterThan(0);
 

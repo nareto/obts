@@ -89,6 +89,7 @@ describe('OpenAPI Phase 3 contract', () => {
     expect(document.paths['/device/diagnostic-events']?.post?.security).toEqual([{ deviceBearer: [] }]);
     expect(contract).not.toContain('local_error_details');
     expect(contract).toContain('missing_buffer_dependency');
+    expect(contract).toContain('invalid_json');
     expect(contract).toContain(API_VERSION);
     expect(contract).toContain('ErrorEnvelope');
     expect(contract).toContain('__Host-obts_session');
@@ -131,6 +132,7 @@ describe('OpenAPI Phase 3 contract', () => {
     expect(pullSection).toContain('multipart/form-data');
     expect(pullSection).toContain('DevicePullRequest');
     expect(pullSection).toContain('packfile');
+    expect(pullSection).toContain('contentType: application/json');
     expect(pullSection).not.toContain('application/json:');
     expect(contract).toContain('current_local_main_is_ancestor');
     expect(contract).toContain('base_commit');

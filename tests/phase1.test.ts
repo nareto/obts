@@ -1789,6 +1789,41 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
     expect(multipartPull.status).toBe(200);
     expect(multipartPull.headers.get('content-type')).toContain('multipart/form-data');
+
+    const mobilePullBody = mobileMultipartBody(
+      {
+        api_version: API_VERSION,
+        plugin_version: '0.4.1',
+        vault_id: admin.vaultId,
+        device_id: state.device_id,
+        current_local_main: state.local_main,
+        requested_target: 'latest'
+      },
+      Buffer.alloc(0),
+      'have.pack'
+    );
+    const mobileMultipartPull = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/pull`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': mobilePullBody.contentType
+      },
+      body: Uint8Array.from(mobilePullBody.body)
+    });
+    expect(mobileMultipartPull.status).toBe(200);
+    expect(mobileMultipartPull.headers.get('content-type')).toContain('multipart/form-data');
+
+    const invalidMobilePullBody = mobileMultipartBody('{', Buffer.alloc(0), 'have.pack');
+    const invalidMobilePull = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/pull`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': invalidMobilePullBody.contentType
+      },
+      body: Uint8Array.from(invalidMobilePullBody.body)
+    });
+    expect(invalidMobilePull.status).toBe(400);
+    expect(((await invalidMobilePull.json()) as { error: { code: string } }).error.code).toBe('invalid_json');
   });
 
   it('rejects malformed commit identifiers in multipart sync manifests', async () => {
@@ -1800,11 +1835,10 @@ describe('Phase 1 sync without conflict resolution', () => {
     const token = await readDeviceToken(deviceDir);
     const emptyPack = Buffer.alloc(0);
 
-    const pushForm = new FormData();
-    pushForm.append(
-      'manifest',
-      JSON.stringify({
+    const pushBody = mobileMultipartBody(
+      {
         api_version: API_VERSION,
+        plugin_version: '0.4.1',
         vault_id: admin.vaultId,
         device_id: state.device_id,
         expected_device_ref: state.server_device_ref,
@@ -1812,15 +1846,17 @@ describe('Phase 1 sync without conflict resolution', () => {
         packfile_sha256: sha256(emptyPack),
         packfile_bytes: emptyPack.byteLength,
         client_known_main: state.local_main
-      })
+      },
+      emptyPack,
+      'pack.pack'
     );
-    pushForm.append('packfile', new Blob([emptyPack], { type: 'application/x-git-packed-objects' }), 'pack.pack');
     const push = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/push`, {
       method: 'POST',
       headers: {
-        authorization: `Bearer ${token}`
+        authorization: `Bearer ${token}`,
+        'content-type': pushBody.contentType
       },
-      body: pushForm
+      body: Uint8Array.from(pushBody.body)
     });
     expect(push.status).toBe(400);
     expect(((await push.json()) as { error: { code: string } }).error.code).toBe('invalid_request');
@@ -4760,6 +4796,25 @@ async function writeQueueFile(vaultDir: string, queue: Json): Promise<void> {
 
 async function sleep(milliseconds: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function mobileMultipartBody(
+  manifest: Record<string, unknown> | string,
+  packfile: Buffer,
+  packFilename: string
+): { contentType: string; body: Buffer } {
+  const boundary = '----obts-mobile-contract-test';
+  const manifestText = typeof manifest === 'string' ? manifest : JSON.stringify(manifest);
+  return {
+    contentType: `multipart/form-data; boundary=${boundary}`,
+    body: Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="manifest"\r\nContent-Type: application/json\r\n\r\n`),
+      Buffer.from(manifestText),
+      Buffer.from(`\r\n--${boundary}\r\nContent-Disposition: form-data; name="packfile"; filename="${packFilename}"\r\nContent-Type: application/x-git-packed-objects\r\n\r\n`),
+      packfile,
+      Buffer.from(`\r\n--${boundary}--\r\n`)
+    ])
+  };
 }
 
 function sha256(data: Buffer): string {
