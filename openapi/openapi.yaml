@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Obsidian True Sync Phase 3 API
-  version: 0.3.6
+  version: 0.3.7
   summary: Deployable note history, restore, diagnostics, and maintenance.
 servers:
   - url: /api/v1

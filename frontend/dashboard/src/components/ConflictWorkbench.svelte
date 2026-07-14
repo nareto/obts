@@ -103,6 +103,10 @@
     fileNodes.get(path)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
+  function jumpToSelectedFile(event: Event) {
+    scrollToFile((event.currentTarget as HTMLSelectElement).value);
+  }
+
   function pathGroup(file: ConflictReviewFile): ConflictReviewPath | null {
     return review.path_conflicts.find((group) => group.affected_paths.includes(file.path)) ?? null;
   }
@@ -243,38 +247,136 @@
   function formatDigest(value: string | null): string {
     return value ? `${value.slice(0, 12)}...` : '-';
   }
+
+  function addedLineCount(rows: ConflictDiffRow[]): number {
+    return changedRows(rows).filter((row) => row.deviceText !== null).length;
+  }
+
+  function removedLineCount(rows: ConflictDiffRow[]): number {
+    return changedRows(rows).filter((row) => row.serverText !== null).length;
+  }
+
+  function isChoiceDisabled(choice: ConflictResolutionKind): boolean {
+    return (choice === 'manual' && hasNonInteractiveContent) || (choice === 'insert_both_blocks' && hasBinary);
+  }
 </script>
 
-<section class="workbench conflict-workbench">
-  <aside class="rail conflict-file-rail">
-    <div>
+<section class="conflict-workbench">
+  <section class="conflict-review-header">
+    <div class="conflict-review-title">
       <p class="eyebrow">Conflict review</p>
       <h2>{conflictType}</h2>
-      <p class="muted">Device {review.device_name}</p>
-      <Status label={statusLabel} />
+      <p>Changes from <strong>{review.device_name}</strong> overlap server main across {review.files.length} file{review.files.length === 1 ? '' : 's'}.</p>
     </div>
-    <div class="conflict-refs">
-      <span>Server <code>{review.expected_main.slice(0, 10)}...</code></span>
-      <span>Device <code>{review.conflict.device_commit.slice(0, 10)}...</code></span>
+    <div class="conflict-compare" aria-label="Compared revisions">
+      <div><span>Server</span><code>{review.expected_main.slice(0, 10)}</code></div>
+      <span class="compare-arrow" aria-hidden="true">&harr;</span>
+      <div><span>Device</span><code>{review.conflict.device_commit.slice(0, 10)}</code></div>
     </div>
-    <nav class="path-list" aria-label="Affected files">
-      {#each review.files as file, index}
-        <button class:active={activePath === file.path} on:click={() => scrollToFile(file.path)}>
-          <span>{file.path}</span>
-          <small>{file.content_kind === 'binary' ? 'Binary' : file.content_kind === 'large_text' ? 'Large text' : `${changedRows(diffs[file.path] ?? []).length} changes`}</small>
-          <b>{index + 1}</b>
-        </button>
-      {/each}
-    </nav>
-  </aside>
+    <Status label={statusLabel} />
+  </section>
 
-  <section class="conflict-document">
-    {#if review.stale}
-      <div class="stale-banner" role="alert">
-        <strong>This review is stale.</strong>
-        <span>The server changed after this package was created. Refresh before resolving.</span>
+  {#if review.stale}
+    <div class="stale-banner" role="alert">
+      <strong>This review is stale.</strong>
+      <span>The server changed after this package was created. Refresh before resolving.</span>
+    </div>
+  {/if}
+
+  <section class="conflict-resolution-toolbar" aria-label="Conflict resolution controls">
+    <label class="conflict-file-jump">
+      <span>Jump to file</span>
+      <select value={activePath} on:change={jumpToSelectedFile}>
+        {#each review.files as file}
+          <option value={file.path}>{file.path}</option>
+        {/each}
+      </select>
+    </label>
+
+    {#if reviewResolved}
+      <div class="resolved-summary">
+        <strong>{review.conflict.resolution_kind ? choiceLabel(review.conflict.resolution_kind) : 'Resolved'}</strong>
+        <span>{review.conflict.resolved_at ? new Date(review.conflict.resolved_at).toLocaleString() : ''}</span>
+        {#if review.conflict.resolution_commit}<code>{review.conflict.resolution_commit.slice(0, 10)}</code>{/if}
       </div>
+    {:else}
+      <div class="resolution-mode" role="group" aria-label="Resolution mode">
+        <button aria-pressed={mode === 'whole'} class:active={mode === 'whole'} on:click={() => (mode = 'whole')}>Whole conflict</button>
+        <button aria-pressed={mode === 'lines'} class:active={mode === 'lines'} disabled={!individualAvailable} on:click={() => (mode = 'lines')}>Line by line</button>
+      </div>
+
+      {#if mode === 'whole'}
+        <label class="resolution-policy">
+          <span>Resolution</span>
+          <select bind:value={resolutionKind}>
+            {#each review.choices as choice}
+              <option value={choice} disabled={isChoiceDisabled(choice)}>{choiceLabel(choice)}</option>
+            {/each}
+          </select>
+        </label>
+        <p class="resolution-context">One decision applies to the complete conflict package.</p>
+      {:else}
+        <div class="review-bulk-actions" aria-label="Choose every changed line">
+          <span><strong>{unresolved}</strong> unresolved</span>
+          <button class="secondary" on:click={() => chooseAll('server')}>All server</button>
+          <button class="secondary" on:click={() => chooseAll('device')}>All device</button>
+          <button class="secondary" on:click={() => chooseAll('both')}>Keep all both</button>
+        </div>
+      {/if}
     {/if}
+
+    {#if review.stale}
+      <button class="primary resolve-action" disabled={submitting} on:click={onRefresh}>Refresh review</button>
+    {:else if !reviewResolved}
+      <button class="primary resolve-action" disabled={submitting || Boolean(manualPlanError) || (mode === 'lines' && unresolved > 0)} on:click={submit}>
+        {submitting ? 'Submitting...' : 'Resolve conflict'}
+      </button>
+    {/if}
+  </section>
+
+  {#if manualPlanError}<p class="warning resolution-banner">{manualPlanError}</p>{/if}
+  {#if !reviewResolved && !individualAvailable}
+    <p class="resolution-banner">
+      Line-by-line resolution is unavailable for {hasBinary ? 'binary content' : hasLargeText ? 'large text content' : hasUnlineableText ? 'an empty-file add/delete' : 'path or rename conflicts'}.
+      Choose a whole-conflict policy so bytes and paths remain safe.
+    </p>
+  {/if}
+
+  <div class="conflict-review-body">
+    <aside class="conflict-file-navigator">
+      <div class="file-navigator-heading">
+        <strong>Files changed</strong>
+        <span>{review.files.length}</span>
+      </div>
+      <nav class="path-list" aria-label="Affected files">
+        {#each review.files as file}
+          {@const fileRows = diffs[file.path] ?? []}
+          {@const added = addedLineCount(fileRows)}
+          {@const removed = removedLineCount(fileRows)}
+          <button
+            class:active={activePath === file.path}
+            aria-current={activePath === file.path ? 'location' : undefined}
+            title={file.path}
+            on:click={() => scrollToFile(file.path)}
+          >
+            <span class="file-nav-path">{file.path}</span>
+            <span class="file-nav-stats">
+              {#if file.content_kind === 'binary'}
+                <b class="file-kind">BIN</b>
+              {:else if file.content_kind === 'large_text'}
+                <b class="file-kind">LARGE</b>
+              {:else if added === 0 && removed === 0}
+                <b class="no-content-delta">no content delta</b>
+              {:else}
+                <b class="addition">+{added}</b><b class="deletion">-{removed}</b>
+              {/if}
+            </span>
+          </button>
+        {/each}
+      </nav>
+    </aside>
+
+    <section class="conflict-document">
 
     {#if mode === 'whole' && resolutionKind === 'manual' && titleGroups.length > 0}
       <section class="structure-editor panel">
@@ -314,25 +416,36 @@
           use:trackFile={file.path}
         >
           <header class="conflict-file-header">
-            <div>
-              <strong>{file.path}</strong>
-              <span>{file.content_kind === 'binary' ? 'Binary file' : file.content_kind === 'large_text' ? 'Large text file' : `${changes.length} changed line${changes.length === 1 ? '' : 's'}`}</span>
+            <div class="conflict-file-identity">
+              <svg aria-hidden="true" viewBox="0 0 16 16" width="16" height="16"><path d="M3.75 1.75A1.75 1.75 0 0 0 2 3.5v9A1.75 1.75 0 0 0 3.75 14.25h8.5A1.75 1.75 0 0 0 14 12.5V6.06a1.75 1.75 0 0 0-.513-1.237l-2.31-2.31A1.75 1.75 0 0 0 9.94 2H3.75Zm6.5 1.81c.02.012.04.027.057.044l2.09 2.09a.25.25 0 0 1 .043.056h-1.69a.5.5 0 0 1-.5-.5V3.56ZM3.5 3.5a.25.25 0 0 1 .25-.25H9v2a1.75 1.75 0 0 0 1.75 1.75h2v5.5a.25.25 0 0 1-.25.25h-8.5a.25.25 0 0 1-.25-.25v-9Z" /></svg>
+              <code title={file.path}>{file.path}</code>
+            </div>
+            <div class="conflict-file-stats">
+              {#if file.content_kind === 'binary'}
+                <span class="file-kind">Binary</span>
+              {:else if file.content_kind === 'large_text'}
+                <span class="file-kind">Large text</span>
+              {:else}
+                <span class="addition">+{addedLineCount(rows)}</span>
+                <span class="deletion">-{removedLineCount(rows)}</span>
+              {/if}
             </div>
             {#if mode === 'lines' && file.content_kind === 'text' && changes.length > 0}
               <div class="file-bulk-actions" aria-label={`Choose all changes in ${file.path}`}>
                 <button class="secondary" on:click={() => chooseFile(file.path, 'server')}>All server</button>
                 <button class="secondary" on:click={() => chooseFile(file.path, 'device')}>All device</button>
-                <button class="secondary" on:click={() => chooseFile(file.path, 'both')}>All both</button>
+                <button class="secondary" on:click={() => chooseFile(file.path, 'both')}>Keep both</button>
               </div>
             {/if}
           </header>
 
-          {#if group}
-            <div class:path-warning={hasTitleConflict(group)} class="path-review compact">
+          {#if group && hasStructuralChange(group)}
+            <section class:path-warning={hasTitleConflict(group)} class="path-review">
+              <div class="path-review-heading"><code>@@ path operation @@</code></div>
               <div><span>Base</span><code>{group.base_path ?? '(absent)'}</code></div>
               <div><span>Server / {group.server_operation}</span><code>{group.server_path ?? '(deleted)'}</code></div>
               <div><span>Device / {group.device_operation}</span><code>{group.device_path ?? '(deleted)'}</code></div>
-            </div>
+            </section>
           {/if}
 
           {#if file.content_kind !== 'text'}
@@ -349,8 +462,19 @@
                 <div><dt>Device</dt><dd>{formatBytes(file.device_bytes)}</dd><dd><code title={file.device_sha256 ?? ''}>{formatDigest(file.device_sha256)}</code></dd></div>
               </dl>
             </div>
+          {:else if changes.length === 0}
+            <div class="no-content-diff">
+              <svg aria-hidden="true" viewBox="0 0 16 16" width="20" height="20"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 1 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z" /></svg>
+              <div>
+                <strong>No content delta</strong>
+                <p>The server and device bytes are identical. This file remains in the review because it belongs to the conflict package.</p>
+              </div>
+            </div>
           {:else}
             <div class="github-diff" aria-label={`Server and device changes for ${file.path}`}>
+              <div class="diff-hunk-header">
+                <span class="line-number">...</span><span class="line-number">...</span><code>@@ server &harr; {review.device_name} @@</code>
+              </div>
               {#each rows as row}
                 {#if row.kind === 'context'}
                   <div class="diff-code-row context">
@@ -423,59 +547,6 @@
         </article>
       {/each}
     </div>
-  </section>
-
-  <aside class="rail right resolution-rail">
-    <h2>Resolution</h2>
-    {#if reviewResolved}
-      <p class="muted">Resolved {review.conflict.resolved_at ? new Date(review.conflict.resolved_at).toLocaleString() : ''}</p>
-      {#if review.conflict.resolution_kind}<p>{choiceLabel(review.conflict.resolution_kind)}</p>{/if}
-      {#if review.conflict.resolution_commit}<p class="mono">{review.conflict.resolution_commit.slice(0, 10)}...</p>{/if}
-    {:else}
-      <div class="resolution-mode" role="group" aria-label="Resolution mode">
-        <button aria-pressed={mode === 'whole'} class:active={mode === 'whole'} on:click={() => (mode = 'whole')}>Whole conflict</button>
-        <button aria-pressed={mode === 'lines'} class:active={mode === 'lines'} disabled={!individualAvailable} on:click={() => (mode = 'lines')}>Individual lines</button>
-      </div>
-
-      {#if mode === 'whole'}
-        <p class="muted">Apply one policy to the complete conflict package.</p>
-        {#each review.choices as choice}
-          <label class="radio">
-            <input
-              type="radio"
-              bind:group={resolutionKind}
-              value={choice}
-              disabled={(choice === 'manual' && hasNonInteractiveContent) || (choice === 'insert_both_blocks' && hasBinary)}
-            />
-            {choiceLabel(choice)}
-          </label>
-        {/each}
-      {:else}
-        <p class="muted">Every changed line must have an explicit decision.</p>
-        <div class="review-bulk-actions">
-          <button class="secondary" on:click={() => chooseAll('server')}>All server</button>
-          <button class="secondary" on:click={() => chooseAll('device')}>All device</button>
-          <button class="secondary" on:click={() => chooseAll('both')}>All both</button>
-        </div>
-        <p class:warning={unresolved > 0}><strong>{unresolved}</strong> unresolved changed line{unresolved === 1 ? '' : 's'}</p>
-      {/if}
-
-      {#if manualPlanError}<p class="warning resolution-note">{manualPlanError}</p>{/if}
-      {#if !individualAvailable}
-        <p class="resolution-note">
-          Individual-line resolution is unavailable for {hasBinary ? 'binary content' : hasLargeText ? 'large text content' : hasUnlineableText ? 'an empty-file add/delete' : 'path/rename conflicts'}.
-          Use a whole-conflict action or complete manual result so bytes and paths remain safe.
-        </p>
-      {/if}
-      {#if review.stale}<p class="muted">Refresh review before submitting.</p>{/if}
-    {/if}
-
-    {#if review.stale}
-      <button class="primary" disabled={submitting} on:click={onRefresh}>Refresh review</button>
-    {:else if !reviewResolved}
-      <button class="primary" disabled={submitting || Boolean(manualPlanError) || (mode === 'lines' && unresolved > 0)} on:click={submit}>
-        {submitting ? 'Submitting...' : 'Submit resolution'}
-      </button>
-    {/if}
-  </aside>
+    </section>
+  </div>
 </section>

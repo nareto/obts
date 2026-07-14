@@ -19,7 +19,7 @@ Each vault has a canonical Git history on the server. Devices submit their own c
 
 - **Full-vault sync** for notes, attachments, Canvas files, Bases, themes, snippets, and community plugin data, with explicit safety exclusions.
 - **Durable conflict handling** instead of last-writer-wins replacement.
-- **Browser-based review** with all-file conflict navigation, line and word diffs, per-line decisions, device status, note history, and restores.
+- **Browser-based review** with a PR-style Files Changed workspace, full-path navigation, line and word diffs, per-line decisions, device status, note history, and restores.
 - **Rename-aware history** with source and rendered Markdown diffs.
 - **Safe restoration** that creates a new commit rather than rewriting existing history.
 - **Recovery before replacement** through local snapshots, patches, ref packs, checksums, and replayable apply journals.

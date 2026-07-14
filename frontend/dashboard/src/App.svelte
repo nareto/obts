@@ -48,6 +48,7 @@
   let diagnostics: DiagnosticEventsResponse | null = null;
   let conflicts: DashboardConflict[] = [];
   let selectedConflictId = '';
+  let conflictListOpen = false;
   let review: ConflictReviewPackage | null = null;
   const connectionId = window.location.pathname.match(/^\/connect\/([^/]+)$/u)?.[1] ?? '';
   let connectionReview: ConnectionReview | null = null;
@@ -288,11 +289,18 @@
   }
 
   async function openConflictFromList(conflict: DashboardConflict) {
+    conflictListOpen = false;
     if (conflict.stale) {
       await refreshConflictReview(conflict.conflict_id);
       return;
     }
     await loadReview(conflict.conflict_id);
+  }
+
+  async function selectConflict(event: Event) {
+    const conflictId = (event.currentTarget as HTMLSelectElement).value;
+    const conflict = conflicts.find((candidate) => candidate.conflict_id === conflictId);
+    if (conflict) await openConflictFromList(conflict);
   }
 
   async function handleAttentionAction(item: AttentionItem) {
@@ -576,7 +584,7 @@
     </aside>
 
     <section class="content">
-      <header>
+      <header class="app-header">
         <button class="icon" title="Open navigation" aria-label="Open navigation" on:click={() => (mobileNavOpen = !mobileNavOpen)}>
           <span aria-hidden="true">☰</span>
         </button>
@@ -674,26 +682,50 @@
         </main>
       {:else if page === 'Conflicts'}
         <main class="conflict-layout">
-          <section class="panel list">
-            <h2>Conflict center</h2>
-            <table>
-              <thead><tr><th>Path</th><th>Device</th><th>Conflict type</th><th>Created</th><th>Status</th><th>Action</th></tr></thead>
-              <tbody>
-                {#each conflicts as conflict}
-                  <tr>
-                    <td>{conflict.affected_paths[0] ?? '-'}</td>
-                    <td>{conflict.device_name}</td>
-                    <td>{conflict.conflict_type}</td>
-                    <td>{new Date(conflict.created_at).toLocaleString()}</td>
-                    <td><Status label={conflict.status_label} /></td>
-                    <td><button class="secondary" on:click={() => openConflictFromList(conflict)}>{conflict.stale ? 'Refresh' : 'Open'}</button></td>
-                  </tr>
-                {:else}
-                  <tr><td colspan="6" class="muted">No conflicts.</td></tr>
-                {/each}
-              </tbody>
-            </table>
+          <section class="conflict-queue-toolbar">
+            <div>
+              <strong>Conflict queue</strong>
+              <span>{unresolvedCount} open / {conflicts.length} total</span>
+            </div>
+            {#if conflicts.length > 0}
+              <label>
+                <span>Current review</span>
+                <select value={selectedConflictId} on:change={selectConflict}>
+                  {#each conflicts as conflict}
+                    <option value={conflict.conflict_id}>
+                      {conflict.affected_paths[0] ?? 'Path conflict'} - {conflict.device_name} - {conflict.status_label}
+                    </option>
+                  {/each}
+                </select>
+              </label>
+              <button class="secondary" aria-expanded={conflictListOpen} on:click={() => (conflictListOpen = !conflictListOpen)}>
+                {conflictListOpen ? 'Hide queue' : 'Browse queue'}
+              </button>
+            {/if}
           </section>
+
+          {#if conflictListOpen || !review}
+            <section class="panel conflict-queue-list">
+              <table>
+                <thead><tr><th>Path</th><th>Device</th><th>Conflict type</th><th>Created</th><th>Status</th><th>Action</th></tr></thead>
+                <tbody>
+                  {#each conflicts as conflict}
+                    <tr>
+                      <td>{conflict.affected_paths[0] ?? '-'}</td>
+                      <td>{conflict.device_name}</td>
+                      <td>{conflict.conflict_type}</td>
+                      <td>{new Date(conflict.created_at).toLocaleString()}</td>
+                      <td><Status label={conflict.status_label} /></td>
+                      <td><button class="secondary" on:click={() => openConflictFromList(conflict)}>{conflict.stale ? 'Refresh' : 'Review'}</button></td>
+                    </tr>
+                  {:else}
+                    <tr><td colspan="6" class="muted">No conflicts.</td></tr>
+                  {/each}
+                </tbody>
+              </table>
+            </section>
+          {/if}
+
           {#if review}
             <ConflictWorkbench
               {review}
@@ -701,8 +733,8 @@
               onSubmit={submitResolution}
               onRefresh={refreshReview}
             />
-          {:else}
-            <section class="panel full"><p class="muted">No conflict selected.</p></section>
+          {:else if conflicts.length === 0}
+            <section class="panel full"><p class="muted">No conflicts to review.</p></section>
           {/if}
         </main>
       {:else if page === 'History'}
