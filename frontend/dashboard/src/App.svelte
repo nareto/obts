@@ -4,6 +4,7 @@
   import Attention from './components/Attention.svelte';
   import type { AttentionItem } from './components/Attention.svelte';
   import Checklist from './components/Checklist.svelte';
+  import ConflictWorkbench from './components/ConflictWorkbench.svelte';
   import DeviceTable from './components/DeviceTable.svelte';
   import Diagnostics from './components/Diagnostics.svelte';
   import Status from './components/Status.svelte';
@@ -11,14 +12,12 @@
   import type {
     DashboardConflict,
     ConnectionReview,
-    ConflictResolutionKind,
+    ConflictResolutionSubmission,
     ConflictReviewPackage,
-    ConflictReviewPath,
     DashboardDevice,
     DashboardSummary,
     DiagnosticEventsResponse,
     MaintenanceRow,
-    ManualFilePlanEntry,
     NoteHistoryQueryResponse,
     NoteHistoryVersion,
     NoteHistoryVersionResponse,
@@ -47,12 +46,6 @@
   let conflicts: DashboardConflict[] = [];
   let selectedConflictId = '';
   let review: ConflictReviewPackage | null = null;
-  let selectedReviewPath = '';
-  let resolutionKind: ConflictResolutionKind = 'keep_server';
-  let manualTextByPath: Record<string, string> = {};
-  let manualPathByConflict: Record<string, string> = {};
-  let manualContentByConflict: Record<string, string> = {};
-  let diffTab: 'rendered' | 'source' = 'source';
   const connectionId = window.location.pathname.match(/^\/connect\/([^/]+)$/u)?.[1] ?? '';
   let connectionReview: ConnectionReview | null = null;
   let connectionSelection: 'new_vault' | 'existing_vault' = 'new_vault';
@@ -76,14 +69,6 @@
   $: selectedVault = vaults.find((vault) => vault.vault_id === vaultId) ?? null;
   $: unresolvedCount = conflicts.filter((conflict) => conflict.status === 'open').length || dashboard?.unresolved_conflict_count || 0;
   $: selectedConflict = conflicts.find((conflict) => conflict.conflict_id === selectedConflictId) ?? null;
-  $: selectedReviewFile = review?.files.find((file) => file.path === selectedReviewPath) ?? review?.files[0] ?? null;
-  $: selectedPathConflict = selectedReviewFile
-    ? review?.path_conflicts.find((item) => item.affected_paths.includes(selectedReviewFile.path)) ?? review?.path_conflicts[0] ?? null
-    : review?.path_conflicts[0] ?? null;
-  $: selectedPathConflictKey = selectedPathConflict ? pathConflictKey(selectedPathConflict) : '';
-  $: selectedPathHasTitleConflict = selectedPathConflict ? pathConflictHasTitleChange(selectedPathConflict) : false;
-  $: reviewResolved = review?.conflict.status === 'resolved';
-  $: reviewStatusLabel = reviewResolved ? 'Synced' : review?.stale ? 'Stale review' : 'Review needed';
   $: recentAuthValid = session ? Date.parse(session.recent_auth_expires_at) > nowMs : false;
   $: syncSummary = dashboardSyncSummary(dashboard, nowMs);
 
@@ -255,18 +240,6 @@
 
   function setReview(nextReview: ConflictReviewPackage) {
     review = nextReview;
-    resolutionKind = 'keep_server';
-    selectedReviewPath = review.files[0]?.path ?? '';
-    manualTextByPath = Object.fromEntries(
-      review.files.map((file) => [file.path, file.server_content ?? file.device_content ?? ''])
-    );
-    manualPathByConflict = Object.fromEntries(
-      review.path_conflicts.map((item) => [pathConflictKey(item), item.server_path ?? item.device_path ?? item.base_path ?? item.affected_paths[0] ?? ''])
-    );
-    manualContentByConflict = Object.fromEntries(
-      review.path_conflicts.map((item) => [pathConflictKey(item), defaultPathConflictContent(item, review!)])
-    );
-    diffTab = review.files[0]?.rendered_markdown_diff ? 'rendered' : 'source';
   }
 
   async function refreshReview() {
@@ -306,61 +279,6 @@
       return;
     }
     await loadReview(item.conflictId);
-  }
-
-  function selectReviewPath(path: string) {
-    selectedReviewPath = path;
-    const file = review?.files.find((candidate) => candidate.path === path);
-    diffTab = file?.rendered_markdown_diff ? 'rendered' : 'source';
-  }
-
-  function updateManualText(path: string, event: Event) {
-    const target = event.currentTarget as HTMLTextAreaElement;
-    manualTextByPath = { ...manualTextByPath, [path]: target.value };
-  }
-
-  function updateManualPath(key: string, event: Event) {
-    const target = event.currentTarget as HTMLInputElement;
-    manualPathByConflict = { ...manualPathByConflict, [key]: target.value };
-  }
-
-  function updateManualPathContent(key: string, event: Event) {
-    const target = event.currentTarget as HTMLTextAreaElement;
-    manualContentByConflict = { ...manualContentByConflict, [key]: target.value };
-  }
-
-  function pathConflictKey(item: ConflictReviewPath) {
-    return item.base_path ?? item.affected_paths.join('|');
-  }
-
-  function pathConflictHasTitleChange(item: ConflictReviewPath) {
-    return item.base_path !== item.server_path || item.base_path !== item.device_path || item.server_path !== item.device_path;
-  }
-
-  function pathConflictLabel(item: ConflictReviewPath) {
-    if (!pathConflictHasTitleChange(item)) return item.base_path ?? item.server_path ?? item.device_path ?? 'Path overlap';
-    return `${item.base_path ?? '(new file)'} -> ${item.server_path ?? '(deleted)'} / ${item.device_path ?? '(deleted)'}`;
-  }
-
-  function defaultPathConflictContent(item: ConflictReviewPath, conflictReview: ConflictReviewPackage) {
-    const server = item.server_path ? conflictReview.files.find((file) => file.path === item.server_path)?.server_content : null;
-    const device = item.device_path ? conflictReview.files.find((file) => file.path === item.device_path)?.device_content : null;
-    return server ?? device ?? '';
-  }
-
-  function buildManualFilePlan(conflictReview: ConflictReviewPackage): ManualFilePlanEntry[] {
-    const plan = new Map<string, string | null>();
-    for (const path of conflictReview.conflict.affected_paths) {
-      plan.set(path, null);
-    }
-    for (const item of conflictReview.path_conflicts.filter(pathConflictHasTitleChange)) {
-      const key = pathConflictKey(item);
-      const path = (manualPathByConflict[key] ?? '').trim();
-      if (path) {
-        plan.set(path, manualContentByConflict[key] ?? '');
-      }
-    }
-    return [...plan.entries()].map(([path, content]) => ({ path, content }));
   }
 
   function withRecentAuth(action: () => Promise<void>) {
@@ -410,25 +328,17 @@
     });
   }
 
-  async function submitResolution() {
+  async function submitResolution(submission: ConflictResolutionSubmission) {
     if (!vaultId || !review || review.stale) return;
     actionError = '';
     notice = '';
     const conflictId = review.conflict.conflict_id;
-    const hasTitleConflict = review.path_conflicts.some(pathConflictHasTitleChange);
-    const manualFiles =
-      resolutionKind === 'manual' && !hasTitleConflict
-        ? Object.fromEntries(review.files.map((file) => [file.path, manualTextByPath[file.path] ?? '']))
-        : undefined;
-    const manualFilePlan = resolutionKind === 'manual' && hasTitleConflict ? buildManualFilePlan(review) : undefined;
     try {
       await api.resolveConflict({
         vaultId,
         conflictId,
         expectedMain: review.expected_main,
-        resolutionKind,
-        manualFiles,
-        manualFilePlan
+        ...submission
       });
       notice = 'Conflict resolved.';
       selectedConflictId = '';
@@ -515,21 +425,6 @@
     });
   }
 
-  function choiceLabel(choice: ConflictResolutionKind) {
-    switch (choice) {
-      case 'keep_server':
-        return 'Keep server version';
-      case 'use_device':
-        return 'Use device version';
-      case 'keep_both_files':
-        return 'Keep both notes/files';
-      case 'insert_both_blocks':
-        return 'Insert both blocks';
-      case 'manual':
-        return 'Manually edit final result';
-    }
-  }
-
 </script>
 
 {#if !session}
@@ -606,7 +501,7 @@
   </main>
 {:else}
   <div class="shell">
-    <aside class:open={mobileNavOpen}>
+    <aside class="app-sidebar" class:open={mobileNavOpen}>
       <select bind:value={vaultId} on:change={refreshVault} aria-label="Current vault">
         {#each vaults as vault}
           <option value={vault.vault_id}>{vault.display_name}</option>
@@ -728,97 +623,12 @@
             </table>
           </section>
           {#if review}
-            <section class="workbench">
-              <aside class="rail">
-                <h2>{selectedPathConflict ? pathConflictLabel(selectedPathConflict) : selectedReviewFile?.path ?? 'Conflict'}</h2>
-                <p class="muted">Device {review.device_name}</p>
-                <p class="mono">Server {shortId(review.expected_main)}</p>
-                <p class="mono">Device {shortId(review.conflict.device_commit)}</p>
-                <p>{selectedConflict?.conflict_type ?? 'Path overlap'}</p>
-                <Status label={reviewStatusLabel} />
-                <div class="path-list" aria-label="Affected paths">
-                  {#each review.files as file}
-                    <button class:active={selectedReviewPath === file.path} on:click={() => selectReviewPath(file.path)}>
-                      <span>{file.path}</span>
-                    </button>
-                  {/each}
-                </div>
-              </aside>
-              <section class="diff">
-                {#if review.stale}
-                  <p class="warning">This review is stale. Refresh before submitting a resolution.</p>
-                {/if}
-                {#if selectedPathConflict}
-                  <div class:path-warning={selectedPathHasTitleConflict} class="path-review">
-                    <div>
-                      <span>Base title</span>
-                      <code>{selectedPathConflict.base_path ?? '(absent)'}</code>
-                    </div>
-                    <div>
-                      <span>Server title</span>
-                      <code>{selectedPathConflict.server_path ?? '(deleted)'}</code>
-                      <small>{selectedPathConflict.server_operation}</small>
-                    </div>
-                    <div>
-                      <span>Device title</span>
-                      <code>{selectedPathConflict.device_path ?? '(deleted)'}</code>
-                      <small>{selectedPathConflict.device_operation}</small>
-                    </div>
-                  </div>
-                {/if}
-                <div class="tabs">
-                  <button class:active={diffTab === 'rendered'} disabled={!selectedReviewFile?.rendered_markdown_diff} on:click={() => (diffTab = 'rendered')}>Rendered</button>
-                  <button class:active={diffTab === 'source'} on:click={() => (diffTab = 'source')}>Source</button>
-                </div>
-                {#if diffTab === 'rendered' && selectedReviewFile?.rendered_markdown_diff}
-                  <div class="rendered">{@html selectedReviewFile.rendered_markdown_diff}</div>
-                {:else}
-                  <pre>{selectedReviewFile?.source_diff ?? 'No file selected.'}</pre>
-                {/if}
-                {#if resolutionKind === 'manual' && selectedPathHasTitleConflict && selectedPathConflict}
-                  <label class="manual-title">
-                    Final title/path
-                    <input
-                      value={manualPathByConflict[selectedPathConflictKey] ?? ''}
-                      on:input={(event) => updateManualPath(selectedPathConflictKey, event)}
-                      aria-label="Manual final note title or path"
-                    />
-                  </label>
-                  <textarea
-                    value={manualContentByConflict[selectedPathConflictKey] ?? ''}
-                    on:input={(event) => updateManualPathContent(selectedPathConflictKey, event)}
-                    aria-label={`Manual final content for ${manualPathByConflict[selectedPathConflictKey] ?? 'custom path'}`}
-                  ></textarea>
-                {:else if resolutionKind === 'manual' && selectedReviewFile}
-                  <textarea
-                    value={manualTextByPath[selectedReviewFile.path] ?? ''}
-                    on:input={(event) => updateManualText(selectedReviewFile!.path, event)}
-                    aria-label={`Manual final result for ${selectedReviewFile.path}`}
-                  ></textarea>
-                {/if}
-              </section>
-              <aside class="rail right">
-                <h2>Resolution</h2>
-                {#if reviewResolved}
-                  <p class="muted">Resolved {review.conflict.resolved_at ? new Date(review.conflict.resolved_at).toLocaleString() : ''}</p>
-                  {#if review.conflict.resolution_kind}<p>{choiceLabel(review.conflict.resolution_kind)}</p>{/if}
-                  {#if review.conflict.resolution_commit}<p class="mono">{shortId(review.conflict.resolution_commit)}</p>{/if}
-                {:else}
-                  {#each review.choices as choice}
-                    <label class="radio"><input type="radio" bind:group={resolutionKind} value={choice} /> {choiceLabel(choice)}</label>
-                  {/each}
-                  {#if selectedPathHasTitleConflict}
-                    <p class="muted">Title conflicts are resolved as file-path changes. Use manual edit for a custom final title.</p>
-                  {/if}
-                  {#if review.stale}<p class="muted">Refresh review before submitting.</p>{/if}
-                {/if}
-                {#if review.stale}
-                  <button class="primary" on:click={refreshReview}>Refresh review</button>
-                {:else if !reviewResolved}
-                  <button class="primary" on:click={submitResolution}>Submit resolution</button>
-                {/if}
-              </aside>
-            </section>
+            <ConflictWorkbench
+              {review}
+              conflictType={selectedConflict?.conflict_type ?? 'Path overlap'}
+              onSubmit={submitResolution}
+              onRefresh={refreshReview}
+            />
           {:else}
             <section class="panel full"><p class="muted">No conflict selected.</p></section>
           {/if}

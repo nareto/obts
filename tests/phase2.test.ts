@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
@@ -109,14 +109,33 @@ describe('Phase 2 dashboard conflict resolution', () => {
     const review = await admin.get<{
       conflict: { conflict_id: string; expected_main: string; device_commit: string };
       stale: boolean;
-      files: Array<{ path: string; server_content: string; device_content: string; source_diff: string }>;
+      path_conflicts: Array<{ group_id: string; kind: string; affected_paths: string[] }>;
+      files: Array<{
+        path: string;
+        content_kind: 'text' | 'binary';
+        server_content: string;
+        device_content: string;
+        server_bytes: number;
+        device_bytes: number;
+        server_sha256: string;
+        device_sha256: string;
+        source_diff: string;
+      }>;
     }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`);
     expect(review.status).toBe(200);
     expect(review.body.stale).toBe(false);
+    expect(review.body.path_conflicts).toEqual([
+      expect.objectContaining({ group_id: expect.stringMatching(/^[0-9a-f]{20}$/u), kind: 'same_path', affected_paths: ['shared.md'] })
+    ]);
     expect(review.body.files[0]).toMatchObject({
       path: 'shared.md',
+      content_kind: 'text',
       server_content: 'server version\n',
-      device_content: 'device version\n'
+      device_content: 'device version\n',
+      server_bytes: 15,
+      device_bytes: 15,
+      server_sha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      device_sha256: expect.stringMatching(/^[0-9a-f]{64}$/u)
     });
     expect(review.body.files[0]?.source_diff).toContain('-server version');
     expect(await server.git.getRef(admin.vaultId, `refs/obts/conflicts/${result.conflictId}/base`)).toBeTruthy();
@@ -370,28 +389,34 @@ describe('Phase 2 dashboard conflict resolution', () => {
 
   it('supports custom final title resolution for rename conflicts and rejects unrelated path collisions', async () => {
     const admin = await setupAdminAndVault(baseUrl);
-    const { result } = await prepareRenameConflict(admin, root, 'rename-manual', { 'Existing.md': 'do not overwrite\n' });
+    const { result } = await prepareRenameConflict(admin, root, 'rename-manual', {
+      'Existing.md': 'do not overwrite\n',
+      'folder/unrelated.md': 'keep descendant\n',
+      plain: 'keep ancestor\n'
+    });
 
     const review = await admin.get<{
       conflict: { expected_main: string };
     }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`);
     expect(review.status).toBe(200);
 
-    const collision = await admin.post<{ error: { code: string } }>(
-      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
-      {
-        expected_main: review.body.conflict.expected_main,
-        resolution_kind: 'manual',
-        manual_file_plan: [
-          { path: 'Old.md', content: null },
-          { path: 'Title A.md', content: null },
-          { path: 'Title B.md', content: null },
-          { path: 'Existing.md', content: 'overwrite attempt\n' }
-        ]
-      }
-    );
-    expect(collision.status).toBe(400);
-    expect(collision.body.error.code).toBe('invalid_resolution');
+    for (const path of ['Existing.md', 'folder', 'plain/child.md']) {
+      const collision = await admin.post<{ error: { code: string } }>(
+        `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
+        {
+          expected_main: review.body.conflict.expected_main,
+          resolution_kind: 'manual',
+          manual_file_plan: [
+            { path: 'Old.md', content: null },
+            { path: 'Title A.md', content: null },
+            { path: 'Title B.md', content: null },
+            { path, content: 'overwrite attempt\n' }
+          ]
+        }
+      );
+      expect(collision.status).toBe(400);
+      expect(collision.body.error.code).toBe('invalid_resolution');
+    }
 
     const resolved = await admin.post<{ resolution_commit: string }>(
       `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
@@ -410,6 +435,8 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(await server.git.listTreePaths(admin.vaultId, resolved.body.resolution_commit)).toEqual([
       'Existing.md',
       'Final Title.md',
+      'folder/unrelated.md',
+      'plain',
       'rename-manual-tablet-ref.md'
     ]);
     expect((await server.git.readBlobAtPath(admin.vaultId, resolved.body.resolution_commit, 'Final Title.md')).toString('utf8')).toBe(
@@ -607,6 +634,70 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(rendered).toContain('&lt;script&gt;alert(2)&lt;/script&gt;');
     expect(rendered).not.toContain('<img src=x');
     expect(rendered).not.toContain('<script>');
+  });
+
+  it('classifies binary conflicts without lossy text decoding and preserves selected bytes', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'desktop-binary-review');
+    const tabletDir = join(root, 'tablet-binary-review');
+    await mkdir(desktopDir, { recursive: true });
+    await mkdir(tabletDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop-binary-review');
+    await writeFile(join(desktopDir, 'asset.bin'), Buffer.from([0, 1, 2, 3]));
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const tablet = await pairPlugin(admin, tabletDir, 'tablet-binary-review');
+    await writeFile(join(desktopDir, 'asset.bin'), Buffer.from([0, 4, 5, 6]));
+    await writeFile(join(tabletDir, 'asset.bin'), Buffer.from([0, 7, 8, 9]));
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const result = await tablet.syncOnce();
+    expect(result.status).toBe('Review needed');
+
+    const review = await admin.get<{
+      conflict: { expected_main: string };
+      files: Array<{
+        content_kind: string;
+        base_content: string | null;
+        server_content: string | null;
+        device_content: string | null;
+        base_bytes: number;
+        server_bytes: number;
+        device_bytes: number;
+        source_diff: string;
+      }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`);
+    expect(review.status).toBe(200);
+    expect(review.body.files[0]).toMatchObject({
+      content_kind: 'binary',
+      base_content: null,
+      server_content: null,
+      device_content: null,
+      base_bytes: 4,
+      server_bytes: 4,
+      device_bytes: 4,
+      source_diff: 'Binary preview unavailable.'
+    });
+
+    for (const body of [
+      { expected_main: review.body.conflict.expected_main, resolution_kind: 'insert_both_blocks' },
+      { expected_main: review.body.conflict.expected_main, resolution_kind: 'manual', manual_files: { 'asset.bin': 'unsafe text' } }
+    ]) {
+      const rejected = await admin.post<{ error: { code: string } }>(
+        `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
+        body
+      );
+      expect(rejected.status).toBe(400);
+      expect(rejected.body.error.code).toBe('invalid_resolution');
+    }
+
+    const resolved = await admin.post<{ resolution_commit: string }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
+      { expected_main: review.body.conflict.expected_main, resolution_kind: 'use_device' }
+    );
+    expect(resolved.status).toBe(200);
+    expect(await server.git.readBlobAtPath(admin.vaultId, resolved.body.resolution_commit, 'asset.bin')).toEqual(
+      Buffer.from([0, 7, 8, 9])
+    );
   });
 
   it('rejects stale and cross-user conflict resolution submissions without requiring recent auth', async () => {
@@ -1539,7 +1630,9 @@ async function prepareRenameConflict(
   const desktop = await pairPlugin(admin, desktopDir, `${prefix}-desktop`);
   await writeFile(join(desktopDir, 'Old.md'), 'base\n');
   for (const [path, content] of Object.entries(extraBaseFiles)) {
-    await writeFile(join(desktopDir, path), content);
+    const absolutePath = join(desktopDir, path);
+    await mkdir(dirname(absolutePath), { recursive: true });
+    await writeFile(absolutePath, content);
   }
   expect((await desktop.syncOnce()).status).toBe('Synced');
 

@@ -345,6 +345,7 @@ export type ConflictResolutionKind =
 export type ConflictPathOperation = 'absent' | 'unchanged' | 'added' | 'modified' | 'deleted' | 'renamed';
 
 export type ConflictReviewPath = {
+  group_id: string;
   kind: 'same_path' | 'rename_rename' | 'rename_delete' | 'rename_edit' | 'delete_edit' | 'path_collision' | 'path_overlap';
   base_path: string | null;
   server_path: string | null;
@@ -356,9 +357,16 @@ export type ConflictReviewPath = {
 
 export type ConflictReviewFile = {
   path: string;
+  content_kind: 'text' | 'large_text' | 'binary';
   base_content: string | null;
   server_content: string | null;
   device_content: string | null;
+  base_bytes: number | null;
+  server_bytes: number | null;
+  device_bytes: number | null;
+  base_sha256: string | null;
+  server_sha256: string | null;
+  device_sha256: string | null;
   source_diff: string;
   rendered_markdown_diff: string | null;
 };

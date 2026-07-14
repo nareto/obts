@@ -54,15 +54,17 @@ From the plugin and dashboard:
 3. Review the matching verification code in the browser and approve either a new vault or an existing owned vault. Approval requires recent dashboard authentication.
 4. Return to Obsidian to review the local/server analysis and confirm use-server, initialize, or merge behavior.
 5. Inspect the Overview, Devices, Conflicts, History, and Maintenance pages for vault status, device state, unresolved conflicts, readiness, and activity.
-6. Resolve review-needed conflicts from the Conflicts page. Resolution submission uses the authenticated dashboard session without another password prompt and includes the expected current `main` commit from the review package.
+6. Resolve review-needed conflicts from the Conflicts page. The workbench displays every affected file in one scrollable review, with a file navigator, unified line numbers, and word-level emphasis inside changed lines. Resolution submission uses the authenticated dashboard session without another password prompt and includes the expected current `main` commit from the review package.
 
-The dashboard offers the Phase 2 conflict choices:
+The dashboard offers complete-conflict shortcuts as well as explicit per-line choices for ordinary text conflicts. Every changed line must be assigned to the server, device, or both before an individual resolution can be submitted. Rename/path conflicts retain path-aware complete-file editing, while binary conflicts expose sizes and hashes without lossy text rendering and allow only byte-preserving whole-file choices. Text sides larger than 512 KiB also use metadata-only review so rendering cannot freeze the dashboard; their original bytes remain available to whole-conflict actions.
+
+The complete-conflict choices are:
 
 - keep the current server version;
 - use the device version for affected paths;
 - keep both by writing device copies next to the server version;
 - insert both blocks for text review;
-- manually edit final content.
+- manually edit complete final content and paths.
 
 If server `main` advances while a review is open, resolution submission fails
 with `409 stale_conflict_review`; the dashboard marks the review stale so it can

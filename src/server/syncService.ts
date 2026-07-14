@@ -21,6 +21,8 @@ import type { DeviceRow, MetadataDb, MetadataStore, SyncOperationRow } from './m
 const MERGE_POLICY_VERSION = 'phase2.semantic-merge.v1';
 const SIMILAR_RENAME_THRESHOLD = 0.72;
 const SIMILAR_RENAME_MAX_BYTES = 256 * 1024;
+const MAX_INTERACTIVE_REVIEW_BYTES = 512 * 1024;
+const REVIEW_TEXT_DECODER = new TextDecoder('utf-8', { fatal: true });
 
 type RenameConfidence = 'git' | 'exact_blob' | 'similar_content';
 
@@ -291,16 +293,40 @@ export class SyncService {
     const pathConflicts = await this.conflictReviewPaths(conflict);
     const files: ConflictReviewFile[] = [];
     for (const path of conflict.affected_paths) {
-      const baseContent = await this.readOptionalTextBlob(vaultId, conflict.base_commit, path);
-      const serverContent = await this.readOptionalTextBlob(vaultId, conflict.current_main, path);
-      const deviceContent = await this.readOptionalTextBlob(vaultId, conflict.device_commit, path);
+      const [baseBlob, serverBlob, deviceBlob] = await Promise.all([
+        this.readOptionalBlob(vaultId, conflict.base_commit, path),
+        this.readOptionalBlob(vaultId, conflict.current_main, path),
+        this.readOptionalBlob(vaultId, conflict.device_commit, path)
+      ]);
+      const baseContent = decodeReviewText(baseBlob);
+      const serverContent = decodeReviewText(serverBlob);
+      const deviceContent = decodeReviewText(deviceBlob);
+      const blobs = [baseBlob, serverBlob, deviceBlob];
+      const contentKind: ConflictReviewFile['content_kind'] = !blobs.every(
+        (blob, index) => blob === null || [baseContent, serverContent, deviceContent][index] !== null
+      )
+        ? 'binary'
+        : blobs.some((blob) => blob !== null && blob.byteLength > MAX_INTERACTIVE_REVIEW_BYTES)
+          ? 'large_text'
+          : 'text';
       files.push({
         path,
-        base_content: baseContent,
-        server_content: serverContent,
-        device_content: deviceContent,
-        source_diff: buildSourceDiff(serverContent, deviceContent),
-        rendered_markdown_diff: path.endsWith('.md') ? buildMarkdownReview(serverContent, deviceContent) : null
+        content_kind: contentKind,
+        base_content: contentKind === 'text' ? baseContent : null,
+        server_content: contentKind === 'text' ? serverContent : null,
+        device_content: contentKind === 'text' ? deviceContent : null,
+        base_bytes: baseBlob?.byteLength ?? null,
+        server_bytes: serverBlob?.byteLength ?? null,
+        device_bytes: deviceBlob?.byteLength ?? null,
+        base_sha256: baseBlob === null ? null : sha256Hex(baseBlob),
+        server_sha256: serverBlob === null ? null : sha256Hex(serverBlob),
+        device_sha256: deviceBlob === null ? null : sha256Hex(deviceBlob),
+        source_diff: contentKind === 'text'
+          ? buildSourceDiff(serverContent, deviceContent)
+          : contentKind === 'large_text'
+            ? 'Text preview unavailable because this conflict exceeds the interactive review limit.'
+            : 'Binary preview unavailable.',
+        rendered_markdown_diff: contentKind === 'text' && path.endsWith('.md') ? buildMarkdownReview(serverContent, deviceContent) : null
       });
     }
     return {
@@ -1209,6 +1235,10 @@ export class SyncService {
       });
     }
 
+    if ((resolutionKind === 'insert_both_blocks' || resolutionKind === 'manual') && await this.conflictContainsBinary(conflict)) {
+      throw new AuthError(400, 'invalid_resolution', 'Binary conflicts require a whole-file server, device, or keep-both resolution.');
+    }
+
     if (resolutionKind === 'insert_both_blocks') {
       for (const path of conflict.affected_paths) {
         const serverText = await this.readOptionalTextBlob(conflict.vault_id, conflict.expected_main, path);
@@ -1279,6 +1309,18 @@ export class SyncService {
     throw new AuthError(400, 'invalid_resolution', 'Unsupported conflict resolution kind.');
   }
 
+  private async conflictContainsBinary(conflict: ConflictRecord): Promise<boolean> {
+    for (const path of conflict.affected_paths) {
+      const blobs = await Promise.all([
+        this.readOptionalBlob(conflict.vault_id, conflict.base_commit, path),
+        this.readOptionalBlob(conflict.vault_id, conflict.expected_main, path),
+        this.readOptionalBlob(conflict.vault_id, conflict.device_commit, path)
+      ]);
+      if (blobs.some((blob) => blob !== null && decodeReviewText(blob) === null)) return true;
+    }
+    return false;
+  }
+
   private async buildManualFilePlanTree(
     conflict: ConflictRecord,
     sourceTree: string,
@@ -1288,6 +1330,7 @@ export class SyncService {
       throw new AuthError(400, 'invalid_resolution', 'Manual file plan requires at least one path.');
     }
     const affected = new Set(conflict.affected_paths);
+    const unaffectedSourcePaths = (await this.git.listTreePaths(conflict.vault_id, sourceTree)).filter((path) => !affected.has(path));
     const seen = new Set<string>();
     const writes = new Map<string, Buffer>();
     const deletes: string[] = [];
@@ -1303,7 +1346,7 @@ export class SyncService {
         deletes.push(entry.path);
         continue;
       }
-      if (!affected.has(entry.path) && (await this.readOptionalBlob(conflict.vault_id, sourceTree, entry.path)) !== null) {
+      if (unaffectedSourcePaths.some((path) => changedPathsConflict(path, entry.path))) {
         throw new AuthError(400, 'invalid_resolution', 'Manual file plan target collides with an unrelated path.');
       }
       writes.set(entry.path, Buffer.from(entry.content, 'utf8'));
@@ -2247,6 +2290,7 @@ function buildConflictReviewPaths(input: {
       groupedPaths.add(path);
     }
     groups.push({
+      group_id: reviewGroupId(basePath, server.path, device.path, affectedPaths),
       kind: reviewPathKind(input.reason, mainAction, deviceAction, basePath, server.path, device.path),
       base_path: basePath,
       server_path: server.path,
@@ -2294,6 +2338,7 @@ function fallbackConflictReviewPaths(
     const serverPath = serverOid === null ? null : path;
     const devicePath = deviceOid === null ? null : path;
     return {
+      group_id: reviewGroupId(basePath, serverPath, devicePath, [path]),
       kind: basePath === serverPath && basePath === devicePath ? 'same_path' : 'path_overlap',
       base_path: basePath,
       server_path: serverPath,
@@ -2303,6 +2348,10 @@ function fallbackConflictReviewPaths(
       affected_paths: [path]
     };
   });
+}
+
+function reviewGroupId(basePath: string | null, serverPath: string | null, devicePath: string | null, affectedPaths: string[]): string {
+  return sha256Hex(JSON.stringify([basePath, serverPath, devicePath, [...affectedPaths].sort()])).slice(0, 20);
 }
 
 function reviewOperation(baseOid: string | null, targetOid: string | null): ConflictReviewPath['server_operation'] {
@@ -2487,6 +2536,15 @@ function conflictCopyPath(path: string, conflictId: string, deviceId: string): s
   const suffix = `device-${deviceId.slice(-8)}-${conflictId.slice(-8)}`;
   const fileName = parsed.ext ? `${parsed.name}.${suffix}${parsed.ext}` : `${parsed.base}.${suffix}`;
   return parsed.dir ? posix.join(parsed.dir, fileName) : fileName;
+}
+
+function decodeReviewText(blob: Buffer | null): string | null {
+  if (blob === null || blob.includes(0)) return null;
+  try {
+    return REVIEW_TEXT_DECODER.decode(blob);
+  } catch {
+    return null;
+  }
 }
 
 function buildSourceDiff(serverContent: string | null, deviceContent: string | null): string {
