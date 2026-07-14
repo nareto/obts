@@ -29,6 +29,7 @@ describe('OpenAPI Phase 3 contract', () => {
       '/admin/users/{user_id}/revoke-admin',
       '/admin/users/{user_id}/password-reset-tokens',
       '/vaults',
+      '/vaults/{vault_id}',
       '/vaults/{vault_id}/main',
       '/vaults/{vault_id}/dashboard',
       '/connections',
@@ -40,6 +41,7 @@ describe('OpenAPI Phase 3 contract', () => {
       '/connections/{connection_id}/diagnostic-events',
       '/connections/{connection_id}/complete',
       '/diagnostic-events',
+      '/vaults/{vault_id}/devices/{device_id}',
       '/vaults/{vault_id}/devices/{device_id}/revoke',
       '/device/self',
       '/device/diagnostic-events',
@@ -77,6 +79,13 @@ describe('OpenAPI Phase 3 contract', () => {
     expect(document.paths['/connections/{connection_id}/complete']?.post?.responses).toHaveProperty('409');
     expect(document.components.securitySchemes).toHaveProperty('connectionBearer');
     expect(document.components.schemas).toHaveProperty('ConnectionStatusResponse');
+    expect(document.components.schemas).toHaveProperty('DisplayName');
+    expect(document.components.schemas).toHaveProperty('VaultNameRequest');
+    expect(document.components.schemas).toHaveProperty('DeviceNameRequest');
+    expect(document.components.schemas).toHaveProperty('DeviceNameResponse');
+    expect(document.paths['/vaults/{vault_id}']?.patch).toBeDefined();
+    expect(document.paths['/vaults/{vault_id}/devices/{device_id}']?.patch).toBeDefined();
+    expect(document.paths['/device/self']?.patch?.security).toEqual([{ deviceBearer: [] }]);
     expect(document.components.schemas).toHaveProperty('ConnectionReviewResponse');
     expect(document.components.schemas).toHaveProperty('ConnectionBootstrapManifest');
     expect(document.components.schemas).toHaveProperty('DiagnosticEvent');

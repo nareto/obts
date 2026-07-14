@@ -401,6 +401,66 @@ export class AuthService {
     });
   }
 
+  async renameVault(input: { actorUserId: string; vaultId: string; displayName: string }): Promise<VaultRow> {
+    return await this.store.mutate((db) => {
+      const vault = ownedVaultOrThrow(db, input.actorUserId, input.vaultId);
+      if (vault.display_name === input.displayName) {
+        return vault;
+      }
+      const timestamp = nowIso();
+      vault.display_name = input.displayName;
+      vault.updated_at = timestamp;
+      db.audit_log.push({
+        audit_id: newId('aud'),
+        actor_user_id: input.actorUserId,
+        actor_device_id: null,
+        vault_id: vault.vault_id,
+        action: 'vault_renamed',
+        resource_class: 'vault',
+        resource_id: vault.vault_id,
+        created_at: timestamp
+      });
+      return vault;
+    });
+  }
+
+  async renameDevice(input: {
+    actorUserId: string;
+    actorDeviceId?: string;
+    vaultId: string;
+    deviceId: string;
+    deviceName: string;
+  }): Promise<DeviceRow> {
+    return await this.store.mutate((db) => {
+      const vault = ownedVaultOrThrow(db, input.actorUserId, input.vaultId);
+      const device = db.devices.find(
+        (candidate) =>
+          candidate.device_id === input.deviceId &&
+          candidate.vault_id === vault.vault_id &&
+          candidate.user_id === input.actorUserId
+      );
+      if (!device) {
+        throw new AuthError(404, 'not_found', 'Resource not found.');
+      }
+      if (device.device_name === input.deviceName) {
+        return device;
+      }
+      const timestamp = nowIso();
+      device.device_name = input.deviceName;
+      db.audit_log.push({
+        audit_id: newId('aud'),
+        actor_user_id: input.actorUserId,
+        actor_device_id: input.actorDeviceId ?? null,
+        vault_id: vault.vault_id,
+        action: 'device_renamed',
+        resource_class: 'device',
+        resource_id: device.device_id,
+        created_at: timestamp
+      });
+      return device;
+    });
+  }
+
   async revokeDevice(input: { actorUserId: string; vaultId: string; deviceId: string }): Promise<void> {
     await this.store.mutate((db) => {
       const vault = ownedVaultOrThrow(db, input.actorUserId, input.vaultId);

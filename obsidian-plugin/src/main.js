@@ -84,6 +84,7 @@ module.exports = class ObtsPlugin extends Plugin {
     this.clientInitialization = null;
     this.reportedDiagnosticErrors = new WeakSet();
     this.diagnosticNoticeShown = false;
+    this.deviceNameRevision = 0;
     this.setStatus("Checking");
     this.client = new ObtsObsidianClient(this);
     if (this.operationAvailability() === "available") await this.initializeClient();
@@ -846,9 +847,12 @@ class ObtsObsidianClient {
     await this.flushEditorBuffersToDisk();
     const summary = await this.localSnapshotSummary();
     const existing = await readJson(this.statePath, null);
+    const deviceName = normalizeDisplayName(this.plugin.settings.deviceName || "Obsidian device");
+    this.plugin.settings.deviceName = deviceName;
+    await this.plugin.saveSettings();
     const connection = await postJson(this.url("/api/v1/connections"), {
       plugin_version: PLUGIN_VERSION,
-      device_name: this.plugin.settings.deviceName || "Obsidian device",
+      device_name: deviceName,
       local_vault_name: this.plugin.app.vault.getName(),
       local_summary: {
         has_content: summary.fileCount > 0,
@@ -2715,6 +2719,46 @@ class ObtsObsidianClient {
     return await response.json();
   }
 
+  async renameCurrentDevice(deviceName) {
+    await this.initialize();
+    const normalized = normalizeDisplayName(deviceName);
+    const state = await this.readState();
+    if (!state.vault_id || !state.device_id) {
+      throw new ObtsBlockedError("not_paired", "Device is not paired.");
+    }
+    const token = await this.readDeviceToken();
+    this.plugin.deviceNameRevision += 1;
+    const response = await fetchWithTimeout(this.url("/api/v1/device/self"), {
+      method: "PATCH",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ device_name: normalized })
+    });
+    if (!response.ok) await throwResponseError(response);
+    const renamed = await response.json();
+    if (renamed.device_id !== state.device_id) {
+      throw new ObtsBlockedError("device_identity_mismatch", "Server device identity does not match local state.");
+    }
+    await this.applyServerDeviceName(renamed.device_name);
+    return renamed.device_name;
+  }
+
+  async applyServerDeviceName(deviceName, persistState = true) {
+    const normalized = normalizeDisplayName(deviceName);
+    if (persistState) {
+      const state = await this.readState();
+      if (state.device_name !== normalized) {
+        await this.writeState(Object.assign({}, state, { device_name: normalized, updated_at: nowIso() }));
+      }
+    }
+    if (this.plugin.settings.deviceName !== normalized) {
+      this.plugin.settings.deviceName = normalized;
+      await this.plugin.saveSettings();
+    }
+  }
+
   async pull(vaultId, deviceId, token, currentLocalMain, requestedTarget = "latest", currentEventSeq = undefined) {
     const capabilities = await this.syncCapabilities();
     if (capabilities) {
@@ -2835,6 +2879,7 @@ class ObtsObsidianClient {
       return;
     }
     const queue = await this.readQueue();
+    const nameRevision = this.plugin.deviceNameRevision;
     const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${state.vault_id}/sync/device-status`), {
       method: "POST",
       headers: {
@@ -2858,6 +2903,9 @@ class ObtsObsidianClient {
       await throwResponseError(response);
     }
     const result = await response.json();
+    if (nameRevision === this.plugin.deviceNameRevision) {
+      await this.applyServerDeviceName(result.device_name, false);
+    }
     this.plugin.handlePluginCompatibility(result.plugin);
     return result;
   }
@@ -3784,16 +3832,19 @@ class ObtsOnboardingModal extends Modal {
     new Setting(contentEl)
       .setName("Device name")
       .setDesc("This name appears in the server dashboard and conflict history.")
-      .addText((text) => text.setValue(this.plugin.settings.deviceName).onChange(async (value) => {
-        try {
-          await this.plugin.runExclusiveAction(async () => {
-            this.plugin.settings.deviceName = value.trim();
-            await this.plugin.saveSettings();
-          });
-        } catch (error) {
-          new Notice(error instanceof Error ? error.message : "Unable to update the device name.");
-        }
-      }));
+      .addText((text) => {
+        text.setValue(this.plugin.settings.deviceName).onChange(async (value) => {
+          try {
+            await this.plugin.runExclusiveAction(async () => {
+              this.plugin.settings.deviceName = value.trim();
+              await this.plugin.saveSettings();
+            });
+          } catch (error) {
+            new Notice(error instanceof Error ? error.message : "Unable to update the device name.");
+          }
+        });
+        if (text.inputEl) text.inputEl.maxLength = 80;
+      });
     new Setting(contentEl)
       .setName("Share error diagnostics with this obts server")
       .setDesc(diagnosticSharingDescription(this.plugin.settings.serverUrl))
@@ -4081,7 +4132,7 @@ class ObtsSettingTab extends PluginSettingTab {
     const paired = Boolean(state && state.vault_id && state.device_id);
     const recoveryBlocked = Boolean(state && state.last_error_code === "local_state_incomplete");
     const restartRequired = availability === "restart_required";
-    const deviceName = state && state.device_name || this.plugin.settings.deviceName || "Obsidian device";
+    const deviceName = this.plugin.settings.deviceName || state && state.device_name || "Obsidian device";
 
     new Setting(containerEl)
       .setName("Server URL")
@@ -4160,9 +4211,31 @@ class ObtsSettingTab extends PluginSettingTab {
           if (typeof button.setWarning === "function") button.setWarning();
         });
     } else if (paired) {
+      let renameDraft = deviceName;
       new Setting(containerEl)
-        .setName("Device")
-        .setDesc(`${deviceName} · ${state.device_id}`);
+        .setName("Device name")
+        .setDesc(`Server device ${state.device_id}`)
+        .addText((text) => {
+          text.setValue(deviceName).onChange((value) => {
+            renameDraft = value;
+          });
+          if (text.inputEl) text.inputEl.maxLength = 80;
+        })
+        .addButton((button) => button.setButtonText("Save name").onClick(async () => {
+          button.setDisabled(true);
+          setFeedback(renameFeedback, "Saving device name...", "muted");
+          try {
+            const renamed = await this.plugin.runExclusiveAction(() => this.plugin.client.renameCurrentDevice(renameDraft));
+            renameDraft = renamed;
+            setFeedback(renameFeedback, `Device renamed to ${renamed}.`, "success");
+            new Notice(`obts device renamed to ${renamed}.`);
+          } catch (error) {
+            setFeedback(renameFeedback, error instanceof Error ? error.message : "Unable to rename this device.", "error");
+          } finally {
+            button.setDisabled(false);
+          }
+        }));
+      const renameFeedback = containerEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
       new Setting(containerEl)
         .setName("Status")
         .setDesc(state.last_error_code ? blockStatusLabel(state.last_error_code) : state.status_label || "Checking");
@@ -4263,7 +4336,7 @@ class ObtsSettingTab extends PluginSettingTab {
         .setDesc("Ready to connect this vault");
       new Setting(containerEl)
         .setName("Device name")
-        .addText((text) =>
+        .addText((text) => {
           text.setValue(this.plugin.settings.deviceName).onChange(async (value) => {
             try {
               await this.plugin.runExclusiveAction(async () => {
@@ -4274,8 +4347,9 @@ class ObtsSettingTab extends PluginSettingTab {
               new Notice(error instanceof Error ? error.message : "Unable to update the device name.");
               await this.display();
             }
-          })
-        );
+          });
+          if (text.inputEl) text.inputEl.maxLength = 80;
+        });
 
       new Setting(containerEl)
         .setName("Sync setup")
@@ -4289,6 +4363,14 @@ class ObtsSettingTab extends PluginSettingTab {
     }
 
   }
+}
+
+function normalizeDisplayName(value) {
+  const normalized = typeof value === "string" ? value.normalize("NFC").trim() : "";
+  if (!normalized || Array.from(normalized).length > 80 || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(normalized)) {
+    throw new Error("Name must contain 1 to 80 visible characters.");
+  }
+  return normalized;
 }
 
 function diagnosticSharingDescription(serverUrl) {

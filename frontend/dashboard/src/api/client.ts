@@ -80,6 +80,14 @@ export class DashboardApi {
     });
   }
 
+  async renameVault(vaultId: string, displayName: string): Promise<VaultSummary> {
+    return await this.request(`/vaults/${vaultId}`, {
+      method: 'PATCH',
+      csrf: true,
+      body: { display_name: displayName }
+    });
+  }
+
   async dashboard(vaultId: string): Promise<DashboardSummary> {
     return await this.request(`/vaults/${vaultId}/dashboard`);
   }
@@ -131,6 +139,14 @@ export class DashboardApi {
       method: 'POST',
       csrf: true,
       body: {}
+    });
+  }
+
+  async renameDevice(vaultId: string, deviceId: string, deviceName: string): Promise<{ device_id: string; device_name: string }> {
+    return await this.request(`/vaults/${vaultId}/devices/${deviceId}`, {
+      method: 'PATCH',
+      csrf: true,
+      body: { device_name: deviceName }
     });
   }
 

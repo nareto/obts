@@ -448,6 +448,22 @@ pre {
   color: var(--neutral);
 }
 
+.device-name-editor {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) auto auto;
+  gap: 6px;
+  align-items: center;
+  min-width: 360px;
+}
+
+.device-name-editor input {
+  min-width: 0;
+}
+
+.device-name-editor small {
+  grid-column: 1 / -1;
+}
+
 .action-cell {
   position: relative;
   width: 48px;

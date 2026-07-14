@@ -152,8 +152,14 @@ export type DeviceStatusReport = {
   path_capabilities?: Record<string, unknown> | null;
 };
 
+export type DeviceNameResponse = {
+  device_id: string;
+  device_name: string;
+};
+
 export type DeviceStatusResponse = {
   status: 'ok';
+  device_name: string;
   plugin: import('./pluginCompatibility.js').PluginCompatibility;
 };
 

@@ -26,6 +26,7 @@ Each vault has a canonical Git history on the server. Devices submit their own c
 - **Empty-folder synchronization** using explicit directory intent outside Git.
 - **Integrity-first operations** with readiness checks, redacted diagnostics, and non-destructive Git maintenance.
 - **Multi-user isolation** where each vault has exactly one owner.
+- **Editable display names** for vaults in the dashboard and devices from either the dashboard or the paired plugin, without renaming local vault folders.
 
 ## How It Works
 
@@ -109,7 +110,7 @@ Plugin commands include:
 - `Replace local with server state`
 - `Rebuild from server main`
 
-Local runtime state and hidden client history live under `.obts/`, which is never synchronized as vault content.
+Local runtime state and hidden client history live under `.obts/`, which is never synchronized as vault content. Rename a vault from the dashboard Overview; this changes server display metadata only. Rename a paired device from the dashboard Devices table or plugin settings. The plugin reconciles dashboard-side device renames during status reports.
 
 Error diagnostics are separate from sync status and are off by default. When enabled, the plugin sends failures only to the configured obts backend using a closed, sanitized schema; it never sends note content, vault or file names, paths, credentials, Git objects, packfiles, stacks, or raw logs. Changing the backend URL disables consent. Owners can inspect and delete retained reports from the dashboard Settings page.
 

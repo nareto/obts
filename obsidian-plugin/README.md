@@ -35,6 +35,11 @@ upload/apply steps when available; and open the dashboard for conflict review
 or plugin settings for other states. Actionable transitions produce one notice,
 while brief routine polling and catch-up do not.
 
+A paired device can be renamed from plugin settings. The server owns the
+canonical display name, and the plugin reconciles owner-side renames made in
+the dashboard during status reporting. Device renames do not affect vault
+content or local filesystem paths.
+
 Commands:
 
 - `Set up sync`

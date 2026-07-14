@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { newId, nowIso } from '../shared/ids.js';
+import { DISPLAY_NAME_MAX_LENGTH, normalizeDisplayName } from '../shared/validators.js';
 import type { DiagnosticEventV1 } from '../shared/diagnostics.js';
 import type { ConflictRecord, EventEnvelope, NoteHistoryVersion } from '../shared/types.js';
 
@@ -338,6 +339,20 @@ export class MetadataStore {
       legacyDb.connections = [];
       changed = true;
     }
+    for (const connection of legacyDb.connections) {
+      const deviceName = migrateDisplayName(connection.proposed_device_name, 'Unnamed device');
+      if (connection.proposed_device_name !== deviceName) {
+        connection.proposed_device_name = deviceName;
+        changed = true;
+      }
+      if (connection.new_vault_display_name !== null) {
+        const vaultName = migrateDisplayName(connection.new_vault_display_name, 'Unnamed vault');
+        if (connection.new_vault_display_name !== vaultName) {
+          connection.new_vault_display_name = vaultName;
+          changed = true;
+        }
+      }
+    }
     const legacyTokens = legacyDb.tokens as unknown as Array<TokenRow & { kind: string }>;
     const retainedTokens = legacyTokens.filter((token: { kind: string }) => token.kind !== 'pairing') as TokenRow[];
     if (retainedTokens.length !== legacyTokens.length) {
@@ -366,12 +381,22 @@ export class MetadataStore {
       changed = true;
     }
     for (const vault of db.vaults) {
+      const displayName = migrateDisplayName(vault.display_name, 'Unnamed vault');
+      if (vault.display_name !== displayName) {
+        vault.display_name = displayName;
+        changed = true;
+      }
       if (!Object.prototype.hasOwnProperty.call(vault, 'root_commit')) {
         vault.root_commit = null;
         changed = true;
       }
     }
     for (const device of db.devices) {
+      const deviceName = migrateDisplayName(device.device_name, 'Unnamed device');
+      if (device.device_name !== deviceName) {
+        device.device_name = deviceName;
+        changed = true;
+      }
       const legacyDevice = device as DeviceRow & {
         last_applied_main?: string | null;
         local_status_label?: string | null;
@@ -449,6 +474,21 @@ export class MetadataStore {
     const retainedIds = new Set(retainedVaultEvents.map((event) => event.event_id));
     db.events = db.events.filter((event) => event.vault_id !== vaultId || retainedIds.has(event.event_id));
   }
+}
+
+function migrateDisplayName(value: unknown, fallback: string): string {
+  const normalized = normalizeDisplayName(value);
+  if (normalized !== null) {
+    return normalized;
+  }
+  if (typeof value !== 'string') {
+    return fallback;
+  }
+  const sanitized = Array.from(value.normalize('NFC').replace(/[\p{Cc}\p{Cf}\p{Cs}]/gu, '').trim())
+    .slice(0, DISPLAY_NAME_MAX_LENGTH)
+    .join('')
+    .trim();
+  return normalizeDisplayName(sanitized) ?? fallback;
 }
 
 function createEmptyDb(): MetadataDb {

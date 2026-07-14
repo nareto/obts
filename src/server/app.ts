@@ -28,6 +28,7 @@ import {
 import {
   assertRecord,
   readCommitId,
+  readDisplayName,
   parseChunkBootstrapRequest,
   parseChunkPullRequest,
   parseChunkPushCreateRequest,
@@ -338,7 +339,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     const body = requestBody(request);
-    const displayName = readString(body, 'display_name');
+    const displayName = readDisplayName(body, 'display_name');
     const vaultId = newId('vlt');
     const rootCommit = await git.initializeVault(vaultId);
     const vault = await store.mutate((db) => {
@@ -374,6 +375,18 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       return row;
     });
     return reply.status(201).send(vault);
+  });
+
+  app.patch('/api/v1/vaults/:vaultId', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
+    const { vaultId } = pathParams(request);
+    const vault = await auth.renameVault({
+      actorUserId: session.user.user_id,
+      vaultId,
+      displayName: readDisplayName(requestBody(request), 'display_name')
+    });
+    return vault;
   });
 
   app.get('/api/v1/vaults/:vaultId/main', async (request) => {
@@ -477,7 +490,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const result = await connections.create(
       {
         plugin_version: readString(body, 'plugin_version'),
-        device_name: readString(body, 'device_name'),
+        device_name: readDisplayName(body, 'device_name'),
         local_vault_name: readString(body, 'local_vault_name'),
         local_summary: {
           has_content: readRequiredBoolean(localSummary, 'has_content'),
@@ -534,7 +547,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       connectionId,
       user: session.user,
       selection,
-      ...(selection === 'existing_vault' ? { vaultId: readString(body, 'vault_id') } : { displayName: readString(body, 'display_name') })
+      ...(selection === 'existing_vault' ? { vaultId: readString(body, 'vault_id') } : { displayName: readDisplayName(body, 'display_name') })
     });
     return { status: 'approved' };
   });
@@ -632,6 +645,19 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     return reply.status(201).send(result);
   });
 
+  app.patch('/api/v1/vaults/:vaultId/devices/:deviceId', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
+    const { vaultId, deviceId } = vaultDevicePathParams(request);
+    const device = await auth.renameDevice({
+      actorUserId: session.user.user_id,
+      vaultId,
+      deviceId,
+      deviceName: readDisplayName(requestBody(request), 'device_name')
+    });
+    return { device_id: device.device_id, device_name: device.device_name };
+  });
+
   app.post('/api/v1/vaults/:vaultId/devices/:deviceId/revoke', async (request) => {
     const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
@@ -660,6 +686,18 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       last_applied_main: deviceAuth.device.last_applied_main,
       event_seq: db.event_seq_by_vault[deviceAuth.vault.vault_id] ?? 0
     };
+  });
+
+  app.patch('/api/v1/device/self', async (request) => {
+    const deviceAuth = await auth.authenticateDeviceAnyVault(request.headers.authorization);
+    const device = await auth.renameDevice({
+      actorUserId: deviceAuth.user.user_id,
+      actorDeviceId: deviceAuth.device.device_id,
+      vaultId: deviceAuth.vault.vault_id,
+      deviceId: deviceAuth.device.device_id,
+      deviceName: readDisplayName(requestBody(request), 'device_name')
+    });
+    return { device_id: device.device_id, device_name: device.device_name };
   });
 
   app.post('/api/v1/device/diagnostic-events', { bodyLimit: DIAGNOSTIC_MAX_BODY_BYTES }, async (request, reply) => {
@@ -881,7 +919,11 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       device.path_capabilities = report.pathCapabilities;
       device.last_status_report_at = nowIso();
     });
-    return { status: 'ok', plugin: describePluginCompatibility(report.pluginVersion) };
+    return {
+      status: 'ok',
+      device_name: deviceAuth.device.device_name,
+      plugin: describePluginCompatibility(report.pluginVersion)
+    };
   });
 
   app.post('/api/v1/vaults/:vaultId/onboarding/complete', async (request) => {

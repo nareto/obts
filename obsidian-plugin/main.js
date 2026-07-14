@@ -21761,7 +21761,7 @@ var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var fsp = null;
 var API_VERSION = "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = "0.4.6";
+var PLUGIN_VERSION = "0.4.7";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var SYNC_STALE_MS = 2 * 60 * 1e3;
@@ -21834,6 +21834,7 @@ module.exports = class ObtsPlugin extends Plugin {
     this.clientInitialization = null;
     this.reportedDiagnosticErrors = /* @__PURE__ */ new WeakSet();
     this.diagnosticNoticeShown = false;
+    this.deviceNameRevision = 0;
     this.setStatus("Checking");
     this.client = new ObtsObsidianClient(this);
     if (this.operationAvailability() === "available") await this.initializeClient();
@@ -22524,9 +22525,12 @@ var ObtsObsidianClient = class {
     await this.flushEditorBuffersToDisk();
     const summary = await this.localSnapshotSummary();
     const existing = await readJson(this.statePath, null);
+    const deviceName = normalizeDisplayName(this.plugin.settings.deviceName || "Obsidian device");
+    this.plugin.settings.deviceName = deviceName;
+    await this.plugin.saveSettings();
     const connection = await postJson(this.url("/api/v1/connections"), {
       plugin_version: PLUGIN_VERSION,
-      device_name: this.plugin.settings.deviceName || "Obsidian device",
+      device_name: deviceName,
       local_vault_name: this.plugin.app.vault.getName(),
       local_summary: {
         has_content: summary.fileCount > 0,
@@ -24262,6 +24266,44 @@ var ObtsObsidianClient = class {
     }
     return await response.json();
   }
+  async renameCurrentDevice(deviceName) {
+    await this.initialize();
+    const normalized = normalizeDisplayName(deviceName);
+    const state = await this.readState();
+    if (!state.vault_id || !state.device_id) {
+      throw new ObtsBlockedError("not_paired", "Device is not paired.");
+    }
+    const token = await this.readDeviceToken();
+    this.plugin.deviceNameRevision += 1;
+    const response = await fetchWithTimeout(this.url("/api/v1/device/self"), {
+      method: "PATCH",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ device_name: normalized })
+    });
+    if (!response.ok) await throwResponseError(response);
+    const renamed = await response.json();
+    if (renamed.device_id !== state.device_id) {
+      throw new ObtsBlockedError("device_identity_mismatch", "Server device identity does not match local state.");
+    }
+    await this.applyServerDeviceName(renamed.device_name);
+    return renamed.device_name;
+  }
+  async applyServerDeviceName(deviceName, persistState = true) {
+    const normalized = normalizeDisplayName(deviceName);
+    if (persistState) {
+      const state = await this.readState();
+      if (state.device_name !== normalized) {
+        await this.writeState(Object.assign({}, state, { device_name: normalized, updated_at: nowIso() }));
+      }
+    }
+    if (this.plugin.settings.deviceName !== normalized) {
+      this.plugin.settings.deviceName = normalized;
+      await this.plugin.saveSettings();
+    }
+  }
   async pull(vaultId, deviceId, token, currentLocalMain, requestedTarget = "latest", currentEventSeq = void 0) {
     const capabilities = await this.syncCapabilities();
     if (capabilities) {
@@ -24376,6 +24418,7 @@ var ObtsObsidianClient = class {
       return;
     }
     const queue = await this.readQueue();
+    const nameRevision = this.plugin.deviceNameRevision;
     const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${state.vault_id}/sync/device-status`), {
       method: "POST",
       headers: {
@@ -24399,6 +24442,9 @@ var ObtsObsidianClient = class {
       await throwResponseError(response);
     }
     const result = await response.json();
+    if (nameRevision === this.plugin.deviceNameRevision) {
+      await this.applyServerDeviceName(result.device_name, false);
+    }
     this.plugin.handlePluginCompatibility(result.plugin);
     return result;
   }
@@ -25217,16 +25263,19 @@ var ObtsOnboardingModal = class extends Modal {
     const summary = contentEl.createDiv({ cls: "obts-onboarding-summary" });
     summary.createEl("strong", { text: this.plugin.app.vault.getName() });
     summary.createEl("span", { text: this.plugin.settings.serverUrl });
-    new Setting(contentEl).setName("Device name").setDesc("This name appears in the server dashboard and conflict history.").addText((text) => text.setValue(this.plugin.settings.deviceName).onChange(async (value) => {
-      try {
-        await this.plugin.runExclusiveAction(async () => {
-          this.plugin.settings.deviceName = value.trim();
-          await this.plugin.saveSettings();
-        });
-      } catch (error) {
-        new Notice(error instanceof Error ? error.message : "Unable to update the device name.");
-      }
-    }));
+    new Setting(contentEl).setName("Device name").setDesc("This name appears in the server dashboard and conflict history.").addText((text) => {
+      text.setValue(this.plugin.settings.deviceName).onChange(async (value) => {
+        try {
+          await this.plugin.runExclusiveAction(async () => {
+            this.plugin.settings.deviceName = value.trim();
+            await this.plugin.saveSettings();
+          });
+        } catch (error) {
+          new Notice(error instanceof Error ? error.message : "Unable to update the device name.");
+        }
+      });
+      if (text.inputEl) text.inputEl.maxLength = 80;
+    });
     new Setting(contentEl).setName("Share error diagnostics with this obts server").setDesc(diagnosticSharingDescription(this.plugin.settings.serverUrl)).addToggle((toggle) => toggle.setValue(this.plugin.diagnosticSharingEnabled()).onChange(async (value) => {
       try {
         await this.plugin.runExclusiveAction(() => this.plugin.setDiagnosticSharing(value));
@@ -25475,7 +25524,7 @@ var ObtsSettingTab = class extends PluginSettingTab {
     const paired = Boolean(state && state.vault_id && state.device_id);
     const recoveryBlocked = Boolean(state && state.last_error_code === "local_state_incomplete");
     const restartRequired = availability === "restart_required";
-    const deviceName = state && state.device_name || this.plugin.settings.deviceName || "Obsidian device";
+    const deviceName = this.plugin.settings.deviceName || state && state.device_name || "Obsidian device";
     new Setting(containerEl).setName("Server URL").addText(
       (text) => text.setValue(this.plugin.settings.serverUrl).onChange(async (value) => {
         try {
@@ -25526,7 +25575,27 @@ var ObtsSettingTab = class extends PluginSettingTab {
         if (typeof button.setWarning === "function") button.setWarning();
       });
     } else if (paired) {
-      new Setting(containerEl).setName("Device").setDesc(`${deviceName} \xB7 ${state.device_id}`);
+      let renameDraft = deviceName;
+      new Setting(containerEl).setName("Device name").setDesc(`Server device ${state.device_id}`).addText((text) => {
+        text.setValue(deviceName).onChange((value) => {
+          renameDraft = value;
+        });
+        if (text.inputEl) text.inputEl.maxLength = 80;
+      }).addButton((button) => button.setButtonText("Save name").onClick(async () => {
+        button.setDisabled(true);
+        setFeedback(renameFeedback, "Saving device name...", "muted");
+        try {
+          const renamed = await this.plugin.runExclusiveAction(() => this.plugin.client.renameCurrentDevice(renameDraft));
+          renameDraft = renamed;
+          setFeedback(renameFeedback, `Device renamed to ${renamed}.`, "success");
+          new Notice(`obts device renamed to ${renamed}.`);
+        } catch (error) {
+          setFeedback(renameFeedback, error instanceof Error ? error.message : "Unable to rename this device.", "error");
+        } finally {
+          button.setDisabled(false);
+        }
+      }));
+      const renameFeedback = containerEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
       new Setting(containerEl).setName("Status").setDesc(state.last_error_code ? blockStatusLabel(state.last_error_code) : state.status_label || "Checking");
       new Setting(containerEl).setName("Actions").addButton(
         (button) => button.setButtonText("Sync now").setCta().onClick(async () => {
@@ -25607,8 +25676,8 @@ var ObtsSettingTab = class extends PluginSettingTab {
       const recoveryFeedback = containerEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
     } else {
       new Setting(containerEl).setName("Status").setDesc("Ready to connect this vault");
-      new Setting(containerEl).setName("Device name").addText(
-        (text) => text.setValue(this.plugin.settings.deviceName).onChange(async (value) => {
+      new Setting(containerEl).setName("Device name").addText((text) => {
+        text.setValue(this.plugin.settings.deviceName).onChange(async (value) => {
           try {
             await this.plugin.runExclusiveAction(async () => {
               this.plugin.settings.deviceName = value.trim();
@@ -25618,14 +25687,22 @@ var ObtsSettingTab = class extends PluginSettingTab {
             new Notice(error instanceof Error ? error.message : "Unable to update the device name.");
             await this.display();
           }
-        })
-      );
+        });
+        if (text.inputEl) text.inputEl.maxLength = 80;
+      });
       new Setting(containerEl).setName("Sync setup").setDesc("Authenticate in your browser, then choose how this local vault should connect.").addButton(
         (button) => button.setButtonText("Set up sync").setCta().onClick(() => new ObtsOnboardingModal(this.app, this.plugin).open())
       );
     }
   }
 };
+function normalizeDisplayName(value) {
+  const normalized = typeof value === "string" ? value.normalize("NFC").trim() : "";
+  if (!normalized || Array.from(normalized).length > 80 || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(normalized)) {
+    throw new Error("Name must contain 1 to 80 visible characters.");
+  }
+  return normalized;
+}
 function diagnosticSharingDescription(serverUrl) {
   const destination = normalizedServerDestination(serverUrl) || "the configured obts backend";
   return `When obts fails, send a small sanitized technical report to ${destination}. Reports include plugin and platform versions, the failing operation, fixed error codes, and diagnostic checkpoints. They never include note content, vault or file names, paths, credentials, Git objects, packfiles, or raw logs.`;

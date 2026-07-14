@@ -11,6 +11,8 @@ import {
 
 const COMMIT_ID_PATTERN = /^[0-9a-f]{40}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
+export const DISPLAY_NAME_MAX_LENGTH = 80;
+const NON_DISPLAY_CHARACTER_PATTERN = /[\p{Cc}\p{Cf}\p{Cs}]/u;
 
 export class ValidationError extends Error {
   readonly code: string;
@@ -35,6 +37,32 @@ export function readString(record: Record<string, unknown>, field: string): stri
     throw new ValidationError('invalid_request', `Missing or invalid field: ${field}.`, { field });
   }
   return value;
+}
+
+export function normalizeDisplayName(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const normalized = value.normalize('NFC').trim();
+  if (
+    normalized.length === 0 ||
+    Array.from(normalized).length > DISPLAY_NAME_MAX_LENGTH ||
+    NON_DISPLAY_CHARACTER_PATTERN.test(normalized)
+  ) {
+    return null;
+  }
+  return normalized;
+}
+
+export function readDisplayName(record: Record<string, unknown>, field: string): string {
+  const normalized = normalizeDisplayName(record[field]);
+  if (normalized === null) {
+    throw new ValidationError('invalid_display_name', 'Name must contain 1 to 80 visible characters.', {
+      field,
+      max_length: DISPLAY_NAME_MAX_LENGTH
+    });
+  }
+  return normalized;
 }
 
 export function readOptionalString(record: Record<string, unknown>, field: string): string | undefined {

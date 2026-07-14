@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Obsidian True Sync Phase 3 API
-  version: 0.3.5
+  version: 0.3.6
   summary: Deployable note history, restore, diagnostics, and maintenance.
 servers:
   - url: /api/v1
@@ -233,6 +233,35 @@ paths:
       responses:
         "201":
           description: Vault metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VaultSummary"
+        "400":
+          $ref: "#/components/responses/Error"
+  /vaults/{vault_id}:
+    patch:
+      summary: Rename an owned vault's server display metadata without renaming any device folder.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - $ref: "#/components/parameters/CsrfHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VaultNameRequest"
+      responses:
+        "200":
+          description: Renamed vault metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VaultSummary"
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
   /vaults/{vault_id}/main:
     get:
       summary: Return current server main for an owned vault.
@@ -478,6 +507,30 @@ paths:
           $ref: "#/components/responses/Error"
         "409":
           $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/devices/{device_id}:
+    patch:
+      summary: Rename a device belonging to an owned vault.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - $ref: "#/components/parameters/DeviceId"
+        - $ref: "#/components/parameters/CsrfHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceNameRequest"
+      responses:
+        "200":
+          description: Renamed device metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceNameResponse"
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
   /vaults/{vault_id}/devices/{device_id}/revoke:
     post:
       summary: Revoke a paired device and its device tokens after recent dashboard auth.
@@ -540,6 +593,27 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeviceSelfResponse"
+        "404":
+          $ref: "#/components/responses/Error"
+    patch:
+      summary: Rename the current paired device using its bearer credential.
+      security:
+        - deviceBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceNameRequest"
+      responses:
+        "200":
+          description: Renamed current-device metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceNameResponse"
+        "400":
+          $ref: "#/components/responses/Error"
         "404":
           $ref: "#/components/responses/Error"
   /device/diagnostic-events:
@@ -1177,6 +1251,11 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorEnvelope"
   schemas:
+    DisplayName:
+      type: string
+      minLength: 1
+      maxLength: 80
+      description: NFC-normalized, trimmed display name without control characters.
     SetupRequest:
       type: object
       required: [username, password]
@@ -1280,12 +1359,55 @@ components:
         expires_at:
           type: string
           format: date-time
-    CreateVaultRequest:
+    VaultSummary:
+      type: object
+      required: [vault_id, owner_user_id, display_name, current_main, status, created_at, updated_at]
+      properties:
+        vault_id:
+          type: string
+        owner_user_id:
+          type: string
+        display_name:
+          $ref: "#/components/schemas/DisplayName"
+        current_main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        status:
+          type: string
+          enum: [active, blocked_integrity]
+        root_commit:
+          oneOf:
+            - type: "null"
+            - type: string
+              pattern: "^[0-9a-f]{40}$"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    VaultNameRequest:
       type: object
       required: [display_name]
       properties:
         display_name:
+          $ref: "#/components/schemas/DisplayName"
+    CreateVaultRequest:
+      $ref: "#/components/schemas/VaultNameRequest"
+    DeviceNameRequest:
+      type: object
+      required: [device_name]
+      properties:
+        device_name:
+          $ref: "#/components/schemas/DisplayName"
+    DeviceNameResponse:
+      type: object
+      required: [device_id, device_name]
+      properties:
+        device_id:
           type: string
+        device_name:
+          $ref: "#/components/schemas/DisplayName"
     ConnectionLocalSummary:
       type: object
       required: [has_content, syncable_file_count, syncable_bytes, has_detached_baseline]
@@ -1307,7 +1429,7 @@ components:
         plugin_version:
           type: string
         device_name:
-          type: string
+          $ref: "#/components/schemas/DisplayName"
         local_vault_name:
           type: string
         local_summary:
@@ -1392,7 +1514,7 @@ components:
         plugin_version:
           type: string
         device_name:
-          type: string
+          $ref: "#/components/schemas/DisplayName"
         local_vault_name:
           type: string
         local_summary:
@@ -1449,7 +1571,7 @@ components:
         vault_id:
           type: string
         display_name:
-          type: string
+          $ref: "#/components/schemas/DisplayName"
     CompleteConnectionRequest:
       type: object
       required: [mode, expected_main]
@@ -1516,7 +1638,7 @@ components:
         device_id:
           type: string
         device_name:
-          type: string
+          $ref: "#/components/schemas/DisplayName"
         device_ref:
           type: string
         server_device_ref:
@@ -1679,10 +1801,12 @@ components:
             - type: object
     DeviceStatusResponse:
       type: object
-      required: [status, plugin]
+      required: [status, device_name, plugin]
       properties:
         status:
           const: ok
+        device_name:
+          $ref: "#/components/schemas/DisplayName"
         plugin:
           $ref: "#/components/schemas/PluginCompatibility"
     PluginCompatibility:
@@ -2361,7 +2485,7 @@ components:
           type: string
           pattern: "^[0-9a-f]{40}$"
         device_name:
-          type: string
+          $ref: "#/components/schemas/DisplayName"
         path_conflicts:
           type: array
           items:

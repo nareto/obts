@@ -47,6 +47,21 @@ class BrowserSession {
     return { status: response.status, body: parsed };
   }
 
+  async patch<T extends Json>(path: string, body: Json, csrf = true): Promise<{ status: number; body: T }> {
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      method: 'PATCH',
+      headers: {
+        'content-type': 'application/json',
+        ...(this.cookie ? { cookie: this.cookie } : {}),
+        ...(csrf && this.csrf ? { 'x-obts-csrf': this.csrf } : {})
+      },
+      body: JSON.stringify(body)
+    });
+    this.captureCookie(response);
+    const parsed = (await response.json()) as T;
+    return { status: response.status, body: parsed };
+  }
+
   async get<T extends Json>(path: string): Promise<{ status: number; body: T }> {
     const response = await fetch(`${this.baseUrl}${path}`, {
       headers: {
@@ -1557,6 +1572,103 @@ describe('Phase 1 sync without conflict resolution', () => {
     const db = await server.store.snapshot();
     expect(db.tokens.filter((token) => token.user_id === user.body.user_id && token.revoked_at === null)).toEqual([]);
     expect(db.devices.find((device) => device.device_id === state.device_id)?.status).toBe('revoked');
+  });
+
+  it('renames vault and device display metadata with owner scoping, validation, audit, and plugin reconciliation', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const beforeVault = await admin.get<{ vaults: Array<{ vault_id: string; display_name: string; current_main: string }> }>('/api/v1/vaults');
+    const originalMain = beforeVault.body.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main;
+
+    const missingCsrf = await admin.patch<{ error: { code: string } }>(
+      `/api/v1/vaults/${admin.vaultId}`,
+      { display_name: 'No CSRF' },
+      false
+    );
+    expect(missingCsrf.status).toBe(403);
+    expect(missingCsrf.body.error.code).toBe('csrf_required');
+
+    const renamedVault = await admin.patch<{ vault_id: string; display_name: string; current_main: string }>(
+      `/api/v1/vaults/${admin.vaultId}`,
+      { display_name: '  Cafe\u0301 notes  ' }
+    );
+    expect(renamedVault.status).toBe(200);
+    expect(renamedVault.body).toMatchObject({ vault_id: admin.vaultId, display_name: 'Café notes', current_main: originalMain });
+    expect(await server.git.getRef(admin.vaultId, 'refs/heads/main')).toBe(originalMain);
+
+    for (const displayName of ['', 'x'.repeat(81), 'bad\nname', 'zero\u200bwidth', 'spoof\u202ename']) {
+      const invalid = await admin.patch<{ error: { code: string } }>(`/api/v1/vaults/${admin.vaultId}`, {
+        display_name: displayName
+      });
+      expect(invalid.status).toBe(400);
+      expect(invalid.body.error.code).toBe('invalid_display_name');
+    }
+
+    const deviceDir = join(root, 'rename-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'phone');
+    const originalState = await plugin.readState();
+    const ownerRename = await admin.patch<{ device_id: string; device_name: string }>(
+      `/api/v1/vaults/${admin.vaultId}/devices/${originalState.device_id}`,
+      { device_name: 'Desk phone' }
+    );
+    expect(ownerRename).toMatchObject({ status: 200, body: { device_id: originalState.device_id, device_name: 'Desk phone' } });
+
+    await plugin.reportDeviceStatus();
+    expect(await plugin.readState()).toMatchObject({ device_name: 'Desk phone' });
+    expect(await plugin.renameCurrentDevice('  Travel phone  ')).toBe('Travel phone');
+    expect(await plugin.readState()).toMatchObject({ device_name: 'Travel phone' });
+
+    const token = await readDeviceToken(deviceDir);
+    const self = await fetch(`${baseUrl}/api/v1/device/self`, {
+      headers: { authorization: `Bearer ${token}` }
+    });
+    expect(self.status).toBe(200);
+    expect(await self.json()).toMatchObject({ device_id: originalState.device_id, device_name: 'Travel phone' });
+    const invalidSelfRename = await fetch(`${baseUrl}/api/v1/device/self`, {
+      method: 'PATCH',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ device_name: 'd'.repeat(81) })
+    });
+    expect(invalidSelfRename.status).toBe(400);
+    expect(await invalidSelfRename.json()).toMatchObject({ error: { code: 'invalid_display_name' } });
+
+    const db = await server.store.snapshot();
+    expect(db.audit_log).toContainEqual(expect.objectContaining({
+      action: 'vault_renamed',
+      actor_user_id: expect.any(String),
+      actor_device_id: null,
+      vault_id: admin.vaultId,
+      resource_id: admin.vaultId
+    }));
+    expect(db.audit_log.filter((row) => row.action === 'device_renamed')).toEqual([
+      expect.objectContaining({ actor_device_id: null, resource_id: originalState.device_id }),
+      expect.objectContaining({ actor_device_id: originalState.device_id, resource_id: originalState.device_id })
+    ]);
+    const reloaded = new MetadataStore(server.config.dataDir);
+    await reloaded.initialize();
+    const persisted = await reloaded.snapshot();
+    expect(persisted.vaults.find((vault) => vault.vault_id === admin.vaultId)?.display_name).toBe('Café notes');
+    expect(persisted.devices.find((device) => device.device_id === originalState.device_id)?.device_name).toBe('Travel phone');
+  });
+
+  it('normalizes legacy persisted vault and device names before serving the new contract', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'legacy-name-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'legacy-device');
+    const state = await plugin.readState();
+    await server.store.mutate((db) => {
+      const vault = db.vaults.find((candidate) => candidate.vault_id === admin.vaultId)!;
+      const device = db.devices.find((candidate) => candidate.device_id === state.device_id)!;
+      vault.display_name = `  ${'v'.repeat(90)}\u202e  `;
+      device.device_name = '\u200b';
+    });
+
+    const reloaded = new MetadataStore(server.config.dataDir);
+    await reloaded.initialize();
+    const migrated = await reloaded.snapshot();
+    expect(migrated.vaults.find((vault) => vault.vault_id === admin.vaultId)?.display_name).toBe('v'.repeat(80));
+    expect(migrated.devices.find((device) => device.device_id === state.device_id)?.device_name).toBe('Unnamed device');
   });
 
   it('revokes individual devices and supports one-time password reset tokens', async () => {
@@ -4697,6 +4809,10 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('/sync/unpair');
     expect(pluginMain).not.toContain('settings.pairingToken =');
     expect(pluginMain).toContain('device_name: this.plugin.settings.deviceName || "Obsidian device"');
+    expect(pluginMain).toContain('async renameCurrentDevice(deviceName)');
+    expect(pluginMain).toContain('method: "PATCH"');
+    expect(pluginMain).toContain('await this.applyServerDeviceName(result.device_name, false)');
+    expect(pluginMain).toContain('setButtonText("Save name")');
     expect(pluginMain).toContain('throwIfSyncBlocked(state)');
     expect(pluginMain).toContain('state.last_error_code === "replace_local_with_server_required"');
     expect(pluginMain).not.toContain('Automatic sync');
@@ -4753,6 +4869,18 @@ describe('Phase 1 sync without conflict resolution', () => {
       expect(response.status).toBe(404);
       expect(response.body.error.code).toBe('not_found');
     }
+
+    const crossUserVaultRename = await other.patch<{ error: { code: string } }>(`/api/v1/vaults/${admin.vaultId}`, {
+      display_name: 'Not mine'
+    });
+    expect(crossUserVaultRename.status).toBe(404);
+    expect(crossUserVaultRename.body.error.code).toBe('not_found');
+    const crossUserDeviceRename = await other.patch<{ error: { code: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/devices/${otherPluginState.device_id}`,
+      { device_name: 'Not mine either' }
+    );
+    expect(crossUserDeviceRename.status).toBe(404);
+    expect(crossUserDeviceRename.body.error.code).toBe('not_found');
 
     const form = new FormData();
     form.append(

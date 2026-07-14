@@ -11,6 +11,7 @@ import {
   type ConnectionStatusResponse,
   type CreateConnectionRequest,
   type CreateConnectionResponse,
+  type DeviceNameResponse,
   type DevicePullManifest,
   type DevicePushManifest,
   type DeviceSelfResponse,
@@ -116,6 +117,18 @@ export class TransportClient {
       }
     });
     return await readJsonOrThrow<DeviceSelfResponse>(response);
+  }
+
+  async renameCurrentDevice(deviceToken: string, deviceName: string): Promise<DeviceNameResponse> {
+    const response = await fetchWithTimeout(this.url('/api/v1/device/self'), {
+      method: 'PATCH',
+      headers: {
+        authorization: `Bearer ${deviceToken}`,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({ device_name: deviceName })
+    });
+    return await readJsonOrThrow<DeviceNameResponse>(response);
   }
 
   async reportDeviceStatus(input: {

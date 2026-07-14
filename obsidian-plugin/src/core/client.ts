@@ -19,6 +19,7 @@ import {
   type PushResult,
   type SyncCapabilities
 } from '../../../src/shared/types.js';
+import { readDisplayName } from '../../../src/shared/validators.js';
 import { PLUGIN_VERSION } from '../version.js';
 import { LocalGitEngine } from './localGit.js';
 import { ApplyLockActiveError, type ApplyJournal, RecoveryManager, sha256File } from './recovery.js';
@@ -220,9 +221,11 @@ export class ObtsPluginClient {
     await this.flushEditorBuffersToDisk();
     const summary = await this.localSnapshotSummary();
     const existing = await this.readExistingState();
+    const deviceName = readDisplayName({ device_name: this.settings.deviceName }, 'device_name');
+    this.settings.deviceName = deviceName;
     const connection = await this.transport.createConnection({
       plugin_version: PLUGIN_VERSION,
-      device_name: this.settings.deviceName,
+      device_name: deviceName,
       local_vault_name: localVaultName,
       local_summary: {
         has_content: summary.fileCount > 0,
@@ -1479,6 +1482,22 @@ export class ObtsPluginClient {
     });
   }
 
+  async renameCurrentDevice(deviceName: string): Promise<string> {
+    await this.initialize();
+    const normalized = readDisplayName({ device_name: deviceName }, 'device_name');
+    const state = await this.readState();
+    if (!state.vault_id || !state.device_id) {
+      throw new PluginBlockedError('not_paired', 'Device is not paired.');
+    }
+    const token = await this.readDeviceToken();
+    const renamed = await this.transport.renameCurrentDevice(token, normalized);
+    if (renamed.device_id !== state.device_id) {
+      throw new PluginBlockedError('device_identity_mismatch', 'Server device identity does not match local state.');
+    }
+    await this.applyServerDeviceName(renamed.device_name);
+    return renamed.device_name;
+  }
+
   async reportDeviceStatus(): Promise<void> {
     const state = await this.readState();
     if (!state.vault_id || !state.device_id) {
@@ -1491,7 +1510,7 @@ export class ObtsPluginClient {
       return;
     }
     const queue = await this.readQueue();
-    await this.transport.reportDeviceStatus({
+    const result = await this.transport.reportDeviceStatus({
       vaultId: state.vault_id,
       deviceToken: token,
       report: {
@@ -1507,6 +1526,15 @@ export class ObtsPluginClient {
         }
       }
     });
+    await this.applyServerDeviceName(result.device_name);
+  }
+
+  private async applyServerDeviceName(deviceName: string): Promise<void> {
+    const state = await this.readState();
+    if (state.device_name !== deviceName) {
+      await this.writeState({ ...state, device_name: deviceName, updated_at: nowIso() });
+    }
+    this.settings.deviceName = deviceName;
   }
 
   async readState(): Promise<LocalPluginState> {

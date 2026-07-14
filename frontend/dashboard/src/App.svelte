@@ -41,6 +41,9 @@
   let vaultId = '';
   let newVaultName = '';
   let createVaultOpen = false;
+  let renameVaultId = '';
+  let renameVaultName = '';
+  let renameVaultOpen = false;
   let dashboard: DashboardSummary | null = null;
   let diagnostics: DiagnosticEventsResponse | null = null;
   let conflicts: DashboardConflict[] = [];
@@ -232,6 +235,34 @@
     await refreshVault();
   }
 
+  function openVaultRename() {
+    if (!selectedVault) return;
+    createVaultOpen = false;
+    renameVaultId = selectedVault.vault_id;
+    renameVaultName = selectedVault.display_name;
+    renameVaultOpen = true;
+  }
+
+  async function renameVault() {
+    if (!renameVaultId || !renameVaultName.trim()) return;
+    actionError = '';
+    busy = true;
+    try {
+      const renamed = await api.renameVault(renameVaultId, renameVaultName);
+      vaults = vaults.map((vault) => vault.vault_id === renamed.vault_id ? renamed : vault);
+      if (dashboard?.vault.vault_id === renamed.vault_id) {
+        dashboard = { ...dashboard, vault: { ...dashboard.vault, display_name: renamed.display_name } };
+      }
+      renameVaultOpen = false;
+      renameVaultId = '';
+      notice = `Vault renamed to ${renamed.display_name}.`;
+    } catch (error) {
+      actionError = error instanceof Error ? error.message : 'Unable to rename this vault.';
+    } finally {
+      busy = false;
+    }
+  }
+
   async function loadReview(conflictId: string) {
     if (!vaultId) return;
     selectedConflictId = conflictId;
@@ -316,6 +347,27 @@
     if (!connectionReview) return;
     await api.denyConnection(connectionReview.connection_id);
     connectionReview = { ...connectionReview, status: 'denied' };
+  }
+
+  async function renameDevice(device: DashboardDevice, deviceName: string) {
+    if (!vaultId) return;
+    actionError = '';
+    const renamed = await api.renameDevice(vaultId, device.device_id, deviceName);
+    if (dashboard) {
+      dashboard = {
+        ...dashboard,
+        devices: dashboard.devices.map((candidate) =>
+          candidate.device_id === renamed.device_id ? { ...candidate, device_name: renamed.device_name } : candidate
+        )
+      };
+    }
+    conflicts = conflicts.map((conflict) =>
+      conflict.device_id === renamed.device_id ? { ...conflict, device_name: renamed.device_name } : conflict
+    );
+    if (review?.conflict.device_id === renamed.device_id) {
+      review = { ...review, device_name: renamed.device_name };
+    }
+    notice = `Device renamed to ${renamed.device_name}.`;
   }
 
   async function revokeDevice(device: DashboardDevice) {
@@ -502,7 +554,12 @@
 {:else}
   <div class="shell">
     <aside class="app-sidebar" class:open={mobileNavOpen}>
-      <select bind:value={vaultId} on:change={refreshVault} aria-label="Current vault">
+      <select
+        bind:value={vaultId}
+        disabled={busy}
+        on:change={() => { renameVaultOpen = false; renameVaultId = ''; void refreshVault(); }}
+        aria-label="Current vault"
+      >
         {#each vaults as vault}
           <option value={vault.vault_id}>{vault.display_name}</option>
         {/each}
@@ -529,18 +586,33 @@
         </div>
         <span class="refresh">Refreshed {lastRefreshed ?? '-'}</span>
         <button class="secondary" on:click={refreshVault}>Refresh</button>
-        {#if page === 'Overview'}<button class="primary" on:click={() => { createVaultOpen = true; newVaultName = ''; }}>New vault</button>{/if}
+        {#if page === 'Overview'}
+          <button class="secondary" disabled={!selectedVault} on:click={openVaultRename}>Rename vault</button>
+          <button class="primary" on:click={() => { renameVaultOpen = false; createVaultOpen = true; newVaultName = ''; }}>New vault</button>
+        {/if}
       </header>
 
       {#if notice}<p class="notice">{notice}</p>{/if}
       {#if actionError}<p class="action-error">{actionError}</p>{/if}
 
-      {#if createVaultOpen}
+      {#if renameVaultOpen}
+        <main class="page">
+          <section class="panel full">
+            <h2>Rename vault</h2>
+            <p class="muted">This changes server display metadata only. It does not rename the physical Obsidian vault folder on any device.</p>
+            <form class="inline-form" on:submit|preventDefault={renameVault}>
+              <label>Vault name<input bind:value={renameVaultName} maxlength="80" disabled={busy} /></label>
+              <button type="button" class="secondary" disabled={busy} on:click={() => { renameVaultOpen = false; renameVaultId = ''; }}>Cancel</button>
+              <button class="primary" disabled={busy || !renameVaultName.trim()}>Save name</button>
+            </form>
+          </section>
+        </main>
+      {:else if createVaultOpen}
         <main class="page">
           <section class="panel full">
             <h2>Create vault</h2>
             <form class="inline-form" on:submit|preventDefault={createVault}>
-              <label>Vault name<input bind:value={newVaultName} /></label>
+              <label>Vault name<input bind:value={newVaultName} maxlength="80" /></label>
               <button type="button" class="secondary" on:click={() => (createVaultOpen = false)}>Cancel</button>
               <button class="primary">Create vault</button>
             </form>
@@ -551,7 +623,7 @@
           <section class="panel full">
             <h2>Create vault</h2>
             <form class="inline-form" on:submit|preventDefault={createVault}>
-              <label>Vault name<input bind:value={newVaultName} /></label>
+              <label>Vault name<input bind:value={newVaultName} maxlength="80" /></label>
               <button class="primary">Create vault</button>
             </form>
           </section>
@@ -564,7 +636,7 @@
           <Summary title="Health/readiness" value={dashboard.health.status === 'ready' ? 'Synced' : 'Integrity failure'} role={dashboard.health.status === 'ready' ? 'success' : 'danger'} detail={dashboard.health.detail ?? dashboard.health.git_version} />
           <section class="panel wide">
             <h2>Devices</h2>
-            <DeviceTable devices={dashboard.devices} nowMs={nowMs} onRevoke={revokeDevice} />
+            <DeviceTable devices={dashboard.devices} nowMs={nowMs} onRename={renameDevice} onRevoke={revokeDevice} />
           </section>
           <section class="panel narrow">
             <h2>Attention</h2>
@@ -597,7 +669,7 @@
         <main class="page">
           <section class="panel full">
             <h2>Devices</h2>
-            <DeviceTable devices={dashboard.devices} nowMs={nowMs} onRevoke={revokeDevice} />
+            <DeviceTable devices={dashboard.devices} nowMs={nowMs} onRename={renameDevice} onRevoke={revokeDevice} />
           </section>
         </main>
       {:else if page === 'Conflicts'}
