@@ -20,11 +20,18 @@ describe('mobile plugin artifact', () => {
     const manifest = JSON.parse(await readFile('obsidian-plugin/manifest.json', 'utf8')) as { isDesktopOnly: boolean };
     const artifact = await readFile('obsidian-plugin/main.js', 'utf8');
     const source = await readFile('obsidian-plugin/src/main.js', 'utf8');
+    const styles = await readFile('obsidian-plugin/styles.css', 'utf8');
 
     expect(manifest.isDesktopOnly).toBe(false);
     expect(artifact).not.toMatch(/require\(["'](?:node:|fs["']|path["']|crypto["']|child_process["']|os["'])/u);
     expect(artifact).not.toContain('requireDesktopVaultPath');
     expect(artifact).not.toContain('Git binary');
+    expect(styles).toContain('.obts-status--success');
+    expect(styles).toContain('.obts-status--active');
+    expect(styles).toContain('.obts-status--warning');
+    expect(styles).toContain('.obts-status--danger');
+    expect(styles).toContain('.obts-ribbon-status');
+    expect(styles).toContain('prefers-reduced-motion');
 
     const unresolvedRequires = [...artifact.matchAll(/require\(["']([^"']+)["']\)/gu)].map((match) => match[1]);
     expect([...new Set(unresolvedRequires)]).toEqual(['obsidian']);
@@ -40,24 +47,77 @@ describe('mobile plugin artifact', () => {
     const module = { exports: {} as unknown };
     const savedSettings: unknown[] = [];
     const requests: Array<Record<string, unknown>> = [];
+    const notices: string[] = [];
+    const openedUrls: string[] = [];
+    const openedSettingTabs: string[] = [];
+    type MockStatusItem = {
+      text: string;
+      classes: Set<string>;
+      attributes: Record<string, string>;
+      listeners: Record<string, Array<(event: any) => void>>;
+      setText: (value: string) => void;
+      classList: { add: (value: string) => void; remove: (value: string) => void };
+      setAttribute: (name: string, value: string) => void;
+      addEventListener: (name: string, listener: (event: any) => void) => void;
+    };
+    const createStatusItem = (): MockStatusItem => {
+      const classes = new Set<string>();
+      const attributes: Record<string, string> = {};
+      const listeners: Record<string, Array<(event: any) => void>> = {};
+      const item: MockStatusItem = {
+        text: '',
+        classes,
+        attributes,
+        listeners,
+        setText(value: string) { item.text = value; },
+        classList: {
+          add(value: string) { classes.add(value); },
+          remove(value: string) { classes.delete(value); }
+        },
+        setAttribute(name: string, value: string) { attributes[name] = value; },
+        addEventListener(name: string, listener: (event: any) => void) {
+          (listeners[name] ||= []).push(listener);
+        }
+      };
+      return item;
+    };
+    const statusItems: MockStatusItem[] = [];
+    const ribbonItems: MockStatusItem[] = [];
+    const ribbonActions: Array<() => void> = [];
     class Plugin {
       app: any;
+      manifest = { id: 'obts' };
       async loadData() { return {}; }
       async saveData(value: unknown) { savedSettings.push(value); }
-      addStatusBarItem() { return { setText() {} }; }
+      addStatusBarItem() {
+        const item = createStatusItem();
+        statusItems.push(item);
+        return item;
+      }
+      addRibbonIcon(_icon: string, _title: string, action: () => void) {
+        const item = createStatusItem();
+        ribbonItems.push(item);
+        ribbonActions.push(action);
+        return item;
+      }
       addSettingTab() {}
       addCommand() {}
       registerEvent() {}
       registerInterval(id: ReturnType<typeof setInterval>) { clearInterval(id); }
-      registerDomEvent() {}
+      registerDomEvent(target: any, name: string, listener: (event: any) => void) {
+        target.addEventListener?.(name, listener);
+      }
     }
     const obsidian = {
       Plugin,
       PluginSettingTab: class {},
       Setting: class {},
-      Notice: class {},
+      Notice: class {
+        constructor(message: string) { notices.push(message); }
+      },
       Modal: class {},
       Platform: {
+        isMobile: true,
         isIosApp: true,
         isAndroidApp: false,
         isMacOS: false,
@@ -92,6 +152,7 @@ describe('mobile plugin artifact', () => {
       clearTimeout,
       setInterval,
       clearInterval,
+      open: (url: string) => openedUrls.push(url),
       document: { hidden: false },
       console
     });
@@ -110,9 +171,61 @@ describe('mobile plugin artifact', () => {
         getName: () => 'Mobile Test Vault',
         on: () => ({})
       },
-      workspace: { getLeavesOfType: () => [] }
+      workspace: { getLeavesOfType: () => [] },
+      setting: {
+        open: () => undefined,
+        openTabById: (id: string) => openedSettingTabs.push(id)
+      }
     };
     await (plugin as any).onload();
+
+    const statusItem = statusItems[0]!;
+    const ribbonItem = ribbonItems[0]!;
+    (plugin as any).setStatus('Offline');
+    const degradedTimer = (plugin as any).degradedStatusTimer;
+    (plugin as any).setStatus('Checking');
+    expect((plugin as any).degradedStatusTimer).toBe(degradedTimer);
+    (plugin as any).setStatus('Offline');
+    expect((plugin as any).degradedStatusTimer).toBe(degradedTimer);
+    (plugin as any).setStatus('Uploading 0/1');
+    expect((plugin as any).degradedStatusTimer).toBeNull();
+    (plugin as any).setStatus('Synced');
+    expect((plugin as any).degradedStatusTimer).toBeNull();
+    (plugin as any).degradedStatusNotifiedBase = 'Offline';
+    (plugin as any).setStatus('Offline');
+    expect((plugin as any).degradedStatusTimer).toBeNull();
+    (plugin as any).setStatus('Synced');
+    const silentNoticeCount = notices.length;
+    (plugin as any).setStatus('Unsafe local state', { notify: false });
+    expect(statusItem.classes).toContain('obts-status--danger');
+    expect(notices).toHaveLength(silentNoticeCount);
+    (plugin as any).setStatus('Not paired');
+
+    const initialNoticeCount = notices.length;
+    (plugin as any).setStatus('Uploading 2/4');
+    expect(statusItem.text).toBe('obts: Uploading 2/4');
+    expect(statusItem.classes).toContain('obts-status');
+    expect(statusItem.classes).toContain('obts-status--active');
+    expect(statusItem.attributes['data-obts-status']).toBe('uploading');
+    expect(ribbonItem.classes).toContain('obts-ribbon-status');
+    expect(ribbonItem.classes).toContain('obts-status--active');
+    expect(ribbonItem.attributes['data-obts-status']).toBe('uploading');
+    (plugin as any).setStatus('Review needed');
+    expect(statusItem.classes).toContain('obts-status--warning');
+    expect(statusItem.attributes.title).toContain('conflict dashboard');
+    expect(notices).toHaveLength(initialNoticeCount + 1);
+    (plugin as any).setStatus('Review needed');
+    expect(notices).toHaveLength(initialNoticeCount + 1);
+    ribbonActions[0]!();
+    expect(openedUrls).toEqual(['http://127.0.0.1:3000/dashboard']);
+    (plugin as any).setStatus('Synced');
+    expect(statusItem.classes).toContain('obts-status--success');
+    expect(ribbonItem.classes).toContain('obts-status--success');
+    expect(notices.at(-1)).toBe('obts: Sync is healthy again.');
+    let prevented = false;
+    statusItem.listeners.keydown![0]!({ key: 'Enter', preventDefault: () => { prevented = true; } });
+    expect(prevented).toBe(true);
+    expect(openedSettingTabs).toEqual(['obts']);
 
     expect(await adapter.exists('.obts/git/HEAD')).toBe(true);
     expect(await adapter.exists('.obts/state.json')).toBe(true);

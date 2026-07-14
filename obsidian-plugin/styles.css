@@ -1,5 +1,103 @@
 .obts-status {
-  font-size: 13px;
+  align-items: center;
+  border-radius: 999px;
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 600;
+  gap: 6px;
+  min-height: 22px;
+  padding: 0 8px;
+  transition: background-color 160ms ease, color 160ms ease;
+}
+
+.obts-status::before {
+  background: currentColor;
+  border-radius: 50%;
+  content: "";
+  flex: 0 0 auto;
+  height: 7px;
+  width: 7px;
+}
+
+.obts-status:hover {
+  background: var(--background-modifier-hover);
+}
+
+.obts-status:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
+}
+
+.obts-status.obts-status--success {
+  background: var(--background-modifier-success);
+  color: var(--text-success);
+}
+
+.obts-status.obts-status--active {
+  color: var(--interactive-accent);
+}
+
+.obts-status.obts-status--active::before {
+  animation: obts-status-pulse 1.1s ease-in-out infinite;
+}
+
+.obts-status.obts-status--warning {
+  background: var(--background-modifier-warning);
+  color: var(--color-orange);
+}
+
+.obts-status.obts-status--danger {
+  background: var(--background-modifier-error);
+  color: var(--text-error);
+}
+
+.obts-status.obts-status--neutral {
+  color: var(--text-muted);
+}
+
+.obts-ribbon-status.obts-status--success {
+  color: var(--text-success);
+}
+
+.obts-ribbon-status.obts-status--active {
+  color: var(--interactive-accent);
+}
+
+.obts-ribbon-status.obts-status--warning {
+  color: var(--color-orange);
+}
+
+.obts-ribbon-status.obts-status--danger {
+  color: var(--text-error);
+}
+
+.obts-ribbon-status.obts-status--neutral {
+  color: var(--text-muted);
+}
+
+.obts-ribbon-status.obts-status--active svg {
+  animation: obts-status-pulse 1.1s ease-in-out infinite;
+  transform-origin: center;
+}
+
+@keyframes obts-status-pulse {
+  0%, 100% {
+    opacity: 0.35;
+    transform: scale(0.8);
+  }
+
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .obts-status.obts-status--active::before,
+  .obts-ribbon-status.obts-status--active svg {
+    animation: none;
+  }
 }
 
 .obts-settings-section-header {

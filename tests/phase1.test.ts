@@ -4667,6 +4667,14 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('/sync/events?after=');
     expect(pluginMain).toContain('/sync/device-status');
     expect(pluginMain).toContain('this.setStatus("Offline")');
+    expect(pluginMain).toContain('statusPresentation');
+    expect(pluginMain).toContain('statusAttentionMessage');
+    expect(pluginMain).toContain('shouldShowRoutineStatusNotice');
+    expect(pluginMain).toContain('handleStatusClick');
+    expect(pluginMain).toContain('addRibbonIcon');
+    expect(pluginMain).toContain('scheduleDegradedStatusNotice');
+    expect(pluginMain).toContain('Uploading ${uploadedChunks}/${groups.length}');
+    expect(pluginMain).toContain('Applying ${completed}/${total}');
     expect(pluginMain).toContain('obts-settings-section-header');
     expect(pluginMain).toContain('obts-status-pill');
     expect(pluginMain).toContain('obts-feedback');

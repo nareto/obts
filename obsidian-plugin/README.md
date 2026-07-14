@@ -28,6 +28,13 @@ A plugin hot reload never steals an active vault-operation lease. A replacement
 waits for the prior operation to finish and, if it cannot quiesce safely, asks
 for a full Obsidian restart instead of allowing overlapping writes.
 
+The desktop status-bar indicator remains visible while Obsidian is active, with
+a matching mobile ribbon indicator where the status bar is unavailable. They
+show healthy, active, warning, and blocked states; report determinate
+upload/apply steps when available; and open the dashboard for conflict review
+or plugin settings for other states. Actionable transitions produce one notice,
+while brief routine polling and catch-up do not.
+
 Commands:
 
 - `Set up sync`

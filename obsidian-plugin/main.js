@@ -21761,10 +21761,12 @@ var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var fsp = null;
 var API_VERSION = "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = "0.4.4";
+var PLUGIN_VERSION = "0.4.5";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var SYNC_STALE_MS = 2 * 60 * 1e3;
+var STATUS_LAG_NOTICE_DELAY_MS = 30 * 1e3;
+var STATUS_NOTICE_DURATION_MS = 15 * 1e3;
 var RETIRED_OPERATION_GRACE_MS = 1500;
 var PLUGIN_UPDATE_URL = "obsidian://brat?plugin=nareto%2Fobts";
 var DIAGNOSTIC_CONSENT_VERSION = 1;
@@ -21789,7 +21791,32 @@ module.exports = class ObtsPlugin extends Plugin {
       this.settings.diagnosticConsentVersion = 0;
       await this.saveData(this.settings);
     }
+    this.currentStatusLabel = null;
+    this.statusNeedsRecoveryNotice = false;
+    this.degradedStatusTimer = null;
+    this.degradedStatusBase = null;
+    this.degradedStatusNotifiedBase = null;
     this.status = this.addStatusBarItem();
+    this.mobileStatus = null;
+    if (this.status) {
+      if (this.status.classList) this.status.classList.add("obts-status");
+      if (typeof this.status.setAttribute === "function") {
+        this.status.setAttribute("role", "button");
+        this.status.setAttribute("tabindex", "0");
+      }
+      if (typeof this.registerDomEvent === "function") {
+        this.registerDomEvent(this.status, "click", () => this.handleStatusClick());
+        this.registerDomEvent(this.status, "keydown", (event) => {
+          if (event.key !== "Enter" && event.key !== " ") return;
+          event.preventDefault();
+          this.handleStatusClick();
+        });
+      }
+    }
+    if (Platform && Platform.isMobile && typeof this.addRibbonIcon === "function") {
+      this.mobileStatus = this.addRibbonIcon("refresh-cw", "obts sync status", () => this.handleStatusClick());
+      if (this.mobileStatus && this.mobileStatus.classList) this.mobileStatus.classList.add("obts-ribbon-status");
+    }
     this.syncQueued = false;
     this.syncRunning = false;
     this.syncRunningSince = null;
@@ -21828,30 +21855,24 @@ module.exports = class ObtsPlugin extends Plugin {
       id: "obts-sync-once",
       name: "Sync once",
       callback: async () => {
-        await this.runUserAction(async () => {
-          const result = await this.syncOnceOrPollResolvedConflict({ confirmInitialImport: false });
-          new Notice(`obts: ${result.status}`);
-        });
+        const result = await this.runUserAction(() => this.syncOnceOrPollResolvedConflict({ confirmInitialImport: false }));
+        if (result && shouldShowRoutineStatusNotice(result.status)) new Notice(`obts: ${result.status}`);
       }
     });
     this.addCommand({
       id: "obts-replace-local-with-server",
       name: "Replace local with server state",
       callback: async () => {
-        await this.runUserAction(async () => {
-          const result = await this.client.replaceLocalWithServer();
-          new Notice(`obts: ${result.status}`);
-        });
+        const result = await this.runUserAction(() => this.client.replaceLocalWithServer());
+        if (result && shouldShowRoutineStatusNotice(result.status)) new Notice(`obts: ${result.status}`);
       }
     });
     this.addCommand({
       id: "obts-rebuild-from-server-main",
       name: "Rebuild from server main",
       callback: async () => {
-        await this.runUserAction(async () => {
-          const result = await this.client.rebuildFromServerMain();
-          new Notice(`obts: ${result.status}`);
-        });
+        const result = await this.runUserAction(() => this.client.rebuildFromServerMain());
+        if (result && shouldShowRoutineStatusNotice(result.status)) new Notice(`obts: ${result.status}`);
       }
     });
     this.addCommand({
@@ -21865,13 +21886,13 @@ module.exports = class ObtsPlugin extends Plugin {
       id: "obts-reset-local-pairing-state",
       name: "Reset local pairing state",
       callback: async () => {
-        await this.runUserAction(async () => {
+        const result = await this.runUserAction(async () => {
           if (!window.confirm("Reset local obts pairing state? This removes local sync credentials after writing a recovery bundle when local files exist. Re-pair this device afterwards.")) {
             return;
           }
-          const result = await this.client.resetLocalPairingState();
-          new Notice(`obts: ${result.status}`);
+          return await this.client.resetLocalPairingState();
         });
+        if (result && shouldShowRoutineStatusNotice(result.status)) new Notice(`obts: ${result.status}`);
       }
     });
     this.registerEvent(this.app.vault.on("create", (file) => this.queueSyncFromWatcher(file && file.path)));
@@ -21902,6 +21923,7 @@ module.exports = class ObtsPlugin extends Plugin {
       window.clearTimeout(this.retiredOperationTimer);
       this.retiredOperationTimer = null;
     }
+    this.clearDegradedStatusTimer();
   }
   async initializeClient() {
     if (this.clientReady) return;
@@ -22047,10 +22069,86 @@ module.exports = class ObtsPlugin extends Plugin {
     const prefix = compatibility.update_required ? "obts plugin update required" : "obts plugin update available";
     new Notice(`${prefix}: ${compatibility.recommended_version}. Run \u201CUpdate plugin with BRAT\u201D from the command palette.`, 15e3);
   }
-  setStatus(label) {
-    if (this.status) {
-      this.status.setText(`obts: ${label || "Checking"}`);
+  setStatus(label, options = {}) {
+    const presentation = statusPresentation(label);
+    const previousBase = statusBaseLabel(this.currentStatusLabel);
+    this.currentStatusLabel = presentation.label;
+    if (this.status) this.status.setText(`obts: ${presentation.label}`);
+    for (const element of [this.status, this.mobileStatus]) {
+      if (!element) continue;
+      if (element.classList) {
+        for (const tone of ["success", "active", "warning", "danger", "neutral"]) {
+          element.classList.remove(`obts-status--${tone}`);
+        }
+        element.classList.add(`obts-status--${presentation.tone}`);
+      }
+      if (typeof element.setAttribute === "function") {
+        element.setAttribute("title", presentation.title);
+        element.setAttribute("aria-label", `obts sync status: ${presentation.label}. ${presentation.action}`);
+        element.setAttribute("data-obts-status", presentation.base.toLowerCase().replace(/ /gu, "-"));
+      }
     }
+    this.handleStatusTransition(previousBase, presentation.base, options.notify !== false);
+  }
+  handleStatusTransition(previousBase, nextBase, notify) {
+    const attentionMessage = statusAttentionMessage(nextBase);
+    if (attentionMessage && previousBase !== nextBase) {
+      this.statusNeedsRecoveryNotice = true;
+      if (notify) new Notice(attentionMessage, STATUS_NOTICE_DURATION_MS);
+    }
+    if (nextBase === "Offline" || nextBase === "Behind") {
+      this.scheduleDegradedStatusNotice(nextBase);
+    } else if (isActiveTransferStatus(nextBase)) {
+      this.clearDegradedStatusTimer();
+    } else if (nextBase === "Synced" || nextBase === "Not paired" || isPersistentAttentionStatus(nextBase)) {
+      this.clearDegradedStatusTimer();
+      this.degradedStatusNotifiedBase = null;
+    }
+    if (nextBase === "Synced" && this.statusNeedsRecoveryNotice) {
+      this.statusNeedsRecoveryNotice = false;
+      new Notice("obts: Sync is healthy again.");
+    } else if (nextBase === "Not paired") {
+      this.statusNeedsRecoveryNotice = false;
+    }
+  }
+  scheduleDegradedStatusNotice(base) {
+    if (this.degradedStatusNotifiedBase === base) return;
+    if (this.degradedStatusTimer !== null && this.degradedStatusBase === base) return;
+    this.clearDegradedStatusTimer();
+    if (this.degradedStatusNotifiedBase !== base) this.degradedStatusNotifiedBase = null;
+    this.degradedStatusBase = base;
+    const timer = window.setTimeout(() => {
+      if (this.degradedStatusTimer !== timer || this.degradedStatusBase !== base) return;
+      this.degradedStatusTimer = null;
+      this.degradedStatusBase = null;
+      const currentBase = statusBaseLabel(this.currentStatusLabel);
+      if (this.unloaded || currentBase === "Synced" || currentBase === "Not paired" || isPersistentAttentionStatus(currentBase)) return;
+      this.statusNeedsRecoveryNotice = true;
+      this.degradedStatusNotifiedBase = base;
+      const message = base === "Offline" ? "obts is still offline. Click the sync indicator to inspect settings." : "obts is still behind the server. Click the sync indicator to inspect status.";
+      new Notice(message, STATUS_NOTICE_DURATION_MS);
+    }, STATUS_LAG_NOTICE_DELAY_MS);
+    this.degradedStatusTimer = timer;
+  }
+  clearDegradedStatusTimer() {
+    if (this.degradedStatusTimer !== null) {
+      window.clearTimeout(this.degradedStatusTimer);
+      this.degradedStatusTimer = null;
+    }
+    this.degradedStatusBase = null;
+  }
+  handleStatusClick() {
+    if (statusBaseLabel(this.currentStatusLabel) === "Review needed") {
+      const destination = normalizedServerDestination(this.settings.serverUrl);
+      if (destination) {
+        window.open(`${destination}/dashboard`);
+        return;
+      }
+    }
+    const settings = this.app && this.app.setting;
+    if (!settings) return;
+    if (typeof settings.open === "function") settings.open();
+    if (typeof settings.openTabById === "function") settings.openTabById(this.manifest && this.manifest.id ? this.manifest.id : "obts");
   }
   queueSyncFromWatcher(paths) {
     if (this.isApplying) {
@@ -22078,6 +22176,7 @@ module.exports = class ObtsPlugin extends Plugin {
   async syncOnceOrPollResolvedConflict(options) {
     await this.flushWatcherHints();
     const state = await this.client.readState();
+    if (!isPersistentAttentionStatus(statusBaseLabel(state.status_label))) this.setStatus("Checking");
     if (state.last_error_code === "conflict_review_required") {
       return await this.client.pollRemoteEventsAndApply();
     }
@@ -22202,9 +22301,11 @@ module.exports = class ObtsPlugin extends Plugin {
       const code = error instanceof ObtsBlockedError ? error.code : "sync_error";
       const message = error instanceof Error ? error.message : "obts sync failed.";
       await this.client.markBlocked(code, error instanceof ObtsBlockedError ? error.details : void 0);
-      this.setStatus((await this.client.readState()).status_label);
+      const blockedState = await this.client.readState();
+      const useStatusNotice = error instanceof ObtsBlockedError;
+      this.setStatus(blockedState.status_label, { notify: useStatusNotice });
       await this.client.reportDeviceStatus().catch(() => void 0);
-      if (showNotice) {
+      if (showNotice && (!useStatusNotice || shouldShowRoutineStatusNotice(blockedState.status_label))) {
         new Notice(message);
       }
     } finally {
@@ -23133,6 +23234,8 @@ var ObtsObsidianClient = class {
         throw new ObtsBlockedError("transfer_closed", "The resumable transfer is closed without an accepted result.");
       }
       const received = new Set(descriptor.received_chunks || []);
+      let uploadedChunks = [...received].filter((index2) => Number.isInteger(index2) && index2 >= 0 && index2 < groups.length).length;
+      this.plugin.setStatus(`Uploading ${uploadedChunks}/${groups.length}`);
       for (let index2 = 0; index2 < groups.length; index2 += 1) {
         if (received.has(index2)) continue;
         const packfile = await this.packObjectChunk(groups[index2], capabilities.max_chunk_bytes);
@@ -23149,6 +23252,8 @@ var ObtsObsidianClient = class {
           }
         );
         if (!response.ok) await throwResponseError(response);
+        uploadedChunks += 1;
+        this.plugin.setStatus(`Uploading ${uploadedChunks}/${groups.length}`);
         await this.reportDeviceStatus().catch(() => void 0);
       }
       const finalizeResponse = await fetchWithTimeout(
@@ -23727,13 +23832,21 @@ var ObtsObsidianClient = class {
         await this.block("unsafe_local_state", "A local file changed during apply preflight.");
       }
     };
-    for (const filePath of journal.affected_paths.filter((candidate) => !targetFiles.has(candidate)).sort((left, right) => right.length - left.length)) {
+    const removals = journal.affected_paths.filter((candidate) => !targetFiles.has(candidate)).sort((left, right) => right.length - left.length);
+    const writes = journal.affected_paths.filter((candidate) => targetFiles.has(candidate));
+    const total = removals.length + writes.length;
+    let completed = 0;
+    const reportProgress = () => this.plugin.setStatus(total > 0 ? `Applying ${completed}/${total}` : "Applying");
+    reportProgress();
+    for (const filePath of removals) {
       if (await this.adapterIsDirectory(filePath)) {
         await assertRecoveredDescendants(filePath);
       }
       await this.adapterRemove(filePath);
+      completed += 1;
+      reportProgress();
     }
-    for (const filePath of journal.affected_paths.filter((candidate) => targetFiles.has(candidate))) {
+    for (const filePath of writes) {
       const content = await this.readBlobIfPresent(journal.target_main, filePath);
       if (content !== null) {
         await this.removeBlockingMaterializationPaths(filePath);
@@ -23743,6 +23856,8 @@ var ObtsObsidianClient = class {
         }
         await this.adapterWriteBinary(filePath, content);
       }
+      completed += 1;
+      reportProgress();
     }
   }
   async createLocalCommit(message) {
@@ -25428,7 +25543,7 @@ var ObtsSettingTab = class extends PluginSettingTab {
             }
             this.plugin.setStatus((await this.plugin.client.readState()).status_label);
             setFeedback(actionFeedback, `Synced: ${result.status}`, "success");
-            new Notice(`obts: ${result.status}`);
+            if (shouldShowRoutineStatusNotice(result.status)) new Notice(`obts: ${result.status}`);
             await this.display();
           } catch (error) {
             setFeedback(actionFeedback, error instanceof Error ? error.message : "Sync failed.", "error");
@@ -25800,6 +25915,46 @@ function changedPathsConflict(left, right) {
 }
 function isRetryableLocalError(code) {
   return code === "upload_interrupted" || code === "pack_preparation_failed" || code === "invalid_path" || code === "path_collision" || code === "excluded_git_path" || code === "excluded_internal_path" || code === "excluded_path" || code === "unsupported_file_mode";
+}
+function statusBaseLabel(label) {
+  const normalized = typeof label === "string" && label.trim().length > 0 ? label.trim() : "Checking";
+  for (const base of ["Uploading", "Applying"]) {
+    if (normalized === base || normalized.startsWith(`${base} `)) return base;
+  }
+  return normalized;
+}
+function statusPresentation(label) {
+  const normalized = typeof label === "string" && label.trim().length > 0 ? label.trim() : "Checking";
+  const base = statusBaseLabel(normalized);
+  const action = base === "Review needed" ? "Click to open the conflict dashboard." : "Click to open obts settings.";
+  let tone = "neutral";
+  if (base === "Synced") tone = "success";
+  else if (["Checking", "Preparing upload", "Uploading", "Applying", "Merging", "Finishing update", "Waiting for operation"].includes(base)) tone = "active";
+  else if (["Ahead", "Behind", "Offline", "Review needed"].includes(base)) tone = "warning";
+  else if (["Blocked", "Needs recovery", "Unsafe local state", "Integrity failure", "Recovery required", "Restart required"].includes(base)) tone = "danger";
+  return {
+    label: normalized,
+    base,
+    tone,
+    action,
+    title: `${normalized}. ${action}`
+  };
+}
+function statusAttentionMessage(base) {
+  if (base === "Review needed") return "obts needs attention: Resolve the conflict in the dashboard. Click the sync indicator to continue.";
+  if (base === "Blocked") return "obts sync is blocked. Click the sync indicator to inspect the required action.";
+  if (base === "Needs recovery") return "obts needs recovery before sync can continue. Click the sync indicator for recovery options.";
+  if (base === "Unsafe local state") return "obts stopped to protect local changes. Click the sync indicator to inspect recovery options.";
+  return null;
+}
+function isPersistentAttentionStatus(base) {
+  return ["Review needed", "Blocked", "Needs recovery", "Unsafe local state", "Integrity failure", "Recovery required", "Restart required"].includes(base);
+}
+function isActiveTransferStatus(base) {
+  return ["Preparing upload", "Uploading", "Applying", "Merging", "Finishing update", "Waiting for operation"].includes(base);
+}
+function shouldShowRoutineStatusNotice(label) {
+  return !isPersistentAttentionStatus(statusBaseLabel(label));
 }
 function samePairedDeviceState(left, right) {
   return Boolean(
