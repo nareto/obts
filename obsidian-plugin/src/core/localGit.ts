@@ -90,6 +90,21 @@ export class LocalGitEngine {
     }
   }
 
+  async sameCommitTree(first: string, second: string): Promise<boolean> {
+    if (first === second) {
+      return true;
+    }
+    try {
+      const [firstCommit, secondCommit] = await Promise.all([
+        git.readCommit({ fs, dir: this.vaultDir, gitdir: this.gitdir, oid: first }),
+        git.readCommit({ fs, dir: this.vaultDir, gitdir: this.gitdir, oid: second })
+      ]);
+      return firstCommit.commit.tree === secondCommit.commit.tree;
+    } catch {
+      return false;
+    }
+  }
+
   async isAncestor(ancestor: string, descendant: string): Promise<boolean> {
     if (ancestor === descendant) {
       return true;

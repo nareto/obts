@@ -17,6 +17,17 @@ state so the owner can recover or reset it explicitly. Authentication happens
 in the server dashboard; the plugin stores neither dashboard credentials nor
 connection secrets in plugin settings.
 
+If an existing-vault merge needs dashboard conflict review, the onboarding
+screen keeps the submission pending and provides **Open dashboard** followed by
+**Check resolution**. Return to that screen after resolving the conflict; do not
+submit the local merge again. Interrupted registered onboarding appears as
+**Setup incomplete** in plugin settings and resumes from the accepted server
+device ref rather than creating another proposal.
+
+A plugin hot reload never steals an active vault-operation lease. A replacement
+waits for the prior operation to finish and, if it cannot quiesce safely, asks
+for a full Obsidian restart instead of allowing overlapping writes.
+
 Commands:
 
 - `Set up sync`

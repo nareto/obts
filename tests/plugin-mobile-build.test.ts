@@ -7,6 +7,7 @@ import vm from 'node:vm';
 import git from 'isomorphic-git';
 import { describe, expect, it } from 'vitest';
 
+import { PLUGIN_VERSION } from '../obsidian-plugin/src/version.js';
 import { MemoryDataAdapter } from './helpers/memoryDataAdapter.js';
 
 const require = createRequire(import.meta.url);
@@ -29,7 +30,7 @@ describe('mobile plugin artifact', () => {
     expect([...new Set(unresolvedRequires)]).toEqual(['obsidian']);
 
     const browserHandoff = source.slice(source.indexOf('setButtonText("Continue in browser")'), source.indexOf('renderWaiting() {'));
-    expect(browserHandoff).toContain('await waitForMobileBrowserReturn();');
+    expect(browserHandoff).toContain('await this.waitForBrowserReturn()');
     expect(browserHandoff).toContain('this.showWaitingError(error, "Unable to start setup.")');
     expect(browserHandoff).not.toContain('setFeedback(feedback, error instanceof Error');
   });
@@ -86,6 +87,7 @@ describe('mobile plugin artifact', () => {
       URL,
       ArrayBuffer,
       Uint8Array,
+      AbortController,
       setTimeout,
       clearTimeout,
       setInterval,
@@ -160,7 +162,7 @@ describe('mobile plugin artifact', () => {
     const diagnosticBody = JSON.parse(String(requests[0]?.body)) as Record<string, unknown>;
     expect(diagnosticBody).toMatchObject({
       schema_version: 1,
-      plugin_version: '0.4.2',
+      plugin_version: PLUGIN_VERSION,
       obsidian_version: '1.9.12',
       platform_family: 'ios',
       failure_code: 'null_pack_slice',
@@ -194,6 +196,23 @@ describe('mobile plugin artifact', () => {
     expect(JSON.stringify(invalidJsonBody)).not.toContain('Expected valid JSON');
     expect(JSON.stringify(invalidJsonBody)).not.toContain('private-note.md');
 
+    const lifecycleError = vm.runInContext(
+      "Object.assign(new Error('private lifecycle detail'), { code: 'operation_interrupted_by_reload' })",
+      context
+    ) as Error;
+    await (plugin as any).reportOnboardingError(lifecycleError, {
+      connection_id: 'con_safe',
+      connection_secret: 'obts_conn_private'
+    });
+    expect(requests).toHaveLength(4);
+    const lifecycleBody = JSON.parse(String(requests[3]?.body)) as Record<string, unknown>;
+    expect(lifecycleBody).toMatchObject({
+      flow: 'plugin',
+      stage: 'plugin_lifecycle',
+      failure_code: 'operation_interrupted_by_reload'
+    });
+    expect(JSON.stringify(lifecycleBody)).not.toContain('private lifecycle detail');
+
     const originalReadState = (plugin as any).client.readState.bind((plugin as any).client);
     const currentState = await originalReadState();
     let resolveState!: (value: unknown) => void;
@@ -207,7 +226,7 @@ describe('mobile plugin artifact', () => {
     resolveState(currentState);
     await racedReport;
     (plugin as any).client.readState = originalReadState;
-    expect(requests).toHaveLength(3);
+    expect(requests).toHaveLength(4);
     expect((plugin as any).diagnosticSharingEnabled()).toBe(false);
     expect(savedSettings.length).toBeGreaterThan(0);
 
@@ -216,11 +235,69 @@ describe('mobile plugin artifact', () => {
     expect((plugin as any).beginSync()).toBe(true);
     (plugin as any).syncRunningSince = Date.now() - 60 * 60 * 1000;
     expect((plugin as any).isSyncInProgress()).toBe(true);
+    await (replacement as any).onload();
+    expect((replacement as any).clientReady).toBe(false);
     expect((replacement as any).beginSync()).toBe(false);
+    await expect((replacement as any).runOnboardingAction(async () => undefined)).rejects.toMatchObject({
+      code: 'sync_lease_blocked'
+    });
     (plugin as any).onunload();
+    expect((plugin as any).beginSync()).toBe(false);
     expect((replacement as any).beginSync()).toBe(false);
+    expect((replacement as any).operationAvailability()).toBe('restart_required');
+    expect((replacement as any).syncBlockedMessage()).toContain('Fully restart Obsidian');
+    await expect((replacement as any).runOnboardingAction(async () => undefined)).rejects.toMatchObject({
+      code: 'operation_interrupted_by_reload'
+    });
     (plugin as any).endSync();
+    await expect((replacement as any).ensureClientReady()).resolves.toBe(true);
+    expect((replacement as any).clientReady).toBe(true);
     expect((replacement as any).beginSync()).toBe(true);
     (replacement as any).endSync();
+
+    const reloadAdapter = new MemoryDataAdapter();
+    const writeBinary = reloadAdapter.writeBinary.bind(reloadAdapter);
+    let releaseInitialization!: () => void;
+    let initializationWriteStarted!: () => void;
+    let firstWriteWaiting = false;
+    let released = false;
+    let overlappingWrites = 0;
+    const initializationStarted = new Promise<void>((resolve) => { initializationWriteStarted = resolve; });
+    const initializationGate = new Promise<void>((resolve) => { releaseInitialization = resolve; });
+    reloadAdapter.writeBinary = async (filePath: string, data: ArrayBuffer) => {
+      if (!firstWriteWaiting) {
+        firstWriteWaiting = true;
+        initializationWriteStarted();
+        await initializationGate;
+      } else if (!released) {
+        overlappingWrites += 1;
+      }
+      await writeBinary(filePath, data);
+    };
+    const reloadApp = {
+      vault: {
+        adapter: reloadAdapter,
+        getName: () => 'Reload Test Vault',
+        on: () => ({})
+      },
+      workspace: { getLeavesOfType: () => [] }
+    };
+    const retiring = new PluginClass();
+    retiring.app = reloadApp;
+    const retiringLoad = (retiring as any).onload();
+    await initializationStarted;
+    const successor = new PluginClass();
+    successor.app = reloadApp;
+    await (successor as any).onload();
+    expect((successor as any).clientReady).toBe(false);
+    expect(overlappingWrites).toBe(0);
+    (retiring as any).onunload();
+    released = true;
+    releaseInitialization();
+    await retiringLoad;
+    await expect((successor as any).ensureClientReady()).resolves.toBe(true);
+    expect((successor as any).clientReady).toBe(true);
+    expect(overlappingWrites).toBe(0);
+    (successor as any).onunload();
   });
 });

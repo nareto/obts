@@ -90,6 +90,8 @@ describe('OpenAPI Phase 3 contract', () => {
     expect(contract).not.toContain('local_error_details');
     expect(contract).toContain('missing_buffer_dependency');
     expect(contract).toContain('invalid_json');
+    expect(contract).toContain('operation_interrupted_by_reload');
+    expect(contract).toContain('sync_lease_blocked');
     expect(contract).toContain(API_VERSION);
     expect(contract).toContain('ErrorEnvelope');
     expect(contract).toContain('__Host-obts_session');

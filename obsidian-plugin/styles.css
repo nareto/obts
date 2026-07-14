@@ -79,3 +79,13 @@
   border-left: 4px solid var(--color-orange);
   background: var(--background-modifier-warning);
 }
+
+.obts-onboarding-steps {
+  margin: 16px 0;
+  padding-left: 24px;
+}
+
+.obts-onboarding-steps li {
+  margin: 8px 0;
+  padding-left: 4px;
+}

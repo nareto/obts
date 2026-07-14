@@ -97,7 +97,8 @@ The recommended installation path is [BRAT](https://github.com/TfTHacker/obsidia
 4. Enter the server URL and device name. Optionally enable **Share error diagnostics with this obts server**, then run **Set up sync**.
 5. Authenticate in the browser, approve a new or existing vault, and return to Obsidian.
 6. If local and server content differ, explicitly choose **Use the server vault** or **Merge local content** after reviewing the recovery/conflict warning.
-7. Connect a second copied vault and complete the [manual smoke test](docs/phase3-smoke-test.md) before using primary data.
+7. If merge submission creates a conflict, open the dashboard from the plugin, resolve the conflict, return to the same plugin screen, and choose **Check resolution**. Do not submit the merge again.
+8. Connect a second copied vault and complete the [manual smoke test](docs/phase3-smoke-test.md) before using primary data.
 
 The server reports minimum and recommended plugin versions. Compatible older clients continue syncing and receive an update notice; clients below the minimum are blocked with an actionable BRAT update command. For manual installation, copy `main.js`, `manifest.json`, and `styles.css` from a GitHub release into `<vault>/.obsidian/plugins/obts/`.
 

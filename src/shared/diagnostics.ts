@@ -23,6 +23,8 @@ export const diagnosticStages = [
 export const diagnosticFailureCodes = [
   'invalid_json',
   'missing_buffer_dependency',
+  'operation_interrupted_by_reload',
+  'sync_lease_blocked',
   'null_pack_slice',
   'pack_index_failed',
   'adapter_read_failed',

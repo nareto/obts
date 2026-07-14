@@ -73,17 +73,25 @@ describe('opt-in error diagnostics backend', () => {
       failure_code: 'invalid_json'
     };
     expect((await postDiagnostic(`${fixture.baseUrl}/api/v1/device/diagnostic-events`, completion.device_token, deviceReport)).status).toBe(202);
+    expect((await postDiagnostic(`${fixture.baseUrl}/api/v1/device/diagnostic-events`, completion.device_token, {
+      ...report,
+      event_id: 'dgr_00112233445566778899aabbccddeeff',
+      flow: 'plugin',
+      stage: 'unknown',
+      failure_code: 'operation_interrupted_by_reload',
+      error_class: 'blocked_error'
+    })).status).toBe(202);
 
     const listed = await fixture.adminGet('/api/v1/diagnostic-events');
     expect(listed.status).toBe(200);
     expect(listed.body).toMatchObject({ ingestion_enabled: true, retention_days: 14 });
-    expect((listed.body.events as unknown[])).toHaveLength(2);
+    expect((listed.body.events as unknown[])).toHaveLength(3);
     const serialized = JSON.stringify(listed.body);
     expect(serialized).not.toContain(pending.connection_secret);
     expect(serialized).not.toContain(completion.device_token);
 
     const snapshot = await fixture.server.store.snapshot();
-    expect(snapshot.diagnostic_events).toHaveLength(2);
+    expect(snapshot.diagnostic_events).toHaveLength(3);
     expect(snapshot.diagnostic_events.every((event) => event.owner_user_id === fixture.userId)).toBe(true);
     expect(snapshot.diagnostic_events.every((event) => event.device_id === completion.device_id)).toBe(true);
 
@@ -105,7 +113,7 @@ describe('opt-in error diagnostics backend', () => {
 
     const deleted = await fixture.adminDelete('/api/v1/diagnostic-events');
     expect(deleted.status).toBe(200);
-    expect(deleted.body).toMatchObject({ deleted_count: 2 });
+    expect(deleted.body).toMatchObject({ deleted_count: 3 });
     expect((await fixture.server.store.snapshot()).diagnostic_events).toEqual([]);
   });
 

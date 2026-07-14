@@ -41,8 +41,12 @@ system to keep Obsidian running in the background.
    restart.
 3. Sync Markdown, Unicode filenames, a binary attachment, an empty folder, and
    community-plugin data between mobile and desktop clients.
-4. Edit the same note on mobile and desktop, confirm conflict review is required,
-   resolve it in the dashboard, and apply the result on mobile.
+4. During existing-vault onboarding, create an overlapping edit, choose **Submit
+   for merge**, and confirm the plugin replaces that action with explicit
+   dashboard instructions. Resolve the conflict, return to the still-open modal,
+   choose **Check resolution**, and confirm the resolved main is applied. Repeat
+   from a force-closed/reopened app and confirm **Setup incomplete** offers
+   **Resume setup** without creating another proposal or `stale_device_ref`.
 5. Start with the phone offline, edit notes, restart Obsidian, reconnect, and
    confirm the queued local commit uploads without losing edits.
 6. Force-close Obsidian during a disposable pull/apply test. Reopen it and
@@ -50,7 +54,9 @@ system to keep Obsidian running in the background.
    unpreserved local content.
 7. Leave Obsidian in the background long enough for mobile timers to suspend,
    then foreground it and confirm scanning and sync resume without duplicate
-   operations.
+   operations. Update the plugin while a disposable operation is active and
+   confirm the replacement either waits for safe handoff or requires a full
+   Obsidian restart; it must never clear the lease by elapsed time.
 8. With diagnostic sharing still off, trigger a disposable error and confirm no
    diagnostic request or server record is created. Enable **Share error
    diagnostics with this obts server**, reproduce one failure, and confirm one

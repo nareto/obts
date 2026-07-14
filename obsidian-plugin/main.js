@@ -21720,10 +21720,11 @@ var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var fsp = null;
 var API_VERSION = "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = "0.4.2";
+var PLUGIN_VERSION = "0.4.3";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var SYNC_STALE_MS = 2 * 60 * 1e3;
+var RETIRED_OPERATION_GRACE_MS = 1500;
 var PLUGIN_UPDATE_URL = "obsidian://brat?plugin=nareto%2Fobts";
 var DIAGNOSTIC_CONSENT_VERSION = 1;
 var DIAGNOSTIC_CONTEXT = /* @__PURE__ */ Symbol("obtsDiagnosticContext");
@@ -21755,18 +21756,31 @@ module.exports = class ObtsPlugin extends Plugin {
     this.pluginCompatibilityNoticeKey = null;
     this.pluginUpdateUrl = PLUGIN_UPDATE_URL;
     this.unloaded = false;
+    this.lifecycleAbortController = new AbortController();
     this.queuedSyncTimer = null;
+    this.retiredOperationTimer = null;
+    this.observedRetiredLease = null;
+    this.retiredOperationNoticeShown = false;
+    this.clientReady = false;
+    this.clientInitialization = null;
     this.reportedDiagnosticErrors = /* @__PURE__ */ new WeakSet();
     this.diagnosticNoticeShown = false;
     this.setStatus("Checking");
     this.client = new ObtsObsidianClient(this);
-    await this.client.initialize();
-    this.setStatus((await this.client.readState()).status_label);
+    if (this.operationAvailability() === "available") await this.initializeClient();
+    else this.observeRetiredOperation();
+    if (this.unloaded) return;
     this.addSettingTab(new ObtsSettingTab(this.app, this));
     this.addCommand({
       id: "obts-setup-sync",
       name: "Set up sync",
-      callback: () => new ObtsOnboardingModal(this.app, this).open()
+      callback: async () => {
+        if (!await this.ensureClientReady()) {
+          new Notice(`obts: ${this.syncBlockedMessage()}`, 15e3);
+          return;
+        }
+        new ObtsOnboardingModal(this.app, this).open();
+      }
     });
     this.addCommand({
       id: "obts-sync-once",
@@ -21835,9 +21849,70 @@ module.exports = class ObtsPlugin extends Plugin {
   }
   onunload() {
     this.unloaded = true;
+    this.lifecycleAbortController.abort();
+    const lease = operationRegistry().get(this.app.vault.adapter);
+    if (operationLeaseOwner(lease) === this && lease && lease.owner) lease.retiring = true;
     if (this.queuedSyncTimer !== null) {
       window.clearTimeout(this.queuedSyncTimer);
       this.queuedSyncTimer = null;
+    }
+    if (this.retiredOperationTimer !== null) {
+      window.clearTimeout(this.retiredOperationTimer);
+      this.retiredOperationTimer = null;
+    }
+  }
+  async initializeClient() {
+    if (this.clientReady) return;
+    if (!this.clientInitialization) {
+      this.clientInitialization = (async () => {
+        if (this.unloaded || !this.beginSync()) {
+          throw new ObtsBlockedError("sync_lease_blocked", this.syncBlockedMessage());
+        }
+        try {
+          await this.client.initialize();
+          if (!this.unloaded) {
+            this.clientReady = true;
+            this.setStatus((await this.client.readState()).status_label);
+          }
+        } finally {
+          this.endSync();
+        }
+      })();
+    }
+    try {
+      await this.clientInitialization;
+    } finally {
+      this.clientInitialization = null;
+    }
+  }
+  handleClientInitializationFailure() {
+    if (this.unloaded) return;
+    this.clientReady = false;
+    this.setStatus("Recovery required");
+    new Notice("obts could not finish local recovery after the plugin update. Fully restart Obsidian, then open obts settings.", 15e3);
+  }
+  async ensureClientReady() {
+    if (this.unloaded) return false;
+    if (this.clientReady) return true;
+    if (this.clientInitialization) {
+      try {
+        await this.clientInitialization;
+        return this.clientReady;
+      } catch {
+        this.handleClientInitializationFailure();
+        return false;
+      }
+    }
+    if (this.operationAvailability() !== "available") {
+      this.observeRetiredOperation();
+      return false;
+    }
+    try {
+      await this.initializeClient();
+      return this.clientReady;
+    } catch {
+      this.handleClientInitializationFailure();
+      return false;
     }
   }
   async saveSettings() {
@@ -21940,6 +22015,7 @@ module.exports = class ObtsPlugin extends Plugin {
       return;
     }
     this.syncQueued = true;
+    if (!this.clientReady) return;
     this.setStatus("Ahead");
     void this.client.recordLocalChangeHint(paths).catch(() => void 0);
     this.scheduleQueuedSync(SYNC_DEBOUNCE_MS);
@@ -21960,7 +22036,7 @@ module.exports = class ObtsPlugin extends Plugin {
     }, delay);
   }
   async runQueuedSync() {
-    if (this.unloaded || !this.syncQueued) return;
+    if (this.unloaded || !this.syncQueued || !await this.ensureClientReady()) return;
     if (this.isSyncInProgress()) {
       this.scheduleQueuedSync(SYNC_DEBOUNCE_MS);
       return;
@@ -22001,7 +22077,7 @@ module.exports = class ObtsPlugin extends Plugin {
     return flushed;
   }
   async runBackgroundSync() {
-    if (this.unloaded || typeof document !== "undefined" && document.hidden) {
+    if (this.unloaded || typeof document !== "undefined" && document.hidden || !await this.ensureClientReady()) {
       return;
     }
     if (this.syncQueued) {
@@ -22022,9 +22098,10 @@ module.exports = class ObtsPlugin extends Plugin {
     await this.runAutomaticSync();
   }
   async runAutomaticSync() {
-    if (this.unloaded || typeof document !== "undefined" && document.hidden || this.isSyncInProgress()) {
+    if (this.unloaded || typeof document !== "undefined" && document.hidden || !await this.ensureClientReady() || this.isSyncInProgress()) {
       return;
     }
+    if (await this.client.readPendingOnboarding()) return;
     if (!this.beginSync()) return;
     try {
       const state = await this.client.readState();
@@ -22056,7 +22133,7 @@ module.exports = class ObtsPlugin extends Plugin {
     this.setStatus("Offline");
   }
   async runUserAction(fn, showNotice = true) {
-    if (this.isSyncInProgress()) {
+    if (!await this.ensureClientReady() || this.isSyncInProgress()) {
       return;
     }
     if (!this.beginSync()) return;
@@ -22078,24 +22155,113 @@ module.exports = class ObtsPlugin extends Plugin {
       this.endSync();
     }
   }
+  async runExclusiveAction(fn) {
+    if (!await this.ensureClientReady() || !this.beginSync()) {
+      const code = this.operationAvailability() === "restart_required" || this.unloaded ? "operation_interrupted_by_reload" : "sync_lease_blocked";
+      throw new ObtsBlockedError(code, this.syncBlockedMessage());
+    }
+    try {
+      return await fn();
+    } finally {
+      this.endSync();
+    }
+  }
+  async runOnboardingAction(fn) {
+    return await this.runExclusiveAction(fn);
+  }
+  operationAvailability() {
+    const lease = operationRegistry().get(this.app.vault.adapter);
+    if (!lease) return "available";
+    const owner = operationLeaseOwner(lease);
+    if (owner === this) return "busy";
+    if (lease && lease.retiring || owner && owner.unloaded) return "restart_required";
+    return "busy";
+  }
+  syncBlockedMessage() {
+    return this.unloaded || this.operationAvailability() === "restart_required" ? "A plugin update interrupted an active operation. Fully restart Obsidian before continuing setup or sync." : "Another obts operation is still running.";
+  }
+  observeRetiredOperation() {
+    const registry = operationRegistry();
+    const lease = registry.get(this.app.vault.adapter);
+    if (!lease || operationLeaseOwner(lease) === this) return;
+    if (this.observedRetiredLease === lease) return;
+    this.observedRetiredLease = lease;
+    this.setStatus("Finishing update");
+    if (lease.completion && typeof lease.completion.then === "function") {
+      void lease.completion.then(async () => {
+        if (this.unloaded) return;
+        if (this.retiredOperationTimer !== null) {
+          window.clearTimeout(this.retiredOperationTimer);
+          this.retiredOperationTimer = null;
+        }
+        this.observedRetiredLease = null;
+        try {
+          await this.initializeClient();
+          void this.runBackgroundSync();
+        } catch {
+          this.handleClientInitializationFailure();
+        }
+      });
+    }
+    this.retiredOperationTimer = window.setTimeout(() => {
+      this.retiredOperationTimer = null;
+      if (this.unloaded) return;
+      const availability = this.operationAvailability();
+      if (availability === "available") {
+        this.observedRetiredLease = null;
+        void this.initializeClient().then(() => this.runBackgroundSync()).catch(() => this.handleClientInitializationFailure());
+        return;
+      }
+      if (availability === "busy") {
+        this.setStatus("Waiting for operation");
+        this.observedRetiredLease = null;
+        this.observeRetiredOperation();
+        return;
+      }
+      this.setStatus("Restart required");
+      if (!this.retiredOperationNoticeShown) {
+        this.retiredOperationNoticeShown = true;
+        if (this.clientReady) {
+          void this.reportDeviceError(new ObtsBlockedError(
+            "operation_interrupted_by_reload",
+            "A plugin update interrupted an active operation."
+          ));
+        }
+        new Notice("obts: Fully restart Obsidian to finish the plugin update safely.", 15e3);
+      }
+    }, RETIRED_OPERATION_GRACE_MS);
+  }
   isSyncInProgress() {
-    const owner = operationRegistry().get(this.app.vault.adapter);
-    if (owner && owner !== this) return true;
-    if (!this.syncRunning) return false;
+    const availability = this.operationAvailability();
+    if (availability === "available") return false;
+    if (availability === "restart_required") this.observeRetiredOperation();
     if (this.syncRunningSince && Date.now() - this.syncRunningSince > SYNC_STALE_MS) this.setStatus("Offline");
     return true;
   }
   beginSync() {
     const registry = operationRegistry();
-    if (registry.has(this.app.vault.adapter)) return false;
-    registry.set(this.app.vault.adapter, this);
+    if (this.unloaded || registry.has(this.app.vault.adapter)) return false;
+    let resolveCompletion;
+    const completion = new Promise((resolve) => {
+      resolveCompletion = resolve;
+    });
+    registry.set(this.app.vault.adapter, {
+      owner: this,
+      retiring: false,
+      completion,
+      resolveCompletion
+    });
     this.syncRunning = true;
     this.syncRunningSince = Date.now();
     return true;
   }
   endSync() {
     const registry = operationRegistry();
-    if (registry.get(this.app.vault.adapter) === this) registry.delete(this.app.vault.adapter);
+    const lease = registry.get(this.app.vault.adapter);
+    if (operationLeaseOwner(lease) === this) {
+      registry.delete(this.app.vault.adapter);
+      if (lease && typeof lease.resolveCompletion === "function") lease.resolveCompletion();
+    }
     this.syncRunning = false;
     this.syncRunningSince = null;
   }
@@ -22311,12 +22477,21 @@ var ObtsObsidianClient = class {
     return analysis;
   }
   async finishOnboarding(connectionId, secret, analysis, mode) {
+    const pending = await this.readPendingOnboarding();
+    if (!pending || pending.journal.connection.connection_id !== connectionId || pending.journal.selected_mode && pending.journal.selected_mode !== mode) {
+      throw new ObtsBlockedError("onboarding_identity_mismatch", "Pending onboarding mode does not match this setup attempt.");
+    }
     this.onboardingOperation = true;
     await this.updateOnboardingStage(connectionId, "registering", mode);
     try {
       return await this.finishOnboardingInternal(connectionId, secret, analysis, mode);
     } catch (error) {
-      await this.updateOnboardingStage(connectionId, "blocked", mode, error instanceof ObtsBlockedError ? error.code : "onboarding_failed");
+      await this.updateOnboardingStage(
+        connectionId,
+        "blocked",
+        mode,
+        error instanceof ObtsBlockedError || error instanceof ObtsTransportError ? error.code : "onboarding_failed"
+      );
       throw error;
     } finally {
       this.onboardingOperation = false;
@@ -22324,10 +22499,12 @@ var ObtsObsidianClient = class {
   }
   async finishOnboardingInternal(connectionId, secret, analysis, mode) {
     const current = await this.localSnapshotSummary();
+    const localFiles = await this.scanSyncableFiles();
+    const resumed = await this.resumeAcceptedOnboarding(connectionId, analysis, mode, localFiles);
+    if (resumed) return resumed;
     if (current.fingerprint !== analysis.localFingerprint) {
       throw new ObtsBlockedError("onboarding_snapshot_changed", "The local vault changed. Review the updated onboarding summary before continuing.");
     }
-    const localFiles = await this.scanSyncableFiles();
     await this.createRecoveryBundle(mode === "use_server" ? "replace_local_with_server" : "initial_import", analysis.expectedMain, localFiles);
     const completion = await postJsonWithBearer(this.url(`/api/v1/connections/${connectionId}/complete`), secret, {
       mode,
@@ -22338,7 +22515,6 @@ var ObtsObsidianClient = class {
         proposal_base: analysis.proposalBase
       } : {}
     });
-    await this.updateOnboardingStage(connectionId, "applying_uploading", mode);
     await writeJson(this.authPath, { device_token: completion.device_token, created_at: nowIso() });
     await this.writeState({
       user_id: completion.user_id,
@@ -22357,6 +22533,13 @@ var ObtsObsidianClient = class {
       unpaired_baseline_main: null,
       updated_at: nowIso()
     });
+    await this.updateOnboardingStage(connectionId, "applying_uploading", mode);
+    const registeredPending = await this.readPendingOnboarding();
+    if (registeredPending && registeredPending.journal.connection.connection_id === connectionId) {
+      await this.writeOnboardingJournal(Object.assign({}, registeredPending.journal, {
+        registered_device_id: completion.device_id
+      }));
+    }
     const pulled = await this.pull(completion.vault_id, completion.device_id, completion.device_token, null, "latest", 0);
     await this.importPack(pulled.packfile);
     if (mode === "use_server") {
@@ -22384,6 +22567,13 @@ var ObtsObsidianClient = class {
     await this.updateRef("refs/heads/local", proposalBase, null, true);
     await this.writeState(Object.assign({}, await this.readState(), { local_main: proposalBase, local_head: proposalBase, status_label: "Ahead", updated_at: nowIso() }));
     const proposalCommit = await this.createLocalCommit("obts: onboarding local vault");
+    const proposalPending = await this.readPendingOnboarding();
+    if (proposalPending && proposalPending.journal.connection.connection_id === connectionId) {
+      await this.writeOnboardingJournal(Object.assign({}, proposalPending.journal, {
+        stage: "uploading_proposal",
+        proposal_commit: proposalCommit
+      }));
+    }
     await this.writeQueue({ pending_commit: proposalCommit, expected_device_ref: null, status: proposalCommit ? "queued_local" : "idle", attempts: 0, updated_at: nowIso() });
     const synced = await this.syncOnce({ confirmInitialImport: false });
     if (synced.status === "Review needed") {
@@ -22396,6 +22586,128 @@ var ObtsObsidianClient = class {
     });
     await this.completePendingOnboarding(connectionId);
     return synced;
+  }
+  async resumeAcceptedOnboarding(connectionId, analysis, mode, localFiles) {
+    const pending = await this.readPendingOnboarding();
+    if (!pending || pending.journal.connection.connection_id !== connectionId || pending.journal.selected_mode && pending.journal.selected_mode !== mode || pending.journal.analysis && (pending.journal.analysis.localFingerprint !== analysis.localFingerprint || pending.journal.analysis.selection !== analysis.selection || pending.journal.analysis.vaultId !== analysis.vaultId || pending.journal.analysis.expectedMain !== analysis.expectedMain || pending.journal.analysis.proposalBase !== analysis.proposalBase || pending.journal.analysis.classification !== analysis.classification)) {
+      throw new ObtsBlockedError("onboarding_identity_mismatch", "Pending onboarding state does not match this setup attempt.");
+    }
+    const state = await this.readState();
+    if (!state.vault_id || !state.device_id) return null;
+    if (analysis.vaultId && analysis.vaultId !== state.vault_id) {
+      throw new ObtsBlockedError("onboarding_identity_mismatch", "Pending onboarding targets a different vault.");
+    }
+    const token = await this.readDeviceToken();
+    const [self, connection] = await Promise.all([
+      this.getDeviceSelf(token),
+      this.pollOnboarding(connectionId, pending.secret)
+    ]);
+    if (self.vault_id !== state.vault_id || self.device_id !== state.device_id || connection.status !== "consumed" || connection.vault_id !== state.vault_id || connection.device_id !== state.device_id || pending.journal.registered_device_id && pending.journal.registered_device_id !== state.device_id) {
+      throw new ObtsBlockedError("onboarding_identity_mismatch", "Registered onboarding identity does not match local device state.");
+    }
+    if (!pending.journal.registered_device_id) {
+      await this.writeOnboardingJournal(Object.assign({}, pending.journal, { registered_device_id: state.device_id }));
+    }
+    const localAlreadyApplied = state.local_main === self.current_main && (mode !== "use_server" || await this.commitExists(self.current_main) && await this.localContentMatchesTree(localFiles, self.current_main));
+    if (localAlreadyApplied && (mode === "use_server" || self.server_device_ref)) {
+      await postJsonWithBearer(this.url(`/api/v1/vaults/${state.vault_id}/onboarding/complete`), token, {
+        applied_main: state.local_main
+      });
+      await this.completePendingOnboarding(connectionId);
+      return { status: state.status_label, main: state.local_main };
+    }
+    if (mode === "use_server") {
+      await this.createRecoveryBundle("replace_local_with_server", self.current_main, localFiles);
+      const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main, "latest", state.last_event_seq || 0);
+      await this.importPack(pulled.packfile);
+      await this.applyTargetMain(
+        pulled.manifest.target_main,
+        pulled.manifest.changed_paths,
+        true,
+        localFiles,
+        false,
+        pulled.manifest.directory_intents || [],
+        pulled.manifest.explicit_directories || [],
+        pulled.manifest.event_seq
+      );
+      await this.acknowledgeAppliedMain(pulled.manifest.target_main);
+      await postJsonWithBearer(this.url(`/api/v1/vaults/${state.vault_id}/onboarding/complete`), token, {
+        applied_main: pulled.manifest.target_main
+      });
+      await this.writeState(Object.assign({}, await this.readState(), {
+        status_label: "Synced",
+        last_error_code: null,
+        updated_at: nowIso()
+      }));
+      await this.completePendingOnboarding(connectionId);
+      return { status: "Synced", main: pulled.manifest.target_main };
+    }
+    if (!self.server_device_ref) return null;
+    await this.createRecoveryBundle("initial_import", self.current_main, localFiles);
+    try {
+      const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main, "latest", state.last_event_seq || 0);
+      await this.importPack(pulled.packfile);
+    } catch (error) {
+      if (!(error instanceof ObtsTransportError && error.code === "device_blocked")) throw error;
+      await this.normalizeAcceptedOnboardingProposal(self.server_device_ref, localFiles);
+      await this.writeState(Object.assign({}, await this.readState(), {
+        server_device_ref: self.server_device_ref,
+        status_label: "Review needed",
+        last_error_code: "conflict_review_required",
+        updated_at: nowIso()
+      }));
+      await this.updateOnboardingStage(connectionId, "awaiting_conflict", mode);
+      return { status: "Review needed" };
+    }
+    await this.normalizeAcceptedOnboardingProposal(self.server_device_ref, localFiles);
+    await this.writeState(Object.assign({}, await this.readState(), {
+      server_device_ref: self.server_device_ref,
+      status_label: "Behind",
+      last_error_code: null,
+      updated_at: nowIso()
+    }));
+    if (!await this.pullAndApply(true)) {
+      throw new ObtsBlockedError(
+        "onboarding_local_changes_after_submit",
+        "Local files changed after the onboarding proposal. Recovery is required before applying the resolved vault."
+      );
+    }
+    const finalState = await this.readState();
+    if (!finalState.local_main) {
+      throw new ObtsBlockedError("onboarding_incomplete", "Onboarding did not produce an applied server main.");
+    }
+    await postJsonWithBearer(this.url(`/api/v1/vaults/${state.vault_id}/onboarding/complete`), token, {
+      applied_main: finalState.local_main
+    });
+    await this.completePendingOnboarding(connectionId);
+    return { status: finalState.status_label, main: finalState.local_main };
+  }
+  async normalizeAcceptedOnboardingProposal(serverDeviceRef, localFiles) {
+    const state = await this.readState();
+    const queue = await this.readQueue();
+    const localCandidate = queue.pending_commit || state.local_head;
+    const matchesAcceptedProposal = localCandidate ? await this.sameCommitTree(localCandidate, serverDeviceRef) : await this.localContentMatchesTree(localFiles, serverDeviceRef);
+    if (!matchesAcceptedProposal) {
+      throw new ObtsBlockedError(
+        "onboarding_local_changes_after_submit",
+        "Local files changed after the onboarding proposal. Recovery is required before continuing."
+      );
+    }
+    await this.updateRef("refs/heads/local", serverDeviceRef, null, true);
+    await this.writeState(Object.assign({}, state, {
+      server_device_ref: serverDeviceRef,
+      local_head: serverDeviceRef,
+      status_label: "Review needed",
+      last_error_code: "conflict_review_required",
+      updated_at: nowIso()
+    }));
+    await this.writeQueue({
+      pending_commit: serverDeviceRef,
+      expected_device_ref: serverDeviceRef,
+      status: "conflicted",
+      attempts: queue.attempts,
+      updated_at: nowIso()
+    });
   }
   async syncOnce(options) {
     await this.initialize();
@@ -23936,6 +24248,18 @@ var ObtsObsidianClient = class {
       return false;
     }
   }
+  async sameCommitTree(first, second) {
+    if (first === second) return true;
+    try {
+      const [firstCommit, secondCommit] = await Promise.all([
+        git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: first }),
+        git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: second })
+      ]);
+      return firstCommit.commit.tree === secondCommit.commit.tree;
+    } catch {
+      return false;
+    }
+  }
   async isAncestor(ancestor, descendant) {
     if (ancestor === descendant) return true;
     try {
@@ -24430,8 +24754,10 @@ var ObtsOnboardingModal = class extends Modal {
     this.connection = null;
     this.analysis = null;
     this.mode = null;
+    this.browserReturnAbortController = null;
   }
   async onOpen() {
+    this.contentEl.addClass("obts-onboarding");
     const pending = await this.plugin.client.readPendingOnboarding();
     if (!pending) {
       this.renderStart();
@@ -24440,6 +24766,14 @@ var ObtsOnboardingModal = class extends Modal {
     this.connection = Object.assign({}, pending.journal.connection, { connection_secret: pending.secret });
     this.analysis = pending.journal.analysis || null;
     this.mode = pending.journal.selected_mode || null;
+    const state = await this.plugin.client.readState();
+    const postRegistrationStage = ["registering", "applying_uploading", "uploading_proposal", "awaiting_conflict"].includes(pending.journal.stage);
+    const resumableSubmission = Boolean(this.analysis && this.mode && (state.vault_id && state.device_id || postRegistrationStage));
+    if (resumableSubmission) {
+      if (pending.journal.stage === "awaiting_conflict") this.renderConflictReview();
+      else this.renderResume();
+      return;
+    }
     if (this.analysis && !["awaiting_browser", "approved", "analyzing"].includes(pending.journal.stage)) {
       this.renderConfirmation();
       return;
@@ -24449,7 +24783,20 @@ var ObtsOnboardingModal = class extends Modal {
   }
   onClose() {
     this.cancelled = true;
+    if (this.browserReturnAbortController) this.browserReturnAbortController.abort();
+    this.browserReturnAbortController = null;
     this.contentEl.empty();
+  }
+  async waitForBrowserReturn() {
+    if (this.browserReturnAbortController) this.browserReturnAbortController.abort();
+    const controller = new AbortController();
+    this.browserReturnAbortController = controller;
+    const returned = await waitForMobileBrowserReturn([
+      controller.signal,
+      this.plugin.lifecycleAbortController.signal
+    ]);
+    if (this.browserReturnAbortController === controller) this.browserReturnAbortController = null;
+    return returned && !this.cancelled && !this.plugin.unloaded;
   }
   renderStart() {
     const { contentEl } = this;
@@ -24461,12 +24808,18 @@ var ObtsOnboardingModal = class extends Modal {
     summary.createEl("strong", { text: this.plugin.app.vault.getName() });
     summary.createEl("span", { text: this.plugin.settings.serverUrl });
     new Setting(contentEl).setName("Device name").setDesc("This name appears in the server dashboard and conflict history.").addText((text) => text.setValue(this.plugin.settings.deviceName).onChange(async (value) => {
-      this.plugin.settings.deviceName = value.trim();
-      await this.plugin.saveSettings();
+      try {
+        await this.plugin.runExclusiveAction(async () => {
+          this.plugin.settings.deviceName = value.trim();
+          await this.plugin.saveSettings();
+        });
+      } catch (error) {
+        new Notice(error instanceof Error ? error.message : "Unable to update the device name.");
+      }
     }));
     new Setting(contentEl).setName("Share error diagnostics with this obts server").setDesc(diagnosticSharingDescription(this.plugin.settings.serverUrl)).addToggle((toggle) => toggle.setValue(this.plugin.diagnosticSharingEnabled()).onChange(async (value) => {
       try {
-        await this.plugin.setDiagnosticSharing(value);
+        await this.plugin.runExclusiveAction(() => this.plugin.setDiagnosticSharing(value));
       } catch (error) {
         new Notice(error instanceof Error ? error.message : "Unable to update diagnostic sharing.");
         this.renderStart();
@@ -24481,12 +24834,14 @@ var ObtsOnboardingModal = class extends Modal {
       button.setDisabled(true);
       setFeedback(feedback, "Scanning the local vault...", "muted");
       try {
-        this.connection = await this.plugin.client.startOnboarding();
+        this.connection = await this.plugin.runExclusiveAction(() => this.plugin.client.startOnboarding());
+        if (this.cancelled || this.plugin.unloaded) return;
         window.open(this.connection.authorization_url);
         this.renderWaiting();
-        await waitForMobileBrowserReturn();
+        if (!await this.waitForBrowserReturn()) return;
         await this.pollUntilApproved();
       } catch (error) {
+        if (this.cancelled || this.plugin.unloaded) return;
         button.setDisabled(false);
         this.showWaitingError(error, "Unable to start setup.");
       }
@@ -24502,12 +24857,14 @@ var ObtsOnboardingModal = class extends Modal {
     code.createEl("strong", { text: this.connection.verification_code });
     const feedback = contentEl.createDiv({ cls: "obts-feedback obts-feedback--muted", text: "Waiting for approval...", attr: { "aria-live": "polite" } });
     new Setting(contentEl).addButton((button) => button.setButtonText("Cancel").onClick(async () => {
-      await this.plugin.client.cancelOnboarding();
+      button.setDisabled(true);
+      await this.plugin.runExclusiveAction(() => this.plugin.client.cancelOnboarding());
       this.close();
     })).addButton((button) => button.setButtonText("Reopen browser").onClick(() => window.open(this.connection.authorization_url)));
     this.waitingFeedback = feedback;
   }
   showWaitingError(error, fallback) {
+    if (this.cancelled || this.plugin.unloaded) return;
     void this.plugin.reportOnboardingError(error, this.connection);
     const message = error instanceof Error ? error.message : fallback;
     if (this.waitingFeedback) setFeedback(this.waitingFeedback, message, "error");
@@ -24515,10 +24872,18 @@ var ObtsOnboardingModal = class extends Modal {
   }
   async pollUntilApproved() {
     while (!this.cancelled && this.connection) {
-      const status2 = await this.plugin.client.pollOnboarding(this.connection.connection_id, this.connection.connection_secret);
+      const status2 = await this.plugin.runExclusiveAction(() => this.plugin.client.pollOnboarding(
+        this.connection.connection_id,
+        this.connection.connection_secret
+      ));
+      if (this.cancelled || this.plugin.unloaded) return;
       if (status2.status === "approved") {
         if (this.waitingFeedback) setFeedback(this.waitingFeedback, "Approved. Comparing local and server vaults...", "success");
-        this.analysis = await this.plugin.client.analyzeOnboarding(this.connection.connection_id, this.connection.connection_secret);
+        this.analysis = await this.plugin.runExclusiveAction(() => this.plugin.client.analyzeOnboarding(
+          this.connection.connection_id,
+          this.connection.connection_secret
+        ));
+        if (this.cancelled || this.plugin.unloaded) return;
         this.renderConfirmation();
         return;
       }
@@ -24564,39 +24929,118 @@ var ObtsOnboardingModal = class extends Modal {
     const feedback = contentEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
     const actionLabel = this.mode === "initialize" ? "Create vault and upload" : this.mode === "merge" ? "Submit for merge" : "Use server vault";
     new Setting(contentEl).addButton((button) => button.setButtonText("Cancel").onClick(async () => {
-      await this.plugin.client.cancelOnboarding();
+      button.setDisabled(true);
+      await this.plugin.runExclusiveAction(() => this.plugin.client.cancelOnboarding());
       this.close();
     })).addButton((button) => button.setButtonText(actionLabel).setCta().onClick(async () => {
       button.setDisabled(true);
       setFeedback(feedback, "Creating recovery bundle and completing setup...", "muted");
       try {
-        const result = await this.plugin.client.finishOnboarding(
+        const result = await this.plugin.runOnboardingAction(() => this.plugin.client.finishOnboarding(
           this.connection.connection_id,
           this.connection.connection_secret,
           this.analysis,
           this.mode
-        );
+        ));
         this.plugin.setStatus((await this.plugin.client.readState()).status_label);
         this.renderResult(result);
       } catch (error) {
+        if (this.cancelled || this.plugin.unloaded) return;
         void this.plugin.reportOnboardingError(error, this.connection);
         button.setDisabled(false);
         setFeedback(feedback, error instanceof Error ? error.message : "Setup failed.", "error");
       }
     }));
   }
-  renderResult(result) {
+  renderResume() {
     const { contentEl } = this;
     contentEl.empty();
-    const reviewNeeded = result.status === "Review needed";
-    contentEl.createEl("h2", { text: reviewNeeded ? "Conflict review needed" : "Sync is ready" });
+    contentEl.createEl("h2", { text: "Finish sync setup" });
     contentEl.createEl("p", {
-      text: reviewNeeded ? "Your local vault was submitted safely, but overlapping changes require review in the dashboard." : "This vault is connected. Sync runs while Obsidian is active."
+      text: "This setup submission started but did not finish. Resume from the durable journal and server state; obts will not submit the local vault a second time."
     });
-    new Setting(contentEl).addButton((button) => button.setButtonText("Close").setCta().onClick(() => this.close())).addButton((button) => {
-      if (reviewNeeded) button.setButtonText("Open dashboard").onClick(() => window.open(`${this.plugin.settings.serverUrl.replace(/\/+$/u, "")}/dashboard`));
-      else button.setDisabled(true).setButtonText("Synced");
+    const feedback = contentEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
+    new Setting(contentEl).addButton((button) => button.setButtonText("Close").onClick(() => this.close())).addButton((button) => button.setButtonText("Resume setup").setCta().onClick(async () => {
+      button.setDisabled(true);
+      setFeedback(feedback, "Checking the accepted onboarding proposal...", "muted");
+      try {
+        const result = await this.resumeRegisteredSetup();
+        this.renderResult(result);
+      } catch (error) {
+        if (this.cancelled || this.plugin.unloaded) return;
+        void this.plugin.reportOnboardingError(error, this.connection);
+        button.setDisabled(false);
+        setFeedback(feedback, error instanceof Error ? error.message : "Unable to resume setup.", "error");
+      }
+    }));
+  }
+  renderConflictReview() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Resolve the conflict, then return here" });
+    contentEl.createEl("p", {
+      text: "Your local vault was submitted once and is safe. Resolve the conflict in the dashboard, return to Obsidian, then check the resolution. Do not submit the merge again."
     });
+    const steps = contentEl.createEl("ol", { cls: "obts-onboarding-steps" });
+    steps.createEl("li", { text: "Open the dashboard and resolve every conflict for this vault." });
+    steps.createEl("li", { text: "Return to this screen in Obsidian." });
+    steps.createEl("li", { text: "Tap Check resolution to apply the resolved server vault and finish setup." });
+    const feedback = contentEl.createDiv({
+      cls: "obts-feedback obts-feedback--muted",
+      text: "Waiting for dashboard conflict resolution...",
+      attr: { "aria-live": "polite" }
+    });
+    new Setting(contentEl).addButton((button) => button.setButtonText("Close").onClick(() => this.close())).addButton((button) => button.setButtonText("Open dashboard").onClick(async () => {
+      window.open(`${this.plugin.settings.serverUrl.replace(/\/+$/u, "")}/dashboard`);
+      setFeedback(feedback, "Resolve the conflict in the dashboard, then return here...", "muted");
+      if (!await this.waitForBrowserReturn()) return;
+      await this.checkConflictResolution(feedback, button);
+    })).addButton((button) => button.setButtonText("Check resolution").setCta().onClick(async () => {
+      await this.checkConflictResolution(feedback, button);
+    }));
+  }
+  async checkConflictResolution(feedback, button) {
+    if (this.cancelled || this.plugin.unloaded) return;
+    button.setDisabled(true);
+    setFeedback(feedback, "Checking the dashboard resolution...", "muted");
+    try {
+      const result = await this.resumeRegisteredSetup();
+      if (result.status === "Review needed") {
+        setFeedback(feedback, "The conflict is still awaiting resolution in the dashboard.", "muted");
+        button.setDisabled(false);
+        return;
+      }
+      this.renderResult(result);
+    } catch (error) {
+      if (this.cancelled || this.plugin.unloaded) return;
+      void this.plugin.reportOnboardingError(error, this.connection);
+      button.setDisabled(false);
+      setFeedback(feedback, error instanceof Error ? error.message : "Unable to check the conflict resolution.", "error");
+    }
+  }
+  async resumeRegisteredSetup() {
+    if (this.cancelled || this.plugin.unloaded) {
+      throw new ObtsBlockedError("operation_interrupted_by_reload", "Setup was interrupted by a plugin reload.");
+    }
+    const result = await this.plugin.runOnboardingAction(() => this.plugin.client.finishOnboarding(
+      this.connection.connection_id,
+      this.connection.connection_secret,
+      this.analysis,
+      this.mode
+    ));
+    this.plugin.setStatus((await this.plugin.client.readState()).status_label);
+    return result;
+  }
+  renderResult(result) {
+    if (result.status === "Review needed") {
+      this.renderConflictReview();
+      return;
+    }
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Sync is ready" });
+    contentEl.createEl("p", { text: "This vault is connected. Sync runs while Obsidian is active." });
+    new Setting(contentEl).addButton((button) => button.setButtonText("Close").setCta().onClick(() => this.close())).addButton((button) => button.setDisabled(true).setButtonText("Synced"));
   }
 };
 var ObtsSettingTab = class extends PluginSettingTab {
@@ -24608,30 +25052,70 @@ var ObtsSettingTab = class extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "Obsidian True Sync" });
-    const state = await this.plugin.client.readState();
-    const paired = Boolean(state.vault_id && state.device_id);
-    const recoveryBlocked = state.last_error_code === "local_state_incomplete";
-    const deviceName = state.device_name || this.plugin.settings.deviceName || "Obsidian device";
+    let availability = this.plugin.operationAvailability();
+    if (!this.plugin.clientReady && availability === "available") {
+      await this.plugin.initializeClient();
+      availability = this.plugin.operationAvailability();
+    }
+    const clientUnavailable = !this.plugin.clientReady;
+    const [state, pendingOnboarding] = clientUnavailable ? [null, null] : await Promise.all([
+      this.plugin.client.readState(),
+      this.plugin.client.readPendingOnboarding()
+    ]);
+    const paired = Boolean(state && state.vault_id && state.device_id);
+    const recoveryBlocked = Boolean(state && state.last_error_code === "local_state_incomplete");
+    const restartRequired = availability === "restart_required";
+    const deviceName = state && state.device_name || this.plugin.settings.deviceName || "Obsidian device";
     new Setting(containerEl).setName("Server URL").addText(
       (text) => text.setValue(this.plugin.settings.serverUrl).onChange(async (value) => {
-        await this.plugin.updateServerUrl(value);
+        try {
+          if (pendingOnboarding) {
+            throw new ObtsBlockedError("onboarding_incomplete", "Finish or cancel onboarding before changing the server URL.");
+          }
+          await this.plugin.runExclusiveAction(() => this.plugin.updateServerUrl(value));
+        } catch (error) {
+          new Notice(error instanceof Error ? error.message : "Unable to update the server URL.");
+          await this.display();
+        }
       })
     );
     new Setting(containerEl).setName("Share error diagnostics with this obts server").setDesc(diagnosticSharingDescription(this.plugin.settings.serverUrl)).addToggle((toggle) => toggle.setValue(this.plugin.diagnosticSharingEnabled()).onChange(async (value) => {
       try {
-        await this.plugin.setDiagnosticSharing(value);
+        await this.plugin.runExclusiveAction(() => this.plugin.setDiagnosticSharing(value));
       } catch (error) {
         new Notice(error instanceof Error ? error.message : "Unable to update diagnostic sharing.");
       }
       await this.display();
     }));
     const sectionHeader = containerEl.createDiv({ cls: "obts-settings-section-header" });
-    sectionHeader.createEl("h3", { text: recoveryBlocked ? "Recovery required" : paired ? "Device" : "Connect Vault" });
-    sectionHeader.createEl("span", {
-      cls: paired ? "obts-status-pill obts-status-pill--ok" : "obts-status-pill",
-      text: recoveryBlocked ? "Needs recovery" : paired ? "Paired" : "Not paired"
+    sectionHeader.createEl("h3", {
+      text: clientUnavailable ? restartRequired ? "Restart required" : "Finishing update" : pendingOnboarding ? "Setup incomplete" : recoveryBlocked ? "Recovery required" : paired ? "Device" : "Connect Vault"
     });
-    if (paired) {
+    sectionHeader.createEl("span", {
+      cls: paired && !pendingOnboarding && !clientUnavailable ? "obts-status-pill obts-status-pill--ok" : "obts-status-pill",
+      text: clientUnavailable ? restartRequired ? "Restart Obsidian" : "Please wait" : pendingOnboarding ? "Resume setup" : recoveryBlocked ? "Needs recovery" : paired ? "Paired" : "Not paired"
+    });
+    if (clientUnavailable) {
+      new Setting(containerEl).setName(restartRequired ? "Plugin update interrupted an operation" : "Waiting for the previous operation").setDesc(
+        restartRequired ? "Fully close Obsidian and reopen it. obts will not clear the old operation lock because doing so could overlap vault writes." : "obts will finish loading when the previous plugin instance releases its active vault operation."
+      );
+    } else if (pendingOnboarding) {
+      const conflictPending = pendingOnboarding.journal.stage === "awaiting_conflict";
+      const canCancelPending = !paired && ["awaiting_browser", "approved", "analyzing", "awaiting_confirmation"].includes(pendingOnboarding.journal.stage);
+      new Setting(containerEl).setName(conflictPending ? "Conflict review submitted" : "Finish connecting this vault").setDesc(
+        restartRequired ? "A plugin update interrupted an operation. Fully restart Obsidian, then return here to resume setup safely." : conflictPending ? "Resolve the conflict in the dashboard, then resume here to apply the resolution. Do not submit the merge again." : "Setup stopped after it started. Resume from the durable onboarding journal; obts will not create a second device."
+      );
+      new Setting(containerEl).setName("Onboarding").addButton((button) => {
+        button.setButtonText(conflictPending ? "Resume conflict setup" : "Resume setup").setCta().setDisabled(restartRequired).onClick(() => new ObtsOnboardingModal(this.app, this.plugin).open());
+      }).addButton((button) => {
+        button.setButtonText("Cancel setup...").setDisabled(!canCancelPending).onClick(async () => {
+          if (!window.confirm("Cancel this unfinished setup? No server device has been registered yet.")) return;
+          await this.plugin.runExclusiveAction(() => this.plugin.client.cancelOnboarding());
+          await this.display();
+        });
+        if (typeof button.setWarning === "function") button.setWarning();
+      });
+    } else if (paired) {
       new Setting(containerEl).setName("Device").setDesc(`${deviceName} \xB7 ${state.device_id}`);
       new Setting(containerEl).setName("Status").setDesc(state.last_error_code ? blockStatusLabel(state.last_error_code) : state.status_label || "Checking");
       new Setting(containerEl).setName("Actions").addButton(
@@ -24644,7 +25128,7 @@ var ObtsSettingTab = class extends PluginSettingTab {
               false
             );
             if (!result) {
-              setFeedback(actionFeedback, "Sync already running.", "muted");
+              setFeedback(actionFeedback, this.plugin.syncBlockedMessage(), "muted");
               return;
             }
             this.plugin.setStatus((await this.plugin.client.readState()).status_label);
@@ -24665,8 +25149,10 @@ var ObtsSettingTab = class extends PluginSettingTab {
           button.setDisabled(true);
           setFeedback(actionFeedback, "Unpairing...", "muted");
           try {
-            await this.plugin.client.unpairCurrentDevice();
-            await this.plugin.saveSettings();
+            await this.plugin.runExclusiveAction(async () => {
+              await this.plugin.client.unpairCurrentDevice();
+              await this.plugin.saveSettings();
+            });
             this.plugin.setStatus("Not paired");
             new Notice("obts unpaired this device.");
             await this.display();
@@ -24691,8 +25177,10 @@ var ObtsSettingTab = class extends PluginSettingTab {
           button.setDisabled(true);
           setFeedback(recoveryFeedback, "Resetting...", "muted");
           try {
-            await this.plugin.client.resetLocalPairingState();
-            await this.plugin.saveSettings();
+            await this.plugin.runExclusiveAction(async () => {
+              await this.plugin.client.resetLocalPairingState();
+              await this.plugin.saveSettings();
+            });
             this.plugin.setStatus("Not paired");
             new Notice("obts reset local pairing state. Re-pair this device to resume sync.");
             await this.display();
@@ -24711,8 +25199,15 @@ var ObtsSettingTab = class extends PluginSettingTab {
       new Setting(containerEl).setName("Status").setDesc("Ready to connect this vault");
       new Setting(containerEl).setName("Device name").addText(
         (text) => text.setValue(this.plugin.settings.deviceName).onChange(async (value) => {
-          this.plugin.settings.deviceName = value.trim();
-          await this.plugin.saveSettings();
+          try {
+            await this.plugin.runExclusiveAction(async () => {
+              this.plugin.settings.deviceName = value.trim();
+              await this.plugin.saveSettings();
+            });
+          } catch (error) {
+            new Notice(error instanceof Error ? error.message : "Unable to update the device name.");
+            await this.display();
+          }
         })
       );
       new Setting(containerEl).setName("Sync setup").setDesc("Authenticate in your browser, then choose how this local vault should connect.").addButton(
@@ -25085,28 +25580,35 @@ function categorizeRecoveryError(error) {
 function sha256(data) {
   return createSha("sha256").update(Buffer2.from(data)).digest("hex");
 }
-async function waitForMobileBrowserReturn() {
-  if (!Platform || !Platform.isMobile || typeof document === "undefined") return;
-  await new Promise((resolve) => {
+async function waitForMobileBrowserReturn(signals = []) {
+  if (signals.some((signal) => signal.aborted)) return false;
+  if (!Platform || !Platform.isMobile || typeof document === "undefined") return true;
+  return await new Promise((resolve) => {
     let sawHidden = document.hidden;
     let timer;
-    const finish = () => {
+    const finish = (returned) => {
       document.removeEventListener("visibilitychange", onVisibilityChange);
+      for (const signal of signals) signal.removeEventListener("abort", onAbort);
       window.clearTimeout(timer);
-      resolve();
+      resolve(returned);
     };
     const onVisibilityChange = () => {
       if (document.hidden) sawHidden = true;
-      else if (sawHidden) finish();
+      else if (sawHidden) finish(true);
     };
+    const onAbort = () => finish(false);
     document.addEventListener("visibilitychange", onVisibilityChange);
-    timer = window.setTimeout(finish, 1500);
+    for (const signal of signals) signal.addEventListener("abort", onAbort, { once: true });
+    timer = window.setTimeout(() => finish(!signals.some((signal) => signal.aborted)), 1500);
   });
 }
 function operationRegistry() {
   const key = "__obtsOperationRegistry";
   if (!globalThis[key]) globalThis[key] = /* @__PURE__ */ new Map();
   return globalThis[key];
+}
+function operationLeaseOwner(lease) {
+  return lease && lease.owner ? lease.owner : lease;
 }
 function randomHex(bytes) {
   const value = new Uint8Array(bytes);
@@ -25163,15 +25665,16 @@ function buildDiagnosticReport(error) {
   const safeErrorCode = error && typeof error === "object" && typeof error.code === "string" ? error.code : "";
   const transport = error instanceof ObtsTransportError;
   const blocked = error instanceof ObtsBlockedError;
-  const failureCode = context && context.failureCode ? context.failureCode : safeErrorCode === "invalid_json" ? "invalid_json" : message.includes("Missing Buffer dependency") ? "missing_buffer_dependency" : message.includes("pack.slice") ? "null_pack_slice" : transport ? "request_failed" : blocked ? "sync_failed" : "unknown";
+  const lifecycleFailure = safeErrorCode === "operation_interrupted_by_reload" || safeErrorCode === "sync_lease_blocked";
+  const failureCode = context && context.failureCode ? context.failureCode : safeErrorCode === "invalid_json" ? "invalid_json" : safeErrorCode === "operation_interrupted_by_reload" || safeErrorCode === "sync_lease_blocked" ? safeErrorCode : message.includes("Missing Buffer dependency") ? "missing_buffer_dependency" : message.includes("pack.slice") ? "null_pack_slice" : transport ? "request_failed" : blocked ? "sync_failed" : "unknown";
   return {
     schema_version: 1,
     event_id: `dgr_${randomHex(16)}`,
     plugin_version: PLUGIN_VERSION,
     obsidian_version: typeof apiVersion === "string" && apiVersion ? apiVersion : "unknown",
     platform_family: Platform && Platform.isIosApp ? "ios" : Platform && Platform.isAndroidApp ? "android" : "desktop",
-    flow: context && context.flow ? context.flow : blocked || transport ? "sync" : "plugin",
-    stage: context && context.stage ? context.stage : transport ? "sync_request" : "unknown",
+    flow: context && context.flow ? context.flow : lifecycleFailure ? "plugin" : blocked || transport ? "sync" : "plugin",
+    stage: context && context.stage ? context.stage : lifecycleFailure ? "plugin_lifecycle" : transport ? "sync_request" : "unknown",
     failure_code: failureCode,
     error_class: transport ? "transport_error" : blocked ? "blocked_error" : error instanceof TypeError ? "type_error" : error instanceof Error ? "error" : "unknown",
     retryable: transport ? error.status >= 500 : false,

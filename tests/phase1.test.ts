@@ -2112,6 +2112,126 @@ describe('Phase 1 sync without conflict resolution', () => {
     await expect(stat(secretPath)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  it('recovers a lost connection-completion response without creating another device', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const phoneDir = join(root, 'lost-completion-phone');
+    await mkdirp(phoneDir);
+    const phone = new ObtsPluginClient(phoneDir, { serverUrl: baseUrl, deviceName: 'phone' });
+    const connection = await phone.startOnboarding('Lost completion phone');
+    expect((await admin.post(`/api/v1/connections/${connection.connection_id}/approve`, {
+      selection: 'existing_vault',
+      vault_id: admin.vaultId
+    })).status).toBe(200);
+    const analysis = await phone.analyzeOnboarding(connection.connection_id, connection.connection_secret);
+    const transport = (phone as unknown as {
+      transport: { completeConnection: (...args: any[]) => Promise<any> };
+    }).transport;
+    const completeConnection = transport.completeConnection.bind(transport);
+    transport.completeConnection = async (...args: any[]) => {
+      await completeConnection(...args);
+      throw new Error('simulated lost completion response');
+    };
+    const submit = {
+      connectionId: connection.connection_id,
+      secret: connection.connection_secret,
+      analysis,
+      mode: 'use_server' as const
+    };
+    await expect(phone.finishOnboarding(submit)).rejects.toThrow('simulated lost completion response');
+    expect((await phone.readState()).device_id).toBeNull();
+    const devicesAfterLostResponse = (await server.store.snapshot()).devices.length;
+    expect(devicesAfterLostResponse).toBe(1);
+
+    const restarted = new ObtsPluginClient(phoneDir, { serverUrl: baseUrl, deviceName: 'phone' });
+    await expect(restarted.finishOnboarding(submit)).resolves.toMatchObject({ status: 'Synced' });
+    expect((await server.store.snapshot()).devices).toHaveLength(devicesAfterLostResponse);
+    expect(await restarted.readPendingOnboarding()).toBeNull();
+  });
+
+  it('resumes use-server onboarding after device registration without creating another device', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'registered-resume-desktop');
+    const phoneDir = join(root, 'registered-resume-phone');
+    await mkdirp(desktopDir);
+    await mkdirp(phoneDir);
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await writeFile(join(desktopDir, 'server.md'), 'server state\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const phone = new ObtsPluginClient(phoneDir, { serverUrl: baseUrl, deviceName: 'phone' });
+    const connection = await phone.startOnboarding('Interrupted phone');
+    expect((await admin.post(`/api/v1/connections/${connection.connection_id}/approve`, {
+      selection: 'existing_vault',
+      vault_id: admin.vaultId
+    })).status).toBe(200);
+    const analysis = await phone.analyzeOnboarding(connection.connection_id, connection.connection_secret);
+    const transport = (phone as unknown as { transport: { pull: (...args: unknown[]) => Promise<unknown> } }).transport;
+    const originalPull = transport.pull.bind(transport);
+    transport.pull = async () => {
+      throw new Error('simulated interruption after registration');
+    };
+    const submit = {
+      connectionId: connection.connection_id,
+      secret: connection.connection_secret,
+      analysis,
+      mode: 'use_server' as const
+    };
+    await expect(phone.finishOnboarding(submit)).rejects.toThrow('simulated interruption');
+    const interruptedState = await phone.readState();
+    expect(interruptedState).toMatchObject({ vault_id: admin.vaultId, status_label: 'Checking' });
+    expect((await phone.readPendingOnboarding())?.journal.stage).toBe('blocked');
+    transport.pull = originalPull;
+
+    const devicesBeforeResume = (await server.store.snapshot()).devices.length;
+    const restarted = new ObtsPluginClient(phoneDir, { serverUrl: baseUrl, deviceName: 'phone' });
+    await expect(restarted.finishOnboarding(submit)).resolves.toMatchObject({ status: 'Synced' });
+    expect(await readFile(join(phoneDir, 'server.md'), 'utf8')).toBe('server state\n');
+    expect(await restarted.readPendingOnboarding()).toBeNull();
+    expect((await server.store.snapshot()).devices).toHaveLength(devicesBeforeResume);
+  });
+
+  it('does not complete new-vault onboarding before the local proposal is accepted', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const phoneDir = join(root, 'proposal-crash-phone');
+    await mkdirp(phoneDir);
+    await writeFile(join(phoneDir, 'local.md'), 'local proposal\n');
+    const phone = new ObtsPluginClient(phoneDir, { serverUrl: baseUrl, deviceName: 'phone' });
+    const connection = await phone.startOnboarding('Proposal crash phone');
+    expect((await admin.post(`/api/v1/connections/${connection.connection_id}/approve`, {
+      selection: 'new_vault',
+      display_name: 'Proposal crash vault'
+    })).status).toBe(200);
+    const analysis = await phone.analyzeOnboarding(connection.connection_id, connection.connection_secret);
+    const git = (phone as unknown as { git: { createLocalCommit(message: string): Promise<string | null> } }).git;
+    const createLocalCommit = git.createLocalCommit.bind(git);
+    git.createLocalCommit = async () => {
+      throw new Error('simulated interruption before proposal commit');
+    };
+    const submit = {
+      connectionId: connection.connection_id,
+      secret: connection.connection_secret,
+      analysis,
+      mode: 'initialize' as const
+    };
+    await expect(phone.finishOnboarding(submit)).rejects.toThrow('simulated interruption before proposal commit');
+    const interruptedState = await phone.readState();
+    const interruptedSelf = await fetch(`${baseUrl}/api/v1/device/self`, {
+      headers: { authorization: `Bearer ${await readDeviceToken(phoneDir)}` }
+    });
+    expect(interruptedSelf.status).toBe(200);
+    expect(((await interruptedSelf.json()) as { server_device_ref: string | null }).server_device_ref).toBeNull();
+    expect(interruptedState.local_main).toMatch(/^[0-9a-f]{40}$/u);
+    expect(await phone.readPendingOnboarding()).not.toBeNull();
+    git.createLocalCommit = createLocalCommit;
+
+    const restarted = new ObtsPluginClient(phoneDir, { serverUrl: baseUrl, deviceName: 'phone' });
+    await expect(restarted.finishOnboarding(submit)).resolves.toMatchObject({ status: 'Synced' });
+    const finalState = await restarted.readState();
+    const vault = (await server.store.snapshot()).vaults.find((candidate) => candidate.vault_id === finalState.vault_id)!;
+    expect(await server.git.listTreePaths(vault.vault_id, vault.current_main)).toContain('local.md');
+    expect(await restarted.readPendingOnboarding()).toBeNull();
+  });
+
   it('creates a new server vault from the browser-approved local onboarding snapshot', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'new-vault-onboarding-device');
@@ -4429,6 +4549,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(backgroundSync).toContain('isRetryableLocalError(state.last_error_code)');
     expect(backgroundSync).toContain('await this.runAutomaticSync();');
     const automaticSync = sourceSection(pluginMain, 'async runAutomaticSync()', 'async handleAutomaticSyncError');
+    expect(automaticSync).toContain('readPendingOnboarding()');
     expect(automaticSync).toContain('syncOnceOrPollResolvedConflict');
     expect(pluginMain).toContain('SYNC_STALE_MS');
     expect(pluginMain).toContain('fetchWithTimeout');
@@ -4447,6 +4568,16 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('class ObtsOnboardingModal');
     expect(pluginMain).toContain('setButtonText("Set up sync")');
     expect(pluginMain).toContain('Continue in browser');
+    expect(pluginMain).toContain('setButtonText("Resume setup")');
+    expect(pluginMain).toContain('Resolve the conflict, then return here');
+    expect(pluginMain).toContain('Do not submit the merge again.');
+    expect(pluginMain).toContain('resumeAcceptedOnboarding');
+    expect(pluginMain).toContain('onboarding_local_changes_after_submit');
+    expect(pluginMain).toContain('operationAvailability()');
+    expect(pluginMain).toContain('runExclusiveAction');
+    expect(pluginMain).toContain('this.lifecycleAbortController.abort()');
+    expect(pluginMain).toContain('this.cancelled || this.plugin.unloaded');
+    expect(pluginMain).toContain('Fully restart Obsidian before continuing setup or sync.');
     expect(pluginMain).toContain('setButtonText("Sync now")');
     expect(pluginMain).toContain('setButtonText("Unpair...")');
     expect(pluginMain).toContain('setWarning');

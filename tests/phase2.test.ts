@@ -210,6 +210,122 @@ describe('Phase 2 dashboard conflict resolution', () => {
     );
   });
 
+  it('resumes onboarding conflict review without resubmitting or losing a reconstructed same-tree proposal', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const serverDir = join(root, 'onboarding-server');
+    const phoneDir = join(root, 'onboarding-phone');
+    await mkdir(serverDir, { recursive: true });
+    await mkdir(phoneDir, { recursive: true });
+    const desktop = await pairPlugin(admin, serverDir, 'desktop');
+    await writeFile(join(serverDir, 'shared.md'), 'server version\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    await writeFile(join(phoneDir, 'shared.md'), 'phone version\n');
+
+    const phone = new ObtsPluginClient(phoneDir, { serverUrl: baseUrl, deviceName: 'phone' });
+    const connection = await phone.startOnboarding('Phone Vault');
+    expect((await admin.post(`/api/v1/connections/${connection.connection_id}/approve`, {
+      selection: 'existing_vault',
+      vault_id: admin.vaultId
+    })).status).toBe(200);
+    const analysis = await phone.analyzeOnboarding(connection.connection_id, connection.connection_secret);
+    const submit = {
+      connectionId: connection.connection_id,
+      secret: connection.connection_secret,
+      analysis,
+      mode: 'merge' as const
+    };
+    const conflicted = await phone.finishOnboarding(submit);
+    expect(conflicted.status).toBe('Review needed');
+    const firstState = await phone.readState();
+    expect(firstState.server_device_ref).toMatch(/^[0-9a-f]{40}$/u);
+    const proposalEventsBeforeRetry = (await server.store.snapshot()).events.filter(
+      (event) => event.event_type === 'device_ref_updated' && event.resource_ids.device_id === firstState.device_id
+    ).length;
+    const identityJournal = (await phone.readPendingOnboarding())!;
+    await expect(phone.finishOnboarding({ ...submit, mode: 'use_server' })).rejects.toMatchObject({
+      code: 'onboarding_identity_mismatch'
+    });
+    expect((await phone.readPendingOnboarding())?.journal).toMatchObject({
+      stage: 'awaiting_conflict',
+      selected_mode: 'merge'
+    });
+    await writeFile(join(phoneDir, '.obts', 'onboarding.json'), `${JSON.stringify({
+      ...identityJournal.journal,
+      registered_device_id: 'dev_00000000000000000000000000000000'
+    }, null, 2)}\n`);
+    await expect(phone.finishOnboarding(submit)).rejects.toMatchObject({ code: 'onboarding_identity_mismatch' });
+    await writeFile(join(phoneDir, '.obts', 'onboarding.json'), `${JSON.stringify(identityJournal.journal, null, 2)}\n`);
+
+    await expect(phone.finishOnboarding(submit)).resolves.toMatchObject({ status: 'Review needed' });
+    expect((await phone.readPendingOnboarding())?.journal.stage).toBe('awaiting_conflict');
+    expect((await server.store.snapshot()).events.filter(
+      (event) => event.event_type === 'device_ref_updated' && event.resource_ids.device_id === firstState.device_id
+    )).toHaveLength(proposalEventsBeforeRetry);
+
+    const review = await admin.get<{ conflict: { conflict_id: string; expected_main: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}`
+    );
+    expect(review.status).toBe(200);
+    const resumableJournal = (await phone.readPendingOnboarding())!;
+    const resolved = await admin.post<{ resolution_commit: string }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}/resolve`,
+      { expected_main: review.body.conflict.expected_main, resolution_kind: 'keep_server' }
+    );
+    expect(resolved.status).toBe(200);
+
+    expect(await phone.pollRemoteEventsAndApply()).toMatchObject({ applied: true, status: 'Synced' });
+    await expect(phone.finishOnboarding(submit)).resolves.toMatchObject({
+      status: 'Synced',
+      main: resolved.body.resolution_commit
+    });
+    expect(await phone.readPendingOnboarding()).toBeNull();
+
+    await writeFile(join(phoneDir, '.obts', 'auth', 'pending-connection.json'), `${JSON.stringify({
+      connection_secret: resumableJournal.secret,
+      created_at: new Date().toISOString()
+    }, null, 2)}\n`);
+    await writeFile(join(phoneDir, 'shared.md'), 'phone version\n');
+    const git = (phone as unknown as { git: { setLocalHead(commit: string): Promise<void>; createLocalCommit(message: string): Promise<string | null> } }).git;
+    await git.setLocalHead(analysis.proposalBase!);
+    const duplicateCommit = await git.createLocalCommit('obts: reconstructed onboarding proposal');
+    expect(duplicateCommit).toMatch(/^[0-9a-f]{40}$/u);
+    const now = new Date().toISOString();
+    await writeFile(join(phoneDir, '.obts', 'state.json'), `${JSON.stringify({
+      ...firstState,
+      server_device_ref: null,
+      local_main: analysis.proposalBase,
+      local_head: duplicateCommit,
+      status_label: 'Uploading',
+      last_error_code: null,
+      updated_at: now
+    }, null, 2)}\n`);
+    await writeFile(join(phoneDir, '.obts', 'queue.json'), `${JSON.stringify({
+      pending_commit: duplicateCommit,
+      expected_device_ref: null,
+      status: 'uploading',
+      attempts: 2,
+      updated_at: now
+    }, null, 2)}\n`);
+    await writeFile(join(phoneDir, '.obts', 'onboarding.json'), `${JSON.stringify({
+      ...resumableJournal.journal,
+      stage: 'blocked',
+      last_error_code: 'stale_device_ref',
+      updated_at: now
+    }, null, 2)}\n`);
+
+    const resumed = await phone.finishOnboarding(submit);
+    expect(resumed).toMatchObject({ status: 'Synced', main: resolved.body.resolution_commit });
+    expect(await readFile(join(phoneDir, 'shared.md'), 'utf8')).toBe('server version\n');
+    expect(await phone.readPendingOnboarding()).toBeNull();
+    expect(JSON.parse(await readFile(join(phoneDir, '.obts', 'queue.json'), 'utf8'))).toMatchObject({
+      pending_commit: null,
+      status: 'idle'
+    });
+    expect((await server.store.snapshot()).events.filter(
+      (event) => event.event_type === 'device_ref_updated' && event.resource_ids.device_id === firstState.device_id
+    )).toHaveLength(proposalEventsBeforeRetry);
+  });
+
   it('reviews and resolves a rename title conflict with path-aware choices', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const { result } = await prepareRenameConflict(admin, root, 'rename-review');

@@ -60,6 +60,7 @@ export type OnboardingStage =
   | 'awaiting_confirmation'
   | 'registering'
   | 'applying_uploading'
+  | 'uploading_proposal'
   | 'awaiting_conflict'
   | 'complete'
   | 'blocked';
@@ -70,6 +71,8 @@ export type OnboardingJournal = {
   connection: Omit<CreateConnectionResponse, 'connection_secret'>;
   analysis: OnboardingAnalysis | null;
   selected_mode: 'initialize' | 'use_server' | 'merge' | null;
+  registered_device_id?: string | null;
+  proposal_commit?: string | null;
   last_error_code: string | null;
   updated_at: string;
 };
@@ -320,6 +323,14 @@ export class ObtsPluginClient {
     analysis: OnboardingAnalysis;
     mode: 'initialize' | 'use_server' | 'merge';
   }): Promise<{ status: string; main?: string; conflictId?: string }> {
+    const pending = await this.readPendingOnboarding();
+    if (
+      !pending ||
+      pending.journal.connection.connection_id !== input.connectionId ||
+      (pending.journal.selected_mode && pending.journal.selected_mode !== input.mode)
+    ) {
+      throw new PluginBlockedError('onboarding_identity_mismatch', 'Pending onboarding mode does not match this setup attempt.');
+    }
     this.onboardingOperation = true;
     await this.updateOnboardingStage(input.connectionId, 'registering', input.mode);
     try {
@@ -329,7 +340,7 @@ export class ObtsPluginClient {
         input.connectionId,
         'blocked',
         input.mode,
-        error instanceof PluginBlockedError ? error.code : 'onboarding_failed'
+        error instanceof PluginBlockedError || error instanceof TransportError ? error.code : 'onboarding_failed'
       );
       throw error;
     } finally {
@@ -344,10 +355,14 @@ export class ObtsPluginClient {
     mode: 'initialize' | 'use_server' | 'merge';
   }): Promise<{ status: string; main?: string; conflictId?: string }> {
     const current = await this.localSnapshotSummary();
+    const localFiles = await this.git.scanSyncableFiles();
+    const resumed = await this.resumeAcceptedOnboarding(input, localFiles);
+    if (resumed) {
+      return resumed;
+    }
     if (current.fingerprint !== input.analysis.localFingerprint) {
       throw new PluginBlockedError('onboarding_snapshot_changed', 'The local vault changed. Review the updated onboarding summary before continuing.');
     }
-    const localFiles = await this.git.scanSyncableFiles();
     const operationType = input.mode === 'use_server' ? 'replace_local_with_server' : 'initial_import';
     await this.createLocalRecoveryBundle(operationType, input.analysis.expectedMain, localFiles);
     const request: CompleteConnectionRequest = {
@@ -366,7 +381,6 @@ export class ObtsPluginClient {
           : {})
     };
     const result = await this.transport.completeConnection(input.connectionId, input.secret, request);
-    await this.updateOnboardingStage(input.connectionId, 'applying_uploading', input.mode);
     await writeJson(join(this.vaultDir, '.obts', 'auth', 'device-token.json'), {
       device_token: result.device_token,
       created_at: nowIso()
@@ -388,6 +402,15 @@ export class ObtsPluginClient {
       unpaired_baseline_main: null,
       updated_at: nowIso()
     });
+    await this.updateOnboardingStage(input.connectionId, 'applying_uploading', input.mode);
+    const registeredPending = await this.readPendingOnboarding();
+    if (registeredPending?.journal.connection.connection_id === input.connectionId) {
+      await this.writeOnboardingJournal({
+        ...registeredPending.journal,
+        registered_device_id: result.device_id,
+        updated_at: nowIso()
+      });
+    }
     const pulled = await this.transport.pull({
       vaultId: result.vault_id,
       deviceId: result.device_id,
@@ -426,6 +449,15 @@ export class ObtsPluginClient {
       updated_at: nowIso()
     });
     const proposalCommit = await this.git.createLocalCommit('obts: onboarding local vault');
+    const proposalPending = await this.readPendingOnboarding();
+    if (proposalPending?.journal.connection.connection_id === input.connectionId) {
+      await this.writeOnboardingJournal({
+        ...proposalPending.journal,
+        stage: 'uploading_proposal',
+        proposal_commit: proposalCommit,
+        updated_at: nowIso()
+      });
+    }
     await this.writeQueue({
       pending_commit: proposalCommit,
       expected_device_ref: null,
@@ -449,6 +481,184 @@ export class ObtsPluginClient {
     });
     await this.completePendingOnboarding(input.connectionId);
     return synced;
+  }
+
+  private async resumeAcceptedOnboarding(
+    input: {
+      connectionId: string;
+      secret: string;
+      analysis: OnboardingAnalysis;
+      mode: 'initialize' | 'use_server' | 'merge';
+    },
+    localFiles: string[]
+  ): Promise<{ status: string; main?: string; conflictId?: string } | null> {
+    const pending = await this.readPendingOnboarding();
+    if (
+      !pending ||
+      pending.journal.connection.connection_id !== input.connectionId ||
+      (pending.journal.selected_mode && pending.journal.selected_mode !== input.mode) ||
+      (pending.journal.analysis && (
+        pending.journal.analysis.localFingerprint !== input.analysis.localFingerprint ||
+        pending.journal.analysis.selection !== input.analysis.selection ||
+        pending.journal.analysis.vaultId !== input.analysis.vaultId ||
+        pending.journal.analysis.expectedMain !== input.analysis.expectedMain ||
+        pending.journal.analysis.proposalBase !== input.analysis.proposalBase ||
+        pending.journal.analysis.classification !== input.analysis.classification
+      ))
+    ) {
+      throw new PluginBlockedError('onboarding_identity_mismatch', 'Pending onboarding state does not match this setup attempt.');
+    }
+    const state = await this.readState();
+    if (!state.vault_id || !state.device_id) {
+      return null;
+    }
+    if (input.analysis.vaultId && input.analysis.vaultId !== state.vault_id) {
+      throw new PluginBlockedError('onboarding_identity_mismatch', 'Pending onboarding targets a different vault.');
+    }
+    const token = await this.readDeviceToken();
+    const [self, connection] = await Promise.all([
+      this.transport.getDeviceSelf(token),
+      this.transport.connectionStatus(input.connectionId, input.secret)
+    ]);
+    if (
+      self.vault_id !== state.vault_id ||
+      self.device_id !== state.device_id ||
+      connection.status !== 'consumed' ||
+      connection.vault_id !== state.vault_id ||
+      connection.device_id !== state.device_id ||
+      (pending.journal.registered_device_id && pending.journal.registered_device_id !== state.device_id)
+    ) {
+      throw new PluginBlockedError('onboarding_identity_mismatch', 'Registered onboarding identity does not match local device state.');
+    }
+    if (!pending.journal.registered_device_id) {
+      await this.writeOnboardingJournal({ ...pending.journal, registered_device_id: state.device_id, updated_at: nowIso() });
+    }
+    const localAlreadyApplied = state.local_main === self.current_main && (
+      input.mode !== 'use_server' || (
+        await this.git.commitExists(self.current_main) && await this.localContentMatchesTree(localFiles, self.current_main)
+      )
+    );
+    if (localAlreadyApplied && (input.mode === 'use_server' || self.server_device_ref)) {
+      await this.transport.acknowledgeOnboarding({
+        vaultId: state.vault_id,
+        deviceToken: token,
+        appliedMain: state.local_main!
+      });
+      await this.completePendingOnboarding(input.connectionId);
+      return { status: state.status_label, main: state.local_main! };
+    }
+    if (input.mode === 'use_server') {
+      await this.createLocalRecoveryBundle('replace_local_with_server', self.current_main, localFiles);
+      const pulled = await this.transport.pull({
+        vaultId: state.vault_id,
+        deviceId: state.device_id,
+        deviceToken: token,
+        currentLocalMain: state.local_main,
+        currentEventSeq: state.last_event_seq
+      });
+      await this.git.importPack(pulled.packfile);
+      await this.applyTargetMain(pulled.manifest.target_main, pulled.manifest.changed_paths, true, {
+        extraAffectedPaths: localFiles,
+        directoryIntents: pulled.manifest.directory_intents ?? [],
+        explicitDirectories: pulled.manifest.explicit_directories ?? [],
+        eventSeq: pulled.manifest.event_seq
+      });
+      await this.acknowledgeAppliedMain(await this.readState(), token, pulled.manifest.target_main);
+      await this.transport.acknowledgeOnboarding({
+        vaultId: state.vault_id,
+        deviceToken: token,
+        appliedMain: pulled.manifest.target_main
+      });
+      await this.writeState({ ...(await this.readState()), status_label: 'Synced', last_error_code: null, updated_at: nowIso() });
+      await this.completePendingOnboarding(input.connectionId);
+      return { status: 'Synced', main: pulled.manifest.target_main };
+    }
+    if (!self.server_device_ref) {
+      return null;
+    }
+
+    await this.createLocalRecoveryBundle('initial_import', self.current_main, localFiles);
+    try {
+      const pulled = await this.transport.pull({
+        vaultId: state.vault_id,
+        deviceId: state.device_id,
+        deviceToken: token,
+        currentLocalMain: state.local_main,
+        currentEventSeq: state.last_event_seq
+      });
+      await this.git.importPack(pulled.packfile);
+    } catch (error) {
+      if (!(error instanceof TransportError && error.code === 'device_blocked')) {
+        throw error;
+      }
+      await this.normalizeAcceptedOnboardingProposal(self.server_device_ref, localFiles);
+      await this.writeState({
+        ...(await this.readState()),
+        server_device_ref: self.server_device_ref,
+        status_label: 'Review needed',
+        last_error_code: 'conflict_review_required',
+        updated_at: nowIso()
+      });
+      await this.updateOnboardingStage(input.connectionId, 'awaiting_conflict', input.mode);
+      return { status: 'Review needed' };
+    }
+
+    await this.normalizeAcceptedOnboardingProposal(self.server_device_ref, localFiles);
+    await this.writeState({
+      ...(await this.readState()),
+      server_device_ref: self.server_device_ref,
+      status_label: 'Behind',
+      last_error_code: null,
+      updated_at: nowIso()
+    });
+    if (!(await this.pullAndApply({ allowDestructive: true }))) {
+      throw new PluginBlockedError(
+        'onboarding_local_changes_after_submit',
+        'Local files changed after the onboarding proposal. Recovery is required before applying the resolved vault.'
+      );
+    }
+    const finalState = await this.readState();
+    if (!finalState.local_main) {
+      throw new PluginBlockedError('onboarding_incomplete', 'Onboarding did not produce an applied server main.');
+    }
+    await this.transport.acknowledgeOnboarding({
+      vaultId: state.vault_id,
+      deviceToken: token,
+      appliedMain: finalState.local_main
+    });
+    await this.completePendingOnboarding(input.connectionId);
+    return { status: finalState.status_label, main: finalState.local_main };
+  }
+
+  private async normalizeAcceptedOnboardingProposal(serverDeviceRef: string, localFiles: string[]): Promise<void> {
+    const state = await this.readState();
+    const queue = await this.readQueue();
+    const localCandidate = queue.pending_commit ?? state.local_head;
+    const matchesAcceptedProposal = localCandidate
+      ? await this.git.sameCommitTree(localCandidate, serverDeviceRef)
+      : await this.localContentMatchesTree(localFiles, serverDeviceRef);
+    if (!matchesAcceptedProposal) {
+      throw new PluginBlockedError(
+        'onboarding_local_changes_after_submit',
+        'Local files changed after the onboarding proposal. Recovery is required before continuing.'
+      );
+    }
+    await this.git.setLocalHead(serverDeviceRef);
+    await this.writeState({
+      ...state,
+      server_device_ref: serverDeviceRef,
+      local_head: serverDeviceRef,
+      status_label: 'Review needed',
+      last_error_code: 'conflict_review_required',
+      updated_at: nowIso()
+    });
+    await this.writeQueue({
+      pending_commit: serverDeviceRef,
+      expected_device_ref: serverDeviceRef,
+      status: 'conflicted',
+      attempts: queue.attempts,
+      updated_at: nowIso()
+    });
   }
 
   async syncOnce(options: { confirmInitialImport?: boolean } = {}): Promise<{ status: string; main?: string; conflictId?: string }> {
