@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Obsidian True Sync Phase 3 API
-  version: 0.3.3
+  version: 0.3.4
   summary: Deployable note history, restore, diagnostics, and maintenance.
 servers:
   - url: /api/v1
@@ -385,6 +385,39 @@ paths:
           $ref: "#/components/responses/Error"
         "409":
           $ref: "#/components/responses/Error"
+  /connections/{connection_id}/bootstrap-chunk:
+    post:
+      summary: Fetch one bounded Git-object bootstrap chunk for an approved connection.
+      security:
+        - connectionBearer: []
+      parameters:
+        - $ref: "#/components/parameters/ConnectionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChunkBootstrapRequest"
+      responses:
+        "200":
+          description: Pinned bootstrap metadata and one independently importable Git pack chunk.
+          content:
+            multipart/form-data:
+              schema:
+                type: object
+                required: [manifest, packfile]
+                properties:
+                  manifest:
+                    $ref: "#/components/schemas/ChunkBootstrapManifest"
+                  packfile:
+                    type: string
+                    contentEncoding: binary
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "413":
+          $ref: "#/components/responses/Error"
   /connections/{connection_id}/diagnostic-events:
     post:
       summary: Accept one opted-in sanitized failure report from an approved onboarding connection.
@@ -539,6 +572,131 @@ paths:
           $ref: "#/components/responses/Error"
         "503":
           $ref: "#/components/responses/Error"
+  /sync/capabilities:
+    get:
+      summary: Discover bounded resumable Git transfer limits.
+      security: []
+      responses:
+        "200":
+          description: Transfer capabilities and hard limits.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncCapabilities"
+  /vaults/{vault_id}/sync/push-transfers:
+    post:
+      summary: Create or resume an idempotent bounded Git object-pack transfer.
+      security:
+        - deviceBearer: []
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChunkPushCreateRequest"
+      responses:
+        "200":
+          description: Existing idempotent transfer.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChunkPushDescriptor"
+        "201":
+          description: Transfer created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChunkPushDescriptor"
+        "409":
+          $ref: "#/components/responses/Error"
+        "413":
+          $ref: "#/components/responses/Error"
+        "429":
+          $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/sync/push-transfers/{transfer_id}:
+    get:
+      summary: Inspect resumable transfer receipts and terminal result.
+      security:
+        - deviceBearer: []
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - $ref: "#/components/parameters/TransferId"
+      responses:
+        "200":
+          description: Transfer descriptor.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChunkPushDescriptor"
+        "404":
+          $ref: "#/components/responses/Error"
+        "410":
+          $ref: "#/components/responses/Error"
+    delete:
+      summary: Abort and delete a resumable transfer owned by this device.
+      security:
+        - deviceBearer: []
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - $ref: "#/components/parameters/TransferId"
+      responses:
+        "204":
+          description: Transfer deleted.
+  /vaults/{vault_id}/sync/push-transfers/{transfer_id}/chunks/{chunk_index}:
+    put:
+      summary: Upload one independently valid bounded Git pack chunk.
+      security:
+        - deviceBearer: []
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - $ref: "#/components/parameters/TransferId"
+        - name: chunk_index
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+        - name: X-Obts-Chunk-Sha256
+          in: header
+          required: true
+          schema:
+            type: string
+            pattern: "^[0-9a-f]{64}$"
+      requestBody:
+        required: true
+        content:
+          application/x-git-packed-objects:
+            schema:
+              type: string
+              contentEncoding: binary
+      responses:
+        "200":
+          description: Idempotent chunk receipt.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChunkPushReceipt"
+        "409":
+          $ref: "#/components/responses/Error"
+        "413":
+          $ref: "#/components/responses/Error"
+        "422":
+          $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/sync/push-transfers/{transfer_id}/finalize:
+    post:
+      summary: Validate the complete quarantined object set and atomically apply the device ref update.
+      security:
+        - deviceBearer: []
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - $ref: "#/components/parameters/TransferId"
+      responses:
+        "200":
+          description: Existing push result contract.
+        "409":
+          $ref: "#/components/responses/Error"
   /vaults/{vault_id}/sync/push:
     post:
       summary: Upload a device commit pack and request a protected device-ref update.
@@ -610,6 +768,37 @@ paths:
         "409":
           $ref: "#/components/responses/Error"
         "404":
+          $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/sync/pull-chunk:
+    post:
+      summary: Pull one bounded independently importable Git object-pack chunk for a pinned target.
+      security:
+        - deviceBearer: []
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChunkPullRequest"
+      responses:
+        "200":
+          description: Chunk manifest and bounded Git pack.
+          content:
+            multipart/form-data:
+              schema:
+                type: object
+                required: [manifest, packfile]
+                properties:
+                  manifest:
+                    $ref: "#/components/schemas/ChunkPullManifest"
+                  packfile:
+                    type: string
+                    contentEncoding: binary
+        "404":
+          $ref: "#/components/responses/Error"
+        "413":
           $ref: "#/components/responses/Error"
   /vaults/{vault_id}/sync/device-status:
     post:
@@ -960,6 +1149,13 @@ components:
       schema:
         type: string
         pattern: "^dev_"
+    TransferId:
+      name: transfer_id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^trn_"
     ConflictId:
       name: conflict_id
       in: path
@@ -1612,6 +1808,177 @@ components:
           type: array
           items:
             type: string
+    SyncCapabilities:
+      type: object
+      required: [capabilities, max_chunk_bytes, target_chunk_bytes, max_transfer_bytes, max_transfer_chunks]
+      properties:
+        capabilities:
+          type: array
+          prefixItems:
+            - const: git-object-pack-chunks-v1
+          minItems: 1
+          maxItems: 1
+        max_chunk_bytes:
+          type: integer
+          minimum: 1048576
+        target_chunk_bytes:
+          type: integer
+          minimum: 1048576
+        max_transfer_bytes:
+          type: integer
+        max_transfer_chunks:
+          type: integer
+    ChunkPushCreateRequest:
+      type: object
+      required: [api_version, vault_id, device_id, expected_device_ref, target_commit, client_known_main, attempt_id, chunk_count, plan_sha256]
+      properties:
+        api_version:
+          const: 2026-07-12.browser-onboarding
+        plugin_version:
+          type: string
+        vault_id:
+          type: string
+        device_id:
+          type: string
+        expected_device_ref:
+          oneOf:
+            - type: "null"
+            - type: string
+              pattern: "^[0-9a-f]{40}$"
+        target_commit:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        client_known_main:
+          oneOf:
+            - type: "null"
+            - type: string
+              pattern: "^[0-9a-f]{40}$"
+        base_commit:
+          oneOf:
+            - type: "null"
+            - type: string
+              pattern: "^[0-9a-f]{40}$"
+        directory_intents:
+          type: array
+          items:
+            $ref: "#/components/schemas/DirectoryIntent"
+        attempt_id:
+          type: string
+          pattern: "^[A-Za-z0-9_-]{8,128}$"
+        chunk_count:
+          type: integer
+          minimum: 1
+          maximum: 4096
+        plan_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+    ChunkPushDescriptor:
+      type: object
+      required: [transfer_id, capability, status, target_commit, chunk_count, received_chunks, max_chunk_bytes, max_transfer_bytes, expires_at]
+      properties:
+        transfer_id:
+          type: string
+          pattern: "^trn_"
+        capability:
+          const: git-object-pack-chunks-v1
+        status:
+          enum: [open, completed, aborted]
+        target_commit:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        chunk_count:
+          type: integer
+        received_chunks:
+          type: array
+          items:
+            type: integer
+        max_chunk_bytes:
+          type: integer
+        max_transfer_bytes:
+          type: integer
+        expires_at:
+          type: string
+          format: date-time
+        result:
+          type: object
+    ChunkPushReceipt:
+      type: object
+      required: [transfer_id, chunk_index, chunk_sha256, received_bytes, idempotent]
+      properties:
+        transfer_id:
+          type: string
+        chunk_index:
+          type: integer
+        chunk_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        received_bytes:
+          type: integer
+        idempotent:
+          type: boolean
+    ChunkPullRequest:
+      allOf:
+        - $ref: "#/components/schemas/DevicePullRequest"
+        - type: object
+          required: [cursor]
+          properties:
+            cursor:
+              type: integer
+              minimum: 0
+    ChunkPullManifest:
+      allOf:
+        - $ref: "#/components/schemas/DevicePullManifest"
+        - type: object
+          required: [capability, cursor, next_cursor, complete, chunk_sha256, chunk_bytes]
+          properties:
+            capability:
+              const: git-object-pack-chunks-v1
+            cursor:
+              type: integer
+            next_cursor:
+              type: integer
+            complete:
+              type: boolean
+            chunk_sha256:
+              type: string
+              pattern: "^[0-9a-f]{64}$"
+            chunk_bytes:
+              type: integer
+    ChunkBootstrapRequest:
+      type: object
+      required: [api_version, cursor, requested_target]
+      properties:
+        api_version:
+          const: 2026-07-12.browser-onboarding
+        plugin_version:
+          type: string
+        cursor:
+          type: integer
+          minimum: 0
+        requested_target:
+          oneOf:
+            - const: latest
+            - type: string
+              pattern: "^[0-9a-f]{40}$"
+    ChunkBootstrapManifest:
+      allOf:
+        - $ref: "#/components/schemas/ConnectionBootstrapManifest"
+        - type: object
+          required: [capability, cursor, next_cursor, complete, chunk_sha256, chunk_bytes]
+          properties:
+            capability:
+              const: git-object-pack-chunks-v1
+            cursor:
+              type: integer
+            next_cursor:
+              type: integer
+            complete:
+              type: boolean
+            chunk_sha256:
+              type: string
+              pattern: "^[0-9a-f]{64}$"
+            chunk_bytes:
+              type: integer
     DirectoryIntent:
       type: object
       required: [op, path]
@@ -1720,6 +2087,8 @@ components:
               - plugin_version
               - path_capabilities
               - last_status_report_at
+              - status_report_fresh
+              - status_report_age_seconds
               - ahead_of_main
               - behind_main
               - blocked
@@ -1789,6 +2158,13 @@ components:
                   - type: "null"
                   - type: string
                     format: date-time
+              status_report_fresh:
+                type: boolean
+              status_report_age_seconds:
+                oneOf:
+                  - type: "null"
+                  - type: integer
+                    minimum: 0
               ahead_of_main:
                 type: boolean
               behind_main:

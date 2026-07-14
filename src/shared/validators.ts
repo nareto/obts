@@ -1,5 +1,13 @@
 import { isSyncableVaultPath, normalizeVaultPath } from './pathPolicy.js';
-import { API_VERSION, type DevicePullRequest, type DevicePushManifest, type DirectoryIntent } from './types.js';
+import {
+  API_VERSION,
+  type ChunkBootstrapRequest,
+  type ChunkPullRequest,
+  type ChunkPushCreateRequest,
+  type DevicePullRequest,
+  type DevicePushManifest,
+  type DirectoryIntent
+} from './types.js';
 
 const COMMIT_ID_PATTERN = /^[0-9a-f]{40}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
@@ -200,6 +208,63 @@ export function parseDevicePullRequest(value: unknown): DevicePullRequest {
     current_local_main: readNullableCommitId(value, 'current_local_main'),
     requested_target: requested,
     ...(currentEventSeq === undefined ? {} : { current_event_seq: currentEventSeq })
+  };
+}
+
+export function parseChunkPushCreateRequest(value: unknown): ChunkPushCreateRequest {
+  assertRecord(value);
+  const apiVersion = readString(value, 'api_version');
+  if (apiVersion !== API_VERSION) throw new ValidationError('unsupported_client', 'Unsupported client API version.');
+  const attemptId = readString(value, 'attempt_id');
+  if (!/^[A-Za-z0-9_-]{8,128}$/u.test(attemptId)) {
+    throw new ValidationError('invalid_request', 'Invalid attempt ID.', { field: 'attempt_id' });
+  }
+  const planSha256 = readSha256(value, 'plan_sha256');
+  const chunkCount = readNonNegativeInteger(value, 'chunk_count');
+  if (chunkCount < 1 || chunkCount > 4096) {
+    throw new ValidationError('invalid_request', 'Invalid chunk count.', { field: 'chunk_count' });
+  }
+  const pluginVersion = readOptionalString(value, 'plugin_version');
+  const baseCommit = Object.prototype.hasOwnProperty.call(value, 'base_commit')
+    ? readNullableCommitId(value, 'base_commit')
+    : undefined;
+  const directoryIntents = readOptionalDirectoryIntents(value, 'directory_intents');
+  return {
+    api_version: API_VERSION,
+    ...(pluginVersion === undefined ? {} : { plugin_version: pluginVersion }),
+    vault_id: readString(value, 'vault_id'),
+    device_id: readString(value, 'device_id'),
+    expected_device_ref: readNullableCommitId(value, 'expected_device_ref'),
+    target_commit: readCommitId(value, 'target_commit'),
+    client_known_main: readNullableCommitId(value, 'client_known_main'),
+    ...(baseCommit === undefined ? {} : { base_commit: baseCommit }),
+    ...(directoryIntents === undefined ? {} : { directory_intents: directoryIntents }),
+    attempt_id: attemptId,
+    chunk_count: chunkCount,
+    plan_sha256: planSha256
+  };
+}
+
+export function parseChunkPullRequest(value: unknown): ChunkPullRequest {
+  const base = parseDevicePullRequest(value);
+  assertRecord(value);
+  return { ...base, cursor: readNonNegativeInteger(value, 'cursor') };
+}
+
+export function parseChunkBootstrapRequest(value: unknown): ChunkBootstrapRequest {
+  assertRecord(value);
+  const apiVersion = readString(value, 'api_version');
+  if (apiVersion !== API_VERSION) throw new ValidationError('unsupported_client', 'Unsupported client API version.');
+  const requested = readString(value, 'requested_target');
+  if (requested !== 'latest' && !COMMIT_ID_PATTERN.test(requested)) {
+    throw new ValidationError('invalid_request', 'Invalid requested target.', { field: 'requested_target' });
+  }
+  const pluginVersion = readOptionalString(value, 'plugin_version');
+  return {
+    api_version: API_VERSION,
+    ...(pluginVersion === undefined ? {} : { plugin_version: pluginVersion }),
+    cursor: readNonNegativeInteger(value, 'cursor'),
+    requested_target: requested
   };
 }
 

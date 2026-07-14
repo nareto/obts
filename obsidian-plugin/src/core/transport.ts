@@ -1,5 +1,10 @@
 import {
   API_VERSION,
+  type ChunkBootstrapManifest,
+  type ChunkPullManifest,
+  type ChunkPushCreateRequest,
+  type ChunkPushDescriptor,
+  type ChunkPushReceipt,
   type CompleteConnectionRequest,
   type CompleteConnectionResponse,
   type ConnectionBootstrapManifest,
@@ -12,7 +17,8 @@ import {
   type DeviceStatusReport,
   type DeviceStatusResponse,
   type EventEnvelope,
-  type PushResult
+  type PushResult,
+  type SyncCapabilities
 } from '../../../src/shared/types.js';
 import { parseDevicePullRequest, parseDevicePushManifest } from '../../../src/shared/validators.js';
 import { PLUGIN_VERSION } from '../version.js';
@@ -21,6 +27,11 @@ const NETWORK_TIMEOUT_MS = 60_000;
 
 export class TransportClient {
   constructor(private readonly serverUrl: string) {}
+
+  async capabilities(): Promise<SyncCapabilities> {
+    const response = await fetchWithTimeout(this.url('/api/v1/sync/capabilities'));
+    return await readJsonOrThrow<SyncCapabilities>(response);
+  }
 
   async createConnection(input: CreateConnectionRequest): Promise<CreateConnectionResponse> {
     const response = await fetchWithTimeout(this.url('/api/v1/connections'), {
@@ -53,6 +64,21 @@ export class TransportClient {
       response.headers.get('content-type') ?? '',
       Buffer.from(await response.arrayBuffer())
     );
+  }
+
+  async bootstrapConnectionChunk(
+    connectionId: string,
+    secret: string,
+    cursor: number,
+    requestedTarget: 'latest' | string
+  ): Promise<{ manifest: ChunkBootstrapManifest; packfile: Buffer }> {
+    const response = await fetchWithTimeout(this.url(`/api/v1/connections/${connectionId}/bootstrap-chunk`), {
+      method: 'POST',
+      headers: { authorization: `Bearer ${secret}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ api_version: API_VERSION, plugin_version: PLUGIN_VERSION, cursor, requested_target: requestedTarget })
+    });
+    if (!response.ok) await throwResponseError(response);
+    return parseMultipart<ChunkBootstrapManifest>(response.headers.get('content-type') ?? '', Buffer.from(await response.arrayBuffer()));
   }
 
   async completeConnection(
@@ -106,6 +132,50 @@ export class TransportClient {
       body: JSON.stringify(input.report)
     });
     return await readJsonOrThrow<DeviceStatusResponse>(response);
+  }
+
+  async createPushTransfer(input: {
+    vaultId: string;
+    deviceToken: string;
+    request: ChunkPushCreateRequest;
+  }): Promise<ChunkPushDescriptor> {
+    const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${input.vaultId}/sync/push-transfers`), {
+      method: 'POST',
+      headers: { authorization: `Bearer ${input.deviceToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify(input.request)
+    });
+    return await readJsonOrThrow<ChunkPushDescriptor>(response);
+  }
+
+  async putPushChunk(input: {
+    vaultId: string;
+    deviceToken: string;
+    transferId: string;
+    index: number;
+    packfile: Buffer;
+    sha256: string;
+  }): Promise<ChunkPushReceipt> {
+    const response = await fetchWithTimeout(
+      this.url(`/api/v1/vaults/${input.vaultId}/sync/push-transfers/${input.transferId}/chunks/${input.index}`),
+      {
+        method: 'PUT',
+        headers: {
+          authorization: `Bearer ${input.deviceToken}`,
+          'content-type': 'application/x-git-packed-objects',
+          'x-obts-chunk-sha256': input.sha256
+        },
+        body: new Uint8Array(input.packfile)
+      }
+    );
+    return await readJsonOrThrow<ChunkPushReceipt>(response);
+  }
+
+  async finalizePushTransfer(input: { vaultId: string; deviceToken: string; transferId: string }): Promise<PushResult> {
+    const response = await fetchWithTimeout(
+      this.url(`/api/v1/vaults/${input.vaultId}/sync/push-transfers/${input.transferId}/finalize`),
+      { method: 'POST', headers: { authorization: `Bearer ${input.deviceToken}` } }
+    );
+    return await readJsonOrThrow<PushResult>(response);
   }
 
   async push(input: {
@@ -165,6 +235,33 @@ export class TransportClient {
     const contentType = response.headers.get('content-type') ?? '';
     const buffer = Buffer.from(await response.arrayBuffer());
     return parseMultipart<DevicePullManifest>(contentType, buffer);
+  }
+
+  async pullChunk(input: {
+    vaultId: string;
+    deviceId: string;
+    deviceToken: string;
+    currentLocalMain: string | null;
+    requestedTarget: 'latest' | string;
+    currentEventSeq: number;
+    cursor: number;
+  }): Promise<{ manifest: ChunkPullManifest; packfile: Buffer }> {
+    const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${input.vaultId}/sync/pull-chunk`), {
+      method: 'POST',
+      headers: { authorization: `Bearer ${input.deviceToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        api_version: API_VERSION,
+        plugin_version: PLUGIN_VERSION,
+        vault_id: input.vaultId,
+        device_id: input.deviceId,
+        current_local_main: input.currentLocalMain,
+        requested_target: input.requestedTarget,
+        current_event_seq: input.currentEventSeq,
+        cursor: input.cursor
+      })
+    });
+    if (!response.ok) await throwResponseError(response);
+    return parseMultipart<ChunkPullManifest>(response.headers.get('content-type') ?? '', Buffer.from(await response.arrayBuffer()));
   }
 
   async pollEvents(input: {

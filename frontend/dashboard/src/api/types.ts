@@ -1,5 +1,6 @@
 export type StatusLabel =
   | 'Synced'
+  | 'Preparing upload'
   | 'Uploading'
   | 'Applying'
   | 'Checking'
@@ -7,6 +8,7 @@ export type StatusLabel =
   | 'Ahead'
   | 'Behind'
   | 'Offline'
+  | 'Status unknown'
   | 'Review needed'
   | 'Stale review'
   | 'Blocked'
@@ -63,6 +65,8 @@ export type DashboardDevice = {
   plugin_version: string | null;
   path_capabilities: Record<string, unknown> | null;
   last_status_report_at: string | null;
+  status_report_fresh: boolean;
+  status_report_age_seconds: number | null;
   ahead_of_main: boolean;
   behind_main: boolean;
   blocked: boolean;

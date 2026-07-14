@@ -53,6 +53,33 @@ describe('mobile DataAdapter filesystem', () => {
     expect(await adapter.exists('.obts/state.json')).toBe(false);
     await fs.promises.recoverReplacements('/.obts');
     expect(await fs.promises.readFile('/.obts/state.json', 'utf8')).toBe('old');
+
+    await adapter.rename('.obts/state.json', '.obts/state.json.obts-replace-backup-crash-one');
+    await fs.promises.recoverReplacements('/.obts');
+    expect(await fs.promises.readFile('/.obts/state.json', 'utf8')).toBe('old');
+  });
+
+  it('serializes same-destination replacements across filesystem wrappers and cleans owned temps', async () => {
+    const adapter = new MemoryDataAdapter();
+    const first = createDataAdapterFs(adapter);
+    const second = createDataAdapterFs(adapter);
+    await first.promises.mkdir('/.obts', { recursive: true });
+    await first.promises.writeFile('/.obts/queue.json', '{"version":0}');
+    await first.promises.writeFile('/.obts/queue.json.tmp-a-1', '{"version":1}');
+    await second.promises.writeFile('/.obts/queue.json.tmp-b-2', '{"version":2}');
+
+    await Promise.all([
+      first.promises.rename('/.obts/queue.json.tmp-a-1', '/.obts/queue.json'),
+      second.promises.rename('/.obts/queue.json.tmp-b-2', '/.obts/queue.json')
+    ]);
+    expect(['{"version":1}', '{"version":2}']).toContain(await first.promises.readFile('/.obts/queue.json', 'utf8'));
+    expect((await first.promises.readdir('/.obts')).filter((name: string) => name.includes('replace-backup'))).toEqual([]);
+
+    await first.promises.writeFile('/.obts/state.json.tmp-dead-1', '{"valid":true}');
+    await first.promises.writeFile('/.obts/state.json.tmp-bad-2', 'not-json');
+    await first.promises.recoverReplacements('/.obts');
+    await expect(first.promises.stat('/.obts/state.json.tmp-dead-1')).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await first.promises.readFile('/.obts/state.json.tmp-bad-2', 'utf8')).toBe('not-json');
   });
 
   it('rejects files used as directories and preserves adapter I/O errors', async () => {

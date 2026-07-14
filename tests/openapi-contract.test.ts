@@ -129,7 +129,7 @@ describe('OpenAPI Phase 3 contract', () => {
 
     const pullSection = contract.slice(
       contract.indexOf('/vaults/{vault_id}/sync/pull'),
-      contract.indexOf('/vaults/{vault_id}/sync/device-status')
+      contract.indexOf('/vaults/{vault_id}/sync/pull-chunk')
     );
     expect(pullSection).toContain('multipart/form-data');
     expect(pullSection).toContain('DevicePullRequest');
@@ -138,6 +138,10 @@ describe('OpenAPI Phase 3 contract', () => {
     expect(pullSection).not.toContain('application/json:');
     expect(contract).toContain('current_local_main_is_ancestor');
     expect(contract).toContain('base_commit');
+    expect(contract).toContain('/sync/capabilities');
+    expect(contract).toContain('/vaults/{vault_id}/sync/push-transfers');
+    expect(contract).toContain('/vaults/{vault_id}/sync/pull-chunk');
+    expect(contract).toContain('git-object-pack-chunks-v1');
 
     const deviceEventsSection = contract.slice(
       contract.indexOf('/vaults/{vault_id}/sync/events'),

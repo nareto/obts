@@ -16,8 +16,16 @@ Use the same server configuration as Phase 1:
 - `OBTS_TEMP_DIR`: optional temporary workspace override. Defaults to
   `$OBTS_DATA_DIR/tmp`.
 - `OBTS_GIT_BINARY`: native Git executable. Defaults to `git`.
-- `OBTS_MAX_UPLOAD_BYTES`: multipart upload limit in bytes. Defaults to
-  `104857600`.
+- `OBTS_MAX_UPLOAD_BYTES`: legacy single-request multipart and per-object
+  validation limit. Defaults to `104857600`.
+- `OBTS_TRANSFER_CHUNK_BYTES`: maximum independently importable Git pack chunk.
+  Defaults to `16777216`.
+- `OBTS_MAX_TRANSFER_BYTES`: aggregate logical object/transfer limit. Defaults
+  to `2147483648`.
+- `OBTS_MAX_TRANSFER_CHUNKS`: maximum chunks in one transfer. Defaults to `4096`.
+- `OBTS_MAX_TRANSFER_STORAGE_BYTES`: global server quarantine cap. Defaults to
+  `4294967296`.
+- `OBTS_TRANSFER_TTL_SECONDS`: resumable push lifetime. Defaults to `86400`.
 - `OBTS_HOST` and `OBTS_PORT`: bind address for `obts serve`.
 
 Persistent-state backup and restore requirements are documented in

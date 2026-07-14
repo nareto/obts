@@ -3,6 +3,7 @@
   import Status from './Status.svelte';
 
   export let devices: DashboardDevice[];
+  export let nowMs: number;
   export let onRevoke: (device: DashboardDevice) => void | Promise<void>;
 
   let openDeviceId = '';
@@ -15,6 +16,23 @@
     if (device.local_error_code) return device.local_error_code;
     if (device.local_queue_status) return `queue: ${device.local_queue_status}`;
     return '-';
+  }
+
+  function effectiveStatus(device: DashboardDevice) {
+    if (
+      device.status_label === 'Synced' &&
+      (!device.last_status_report_at || nowMs - Date.parse(device.last_status_report_at) > 5 * 60 * 1000)
+    ) {
+      return 'Status unknown';
+    }
+    return device.status_label;
+  }
+
+  function relationDetail(device: DashboardDevice) {
+    if (!device.status_report_fresh || !device.last_status_report_at || nowMs - Date.parse(device.last_status_report_at) > 5 * 60 * 1000) return 'Unknown locally';
+    if (device.ahead_of_main) return 'Ahead';
+    if (device.behind_main) return 'Behind';
+    return 'Current';
   }
 
   function toggleMenu(deviceId: string) {
@@ -44,9 +62,9 @@
     {#each devices as device}
       <tr>
         <td>{device.device_name}</td>
-        <td><Status label={device.status_label} /></td>
+        <td><Status label={effectiveStatus(device)} /></td>
         <td>{device.last_seen_at ? new Date(device.last_seen_at).toLocaleString() : '-'}</td>
-        <td>{device.ahead_of_main ? 'Ahead' : device.behind_main ? 'Behind' : 'Current'}</td>
+        <td>{relationDetail(device)}</td>
         <td class="mono">{shortId(device.last_applied_main)}</td>
         <td>{localDetail(device)}</td>
         <td>{device.last_successful_sync_at ? new Date(device.last_successful_sync_at).toLocaleString() : '-'}</td>

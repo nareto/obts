@@ -2,6 +2,30 @@ const { Buffer } = require("buffer");
 const path = require("path-browserify");
 
 const REPLACEMENT_BACKUP_SUFFIX = ".obts-replace-backup";
+const adapterPathQueues = new WeakMap();
+
+async function withAdapterPathLocks(adapter, paths, operation) {
+  let queues = adapterPathQueues.get(adapter);
+  if (!queues) {
+    queues = new Map();
+    adapterPathQueues.set(adapter, queues);
+  }
+  const keys = [...new Set(paths.map(adapterPath))].sort();
+  const priors = keys.map((key) => queues.get(key) || Promise.resolve());
+  let release;
+  const current = new Promise((resolve) => { release = resolve; });
+  const tails = keys.map((key, index) => priors[index].then(() => current));
+  keys.forEach((key, index) => queues.set(key, tails[index]));
+  await Promise.all(priors);
+  try {
+    return await operation();
+  } finally {
+    release();
+    keys.forEach((key, index) => {
+      if (queues.get(key) === tails[index]) queues.delete(key);
+    });
+  }
+}
 
 function createDataAdapterFs(adapter) {
   if (!adapter) {
@@ -23,16 +47,18 @@ function createDataAdapterFs(adapter) {
     async writeFile(filePath, data, options = {}) {
       const normalized = adapterPath(filePath);
       const flag = typeof options === "object" && options ? options.flag : undefined;
-      if (flag === "wx" && await adapterStat(adapter, normalized)) {
-        throw fsError("EEXIST", normalized);
-      }
-      await ensureParentDirectories(adapter, normalized);
       const bytes = typeof data === "string" ? Buffer.from(data, options.encoding || "utf8") : Buffer.from(data);
-      try {
-        await adapter.writeBinary(normalized, toArrayBuffer(bytes));
-      } catch (error) {
-        throw await translateError(adapter, normalized, error, "EIO");
-      }
+      await withAdapterPathLocks(adapter, [normalized], async () => {
+        if (flag === "wx" && await adapterStat(adapter, normalized)) {
+          throw fsError("EEXIST", normalized);
+        }
+        await ensureParentDirectories(adapter, normalized);
+        try {
+          await adapter.writeBinary(normalized, toArrayBuffer(bytes));
+        } catch (error) {
+          throw await translateError(adapter, normalized, error, "EIO");
+        }
+      });
     },
 
     async mkdir(dirPath, options = {}) {
@@ -132,34 +158,31 @@ function createDataAdapterFs(adapter) {
     async rename(oldPath, newPath) {
       const source = adapterPath(oldPath);
       const destination = adapterPath(newPath);
-      const sourceStat = await adapterStat(adapter, source);
-      if (!sourceStat) throw fsError("ENOENT", source);
-      await ensureParentDirectories(adapter, destination);
-      const destinationStat = await adapterStat(adapter, destination);
-      if (!destinationStat) {
-        await adapter.rename(source, destination);
-        return;
-      }
-      if (sourceStat.type === "folder" || destinationStat.type === "folder") {
-        throw fsError(sourceStat.type === "folder" ? "EEXIST" : "EISDIR", destination);
-      }
-
-      const backup = `${destination}${REPLACEMENT_BACKUP_SUFFIX}`;
-      const priorBackup = await adapterStat(adapter, backup);
-      if (priorBackup) {
-        if (priorBackup.type === "folder") throw fsError("EISDIR", backup);
-        await adapter.remove(backup);
-      }
-      await adapter.rename(destination, backup);
-      try {
-        await adapter.rename(source, destination);
-      } catch (error) {
-        if (!await adapterStat(adapter, destination) && await adapterStat(adapter, backup)) {
-          await adapter.rename(backup, destination);
+      await withAdapterPathLocks(adapter, [source, destination], async () => {
+        const sourceStat = await adapterStat(adapter, source);
+        if (!sourceStat) throw fsError("ENOENT", source);
+        await ensureParentDirectories(adapter, destination);
+        const destinationStat = await adapterStat(adapter, destination);
+        if (!destinationStat) {
+          await adapter.rename(source, destination);
+          return;
         }
-        throw error;
-      }
-      await adapter.remove(backup).catch(() => undefined);
+        if (sourceStat.type === "folder" || destinationStat.type === "folder") {
+          throw fsError(sourceStat.type === "folder" ? "EEXIST" : "EISDIR", destination);
+        }
+
+        const backup = `${destination}${REPLACEMENT_BACKUP_SUFFIX}-${randomSuffix()}`;
+        await adapter.rename(destination, backup);
+        try {
+          await adapter.rename(source, destination);
+        } catch (error) {
+          if (!await adapterStat(adapter, destination) && await adapterStat(adapter, backup)) {
+            await adapter.rename(backup, destination);
+          }
+          throw error;
+        }
+        await adapter.remove(backup).catch(() => undefined);
+      });
     },
 
     async copyFile(sourcePath, destinationPath) {
@@ -233,11 +256,30 @@ async function recoverReplacementTree(adapter, dirPath) {
   const listing = await adapter.list(dirPath);
   for (const folder of listing.folders || []) await recoverReplacementTree(adapter, folder);
   for (const file of listing.files || []) {
-    if (!file.endsWith(REPLACEMENT_BACKUP_SUFFIX)) continue;
-    const destination = file.slice(0, -REPLACEMENT_BACKUP_SUFFIX.length);
-    if (await adapterStat(adapter, destination)) await adapter.remove(file);
-    else await adapter.rename(file, destination);
+    const marker = file.lastIndexOf(REPLACEMENT_BACKUP_SUFFIX);
+    if (marker >= 0) {
+      const suffix = file.slice(marker + REPLACEMENT_BACKUP_SUFFIX.length);
+      if (suffix === "" || /^-[a-z0-9-]+$/u.test(suffix)) {
+        const destination = file.slice(0, marker);
+        await withAdapterPathLocks(adapter, [destination], async () => {
+          if (await adapterStat(adapter, destination)) await adapter.remove(file);
+          else await adapter.rename(file, destination);
+        });
+      }
+      continue;
+    }
+    if (!/\/[a-z0-9-]+\.json\.tmp-[a-z0-9-]+$/u.test(file)) continue;
+    try {
+      JSON.parse(Buffer.from(await adapter.readBinary(file)).toString("utf8"));
+      await adapter.remove(file);
+    } catch {
+      // Keep unknown or malformed files for manual recovery.
+    }
   }
+}
+
+function randomSuffix() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function adapterPath(filePath) {

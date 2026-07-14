@@ -49,6 +49,7 @@ module.exports = class ObtsPlugin extends Plugin {
     this.unloaded = false;
     this.lifecycleAbortController = new AbortController();
     this.queuedSyncTimer = null;
+    this.pendingWatcherPaths = new Set();
     this.retiredOperationTimer = null;
     this.observedRetiredLease = null;
     this.retiredOperationNoticeShown = false;
@@ -345,11 +346,26 @@ module.exports = class ObtsPlugin extends Plugin {
     this.syncQueued = true;
     if (!this.clientReady) return;
     this.setStatus("Ahead");
-    void this.client.recordLocalChangeHint(paths).catch(() => undefined);
+    for (const candidate of Array.isArray(paths) ? paths : [paths]) {
+      if (typeof candidate === "string" && candidate.length > 0) this.pendingWatcherPaths.add(candidate);
+    }
     this.scheduleQueuedSync(SYNC_DEBOUNCE_MS);
   }
 
+  async flushWatcherHints() {
+    if (this.pendingWatcherPaths.size === 0) return;
+    const paths = [...this.pendingWatcherPaths];
+    this.pendingWatcherPaths.clear();
+    try {
+      await this.client.recordLocalChangeHint(paths);
+    } catch (error) {
+      for (const filePath of paths) this.pendingWatcherPaths.add(filePath);
+      throw error;
+    }
+  }
+
   async syncOnceOrPollResolvedConflict(options) {
+    await this.flushWatcherHints();
     const state = await this.client.readState();
     if (state.last_error_code === "conflict_review_required") {
       return await this.client.pollRemoteEventsAndApply();
@@ -633,6 +649,8 @@ class ObtsObsidianClient {
     this.applyLockPath = path.join(this.obtsDir, "apply.lock");
     this.onboardingJournalPath = path.join(this.obtsDir, "onboarding.json");
     this.pendingConnectionPath = path.join(this.obtsDir, "auth", "pending-connection.json");
+    this.bootstrapTransferPath = path.join(this.obtsDir, "bootstrap-transfer.json");
+    this.pullTransferPath = path.join(this.obtsDir, "pull-transfer.json");
     this.onboardingOperation = false;
   }
 
@@ -692,6 +710,7 @@ class ObtsObsidianClient {
   async cancelOnboarding() {
     await fsp.rm(this.pendingConnectionPath, { force: true });
     await fsp.rm(this.onboardingJournalPath, { force: true });
+    await fsp.rm(this.bootstrapTransferPath, { force: true });
   }
 
   async writeOnboardingJournal(journal) {
@@ -759,6 +778,75 @@ class ObtsObsidianClient {
     return status;
   }
 
+  async syncCapabilities() {
+    try {
+      const response = await fetchWithTimeout(this.url("/api/v1/sync/capabilities"));
+      if (response.status === 404) return null;
+      if (!response.ok) await throwResponseError(response);
+      const capabilities = await response.json();
+      return Array.isArray(capabilities.capabilities) && capabilities.capabilities.includes("git-object-pack-chunks-v1")
+        ? capabilities
+        : null;
+    } catch (error) {
+      if (error instanceof ObtsTransportError && error.status === 404) return null;
+      throw error;
+    }
+  }
+
+  async bootstrapWithChunks(connectionId, secret) {
+    const capabilities = await this.syncCapabilities();
+    if (!capabilities) {
+      const response = await fetchWithTimeout(this.url(`/api/v1/connections/${connectionId}/bootstrap`), {
+        method: "POST",
+        headers: { authorization: `Bearer ${secret}` }
+      });
+      if (!response.ok) await throwResponseError(response);
+      return parseMultipartPull(response.headers.get("content-type") || "", Buffer.from(await response.arrayBuffer()));
+    }
+    const checkpoint = await readJson(this.bootstrapTransferPath, null);
+    let cursor = checkpoint && checkpoint.connection_id === connectionId ? checkpoint.next_cursor : 0;
+    let target = checkpoint && checkpoint.connection_id === connectionId ? checkpoint.target_main : "latest";
+    if (checkpoint && checkpoint.connection_id !== connectionId) await fsp.rm(this.bootstrapTransferPath, { force: true });
+    let finalManifest = null;
+    let chunkCount = checkpoint && checkpoint.connection_id === connectionId ? checkpoint.received_chunks || 0 : 0;
+    let transferredBytes = checkpoint && checkpoint.connection_id === connectionId ? checkpoint.transferred_bytes || 0 : 0;
+    while (true) {
+      const response = await fetchWithTimeout(this.url(`/api/v1/connections/${connectionId}/bootstrap-chunk`), {
+        method: "POST",
+        headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" },
+        body: JSON.stringify({ api_version: API_VERSION, plugin_version: PLUGIN_VERSION, cursor, requested_target: target })
+      });
+      if (!response.ok) await throwResponseError(response);
+      const chunk = parseMultipartPull(response.headers.get("content-type") || "", Buffer.from(await response.arrayBuffer()));
+      if (chunk.packfile.byteLength !== chunk.manifest.chunk_bytes || sha256(chunk.packfile) !== chunk.manifest.chunk_sha256) {
+        throw new ObtsBlockedError("chunk_digest_mismatch", "Downloaded bootstrap chunk failed integrity validation.");
+      }
+      chunkCount += 1;
+      transferredBytes += chunk.packfile.byteLength;
+      if (chunkCount > capabilities.max_transfer_chunks || transferredBytes > capabilities.max_transfer_bytes) {
+        throw new ObtsBlockedError("transfer_too_large", "Bootstrap transfer exceeded negotiated limits.");
+      }
+      await this.importPack(chunk.packfile, "onboarding", [makeDiagnosticBreadcrumb("bootstrap_chunk", "succeeded", chunk.packfile)]);
+      finalManifest = chunk.manifest;
+      target = finalManifest.target_main;
+      if (finalManifest.complete) {
+        await fsp.rm(this.bootstrapTransferPath, { force: true });
+        break;
+      }
+      if (finalManifest.next_cursor <= cursor) throw new ObtsBlockedError("invalid_transfer_cursor", "Bootstrap transfer did not advance.");
+      cursor = finalManifest.next_cursor;
+      await writeJson(this.bootstrapTransferPath, {
+        connection_id: connectionId,
+        target_main: target,
+        next_cursor: cursor,
+        received_chunks: chunkCount,
+        transferred_bytes: transferredBytes,
+        updated_at: nowIso()
+      });
+    }
+    return { manifest: finalManifest, packfile: Buffer.alloc(0) };
+  }
+
   async analyzeOnboarding(connectionId, secret) {
     await this.updateOnboardingStage(connectionId, "analyzing");
     const status = await this.pollOnboarding(connectionId, secret);
@@ -784,33 +872,8 @@ class ObtsObsidianClient {
       if (pending) await this.writeOnboardingJournal(Object.assign({}, pending.journal, { stage: "awaiting_confirmation", analysis }));
       return analysis;
     }
-    const response = await fetchWithTimeout(this.url(`/api/v1/connections/${connectionId}/bootstrap`), {
-      method: "POST",
-      headers: { authorization: `Bearer ${secret}` }
-    });
-    if (!response.ok) await throwResponseError(response);
-    const responseBody = Buffer.from(await response.arrayBuffer());
-    let bootstrap;
-    try {
-      bootstrap = parseMultipartPull(response.headers.get("content-type") || "", responseBody);
-    } catch (error) {
-      annotateDiagnosticError(error, {
-        flow: "onboarding",
-        stage: "multipart_parse",
-        failureCode: "multipart_parse_failed",
-        breadcrumbs: [makeDiagnosticBreadcrumb("bootstrap_response", "returned", responseBody)]
-      });
-      throw error;
-    }
-    await this.importPack(bootstrap.packfile, "onboarding", [
-      makeDiagnosticBreadcrumb("onboarding_approved", "succeeded"),
-      makeDiagnosticBreadcrumb("bootstrap_response", "returned", responseBody),
-      makeDiagnosticBreadcrumb(
-        "multipart_pack",
-        Buffer.from(bootstrap.packfile).subarray(0, 4).toString("ascii") === "PACK" ? "succeeded" : "failed",
-        bootstrap.packfile
-      )
-    ]);
+    const bootstrap = await this.bootstrapWithChunks(connectionId, secret);
+    await this.importPack(bootstrap.packfile, "onboarding", [makeDiagnosticBreadcrumb("onboarding_approved", "succeeded")]);
     const localFiles = await this.scanSyncableFiles();
     const matchesServer = localFiles.length === bootstrap.manifest.changed_paths.length && await this.localContentMatchesTree(localFiles, bootstrap.manifest.target_main);
     const repair = await this.discoverPairingRepairContext(await readJson(this.statePath, null));
@@ -855,7 +918,9 @@ class ObtsObsidianClient {
     this.onboardingOperation = true;
     await this.updateOnboardingStage(connectionId, "registering", mode);
     try {
-      return await this.finishOnboardingInternal(connectionId, secret, analysis, mode);
+      const result = await this.finishOnboardingInternal(connectionId, secret, analysis, mode);
+      await this.reportDeviceStatus().catch(() => undefined);
+      return result;
     } catch (error) {
       await this.updateOnboardingStage(
         connectionId,
@@ -1326,40 +1391,60 @@ class ObtsObsidianClient {
   async uploadQueuedCommit(queue) {
     const state = await this.readState();
     const token = await this.readDeviceToken();
-    await this.writeQueue(Object.assign({}, queue, { status: "uploading", attempts: queue.attempts + 1, updated_at: nowIso() }));
     await this.writeState(Object.assign({}, state, {
-      status_label: "Uploading",
+      status_label: "Preparing upload",
       last_error_code: null,
       updated_at: nowIso()
     }));
-    this.plugin.setStatus("Uploading");
-    const packfile = await this.createPackForCommit(queue.pending_commit, [queue.expected_device_ref, state.local_main].filter(Boolean));
+    this.plugin.setStatus("Preparing upload");
+    await this.reportDeviceStatus().catch(() => undefined);
     const pendingDirectoryIntents = (await this.readDirectoryState()).pending_intents;
-    const manifest = {
-      api_version: API_VERSION,
-      plugin_version: PLUGIN_VERSION,
-      vault_id: state.vault_id,
-      device_id: state.device_id,
-      expected_device_ref: queue.expected_device_ref,
-      target_commit: queue.pending_commit,
-      packfile_sha256: sha256(packfile),
-      packfile_bytes: packfile.byteLength,
-      client_known_main: state.local_main,
-      ...(queue.expected_device_ref === null && state.local_main ? { base_commit: state.local_main } : {}),
-      ...(pendingDirectoryIntents.length > 0 ? { directory_intents: pendingDirectoryIntents } : {}),
-      attempt_id: `sync_${Date.now()}_${randomHex(8)}`
-    };
     let result;
     try {
-      result = await this.push(state.vault_id, token, manifest, packfile);
+      const capabilities = await this.syncCapabilities();
+      if (capabilities) {
+        result = await this.pushInChunks(state, queue, token, pendingDirectoryIntents, capabilities);
+      } else {
+        const packfile = await this.createPackForCommit(queue.pending_commit, [queue.expected_device_ref, state.local_main].filter(Boolean));
+        const manifest = {
+          api_version: API_VERSION,
+          plugin_version: PLUGIN_VERSION,
+          vault_id: state.vault_id,
+          device_id: state.device_id,
+          expected_device_ref: queue.expected_device_ref,
+          target_commit: queue.pending_commit,
+          packfile_sha256: sha256(packfile),
+          packfile_bytes: packfile.byteLength,
+          client_known_main: state.local_main,
+          ...(queue.expected_device_ref === null && state.local_main ? { base_commit: state.local_main } : {}),
+          ...(pendingDirectoryIntents.length > 0 ? { directory_intents: pendingDirectoryIntents } : {}),
+          attempt_id: `sync_${Date.now()}_${randomHex(8)}`
+        };
+        await this.writeQueue(Object.assign({}, queue, { status: "uploading", attempts: queue.attempts + 1, updated_at: nowIso() }));
+        await this.writeState(Object.assign({}, state, { status_label: "Uploading", last_error_code: null, updated_at: nowIso() }));
+        this.plugin.setStatus("Uploading");
+        await this.reportDeviceStatus().catch(() => undefined);
+        try {
+          result = await this.push(state.vault_id, token, manifest, packfile);
+        } catch (error) {
+          if (!(error instanceof ObtsTransportError && error.code === "stale_device_ref")) throw error;
+          result = await this.retryPushAfterStaleDeviceRef(state, queue, token, manifest, packfile);
+          if (!result) throw error;
+        }
+      }
     } catch (error) {
-      if (!(error instanceof ObtsTransportError && error.code === "stale_device_ref")) {
-        throw error;
+      const latestQueue = await this.readQueue();
+      if (latestQueue.pending_commit === queue.pending_commit && latestQueue.status !== "blocked_recovery") {
+        await this.writeQueue(Object.assign({}, latestQueue, { status: "queued_local", updated_at: nowIso() }));
+        await this.writeState(Object.assign({}, await this.readState(), {
+          status_label: "Ahead",
+          last_error_code: latestQueue.attempts > queue.attempts ? "upload_interrupted" : "pack_preparation_failed",
+          updated_at: nowIso()
+        }));
+        this.plugin.setStatus("Ahead");
+        await this.reportDeviceStatus().catch(() => undefined);
       }
-      result = await this.retryPushAfterStaleDeviceRef(state, queue, token, manifest, packfile);
-      if (!result) {
-        throw error;
-      }
+      throw error;
     }
     if (result.status === "conflicted") {
       await this.writeQueue(Object.assign({}, queue, { status: "conflicted", updated_at: nowIso() }));
@@ -1388,6 +1473,87 @@ class ObtsObsidianClient {
         updated_at: nowIso()
       }));
       await this.clearPendingDirectoryIntents();
+    }
+  }
+
+  async pushInChunks(state, queue, token, directoryIntents, capabilities, allowStaleRetry = true) {
+    const groups = await this.planPackChunks(
+      queue.pending_commit,
+      [queue.expected_device_ref, state.local_main].filter(Boolean),
+      capabilities.target_chunk_bytes,
+      capabilities.max_chunk_bytes
+    );
+    if (groups.length === 0 || groups.length > capabilities.max_transfer_chunks) {
+      throw new ObtsBlockedError("invalid_transfer_plan", "Git transfer plan is empty or exceeds the server chunk limit.");
+    }
+    const planSha256 = sha256(Buffer.from(JSON.stringify(groups)));
+    const attemptId = `xfer_${sha256(Buffer.from(`${state.device_id}:${queue.pending_commit}:${queue.expected_device_ref || "none"}:${planSha256}`)).slice(0, 32)}`;
+    await this.writeQueue(Object.assign({}, queue, { status: "uploading", attempts: queue.attempts + 1, updated_at: nowIso() }));
+    await this.writeState(Object.assign({}, state, { status_label: "Uploading", last_error_code: null, updated_at: nowIso() }));
+    this.plugin.setStatus("Uploading");
+    await this.reportDeviceStatus().catch(() => undefined);
+    try {
+      const createResponse = await fetchWithTimeout(this.url(`/api/v1/vaults/${state.vault_id}/sync/push-transfers`), {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          api_version: API_VERSION,
+          plugin_version: PLUGIN_VERSION,
+          vault_id: state.vault_id,
+          device_id: state.device_id,
+          expected_device_ref: queue.expected_device_ref,
+          target_commit: queue.pending_commit,
+          client_known_main: state.local_main,
+          ...(queue.expected_device_ref === null && state.local_main ? { base_commit: state.local_main } : {}),
+          ...(directoryIntents.length > 0 ? { directory_intents: directoryIntents } : {}),
+          attempt_id: attemptId,
+          chunk_count: groups.length,
+          plan_sha256: planSha256
+        })
+      });
+      if (!createResponse.ok) await throwResponseError(createResponse);
+      const descriptor = await createResponse.json();
+      if (descriptor.status !== "open") {
+        if (descriptor.result && descriptor.result.status !== "rejected") return descriptor.result;
+        throw new ObtsBlockedError("transfer_closed", "The resumable transfer is closed without an accepted result.");
+      }
+      const received = new Set(descriptor.received_chunks || []);
+      for (let index = 0; index < groups.length; index += 1) {
+        if (received.has(index)) continue;
+        const packfile = await this.packObjectChunk(groups[index], capabilities.max_chunk_bytes);
+        const response = await fetchWithTimeout(
+          this.url(`/api/v1/vaults/${state.vault_id}/sync/push-transfers/${descriptor.transfer_id}/chunks/${index}`),
+          {
+            method: "PUT",
+            headers: {
+              authorization: `Bearer ${token}`,
+              "content-type": "application/x-git-packed-objects",
+              "x-obts-chunk-sha256": sha256(packfile)
+            },
+            body: packfile
+          }
+        );
+        if (!response.ok) await throwResponseError(response);
+        await this.reportDeviceStatus().catch(() => undefined);
+      }
+      const finalizeResponse = await fetchWithTimeout(
+        this.url(`/api/v1/vaults/${state.vault_id}/sync/push-transfers/${descriptor.transfer_id}/finalize`),
+        { method: "POST", headers: { authorization: `Bearer ${token}` } }
+      );
+      if (!finalizeResponse.ok) await throwResponseError(finalizeResponse);
+      return await finalizeResponse.json();
+    } catch (error) {
+      if (allowStaleRetry && error instanceof ObtsTransportError && error.code === "stale_device_ref") {
+        const self = await this.getDeviceSelf(token);
+        const recoveredRef = self.server_device_ref;
+        if (recoveredRef && recoveredRef !== queue.expected_device_ref && await this.isAncestor(recoveredRef, queue.pending_commit)) {
+          const recoveredQueue = Object.assign({}, queue, { expected_device_ref: recoveredRef, status: "uploading", updated_at: nowIso() });
+          await this.writeQueue(recoveredQueue);
+          await this.writeState(Object.assign({}, state, { server_device_ref: recoveredRef, status_label: "Preparing upload", updated_at: nowIso() }));
+          return await this.pushInChunks(Object.assign({}, state, { server_device_ref: recoveredRef }), recoveredQueue, token, directoryIntents, capabilities, false);
+        }
+      }
+      throw error;
     }
   }
 
@@ -2175,6 +2341,42 @@ class ObtsObsidianClient {
     return oids.size ? await this.packObjects([...oids].sort()) : Buffer.alloc(0);
   }
 
+  async planPackChunks(commit, excludeCommits, targetChunkBytes, maxChunkBytes) {
+    const oids = new Set(await this.collectReachableObjects(commit));
+    for (const exclude of excludeCommits) {
+      if (!(await this.commitExists(exclude))) continue;
+      for (const oid of await this.collectReachableObjects(exclude)) oids.delete(oid);
+    }
+    const groups = [];
+    let group = [];
+    let groupBytes = 0;
+    for (const oid of [...oids].sort()) {
+      const result = await git.readObject({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid, format: "content" });
+      const size = Buffer.from(result.object).byteLength;
+      const packHeadroom = Math.min(1024 * 1024, Math.max(64 * 1024, Math.floor(maxChunkBytes * 0.1)));
+      if (size > maxChunkBytes - packHeadroom) {
+        throw new ObtsBlockedError("object_too_large_for_chunk", "A file is too large for bounded mobile transfer.");
+      }
+      if (group.length > 0 && groupBytes + size > targetChunkBytes) {
+        groups.push(group);
+        group = [];
+        groupBytes = 0;
+      }
+      group.push(oid);
+      groupBytes += size;
+    }
+    if (group.length > 0) groups.push(group);
+    return groups;
+  }
+
+  async packObjectChunk(oids, maxChunkBytes) {
+    const packfile = await this.packObjects(oids);
+    if (packfile.byteLength > maxChunkBytes) {
+      throw new ObtsBlockedError("chunk_too_large", "Generated Git pack chunk exceeds the negotiated transfer limit.");
+    }
+    return packfile;
+  }
+
   async createPackForCommit(commit, excludeCommits = []) {
     const oids = new Set(await this.collectReachableObjects(commit));
     for (const exclude of excludeCommits) {
@@ -2391,6 +2593,70 @@ class ObtsObsidianClient {
   }
 
   async pull(vaultId, deviceId, token, currentLocalMain, requestedTarget = "latest", currentEventSeq = undefined) {
+    const capabilities = await this.syncCapabilities();
+    if (capabilities) {
+      const checkpoint = await readJson(this.pullTransferPath, null);
+      const checkpointMatches = checkpoint &&
+        checkpoint.vault_id === vaultId &&
+        checkpoint.device_id === deviceId &&
+        checkpoint.current_local_main === currentLocalMain &&
+        (requestedTarget === "latest" || requestedTarget === checkpoint.target_main);
+      let cursor = checkpointMatches ? checkpoint.next_cursor : 0;
+      let target = checkpointMatches ? checkpoint.target_main : requestedTarget;
+      if (checkpoint && !checkpointMatches) await fsp.rm(this.pullTransferPath, { force: true });
+      let finalManifest = null;
+      let chunkCount = checkpointMatches ? checkpoint.received_chunks || 0 : 0;
+      let transferredBytes = checkpointMatches ? checkpoint.transferred_bytes || 0 : 0;
+      while (true) {
+        const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${vaultId}/sync/pull-chunk`), {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+          body: JSON.stringify({
+            api_version: API_VERSION,
+            plugin_version: PLUGIN_VERSION,
+            vault_id: vaultId,
+            device_id: deviceId,
+            current_local_main: currentLocalMain,
+            requested_target: target,
+            current_event_seq: currentEventSeq || 0,
+            cursor
+          })
+        });
+        if (!response.ok) await throwResponseError(response);
+        const chunk = parseMultipartPull(response.headers.get("content-type") || "", Buffer.from(await response.arrayBuffer()));
+        if (chunk.packfile.byteLength !== chunk.manifest.chunk_bytes || sha256(chunk.packfile) !== chunk.manifest.chunk_sha256) {
+          throw new ObtsBlockedError("chunk_digest_mismatch", "Downloaded Git chunk failed integrity validation.");
+        }
+        chunkCount += 1;
+        transferredBytes += chunk.packfile.byteLength;
+        if (chunkCount > capabilities.max_transfer_chunks || transferredBytes > capabilities.max_transfer_bytes) {
+          throw new ObtsBlockedError("transfer_too_large", "Pull transfer exceeded negotiated limits.");
+        }
+        await this.importPack(chunk.packfile, "sync", [makeDiagnosticBreadcrumb("pull_chunk", "succeeded", chunk.packfile)]);
+        finalManifest = chunk.manifest;
+        target = finalManifest.target_main;
+        if (finalManifest.complete) {
+          await fsp.rm(this.pullTransferPath, { force: true });
+          break;
+        }
+        if (finalManifest.next_cursor <= cursor) throw new ObtsBlockedError("invalid_transfer_cursor", "Pull transfer did not advance.");
+        cursor = finalManifest.next_cursor;
+        await writeJson(this.pullTransferPath, {
+          vault_id: vaultId,
+          device_id: deviceId,
+          current_local_main: currentLocalMain,
+          target_main: target,
+          next_cursor: cursor,
+          received_chunks: chunkCount,
+          transferred_bytes: transferredBytes,
+          updated_at: nowIso()
+        });
+      }
+      if (!await this.commitExists(finalManifest.target_main)) {
+        throw new ObtsBlockedError("transfer_incomplete", "Downloaded Git chunks do not contain the target commit.");
+      }
+      return { manifest: finalManifest, packfile: Buffer.alloc(0) };
+    }
     const multipart = createMultipartBody([
       {
         name: "manifest",
@@ -4227,7 +4493,7 @@ function changedPathsConflict(left, right) {
 }
 
 function isRetryableLocalError(code) {
-  return code === "invalid_path" || code === "path_collision" || code === "excluded_git_path" || code === "excluded_internal_path" || code === "excluded_path" || code === "unsupported_file_mode";
+  return code === "upload_interrupted" || code === "pack_preparation_failed" || code === "invalid_path" || code === "path_collision" || code === "excluded_git_path" || code === "excluded_internal_path" || code === "excluded_path" || code === "unsupported_file_mode";
 }
 
 function samePairedDeviceState(left, right) {
@@ -4268,7 +4534,12 @@ async function writeJson(filePath, value) {
   await fsp.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
   const temporaryPath = `${filePath}.tmp-${randomHex(4)}-${Date.now()}`;
   await fsp.writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  await fsp.rename(temporaryPath, filePath);
+  try {
+    await fsp.rename(temporaryPath, filePath);
+  } catch (error) {
+    await fsp.rm(temporaryPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
 }
 
 async function exists(filePath) {

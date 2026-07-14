@@ -16,6 +16,9 @@ import {
 } from '../shared/pluginCompatibility.js';
 import {
   API_VERSION,
+  CHUNK_TRANSFER_CAPABILITY,
+  type ChunkBootstrapManifest,
+  type ChunkPullManifest,
   type DevicePullManifest,
   type DevicePullRequest,
   type DirectoryIntent,
@@ -25,6 +28,9 @@ import {
 import {
   assertRecord,
   readCommitId,
+  parseChunkBootstrapRequest,
+  parseChunkPullRequest,
+  parseChunkPushCreateRequest,
   parseDevicePullRequest,
   parseDevicePushManifest,
   parseJsonObject,
@@ -35,6 +41,7 @@ import {
   ValidationError
 } from '../shared/validators.js';
 import { AuthError, AuthService, ownedVaultOrThrow } from './authService.js';
+import { ChunkTransferService } from './chunkTransferService.js';
 import { ConnectionService } from './connectionService.js';
 import { createServerConfig, ensureServerDirectories, type ServerConfig } from './config.js';
 import { DiagnosticService } from './diagnosticService.js';
@@ -51,6 +58,7 @@ export type ObtsServer = {
   connections: ConnectionService;
   diagnostics: DiagnosticService;
   sync: SyncService;
+  chunkTransfers: ChunkTransferService;
 };
 
 let dashboardRootPromise: Promise<string> | null = null;
@@ -70,10 +78,16 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   const diagnostics = new DiagnosticService(store, config);
   await diagnostics.initialize();
   const sync = new SyncService(store, git, config.maxUploadBytes);
+  const chunkTransfers = new ChunkTransferService(config, git, sync);
   const app = Fastify({
     logger: false,
     genReqId: () => newId('req')
   });
+  app.addContentTypeParser(
+    'application/x-git-packed-objects',
+    { parseAs: 'buffer', bodyLimit: config.transferChunkBytes },
+    (_request, body, done) => done(null, body)
+  );
   await app.register(cookie, { secret: config.sessionSecret });
   await app.register(multipart, {
     limits: {
@@ -93,6 +107,8 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.options('/api/v1/*', async (_request, reply) => reply.status(204).send());
+
+  app.get('/api/v1/sync/capabilities', async () => chunkTransfers.capabilities());
 
   app.get('/health/live', async () => ({ status: 'ok' }));
 
@@ -388,23 +404,46 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
           const localStatusFresh = isFreshDeviceStatus(device.last_status_report_at);
           const localStatusLabel = localStatusFresh ? device.local_status_label : null;
           const localErrorCode = localStatusFresh ? device.local_error_code : null;
+          const localQueueStatus = localStatusFresh ? device.local_queue_status : null;
+          const pendingLocal = localStatusFresh && (
+            (localQueueStatus !== null && localQueueStatus !== 'idle' && localQueueStatus !== 'merged') ||
+            (device.local_head !== null && device.local_head !== device.local_main)
+          );
+          const convergenceProven = localStatusFresh &&
+            localStatusLabel === 'Synced' &&
+            localQueueStatus === 'idle' &&
+            device.local_main === vault.current_main &&
+            device.local_head === vault.current_main &&
+            device.last_applied_main === vault.current_main;
           return {
             device_id: device.device_id,
             device_name: device.device_name,
             status: device.status,
-            status_label: dashboardDeviceStatusLabel(device.status, { behindMain, offline, localStatusLabel, localErrorCode }),
+            status_label: dashboardDeviceStatusLabel(device.status, {
+              behindMain,
+              offline,
+              localStatusFresh,
+              localStatusLabel,
+              localErrorCode,
+              pendingLocal,
+              convergenceProven
+            }),
             last_seen_at: device.last_seen_at,
             device_ref_head: device.device_ref_head,
             last_applied_main: device.last_applied_main,
             last_successful_sync_at: device.last_successful_sync_at,
             local_status_label: localStatusLabel,
             local_error_code: localErrorCode,
-            local_queue_status: localStatusFresh ? device.local_queue_status : null,
+            local_queue_status: localQueueStatus,
             local_main: localStatusFresh ? device.local_main : null,
             local_head: localStatusFresh ? device.local_head : null,
             plugin_version: localStatusFresh ? device.plugin_version : null,
             path_capabilities: localStatusFresh ? device.path_capabilities : null,
             last_status_report_at: device.last_status_report_at,
+            status_report_fresh: localStatusFresh,
+            status_report_age_seconds: device.last_status_report_at === null
+              ? null
+              : Math.max(0, Math.floor((Date.now() - Date.parse(device.last_status_report_at)) / 1000)),
             ahead_of_main: aheadOfMain,
             behind_main: behindMain,
             blocked: device.status === 'review_needed' || device.status === 'blocked_recovery' || isBlockingLocalReport(localStatusLabel, localErrorCode),
@@ -526,6 +565,38 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     });
   });
 
+  app.post('/api/v1/connections/:connectionId/bootstrap-chunk', async (request, reply) => {
+    const { connectionId } = connectionPathParams(request);
+    const chunkRequest = parseChunkBootstrapRequest(requestBody(request));
+    requireCompatiblePlugin(chunkRequest.plugin_version, null);
+    const metadata = await connections.bootstrapMetadata(connectionId, readBearerToken(request.headers.authorization));
+    const requestedTarget = chunkRequest.requested_target === 'latest' ? metadata.targetMain : chunkRequest.requested_target;
+    if (!(await git.commitExists(metadata.vaultId, requestedTarget)) || !(await git.isAncestor(metadata.vaultId, requestedTarget, metadata.targetMain))) {
+      throw new AuthError(404, 'not_found', 'Resource not found.');
+    }
+    const chunk = await createPullObjectChunk(git, metadata.vaultId, requestedTarget, null, chunkRequest.cursor, config);
+    const eventSnapshot = eventSnapshotForTarget(await store.snapshot(), metadata.vaultId, requestedTarget, 0);
+    const manifest: ChunkBootstrapManifest = {
+      api_version: API_VERSION,
+      connection_id: connectionId,
+      vault_id: metadata.vaultId,
+      vault_name: metadata.vaultName,
+      root_commit: metadata.rootCommit,
+      target_main: requestedTarget,
+      changed_paths: (requestedTarget === metadata.targetMain
+        ? metadata.changedPaths
+        : await git.listTreePaths(metadata.vaultId, requestedTarget)).filter((path) => isSyncableVaultPath(path)),
+      explicit_directories: eventSnapshot.explicitDirectories,
+      capability: CHUNK_TRANSFER_CAPABILITY,
+      cursor: chunkRequest.cursor,
+      next_cursor: chunk.nextCursor,
+      complete: chunk.complete,
+      chunk_sha256: sha256Hex(chunk.packfile),
+      chunk_bytes: chunk.packfile.byteLength
+    };
+    return sendMultipart(reply, { manifest, packfile: chunk.packfile });
+  });
+
   app.post('/api/v1/connections/:connectionId/diagnostic-events', { bodyLimit: DIAGNOSTIC_MAX_BODY_BYTES }, async (request, reply) => {
     const { connectionId } = connectionPathParams(request);
     const connectionAuth = await connections.authenticateDiagnostics(
@@ -597,6 +668,56 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     return reply.status(result.status === 'accepted' ? 202 : 200).send(result);
   });
 
+  app.post('/api/v1/vaults/:vaultId/sync/push-transfers', async (request, reply) => {
+    const { vaultId } = pathParams(request);
+    const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+    const body = parseChunkPushCreateRequest(requestBody(request));
+    requireCompatiblePlugin(body.plugin_version, deviceAuth.device.plugin_version);
+    const result = await chunkTransfers.createPush(deviceAuth, body);
+    return reply.status(result.created ? 201 : 200).send(result.descriptor);
+  });
+
+  app.get('/api/v1/vaults/:vaultId/sync/push-transfers/:transferId', async (request) => {
+    const { vaultId } = pathParams(request);
+    const transferId = (request.params as { transferId?: string }).transferId ?? '';
+    const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+    return await chunkTransfers.getPush(deviceAuth, transferId);
+  });
+
+  app.put('/api/v1/vaults/:vaultId/sync/push-transfers/:transferId/chunks/:chunkIndex', {
+    bodyLimit: config.transferChunkBytes
+  }, async (request) => {
+    const { vaultId } = pathParams(request);
+    const params = request.params as { transferId?: string; chunkIndex?: string };
+    const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+    const digest = typeof request.headers['x-obts-chunk-sha256'] === 'string' ? request.headers['x-obts-chunk-sha256'] : '';
+    if (!/^[0-9a-f]{64}$/u.test(digest)) throw new ValidationError('invalid_request', 'Invalid chunk digest.');
+    const index = Number(params.chunkIndex);
+    if (!Number.isSafeInteger(index)) throw new ValidationError('invalid_request', 'Invalid chunk index.');
+    if (!Buffer.isBuffer(request.body)) throw new ValidationError('invalid_request', 'Expected Git pack chunk bytes.');
+    return await chunkTransfers.putChunk(deviceAuth, params.transferId ?? '', index, request.body, digest);
+  });
+
+  app.post('/api/v1/vaults/:vaultId/sync/push-transfers/:transferId/finalize', async (request, reply) => {
+    const { vaultId } = pathParams(request);
+    const transferId = (request.params as { transferId?: string }).transferId ?? '';
+    const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+    const result = await chunkTransfers.finalizePush(deviceAuth, transferId);
+    if (result.status === 'rejected') {
+      const status = result.code === 'not_found' ? 404 : result.code === 'malformed_packfile' ? 400 : 409;
+      return reply.status(status).send({ error: { code: result.code, message: result.message, request_id: request.id, details: {} } });
+    }
+    return reply.send(result);
+  });
+
+  app.delete('/api/v1/vaults/:vaultId/sync/push-transfers/:transferId', async (request, reply) => {
+    const { vaultId } = pathParams(request);
+    const transferId = (request.params as { transferId?: string }).transferId ?? '';
+    const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+    await chunkTransfers.deletePush(deviceAuth, transferId);
+    return reply.status(204).send();
+  });
+
   app.post('/api/v1/vaults/:vaultId/sync/push', async (request, reply) => {
     const { vaultId } = pathParams(request);
     const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
@@ -615,6 +736,62 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       });
     }
     return reply.send(result);
+  });
+
+  app.post('/api/v1/vaults/:vaultId/sync/pull-chunk', async (request, reply) => {
+    const { vaultId } = pathParams(request);
+    const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+    if (deviceAuth.vault.status === 'blocked_integrity') throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+    if (deviceAuth.device.status === 'review_needed' || deviceAuth.device.status === 'blocked_recovery') {
+      throw new AuthError(409, 'device_blocked', 'Device requires review or recovery before pulling server state.');
+    }
+    const pullRequest = parseChunkPullRequest(requestBody(request));
+    requireCompatiblePlugin(pullRequest.plugin_version, deviceAuth.device.plugin_version);
+    if (pullRequest.vault_id !== vaultId || pullRequest.device_id !== deviceAuth.device.device_id) {
+      throw new AuthError(404, 'not_found', 'Resource not found.');
+    }
+    const targetMain = pullRequest.requested_target === 'latest' ? deviceAuth.vault.current_main : pullRequest.requested_target;
+    if (!(await git.commitExists(vaultId, targetMain)) || !(await git.isAncestor(vaultId, targetMain, deviceAuth.vault.current_main))) {
+      throw new AuthError(404, 'not_found', 'Resource not found.');
+    }
+    const currentLocalMainExists = pullRequest.current_local_main !== null && await git.commitExists(vaultId, pullRequest.current_local_main);
+    const have = currentLocalMainExists ? pullRequest.current_local_main : null;
+    const currentLocalMainIsAncestor = have ? await git.isAncestor(vaultId, have, targetMain) : null;
+    const allChangedPaths = have === null
+      ? await git.listTreePaths(vaultId, targetMain)
+      : (await git.changedPaths(vaultId, have, targetMain)).map((entry) => entry.path);
+    const db = await store.snapshot();
+    const currentEventSeq = Number.isSafeInteger(pullRequest.current_event_seq) ? pullRequest.current_event_seq ?? 0 : 0;
+    const eventSnapshot = eventSnapshotForTarget(db, vaultId, targetMain, currentEventSeq);
+    const chunk = await createPullObjectChunk(git, vaultId, targetMain, have, pullRequest.cursor, config);
+    const manifest: ChunkPullManifest = {
+      api_version: API_VERSION,
+      vault_id: vaultId,
+      device_id: deviceAuth.device.device_id,
+      target_main: targetMain,
+      changed_paths: [...new Set(allChangedPaths.filter((path) => isSyncableVaultPath(path)))].sort(),
+      current_local_main_is_ancestor: currentLocalMainIsAncestor,
+      event_seq: eventSnapshot.eventSeq,
+      directory_intents: eventSnapshot.directoryIntents,
+      explicit_directories: eventSnapshot.explicitDirectories,
+      capability: CHUNK_TRANSFER_CAPABILITY,
+      cursor: pullRequest.cursor,
+      next_cursor: chunk.nextCursor,
+      complete: chunk.complete,
+      chunk_sha256: sha256Hex(chunk.packfile),
+      chunk_bytes: chunk.packfile.byteLength
+    };
+    if (pullRequest.current_local_main === targetMain && chunk.complete) {
+      await store.mutate((mutableDb) => {
+        const device = mutableDb.devices.find((candidate) => candidate.device_id === deviceAuth.device.device_id);
+        if (device && device.status !== 'revoked' && device.status !== 'review_needed' && device.status !== 'blocked_recovery') {
+          device.status = 'synced';
+          device.last_applied_main = targetMain;
+          device.last_successful_sync_at = nowIso();
+        }
+      });
+    }
+    return sendMultipart(reply, { manifest, packfile: chunk.packfile });
   });
 
   app.post('/api/v1/vaults/:vaultId/sync/pull', async (request, reply) => {
@@ -1185,7 +1362,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   diagnosticPruneTimer.unref();
   app.addHook('onClose', async () => clearInterval(diagnosticPruneTimer));
 
-  return { app, config, store, git, auth, connections, diagnostics, sync };
+  return { app, config, store, git, auth, connections, diagnostics, sync, chunkTransfers };
 }
 
 function buildDashboardConflicts(
@@ -1618,6 +1795,36 @@ function readEventCursor(request: FastifyRequest): number {
   return after;
 }
 
+function eventSnapshotForTarget(
+  db: MetadataDb,
+  vaultId: string,
+  targetMain: string,
+  afterEventSeq: number
+): { eventSeq: number; directoryIntents: DirectoryIntent[]; explicitDirectories: string[] } {
+  const vaultEvents = db.events
+    .filter((event) => event.vault_id === vaultId)
+    .sort((left, right) => left.event_seq - right.event_seq);
+  const mainEvent = [...vaultEvents].reverse().find((event) =>
+    event.event_type === 'main_advanced' && event.commit_cursors.main === targetMain
+  );
+  const eventSeq = mainEvent?.event_seq ?? 0;
+  const throughTarget = vaultEvents.filter((event) => event.event_seq <= eventSeq);
+  const directoryIntents = directoryIntentsFromEvents(
+    throughTarget.filter((event) => event.event_seq > afterEventSeq)
+  );
+  const explicit = new Set<string>();
+  for (const intent of directoryIntentsFromEvents(throughTarget)) {
+    if (intent.op === 'delete') {
+      for (const candidate of [...explicit]) {
+        if (candidate === intent.path || candidate.startsWith(`${intent.path}/`)) explicit.delete(candidate);
+      }
+    } else {
+      explicit.add(intent.path);
+    }
+  }
+  return { eventSeq, directoryIntents, explicitDirectories: [...explicit].sort() };
+}
+
 function directoryIntentsFromEvents(events: Array<{ payload: Record<string, unknown> }>): DirectoryIntent[] {
   const intents: DirectoryIntent[] = [];
   for (const event of events) {
@@ -1712,8 +1919,8 @@ function setApiCorsHeaders(request: FastifyRequest, reply: FastifyReply): void {
     return;
   }
   reply.header('access-control-allow-origin', '*');
-  reply.header('access-control-allow-methods', 'GET, POST, DELETE, OPTIONS');
-  reply.header('access-control-allow-headers', 'authorization, content-type, x-obts-csrf');
+  reply.header('access-control-allow-methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  reply.header('access-control-allow-headers', 'authorization, content-type, x-obts-csrf, x-obts-chunk-sha256');
   reply.header('access-control-max-age', '600');
 }
 
@@ -1971,6 +2178,52 @@ function readMultipartJsonObject(value: unknown): Record<string, unknown> {
   }
   assertRecord(value);
   return value;
+}
+
+async function createPullObjectChunk(
+  git: GitService,
+  vaultId: string,
+  target: string,
+  have: string | null,
+  cursor: number,
+  config: ServerConfig
+): Promise<{ packfile: Buffer; nextCursor: number; complete: boolean }> {
+  const objects = await git.reachableObjectSizes(vaultId, target, have);
+  const totalObjectBytes = objects.reduce((total, entry) => total + entry.size, 0);
+  if (totalObjectBytes > config.maxTransferBytes) {
+    throw new AuthError(413, 'transfer_too_large', 'Pull exceeds the configured aggregate transfer limit.');
+  }
+  const targetBytes = Math.max(1_048_576, Math.floor(config.transferChunkBytes * 0.75));
+  const packHeadroom = Math.min(1_048_576, Math.max(64 * 1024, Math.floor(config.transferChunkBytes * 0.1)));
+  const groups: string[][] = [];
+  let group: string[] = [];
+  let groupBytes = 0;
+  for (const object of objects) {
+    if (object.size > config.transferChunkBytes - packHeadroom) {
+      throw new AuthError(413, 'object_too_large_for_chunk', 'A Git object exceeds the negotiated chunk limit.');
+    }
+    if (group.length > 0 && groupBytes + object.size > targetBytes) {
+      groups.push(group);
+      group = [];
+      groupBytes = 0;
+    }
+    group.push(object.oid);
+    groupBytes += object.size;
+  }
+  if (group.length > 0) groups.push(group);
+  if (groups.length > config.maxTransferChunks) {
+    throw new AuthError(413, 'too_many_chunks', 'Pull exceeds the configured chunk-count limit.');
+  }
+  if (!Number.isSafeInteger(cursor) || cursor < 0 || cursor > groups.length) {
+    throw new ValidationError('invalid_request', 'Invalid transfer cursor.', { field: 'cursor' });
+  }
+  if (cursor === groups.length) return { packfile: Buffer.alloc(0), nextCursor: cursor, complete: true };
+  const packfile = await git.exportObjectPack(vaultId, groups[cursor]!, config.transferChunkBytes);
+  if (packfile.byteLength > config.transferChunkBytes) {
+    throw new AuthError(413, 'chunk_too_large', 'Generated Git pack exceeds the negotiated chunk limit.');
+  }
+  const nextCursor = cursor + 1;
+  return { packfile, nextCursor, complete: nextCursor === groups.length };
 }
 
 function sendMultipart(reply: FastifyReply, input: { manifest: object; packfile: Buffer }): FastifyReply {
@@ -2842,7 +3095,15 @@ function deviceStatusLabel(status: string): string {
 
 function dashboardDeviceStatusLabel(
   status: string,
-  state: { behindMain: boolean; offline: boolean; localStatusLabel?: string | null; localErrorCode?: string | null }
+  state: {
+    behindMain: boolean;
+    offline: boolean;
+    localStatusFresh: boolean;
+    pendingLocal: boolean;
+    convergenceProven: boolean;
+    localStatusLabel?: string | null;
+    localErrorCode?: string | null;
+  }
 ): string {
   if (isLocalStatusOverride(state.localStatusLabel ?? null, state.localErrorCode ?? null)) {
     return state.localStatusLabel || 'Unsafe local state';
@@ -2852,6 +3113,12 @@ function dashboardDeviceStatusLabel(
   }
   if (status === 'synced' && state.behindMain) {
     return 'Behind';
+  }
+  if (status === 'synced' && state.pendingLocal) {
+    return 'Ahead';
+  }
+  if (status === 'synced' && !state.convergenceProven) {
+    return 'Status unknown';
   }
   return deviceStatusLabel(status);
 }
@@ -2866,8 +3133,12 @@ function isLocalStatusOverride(label: string | null, errorCode: string | null): 
       label === 'Unsafe local state' ||
       label === 'Needs recovery' ||
       label === 'Blocked' ||
+      label === 'Preparing upload' ||
       label === 'Uploading' ||
       label === 'Applying' ||
+      label === 'Checking' ||
+      label === 'Behind' ||
+      label === 'Offline' ||
       label === 'Ahead' ||
       label === 'Review needed'
   );

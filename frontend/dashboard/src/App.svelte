@@ -85,6 +85,34 @@
   $: reviewResolved = review?.conflict.status === 'resolved';
   $: reviewStatusLabel = reviewResolved ? 'Synced' : review?.stale ? 'Stale review' : 'Review needed';
   $: recentAuthValid = session ? Date.parse(session.recent_auth_expires_at) > nowMs : false;
+  $: syncSummary = dashboardSyncSummary(dashboard, nowMs);
+
+  function effectiveStatusLabel(device: DashboardDevice, currentTime: number): StatusLabel {
+    if (
+      device.status_label === 'Synced' &&
+      (!device.last_status_report_at || currentTime - Date.parse(device.last_status_report_at) > 5 * 60 * 1000)
+    ) {
+      return 'Status unknown';
+    }
+    return device.status_label;
+  }
+
+  function dashboardSyncSummary(value: DashboardSummary | null, currentTime: number): {
+    label: string;
+    role: 'success' | 'info' | 'warning' | 'danger' | 'neutral';
+  } {
+    if (!value) return { label: 'Checking', role: 'neutral' };
+    if (value.vault.status !== 'active') return { label: 'Integrity failure', role: 'danger' };
+    if (value.devices.length === 0) return { label: 'Status unknown', role: 'warning' };
+    if (value.devices.every((device) => effectiveStatusLabel(device, currentTime) === 'Synced')) return { label: 'Synced', role: 'success' };
+    if (value.devices.some((device) => ['Blocked', 'Needs recovery', 'Unsafe local state', 'Integrity failure'].includes(effectiveStatusLabel(device, currentTime)))) {
+      return { label: 'Attention required', role: 'danger' };
+    }
+    if (value.devices.some((device) => ['Preparing upload', 'Uploading', 'Applying', 'Merging'].includes(effectiveStatusLabel(device, currentTime)))) {
+      return { label: 'Sync in progress', role: 'info' };
+    }
+    return { label: 'Not converged', role: 'warning' };
+  }
 
   onMount(() => {
     void bootstrap();
@@ -635,13 +663,13 @@
         </main>
       {:else if page === 'Overview' && dashboard}
         <main class="grid">
-          <Summary title="Sync status" value={dashboard.vault.status === 'active' ? 'Synced' : 'Integrity failure'} role={dashboard.vault.status === 'active' ? 'success' : 'danger'} detail={shortId(dashboard.vault.current_main)} />
+          <Summary title="Sync status" value={syncSummary.label} role={syncSummary.role} detail={shortId(dashboard.vault.current_main)} />
           <Summary title="Unresolved conflicts" value={String(unresolvedCount)} role={unresolvedCount ? 'warning' : 'success'} detail="Review queue" />
           <Summary title="Paired devices" value={String(dashboard.devices.length)} role="neutral" detail="Registered devices" />
           <Summary title="Health/readiness" value={dashboard.health.status === 'ready' ? 'Synced' : 'Integrity failure'} role={dashboard.health.status === 'ready' ? 'success' : 'danger'} detail={dashboard.health.detail ?? dashboard.health.git_version} />
           <section class="panel wide">
             <h2>Devices</h2>
-            <DeviceTable devices={dashboard.devices} onRevoke={revokeDevice} />
+            <DeviceTable devices={dashboard.devices} nowMs={nowMs} onRevoke={revokeDevice} />
           </section>
           <section class="panel narrow">
             <h2>Attention</h2>
@@ -674,7 +702,7 @@
         <main class="page">
           <section class="panel full">
             <h2>Devices</h2>
-            <DeviceTable devices={dashboard.devices} onRevoke={revokeDevice} />
+            <DeviceTable devices={dashboard.devices} nowMs={nowMs} onRevoke={revokeDevice} />
           </section>
         </main>
       {:else if page === 'Conflicts'}

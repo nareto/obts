@@ -15,7 +15,7 @@ import type {
   ResolveConflictResponse
 } from '../shared/types.js';
 import { AuthError, type AuthenticatedDevice } from './authService.js';
-import { GitCommandError, GitService, sha256Hex, type GitDiffEntry } from './gitService.js';
+import { GitCommandError, GitService, sha256Hex, type GitDiffEntry, type GitObjectReader } from './gitService.js';
 import type { DeviceRow, MetadataDb, MetadataStore, SyncOperationRow } from './metadataStore.js';
 
 const MERGE_POLICY_VERSION = 'phase2.semantic-merge.v1';
@@ -115,7 +115,8 @@ export class SyncService {
   async pushDeviceCommit(
     auth: AuthenticatedDevice,
     manifest: DevicePushManifest,
-    packfile: Buffer
+    packfile: Buffer,
+    staged?: { reader: GitObjectReader; promote: () => Promise<void> }
   ): Promise<PushResult> {
     if (auth.vault.status === 'blocked_integrity') {
       return {
@@ -127,11 +128,13 @@ export class SyncService {
     if (manifest.vault_id !== auth.vault.vault_id || manifest.device_id !== auth.device.device_id) {
       return { status: 'rejected', code: 'not_found', message: 'Resource not found.' };
     }
-    if (manifest.packfile_bytes !== packfile.byteLength || packfile.byteLength > this.maxUploadBytes) {
-      return { status: 'rejected', code: 'invalid_packfile', message: 'Packfile size does not match the manifest.' };
-    }
-    if (sha256Hex(packfile) !== manifest.packfile_sha256) {
-      return { status: 'rejected', code: 'invalid_packfile', message: 'Packfile digest does not match the manifest.' };
+    if (!staged) {
+      if (manifest.packfile_bytes !== packfile.byteLength || packfile.byteLength > this.maxUploadBytes) {
+        return { status: 'rejected', code: 'invalid_packfile', message: 'Packfile size does not match the manifest.' };
+      }
+      if (sha256Hex(packfile) !== manifest.packfile_sha256) {
+        return { status: 'rejected', code: 'invalid_packfile', message: 'Packfile digest does not match the manifest.' };
+      }
     }
 
     return await this.withVaultLock(auth.vault.vault_id, async () => {
@@ -191,14 +194,9 @@ export class SyncService {
           }
         }
 
-        const quarantineResult = await this.validateQuarantinedUpload(
-          auth,
-          operation,
-          manifest,
-          packfile,
-          currentDeviceRef,
-          currentMain
-        );
+        const quarantineResult = staged
+          ? await this.validateUploadReader(auth, operation, manifest, staged.reader, currentDeviceRef, currentMain)
+          : await this.validateQuarantinedUpload(auth, operation, manifest, packfile, currentDeviceRef, currentMain);
         if (quarantineResult !== null) {
           return quarantineResult;
         }
@@ -222,7 +220,8 @@ export class SyncService {
           op.updated_at = nowIso();
         });
 
-        await this.git.importPack(auth.vault.vault_id, packfile);
+        if (staged) await staged.promote();
+        else await this.git.importPack(auth.vault.vault_id, packfile);
         await this.git.updateRef(auth.vault.vault_id, auth.device.device_ref, manifest.target_commit, currentDeviceRef);
 
         const refEventSeq = await this.store.mutate((db) => {
@@ -642,7 +641,23 @@ export class SyncService {
     currentMain: string
   ): Promise<PushResult | null> {
     try {
-      return await this.git.withQuarantinedPack(auth.vault.vault_id, packfile, async (reader) => {
+      return await this.git.withQuarantinedPack(auth.vault.vault_id, packfile, async (reader) =>
+        await this.validateUploadReader(auth, operation, manifest, reader, currentDeviceRef, currentMain)
+      );
+    } catch {
+      return await this.rejectDevicePush(auth, operation.operation_id, 'malformed_packfile', 'Malformed Git packfile.');
+    }
+  }
+
+  private async validateUploadReader(
+    auth: AuthenticatedDevice,
+    operation: SyncOperationRow,
+    manifest: DevicePushManifest,
+    reader: GitObjectReader,
+    currentDeviceRef: string | null,
+    currentMain: string
+  ): Promise<PushResult | null> {
+    try {
         if (!(await reader.commitExists(auth.vault.vault_id, manifest.target_commit))) {
           return await this.rejectDevicePush(
             auth,
@@ -677,9 +692,8 @@ export class SyncService {
           }
         }
         return null;
-      });
     } catch {
-      return await this.rejectDevicePush(auth, operation.operation_id, 'malformed_packfile', 'Malformed Git packfile.');
+      return await this.rejectDevicePush(auth, operation.operation_id, 'malformed_packfile', 'Malformed Git object set.');
     }
   }
 

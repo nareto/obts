@@ -66,3 +66,14 @@ system to keep Obsidian running in the background.
    commit IDs, Git objects, pack bytes, messages, or stacks. Change the server
    URL and confirm sharing turns off. Delete all reports through recent
    authentication and confirm the list is empty.
+10. Add more than 100 MiB of disposable files while keeping every individual
+    file below the advertised object limit. Confirm the client reports
+    **Preparing upload**, then uploads several bounded chunks without building a
+    whole-transfer multipart body.
+11. Force-close after the first chunk receipt, reopen, and sync again. Confirm
+    the same transfer attempt resumes from its received-chunk list, advances the
+    device ref once, and eventually appears on a second device.
+12. Leave one device without a fresh status report for over five minutes while
+    another device advances main. Confirm the dashboard shows **Status unknown**
+    or **Behind**, never **Synced**, until the stale device freshly reports its
+    local main, local head, and idle queue after applying the canonical main.

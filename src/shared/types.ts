@@ -237,6 +237,81 @@ export type DevicePullManifest = {
   explicit_directories?: string[];
 };
 
+export const CHUNK_TRANSFER_CAPABILITY = 'git-object-pack-chunks-v1' as const;
+
+export type SyncCapabilities = {
+  capabilities: [typeof CHUNK_TRANSFER_CAPABILITY];
+  max_chunk_bytes: number;
+  target_chunk_bytes: number;
+  max_transfer_bytes: number;
+  max_transfer_chunks: number;
+};
+
+export type ChunkPushCreateRequest = {
+  api_version: typeof API_VERSION;
+  plugin_version?: string;
+  vault_id: string;
+  device_id: string;
+  expected_device_ref: string | null;
+  target_commit: string;
+  client_known_main: string | null;
+  base_commit?: string | null;
+  directory_intents?: DirectoryIntent[];
+  attempt_id: string;
+  chunk_count: number;
+  plan_sha256: string;
+};
+
+export type ChunkPushDescriptor = {
+  transfer_id: string;
+  capability: typeof CHUNK_TRANSFER_CAPABILITY;
+  status: 'open' | 'completed' | 'aborted';
+  target_commit: string;
+  chunk_count: number;
+  received_chunks: number[];
+  max_chunk_bytes: number;
+  max_transfer_bytes: number;
+  expires_at: string;
+  result?: PushResult;
+};
+
+export type ChunkPushReceipt = {
+  transfer_id: string;
+  chunk_index: number;
+  chunk_sha256: string;
+  received_bytes: number;
+  idempotent: boolean;
+};
+
+export type ChunkPullRequest = DevicePullRequest & {
+  cursor: number;
+};
+
+export type ChunkPullManifest = DevicePullManifest & {
+  capability: typeof CHUNK_TRANSFER_CAPABILITY;
+  cursor: number;
+  next_cursor: number;
+  complete: boolean;
+  chunk_sha256: string;
+  chunk_bytes: number;
+};
+
+export type ChunkBootstrapRequest = {
+  api_version: typeof API_VERSION;
+  plugin_version?: string;
+  cursor: number;
+  requested_target: 'latest' | string;
+};
+
+export type ChunkBootstrapManifest = ConnectionBootstrapManifest & {
+  capability: typeof CHUNK_TRANSFER_CAPABILITY;
+  cursor: number;
+  next_cursor: number;
+  complete: boolean;
+  chunk_sha256: string;
+  chunk_bytes: number;
+};
+
 export type ConflictRecord = {
   conflict_id: string;
   vault_id: string;

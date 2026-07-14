@@ -187,7 +187,7 @@ export class ConnectionService {
     });
   }
 
-  async bootstrap(connectionId: string, secret: string): Promise<{
+  async bootstrapMetadata(connectionId: string, secret: string): Promise<{
     connection: ConnectionRequestRow;
     vaultId: string;
     vaultName: string;
@@ -195,7 +195,6 @@ export class ConnectionService {
     targetMain: string;
     changedPaths: string[];
     explicitDirectories: string[];
-    packfile: Buffer;
   }> {
     const { db, connection } = await this.store.mutate((mutableDb) => {
       expireConnections(mutableDb.connections);
@@ -209,7 +208,6 @@ export class ConnectionService {
     if (vault.status !== 'active' || !vault.root_commit) {
       throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
     }
-    const packfile = await this.git.exportPack(vault.vault_id, vault.current_main, null);
     return {
       connection,
       vaultId: vault.vault_id,
@@ -217,8 +215,24 @@ export class ConnectionService {
       rootCommit: vault.root_commit,
       targetMain: vault.current_main,
       changedPaths: await this.git.listTreePaths(vault.vault_id, vault.current_main),
-      explicitDirectories: db.directory_state_by_vault[vault.vault_id]?.explicit_dirs ?? [],
-      packfile
+      explicitDirectories: db.directory_state_by_vault[vault.vault_id]?.explicit_dirs ?? []
+    };
+  }
+
+  async bootstrap(connectionId: string, secret: string): Promise<{
+    connection: ConnectionRequestRow;
+    vaultId: string;
+    vaultName: string;
+    rootCommit: string;
+    targetMain: string;
+    changedPaths: string[];
+    explicitDirectories: string[];
+    packfile: Buffer;
+  }> {
+    const metadata = await this.bootstrapMetadata(connectionId, secret);
+    return {
+      ...metadata,
+      packfile: await this.git.exportPack(metadata.vaultId, metadata.targetMain, null)
     };
   }
 

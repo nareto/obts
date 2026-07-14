@@ -39,7 +39,12 @@ Environment:
   OBTS_PUBLIC_BASE_URL      Public server URL used in dashboard and browser onboarding links.
   OBTS_SESSION_SECRET       Dashboard/API session signing secret.
   OBTS_GIT_BINARY           Native git executable. Defaults to git.
-  OBTS_MAX_UPLOAD_BYTES     Upload limit in bytes. Defaults to 104857600.
+  OBTS_MAX_UPLOAD_BYTES     Legacy single-request upload limit. Defaults to 104857600.
+  OBTS_TRANSFER_CHUNK_BYTES Bounded Git pack chunk size. Defaults to 16777216.
+  OBTS_MAX_TRANSFER_BYTES   Maximum aggregate chunk transfer. Defaults to 2147483648.
+  OBTS_MAX_TRANSFER_CHUNKS  Maximum chunks per transfer. Defaults to 4096.
+  OBTS_MAX_TRANSFER_STORAGE_BYTES Global transfer quarantine cap. Defaults to 4294967296.
+  OBTS_TRANSFER_TTL_SECONDS Resumable push lifetime. Defaults to 86400.
   OBTS_DIAGNOSTIC_INGEST_ENABLED
                             Accept opted-in plugin error reports. Defaults to false.
   OBTS_DIAGNOSTIC_RETENTION_DAYS
@@ -337,6 +342,11 @@ function configFromEnv(env: CliEnv): Partial<ServerConfig> & { dataDir: string }
     ...(env.OBTS_SESSION_SECRET ? { sessionSecret: env.OBTS_SESSION_SECRET } : {}),
     ...(env.OBTS_GIT_BINARY ? { gitBinary: env.OBTS_GIT_BINARY } : {}),
     ...(env.OBTS_MAX_UPLOAD_BYTES ? { maxUploadBytes: parseInteger(env.OBTS_MAX_UPLOAD_BYTES, 'OBTS_MAX_UPLOAD_BYTES') } : {}),
+    ...(env.OBTS_TRANSFER_CHUNK_BYTES ? { transferChunkBytes: parseInteger(env.OBTS_TRANSFER_CHUNK_BYTES, 'OBTS_TRANSFER_CHUNK_BYTES') } : {}),
+    ...(env.OBTS_MAX_TRANSFER_BYTES ? { maxTransferBytes: parseInteger(env.OBTS_MAX_TRANSFER_BYTES, 'OBTS_MAX_TRANSFER_BYTES') } : {}),
+    ...(env.OBTS_MAX_TRANSFER_CHUNKS ? { maxTransferChunks: parseInteger(env.OBTS_MAX_TRANSFER_CHUNKS, 'OBTS_MAX_TRANSFER_CHUNKS') } : {}),
+    ...(env.OBTS_MAX_TRANSFER_STORAGE_BYTES ? { maxTransferStorageBytes: parseInteger(env.OBTS_MAX_TRANSFER_STORAGE_BYTES, 'OBTS_MAX_TRANSFER_STORAGE_BYTES') } : {}),
+    ...(env.OBTS_TRANSFER_TTL_SECONDS ? { transferTtlSeconds: parseInteger(env.OBTS_TRANSFER_TTL_SECONDS, 'OBTS_TRANSFER_TTL_SECONDS') } : {}),
     ...(env.OBTS_DIAGNOSTIC_INGEST_ENABLED
       ? { diagnosticIngestEnabled: parseBoolean(env.OBTS_DIAGNOSTIC_INGEST_ENABLED, 'OBTS_DIAGNOSTIC_INGEST_ENABLED') }
       : {}),

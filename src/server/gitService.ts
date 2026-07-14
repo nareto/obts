@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { chmod, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { constants, copyFile, chmod, mkdir, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { spawn } from 'node:child_process';
 
@@ -207,6 +207,114 @@ export class GitService {
   async importPack(vaultId: string, packfile: Buffer): Promise<void> {
     const repo = this.repoPath(vaultId);
     await this.exec(repo, ['unpack-objects', '-q'], packfile);
+  }
+
+  async initializeTransferRepo(vaultId: string, repo: string): Promise<void> {
+    await mkdir(dirname(repo), { recursive: true, mode: 0o700 });
+    try {
+      await stat(repo);
+    } catch {
+      await this.execRaw(['init', '--bare', repo]);
+    }
+    await mkdir(join(repo, 'objects', 'info'), { recursive: true, mode: 0o700 });
+    await writeFile(join(repo, 'objects', 'info', 'alternates'), `${join(this.repoPath(vaultId), 'objects')}\n`, { mode: 0o600 });
+  }
+
+  async importPackIntoRepo(repo: string, packfile: Buffer): Promise<void> {
+    const packDir = join(repo, 'objects', 'pack');
+    await mkdir(packDir, { recursive: true, mode: 0o700 });
+    const before = new Set(await readdir(packDir));
+    try {
+      await this.exec(repo, ['index-pack', '--stdin', '--fix-thin'], packfile);
+    } catch (error) {
+      for (const entry of await readdir(packDir)) {
+        if (!before.has(entry)) await rm(join(packDir, entry), { force: true });
+      }
+      throw error;
+    }
+  }
+
+  readerForRepo(repo: string): GitObjectReader {
+    return {
+      commitExists: async (_vaultId, commit) => await this.commitExistsInRepo(repo, commit),
+      validateTreePathPolicy: async (_vaultId, commit, maxBlobBytes) =>
+        await this.validateTreePathPolicyInRepo(repo, commit, maxBlobBytes),
+      isAncestor: async (_vaultId, ancestor, descendant) => await this.isAncestorInRepo(repo, ancestor, descendant),
+      changedPaths: async (_vaultId, base, commit) => await this.changedPathsInRepo(repo, base, commit),
+      listTreePaths: async (_vaultId, commit) => await this.listTreePathsInRepo(repo, commit)
+    };
+  }
+
+  async promoteTransferObjects(vaultId: string, transferRepo: string): Promise<void> {
+    const sourceObjects = join(transferRepo, 'objects');
+    const targetObjects = join(this.repoPath(vaultId), 'objects');
+    const sourcePacks = join(sourceObjects, 'pack');
+    const targetPacks = join(targetObjects, 'pack');
+    await mkdir(targetPacks, { recursive: true, mode: 0o700 });
+    const packEntries = (await readdir(sourcePacks, { withFileTypes: true }))
+      .filter((entry) => entry.isFile() && /^pack-[0-9a-f]{40}\.(?:pack|idx)$/u.test(entry.name))
+      .sort((left, right) => {
+        const leftOrder = left.name.endsWith('.pack') ? 0 : 1;
+        const rightOrder = right.name.endsWith('.pack') ? 0 : 1;
+        return leftOrder - rightOrder || left.name.localeCompare(right.name);
+      });
+    for (const entry of packEntries) {
+      const destination = join(targetPacks, entry.name);
+      try {
+        await stat(destination);
+        continue;
+      } catch {
+        // Copy to a private name before publishing the immutable pack component.
+      }
+      const temporary = `${destination}.tmp-${randomBytes(8).toString('hex')}`;
+      try {
+        await copyFile(join(sourcePacks, entry.name), temporary, constants.COPYFILE_EXCL);
+        await chmod(temporary, 0o600);
+        await rename(temporary, destination);
+      } finally {
+        await rm(temporary, { force: true });
+      }
+    }
+    for (const entry of await readdir(sourceObjects, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !/^[0-9a-f]{2}$/u.test(entry.name)) continue;
+      const sourceDir = join(sourceObjects, entry.name);
+      const targetDir = join(targetObjects, entry.name);
+      await mkdir(targetDir, { recursive: true, mode: 0o700 });
+      for (const object of await readdir(sourceDir, { withFileTypes: true })) {
+        if (!object.isFile() || !/^[0-9a-f]{38}$/u.test(object.name)) continue;
+        try {
+          await copyFile(join(sourceDir, object.name), join(targetDir, object.name), constants.COPYFILE_EXCL);
+        } catch (error) {
+          if (!(error && typeof error === 'object' && 'code' in error && error.code === 'EEXIST')) throw error;
+        }
+      }
+    }
+  }
+
+  async reachableObjectSizes(vaultId: string, target: string, have: string | null): Promise<Array<{ oid: string; size: number }>> {
+    const repo = this.repoPath(vaultId);
+    const args = ['rev-list', '--objects', target, ...(have ? [`^${have}`] : [])];
+    const { stdout } = await this.exec(repo, args);
+    const oids = [...new Set(asText(stdout).split('\n').map((line) => line.trim().split(/\s+/u)[0]).filter((oid): oid is string => Boolean(oid)))];
+    if (oids.length === 0) return [];
+    const input = Buffer.from(`${oids.join('\n')}\n`);
+    const result = await this.exec(repo, ['cat-file', '--batch-check=%(objectname) %(objectsize)'], input);
+    const sizes = new Map<string, number>();
+    for (const line of asText(result.stdout).trim().split('\n')) {
+      const [oid, rawSize] = line.split(' ');
+      const size = Number(rawSize);
+      if (oid && Number.isSafeInteger(size) && size >= 0) sizes.set(oid, size);
+    }
+    return oids.map((oid) => ({ oid, size: sizes.get(oid) ?? 0 }));
+  }
+
+  async exportObjectPack(vaultId: string, oids: string[], maxBytes: number): Promise<Buffer> {
+    if (oids.length === 0) return Buffer.alloc(0);
+    const { stdout } = await this.exec(this.repoPath(vaultId), ['pack-objects', '--stdout'], Buffer.from(`${oids.join('\n')}\n`), undefined, {
+      encoding: 'buffer',
+      maxBuffer: maxBytes + 1024 * 1024
+    });
+    return Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
   }
 
   async withQuarantinedPack<T>(

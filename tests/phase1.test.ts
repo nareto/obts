@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -736,14 +736,14 @@ describe('Phase 1 sync without conflict resolution', () => {
 
     const internals = fixtureB as unknown as {
       transport: {
-        pull: (input: { requestedTarget?: string }) => Promise<unknown>;
+        pullChunk: (input: { requestedTarget?: string; cursor: number }) => Promise<unknown>;
       };
     };
-    const originalPull = internals.transport.pull.bind(internals.transport);
+    const originalPull = internals.transport.pullChunk.bind(internals.transport);
     let injectedLocalEdit = false;
-    internals.transport.pull = async (input) => {
+    internals.transport.pullChunk = async (input) => {
       const result = await originalPull(input);
-      if (!injectedLocalEdit && input.requestedTarget === undefined) {
+      if (!injectedLocalEdit && input.cursor === 0) {
         injectedLocalEdit = true;
         await writeFile(join(fixtureBDir, 'shared.md'), 'fixtureB must survive\n');
       }
@@ -981,10 +981,10 @@ describe('Phase 1 sync without conflict resolution', () => {
     let observedUploading = false;
     const internals = plugin as unknown as {
       transport: {
-        push: (...args: unknown[]) => Promise<unknown>;
+        putPushChunk: (...args: unknown[]) => Promise<unknown>;
       };
     };
-    internals.transport.push = async () => {
+    internals.transport.putPushChunk = async () => {
       observedUploading = true;
       expect(await plugin.readState()).toMatchObject({
         status_label: 'Uploading',
@@ -996,12 +996,12 @@ describe('Phase 1 sync without conflict resolution', () => {
     await expect(plugin.syncOnce()).rejects.toThrow('stop upload after status observation');
     expect(observedUploading).toBe(true);
     expect(await plugin.readQueue()).toMatchObject({
-      status: 'uploading',
+      status: 'queued_local',
       attempts: 1
     });
     expect(await plugin.readState()).toMatchObject({
-      status_label: 'Uploading',
-      last_error_code: null
+      status_label: 'Ahead',
+      last_error_code: 'upload_interrupted'
     });
   });
 
@@ -1174,6 +1174,27 @@ describe('Phase 1 sync without conflict resolution', () => {
     } finally {
       await httpsServer.app.close();
     }
+  });
+
+  it('never derives Synced from an expired local convergence report', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'stale-status-device');
+    await mkdirp(deviceDir);
+    await pairPlugin(admin, deviceDir, 'stale-laptop');
+    await server.store.mutate((db) => {
+      const device = db.devices.find((candidate) => candidate.device_name === 'stale-laptop');
+      expect(device).toBeDefined();
+      device!.status = 'synced';
+      device!.last_status_report_at = new Date(Date.now() - 6 * 60 * 1000).toISOString();
+    });
+
+    const dashboard = await admin.get<{ devices: Array<{ device_name: string; status_label: string; status_report_fresh: boolean }> }>(
+      `/api/v1/vaults/${admin.vaultId}/dashboard`
+    );
+    expect(dashboard.body.devices.find((device) => device.device_name === 'stale-laptop')).toMatchObject({
+      status_label: 'Status unknown',
+      status_report_fresh: false
+    });
   });
 
   it('reports devices behind current main in the dashboard summary', async () => {
@@ -2165,9 +2186,9 @@ describe('Phase 1 sync without conflict resolution', () => {
       vault_id: admin.vaultId
     })).status).toBe(200);
     const analysis = await phone.analyzeOnboarding(connection.connection_id, connection.connection_secret);
-    const transport = (phone as unknown as { transport: { pull: (...args: unknown[]) => Promise<unknown> } }).transport;
-    const originalPull = transport.pull.bind(transport);
-    transport.pull = async () => {
+    const transport = (phone as unknown as { transport: { pullChunk: (...args: unknown[]) => Promise<unknown> } }).transport;
+    const originalPull = transport.pullChunk.bind(transport);
+    transport.pullChunk = async () => {
       throw new Error('simulated interruption after registration');
     };
     const submit = {
@@ -2180,7 +2201,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     const interruptedState = await phone.readState();
     expect(interruptedState).toMatchObject({ vault_id: admin.vaultId, status_label: 'Checking' });
     expect((await phone.readPendingOnboarding())?.journal.stage).toBe('blocked');
-    transport.pull = originalPull;
+    transport.pullChunk = originalPull;
 
     const devicesBeforeResume = (await server.store.snapshot()).devices.length;
     const restarted = new ObtsPluginClient(phoneDir, { serverUrl: baseUrl, deviceName: 'phone' });
@@ -4259,6 +4280,90 @@ describe('Phase 1 sync without conflict resolution', () => {
       device_ref_head: firstPush.device_ref,
       status: 'blocked_recovery'
     });
+  });
+
+  it('resumes a multi-pack upload whose aggregate exceeds the legacy request limit', async () => {
+    await server.app.close();
+    server = await createObtsServer({
+      dataDir: join(root, 'chunk-server-data'),
+      publicBaseUrl: 'http://127.0.0.1:0',
+      sessionSecret: 'test-session-secret-with-enough-entropy',
+      maxUploadBytes: 1_048_576,
+      transferChunkBytes: 1_048_576,
+      maxTransferBytes: 8_388_608
+    });
+    baseUrl = await server.app.listen({ port: 0, host: '127.0.0.1' });
+    const preflight = await fetch(`${baseUrl}/api/v1/vaults/example/sync/push-transfers/example/chunks/0`, { method: 'OPTIONS' });
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get('access-control-allow-methods')).toContain('PUT');
+    expect(preflight.headers.get('access-control-allow-headers')).toContain('x-obts-chunk-sha256');
+
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'resumable-large-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'chunked-laptop');
+    const receiverDir = join(root, 'resumable-large-receiver');
+    await mkdirp(receiverDir);
+    const receiver = await pairPlugin(admin, receiverDir, 'chunked-phone');
+    await writeFile(join(deviceDir, 'first.bin'), randomBytes(700_000));
+    await writeFile(join(deviceDir, 'second.bin'), randomBytes(700_000));
+
+    const internals = plugin as unknown as {
+      transport: { putPushChunk: (...args: unknown[]) => Promise<unknown> };
+    };
+    const originalPut = internals.transport.putPushChunk.bind(internals.transport);
+    let uploadedChunks = 0;
+    internals.transport.putPushChunk = async (...args) => {
+      await originalPut(...args);
+      uploadedChunks += 1;
+      throw new Error('simulated interruption after durable chunk receipt');
+    };
+    await expect(plugin.syncOnce()).rejects.toThrow('simulated interruption');
+    expect(uploadedChunks).toBe(1);
+    expect(await plugin.readQueue()).toMatchObject({ status: 'queued_local', attempts: 1 });
+
+    const restarted = new ObtsPluginClient(deviceDir, { serverUrl: baseUrl, deviceName: 'chunked-laptop' });
+    await restarted.initialize();
+    await expect(restarted.syncOnce()).resolves.toMatchObject({ status: 'Synced' });
+    const transferEntries = await readdir(server.config.transferDir);
+    expect(transferEntries).toHaveLength(1);
+    const session = JSON.parse(await readFile(join(server.config.transferDir, transferEntries[0]!, 'session.json'), 'utf8')) as {
+      status: string;
+      total_bytes: number;
+      receipts: unknown[];
+    };
+    expect(session).toMatchObject({ status: 'completed' });
+    expect(session.total_bytes).toBeGreaterThan(server.config.maxUploadBytes);
+    expect(session.receipts.length).toBeGreaterThan(1);
+
+    const receiverTransport = (receiver as unknown as {
+      transport: { pullChunk: (input: { cursor: number }) => Promise<unknown> };
+    }).transport;
+    const receiverPull = receiverTransport.pullChunk.bind(receiverTransport);
+    let receiverCalls = 0;
+    receiverTransport.pullChunk = async (input) => {
+      receiverCalls += 1;
+      if (receiverCalls === 2) throw new Error('simulated interruption after pull checkpoint');
+      return await receiverPull(input);
+    };
+    await expect(receiver.syncOnce()).rejects.toThrow('simulated interruption');
+    expect(JSON.parse(await readFile(join(receiverDir, '.obts', 'pull-transfer.json'), 'utf8'))).toMatchObject({ next_cursor: 1 });
+
+    const restartedReceiver = new ObtsPluginClient(receiverDir, { serverUrl: baseUrl, deviceName: 'chunked-phone' });
+    const restartedTransport = (restartedReceiver as unknown as {
+      transport: { pullChunk: (input: { cursor: number }) => Promise<unknown> };
+    }).transport;
+    const restartedPull = restartedTransport.pullChunk.bind(restartedTransport);
+    const resumedCursors: number[] = [];
+    restartedTransport.pullChunk = async (input) => {
+      resumedCursors.push(input.cursor);
+      return await restartedPull(input);
+    };
+    await restartedReceiver.initialize();
+    await expect(restartedReceiver.syncOnce()).resolves.toMatchObject({ status: 'Synced' });
+    expect(resumedCursors[0]).toBe(1);
+    expect(await readFile(join(receiverDir, 'first.bin'))).toEqual(await readFile(join(deviceDir, 'first.bin')));
+    await expect(stat(join(receiverDir, '.obts', 'pull-transfer.json'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('accepts full-vault attachment uploads through normal device refs', async () => {

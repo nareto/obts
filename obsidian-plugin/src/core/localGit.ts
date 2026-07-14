@@ -40,6 +40,7 @@ export class LocalGitEngine {
   }
 
   async importPack(packfile: Buffer): Promise<void> {
+    if (packfile.byteLength === 0) return;
     const packPath = join(this.gitdir, 'objects', 'pack', `obts-pull-${Date.now()}-${Math.random().toString(16).slice(2)}.pack`);
     await mkdir(dirname(packPath), { recursive: true, mode: 0o700 });
     await writeFile(packPath, packfile, { mode: 0o600 });
@@ -209,6 +210,45 @@ export class LocalGitEngine {
         email: 'device@obts.local'
       }
     });
+  }
+
+  async planPackChunks(
+    commit: string,
+    excludeCommits: string[],
+    targetChunkBytes: number,
+    maxChunkBytes: number
+  ): Promise<string[][]> {
+    const oids = new Set(await this.collectReachableObjects(commit));
+    for (const exclude of excludeCommits) {
+      if (!(await this.commitExists(exclude))) continue;
+      for (const oid of await this.collectReachableObjects(exclude)) oids.delete(oid);
+    }
+    const groups: string[][] = [];
+    let group: string[] = [];
+    let groupBytes = 0;
+    for (const oid of [...oids].sort()) {
+      const result = await git.readObject({ fs, dir: this.vaultDir, gitdir: this.gitdir, oid, format: 'content' });
+      const size = Buffer.from(result.object as Uint8Array).byteLength;
+      const packHeadroom = Math.min(1_048_576, Math.max(64 * 1024, Math.floor(maxChunkBytes * 0.1)));
+      if (size > maxChunkBytes - packHeadroom) {
+        throw new Error('A Git object is too large for bounded mobile transfer.');
+      }
+      if (group.length > 0 && groupBytes + size > targetChunkBytes) {
+        groups.push(group);
+        group = [];
+        groupBytes = 0;
+      }
+      group.push(oid);
+      groupBytes += size;
+    }
+    if (group.length > 0) groups.push(group);
+    return groups;
+  }
+
+  async packObjectChunk(oids: string[], maxChunkBytes: number): Promise<Buffer> {
+    const packfile = await this.packObjects(oids);
+    if (packfile.byteLength > maxChunkBytes) throw new Error('Generated Git pack chunk exceeds the negotiated transfer limit.');
+    return packfile;
   }
 
   async createPackForCommit(commit: string, excludeCommits: string[] = []): Promise<Buffer> {

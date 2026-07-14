@@ -6,11 +6,18 @@ import { newId, nowIso } from '../../../src/shared/ids.js';
 import { assertSyncableTreePaths, isSyncableVaultPath, normalizeVaultPath, PathPolicyViolation } from '../../../src/shared/pathPolicy.js';
 import {
   API_VERSION,
+  CHUNK_TRANSFER_CAPABILITY,
+  type ChunkBootstrapManifest,
+  type ChunkPullManifest,
   type CompleteConnectionRequest,
+  type ConnectionBootstrapManifest,
+  type DevicePullManifest,
   type ConnectionStatusResponse,
   type CreateConnectionResponse,
   type DevicePushManifest,
-  type DirectoryIntent
+  type DirectoryIntent,
+  type PushResult,
+  type SyncCapabilities
 } from '../../../src/shared/types.js';
 import { PLUGIN_VERSION } from '../version.js';
 import { LocalGitEngine } from './localGit.js';
@@ -276,7 +283,7 @@ export class ObtsPluginClient {
       return analysis;
     }
 
-    const bootstrap = await this.transport.bootstrapConnection(connectionId, secret);
+    const bootstrap = await this.bootstrapWithChunks(connectionId, secret);
     await this.git.importPack(bootstrap.packfile);
     const localFiles = await this.git.scanSyncableFiles();
     const matchesServer =
@@ -317,6 +324,138 @@ export class ObtsPluginClient {
     return analysis;
   }
 
+  private async supportsChunkTransfers(): Promise<boolean> {
+    try {
+      const capabilities = await this.transport.capabilities();
+      return capabilities.capabilities.includes(CHUNK_TRANSFER_CAPABILITY);
+    } catch (error) {
+      if (error instanceof TransportError && error.status === 404) return false;
+      throw error;
+    }
+  }
+
+  private async bootstrapWithChunks(
+    connectionId: string,
+    secret: string
+  ): Promise<{ manifest: ConnectionBootstrapManifest; packfile: Buffer }> {
+    if (!(await this.supportsChunkTransfers())) return await this.transport.bootstrapConnection(connectionId, secret);
+    const capabilities = await this.transport.capabilities();
+    const checkpointPath = join(this.vaultDir, '.obts', 'bootstrap-transfer.json');
+    const checkpoint = await readJsonOrNull<{
+      connection_id: string;
+      target_main: string;
+      next_cursor: number;
+      received_chunks?: number;
+      transferred_bytes?: number;
+    }>(checkpointPath);
+    let cursor = checkpoint?.connection_id === connectionId ? checkpoint.next_cursor : 0;
+    let target: 'latest' | string = checkpoint?.connection_id === connectionId ? checkpoint.target_main : 'latest';
+    if (checkpoint && checkpoint.connection_id !== connectionId) await rm(checkpointPath, { force: true });
+    let finalManifest: ChunkBootstrapManifest | null = null;
+    let chunkCount = checkpoint?.connection_id === connectionId ? checkpoint.received_chunks ?? 0 : 0;
+    let transferredBytes = checkpoint?.connection_id === connectionId ? checkpoint.transferred_bytes ?? 0 : 0;
+    while (true) {
+      const chunk = await this.transport.bootstrapConnectionChunk(connectionId, secret, cursor, target);
+      if (chunk.packfile.byteLength !== chunk.manifest.chunk_bytes || createHash('sha256').update(chunk.packfile).digest('hex') !== chunk.manifest.chunk_sha256) {
+        throw new PluginBlockedError('chunk_digest_mismatch', 'Downloaded bootstrap chunk failed integrity validation.');
+      }
+      chunkCount += 1;
+      transferredBytes += chunk.packfile.byteLength;
+      if (chunkCount > capabilities.max_transfer_chunks || transferredBytes > capabilities.max_transfer_bytes) {
+        throw new PluginBlockedError('transfer_too_large', 'Bootstrap transfer exceeded negotiated limits.');
+      }
+      await this.git.importPack(chunk.packfile);
+      finalManifest = chunk.manifest;
+      target = chunk.manifest.target_main;
+      if (chunk.manifest.complete) {
+        await rm(checkpointPath, { force: true });
+        break;
+      }
+      if (chunk.manifest.next_cursor <= cursor) throw new PluginBlockedError('invalid_transfer_cursor', 'Bootstrap transfer did not advance.');
+      cursor = chunk.manifest.next_cursor;
+      await writeJson(checkpointPath, {
+        connection_id: connectionId,
+        target_main: target,
+        next_cursor: cursor,
+        received_chunks: chunkCount,
+        transferred_bytes: transferredBytes,
+        updated_at: nowIso()
+      });
+    }
+    return { manifest: finalManifest!, packfile: Buffer.alloc(0) };
+  }
+
+  private async pullWithChunks(input: {
+    vaultId: string;
+    deviceId: string;
+    deviceToken: string;
+    currentLocalMain: string | null;
+    requestedTarget?: 'latest' | string;
+    currentEventSeq?: number;
+  }): Promise<{ manifest: DevicePullManifest; packfile: Buffer }> {
+    if (!(await this.supportsChunkTransfers())) return await this.transport.pull(input);
+    const capabilities = await this.transport.capabilities();
+    const checkpointPath = join(this.vaultDir, '.obts', 'pull-transfer.json');
+    const checkpoint = await readJsonOrNull<{
+      vault_id: string;
+      device_id: string;
+      current_local_main: string | null;
+      target_main: string;
+      next_cursor: number;
+      received_chunks?: number;
+      transferred_bytes?: number;
+    }>(checkpointPath);
+    const checkpointMatches = checkpoint?.vault_id === input.vaultId &&
+      checkpoint.device_id === input.deviceId &&
+      checkpoint.current_local_main === input.currentLocalMain &&
+      (input.requestedTarget === undefined || input.requestedTarget === 'latest' || input.requestedTarget === checkpoint.target_main);
+    let cursor = checkpointMatches ? checkpoint.next_cursor : 0;
+    let target: 'latest' | string = checkpointMatches ? checkpoint.target_main : input.requestedTarget ?? 'latest';
+    if (checkpoint && !checkpointMatches) await rm(checkpointPath, { force: true });
+    let finalManifest: ChunkPullManifest | null = null;
+    let chunkCount = checkpointMatches ? checkpoint.received_chunks ?? 0 : 0;
+    let transferredBytes = checkpointMatches ? checkpoint.transferred_bytes ?? 0 : 0;
+    while (true) {
+      const chunk = await this.transport.pullChunk({
+        ...input,
+        requestedTarget: target,
+        currentEventSeq: input.currentEventSeq ?? 0,
+        cursor
+      });
+      if (chunk.packfile.byteLength !== chunk.manifest.chunk_bytes || createHash('sha256').update(chunk.packfile).digest('hex') !== chunk.manifest.chunk_sha256) {
+        throw new PluginBlockedError('chunk_digest_mismatch', 'Downloaded Git chunk failed integrity validation.');
+      }
+      chunkCount += 1;
+      transferredBytes += chunk.packfile.byteLength;
+      if (chunkCount > capabilities.max_transfer_chunks || transferredBytes > capabilities.max_transfer_bytes) {
+        throw new PluginBlockedError('transfer_too_large', 'Pull transfer exceeded negotiated limits.');
+      }
+      await this.git.importPack(chunk.packfile);
+      finalManifest = chunk.manifest;
+      target = chunk.manifest.target_main;
+      if (chunk.manifest.complete) {
+        await rm(checkpointPath, { force: true });
+        break;
+      }
+      if (chunk.manifest.next_cursor <= cursor) throw new PluginBlockedError('invalid_transfer_cursor', 'Pull transfer did not advance.');
+      cursor = chunk.manifest.next_cursor;
+      await writeJson(checkpointPath, {
+        vault_id: input.vaultId,
+        device_id: input.deviceId,
+        current_local_main: input.currentLocalMain,
+        target_main: target,
+        next_cursor: cursor,
+        received_chunks: chunkCount,
+        transferred_bytes: transferredBytes,
+        updated_at: nowIso()
+      });
+    }
+    if (!(await this.git.commitExists(finalManifest!.target_main))) {
+      throw new PluginBlockedError('transfer_incomplete', 'Downloaded Git chunks do not contain the target commit.');
+    }
+    return { manifest: finalManifest!, packfile: Buffer.alloc(0) };
+  }
+
   async finishOnboarding(input: {
     connectionId: string;
     secret: string;
@@ -334,7 +473,9 @@ export class ObtsPluginClient {
     this.onboardingOperation = true;
     await this.updateOnboardingStage(input.connectionId, 'registering', input.mode);
     try {
-      return await this.finishOnboardingInternal(input);
+      const result = await this.finishOnboardingInternal(input);
+      await this.reportDeviceStatus().catch(() => undefined);
+      return result;
     } catch (error) {
       await this.updateOnboardingStage(
         input.connectionId,
@@ -411,7 +552,7 @@ export class ObtsPluginClient {
         updated_at: nowIso()
       });
     }
-    const pulled = await this.transport.pull({
+    const pulled = await this.pullWithChunks({
       vaultId: result.vault_id,
       deviceId: result.device_id,
       deviceToken: result.device_token,
@@ -549,7 +690,7 @@ export class ObtsPluginClient {
     }
     if (input.mode === 'use_server') {
       await this.createLocalRecoveryBundle('replace_local_with_server', self.current_main, localFiles);
-      const pulled = await this.transport.pull({
+      const pulled = await this.pullWithChunks({
         vaultId: state.vault_id,
         deviceId: state.device_id,
         deviceToken: token,
@@ -579,7 +720,7 @@ export class ObtsPluginClient {
 
     await this.createLocalRecoveryBundle('initial_import', self.current_main, localFiles);
     try {
-      const pulled = await this.transport.pull({
+      const pulled = await this.pullWithChunks({
         vaultId: state.vault_id,
         deviceId: state.device_id,
         deviceToken: token,
@@ -749,33 +890,60 @@ export class ObtsPluginClient {
       if (!currentState.vault_id || !currentState.device_id) {
         throw new PluginBlockedError('not_paired', 'Device is not paired.');
       }
-      await this.writeQueue({ ...queue, status: 'uploading', attempts: queue.attempts + 1, updated_at: nowIso() });
       await this.writeState({
         ...currentState,
-        status_label: 'Uploading',
+        status_label: 'Preparing upload',
         last_error_code: null,
         updated_at: nowIso()
       });
-      const packfile = await this.git.createPackForCommit(
-        queue.pending_commit,
-        [queue.expected_device_ref, currentState.local_main].filter((commit): commit is string => typeof commit === 'string')
-      );
+      await this.reportDeviceStatus().catch(() => undefined);
       pendingDirectoryIntents = (await this.readDirectoryState()).pending_intents;
-      const manifest: DevicePushManifest = {
-        api_version: API_VERSION,
-        plugin_version: PLUGIN_VERSION,
-        vault_id: currentState.vault_id,
-        device_id: currentState.device_id,
-        expected_device_ref: queue.expected_device_ref,
-        target_commit: queue.pending_commit,
-        packfile_sha256: sha256(packfile),
-        packfile_bytes: packfile.byteLength,
-        client_known_main: currentState.local_main,
-        ...(queue.expected_device_ref === null && currentState.local_main ? { base_commit: currentState.local_main } : {}),
-        ...(pendingDirectoryIntents.length > 0 ? { directory_intents: pendingDirectoryIntents } : {}),
-        attempt_id: newId('sync')
-      };
-      const result = await this.pushOrBlock(currentState, queue, token, manifest, packfile);
+      let result;
+      try {
+        const capabilities = await this.transport.capabilities().catch((error) => {
+          if (error instanceof TransportError && error.status === 404) return null;
+          throw error;
+        });
+        if (capabilities?.capabilities.includes(CHUNK_TRANSFER_CAPABILITY)) {
+          result = await this.pushCommitInChunks(currentState, queue, token, pendingDirectoryIntents, capabilities);
+        } else {
+          const packfile = await this.git.createPackForCommit(
+            queue.pending_commit,
+            [queue.expected_device_ref, currentState.local_main].filter((commit): commit is string => typeof commit === 'string')
+          );
+          const manifest: DevicePushManifest = {
+            api_version: API_VERSION,
+            plugin_version: PLUGIN_VERSION,
+            vault_id: currentState.vault_id,
+            device_id: currentState.device_id,
+            expected_device_ref: queue.expected_device_ref,
+            target_commit: queue.pending_commit,
+            packfile_sha256: sha256(packfile),
+            packfile_bytes: packfile.byteLength,
+            client_known_main: currentState.local_main,
+            ...(queue.expected_device_ref === null && currentState.local_main ? { base_commit: currentState.local_main } : {}),
+            ...(pendingDirectoryIntents.length > 0 ? { directory_intents: pendingDirectoryIntents } : {}),
+            attempt_id: newId('sync')
+          };
+          await this.writeQueue({ ...queue, status: 'uploading', attempts: queue.attempts + 1, updated_at: nowIso() });
+          await this.writeState({ ...currentState, status_label: 'Uploading', last_error_code: null, updated_at: nowIso() });
+          await this.reportDeviceStatus().catch(() => undefined);
+          result = await this.pushOrBlock(currentState, queue, token, manifest, packfile);
+        }
+      } catch (error) {
+        const latestQueue = await this.readQueue();
+        if (latestQueue.pending_commit === queue.pending_commit && latestQueue.status !== 'blocked_recovery') {
+          await this.writeQueue({ ...latestQueue, status: 'queued_local', updated_at: nowIso() });
+          await this.writeState({
+            ...(await this.readState()),
+            status_label: 'Ahead',
+            last_error_code: latestQueue.attempts > queue.attempts ? 'upload_interrupted' : 'pack_preparation_failed',
+            updated_at: nowIso()
+          });
+          await this.reportDeviceStatus().catch(() => undefined);
+        }
+        throw error;
+      }
       if (result.status === 'conflicted') {
         await this.writeQueue({
           ...queue,
@@ -820,6 +988,100 @@ export class ObtsPluginClient {
       : { status: finalState.status_label };
   }
 
+  private async pushCommitInChunks(
+    currentState: LocalPluginState,
+    queue: QueueState,
+    token: string,
+    directoryIntents: DirectoryIntent[],
+    capabilities: SyncCapabilities,
+    allowStaleRetry = true
+  ): Promise<PushResult> {
+    if (!currentState.vault_id || !currentState.device_id || !queue.pending_commit) {
+      throw new PluginBlockedError('not_paired', 'Chunk transfer requires a paired device and pending commit.');
+    }
+    const exclude = [queue.expected_device_ref, currentState.local_main].filter((commit): commit is string => typeof commit === 'string');
+    const groups = await this.git.planPackChunks(
+      queue.pending_commit,
+      exclude,
+      capabilities.target_chunk_bytes,
+      capabilities.max_chunk_bytes
+    );
+    if (groups.length === 0 || groups.length > capabilities.max_transfer_chunks) {
+      throw new PluginBlockedError('invalid_transfer_plan', 'Git transfer plan is empty or exceeds the server chunk limit.');
+    }
+    const planSha256 = sha256(Buffer.from(JSON.stringify(groups)));
+    const attemptId = `xfer_${sha256(Buffer.from(`${currentState.device_id}:${queue.pending_commit}:${queue.expected_device_ref ?? 'none'}:${planSha256}`)).slice(0, 32)}`;
+    await this.writeQueue({ ...queue, status: 'uploading', attempts: queue.attempts + 1, updated_at: nowIso() });
+    await this.writeState({ ...currentState, status_label: 'Uploading', last_error_code: null, updated_at: nowIso() });
+    await this.reportDeviceStatus().catch(() => undefined);
+    try {
+      const descriptor = await this.transport.createPushTransfer({
+        vaultId: currentState.vault_id,
+        deviceToken: token,
+        request: {
+          api_version: API_VERSION,
+          plugin_version: PLUGIN_VERSION,
+          vault_id: currentState.vault_id,
+          device_id: currentState.device_id,
+          expected_device_ref: queue.expected_device_ref,
+          target_commit: queue.pending_commit,
+          client_known_main: currentState.local_main,
+          ...(queue.expected_device_ref === null && currentState.local_main ? { base_commit: currentState.local_main } : {}),
+          ...(directoryIntents.length > 0 ? { directory_intents: directoryIntents } : {}),
+          attempt_id: attemptId,
+          chunk_count: groups.length,
+          plan_sha256: planSha256
+        }
+      });
+      if (descriptor.status !== 'open') {
+        if (descriptor.result && descriptor.result.status !== 'rejected') return descriptor.result;
+        throw new PluginBlockedError('transfer_closed', 'The resumable transfer is closed without an accepted result.');
+      }
+      const received = new Set(descriptor.received_chunks);
+      for (let index = 0; index < groups.length; index += 1) {
+        if (received.has(index)) continue;
+        const packfile = await this.git.packObjectChunk(groups[index]!, capabilities.max_chunk_bytes);
+        await this.transport.putPushChunk({
+          vaultId: currentState.vault_id,
+          deviceToken: token,
+          transferId: descriptor.transfer_id,
+          index,
+          packfile,
+          sha256: sha256(packfile)
+        });
+        await this.reportDeviceStatus().catch(() => undefined);
+      }
+      return await this.transport.finalizePushTransfer({
+        vaultId: currentState.vault_id,
+        deviceToken: token,
+        transferId: descriptor.transfer_id
+      });
+    } catch (error) {
+      if (allowStaleRetry && error instanceof TransportError && error.code === 'stale_device_ref') {
+        const self = await this.transport.getDeviceSelf(token);
+        const recoveredRef = self.server_device_ref;
+        if (recoveredRef && recoveredRef !== queue.expected_device_ref && await this.git.isAncestor(recoveredRef, queue.pending_commit)) {
+          const recoveredQueue = { ...queue, expected_device_ref: recoveredRef, status: 'uploading' as const, updated_at: nowIso() };
+          await this.writeQueue(recoveredQueue);
+          await this.writeState({ ...currentState, server_device_ref: recoveredRef, status_label: 'Preparing upload', updated_at: nowIso() });
+          return await this.pushCommitInChunks(
+            { ...currentState, server_device_ref: recoveredRef },
+            recoveredQueue,
+            token,
+            directoryIntents,
+            capabilities,
+            false
+          );
+        }
+      }
+      if (error instanceof TransportError && ['same_device_non_fast_forward', 'stale_device_ref', 'device_blocked'].includes(error.code)) {
+        await this.writeQueue({ ...queue, status: 'blocked_recovery', updated_at: nowIso() });
+        await this.block(error.code, error.message);
+      }
+      throw error;
+    }
+  }
+
   async replaceLocalWithServer(): Promise<{ status: string; main: string }> {
     await this.initialize();
     const state = await this.readState();
@@ -831,7 +1093,7 @@ export class ObtsPluginClient {
     }
     const token = await this.readDeviceToken();
     const localFiles = await this.git.scanSyncableFiles();
-    const pulled = await this.transport.pull({
+    const pulled = await this.pullWithChunks({
       vaultId: state.vault_id,
       deviceId: state.device_id,
       deviceToken: token,
@@ -886,7 +1148,7 @@ export class ObtsPluginClient {
     const queue = await this.readQueue();
     const localFiles = await this.git.scanSyncableFiles();
     const localSnapshot = await readFileSnapshot(this.vaultDir, localFiles);
-    const pulled = await this.transport.pull({
+    const pulled = await this.pullWithChunks({
       vaultId: state.vault_id,
       deviceId: state.device_id,
       deviceToken: token,
@@ -1016,7 +1278,7 @@ export class ObtsPluginClient {
       return false;
     }
     const token = await this.readDeviceToken();
-    const pulled = await this.transport.pull({
+    const pulled = await this.pullWithChunks({
       vaultId: state.vault_id,
       deviceId: state.device_id,
       deviceToken: token,
@@ -2303,7 +2565,7 @@ export class ObtsPluginClient {
       return;
     }
     try {
-      await this.transport.pull({
+      await this.pullWithChunks({
         vaultId: state.vault_id,
         deviceId: state.device_id,
         deviceToken: token,
@@ -2488,7 +2750,7 @@ export class ObtsPluginClient {
     localMain: string | null
   ): Promise<void> {
     try {
-      const pulled = await this.transport.pull({
+      const pulled = await this.pullWithChunks({
         vaultId,
         deviceId,
         deviceToken: token,
@@ -2878,6 +3140,14 @@ function categorizeRecoveryError(error: unknown): string {
   return 'recovery_unexpected_error';
 }
 
+async function readJsonOrNull<T>(path: string): Promise<T | null> {
+  try {
+    return JSON.parse(await readFile(path, 'utf8')) as T;
+  } catch {
+    return null;
+  }
+}
+
 async function writeJson(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const temporaryPath = `${path}.tmp-${process.pid}-${Date.now()}`;
@@ -2888,5 +3158,10 @@ async function writeJson(path: string, value: unknown): Promise<void> {
   } finally {
     await handle.close();
   }
-  await rename(temporaryPath, path);
+  try {
+    await rename(temporaryPath, path);
+  } catch (error) {
+    await rm(temporaryPath, { force: true });
+    throw error;
+  }
 }
