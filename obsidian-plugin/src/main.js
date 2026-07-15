@@ -16,6 +16,9 @@ const PERIODIC_FULL_SCAN_INTERVAL_MS = 5 * 60 * 1000;
 const SYNC_STALE_MS = 2 * 60 * 1000;
 const STATUS_LAG_NOTICE_DELAY_MS = 30 * 1000;
 const STATUS_NOTICE_DURATION_MS = 15 * 1000;
+const MOBILE_PACK_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+const MOBILE_PACK_READ_ATTEMPTS = 5;
+const MOBILE_PACK_READ_RETRY_MS = 100;
 const RETIRED_OPERATION_GRACE_MS = 1500;
 const PLUGIN_UPDATE_URL = "obsidian://brat?plugin=nareto%2Fobts";
 const DIAGNOSTIC_CONSENT_VERSION = 1;
@@ -85,14 +88,12 @@ module.exports = class ObtsPlugin extends Plugin {
     this.retiredOperationNoticeShown = false;
     this.clientReady = false;
     this.clientInitialization = null;
+    this.layoutStarted = false;
     this.reportedDiagnosticErrors = new WeakSet();
     this.diagnosticNoticeShown = false;
     this.deviceNameRevision = 0;
     this.setStatus("Checking");
     this.client = new ObtsObsidianClient(this);
-    if (this.operationAvailability() === "available") await this.initializeClient();
-    else this.observeRetiredOperation();
-    if (this.unloaded) return;
 
     this.addSettingTab(new ObtsSettingTab(this.app, this));
 
@@ -157,10 +158,12 @@ module.exports = class ObtsPlugin extends Plugin {
       }
     });
 
-    this.registerEvent(this.app.vault.on("create", (file) => this.queueSyncFromWatcher(file && file.path)));
-    this.registerEvent(this.app.vault.on("modify", (file) => this.queueSyncFromWatcher(file && file.path)));
-    this.registerEvent(this.app.vault.on("delete", (file) => this.queueSyncFromWatcher(file && file.path)));
-    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.queueSyncFromWatcher([file && file.path, oldPath])));
+    const start = () => this.startAfterLayoutReady();
+    if (this.app.workspace && typeof this.app.workspace.onLayoutReady === "function") {
+      this.app.workspace.onLayoutReady(start);
+    } else {
+      window.setTimeout(start, 0);
+    }
 
     this.registerInterval(
       window.setInterval(() => {
@@ -171,6 +174,20 @@ module.exports = class ObtsPlugin extends Plugin {
       this.registerDomEvent(document, "visibilitychange", () => {
         if (!document.hidden) void this.runBackgroundSync();
       });
+    }
+  }
+
+  startAfterLayoutReady() {
+    if (this.unloaded || this.layoutStarted) return;
+    this.layoutStarted = true;
+    this.registerEvent(this.app.vault.on("create", (file) => this.queueSyncFromWatcher(file && file.path)));
+    this.registerEvent(this.app.vault.on("modify", (file) => this.queueSyncFromWatcher(file && file.path)));
+    this.registerEvent(this.app.vault.on("delete", (file) => this.queueSyncFromWatcher(file && file.path)));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.queueSyncFromWatcher([file && file.path, oldPath])));
+    if (this.operationAvailability() === "available") {
+      void this.initializeClient().catch(() => this.handleClientInitializationFailure());
+    } else {
+      this.observeRetiredOperation();
     }
   }
 
@@ -535,7 +552,7 @@ module.exports = class ObtsPlugin extends Plugin {
   }
 
   async runBackgroundSync() {
-    if (this.unloaded || (typeof document !== "undefined" && document.hidden) || !(await this.ensureClientReady())) {
+    if (!this.layoutStarted || this.unloaded || (typeof document !== "undefined" && document.hidden) || !(await this.ensureClientReady())) {
       return;
     }
     if (this.syncQueued) {
@@ -772,7 +789,13 @@ class ObtsObsidianClient {
     this.plugin = plugin;
     this.adapter = plugin.app.vault.adapter;
     this.adapterFs = createDataAdapterFs(this.adapter);
-    this.fs = createReadOverlayFs(this.adapterFs, []);
+    const mobile = Boolean(Platform && Platform.isMobile);
+    this.fs = createReadOverlayFs(this.adapterFs, [], {
+      maxBytes: mobile ? MOBILE_PACK_CACHE_MAX_BYTES : 0,
+      cacheRead: (filePath) => mobile && filePath.endsWith(".pack"),
+      readAttempts: mobile ? MOBILE_PACK_READ_ATTEMPTS : 1,
+      retryDelayMs: mobile ? MOBILE_PACK_READ_RETRY_MS : 0
+    });
     fsp = this.adapterFs.promises;
     this.vaultDir = "/";
     this.obtsDir = path.join(this.vaultDir, ".obts");
@@ -795,7 +818,6 @@ class ObtsObsidianClient {
     await fsp.recoverReplacements(this.obtsDir);
     await fsp.mkdir(path.join(this.obtsDir, "auth"), { recursive: true, mode: 0o700 });
     await git.init({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, defaultBranch: "local" });
-    await this.loadPersistedPackOverlays();
     await git.writeRef({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, ref: "HEAD", value: "refs/heads/local", symbolic: true, force: true });
     await fsp.mkdir(path.join(this.gitdir, "info"), { recursive: true, mode: 0o700 });
     await fsp.writeFile(path.join(this.gitdir, "info", "exclude"), ".obts/\n.git/\n", { mode: 0o600 });
@@ -2600,7 +2622,7 @@ class ObtsObsidianClient {
   }
 
   async importPack(packfile, diagnosticFlow = "sync", initialBreadcrumbs = []) {
-    if (!packfile || packfile.byteLength === 0) return;
+    if (!packfile || packfile.byteLength === 0 || isEmptyGitPack(packfile)) return;
     const breadcrumbs = initialBreadcrumbs.slice(0, 16);
     const packPath = path.join(this.gitdir, "objects", "pack", `obts-pull-${Date.now()}-${randomHex(4)}.pack`);
     try {
@@ -2659,28 +2681,14 @@ class ObtsObsidianClient {
     }
   }
 
-  async loadPersistedPackOverlays() {
-    if (!Platform || !Platform.isMobile) return;
-    const packDir = path.join(this.gitdir, "objects", "pack");
-    let entries;
-    try {
-      entries = await fsp.readdir(packDir);
-    } catch {
-      return;
-    }
-    for (const entry of entries.filter((name) => name.endsWith(".pack"))) {
-      const packPath = path.join(packDir, entry);
-      const persistedPack = await this.waitForPersistedBinary(packPath);
-      this.fs.setReadOverlay(packPath, persistedPack);
-    }
-  }
-
   async waitForPersistedBinary(filePath, expected = null) {
+    const expectedBytes = expected === null ? null : Buffer.isBuffer(expected) ? expected : Buffer.from(expected);
     let lastError;
     for (let attempt = 0; attempt < 5; attempt += 1) {
       try {
-        const persisted = Buffer.from(await fsp.readFile(filePath));
-        if (expected === null || buffersEqual(persisted, Buffer.from(expected))) return persisted;
+        const value = await fsp.readFile(filePath);
+        const persisted = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        if (expectedBytes === null || buffersEqual(persisted, expectedBytes)) return persisted;
         lastError = new Error("Persisted bytes did not match the downloaded Git pack.");
       } catch (error) {
         lastError = error;
@@ -4824,6 +4832,15 @@ function buffersEqual(left, right) {
     return left === right;
   }
   return Buffer.compare(left, right) === 0;
+}
+
+function isEmptyGitPack(packfile) {
+  const bytes = Buffer.isBuffer(packfile) ? packfile : Buffer.from(packfile);
+  if (bytes.byteLength !== 32 || bytes.subarray(0, 4).toString("ascii") !== "PACK") return false;
+  const version = bytes.readUInt32BE(4);
+  if ((version !== 2 && version !== 3) || bytes.readUInt32BE(8) !== 0) return false;
+  const expectedDigest = createSha("sha1").update(bytes.subarray(0, 12)).digest();
+  return buffersEqual(bytes.subarray(12), expectedDigest);
 }
 
 function changedPathsConflict(left, right) {

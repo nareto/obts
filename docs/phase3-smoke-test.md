@@ -72,7 +72,10 @@ system to keep Obsidian running in the background.
     whole-transfer multipart body.
 11. Force-close after the first chunk receipt, reopen, and sync again. Confirm
     the same transfer attempt resumes from its received-chunk list, advances the
-    device ref once, and eventually appears on a second device.
+    device ref once, and eventually appears on a second device. Force-close and
+    reopen once more after the completed transfer; confirm the vault becomes
+    interactive before background obts initialization finishes and subsequent
+    sync can still read the imported history.
 12. Leave one device without a fresh status report for over five minutes while
     another device advances main. Confirm the dashboard shows **Status unknown**
     or **Behind**, never **Synced**, until the stale device freshly reports its

@@ -21649,7 +21649,7 @@ var require_data_adapter_fs = __commonJS({
       return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
     }
     function createPackIndexFs2(fs, packfile, observer = void 0) {
-      const pack = Buffer3.from(packfile);
+      const pack = Buffer3.isBuffer(packfile) ? packfile : Buffer3.from(packfile);
       let packReadPending = true;
       const observe = (event) => {
         try {
@@ -21725,24 +21725,66 @@ var require_data_adapter_fs = __commonJS({
       const code = error && typeof error.code === "string" ? error.code.toLowerCase() : "unknown";
       return (/* @__PURE__ */ new Set(["enoent", "eexist", "eisdir", "enotdir", "enotempty", "eacces", "eperm", "eio"])).has(code) ? code : "unknown";
     }
-    function createReadOverlayFs2(fs, files) {
-      const overrides = new Map([...files].map(([filePath, data]) => [adapterPath(filePath), Buffer3.from(data)]));
+    function createReadOverlayFs2(fs, files, options = {}) {
+      const overrides = /* @__PURE__ */ new Map();
+      const maxBytes = Number.isFinite(options.maxBytes) ? Math.max(0, options.maxBytes) : Number.POSITIVE_INFINITY;
+      const cacheRead = typeof options.cacheRead === "function" ? options.cacheRead : () => false;
+      const readAttempts = Number.isInteger(options.readAttempts) ? Math.max(1, options.readAttempts) : 1;
+      const retryDelayMs = Number.isFinite(options.retryDelayMs) ? Math.max(0, options.retryDelayMs) : 0;
+      let overrideBytes = 0;
+      const deleteReadOverlay = (filePath) => {
+        const key = adapterPath(filePath);
+        const existing = overrides.get(key);
+        if (!existing) return;
+        overrideBytes -= existing.byteLength;
+        overrides.delete(key);
+      };
+      const setReadOverlay = (filePath, data) => {
+        const key = adapterPath(filePath);
+        deleteReadOverlay(key);
+        if (maxBytes === 0 || data && typeof data.byteLength === "number" && data.byteLength > maxBytes) return;
+        const bytes = Buffer3.from(data);
+        if (bytes.byteLength > maxBytes) return;
+        while (overrideBytes + bytes.byteLength > maxBytes && overrides.size > 0) {
+          deleteReadOverlay(overrides.keys().next().value);
+        }
+        overrides.set(key, bytes);
+        overrideBytes += bytes.byteLength;
+      };
+      for (const [filePath, data] of files) setReadOverlay(filePath, data);
       return {
-        setReadOverlay(filePath, data) {
-          overrides.set(adapterPath(filePath), Buffer3.from(data));
-        },
-        deleteReadOverlay(filePath) {
-          overrides.delete(adapterPath(filePath));
-        },
+        setReadOverlay,
+        deleteReadOverlay,
         promises: {
           ...fs.promises,
-          async readFile(filePath, options) {
-            const override = overrides.get(adapterPath(filePath));
+          async readFile(filePath, readOptions) {
+            const key = adapterPath(filePath);
+            const override = overrides.get(key);
             if (override) {
-              const encoding = typeof options === "string" ? options : options && options.encoding;
-              return encoding ? override.toString(encoding) : Buffer3.from(override);
+              overrides.delete(key);
+              overrides.set(key, override);
+              const encoding2 = typeof readOptions === "string" ? readOptions : readOptions && readOptions.encoding;
+              return encoding2 ? override.toString(encoding2) : Buffer3.from(override);
             }
-            return await fs.promises.readFile(filePath, options);
+            let value;
+            let lastError;
+            const attempts = cacheRead(key) ? readAttempts : 1;
+            for (let attempt = 0; attempt < attempts; attempt += 1) {
+              try {
+                value = await fs.promises.readFile(filePath, readOptions);
+                lastError = null;
+                break;
+              } catch (error) {
+                lastError = error;
+                if (attempt + 1 < attempts && retryDelayMs > 0) {
+                  await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+                }
+              }
+            }
+            if (lastError) throw lastError;
+            const encoding = typeof readOptions === "string" ? readOptions : readOptions && readOptions.encoding;
+            if (cacheRead(key) && !encoding) setReadOverlay(key, value);
+            return value;
           }
         }
       };
@@ -21761,13 +21803,16 @@ var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var fsp = null;
 var API_VERSION = "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = "0.4.8";
+var PLUGIN_VERSION = "0.4.9";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_FULL_SCAN_INTERVAL_MS = 5 * 60 * 1e3;
 var SYNC_STALE_MS = 2 * 60 * 1e3;
 var STATUS_LAG_NOTICE_DELAY_MS = 30 * 1e3;
 var STATUS_NOTICE_DURATION_MS = 15 * 1e3;
+var MOBILE_PACK_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+var MOBILE_PACK_READ_ATTEMPTS = 5;
+var MOBILE_PACK_READ_RETRY_MS = 100;
 var RETIRED_OPERATION_GRACE_MS = 1500;
 var PLUGIN_UPDATE_URL = "obsidian://brat?plugin=nareto%2Fobts";
 var DIAGNOSTIC_CONSENT_VERSION = 1;
@@ -21835,14 +21880,12 @@ module.exports = class ObtsPlugin extends Plugin {
     this.retiredOperationNoticeShown = false;
     this.clientReady = false;
     this.clientInitialization = null;
+    this.layoutStarted = false;
     this.reportedDiagnosticErrors = /* @__PURE__ */ new WeakSet();
     this.diagnosticNoticeShown = false;
     this.deviceNameRevision = 0;
     this.setStatus("Checking");
     this.client = new ObtsObsidianClient(this);
-    if (this.operationAvailability() === "available") await this.initializeClient();
-    else this.observeRetiredOperation();
-    if (this.unloaded) return;
     this.addSettingTab(new ObtsSettingTab(this.app, this));
     this.addCommand({
       id: "obts-setup-sync",
@@ -21899,10 +21942,12 @@ module.exports = class ObtsPlugin extends Plugin {
         if (result && shouldShowRoutineStatusNotice(result.status)) new Notice(`obts: ${result.status}`);
       }
     });
-    this.registerEvent(this.app.vault.on("create", (file) => this.queueSyncFromWatcher(file && file.path)));
-    this.registerEvent(this.app.vault.on("modify", (file) => this.queueSyncFromWatcher(file && file.path)));
-    this.registerEvent(this.app.vault.on("delete", (file) => this.queueSyncFromWatcher(file && file.path)));
-    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.queueSyncFromWatcher([file && file.path, oldPath])));
+    const start = () => this.startAfterLayoutReady();
+    if (this.app.workspace && typeof this.app.workspace.onLayoutReady === "function") {
+      this.app.workspace.onLayoutReady(start);
+    } else {
+      window.setTimeout(start, 0);
+    }
     this.registerInterval(
       window.setInterval(() => {
         void this.runBackgroundSync();
@@ -21912,6 +21957,19 @@ module.exports = class ObtsPlugin extends Plugin {
       this.registerDomEvent(document, "visibilitychange", () => {
         if (!document.hidden) void this.runBackgroundSync();
       });
+    }
+  }
+  startAfterLayoutReady() {
+    if (this.unloaded || this.layoutStarted) return;
+    this.layoutStarted = true;
+    this.registerEvent(this.app.vault.on("create", (file) => this.queueSyncFromWatcher(file && file.path)));
+    this.registerEvent(this.app.vault.on("modify", (file) => this.queueSyncFromWatcher(file && file.path)));
+    this.registerEvent(this.app.vault.on("delete", (file) => this.queueSyncFromWatcher(file && file.path)));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.queueSyncFromWatcher([file && file.path, oldPath])));
+    if (this.operationAvailability() === "available") {
+      void this.initializeClient().catch(() => this.handleClientInitializationFailure());
+    } else {
+      this.observeRetiredOperation();
     }
   }
   onunload() {
@@ -22236,7 +22294,7 @@ module.exports = class ObtsPlugin extends Plugin {
     return flushed;
   }
   async runBackgroundSync() {
-    if (this.unloaded || typeof document !== "undefined" && document.hidden || !await this.ensureClientReady()) {
+    if (!this.layoutStarted || this.unloaded || typeof document !== "undefined" && document.hidden || !await this.ensureClientReady()) {
       return;
     }
     if (this.syncQueued) {
@@ -22454,7 +22512,13 @@ var ObtsObsidianClient = class {
     this.plugin = plugin;
     this.adapter = plugin.app.vault.adapter;
     this.adapterFs = createDataAdapterFs(this.adapter);
-    this.fs = createReadOverlayFs(this.adapterFs, []);
+    const mobile = Boolean(Platform && Platform.isMobile);
+    this.fs = createReadOverlayFs(this.adapterFs, [], {
+      maxBytes: mobile ? MOBILE_PACK_CACHE_MAX_BYTES : 0,
+      cacheRead: (filePath) => mobile && filePath.endsWith(".pack"),
+      readAttempts: mobile ? MOBILE_PACK_READ_ATTEMPTS : 1,
+      retryDelayMs: mobile ? MOBILE_PACK_READ_RETRY_MS : 0
+    });
     fsp = this.adapterFs.promises;
     this.vaultDir = "/";
     this.obtsDir = path.join(this.vaultDir, ".obts");
@@ -22476,7 +22540,6 @@ var ObtsObsidianClient = class {
     await fsp.recoverReplacements(this.obtsDir);
     await fsp.mkdir(path.join(this.obtsDir, "auth"), { recursive: true, mode: 448 });
     await git.init({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, defaultBranch: "local" });
-    await this.loadPersistedPackOverlays();
     await git.writeRef({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, ref: "HEAD", value: "refs/heads/local", symbolic: true, force: true });
     await fsp.mkdir(path.join(this.gitdir, "info"), { recursive: true, mode: 448 });
     await fsp.writeFile(path.join(this.gitdir, "info", "exclude"), ".obts/\n.git/\n", { mode: 384 });
@@ -24157,7 +24220,7 @@ var ObtsObsidianClient = class {
     return Buffer2.from(packfile);
   }
   async importPack(packfile, diagnosticFlow = "sync", initialBreadcrumbs = []) {
-    if (!packfile || packfile.byteLength === 0) return;
+    if (!packfile || packfile.byteLength === 0 || isEmptyGitPack(packfile)) return;
     const breadcrumbs = initialBreadcrumbs.slice(0, 16);
     const packPath = path.join(this.gitdir, "objects", "pack", `obts-pull-${Date.now()}-${randomHex(4)}.pack`);
     try {
@@ -24211,27 +24274,14 @@ var ObtsObsidianClient = class {
       throw wrapped;
     }
   }
-  async loadPersistedPackOverlays() {
-    if (!Platform || !Platform.isMobile) return;
-    const packDir = path.join(this.gitdir, "objects", "pack");
-    let entries;
-    try {
-      entries = await fsp.readdir(packDir);
-    } catch {
-      return;
-    }
-    for (const entry of entries.filter((name) => name.endsWith(".pack"))) {
-      const packPath = path.join(packDir, entry);
-      const persistedPack = await this.waitForPersistedBinary(packPath);
-      this.fs.setReadOverlay(packPath, persistedPack);
-    }
-  }
   async waitForPersistedBinary(filePath, expected = null) {
+    const expectedBytes = expected === null ? null : Buffer2.isBuffer(expected) ? expected : Buffer2.from(expected);
     let lastError;
     for (let attempt = 0; attempt < 5; attempt += 1) {
       try {
-        const persisted = Buffer2.from(await fsp.readFile(filePath));
-        if (expected === null || buffersEqual(persisted, Buffer2.from(expected))) return persisted;
+        const value = await fsp.readFile(filePath);
+        const persisted = Buffer2.isBuffer(value) ? value : Buffer2.from(value);
+        if (expectedBytes === null || buffersEqual(persisted, expectedBytes)) return persisted;
         lastError = new Error("Persisted bytes did not match the downloaded Git pack.");
       } catch (error) {
         lastError = error;
@@ -26101,6 +26151,14 @@ function buffersEqual(left, right) {
     return left === right;
   }
   return Buffer2.compare(left, right) === 0;
+}
+function isEmptyGitPack(packfile) {
+  const bytes = Buffer2.isBuffer(packfile) ? packfile : Buffer2.from(packfile);
+  if (bytes.byteLength !== 32 || bytes.subarray(0, 4).toString("ascii") !== "PACK") return false;
+  const version2 = bytes.readUInt32BE(4);
+  if (version2 !== 2 && version2 !== 3 || bytes.readUInt32BE(8) !== 0) return false;
+  const expectedDigest = createSha("sha1").update(bytes.subarray(0, 12)).digest();
+  return buffersEqual(bytes.subarray(12), expectedDigest);
 }
 function changedPathsConflict(left, right) {
   return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);

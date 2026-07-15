@@ -316,7 +316,7 @@ function toArrayBuffer(data) {
 }
 
 function createPackIndexFs(fs, packfile, observer = undefined) {
-  const pack = Buffer.from(packfile);
+  const pack = Buffer.isBuffer(packfile) ? packfile : Buffer.from(packfile);
   let packReadPending = true;
   const observe = (event) => {
     try {
@@ -399,24 +399,72 @@ function diagnosticIoCode(error) {
     : "unknown";
 }
 
-function createReadOverlayFs(fs, files) {
-  const overrides = new Map([...files].map(([filePath, data]) => [adapterPath(filePath), Buffer.from(data)]));
+function createReadOverlayFs(fs, files, options = {}) {
+  const overrides = new Map();
+  const maxBytes = Number.isFinite(options.maxBytes) ? Math.max(0, options.maxBytes) : Number.POSITIVE_INFINITY;
+  const cacheRead = typeof options.cacheRead === "function" ? options.cacheRead : () => false;
+  const readAttempts = Number.isInteger(options.readAttempts) ? Math.max(1, options.readAttempts) : 1;
+  const retryDelayMs = Number.isFinite(options.retryDelayMs) ? Math.max(0, options.retryDelayMs) : 0;
+  let overrideBytes = 0;
+
+  const deleteReadOverlay = (filePath) => {
+    const key = adapterPath(filePath);
+    const existing = overrides.get(key);
+    if (!existing) return;
+    overrideBytes -= existing.byteLength;
+    overrides.delete(key);
+  };
+
+  const setReadOverlay = (filePath, data) => {
+    const key = adapterPath(filePath);
+    deleteReadOverlay(key);
+    if (maxBytes === 0 || (data && typeof data.byteLength === "number" && data.byteLength > maxBytes)) return;
+    const bytes = Buffer.from(data);
+    if (bytes.byteLength > maxBytes) return;
+    while (overrideBytes + bytes.byteLength > maxBytes && overrides.size > 0) {
+      deleteReadOverlay(overrides.keys().next().value);
+    }
+    overrides.set(key, bytes);
+    overrideBytes += bytes.byteLength;
+  };
+
+  for (const [filePath, data] of files) setReadOverlay(filePath, data);
+
   return {
-    setReadOverlay(filePath, data) {
-      overrides.set(adapterPath(filePath), Buffer.from(data));
-    },
-    deleteReadOverlay(filePath) {
-      overrides.delete(adapterPath(filePath));
-    },
+    setReadOverlay,
+    deleteReadOverlay,
     promises: {
       ...fs.promises,
-      async readFile(filePath, options) {
-        const override = overrides.get(adapterPath(filePath));
+      async readFile(filePath, readOptions) {
+        const key = adapterPath(filePath);
+        const override = overrides.get(key);
         if (override) {
-          const encoding = typeof options === "string" ? options : options && options.encoding;
+          overrides.delete(key);
+          overrides.set(key, override);
+          const encoding = typeof readOptions === "string" ? readOptions : readOptions && readOptions.encoding;
           return encoding ? override.toString(encoding) : Buffer.from(override);
         }
-        return await fs.promises.readFile(filePath, options);
+
+        let value;
+        let lastError;
+        const attempts = cacheRead(key) ? readAttempts : 1;
+        for (let attempt = 0; attempt < attempts; attempt += 1) {
+          try {
+            value = await fs.promises.readFile(filePath, readOptions);
+            lastError = null;
+            break;
+          } catch (error) {
+            lastError = error;
+            if (attempt + 1 < attempts && retryDelayMs > 0) {
+              await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+            }
+          }
+        }
+        if (lastError) throw lastError;
+
+        const encoding = typeof readOptions === "string" ? readOptions : readOptions && readOptions.encoding;
+        if (cacheRead(key) && !encoding) setReadOverlay(key, value);
+        return value;
       }
     }
   };

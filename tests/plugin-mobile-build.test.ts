@@ -1,5 +1,5 @@
 import { Buffer } from 'node:buffer';
-import { webcrypto } from 'node:crypto';
+import { createHash, webcrypto } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import vm from 'node:vm';
@@ -84,6 +84,7 @@ describe('mobile plugin artifact', () => {
     const statusItems: MockStatusItem[] = [];
     const ribbonItems: MockStatusItem[] = [];
     const ribbonActions: Array<() => void> = [];
+    const layoutReadyCallbacks: Array<() => void> = [];
     class Plugin {
       app: any;
       manifest = { id: 'obts' };
@@ -163,6 +164,18 @@ describe('mobile plugin artifact', () => {
     expect(typeof (context as any).Buffer).toBe('function');
 
     const adapter = new MemoryDataAdapter();
+    await adapter.mkdir('.obts');
+    await adapter.mkdir('.obts/git');
+    await adapter.mkdir('.obts/git/objects');
+    await adapter.mkdir('.obts/git/objects/pack');
+    await adapter.writeBinary('.obts/git/objects/pack/startup.pack', Uint8Array.from(Buffer.alloc(64 * 1024, 1)).buffer);
+    let startupPackReads = 0;
+    const adapterReadBinary = adapter.readBinary.bind(adapter);
+    adapter.readBinary = async (filePath: string) => {
+      if (filePath.endsWith('.pack')) startupPackReads += 1;
+      return await adapterReadBinary(filePath);
+    };
+
     const PluginClass = module.exports as new () => Plugin;
     const plugin = new PluginClass();
     plugin.app = {
@@ -171,13 +184,22 @@ describe('mobile plugin artifact', () => {
         getName: () => 'Mobile Test Vault',
         on: () => ({})
       },
-      workspace: { getLeavesOfType: () => [] },
+      workspace: {
+        getLeavesOfType: () => [],
+        onLayoutReady: (callback: () => void) => layoutReadyCallbacks.push(callback)
+      },
       setting: {
         open: () => undefined,
         openTabById: (id: string) => openedSettingTabs.push(id)
       }
     };
     await (plugin as any).onload();
+    expect(layoutReadyCallbacks).toHaveLength(1);
+    expect(startupPackReads).toBe(0);
+    expect(await adapter.exists('.obts/state.json')).toBe(false);
+    await (plugin as any).runBackgroundSync();
+    expect(startupPackReads).toBe(0);
+    expect(await adapter.exists('.obts/state.json')).toBe(false);
 
     const statusItem = statusItems[0]!;
     const ribbonItem = ribbonItems[0]!;
@@ -230,6 +252,10 @@ describe('mobile plugin artifact', () => {
     expect(prevented).toBe(true);
     expect(openedSettingTabs).toEqual(['obts']);
 
+    layoutReadyCallbacks.shift()!();
+    expect(await (plugin as any).ensureClientReady()).toBe(true);
+    expect(startupPackReads).toBe(0);
+    await adapter.remove('.obts/git/objects/pack/startup.pack');
     expect(await adapter.exists('.obts/git/HEAD')).toBe(true);
     expect(await adapter.exists('.obts/state.json')).toBe(true);
     expect(await adapter.exists('.obts/queue.json')).toBe(true);
@@ -254,8 +280,17 @@ describe('mobile plugin artifact', () => {
     const packed = await git.packObjects({ ...sourceArgs, oids: [blob, tree, commit] });
     await expect((plugin as any).client.importPack(packed.packfile)).resolves.toBeUndefined();
     expect((await adapter.list('.obts/git/objects/pack')).files.some((file) => file.endsWith('.idx'))).toBe(true);
+    const packFilesBeforeEmptyImport = (await adapter.list('.obts/git/objects/pack')).files;
+    const emptyPackHeader = Buffer.alloc(12);
+    emptyPackHeader.write('PACK', 0, 'ascii');
+    emptyPackHeader.writeUInt32BE(2, 4);
+    emptyPackHeader.writeUInt32BE(0, 8);
+    const emptyPack = Buffer.concat([emptyPackHeader, createHash('sha1').update(emptyPackHeader).digest()]);
+    await expect((plugin as any).client.importPack(emptyPack)).resolves.toBeUndefined();
+    expect((await adapter.list('.obts/git/objects/pack')).files).toEqual(packFilesBeforeEmptyImport);
 
     const runtimeAdapter = new MemoryDataAdapter();
+    const runtimeLayoutReadyCallbacks: Array<() => void> = [];
     const runtimePlugin = new PluginClass();
     runtimePlugin.app = {
       vault: {
@@ -264,10 +299,15 @@ describe('mobile plugin artifact', () => {
         on: () => ({}),
         getAbstractFileByPath: () => null
       },
-      workspace: { getLeavesOfType: () => [] },
+      workspace: {
+        getLeavesOfType: () => [],
+        onLayoutReady: (callback: () => void) => runtimeLayoutReadyCallbacks.push(callback)
+      },
       setting: { open: () => undefined, openTabById: () => undefined }
     };
     await (runtimePlugin as any).onload();
+    runtimeLayoutReadyCallbacks.shift()!();
+    expect(await (runtimePlugin as any).ensureClientReady()).toBe(true);
     const runtimeClient = (runtimePlugin as any).client;
     const encode = (value: string) => new TextEncoder().encode(value).buffer;
     await runtimeAdapter.writeBinary('note.md', encode('runtime baseline\n'));
@@ -518,10 +558,12 @@ describe('mobile plugin artifact', () => {
     await (successor as any).onload();
     expect((successor as any).clientReady).toBe(false);
     expect(overlappingWrites).toBe(0);
+    const retiringInitialization = (retiring as any).clientInitialization;
     (retiring as any).onunload();
     released = true;
     releaseInitialization();
     await retiringLoad;
+    await retiringInitialization;
     await expect((successor as any).ensureClientReady()).resolves.toBe(true);
     expect((successor as any).clientReady).toBe(true);
     expect(overlappingWrites).toBe(0);

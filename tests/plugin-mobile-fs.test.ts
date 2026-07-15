@@ -10,7 +10,11 @@ const require = createRequire(import.meta.url);
 const { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require('../obsidian-plugin/src/data-adapter-fs.cjs') as {
   createDataAdapterFs: (adapter: MemoryDataAdapter) => any;
   createPackIndexFs: (fs: any, packfile: Uint8Array, observer?: (event: Record<string, unknown>) => void) => any;
-  createReadOverlayFs: (fs: any, files: Array<[string, Uint8Array]>) => any;
+  createReadOverlayFs: (
+    fs: any,
+    files: Array<[string, Uint8Array]>,
+    options?: { maxBytes?: number; cacheRead?: (filePath: string) => boolean; readAttempts?: number; retryDelayMs?: number }
+  ) => any;
 };
 
 describe('mobile DataAdapter filesystem', () => {
@@ -120,6 +124,44 @@ describe('mobile DataAdapter filesystem', () => {
     expect(JSON.stringify(events)).not.toContain('diagnostic-secret-body');
   });
 
+  it('loads persisted packs lazily with a bounded retrying cache', async () => {
+    const packs = new Map([
+      ['.obts/git/objects/pack/a.pack', Buffer.alloc(8, 1)],
+      ['.obts/git/objects/pack/b.pack', Buffer.alloc(8, 2)]
+    ]);
+    const reads = new Map<string, number>();
+    let failFirstRead = true;
+    const fs = createReadOverlayFs(
+      {
+        promises: {
+          async readFile(filePath: string) {
+            const count = (reads.get(filePath) ?? 0) + 1;
+            reads.set(filePath, count);
+            if (filePath.endsWith('a.pack') && failFirstRead) {
+              failFirstRead = false;
+              throw new Error('transient mobile pack read miss');
+            }
+            return Buffer.from(packs.get(filePath)!);
+          }
+        }
+      },
+      [],
+      {
+        maxBytes: 8,
+        cacheRead: (filePath: string) => filePath.endsWith('.pack'),
+        readAttempts: 2
+      }
+    );
+
+    expect(await fs.promises.readFile('.obts/git/objects/pack/a.pack')).toEqual(packs.get('.obts/git/objects/pack/a.pack'));
+    expect(await fs.promises.readFile('.obts/git/objects/pack/a.pack')).toEqual(packs.get('.obts/git/objects/pack/a.pack'));
+    expect(reads.get('.obts/git/objects/pack/a.pack')).toBe(2);
+
+    await fs.promises.readFile('.obts/git/objects/pack/b.pack');
+    await fs.promises.readFile('.obts/git/objects/pack/a.pack');
+    expect(reads.get('.obts/git/objects/pack/a.pack')).toBe(3);
+  });
+
   it('supports isomorphic-git init, object storage, refs, packs, and reopen', async () => {
     const sourceAdapter = new MemoryDataAdapter();
     const sourceFs = createDataAdapterFs(sourceAdapter);
@@ -190,5 +232,29 @@ describe('mobile DataAdapter filesystem', () => {
 
     expect(Buffer.from((await git.readBlob({ ...overlaidDestinationArgs, oid: commit, filepath: 'note.md' })).blob).toString('utf8')).toBe('mobile vault\n');
     expect(await git.resolveRef({ ...overlaidDestinationArgs, ref: 'refs/heads/local' })).toBe(commit);
+
+    let firstPersistedPackRead = true;
+    const reopenedFs = createReadOverlayFs(
+      {
+        promises: {
+          ...destinationFs.promises,
+          async readFile(filePath: string, options: unknown) {
+            if (filePath.endsWith('.pack') && firstPersistedPackRead) {
+              firstPersistedPackRead = false;
+              throw new Error('transient restart pack read miss');
+            }
+            return await destinationFs.promises.readFile(filePath, options);
+          }
+        }
+      },
+      [],
+      {
+        maxBytes: 1024 * 1024,
+        cacheRead: (filePath: string) => filePath.endsWith('.pack'),
+        readAttempts: 2
+      }
+    );
+    const reopenedArgs = { ...destinationArgs, fs: reopenedFs };
+    expect(Buffer.from((await git.readBlob({ ...reopenedArgs, oid: commit, filepath: 'note.md' })).blob).toString('utf8')).toBe('mobile vault\n');
   });
 });
