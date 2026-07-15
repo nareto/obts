@@ -141,10 +141,10 @@ export class LocalGitEngine {
     return sorted;
   }
 
-  async createLocalCommit(message: string): Promise<string | null> {
+  async createLocalCommit(message: string, knownFiles?: string[]): Promise<string | null> {
     const baseCommit = await this.resolveRef('refs/heads/local');
     const baseEntries = baseCommit ? await this.flattenTree(baseCommit) : new Map<string, TreeEntry>();
-    const files = await this.scanSyncableFiles();
+    const files = knownFiles ?? await this.scanSyncableFiles();
     const fileSet = new Set(files);
     const nextEntries = new Map(baseEntries);
 

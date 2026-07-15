@@ -418,10 +418,9 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
           const localStatusLabel = localStatusFresh ? device.local_status_label : null;
           const localErrorCode = localStatusFresh ? device.local_error_code : null;
           const localQueueStatus = localStatusFresh ? device.local_queue_status : null;
-          const pendingLocal = localStatusFresh && (
-            (localQueueStatus !== null && localQueueStatus !== 'idle' && localQueueStatus !== 'merged') ||
-            (device.local_head !== null && device.local_head !== device.local_main)
-          );
+          const pendingLocal = localStatusFresh &&
+            device.local_head !== null &&
+            device.local_head !== device.local_main;
           const convergenceProven = localStatusFresh &&
             localStatusLabel === 'Synced' &&
             localQueueStatus === 'idle' &&

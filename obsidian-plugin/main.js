@@ -21761,9 +21761,10 @@ var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var fsp = null;
 var API_VERSION = "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = "0.4.7";
+var PLUGIN_VERSION = "0.4.8";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
+var PERIODIC_FULL_SCAN_INTERVAL_MS = 5 * 60 * 1e3;
 var SYNC_STALE_MS = 2 * 60 * 1e3;
 var STATUS_LAG_NOTICE_DELAY_MS = 30 * 1e3;
 var STATUS_NOTICE_DURATION_MS = 15 * 1e3;
@@ -21820,6 +21821,8 @@ module.exports = class ObtsPlugin extends Plugin {
     this.syncQueued = false;
     this.syncRunning = false;
     this.syncRunningSince = null;
+    this.lastFullScanCompletedAt = null;
+    this.lastCheckingProgressAt = 0;
     this.isApplying = false;
     this.pluginCompatibilityNoticeKey = null;
     this.pluginUpdateUrl = PLUGIN_UPDATE_URL;
@@ -22157,7 +22160,7 @@ module.exports = class ObtsPlugin extends Plugin {
     }
     this.syncQueued = true;
     if (!this.clientReady) return;
-    this.setStatus("Ahead");
+    if (!this.syncRunning) this.setStatus("Checking");
     for (const candidate of Array.isArray(paths) ? paths : [paths]) {
       if (typeof candidate === "string" && candidate.length > 0) this.pendingWatcherPaths.add(candidate);
     }
@@ -22251,7 +22254,29 @@ module.exports = class ObtsPlugin extends Plugin {
       await this.client.reportDeviceStatus().catch(() => void 0);
       return;
     }
-    await this.runAutomaticSync();
+    const queue = await this.client.readQueue();
+    const fullScanDue = this.lastFullScanCompletedAt === null || Date.now() - this.lastFullScanCompletedAt >= PERIODIC_FULL_SCAN_INTERVAL_MS;
+    if (queue.pending_commit || queue.status === "queued_local" || fullScanDue) {
+      await this.runAutomaticSync();
+      return;
+    }
+    await this.runRemotePoll();
+  }
+  async runRemotePoll() {
+    if (!this.beginSync()) return;
+    try {
+      await this.client.pollRemoteEventsAndApply();
+      this.setStatus((await this.client.readState()).status_label);
+      await this.client.reportDeviceStatus().catch(() => void 0);
+    } catch (error) {
+      await this.handleAutomaticSyncError(error);
+    } finally {
+      this.endSync();
+      if (this.syncQueued) this.scheduleQueuedSync(0);
+    }
+  }
+  markFullScanCompleted() {
+    this.lastFullScanCompletedAt = Date.now();
   }
   async runAutomaticSync() {
     if (this.unloaded || typeof document !== "undefined" && document.hidden || !await this.ensureClientReady() || this.isSyncInProgress()) {
@@ -22445,6 +22470,7 @@ var ObtsObsidianClient = class {
     this.bootstrapTransferPath = path.join(this.obtsDir, "bootstrap-transfer.json");
     this.pullTransferPath = path.join(this.obtsDir, "pull-transfer.json");
     this.onboardingOperation = false;
+    this.queueMutation = Promise.resolve();
   }
   async initialize() {
     await fsp.recoverReplacements(this.obtsDir);
@@ -22927,8 +22953,20 @@ var ObtsObsidianClient = class {
     this.throwIfSyncBlocked(state);
     await this.flushEditorBuffersToDisk();
     await this.reconcileQueueWithLocalHead(await this.readState());
-    let pendingDirectoryIntents = await this.reconcileDirectoryState();
+    const queueBeforeScan = await this.readQueue();
+    const hasCommittedLocal = Boolean(
+      queueBeforeScan.pending_commit || state.local_head && state.local_head !== state.local_main
+    );
+    if (!hasCommittedLocal) {
+      await this.writeState(Object.assign({}, await this.readState(), {
+        status_label: "Checking",
+        last_error_code: null,
+        updated_at: nowIso()
+      }));
+      await this.reportDeviceStatus().catch(() => void 0);
+    }
     const localFiles = await this.scanSyncableFiles();
+    let pendingDirectoryIntents = await this.reconcileDirectoryState(localFiles);
     if (localFiles.length > 0 && !state.initial_import_confirmed && state.server_device_ref === null) {
       await this.createRecoveryBundle("initial_import", state.local_main, localFiles);
       if (!options.confirmInitialImport) {
@@ -22936,7 +22974,7 @@ var ObtsObsidianClient = class {
       }
       await this.writeState(Object.assign({}, state, { initial_import_confirmed: true, status_label: "Ahead", updated_at: nowIso() }));
     }
-    let commit2 = await this.createLocalCommit("obts: local vault changes");
+    let commit2 = await this.createLocalCommit("obts: local vault changes", localFiles);
     if (!commit2 && pendingDirectoryIntents.length > 0) {
       commit2 = await this.createMetadataCommit("obts: local directory changes");
     }
@@ -22950,12 +22988,29 @@ var ObtsObsidianClient = class {
         updated_at: nowIso()
       });
       await this.writeState(Object.assign({}, currentState, { local_head: commit2, status_label: "Ahead", last_error_code: null, updated_at: nowIso() }));
+    } else if (pendingDirectoryIntents.length === 0 && !this.plugin.syncQueued) {
+      await this.clearQueuedHintIfUnchanged(queueBeforeScan.change_seq || 0);
+      const [reconciledState, reconciledQueue] = await Promise.all([this.readState(), this.readQueue()]);
+      if (reconciledState.local_head === reconciledState.local_main && reconciledQueue.status !== "queued_local") {
+        await this.writeState(Object.assign({}, reconciledState, {
+          status_label: "Synced",
+          last_error_code: null,
+          updated_at: nowIso()
+        }));
+      }
     }
+    this.plugin.markFullScanCompleted();
     const queue = await this.readQueue();
+    let uploaded = false;
     if (queue.pending_commit) {
       await this.uploadQueuedCommit(queue);
+      uploaded = true;
     }
-    await this.pullAndApply(true);
+    const postUploadState = await this.readState();
+    if (postUploadState.last_error_code !== "conflict_review_required") {
+      if (uploaded) await this.pullAndApply(true);
+      else await this.pollRemoteEventsAndApply();
+    }
     const finalState = await this.readState();
     await this.reportDeviceStatus().catch(() => void 0);
     return { status: finalState.status_label, main: finalState.local_main || void 0 };
@@ -23104,10 +23159,17 @@ var ObtsObsidianClient = class {
         expected_device_ref: state.server_device_ref,
         status: "queued_local",
         attempts: 0,
+        change_seq: (queue.change_seq || 0) + 1,
         updated_at: nowIso()
       });
     }
-    await this.writeState(Object.assign({}, state, { status_label: "Ahead", updated_at: nowIso() }));
+    const hasCommittedLocal = Boolean(
+      queue.pending_commit || state.local_head && state.local_head !== state.local_main
+    );
+    await this.writeState(Object.assign({}, state, {
+      status_label: hasCommittedLocal ? "Ahead" : "Checking",
+      updated_at: nowIso()
+    }));
   }
   async uploadQueuedCommit(queue) {
     const state = await this.readState();
@@ -23484,7 +23546,7 @@ var ObtsObsidianClient = class {
     const state = await this.readState();
     const compactedDirectoryIntents = compactDirectoryIntents(directoryIntents);
     const explicitDirectorySet = Array.from(new Set(explicitDirectories)).sort();
-    const hasDirectoryWork = compactedDirectoryIntents.length > 0 || explicitDirectorySet.length > 0;
+    const hasDirectoryWork = await this.hasActionableDirectoryWork(compactedDirectoryIntents, explicitDirectorySet);
     if (state.local_main === targetMain && extraAffectedPaths.length === 0 && !hasDirectoryWork) {
       await this.writeState(Object.assign({}, state, {
         status_label: "Synced",
@@ -23864,20 +23926,25 @@ var ObtsObsidianClient = class {
       reportProgress();
     }
   }
-  async createLocalCommit(message) {
+  async createLocalCommit(message, knownLocalFiles = void 0) {
     const base = await this.resolveRef("refs/heads/local");
     const baseEntries = base ? await this.flattenTree(base) : /* @__PURE__ */ new Map();
-    const localFiles = await this.scanSyncableFiles();
+    const localFiles = knownLocalFiles || await this.scanSyncableFiles();
     const localSet = new Set(localFiles);
     const nextEntries = new Map(baseEntries);
     for (const filePath of baseEntries.keys()) {
       if (!isSyncableVaultPath(filePath) || !localSet.has(filePath)) nextEntries.delete(filePath);
     }
+    this.reportCheckingProgress(0, localFiles.length);
+    let checked = 0;
     for (const filePath of localFiles) {
       const content = await this.adapterReadBinary(filePath);
-      if (content === null) continue;
-      const oid = await git.writeBlob({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, blob: content });
-      nextEntries.set(filePath, { mode: "100644", path: filePath, oid, type: "blob" });
+      if (content !== null) {
+        const oid = await git.writeBlob({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, blob: content });
+        nextEntries.set(filePath, { mode: "100644", path: filePath, oid, type: "blob" });
+      }
+      checked += 1;
+      this.reportCheckingProgress(checked, localFiles.length);
     }
     const tree = await this.writeTreeFromEntries(nextEntries);
     if (base) {
@@ -23910,6 +23977,12 @@ var ObtsObsidianClient = class {
   async scanSyncableFiles() {
     const result = (await this.listLocalVaultFiles()).filter((filePath) => isSyncableVaultPath(filePath));
     return assertNoCaseCollisions(result.sort());
+  }
+  reportCheckingProgress(completed, total) {
+    const now = Date.now();
+    if (completed !== 0 && completed !== total && now - this.plugin.lastCheckingProgressAt < 250) return;
+    this.plugin.lastCheckingProgressAt = now;
+    this.plugin.setStatus(total > 0 ? `Checking ${completed}/${total}` : "Checking");
   }
   async localSnapshotSummary() {
     const files = await this.scanSyncableFiles();
@@ -24932,16 +25005,47 @@ var ObtsObsidianClient = class {
     };
   }
   async readQueue() {
-    return await readJson(this.queuePath, {
+    const queue = await readJson(this.queuePath, {
       pending_commit: null,
       expected_device_ref: null,
       status: "idle",
       attempts: 0,
+      change_seq: 0,
       updated_at: nowIso()
+    });
+    return Object.assign({}, queue, {
+      change_seq: Number.isSafeInteger(queue.change_seq) && queue.change_seq >= 0 ? queue.change_seq : 0
     });
   }
   async writeQueue(queue) {
-    await writeJson(this.queuePath, queue);
+    await this.mutateQueue(async () => {
+      const existing = await readJson(this.queuePath, null);
+      await writeJson(this.queuePath, Object.assign({}, queue, {
+        change_seq: Number.isSafeInteger(queue.change_seq) && queue.change_seq >= 0 ? queue.change_seq : Number.isSafeInteger(existing && existing.change_seq) && existing.change_seq >= 0 ? existing.change_seq : 0
+      }));
+    });
+  }
+  async clearQueuedHintIfUnchanged(expectedChangeSeq) {
+    return await this.mutateQueue(async () => {
+      const queue = await this.readQueue();
+      if (queue.pending_commit !== null || queue.status !== "queued_local" || queue.change_seq !== expectedChangeSeq) {
+        return false;
+      }
+      await writeJson(this.queuePath, {
+        pending_commit: null,
+        expected_device_ref: (await this.readState()).server_device_ref,
+        status: "idle",
+        attempts: 0,
+        change_seq: queue.change_seq,
+        updated_at: nowIso()
+      });
+      return true;
+    });
+  }
+  async mutateQueue(fn) {
+    const run = this.queueMutation.then(fn, fn);
+    this.queueMutation = run.then(() => void 0, () => void 0);
+    return await run;
   }
   async readDirectoryState() {
     const state = await readJson(this.directoryStatePath, null);
@@ -24963,14 +25067,14 @@ var ObtsObsidianClient = class {
       updated_at: state.updated_at
     });
   }
-  async reconcileDirectoryState() {
+  async reconcileDirectoryState(knownLocalFiles = void 0) {
     if (!await exists(this.directoryStatePath)) {
-      await this.refreshDirectoryStateFromDisk([]);
+      await this.refreshDirectoryStateFromDisk([], knownLocalFiles);
       return [];
     }
     const previous = await this.readDirectoryState();
     const currentDirs = await this.listLocalVaultDirectories();
-    const currentFiles = await this.scanSyncableFiles();
+    const currentFiles = knownLocalFiles || await this.scanSyncableFiles();
     const explicitDirs = explicitEmptyDirectories(currentDirs, currentFiles);
     const previousDirs = new Set(previous.observed_dirs);
     const previousExplicitDirs = new Set(previous.explicit_empty_dirs);
@@ -24989,16 +25093,27 @@ var ObtsObsidianClient = class {
   async clearPendingDirectoryIntents() {
     await this.refreshDirectoryStateFromDisk([]);
   }
-  async refreshDirectoryStateFromDisk(pendingIntents = void 0) {
+  async refreshDirectoryStateFromDisk(pendingIntents = void 0, knownLocalFiles = void 0) {
     const previous = await this.readDirectoryState();
     const currentDirs = await this.listLocalVaultDirectories();
-    const currentFiles = await this.scanSyncableFiles();
+    const currentFiles = knownLocalFiles || await this.scanSyncableFiles();
     await this.writeDirectoryState({
       observed_dirs: currentDirs,
       explicit_empty_dirs: explicitEmptyDirectories(currentDirs, currentFiles),
       pending_intents: pendingIntents === void 0 ? previous.pending_intents : pendingIntents,
       updated_at: nowIso()
     });
+  }
+  async hasActionableDirectoryWork(directoryIntents, explicitDirectories) {
+    for (const intent of directoryIntents) {
+      const isDirectory = await this.adapterIsDirectory(intent.path);
+      if (intent.op === "create" && !isDirectory) return true;
+      if (intent.op === "delete" && isDirectory && await this.adapterDirectoryIsEmpty(intent.path)) return true;
+    }
+    for (const dirPath of explicitDirectories) {
+      if (!await this.adapterIsDirectory(dirPath)) return true;
+    }
+    return false;
   }
   async applyDirectoryChanges(directoryIntents, explicitDirectories) {
     for (const intent of directoryIntents.filter((entry) => entry.op === "delete").sort((left, right) => right.path.length - left.path.length)) {
@@ -25995,7 +26110,7 @@ function isRetryableLocalError(code) {
 }
 function statusBaseLabel(label) {
   const normalized = typeof label === "string" && label.trim().length > 0 ? label.trim() : "Checking";
-  for (const base of ["Uploading", "Applying"]) {
+  for (const base of ["Checking", "Uploading", "Applying"]) {
     if (normalized === base || normalized.startsWith(`${base} `)) return base;
   }
   return normalized;

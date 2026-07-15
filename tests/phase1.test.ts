@@ -453,7 +453,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     await writeFile(join(deviceDir, 'watched.md'), 'from watcher\n');
     await plugin.recordLocalChangeHint(['watched.md', '.obts/state.json', '.git/config', '../outside.md']);
     expect(await plugin.readState()).toMatchObject({
-      status_label: 'Ahead',
+      status_label: 'Checking',
       last_error_code: null
     });
     expect(await plugin.readQueue()).toMatchObject({
@@ -479,6 +479,50 @@ describe('Phase 1 sync without conflict resolution', () => {
     const main = (await restartedPlugin.readState()).local_main;
     expect(main).toMatch(/^[0-9a-f]{40}$/u);
     expect(await server.git.listTreePaths(admin.vaultId, main!)).toContain('watched.md');
+  });
+
+  it('clears a watcher hint when the reconciled vault tree is unchanged', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'watcher-noop-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'noop-laptop');
+
+    await plugin.recordLocalChangeHint(['already-gone.md']);
+    expect(await plugin.readState()).toMatchObject({ status_label: 'Checking' });
+    expect(await plugin.readQueue()).toMatchObject({ pending_commit: null, status: 'queued_local' });
+
+    expect((await plugin.syncOnce()).status).toBe('Synced');
+    expect(await plugin.readQueue()).toMatchObject({ pending_commit: null, status: 'idle' });
+  });
+
+  it('does not clear a newer watcher hint that arrives during reconciliation', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'watcher-race-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'race-laptop');
+
+    await plugin.recordLocalChangeHint(['first-hint.md']);
+    const beforeRaceChangeSeq = (await plugin.readQueue()).change_seq ?? 0;
+    const internals = plugin as unknown as {
+      git: { createLocalCommit: (message: string, knownFiles?: string[]) => Promise<string | null> };
+    };
+    const createLocalCommit = internals.git.createLocalCommit.bind(internals.git);
+    internals.git.createLocalCommit = async (message, knownFiles) => {
+      const result = await createLocalCommit(message, knownFiles);
+      await plugin.recordLocalChangeHint(['newer-hint.md']);
+      return result;
+    };
+
+    await plugin.syncOnce();
+    expect(await plugin.readQueue()).toMatchObject({
+      pending_commit: null,
+      status: 'queued_local',
+      change_seq: beforeRaceChangeSeq + 1
+    });
+
+    internals.git.createLocalCommit = createLocalCommit;
+    await plugin.syncOnce();
+    expect(await plugin.readQueue()).toMatchObject({ pending_commit: null, status: 'idle' });
   });
 
   it('syncs Obsidian-valid punctuation paths and large markdown directories', async () => {
@@ -1209,6 +1253,33 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(dashboard.body.devices.find((device) => device.device_name === 'stale-laptop')).toMatchObject({
       status_label: 'Status unknown',
       status_report_fresh: false
+    });
+  });
+
+  it('does not report an uncommitted watcher marker as Ahead', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'uncommitted-watcher-status-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'watcher-laptop');
+    const state = await plugin.readState();
+
+    await server.store.mutate((db) => {
+      const device = db.devices.find((candidate) => candidate.device_name === 'watcher-laptop');
+      expect(device).toBeDefined();
+      device!.status = 'synced';
+      device!.last_applied_main = state.local_main;
+      device!.local_status_label = 'Synced';
+      device!.local_queue_status = 'queued_local';
+      device!.local_main = state.local_main;
+      device!.local_head = state.local_main;
+      device!.last_status_report_at = new Date().toISOString();
+    });
+
+    const dashboard = await admin.get<{ devices: Array<{ device_name: string; status_label: string }> }>(
+      `/api/v1/vaults/${admin.vaultId}/dashboard`
+    );
+    expect(dashboard.body.devices.find((device) => device.device_name === 'watcher-laptop')).toMatchObject({
+      status_label: 'Status unknown'
     });
   });
 
@@ -4753,7 +4824,9 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('this.app.vault.on("modify"');
     expect(pluginMain).toContain('adapter.writeBinary');
     expect(pluginMain).toContain('BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000');
+    expect(pluginMain).toContain('PERIODIC_FULL_SCAN_INTERVAL_MS = 5 * 60 * 1000');
     expect(pluginMain).toContain('runBackgroundSync()');
+    expect(pluginMain).toContain('runRemotePoll()');
     expect(pluginMain).toContain('runAutomaticSync()');
     expect(pluginMain).toContain('flushOpenMarkdownEditorsToDisk');
     expect(pluginMain).toContain('ensureNoLocalChangesBeforeApply');
@@ -4765,6 +4838,8 @@ describe('Phase 1 sync without conflict resolution', () => {
     const backgroundSync = sourceSection(pluginMain, 'async runBackgroundSync()', 'async runAutomaticSync()');
     expect(backgroundSync).toContain('isRetryableLocalError(state.last_error_code)');
     expect(backgroundSync).toContain('await this.runAutomaticSync();');
+    expect(backgroundSync).toContain('await this.runRemotePoll();');
+    expect(backgroundSync).toContain('fullScanDue');
     const automaticSync = sourceSection(pluginMain, 'async runAutomaticSync()', 'async handleAutomaticSyncError');
     expect(automaticSync).toContain('readPendingOnboarding()');
     expect(automaticSync).toContain('syncOnceOrPollResolvedConflict');
@@ -4785,6 +4860,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('handleStatusClick');
     expect(pluginMain).toContain('addRibbonIcon');
     expect(pluginMain).toContain('scheduleDegradedStatusNotice');
+    expect(pluginMain).toContain('Checking ${completed}/${total}');
     expect(pluginMain).toContain('Uploading ${uploadedChunks}/${groups.length}');
     expect(pluginMain).toContain('Applying ${completed}/${total}');
     expect(pluginMain).toContain('obts-settings-section-header');

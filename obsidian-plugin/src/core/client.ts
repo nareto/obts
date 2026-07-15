@@ -110,6 +110,7 @@ export type QueueState = {
   expected_device_ref: string | null;
   status: 'idle' | 'queued_local' | 'uploading' | 'uploaded' | 'merged' | 'conflicted' | 'blocked_recovery';
   attempts: number;
+  change_seq?: number;
   updated_at: string;
 };
 
@@ -141,6 +142,7 @@ export class ObtsPluginClient {
   private readonly git: LocalGitEngine;
   private readonly recovery: RecoveryManager;
   private onboardingOperation = false;
+  private queueMutation: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly vaultDir: string,
@@ -817,7 +819,7 @@ export class ObtsPluginClient {
     this.throwIfSyncBlocked(state);
     await this.flushEditorBuffersToDisk();
     await this.reconcileQueueWithLocalHead(await this.readState());
-    let pendingDirectoryIntents = await this.reconcileDirectoryState();
+    const queueBeforeScan = await this.readQueue();
     let localFiles: string[];
     try {
       localFiles = await this.git.scanSyncableFiles();
@@ -827,6 +829,7 @@ export class ObtsPluginClient {
       }
       throw error;
     }
+    let pendingDirectoryIntents = await this.reconcileDirectoryState(localFiles);
     if (localFiles.length > 0 && !state.initial_import_confirmed && state.server_device_ref === null) {
       await this.createLocalRecoveryBundle('initial_import', state.local_main, localFiles);
       if (!options.confirmInitialImport) {
@@ -842,7 +845,7 @@ export class ObtsPluginClient {
 
     let commit: string | null;
     try {
-      commit = await this.git.createLocalCommit('obts: local vault changes');
+      commit = await this.git.createLocalCommit('obts: local vault changes', localFiles);
     } catch (error) {
       if (error instanceof PathPolicyViolation) {
         await this.block(error.code, error.message, error.details);
@@ -869,20 +872,8 @@ export class ObtsPluginClient {
     }
 
     if (!commit) {
-      const existingQueue = await this.readQueue();
-      if (
-        existingQueue.status === 'queued_local' &&
-        existingQueue.pending_commit === null &&
-        pendingDirectoryIntents.length === 0 &&
-        (await this.visibleVaultMatchesLocalHead(await this.readState()))
-      ) {
-        await this.writeQueue({
-          pending_commit: null,
-          expected_device_ref: state.server_device_ref,
-          status: 'idle',
-          attempts: 0,
-          updated_at: nowIso()
-        });
+      if (pendingDirectoryIntents.length === 0) {
+        await this.clearQueuedHintIfUnchanged(queueBeforeScan.change_seq ?? 0);
       }
     }
 
@@ -1471,12 +1462,16 @@ export class ObtsPluginClient {
         expected_device_ref: state.server_device_ref,
         status: 'queued_local',
         attempts: 0,
+        change_seq: (queue.change_seq ?? 0) + 1,
         updated_at: nowIso()
       });
     }
+    const hasCommittedLocal = Boolean(
+      queue.pending_commit || (state.local_head && state.local_head !== state.local_main)
+    );
     await this.writeState({
       ...state,
-      status_label: 'Ahead',
+      status_label: hasCommittedLocal ? 'Ahead' : 'Checking',
       last_error_code: null,
       updated_at: nowIso()
     });
@@ -1603,13 +1598,20 @@ export class ObtsPluginClient {
 
   async readQueue(): Promise<QueueState> {
     try {
-      return JSON.parse(await readFile(this.queuePath, 'utf8')) as QueueState;
+      const queue = JSON.parse(await readFile(this.queuePath, 'utf8')) as QueueState;
+      return {
+        ...queue,
+        change_seq: typeof queue.change_seq === 'number' && Number.isSafeInteger(queue.change_seq) && queue.change_seq >= 0
+          ? queue.change_seq
+          : 0
+      };
     } catch {
       return {
         pending_commit: null,
         expected_device_ref: null,
         status: 'idle',
         attempts: 0,
+        change_seq: 0,
         updated_at: nowIso()
       };
     }
@@ -1638,14 +1640,14 @@ export class ObtsPluginClient {
     });
   }
 
-  private async reconcileDirectoryState(): Promise<DirectoryIntent[]> {
+  private async reconcileDirectoryState(knownLocalFiles?: string[]): Promise<DirectoryIntent[]> {
     if (!(await exists(this.directoryStatePath))) {
-      await this.refreshDirectoryStateFromDisk([]);
+      await this.refreshDirectoryStateFromDisk([], knownLocalFiles);
       return [];
     }
     const previous = await this.readDirectoryState();
     const currentDirs = await listLocalVaultDirectories(this.vaultDir);
-    const currentFiles = await this.git.scanSyncableFiles();
+    const currentFiles = knownLocalFiles ?? await this.git.scanSyncableFiles();
     const explicitDirs = explicitEmptyDirectories(currentDirs, currentFiles);
     const previousDirs = new Set(previous.observed_dirs);
     const previousExplicitDirs = new Set(previous.explicit_empty_dirs);
@@ -1670,16 +1672,29 @@ export class ObtsPluginClient {
     await this.refreshDirectoryStateFromDisk([]);
   }
 
-  private async refreshDirectoryStateFromDisk(pendingIntents?: DirectoryIntent[]): Promise<void> {
+  private async refreshDirectoryStateFromDisk(pendingIntents?: DirectoryIntent[], knownLocalFiles?: string[]): Promise<void> {
     const previous = await this.readDirectoryState();
     const currentDirs = await listLocalVaultDirectories(this.vaultDir);
-    const currentFiles = await this.git.scanSyncableFiles();
+    const currentFiles = knownLocalFiles ?? await this.git.scanSyncableFiles();
     await this.writeDirectoryState({
       observed_dirs: currentDirs,
       explicit_empty_dirs: explicitEmptyDirectories(currentDirs, currentFiles),
       pending_intents: pendingIntents ?? previous.pending_intents,
       updated_at: nowIso()
     });
+  }
+
+  private async hasActionableDirectoryWork(directoryIntents: DirectoryIntent[], explicitDirectories: string[]): Promise<boolean> {
+    for (const intent of directoryIntents) {
+      const absolutePath = join(this.vaultDir, intent.path);
+      const isDirectory = await pathIsDirectory(absolutePath);
+      if (intent.op === 'create' && !isDirectory) return true;
+      if (intent.op === 'delete' && isDirectory && await directoryIsEmpty(absolutePath)) return true;
+    }
+    for (const path of explicitDirectories) {
+      if (!(await pathIsDirectory(join(this.vaultDir, path)))) return true;
+    }
+    return false;
   }
 
   private async applyDirectoryChanges(directoryIntents: DirectoryIntent[], explicitDirectories: string[]): Promise<void> {
@@ -1709,7 +1724,7 @@ export class ObtsPluginClient {
     const state = await this.readState();
     const directoryIntents = compactDirectoryIntents(options.directoryIntents ?? []);
     const explicitDirectories = [...new Set(options.explicitDirectories ?? [])].sort();
-    const hasDirectoryWork = directoryIntents.length > 0 || explicitDirectories.length > 0;
+    const hasDirectoryWork = await this.hasActionableDirectoryWork(directoryIntents, explicitDirectories);
     if (state.local_main === targetMain && (options.extraAffectedPaths?.length ?? 0) === 0 && !hasDirectoryWork) {
       await this.writeState({
         ...state,
@@ -2885,7 +2900,46 @@ export class ObtsPluginClient {
   }
 
   private async writeQueue(queue: QueueState): Promise<void> {
-    await writeJson(this.queuePath, queue);
+    await this.mutateQueue(async () => {
+      const existing = await readJsonOrNull<QueueState>(this.queuePath);
+      const existingSeq = existing?.change_seq;
+      await writeJson(this.queuePath, {
+        ...queue,
+        change_seq: typeof queue.change_seq === 'number' && Number.isSafeInteger(queue.change_seq) && queue.change_seq >= 0
+          ? queue.change_seq
+          : typeof existingSeq === 'number' && Number.isSafeInteger(existingSeq) && existingSeq >= 0
+            ? existingSeq
+            : 0
+      });
+    });
+  }
+
+  private async clearQueuedHintIfUnchanged(expectedChangeSeq: number): Promise<boolean> {
+    return await this.mutateQueue(async () => {
+      const queue = await this.readQueue();
+      if (
+        queue.pending_commit !== null ||
+        queue.status !== 'queued_local' ||
+        queue.change_seq !== expectedChangeSeq
+      ) {
+        return false;
+      }
+      await writeJson(this.queuePath, {
+        pending_commit: null,
+        expected_device_ref: (await this.readState()).server_device_ref,
+        status: 'idle',
+        attempts: 0,
+        change_seq: expectedChangeSeq,
+        updated_at: nowIso()
+      });
+      return true;
+    });
+  }
+
+  private async mutateQueue<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.queueMutation.then(fn, fn);
+    this.queueMutation = run.then(() => undefined, () => undefined);
+    return await run;
   }
 
   private get onboardingJournalPath(): string {

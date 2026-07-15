@@ -170,6 +170,8 @@ Acceptance criteria:
 
 - Local edits are durably committed or recoverably snapshotted before upload.
 - On startup and before sync decisions, the scanner commits visible filesystem differences to the local Git journal when path policy validation passes.
+- Watcher hints remain `Checking` until a scan proves a local commit exists; an unchanged scan clears its durable hint, and only a real unmerged local commit is `Ahead`.
+- Frequent remote event polling does not rescan vault contents. Full local scans run on startup, after watcher hints, and on a slower fallback cadence to catch missed events.
 - If `state.json` is missing, corrupt, or incomplete but the device token and local Git journal are intact, the plugin rehydrates non-secret identity/ref metadata from the server and resumes normal commit/upload behavior without reset or reconnect.
 - `.obts/` is excluded from vault sync, Git worktree content, and manifest/path scanning.
 - Retrying an upload of the same Git commit is idempotent.
@@ -214,6 +216,7 @@ Behavior:
 Acceptance criteria:
 
 - Empty folder creation syncs to other devices.
+- Repeated authoritative directory state is idempotent: an unchanged `main` with already-present explicit directories does not enter `Applying`.
 - Right-click folder deletion removes the empty folder shell on other devices after file deletes are applied.
 - Individually emptying a folder preserves that empty folder on other devices.
 - A remote folder tombstone never deletes non-empty local content.

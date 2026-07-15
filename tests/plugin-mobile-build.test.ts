@@ -202,6 +202,9 @@ describe('mobile plugin artifact', () => {
     (plugin as any).setStatus('Not paired');
 
     const initialNoticeCount = notices.length;
+    (plugin as any).setStatus('Checking 3/5');
+    expect(statusItem.text).toBe('obts: Checking 3/5');
+    expect(statusItem.attributes['data-obts-status']).toBe('checking');
     (plugin as any).setStatus('Uploading 2/4');
     expect(statusItem.text).toBe('obts: Uploading 2/4');
     expect(statusItem.classes).toContain('obts-status');
@@ -251,6 +254,117 @@ describe('mobile plugin artifact', () => {
     const packed = await git.packObjects({ ...sourceArgs, oids: [blob, tree, commit] });
     await expect((plugin as any).client.importPack(packed.packfile)).resolves.toBeUndefined();
     expect((await adapter.list('.obts/git/objects/pack')).files.some((file) => file.endsWith('.idx'))).toBe(true);
+
+    const runtimeAdapter = new MemoryDataAdapter();
+    const runtimePlugin = new PluginClass();
+    runtimePlugin.app = {
+      vault: {
+        adapter: runtimeAdapter,
+        getName: () => 'Runtime Test Vault',
+        on: () => ({}),
+        getAbstractFileByPath: () => null
+      },
+      workspace: { getLeavesOfType: () => [] },
+      setting: { open: () => undefined, openTabById: () => undefined }
+    };
+    await (runtimePlugin as any).onload();
+    const runtimeClient = (runtimePlugin as any).client;
+    const encode = (value: string) => new TextEncoder().encode(value).buffer;
+    await runtimeAdapter.writeBinary('note.md', encode('runtime baseline\n'));
+    const runtimeMain = await runtimeClient.createLocalCommit('runtime baseline');
+    expect(runtimeMain).toMatch(/^[0-9a-f]{40}$/u);
+    await runtimeClient.updateRef('refs/heads/main', runtimeMain, null, true);
+    await runtimeAdapter.writeBinary('.obts/auth/device-token.json', encode('{"device_token":"test-token"}\n'));
+    await runtimeAdapter.mkdir('mainvault');
+    await runtimeClient.writeState({
+      user_id: 'usr_test',
+      vault_id: 'vlt_test',
+      device_id: 'dev_test',
+      device_name: 'runtime-device',
+      device_ref: 'refs/obts/devices/dev_test',
+      server_device_ref: runtimeMain,
+      local_main: runtimeMain,
+      local_head: runtimeMain,
+      initial_import_confirmed: true,
+      status_label: 'Synced',
+      last_error_code: null,
+      last_event_seq: 0,
+      unpaired_baseline_vault_id: null,
+      unpaired_baseline_main: null,
+      updated_at: new Date().toISOString()
+    });
+    await runtimeClient.writeQueue({
+      pending_commit: null,
+      expected_device_ref: runtimeMain,
+      status: 'idle',
+      attempts: 0,
+      updated_at: new Date().toISOString()
+    });
+    await runtimeClient.refreshDirectoryStateFromDisk([]);
+
+    let applyLockAttempts = 0;
+    const acquireApplyLock = runtimeClient.acquireApplyLock.bind(runtimeClient);
+    runtimeClient.acquireApplyLock = async (...args: unknown[]) => {
+      applyLockAttempts += 1;
+      return await acquireApplyLock(...args);
+    };
+    await runtimeClient.applyTargetMain(runtimeMain, [], true, [], true, [], ['mainvault'], 0);
+    expect(applyLockAttempts).toBe(0);
+    runtimeClient.acquireApplyLock = acquireApplyLock;
+    await runtimeClient.applyTargetMain(runtimeMain, [], true, [], true, [], ['mainvault', 'missing-empty'], 0);
+    expect(await runtimeAdapter.exists('missing-empty')).toBe(true);
+
+    runtimeClient.pollEvents = async () => ({ current_event_seq: 0, events: [] });
+    runtimeClient.reportDeviceStatus = async () => undefined;
+    await runtimeClient.recordLocalChangeHint(['note.md']);
+    expect(await runtimeClient.readState()).toMatchObject({ status_label: 'Checking' });
+    expect(await runtimeClient.readQueue()).toMatchObject({ pending_commit: null, status: 'queued_local' });
+    expect(await runtimeClient.syncOnce({ confirmInitialImport: false })).toMatchObject({ status: 'Synced', main: runtimeMain });
+    expect(await runtimeClient.readQueue()).toMatchObject({ pending_commit: null, status: 'idle' });
+
+    await runtimeClient.recordLocalChangeHint(['note.md']);
+    const beforeRaceChangeSeq = (await runtimeClient.readQueue()).change_seq;
+    const createLocalCommit = runtimeClient.createLocalCommit.bind(runtimeClient);
+    runtimeClient.createLocalCommit = async (...args: unknown[]) => {
+      const result = await createLocalCommit(...args);
+      await runtimeClient.recordLocalChangeHint(['note.md']);
+      return result;
+    };
+    await runtimeClient.syncOnce({ confirmInitialImport: false });
+    expect(await runtimeClient.readQueue()).toMatchObject({
+      pending_commit: null,
+      status: 'queued_local',
+      change_seq: beforeRaceChangeSeq + 1
+    });
+    runtimeClient.createLocalCommit = createLocalCommit;
+    await runtimeClient.syncOnce({ confirmInitialImport: false });
+    expect(await runtimeClient.readQueue()).toMatchObject({ pending_commit: null, status: 'idle' });
+
+    let lightweightPolls = 0;
+    let fullScans = 0;
+    runtimeClient.pollRemoteEventsAndApply = async () => {
+      lightweightPolls += 1;
+      return { applied: false, status: 'Synced' };
+    };
+    runtimeClient.syncOnce = async () => {
+      fullScans += 1;
+      (runtimePlugin as any).markFullScanCompleted();
+      throw new Error('network unavailable after scan');
+    };
+    (runtimePlugin as any).lastFullScanCompletedAt = Date.now();
+    for (let index = 0; index < 10; index += 1) await (runtimePlugin as any).runBackgroundSync();
+    expect(lightweightPolls).toBe(10);
+    expect(fullScans).toBe(0);
+    (runtimePlugin as any).lastFullScanCompletedAt = null;
+    await (runtimePlugin as any).runBackgroundSync();
+    expect(fullScans).toBe(1);
+    expect((runtimePlugin as any).lastFullScanCompletedAt).toEqual(expect.any(Number));
+    await (runtimePlugin as any).runBackgroundSync();
+    expect(fullScans).toBe(1);
+    expect(lightweightPolls).toBe(11);
+
+    (plugin as any).client = new runtimeClient.constructor(plugin);
+    await (plugin as any).client.initialize();
 
     const diagnosticError = vm.runInContext(
       "new TypeError(\"null is not an object (evaluating 'pack.slice') private-note.md obts_dev_secret\")",

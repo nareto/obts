@@ -74,6 +74,7 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - empty or already-matching paired devices acknowledge the current server `main`
   immediately and appear Synced without needing a later manual sync;
 - watcher change hints and directory-intent scans for syncable vault paths survive plugin restart and are consumed by the next normal Git-backed sync scan, while internal `.obts` and visible `.git` paths are ignored;
+- unchanged watcher hints converge back to an idle queue, frequent event polling avoids full-vault rescans, and repeated already-materialized directory state remains a no-op;
 - plugin state surfaces `Uploading` during queued push attempts and `Applying`
   while pulled server `main` is being materialized locally;
 - divergent additional-device local content is committed as that actor device's proposal, optionally using current server `main` as `base_commit`, and the server either merges it or records a conflict without adopting another device ref;
