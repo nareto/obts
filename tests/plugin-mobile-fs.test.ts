@@ -63,6 +63,37 @@ describe('mobile DataAdapter filesystem', () => {
     expect(await fs.promises.readFile('/.obts/state.json', 'utf8')).toBe('old');
   });
 
+  it('bounds replacement recovery and stops when plugin unload aborts it', async () => {
+    const adapter = new MemoryDataAdapter();
+    const fs = createDataAdapterFs(adapter);
+    await fs.promises.mkdir('/.obts/nested', { recursive: true });
+    await fs.promises.writeFile('/.obts/state.json.obts-replace-backup-crash', 'root');
+    await fs.promises.writeFile('/.obts/nested/queue.json.obts-replace-backup-crash', 'nested');
+
+    await fs.promises.recoverReplacements('/.obts', { maxDepth: 0 });
+    expect(await fs.promises.readFile('/.obts/state.json', 'utf8')).toBe('root');
+    expect(await fs.promises.readFile('/.obts/nested/queue.json.obts-replace-backup-crash', 'utf8')).toBe('nested');
+
+    const controller = new AbortController();
+    controller.abort();
+    await expect(fs.promises.recoverReplacements('/.obts/nested', { signal: controller.signal })).rejects.toMatchObject({
+      code: 'ABORT_ERR'
+    });
+
+    const traversalController = new AbortController();
+    const list = adapter.list.bind(adapter);
+    adapter.list = async (filePath: string) => {
+      const listing = await list(filePath);
+      if (filePath === '.obts/nested') traversalController.abort();
+      return listing;
+    };
+    await expect(fs.promises.recoverReplacements('/.obts', { signal: traversalController.signal })).rejects.toMatchObject({
+      code: 'ABORT_ERR'
+    });
+    expect(await fs.promises.readFile('/.obts/nested/queue.json.obts-replace-backup-crash', 'utf8')).toBe('nested');
+    await expect(fs.promises.stat('/.obts/nested/queue.json')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('serializes same-destination replacements across filesystem wrappers and cleans owned temps', async () => {
     const adapter = new MemoryDataAdapter();
     const first = createDataAdapterFs(adapter);

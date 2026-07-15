@@ -190,10 +190,11 @@ function createDataAdapterFs(adapter) {
       await promises.writeFile(destinationPath, data);
     },
 
-    async recoverReplacements(rootPath = "/.obts") {
+    async recoverReplacements(rootPath = "/.obts", options = {}) {
       const root = adapterPath(rootPath);
       if (!await adapterStat(adapter, root)) return;
-      await recoverReplacementTree(adapter, root);
+      const maxDepth = Number.isInteger(options.maxDepth) ? Math.max(0, options.maxDepth) : Number.POSITIVE_INFINITY;
+      await recoverReplacementTree(adapter, root, 0, maxDepth, options.signal);
     }
   };
 
@@ -252,10 +253,17 @@ async function ensureDirectories(adapter, dirPath) {
   }
 }
 
-async function recoverReplacementTree(adapter, dirPath) {
+async function recoverReplacementTree(adapter, dirPath, depth, maxDepth, signal) {
+  throwIfAborted(signal);
   const listing = await adapter.list(dirPath);
-  for (const folder of listing.folders || []) await recoverReplacementTree(adapter, folder);
+  throwIfAborted(signal);
+  if (depth < maxDepth) {
+    for (const folder of listing.folders || []) {
+      await recoverReplacementTree(adapter, folder, depth + 1, maxDepth, signal);
+    }
+  }
   for (const file of listing.files || []) {
+    throwIfAborted(signal);
     const marker = file.lastIndexOf(REPLACEMENT_BACKUP_SUFFIX);
     if (marker >= 0) {
       const suffix = file.slice(marker + REPLACEMENT_BACKUP_SUFFIX.length);
@@ -276,6 +284,11 @@ async function recoverReplacementTree(adapter, dirPath) {
       // Keep unknown or malformed files for manual recovery.
     }
   }
+}
+
+function throwIfAborted(signal) {
+  if (!signal || !signal.aborted) return;
+  throw Object.assign(new Error("Filesystem recovery was interrupted by plugin unload."), { code: "ABORT_ERR" });
 }
 
 function randomSuffix() {

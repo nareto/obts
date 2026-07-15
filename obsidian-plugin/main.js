@@ -21538,10 +21538,11 @@ var require_data_adapter_fs = __commonJS({
           const data = await promises.readFile(sourcePath);
           await promises.writeFile(destinationPath, data);
         },
-        async recoverReplacements(rootPath = "/.obts") {
+        async recoverReplacements(rootPath = "/.obts", options = {}) {
           const root = adapterPath(rootPath);
           if (!await adapterStat(adapter, root)) return;
-          await recoverReplacementTree(adapter, root);
+          const maxDepth = Number.isInteger(options.maxDepth) ? Math.max(0, options.maxDepth) : Number.POSITIVE_INFINITY;
+          await recoverReplacementTree(adapter, root, 0, maxDepth, options.signal);
         }
       };
       return { promises };
@@ -21592,10 +21593,17 @@ var require_data_adapter_fs = __commonJS({
         else if (stat.type !== "folder") throw fsError("ENOTDIR", current);
       }
     }
-    async function recoverReplacementTree(adapter, dirPath) {
+    async function recoverReplacementTree(adapter, dirPath, depth, maxDepth, signal) {
+      throwIfAborted(signal);
       const listing = await adapter.list(dirPath);
-      for (const folder of listing.folders || []) await recoverReplacementTree(adapter, folder);
+      throwIfAborted(signal);
+      if (depth < maxDepth) {
+        for (const folder of listing.folders || []) {
+          await recoverReplacementTree(adapter, folder, depth + 1, maxDepth, signal);
+        }
+      }
       for (const file of listing.files || []) {
+        throwIfAborted(signal);
         const marker = file.lastIndexOf(REPLACEMENT_BACKUP_SUFFIX);
         if (marker >= 0) {
           const suffix = file.slice(marker + REPLACEMENT_BACKUP_SUFFIX.length);
@@ -21615,6 +21623,10 @@ var require_data_adapter_fs = __commonJS({
         } catch {
         }
       }
+    }
+    function throwIfAborted(signal) {
+      if (!signal || !signal.aborted) return;
+      throw Object.assign(new Error("Filesystem recovery was interrupted by plugin unload."), { code: "ABORT_ERR" });
     }
     function randomSuffix() {
       return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -21803,7 +21815,7 @@ var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var fsp = null;
 var API_VERSION = "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = "0.4.9";
+var PLUGIN_VERSION = "0.4.10";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_FULL_SCAN_INTERVAL_MS = 5 * 60 * 1e3;
@@ -22537,7 +22549,7 @@ var ObtsObsidianClient = class {
     this.queueMutation = Promise.resolve();
   }
   async initialize() {
-    await fsp.recoverReplacements(this.obtsDir);
+    await this.recoverInterruptedReplacements();
     await fsp.mkdir(path.join(this.obtsDir, "auth"), { recursive: true, mode: 448 });
     await git.init({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, defaultBranch: "local" });
     await git.writeRef({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, ref: "HEAD", value: "refs/heads/local", symbolic: true, force: true });
@@ -22579,6 +22591,28 @@ var ObtsObsidianClient = class {
       updated_at: nowIso()
     }));
     await this.writeQueue(await this.readQueue());
+  }
+  async recoverInterruptedReplacements() {
+    const signal = this.plugin.lifecycleAbortController.signal;
+    const shallow = { maxDepth: 0, signal };
+    await fsp.recoverReplacements(this.obtsDir, shallow);
+    await fsp.recoverReplacements(path.join(this.obtsDir, "auth"), shallow);
+    await fsp.recoverReplacements(this.gitdir, shallow);
+    await fsp.recoverReplacements(path.join(this.gitdir, "refs"), { signal });
+    const recoveryDir = path.join(this.obtsDir, "recovery");
+    let bundles;
+    try {
+      bundles = await fsp.readdir(recoveryDir, { withFileTypes: true });
+    } catch (error) {
+      if (error && error.code === "ENOENT" && !error.cause) return;
+      throw error;
+    }
+    for (const bundle of bundles) {
+      if (!bundle.isDirectory()) continue;
+      const bundleDir = path.join(recoveryDir, bundle.name);
+      await fsp.recoverReplacements(bundleDir, shallow);
+      await fsp.recoverReplacements(path.join(bundleDir, "journal"), shallow);
+    }
   }
   async readPendingOnboarding() {
     const journal = await readJson(this.onboardingJournalPath, null);
@@ -25689,6 +25723,7 @@ var ObtsSettingTab = class extends PluginSettingTab {
     const paired = Boolean(state && state.vault_id && state.device_id);
     const recoveryBlocked = Boolean(state && state.last_error_code === "local_state_incomplete");
     const restartRequired = availability === "restart_required";
+    const initializationInProgress = clientUnavailable && Boolean(this.plugin.clientInitialization);
     const deviceName = this.plugin.settings.deviceName || state && state.device_name || "Obsidian device";
     new Setting(containerEl).setName("Server URL").addText(
       (text) => text.setValue(this.plugin.settings.serverUrl).onChange(async (value) => {
@@ -25713,15 +25748,17 @@ var ObtsSettingTab = class extends PluginSettingTab {
     }));
     const sectionHeader = containerEl.createDiv({ cls: "obts-settings-section-header" });
     sectionHeader.createEl("h3", {
-      text: clientUnavailable ? restartRequired ? "Restart required" : "Finishing update" : pendingOnboarding ? "Setup incomplete" : recoveryBlocked ? "Recovery required" : paired ? "Device" : "Connect Vault"
+      text: clientUnavailable ? restartRequired ? "Restart required" : initializationInProgress ? "Loading obts" : "Finishing update" : pendingOnboarding ? "Setup incomplete" : recoveryBlocked ? "Recovery required" : paired ? "Device" : "Connect Vault"
     });
     sectionHeader.createEl("span", {
       cls: paired && !pendingOnboarding && !clientUnavailable ? "obts-status-pill obts-status-pill--ok" : "obts-status-pill",
-      text: clientUnavailable ? restartRequired ? "Restart Obsidian" : "Please wait" : pendingOnboarding ? "Resume setup" : recoveryBlocked ? "Needs recovery" : paired ? "Paired" : "Not paired"
+      text: clientUnavailable ? restartRequired ? "Restart Obsidian" : initializationInProgress ? "Loading" : "Please wait" : pendingOnboarding ? "Resume setup" : recoveryBlocked ? "Needs recovery" : paired ? "Paired" : "Not paired"
     });
     if (clientUnavailable) {
-      new Setting(containerEl).setName(restartRequired ? "Plugin update interrupted an operation" : "Waiting for the previous operation").setDesc(
-        restartRequired ? "Fully close Obsidian and reopen it. obts will not clear the old operation lock because doing so could overlap vault writes." : "obts will finish loading when the previous plugin instance releases its active vault operation."
+      new Setting(containerEl).setName(
+        restartRequired ? "Plugin update interrupted an operation" : initializationInProgress ? "Checking local obts state" : "Waiting for the previous operation"
+      ).setDesc(
+        restartRequired ? "Fully close Obsidian and reopen it. obts will not clear the old operation lock because doing so could overlap vault writes." : initializationInProgress ? "obts is recovering local metadata in the background. The vault remains available while this finishes." : "obts will finish loading when the previous plugin instance releases its active vault operation."
       );
     } else if (pendingOnboarding) {
       const conflictPending = pendingOnboarding.journal.stage === "awaiting_conflict";

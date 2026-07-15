@@ -85,6 +85,50 @@ describe('mobile plugin artifact', () => {
     const ribbonItems: MockStatusItem[] = [];
     const ribbonActions: Array<() => void> = [];
     const layoutReadyCallbacks: Array<() => void> = [];
+    const settingTabs: any[] = [];
+    const renderedSettingNames: string[] = [];
+    const renderedElementTexts: string[] = [];
+    const createContainer = (): any => ({
+      empty() {
+        renderedSettingNames.length = 0;
+        renderedElementTexts.length = 0;
+      },
+      createEl(_tag: string, options: { text?: string } = {}) {
+        if (options.text) renderedElementTexts.push(options.text);
+        return createContainer();
+      },
+      createDiv() { return createContainer(); }
+    });
+    const createControl = (): any => {
+      const control: any = {
+        inputEl: {},
+        setValue() { return control; },
+        onChange() { return control; },
+        setButtonText() { return control; },
+        setCta() { return control; },
+        setDisabled() { return control; },
+        onClick() { return control; },
+        setWarning() { return control; }
+      };
+      return control;
+    };
+    class PluginSettingTab {
+      app: any;
+      plugin: any;
+      containerEl = createContainer();
+      constructor(app: any, plugin: any) {
+        this.app = app;
+        this.plugin = plugin;
+      }
+    }
+    class Setting {
+      constructor(_container: any) {}
+      setName(value: string) { renderedSettingNames.push(value); return this; }
+      setDesc(_value: string) { return this; }
+      addText(callback: (control: any) => void) { callback(createControl()); return this; }
+      addToggle(callback: (control: any) => void) { callback(createControl()); return this; }
+      addButton(callback: (control: any) => void) { callback(createControl()); return this; }
+    }
     class Plugin {
       app: any;
       manifest = { id: 'obts' };
@@ -101,7 +145,7 @@ describe('mobile plugin artifact', () => {
         ribbonActions.push(action);
         return item;
       }
-      addSettingTab() {}
+      addSettingTab(tab: any) { settingTabs.push(tab); }
       addCommand() {}
       registerEvent() {}
       registerInterval(id: ReturnType<typeof setInterval>) { clearInterval(id); }
@@ -111,8 +155,8 @@ describe('mobile plugin artifact', () => {
     }
     const obsidian = {
       Plugin,
-      PluginSettingTab: class {},
-      Setting: class {},
+      PluginSettingTab,
+      Setting,
       Notice: class {
         constructor(message: string) { notices.push(message); }
       },
@@ -169,7 +213,26 @@ describe('mobile plugin artifact', () => {
     await adapter.mkdir('.obts/git/objects');
     await adapter.mkdir('.obts/git/objects/pack');
     await adapter.writeBinary('.obts/git/objects/pack/startup.pack', Uint8Array.from(Buffer.alloc(64 * 1024, 1)).buffer);
+    await adapter.mkdir('.obts/recovery');
+    await adapter.mkdir('.obts/recovery/rec_startup');
+    await adapter.mkdir('.obts/recovery/rec_startup/files');
+    await adapter.mkdir('.obts/recovery/rec_startup/files/deep');
+    await adapter.mkdir('.obts/recovery/rec_startup/journal');
+    await adapter.writeBinary('.obts/recovery/rec_startup/files/deep/note.md', new TextEncoder().encode('preserved recovery data').buffer);
+    await adapter.writeBinary('.obts/recovery/rec_startup/manifest.json.tmp-dead-1', new TextEncoder().encode('{"valid":true}').buffer);
+    await adapter.writeBinary(
+      '.obts/recovery/rec_startup/journal/apply-journal.json.obts-replace-backup-crash-one',
+      new TextEncoder().encode('{"phase":"planned"}').buffer
+    );
     let startupPackReads = 0;
+    let failRecoveryListing = false;
+    const listedStartupPaths: string[] = [];
+    const adapterList = adapter.list.bind(adapter);
+    adapter.list = async (filePath: string) => {
+      listedStartupPaths.push(filePath);
+      if (failRecoveryListing && filePath === '.obts/recovery') throw new Error('transient recovery listing failure');
+      return await adapterList(filePath);
+    };
     const adapterReadBinary = adapter.readBinary.bind(adapter);
     adapter.readBinary = async (filePath: string) => {
       if (filePath.endsWith('.pack')) startupPackReads += 1;
@@ -253,8 +316,21 @@ describe('mobile plugin artifact', () => {
     expect(openedSettingTabs).toEqual(['obts']);
 
     layoutReadyCallbacks.shift()!();
+    await settingTabs[0]!.display();
+    expect(renderedElementTexts).toContain('Loading obts');
+    expect(renderedSettingNames).toContain('Checking local obts state');
+    expect(renderedSettingNames).not.toContain('Waiting for the previous operation');
     expect(await (plugin as any).ensureClientReady()).toBe(true);
     expect(startupPackReads).toBe(0);
+    expect(listedStartupPaths).not.toContain('.obts/git/objects');
+    expect(listedStartupPaths).not.toContain('.obts/git/objects/pack');
+    expect(listedStartupPaths).not.toContain('.obts/recovery/rec_startup/files');
+    expect(await adapter.exists('.obts/recovery/rec_startup/manifest.json.tmp-dead-1')).toBe(false);
+    expect(await adapter.exists('.obts/recovery/rec_startup/journal/apply-journal.json')).toBe(true);
+    expect(await adapter.exists('.obts/recovery/rec_startup/files/deep/note.md')).toBe(true);
+    failRecoveryListing = true;
+    await expect((plugin as any).client.recoverInterruptedReplacements()).rejects.toThrow('ENOENT');
+    failRecoveryListing = false;
     await adapter.remove('.obts/git/objects/pack/startup.pack');
     expect(await adapter.exists('.obts/git/HEAD')).toBe(true);
     expect(await adapter.exists('.obts/state.json')).toBe(true);
