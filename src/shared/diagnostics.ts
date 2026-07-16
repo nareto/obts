@@ -35,6 +35,7 @@ export const diagnosticFailureCodes = [
   'onboarding_failed',
   'sync_failed',
   'recovery_failed',
+  'operation_stalled',
   'unknown'
 ] as const;
 export const diagnosticErrorClasses = ['type_error', 'transport_error', 'blocked_error', 'error', 'unknown'] as const;
@@ -51,7 +52,18 @@ export const diagnosticPoints = [
   'index_pack',
   'sync_request',
   'apply',
-  'recovery'
+  'recovery',
+  'startup_metadata',
+  'startup_git',
+  'startup_state',
+  'recovery_journal',
+  'recovery_target_commit',
+  'recovery_target_tree',
+  'recovery_file_validation',
+  'recovery_bundle',
+  'recovery_file_apply',
+  'recovery_refs',
+  'recovery_state'
 ] as const;
 export const diagnosticOutcomes = ['started', 'returned', 'succeeded', 'failed'] as const;
 export const diagnosticValueKinds = ['buffer', 'uint8array', 'arraybuffer', 'string', 'null', 'other', 'unknown'] as const;
