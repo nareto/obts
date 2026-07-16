@@ -315,6 +315,38 @@ export class LocalGitEngine {
     return result.sort();
   }
 
+  async listTreeBlobOids(commit: string): Promise<Map<string, string>> {
+    const entries = await this.flattenTree(commit);
+    return new Map([...entries].map(([path, entry]) => [path, entry.oid]));
+  }
+
+  async hashBlob(content: Buffer): Promise<string> {
+    return (await git.hashBlob({ object: content })).oid;
+  }
+
+  async readBlobOidRequired(oid: string): Promise<Buffer> {
+    const result = await git.readObject({
+      fs,
+      dir: this.vaultDir,
+      gitdir: this.gitdir,
+      oid,
+      format: 'content'
+    });
+    if (result.type !== 'blob') throw new Error(`Git object ${oid} is not a blob.`);
+    return Buffer.from(result.object);
+  }
+
+  async readBlobRequired(commit: string, filepath: string): Promise<Buffer> {
+    const result = await git.readBlob({
+      fs,
+      dir: this.vaultDir,
+      gitdir: this.gitdir,
+      oid: commit,
+      filepath
+    });
+    return Buffer.from(result.blob);
+  }
+
   async readBlob(commit: string, filepath: string): Promise<Buffer | null> {
     try {
       const result = await git.readBlob({

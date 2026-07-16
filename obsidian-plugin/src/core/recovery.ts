@@ -3,6 +3,7 @@ import { mkdir, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/pro
 import { dirname, extname, join, relative } from 'node:path';
 
 import { newId, nowIso } from '../../../src/shared/ids.js';
+import { normalizeVaultPath } from '../../../src/shared/pathPolicy.js';
 
 export type ApplyJournal = {
   apply_id: string;
@@ -92,9 +93,10 @@ export class RecoveryManager {
 
   async readApplyJournal(): Promise<ApplyJournal | null> {
     try {
-      return JSON.parse(await readFile(join(this.vaultDir, '.obts', 'apply-journal.json'), 'utf8')) as ApplyJournal;
-    } catch {
-      return null;
+      return parseApplyJournal(JSON.parse(await readFile(join(this.vaultDir, '.obts', 'apply-journal.json'), 'utf8')));
+    } catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return null;
+      throw error;
     }
   }
 
@@ -129,7 +131,8 @@ export class RecoveryManager {
         if (isTextPatchPath(path)) {
           await writeTextSnapshotPatch(bundleDir, path, content);
         }
-      } catch {
+      } catch (error) {
+        if (!hasErrorCode(error, 'ENOENT') && !hasErrorCode(error, 'EISDIR')) throw error;
         snapshotChecksums.push(`missing  files/${path}`);
       }
     }
@@ -166,6 +169,46 @@ export async function sha256File(path: string): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+function parseApplyJournal(value: unknown): ApplyJournal {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Apply journal is invalid.');
+  const journal = value as Record<string, unknown>;
+  const operations = new Set(['pull_apply', 'initial_import', 'replace_local_with_server', 'rebuild_from_server']);
+  const phases = new Set(['planned', 'recovery_bundle_written', 'writing_files', 'verifying', 'committed', 'blocked_recovery']);
+  const affectedPaths = journal.affected_paths;
+  const preflight = journal.preflight_sha256;
+  if (
+    typeof journal.apply_id !== 'string' || journal.apply_id.length === 0 ||
+    typeof journal.operation_type !== 'string' || !operations.has(journal.operation_type) ||
+    typeof journal.target_main !== 'string' || !/^[0-9a-f]{40}$/u.test(journal.target_main) ||
+    !isNullableString(journal.expected_prior_local_main) ||
+    !isNullableString(journal.expected_prior_local_device_ref) ||
+    typeof journal.phase !== 'string' || !phases.has(journal.phase) ||
+    !Array.isArray(affectedPaths) || affectedPaths.some((path) => typeof path !== 'string' || !isSafeJournalPath(path)) ||
+    new Set(affectedPaths).size !== affectedPaths.length ||
+    !preflight || typeof preflight !== 'object' || Array.isArray(preflight) ||
+    affectedPaths.some((path) => !Object.hasOwn(preflight, path) || !isNullableSha256((preflight as Record<string, unknown>)[path])) ||
+    !isNullableString(journal.recovery_bundle_id) ||
+    !isNullableString(journal.last_completed_step) ||
+    !isNullableString(journal.redacted_error_category)
+  ) {
+    throw new Error('Apply journal is invalid.');
+  }
+  return value as ApplyJournal;
+}
+
+function isSafeJournalPath(path: string): boolean {
+  const normalized = normalizeVaultPath(path);
+  return normalized.ok && normalized.path === path;
+}
+
+function isNullableString(value: unknown): boolean {
+  return value === null || typeof value === 'string';
+}
+
+function isNullableSha256(value: unknown): boolean {
+  return value === null || typeof value === 'string' && /^[0-9a-f]{64}$/u.test(value);
 }
 
 function sha256(data: Buffer): string {

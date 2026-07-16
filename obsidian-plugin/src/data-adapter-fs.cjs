@@ -432,7 +432,7 @@ function createReadOverlayFs(fs, files, options = {}) {
     const key = adapterPath(filePath);
     deleteReadOverlay(key);
     if (maxBytes === 0 || (data && typeof data.byteLength === "number" && data.byteLength > maxBytes)) return;
-    const bytes = Buffer.from(data);
+    const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data);
     if (bytes.byteLength > maxBytes) return;
     while (overrideBytes + bytes.byteLength > maxBytes && overrides.size > 0) {
       deleteReadOverlay(overrides.keys().next().value);
@@ -455,7 +455,7 @@ function createReadOverlayFs(fs, files, options = {}) {
           overrides.delete(key);
           overrides.set(key, override);
           const encoding = typeof readOptions === "string" ? readOptions : readOptions && readOptions.encoding;
-          return encoding ? override.toString(encoding) : Buffer.from(override);
+          return encoding ? override.toString(encoding) : override;
         }
 
         let value;

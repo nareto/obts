@@ -21755,7 +21755,7 @@ var require_data_adapter_fs = __commonJS({
         const key = adapterPath(filePath);
         deleteReadOverlay(key);
         if (maxBytes === 0 || data && typeof data.byteLength === "number" && data.byteLength > maxBytes) return;
-        const bytes = Buffer3.from(data);
+        const bytes = Buffer3.isBuffer(data) ? data : Buffer3.from(data);
         if (bytes.byteLength > maxBytes) return;
         while (overrideBytes + bytes.byteLength > maxBytes && overrides.size > 0) {
           deleteReadOverlay(overrides.keys().next().value);
@@ -21776,7 +21776,7 @@ var require_data_adapter_fs = __commonJS({
               overrides.delete(key);
               overrides.set(key, override);
               const encoding2 = typeof readOptions === "string" ? readOptions : readOptions && readOptions.encoding;
-              return encoding2 ? override.toString(encoding2) : Buffer3.from(override);
+              return encoding2 ? override.toString(encoding2) : override;
             }
             let value;
             let lastError;
@@ -21815,7 +21815,7 @@ var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var fsp = null;
 var API_VERSION = "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = "0.4.12";
+var PLUGIN_VERSION = "0.4.13";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_FULL_SCAN_INTERVAL_MS = 5 * 60 * 1e3;
@@ -22085,6 +22085,9 @@ module.exports = class ObtsPlugin extends Plugin {
       this.reportedInitializationStalls.add(diagnosticPoint);
       void this.reportInitializationStall(diagnosticPoint);
     }, INITIALIZATION_STALL_DIAGNOSTIC_MS);
+  }
+  updateInitializationProgress(label) {
+    if (this.clientInitialization) this.initializationStage = label;
   }
   clearInitializationWatchdog() {
     if (this.initializationWatchdogTimer !== null) {
@@ -22628,13 +22631,12 @@ var ObtsObsidianClient = class {
     this.plugin.setInitializationStage("Reading local sync state", "startup_state");
     const state = await this.repairLocalStateIfNeeded(await this.readState());
     this.plugin.setInitializationStage("Checking interrupted apply journal", "recovery_journal");
-    const journal = await readJson(this.applyJournalPath, null);
+    const journal = await readApplyJournalStrict(this.applyJournalPath);
     if (journal) this.plugin.setInitializationStage("Recovering an interrupted apply", "recovery_journal");
     if (journal && journal.phase === "committed") {
       this.plugin.setInitializationStage("Restoring recovered refs", "recovery_refs");
       await this.updateRef("refs/heads/main", journal.target_main, null, true);
       await this.updateRef("refs/heads/local", journal.target_main, null, true);
-      await this.clearApplyState();
       this.plugin.setInitializationStage("Persisting recovered sync state", "recovery_state");
       await this.writeState(Object.assign({}, state, {
         local_main: journal.target_main,
@@ -22643,6 +22645,7 @@ var ObtsObsidianClient = class {
         last_error_code: null,
         updated_at: nowIso()
       }));
+      await this.clearApplyState();
       return;
     }
     if (journal && await this.recoverBlockedApplyWithPreservedLocalChanges(journal, state)) {
@@ -23756,7 +23759,8 @@ var ObtsObsidianClient = class {
       redacted_error_category: null
     };
     try {
-      const targetFiles = new Set(await this.listTreeFiles(targetMain));
+      const targetEntries = await this.listTreeBlobOids(targetMain);
+      const targetFiles = new Set(targetEntries.keys());
       const affected = new Set(changedPaths || []);
       if (state.local_main) {
         for (const previousPath of await this.listTreeFiles(state.local_main)) {
@@ -23775,7 +23779,8 @@ var ObtsObsidianClient = class {
       const affectedPaths = Array.from(affected).filter((filePath) => isRecoverableApplyPath(filePath)).sort();
       journal.affected_paths = affectedPaths;
       for (const filePath of affectedPaths) {
-        journal.preflight_sha256[filePath] = await this.adapterSha256(filePath);
+        const fingerprint = await this.recoveryFileFingerprint(filePath);
+        journal.preflight_sha256[filePath] = fingerprint.kind === "file" ? fingerprint.sha256 : null;
       }
       await writeJson(this.applyJournalPath, journal);
       if (affectedPaths.length > 0) {
@@ -23804,14 +23809,15 @@ var ObtsObsidianClient = class {
       journal.phase = "writing_files";
       await writeJson(this.applyJournalPath, journal);
       for (const filePath of affectedPaths) {
-        if (await this.adapterSha256(filePath) !== journal.preflight_sha256[filePath]) {
+        const fingerprint = await this.recoveryFileFingerprint(filePath);
+        if (!this.fingerprintMatchesPreflight(fingerprint, journal.preflight_sha256[filePath] || null)) {
           journal.phase = "blocked_recovery";
           journal.redacted_error_category = "preflight_hash_changed";
           await writeJson(this.applyJournalPath, journal);
           await this.block("unsafe_local_state", "A local file changed during apply preflight.");
         }
       }
-      await this.writeTargetFilesFromJournal(journal, targetFiles);
+      await this.writeTargetFilesFromJournal(journal, targetEntries, /* @__PURE__ */ new Set());
       await this.applyDirectoryChanges(compactedDirectoryIntents, explicitDirectorySet);
       journal.phase = "verifying";
       journal.last_completed_step = "files_written";
@@ -23820,7 +23826,7 @@ var ObtsObsidianClient = class {
       if (requireCleanVisibleState) {
         await this.flushEditorBuffersToDisk();
         try {
-          preservedLocalChangePaths = await this.localChangedPathsFromTree(targetMain);
+          preservedLocalChangePaths = await this.localChangedPathsFromTree(targetEntries);
         } catch (error) {
           journal.phase = "blocked_recovery";
           journal.redacted_error_category = categorizeRecoveryError(error);
@@ -23865,16 +23871,16 @@ var ObtsObsidianClient = class {
     if (!await this.commitExists(journal.target_main)) return false;
     const canRecoverFinalVisibleTree = journal.last_completed_step === "files_written" || journal.last_completed_step === "refs_updated";
     this.plugin.setInitializationStage("Reading interrupted apply target tree", "recovery_target_tree");
-    const targetFiles = new Set(await this.listTreeFiles(journal.target_main));
+    const targetEntries = await this.listTreeBlobOids(journal.target_main);
     this.plugin.setInitializationStage("Validating interrupted apply files", "recovery_file_validation");
     let preservedLocalChangePaths = [];
     if (canRecoverFinalVisibleTree) {
-      preservedLocalChangePaths = await this.localChangedPathsFromTree(journal.target_main);
+      preservedLocalChangePaths = await this.localChangedPathsFromTree(targetEntries);
     } else {
-      if (!await this.affectedApplyPathsMatchTarget(journal, targetFiles)) {
+      if (!await this.affectedApplyPathsMatchTarget(journal, targetEntries)) {
         return false;
       }
-      preservedLocalChangePaths = await this.classifySafeResidualLocalChanges(state, journal, journal.target_main);
+      preservedLocalChangePaths = await this.classifySafeResidualLocalChanges(state, journal, targetEntries);
       if (preservedLocalChangePaths.length === 0) {
         return false;
       }
@@ -23926,9 +23932,10 @@ var ObtsObsidianClient = class {
       return false;
     }
     this.plugin.setInitializationStage("Reading interrupted apply target tree", "recovery_target_tree");
-    const targetFiles = new Set(await this.listTreeFiles(journal.target_main));
+    const targetEntries = await this.listTreeBlobOids(journal.target_main);
     this.plugin.setInitializationStage("Validating interrupted apply files", "recovery_file_validation");
-    if (!await this.applyJournalMatchesCurrentFiles(journal, targetFiles)) {
+    const validation = await this.applyJournalMatchesCurrentFiles(journal, targetEntries);
+    if (!validation.matches) {
       journal.phase = "blocked_recovery";
       journal.redacted_error_category = "local_files_diverge_from_journal";
       journal.last_completed_step = journal.last_completed_step || "recovery_bundle";
@@ -23950,10 +23957,17 @@ var ObtsObsidianClient = class {
       journal.redacted_error_category = null;
       await writeJson(this.applyJournalPath, journal);
       this.plugin.setInitializationStage("Restoring interrupted apply files", "recovery_file_apply");
-      await this.writeTargetFilesFromJournal(journal, targetFiles);
+      await this.writeTargetFilesFromJournal(journal, targetEntries, validation.targetMatchedPaths);
       journal.phase = "verifying";
       journal.last_completed_step = "files_written";
       await writeJson(this.applyJournalPath, journal);
+      this.plugin.setInitializationStage("Revalidating interrupted apply files", "recovery_file_validation");
+      if (!await this.affectedApplyPathsMatchTarget(journal, targetEntries)) {
+        journal.phase = "blocked_recovery";
+        journal.redacted_error_category = "local_changed_during_apply";
+        await writeJson(this.applyJournalPath, journal);
+        return false;
+      }
       this.plugin.setInitializationStage("Restoring interrupted apply refs", "recovery_refs");
       await this.updateRef("refs/heads/main", journal.target_main, null, true);
       await this.updateRef("refs/heads/local", journal.target_main, null, true);
@@ -23980,61 +23994,65 @@ var ObtsObsidianClient = class {
       await fsp.rm(this.applyLockPath, { force: true });
     }
   }
-  async affectedApplyPathsMatchTarget(journal, targetFiles) {
+  async affectedApplyPathsMatchTarget(journal, targetEntries) {
+    const total = journal.affected_paths.length;
+    let completed = 0;
     for (const filePath of journal.affected_paths) {
-      const currentHash = await this.adapterSha256(filePath);
-      const targetContent = targetFiles.has(filePath) ? await this.readBlobIfPresent(journal.target_main, filePath) : null;
-      const targetHash = targetContent === null ? null : sha256(targetContent);
-      if (currentHash !== targetHash) {
+      const fingerprint = await this.recoveryFileFingerprint(filePath);
+      if (!this.fingerprintMatchesTarget(fingerprint, targetEntries.get(filePath))) {
         return false;
       }
+      completed += 1;
+      await this.reportRecoveryValidationProgress(completed, total);
     }
     return true;
   }
-  async localChangedPathsFromTree(targetMain) {
+  async localChangedPathsFromTree(targetEntries) {
     const localFiles = new Set(await this.scanSyncableFiles());
-    const targetFiles = new Set(await this.listTreeFiles(targetMain));
+    const candidatePaths = Array.from(/* @__PURE__ */ new Set([...localFiles, ...targetEntries.keys()])).sort();
     const changedPaths = [];
-    for (const filePath of Array.from(/* @__PURE__ */ new Set([...localFiles, ...targetFiles])).sort()) {
-      const localContent = localFiles.has(filePath) ? await this.adapterReadBinary(filePath) : null;
-      const targetContent = targetFiles.has(filePath) ? await this.readBlobIfPresent(targetMain, filePath) : null;
-      if (!buffersEqual(localContent, targetContent)) {
+    let completed = 0;
+    for (const filePath of candidatePaths) {
+      const fingerprint = await this.recoveryFileFingerprint(filePath);
+      if (!this.fingerprintMatchesTarget(fingerprint, targetEntries.get(filePath))) {
         changedPaths.push(filePath);
       }
+      completed += 1;
+      await this.reportRecoveryValidationProgress(completed, candidatePaths.length);
     }
     return changedPaths;
   }
-  async classifySafeResidualLocalChanges(state, journal, targetMain) {
-    if (await this.localContentMatchesTree(await this.scanSyncableFiles(), targetMain)) {
-      return [];
-    }
+  async classifySafeResidualLocalChanges(state, journal, targetEntries) {
     const queue = await this.readQueue();
     const pendingCommit = queue.status === "conflicted" ? queue.pending_commit : null;
     if (!pendingCommit || !await this.commitExists(pendingCommit)) {
       return [];
     }
+    const pendingEntries = await this.listTreeBlobOids(pendingCommit);
+    const priorEntries = state.local_main ? await this.listTreeBlobOids(state.local_main) : /* @__PURE__ */ new Map();
     const localFiles = new Set(await this.scanSyncableFiles());
-    const targetFiles = new Set(await this.listTreeFiles(targetMain));
-    const candidatePaths = Array.from(/* @__PURE__ */ new Set([...localFiles, ...targetFiles])).sort();
+    const candidatePaths = Array.from(/* @__PURE__ */ new Set([...localFiles, ...targetEntries.keys()])).sort();
     const preservedPaths = [];
+    let completed = 0;
     for (const filePath of candidatePaths) {
-      const localContent = localFiles.has(filePath) ? await this.adapterReadBinary(filePath) : null;
-      const targetContent = targetFiles.has(filePath) ? await this.readBlob(targetMain, filePath) : null;
-      if (buffersEqual(localContent, targetContent)) {
+      const fingerprint = await this.recoveryFileFingerprint(filePath);
+      if (this.fingerprintMatchesTarget(fingerprint, targetEntries.get(filePath))) {
+        completed += 1;
+        await this.reportRecoveryValidationProgress(completed, candidatePaths.length);
         continue;
       }
       if (journal.affected_paths.some((affectedPath) => changedPathsConflict(filePath, affectedPath))) {
         return [];
       }
-      const pendingContent = await this.readBlobIfPresent(pendingCommit, filePath);
-      if (!buffersEqual(localContent, pendingContent)) {
+      if (!this.fingerprintMatchesTarget(fingerprint, pendingEntries.get(filePath))) {
         return [];
       }
-      const priorContent = state.local_main ? await this.readBlobIfPresent(state.local_main, filePath) : null;
-      if (buffersEqual(pendingContent, priorContent)) {
+      if (this.fingerprintMatchesTarget(fingerprint, priorEntries.get(filePath))) {
         return [];
       }
       preservedPaths.push(filePath);
+      completed += 1;
+      await this.reportRecoveryValidationProgress(completed, candidatePaths.length);
     }
     return preservedPaths;
   }
@@ -24058,25 +24076,53 @@ var ObtsObsidianClient = class {
       updated_at: nowIso()
     }));
   }
-  async applyJournalMatchesCurrentFiles(journal, targetFiles) {
-    for (const filePath of journal.affected_paths) {
-      const currentHash = await this.adapterSha256(filePath);
-      const preflightHash = journal.preflight_sha256[filePath] || null;
-      if (currentHash === preflightHash) {
-        continue;
-      }
-      if (journal.phase !== "writing_files" && journal.phase !== "verifying") {
-        return false;
-      }
-      const targetContent = targetFiles.has(filePath) ? await this.readBlobIfPresent(journal.target_main, filePath) : null;
-      const targetHash = targetContent === null ? null : sha256(targetContent);
-      if (currentHash !== targetHash) {
-        return false;
-      }
+  async recoveryFileFingerprint(filePath) {
+    let metadata;
+    try {
+      metadata = await fsp.stat(filePath);
+    } catch (error) {
+      if (error && (error.code === "ENOENT" || error.code === "ENOTDIR")) return { kind: "missing", sha256: null, oid: null };
+      throw error;
     }
-    return true;
+    if (!metadata.isFile()) return { kind: "other", sha256: null, oid: null };
+    const content = await fsp.readFile(filePath);
+    return {
+      kind: "file",
+      sha256: sha256(content),
+      oid: (await git.hashBlob({ object: content })).oid
+    };
   }
-  async writeTargetFilesFromJournal(journal, targetFiles) {
+  fingerprintMatchesTarget(fingerprint, targetOid) {
+    return targetOid === void 0 ? fingerprint.kind === "missing" : fingerprint.kind === "file" && fingerprint.oid === targetOid;
+  }
+  fingerprintMatchesPreflight(fingerprint, preflightHash) {
+    return preflightHash === null ? fingerprint.kind === "missing" || fingerprint.kind === "other" : fingerprint.kind === "file" && fingerprint.sha256 === preflightHash;
+  }
+  async reportRecoveryValidationProgress(completed, total) {
+    this.plugin.updateInitializationProgress(total > 0 ? `Validating interrupted apply files ${completed}/${total}` : "Validating interrupted apply files");
+    if (completed === total || completed % 25 === 0) {
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    }
+  }
+  async applyJournalMatchesCurrentFiles(journal, targetEntries) {
+    const targetMatchedPaths = /* @__PURE__ */ new Set();
+    const total = journal.affected_paths.length;
+    let completed = 0;
+    for (const filePath of journal.affected_paths) {
+      const fingerprint = await this.recoveryFileFingerprint(filePath);
+      const matchesTarget = this.fingerprintMatchesTarget(fingerprint, targetEntries.get(filePath));
+      if (matchesTarget) targetMatchedPaths.add(filePath);
+      if (!this.fingerprintMatchesPreflight(fingerprint, journal.preflight_sha256[filePath] || null)) {
+        if (journal.phase !== "writing_files" && journal.phase !== "verifying" || !matchesTarget) {
+          return { matches: false, targetMatchedPaths };
+        }
+      }
+      completed += 1;
+      await this.reportRecoveryValidationProgress(completed, total);
+    }
+    return { matches: true, targetMatchedPaths };
+  }
+  async writeTargetFilesFromJournal(journal, targetEntries, targetMatchedPaths) {
     const assertRecoveredDescendants = async (filePath) => {
       const descendants = await this.listLocalDescendantFiles(filePath);
       if (descendants.some((descendant) => !(descendant in journal.preflight_sha256))) {
@@ -24086,8 +24132,8 @@ var ObtsObsidianClient = class {
         await this.block("unsafe_local_state", "A local file changed during apply preflight.");
       }
     };
-    const removals = journal.affected_paths.filter((candidate) => !targetFiles.has(candidate)).sort((left, right) => right.length - left.length);
-    const writes = journal.affected_paths.filter((candidate) => targetFiles.has(candidate));
+    const removals = journal.affected_paths.filter((candidate) => !targetEntries.has(candidate) && !targetMatchedPaths.has(candidate)).sort((left, right) => right.length - left.length);
+    const writes = journal.affected_paths.filter((candidate) => targetEntries.has(candidate) && !targetMatchedPaths.has(candidate)).sort((left, right) => targetEntries.get(left).localeCompare(targetEntries.get(right)));
     const total = removals.length + writes.length;
     let completed = 0;
     const reportProgress = () => this.plugin.setStatus(total > 0 ? `Applying ${completed}/${total}` : "Applying");
@@ -24101,15 +24147,13 @@ var ObtsObsidianClient = class {
       reportProgress();
     }
     for (const filePath of writes) {
-      const content = await this.readBlobIfPresent(journal.target_main, filePath);
-      if (content !== null) {
-        await this.removeBlockingMaterializationPaths(filePath);
-        if (await this.adapterIsDirectory(filePath)) {
-          await assertRecoveredDescendants(filePath);
-          await this.adapterRemove(filePath);
-        }
-        await this.adapterWriteBinary(filePath, content);
+      const content = await this.readBlobOid(targetEntries.get(filePath));
+      await this.removeBlockingMaterializationPaths(filePath);
+      if (await this.adapterIsDirectory(filePath)) {
+        await assertRecoveredDescendants(filePath);
+        await this.adapterRemove(filePath);
       }
+      await this.adapterWriteBinary(filePath, content);
       completed += 1;
       reportProgress();
     }
@@ -24255,16 +24299,23 @@ var ObtsObsidianClient = class {
     const snapshotChecksums = [];
     for (const filePath of affectedPaths) {
       if (filePath.startsWith(".obts/")) continue;
-      const content = await this.adapterReadBinary(filePath);
-      if (content !== null) {
-        const target = path.join(bundleDir, "files", filePath);
-        await fsp.mkdir(path.dirname(target), { recursive: true, mode: 448 });
-        await fsp.writeFile(target, content, { mode: 384 });
-        snapshotChecksums.push(`${sha256(content)}  files/${filePath}`);
-        if (isTextPatchPath(filePath)) await writeTextSnapshotPatch(bundleDir, filePath, content);
-      } else {
-        snapshotChecksums.push(`missing  files/${filePath}`);
+      let metadata;
+      try {
+        metadata = await fsp.stat(filePath);
+      } catch (error) {
+        if (!error || error.code !== "ENOENT") throw error;
+        metadata = null;
       }
+      if (!metadata || !metadata.isFile()) {
+        snapshotChecksums.push(`missing  files/${filePath}`);
+        continue;
+      }
+      const content = await fsp.readFile(filePath);
+      const target = path.join(bundleDir, "files", filePath);
+      await fsp.mkdir(path.dirname(target), { recursive: true, mode: 448 });
+      await fsp.writeFile(target, content, { mode: 384 });
+      snapshotChecksums.push(`${sha256(content)}  files/${filePath}`);
+      if (isTextPatchPath(filePath)) await writeTextSnapshotPatch(bundleDir, filePath, content);
     }
     const manifest = {
       bundle_id: bundleId,
@@ -24422,6 +24473,15 @@ var ObtsObsidianClient = class {
       if (entry.type === "blob" && isSyncableVaultPath(entryPath)) result.push(entryPath);
     });
     return result.sort();
+  }
+  async listTreeBlobOids(commit2) {
+    const entries = await this.flattenTree(commit2);
+    return new Map([...entries].filter(([filePath]) => isSyncableVaultPath(filePath)).map(([filePath, entry]) => [filePath, entry.oid]));
+  }
+  async readBlobOid(oid) {
+    const result = await git.readObject({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid, format: "content" });
+    if (result.type !== "blob") throw new Error(`Git object ${oid} is not a blob.`);
+    return Buffer2.from(result.object);
   }
   async readBlob(commit2, filePath) {
     const result = await git.readBlob({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: commit2, filepath: filePath });
@@ -26420,6 +26480,34 @@ async function readJson(filePath, fallback) {
   } catch {
     return fallback;
   }
+}
+async function readApplyJournalStrict(filePath) {
+  try {
+    return parseApplyJournal(JSON.parse(await fsp.readFile(filePath, "utf8")));
+  } catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+function parseApplyJournal(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Apply journal is invalid.");
+  const operations = /* @__PURE__ */ new Set(["pull_apply", "initial_import", "replace_local_with_server", "rebuild_from_server"]);
+  const phases = /* @__PURE__ */ new Set(["planned", "recovery_bundle_written", "writing_files", "verifying", "committed", "blocked_recovery"]);
+  const affectedPaths = value.affected_paths;
+  const preflight = value.preflight_sha256;
+  if (typeof value.apply_id !== "string" || value.apply_id.length === 0 || typeof value.operation_type !== "string" || !operations.has(value.operation_type) || typeof value.target_main !== "string" || !/^[0-9a-f]{40}$/u.test(value.target_main) || !isNullableString(value.expected_prior_local_main) || !isNullableString(value.expected_prior_local_device_ref) || typeof value.phase !== "string" || !phases.has(value.phase) || !Array.isArray(affectedPaths) || affectedPaths.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath)) || new Set(affectedPaths).size !== affectedPaths.length || !preflight || typeof preflight !== "object" || Array.isArray(preflight) || affectedPaths.some((filePath) => !Object.hasOwn(preflight, filePath) || !isNullableSha256(preflight[filePath])) || !isNullableString(value.recovery_bundle_id) || !isNullableString(value.last_completed_step) || !isNullableString(value.redacted_error_category)) {
+    throw new Error("Apply journal is invalid.");
+  }
+  return value;
+}
+function isSafeJournalPath(filePath) {
+  return normalizePath2(filePath) === filePath && isValidVaultPath(filePath);
+}
+function isNullableString(value) {
+  return value === null || typeof value === "string";
+}
+function isNullableSha256(value) {
+  return value === null || typeof value === "string" && /^[0-9a-f]{64}$/u.test(value);
 }
 async function writeJson(filePath, value) {
   await fsp.mkdir(path.dirname(filePath), { recursive: true, mode: 448 });

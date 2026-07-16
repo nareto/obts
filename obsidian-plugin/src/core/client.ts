@@ -114,6 +114,16 @@ export type QueueState = {
   updated_at: string;
 };
 
+type RecoveryFileFingerprint =
+  | { kind: 'missing'; sha256: null; oid: null }
+  | { kind: 'file'; sha256: string; oid: string }
+  | { kind: 'other'; sha256: null; oid: null };
+
+type ApplyJournalValidation = {
+  matches: boolean;
+  targetMatchedPaths: Set<string>;
+};
+
 type DirectorySyncState = {
   observed_dirs: string[];
   explicit_empty_dirs: string[];
@@ -1755,7 +1765,8 @@ export class ObtsPluginClient {
         last_error_code: null,
         updated_at: nowIso()
       });
-      const targetFiles = new Set(await this.materializedTreeFiles(targetMain));
+      const targetEntries = await this.materializedTreeBlobOids(targetMain);
+      const targetFiles = new Set(targetEntries.keys());
       const affected = new Set(changedPaths);
       if (state.local_main) {
         for (const path of await this.materializedTreeFiles(state.local_main)) {
@@ -1774,7 +1785,8 @@ export class ObtsPluginClient {
       const affectedPaths = [...affected].filter((path) => isRecoverableApplyPath(path)).sort();
       const preflight: Record<string, string | null> = {};
       for (const path of affectedPaths) {
-        preflight[path] = await sha256File(join(this.vaultDir, path));
+        const fingerprint = await this.recoveryFileFingerprint(path);
+        preflight[path] = fingerprint.kind === 'file' ? fingerprint.sha256 : null;
       }
 
       const journal: ApplyJournal = {
@@ -1836,15 +1848,15 @@ export class ObtsPluginClient {
       journal.phase = 'writing_files';
       await this.recovery.writeApplyJournal(journal);
       for (const path of affectedPaths) {
-        const currentHash = await sha256File(join(this.vaultDir, path));
-        if (currentHash !== preflight[path]) {
+        const fingerprint = await this.recoveryFileFingerprint(path);
+        if (!this.fingerprintMatchesPreflight(fingerprint, preflight[path] ?? null)) {
           journal.phase = 'blocked_recovery';
           journal.redacted_error_category = 'preflight_hash_changed';
           await this.recovery.writeApplyJournal(journal);
           await this.block('unsafe_local_state', 'A local file changed during apply preflight.');
         }
       }
-      await this.writeTargetFilesFromJournal(journal, targetFiles);
+      await this.writeTargetFilesFromJournal(journal, targetEntries, new Set());
       await this.applyDirectoryChanges(directoryIntents, explicitDirectories);
 
       journal.phase = 'verifying';
@@ -1854,7 +1866,7 @@ export class ObtsPluginClient {
       if (options.requireCleanVisibleState) {
         await this.flushEditorBuffersToDisk();
         try {
-          preservedLocalChangePaths = await this.localChangedPathsFromTree(targetMain);
+          preservedLocalChangePaths = await this.localChangedPathsFromTree(targetEntries);
         } catch (error) {
           journal.phase = 'blocked_recovery';
           journal.redacted_error_category = categorizeRecoveryError(error);
@@ -1904,15 +1916,15 @@ export class ObtsPluginClient {
     }
 
     const canRecoverFinalVisibleTree = journal.last_completed_step === 'files_written' || journal.last_completed_step === 'refs_updated';
-    const targetFiles = new Set(await this.materializedTreeFiles(journal.target_main));
+    const targetEntries = await this.materializedTreeBlobOids(journal.target_main);
     let preservedLocalChangePaths: string[] = [];
     if (canRecoverFinalVisibleTree) {
-      preservedLocalChangePaths = await this.localChangedPathsFromTree(journal.target_main);
+      preservedLocalChangePaths = await this.localChangedPathsFromTree(targetEntries);
     } else {
-      if (!(await this.affectedApplyPathsMatchTarget(journal, targetFiles))) {
+      if (!(await this.affectedApplyPathsMatchTarget(journal, targetEntries))) {
         return false;
       }
-      preservedLocalChangePaths = await this.classifySafeResidualLocalChanges(state, journal, journal.target_main);
+      preservedLocalChangePaths = await this.classifySafeResidualLocalChanges(state, journal, targetEntries);
       if (preservedLocalChangePaths.length === 0) {
         return false;
       }
@@ -1964,8 +1976,9 @@ export class ObtsPluginClient {
       return false;
     }
 
-    const targetFiles = new Set(await this.materializedTreeFiles(journal.target_main));
-    if (!(await this.applyJournalMatchesCurrentFiles(journal, targetFiles))) {
+    const targetEntries = await this.materializedTreeBlobOids(journal.target_main);
+    const validation = await this.applyJournalMatchesCurrentFiles(journal, targetEntries);
+    if (!validation.matches) {
       journal.phase = 'blocked_recovery';
       journal.redacted_error_category = 'local_files_diverge_from_journal';
       journal.last_completed_step = journal.last_completed_step ?? 'recovery_bundle';
@@ -2000,11 +2013,17 @@ export class ObtsPluginClient {
       journal.phase = 'writing_files';
       journal.redacted_error_category = null;
       await this.recovery.writeApplyJournal(journal);
-      await this.writeTargetFilesFromJournal(journal, targetFiles);
+      await this.writeTargetFilesFromJournal(journal, targetEntries, validation.targetMatchedPaths);
 
       journal.phase = 'verifying';
       journal.last_completed_step = 'files_written';
       await this.recovery.writeApplyJournal(journal);
+      if (!(await this.affectedApplyPathsMatchTarget(journal, targetEntries))) {
+        journal.phase = 'blocked_recovery';
+        journal.redacted_error_category = 'local_changed_during_apply';
+        await this.recovery.writeApplyJournal(journal);
+        return false;
+      }
       await this.git.setLocalMain(journal.target_main);
       await this.git.setLocalHead(journal.target_main);
       journal.phase = 'committed';
@@ -2032,26 +2051,25 @@ export class ObtsPluginClient {
     }
   }
 
-  private async affectedApplyPathsMatchTarget(journal: ApplyJournal, targetFiles: Set<string>): Promise<boolean> {
+  private async affectedApplyPathsMatchTarget(
+    journal: ApplyJournal,
+    targetEntries: Map<string, string>
+  ): Promise<boolean> {
     for (const path of journal.affected_paths) {
-      const currentHash = await sha256File(join(this.vaultDir, path));
-      const targetContent = targetFiles.has(path) ? await this.git.readBlob(journal.target_main, path) : null;
-      const targetHash = targetContent === null ? null : sha256(targetContent);
-      if (currentHash !== targetHash) {
+      const fingerprint = await this.recoveryFileFingerprint(path);
+      if (!this.fingerprintMatchesTarget(fingerprint, targetEntries.get(path))) {
         return false;
       }
     }
     return true;
   }
 
-  private async localChangedPathsFromTree(targetMain: string): Promise<string[]> {
+  private async localChangedPathsFromTree(targetEntries: Map<string, string>): Promise<string[]> {
     const localFiles = new Set(await this.git.scanSyncableFiles());
-    const targetFiles = new Set(await this.materializedTreeFiles(targetMain));
     const changedPaths: string[] = [];
-    for (const path of [...new Set([...localFiles, ...targetFiles])].sort()) {
-      const localContent = localFiles.has(path) ? await readFile(join(this.vaultDir, path)) : null;
-      const targetContent = targetFiles.has(path) ? await this.git.readBlob(targetMain, path) : null;
-      if (!buffersEqual(localContent, targetContent)) {
+    for (const path of [...new Set([...localFiles, ...targetEntries.keys()])].sort()) {
+      const fingerprint = await this.recoveryFileFingerprint(path);
+      if (!this.fingerprintMatchesTarget(fingerprint, targetEntries.get(path))) {
         changedPaths.push(path);
       }
     }
@@ -2061,40 +2079,35 @@ export class ObtsPluginClient {
   private async classifySafeResidualLocalChanges(
     state: LocalPluginState,
     journal: ApplyJournal,
-    targetMain: string
+    targetEntries: Map<string, string>
   ): Promise<string[]> {
-    if (!(await this.localContentMatchesTree(await this.git.scanSyncableFiles(), targetMain))) {
-      const queue = await this.readQueue();
-      const pendingCommit = queue.status === 'conflicted' ? queue.pending_commit : null;
-      if (!pendingCommit || !(await this.git.commitExists(pendingCommit))) {
+    const queue = await this.readQueue();
+    const pendingCommit = queue.status === 'conflicted' ? queue.pending_commit : null;
+    if (!pendingCommit || !(await this.git.commitExists(pendingCommit))) {
+      return [];
+    }
+    const pendingEntries = await this.materializedTreeBlobOids(pendingCommit);
+    const priorEntries = state.local_main ? await this.materializedTreeBlobOids(state.local_main) : new Map<string, string>();
+    const localFiles = new Set(await this.git.scanSyncableFiles());
+    const candidatePaths = [...new Set([...localFiles, ...targetEntries.keys()])].sort();
+    const preservedPaths: string[] = [];
+    for (const path of candidatePaths) {
+      const fingerprint = await this.recoveryFileFingerprint(path);
+      if (this.fingerprintMatchesTarget(fingerprint, targetEntries.get(path))) {
+        continue;
+      }
+      if (journal.affected_paths.some((affectedPath) => changedPathsConflict(path, affectedPath))) {
         return [];
       }
-      const localFiles = new Set(await this.git.scanSyncableFiles());
-      const targetFiles = new Set(await this.materializedTreeFiles(targetMain));
-      const candidatePaths = [...new Set([...localFiles, ...targetFiles])].sort();
-      const preservedPaths: string[] = [];
-      for (const path of candidatePaths) {
-        const localContent = localFiles.has(path) ? await readFile(join(this.vaultDir, path)) : null;
-        const targetContent = targetFiles.has(path) ? await this.git.readBlob(targetMain, path) : null;
-        if (buffersEqual(localContent, targetContent)) {
-          continue;
-        }
-        if (journal.affected_paths.some((affectedPath) => changedPathsConflict(path, affectedPath))) {
-          return [];
-        }
-        const pendingContent = await this.git.readBlob(pendingCommit, path);
-        if (!buffersEqual(localContent, pendingContent)) {
-          return [];
-        }
-        const priorContent = state.local_main ? await this.git.readBlob(state.local_main, path) : null;
-        if (buffersEqual(pendingContent, priorContent)) {
-          return [];
-        }
-        preservedPaths.push(path);
+      if (!this.fingerprintMatchesTarget(fingerprint, pendingEntries.get(path))) {
+        return [];
       }
-      return preservedPaths;
+      if (this.fingerprintMatchesTarget(fingerprint, priorEntries.get(path))) {
+        return [];
+      }
+      preservedPaths.push(path);
     }
-    return [];
+    return preservedPaths;
   }
 
   private async queuePreservedLocalChanges(targetMain: string, expectedDeviceRef: string | null): Promise<void> {
@@ -2119,26 +2132,62 @@ export class ObtsPluginClient {
     });
   }
 
-  private async applyJournalMatchesCurrentFiles(journal: ApplyJournal, targetFiles: Set<string>): Promise<boolean> {
-    for (const path of journal.affected_paths) {
-      const currentHash = await sha256File(join(this.vaultDir, path));
-      const preflightHash = journal.preflight_sha256[path] ?? null;
-      if (currentHash === preflightHash) {
-        continue;
+  private async recoveryFileFingerprint(path: string): Promise<RecoveryFileFingerprint> {
+    const absolutePath = join(this.vaultDir, path);
+    let metadata;
+    try {
+      metadata = await stat(absolutePath);
+    } catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && (error.code === 'ENOENT' || error.code === 'ENOTDIR')) {
+        return { kind: 'missing', sha256: null, oid: null };
       }
-      if (journal.phase !== 'writing_files' && journal.phase !== 'verifying') {
-        return false;
-      }
-      const targetContent = targetFiles.has(path) ? await this.git.readBlob(journal.target_main, path) : null;
-      const targetHash = targetContent === null ? null : sha256(targetContent);
-      if (currentHash !== targetHash) {
-        return false;
-      }
+      throw error;
     }
-    return true;
+    if (!metadata.isFile()) return { kind: 'other', sha256: null, oid: null };
+    const content = await readFile(absolutePath);
+    return {
+      kind: 'file',
+      sha256: sha256(content),
+      oid: await this.git.hashBlob(content)
+    };
   }
 
-  private async writeTargetFilesFromJournal(journal: ApplyJournal, targetFiles: Set<string>): Promise<void> {
+  private fingerprintMatchesTarget(fingerprint: RecoveryFileFingerprint, targetOid: string | undefined): boolean {
+    return targetOid === undefined
+      ? fingerprint.kind === 'missing'
+      : fingerprint.kind === 'file' && fingerprint.oid === targetOid;
+  }
+
+  private fingerprintMatchesPreflight(fingerprint: RecoveryFileFingerprint, preflightHash: string | null): boolean {
+    return preflightHash === null
+      ? fingerprint.kind === 'missing' || fingerprint.kind === 'other'
+      : fingerprint.kind === 'file' && fingerprint.sha256 === preflightHash;
+  }
+
+  private async applyJournalMatchesCurrentFiles(
+    journal: ApplyJournal,
+    targetEntries: Map<string, string>
+  ): Promise<ApplyJournalValidation> {
+    const targetMatchedPaths = new Set<string>();
+    for (const path of journal.affected_paths) {
+      const fingerprint = await this.recoveryFileFingerprint(path);
+      const matchesTarget = this.fingerprintMatchesTarget(fingerprint, targetEntries.get(path));
+      if (matchesTarget) targetMatchedPaths.add(path);
+      if (this.fingerprintMatchesPreflight(fingerprint, journal.preflight_sha256[path] ?? null)) {
+        continue;
+      }
+      if ((journal.phase !== 'writing_files' && journal.phase !== 'verifying') || !matchesTarget) {
+        return { matches: false, targetMatchedPaths };
+      }
+    }
+    return { matches: true, targetMatchedPaths };
+  }
+
+  private async writeTargetFilesFromJournal(
+    journal: ApplyJournal,
+    targetEntries: Map<string, string>,
+    targetMatchedPaths: Set<string>
+  ): Promise<void> {
     const assertRecoveredDescendants = async (path: string): Promise<void> => {
       const descendants = await listLocalDescendantFiles(this.vaultDir, path);
       if (descendants.some((descendant) => !(descendant in journal.preflight_sha256))) {
@@ -2150,7 +2199,7 @@ export class ObtsPluginClient {
     };
 
     const obsoleteLocalPaths = journal.affected_paths
-      .filter((path) => !targetFiles.has(path))
+      .filter((path) => !targetEntries.has(path) && !targetMatchedPaths.has(path))
       .sort((left, right) => right.length - left.length);
     for (const path of obsoleteLocalPaths) {
       if (await pathIsDirectory(join(this.vaultDir, path))) {
@@ -2159,18 +2208,19 @@ export class ObtsPluginClient {
       await rm(join(this.vaultDir, path), { recursive: true, force: true });
     }
 
-    for (const path of journal.affected_paths.filter((candidate) => targetFiles.has(candidate))) {
-      const targetContent = await this.git.readBlob(journal.target_main, path);
+    const writePaths = journal.affected_paths
+      .filter((candidate) => targetEntries.has(candidate) && !targetMatchedPaths.has(candidate))
+      .sort((left, right) => targetEntries.get(left)!.localeCompare(targetEntries.get(right)!));
+    for (const path of writePaths) {
+      const targetContent = await this.git.readBlobOidRequired(targetEntries.get(path)!);
       const absolutePath = join(this.vaultDir, path);
-      if (targetContent !== null) {
-        await removeBlockingMaterializationPaths(this.vaultDir, path);
-        if (await pathIsDirectory(absolutePath)) {
-          await assertRecoveredDescendants(path);
-          await rm(absolutePath, { recursive: true, force: true });
-        }
-        await mkdir(dirname(absolutePath), { recursive: true, mode: 0o700 });
-        await writeFile(absolutePath, targetContent);
+      await removeBlockingMaterializationPaths(this.vaultDir, path);
+      if (await pathIsDirectory(absolutePath)) {
+        await assertRecoveredDescendants(path);
+        await rm(absolutePath, { recursive: true, force: true });
       }
+      await mkdir(dirname(absolutePath), { recursive: true, mode: 0o700 });
+      await writeFile(absolutePath, targetContent);
     }
   }
 
@@ -2461,6 +2511,12 @@ export class ObtsPluginClient {
 
   private async materializedTreeFiles(commit: string): Promise<string[]> {
     return (await this.git.listTreeFiles(commit)).filter((path) => isSyncableVaultPath(path));
+  }
+
+  private async materializedTreeBlobOids(commit: string): Promise<Map<string, string>> {
+    return new Map(
+      [...(await this.git.listTreeBlobOids(commit))].filter(([path]) => isSyncableVaultPath(path))
+    );
   }
 
   private async reconcileQueueWithLocalHead(state: LocalPluginState): Promise<void> {
@@ -3023,13 +3079,6 @@ export class ObtsPluginClient {
 
 function sha256(data: Buffer): string {
   return createHash('sha256').update(data).digest('hex');
-}
-
-function buffersEqual(left: Buffer | null, right: Buffer | null): boolean {
-  if (left === null || right === null) {
-    return left === right;
-  }
-  return left.equals(right);
 }
 
 function requireOnboardingBase(value: string | null): string {

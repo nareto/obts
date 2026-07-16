@@ -456,6 +456,37 @@ describe('mobile plugin artifact', () => {
     const packed = await git.packObjects({ ...sourceArgs, oids: [blob, tree, commit] });
     await expect((plugin as any).client.importPack(packed.packfile)).resolves.toBeUndefined();
     expect((await adapter.list('.obts/git/objects/pack')).files.some((file) => file.endsWith('.idx'))).toBe(true);
+    await adapter.writeBinary('note.md', new TextEncoder().encode('mobile bundle pack\n').buffer);
+    const packedTargetEntries = await (plugin as any).client.listTreeBlobOids(commit);
+    const packedClientReadBlob = (plugin as any).client.readBlob.bind((plugin as any).client);
+    let packedTargetBlobReads = 0;
+    (plugin as any).client.readBlob = async (...args: unknown[]) => {
+      packedTargetBlobReads += 1;
+      return await packedClientReadBlob(...args);
+    };
+    const packedValidation = await (plugin as any).client.applyJournalMatchesCurrentFiles({
+      phase: 'verifying',
+      affected_paths: ['note.md'],
+      preflight_sha256: { 'note.md': createHash('sha256').update('before apply\n').digest('hex') }
+    }, packedTargetEntries);
+    expect(packedValidation.matches).toBe(true);
+    expect([...packedValidation.targetMatchedPaths]).toEqual(['note.md']);
+    expect(await (plugin as any).client.localChangedPathsFromTree(packedTargetEntries)).toEqual([]);
+    await (plugin as any).client.writeTargetFilesFromJournal({
+      target_main: commit,
+      affected_paths: ['note.md'],
+      preflight_sha256: { 'note.md': createHash('sha256').update('before apply\n').digest('hex') }
+    }, packedTargetEntries, packedValidation.targetMatchedPaths);
+    expect(packedTargetBlobReads).toBe(0);
+    (plugin as any).client.readBlob = packedClientReadBlob;
+    const recoveryReadBinary = adapter.readBinary.bind(adapter);
+    adapter.readBinary = async (filePath: string) => {
+      if (filePath === 'note.md') throw new Error('transient recovery read failure');
+      return await recoveryReadBinary(filePath);
+    };
+    await expect((plugin as any).client.recoveryFileFingerprint('note.md')).rejects.toThrow();
+    await expect((plugin as any).client.createRecoveryBundle('pull_apply', commit, ['note.md'])).rejects.toThrow();
+    adapter.readBinary = recoveryReadBinary;
     const packFilesBeforeEmptyImport = (await adapter.list('.obts/git/objects/pack')).files;
     const emptyPackHeader = Buffer.alloc(12);
     emptyPackHeader.write('PACK', 0, 'ascii');
