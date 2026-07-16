@@ -112,7 +112,7 @@ Plugin commands include:
 
 Local runtime state and hidden client history live under `.obts/`, which is never synchronized as vault content. Rename a vault from the dashboard Overview; this changes server display metadata only. Rename a paired device from the dashboard Devices table or plugin settings. The plugin reconciles dashboard-side device renames during status reports.
 
-Error diagnostics are separate from sync status and are off by default. When enabled, the plugin sends failures only to the configured obts backend using a closed, sanitized schema; it never sends note content, vault or file names, paths, credentials, Git objects, packfiles, stacks, or raw logs. Changing the backend URL disables consent. Owners can inspect and delete retained reports from the dashboard Settings page.
+Error diagnostics are separate from sync status and are off by default. When enabled, the plugin sends failures and startup checkpoints that remain stalled for 30 seconds only to the configured obts backend using a closed, sanitized schema; it never sends note content, vault or file names, paths, credentials, Git objects, packfiles, stacks, or raw logs. Changing the backend URL disables consent. Owners can inspect and delete retained reports from the dashboard Settings page.
 
 ## Develop From Source
 

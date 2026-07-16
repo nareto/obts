@@ -16,6 +16,7 @@ const PERIODIC_FULL_SCAN_INTERVAL_MS = 5 * 60 * 1000;
 const SYNC_STALE_MS = 2 * 60 * 1000;
 const STATUS_LAG_NOTICE_DELAY_MS = 30 * 1000;
 const STATUS_NOTICE_DURATION_MS = 15 * 1000;
+const INITIALIZATION_STALL_DIAGNOSTIC_MS = 30 * 1000;
 const MOBILE_PACK_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 const MOBILE_PACK_READ_ATTEMPTS = 5;
 const MOBILE_PACK_READ_RETRY_MS = 100;
@@ -89,6 +90,11 @@ module.exports = class ObtsPlugin extends Plugin {
     this.clientReady = false;
     this.clientInitialization = null;
     this.initializationStage = null;
+    this.initializationStageStartedAt = null;
+    this.initializationDiagnosticPoint = null;
+    this.initializationDiagnosticToken = null;
+    this.initializationWatchdogTimer = null;
+    this.reportedInitializationStalls = new Set();
     this.layoutStarted = false;
     this.reportedDiagnosticErrors = new WeakSet();
     this.diagnosticNoticeShown = false;
@@ -205,6 +211,8 @@ module.exports = class ObtsPlugin extends Plugin {
       window.clearTimeout(this.retiredOperationTimer);
       this.retiredOperationTimer = null;
     }
+    this.clearInitializationWatchdog();
+    this.initializationDiagnosticToken = null;
     this.clearDegradedStatusTimer();
   }
 
@@ -216,12 +224,19 @@ module.exports = class ObtsPlugin extends Plugin {
           throw new ObtsBlockedError("sync_lease_blocked", this.syncBlockedMessage());
         }
         try {
-          this.initializationStage = "Starting local state checks";
+          this.setInitializationStage("Starting local state checks", null);
+          await this.prepareInitializationDiagnosticAuth();
           await this.client.initialize();
+          this.setInitializationStage("Finalizing local sync status", "startup_state");
+          const readyState = await this.client.readState();
           if (!this.unloaded) {
             this.clientReady = true;
+            this.clearInitializationWatchdog();
             this.initializationStage = null;
-            this.setStatus((await this.client.readState()).status_label);
+            this.initializationStageStartedAt = null;
+            this.initializationDiagnosticPoint = null;
+            this.initializationDiagnosticToken = null;
+            this.setStatus(readyState.status_label);
           }
         } finally {
           this.endSync();
@@ -237,6 +252,8 @@ module.exports = class ObtsPlugin extends Plugin {
 
   handleClientInitializationFailure() {
     if (this.unloaded) return;
+    this.clearInitializationWatchdog();
+    this.initializationDiagnosticToken = null;
     this.clientReady = false;
     this.setStatus("Recovery required");
     new Notice("obts could not finish local recovery after the plugin update. Fully restart Obsidian, then open obts settings.", 15000);
@@ -264,6 +281,47 @@ module.exports = class ObtsPlugin extends Plugin {
     } catch {
       this.handleClientInitializationFailure();
       return false;
+    }
+  }
+
+  setInitializationStage(label, diagnosticPoint) {
+    this.initializationStage = label;
+    this.initializationStageStartedAt = Date.now();
+    this.initializationDiagnosticPoint = diagnosticPoint;
+    this.clearInitializationWatchdog();
+    if (!diagnosticPoint || this.reportedInitializationStalls.has(diagnosticPoint)) return;
+    this.initializationWatchdogTimer = window.setTimeout(() => {
+      this.initializationWatchdogTimer = null;
+      if (
+        this.unloaded ||
+        this.clientReady ||
+        !this.clientInitialization ||
+        this.initializationDiagnosticPoint !== diagnosticPoint ||
+        this.reportedInitializationStalls.has(diagnosticPoint) ||
+        !this.diagnosticSharingEnabled() ||
+        !this.initializationDiagnosticToken
+      ) return;
+      this.reportedInitializationStalls.add(diagnosticPoint);
+      void this.reportInitializationStall(diagnosticPoint);
+    }, INITIALIZATION_STALL_DIAGNOSTIC_MS);
+  }
+
+  clearInitializationWatchdog() {
+    if (this.initializationWatchdogTimer !== null) {
+      window.clearTimeout(this.initializationWatchdogTimer);
+      this.initializationWatchdogTimer = null;
+    }
+  }
+
+  async prepareInitializationDiagnosticAuth() {
+    this.initializationDiagnosticToken = null;
+    if (!this.diagnosticSharingEnabled()) return;
+    try {
+      const state = await this.client.readPrimaryState() || await this.client.readBackupState();
+      if (!state || !state.vault_id || !state.device_id) return;
+      this.initializationDiagnosticToken = await this.client.readDeviceToken();
+    } catch {
+      // Startup diagnostics remain best effort and never change recovery.
     }
   }
 
@@ -362,6 +420,41 @@ module.exports = class ObtsPlugin extends Plugin {
       }
     } catch {
       // Diagnostic delivery is best effort and never changes sync behavior.
+    }
+  }
+
+  async reportInitializationStall(diagnosticPoint) {
+    if (
+      this.unloaded ||
+      !this.diagnosticSharingEnabled() ||
+      !this.initializationDiagnosticToken
+    ) return;
+    const consentDestination = this.settings.diagnosticConsentServer;
+    const token = this.initializationDiagnosticToken;
+    const report = buildStalledOperationDiagnostic(diagnosticPoint);
+    try {
+      if (
+        this.unloaded ||
+        !this.diagnosticSharingEnabled() ||
+        this.settings.diagnosticConsentServer !== consentDestination
+      ) return;
+      const response = await fetchWithTimeout(`${consentDestination}/api/v1/device/diagnostic-events`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify(report)
+      });
+      if (
+        response.ok &&
+        !this.unloaded &&
+        this.diagnosticSharingEnabled() &&
+        this.settings.diagnosticConsentServer === consentDestination &&
+        !this.diagnosticNoticeShown
+      ) {
+        this.diagnosticNoticeShown = true;
+        new Notice(`obts sent a sanitized stalled-operation diagnostic to ${consentDestination}.`);
+      }
+    } catch {
+      // Stall reporting must not alter or interrupt recovery.
     }
   }
 
@@ -818,22 +911,25 @@ class ObtsObsidianClient {
   }
 
   async initialize() {
-    this.plugin.initializationStage = "Recovering metadata replacements";
+    this.plugin.setInitializationStage("Recovering metadata replacements", "startup_metadata");
     await this.recoverInterruptedReplacements();
-    this.plugin.initializationStage = "Opening local Git state";
+    this.plugin.setInitializationStage("Opening local Git state", "startup_git");
     await fsp.mkdir(path.join(this.obtsDir, "auth"), { recursive: true, mode: 0o700 });
     await git.init({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, defaultBranch: "local" });
     await git.writeRef({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, ref: "HEAD", value: "refs/heads/local", symbolic: true, force: true });
     await fsp.mkdir(path.join(this.gitdir, "info"), { recursive: true, mode: 0o700 });
     await fsp.writeFile(path.join(this.gitdir, "info", "exclude"), ".obts/\n.git/\n", { mode: 0o600 });
-    this.plugin.initializationStage = "Reading local sync state";
+    this.plugin.setInitializationStage("Reading local sync state", "startup_state");
     const state = await this.repairLocalStateIfNeeded(await this.readState());
+    this.plugin.setInitializationStage("Checking interrupted apply journal", "recovery_journal");
     const journal = await readJson(this.applyJournalPath, null);
-    if (journal) this.plugin.initializationStage = "Recovering an interrupted apply";
+    if (journal) this.plugin.setInitializationStage("Recovering an interrupted apply", "recovery_journal");
     if (journal && journal.phase === "committed") {
+      this.plugin.setInitializationStage("Restoring recovered refs", "recovery_refs");
       await this.updateRef("refs/heads/main", journal.target_main, null, true);
       await this.updateRef("refs/heads/local", journal.target_main, null, true);
       await this.clearApplyState();
+      this.plugin.setInitializationStage("Persisting recovered sync state", "recovery_state");
       await this.writeState(Object.assign({}, state, {
         local_main: journal.target_main,
         local_head: journal.target_main,
@@ -852,6 +948,7 @@ class ObtsObsidianClient {
       return;
     }
     if (journal) {
+      this.plugin.setInitializationStage("Persisting blocked recovery state", "recovery_state");
       await this.writeState(Object.assign({}, state, {
         status_label: "Unsafe local state",
         last_error_code: "apply_journal_recovery_required",
@@ -859,7 +956,7 @@ class ObtsObsidianClient {
       }));
       return;
     }
-    this.plugin.initializationStage = "Persisting recovered metadata";
+    this.plugin.setInitializationStage("Persisting recovered metadata", "startup_state");
     await this.writeState(Object.assign({}, state, {
       status_label: state.status_label || "Checking",
       updated_at: nowIso()
@@ -2155,11 +2252,15 @@ class ObtsObsidianClient {
   }
 
   async recoverBlockedApplyWithPreservedLocalChanges(journal, state) {
-    if (journal.phase !== "blocked_recovery" || journal.redacted_error_category !== "local_changed_during_apply" || !(await this.commitExists(journal.target_main))) {
+    if (journal.phase !== "blocked_recovery" || journal.redacted_error_category !== "local_changed_during_apply") {
       return false;
     }
+    this.plugin.setInitializationStage("Reading interrupted apply target commit", "recovery_target_commit");
+    if (!(await this.commitExists(journal.target_main))) return false;
     const canRecoverFinalVisibleTree = journal.last_completed_step === "files_written" || journal.last_completed_step === "refs_updated";
+    this.plugin.setInitializationStage("Reading interrupted apply target tree", "recovery_target_tree");
     const targetFiles = new Set(await this.listTreeFiles(journal.target_main));
+    this.plugin.setInitializationStage("Validating interrupted apply files", "recovery_file_validation");
     let preservedLocalChangePaths = [];
     if (canRecoverFinalVisibleTree) {
       preservedLocalChangePaths = await this.localChangedPathsFromTree(journal.target_main);
@@ -2177,14 +2278,17 @@ class ObtsObsidianClient {
       await this.acquireApplyLock(journal.apply_id);
       this.plugin.isApplying = true;
       if (preservedLocalChangePaths.length > 0) {
+        this.plugin.setInitializationStage("Writing interrupted apply recovery bundle", "recovery_bundle");
         await this.createRecoveryBundle("rebuild_from_server", journal.target_main, preservedLocalChangePaths);
       }
+      this.plugin.setInitializationStage("Restoring interrupted apply refs", "recovery_refs");
       await this.updateRef("refs/heads/main", journal.target_main, null, true);
       await this.updateRef("refs/heads/local", journal.target_main, null, true);
       journal.phase = "committed";
       journal.last_completed_step = "refs_updated";
       journal.redacted_error_category = null;
       await writeJson(this.applyJournalPath, journal);
+      this.plugin.setInitializationStage("Persisting interrupted apply state", "recovery_state");
       await this.writeState(Object.assign({}, state, {
         local_main: journal.target_main,
         local_head: journal.target_main,
@@ -2212,10 +2316,13 @@ class ObtsObsidianClient {
     if (journal.phase === "blocked_recovery" && journal.redacted_error_category === "local_changed_during_apply") {
       return false;
     }
+    this.plugin.setInitializationStage("Reading interrupted apply target commit", "recovery_target_commit");
     if (!(await this.commitExists(journal.target_main))) {
       return false;
     }
+    this.plugin.setInitializationStage("Reading interrupted apply target tree", "recovery_target_tree");
     const targetFiles = new Set(await this.listTreeFiles(journal.target_main));
+    this.plugin.setInitializationStage("Validating interrupted apply files", "recovery_file_validation");
     if (!(await this.applyJournalMatchesCurrentFiles(journal, targetFiles))) {
       journal.phase = "blocked_recovery";
       journal.redacted_error_category = "local_files_diverge_from_journal";
@@ -2228,6 +2335,7 @@ class ObtsObsidianClient {
       await this.acquireApplyLock(journal.apply_id);
       this.plugin.isApplying = true;
       if (journal.affected_paths.length > 0 && journal.recovery_bundle_id === null) {
+        this.plugin.setInitializationStage("Writing interrupted apply recovery bundle", "recovery_bundle");
         journal.recovery_bundle_id = await this.createRecoveryBundle(journal.operation_type, journal.target_main, journal.affected_paths, journal);
         journal.last_completed_step = "recovery_bundle";
         journal.phase = "recovery_bundle_written";
@@ -2236,15 +2344,18 @@ class ObtsObsidianClient {
       journal.phase = "writing_files";
       journal.redacted_error_category = null;
       await writeJson(this.applyJournalPath, journal);
+      this.plugin.setInitializationStage("Restoring interrupted apply files", "recovery_file_apply");
       await this.writeTargetFilesFromJournal(journal, targetFiles);
       journal.phase = "verifying";
       journal.last_completed_step = "files_written";
       await writeJson(this.applyJournalPath, journal);
+      this.plugin.setInitializationStage("Restoring interrupted apply refs", "recovery_refs");
       await this.updateRef("refs/heads/main", journal.target_main, null, true);
       await this.updateRef("refs/heads/local", journal.target_main, null, true);
       journal.phase = "committed";
       journal.last_completed_step = "refs_updated";
       await writeJson(this.applyJournalPath, journal);
+      this.plugin.setInitializationStage("Persisting interrupted apply state", "recovery_state");
       await this.writeState(Object.assign({}, state, {
         local_main: journal.target_main,
         local_head: journal.target_main,
@@ -3466,7 +3577,7 @@ class ObtsObsidianClient {
       }
     }
 
-    this.plugin.initializationStage = "Validating local state history";
+    this.plugin.setInitializationStage("Validating local state history", "startup_state");
     if (await this.backupStateCursorsDescend(primaryState, backupState)) {
       return backupState;
     }
@@ -3537,7 +3648,7 @@ class ObtsObsidianClient {
     if (state.last_error_code !== "local_state_incomplete") {
       return state;
     }
-    this.plugin.initializationStage = "Repairing incomplete local state";
+    this.plugin.setInitializationStage("Repairing incomplete local state", "startup_state");
     let token;
     try {
       token = await this.readDeviceToken();
@@ -4082,7 +4193,7 @@ class ObtsOnboardingModal extends Modal {
       .setDesc(diagnosticSharingDescription(this.plugin.settings.serverUrl))
       .addToggle((toggle) => toggle.setValue(this.plugin.diagnosticSharingEnabled()).onChange(async (value) => {
         try {
-          await this.plugin.runExclusiveAction(() => this.plugin.setDiagnosticSharing(value));
+          await this.plugin.setDiagnosticSharing(value);
         } catch (error) {
           new Notice(error instanceof Error ? error.message : "Unable to update diagnostic sharing.");
           this.renderStart();
@@ -4366,6 +4477,7 @@ class ObtsSettingTab extends PluginSettingTab {
     const restartRequired = availability === "restart_required";
     const initializationInProgress = clientUnavailable && Boolean(this.plugin.clientInitialization);
     const initializationStage = this.plugin.initializationStage || "Checking local obts state";
+    const initializationElapsed = formatElapsed(Date.now() - (this.plugin.initializationStageStartedAt || Date.now()));
     const deviceName = this.plugin.settings.deviceName || state && state.device_name || "Obsidian device";
 
     new Setting(containerEl)
@@ -4389,7 +4501,7 @@ class ObtsSettingTab extends PluginSettingTab {
       .setDesc(diagnosticSharingDescription(this.plugin.settings.serverUrl))
       .addToggle((toggle) => toggle.setValue(this.plugin.diagnosticSharingEnabled()).onChange(async (value) => {
         try {
-          await this.plugin.runExclusiveAction(() => this.plugin.setDiagnosticSharing(value));
+          await this.plugin.setDiagnosticSharing(value);
         } catch (error) {
           new Notice(error instanceof Error ? error.message : "Unable to update diagnostic sharing.");
         }
@@ -4441,7 +4553,7 @@ class ObtsSettingTab extends PluginSettingTab {
           restartRequired
             ? "Fully close Obsidian and reopen it. obts will not clear the old operation lock because doing so could overlap vault writes."
             : initializationInProgress
-              ? "The vault remains available while this background step finishes. Close and reopen settings to refresh its progress."
+              ? `This checkpoint has been running for ${initializationElapsed}. The vault remains available while it finishes. Close and reopen settings to refresh.`
               : "obts will finish loading when the previous plugin instance releases its active vault operation."
         );
     } else if (pendingOnboarding) {
@@ -4641,7 +4753,17 @@ function normalizeDisplayName(value) {
 
 function diagnosticSharingDescription(serverUrl) {
   const destination = normalizedServerDestination(serverUrl) || "the configured obts backend";
-  return `When obts fails, send a small sanitized technical report to ${destination}. Reports include plugin and platform versions, the failing operation, fixed error codes, and diagnostic checkpoints. They never include note content, vault or file names, paths, credentials, Git objects, packfiles, or raw logs.`;
+  return `When obts fails or a startup checkpoint stalls, send a small sanitized technical report to ${destination}. Reports include plugin and platform versions, the failing operation, fixed error codes, and diagnostic checkpoints. They never include note content, vault or file names, paths, credentials, Git objects, packfiles, or raw logs.`;
+}
+
+function formatElapsed(milliseconds) {
+  const seconds = Math.max(0, Math.floor(milliseconds / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  if (minutes < 60) return `${minutes}m ${remainingSeconds}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
 }
 
 function formatBytes(value) {
@@ -5206,6 +5328,29 @@ function diagnosticContextForError(error) {
     current = current.cause;
   }
   return null;
+}
+
+function buildStalledOperationDiagnostic(diagnosticPoint) {
+  const recovery = diagnosticPoint.startsWith("recovery_");
+  return {
+    schema_version: 1,
+    event_id: `dgr_${randomHex(16)}`,
+    plugin_version: PLUGIN_VERSION,
+    obsidian_version: typeof apiVersion === "string" && apiVersion ? apiVersion : "unknown",
+    platform_family: Platform && Platform.isIosApp ? "ios" : Platform && Platform.isAndroidApp ? "android" : "desktop",
+    flow: recovery ? "recovery" : "plugin",
+    stage: recovery ? "recovery" : "plugin_lifecycle",
+    failure_code: "operation_stalled",
+    error_class: "unknown",
+    retryable: true,
+    breadcrumbs: [{
+      point: diagnosticPoint,
+      outcome: "started",
+      value_kind: "unknown",
+      size_bucket: "unknown",
+      error_code: "none"
+    }]
+  };
 }
 
 function buildDiagnosticReport(error) {

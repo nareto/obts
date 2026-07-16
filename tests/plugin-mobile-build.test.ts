@@ -40,6 +40,8 @@ describe('mobile plugin artifact', () => {
     expect(browserHandoff).toContain('await this.waitForBrowserReturn()');
     expect(browserHandoff).toContain('this.showWaitingError(error, "Unable to start setup.")');
     expect(browserHandoff).not.toContain('setFeedback(feedback, error instanceof Error');
+    expect(source).not.toContain('runExclusiveAction(() => this.plugin.setDiagnosticSharing');
+    expect(source).toContain('await this.plugin.setDiagnosticSharing(value)');
   });
 
   it('loads with only the Obsidian API external and browser globals', async () => {
@@ -87,10 +89,12 @@ describe('mobile plugin artifact', () => {
     const layoutReadyCallbacks: Array<() => void> = [];
     const settingTabs: any[] = [];
     const renderedSettingNames: string[] = [];
+    const renderedSettingDescriptions: string[] = [];
     const renderedElementTexts: string[] = [];
     const createContainer = (): any => ({
       empty() {
         renderedSettingNames.length = 0;
+        renderedSettingDescriptions.length = 0;
         renderedElementTexts.length = 0;
       },
       createEl(_tag: string, options: { text?: string } = {}) {
@@ -124,7 +128,7 @@ describe('mobile plugin artifact', () => {
     class Setting {
       constructor(_container: any) {}
       setName(value: string) { renderedSettingNames.push(value); return this; }
-      setDesc(_value: string) { return this; }
+      setDesc(value: string) { renderedSettingDescriptions.push(value); return this; }
       addText(callback: (control: any) => void) { callback(createControl()); return this; }
       addToggle(callback: (control: any) => void) { callback(createControl()); return this; }
       addButton(callback: (control: any) => void) { callback(createControl()); return this; }
@@ -318,7 +322,8 @@ describe('mobile plugin artifact', () => {
     layoutReadyCallbacks.shift()!();
     await settingTabs[0]!.display();
     expect(renderedElementTexts).toContain('Loading obts');
-    expect(renderedSettingNames).toContain('Recovering metadata replacements');
+    expect(renderedSettingNames.some((value) => ['Starting local state checks', 'Recovering metadata replacements'].includes(value))).toBe(true);
+    expect(renderedSettingDescriptions.some((value) => value.includes('checkpoint has been running for'))).toBe(true);
     expect(renderedSettingNames).not.toContain('Waiting for the previous operation');
     expect(await (plugin as any).ensureClientReady()).toBe(true);
     expect(startupPackReads).toBe(0);
@@ -459,6 +464,80 @@ describe('mobile plugin artifact', () => {
     const emptyPack = Buffer.concat([emptyPackHeader, createHash('sha1').update(emptyPackHeader).digest()]);
     await expect((plugin as any).client.importPack(emptyPack)).resolves.toBeUndefined();
     expect((await adapter.list('.obts/git/objects/pack')).files).toEqual(packFilesBeforeEmptyImport);
+
+    const originalWindowSetTimeout = (context as any).setTimeout;
+    const originalWindowClearTimeout = (context as any).clearTimeout;
+    let stallWatchdog: (() => void) | null = null;
+    (context as any).setTimeout = (callback: () => void, delay: number) => {
+      if (delay === 30_000) {
+        stallWatchdog = callback;
+        return 99_001;
+      }
+      return originalWindowSetTimeout(callback, delay);
+    };
+    (context as any).clearTimeout = (timer: number) => {
+      if (timer !== 99_001) originalWindowClearTimeout(timer);
+    };
+    const clientReadState = (plugin as any).client.readState;
+    const clientReadPrimaryState = (plugin as any).client.readPrimaryState;
+    const clientReadDeviceToken = (plugin as any).client.readDeviceToken;
+    (plugin as any).client.readState = async () => { throw new Error('stalled diagnostics must not read state'); };
+    (plugin as any).client.readPrimaryState = async () => ({ vault_id: 'vlt_stall', device_id: 'dev_stall' });
+    (plugin as any).client.readDeviceToken = async () => 'test-device-token';
+    (plugin as any).settings.shareErrorDiagnostics = true;
+    (plugin as any).settings.diagnosticConsentServer = 'http://127.0.0.1:3000';
+    (plugin as any).settings.diagnosticConsentVersion = 1;
+    (plugin as any).setInitializationStage('Starting local state checks', null);
+    expect(stallWatchdog).toBeNull();
+    await (plugin as any).prepareInitializationDiagnosticAuth();
+    expect((plugin as any).initializationDiagnosticToken).toBe('test-device-token');
+    (plugin as any).clientReady = false;
+    (plugin as any).clientInitialization = Promise.resolve();
+    (plugin as any).setInitializationStage('Checking interrupted apply journal', 'recovery_journal');
+    const staleWatchdog = stallWatchdog!;
+    stallWatchdog = null;
+    (plugin as any).setInitializationStage('Reading interrupted apply target commit', 'recovery_target_commit');
+    const activeWatchdog = stallWatchdog!;
+    staleWatchdog();
+    await Promise.resolve();
+    expect(requests).toHaveLength(0);
+    activeWatchdog();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(requests).toHaveLength(1);
+    stallWatchdog = null;
+    (plugin as any).setInitializationStage('Reading interrupted apply target commit', 'recovery_target_commit');
+    expect(stallWatchdog).toBeNull();
+    const stallRequest = requests.at(-1)!;
+    const stallReport = JSON.parse(stallRequest.body as string) as Record<string, any>;
+    expect(stallRequest.url).toBe('http://127.0.0.1:3000/api/v1/device/diagnostic-events');
+    expect((stallRequest.headers as Record<string, string>).authorization).toBe('Bearer test-device-token');
+    expect(stallReport).toMatchObject({
+      flow: 'recovery',
+      stage: 'recovery',
+      failure_code: 'operation_stalled',
+      retryable: true,
+      breadcrumbs: [{ point: 'recovery_target_commit', outcome: 'started' }]
+    });
+    expect(JSON.stringify(stallReport)).not.toContain('stalled diagnostics must not read state');
+    await (plugin as any).setDiagnosticSharing(false);
+    stallWatchdog = null;
+    (plugin as any).setInitializationStage('Reading interrupted apply target tree', 'recovery_target_tree');
+    expect(stallWatchdog).not.toBeNull();
+    stallWatchdog!();
+    await Promise.resolve();
+    expect(requests).toHaveLength(1);
+    (plugin as any).client.readState = clientReadState;
+    (plugin as any).client.readPrimaryState = clientReadPrimaryState;
+    (plugin as any).client.readDeviceToken = clientReadDeviceToken;
+    (plugin as any).clientInitialization = null;
+    (plugin as any).clientReady = true;
+    (plugin as any).settings.shareErrorDiagnostics = false;
+    (plugin as any).settings.diagnosticConsentServer = '';
+    (plugin as any).settings.diagnosticConsentVersion = 0;
+    requests.length = 0;
+    (context as any).setTimeout = originalWindowSetTimeout;
+    (context as any).clearTimeout = originalWindowClearTimeout;
 
     const runtimeAdapter = new MemoryDataAdapter();
     const runtimeLayoutReadyCallbacks: Array<() => void> = [];

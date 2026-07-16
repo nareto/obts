@@ -60,7 +60,10 @@ system to keep Obsidian running in the background.
 8. With diagnostic sharing still off, trigger a disposable error and confirm no
    diagnostic request or server record is created. Enable **Share error
    diagnostics with this obts server**, reproduce one failure, and confirm one
-   sanitized report appears on the owner Settings page.
+   sanitized report appears on the owner Settings page. Hold a disposable
+   startup recovery checkpoint for over 30 seconds and confirm exactly one
+   `operation_stalled` report identifies the fixed checkpoint without clearing
+   the apply journal, releasing the operation lease, or starting another sync.
 9. Confirm the report contains only fixed operation checkpoints and coarse
    runtime values, with no note content, vault/file names, paths, credentials,
    commit IDs, Git objects, pack bytes, messages, or stacks. Change the server
