@@ -2691,10 +2691,68 @@ export class ObtsPluginClient {
     if (!backupState || !samePairedDeviceState(primaryState, backupState)) {
       return primaryState;
     }
+    if (sameStateCursors(primaryState, backupState)) return primaryState;
+
+    const [localMain, localHead] = await Promise.all([
+      this.git.resolveRef('refs/heads/main'),
+      this.git.resolveRef('refs/heads/local')
+    ]);
+    const primaryMatchesRefs = primaryState.local_main === localMain && primaryState.local_head === localHead;
+    const backupMatchesRefs = backupState.local_main === localMain && backupState.local_head === localHead;
+    const comparableLocalCursors = Boolean(
+      primaryState.local_main && primaryState.local_head && backupState.local_main && backupState.local_head
+    );
+    if (comparableLocalCursors && primaryMatchesRefs !== backupMatchesRefs) {
+      return backupMatchesRefs ? await this.restoreRecoveredBackupState(primaryState, backupState) : primaryState;
+    }
+    if (comparableLocalCursors && primaryMatchesRefs && backupMatchesRefs) {
+      const expectedDeviceRef = (await this.readQueue()).expected_device_ref;
+      const primaryMatchesQueue = primaryState.server_device_ref === expectedDeviceRef;
+      const backupMatchesQueue = backupState.server_device_ref === expectedDeviceRef;
+      if (primaryMatchesQueue !== backupMatchesQueue) {
+        return backupMatchesQueue
+          ? await this.restoreRecoveredBackupState(primaryState, backupState, expectedDeviceRef)
+          : primaryState;
+      }
+    }
+
     if (await this.backupStateCursorsDescend(primaryState, backupState)) {
       return backupState;
     }
     return primaryState;
+  }
+
+  private async restoreRecoveredBackupState(
+    primaryState: LocalPluginState,
+    backupState: LocalPluginState,
+    knownExpectedDeviceRef: string | null | undefined = undefined
+  ): Promise<LocalPluginState> {
+    const expectedDeviceRef = knownExpectedDeviceRef === undefined
+      ? (await this.readQueue()).expected_device_ref
+      : knownExpectedDeviceRef;
+    const backupMatchesQueue = Boolean(expectedDeviceRef && backupState.server_device_ref === expectedDeviceRef);
+    const recoveredServerDeviceRef = backupMatchesQueue
+      ? backupState.server_device_ref
+      : primaryState.server_device_ref;
+    const preservePrimaryServerState = recoveredServerDeviceRef === primaryState.server_device_ref &&
+      primaryState.server_device_ref !== backupState.server_device_ref;
+    const recovered: LocalPluginState = {
+      ...backupState,
+      device_name: primaryState.device_name || backupState.device_name || null,
+      server_device_ref: recoveredServerDeviceRef,
+      initial_import_confirmed: primaryState.initial_import_confirmed || backupState.initial_import_confirmed,
+      last_event_seq: Math.max(primaryState.last_event_seq || 0, backupState.last_event_seq || 0),
+      updated_at: nowIso(),
+      ...(preservePrimaryServerState
+        ? {
+            status_label: primaryState.status_label,
+            last_error_code: primaryState.last_error_code,
+            last_error_details: primaryState.last_error_details || null
+          }
+        : {})
+    };
+    await writeJson(this.statePath, recovered);
+    return recovered;
   }
 
   private async backupStateCursorsDescend(primaryState: LocalPluginState, backupState: LocalPluginState): Promise<boolean> {
@@ -3198,6 +3256,12 @@ function samePairedDeviceState(left: LocalPluginState, right: LocalPluginState):
       left.vault_id === right.vault_id &&
       left.device_id === right.device_id
   );
+}
+
+function sameStateCursors(left: LocalPluginState, right: LocalPluginState): boolean {
+  return left.local_main === right.local_main &&
+    left.local_head === right.local_head &&
+    left.server_device_ref === right.server_device_ref;
 }
 
 function categorizeRecoveryError(error: unknown): string {

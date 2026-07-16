@@ -88,6 +88,7 @@ module.exports = class ObtsPlugin extends Plugin {
     this.retiredOperationNoticeShown = false;
     this.clientReady = false;
     this.clientInitialization = null;
+    this.initializationStage = null;
     this.layoutStarted = false;
     this.reportedDiagnosticErrors = new WeakSet();
     this.diagnosticNoticeShown = false;
@@ -215,9 +216,11 @@ module.exports = class ObtsPlugin extends Plugin {
           throw new ObtsBlockedError("sync_lease_blocked", this.syncBlockedMessage());
         }
         try {
+          this.initializationStage = "Starting local state checks";
           await this.client.initialize();
           if (!this.unloaded) {
             this.clientReady = true;
+            this.initializationStage = null;
             this.setStatus((await this.client.readState()).status_label);
           }
         } finally {
@@ -815,14 +818,18 @@ class ObtsObsidianClient {
   }
 
   async initialize() {
+    this.plugin.initializationStage = "Recovering metadata replacements";
     await this.recoverInterruptedReplacements();
+    this.plugin.initializationStage = "Opening local Git state";
     await fsp.mkdir(path.join(this.obtsDir, "auth"), { recursive: true, mode: 0o700 });
     await git.init({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, defaultBranch: "local" });
     await git.writeRef({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, ref: "HEAD", value: "refs/heads/local", symbolic: true, force: true });
     await fsp.mkdir(path.join(this.gitdir, "info"), { recursive: true, mode: 0o700 });
     await fsp.writeFile(path.join(this.gitdir, "info", "exclude"), ".obts/\n.git/\n", { mode: 0o600 });
+    this.plugin.initializationStage = "Reading local sync state";
     const state = await this.repairLocalStateIfNeeded(await this.readState());
     const journal = await readJson(this.applyJournalPath, null);
+    if (journal) this.plugin.initializationStage = "Recovering an interrupted apply";
     if (journal && journal.phase === "committed") {
       await this.updateRef("refs/heads/main", journal.target_main, null, true);
       await this.updateRef("refs/heads/local", journal.target_main, null, true);
@@ -852,6 +859,7 @@ class ObtsObsidianClient {
       }));
       return;
     }
+    this.plugin.initializationStage = "Persisting recovered metadata";
     await this.writeState(Object.assign({}, state, {
       status_label: state.status_label || "Checking",
       updated_at: nowIso()
@@ -3309,9 +3317,18 @@ class ObtsObsidianClient {
 
   async resolveRef(ref) {
     try {
-      const oid = await git.resolveRef({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, ref });
+      const oid = await this.resolveRefPointer(ref);
+      if (!oid) return null;
       await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid });
       return oid;
+    } catch {
+      return null;
+    }
+  }
+
+  async resolveRefPointer(ref) {
+    try {
+      return await git.resolveRef({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, ref });
     } catch {
       return null;
     }
@@ -3424,10 +3441,59 @@ class ObtsObsidianClient {
     if (!backupState || !samePairedDeviceState(primaryState, backupState)) {
       return primaryState;
     }
+    if (sameStateCursors(primaryState, backupState)) return primaryState;
+
+    const [localMain, localHead] = await Promise.all([
+      this.resolveRefPointer("refs/heads/main"),
+      this.resolveRefPointer("refs/heads/local")
+    ]);
+    const primaryMatchesRefs = primaryState.local_main === localMain && primaryState.local_head === localHead;
+    const backupMatchesRefs = backupState.local_main === localMain && backupState.local_head === localHead;
+    const comparableLocalCursors = Boolean(
+      primaryState.local_main && primaryState.local_head && backupState.local_main && backupState.local_head
+    );
+    if (comparableLocalCursors && primaryMatchesRefs !== backupMatchesRefs) {
+      return backupMatchesRefs ? await this.restoreRecoveredBackupState(primaryState, backupState) : primaryState;
+    }
+    if (comparableLocalCursors && primaryMatchesRefs && backupMatchesRefs) {
+      const expectedDeviceRef = (await this.readQueue()).expected_device_ref;
+      const primaryMatchesQueue = primaryState.server_device_ref === expectedDeviceRef;
+      const backupMatchesQueue = backupState.server_device_ref === expectedDeviceRef;
+      if (primaryMatchesQueue !== backupMatchesQueue) {
+        return backupMatchesQueue
+          ? await this.restoreRecoveredBackupState(primaryState, backupState, expectedDeviceRef)
+          : primaryState;
+      }
+    }
+
+    this.plugin.initializationStage = "Validating local state history";
     if (await this.backupStateCursorsDescend(primaryState, backupState)) {
       return backupState;
     }
     return primaryState;
+  }
+
+  async restoreRecoveredBackupState(primaryState, backupState, knownExpectedDeviceRef = undefined) {
+    const expectedDeviceRef = knownExpectedDeviceRef === undefined
+      ? (await this.readQueue()).expected_device_ref
+      : knownExpectedDeviceRef;
+    const backupMatchesQueue = expectedDeviceRef && backupState.server_device_ref === expectedDeviceRef;
+    const recovered = Object.assign({}, backupState, {
+      device_name: primaryState.device_name || backupState.device_name || null,
+      server_device_ref: backupMatchesQueue
+        ? backupState.server_device_ref
+        : primaryState.server_device_ref,
+      initial_import_confirmed: Boolean(primaryState.initial_import_confirmed || backupState.initial_import_confirmed),
+      last_event_seq: Math.max(primaryState.last_event_seq || 0, backupState.last_event_seq || 0),
+      updated_at: nowIso()
+    });
+    if (recovered.server_device_ref === primaryState.server_device_ref && primaryState.server_device_ref !== backupState.server_device_ref) {
+      recovered.status_label = primaryState.status_label;
+      recovered.last_error_code = primaryState.last_error_code;
+      recovered.last_error_details = primaryState.last_error_details || null;
+    }
+    await writeJson(this.statePath, recovered);
+    return recovered;
   }
 
   async backupStateCursorsDescend(primaryState, backupState) {
@@ -3471,6 +3537,7 @@ class ObtsObsidianClient {
     if (state.last_error_code !== "local_state_incomplete") {
       return state;
     }
+    this.plugin.initializationStage = "Repairing incomplete local state";
     let token;
     try {
       token = await this.readDeviceToken();
@@ -4298,6 +4365,7 @@ class ObtsSettingTab extends PluginSettingTab {
     const recoveryBlocked = Boolean(state && state.last_error_code === "local_state_incomplete");
     const restartRequired = availability === "restart_required";
     const initializationInProgress = clientUnavailable && Boolean(this.plugin.clientInitialization);
+    const initializationStage = this.plugin.initializationStage || "Checking local obts state";
     const deviceName = this.plugin.settings.deviceName || state && state.device_name || "Obsidian device";
 
     new Setting(containerEl)
@@ -4366,14 +4434,14 @@ class ObtsSettingTab extends PluginSettingTab {
           restartRequired
             ? "Plugin update interrupted an operation"
             : initializationInProgress
-              ? "Checking local obts state"
+              ? initializationStage
               : "Waiting for the previous operation"
         )
         .setDesc(
           restartRequired
             ? "Fully close Obsidian and reopen it. obts will not clear the old operation lock because doing so could overlap vault writes."
             : initializationInProgress
-              ? "obts is recovering local metadata in the background. The vault remains available while this finishes."
+              ? "The vault remains available while this background step finishes. Close and reopen settings to refresh its progress."
               : "obts will finish loading when the previous plugin instance releases its active vault operation."
         );
     } else if (pendingOnboarding) {
@@ -4965,6 +5033,12 @@ function samePairedDeviceState(left, right) {
       left.vault_id === right.vault_id &&
       left.device_id === right.device_id
   );
+}
+
+function sameStateCursors(left, right) {
+  return left.local_main === right.local_main &&
+    left.local_head === right.local_head &&
+    left.server_device_ref === right.server_device_ref;
 }
 
 function blockStatusLabel(code) {

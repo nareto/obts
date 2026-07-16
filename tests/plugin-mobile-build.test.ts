@@ -318,7 +318,7 @@ describe('mobile plugin artifact', () => {
     layoutReadyCallbacks.shift()!();
     await settingTabs[0]!.display();
     expect(renderedElementTexts).toContain('Loading obts');
-    expect(renderedSettingNames).toContain('Checking local obts state');
+    expect(renderedSettingNames).toContain('Recovering metadata replacements');
     expect(renderedSettingNames).not.toContain('Waiting for the previous operation');
     expect(await (plugin as any).ensureClientReady()).toBe(true);
     expect(startupPackReads).toBe(0);
@@ -335,6 +335,101 @@ describe('mobile plugin artifact', () => {
     expect(await adapter.exists('.obts/git/HEAD')).toBe(true);
     expect(await adapter.exists('.obts/state.json')).toBe(true);
     expect(await adapter.exists('.obts/queue.json')).toBe(true);
+
+    const stateClient = (plugin as any).client;
+    const primaryState = {
+      vault_id: 'vlt_state',
+      device_id: 'dev_state',
+      local_main: '1'.repeat(40),
+      local_head: '2'.repeat(40),
+      server_device_ref: '3'.repeat(40)
+    };
+    const backupState = {
+      ...primaryState,
+      local_main: '4'.repeat(40),
+      local_head: '5'.repeat(40),
+      server_device_ref: '6'.repeat(40)
+    };
+    const readBackupState = stateClient.readBackupState.bind(stateClient);
+    const readQueue = stateClient.readQueue.bind(stateClient);
+    const resolveRefPointer = stateClient.resolveRefPointer.bind(stateClient);
+    const restoreRecoveredBackupState = stateClient.restoreRecoveredBackupState.bind(stateClient);
+    const backupStateCursorsDescend = stateClient.backupStateCursorsDescend.bind(stateClient);
+    let ancestryChecks = 0;
+    let restoredBackups = 0;
+    stateClient.readBackupState = async () => backupState;
+    stateClient.resolveRefPointer = async (ref: string) => ref.endsWith('/main') ? primaryState.local_main : primaryState.local_head;
+    stateClient.restoreRecoveredBackupState = async (_primary: unknown, backup: unknown) => { restoredBackups += 1; return backup; };
+    stateClient.backupStateCursorsDescend = async () => { ancestryChecks += 1; return false; };
+    expect(await stateClient.preferRecoverableBackupState(primaryState)).toBe(primaryState);
+    stateClient.resolveRefPointer = async (ref: string) => ref.endsWith('/main') ? backupState.local_main : backupState.local_head;
+    expect(await stateClient.preferRecoverableBackupState(primaryState)).toBe(backupState);
+
+    const serverOnlyBackup = { ...primaryState, server_device_ref: '7'.repeat(40) };
+    stateClient.readBackupState = async () => serverOnlyBackup;
+    stateClient.resolveRefPointer = async (ref: string) => ref.endsWith('/main') ? primaryState.local_main : primaryState.local_head;
+    stateClient.readQueue = async () => ({ expected_device_ref: primaryState.server_device_ref });
+    expect(await stateClient.preferRecoverableBackupState(primaryState)).toBe(primaryState);
+    stateClient.readQueue = async () => ({ expected_device_ref: serverOnlyBackup.server_device_ref });
+    expect(await stateClient.preferRecoverableBackupState(primaryState)).toBe(serverOnlyBackup);
+    expect(ancestryChecks).toBe(0);
+    expect(restoredBackups).toBe(2);
+    stateClient.readBackupState = readBackupState;
+    stateClient.readQueue = readQueue;
+    stateClient.resolveRefPointer = resolveRefPointer;
+    stateClient.restoreRecoveredBackupState = restoreRecoveredBackupState;
+    stateClient.backupStateCursorsDescend = backupStateCursorsDescend;
+
+    const originalPrimaryState = await stateClient.readPrimaryState();
+    const mixedPrimary = {
+      ...primaryState,
+      device_name: 'new name',
+      initial_import_confirmed: true,
+      last_event_seq: 9,
+      status_label: 'Synced',
+      last_error_code: null
+    };
+    const mixedBackup = {
+      ...backupState,
+      device_name: 'old name',
+      server_device_ref: '8'.repeat(40),
+      initial_import_confirmed: false,
+      last_event_seq: 4,
+      status_label: 'Ahead',
+      last_error_code: 'upload_interrupted'
+    };
+    const mergedRecovery = await stateClient.restoreRecoveredBackupState(
+      mixedPrimary,
+      mixedBackup,
+      mixedPrimary.server_device_ref
+    );
+    expect(mergedRecovery).toMatchObject({
+      local_main: mixedBackup.local_main,
+      local_head: mixedBackup.local_head,
+      server_device_ref: mixedPrimary.server_device_ref,
+      device_name: mixedPrimary.device_name,
+      initial_import_confirmed: true,
+      last_event_seq: 9,
+      status_label: mixedPrimary.status_label,
+      last_error_code: mixedPrimary.last_error_code
+    });
+    const nullServerPrimary = {
+      ...mixedPrimary,
+      server_device_ref: null,
+      status_label: 'Needs recovery',
+      last_error_code: 'replace_local_with_server_required'
+    };
+    const nullServerRecovery = await stateClient.restoreRecoveredBackupState(
+      nullServerPrimary,
+      mixedBackup,
+      null
+    );
+    expect(nullServerRecovery).toMatchObject({
+      server_device_ref: null,
+      status_label: nullServerPrimary.status_label,
+      last_error_code: nullServerPrimary.last_error_code
+    });
+    await stateClient.writeState(originalPrimaryState);
 
     const sourceAdapter = new MemoryDataAdapter();
     const sourceFs = createDataAdapterFs(sourceAdapter);
