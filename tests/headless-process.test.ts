@@ -36,7 +36,8 @@ describe('headless client process', () => {
     child.stderr.on('data', (chunk: string) => (stderr += chunk));
 
     child.stdin.write('{"id":1,"command":"read-state"}\n');
-    child.stdin.write('{"id":2,"command":"shutdown"}\n');
+    child.stdin.write('{"id":2,"command":"read-index-delta"}\n');
+    child.stdin.write('{"id":3,"command":"shutdown"}\n');
     child.stdin.end();
 
     const exitCode = await new Promise<number | null>((resolve, reject) => {
@@ -54,9 +55,14 @@ describe('headless client process', () => {
       ['event', 'ready'],
       ['response', 1],
       ['response', 2],
+      ['response', 3],
       ['event', 'stopping']
     ]);
     expect(messages[1]).toMatchObject({ ok: true, result: { status_label: 'Checking' } });
+    expect(messages[2]).toMatchObject({
+      ok: true,
+      result: { head: null, base: null, mode: 'unavailable', files: [], changes: [] }
+    });
   });
 
   it('fails startup cleanly when required configuration is missing', async () => {

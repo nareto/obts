@@ -51,6 +51,15 @@ pub struct PersistedSyncState {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObtsProjectionState {
+    pub indexed_commit: Option<String>,
+    pub target_commit: Option<String>,
+    pub status: String,
+    pub failure_code: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PersistedStagedChunk {
     pub parent_id: String,
@@ -162,13 +171,16 @@ pub struct PersistedSearchNote {
 #[derive(Debug, Clone)]
 pub struct BlockEmbeddingCandidate {
     pub id: String,
-    pub text: String,
+    pub note_id: String,
+    pub block_index: usize,
+    pub breadcrumb: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct BlockSemanticMatch {
     pub block_id: String,
     pub note_id: String,
+    pub block_index: usize,
     pub heading_path: String,
     pub content: String,
     pub score: f32,
@@ -988,11 +1000,11 @@ impl PostgresPersistence {
         &self,
         limit: usize,
         max_failures: i32,
-    ) -> Result<Vec<(String, String, String, String)>, PersistenceError> {
+    ) -> Result<Vec<(String, String, String)>, PersistenceError> {
         let effective_limit = limit.max(1).min(i32::MAX as usize) as i32;
         let rows = sqlx::query(
             r#"
-            SELECT id, path, title, content
+            SELECT id, path, title
             FROM notes
             WHERE embedding IS NULL
               AND embedding_failures < $2
@@ -1011,7 +1023,6 @@ impl PostgresPersistence {
                     row.try_get("id")?,
                     row.try_get("path")?,
                     row.try_get("title")?,
-                    row.try_get("content")?,
                 ))
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()
@@ -1055,13 +1066,9 @@ impl PostgresPersistence {
             r#"
             SELECT
                 id,
-                ts_rank_cd(
-                    to_tsvector('simple', coalesce(title, '') || ' ' || coalesce(search_text, '')),
-                    plainto_tsquery('simple', $1)
-                ) AS score
+                ts_rank_cd(search_vector, plainto_tsquery('simple', $1)) AS score
             FROM notes
-            WHERE to_tsvector('simple', coalesce(title, '') || ' ' || coalesce(search_text, ''))
-                @@ plainto_tsquery('simple', $1)
+            WHERE search_vector @@ plainto_tsquery('simple', $1)
             ORDER BY score DESC, id ASC
             LIMIT $2
             "#,
@@ -1528,6 +1535,71 @@ impl PostgresPersistence {
             })),
             None => Ok(None),
         }
+    }
+
+    pub async fn load_obts_projection_state(
+        &self,
+    ) -> Result<Option<ObtsProjectionState>, PersistenceError> {
+        let row = sqlx::query(
+            "SELECT indexed_commit, target_commit, status, failure_code, updated_at FROM obts_projection_state WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            Ok(ObtsProjectionState {
+                indexed_commit: row.try_get("indexed_commit")?,
+                target_commit: row.try_get("target_commit")?,
+                status: row.try_get("status")?,
+                failure_code: row.try_get("failure_code")?,
+                updated_at: row.try_get("updated_at")?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn save_obts_projection_state(
+        &self,
+        state: &ObtsProjectionState,
+    ) -> Result<(), PersistenceError> {
+        sqlx::query(
+            r#"
+            INSERT INTO obts_projection_state (
+                id, indexed_commit, target_commit, status, failure_code, updated_at
+            ) VALUES (1, $1, $2, $3, $4, $5)
+            ON CONFLICT (id) DO UPDATE SET
+                indexed_commit = EXCLUDED.indexed_commit,
+                target_commit = EXCLUDED.target_commit,
+                status = EXCLUDED.status,
+                failure_code = EXCLUDED.failure_code,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(&state.indexed_commit)
+        .bind(&state.target_commit)
+        .bind(&state.status)
+        .bind(&state.failure_code)
+        .bind(state.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn purge_raw_projection_content(&self) -> Result<(), PersistenceError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE notes SET content = '', search_text = '' WHERE content <> '' OR search_text <> ''")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE vault_files SET content = '' WHERE content <> ''")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE blocks SET content = '' WHERE content <> ''")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE chunk_staging SET content = '' WHERE content <> ''")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn enqueue_recovery_targets(
@@ -2172,7 +2244,7 @@ impl PostgresPersistence {
                 .bind(&block_id)
                 .bind(&heading_path_str)
                 .bind(breadcrumb)
-                .bind(&block.content)
+                .bind("")
                 .bind(&content_hash)
                 .bind(now)
                 .execute(&mut *tx)
@@ -2190,7 +2262,7 @@ impl PostgresPersistence {
                 .bind(block_index_i32)
                 .bind(&heading_path_str)
                 .bind(breadcrumb)
-                .bind(&block.content)
+                .bind("")
                 .bind(&content_hash)
                 .bind(now)
                 .bind(now)
@@ -2229,7 +2301,7 @@ impl PostgresPersistence {
         let effective_limit = limit.max(1).min(i32::MAX as usize) as i32;
         let rows = sqlx::query(
             r#"
-            SELECT id, breadcrumb || E'\n' || content AS text
+            SELECT id, note_id, block_index, breadcrumb
             FROM blocks
             WHERE embedding IS NULL
               AND embedding_failures < $2
@@ -2244,9 +2316,12 @@ impl PostgresPersistence {
 
         rows.into_iter()
             .map(|row| {
+                let block_index: i32 = row.try_get("block_index")?;
                 Ok(BlockEmbeddingCandidate {
                     id: row.try_get("id")?,
-                    text: row.try_get("text")?,
+                    note_id: row.try_get("note_id")?,
+                    block_index: block_index.max(0) as usize,
+                    breadcrumb: row.try_get("breadcrumb")?,
                 })
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()
@@ -2449,8 +2524,8 @@ impl PostgresPersistence {
             SELECT
                 id,
                 note_id,
+                block_index,
                 heading_path,
-                content,
                 (1 - (embedding <=> $1))::real AS score
             FROM blocks
             WHERE embedding IS NOT NULL
@@ -2467,14 +2542,15 @@ impl PostgresPersistence {
             .map(|row| {
                 let id: String = row.try_get("id")?;
                 let note_id: String = row.try_get("note_id")?;
+                let block_index: i32 = row.try_get("block_index")?;
                 let heading_path: String = row.try_get("heading_path")?;
-                let content: String = row.try_get("content")?;
                 let score: f32 = row.try_get("score")?;
                 Ok(BlockSemanticMatch {
                     block_id: id,
                     note_id,
+                    block_index: block_index.max(0) as usize,
                     heading_path,
-                    content,
+                    content: String::new(),
                     score,
                 })
             })
@@ -2815,7 +2891,7 @@ async fn upsert_vault_file_tx(
     sqlx::query(
         r#"
         INSERT INTO vault_files (path, content, couchdb_rev, created_at, updated_at, indexed_at)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        VALUES ($1, '', $2, $3, $4, $5)
         ON CONFLICT (path)
         DO UPDATE SET
             content = EXCLUDED.content,
@@ -2826,7 +2902,6 @@ async fn upsert_vault_file_tx(
         "#,
     )
     .bind(&file.path)
-    .bind(&file.content)
     .bind(&file.couchdb_rev)
     .bind(file.created_at)
     .bind(file.updated_at)
@@ -2868,23 +2943,25 @@ async fn upsert_note_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     note: &PersistedNoteRecord,
 ) -> Result<(), PersistenceError> {
+    let derived_search_text = format!("{}\n{}", note.title, note.search_text);
     let bounded_search_text =
-        truncate_utf8_to_byte_limit(&note.search_text, MAX_INDEXED_SEARCH_TEXT_BYTES);
+        truncate_utf8_to_byte_limit(&derived_search_text, MAX_INDEXED_SEARCH_TEXT_BYTES);
 
     sqlx::query(
         r#"
         INSERT INTO notes (
-            id, path, title, content, search_text, summary, frontmatter,
+            id, path, title, content, search_text, search_vector, summary, frontmatter,
             embedding, couchdb_rev, created_at, updated_at, indexed_at,
             embedding_failures, embedding_failed_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 0, NULL)
+        VALUES ($1, $2, $3, '', '', to_tsvector('simple', $4), $5, $6, $7, $8, $9, $10, $11, 0, NULL)
         ON CONFLICT (id)
         DO UPDATE SET
             path = EXCLUDED.path,
             title = EXCLUDED.title,
-            content = EXCLUDED.content,
-            search_text = EXCLUDED.search_text,
+            content = '',
+            search_text = '',
+            search_vector = EXCLUDED.search_vector,
             summary = EXCLUDED.summary,
             frontmatter = EXCLUDED.frontmatter,
             embedding = EXCLUDED.embedding,
@@ -2899,7 +2976,6 @@ async fn upsert_note_tx(
     .bind(&note.id)
     .bind(&note.path)
     .bind(&note.title)
-    .bind(&note.content)
     .bind(bounded_search_text)
     .bind(&note.summary)
     .bind(&note.frontmatter)

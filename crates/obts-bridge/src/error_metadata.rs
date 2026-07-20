@@ -2,7 +2,6 @@ use axum::http::StatusCode;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::couchdb::CouchDbError;
 use crate::new_note::WriteError;
 use crate::service::ServiceError;
 
@@ -149,9 +148,6 @@ pub(crate) fn service_error_metadata(
                 .with_http_status(400)
         }
         ServiceError::Write(error) => write_error_metadata(error),
-        ServiceError::CouchDbWrite(error) => couchdb_error_metadata(error),
-        ServiceError::CouchDbUpdate(error) => couchdb_error_metadata(error),
-        ServiceError::VaultFileRepair(error) => couchdb_error_metadata(error),
         ServiceError::Headless(_) => ErrorMetadata::new(
             ErrorCategory::Transient,
             true,
@@ -183,33 +179,6 @@ pub(crate) fn service_error_metadata(
             )
             .with_http_status(503),
         },
-        ServiceError::VaultFileTemporarilyUnavailable {
-            target_hash,
-            source_state,
-            recovery_state,
-            expected_child_count,
-            live_child_count,
-            missing_child_count,
-            tombstoned_child_count,
-        } => ErrorMetadata::new(
-            ErrorCategory::Transient,
-            true,
-            "raw vault file unavailable",
-            "The authoritative CouchDB file is incomplete or unavailable; repair the reported source state before retrying",
-        )
-        .with_http_status(503)
-        .with_details(serde_json::json!({
-            "component": "couchdb",
-            "phase": "source_reconciliation",
-            "sourceState": source_state,
-            "targetHash": target_hash,
-            "recoveryState": recovery_state,
-            "expectedChildCount": expected_child_count,
-            "liveChildCount": live_child_count,
-            "missingChildCount": missing_child_count,
-            "tombstonedChildCount": tombstoned_child_count,
-            "action": "retry after source recovery; if recovery remains quarantined, inspect the content-free note source diagnostic"
-        })),
     };
     if let Some(tool_name) = tool_name {
         metadata = metadata.with_tool(tool_name);
@@ -300,47 +269,6 @@ fn write_error_metadata(error: &WriteError) -> ErrorMetadata {
     }
 }
 
-fn couchdb_error_metadata(error: &CouchDbError) -> ErrorMetadata {
-    match error {
-        CouchDbError::NoteAlreadyExists { .. } => ErrorMetadata::new(
-            ErrorCategory::Business,
-            false,
-            "resource already exists",
-            error.to_string(),
-        )
-        .with_http_status(409),
-        CouchDbError::NoteNotFound { .. } => ErrorMetadata::new(
-            ErrorCategory::Business,
-            false,
-            "resource not found",
-            error.to_string(),
-        )
-        .with_http_status(404),
-        CouchDbError::RevisionConflict { .. } | CouchDbError::Conflict { .. } => {
-            ErrorMetadata::new(
-                ErrorCategory::Business,
-                false,
-                "source revision conflict",
-                "The authoritative CouchDB revision changed while the edit was being prepared; read the latest file and reapply the edit",
-            )
-            .with_http_status(409)
-            .with_details(serde_json::json!({
-                "component": "couchdb",
-                "phase": "source_commit",
-                "sourceState": "revision_conflict",
-                "action": "read the latest source-backed file and reapply the exact edit"
-            }))
-        }
-        _ => ErrorMetadata::new(
-            ErrorCategory::Transient,
-            true,
-            "persistence failed",
-            error.to_string(),
-        )
-        .with_http_status(503),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -364,29 +292,5 @@ mod tests {
         assert_eq!(value["details"]["failureKind"], "insufficient_storage");
         assert_eq!(value["details"]["sourceCommitted"], false);
         assert_ne!(value["details"]["action"], json!(null));
-    }
-
-    #[test]
-    fn incomplete_source_reports_recovery_transition_and_child_counts() {
-        let metadata = service_error_metadata(
-            &ServiceError::VaultFileTemporarilyUnavailable {
-                target_hash: "safe-target".to_string(),
-                source_state: "incomplete_live_source",
-                recovery_state: "reactivated",
-                expected_child_count: Some(83),
-                live_child_count: Some(31),
-                missing_child_count: Some(0),
-                tombstoned_child_count: Some(52),
-            },
-            None,
-        );
-        let value = serde_json::to_value(metadata).expect("serialize metadata");
-
-        assert_eq!(value["httpStatus"], 503);
-        assert_eq!(value["isRetryable"], true);
-        assert_eq!(value["details"]["sourceState"], "incomplete_live_source");
-        assert_eq!(value["details"]["recoveryState"], "reactivated");
-        assert_eq!(value["details"]["expectedChildCount"], 83);
-        assert_eq!(value["details"]["tombstonedChildCount"], 52);
     }
 }

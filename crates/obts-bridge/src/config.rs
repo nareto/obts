@@ -163,16 +163,24 @@ impl Default for ClientConfig {
 impl ClientConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         if self.vault_dir.trim().is_empty() {
-            return Err(ConfigError::InvalidClient("client.vault_dir is required".to_string()));
+            return Err(ConfigError::InvalidClient(
+                "client.vault_dir is required".to_string(),
+            ));
         }
         if self.auto_start && self.headless_command.trim().is_empty() {
-            return Err(ConfigError::InvalidClient("client.headless_command is required when auto_start is true".to_string()));
+            return Err(ConfigError::InvalidClient(
+                "client.headless_command is required when auto_start is true".to_string(),
+            ));
         }
         if self.auto_start && self.server_url.trim().is_empty() {
-            return Err(ConfigError::InvalidClient("client.server_url is required when auto_start is true".to_string()));
+            return Err(ConfigError::InvalidClient(
+                "client.server_url is required when auto_start is true".to_string(),
+            ));
         }
         if self.device_name.trim().is_empty() {
-            return Err(ConfigError::InvalidClient("client.device_name is required".to_string()));
+            return Err(ConfigError::InvalidClient(
+                "client.device_name is required".to_string(),
+            ));
         }
         Ok(())
     }

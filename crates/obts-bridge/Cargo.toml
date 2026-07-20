@@ -1,6 +1,6 @@
 [package]
 name = "obts_bridge"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Headless OBTS client bridge providing scoped REST and MCP context for agents."
 license = "Apache-2.0"

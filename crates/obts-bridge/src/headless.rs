@@ -1,7 +1,8 @@
 use std::process::Stdio;
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -28,7 +29,9 @@ pub struct HeadlessClient {
 
 impl std::fmt::Debug for HeadlessClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("HeadlessClient").finish_non_exhaustive()
+        formatter
+            .debug_struct("HeadlessClient")
+            .finish_non_exhaustive()
     }
 }
 
@@ -42,7 +45,69 @@ pub struct HeadlessFilesystemGuard<'a> {
     process: MutexGuard<'a, HeadlessProcess>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct HeadlessIndexDelta {
+    pub head: Option<String>,
+    pub base: Option<String>,
+    pub mode: String,
+    pub files: Vec<HeadlessIndexFile>,
+    pub changes: Vec<HeadlessIndexChange>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct HeadlessIndexFile {
+    pub path: String,
+    pub oid: String,
+    pub content_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct HeadlessIndexChange {
+    pub path: String,
+    pub kind: String,
+    pub oid: Option<String>,
+    pub content_sha256: Option<String>,
+}
+
 impl HeadlessFilesystemGuard<'_> {
+    pub async fn read_index_delta(
+        &mut self,
+        client: &HeadlessClient,
+        from_commit: Option<&str>,
+    ) -> Result<HeadlessIndexDelta, HeadlessError> {
+        let arguments = from_commit
+            .map(|commit| json!({ "fromCommit": commit }))
+            .unwrap_or(Value::Null);
+        let result = timeout(
+            REQUEST_TIMEOUT,
+            request_on_process(
+                &mut self.process,
+                &client.next_id,
+                &client.state,
+                "read-index-delta",
+                arguments,
+            ),
+        )
+        .await;
+        match result {
+            Ok(Ok(value)) => {
+                client.healthy.store(true, Ordering::Release);
+                serde_json::from_value(value).map_err(HeadlessError::Json)
+            }
+            Ok(Err(error)) => {
+                if error.is_process_failure() {
+                    client.healthy.store(false, Ordering::Release);
+                }
+                Err(error)
+            }
+            Err(_) => {
+                quarantine_process(&mut self.process).await;
+                client.healthy.store(false, Ordering::Release);
+                Err(HeadlessError::Timeout)
+            }
+        }
+    }
+
     pub async fn notify_local_change(
         mut self,
         client: &HeadlessClient,
@@ -107,6 +172,15 @@ impl HeadlessClient {
         let state = self.state.read().expect("headless state lock");
         state.get("vault_id").is_some_and(|value| !value.is_null())
             && state.get("device_id").is_some_and(|value| !value.is_null())
+    }
+
+    pub fn local_head(&self) -> Option<String> {
+        self.state
+            .read()
+            .expect("headless state lock")
+            .get("local_head")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
     }
 
     pub async fn lock_filesystem(&self) -> Result<HeadlessFilesystemGuard<'_>, HeadlessError> {
@@ -174,13 +248,7 @@ impl HeadlessClient {
             .map_err(|_| HeadlessError::Timeout)?;
         let result = timeout(
             REQUEST_TIMEOUT,
-            request_on_process(
-                &mut process,
-                &self.next_id,
-                &self.state,
-                command,
-                arguments,
-            ),
+            request_on_process(&mut process, &self.next_id, &self.state, command, arguments),
         )
         .await;
         match result {
@@ -197,7 +265,8 @@ impl HeadlessClient {
     }
 
     pub async fn notify_local_change(&self, path: &str) -> Result<Value, HeadlessError> {
-        self.request("record-local-change", json!({ "paths": [path] })).await?;
+        self.request("record-local-change", json!({ "paths": [path] }))
+            .await?;
         self.request("sync-once", Value::Null).await
     }
 }
@@ -223,16 +292,27 @@ async fn request_on_process(
     let mut request = match arguments {
         Value::Object(map) => map,
         Value::Null => serde_json::Map::new(),
-        _ => return Err(HeadlessError::Protocol("request arguments must be an object".to_string())),
+        _ => {
+            return Err(HeadlessError::Protocol(
+                "request arguments must be an object".to_string(),
+            ));
+        }
     };
     request.insert("id".to_string(), json!(id));
     request.insert("command".to_string(), json!(command));
-    process.stdin.write_all(serde_json::to_string(&request)?.as_bytes()).await?;
+    process
+        .stdin
+        .write_all(serde_json::to_string(&request)?.as_bytes())
+        .await?;
     process.stdin.write_all(b"\n").await?;
     process.stdin.flush().await?;
 
     loop {
-        let line = process.stdout.next_line().await?.ok_or(HeadlessError::Exited)?;
+        let line = process
+            .stdout
+            .next_line()
+            .await?
+            .ok_or(HeadlessError::Exited)?;
         let message: Value = serde_json::from_str(&line)?;
         if message.get("type").and_then(Value::as_str) == Some("event") {
             if let Some(next_state) = message.get("state") {
@@ -252,9 +332,18 @@ async fn request_on_process(
             }
             return Ok(result);
         }
-        let code = message.pointer("/error/code").and_then(Value::as_str).unwrap_or("headless_error");
-        let detail = message.pointer("/error/message").and_then(Value::as_str).unwrap_or("Headless client command failed.");
-        return Err(HeadlessError::Remote { code: code.to_string(), message: detail.to_string() });
+        let code = message
+            .pointer("/error/code")
+            .and_then(Value::as_str)
+            .unwrap_or("headless_error");
+        let detail = message
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or("Headless client command failed.");
+        return Err(HeadlessError::Remote {
+            code: code.to_string(),
+            message: detail.to_string(),
+        });
     }
 }
 
@@ -278,9 +367,18 @@ async fn spawn_process(config: &ClientConfig) -> Result<(HeadlessProcess, Value)
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     let mut child = command.spawn()?;
-    let stdin = child.stdin.take().ok_or(HeadlessError::MissingPipe("stdin"))?;
-    let stdout = child.stdout.take().ok_or(HeadlessError::MissingPipe("stdout"))?;
-    let stderr = child.stderr.take().ok_or(HeadlessError::MissingPipe("stderr"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or(HeadlessError::MissingPipe("stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or(HeadlessError::MissingPipe("stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or(HeadlessError::MissingPipe("stderr"))?;
     tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -319,16 +417,21 @@ pub fn spawn_maintenance(
                 }
                 Err(_) => {}
             }
-            if !restart
-                && let Err(error) = client.request("sync-once", Value::Null).await
-                && !error.is_unpaired()
-            {
-                restart = error.is_process_failure();
-                warn!(error = %error, "headless local sync failed");
+            if !restart {
+                match client.request("sync-once", Value::Null).await {
+                    Ok(_) => {
+                        if client.local_head() != filesystem.indexed_commit() {
+                            filesystem.mark_dirty();
+                        }
+                    }
+                    Err(error) if !error.is_unpaired() => {
+                        restart = error.is_process_failure();
+                        warn!(error = %error, "headless local sync failed");
+                    }
+                    Err(_) => {}
+                }
             }
-            if restart
-                && let Err(error) = client.restart().await
-            {
+            if restart && let Err(error) = client.restart().await {
                 warn!(error = %error, "headless client restart failed");
             }
             sleep(interval).await;
@@ -341,10 +444,17 @@ async fn read_until_event(
     event: &str,
 ) -> Result<Value, HeadlessError> {
     loop {
-        let line = process.stdout.next_line().await?.ok_or(HeadlessError::Exited)?;
+        let line = process
+            .stdout
+            .next_line()
+            .await?
+            .ok_or(HeadlessError::Exited)?;
         let message: Value = serde_json::from_str(&line)?;
         if message.get("type").and_then(Value::as_str) == Some("fatal") {
-            let detail = message.pointer("/error/message").and_then(Value::as_str).unwrap_or("Headless client failed.");
+            let detail = message
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("Headless client failed.");
             return Err(HeadlessError::Protocol(detail.to_string()));
         }
         if message.get("type").and_then(Value::as_str) == Some("event")

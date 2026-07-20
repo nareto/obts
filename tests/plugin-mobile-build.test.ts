@@ -622,6 +622,24 @@ describe('mobile plugin artifact', () => {
       updated_at: new Date().toISOString()
     });
     await runtimeClient.refreshDirectoryStateFromDisk([]);
+    expect(await runtimeClient.readIndexDelta(null)).toMatchObject({
+      head: runtimeMain,
+      base: null,
+      mode: 'rebuild',
+      changes: [
+        {
+          path: 'note.md',
+          kind: 'add',
+          content_sha256: `sha256:${createHash('sha256').update('runtime baseline\n').digest('hex')}`
+        }
+      ]
+    });
+    expect(await runtimeClient.readIndexDelta(runtimeMain)).toMatchObject({
+      head: runtimeMain,
+      base: runtimeMain,
+      mode: 'incremental',
+      changes: []
+    });
 
     let applyLockAttempts = 0;
     const acquireApplyLock = runtimeClient.acquireApplyLock.bind(runtimeClient);

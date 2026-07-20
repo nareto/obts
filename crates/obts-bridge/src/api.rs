@@ -49,7 +49,7 @@ impl AppState {
             crate::store::VaultStore::new_with_auth_config(20, runtime_config.auth_config());
         store.seed_example_data().await;
         Self {
-            service: VaultBridgeService::new(store, None),
+            service: VaultBridgeService::new_for_tests(store),
             api_tokens: ApiTokenState::default(),
             mcp: None,
             runtime_config,
@@ -380,14 +380,8 @@ fn service_error_legacy_error(error: &ServiceError) -> String {
             crate::new_note::WriteError::NotFound { .. } => "not found".to_string(),
             other => other.to_string(),
         },
-        ServiceError::CouchDbWrite(error)
-        | ServiceError::CouchDbUpdate(error)
-        | ServiceError::VaultFileRepair(error) => error.to_string(),
         ServiceError::FilesystemWrite(error) => error.to_string(),
         ServiceError::Headless(error) => error.to_string(),
-        ServiceError::VaultFileTemporarilyUnavailable { .. } => {
-            "raw vault file is temporarily unavailable".to_string()
-        }
     }
 }
 
@@ -506,11 +500,15 @@ pub fn app_router(state: AppState) -> Router {
 }
 
 async fn auth_from_headers(state: &AppState, headers: &HeaderMap) -> Result<AuthContext, ApiError> {
+    let auth = authorize_from_headers(state, headers).await?;
     state.service.ensure_index_current()?;
-    authorize_from_headers(state, headers).await
+    Ok(auth)
 }
 
-async fn authorize_from_headers(state: &AppState, headers: &HeaderMap) -> Result<AuthContext, ApiError> {
+async fn authorize_from_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthContext, ApiError> {
     let key = api_key_from_headers(headers).ok_or(ApiError::Unauthorized)?;
     state
         .api_tokens
@@ -1339,15 +1337,24 @@ fn prometheus_label_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::StatusCode;
+    use std::collections::BTreeMap;
+
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use axum::response::IntoResponse;
+    use chrono::Utc;
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
+    use tempfile::tempdir;
 
     use super::{
-        ApiError, build_info_metric_line, commit_from_image_tag, prometheus_label_escape,
-        write_response,
+        ApiError, ApiTokenState, AppState, auth_from_headers, build_info_metric_line,
+        commit_from_image_tag, prometheus_label_escape, write_response,
     };
+    use crate::config::{ApiTokenConfig, AppConfig};
+    use crate::filesystem::FilesystemSource;
+    use crate::runtime_config::{AuthConfigSnapshot, RuntimeConfigState};
+    use crate::service::{ServiceError, VaultBridgeService};
+    use crate::store::VaultStore;
 
     async fn api_error_body(error: ApiError) -> (StatusCode, Value) {
         let response = error.into_response();
@@ -1360,6 +1367,69 @@ mod tests {
             .to_bytes();
         let body = serde_json::from_slice(&body).expect("json body");
         (status, body)
+    }
+
+    #[tokio::test]
+    async fn api_tokens_resolve_contexts_and_follow_runtime_rotation() {
+        let state = ApiTokenState::for_tests([("agent", "secret-token", "non_personal")]);
+        let auth = state
+            .authorize("  secret-token  ")
+            .await
+            .expect("authorized");
+        assert_eq!(auth.context.as_str(), "non_personal");
+        assert_eq!(auth.principal.as_str(), "api_token:agent");
+        assert!(state.authorize("").await.is_none());
+        assert!(state.authorize("wrong-token").await.is_none());
+
+        state
+            .auth_config
+            .set_snapshot(AuthConfigSnapshot {
+                api_tokens: BTreeMap::from([(
+                    "agent".to_string(),
+                    ApiTokenConfig {
+                        context: "admin".to_string(),
+                    },
+                )]),
+                loaded_at: Utc::now(),
+                ..AuthConfigSnapshot::default()
+            })
+            .await;
+        let rotated = state
+            .authorize("secret-token")
+            .await
+            .expect("rotated context");
+        assert_eq!(rotated.context.as_str(), "admin");
+        assert_eq!(rotated.principal.as_str(), "api_token:agent");
+    }
+
+    #[tokio::test]
+    async fn rest_authentication_precedes_index_readiness() {
+        let config = AppConfig::default();
+        let runtime_config = RuntimeConfigState::for_tests(&config);
+        let source_root = tempdir().expect("source root");
+        let source = std::sync::Arc::new(
+            FilesystemSource::new(source_root.path()).expect("filesystem source"),
+        );
+        let state = AppState {
+            service: VaultBridgeService::new_with_filesystem(
+                VaultStore::new_with_auth_config(10, runtime_config.auth_config()),
+                source,
+                None,
+            ),
+            api_tokens: ApiTokenState::for_tests([("agent", "secret-token", "admin")]),
+            mcp: None,
+            runtime_config,
+        };
+        let missing = auth_from_headers(&state, &HeaderMap::new()).await;
+        assert!(matches!(missing, Err(ApiError::Unauthorized)));
+
+        let mut valid_headers = HeaderMap::new();
+        valid_headers.insert("x-api-key", HeaderValue::from_static("secret-token"));
+        let stale = auth_from_headers(&state, &valid_headers).await;
+        assert!(matches!(
+            stale,
+            Err(ApiError::Service(ServiceError::IndexCatchingUp))
+        ));
     }
 
     #[tokio::test]

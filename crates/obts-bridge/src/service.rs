@@ -1,6 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::Value;
@@ -12,35 +11,30 @@ use tracing::{info, warn};
 use crate::authorization::AuthContext;
 use crate::base_query::{QueryBaseRequest, QueryBaseResponse};
 use crate::context::{AssembleContextRequest, AssembleContextResponse};
-use crate::couchdb::{CouchDbClient, CouchDbError};
 use crate::filesystem::{FilesystemError, FilesystemSource};
 use crate::headless::{HeadlessClient, HeadlessError, HeadlessFilesystemGuard};
-use crate::livesync::{ChangeEvent, LivesyncDocument};
 use crate::model::{Note, NoteId, VaultFile};
 use crate::new_note::{NewNoteFileType, NewNoteRequest, UpdateNoteRequest, WriteError};
-use crate::persistence::RECOVERY_KIND_FILE_ALIAS;
 use crate::search::{SearchMode, SearchResponse};
 use crate::store::{
     BacklinksResponse, LocalProjectionOutcome, NeighborDirection, NeighborsResponse,
     NewNoteResponse, NoteTimeFilter, NoteVisibility, PathResponse, PreparedVaultWrite,
-    QueryNotesRequest, RecentNotesResponse, RecoveredVaultFileState, StaleFileRecoveryTarget,
-    StatusResponse, TagsResponse, UpdateNoteResponse, VaultFileVisibility, VaultStore,
+    QueryNotesRequest, RecentNotesResponse, StatusResponse, TagsResponse, UpdateNoteResponse,
+    VaultFileVisibility, VaultStore,
 };
 
 #[derive(Clone, Debug)]
 pub struct VaultBridgeService {
     pub store: VaultStore,
-    pub couchdb: Option<Arc<CouchDbClient>>,
     pub filesystem: Option<Arc<FilesystemSource>>,
     pub headless: Option<HeadlessClient>,
     vault_file_repair_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
 }
 
 impl VaultBridgeService {
-    pub fn new(store: VaultStore, couchdb: Option<Arc<CouchDbClient>>) -> Self {
+    pub fn new_for_tests(store: VaultStore) -> Self {
         Self {
             store,
-            couchdb,
             filesystem: None,
             headless: None,
             vault_file_repair_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -54,7 +48,6 @@ impl VaultBridgeService {
     ) -> Self {
         Self {
             store,
-            couchdb: None,
             filesystem: Some(filesystem),
             headless,
             vault_file_repair_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -62,7 +55,11 @@ impl VaultBridgeService {
     }
 
     pub fn ensure_index_current(&self) -> Result<(), ServiceError> {
-        if self.headless.as_ref().is_some_and(|client| !client.is_paired()) {
+        if self
+            .headless
+            .as_ref()
+            .is_some_and(|client| !client.is_paired())
+        {
             return Err(ServiceError::HeadlessNotPaired);
         }
         if self
@@ -199,6 +196,17 @@ impl VaultBridgeService {
         if auth.context.as_str() != "admin" {
             return Err(ServiceError::Forbidden);
         }
+        if command == "reset-index-projection" {
+            self.filesystem
+                .as_ref()
+                .ok_or_else(|| {
+                    ServiceError::BadRequest("filesystem source is disabled".to_string())
+                })?
+                .reset_commit_projection()
+                .await
+                .map_err(ServiceError::FilesystemWrite)?;
+            return Ok(serde_json::json!({ "status": "index_projection_reset" }));
+        }
         if !matches!(
             command,
             "read-state"
@@ -217,7 +225,9 @@ impl VaultBridgeService {
                 | "unpair-device"
                 | "reset-local-pairing"
         ) {
-            return Err(ServiceError::BadRequest("unsupported headless administration command".to_string()));
+            return Err(ServiceError::BadRequest(
+                "unsupported headless administration command".to_string(),
+            ));
         }
         self.headless
             .as_ref()
@@ -253,33 +263,27 @@ impl VaultBridgeService {
         let file_type = write.file_type;
         let indexed_as_note = write.note.is_some();
         let operation_id = write.operation_id.clone();
-        let (couchdb_rev, source_committed) = if let Some(filesystem) = self.filesystem.as_ref() {
-            let headless_guard = if let Some(headless) = self.headless.as_ref() {
-                Some(headless.lock_filesystem().await.map_err(ServiceError::Headless)?)
-            } else {
-                None
-            };
-            let revision = filesystem
-                .create(&write.path, &write.content)
-                .await
-                .map_err(ServiceError::FilesystemWrite)?;
-            self.notify_headless_write_locked(headless_guard, &write.path).await;
-            (revision, true)
-        } else if let Some(couchdb) = self.couchdb.as_ref() {
-            (
-                couchdb
-                    .write_livesync_note(&path, &write.content)
+        let filesystem = self
+            .filesystem
+            .as_ref()
+            .ok_or_else(|| ServiceError::BadRequest("filesystem source is disabled".to_string()))?;
+        let headless_guard = if let Some(headless) = self.headless.as_ref() {
+            Some(
+                headless
+                    .lock_filesystem()
                     .await
-                    .map_err(ServiceError::CouchDbWrite)?
-                    .couchdb_rev,
-                true,
+                    .map_err(ServiceError::Headless)?,
             )
         } else {
-            ("local-new-note".to_string(), false)
+            None
         };
-        let projection = self
-            .finalize_prepared_write(write, &couchdb_rev, source_committed)
-            .await?;
+        let revision = filesystem
+            .create(&write.path, &write.content)
+            .await
+            .map_err(ServiceError::FilesystemWrite)?;
+        self.notify_headless_write_locked(headless_guard, &write.path)
+            .await;
+        let projection = self.finalize_prepared_write(write, &revision).await?;
         Ok(NewNoteResponse {
             id: response_id,
             status: projection.response_status("created"),
@@ -311,37 +315,31 @@ impl VaultBridgeService {
             .await
             .map_err(ServiceError::Write)?;
         let operation_id = write.operation_id.clone();
-        let (couchdb_rev, source_committed) = if let Some(filesystem) = self.filesystem.as_ref() {
-            let headless_guard = if let Some(headless) = self.headless.as_ref() {
-                Some(headless.lock_filesystem().await.map_err(ServiceError::Headless)?)
-            } else {
-                None
-            };
-            let revision = filesystem
-                .update(&write.path, &write.content, write.expected_couchdb_rev.as_deref())
-                .await
-                .map_err(ServiceError::FilesystemWrite)?;
-            self.notify_headless_write_locked(headless_guard, &write.path).await;
-            (revision, true)
-        } else if let Some(couchdb) = self.couchdb.as_ref() {
-            (
-                couchdb
-                    .update_livesync_note_if_revision(
-                        note_id.as_str(),
-                        &write.content,
-                        write.expected_couchdb_rev.as_deref(),
-                    )
+        let filesystem = self
+            .filesystem
+            .as_ref()
+            .ok_or_else(|| ServiceError::BadRequest("filesystem source is disabled".to_string()))?;
+        let headless_guard = if let Some(headless) = self.headless.as_ref() {
+            Some(
+                headless
+                    .lock_filesystem()
                     .await
-                    .map_err(ServiceError::CouchDbUpdate)?
-                    .couchdb_rev,
-                true,
+                    .map_err(ServiceError::Headless)?,
             )
         } else {
-            ("local-update-note".to_string(), false)
+            None
         };
-        let projection = self
-            .finalize_prepared_write(write, &couchdb_rev, source_committed)
-            .await?;
+        let revision = filesystem
+            .update(
+                &write.path,
+                &write.content,
+                write.expected_couchdb_rev.as_deref(),
+            )
+            .await
+            .map_err(ServiceError::FilesystemWrite)?;
+        self.notify_headless_write_locked(headless_guard, &write.path)
+            .await;
+        let projection = self.finalize_prepared_write(write, &revision).await?;
         Ok(UpdateNoteResponse {
             id: note_id.clone(),
             status: projection.response_status("updated"),
@@ -367,38 +365,6 @@ impl VaultBridgeService {
                 status.status = "degraded";
                 "index_catching_up"
             };
-            return status;
-        }
-        let Some(couchdb) = self.couchdb.as_ref() else {
-            return status;
-        };
-
-        match tokio::time::timeout(Duration::from_secs(3), couchdb.current_sequence()).await {
-            Ok(Ok(current_seq)) => {
-                status.dependencies.couchdb = "healthy";
-                status.sync.behind_by = sequence_lag(&status.sync.last_seq, &current_seq);
-                status.sync.couchdb_current_seq = current_seq;
-                status.sync.current_seq_source = "live";
-                status.sync.current_seq_observed_at = Utc::now();
-                if status.sync.behind_by > 0 {
-                    status.status = "degraded";
-                }
-            }
-            Ok(Err(error)) => {
-                status.dependencies.couchdb = "unavailable";
-                status.status = "degraded";
-                warn!(
-                    error = %error,
-                    "status could not refresh live CouchDB sequence; reporting cached watermark"
-                );
-            }
-            Err(_) => {
-                status.dependencies.couchdb = "unavailable";
-                status.status = "degraded";
-                warn!(
-                    "status timed out refreshing live CouchDB sequence; reporting cached watermark"
-                );
-            }
         }
         status
     }
@@ -437,33 +403,27 @@ impl VaultBridgeService {
         let file_type = write.file_type;
         let indexed_as_note = write.note.is_some();
         let operation_id = write.operation_id.clone();
-        let (couchdb_rev, source_committed) = if let Some(filesystem) = self.filesystem.as_ref() {
-            let headless_guard = if let Some(headless) = self.headless.as_ref() {
-                Some(headless.lock_filesystem().await.map_err(ServiceError::Headless)?)
-            } else {
-                None
-            };
-            let revision = filesystem
-                .create(&write.path, &write.content)
-                .await
-                .map_err(ServiceError::FilesystemWrite)?;
-            self.notify_headless_write_locked(headless_guard, &write.path).await;
-            (revision, true)
-        } else if let Some(couchdb) = self.couchdb.as_ref() {
-            (
-                couchdb
-                    .write_livesync_note(&path, &write.content)
+        let filesystem = self
+            .filesystem
+            .as_ref()
+            .ok_or_else(|| ServiceError::BadRequest("filesystem source is disabled".to_string()))?;
+        let headless_guard = if let Some(headless) = self.headless.as_ref() {
+            Some(
+                headless
+                    .lock_filesystem()
                     .await
-                    .map_err(ServiceError::CouchDbWrite)?
-                    .couchdb_rev,
-                true,
+                    .map_err(ServiceError::Headless)?,
             )
         } else {
-            ("local-new-file".to_string(), false)
+            None
         };
-        let projection = self
-            .finalize_prepared_write(write, &couchdb_rev, source_committed)
-            .await?;
+        let revision = filesystem
+            .create(&write.path, &write.content)
+            .await
+            .map_err(ServiceError::FilesystemWrite)?;
+        self.notify_headless_write_locked(headless_guard, &write.path)
+            .await;
+        let projection = self.finalize_prepared_write(write, &revision).await?;
         Ok(NewNoteResponse {
             id: response_id,
             status: projection.response_status("created"),
@@ -490,37 +450,31 @@ impl VaultBridgeService {
             .await
             .map_err(ServiceError::Write)?;
         let operation_id = write.operation_id.clone();
-        let (couchdb_rev, source_committed) = if let Some(filesystem) = self.filesystem.as_ref() {
-            let headless_guard = if let Some(headless) = self.headless.as_ref() {
-                Some(headless.lock_filesystem().await.map_err(ServiceError::Headless)?)
-            } else {
-                None
-            };
-            let revision = filesystem
-                .update(&write.path, &write.content, write.expected_couchdb_rev.as_deref())
-                .await
-                .map_err(ServiceError::FilesystemWrite)?;
-            self.notify_headless_write_locked(headless_guard, &write.path).await;
-            (revision, true)
-        } else if let Some(couchdb) = self.couchdb.as_ref() {
-            (
-                couchdb
-                    .update_livesync_note_if_revision(
-                        file_id.as_str(),
-                        &write.content,
-                        write.expected_couchdb_rev.as_deref(),
-                    )
+        let filesystem = self
+            .filesystem
+            .as_ref()
+            .ok_or_else(|| ServiceError::BadRequest("filesystem source is disabled".to_string()))?;
+        let headless_guard = if let Some(headless) = self.headless.as_ref() {
+            Some(
+                headless
+                    .lock_filesystem()
                     .await
-                    .map_err(ServiceError::CouchDbUpdate)?
-                    .couchdb_rev,
-                true,
+                    .map_err(ServiceError::Headless)?,
             )
         } else {
-            ("local-edit-file".to_string(), false)
+            None
         };
-        let projection = self
-            .finalize_prepared_write(write, &couchdb_rev, source_committed)
-            .await?;
+        let revision = filesystem
+            .update(
+                &write.path,
+                &write.content,
+                write.expected_couchdb_rev.as_deref(),
+            )
+            .await
+            .map_err(ServiceError::FilesystemWrite)?;
+        self.notify_headless_write_locked(headless_guard, &write.path)
+            .await;
+        let projection = self.finalize_prepared_write(write, &revision).await?;
         Ok(UpdateNoteResponse {
             id: file_id.clone(),
             status: projection.response_status("updated"),
@@ -550,21 +504,12 @@ impl VaultBridgeService {
     async fn finalize_prepared_write(
         &self,
         write: PreparedVaultWrite,
-        couchdb_rev: &str,
-        source_committed: bool,
+        revision: &str,
     ) -> Result<LocalProjectionOutcome, ServiceError> {
-        if source_committed {
-            return self
-                .store
-                .project_source_committed_vault_write(write, couchdb_rev)
-                .await
-                .map_err(ServiceError::Write);
-        }
         self.store
-            .commit_prepared_vault_write(write, couchdb_rev)
+            .project_source_committed_vault_write(write, revision)
             .await
-            .map_err(ServiceError::Write)?;
-        Ok(LocalProjectionOutcome::Applied)
+            .map_err(ServiceError::Write)
     }
 
     async fn ensure_vault_file_available(
@@ -575,14 +520,23 @@ impl VaultBridgeService {
         if let Some(file) = self.store.get_vault_file_for_policy(auth, file_id).await {
             if let Some(filesystem) = self.filesystem.as_ref() {
                 let _headless_guard = if let Some(headless) = self.headless.as_ref() {
-                    Some(headless.lock_filesystem().await.map_err(ServiceError::Headless)?)
+                    Some(
+                        headless
+                            .lock_filesystem()
+                            .await
+                            .map_err(ServiceError::Headless)?,
+                    )
                 } else {
                     None
                 };
-                let current = filesystem
-                    .read(file_id.as_str())
-                    .await
-                    .map_err(ServiceError::FilesystemWrite)?;
+                let current = match filesystem.read(file_id.as_str()).await {
+                    Ok(current) => current,
+                    Err(FilesystemError::NotFound) => {
+                        filesystem.mark_dirty();
+                        return Err(ServiceError::IndexCatchingUp);
+                    }
+                    Err(error) => return Err(ServiceError::FilesystemWrite(error)),
+                };
                 let current_sha256 = hex::encode(Sha256::digest(current.content.as_bytes()));
                 if current_sha256 != file.content_sha256 {
                     filesystem.mark_dirty();
@@ -619,16 +573,8 @@ impl VaultBridgeService {
             log_vault_file_lookup_miss(auth, file_id.as_str(), visibility);
             return Err(ServiceError::NotFound);
         }
-        let Some(_) = self.couchdb.as_deref() else {
-            return Err(ServiceError::NotFound);
-        };
-        let repair_lock = self.vault_file_repair_lock(file_id.as_str()).await;
-        let _repair_guard = repair_lock.lock().await;
-        if let Some(file) = self.store.get_vault_file_for_policy(auth, file_id).await {
-            return Ok(file);
-        }
-        self.reconcile_vault_file_from_source(auth, file_id, true)
-            .await
+        log_vault_file_lookup_miss(auth, file_id.as_str(), visibility);
+        Err(ServiceError::NotFound)
     }
 
     async fn refresh_vault_file_for_write(
@@ -646,230 +592,7 @@ impl VaultBridgeService {
             log_vault_file_lookup_miss(auth, file_id.as_str(), visibility);
             return Err(ServiceError::NotFound);
         }
-        if self.couchdb.is_none() {
-            return local_file.ok_or(ServiceError::NotFound);
-        }
-        self.reconcile_vault_file_from_source(auth, file_id, false)
-            .await
-    }
-
-    async fn reconcile_vault_file_from_source(
-        &self,
-        auth: &AuthContext,
-        file_id: &NoteId,
-        allow_index_fallback: bool,
-    ) -> Result<VaultFile, ServiceError> {
-        let couch = self.couchdb.as_deref().ok_or(ServiceError::NotFound)?;
-        let target = self.store.vault_file_recovery_target(file_id).await;
-        let mut repair_attempted = false;
-        let mut source_diagnostic = None;
-        let recovery = loop {
-            let mut recovery = self
-                .recover_vault_file_from_couch(couch, file_id, target.as_ref())
-                .await
-                .map_err(ServiceError::VaultFileRepair)?;
-            if let Some(recovered) = recovery.recovered.take() {
-                self.store
-                    .project_recovered_vault_file(recovered)
-                    .await
-                    .map_err(ServiceError::Write)?;
-                if let Some(file) = self.store.get_vault_file_for_policy(auth, file_id).await {
-                    info!(
-                        lookup_hash = lookup_fingerprint("vault_file", file_id.as_str()).as_str(),
-                        "refreshed policy-visible vault file from CouchDB"
-                    );
-                    return Ok(file);
-                }
-            }
-
-            if allow_index_fallback || repair_attempted || !recovery.source_file_seen {
-                break recovery;
-            }
-            repair_attempted = true;
-            match couch
-                .diagnose_note_source(file_id.as_str(), couch.livesync_decryptor())
-                .await
-            {
-                Ok(diagnostic)
-                    if diagnostic.missing_child_count == 0
-                        && diagnostic.tombstoned_child_count == 0
-                        && diagnostic.unknown_child_count == 0 =>
-                {
-                    source_diagnostic = Some(diagnostic);
-                    continue;
-                }
-                Ok(diagnostic)
-                    if diagnostic.tombstoned_child_count > 0
-                        && diagnostic.missing_child_count == 0
-                        && diagnostic.unknown_child_count == 0 =>
-                {
-                    let Some(parent_revision) = diagnostic.file_revision.as_deref() else {
-                        source_diagnostic = Some(diagnostic);
-                        break recovery;
-                    };
-                    match couch
-                        .repair_tombstoned_note_children(
-                            file_id.as_str(),
-                            parent_revision,
-                            couch.livesync_decryptor(),
-                        )
-                        .await
-                    {
-                        Ok(result)
-                            if !result.parent_revision_changed
-                                && result.diagnostic.missing_child_count == 0
-                                && result.diagnostic.tombstoned_child_count == 0
-                                && result.diagnostic.unknown_child_count == 0 =>
-                        {
-                            info!(
-                                lookup_hash = lookup_fingerprint("vault_file", file_id.as_str()),
-                                repaired_child_count = result.repaired_child_count,
-                                "confirmed referenced LiveSync leaves before write reconciliation"
-                            );
-                            source_diagnostic = Some(result.diagnostic);
-                            continue;
-                        }
-                        Ok(result) => source_diagnostic = Some(result.diagnostic),
-                        Err(error) => warn!(
-                            lookup_hash = lookup_fingerprint("vault_file", file_id.as_str()),
-                            error = %error,
-                            "referenced LiveSync leaf repair failed during write reconciliation"
-                        ),
-                    }
-                }
-                Ok(diagnostic) => source_diagnostic = Some(diagnostic),
-                Err(error) => warn!(
-                    lookup_hash = lookup_fingerprint("vault_file", file_id.as_str()),
-                    error = %error,
-                    "source diagnosis failed during write reconciliation"
-                ),
-            }
-            break recovery;
-        };
-
-        let deletion_lookup = target
-            .as_ref()
-            .map(|target| target.file_doc_id.as_str())
-            .unwrap_or_else(|| file_id.as_str());
-        let deleted_document_id = if recovery.source_file_seen || recovery.source_deletion_seen {
-            None
-        } else {
-            couch
-                .deleted_recovery_document_id(deletion_lookup)
-                .await
-                .map_err(ServiceError::VaultFileRepair)?
-        };
-        if recovery.source_deletion_seen || deleted_document_id.is_some() {
-            self.store
-                .commit_confirmed_vault_file_deletion(file_id)
-                .await
-                .map_err(ServiceError::Write)?;
-            info!(
-                lookup_hash = lookup_fingerprint("vault_file", file_id.as_str()).as_str(),
-                "removed stale local vault state after confirming source deletion"
-            );
-            return Err(ServiceError::NotFound);
-        }
-
-        if allow_index_fallback
-            && recovery.source_file_seen
-            && let Some(recovered) = self
-                .store
-                .recovered_vault_file_from_index(file_id)
-                .await
-                .map_err(ServiceError::Write)?
-        {
-            self.store
-                .project_recovered_vault_file(recovered)
-                .await
-                .map_err(ServiceError::Write)?;
-            if let Some(file) = self.store.get_vault_file_for_policy(auth, file_id).await {
-                warn!(
-                    lookup_hash = lookup_fingerprint("vault_file", file_id.as_str()).as_str(),
-                    "reconstructed raw vault file from visible index after incomplete CouchDB chunk recovery"
-                );
-                return Ok(file);
-            }
-        }
-
-        if !allow_index_fallback && recovery.source_file_seen && source_diagnostic.is_none() {
-            source_diagnostic = couch
-                .diagnose_note_source(file_id.as_str(), couch.livesync_decryptor())
-                .await
-                .ok();
-        }
-        let mut recovery_state = "not_requested";
-        if !allow_index_fallback
-            && let Some(diagnostic) = source_diagnostic.as_ref()
-            && let (Some(parent_id), Some(parent_revision)) = (
-                diagnostic.file_document_id.as_deref(),
-                diagnostic.file_revision.as_deref(),
-            )
-        {
-            let recovery_target_id = target
-                .as_ref()
-                .map(|target| target.file_doc_id.as_str())
-                .unwrap_or(parent_id);
-            recovery_state = match self
-                .store
-                .reactivate_sync_recovery(
-                    RECOVERY_KIND_FILE_ALIAS,
-                    recovery_target_id,
-                    parent_revision,
-                    300,
-                )
-                .await
-            {
-                Ok(true) => "reactivated",
-                Ok(false) => "queued_or_cooldown",
-                Err(error) => {
-                    warn!(
-                        lookup_hash = lookup_fingerprint("vault_file", file_id.as_str()),
-                        error = %error,
-                        "failed to reactivate source recovery after write reconciliation"
-                    );
-                    "reactivation_failed"
-                }
-            };
-        }
-
-        let target_hash = lookup_fingerprint("vault_file", file_id.as_str());
-        let source_state = if recovery.source_file_seen {
-            "incomplete_live_source"
-        } else {
-            "source_missing"
-        };
-        let expected_child_count = source_diagnostic
-            .as_ref()
-            .map(|diagnostic| diagnostic.expected_child_count);
-        let live_child_count = source_diagnostic
-            .as_ref()
-            .map(|diagnostic| diagnostic.live_child_count);
-        let missing_child_count = source_diagnostic
-            .as_ref()
-            .map(|diagnostic| diagnostic.missing_child_count);
-        let tombstoned_child_count = source_diagnostic
-            .as_ref()
-            .map(|diagnostic| diagnostic.tombstoned_child_count);
-        warn!(
-            lookup_hash = target_hash,
-            source_state,
-            recovery_state,
-            expected_child_count,
-            live_child_count,
-            missing_child_count,
-            tombstoned_child_count,
-            "policy-visible vault file could not be reconstructed from CouchDB"
-        );
-        Err(ServiceError::VaultFileTemporarilyUnavailable {
-            target_hash,
-            source_state,
-            recovery_state,
-            expected_child_count,
-            live_child_count,
-            missing_child_count,
-            tombstoned_child_count,
-        })
+        local_file.ok_or(ServiceError::NotFound)
     }
 
     async fn vault_file_repair_lock(&self, path: &str) -> Arc<Mutex<()>> {
@@ -882,141 +605,6 @@ impl VaultBridgeService {
         locks.insert(path.to_string(), Arc::downgrade(&lock));
         lock
     }
-
-    async fn recover_vault_file_from_couch(
-        &self,
-        couch: &CouchDbClient,
-        file_id: &NoteId,
-        target: Option<&StaleFileRecoveryTarget>,
-    ) -> Result<VaultFileRecoveryAttempt, CouchDbError> {
-        let mut source_file_seen = false;
-        let mut source_deletion_seen = false;
-        if let Some(target) = target {
-            let mut document_ids = Vec::with_capacity(target.child_doc_ids.len() + 1);
-            document_ids.push(target.file_doc_id.clone());
-            document_ids.extend(target.child_doc_ids.iter().cloned());
-            let changes = couch.fetch_documents_as_changes(&document_ids).await?;
-            source_file_seen |= changes_contain_live_file_document(&changes);
-            source_deletion_seen |= changes_contain_deleted_file_document(&changes);
-            if let Some(recovered) =
-                reconstruct_vault_file(file_id, changes, couch.livesync_decryptor()).await
-            {
-                return Ok(VaultFileRecoveryAttempt {
-                    recovered: Some(recovered),
-                    source_file_seen: true,
-                    source_deletion_seen: false,
-                });
-            }
-
-            let changes = couch
-                .fetch_parent_recovery_changes(&target.file_doc_id)
-                .await?;
-            source_file_seen |= changes_contain_live_file_document(&changes);
-            source_deletion_seen |= changes_contain_deleted_file_document(&changes);
-            if let Some(recovered) =
-                reconstruct_vault_file(file_id, changes, couch.livesync_decryptor()).await
-            {
-                return Ok(VaultFileRecoveryAttempt {
-                    recovered: Some(recovered),
-                    source_file_seen: true,
-                    source_deletion_seen: false,
-                });
-            }
-        }
-
-        let changes = couch
-            .fetch_parent_recovery_changes(file_id.as_str())
-            .await?;
-        source_file_seen |= changes_contain_live_file_document(&changes);
-        source_deletion_seen |= changes_contain_deleted_file_document(&changes);
-        if let Some(recovered) =
-            reconstruct_vault_file(file_id, changes, couch.livesync_decryptor()).await
-        {
-            return Ok(VaultFileRecoveryAttempt {
-                recovered: Some(recovered),
-                source_file_seen: true,
-                source_deletion_seen: false,
-            });
-        }
-
-        let path_changes = couch
-            .find_file_document_changes_by_note_paths(
-                &[file_id.as_str().to_string()],
-                couch.livesync_decryptor(),
-            )
-            .await?;
-        source_file_seen |= !path_changes.is_empty();
-        let parent_ids = path_changes
-            .iter()
-            .map(|change| change.id.clone())
-            .collect::<Vec<_>>();
-        let mut changes = path_changes;
-        for parent_id in parent_ids {
-            let parent_changes = couch.fetch_parent_recovery_changes(&parent_id).await?;
-            source_file_seen |= changes_contain_live_file_document(&parent_changes);
-            source_deletion_seen |= changes_contain_deleted_file_document(&parent_changes);
-            append_unique_changes(&mut changes, parent_changes);
-        }
-        Ok(VaultFileRecoveryAttempt {
-            recovered: reconstruct_vault_file(file_id, changes, couch.livesync_decryptor()).await,
-            source_file_seen,
-            source_deletion_seen,
-        })
-    }
-}
-
-struct VaultFileRecoveryAttempt {
-    recovered: Option<RecoveredVaultFileState>,
-    source_file_seen: bool,
-    source_deletion_seen: bool,
-}
-
-fn changes_contain_live_file_document(changes: &[ChangeEvent]) -> bool {
-    changes.iter().any(|change| {
-        change
-            .doc
-            .clone()
-            .and_then(|doc| LivesyncDocument::try_from(doc).ok())
-            .is_some_and(|doc| matches!(doc, LivesyncDocument::File(file) if !file.deleted))
-    })
-}
-
-fn changes_contain_deleted_file_document(changes: &[ChangeEvent]) -> bool {
-    changes.iter().any(|change| {
-        change.deleted
-            && change
-                .doc
-                .clone()
-                .and_then(|doc| LivesyncDocument::try_from(doc).ok())
-                .is_some_and(|doc| matches!(doc, LivesyncDocument::File(_)))
-    })
-}
-
-async fn reconstruct_vault_file(
-    file_id: &NoteId,
-    changes: Vec<ChangeEvent>,
-    decryptor: Option<&crate::encryption::Decryptor>,
-) -> Option<RecoveredVaultFileState> {
-    if changes.is_empty() {
-        return None;
-    }
-    let recovery_store = VaultStore::new(20);
-    recovery_store
-        .ingest_changes_batch(changes, "", 250, Duration::MAX, decryptor)
-        .await;
-    recovery_store.recovered_vault_file_state(file_id).await
-}
-
-fn append_unique_changes(existing: &mut Vec<ChangeEvent>, additional: Vec<ChangeEvent>) {
-    let mut seen = existing
-        .iter()
-        .map(|change| change.id.clone())
-        .collect::<HashSet<_>>();
-    existing.extend(
-        additional
-            .into_iter()
-            .filter(|change| seen.insert(change.id.clone())),
-    );
 }
 
 fn log_note_lookup_miss(
@@ -1073,19 +661,6 @@ fn log_vault_file_lookup_miss(
     );
 }
 
-fn sequence_lag(last_seq: &str, current_seq: &str) -> i64 {
-    fn prefix(value: &str) -> i64 {
-        value
-            .split_once('-')
-            .map(|(prefix, _)| prefix)
-            .unwrap_or(value)
-            .parse::<i64>()
-            .unwrap_or(0)
-    }
-
-    (prefix(current_seq) - prefix(last_seq)).max(0)
-}
-
 #[derive(Debug, Error)]
 pub enum ServiceError {
     #[error("not found")]
@@ -1100,710 +675,141 @@ pub enum ServiceError {
     BadRequest(String),
     #[error(transparent)]
     Write(#[from] WriteError),
-    #[error("failed to write note to couchdb: {0}")]
-    CouchDbWrite(CouchDbError),
-    #[error("failed to update note in couchdb: {0}")]
-    CouchDbUpdate(CouchDbError),
     #[error("failed to write the headless vault filesystem: {0}")]
     FilesystemWrite(FilesystemError),
     #[error("headless client operation failed: {0}")]
     Headless(HeadlessError),
-    #[error("failed to repair raw vault file from couchdb: {0}")]
-    VaultFileRepair(CouchDbError),
-    #[error("raw vault file is temporarily unavailable while source reconciliation is incomplete")]
-    VaultFileTemporarilyUnavailable {
-        target_hash: String,
-        source_state: &'static str,
-        recovery_state: &'static str,
-        expected_child_count: Option<usize>,
-        live_child_count: Option<usize>,
-        missing_child_count: Option<usize>,
-        tombstoned_child_count: Option<usize>,
-    },
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::{BTreeMap, HashMap, HashSet};
+mod obts_tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
 
-    use axum::extract::{Path, Query, State};
-    use axum::http::StatusCode;
-    use axum::routing::get;
-    use axum::{Json, Router};
     use chrono::Utc;
-    use serde::Deserialize;
-    use sha2::{Digest, Sha256};
+    use tempfile::tempdir;
 
     use super::{ServiceError, VaultBridgeService};
     use crate::authorization::{AccessPolicy, AuthContext, ContextName};
-    use crate::config::{CouchDbConfig, DatabaseConfig, FeedMode};
-    use crate::couchdb::{CouchDbClient, build_livesync_note_documents};
-    use crate::livesync::ChangeEvent;
+    use crate::config::AppConfig;
+    use crate::filesystem::FilesystemSource;
     use crate::model::NoteId;
-    use crate::new_note::{
-        ContentPatchOperation, NewNoteFileType, PersistenceFailureKind, UpdateNoteRequest,
-        WriteError,
-    };
-    use crate::persistence::PostgresPersistence;
-    use crate::store::{NoteInput, RecoveredVaultFileState, VaultStore};
-
-    #[derive(Clone, Default)]
-    struct MockCouchState {
-        docs: Arc<HashMap<String, serde_json::Value>>,
-        deleted: Arc<HashSet<String>>,
-        requests: Arc<AtomicUsize>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct AllDocsRequest {
-        keys: Vec<String>,
-        #[serde(default)]
-        include_docs: bool,
-    }
-
-    async fn all_docs_by_key(
-        State(state): State<MockCouchState>,
-        Json(request): Json<AllDocsRequest>,
-    ) -> Json<serde_json::Value> {
-        state.requests.fetch_add(1, Ordering::SeqCst);
-        let rows = request
-            .keys
-            .into_iter()
-            .map(|key| mock_all_docs_row(&state, key, request.include_docs))
-            .collect::<Vec<_>>();
-        Json(serde_json::json!({ "rows": rows }))
-    }
-
-    async fn all_docs_scan(
-        State(state): State<MockCouchState>,
-        Query(query): Query<HashMap<String, String>>,
-    ) -> Json<serde_json::Value> {
-        state.requests.fetch_add(1, Ordering::SeqCst);
-        let include_docs = query
-            .get("include_docs")
-            .is_some_and(|value| value == "true");
-        let limit = query
-            .get("limit")
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(500);
-        let startkey = query
-            .get("startkey")
-            .and_then(|value| serde_json::from_str::<String>(value).ok());
-        let skip = query
-            .get("skip")
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(0);
-        let mut keys = state
-            .docs
-            .keys()
-            .chain(state.deleted.iter())
-            .cloned()
-            .collect::<Vec<_>>();
-        keys.sort();
-        keys.dedup();
-        let start = startkey
-            .as_ref()
-            .and_then(|key| keys.iter().position(|candidate| candidate == key))
-            .map(|index| index.saturating_add(skip))
-            .unwrap_or(0);
-        let rows = keys
-            .into_iter()
-            .skip(start)
-            .take(limit)
-            .map(|key| mock_all_docs_row(&state, key, include_docs))
-            .collect::<Vec<_>>();
-        Json(serde_json::json!({ "rows": rows }))
-    }
-
-    fn mock_all_docs_row(
-        state: &MockCouchState,
-        key: String,
-        include_docs: bool,
-    ) -> serde_json::Value {
-        if state.deleted.contains(&key) {
-            return serde_json::json!({
-                "id": key,
-                "key": key,
-                "value": { "rev": "3-deleted", "deleted": true }
-            });
-        }
-        if let Some(doc) = state.docs.get(&key) {
-            let mut row = serde_json::json!({
-                "id": key,
-                "key": key,
-                "value": {
-                    "rev": doc.get("_rev").and_then(serde_json::Value::as_str).unwrap_or("1-test")
-                }
-            });
-            if include_docs {
-                row["doc"] = doc.clone();
-            }
-            return row;
-        }
-        serde_json::json!({ "key": key, "error": "not_found" })
-    }
-
-    async fn database_info() -> Json<serde_json::Value> {
-        Json(serde_json::json!({"update_seq": "8-g1AAA-live"}))
-    }
-
-    async fn get_document(
-        State(state): State<MockCouchState>,
-        Path((_db, doc_id)): Path<(String, String)>,
-    ) -> (StatusCode, Json<serde_json::Value>) {
-        state.requests.fetch_add(1, Ordering::SeqCst);
-        match state.docs.get(&doc_id) {
-            Some(doc) => (StatusCode::OK, Json(doc.clone())),
-            None => (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "not_found"})),
-            ),
-        }
-    }
-
-    async fn put_document(
-        State(state): State<MockCouchState>,
-        Path((_db, doc_id)): Path<(String, String)>,
-        Json(_doc): Json<serde_json::Value>,
-    ) -> Json<serde_json::Value> {
-        state.requests.fetch_add(1, Ordering::SeqCst);
-        Json(serde_json::json!({"ok": true, "id": doc_id, "rev": "3-mock"}))
-    }
-
-    async fn delete_document(
-        State(state): State<MockCouchState>,
-        Path((_db, doc_id)): Path<(String, String)>,
-    ) -> Json<serde_json::Value> {
-        state.requests.fetch_add(1, Ordering::SeqCst);
-        Json(serde_json::json!({"ok": true, "id": doc_id, "rev": "3-deleted"}))
-    }
-
-    fn spawn_mock_couchdb(
-        docs: HashMap<String, serde_json::Value>,
-        deleted: HashSet<String>,
-    ) -> (Arc<CouchDbClient>, MockCouchState) {
-        let state = MockCouchState {
-            docs: Arc::new(docs),
-            deleted: Arc::new(deleted),
-            requests: Arc::new(AtomicUsize::new(0)),
-        };
-        let app = Router::new()
-            .route("/{db}", get(database_info))
-            .route("/{db}/_all_docs", get(all_docs_scan).post(all_docs_by_key))
-            .route(
-                "/{db}/{doc_id}",
-                get(get_document).put(put_document).delete(delete_document),
-            )
-            .with_state(state.clone());
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock couchdb");
-        listener
-            .set_nonblocking(true)
-            .expect("set mock listener nonblocking");
-        let addr = listener.local_addr().expect("mock address");
-        tokio::spawn(async move {
-            let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
-            axum::serve(listener, app)
-                .await
-                .expect("serve mock couchdb");
-        });
-        let couch = CouchDbClient::new(&CouchDbConfig {
-            url: format!("http://{addr}"),
-            database: "mainvault".to_string(),
-            username: "user".to_string(),
-            password: "pass".to_string(),
-            poll_interval_seconds: 1,
-            feed_mode: FeedMode::Longpoll,
-            ..Default::default()
-        })
-        .expect("couch client");
-        (Arc::new(couch), state)
-    }
+    use crate::new_note::NewNoteFileType;
+    use crate::runtime_config::RuntimeConfigState;
+    use crate::store::{RecoveredVaultFileState, VaultStore};
 
     #[tokio::test]
-    async fn status_uses_live_couchdb_sequence_instead_of_cached_watermark() {
-        let store = VaultStore::new(20);
-        store.set_sync_state("5-g1AAA", "5-g1AAA").await;
-        let (couch, _) = spawn_mock_couchdb(HashMap::new(), HashSet::new());
-        let service = VaultBridgeService::new(store, Some(couch));
-
-        let status = service.status().await;
-
-        assert_eq!(status.sync.couchdb_current_seq, "8-g1AAA-live");
-        assert_eq!(status.sync.behind_by, 3);
-        assert_eq!(status.sync.current_seq_source, "live");
-    }
-
-    async fn indexed_store(path: &str, couchdb_rev: &str) -> (VaultStore, AuthContext) {
-        let store = VaultStore::new(20);
-        let now = Utc::now();
+    async fn filesystem_backed_reads_fail_closed_when_visible_content_drifts() {
+        let store = VaultStore::new(10);
         store
-            .upsert_note(NoteInput {
-                id: NoteId::new(path),
-                title: "Repair Target".to_string(),
-                content: "# Repair Target\n\nStale indexed content.\n".to_string(),
-                frontmatter: serde_json::json!({"tags": ["shared"]}),
-                tags: vec!["shared".to_string()],
-                couchdb_rev: couchdb_rev.to_string(),
-                created_at: Some(now),
-                updated_at: now,
-                embedding: None,
-                links: Vec::new(),
-            })
+            .set_authorization_config(BTreeMap::from([(
+                "admin".to_string(),
+                AccessPolicy::admin(),
+            )]))
             .await;
-        let mut contexts = BTreeMap::new();
-        contexts.insert("admin".to_string(), AccessPolicy::admin());
-        store.set_authorization_config(contexts).await;
-        (
-            store,
-            AuthContext::new(ContextName::new("admin"), "test:admin".to_string()),
-        )
-    }
-
-    #[tokio::test]
-    async fn policy_visible_raw_read_repairs_missing_file_from_couchdb() {
-        let path = "11Active/repair-target.md";
-        let (store, auth) = indexed_store(path, "1-stale").await;
-        let docs = build_livesync_note_documents(path, "# Repair Target\n\nAuthoritative body.\n");
-        let mut file_doc = docs.file_doc;
-        let mut leaf_doc = docs.leaf_doc;
-        file_doc["_rev"] = serde_json::json!("2-file");
-        leaf_doc["_rev"] = serde_json::json!("2-leaf");
-        store
-            .ingest_changes_batch(
-                vec![ChangeEvent {
-                    seq: serde_json::Value::String(String::new()),
-                    id: docs.file_id.clone(),
-                    deleted: false,
-                    doc: Some(file_doc.clone()),
-                }],
-                "",
-                250,
-                Duration::from_secs(60),
-                None,
-            )
-            .await;
-        let mut source_docs = HashMap::new();
-        source_docs.insert(docs.file_id, file_doc);
-        source_docs.insert(docs.leaf_id, leaf_doc);
-        let (couch, state) = spawn_mock_couchdb(source_docs, HashSet::new());
-        let service = VaultBridgeService::new(store.clone(), Some(couch));
-
-        let file = service
-            .get_vault_file(&auth, &NoteId::new(path))
+        let root = tempdir().expect("vault root");
+        let source = Arc::new(FilesystemSource::new(root.path()).expect("filesystem source"));
+        let path = "11New/service-test.md";
+        let content = "# Service test\n\nOriginal.\n";
+        let revision = source
+            .create(path, content)
             .await
-            .expect("targeted repair should satisfy read");
-
-        assert!(file.content.contains("Authoritative body."));
-        assert!(state.requests.load(Ordering::SeqCst) > 0);
-        assert!(
-            store
-                .get_vault_file_for_policy(&auth, &NoteId::new(path))
-                .await
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn repaired_raw_file_survives_fresh_postgres_hydration() {
-        let Some(database_url) = std::env::var("VAULT_BRIDGE_TEST_DATABASE_URL").ok() else {
-            return;
-        };
-        assert!(
-            database_url
-                .rsplit('/')
-                .next()
-                .is_some_and(|name| name.contains("test"))
-        );
-        let persistence = Arc::new(
-            PostgresPersistence::connect_and_migrate(
-                &DatabaseConfig {
-                    url: database_url,
-                    max_connections: 5,
-                },
-                64,
-            )
-            .await
-            .expect("test postgres"),
-        );
-        sqlx::query(
-            "TRUNCATE TABLE access_log, api_keys, links, tags, blocks, notes, vault_files, sync_state, store_state, sync_recovery_queue, chunk_staging, file_aliases RESTART IDENTITY CASCADE",
-        )
-        .execute(persistence.pool())
-        .await
-        .expect("reset test postgres");
-
-        let path = "11Active/durable-read-repair.md";
-        let store = VaultStore::new_with_persistence(20, persistence.clone());
-        let now = Utc::now();
-        store
-            .upsert_note(NoteInput {
-                id: NoteId::new(path),
-                title: "Durable Read Repair".to_string(),
-                content: "# Durable Read Repair\n\nStale index.\n".to_string(),
-                frontmatter: serde_json::json!({"tags": ["shared"]}),
-                tags: vec!["shared".to_string()],
-                couchdb_rev: "1-stale".to_string(),
-                created_at: Some(now),
-                updated_at: now,
-                embedding: None,
-                links: Vec::new(),
-            })
-            .await;
-        let mut contexts = BTreeMap::new();
-        contexts.insert("admin".to_string(), AccessPolicy::admin());
-        store.set_authorization_config(contexts.clone()).await;
-        let auth = AuthContext::new(ContextName::new("admin"), "test:admin".to_string());
-        let docs = build_livesync_note_documents(path, "# Durable Read Repair\n\nSource body.\n");
-        let mut file_doc = docs.file_doc;
-        let mut leaf_doc = docs.leaf_doc;
-        file_doc["_rev"] = serde_json::json!("2-file");
-        leaf_doc["_rev"] = serde_json::json!("2-leaf");
-        store
-            .ingest_changes_batch(
-                vec![ChangeEvent {
-                    seq: serde_json::Value::String(String::new()),
-                    id: docs.file_id.clone(),
-                    deleted: false,
-                    doc: Some(file_doc.clone()),
-                }],
-                "",
-                250,
-                Duration::from_secs(60),
-                None,
-            )
-            .await;
-        let mut source_docs = HashMap::new();
-        source_docs.insert(docs.file_id, file_doc);
-        source_docs.insert(docs.leaf_id, leaf_doc);
-        let (couch, _) = spawn_mock_couchdb(source_docs, HashSet::new());
-        let service = VaultBridgeService::new(store, Some(couch));
-
-        service
-            .get_vault_file(&auth, &NoteId::new(path))
-            .await
-            .expect("repair raw file");
-
-        let fresh_store = VaultStore::new_with_persistence(20, persistence);
-        fresh_store
-            .hydrate_from_persistence()
-            .await
-            .expect("fresh hydration");
-        fresh_store.set_authorization_config(contexts).await;
-        let raw = fresh_store
-            .get_vault_file_for_policy(&auth, &NoteId::new(path))
-            .await
-            .expect("repaired raw survives hydration");
-        assert!(raw.content.contains("Source body."));
-    }
-
-    #[tokio::test]
-    async fn raw_edit_repairs_missing_file_before_applying_patch() {
-        let path = "11Active/edit-repair-target.md";
-        let (store, auth) = indexed_store(path, "1-stale").await;
-        let docs = build_livesync_note_documents(path, "# Edit Repair Target\n\nOriginal body.\n");
-        let mut file_doc = docs.file_doc;
-        let mut leaf_doc = docs.leaf_doc;
-        file_doc["_rev"] = serde_json::json!("2-file");
-        leaf_doc["_rev"] = serde_json::json!("2-leaf");
-        store
-            .ingest_changes_batch(
-                vec![ChangeEvent {
-                    seq: serde_json::Value::String(String::new()),
-                    id: docs.file_id.clone(),
-                    deleted: false,
-                    doc: Some(file_doc.clone()),
-                }],
-                "",
-                250,
-                Duration::from_secs(60),
-                None,
-            )
-            .await;
-        let mut source_docs = HashMap::new();
-        source_docs.insert(docs.file_id, file_doc);
-        source_docs.insert(docs.leaf_id, leaf_doc);
-        let (couch, _) = spawn_mock_couchdb(source_docs, HashSet::new());
-        let service = VaultBridgeService::new(store, Some(couch));
-
-        let response = service
-            .edit_vault_file(
-                &auth,
-                &NoteId::new(path),
-                UpdateNoteRequest {
-                    expected_sha256: Some(hex::encode(Sha256::digest(
-                        b"# Edit Repair Target\n\nOriginal body.\n",
-                    ))),
-                    content: None,
-                    content_patch: Some(vec![ContentPatchOperation::Append {
-                        text: "\nRepaired and edited.\n".to_string(),
-                    }]),
-                    tags: None,
-                    metadata: None,
-                },
-            )
-            .await
-            .expect("edit should repair before applying patch");
-
-        assert_eq!(response.status, "updated");
-        let file = service
-            .get_vault_file(&auth, &NoteId::new(path))
-            .await
-            .expect("edited raw file");
-        assert!(file.content.contains("Repaired and edited."));
-    }
-
-    #[tokio::test]
-    async fn blind_append_requires_matching_content_hash() {
-        let path = "11Active/hash-guard.md";
-        let content = "# Hash Guard\n\nOriginal body.\n";
-        let (store, auth) = indexed_store(path, "1-stale").await;
+            .expect("create source file");
         store
             .project_filesystem_file(RecoveredVaultFileState {
                 path: path.to_string(),
                 content: content.to_string(),
                 file_type: NewNoteFileType::Md,
-                couchdb_rev: format!("sha256:{}", hex::encode(Sha256::digest(content.as_bytes()))),
+                couchdb_rev: revision.clone(),
                 created_at: Some(Utc::now()),
                 updated_at: Utc::now(),
             })
             .await
-            .expect("project raw file");
-
-        let without_hash = store
-            .prepare_edit_vault_file_write(
-                &auth,
-                &NoteId::new(path),
-                UpdateNoteRequest {
-                    expected_sha256: None,
-                    content: None,
-                    content_patch: Some(vec![ContentPatchOperation::Append {
-                        text: "Appended.\n".to_string(),
-                    }]),
-                    tags: None,
-                    metadata: None,
-                },
-                Utc::now(),
-            )
-            .await;
-        assert!(matches!(without_hash, Err(WriteError::InvalidUpdate { .. })));
-
-        let wrong_hash = store
-            .prepare_edit_vault_file_write(
-                &auth,
-                &NoteId::new(path),
-                UpdateNoteRequest {
-                    expected_sha256: Some("deadbeef".to_string()),
-                    content: None,
-                    content_patch: Some(vec![ContentPatchOperation::Append {
-                        text: "Appended.\n".to_string(),
-                    }]),
-                    tags: None,
-                    metadata: None,
-                },
-                Utc::now(),
-            )
-            .await;
-        assert!(matches!(wrong_hash, Err(WriteError::ContentChanged { .. })));
-
-        let expected = hex::encode(Sha256::digest(content.as_bytes()));
-        let guarded = store
-            .prepare_edit_vault_file_write(
-                &auth,
-                &NoteId::new(path),
-                UpdateNoteRequest {
-                    expected_sha256: Some(expected),
-                    content: None,
-                    content_patch: Some(vec![ContentPatchOperation::Append {
-                        text: "Appended.\n".to_string(),
-                    }]),
-                    tags: None,
-                    metadata: None,
-                },
-                Utc::now(),
-            )
-            .await;
-        assert!(guarded.is_ok());
-    }
-
-    #[tokio::test]
-    async fn source_committed_edit_returns_accepted_when_projection_is_pending() {
-        let path = "11Active/pending-projection.md";
-        let (store, auth) = indexed_store(path, "1-stale").await;
-        let docs = build_livesync_note_documents(path, "# Pending Projection\n\nOriginal body.\n");
-        let mut file_doc = docs.file_doc;
-        let mut leaf_doc = docs.leaf_doc;
-        file_doc["_rev"] = serde_json::json!("2-file");
-        leaf_doc["_rev"] = serde_json::json!("2-leaf");
-        store
-            .ingest_changes_batch(
-                vec![ChangeEvent {
-                    seq: serde_json::Value::String(String::new()),
-                    id: docs.file_id.clone(),
-                    deleted: false,
-                    doc: Some(file_doc.clone()),
-                }],
-                "",
-                250,
-                Duration::from_secs(60),
-                None,
-            )
-            .await;
-        let source_docs = HashMap::from([(docs.file_id, file_doc), (docs.leaf_id, leaf_doc)]);
-        let (couch, _) = spawn_mock_couchdb(source_docs, HashSet::new());
-        store
-            .force_projection_failure_for_test(Some(PersistenceFailureKind::DatabaseUnavailable))
-            .await;
-        let service = VaultBridgeService::new(store, Some(couch));
-
-        let response = service
-            .edit_vault_file(
-                &auth,
-                &NoteId::new(path),
-                UpdateNoteRequest {
-                    expected_sha256: None,
-                    content: None,
-                    content_patch: Some(vec![ContentPatchOperation::Replace {
-                        old: "Original body.".to_string(),
-                        new: "Committed source body.".to_string(),
-                    }]),
-                    tags: None,
-                    metadata: None,
-                },
-            )
-            .await
-            .expect("source commit should be accepted while projection is pending");
-
-        assert_eq!(response.status, "accepted");
-        assert_eq!(response.local_projection, "pending");
-        assert!(response.operation_id.starts_with("write-"));
+            .expect("project source file");
+        let service = VaultBridgeService::new_with_filesystem(store, source.clone(), None);
+        let admin = AuthContext::new(ContextName::new("admin"), "test:admin".to_string());
         let file = service
-            .get_vault_file(&auth, &NoteId::new(path))
+            .get_vault_file(&admin, &NoteId::new(path))
             .await
-            .expect("source-committed content should be readable from process cache");
-        assert!(file.content.contains("Committed source body."));
-        let status = service.status().await;
-        assert_eq!(status.status, "degraded");
-        assert_eq!(status.write_projection.pending, 1);
-    }
+            .expect("filesystem-backed read");
+        assert_eq!(file.content, content);
 
-    #[tokio::test]
-    async fn incomplete_live_source_falls_back_to_visible_index_content() {
-        let path = "11Active/incomplete-live-source.md";
-        let (store, auth) = indexed_store(path, "1-stale").await;
-        let docs = build_livesync_note_documents(path, "# Incomplete Live Source\n\nNewer body.\n");
-        let mut file_doc = docs.file_doc;
-        file_doc["_rev"] = serde_json::json!("2-file");
-        store
-            .ingest_changes_batch(
-                vec![ChangeEvent {
-                    seq: serde_json::Value::String(String::new()),
-                    id: docs.file_id.clone(),
-                    deleted: false,
-                    doc: Some(file_doc.clone()),
-                }],
-                "",
-                250,
-                Duration::from_secs(60),
-                None,
-            )
-            .await;
-        let (couch, _) =
-            spawn_mock_couchdb(HashMap::from([(docs.file_id, file_doc)]), HashSet::new());
-        let service = VaultBridgeService::new(store, Some(couch));
-
-        let file = service
-            .get_vault_file(&auth, &NoteId::new(path))
+        source
+            .update(path, "# Drifted\n", Some(&revision))
             .await
-            .expect("visible index should provide a safe read fallback");
-
-        assert!(file.content.contains("Stale indexed content."));
-    }
-
-    #[tokio::test]
-    async fn unresolved_policy_visible_raw_read_is_retryable() {
-        let path = "11Active/incomplete-source.md";
-        let (store, auth) = indexed_store(path, "1-stale").await;
-        let (couch, _) = spawn_mock_couchdb(HashMap::new(), HashSet::new());
-        let service = VaultBridgeService::new(store, Some(couch));
-
-        let error = service
-            .get_vault_file(&auth, &NoteId::new(path))
-            .await
-            .expect_err("incomplete source should not look like policy denial");
-
+            .expect("external drift");
         assert!(matches!(
-            error,
-            ServiceError::VaultFileTemporarilyUnavailable { .. }
+            service.get_vault_file(&admin, &NoteId::new(path)).await,
+            Err(ServiceError::IndexCatchingUp)
         ));
     }
 
     #[tokio::test]
-    async fn filtered_missing_raw_note_does_not_query_couchdb() {
-        let path = "11Active/filtered.md";
-        let (store, _) = indexed_store(path, "1-stale").await;
+    async fn filesystem_backed_reads_fail_closed_when_indexed_file_disappears() {
+        let store = VaultStore::new(10);
         store
             .set_authorization_config(BTreeMap::from([(
-                "blocked".to_string(),
-                AccessPolicy::default(),
+                "admin".to_string(),
+                AccessPolicy::admin(),
             )]))
             .await;
-        let auth = AuthContext::new(ContextName::new("blocked"), "test:blocked".to_string());
-        let (couch, state) = spawn_mock_couchdb(HashMap::new(), HashSet::new());
-        let service = VaultBridgeService::new(store, Some(couch));
-
-        let error = service
-            .get_vault_file(&auth, &NoteId::new(path))
+        let root = tempdir().expect("vault root");
+        let source = Arc::new(FilesystemSource::new(root.path()).expect("filesystem source"));
+        let path = "11New/deleted-during-read.md";
+        let content = "# Delete race\n";
+        let revision = source
+            .create(path, content)
             .await
-            .expect_err("filtered note must stay opaque");
-
-        assert!(matches!(error, ServiceError::NotFound));
-        assert_eq!(state.requests.load(Ordering::SeqCst), 0);
+            .expect("create source file");
+        store
+            .project_filesystem_file(RecoveredVaultFileState {
+                path: path.to_string(),
+                content: content.to_string(),
+                file_type: NewNoteFileType::Md,
+                couchdb_rev: revision,
+                created_at: Some(Utc::now()),
+                updated_at: Utc::now(),
+            })
+            .await
+            .expect("project source file");
+        let service = VaultBridgeService::new_with_filesystem(store, source.clone(), None);
+        tokio::fs::remove_file(root.path().join(path))
+            .await
+            .expect("remove source file");
+        let admin = AuthContext::new(ContextName::new("admin"), "test:admin".to_string());
+        assert!(matches!(
+            service.get_vault_file(&admin, &NoteId::new(path)).await,
+            Err(ServiceError::IndexCatchingUp)
+        ));
     }
 
     #[tokio::test]
-    async fn confirmed_source_tombstone_prunes_stale_local_note() {
-        let path = "11Active/deleted-source.md";
-        let (store, auth) = indexed_store(path, "1-stale").await;
-        let docs = build_livesync_note_documents(path, "# Deleted Source\n");
-        let mut file_doc = docs.file_doc;
-        file_doc["_rev"] = serde_json::json!("2-file");
-        store
-            .ingest_changes_batch(
-                vec![ChangeEvent {
-                    seq: serde_json::Value::String(String::new()),
-                    id: docs.file_id.clone(),
-                    deleted: false,
-                    doc: Some(file_doc),
-                }],
-                "",
-                250,
-                Duration::from_secs(60),
-                None,
-            )
-            .await;
-        let (couch, _) = spawn_mock_couchdb(HashMap::new(), HashSet::from([docs.file_id.clone()]));
-        let service = VaultBridgeService::new(store.clone(), Some(couch));
-
-        let error = service
-            .get_vault_file(&auth, &NoteId::new(path))
-            .await
-            .expect_err("confirmed deletion should remain a genuine 404");
-
-        assert!(matches!(error, ServiceError::NotFound));
-        assert!(
-            store
-                .get_note_for_policy(&auth, &NoteId::new(path))
+    async fn only_admin_can_reset_the_derived_projection_cursor() {
+        let config = AppConfig::default();
+        let runtime_config = RuntimeConfigState::for_tests(&config);
+        let store = VaultStore::new_with_auth_config(10, runtime_config.auth_config());
+        let root = tempdir().expect("vault root");
+        let source = Arc::new(FilesystemSource::new(root.path()).expect("filesystem source"));
+        let service = VaultBridgeService::new_with_filesystem(store, source, None);
+        let non_admin =
+            AuthContext::new(ContextName::new("non_personal"), "test:agent".to_string());
+        assert!(matches!(
+            service
+                .headless_command(
+                    &non_admin,
+                    "reset-index-projection",
+                    serde_json::Value::Null
+                )
+                .await,
+            Err(ServiceError::Forbidden)
+        ));
+        let admin = AuthContext::new(ContextName::new("admin"), "test:admin".to_string());
+        assert_eq!(
+            service
+                .headless_command(&admin, "reset-index-projection", serde_json::Value::Null)
                 .await
-                .is_none()
-        );
-        assert!(
-            store
-                .vault_file_recovery_target(&NoteId::new(path))
-                .await
-                .is_none()
+                .expect("reset projection"),
+            serde_json::json!({ "status": "index_projection_reset" })
         );
     }
 }
