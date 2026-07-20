@@ -3,5 +3,6 @@ dist
 .git
 .obts-server
 coverage
+crates/obts-bridge/target
 *.log
 
