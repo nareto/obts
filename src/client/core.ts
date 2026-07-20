@@ -97,6 +97,19 @@ export type RebuildResult = {
 
 export type SyncResult = { status: string; main?: string; conflictId?: string };
 
+export type IndexDelta = {
+  head: string | null;
+  base: string | null;
+  mode: 'incremental' | 'rebuild' | 'diverged' | 'unavailable';
+  files: Array<{ path: string; oid: string; content_sha256: string }>;
+  changes: Array<{
+    path: string;
+    kind: 'add' | 'modify' | 'delete';
+    oid: string | null;
+    content_sha256: string | null;
+  }>;
+};
+
 type SharedClientCore = {
   initialize(): Promise<void>;
   readState(): Promise<LocalPluginState>;
@@ -126,6 +139,7 @@ type SharedClientCore = {
   resetLocalPairingState(): Promise<{ status: 'Not paired'; recoveryBundleId: string | null }>;
   reportDeviceStatus(): Promise<void>;
   markBlocked(code: string, details?: Record<string, unknown>): Promise<void>;
+  readIndexDelta(fromCommit?: string | null): Promise<IndexDelta>;
 };
 
 type SharedClientInternals = SharedClientCore & {
@@ -293,6 +307,10 @@ export class ObtsPluginClient {
     return this.client.markBlocked(code, details);
   }
 
+  readIndexDelta(fromCommit?: string | null): Promise<IndexDelta> {
+    return this.client.readIndexDelta(fromCommit);
+  }
+
   writeState(state: unknown): Promise<void> {
     return this.client.writeState(state);
   }
@@ -428,7 +446,7 @@ function createNodePluginHost(vaultDir: string, settings: ObtsPluginSettings) {
     markFullScanCompleted: () => undefined,
     handlePluginCompatibility: (_compatibility: unknown) => undefined,
     flushOpenMarkdownEditorsToDisk: async (): Promise<void> => {},
-    saveSettings: async () => undefined
+    saveSettings: async (): Promise<void> => {}
   };
   return host;
 }

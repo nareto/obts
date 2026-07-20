@@ -9,7 +9,10 @@ use tracing_subscriber::EnvFilter;
 
 use obts_bridge::api::{ApiTokenState, AppState, serve};
 use obts_bridge::config::AppConfig;
-use obts_bridge::filesystem::{FilesystemSource, spawn_filesystem_worker, synchronize_snapshot};
+use obts_bridge::filesystem::{
+    FilesystemSource, hydrate_runtime_snapshot, spawn_filesystem_worker,
+    synchronize_commit_projection, synchronize_snapshot,
+};
 use obts_bridge::headless::{HeadlessClient, spawn_maintenance};
 use obts_bridge::new_note::NewNotePathSettings;
 use obts_bridge::persistence::PostgresPersistence;
@@ -71,10 +74,13 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(persistence)
     } else {
-        warn!("database persistence is disabled; semantic and durable indexed operation is not production-ready");
+        warn!(
+            "database persistence is disabled; semantic and durable indexed operation is not production-ready"
+        );
         None
     };
 
+    let projection_persistence = persistence.clone();
     let store = if let Some(persistence) = persistence {
         let store = obts_bridge::store::VaultStore::new_with_persistence_and_auth_config(
             config.indexer.hub_note_threshold,
@@ -94,10 +100,14 @@ async fn main() -> anyhow::Result<()> {
     };
     configure_store(&store, &config).await;
 
-    let filesystem = Arc::new(
+    let filesystem = Arc::new(if let Some(persistence) = projection_persistence {
+        FilesystemSource::new_with_persistence(&config.client.vault_dir, persistence)
+            .await
+            .context("failed to initialize the durable headless vault projection")?
+    } else {
         FilesystemSource::new(&config.client.vault_dir)
-            .context("failed to initialize the headless vault filesystem")?,
-    );
+            .context("failed to initialize the headless vault filesystem")?
+    });
     let headless = if config.client.auto_start {
         Some(
             HeadlessClient::spawn(&config.client)
@@ -108,21 +118,45 @@ async fn main() -> anyhow::Result<()> {
         warn!("headless OBTS client autostart is disabled");
         None
     };
-    let initial_scan_guard = if let Some(client) = headless.as_ref() {
-        Some(
-            client
-                .lock_filesystem()
+    if let Some(client) = headless.as_ref() {
+        let mut guard = client
+            .lock_filesystem()
+            .await
+            .context("failed to coordinate the initial commit projection")?;
+        let had_cursor = filesystem.indexed_commit().is_some();
+        if had_cursor {
+            hydrate_runtime_snapshot(&store, &filesystem)
                 .await
-                .context("failed to coordinate the initial filesystem projection")?,
-        )
+                .context("failed to hydrate runtime content from the headless vault")?;
+        }
+        match synchronize_commit_projection(&store, &filesystem, &mut guard, client).await {
+            Ok(projected) => info!(
+                projected,
+                vault_dir = %filesystem.root().display(),
+                "initial commit projection ready"
+            ),
+            Err(error) => warn!(
+                error = %error,
+                "initial commit projection deferred until the headless client is paired and synchronized"
+            ),
+        }
     } else {
-        None
-    };
-    let projected = synchronize_snapshot(&store, &filesystem)
-        .await
-        .context("failed to build the initial filesystem projection")?;
-    drop(initial_scan_guard);
-    info!(projected, vault_dir = %filesystem.root().display(), "initial filesystem projection ready");
+        let projected = synchronize_snapshot(&store, &filesystem)
+            .await
+            .context("failed to build the development filesystem projection")?;
+        hydrate_runtime_snapshot(&store, &filesystem)
+            .await
+            .context("failed to hydrate development runtime content")?;
+        filesystem
+            .purge_persisted_raw_content()
+            .await
+            .context("failed to finalize the derived-only development projection")?;
+        info!(
+            projected,
+            vault_dir = %filesystem.root().display(),
+            "development filesystem projection ready without headless commit attestation"
+        );
+    }
 
     let mut worker_handles = vec![spawn_filesystem_worker(
         store.clone(),
@@ -229,8 +263,8 @@ fn config_reload_poll_interval() -> anyhow::Result<Option<Duration>> {
     let raw = std::env::var("CONFIG_RELOAD_INTERVAL_SECONDS")
         .unwrap_or_else(|_| DEFAULT_CONFIG_RELOAD_INTERVAL_SECONDS.to_string());
     let trimmed = raw.trim();
-    let seconds = trimmed
-        .parse::<u64>()
-        .with_context(|| format!("CONFIG_RELOAD_INTERVAL_SECONDS must be a non-negative integer, got '{raw}'"))?;
+    let seconds = trimmed.parse::<u64>().with_context(|| {
+        format!("CONFIG_RELOAD_INTERVAL_SECONDS must be a non-negative integer, got '{raw}'")
+    })?;
     Ok((seconds > 0).then(|| Duration::from_secs(seconds)))
 }

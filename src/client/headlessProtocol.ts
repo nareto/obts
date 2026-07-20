@@ -23,6 +23,7 @@ export type HeadlessClient = Pick<
   | 'readState'
   | 'readQueue'
   | 'readPendingOnboarding'
+  | 'readIndexDelta'
   | 'startOnboarding'
   | 'pollOnboarding'
   | 'analyzeOnboarding'
@@ -99,6 +100,8 @@ export class HeadlessSession {
         return { result: await this.client.readQueue(), stateChanged: false };
       case 'read-pending-onboarding':
         return { result: await this.client.readPendingOnboarding(), stateChanged: false };
+      case 'read-index-delta':
+        return { result: await this.client.readIndexDelta(optionalString(request, 'fromCommit')), stateChanged: false };
       case 'start-onboarding':
         return { result: await this.client.startOnboarding(requiredString(request, 'localVaultName')), stateChanged: true };
       case 'poll-onboarding':
@@ -210,6 +213,15 @@ function optionalBoolean(request: HeadlessRequest, field: string): boolean | und
   const value = request[field];
   if (value === undefined) return undefined;
   if (typeof value !== 'boolean') throw new ProtocolInputError('invalid_request', `${field} must be a boolean.`);
+  return value;
+}
+
+function optionalString(request: HeadlessRequest, field: string): string | undefined {
+  const value = request[field];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new ProtocolInputError('invalid_request', `${field} must be a non-empty string when provided.`);
+  }
   return value;
 }
 

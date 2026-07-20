@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
@@ -774,6 +774,7 @@ pub struct VaultStore {
     audit: Arc<RwLock<StoreAuditState>>,
     sync_state: Arc<RwLock<RuntimeSyncState>>,
     cache_generation: Arc<AtomicU64>,
+    filesystem_content_authoritative: Arc<AtomicBool>,
     read_refresh_lock: Arc<Mutex<()>>,
     projection_health: Arc<RwLock<ProjectionHealthState>>,
     #[cfg(test)]
@@ -879,6 +880,7 @@ impl VaultStore {
             audit: Arc::new(RwLock::new(audit)),
             sync_state: Arc::new(RwLock::new(sync_state)),
             cache_generation: Arc::new(AtomicU64::new(0)),
+            filesystem_content_authoritative: Arc::new(AtomicBool::new(false)),
             read_refresh_lock: Arc::new(Mutex::new(())),
             projection_health: Arc::new(RwLock::new(ProjectionHealthState::default())),
             #[cfg(test)]
@@ -930,7 +932,11 @@ impl VaultStore {
     }
 
     async fn prepare_cached_read(&self, read_context: &'static str) {
-        if self.persistence.is_none() {
+        if self.persistence.is_none()
+            || self
+                .filesystem_content_authoritative
+                .load(Ordering::Acquire)
+        {
             return;
         }
 
@@ -1130,14 +1136,6 @@ impl VaultStore {
         if health.pending.len() < before {
             health.last_success_at = Some(Utc::now());
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn force_projection_failure_for_test(
-        &self,
-        failure: Option<PersistenceFailureKind>,
-    ) {
-        *self.forced_projection_failure.write().await = failure;
     }
 
     pub async fn set_authorization_config(&self, config: AuthorizationConfig) {
@@ -1949,6 +1947,31 @@ impl VaultStore {
         response
     }
 
+    async fn hydrate_block_matches(
+        &self,
+        matches: Vec<BlockSemanticMatch>,
+    ) -> Vec<BlockSemanticMatch> {
+        let settings = self.settings.read().await.clone();
+        let guard = self.inner.read().await;
+        matches
+            .into_iter()
+            .filter_map(|mut block_match| {
+                let note = guard.notes.get(&NoteId::new(&block_match.note_id))?;
+                let blocks = split_into_semantic_blocks(
+                    &note.content,
+                    settings.block_min_chars,
+                    settings.block_chunk_bytes,
+                    settings.block_chunk_overlap_sentences,
+                );
+                block_match.content = blocks
+                    .into_iter()
+                    .find(|block| block.block_index == block_match.block_index)?
+                    .content;
+                Some(block_match)
+            })
+            .collect()
+    }
+
     async fn search_via_persistence(
         &self,
         persistence: &PostgresPersistence,
@@ -1976,9 +1999,13 @@ impl VaultStore {
                     let note_results = persistence
                         .search_semantic_ranking(&query_embedding, ranking_limit)
                         .await?;
-                    let block_results = persistence
-                        .search_block_semantic_ranking(&query_embedding, ranking_limit)
-                        .await?;
+                    let block_results = self
+                        .hydrate_block_matches(
+                            persistence
+                                .search_block_semantic_ranking(&query_embedding, ranking_limit)
+                                .await?,
+                        )
+                        .await;
                     let mut merged: HashMap<String, f32> = HashMap::new();
                     for (id, score) in &note_results {
                         let entry = merged.entry(id.clone()).or_insert(0.0);
@@ -2045,7 +2072,23 @@ impl VaultStore {
                 ordered_ids.push(id_string);
             }
         }
-        let note_map = persistence.load_search_note_map(&ordered_ids).await?;
+        let note_map = {
+            let guard = self.inner.read().await;
+            ordered_ids
+                .iter()
+                .filter_map(|id| {
+                    let note = guard.notes.get(&NoteId::new(id))?;
+                    Some((
+                        id.clone(),
+                        PersistedSearchNote {
+                            id: id.clone(),
+                            title: note.title.clone(),
+                            content: note.content.clone(),
+                        },
+                    ))
+                })
+                .collect::<HashMap<_, _>>()
+        };
 
         let mut results = Vec::new();
         for (id, score, match_type) in ranked {
@@ -2175,6 +2218,7 @@ impl VaultStore {
                             .await
                         {
                             Ok(block_results) => {
+                                let block_results = self.hydrate_block_matches(block_results).await;
                                 let mut chunk_scores: HashMap<NoteId, f32> = HashMap::new();
                                 for block in block_results {
                                     let note_id = NoteId::new(block.note_id.clone());
@@ -3240,7 +3284,8 @@ impl VaultStore {
     }
 
     pub async fn indexed_vault_file_revisions(&self) -> HashMap<String, String> {
-        self.prepare_cached_read("filesystem revision snapshot").await;
+        self.prepare_cached_read("filesystem revision snapshot")
+            .await;
         let guard = self.inner.read().await;
         guard
             .vault_files
@@ -3256,64 +3301,57 @@ impl VaultStore {
         self.project_recovered_vault_file(recovered).await
     }
 
+    pub async fn hydrate_runtime_filesystem_snapshot(
+        &self,
+        recovered_files: Vec<RecoveredVaultFileState>,
+    ) {
+        let mut prepared = Vec::with_capacity(recovered_files.len());
+        for recovered in recovered_files {
+            let revision = recovered.couchdb_rev.clone();
+            prepared.push((
+                self.prepared_recovered_vault_file(recovered).await,
+                revision,
+            ));
+        }
+        let now = Utc::now();
+        let mut guard = self.inner.write().await;
+        let embeddings = guard
+            .notes
+            .iter()
+            .map(|(id, note)| (id.clone(), (note.embedding.clone(), note.indexed_at)))
+            .collect::<HashMap<_, _>>();
+        guard.notes.clear();
+        guard.links.clear();
+        guard.vault_files.clear();
+        for (write, revision) in prepared {
+            upsert_vault_file_locked(
+                &mut guard,
+                &write.path,
+                &write.content,
+                &revision,
+                write.created_at,
+                write.updated_at,
+                now,
+            );
+            if let Some(mut note) = write.note {
+                let indexed_at = embeddings
+                    .get(&note.id)
+                    .map(|(embedding, indexed_at)| {
+                        note.embedding = embedding.clone();
+                        *indexed_at
+                    })
+                    .unwrap_or(now);
+                upsert_note_locked(&mut guard, note, indexed_at);
+            }
+        }
+        rebuild_graph_cache_locked(&mut guard);
+        drop(guard);
+        self.filesystem_content_authoritative
+            .store(true, Ordering::Release);
+    }
+
     pub async fn delete_filesystem_file(&self, file_id: &NoteId) -> Result<(), WriteError> {
         self.commit_confirmed_vault_file_deletion(file_id).await
-    }
-
-    pub(crate) async fn recovered_vault_file_state(
-        &self,
-        file_id: &NoteId,
-    ) -> Option<RecoveredVaultFileState> {
-        let guard = self.inner.read().await;
-        let file = guard.vault_files.get(file_id.as_str())?;
-        Some(RecoveredVaultFileState {
-            path: file.path.clone(),
-            content: file.content.clone(),
-            file_type: if is_markdown_note_path(&file.path) {
-                NewNoteFileType::Md
-            } else {
-                NewNoteFileType::Base
-            },
-            couchdb_rev: file.couchdb_rev.clone(),
-            created_at: file.created_at,
-            updated_at: file.updated_at,
-        })
-    }
-
-    pub(crate) async fn recovered_vault_file_from_index(
-        &self,
-        file_id: &NoteId,
-    ) -> Result<Option<RecoveredVaultFileState>, WriteError> {
-        let (frontmatter, body, tags, couchdb_rev, created_at, updated_at) = {
-            let guard = self.inner.read().await;
-            let Some(note) = guard.notes.get(file_id) else {
-                return Ok(None);
-            };
-            (
-                note.frontmatter.clone(),
-                note.content.clone(),
-                note.tags.clone(),
-                note.couchdb_rev.clone(),
-                note.created_at,
-                note.updated_at,
-            )
-        };
-        let content = UpdateNoteRequest {
-            expected_sha256: None,
-            content: None,
-            content_patch: None,
-            tags: None,
-            metadata: None,
-        }
-        .rebuild_markdown(&frontmatter, &body, &tags, updated_at)?;
-        Ok(Some(RecoveredVaultFileState {
-            path: file_id.as_str().to_string(),
-            content,
-            file_type: NewNoteFileType::Md,
-            couchdb_rev,
-            created_at,
-            updated_at,
-        }))
     }
 
     pub(crate) async fn project_recovered_vault_file(
@@ -3552,7 +3590,10 @@ impl VaultStore {
         }
         if request.content_patch.as_ref().is_some_and(|operations| {
             operations.iter().any(|operation| {
-                matches!(operation, ContentPatchOperation::Append { .. } | ContentPatchOperation::Prepend { .. })
+                matches!(
+                    operation,
+                    ContentPatchOperation::Append { .. } | ContentPatchOperation::Prepend { .. }
+                )
             })
         }) && request.expected_sha256.is_none()
         {
@@ -3663,7 +3704,7 @@ impl VaultStore {
                 Ok(rows) => {
                     return rows
                         .into_iter()
-                        .map(|(id, _, _, _)| NoteId::new(id))
+                        .map(|(id, _, _)| NoteId::new(id))
                         .collect::<Vec<_>>();
                 }
                 Err(error) => {
@@ -3700,16 +3741,18 @@ impl VaultStore {
                 .await
             {
                 Ok(rows) => {
+                    let guard = self.inner.read().await;
                     return rows
                         .into_iter()
-                        .map(|(id, path, title, content)| {
+                        .filter_map(|(id, path, title)| {
+                            let note = guard.notes.get(&NoteId::new(&id))?;
                             let prefix = breadcrumb_prefix(&path, &title, &[]);
                             let text = if prefix.is_empty() {
-                                content
+                                note.content.clone()
                             } else {
-                                format!("{prefix}\n{content}")
+                                format!("{prefix}\n{}", note.content)
                             };
-                            (NoteId::new(id), text)
+                            Some((NoteId::new(id), text))
                         })
                         .collect::<Vec<_>>();
                 }
@@ -3808,16 +3851,33 @@ impl VaultStore {
             return Vec::new();
         };
         let max_failures_i32 = max_failures.min(i32::MAX as usize) as i32;
-        match persistence
+        let rows = match persistence
             .pending_block_embedding_batch(limit.max(1), max_failures_i32)
             .await
         {
-            Ok(rows) => rows.into_iter().map(|row| (row.id, row.text)).collect(),
+            Ok(rows) => rows,
             Err(error) => {
                 warn!(error = %error, "failed to load pending block embedding batch");
-                Vec::new()
+                return Vec::new();
             }
-        }
+        };
+        let settings = self.settings.read().await.clone();
+        let guard = self.inner.read().await;
+        rows.into_iter()
+            .filter_map(|row| {
+                let note = guard.notes.get(&NoteId::new(&row.note_id))?;
+                let blocks = split_into_semantic_blocks(
+                    &note.content,
+                    settings.block_min_chars,
+                    settings.block_chunk_bytes,
+                    settings.block_chunk_overlap_sentences,
+                );
+                let block = blocks
+                    .into_iter()
+                    .find(|block| block.block_index == row.block_index)?;
+                Some((row.id, format!("{}\n{}", row.breadcrumb, block.content)))
+            })
+            .collect()
     }
 
     /// Worker B primitive: persist block embeddings from an external provider.
