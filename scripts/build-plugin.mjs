@@ -8,7 +8,7 @@ import { build } from 'esbuild';
 
 const checkOnly = process.argv.includes('--check');
 const manifestPath = new URL('../obsidian-plugin/manifest.json', import.meta.url);
-const sourcePath = new URL('../obsidian-plugin/src/main.js', import.meta.url);
+const sourcePath = new URL('../obsidian-plugin/src/main.cjs', import.meta.url);
 const outputPath = new URL('../obsidian-plugin/main.js', import.meta.url);
 const apiTypesPath = new URL('../src/shared/types.ts', import.meta.url);
 const versionModulePath = new URL('../obsidian-plugin/src/version.ts', import.meta.url);

@@ -19,7 +19,7 @@ describe('mobile plugin artifact', () => {
   it('is advertised for mobile and contains no unresolved desktop runtime dependencies', async () => {
     const manifest = JSON.parse(await readFile('obsidian-plugin/manifest.json', 'utf8')) as { isDesktopOnly: boolean };
     const artifact = await readFile('obsidian-plugin/main.js', 'utf8');
-    const source = await readFile('obsidian-plugin/src/main.js', 'utf8');
+    const source = await readFile('obsidian-plugin/src/main.cjs', 'utf8');
     const styles = await readFile('obsidian-plugin/styles.css', 'utf8');
 
     expect(manifest.isDesktopOnly).toBe(false);

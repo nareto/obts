@@ -9946,14 +9946,14 @@ function assertParameter(name, value) {
 function isAbsolute(filepath) {
   return filepath.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(filepath);
 }
-async function discoverGitdir({ fsp: fsp2, dotgit }) {
-  assertParameter("fsp", fsp2);
+async function discoverGitdir({ fsp, dotgit }) {
+  assertParameter("fsp", fsp);
   assertParameter("dotgit", dotgit);
-  const dotgitStat = await fsp2._stat(dotgit).catch(() => ({ isFile: () => false, isDirectory: () => false }));
+  const dotgitStat = await fsp._stat(dotgit).catch(() => ({ isFile: () => false, isDirectory: () => false }));
   if (dotgitStat.isDirectory()) {
     return dotgit;
   } else if (dotgitStat.isFile()) {
-    return fsp2._readFile(dotgit, "utf8").then((contents) => contents.trimRight().substr(8)).then((submoduleGitdir) => {
+    return fsp._readFile(dotgit, "utf8").then((contents) => contents.trimRight().substr(8)).then((submoduleGitdir) => {
       if (isAbsolute(submoduleGitdir)) {
         return submoduleGitdir;
       }
@@ -10698,10 +10698,10 @@ async function addRemote({
     assertParameter("gitdir", gitdir);
     assertParameter("remote", remote);
     assertParameter("url", url);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _addRemote({
-      fs: fsp2,
+      fs: fsp,
       gitdir: updatedGitdir,
       remote,
       url,
@@ -10849,10 +10849,10 @@ async function branch({
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
     assertParameter("ref", ref);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _branch({
-      fs: fsp2,
+      fs: fsp,
       gitdir: updatedGitdir,
       ref,
       object,
@@ -11489,10 +11489,10 @@ async function checkout({
     assertParameter("dir", dir);
     assertParameter("gitdir", gitdir);
     const ref = _ref || "HEAD";
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _checkout({
-      fs: fsp2,
+      fs: fsp,
       cache,
       onProgress,
       onPostCheckout,
@@ -12959,10 +12959,10 @@ async function clone({
       assertParameter("dir", dir);
     }
     assertParameter("url", url);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _clone({
-      fs: fsp2,
+      fs: fsp,
       cache,
       http,
       onProgress,
@@ -13051,10 +13051,10 @@ async function currentBranch({
   try {
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _currentBranch({
-      fs: fsp2,
+      fs: fsp,
       gitdir: updatedGitdir,
       fullname,
       test
@@ -13091,10 +13091,10 @@ async function deleteBranch({
   try {
     assertParameter("fs", fs);
     assertParameter("ref", ref);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _deleteBranch({
-      fs: fsp2,
+      fs: fsp,
       gitdir: updatedGitdir,
       ref
     });
@@ -13107,9 +13107,9 @@ async function deleteRef({ fs, dir, gitdir = join(dir, ".git"), ref }) {
   try {
     assertParameter("fs", fs);
     assertParameter("ref", ref);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
-    await GitRefManager.deleteRef({ fs: fsp2, gitdir: updatedGitdir, ref });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
+    await GitRefManager.deleteRef({ fs: fsp, gitdir: updatedGitdir, ref });
   } catch (err) {
     err.caller = "git.deleteRef";
     throw err;
@@ -13129,10 +13129,10 @@ async function deleteRemote({
   try {
     assertParameter("fs", fs);
     assertParameter("remote", remote);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _deleteRemote({
-      fs: fsp2,
+      fs: fsp,
       gitdir: updatedGitdir,
       remote
     });
@@ -13149,10 +13149,10 @@ async function deleteTag({ fs, dir, gitdir = join(dir, ".git"), ref }) {
   try {
     assertParameter("fs", fs);
     assertParameter("ref", ref);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _deleteTag({
-      fs: fsp2,
+      fs: fsp,
       gitdir: updatedGitdir,
       ref
     });
@@ -13225,10 +13225,10 @@ async function expandOid({
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
     assertParameter("oid", oid);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _expandOid({
-      fs: fsp2,
+      fs: fsp,
       cache,
       gitdir: updatedGitdir,
       oid
@@ -13243,10 +13243,10 @@ async function expandRef({ fs, dir, gitdir = join(dir, ".git"), ref }) {
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
     assertParameter("ref", ref);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await GitRefManager.expand({
-      fs: fsp2,
+      fs: fsp,
       gitdir: updatedGitdir,
       ref
     });
@@ -13526,10 +13526,10 @@ async function fastForward({
       timestamp: Date.now(),
       timezoneOffset: 0
     };
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _pull({
-      fs: fsp2,
+      fs: fsp,
       cache,
       http,
       onProgress,
@@ -13585,10 +13585,10 @@ async function fetch({
     assertParameter("fs", fs);
     assertParameter("http", http);
     assertParameter("gitdir", gitdir);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _fetch({
-      fs: fsp2,
+      fs: fsp,
       cache,
       http,
       onProgress,
@@ -13628,10 +13628,10 @@ async function findMergeBase({
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
     assertParameter("oids", oids);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _findMergeBase({
-      fs: fsp2,
+      fs: fsp,
       cache,
       gitdir: updatedGitdir,
       oids
@@ -13667,10 +13667,10 @@ async function getConfig({ fs, dir, gitdir = join(dir, ".git"), path: path2 }) {
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
     assertParameter("path", path2);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _getConfig({
-      fs: fsp2,
+      fs: fsp,
       gitdir: updatedGitdir,
       path: path2
     });
@@ -13693,10 +13693,10 @@ async function getConfigAll({
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
     assertParameter("path", path2);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _getConfigAll({
-      fs: fsp2,
+      fs: fsp,
       gitdir: updatedGitdir,
       path: path2
     });
@@ -13909,10 +13909,10 @@ async function indexPack({
     assertParameter("dir", dir);
     assertParameter("gitdir", dir);
     assertParameter("filepath", filepath);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _indexPack({
-      fs: fsp2,
+      fs: fsp,
       cache,
       onProgress,
       dir,
@@ -13937,10 +13937,10 @@ async function init({
     if (!bare) {
       assertParameter("dir", dir);
     }
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _init({
-      fs: fsp2,
+      fs: fsp,
       bare,
       dir,
       gitdir: updatedGitdir,
@@ -14013,10 +14013,10 @@ async function isDescendent({
     assertParameter("gitdir", gitdir);
     assertParameter("oid", oid);
     assertParameter("ancestor", ancestor);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _isDescendent({
-      fs: fsp2,
+      fs: fsp,
       cache,
       gitdir: updatedGitdir,
       oid,
@@ -14039,10 +14039,10 @@ async function isIgnored({
     assertParameter("dir", dir);
     assertParameter("gitdir", gitdir);
     assertParameter("filepath", filepath);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return GitIgnoreManager.isIgnored({
-      fs: fsp2,
+      fs: fsp,
       dir,
       gitdir: updatedGitdir,
       filepath
@@ -14061,10 +14061,10 @@ async function listBranches({
   try {
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return GitRefManager.listBranches({
-      fs: fsp2,
+      fs: fsp,
       gitdir: updatedGitdir,
       remote
     });
@@ -14129,10 +14129,10 @@ async function listFiles({
   try {
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _listFiles({
-      fs: fsp2,
+      fs: fsp,
       cache,
       gitdir: updatedGitdir,
       ref
@@ -14174,10 +14174,10 @@ async function listNotes({
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
     assertParameter("ref", ref);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _listNotes({
-      fs: fsp2,
+      fs: fsp,
       cache,
       gitdir: updatedGitdir,
       ref
@@ -14196,9 +14196,9 @@ async function listRefs({
   try {
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
-    return GitRefManager.listRefs({ fs: fsp2, gitdir: updatedGitdir, filepath });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
+    return GitRefManager.listRefs({ fs: fsp, gitdir: updatedGitdir, filepath });
   } catch (err) {
     err.caller = "git.listRefs";
     throw err;
@@ -14219,10 +14219,10 @@ async function listRemotes({ fs, dir, gitdir = join(dir, ".git") }) {
   try {
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _listRemotes({
-      fs: fsp2,
+      fs: fsp,
       gitdir: updatedGitdir
     });
   } catch (err) {
@@ -14318,9 +14318,9 @@ async function listTags({ fs, dir, gitdir = join(dir, ".git") }) {
   try {
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
-    return GitRefManager.listTags({ fs: fsp2, gitdir: updatedGitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
+    return GitRefManager.listTags({ fs: fsp, gitdir: updatedGitdir });
   } catch (err) {
     err.caller = "git.listTags";
     throw err;
@@ -14525,10 +14525,10 @@ async function log({
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
     assertParameter("ref", ref);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _log({
-      fs: fsp2,
+      fs: fsp,
       cache,
       gitdir: updatedGitdir,
       filepath,
@@ -14679,10 +14679,10 @@ async function packObjects({
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
     assertParameter("oids", oids);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _packObjects({
-      fs: fsp2,
+      fs: fsp,
       cache,
       gitdir: updatedGitdir,
       oids,
@@ -15130,10 +15130,10 @@ async function push({
     assertParameter("fs", fs);
     assertParameter("http", http);
     assertParameter("gitdir", gitdir);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _push({
-      fs: fsp2,
+      fs: fsp,
       cache,
       http,
       onProgress,
@@ -15198,10 +15198,10 @@ async function readBlob({
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
     assertParameter("oid", oid);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _readBlob({
-      fs: fsp2,
+      fs: fsp,
       cache,
       gitdir: updatedGitdir,
       oid,
@@ -15223,10 +15223,10 @@ async function readCommit({
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
     assertParameter("oid", oid);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _readCommit({
-      fs: fsp2,
+      fs: fsp,
       cache,
       gitdir: updatedGitdir,
       oid
@@ -15266,10 +15266,10 @@ async function readNote({
     assertParameter("gitdir", gitdir);
     assertParameter("ref", ref);
     assertParameter("oid", oid);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _readNote({
-      fs: fsp2,
+      fs: fsp,
       cache,
       gitdir: updatedGitdir,
       ref,
@@ -15380,10 +15380,10 @@ async function readTag({
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
     assertParameter("oid", oid);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _readTag({
-      fs: fsp2,
+      fs: fsp,
       cache,
       gitdir: updatedGitdir,
       oid
@@ -15405,10 +15405,10 @@ async function readTree({
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
     assertParameter("oid", oid);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _readTree({
-      fs: fsp2,
+      fs: fsp,
       cache,
       gitdir: updatedGitdir,
       oid,
@@ -15430,10 +15430,10 @@ async function remove({
     assertParameter("fs", _fs);
     assertParameter("gitdir", gitdir);
     assertParameter("filepath", filepath);
-    const fsp2 = new FileSystem(_fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(_fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     await GitIndexManager.acquire(
-      { fs: fsp2, gitdir: updatedGitdir, cache },
+      { fs: fsp, gitdir: updatedGitdir, cache },
       async function(index2) {
         index2.delete({ filepath });
       }
@@ -15593,10 +15593,10 @@ async function renameBranch({
     assertParameter("gitdir", gitdir);
     assertParameter("ref", ref);
     assertParameter("oldref", oldref);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _renameBranch({
-      fs: fsp2,
+      fs: fsp,
       gitdir: updatedGitdir,
       ref,
       oldref,
@@ -15696,10 +15696,10 @@ async function resolveRef({
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
     assertParameter("ref", ref);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     const oid = await GitRefManager.resolve({
-      fs: fsp2,
+      fs: fsp,
       gitdir: updatedGitdir,
       ref,
       depth
@@ -16328,10 +16328,10 @@ async function walk({
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
     assertParameter("trees", trees);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _walk({
-      fs: fsp2,
+      fs: fsp,
       cache,
       dir,
       gitdir: updatedGitdir,
@@ -16350,10 +16350,10 @@ async function writeBlob({ fs, dir, gitdir = join(dir, ".git"), blob }) {
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
     assertParameter("blob", blob);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _writeObject({
-      fs: fsp2,
+      fs: fsp,
       gitdir: updatedGitdir,
       type: "blob",
       object: blob,
@@ -16374,10 +16374,10 @@ async function writeCommit({
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
     assertParameter("commit", commit2);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _writeCommit({
-      fs: fsp2,
+      fs: fsp,
       gitdir: updatedGitdir,
       commit: commit2
     });
@@ -16495,10 +16495,10 @@ async function writeTag({ fs, dir, gitdir = join(dir, ".git"), tag: tag2 }) {
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
     assertParameter("tag", tag2);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _writeTag({
-      fs: fsp2,
+      fs: fsp,
       gitdir: updatedGitdir,
       tag: tag2
     });
@@ -16512,10 +16512,10 @@ async function writeTree({ fs, dir, gitdir = join(dir, ".git"), tree }) {
     assertParameter("fs", fs);
     assertParameter("gitdir", gitdir);
     assertParameter("tree", tree);
-    const fsp2 = new FileSystem(fs);
-    const updatedGitdir = await discoverGitdir({ fsp: fsp2, dotgit: gitdir });
+    const fsp = new FileSystem(fs);
+    const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir });
     return await _writeTree({
-      fs: fsp2,
+      fs: fsp,
       gitdir: updatedGitdir,
       tree
     });
@@ -21806,16 +21806,16 @@ var require_data_adapter_fs = __commonJS({
 });
 
 // obsidian-plugin/src/main.js
-var { Plugin, PluginSettingTab, Setting, Notice, Modal, Platform, requestUrl, apiVersion } = require("obsidian");
+var obtsRuntime = globalThis.__OBTS_CLIENT_RUNTIME__ || require("obsidian");
+var { Plugin, PluginSettingTab, Setting, Notice, Modal, Platform, requestUrl, apiVersion } = obtsRuntime;
 var { Buffer: Buffer2 } = require_buffer();
 if (typeof globalThis.Buffer === "undefined") globalThis.Buffer = Buffer2;
 var git = (init_isomorphic_git(), __toCommonJS(isomorphic_git_exports));
 var path = require_path_browserify();
 var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
-var fsp = null;
-var API_VERSION = "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = "0.4.14";
+var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.15";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_FULL_SCAN_INTERVAL_MS = 5 * 60 * 1e3;
@@ -22602,7 +22602,7 @@ var ObtsObsidianClient = class {
       readAttempts: mobile ? MOBILE_PACK_READ_ATTEMPTS : 1,
       retryDelayMs: mobile ? MOBILE_PACK_READ_RETRY_MS : 0
     });
-    fsp = this.adapterFs.promises;
+    this.fsp = this.adapterFs.promises;
     this.vaultDir = "/";
     this.obtsDir = path.join(this.vaultDir, ".obts");
     this.gitdir = path.join(this.obtsDir, "git");
@@ -22623,15 +22623,15 @@ var ObtsObsidianClient = class {
     this.plugin.setInitializationStage("Recovering metadata replacements", "startup_metadata");
     await this.recoverInterruptedReplacements();
     this.plugin.setInitializationStage("Opening local Git state", "startup_git");
-    await fsp.mkdir(path.join(this.obtsDir, "auth"), { recursive: true, mode: 448 });
+    await this.fsp.mkdir(path.join(this.obtsDir, "auth"), { recursive: true, mode: 448 });
     await git.init({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, defaultBranch: "local" });
     await git.writeRef({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, ref: "HEAD", value: "refs/heads/local", symbolic: true, force: true });
-    await fsp.mkdir(path.join(this.gitdir, "info"), { recursive: true, mode: 448 });
-    await fsp.writeFile(path.join(this.gitdir, "info", "exclude"), ".obts/\n.git/\n", { mode: 384 });
+    await this.fsp.mkdir(path.join(this.gitdir, "info"), { recursive: true, mode: 448 });
+    await this.fsp.writeFile(path.join(this.gitdir, "info", "exclude"), ".obts/\n.git/\n", { mode: 384 });
     this.plugin.setInitializationStage("Reading local sync state", "startup_state");
     const state = await this.repairLocalStateIfNeeded(await this.readState());
     this.plugin.setInitializationStage("Checking interrupted apply journal", "recovery_journal");
-    const journal = await readApplyJournalStrict(this.applyJournalPath);
+    const journal = await readApplyJournalStrict(this.fsp, this.applyJournalPath);
     if (journal) this.plugin.setInitializationStage("Recovering an interrupted apply", "recovery_journal");
     if (journal && journal.phase === "committed") {
       this.plugin.setInitializationStage("Restoring recovered refs", "recovery_refs");
@@ -22675,14 +22675,14 @@ var ObtsObsidianClient = class {
   async recoverInterruptedReplacements() {
     const signal = this.plugin.lifecycleAbortController.signal;
     const shallow = { maxDepth: 0, signal };
-    await fsp.recoverReplacements(this.obtsDir, shallow);
-    await fsp.recoverReplacements(path.join(this.obtsDir, "auth"), shallow);
-    await fsp.recoverReplacements(this.gitdir, shallow);
-    await fsp.recoverReplacements(path.join(this.gitdir, "refs"), { signal });
+    await this.fsp.recoverReplacements(this.obtsDir, shallow);
+    await this.fsp.recoverReplacements(path.join(this.obtsDir, "auth"), shallow);
+    await this.fsp.recoverReplacements(this.gitdir, shallow);
+    await this.fsp.recoverReplacements(path.join(this.gitdir, "refs"), { signal });
     const recoveryDir = path.join(this.obtsDir, "recovery");
     let bundles;
     try {
-      bundles = await fsp.readdir(recoveryDir, { withFileTypes: true });
+      bundles = await this.fsp.readdir(recoveryDir, { withFileTypes: true });
     } catch (error) {
       if (error && error.code === "ENOENT" && !error.cause) return;
       throw error;
@@ -22690,23 +22690,23 @@ var ObtsObsidianClient = class {
     for (const bundle of bundles) {
       if (!bundle.isDirectory()) continue;
       const bundleDir = path.join(recoveryDir, bundle.name);
-      await fsp.recoverReplacements(bundleDir, shallow);
-      await fsp.recoverReplacements(path.join(bundleDir, "journal"), shallow);
+      await this.fsp.recoverReplacements(bundleDir, shallow);
+      await this.fsp.recoverReplacements(path.join(bundleDir, "journal"), shallow);
     }
   }
   async readPendingOnboarding() {
-    const journal = await readJson(this.onboardingJournalPath, null);
-    const pending = await readJson(this.pendingConnectionPath, null);
+    const journal = await readJson(this.fsp, this.onboardingJournalPath, null);
+    const pending = await readJson(this.fsp, this.pendingConnectionPath, null);
     if (!journal || journal.stage === "complete" || !pending || !pending.connection_secret) return null;
     return { journal, secret: pending.connection_secret };
   }
   async cancelOnboarding() {
-    await fsp.rm(this.pendingConnectionPath, { force: true });
-    await fsp.rm(this.onboardingJournalPath, { force: true });
-    await fsp.rm(this.bootstrapTransferPath, { force: true });
+    await this.fsp.rm(this.pendingConnectionPath, { force: true });
+    await this.fsp.rm(this.onboardingJournalPath, { force: true });
+    await this.fsp.rm(this.bootstrapTransferPath, { force: true });
   }
   async writeOnboardingJournal(journal) {
-    await writeJson(this.onboardingJournalPath, Object.assign({}, journal, { updated_at: nowIso() }));
+    await writeJson(this.fsp, this.onboardingJournalPath, Object.assign({}, journal, { updated_at: nowIso() }));
   }
   async updateOnboardingStage(connectionId, stage, selectedMode, errorCode = null) {
     const pending = await this.readPendingOnboarding();
@@ -22721,13 +22721,13 @@ var ObtsObsidianClient = class {
     const pending = await this.readPendingOnboarding();
     if (!pending || pending.journal.connection.connection_id !== connectionId) return;
     await this.writeOnboardingJournal(Object.assign({}, pending.journal, { stage: "complete", last_error_code: null }));
-    await fsp.rm(this.pendingConnectionPath, { force: true });
+    await this.fsp.rm(this.pendingConnectionPath, { force: true });
   }
   async startOnboarding() {
     await this.assertPairingCanStart();
     await this.flushEditorBuffersToDisk();
     const summary = await this.localSnapshotSummary();
-    const existing = await readJson(this.statePath, null);
+    const existing = await readJson(this.fsp, this.statePath, null);
     const deviceName = normalizeDisplayName(this.plugin.settings.deviceName || "Obsidian device");
     this.plugin.settings.deviceName = deviceName;
     await this.plugin.saveSettings();
@@ -22742,7 +22742,7 @@ var ObtsObsidianClient = class {
         has_detached_baseline: Boolean(existing && existing.unpaired_baseline_vault_id && existing.unpaired_baseline_main)
       }
     });
-    await writeJson(this.pendingConnectionPath, { connection_secret: connection.connection_secret, created_at: nowIso() });
+    await writeJson(this.fsp, this.pendingConnectionPath, { connection_secret: connection.connection_secret, created_at: nowIso() });
     const redactedConnection = Object.assign({}, connection);
     delete redactedConnection.connection_secret;
     await this.writeOnboardingJournal({
@@ -22763,8 +22763,8 @@ var ObtsObsidianClient = class {
     const status2 = await response.json();
     if (status2.status === "approved") await this.updateOnboardingStage(connectionId, "approved");
     if (status2.status === "denied" || status2.status === "expired") {
-      await fsp.rm(this.pendingConnectionPath, { force: true });
-      await fsp.rm(this.onboardingJournalPath, { force: true });
+      await this.fsp.rm(this.pendingConnectionPath, { force: true });
+      await this.fsp.rm(this.onboardingJournalPath, { force: true });
     }
     return status2;
   }
@@ -22790,10 +22790,10 @@ var ObtsObsidianClient = class {
       if (!response.ok) await throwResponseError(response);
       return parseMultipartPull(response.headers.get("content-type") || "", Buffer2.from(await response.arrayBuffer()));
     }
-    const checkpoint = await readJson(this.bootstrapTransferPath, null);
+    const checkpoint = await readJson(this.fsp, this.bootstrapTransferPath, null);
     let cursor = checkpoint && checkpoint.connection_id === connectionId ? checkpoint.next_cursor : 0;
     let target = checkpoint && checkpoint.connection_id === connectionId ? checkpoint.target_main : "latest";
-    if (checkpoint && checkpoint.connection_id !== connectionId) await fsp.rm(this.bootstrapTransferPath, { force: true });
+    if (checkpoint && checkpoint.connection_id !== connectionId) await this.fsp.rm(this.bootstrapTransferPath, { force: true });
     let finalManifest = null;
     let chunkCount = checkpoint && checkpoint.connection_id === connectionId ? checkpoint.received_chunks || 0 : 0;
     let transferredBytes = checkpoint && checkpoint.connection_id === connectionId ? checkpoint.transferred_bytes || 0 : 0;
@@ -22817,12 +22817,12 @@ var ObtsObsidianClient = class {
       finalManifest = chunk.manifest;
       target = finalManifest.target_main;
       if (finalManifest.complete) {
-        await fsp.rm(this.bootstrapTransferPath, { force: true });
+        await this.fsp.rm(this.bootstrapTransferPath, { force: true });
         break;
       }
       if (finalManifest.next_cursor <= cursor) throw new ObtsBlockedError("invalid_transfer_cursor", "Bootstrap transfer did not advance.");
       cursor = finalManifest.next_cursor;
-      await writeJson(this.bootstrapTransferPath, {
+      await writeJson(this.fsp, this.bootstrapTransferPath, {
         connection_id: connectionId,
         target_main: target,
         next_cursor: cursor,
@@ -22862,7 +22862,7 @@ var ObtsObsidianClient = class {
     await this.importPack(bootstrap.packfile, "onboarding", [makeDiagnosticBreadcrumb("onboarding_approved", "succeeded")]);
     const localFiles = await this.scanSyncableFiles();
     const matchesServer = localFiles.length === bootstrap.manifest.changed_paths.length && await this.localContentMatchesTree(localFiles, bootstrap.manifest.target_main);
-    const repair = await this.discoverPairingRepairContext(await readJson(this.statePath, null));
+    const repair = await this.discoverPairingRepairContext(await readJson(this.fsp, this.statePath, null));
     const baseline = this.baselineForPairing(repair.baseline, bootstrap.manifest.vault_id);
     const validBaseline = baseline && await this.commitExists(baseline.main) && await this.isAncestor(baseline.main, bootstrap.manifest.target_main) ? baseline : null;
     const matchesBaseline = validBaseline ? await this.localContentMatchesTree(localFiles, validBaseline.main) : false;
@@ -22906,6 +22906,9 @@ var ObtsObsidianClient = class {
       this.onboardingOperation = false;
     }
   }
+  async completeConnection(connectionId, secret, request) {
+    return await postJsonWithBearer(this.url(`/api/v1/connections/${connectionId}/complete`), secret, request);
+  }
   async finishOnboardingInternal(connectionId, secret, analysis, mode) {
     const current = await this.localSnapshotSummary();
     const localFiles = await this.scanSyncableFiles();
@@ -22915,7 +22918,7 @@ var ObtsObsidianClient = class {
       throw new ObtsBlockedError("onboarding_snapshot_changed", "The local vault changed. Review the updated onboarding summary before continuing.");
     }
     await this.createRecoveryBundle(mode === "use_server" ? "replace_local_with_server" : "initial_import", analysis.expectedMain, localFiles);
-    const completion = await postJsonWithBearer(this.url(`/api/v1/connections/${connectionId}/complete`), secret, {
+    const completion = await this.completeConnection(connectionId, secret, {
       mode,
       expected_main: analysis.expectedMain,
       ...mode === "initialize" ? { proposal_kind: "new_vault_import" } : {},
@@ -22924,7 +22927,7 @@ var ObtsObsidianClient = class {
         proposal_base: analysis.proposalBase
       } : {}
     });
-    await writeJson(this.authPath, { device_token: completion.device_token, created_at: nowIso() });
+    await writeJson(this.fsp, this.authPath, { device_token: completion.device_token, created_at: nowIso() });
     await this.writeState({
       user_id: completion.user_id,
       vault_id: completion.vault_id,
@@ -23179,18 +23182,39 @@ var ObtsObsidianClient = class {
     this.plugin.markFullScanCompleted();
     const queue = await this.readQueue();
     let uploaded = false;
+    let uploadResult = null;
     if (queue.pending_commit) {
-      await this.uploadQueuedCommit(queue);
+      uploadResult = await this.uploadQueuedCommit(queue);
       uploaded = true;
     }
     const postUploadState = await this.readState();
     if (postUploadState.last_error_code !== "conflict_review_required") {
-      if (uploaded) await this.pullAndApply(true);
-      else await this.pollRemoteEventsAndApply();
+      try {
+        if (uploaded) {
+          await this.pullAndApply(true);
+        } else {
+          await this.pollRemoteEventsAndApply();
+        }
+      } catch (error) {
+        if (!(uploaded && error instanceof ObtsTransportError && error.code === "device_blocked")) throw error;
+        const blockedQueue = await this.readQueue();
+        await this.writeQueue(Object.assign({}, blockedQueue, { status: "conflicted", updated_at: nowIso() }));
+        await this.writeState(Object.assign({}, await this.readState(), {
+          status_label: "Review needed",
+          last_error_code: "conflict_review_required",
+          updated_at: nowIso()
+        }));
+        const conflictId = error.details && typeof error.details.conflict_id === "string" ? error.details.conflict_id : null;
+        if (conflictId) uploadResult = Object.assign({}, uploadResult, { conflict_id: conflictId });
+      }
     }
     const finalState = await this.readState();
     await this.reportDeviceStatus().catch(() => void 0);
-    return { status: finalState.status_label, main: finalState.local_main || void 0 };
+    return {
+      status: finalState.status_label,
+      main: finalState.local_main || void 0,
+      ...uploadResult && uploadResult.conflict_id ? { conflictId: uploadResult.conflict_id } : {}
+    };
   }
   async replaceLocalWithServer() {
     await this.initialize();
@@ -23414,7 +23438,7 @@ var ObtsObsidianClient = class {
         last_error_code: "conflict_review_required",
         updated_at: nowIso()
       }));
-      return;
+      return result;
     }
     if (result.status === "merged" || result.status === "noop") {
       await this.writeQueue({
@@ -23434,6 +23458,22 @@ var ObtsObsidianClient = class {
       }));
       await this.clearPendingDirectoryIntents();
     }
+    return result;
+  }
+  async putPushChunk({ vaultId, token, transferId, index: index2, packfile }) {
+    const response = await fetchWithTimeout(
+      this.url(`/api/v1/vaults/${vaultId}/sync/push-transfers/${transferId}/chunks/${index2}`),
+      {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/x-git-packed-objects",
+          "x-obts-chunk-sha256": sha256(packfile)
+        },
+        body: packfile
+      }
+    );
+    if (!response.ok) await throwResponseError(response);
   }
   async pushInChunks(state, queue, token, directoryIntents, capabilities, allowStaleRetry = true) {
     const groups = await this.planPackChunks(
@@ -23482,19 +23522,13 @@ var ObtsObsidianClient = class {
       for (let index2 = 0; index2 < groups.length; index2 += 1) {
         if (received.has(index2)) continue;
         const packfile = await this.packObjectChunk(groups[index2], capabilities.max_chunk_bytes);
-        const response = await fetchWithTimeout(
-          this.url(`/api/v1/vaults/${state.vault_id}/sync/push-transfers/${descriptor.transfer_id}/chunks/${index2}`),
-          {
-            method: "PUT",
-            headers: {
-              authorization: `Bearer ${token}`,
-              "content-type": "application/x-git-packed-objects",
-              "x-obts-chunk-sha256": sha256(packfile)
-            },
-            body: packfile
-          }
-        );
-        if (!response.ok) await throwResponseError(response);
+        await this.putPushChunk({
+          vaultId: state.vault_id,
+          token,
+          transferId: descriptor.transfer_id,
+          index: index2,
+          packfile
+        });
         uploadedChunks += 1;
         this.plugin.setStatus(`Uploading ${uploadedChunks}/${groups.length}`);
         await this.reportDeviceStatus().catch(() => void 0);
@@ -23620,7 +23654,6 @@ var ObtsObsidianClient = class {
       }
       throw error;
     }
-    await this.writeState(Object.assign({}, await this.readState(), { last_event_seq: page.current_event_seq, updated_at: nowIso() }));
     const currentState = await this.readState();
     const shouldPull = page.events.some((event) => {
       const main = event && event.commit_cursors ? event.commit_cursors.main : null;
@@ -23631,6 +23664,7 @@ var ObtsObsidianClient = class {
       return (event.event_type === "main_advanced" || event.event_type === "conflict_resolved") && hasNewMain;
     });
     if (!shouldPull) {
+      await this.writeState(Object.assign({}, currentState, { last_event_seq: page.current_event_seq, updated_at: nowIso() }));
       return { applied: false, status: currentState.status_label };
     }
     if (wasConflictBlocked && currentState.last_error_code === "conflict_review_required") {
@@ -23661,7 +23695,7 @@ var ObtsObsidianClient = class {
     const token = await this.readDeviceToken();
     await this.unpairDevice(state.vault_id, token);
     const baselineMain = state.local_main || await this.resolveRef("refs/heads/main");
-    await fsp.rm(this.authPath, { force: true });
+    await this.fsp.rm(this.authPath, { force: true });
     await this.writeQueue({
       pending_commit: null,
       expected_device_ref: null,
@@ -23692,7 +23726,7 @@ var ObtsObsidianClient = class {
     const state = await this.readState();
     const localFiles = await this.scanSyncableFiles();
     const recoveryBundleId = localFiles.length > 0 ? await this.createRecoveryBundle("rebuild_from_server", state.local_main, localFiles) : null;
-    await fsp.rm(this.authPath, { force: true });
+    await this.fsp.rm(this.authPath, { force: true });
     await this.writeQueue({
       pending_commit: null,
       expected_device_ref: null,
@@ -23782,38 +23816,38 @@ var ObtsObsidianClient = class {
         const fingerprint = await this.recoveryFileFingerprint(filePath);
         journal.preflight_sha256[filePath] = fingerprint.kind === "file" ? fingerprint.sha256 : null;
       }
-      await writeJson(this.applyJournalPath, journal);
+      await writeJson(this.fsp, this.applyJournalPath, journal);
       if (affectedPaths.length > 0) {
         if (!allowDestructive) {
           journal.phase = "blocked_recovery";
           journal.redacted_error_category = "destructive_apply_not_allowed";
-          await writeJson(this.applyJournalPath, journal);
+          await writeJson(this.fsp, this.applyJournalPath, journal);
           await this.block("unsafe_local_state", "Destructive apply is not allowed in this mode.");
         }
         try {
           journal.recovery_bundle_id = await this.createRecoveryBundle("pull_apply", targetMain, affectedPaths, journal);
           journal.phase = "recovery_bundle_written";
           journal.last_completed_step = "recovery_bundle";
-          await writeJson(this.applyJournalPath, journal);
+          await writeJson(this.fsp, this.applyJournalPath, journal);
         } catch {
           journal.phase = "blocked_recovery";
           journal.redacted_error_category = "recovery_bundle_failed";
-          await writeJson(this.applyJournalPath, journal);
+          await writeJson(this.fsp, this.applyJournalPath, journal);
           await this.block("recovery_bundle_failed", "Recovery bundle creation failed before apply.");
         }
       }
       if (requireCleanVisibleState && !await this.ensureNoLocalChangesBeforeApply(state)) {
-        await fsp.rm(this.applyJournalPath, { force: true });
+        await this.fsp.rm(this.applyJournalPath, { force: true });
         return;
       }
       journal.phase = "writing_files";
-      await writeJson(this.applyJournalPath, journal);
+      await writeJson(this.fsp, this.applyJournalPath, journal);
       for (const filePath of affectedPaths) {
         const fingerprint = await this.recoveryFileFingerprint(filePath);
         if (!this.fingerprintMatchesPreflight(fingerprint, journal.preflight_sha256[filePath] || null)) {
           journal.phase = "blocked_recovery";
           journal.redacted_error_category = "preflight_hash_changed";
-          await writeJson(this.applyJournalPath, journal);
+          await writeJson(this.fsp, this.applyJournalPath, journal);
           await this.block("unsafe_local_state", "A local file changed during apply preflight.");
         }
       }
@@ -23821,7 +23855,7 @@ var ObtsObsidianClient = class {
       await this.applyDirectoryChanges(compactedDirectoryIntents, explicitDirectorySet);
       journal.phase = "verifying";
       journal.last_completed_step = "files_written";
-      await writeJson(this.applyJournalPath, journal);
+      await writeJson(this.fsp, this.applyJournalPath, journal);
       let preservedLocalChangePaths = [];
       if (requireCleanVisibleState) {
         await this.flushEditorBuffersToDisk();
@@ -23830,7 +23864,7 @@ var ObtsObsidianClient = class {
         } catch (error) {
           journal.phase = "blocked_recovery";
           journal.redacted_error_category = categorizeRecoveryError(error);
-          await writeJson(this.applyJournalPath, journal);
+          await writeJson(this.fsp, this.applyJournalPath, journal);
           if (error instanceof ObtsBlockedError) {
             await this.block(error.code, error.message, error.details);
           }
@@ -23844,7 +23878,7 @@ var ObtsObsidianClient = class {
       await this.updateRef("refs/heads/local", targetMain, null, true);
       journal.phase = "committed";
       journal.last_completed_step = "refs_updated";
-      await writeJson(this.applyJournalPath, journal);
+      await writeJson(this.fsp, this.applyJournalPath, journal);
       await this.writeState(Object.assign({}, state, {
         local_main: targetMain,
         local_head: targetMain,
@@ -23860,7 +23894,7 @@ var ObtsObsidianClient = class {
       }
     } finally {
       this.plugin.isApplying = false;
-      await fsp.rm(this.applyLockPath, { force: true });
+      await this.fsp.rm(this.applyLockPath, { force: true });
     }
   }
   async recoverBlockedApplyWithPreservedLocalChanges(journal, state) {
@@ -23886,7 +23920,7 @@ var ObtsObsidianClient = class {
       }
     }
     try {
-      await fsp.rm(this.applyLockPath, { force: true });
+      await this.fsp.rm(this.applyLockPath, { force: true });
       await this.acquireApplyLock(journal.apply_id);
       this.plugin.isApplying = true;
       if (preservedLocalChangePaths.length > 0) {
@@ -23899,7 +23933,7 @@ var ObtsObsidianClient = class {
       journal.phase = "committed";
       journal.last_completed_step = "refs_updated";
       journal.redacted_error_category = null;
-      await writeJson(this.applyJournalPath, journal);
+      await writeJson(this.fsp, this.applyJournalPath, journal);
       this.plugin.setInitializationStage("Persisting interrupted apply state", "recovery_state");
       await this.writeState(Object.assign({}, state, {
         local_main: journal.target_main,
@@ -23916,11 +23950,11 @@ var ObtsObsidianClient = class {
     } catch (error) {
       journal.redacted_error_category = categorizeRecoveryError(error);
       journal.last_completed_step = journal.last_completed_step || "recovery_bundle";
-      await writeJson(this.applyJournalPath, journal);
+      await writeJson(this.fsp, this.applyJournalPath, journal);
       return false;
     } finally {
       this.plugin.isApplying = false;
-      await fsp.rm(this.applyLockPath, { force: true });
+      await this.fsp.rm(this.applyLockPath, { force: true });
     }
   }
   async recoverIncompleteApplyJournal(journal, state) {
@@ -23939,11 +23973,11 @@ var ObtsObsidianClient = class {
       journal.phase = "blocked_recovery";
       journal.redacted_error_category = "local_files_diverge_from_journal";
       journal.last_completed_step = journal.last_completed_step || "recovery_bundle";
-      await writeJson(this.applyJournalPath, journal);
+      await writeJson(this.fsp, this.applyJournalPath, journal);
       return false;
     }
     try {
-      await fsp.rm(this.applyLockPath, { force: true });
+      await this.fsp.rm(this.applyLockPath, { force: true });
       await this.acquireApplyLock(journal.apply_id);
       this.plugin.isApplying = true;
       if (journal.affected_paths.length > 0 && journal.recovery_bundle_id === null) {
@@ -23951,21 +23985,21 @@ var ObtsObsidianClient = class {
         journal.recovery_bundle_id = await this.createRecoveryBundle(journal.operation_type, journal.target_main, journal.affected_paths, journal);
         journal.last_completed_step = "recovery_bundle";
         journal.phase = "recovery_bundle_written";
-        await writeJson(this.applyJournalPath, journal);
+        await writeJson(this.fsp, this.applyJournalPath, journal);
       }
       journal.phase = "writing_files";
       journal.redacted_error_category = null;
-      await writeJson(this.applyJournalPath, journal);
+      await writeJson(this.fsp, this.applyJournalPath, journal);
       this.plugin.setInitializationStage("Restoring interrupted apply files", "recovery_file_apply");
       await this.writeTargetFilesFromJournal(journal, targetEntries, validation.targetMatchedPaths);
       journal.phase = "verifying";
       journal.last_completed_step = "files_written";
-      await writeJson(this.applyJournalPath, journal);
+      await writeJson(this.fsp, this.applyJournalPath, journal);
       this.plugin.setInitializationStage("Revalidating interrupted apply files", "recovery_file_validation");
       if (!await this.affectedApplyPathsMatchTarget(journal, targetEntries)) {
         journal.phase = "blocked_recovery";
         journal.redacted_error_category = "local_changed_during_apply";
-        await writeJson(this.applyJournalPath, journal);
+        await writeJson(this.fsp, this.applyJournalPath, journal);
         return false;
       }
       this.plugin.setInitializationStage("Restoring interrupted apply refs", "recovery_refs");
@@ -23973,7 +24007,7 @@ var ObtsObsidianClient = class {
       await this.updateRef("refs/heads/local", journal.target_main, null, true);
       journal.phase = "committed";
       journal.last_completed_step = "refs_updated";
-      await writeJson(this.applyJournalPath, journal);
+      await writeJson(this.fsp, this.applyJournalPath, journal);
       this.plugin.setInitializationStage("Persisting interrupted apply state", "recovery_state");
       await this.writeState(Object.assign({}, state, {
         local_main: journal.target_main,
@@ -23987,11 +24021,11 @@ var ObtsObsidianClient = class {
     } catch (error) {
       journal.redacted_error_category = categorizeRecoveryError(error);
       journal.last_completed_step = journal.last_completed_step || "recovery_bundle";
-      await writeJson(this.applyJournalPath, journal);
+      await writeJson(this.fsp, this.applyJournalPath, journal);
       return false;
     } finally {
       this.plugin.isApplying = false;
-      await fsp.rm(this.applyLockPath, { force: true });
+      await this.fsp.rm(this.applyLockPath, { force: true });
     }
   }
   async affectedApplyPathsMatchTarget(journal, targetEntries) {
@@ -24079,13 +24113,13 @@ var ObtsObsidianClient = class {
   async recoveryFileFingerprint(filePath) {
     let metadata;
     try {
-      metadata = await fsp.stat(filePath);
+      metadata = await this.fsp.stat(filePath);
     } catch (error) {
       if (error && (error.code === "ENOENT" || error.code === "ENOTDIR")) return { kind: "missing", sha256: null, oid: null };
       throw error;
     }
     if (!metadata.isFile()) return { kind: "other", sha256: null, oid: null };
-    const content = await fsp.readFile(filePath);
+    const content = await this.fsp.readFile(filePath);
     return {
       kind: "file",
       sha256: sha256(content),
@@ -24101,7 +24135,7 @@ var ObtsObsidianClient = class {
   async reportRecoveryValidationProgress(completed, total) {
     this.plugin.updateInitializationProgress(total > 0 ? `Validating interrupted apply files ${completed}/${total}` : "Validating interrupted apply files");
     if (completed === total || completed % 25 === 0) {
-      await new Promise((resolve) => window.setTimeout(resolve, 0));
+      await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
     }
   }
   async applyJournalMatchesCurrentFiles(journal, targetEntries) {
@@ -24128,7 +24162,7 @@ var ObtsObsidianClient = class {
       if (descendants.some((descendant) => !(descendant in journal.preflight_sha256))) {
         journal.phase = "blocked_recovery";
         journal.redacted_error_category = "preflight_hash_changed";
-        await writeJson(this.applyJournalPath, journal);
+        await writeJson(this.fsp, this.applyJournalPath, journal);
         await this.block("unsafe_local_state", "A local file changed during apply preflight.");
       }
     };
@@ -24292,16 +24326,16 @@ var ObtsObsidianClient = class {
     const state = await this.readState();
     const bundleId = `rec_${Date.now()}_${randomHex(8)}`;
     const bundleDir = path.join(this.obtsDir, "recovery", bundleId);
-    await fsp.mkdir(path.join(bundleDir, "files"), { recursive: true, mode: 448 });
-    await fsp.mkdir(path.join(bundleDir, "git"), { recursive: true, mode: 448 });
-    await fsp.mkdir(path.join(bundleDir, "patches"), { recursive: true, mode: 448 });
-    await fsp.mkdir(path.join(bundleDir, "journal"), { recursive: true, mode: 448 });
+    await this.fsp.mkdir(path.join(bundleDir, "files"), { recursive: true, mode: 448 });
+    await this.fsp.mkdir(path.join(bundleDir, "git"), { recursive: true, mode: 448 });
+    await this.fsp.mkdir(path.join(bundleDir, "patches"), { recursive: true, mode: 448 });
+    await this.fsp.mkdir(path.join(bundleDir, "journal"), { recursive: true, mode: 448 });
     const snapshotChecksums = [];
     for (const filePath of affectedPaths) {
       if (filePath.startsWith(".obts/")) continue;
       let metadata;
       try {
-        metadata = await fsp.stat(filePath);
+        metadata = await this.fsp.stat(filePath);
       } catch (error) {
         if (!error || error.code !== "ENOENT") throw error;
         metadata = null;
@@ -24310,12 +24344,12 @@ var ObtsObsidianClient = class {
         snapshotChecksums.push(`missing  files/${filePath}`);
         continue;
       }
-      const content = await fsp.readFile(filePath);
+      const content = await this.fsp.readFile(filePath);
       const target = path.join(bundleDir, "files", filePath);
-      await fsp.mkdir(path.dirname(target), { recursive: true, mode: 448 });
-      await fsp.writeFile(target, content, { mode: 384 });
+      await this.fsp.mkdir(path.dirname(target), { recursive: true, mode: 448 });
+      await this.fsp.writeFile(target, content, { mode: 384 });
       snapshotChecksums.push(`${sha256(content)}  files/${filePath}`);
-      if (isTextPatchPath(filePath)) await writeTextSnapshotPatch(bundleDir, filePath, content);
+      if (isTextPatchPath(filePath)) await writeTextSnapshotPatch(this.fsp, bundleDir, filePath, content);
     }
     const manifest = {
       bundle_id: bundleId,
@@ -24331,11 +24365,11 @@ var ObtsObsidianClient = class {
       plugin_version: PLUGIN_VERSION,
       checksum_manifest: snapshotChecksums
     };
-    await writeJson(path.join(bundleDir, "manifest.json"), manifest);
-    if (journal) await writeJson(path.join(bundleDir, "journal", "apply-journal.json"), journal);
+    await writeJson(this.fsp, path.join(bundleDir, "manifest.json"), manifest);
+    if (journal) await writeJson(this.fsp, path.join(bundleDir, "journal", "apply-journal.json"), journal);
     const pack = await this.createRecoveryRefsPack();
-    await fsp.writeFile(path.join(bundleDir, "git", "local-refs.pack"), pack, { mode: 384 });
-    await fsp.writeFile(path.join(bundleDir, "checksums.sha256"), `${(await bundleChecksums(bundleDir)).join("\n")}
+    await this.fsp.writeFile(path.join(bundleDir, "git", "local-refs.pack"), pack, { mode: 384 });
+    await this.fsp.writeFile(path.join(bundleDir, "checksums.sha256"), `${(await bundleChecksums(this.fsp, bundleDir)).join("\n")}
 `, { mode: 384 });
     return bundleId;
   }
@@ -24400,9 +24434,9 @@ var ObtsObsidianClient = class {
     const breadcrumbs = initialBreadcrumbs.slice(0, 16);
     const packPath = path.join(this.gitdir, "objects", "pack", `obts-pull-${Date.now()}-${randomHex(4)}.pack`);
     try {
-      await fsp.mkdir(path.dirname(packPath), { recursive: true, mode: 448 });
+      await this.fsp.mkdir(path.dirname(packPath), { recursive: true, mode: 448 });
       breadcrumbs.push(makeDiagnosticBreadcrumb("pack_persist_write", "started", packfile));
-      await fsp.writeFile(packPath, packfile, { mode: 384 });
+      await this.fsp.writeFile(packPath, packfile, { mode: 384 });
       breadcrumbs.push(makeDiagnosticBreadcrumb("pack_persist_write", "succeeded", packfile));
     } catch (error) {
       breadcrumbs.push(makeDiagnosticBreadcrumb("pack_persist_write", "failed", packfile, diagnosticIoCode(error)));
@@ -24455,14 +24489,14 @@ var ObtsObsidianClient = class {
     let lastError;
     for (let attempt = 0; attempt < 5; attempt += 1) {
       try {
-        const value = await fsp.readFile(filePath);
+        const value = await this.fsp.readFile(filePath);
         const persisted = Buffer2.isBuffer(value) ? value : Buffer2.from(value);
         if (expectedBytes === null || buffersEqual(persisted, expectedBytes)) return persisted;
         lastError = new Error("Persisted bytes did not match the downloaded Git pack.");
       } catch (error) {
         lastError = error;
       }
-      await new Promise((resolve) => window.setTimeout(resolve, 100));
+      await new Promise((resolve) => globalThis.setTimeout(resolve, 100));
     }
     throw new Error("Obsidian's vault adapter could not persist the downloaded Git pack.", { cause: lastError });
   }
@@ -24612,34 +24646,45 @@ var ObtsObsidianClient = class {
       await this.plugin.saveSettings();
     }
   }
+  async pullChunk({ vaultId, deviceId, token, currentLocalMain, requestedTarget, currentEventSeq, cursor }) {
+    const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${vaultId}/sync/pull-chunk`), {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        api_version: API_VERSION,
+        plugin_version: PLUGIN_VERSION,
+        vault_id: vaultId,
+        device_id: deviceId,
+        current_local_main: currentLocalMain,
+        requested_target: requestedTarget,
+        current_event_seq: currentEventSeq || 0,
+        cursor
+      })
+    });
+    if (!response.ok) await throwResponseError(response);
+    return parseMultipartPull(response.headers.get("content-type") || "", Buffer2.from(await response.arrayBuffer()));
+  }
   async pull(vaultId, deviceId, token, currentLocalMain, requestedTarget = "latest", currentEventSeq = void 0) {
     const capabilities = await this.syncCapabilities();
     if (capabilities) {
-      const checkpoint = await readJson(this.pullTransferPath, null);
+      const checkpoint = await readJson(this.fsp, this.pullTransferPath, null);
       const checkpointMatches = checkpoint && checkpoint.vault_id === vaultId && checkpoint.device_id === deviceId && checkpoint.current_local_main === currentLocalMain && (requestedTarget === "latest" || requestedTarget === checkpoint.target_main);
       let cursor = checkpointMatches ? checkpoint.next_cursor : 0;
       let target = checkpointMatches ? checkpoint.target_main : requestedTarget;
-      if (checkpoint && !checkpointMatches) await fsp.rm(this.pullTransferPath, { force: true });
+      if (checkpoint && !checkpointMatches) await this.fsp.rm(this.pullTransferPath, { force: true });
       let finalManifest = null;
       let chunkCount = checkpointMatches ? checkpoint.received_chunks || 0 : 0;
       let transferredBytes = checkpointMatches ? checkpoint.transferred_bytes || 0 : 0;
       while (true) {
-        const response2 = await fetchWithTimeout(this.url(`/api/v1/vaults/${vaultId}/sync/pull-chunk`), {
-          method: "POST",
-          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-          body: JSON.stringify({
-            api_version: API_VERSION,
-            plugin_version: PLUGIN_VERSION,
-            vault_id: vaultId,
-            device_id: deviceId,
-            current_local_main: currentLocalMain,
-            requested_target: target,
-            current_event_seq: currentEventSeq || 0,
-            cursor
-          })
+        const chunk = await this.pullChunk({
+          vaultId,
+          deviceId,
+          token,
+          currentLocalMain,
+          requestedTarget: target,
+          currentEventSeq,
+          cursor
         });
-        if (!response2.ok) await throwResponseError(response2);
-        const chunk = parseMultipartPull(response2.headers.get("content-type") || "", Buffer2.from(await response2.arrayBuffer()));
         if (chunk.packfile.byteLength !== chunk.manifest.chunk_bytes || sha256(chunk.packfile) !== chunk.manifest.chunk_sha256) {
           throw new ObtsBlockedError("chunk_digest_mismatch", "Downloaded Git chunk failed integrity validation.");
         }
@@ -24652,12 +24697,12 @@ var ObtsObsidianClient = class {
         finalManifest = chunk.manifest;
         target = finalManifest.target_main;
         if (finalManifest.complete) {
-          await fsp.rm(this.pullTransferPath, { force: true });
+          await this.fsp.rm(this.pullTransferPath, { force: true });
           break;
         }
         if (finalManifest.next_cursor <= cursor) throw new ObtsBlockedError("invalid_transfer_cursor", "Pull transfer did not advance.");
         cursor = finalManifest.next_cursor;
-        await writeJson(this.pullTransferPath, {
+        await writeJson(this.fsp, this.pullTransferPath, {
           vault_id: vaultId,
           device_id: deviceId,
           current_local_main: currentLocalMain,
@@ -24752,6 +24797,11 @@ var ObtsObsidianClient = class {
     const result = await response.json();
     if (nameRevision === this.plugin.deviceNameRevision) {
       await this.applyServerDeviceName(result.device_name, false);
+      const latestState = await this.readState();
+      const normalizedName = normalizeDisplayName(result.device_name);
+      if (latestState.device_name !== normalizedName) {
+        await this.writeState(Object.assign({}, latestState, { device_name: normalizedName, updated_at: nowIso() }));
+      }
     }
     this.plugin.handlePluginCompatibility(result.plugin);
     return result;
@@ -24855,14 +24905,14 @@ var ObtsObsidianClient = class {
     await this.plugin.flushOpenMarkdownEditorsToDisk();
   }
   async assertPairingCanStart() {
-    if (!await exists(this.obtsDir)) {
+    if (!await exists(this.fsp, this.obtsDir)) {
       return;
     }
-    const existingState = await readJson(this.statePath, null);
+    const existingState = await readJson(this.fsp, this.statePath, null);
     if (existingState && (existingState.vault_id || existingState.device_id)) {
       await this.block("local_state_already_paired", "Local .obts state already belongs to a paired device.");
     }
-    if (await exists(this.authPath)) {
+    if (await exists(this.fsp, this.authPath)) {
       await this.block("local_state_already_paired", "A device token already exists for this vault.");
     }
     if (await this.isCleanUnpairedScaffold(existingState)) {
@@ -24877,7 +24927,7 @@ var ObtsObsidianClient = class {
     if (existingState.user_id || existingState.vault_id || existingState.device_id || existingState.device_ref || existingState.server_device_ref || existingState.local_main || existingState.local_head || existingState.initial_import_confirmed || existingState.last_error_code && existingState.last_error_code !== "partial_local_state") {
       return false;
     }
-    if (await exists(this.applyJournalPath) || await exists(this.applyLockPath) || !await exists(this.queuePath)) {
+    if (await exists(this.fsp, this.applyJournalPath) || await exists(this.fsp, this.applyLockPath) || !await exists(this.fsp, this.queuePath)) {
       return false;
     }
     const queue = await this.readQueue();
@@ -24961,9 +25011,9 @@ var ObtsObsidianClient = class {
     await this.block("same_device_non_fast_forward", "Local Git history diverged from this device ref and requires recovery.");
   }
   async acquireApplyLock(applyId) {
-    await fsp.mkdir(path.dirname(this.applyLockPath), { recursive: true, mode: 448 });
+    await this.fsp.mkdir(path.dirname(this.applyLockPath), { recursive: true, mode: 448 });
     try {
-      await fsp.writeFile(this.applyLockPath, JSON.stringify({ apply_id: applyId, created_at: nowIso() }, null, 2), { flag: "wx", mode: 384 });
+      await this.fsp.writeFile(this.applyLockPath, JSON.stringify({ apply_id: applyId, created_at: nowIso() }, null, 2), { flag: "wx", mode: 384 });
     } catch (error) {
       if (error && error.code === "EEXIST") {
         await this.block("apply_lock_active", "Another apply operation already holds the local vault lock.");
@@ -24972,15 +25022,15 @@ var ObtsObsidianClient = class {
     }
   }
   async clearApplyState() {
-    await fsp.rm(this.applyJournalPath, { force: true });
-    await fsp.rm(this.applyLockPath, { force: true });
+    await this.fsp.rm(this.applyJournalPath, { force: true });
+    await this.fsp.rm(this.applyLockPath, { force: true });
   }
   async updateRef(ref, target, expected, force = false) {
     const refPath = path.join(this.gitdir, ref);
     const lockPath = `${refPath}.lock`;
-    await fsp.mkdir(path.dirname(refPath), { recursive: true });
+    await this.fsp.mkdir(path.dirname(refPath), { recursive: true });
     try {
-      await fsp.writeFile(lockPath, `${target}
+      await this.fsp.writeFile(lockPath, `${target}
 `, { flag: "wx", mode: 384 });
     } catch (error) {
       throw new Error(`Local ref ${ref} is locked by another operation.`, { cause: error });
@@ -24990,9 +25040,9 @@ var ObtsObsidianClient = class {
         const current = await this.resolveRef(ref);
         if (current !== expected) throw new Error(`Local ref ${ref} changed while updating it.`);
       }
-      await fsp.rename(lockPath, refPath);
+      await this.fsp.rename(lockPath, refPath);
     } finally {
-      await fsp.rm(lockPath, { force: true }).catch(() => void 0);
+      await this.fsp.rm(lockPath, { force: true }).catch(() => void 0);
     }
   }
   async resolveRef(ref) {
@@ -25042,13 +25092,13 @@ var ObtsObsidianClient = class {
   }
   async readState() {
     try {
-      const state = JSON.parse(await fsp.readFile(this.statePath, "utf8"));
+      const state = JSON.parse(await this.fsp.readFile(this.statePath, "utf8"));
       if (await this.hasActiveTokenWithoutIdentity(state)) {
         return await this.readBackupState() || this.localStateIncomplete(state);
       }
       return await this.preferRecoverableBackupState(state);
     } catch {
-      if (await exists(this.authPath)) {
+      if (await exists(this.fsp, this.authPath)) {
         const backupState = await this.readBackupState();
         return backupState || this.localStateIncomplete(null);
       }
@@ -25074,7 +25124,7 @@ var ObtsObsidianClient = class {
   async writeState(state) {
     const guardedState = await this.guardStateCursorRegression(state);
     await this.backupExistingState();
-    await writeJson(this.statePath, guardedState);
+    await writeJson(this.fsp, this.statePath, guardedState);
   }
   async guardStateCursorRegression(nextState) {
     const currentState = await this.readPrimaryState();
@@ -25155,7 +25205,7 @@ var ObtsObsidianClient = class {
       recovered.last_error_code = primaryState.last_error_code;
       recovered.last_error_details = primaryState.last_error_details || null;
     }
-    await writeJson(this.statePath, recovered);
+    await writeJson(this.fsp, this.statePath, recovered);
     return recovered;
   }
   async backupStateCursorsDescend(primaryState, backupState) {
@@ -25184,7 +25234,7 @@ var ObtsObsidianClient = class {
   }
   async readPrimaryState() {
     try {
-      return JSON.parse(await fsp.readFile(this.statePath, "utf8"));
+      return JSON.parse(await this.fsp.readFile(this.statePath, "utf8"));
     } catch {
       return null;
     }
@@ -25248,16 +25298,16 @@ var ObtsObsidianClient = class {
   }
   async backupExistingState() {
     try {
-      const state = JSON.parse(await fsp.readFile(this.statePath, "utf8"));
+      const state = JSON.parse(await this.fsp.readFile(this.statePath, "utf8"));
       if (state.vault_id && state.device_id) {
-        await fsp.copyFile(this.statePath, `${this.statePath}.bak`);
+        await this.fsp.copyFile(this.statePath, `${this.statePath}.bak`);
       }
     } catch {
     }
   }
   async readBackupState() {
     try {
-      const state = JSON.parse(await fsp.readFile(`${this.statePath}.bak`, "utf8"));
+      const state = JSON.parse(await this.fsp.readFile(`${this.statePath}.bak`, "utf8"));
       if (state.vault_id && state.device_id) {
         return state;
       }
@@ -25267,7 +25317,7 @@ var ObtsObsidianClient = class {
     return null;
   }
   async hasActiveTokenWithoutIdentity(state) {
-    return Boolean((!state.vault_id || !state.device_id) && await exists(this.authPath));
+    return Boolean((!state.vault_id || !state.device_id) && await exists(this.fsp, this.authPath));
   }
   localStateIncomplete(state) {
     return {
@@ -25289,7 +25339,7 @@ var ObtsObsidianClient = class {
     };
   }
   async readQueue() {
-    const queue = await readJson(this.queuePath, {
+    const queue = await readJson(this.fsp, this.queuePath, {
       pending_commit: null,
       expected_device_ref: null,
       status: "idle",
@@ -25303,8 +25353,8 @@ var ObtsObsidianClient = class {
   }
   async writeQueue(queue) {
     await this.mutateQueue(async () => {
-      const existing = await readJson(this.queuePath, null);
-      await writeJson(this.queuePath, Object.assign({}, queue, {
+      const existing = await readJson(this.fsp, this.queuePath, null);
+      await writeJson(this.fsp, this.queuePath, Object.assign({}, queue, {
         change_seq: Number.isSafeInteger(queue.change_seq) && queue.change_seq >= 0 ? queue.change_seq : Number.isSafeInteger(existing && existing.change_seq) && existing.change_seq >= 0 ? existing.change_seq : 0
       }));
     });
@@ -25315,7 +25365,7 @@ var ObtsObsidianClient = class {
       if (queue.pending_commit !== null || queue.status !== "queued_local" || queue.change_seq !== expectedChangeSeq) {
         return false;
       }
-      await writeJson(this.queuePath, {
+      await writeJson(this.fsp, this.queuePath, {
         pending_commit: null,
         expected_device_ref: (await this.readState()).server_device_ref,
         status: "idle",
@@ -25332,7 +25382,7 @@ var ObtsObsidianClient = class {
     return await run;
   }
   async readDirectoryState() {
-    const state = await readJson(this.directoryStatePath, null);
+    const state = await readJson(this.fsp, this.directoryStatePath, null);
     if (!state) {
       return { observed_dirs: [], explicit_empty_dirs: [], pending_intents: [], updated_at: nowIso() };
     }
@@ -25344,7 +25394,7 @@ var ObtsObsidianClient = class {
     };
   }
   async writeDirectoryState(state) {
-    await writeJson(this.directoryStatePath, {
+    await writeJson(this.fsp, this.directoryStatePath, {
       observed_dirs: Array.from(new Set(state.observed_dirs)).sort(),
       explicit_empty_dirs: Array.from(new Set(state.explicit_empty_dirs)).sort(),
       pending_intents: compactDirectoryIntents(state.pending_intents),
@@ -25352,7 +25402,7 @@ var ObtsObsidianClient = class {
     });
   }
   async reconcileDirectoryState(knownLocalFiles = void 0) {
-    if (!await exists(this.directoryStatePath)) {
+    if (!await exists(this.fsp, this.directoryStatePath)) {
       await this.refreshDirectoryStateFromDisk([], knownLocalFiles);
       return [];
     }
@@ -25410,7 +25460,7 @@ var ObtsObsidianClient = class {
     }
   }
   async readDeviceToken() {
-    const tokenFile = await readJson(this.authPath, {});
+    const tokenFile = await readJson(this.fsp, this.authPath, {});
     if (!tokenFile.device_token) {
       throw new ObtsBlockedError("not_paired", "Device token is missing.");
     }
@@ -26270,7 +26320,7 @@ function directoryPrefixes(filePath) {
   }
   return prefixes;
 }
-async function writeTextSnapshotPatch(bundleDir, filePath, content) {
+async function writeTextSnapshotPatch(fsp, bundleDir, filePath, content) {
   const patchPath = path.join(bundleDir, "patches", `${filePath.replaceAll("/", "__")}.patch`);
   await fsp.mkdir(path.dirname(patchPath), { recursive: true, mode: 448 });
   const body = [
@@ -26284,9 +26334,9 @@ async function writeTextSnapshotPatch(bundleDir, filePath, content) {
   await fsp.writeFile(patchPath, `${body}
 `, { mode: 384 });
 }
-async function bundleChecksums(bundleDir) {
+async function bundleChecksums(fsp, bundleDir) {
   const entries = [];
-  await walkBundleFiles(bundleDir, async (absolutePath) => {
+  await walkBundleFiles(fsp, bundleDir, async (absolutePath) => {
     const relativePath = normalizePath2(path.relative(bundleDir, absolutePath));
     if (relativePath === "checksums.sha256") {
       return;
@@ -26295,12 +26345,12 @@ async function bundleChecksums(bundleDir) {
   });
   return entries.sort();
 }
-async function walkBundleFiles(root, visitFile) {
+async function walkBundleFiles(fsp, root, visitFile) {
   const entries = await fsp.readdir(root, { withFileTypes: true });
   for (const entry of entries) {
     const absolutePath = path.join(root, entry.name);
     if (entry.isDirectory()) {
-      await walkBundleFiles(absolutePath, visitFile);
+      await walkBundleFiles(fsp, absolutePath, visitFile);
     } else if (entry.isFile()) {
       await visitFile(absolutePath);
     }
@@ -26474,14 +26524,14 @@ function blockStatusLabel(code) {
   }
   return "Unsafe local state";
 }
-async function readJson(filePath, fallback) {
+async function readJson(fsp, filePath, fallback) {
   try {
     return JSON.parse(await fsp.readFile(filePath, "utf8"));
   } catch {
     return fallback;
   }
 }
-async function readApplyJournalStrict(filePath) {
+async function readApplyJournalStrict(fsp, filePath) {
   try {
     return parseApplyJournal(JSON.parse(await fsp.readFile(filePath, "utf8")));
   } catch (error) {
@@ -26509,7 +26559,7 @@ function isNullableString(value) {
 function isNullableSha256(value) {
   return value === null || typeof value === "string" && /^[0-9a-f]{64}$/u.test(value);
 }
-async function writeJson(filePath, value) {
+async function writeJson(fsp, filePath, value) {
   await fsp.mkdir(path.dirname(filePath), { recursive: true, mode: 448 });
   const temporaryPath = `${filePath}.tmp-${randomHex(4)}-${Date.now()}`;
   await fsp.writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}
@@ -26521,7 +26571,7 @@ async function writeJson(filePath, value) {
     throw error;
   }
 }
-async function exists(filePath) {
+async function exists(fsp, filePath) {
   try {
     await fsp.stat(filePath);
     return true;
@@ -26784,3 +26834,6 @@ function toArrayBuffer(data) {
 function nowIso() {
   return (/* @__PURE__ */ new Date()).toISOString();
 }
+module.exports.ObtsClientCore = ObtsObsidianClient;
+module.exports.PluginBlockedError = ObtsBlockedError;
+module.exports.TransportError = ObtsTransportError;
