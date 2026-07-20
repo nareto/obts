@@ -942,10 +942,10 @@ describe('Phase 1 sync without conflict resolution', () => {
     };
 
     const applyResult = await fixtureB.syncOnce();
-    expect(applyResult.status).toBe('Ahead');
+    expect(applyResult.status).toBe('Synced');
     expect(await readFile(join(fixtureBDir, 'incoming', 'keep', 'a.md'), 'utf8')).toBe('keep a\n');
     expect(await exists(join(fixtureBDir, 'incoming', 'remove', 'b.md'))).toBe(false);
-    expect(await fixtureB.readQueue()).toMatchObject({ status: 'queued_local' });
+    expect(await fixtureB.readQueue()).toMatchObject({ status: 'merged' });
     expect(await exists(join(fixtureBDir, '.obts', 'apply-journal.json'))).toBe(false);
 
     expect((await fixtureB.syncOnce()).status).toBe('Synced');
@@ -4940,7 +4940,7 @@ describe('Phase 1 sync without conflict resolution', () => {
   });
 
   it('ships an installable Obsidian plugin with Phase 1 sync behavior', async () => {
-    const pluginMain = await readFile(join(process.cwd(), 'obsidian-plugin', 'src', 'main.js'), 'utf8');
+    const pluginMain = await readFile(join(process.cwd(), 'obsidian-plugin', 'src', 'main.cjs'), 'utf8');
     const pluginReadme = await readFile(join(process.cwd(), 'obsidian-plugin', 'README.md'), 'utf8');
 
     expect(pluginMain).toContain('class ObtsObsidianClient');
