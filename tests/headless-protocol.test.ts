@@ -26,6 +26,7 @@ function fakeClient(overrides: Partial<HeadlessClient> = {}): HeadlessClient {
     readState: vi.fn(async () => state),
     readQueue: vi.fn(async () => ({ pending_commit: null, expected_device_ref: null, status: 'idle', attempts: 0, updated_at: state.updated_at })),
     readPendingOnboarding: vi.fn(async () => null),
+    readIndexDelta: vi.fn(async () => ({ head: null, base: null, mode: 'unavailable', files: [], changes: [] })),
     startOnboarding: vi.fn(async () => ({ connection_id: 'connection', connection_secret: 'secret', expires_at: state.updated_at, browser_url: 'https://example.test' })),
     pollOnboarding: vi.fn(async () => ({ status: 'pending' } as never)),
     analyzeOnboarding: vi.fn(async () => ({ classification: 'new_empty' } as never)),
@@ -99,6 +100,28 @@ describe('headless client protocol', () => {
     expect(messages[0]).toMatchObject({ type: 'response', id: 'bad', ok: false, error: { code: 'invalid_request' } });
     expect(messages[1]).toMatchObject({ type: 'response', id: 'unknown', ok: false, error: { code: 'unknown_command' } });
     expect(messages[2]).toMatchObject({ type: 'response', id: 'good', ok: true });
+  });
+
+  it('returns commit-index deltas without changing client state', async () => {
+    const messages: HeadlessMessage[] = [];
+    const readIndexDelta = vi.fn(async () => ({
+      head: 'b'.repeat(40),
+      base: 'a'.repeat(40),
+      mode: 'incremental' as const,
+      files: [{ path: 'Notes/test.md', oid: 'c'.repeat(40), content_sha256: 'd'.repeat(64) }],
+      changes: [{
+        path: 'Notes/test.md',
+        kind: 'modify' as const,
+        oid: 'c'.repeat(40),
+        content_sha256: 'd'.repeat(64)
+      }]
+    }));
+    const session = new HeadlessSession(fakeClient({ readIndexDelta }), async (message) => void messages.push(message));
+
+    await session.submit({ id: 1, command: 'read-index-delta', fromCommit: 'a'.repeat(40) });
+
+    expect(readIndexDelta).toHaveBeenCalledWith('a'.repeat(40));
+    expect(messages).toEqual([{ type: 'response', id: 1, ok: true, result: await readIndexDelta.mock.results[0]!.value }]);
   });
 
   it('passes filesystem change hints and requests immediate synchronization', async () => {

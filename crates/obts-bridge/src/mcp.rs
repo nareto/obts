@@ -1861,16 +1861,6 @@ impl IntoResponse for McpError {
             McpError::Service(ServiceError::Write(
                 WriteError::AlreadyExists { .. } | WriteError::ContentChanged { .. },
             )) => StatusCode::CONFLICT,
-            McpError::Service(
-                ServiceError::CouchDbWrite(
-                    crate::couchdb::CouchDbError::NoteAlreadyExists { .. }
-                    | crate::couchdb::CouchDbError::Conflict { .. },
-                )
-                | ServiceError::CouchDbUpdate(
-                    crate::couchdb::CouchDbError::Conflict { .. }
-                    | crate::couchdb::CouchDbError::RevisionConflict { .. },
-                ),
-            ) => StatusCode::CONFLICT,
             McpError::Service(ServiceError::Write(WriteError::Persistence { .. })) => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
@@ -1882,16 +1872,8 @@ impl IntoResponse for McpError {
                 crate::filesystem::FilesystemError::NotFound,
             )) => StatusCode::NOT_FOUND,
             McpError::Service(ServiceError::FilesystemWrite(_))
-            | McpError::Service(ServiceError::Headless(_)) => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            | McpError::Service(ServiceError::Headless(_)) => StatusCode::SERVICE_UNAVAILABLE,
             McpError::Service(ServiceError::Write(_)) => StatusCode::BAD_REQUEST,
-            McpError::Service(
-                ServiceError::CouchDbWrite(_)
-                | ServiceError::CouchDbUpdate(_)
-                | ServiceError::VaultFileRepair(_)
-                | ServiceError::VaultFileTemporarilyUnavailable { .. },
-            ) => StatusCode::SERVICE_UNAVAILABLE,
             McpError::Serialization(_) => StatusCode::INTERNAL_SERVER_ERROR,
             McpError::MissingEnvironment(_)
             | McpError::InvalidEnvironment(_)
@@ -1907,14 +1889,23 @@ impl IntoResponse for McpError {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_GRAPH_TRAVERSAL_DEPTH, MAX_NOTE_LIST_LIMIT, McpError, log_request_outcome,
+        MAX_GRAPH_TRAVERSAL_DEPTH, MAX_NOTE_LIST_LIMIT, McpError, McpState, log_request_outcome,
         sanitize_tool_response, server_definition, tool_definitions,
     };
-    use axum::http::StatusCode;
+    use axum::http::header::AUTHORIZATION;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use chrono::Utc;
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
+    use tempfile::tempdir;
     use tracing_subscriber::fmt::MakeWriter;
+
+    use crate::config::McpTokenConfig;
+    use crate::runtime_config::{AuthConfigSnapshot, RuntimeAuthConfig};
+    use crate::service::VaultBridgeService;
+    use crate::store::VaultStore;
 
     #[derive(Clone, Default)]
     struct SharedLogBuffer {
@@ -1960,6 +1951,75 @@ mod tests {
             .into_iter()
             .find(|tool| tool.name == name)
             .unwrap_or_else(|| panic!("missing tool definition: {name}"))
+    }
+
+    #[tokio::test]
+    async fn mcp_bearer_tokens_resolve_contexts_and_follow_runtime_rotation() {
+        let token_dir = tempdir().expect("token dir");
+        std::fs::write(token_dir.path().join("agent.token"), "secret-token\n").expect("token file");
+        let auth_config = RuntimeAuthConfig::new(AuthConfigSnapshot {
+            mcp_tokens: BTreeMap::from([(
+                "agent".to_string(),
+                McpTokenConfig {
+                    context: "non_personal".to_string(),
+                },
+            )]),
+            loaded_at: Utc::now(),
+            ..AuthConfigSnapshot::default()
+        });
+        let state = McpState::new_with_auth_config(
+            VaultBridgeService::new_for_tests(VaultStore::new(10)),
+            None,
+            None,
+            Some(token_dir.path().to_path_buf()),
+            auth_config.clone(),
+        )
+        .expect("MCP state");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer secret-token"),
+        );
+        let auth = state.authorize(&headers).await.expect("authorized");
+        assert_eq!(auth.context.as_str(), "non_personal");
+        assert_eq!(auth.principal.as_str(), "mcp_token:agent");
+
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic secret-token"),
+        );
+        assert!(matches!(
+            state.authorize(&headers).await,
+            Err(McpError::Unauthorized)
+        ));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong-token"),
+        );
+        assert!(matches!(
+            state.authorize(&headers).await,
+            Err(McpError::Unauthorized)
+        ));
+
+        auth_config
+            .set_snapshot(AuthConfigSnapshot {
+                mcp_tokens: BTreeMap::from([(
+                    "agent".to_string(),
+                    McpTokenConfig {
+                        context: "admin".to_string(),
+                    },
+                )]),
+                loaded_at: Utc::now(),
+                ..AuthConfigSnapshot::default()
+            })
+            .await;
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("bearer secret-token"),
+        );
+        let rotated = state.authorize(&headers).await.expect("rotated context");
+        assert_eq!(rotated.context.as_str(), "admin");
+        assert_eq!(rotated.principal.as_str(), "mcp_token:agent");
     }
 
     #[test]

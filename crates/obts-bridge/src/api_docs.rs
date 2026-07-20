@@ -978,7 +978,7 @@ pub(crate) fn openapi_spec() -> Value {
                 "post": {
                     "tags": ["obts_bridge"],
                     "summary": "Run an authenticated headless-client administration command",
-                    "description": "Requires an API token mapped to the admin context. Commands cover pairing, state and queue inspection, synchronization, rename, unpair, and explicit recovery operations.",
+                    "description": "Requires an API token mapped to the admin context. Commands cover pairing, state and queue inspection, synchronization, rename, unpair, explicit client recovery, and reset-index-projection for a derived-only index rebuild.",
                     "security": [{"api_key": []}],
                     "requestBody": {
                         "required": true,

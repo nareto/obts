@@ -2950,6 +2950,47 @@ class ObtsObsidianClient {
     return result.sort();
   }
 
+  async readIndexDelta(fromCommit = null) {
+    const state = await this.readState();
+    const head = state.local_head;
+    if (!head || !(await this.commitExists(head))) {
+      return { head: null, base: null, mode: "unavailable", files: [], changes: [] };
+    }
+    const targetEntries = await this.listTreeBlobOids(head);
+    let base = null;
+    let mode = "rebuild";
+    let priorEntries = new Map();
+    if (typeof fromCommit === "string") {
+      if (!(await this.commitExists(fromCommit)) || !(await this.isAncestor(fromCommit, head))) {
+        return { head, base: fromCommit, mode: "diverged", files: [], changes: [] };
+      }
+      base = fromCommit;
+      mode = "incremental";
+      priorEntries = await this.listTreeBlobOids(fromCommit);
+    }
+    const targetDigests = new Map();
+    const files = [];
+    for (const [filePath, oid] of [...targetEntries.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+      const contentSha256 = `sha256:${sha256(await this.readBlobOid(oid))}`;
+      targetDigests.set(filePath, contentSha256);
+      files.push({ path: filePath, oid, content_sha256: contentSha256 });
+    }
+    const paths = Array.from(new Set([...priorEntries.keys(), ...targetEntries.keys()])).sort();
+    const changes = [];
+    for (const filePath of paths) {
+      const before = priorEntries.get(filePath);
+      const after = targetEntries.get(filePath);
+      if (before === after) continue;
+      changes.push({
+        path: filePath,
+        kind: before === undefined ? "add" : after === undefined ? "delete" : "modify",
+        oid: after || null,
+        content_sha256: after ? targetDigests.get(filePath) : null
+      });
+    }
+    return { head, base, mode, files, changes };
+  }
+
   async listTreeBlobOids(commit) {
     const entries = await this.flattenTree(commit);
     return new Map([...entries]

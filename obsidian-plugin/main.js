@@ -21815,7 +21815,7 @@ var path = require_path_browserify();
 var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.15";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.16";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_FULL_SCAN_INTERVAL_MS = 5 * 60 * 1e3;
@@ -24507,6 +24507,46 @@ var ObtsObsidianClient = class {
       if (entry.type === "blob" && isSyncableVaultPath(entryPath)) result.push(entryPath);
     });
     return result.sort();
+  }
+  async readIndexDelta(fromCommit = null) {
+    const state = await this.readState();
+    const head = state.local_head;
+    if (!head || !await this.commitExists(head)) {
+      return { head: null, base: null, mode: "unavailable", files: [], changes: [] };
+    }
+    const targetEntries = await this.listTreeBlobOids(head);
+    let base = null;
+    let mode = "rebuild";
+    let priorEntries = /* @__PURE__ */ new Map();
+    if (typeof fromCommit === "string") {
+      if (!await this.commitExists(fromCommit) || !await this.isAncestor(fromCommit, head)) {
+        return { head, base: fromCommit, mode: "diverged", files: [], changes: [] };
+      }
+      base = fromCommit;
+      mode = "incremental";
+      priorEntries = await this.listTreeBlobOids(fromCommit);
+    }
+    const targetDigests = /* @__PURE__ */ new Map();
+    const files = [];
+    for (const [filePath, oid] of [...targetEntries.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+      const contentSha256 = `sha256:${sha256(await this.readBlobOid(oid))}`;
+      targetDigests.set(filePath, contentSha256);
+      files.push({ path: filePath, oid, content_sha256: contentSha256 });
+    }
+    const paths = Array.from(/* @__PURE__ */ new Set([...priorEntries.keys(), ...targetEntries.keys()])).sort();
+    const changes = [];
+    for (const filePath of paths) {
+      const before = priorEntries.get(filePath);
+      const after = targetEntries.get(filePath);
+      if (before === after) continue;
+      changes.push({
+        path: filePath,
+        kind: before === void 0 ? "add" : after === void 0 ? "delete" : "modify",
+        oid: after || null,
+        content_sha256: after ? targetDigests.get(filePath) : null
+      });
+    }
+    return { head, base, mode, files, changes };
   }
   async listTreeBlobOids(commit2) {
     const entries = await this.flattenTree(commit2);
