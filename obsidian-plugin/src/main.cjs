@@ -1,4 +1,5 @@
-const { Plugin, PluginSettingTab, Setting, Notice, Modal, Platform, requestUrl, apiVersion } = require("obsidian");
+const obtsRuntime = globalThis.__OBTS_CLIENT_RUNTIME__ || require("obsidian");
+const { Plugin, PluginSettingTab, Setting, Notice, Modal, Platform, requestUrl, apiVersion } = obtsRuntime;
 const { Buffer } = require("buffer");
 if (typeof globalThis.Buffer === "undefined") globalThis.Buffer = Buffer;
 const git = require("isomorphic-git");
@@ -6,10 +7,9 @@ const path = require("path-browserify");
 const createSha = require("sha.js");
 const { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require("./data-adapter-fs.cjs");
 
-let fsp = null;
 
-const API_VERSION = "__OBTS_API_VERSION__";
-const PLUGIN_VERSION = "__OBTS_PLUGIN_VERSION__";
+const API_VERSION = obtsRuntime.obtsApiVersion || "__OBTS_API_VERSION__";
+const PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "__OBTS_PLUGIN_VERSION__";
 const SYNC_DEBOUNCE_MS = 1500;
 const BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000;
 const PERIODIC_FULL_SCAN_INTERVAL_MS = 5 * 60 * 1000;
@@ -896,7 +896,7 @@ class ObtsObsidianClient {
       readAttempts: mobile ? MOBILE_PACK_READ_ATTEMPTS : 1,
       retryDelayMs: mobile ? MOBILE_PACK_READ_RETRY_MS : 0
     });
-    fsp = this.adapterFs.promises;
+    this.fsp = this.adapterFs.promises;
     this.vaultDir = "/";
     this.obtsDir = path.join(this.vaultDir, ".obts");
     this.gitdir = path.join(this.obtsDir, "git");
@@ -918,15 +918,15 @@ class ObtsObsidianClient {
     this.plugin.setInitializationStage("Recovering metadata replacements", "startup_metadata");
     await this.recoverInterruptedReplacements();
     this.plugin.setInitializationStage("Opening local Git state", "startup_git");
-    await fsp.mkdir(path.join(this.obtsDir, "auth"), { recursive: true, mode: 0o700 });
+    await this.fsp.mkdir(path.join(this.obtsDir, "auth"), { recursive: true, mode: 0o700 });
     await git.init({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, defaultBranch: "local" });
     await git.writeRef({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, ref: "HEAD", value: "refs/heads/local", symbolic: true, force: true });
-    await fsp.mkdir(path.join(this.gitdir, "info"), { recursive: true, mode: 0o700 });
-    await fsp.writeFile(path.join(this.gitdir, "info", "exclude"), ".obts/\n.git/\n", { mode: 0o600 });
+    await this.fsp.mkdir(path.join(this.gitdir, "info"), { recursive: true, mode: 0o700 });
+    await this.fsp.writeFile(path.join(this.gitdir, "info", "exclude"), ".obts/\n.git/\n", { mode: 0o600 });
     this.plugin.setInitializationStage("Reading local sync state", "startup_state");
     const state = await this.repairLocalStateIfNeeded(await this.readState());
     this.plugin.setInitializationStage("Checking interrupted apply journal", "recovery_journal");
-    const journal = await readApplyJournalStrict(this.applyJournalPath);
+    const journal = await readApplyJournalStrict(this.fsp, this.applyJournalPath);
     if (journal) this.plugin.setInitializationStage("Recovering an interrupted apply", "recovery_journal");
     if (journal && journal.phase === "committed") {
       this.plugin.setInitializationStage("Restoring recovered refs", "recovery_refs");
@@ -971,15 +971,15 @@ class ObtsObsidianClient {
   async recoverInterruptedReplacements() {
     const signal = this.plugin.lifecycleAbortController.signal;
     const shallow = { maxDepth: 0, signal };
-    await fsp.recoverReplacements(this.obtsDir, shallow);
-    await fsp.recoverReplacements(path.join(this.obtsDir, "auth"), shallow);
-    await fsp.recoverReplacements(this.gitdir, shallow);
-    await fsp.recoverReplacements(path.join(this.gitdir, "refs"), { signal });
+    await this.fsp.recoverReplacements(this.obtsDir, shallow);
+    await this.fsp.recoverReplacements(path.join(this.obtsDir, "auth"), shallow);
+    await this.fsp.recoverReplacements(this.gitdir, shallow);
+    await this.fsp.recoverReplacements(path.join(this.gitdir, "refs"), { signal });
 
     const recoveryDir = path.join(this.obtsDir, "recovery");
     let bundles;
     try {
-      bundles = await fsp.readdir(recoveryDir, { withFileTypes: true });
+      bundles = await this.fsp.readdir(recoveryDir, { withFileTypes: true });
     } catch (error) {
       if (error && error.code === "ENOENT" && !error.cause) return;
       throw error;
@@ -987,26 +987,26 @@ class ObtsObsidianClient {
     for (const bundle of bundles) {
       if (!bundle.isDirectory()) continue;
       const bundleDir = path.join(recoveryDir, bundle.name);
-      await fsp.recoverReplacements(bundleDir, shallow);
-      await fsp.recoverReplacements(path.join(bundleDir, "journal"), shallow);
+      await this.fsp.recoverReplacements(bundleDir, shallow);
+      await this.fsp.recoverReplacements(path.join(bundleDir, "journal"), shallow);
     }
   }
 
   async readPendingOnboarding() {
-    const journal = await readJson(this.onboardingJournalPath, null);
-    const pending = await readJson(this.pendingConnectionPath, null);
+    const journal = await readJson(this.fsp, this.onboardingJournalPath, null);
+    const pending = await readJson(this.fsp, this.pendingConnectionPath, null);
     if (!journal || journal.stage === "complete" || !pending || !pending.connection_secret) return null;
     return { journal, secret: pending.connection_secret };
   }
 
   async cancelOnboarding() {
-    await fsp.rm(this.pendingConnectionPath, { force: true });
-    await fsp.rm(this.onboardingJournalPath, { force: true });
-    await fsp.rm(this.bootstrapTransferPath, { force: true });
+    await this.fsp.rm(this.pendingConnectionPath, { force: true });
+    await this.fsp.rm(this.onboardingJournalPath, { force: true });
+    await this.fsp.rm(this.bootstrapTransferPath, { force: true });
   }
 
   async writeOnboardingJournal(journal) {
-    await writeJson(this.onboardingJournalPath, Object.assign({}, journal, { updated_at: nowIso() }));
+    await writeJson(this.fsp, this.onboardingJournalPath, Object.assign({}, journal, { updated_at: nowIso() }));
   }
 
   async updateOnboardingStage(connectionId, stage, selectedMode, errorCode = null) {
@@ -1023,14 +1023,14 @@ class ObtsObsidianClient {
     const pending = await this.readPendingOnboarding();
     if (!pending || pending.journal.connection.connection_id !== connectionId) return;
     await this.writeOnboardingJournal(Object.assign({}, pending.journal, { stage: "complete", last_error_code: null }));
-    await fsp.rm(this.pendingConnectionPath, { force: true });
+    await this.fsp.rm(this.pendingConnectionPath, { force: true });
   }
 
   async startOnboarding() {
     await this.assertPairingCanStart();
     await this.flushEditorBuffersToDisk();
     const summary = await this.localSnapshotSummary();
-    const existing = await readJson(this.statePath, null);
+    const existing = await readJson(this.fsp, this.statePath, null);
     const deviceName = normalizeDisplayName(this.plugin.settings.deviceName || "Obsidian device");
     this.plugin.settings.deviceName = deviceName;
     await this.plugin.saveSettings();
@@ -1045,7 +1045,7 @@ class ObtsObsidianClient {
         has_detached_baseline: Boolean(existing && existing.unpaired_baseline_vault_id && existing.unpaired_baseline_main)
       }
     });
-    await writeJson(this.pendingConnectionPath, { connection_secret: connection.connection_secret, created_at: nowIso() });
+    await writeJson(this.fsp, this.pendingConnectionPath, { connection_secret: connection.connection_secret, created_at: nowIso() });
     const redactedConnection = Object.assign({}, connection);
     delete redactedConnection.connection_secret;
     await this.writeOnboardingJournal({
@@ -1067,8 +1067,8 @@ class ObtsObsidianClient {
     const status = await response.json();
     if (status.status === "approved") await this.updateOnboardingStage(connectionId, "approved");
     if (status.status === "denied" || status.status === "expired") {
-      await fsp.rm(this.pendingConnectionPath, { force: true });
-      await fsp.rm(this.onboardingJournalPath, { force: true });
+      await this.fsp.rm(this.pendingConnectionPath, { force: true });
+      await this.fsp.rm(this.onboardingJournalPath, { force: true });
     }
     return status;
   }
@@ -1098,10 +1098,10 @@ class ObtsObsidianClient {
       if (!response.ok) await throwResponseError(response);
       return parseMultipartPull(response.headers.get("content-type") || "", Buffer.from(await response.arrayBuffer()));
     }
-    const checkpoint = await readJson(this.bootstrapTransferPath, null);
+    const checkpoint = await readJson(this.fsp, this.bootstrapTransferPath, null);
     let cursor = checkpoint && checkpoint.connection_id === connectionId ? checkpoint.next_cursor : 0;
     let target = checkpoint && checkpoint.connection_id === connectionId ? checkpoint.target_main : "latest";
-    if (checkpoint && checkpoint.connection_id !== connectionId) await fsp.rm(this.bootstrapTransferPath, { force: true });
+    if (checkpoint && checkpoint.connection_id !== connectionId) await this.fsp.rm(this.bootstrapTransferPath, { force: true });
     let finalManifest = null;
     let chunkCount = checkpoint && checkpoint.connection_id === connectionId ? checkpoint.received_chunks || 0 : 0;
     let transferredBytes = checkpoint && checkpoint.connection_id === connectionId ? checkpoint.transferred_bytes || 0 : 0;
@@ -1125,12 +1125,12 @@ class ObtsObsidianClient {
       finalManifest = chunk.manifest;
       target = finalManifest.target_main;
       if (finalManifest.complete) {
-        await fsp.rm(this.bootstrapTransferPath, { force: true });
+        await this.fsp.rm(this.bootstrapTransferPath, { force: true });
         break;
       }
       if (finalManifest.next_cursor <= cursor) throw new ObtsBlockedError("invalid_transfer_cursor", "Bootstrap transfer did not advance.");
       cursor = finalManifest.next_cursor;
-      await writeJson(this.bootstrapTransferPath, {
+      await writeJson(this.fsp, this.bootstrapTransferPath, {
         connection_id: connectionId,
         target_main: target,
         next_cursor: cursor,
@@ -1171,7 +1171,7 @@ class ObtsObsidianClient {
     await this.importPack(bootstrap.packfile, "onboarding", [makeDiagnosticBreadcrumb("onboarding_approved", "succeeded")]);
     const localFiles = await this.scanSyncableFiles();
     const matchesServer = localFiles.length === bootstrap.manifest.changed_paths.length && await this.localContentMatchesTree(localFiles, bootstrap.manifest.target_main);
-    const repair = await this.discoverPairingRepairContext(await readJson(this.statePath, null));
+    const repair = await this.discoverPairingRepairContext(await readJson(this.fsp, this.statePath, null));
     const baseline = this.baselineForPairing(repair.baseline, bootstrap.manifest.vault_id);
     const validBaseline = baseline && await this.commitExists(baseline.main) && await this.isAncestor(baseline.main, bootstrap.manifest.target_main) ? baseline : null;
     const matchesBaseline = validBaseline ? await this.localContentMatchesTree(localFiles, validBaseline.main) : false;
@@ -1229,6 +1229,10 @@ class ObtsObsidianClient {
     }
   }
 
+  async completeConnection(connectionId, secret, request) {
+    return await postJsonWithBearer(this.url(`/api/v1/connections/${connectionId}/complete`), secret, request);
+  }
+
   async finishOnboardingInternal(connectionId, secret, analysis, mode) {
     const current = await this.localSnapshotSummary();
     const localFiles = await this.scanSyncableFiles();
@@ -1238,7 +1242,7 @@ class ObtsObsidianClient {
       throw new ObtsBlockedError("onboarding_snapshot_changed", "The local vault changed. Review the updated onboarding summary before continuing.");
     }
     await this.createRecoveryBundle(mode === "use_server" ? "replace_local_with_server" : "initial_import", analysis.expectedMain, localFiles);
-    const completion = await postJsonWithBearer(this.url(`/api/v1/connections/${connectionId}/complete`), secret, {
+    const completion = await this.completeConnection(connectionId, secret, {
       mode,
       expected_main: analysis.expectedMain,
       ...(mode === "initialize" ? { proposal_kind: "new_vault_import" } : {}),
@@ -1247,7 +1251,7 @@ class ObtsObsidianClient {
         proposal_base: analysis.proposalBase
       } : {})
     });
-    await writeJson(this.authPath, { device_token: completion.device_token, created_at: nowIso() });
+    await writeJson(this.fsp, this.authPath, { device_token: completion.device_token, created_at: nowIso() });
     await this.writeState({
       user_id: completion.user_id,
       vault_id: completion.vault_id,
@@ -1538,19 +1542,40 @@ class ObtsObsidianClient {
     this.plugin.markFullScanCompleted();
     const queue = await this.readQueue();
     let uploaded = false;
+    let uploadResult = null;
     if (queue.pending_commit) {
-      await this.uploadQueuedCommit(queue);
+      uploadResult = await this.uploadQueuedCommit(queue);
       uploaded = true;
     }
 
     const postUploadState = await this.readState();
     if (postUploadState.last_error_code !== "conflict_review_required") {
-      if (uploaded) await this.pullAndApply(true);
-      else await this.pollRemoteEventsAndApply();
+      try {
+        if (uploaded) {
+          await this.pullAndApply(true);
+        } else {
+          await this.pollRemoteEventsAndApply();
+        }
+      } catch (error) {
+        if (!(uploaded && error instanceof ObtsTransportError && error.code === "device_blocked")) throw error;
+        const blockedQueue = await this.readQueue();
+        await this.writeQueue(Object.assign({}, blockedQueue, { status: "conflicted", updated_at: nowIso() }));
+        await this.writeState(Object.assign({}, await this.readState(), {
+          status_label: "Review needed",
+          last_error_code: "conflict_review_required",
+          updated_at: nowIso()
+        }));
+        const conflictId = error.details && typeof error.details.conflict_id === "string" ? error.details.conflict_id : null;
+        if (conflictId) uploadResult = Object.assign({}, uploadResult, { conflict_id: conflictId });
+      }
     }
     const finalState = await this.readState();
     await this.reportDeviceStatus().catch(() => undefined);
-    return { status: finalState.status_label, main: finalState.local_main || undefined };
+    return {
+      status: finalState.status_label,
+      main: finalState.local_main || undefined,
+      ...(uploadResult && uploadResult.conflict_id ? { conflictId: uploadResult.conflict_id } : {})
+    };
   }
 
   async replaceLocalWithServer() {
@@ -1788,7 +1813,7 @@ class ObtsObsidianClient {
         last_error_code: "conflict_review_required",
         updated_at: nowIso()
       }));
-      return;
+      return result;
     }
     if (result.status === "merged" || result.status === "noop") {
       await this.writeQueue({
@@ -1808,6 +1833,23 @@ class ObtsObsidianClient {
       }));
       await this.clearPendingDirectoryIntents();
     }
+    return result;
+  }
+
+  async putPushChunk({ vaultId, token, transferId, index, packfile }) {
+    const response = await fetchWithTimeout(
+      this.url(`/api/v1/vaults/${vaultId}/sync/push-transfers/${transferId}/chunks/${index}`),
+      {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/x-git-packed-objects",
+          "x-obts-chunk-sha256": sha256(packfile)
+        },
+        body: packfile
+      }
+    );
+    if (!response.ok) await throwResponseError(response);
   }
 
   async pushInChunks(state, queue, token, directoryIntents, capabilities, allowStaleRetry = true) {
@@ -1857,19 +1899,13 @@ class ObtsObsidianClient {
       for (let index = 0; index < groups.length; index += 1) {
         if (received.has(index)) continue;
         const packfile = await this.packObjectChunk(groups[index], capabilities.max_chunk_bytes);
-        const response = await fetchWithTimeout(
-          this.url(`/api/v1/vaults/${state.vault_id}/sync/push-transfers/${descriptor.transfer_id}/chunks/${index}`),
-          {
-            method: "PUT",
-            headers: {
-              authorization: `Bearer ${token}`,
-              "content-type": "application/x-git-packed-objects",
-              "x-obts-chunk-sha256": sha256(packfile)
-            },
-            body: packfile
-          }
-        );
-        if (!response.ok) await throwResponseError(response);
+        await this.putPushChunk({
+          vaultId: state.vault_id,
+          token,
+          transferId: descriptor.transfer_id,
+          index,
+          packfile
+        });
         uploadedChunks += 1;
         this.plugin.setStatus(`Uploading ${uploadedChunks}/${groups.length}`);
         await this.reportDeviceStatus().catch(() => undefined);
@@ -1998,7 +2034,6 @@ class ObtsObsidianClient {
       }
       throw error;
     }
-    await this.writeState(Object.assign({}, await this.readState(), { last_event_seq: page.current_event_seq, updated_at: nowIso() }));
     const currentState = await this.readState();
     const shouldPull = page.events.some((event) => {
       const main = event && event.commit_cursors ? event.commit_cursors.main : null;
@@ -2009,6 +2044,7 @@ class ObtsObsidianClient {
       return (event.event_type === "main_advanced" || event.event_type === "conflict_resolved") && hasNewMain;
     });
     if (!shouldPull) {
+      await this.writeState(Object.assign({}, currentState, { last_event_seq: page.current_event_seq, updated_at: nowIso() }));
       return { applied: false, status: currentState.status_label };
     }
     if (wasConflictBlocked && currentState.last_error_code === "conflict_review_required") {
@@ -2041,7 +2077,7 @@ class ObtsObsidianClient {
     const token = await this.readDeviceToken();
     await this.unpairDevice(state.vault_id, token);
     const baselineMain = state.local_main || await this.resolveRef("refs/heads/main");
-    await fsp.rm(this.authPath, { force: true });
+    await this.fsp.rm(this.authPath, { force: true });
     await this.writeQueue({
       pending_commit: null,
       expected_device_ref: null,
@@ -2073,7 +2109,7 @@ class ObtsObsidianClient {
     const state = await this.readState();
     const localFiles = await this.scanSyncableFiles();
     const recoveryBundleId = localFiles.length > 0 ? await this.createRecoveryBundle("rebuild_from_server", state.local_main, localFiles) : null;
-    await fsp.rm(this.authPath, { force: true });
+    await this.fsp.rm(this.authPath, { force: true });
     await this.writeQueue({
       pending_commit: null,
       expected_device_ref: null,
@@ -2173,40 +2209,40 @@ class ObtsObsidianClient {
         const fingerprint = await this.recoveryFileFingerprint(filePath);
         journal.preflight_sha256[filePath] = fingerprint.kind === "file" ? fingerprint.sha256 : null;
       }
-      await writeJson(this.applyJournalPath, journal);
+      await writeJson(this.fsp, this.applyJournalPath, journal);
 
       if (affectedPaths.length > 0) {
         if (!allowDestructive) {
           journal.phase = "blocked_recovery";
           journal.redacted_error_category = "destructive_apply_not_allowed";
-          await writeJson(this.applyJournalPath, journal);
+          await writeJson(this.fsp, this.applyJournalPath, journal);
           await this.block("unsafe_local_state", "Destructive apply is not allowed in this mode.");
         }
         try {
           journal.recovery_bundle_id = await this.createRecoveryBundle("pull_apply", targetMain, affectedPaths, journal);
           journal.phase = "recovery_bundle_written";
           journal.last_completed_step = "recovery_bundle";
-          await writeJson(this.applyJournalPath, journal);
+          await writeJson(this.fsp, this.applyJournalPath, journal);
         } catch {
           journal.phase = "blocked_recovery";
           journal.redacted_error_category = "recovery_bundle_failed";
-          await writeJson(this.applyJournalPath, journal);
+          await writeJson(this.fsp, this.applyJournalPath, journal);
           await this.block("recovery_bundle_failed", "Recovery bundle creation failed before apply.");
         }
       }
 
       if (requireCleanVisibleState && !(await this.ensureNoLocalChangesBeforeApply(state))) {
-        await fsp.rm(this.applyJournalPath, { force: true });
+        await this.fsp.rm(this.applyJournalPath, { force: true });
         return;
       }
       journal.phase = "writing_files";
-      await writeJson(this.applyJournalPath, journal);
+      await writeJson(this.fsp, this.applyJournalPath, journal);
       for (const filePath of affectedPaths) {
         const fingerprint = await this.recoveryFileFingerprint(filePath);
         if (!this.fingerprintMatchesPreflight(fingerprint, journal.preflight_sha256[filePath] || null)) {
           journal.phase = "blocked_recovery";
           journal.redacted_error_category = "preflight_hash_changed";
-          await writeJson(this.applyJournalPath, journal);
+          await writeJson(this.fsp, this.applyJournalPath, journal);
           await this.block("unsafe_local_state", "A local file changed during apply preflight.");
         }
       }
@@ -2215,7 +2251,7 @@ class ObtsObsidianClient {
 
       journal.phase = "verifying";
       journal.last_completed_step = "files_written";
-      await writeJson(this.applyJournalPath, journal);
+      await writeJson(this.fsp, this.applyJournalPath, journal);
       let preservedLocalChangePaths = [];
       if (requireCleanVisibleState) {
         await this.flushEditorBuffersToDisk();
@@ -2224,7 +2260,7 @@ class ObtsObsidianClient {
         } catch (error) {
           journal.phase = "blocked_recovery";
           journal.redacted_error_category = categorizeRecoveryError(error);
-          await writeJson(this.applyJournalPath, journal);
+          await writeJson(this.fsp, this.applyJournalPath, journal);
           if (error instanceof ObtsBlockedError) {
             await this.block(error.code, error.message, error.details);
           }
@@ -2238,7 +2274,7 @@ class ObtsObsidianClient {
       await this.updateRef("refs/heads/local", targetMain, null, true);
       journal.phase = "committed";
       journal.last_completed_step = "refs_updated";
-      await writeJson(this.applyJournalPath, journal);
+      await writeJson(this.fsp, this.applyJournalPath, journal);
       await this.writeState(Object.assign({}, state, {
         local_main: targetMain,
         local_head: targetMain,
@@ -2254,7 +2290,7 @@ class ObtsObsidianClient {
       }
     } finally {
       this.plugin.isApplying = false;
-      await fsp.rm(this.applyLockPath, { force: true });
+      await this.fsp.rm(this.applyLockPath, { force: true });
     }
   }
 
@@ -2281,7 +2317,7 @@ class ObtsObsidianClient {
       }
     }
     try {
-      await fsp.rm(this.applyLockPath, { force: true });
+      await this.fsp.rm(this.applyLockPath, { force: true });
       await this.acquireApplyLock(journal.apply_id);
       this.plugin.isApplying = true;
       if (preservedLocalChangePaths.length > 0) {
@@ -2294,7 +2330,7 @@ class ObtsObsidianClient {
       journal.phase = "committed";
       journal.last_completed_step = "refs_updated";
       journal.redacted_error_category = null;
-      await writeJson(this.applyJournalPath, journal);
+      await writeJson(this.fsp, this.applyJournalPath, journal);
       this.plugin.setInitializationStage("Persisting interrupted apply state", "recovery_state");
       await this.writeState(Object.assign({}, state, {
         local_main: journal.target_main,
@@ -2311,11 +2347,11 @@ class ObtsObsidianClient {
     } catch (error) {
       journal.redacted_error_category = categorizeRecoveryError(error);
       journal.last_completed_step = journal.last_completed_step || "recovery_bundle";
-      await writeJson(this.applyJournalPath, journal);
+      await writeJson(this.fsp, this.applyJournalPath, journal);
       return false;
     } finally {
       this.plugin.isApplying = false;
-      await fsp.rm(this.applyLockPath, { force: true });
+      await this.fsp.rm(this.applyLockPath, { force: true });
     }
   }
 
@@ -2335,11 +2371,11 @@ class ObtsObsidianClient {
       journal.phase = "blocked_recovery";
       journal.redacted_error_category = "local_files_diverge_from_journal";
       journal.last_completed_step = journal.last_completed_step || "recovery_bundle";
-      await writeJson(this.applyJournalPath, journal);
+      await writeJson(this.fsp, this.applyJournalPath, journal);
       return false;
     }
     try {
-      await fsp.rm(this.applyLockPath, { force: true });
+      await this.fsp.rm(this.applyLockPath, { force: true });
       await this.acquireApplyLock(journal.apply_id);
       this.plugin.isApplying = true;
       if (journal.affected_paths.length > 0 && journal.recovery_bundle_id === null) {
@@ -2347,21 +2383,21 @@ class ObtsObsidianClient {
         journal.recovery_bundle_id = await this.createRecoveryBundle(journal.operation_type, journal.target_main, journal.affected_paths, journal);
         journal.last_completed_step = "recovery_bundle";
         journal.phase = "recovery_bundle_written";
-        await writeJson(this.applyJournalPath, journal);
+        await writeJson(this.fsp, this.applyJournalPath, journal);
       }
       journal.phase = "writing_files";
       journal.redacted_error_category = null;
-      await writeJson(this.applyJournalPath, journal);
+      await writeJson(this.fsp, this.applyJournalPath, journal);
       this.plugin.setInitializationStage("Restoring interrupted apply files", "recovery_file_apply");
       await this.writeTargetFilesFromJournal(journal, targetEntries, validation.targetMatchedPaths);
       journal.phase = "verifying";
       journal.last_completed_step = "files_written";
-      await writeJson(this.applyJournalPath, journal);
+      await writeJson(this.fsp, this.applyJournalPath, journal);
       this.plugin.setInitializationStage("Revalidating interrupted apply files", "recovery_file_validation");
       if (!(await this.affectedApplyPathsMatchTarget(journal, targetEntries))) {
         journal.phase = "blocked_recovery";
         journal.redacted_error_category = "local_changed_during_apply";
-        await writeJson(this.applyJournalPath, journal);
+        await writeJson(this.fsp, this.applyJournalPath, journal);
         return false;
       }
       this.plugin.setInitializationStage("Restoring interrupted apply refs", "recovery_refs");
@@ -2369,7 +2405,7 @@ class ObtsObsidianClient {
       await this.updateRef("refs/heads/local", journal.target_main, null, true);
       journal.phase = "committed";
       journal.last_completed_step = "refs_updated";
-      await writeJson(this.applyJournalPath, journal);
+      await writeJson(this.fsp, this.applyJournalPath, journal);
       this.plugin.setInitializationStage("Persisting interrupted apply state", "recovery_state");
       await this.writeState(Object.assign({}, state, {
         local_main: journal.target_main,
@@ -2383,11 +2419,11 @@ class ObtsObsidianClient {
     } catch (error) {
       journal.redacted_error_category = categorizeRecoveryError(error);
       journal.last_completed_step = journal.last_completed_step || "recovery_bundle";
-      await writeJson(this.applyJournalPath, journal);
+      await writeJson(this.fsp, this.applyJournalPath, journal);
       return false;
     } finally {
       this.plugin.isApplying = false;
-      await fsp.rm(this.applyLockPath, { force: true });
+      await this.fsp.rm(this.applyLockPath, { force: true });
     }
   }
 
@@ -2480,13 +2516,13 @@ class ObtsObsidianClient {
   async recoveryFileFingerprint(filePath) {
     let metadata;
     try {
-      metadata = await fsp.stat(filePath);
+      metadata = await this.fsp.stat(filePath);
     } catch (error) {
       if (error && (error.code === "ENOENT" || error.code === "ENOTDIR")) return { kind: "missing", sha256: null, oid: null };
       throw error;
     }
     if (!metadata.isFile()) return { kind: "other", sha256: null, oid: null };
-    const content = await fsp.readFile(filePath);
+    const content = await this.fsp.readFile(filePath);
     return {
       kind: "file",
       sha256: sha256(content),
@@ -2511,7 +2547,7 @@ class ObtsObsidianClient {
       ? `Validating interrupted apply files ${completed}/${total}`
       : "Validating interrupted apply files");
     if (completed === total || completed % 25 === 0) {
-      await new Promise((resolve) => window.setTimeout(resolve, 0));
+      await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
     }
   }
 
@@ -2540,7 +2576,7 @@ class ObtsObsidianClient {
       if (descendants.some((descendant) => !(descendant in journal.preflight_sha256))) {
         journal.phase = "blocked_recovery";
         journal.redacted_error_category = "preflight_hash_changed";
-        await writeJson(this.applyJournalPath, journal);
+        await writeJson(this.fsp, this.applyJournalPath, journal);
         await this.block("unsafe_local_state", "A local file changed during apply preflight.");
       }
     };
@@ -2720,16 +2756,16 @@ class ObtsObsidianClient {
     const state = await this.readState();
     const bundleId = `rec_${Date.now()}_${randomHex(8)}`;
     const bundleDir = path.join(this.obtsDir, "recovery", bundleId);
-    await fsp.mkdir(path.join(bundleDir, "files"), { recursive: true, mode: 0o700 });
-    await fsp.mkdir(path.join(bundleDir, "git"), { recursive: true, mode: 0o700 });
-    await fsp.mkdir(path.join(bundleDir, "patches"), { recursive: true, mode: 0o700 });
-    await fsp.mkdir(path.join(bundleDir, "journal"), { recursive: true, mode: 0o700 });
+    await this.fsp.mkdir(path.join(bundleDir, "files"), { recursive: true, mode: 0o700 });
+    await this.fsp.mkdir(path.join(bundleDir, "git"), { recursive: true, mode: 0o700 });
+    await this.fsp.mkdir(path.join(bundleDir, "patches"), { recursive: true, mode: 0o700 });
+    await this.fsp.mkdir(path.join(bundleDir, "journal"), { recursive: true, mode: 0o700 });
     const snapshotChecksums = [];
     for (const filePath of affectedPaths) {
       if (filePath.startsWith(".obts/")) continue;
       let metadata;
       try {
-        metadata = await fsp.stat(filePath);
+        metadata = await this.fsp.stat(filePath);
       } catch (error) {
         if (!error || error.code !== "ENOENT") throw error;
         metadata = null;
@@ -2738,12 +2774,12 @@ class ObtsObsidianClient {
         snapshotChecksums.push(`missing  files/${filePath}`);
         continue;
       }
-      const content = await fsp.readFile(filePath);
+      const content = await this.fsp.readFile(filePath);
       const target = path.join(bundleDir, "files", filePath);
-      await fsp.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
-      await fsp.writeFile(target, content, { mode: 0o600 });
+      await this.fsp.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+      await this.fsp.writeFile(target, content, { mode: 0o600 });
       snapshotChecksums.push(`${sha256(content)}  files/${filePath}`);
-      if (isTextPatchPath(filePath)) await writeTextSnapshotPatch(bundleDir, filePath, content);
+      if (isTextPatchPath(filePath)) await writeTextSnapshotPatch(this.fsp, bundleDir, filePath, content);
     }
     const manifest = {
       bundle_id: bundleId,
@@ -2759,11 +2795,11 @@ class ObtsObsidianClient {
       plugin_version: PLUGIN_VERSION,
       checksum_manifest: snapshotChecksums
     };
-    await writeJson(path.join(bundleDir, "manifest.json"), manifest);
-    if (journal) await writeJson(path.join(bundleDir, "journal", "apply-journal.json"), journal);
+    await writeJson(this.fsp, path.join(bundleDir, "manifest.json"), manifest);
+    if (journal) await writeJson(this.fsp, path.join(bundleDir, "journal", "apply-journal.json"), journal);
     const pack = await this.createRecoveryRefsPack();
-    await fsp.writeFile(path.join(bundleDir, "git", "local-refs.pack"), pack, { mode: 0o600 });
-    await fsp.writeFile(path.join(bundleDir, "checksums.sha256"), `${(await bundleChecksums(bundleDir)).join("\n")}\n`, { mode: 0o600 });
+    await this.fsp.writeFile(path.join(bundleDir, "git", "local-refs.pack"), pack, { mode: 0o600 });
+    await this.fsp.writeFile(path.join(bundleDir, "checksums.sha256"), `${(await bundleChecksums(this.fsp, bundleDir)).join("\n")}\n`, { mode: 0o600 });
     return bundleId;
   }
 
@@ -2833,9 +2869,9 @@ class ObtsObsidianClient {
     const breadcrumbs = initialBreadcrumbs.slice(0, 16);
     const packPath = path.join(this.gitdir, "objects", "pack", `obts-pull-${Date.now()}-${randomHex(4)}.pack`);
     try {
-      await fsp.mkdir(path.dirname(packPath), { recursive: true, mode: 0o700 });
+      await this.fsp.mkdir(path.dirname(packPath), { recursive: true, mode: 0o700 });
       breadcrumbs.push(makeDiagnosticBreadcrumb("pack_persist_write", "started", packfile));
-      await fsp.writeFile(packPath, packfile, { mode: 0o600 });
+      await this.fsp.writeFile(packPath, packfile, { mode: 0o600 });
       breadcrumbs.push(makeDiagnosticBreadcrumb("pack_persist_write", "succeeded", packfile));
     } catch (error) {
       breadcrumbs.push(makeDiagnosticBreadcrumb("pack_persist_write", "failed", packfile, diagnosticIoCode(error)));
@@ -2893,14 +2929,14 @@ class ObtsObsidianClient {
     let lastError;
     for (let attempt = 0; attempt < 5; attempt += 1) {
       try {
-        const value = await fsp.readFile(filePath);
+        const value = await this.fsp.readFile(filePath);
         const persisted = Buffer.isBuffer(value) ? value : Buffer.from(value);
         if (expectedBytes === null || buffersEqual(persisted, expectedBytes)) return persisted;
         lastError = new Error("Persisted bytes did not match the downloaded Git pack.");
       } catch (error) {
         lastError = error;
       }
-      await new Promise((resolve) => window.setTimeout(resolve, 100));
+      await new Promise((resolve) => globalThis.setTimeout(resolve, 100));
     }
     throw new Error("Obsidian's vault adapter could not persist the downloaded Git pack.", { cause: lastError });
   }
@@ -3067,10 +3103,29 @@ class ObtsObsidianClient {
     }
   }
 
+  async pullChunk({ vaultId, deviceId, token, currentLocalMain, requestedTarget, currentEventSeq, cursor }) {
+    const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${vaultId}/sync/pull-chunk`), {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        api_version: API_VERSION,
+        plugin_version: PLUGIN_VERSION,
+        vault_id: vaultId,
+        device_id: deviceId,
+        current_local_main: currentLocalMain,
+        requested_target: requestedTarget,
+        current_event_seq: currentEventSeq || 0,
+        cursor
+      })
+    });
+    if (!response.ok) await throwResponseError(response);
+    return parseMultipartPull(response.headers.get("content-type") || "", Buffer.from(await response.arrayBuffer()));
+  }
+
   async pull(vaultId, deviceId, token, currentLocalMain, requestedTarget = "latest", currentEventSeq = undefined) {
     const capabilities = await this.syncCapabilities();
     if (capabilities) {
-      const checkpoint = await readJson(this.pullTransferPath, null);
+      const checkpoint = await readJson(this.fsp, this.pullTransferPath, null);
       const checkpointMatches = checkpoint &&
         checkpoint.vault_id === vaultId &&
         checkpoint.device_id === deviceId &&
@@ -3078,27 +3133,20 @@ class ObtsObsidianClient {
         (requestedTarget === "latest" || requestedTarget === checkpoint.target_main);
       let cursor = checkpointMatches ? checkpoint.next_cursor : 0;
       let target = checkpointMatches ? checkpoint.target_main : requestedTarget;
-      if (checkpoint && !checkpointMatches) await fsp.rm(this.pullTransferPath, { force: true });
+      if (checkpoint && !checkpointMatches) await this.fsp.rm(this.pullTransferPath, { force: true });
       let finalManifest = null;
       let chunkCount = checkpointMatches ? checkpoint.received_chunks || 0 : 0;
       let transferredBytes = checkpointMatches ? checkpoint.transferred_bytes || 0 : 0;
       while (true) {
-        const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${vaultId}/sync/pull-chunk`), {
-          method: "POST",
-          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-          body: JSON.stringify({
-            api_version: API_VERSION,
-            plugin_version: PLUGIN_VERSION,
-            vault_id: vaultId,
-            device_id: deviceId,
-            current_local_main: currentLocalMain,
-            requested_target: target,
-            current_event_seq: currentEventSeq || 0,
-            cursor
-          })
+        const chunk = await this.pullChunk({
+          vaultId,
+          deviceId,
+          token,
+          currentLocalMain,
+          requestedTarget: target,
+          currentEventSeq,
+          cursor
         });
-        if (!response.ok) await throwResponseError(response);
-        const chunk = parseMultipartPull(response.headers.get("content-type") || "", Buffer.from(await response.arrayBuffer()));
         if (chunk.packfile.byteLength !== chunk.manifest.chunk_bytes || sha256(chunk.packfile) !== chunk.manifest.chunk_sha256) {
           throw new ObtsBlockedError("chunk_digest_mismatch", "Downloaded Git chunk failed integrity validation.");
         }
@@ -3111,12 +3159,12 @@ class ObtsObsidianClient {
         finalManifest = chunk.manifest;
         target = finalManifest.target_main;
         if (finalManifest.complete) {
-          await fsp.rm(this.pullTransferPath, { force: true });
+          await this.fsp.rm(this.pullTransferPath, { force: true });
           break;
         }
         if (finalManifest.next_cursor <= cursor) throw new ObtsBlockedError("invalid_transfer_cursor", "Pull transfer did not advance.");
         cursor = finalManifest.next_cursor;
-        await writeJson(this.pullTransferPath, {
+        await writeJson(this.fsp, this.pullTransferPath, {
           vault_id: vaultId,
           device_id: deviceId,
           current_local_main: currentLocalMain,
@@ -3213,6 +3261,11 @@ class ObtsObsidianClient {
     const result = await response.json();
     if (nameRevision === this.plugin.deviceNameRevision) {
       await this.applyServerDeviceName(result.device_name, false);
+      const latestState = await this.readState();
+      const normalizedName = normalizeDisplayName(result.device_name);
+      if (latestState.device_name !== normalizedName) {
+        await this.writeState(Object.assign({}, latestState, { device_name: normalizedName, updated_at: nowIso() }));
+      }
     }
     this.plugin.handlePluginCompatibility(result.plugin);
     return result;
@@ -3327,14 +3380,14 @@ class ObtsObsidianClient {
   }
 
   async assertPairingCanStart() {
-    if (!(await exists(this.obtsDir))) {
+    if (!(await exists(this.fsp, this.obtsDir))) {
       return;
     }
-    const existingState = await readJson(this.statePath, null);
+    const existingState = await readJson(this.fsp, this.statePath, null);
     if (existingState && (existingState.vault_id || existingState.device_id)) {
       await this.block("local_state_already_paired", "Local .obts state already belongs to a paired device.");
     }
-    if (await exists(this.authPath)) {
+    if (await exists(this.fsp, this.authPath)) {
       await this.block("local_state_already_paired", "A device token already exists for this vault.");
     }
     if (await this.isCleanUnpairedScaffold(existingState)) {
@@ -3361,9 +3414,9 @@ class ObtsObsidianClient {
       return false;
     }
     if (
-      (await exists(this.applyJournalPath)) ||
-      (await exists(this.applyLockPath)) ||
-      !(await exists(this.queuePath))
+      (await exists(this.fsp, this.applyJournalPath)) ||
+      (await exists(this.fsp, this.applyLockPath)) ||
+      !(await exists(this.fsp, this.queuePath))
     ) {
       return false;
     }
@@ -3467,9 +3520,9 @@ class ObtsObsidianClient {
   }
 
   async acquireApplyLock(applyId) {
-    await fsp.mkdir(path.dirname(this.applyLockPath), { recursive: true, mode: 0o700 });
+    await this.fsp.mkdir(path.dirname(this.applyLockPath), { recursive: true, mode: 0o700 });
     try {
-      await fsp.writeFile(this.applyLockPath, JSON.stringify({ apply_id: applyId, created_at: nowIso() }, null, 2), { flag: "wx", mode: 0o600 });
+      await this.fsp.writeFile(this.applyLockPath, JSON.stringify({ apply_id: applyId, created_at: nowIso() }, null, 2), { flag: "wx", mode: 0o600 });
     } catch (error) {
       if (error && error.code === "EEXIST") {
         await this.block("apply_lock_active", "Another apply operation already holds the local vault lock.");
@@ -3479,16 +3532,16 @@ class ObtsObsidianClient {
   }
 
   async clearApplyState() {
-    await fsp.rm(this.applyJournalPath, { force: true });
-    await fsp.rm(this.applyLockPath, { force: true });
+    await this.fsp.rm(this.applyJournalPath, { force: true });
+    await this.fsp.rm(this.applyLockPath, { force: true });
   }
 
   async updateRef(ref, target, expected, force = false) {
     const refPath = path.join(this.gitdir, ref);
     const lockPath = `${refPath}.lock`;
-    await fsp.mkdir(path.dirname(refPath), { recursive: true });
+    await this.fsp.mkdir(path.dirname(refPath), { recursive: true });
     try {
-      await fsp.writeFile(lockPath, `${target}\n`, { flag: "wx", mode: 0o600 });
+      await this.fsp.writeFile(lockPath, `${target}\n`, { flag: "wx", mode: 0o600 });
     } catch (error) {
       throw new Error(`Local ref ${ref} is locked by another operation.`, { cause: error });
     }
@@ -3497,9 +3550,9 @@ class ObtsObsidianClient {
         const current = await this.resolveRef(ref);
         if (current !== expected) throw new Error(`Local ref ${ref} changed while updating it.`);
       }
-      await fsp.rename(lockPath, refPath);
+      await this.fsp.rename(lockPath, refPath);
     } finally {
-      await fsp.rm(lockPath, { force: true }).catch(() => undefined);
+      await this.fsp.rm(lockPath, { force: true }).catch(() => undefined);
     }
   }
 
@@ -3555,13 +3608,13 @@ class ObtsObsidianClient {
 
   async readState() {
     try {
-      const state = JSON.parse(await fsp.readFile(this.statePath, "utf8"));
+      const state = JSON.parse(await this.fsp.readFile(this.statePath, "utf8"));
       if (await this.hasActiveTokenWithoutIdentity(state)) {
         return await this.readBackupState() || this.localStateIncomplete(state);
       }
       return await this.preferRecoverableBackupState(state);
     } catch {
-      if (await exists(this.authPath)) {
+      if (await exists(this.fsp, this.authPath)) {
         const backupState = await this.readBackupState();
         return backupState || this.localStateIncomplete(null);
       }
@@ -3588,7 +3641,7 @@ class ObtsObsidianClient {
   async writeState(state) {
     const guardedState = await this.guardStateCursorRegression(state);
     await this.backupExistingState();
-    await writeJson(this.statePath, guardedState);
+    await writeJson(this.fsp, this.statePath, guardedState);
   }
 
   async guardStateCursorRegression(nextState) {
@@ -3680,7 +3733,7 @@ class ObtsObsidianClient {
       recovered.last_error_code = primaryState.last_error_code;
       recovered.last_error_details = primaryState.last_error_details || null;
     }
-    await writeJson(this.statePath, recovered);
+    await writeJson(this.fsp, this.statePath, recovered);
     return recovered;
   }
 
@@ -3715,7 +3768,7 @@ class ObtsObsidianClient {
 
   async readPrimaryState() {
     try {
-      return JSON.parse(await fsp.readFile(this.statePath, "utf8"));
+      return JSON.parse(await this.fsp.readFile(this.statePath, "utf8"));
     } catch {
       return null;
     }
@@ -3783,9 +3836,9 @@ class ObtsObsidianClient {
 
   async backupExistingState() {
     try {
-      const state = JSON.parse(await fsp.readFile(this.statePath, "utf8"));
+      const state = JSON.parse(await this.fsp.readFile(this.statePath, "utf8"));
       if (state.vault_id && state.device_id) {
-        await fsp.copyFile(this.statePath, `${this.statePath}.bak`);
+        await this.fsp.copyFile(this.statePath, `${this.statePath}.bak`);
       }
     } catch {
       // Keep any existing backup when the primary state file is unreadable.
@@ -3794,7 +3847,7 @@ class ObtsObsidianClient {
 
   async readBackupState() {
     try {
-      const state = JSON.parse(await fsp.readFile(`${this.statePath}.bak`, "utf8"));
+      const state = JSON.parse(await this.fsp.readFile(`${this.statePath}.bak`, "utf8"));
       if (state.vault_id && state.device_id) {
         return state;
       }
@@ -3805,7 +3858,7 @@ class ObtsObsidianClient {
   }
 
   async hasActiveTokenWithoutIdentity(state) {
-    return Boolean((!state.vault_id || !state.device_id) && await exists(this.authPath));
+    return Boolean((!state.vault_id || !state.device_id) && await exists(this.fsp, this.authPath));
   }
 
   localStateIncomplete(state) {
@@ -3829,7 +3882,7 @@ class ObtsObsidianClient {
   }
 
   async readQueue() {
-    const queue = await readJson(this.queuePath, {
+    const queue = await readJson(this.fsp, this.queuePath, {
       pending_commit: null,
       expected_device_ref: null,
       status: "idle",
@@ -3844,8 +3897,8 @@ class ObtsObsidianClient {
 
   async writeQueue(queue) {
     await this.mutateQueue(async () => {
-      const existing = await readJson(this.queuePath, null);
-      await writeJson(this.queuePath, Object.assign({}, queue, {
+      const existing = await readJson(this.fsp, this.queuePath, null);
+      await writeJson(this.fsp, this.queuePath, Object.assign({}, queue, {
         change_seq: Number.isSafeInteger(queue.change_seq) && queue.change_seq >= 0
           ? queue.change_seq
           : Number.isSafeInteger(existing && existing.change_seq) && existing.change_seq >= 0
@@ -3865,7 +3918,7 @@ class ObtsObsidianClient {
       ) {
         return false;
       }
-      await writeJson(this.queuePath, {
+      await writeJson(this.fsp, this.queuePath, {
         pending_commit: null,
         expected_device_ref: (await this.readState()).server_device_ref,
         status: "idle",
@@ -3884,7 +3937,7 @@ class ObtsObsidianClient {
   }
 
   async readDirectoryState() {
-    const state = await readJson(this.directoryStatePath, null);
+    const state = await readJson(this.fsp, this.directoryStatePath, null);
     if (!state) {
       return { observed_dirs: [], explicit_empty_dirs: [], pending_intents: [], updated_at: nowIso() };
     }
@@ -3897,7 +3950,7 @@ class ObtsObsidianClient {
   }
 
   async writeDirectoryState(state) {
-    await writeJson(this.directoryStatePath, {
+    await writeJson(this.fsp, this.directoryStatePath, {
       observed_dirs: Array.from(new Set(state.observed_dirs)).sort(),
       explicit_empty_dirs: Array.from(new Set(state.explicit_empty_dirs)).sort(),
       pending_intents: compactDirectoryIntents(state.pending_intents),
@@ -3906,7 +3959,7 @@ class ObtsObsidianClient {
   }
 
   async reconcileDirectoryState(knownLocalFiles = undefined) {
-    if (!(await exists(this.directoryStatePath))) {
+    if (!(await exists(this.fsp, this.directoryStatePath))) {
       await this.refreshDirectoryStateFromDisk([], knownLocalFiles);
       return [];
     }
@@ -3972,7 +4025,7 @@ class ObtsObsidianClient {
   }
 
   async readDeviceToken() {
-    const tokenFile = await readJson(this.authPath, {});
+    const tokenFile = await readJson(this.fsp, this.authPath, {});
     if (!tokenFile.device_token) {
       throw new ObtsBlockedError("not_paired", "Device token is missing.");
     }
@@ -5005,7 +5058,7 @@ function directoryPrefixes(filePath) {
   return prefixes;
 }
 
-async function writeTextSnapshotPatch(bundleDir, filePath, content) {
+async function writeTextSnapshotPatch(fsp, bundleDir, filePath, content) {
   const patchPath = path.join(bundleDir, "patches", `${filePath.replaceAll("/", "__")}.patch`);
   await fsp.mkdir(path.dirname(patchPath), { recursive: true, mode: 0o700 });
   const body = [
@@ -5019,9 +5072,9 @@ async function writeTextSnapshotPatch(bundleDir, filePath, content) {
   await fsp.writeFile(patchPath, `${body}\n`, { mode: 0o600 });
 }
 
-async function bundleChecksums(bundleDir) {
+async function bundleChecksums(fsp, bundleDir) {
   const entries = [];
-  await walkBundleFiles(bundleDir, async (absolutePath) => {
+  await walkBundleFiles(fsp, bundleDir, async (absolutePath) => {
     const relativePath = normalizePath(path.relative(bundleDir, absolutePath));
     if (relativePath === "checksums.sha256") {
       return;
@@ -5031,12 +5084,12 @@ async function bundleChecksums(bundleDir) {
   return entries.sort();
 }
 
-async function walkBundleFiles(root, visitFile) {
+async function walkBundleFiles(fsp, root, visitFile) {
   const entries = await fsp.readdir(root, { withFileTypes: true });
   for (const entry of entries) {
     const absolutePath = path.join(root, entry.name);
     if (entry.isDirectory()) {
-      await walkBundleFiles(absolutePath, visitFile);
+      await walkBundleFiles(fsp, absolutePath, visitFile);
     } else if (entry.isFile()) {
       await visitFile(absolutePath);
     }
@@ -5253,7 +5306,7 @@ function blockStatusLabel(code) {
   return "Unsafe local state";
 }
 
-async function readJson(filePath, fallback) {
+async function readJson(fsp, filePath, fallback) {
   try {
     return JSON.parse(await fsp.readFile(filePath, "utf8"));
   } catch {
@@ -5261,7 +5314,7 @@ async function readJson(filePath, fallback) {
   }
 }
 
-async function readApplyJournalStrict(filePath) {
+async function readApplyJournalStrict(fsp, filePath) {
   try {
     return parseApplyJournal(JSON.parse(await fsp.readFile(filePath, "utf8")));
   } catch (error) {
@@ -5308,7 +5361,7 @@ function isNullableSha256(value) {
   return value === null || typeof value === "string" && /^[0-9a-f]{64}$/u.test(value);
 }
 
-async function writeJson(filePath, value) {
+async function writeJson(fsp, filePath, value) {
   await fsp.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
   const temporaryPath = `${filePath}.tmp-${randomHex(4)}-${Date.now()}`;
   await fsp.writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
@@ -5320,7 +5373,7 @@ async function writeJson(filePath, value) {
   }
 }
 
-async function exists(filePath) {
+async function exists(fsp, filePath) {
   try {
     await fsp.stat(filePath);
     return true;
@@ -5615,3 +5668,7 @@ function toArrayBuffer(data) {
 function nowIso() {
   return new Date().toISOString();
 }
+
+module.exports.ObtsClientCore = ObtsObsidianClient;
+module.exports.PluginBlockedError = ObtsBlockedError;
+module.exports.TransportError = ObtsTransportError;
