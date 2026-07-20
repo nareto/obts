@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/obts-bridge"]
+resolver = "3"

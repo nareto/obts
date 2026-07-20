@@ -1,0 +1,109 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+  log_level: "info"
+
+client:
+  vault_dir: "/var/lib/obts-bridge/vault"
+  headless_command: "node /app/obts/dist/src/headless.js"
+  server_url: "${OBTS_SERVER_URL}"
+  device_name: "obts-bridge"
+  scan_interval_seconds: 2
+  auto_start: true
+
+database:
+  url: "postgres://obts_bridge:${PG_PASS}@postgres:5432/obts_bridge"
+  max_connections: 10
+
+api_tokens:
+  admin:
+    context: admin
+  granularix_scripts:
+    context: non_personal
+
+mcp_tokens:
+  granularix_agents:
+    context: non_personal
+
+indexer:
+  debounce_seconds: 1
+  max_changes_per_batch: 128
+  max_link_context_chars: 250
+  hub_note_threshold: 20
+  hub_note_fanout: 6
+  hub_note_folders: []
+  chunk_staging_timeout_seconds: 60
+  recovery_batch_size: 4
+  recovery_max_failures: 5
+  recovery_base_backoff_seconds: 30
+  recovery_max_backoff_seconds: 3600
+
+embedding:
+  mode: "localai"
+  localai:
+    url: "${LOCALAI_URL}"
+    model: "${EMBEDDING_MODEL}"
+  dimensions: 1024
+  hnsw_m: 16
+  hnsw_ef_construction: 64
+  batch_size: 32
+  poll_interval_seconds: 5
+  timeout_seconds: 30
+  note_chunk_bytes: 800
+  block_chunk_bytes: 800
+  block_chunk_overlap_sentences: 1
+
+contexts:
+  admin:
+    read:
+      - allow:
+          default: true
+    create:
+      - allow:
+          default: true
+    edit:
+      - allow:
+          default: true
+
+  non_personal:
+    read:
+      - deny:
+          path_prefix: "66Journal/"
+      - deny:
+          tags_any: ["personal"]
+      - allow:
+          default: true
+    create:
+      - allow:
+          default: true
+        add_tags: ["ai-created"]
+        set_owner: true
+    edit:
+      - allow:
+          path_prefix: "44Newsletters/"
+        preserve_tags: ["daily_scout", "ai-created"]
+      - allow:
+          tags_any: ["workout2026"]
+        preserve_tags: ["workout2026"]
+      - allow:
+          tags_any: ["ai-editable"]
+        preserve_tags: ["ai-editable"]
+      - allow:
+          tags_all: ["ai-created"]
+          owner: true
+        preserve_tags: ["ai-created"]
+
+context_assembly:
+  default_max_tokens: 8000
+  max_max_tokens: 32000
+  default_max_depth: 2
+
+new_note:
+  base_path: "00New"
+  path_template: "{base}/{date}-{slug}.md"
+  date_format: "%Y-%m-%d"
+  max_title_slug_length: 60
+
+audit:
+  enabled: true
+  retention_days: 90

@@ -173,6 +173,7 @@ Community plugin history is metadata-only by default in the dashboard; revealing
 - [Phase 2 operations](docs/phase2-operations.md) — dashboard conflict resolution
 - [Phase 3 operations](docs/phase3-operations.md) — history, restore, diagnostics, integrity, and maintenance
 - [Persistent state and backup](docs/persistent-state.md) — authoritative state and consistency requirements
+- [OBTS Bridge](docs/obts-bridge.md) — headless client, scoped REST/MCP, indexing, and agent access
 - [OpenAPI contract](openapi/openapi.yaml) — HTTP API definition
 - [Architecture overview](architecture/docs/01-overview.md) — system boundaries and Git model
 - [Product requirements](prd.md) — detailed behavior and design constraints
