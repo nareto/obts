@@ -1141,7 +1141,7 @@ v1 retains all commits reachable from `main`, device refs, unresolved conflict r
 
 Before destructive local apply or rebuild, the plugin writes a local recovery bundle under `.obts/recovery/{bundle_id}/`. Recovery bundles are local sensitive state and are not synced as vault content.
 
-The apply journal is stored at `.obts/apply-journal.json` and contains apply ID, operation type, target `main`, expected prior local `main`, expected prior local device ref, phase, affected paths, per-file preflight SHA-256 values, recovery bundle ID, last completed step, and redacted error category. The phase value is one of `planned`, `recovery_bundle_written`, `writing_files`, `verifying`, `committed`, or `blocked_recovery`.
+The apply journal is stored at `.obts/apply-journal.json` and contains a schema version, apply ID, operation type, target `main`, expected prior local `main`, expected prior local device ref, phase, affected paths, per-path typed preflight fingerprints, backward-compatible per-file SHA-256 values, recovery bundle ID, last completed step, and redacted error category. A typed fingerprint distinguishes `missing`, `file`, `directory`, and `other`; file fingerprints include SHA-256 and Git blob identity. Journal readers accept the prior unversioned SHA-only form for interrupted-operation recovery. The phase value is one of `planned`, `recovery_bundle_written`, `writing_files`, `verifying`, `committed`, or `blocked_recovery`.
 
 Every recovery bundle contains:
 
@@ -1155,6 +1155,7 @@ Every recovery bundle contains:
 Local apply/recovery rules:
 
 - destructive apply and rebuild operations require a recovery bundle first;
+- recovery bundles are staged under an incomplete temporary name and become eligible for journal publication only after their files, patches, refs pack, manifest, checksums, and completion marker are durable; startup may remove incomplete unreferenced staging directories;
 - recovery bundles are created before file deletes, overwrites, renames, replace-local, rebuild, reset, or any operation that removes or overwrites local content;
 - recovery bundle creation failure blocks the destructive operation;
 - recovery bundles are retained until the user explicitly deletes them;

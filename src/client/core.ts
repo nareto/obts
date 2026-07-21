@@ -442,6 +442,7 @@ function createNodePluginHost(vaultDir: string, settings: ObtsPluginSettings) {
     deviceNameRevision: 0,
     setInitializationStage: (_label: string, _diagnosticPoint?: string) => undefined,
     updateInitializationProgress: (_message: string) => undefined,
+    setOperationProgress: (_status: string, _diagnosticPoint: string) => undefined,
     setStatus: (_status: string) => undefined,
     markFullScanCompleted: () => undefined,
     handlePluginCompatibility: (_compatibility: unknown) => undefined,

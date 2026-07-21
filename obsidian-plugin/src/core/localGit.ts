@@ -1,5 +1,6 @@
 import * as fs from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { dirname, join, relative } from 'node:path';
 
 import git, { type TreeEntry } from 'isomorphic-git';
@@ -10,6 +11,16 @@ import {
   normalizeVaultPath,
   PathPolicyViolation
 } from '../../../src/shared/pathPolicy.js';
+
+const require = createRequire(import.meta.url);
+const { createByteBudget, runBoundedWork } = require('../work-pool.cjs') as {
+  createByteBudget: (maxBytes: number) => { acquire: (bytes: number) => Promise<() => void> };
+  runBoundedWork: <T, R>(
+    items: T[],
+    options: { concurrency: number; yieldEvery?: number },
+    worker: (item: T, index: number) => Promise<R>
+  ) => Promise<R[]>;
+};
 
 export type LocalGitState = {
   localMain: string | null;
@@ -154,21 +165,27 @@ export class LocalGitEngine {
       }
     }
 
-    for (const filepath of files) {
-      const blob = await readFile(join(this.vaultDir, filepath));
-      const oid = await git.writeBlob({
-        fs,
-        dir: this.vaultDir,
-        gitdir: this.gitdir,
-        blob
-      });
-      nextEntries.set(filepath, {
-        mode: '100644',
-        path: filepath,
-        oid,
-        type: 'blob'
-      });
-    }
+    const byteBudget = createByteBudget(64 * 1024 * 1024);
+    const entries = await runBoundedWork(files, { concurrency: 4, yieldEvery: 25 }, async (filepath) => {
+      const before = await stat(join(this.vaultDir, filepath));
+      const releaseBytes = await byteBudget.acquire(before.size);
+      try {
+        const blob = await readFile(join(this.vaultDir, filepath));
+        const after = await stat(join(this.vaultDir, filepath));
+        if (!after.isFile() || before.size !== after.size || blob.byteLength !== after.size || before.mtimeMs !== after.mtimeMs) {
+          throw new Error('Local vault contents changed during a consistency checkpoint.');
+        }
+        const oid = (await git.hashBlob({ object: blob })).oid;
+        if (baseEntries.get(filepath)?.oid !== oid) {
+          const writtenOid = await git.writeBlob({ fs, dir: this.vaultDir, gitdir: this.gitdir, blob });
+          if (writtenOid !== oid) throw new Error('Git blob identity changed while persisting a local snapshot.');
+        }
+        return { mode: '100644', path: filepath, oid, type: 'blob' } satisfies TreeEntry;
+      } finally {
+        releaseBytes();
+      }
+    });
+    for (let index = 0; index < files.length; index += 1) nextEntries.set(files[index]!, entries[index]!);
 
     const tree = await this.writeTreeFromEntries(nextEntries);
     if (baseCommit) {
