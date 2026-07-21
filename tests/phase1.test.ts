@@ -880,20 +880,15 @@ describe('Phase 1 sync without conflict resolution', () => {
     await writeFile(join(fixtureADir, 'shared.md'), 'fixtureA accepted\n');
     expect((await fixtureA.syncOnce()).status).toBe('Synced');
 
-    const internals = fixtureB as unknown as {
-      recovery: {
-        createRecoveryBundle: (...args: unknown[]) => Promise<string>;
-      };
-    };
-    const originalCreateRecoveryBundle = internals.recovery.createRecoveryBundle.bind(internals.recovery);
+    const internals = (fixtureB as unknown as { client: Record<string, (...args: unknown[]) => Promise<unknown>> }).client;
+    const originalStageRecoveryBundle = internals.stageRecoveryBundleFiles!.bind(internals);
     let injectedLocalEdit = false;
-    internals.recovery.createRecoveryBundle = async (...args) => {
-      const bundleId = await originalCreateRecoveryBundle(...args);
+    internals.stageRecoveryBundleFiles = async (...args) => {
       if (!injectedLocalEdit) {
         injectedLocalEdit = true;
         await writeFile(join(fixtureBDir, 'shared.md'), 'fixtureB during apply prep\n');
       }
-      return bundleId;
+      return await originalStageRecoveryBundle(...args);
     };
 
     const firstFixtureBSync = await fixtureB.syncOnce();
@@ -1077,19 +1072,15 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect((await plugin1.syncOnce()).status).toBe('Synced');
 
     let observedApplying = false;
-    const internals = plugin2 as unknown as {
-      recovery: {
-        createRecoveryBundle: (...args: unknown[]) => Promise<string>;
-      };
-    };
-    const createRecoveryBundle = internals.recovery.createRecoveryBundle.bind(internals.recovery);
-    internals.recovery.createRecoveryBundle = async (...args: unknown[]) => {
+    const internals = (plugin2 as unknown as { client: Record<string, (...args: unknown[]) => Promise<unknown>> }).client;
+    const stageRecoveryBundleFiles = internals.stageRecoveryBundleFiles!.bind(internals);
+    internals.stageRecoveryBundleFiles = async (...args: unknown[]) => {
       observedApplying = true;
       expect(await plugin2.readState()).toMatchObject({
         status_label: 'Applying',
         last_error_code: null
       });
-      return await createRecoveryBundle(...args);
+      return await stageRecoveryBundleFiles(...args);
     };
 
     expect((await plugin2.syncOnce()).status).toBe('Synced');
@@ -4203,8 +4194,8 @@ describe('Phase 1 sync without conflict resolution', () => {
   it('blocks destructive apply if recovery bundle creation fails', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const { plugin2, device2Dir } = await preparePullApplyScenario(root, admin, 'bundle-device-1', 'bundle-device-2');
-    const internal = plugin2 as unknown as { recovery: { createRecoveryBundle(input: unknown): Promise<string> } };
-    internal.recovery.createRecoveryBundle = async () => {
+    const internal = (plugin2 as unknown as { client: Record<string, (...args: unknown[]) => Promise<unknown>> }).client;
+    internal.finalizeRecoveryBundle = async () => {
       throw new Error('simulated recovery storage failure');
     };
 
@@ -4223,13 +4214,37 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
   });
 
+  it('does not resume an apply that was explicitly blocked from destructive writes', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const { plugin2, device2Dir } = await preparePullApplyScenario(root, admin, 'non-destructive-device-1', 'non-destructive-device-2');
+
+    await expect(plugin2.pullAndApply({ allowDestructive: false })).rejects.toMatchObject({ code: 'unsafe_local_state' });
+    expect(await readFile(join(device2Dir, 'shared.md'), 'utf8')).toBe('base\n');
+    expect(JSON.parse(await readFile(join(device2Dir, '.obts', 'apply-journal.json'), 'utf8'))).toMatchObject({
+      phase: 'blocked_recovery',
+      redacted_error_category: 'destructive_apply_not_allowed'
+    });
+
+    const restarted = new ObtsPluginClient(device2Dir, { serverUrl: baseUrl, deviceName: 'non-destructive-device-2' });
+    await restarted.initialize();
+    expect(await readFile(join(device2Dir, 'shared.md'), 'utf8')).toBe('base\n');
+    expect(await restarted.readState()).toMatchObject({
+      status_label: 'Unsafe local state',
+      last_error_code: 'apply_journal_recovery_required'
+    });
+    expect(JSON.parse(await readFile(join(device2Dir, '.obts', 'apply-journal.json'), 'utf8'))).toMatchObject({
+      phase: 'blocked_recovery',
+      redacted_error_category: 'destructive_apply_not_allowed'
+    });
+  });
+
   it('defers destructive apply if an affected file changes after preflight', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const { plugin2, device2Dir } = await preparePullApplyScenario(root, admin, 'preflight-device-1', 'preflight-device-2');
-    const internal = plugin2 as unknown as { recovery: { createRecoveryBundle(input: unknown): Promise<string> } };
-    const originalCreateRecoveryBundle = internal.recovery.createRecoveryBundle.bind(internal.recovery);
-    internal.recovery.createRecoveryBundle = async (input: unknown) => {
-      const bundleId = await originalCreateRecoveryBundle(input);
+    const internal = (plugin2 as unknown as { client: Record<string, (...args: unknown[]) => Promise<unknown>> }).client;
+    const originalFinalizeRecoveryBundle = internal.finalizeRecoveryBundle!.bind(internal);
+    internal.finalizeRecoveryBundle = async (...args: unknown[]) => {
+      const bundleId = await originalFinalizeRecoveryBundle(...args);
       await writeFile(join(device2Dir, 'shared.md'), 'changed after preflight\n');
       return bundleId;
     };

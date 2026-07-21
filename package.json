@@ -19,7 +19,8 @@
     "check": "npm run build:plugin:check && tsc -p tsconfig.json --noEmit && vite build --config frontend/dashboard/vite.config.ts --mode check",
     "lint": "npm run check",
     "test": "npm run build && npm run build:plugin:check && vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "benchmark:large-vault": "npm run build && node scripts/benchmark-large-vault.mjs"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",
