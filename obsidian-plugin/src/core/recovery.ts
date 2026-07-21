@@ -5,7 +5,14 @@ import { dirname, extname, join, relative } from 'node:path';
 import { newId, nowIso } from '../../../src/shared/ids.js';
 import { normalizeVaultPath } from '../../../src/shared/pathPolicy.js';
 
+export type ApplyFingerprint = {
+  kind: 'missing' | 'file' | 'directory' | 'other';
+  sha256: string | null;
+  oid: string | null;
+};
+
 export type ApplyJournal = {
+  journal_version?: 1 | 2;
   apply_id: string;
   operation_type: 'pull_apply' | 'initial_import' | 'replace_local_with_server' | 'rebuild_from_server';
   target_main: string;
@@ -14,6 +21,7 @@ export type ApplyJournal = {
   phase: 'planned' | 'recovery_bundle_written' | 'writing_files' | 'verifying' | 'committed' | 'blocked_recovery';
   affected_paths: string[];
   preflight_sha256: Record<string, string | null>;
+  preflight_fingerprints?: Record<string, ApplyFingerprint>;
   recovery_bundle_id: string | null;
   last_completed_step: string | null;
   redacted_error_category: string | null;
@@ -178,7 +186,10 @@ function parseApplyJournal(value: unknown): ApplyJournal {
   const phases = new Set(['planned', 'recovery_bundle_written', 'writing_files', 'verifying', 'committed', 'blocked_recovery']);
   const affectedPaths = journal.affected_paths;
   const preflight = journal.preflight_sha256;
+  const journalVersion = journal.journal_version === undefined ? 1 : journal.journal_version;
+  const typedPreflight = journal.preflight_fingerprints;
   if (
+    journalVersion !== 1 && journalVersion !== 2 ||
     typeof journal.apply_id !== 'string' || journal.apply_id.length === 0 ||
     typeof journal.operation_type !== 'string' || !operations.has(journal.operation_type) ||
     typeof journal.target_main !== 'string' || !/^[0-9a-f]{40}$/u.test(journal.target_main) ||
@@ -189,6 +200,11 @@ function parseApplyJournal(value: unknown): ApplyJournal {
     new Set(affectedPaths).size !== affectedPaths.length ||
     !preflight || typeof preflight !== 'object' || Array.isArray(preflight) ||
     affectedPaths.some((path) => !Object.hasOwn(preflight, path) || !isNullableSha256((preflight as Record<string, unknown>)[path])) ||
+    journalVersion === 2 && (
+      !typedPreflight || typeof typedPreflight !== 'object' || Array.isArray(typedPreflight) ||
+      affectedPaths.some((path) => !Object.hasOwn(typedPreflight, path) ||
+        !isApplyFingerprint((typedPreflight as Record<string, unknown>)[path]))
+    ) ||
     !isNullableString(journal.recovery_bundle_id) ||
     !isNullableString(journal.last_completed_step) ||
     !isNullableString(journal.redacted_error_category)
@@ -209,6 +225,17 @@ function isNullableString(value: unknown): boolean {
 
 function isNullableSha256(value: unknown): boolean {
   return value === null || typeof value === 'string' && /^[0-9a-f]{64}$/u.test(value);
+}
+
+function isApplyFingerprint(value: unknown): value is ApplyFingerprint {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const fingerprint = value as Record<string, unknown>;
+  if (!['missing', 'file', 'directory', 'other'].includes(String(fingerprint.kind))) return false;
+  if (fingerprint.kind === 'file') {
+    return typeof fingerprint.sha256 === 'string' && /^[0-9a-f]{64}$/u.test(fingerprint.sha256) &&
+      typeof fingerprint.oid === 'string' && /^[0-9a-f]{40}$/u.test(fingerprint.oid);
+  }
+  return fingerprint.sha256 === null && fingerprint.oid === null;
 }
 
 function sha256(data: Buffer): string {

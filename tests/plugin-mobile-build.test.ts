@@ -486,6 +486,7 @@ describe('mobile plugin artifact', () => {
     };
     await expect((plugin as any).client.recoveryFileFingerprint('note.md')).rejects.toThrow();
     await expect((plugin as any).client.createRecoveryBundle('pull_apply', commit, ['note.md'])).rejects.toThrow();
+    expect((await adapter.list('.obts/recovery')).folders.some((folder) => folder.includes('.partial-rec_'))).toBe(false);
     adapter.readBinary = recoveryReadBinary;
     const packFilesBeforeEmptyImport = (await adapter.list('.obts/git/objects/pack')).files;
     const emptyPackHeader = Buffer.alloc(12);
