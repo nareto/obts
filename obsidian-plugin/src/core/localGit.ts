@@ -282,15 +282,18 @@ export class LocalGitEngine {
   }
 
   async createRecoveryRefsPack(): Promise<Buffer> {
-    const refs = await this.recoveryRefs();
-    const oids = new Set<string>();
-    for (const ref of refs) {
-      const commit = await this.resolveRef(ref);
-      if (!commit) {
-        continue;
-      }
-      for (const oid of await this.collectReachableObjects(commit)) {
-        oids.add(oid);
+    const localCommit = await this.resolveRef('refs/heads/local');
+    if (!localCommit) {
+      return Buffer.alloc(0);
+    }
+    const mainCommit = await this.resolveRef('refs/heads/main');
+    if (mainCommit === localCommit) {
+      return Buffer.alloc(0);
+    }
+    const oids = new Set(await this.collectReachableObjects(localCommit));
+    if (mainCommit && await this.commitExists(mainCommit)) {
+      for (const oid of await this.collectReachableObjects(mainCommit)) {
+        oids.delete(oid);
       }
     }
     if (oids.size === 0) {
@@ -310,16 +313,6 @@ export class LocalGitEngine {
       throw new Error('isomorphic-git did not return a packfile.');
     }
     return Buffer.from(packfile);
-  }
-
-  private async recoveryRefs(): Promise<string[]> {
-    const refs = new Set<string>();
-    for (const ref of ['refs/heads/local', 'refs/heads/main']) {
-      if (await this.resolveRef(ref)) {
-        refs.add(ref);
-      }
-    }
-    return [...refs].sort();
   }
 
   async listTreeFiles(commit: string): Promise<string[]> {

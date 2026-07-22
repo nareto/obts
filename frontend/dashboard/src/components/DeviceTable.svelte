@@ -4,7 +4,7 @@
   import Status from './Status.svelte';
 
   export let devices: DashboardDevice[];
-  export let nowMs: number;
+  export let statusCurrent: boolean;
   export let onRename: (device: DashboardDevice, deviceName: string) => void | Promise<void>;
   export let onRevoke: (device: DashboardDevice) => void | Promise<void>;
 
@@ -26,17 +26,11 @@
   }
 
   function effectiveStatus(device: DashboardDevice) {
-    if (
-      device.status_label === 'Synced' &&
-      (!device.last_status_report_at || nowMs - Date.parse(device.last_status_report_at) > 5 * 60 * 1000)
-    ) {
-      return 'Status unknown';
-    }
-    return device.status_label;
+    return statusCurrent ? device.status_label : 'Status unknown';
   }
 
   function relationDetail(device: DashboardDevice) {
-    if (!device.status_report_fresh || !device.last_status_report_at || nowMs - Date.parse(device.last_status_report_at) > 5 * 60 * 1000) return 'Unknown locally';
+    if (!statusCurrent || !device.status_report_fresh || !device.last_status_report_at) return 'Unknown locally';
     if (device.ahead_of_main) return 'Ahead';
     if (device.behind_main) return 'Behind';
     return 'Current';
