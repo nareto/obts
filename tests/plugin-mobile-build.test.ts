@@ -654,6 +654,96 @@ describe('mobile plugin artifact', () => {
     await runtimeClient.applyTargetMain(runtimeMain, [], true, [], true, [], ['mainvault', 'missing-empty'], 0);
     expect(await runtimeAdapter.exists('missing-empty')).toBe(true);
 
+    await runtimeAdapter.mkdir('mobile-delete');
+    await runtimeAdapter.mkdir('mobile-delete/nested');
+    await runtimeAdapter.mkdir('mobile-delete/nested/leaf');
+    const runtimeRmdir = runtimeAdapter.rmdir.bind(runtimeAdapter);
+    const runtimeRecursiveFlags: boolean[] = [];
+    runtimeAdapter.rmdir = async (path: string, recursive = false) => {
+      if (path === 'mobile-delete' || path.startsWith('mobile-delete/')) runtimeRecursiveFlags.push(recursive);
+      await runtimeRmdir(path, recursive);
+    };
+    const mobileDeleteDirectories = ['mobile-delete', 'mobile-delete/nested', 'mobile-delete/nested/leaf'];
+    const residual = await runtimeClient.applyDirectoryChanges(
+      [{ op: 'delete', path: 'mobile-delete' }],
+      [],
+      new Set(mobileDeleteDirectories),
+      await runtimeClient.captureDirectoryCreationTimes(mobileDeleteDirectories)
+    );
+    expect(await runtimeAdapter.exists('mobile-delete')).toBe(false);
+    expect([...residual]).toEqual([]);
+    expect(runtimeRecursiveFlags).toEqual([false, false, false]);
+
+    await runtimeAdapter.mkdir('persistent-rmdir-failure');
+    const workingRmdir = runtimeAdapter.rmdir.bind(runtimeAdapter);
+    let failedRmdirAttempts = 0;
+    runtimeAdapter.rmdir = async (path: string, recursive = false) => {
+      if (path === 'persistent-rmdir-failure') {
+        failedRmdirAttempts += 1;
+        throw Object.assign(new Error('simulated persistent mobile rmdir failure'), { code: 'EIO' });
+      }
+      await workingRmdir(path, recursive);
+    };
+    await expect(runtimeClient.applyDirectoryChanges(
+      [{ op: 'delete', path: 'persistent-rmdir-failure' }],
+      [],
+      new Set(['persistent-rmdir-failure']),
+      { 'persistent-rmdir-failure': (await runtimeAdapter.stat('persistent-rmdir-failure'))?.ctime ?? null }
+    )).rejects.toMatchObject({ code: 'directory_delete_failed' });
+    expect(failedRmdirAttempts).toBe(3);
+    expect(await runtimeAdapter.exists('persistent-rmdir-failure')).toBe(true);
+    runtimeAdapter.rmdir = workingRmdir;
+
+    await runtimeAdapter.mkdir('missing-directory-identity');
+    await expect(runtimeClient.applyDirectoryChanges(
+      [{ op: 'delete', path: 'missing-directory-identity' }],
+      [],
+      new Set(['missing-directory-identity']),
+      { 'missing-directory-identity': null }
+    )).rejects.toMatchObject({ code: 'directory_identity_unavailable' });
+    expect(await runtimeAdapter.exists('missing-directory-identity')).toBe(true);
+
+    await runtimeAdapter.mkdir('directory-inspection-failure');
+    const inspectionCtime = (await runtimeAdapter.stat('directory-inspection-failure'))?.ctime ?? null;
+    const runtimeStat = runtimeAdapter.stat.bind(runtimeAdapter);
+    runtimeAdapter.stat = async (path: string) => {
+      if (path === 'directory-inspection-failure') throw Object.assign(new Error('simulated mobile stat failure'), { code: 'EIO' });
+      return await runtimeStat(path);
+    };
+    await expect(runtimeClient.applyDirectoryChanges(
+      [{ op: 'delete', path: 'directory-inspection-failure' }],
+      [],
+      new Set(['directory-inspection-failure']),
+      { 'directory-inspection-failure': inspectionCtime }
+    )).rejects.toMatchObject({ code: 'directory_inspection_failed' });
+    runtimeAdapter.stat = runtimeStat;
+
+    await runtimeAdapter.mkdir('directory-list-failure');
+    const listFailureCtime = (await runtimeAdapter.stat('directory-list-failure'))?.ctime ?? null;
+    const runtimeList = runtimeAdapter.list.bind(runtimeAdapter);
+    runtimeAdapter.list = async (path: string) => {
+      if (path === 'directory-list-failure') throw Object.assign(new Error('simulated mobile list failure'), { code: 'EIO' });
+      return await runtimeList(path);
+    };
+    await expect(runtimeClient.applyDirectoryChanges(
+      [{ op: 'delete', path: 'directory-list-failure' }],
+      [],
+      new Set(['directory-list-failure']),
+      { 'directory-list-failure': listFailureCtime }
+    )).rejects.toMatchObject({ code: 'directory_inspection_failed' });
+    runtimeAdapter.list = runtimeList;
+
+    const runtimeMkdir = runtimeAdapter.mkdir.bind(runtimeAdapter);
+    runtimeAdapter.mkdir = async (path: string) => {
+      if (path === 'failed-authoritative-directory') throw Object.assign(new Error('simulated mobile mkdir failure'), { code: 'EIO' });
+      await runtimeMkdir(path);
+    };
+    await expect(runtimeClient.applyDirectoryChanges([], ['failed-authoritative-directory'], new Set(), {})).rejects.toMatchObject({
+      code: 'directory_materialization_failed'
+    });
+    runtimeAdapter.mkdir = runtimeMkdir;
+    await runtimeClient.refreshDirectoryStateFromDisk([]);
+
     runtimeClient.pollEvents = async () => ({ current_event_seq: 0, events: [] });
     runtimeClient.reportDeviceStatus = async () => undefined;
     await runtimeClient.recordLocalChangeHint(['note.md']);

@@ -216,16 +216,17 @@ Behavior:
 4. Deleting files individually while leaving the folder present records the folder as explicit empty-directory state, not as a folder-delete tombstone.
 5. Accepted directory intents are stored in server metadata and emitted with the accepted `main` event and pull manifest.
 6. Remote apply materializes explicit empty directories after file writes/deletes.
-7. Remote apply removes a tombstoned directory only when it is empty after file apply; non-empty local directories are never recursively removed by a directory tombstone.
+7. Remote apply prunes the pre-existing tombstoned hierarchy deepest-first after file apply, removing each directory only through a non-recursive empty-directory operation. Non-empty local directories and genuinely new concurrent directories are never recursively removed by a directory tombstone.
 8. Historical states that predate directory intents cannot infer right-click folder-delete intent from the Git file tree alone.
 
 Acceptance criteria:
 
 - Empty folder creation syncs to other devices.
 - Repeated authoritative directory state is idempotent: an unchanged `main` with already-present explicit directories does not enter `Applying`.
-- Right-click folder deletion removes the empty folder shell on other devices after file deletes are applied.
+- Right-click folder deletion removes the complete nested empty folder hierarchy on other devices after file deletes are applied.
+- Tombstone apply prunes directories deepest-first with non-recursive empty-directory removals, verifies the pre-apply directory creation identity immediately before removal, and fails closed when identity, inspection, removal, or authoritative directory creation cannot be verified; it never force-deletes a subtree that may have gained local content.
 - Individually emptying a folder preserves that empty folder on other devices.
-- A remote folder tombstone never deletes non-empty local content.
+- A remote folder tombstone never deletes non-empty local content, and a genuinely new empty folder created concurrently with apply is preserved rather than confused with a stale tombstoned shell.
 
 ### 3.7 Concurrent Edits And Merge
 
@@ -1151,7 +1152,7 @@ v1 retains all commits reachable from `main`, device refs, unresolved conflict r
 
 Before destructive local apply or rebuild, the plugin writes a local recovery bundle under `.obts/recovery/{bundle_id}/`. Recovery bundles are local sensitive state and are not synced as vault content.
 
-The apply journal is stored at `.obts/apply-journal.json` and contains a schema version, apply ID, operation type, target `main`, expected prior local `main`, expected prior local device ref, phase, affected paths, per-path typed preflight fingerprints, backward-compatible per-file SHA-256 values, recovery bundle ID, last completed step, and redacted error category. A typed fingerprint distinguishes `missing`, `file`, `directory`, and `other`; file fingerprints include SHA-256 and Git blob identity. Journal readers accept the prior unversioned SHA-only form for interrupted-operation recovery. The phase value is one of `planned`, `recovery_bundle_written`, `writing_files`, `verifying`, `committed`, or `blocked_recovery`.
+The apply journal is stored at `.obts/apply-journal.json` and contains a schema version, apply ID, operation type, target `main`, expected prior local `main`, expected prior local device ref, phase, affected paths, per-path typed preflight fingerprints, backward-compatible per-file SHA-256 values, directory intents, authoritative explicit directories, the pre-apply directory inventory and creation-time identities, local-preservation policy, target event cursor, recovery bundle ID, last completed step, and redacted error category. A typed fingerprint distinguishes `missing`, `file`, `directory`, and `other`; file fingerprints include SHA-256 and Git blob identity. Version 3 makes directory apply crash-replayable, while journal readers continue accepting version 1 SHA-only and version 2 typed-fingerprint forms. The phase value is one of `planned`, `recovery_bundle_written`, `writing_files`, `verifying`, `committed`, or `blocked_recovery`.
 
 Every recovery bundle contains:
 

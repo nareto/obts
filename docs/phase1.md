@@ -38,7 +38,7 @@ Implemented runtime pieces:
   plugin can observe `main_advanced`, conflict, rejection, and recovery events
   without a dashboard session cookie.
 - Plugin-side `.obts/` state with `isomorphic-git`, device token storage, durable watcher change hints, queue state, explicit directory-intent state for empty folder creation/deletion, recovery bundles with file snapshots, text patches, local-only Git refs packs, and artifact checksums, local apply lock, apply journal, local commit creation, device-token metadata rehydration when `state.json` is lost, multipart push, multipart pull, safe apply, safe incomplete-journal replay with recovery blocking when replay is unsafe, explicit replace-local-with-server recovery, and explicit rebuild from current server `main`.
-- One sync decision performs one coherent pre-sync content snapshot, revalidates only queued/affected state around pull, and labels its single post-apply preservation snapshot as verification instead of repeating full-vault `Checking` passes.
+- One sync decision performs one coherent pre-sync content snapshot, revalidates only queued/affected state around pull, and labels its single post-apply preservation snapshot as verification instead of repeating full-vault `Checking` passes. Folder tombstones prune pre-existing empty descendants deepest-first with non-recursive removals, so stale shells are not re-uploaded as local creations while concurrent new folders and files remain protected.
 - Long local operations retain `Checking`, `Preparing upload`, or `Applying`, report device status every 30 seconds, and surface a taking-longer detail; only transport unavailability produces `Offline`.
 - Uploads preflight server vault status before object planning, preserve permanent rejection codes, back off transient retries, cache repeated plans, and pack only commits plus changed tree/blob objects relative to acknowledged bases. Large deletion packs therefore scale with retained/changed structure rather than deleted content history.
 - Validated operator integrity repair is advertised through device-status responses; clients blocked specifically on `blocked_integrity` automatically clear that local block, record a fresh scan hint, and resume without reset or reconnect.
@@ -90,7 +90,7 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - compact same-file JSON Canvas edits with disjoint semantic fields merge deterministically when native Git reports a text conflict, while same-field Canvas edits create a durable conflict;
 - lost `state.json` with a valid device token and intact local Git refs is repaired automatically, preserving filesystem-as-source-of-truth semantics and uploading edits through the device ref;
 - Git-safe Obsidian paths with punctuation or case distinctions are synced when the local adapter can represent them;
-- explicit empty folder creation and folder delete tombstones sync as Obsidian directory metadata outside the Git file tree; tombstones remove only empty remote directories and never recursively delete non-empty local content;
+- explicit empty folder creation and folder delete tombstones sync as Obsidian directory metadata outside the Git file tree; tombstones remove deeply nested empty hierarchies without resurrection, use only non-recursive empty-directory removals, and never recursively delete non-empty local content;
 - safe same-file Obsidian Bases edits merge through the semantic Bases validator, including compact YAML that native Git cannot merge cleanly, while unsafe same-field Bases edits create a durable conflict;
 - same-path binary attachment edits auto-merge only when object identity matches;
 - unsafe concurrent same-path edits and file/directory hierarchy collisions create a durable conflict record and do not overwrite current `main`;
@@ -111,7 +111,7 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - prepared sync operations remain readiness-safe during the live ref-to-metadata commit window and recover deterministically on restart when Git refs already moved, resume pending device ref merges, or abort safely before ref mutation;
 - integrity-blocked uploads stop before pack planning, preserve their queued commits and permanent error, then resume from a fresh scan after validated repair;
 - event polling returns `410` for expired cursors after retention pruning;
-- incomplete apply journals replay idempotently on restart when the target commit is present and affected files still match preflight or target content;
+- incomplete apply journals replay idempotently on restart when the target commit is present and affected files still match preflight or target content; version 3 journals also replay nested directory tombstones, explicit directory materialization, event acknowledgement, and concurrent empty-folder preservation before advancing refs;
 - unreplayable apply journals block sync on restart instead of attempting an unsafe apply;
 - committed apply journals replay idempotently on restart and clear stale local apply locks;
 - local apply lock contention blocks before a destructive pull apply starts;

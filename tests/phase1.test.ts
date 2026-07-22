@@ -672,9 +672,10 @@ describe('Phase 1 sync without conflict resolution', () => {
     const phoneDir = join(root, 'folder-delete-phone');
     await mkdirp(desktopDir);
     await mkdirp(phoneDir);
-    await mkdirp(join(desktopDir, 'Delete Me'));
+    await mkdirp(join(desktopDir, 'Delete Me', 'nested', 'deeper'));
+    await mkdirp(join(desktopDir, 'Delete Me', 'empty-sibling', 'leaf'));
     await mkdirp(join(desktopDir, 'Keep Shell'));
-    await writeFile(join(desktopDir, 'Delete Me', 'note.md'), 'delete me\n');
+    await writeFile(join(desktopDir, 'Delete Me', 'nested', 'deeper', 'note.md'), 'delete me\n');
     await writeFile(join(desktopDir, 'Keep Shell', 'note.md'), 'keep shell\n');
     const desktop = await pairPlugin(admin, desktopDir, 'desktop');
     expect((await desktop.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
@@ -683,11 +684,219 @@ describe('Phase 1 sync without conflict resolution', () => {
     await rm(join(desktopDir, 'Delete Me'), { recursive: true, force: true });
     await rm(join(desktopDir, 'Keep Shell', 'note.md'));
     expect((await desktop.syncOnce()).status).toBe('Synced');
+    const phoneInternal = (phone as unknown as { client: { adapter: { rmdir: (path: string, recursive: boolean) => Promise<void> } } }).client;
+    const originalRmdir = phoneInternal.adapter.rmdir.bind(phoneInternal.adapter);
+    const recursiveDeleteFlags: boolean[] = [];
+    let injectedRmdirFailure = false;
+    phoneInternal.adapter.rmdir = async (path, recursive) => {
+      if (path === 'Delete Me' || path.startsWith('Delete Me/')) {
+        recursiveDeleteFlags.push(recursive);
+        if (!injectedRmdirFailure) {
+          injectedRmdirFailure = true;
+          const error = new Error('simulated transient directory adapter failure') as Error & { code?: string };
+          error.code = 'EIO';
+          throw error;
+        }
+      }
+      await originalRmdir(path, recursive);
+    };
     expect((await phone.syncOnce()).status).toBe('Synced');
 
+    expect(injectedRmdirFailure).toBe(true);
+    expect(recursiveDeleteFlags.length).toBeGreaterThan(1);
+    expect(recursiveDeleteFlags.every((recursive) => recursive === false)).toBe(true);
     expect(await exists(join(phoneDir, 'Delete Me'))).toBe(false);
     expect(await isDirectory(join(phoneDir, 'Keep Shell'))).toBe(true);
     expect(await exists(join(phoneDir, 'Keep Shell', 'note.md'))).toBe(false);
+  });
+
+  it('does not resurrect a deleted nested folder hierarchy from another device', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const sourceDir = join(root, 'nested-delete-source');
+    const receiverDir = join(root, 'nested-delete-receiver');
+    const observerDir = join(root, 'nested-delete-observer');
+    await mkdirp(join(sourceDir, 'Main Vault', 'Projects', 'Archive', 'Empty Child'));
+    await mkdirp(join(receiverDir));
+    await mkdirp(join(observerDir));
+    await writeFile(join(sourceDir, 'Main Vault', 'Projects', 'Archive', 'note.md'), 'delete the tree\n');
+    const source = await pairPlugin(admin, sourceDir, 'nested-delete-source');
+    expect((await source.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+    const receiver = await pairPlugin(admin, receiverDir, 'nested-delete-receiver');
+    const observer = await pairPlugin(admin, observerDir, 'nested-delete-observer');
+    expect(await isDirectory(join(receiverDir, 'Main Vault', 'Projects', 'Archive', 'Empty Child'))).toBe(true);
+
+    await rm(join(sourceDir, 'Main Vault'), { recursive: true, force: true });
+    expect((await source.syncOnce()).status).toBe('Synced');
+    expect((await receiver.syncOnce()).status).toBe('Synced');
+    expect(await exists(join(receiverDir, 'Main Vault'))).toBe(false);
+    expect(await receiver.readQueue()).toMatchObject({ status: 'idle', pending_commit: null });
+
+    expect((await receiver.syncOnce()).status).toBe('Synced');
+    expect((await observer.syncOnce()).status).toBe('Synced');
+    expect(await exists(join(observerDir, 'Main Vault'))).toBe(false);
+    const directoryState = (await server.store.snapshot()).directory_state_by_vault[admin.vaultId];
+    expect(directoryState?.explicit_dirs.some((path) => path === 'Main Vault' || path.startsWith('Main Vault/'))).toBe(false);
+  });
+
+  it('replays nested directory tombstones after a crash before pruning', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const sourceDir = join(root, 'tombstone-crash-source');
+    const receiverDir = join(root, 'tombstone-crash-receiver');
+    await mkdirp(join(sourceDir, 'Crash Tree', 'Nested', 'Empty Leaf'));
+    await mkdirp(receiverDir);
+    await writeFile(join(sourceDir, 'Crash Tree', 'Nested', 'note.md'), 'removed before crash\n');
+    const source = await pairPlugin(admin, sourceDir, 'tombstone-crash-source');
+    expect((await source.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+    const receiver = await pairPlugin(admin, receiverDir, 'tombstone-crash-receiver');
+
+    await rm(join(sourceDir, 'Crash Tree'), { recursive: true, force: true });
+    expect((await source.syncOnce()).status).toBe('Synced');
+    const receiverInternal = (receiver as unknown as { client: Record<string, any> }).client;
+    const originalApplyDirectoryChanges = receiverInternal.applyDirectoryChanges.bind(receiverInternal);
+    let interrupted = false;
+    receiverInternal.applyDirectoryChanges = async (...args: unknown[]) => {
+      if (!interrupted) {
+        interrupted = true;
+        throw new Error('simulated crash before directory pruning');
+      }
+      return await originalApplyDirectoryChanges(...args);
+    };
+    await expect(receiver.syncOnce()).rejects.toThrow('simulated crash before directory pruning');
+    expect(interrupted).toBe(true);
+    expect(await exists(join(receiverDir, 'Crash Tree'))).toBe(true);
+    expect(await exists(join(receiverDir, 'Crash Tree', 'Nested', 'note.md'))).toBe(false);
+    expect(JSON.parse(await readFile(join(receiverDir, '.obts', 'apply-journal.json'), 'utf8'))).toMatchObject({
+      journal_version: 3,
+      phase: 'writing_files',
+      directory_intents: [{ op: 'delete', path: 'Crash Tree' }],
+      preserve_local_changes: true
+    });
+    await writeFile(join(receiverDir, 'local-after-crash.md'), 'must survive recovery\n');
+
+    const restarted = new ObtsPluginClient(receiverDir, { serverUrl: baseUrl, deviceName: 'tombstone-crash-receiver' });
+    await restarted.initialize();
+    expect(await exists(join(receiverDir, 'Crash Tree'))).toBe(false);
+    expect(await exists(join(receiverDir, '.obts', 'apply-journal.json'))).toBe(false);
+    expect(await restarted.readQueue()).toMatchObject({ status: 'queued_local', pending_commit: expect.any(String) });
+    expect(await restarted.readState()).toMatchObject({ status_label: 'Ahead', last_error_code: null });
+    expect((await restarted.syncOnce()).status).toBe('Synced');
+    expect(await exists(join(receiverDir, 'Crash Tree'))).toBe(false);
+    expect(await server.git.listTreePaths(admin.vaultId, (await restarted.readState()).local_main!)).toContain('local-after-crash.md');
+  });
+
+  it('finishes committed v3 directory recovery with the target event cursor', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const sourceDir = join(root, 'committed-tombstone-source');
+    const receiverDir = join(root, 'committed-tombstone-receiver');
+    await mkdirp(join(sourceDir, 'Committed Tree', 'Nested'));
+    await mkdirp(receiverDir);
+    await writeFile(join(sourceDir, 'Committed Tree', 'Nested', 'note.md'), 'committed crash\n');
+    const source = await pairPlugin(admin, sourceDir, 'committed-tombstone-source');
+    expect((await source.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+    const receiver = await pairPlugin(admin, receiverDir, 'committed-tombstone-receiver');
+
+    await rm(join(sourceDir, 'Committed Tree'), { recursive: true, force: true });
+    expect((await source.syncOnce()).status).toBe('Synced');
+    const receiverInternal = (receiver as unknown as { client: Record<string, any> }).client;
+    const originalWriteState = receiverInternal.writeState.bind(receiverInternal);
+    let interrupted = false;
+    receiverInternal.writeState = async (...args: unknown[]) => {
+      let journal: { phase?: string } | null = null;
+      try {
+        journal = JSON.parse(await readFile(join(receiverDir, '.obts', 'apply-journal.json'), 'utf8')) as { phase?: string };
+      } catch {
+        journal = null;
+      }
+      if (!interrupted && journal?.phase === 'committed') {
+        interrupted = true;
+        throw new Error('simulated crash after committed directory journal');
+      }
+      return await originalWriteState(...args);
+    };
+    await expect(receiver.syncOnce()).rejects.toThrow('simulated crash after committed directory journal');
+    const committedJournal = JSON.parse(await readFile(join(receiverDir, '.obts', 'apply-journal.json'), 'utf8')) as {
+      journal_version: number;
+      phase: string;
+      event_seq: number;
+    };
+    expect(committedJournal).toMatchObject({ journal_version: 3, phase: 'committed', event_seq: expect.any(Number) });
+    expect(await exists(join(receiverDir, 'Committed Tree'))).toBe(false);
+
+    const restarted = new ObtsPluginClient(receiverDir, { serverUrl: baseUrl, deviceName: 'committed-tombstone-receiver' });
+    await restarted.initialize();
+    expect(await restarted.readState()).toMatchObject({
+      status_label: 'Synced',
+      last_error_code: null,
+      last_event_seq: committedJournal.event_seq
+    });
+    expect(await exists(join(receiverDir, '.obts', 'apply-journal.json'))).toBe(false);
+    expect(await exists(join(receiverDir, 'Committed Tree'))).toBe(false);
+    expect((await restarted.syncOnce()).status).toBe('Synced');
+    expect(await exists(join(receiverDir, 'Committed Tree'))).toBe(false);
+  });
+
+  it('preserves a new empty descendant created while pruning a remote tombstone', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const sourceDir = join(root, 'tombstone-race-source');
+    const receiverDir = join(root, 'tombstone-race-receiver');
+    await mkdirp(join(sourceDir, 'Delete Tree', 'Old Branch', 'Empty Leaf'));
+    await mkdirp(receiverDir);
+    await writeFile(join(sourceDir, 'Delete Tree', 'Old Branch', 'note.md'), 'remote deletion\n');
+    const source = await pairPlugin(admin, sourceDir, 'tombstone-race-source');
+    expect((await source.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+    const receiver = await pairPlugin(admin, receiverDir, 'tombstone-race-receiver');
+
+    await rm(join(sourceDir, 'Delete Tree'), { recursive: true, force: true });
+    expect((await source.syncOnce()).status).toBe('Synced');
+    const receiverInternal = (receiver as unknown as { client: Record<string, any> }).client;
+    const originalWriteTargetFiles = receiverInternal.writeTargetFilesFromJournal.bind(receiverInternal);
+    receiverInternal.writeTargetFilesFromJournal = async (...args: unknown[]) => {
+      await originalWriteTargetFiles(...args);
+      await mkdirp(join(receiverDir, 'Delete Tree', 'New Local Empty'));
+    };
+
+    expect((await receiver.syncOnce()).status).toBe('Ahead');
+    expect(await exists(join(receiverDir, 'Delete Tree', 'Old Branch'))).toBe(false);
+    expect(await isDirectory(join(receiverDir, 'Delete Tree', 'New Local Empty'))).toBe(true);
+    expect(await receiver.readQueue()).toMatchObject({ status: 'queued_local', pending_commit: expect.any(String) });
+    expect((await receiver.syncOnce()).status).toBe('Synced');
+    expect(await receiver.readQueue()).toMatchObject({ status: 'idle', pending_commit: null });
+
+    expect((await source.syncOnce()).status).toBe('Synced');
+    expect(await exists(join(sourceDir, 'Delete Tree', 'Old Branch'))).toBe(false);
+    expect(await isDirectory(join(sourceDir, 'Delete Tree', 'New Local Empty'))).toBe(true);
+  });
+
+  it('preserves an empty tombstone root recreated at the same path during apply', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const sourceDir = join(root, 'same-path-directory-source');
+    const receiverDir = join(root, 'same-path-directory-receiver');
+    await mkdirp(join(sourceDir, 'Recreated Tree', 'Old Nested'));
+    await mkdirp(receiverDir);
+    await writeFile(join(sourceDir, 'Recreated Tree', 'Old Nested', 'note.md'), 'old content\n');
+    const source = await pairPlugin(admin, sourceDir, 'same-path-directory-source');
+    expect((await source.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+    const receiver = await pairPlugin(admin, receiverDir, 'same-path-directory-receiver');
+
+    await rm(join(sourceDir, 'Recreated Tree'), { recursive: true, force: true });
+    expect((await source.syncOnce()).status).toBe('Synced');
+    const receiverInternal = (receiver as unknown as { client: Record<string, any> }).client;
+    const originalWriteTargetFiles = receiverInternal.writeTargetFilesFromJournal.bind(receiverInternal);
+    receiverInternal.writeTargetFilesFromJournal = async (...args: unknown[]) => {
+      await originalWriteTargetFiles(...args);
+      await rm(join(receiverDir, 'Recreated Tree'), { recursive: true, force: true });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      await mkdirp(join(receiverDir, 'Recreated Tree'));
+    };
+
+    const receiverResult = await receiver.syncOnce();
+    expect(['Ahead', 'Synced']).toContain(receiverResult.status);
+    expect(await isDirectory(join(receiverDir, 'Recreated Tree'))).toBe(true);
+    expect(await exists(join(receiverDir, 'Recreated Tree', 'Old Nested'))).toBe(false);
+    if (receiverResult.status === 'Ahead') expect((await receiver.syncOnce()).status).toBe('Synced');
+    expect((await source.syncOnce()).status).toBe('Synced');
+    expect(await isDirectory(join(sourceDir, 'Recreated Tree'))).toBe(true);
+    expect(await exists(join(sourceDir, 'Recreated Tree', 'Old Nested'))).toBe(false);
   });
 
   it('does not apply an empty-folder tombstone over non-empty local content', async () => {
