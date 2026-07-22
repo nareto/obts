@@ -137,6 +137,7 @@ export type DeviceSelfResponse = {
   device_ref: string;
   server_device_ref: string | null;
   current_main: string;
+  vault_status: 'active' | 'blocked_integrity';
   status: 'paired' | 'synced' | 'ahead' | 'review_needed' | 'blocked_recovery' | 'revoked';
   last_applied_main: string | null;
   event_seq: number;
@@ -160,6 +161,7 @@ export type DeviceNameResponse = {
 export type DeviceStatusResponse = {
   status: 'ok';
   device_name: string;
+  vault_status: 'active' | 'blocked_integrity';
   plugin: import('./pluginCompatibility.js').PluginCompatibility;
 };
 

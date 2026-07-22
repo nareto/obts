@@ -30,11 +30,15 @@ automation.
 Backups must be point-in-time consistent across metadata and Git stores.
 `/health/ready` runs native Git object-integrity checks and verifies that every metadata `current_main` matches
 `refs/heads/main`, every recorded device ref matches its Git ref, and every
-open conflict still points at existing commits and protection refs. Current
-derived-history rows must point at existing commits. If a restore loses required
-Git state or metadata, migrations, filesystem access, or native Git, readiness
-fails closed until operator repair; history and restore endpoints also refuse a
-vault marked `blocked_integrity`.
+open conflict still points at existing commits and protection refs. A recent
+prepared sync operation may temporarily prove the expected old ref and target
+new ref during the bounded interval between the compare-and-swap ref update and
+its metadata commit; readiness validates against that target without treating
+it as restored-state corruption. Stale or unrelated mismatches still fail
+closed. Current derived-history rows must point at existing commits. If a
+restore loses required Git state or metadata, migrations, filesystem access, or
+native Git, readiness fails closed until operator repair; history and restore
+endpoints also refuse a vault marked `blocked_integrity`.
 
 At startup the server also rejects orphan per-vault Git repositories that have
 no matching metadata record and marks a metadata-backed vault
@@ -45,9 +49,15 @@ history.
 
 Once the operator has stopped the server and restored or repaired the
 underlying state, run `obts integrity repair --vault-id ID`. This local command
-only validates and clears the block; it never chooses between mismatched refs,
-reconstructs missing objects, or discards metadata. `/health/ready` must pass
-after the command before traffic resumes.
+only validates and clears the block; unlike live readiness, repair does not
+accept a prepared-operation transition as proof of a durable repair. It never
+chooses between mismatched refs, reconstructs missing objects, or discards
+metadata. `/health/ready` must pass
+after the command before sync traffic resumes. The routed service itself uses
+process-local liveness rather than global readiness so the authenticated
+operator can still reach diagnostics and repair controls while one vault is
+blocked. Device-status responses advertise the repaired active state so queued
+clients can perform a fresh scan and resume without reset or reconnect.
 
 Event rows are retained for 30 days or 100,000 events per vault. Clients that
 resume from an older pruned cursor receive `410 event_cursor_expired` and must

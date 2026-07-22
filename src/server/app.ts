@@ -63,6 +63,7 @@ export type ObtsServer = {
 };
 
 let dashboardRootPromise: Promise<string> | null = null;
+const LIVE_REF_TRANSITION_GRACE_MS = 2 * 60 * 1000;
 
 export async function createObtsServer(overrides: Partial<ServerConfig> & { dataDir: string }): Promise<ObtsServer> {
   const config = createServerConfig(overrides);
@@ -681,6 +682,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       device_ref: deviceAuth.device.device_ref,
       server_device_ref: deviceAuth.device.device_ref_head,
       current_main: deviceAuth.vault.current_main,
+      vault_status: deviceAuth.vault.status,
       status: deviceAuth.device.status,
       last_applied_main: deviceAuth.device.last_applied_main,
       event_seq: db.event_seq_by_vault[deviceAuth.vault.vault_id] ?? 0
@@ -921,6 +923,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     return {
       status: 'ok',
       device_name: deviceAuth.device.device_name,
+      vault_status: deviceAuth.vault.status,
       plugin: describePluginCompatibility(report.pluginVersion)
     };
   });
@@ -2535,9 +2538,20 @@ async function buildReadinessSummary(
   const metadataStoreReady = metadataDirectoryReady.ok && metadataFileReady.ok;
   const gitStoreReady = await checkWritableDirectory(config.gitStoreDir);
   const tempWorkspaceReady = await checkWritableDirectory(config.tempDir);
-  const persistentState = await checkPersistentState(db, git);
+  let persistentState = await checkPersistentState(db, git);
   if (!persistentState.ok && persistentState.vaultId) {
-    await blockVaultForIntegrity(store, persistentState.vaultId);
+    // Hold metadata mutation while rechecking so a newly prepared ref transition cannot race the durable block.
+    persistentState = await store.mutate(async (mutableDb) => {
+      const result = await checkPersistentState(mutableDb, git);
+      if (!result.ok && result.vaultId) {
+        const vault = mutableDb.vaults.find((candidate) => candidate.vault_id === result.vaultId);
+        if (vault && vault.status !== 'blocked_integrity') {
+          vault.status = 'blocked_integrity';
+          vault.updated_at = nowIso();
+        }
+      }
+      return result;
+    });
   }
   const eventDelivery = checkEventDelivery(db);
   const filesystemPermissions = dataDirectoryReady.ok && metadataStoreReady && gitStoreReady.ok && tempWorkspaceReady.ok;
@@ -2616,7 +2630,7 @@ async function checkPersistentState(db: MetadataDb, git: GitService): Promise<Pe
     return { ok: false, error: 'server Git store cannot be enumerated' };
   }
   for (const vault of db.vaults) {
-    const result = await checkVaultPersistentState(db, vault.vault_id, git);
+    const result = await checkVaultPersistentState(db, vault.vault_id, git, true);
     if (!result.ok) {
       return result;
     }
@@ -2624,7 +2638,12 @@ async function checkPersistentState(db: MetadataDb, git: GitService): Promise<Pe
   return { ok: true };
 }
 
-async function checkVaultPersistentState(db: MetadataDb, vaultId: string, git: GitService): Promise<PersistentStateCheck> {
+async function checkVaultPersistentState(
+  db: MetadataDb,
+  vaultId: string,
+  git: GitService,
+  allowPreparedTransitions = false
+): Promise<PersistentStateCheck> {
   const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
   if (!vault) {
     return { ok: false, error: 'vault metadata is missing' };
@@ -2637,16 +2656,25 @@ async function checkVaultPersistentState(db: MetadataDb, vaultId: string, git: G
     return { ...permissions, vaultId };
   }
   const mainRef = await git.getRef(vaultId, 'refs/heads/main');
-  if (mainRef !== vault.current_main) {
+  const mainTransition = allowPreparedTransitions && mainRef !== vault.current_main && await preparedRefTransitionAllows(
+    db,
+    vaultId,
+    'refs/heads/main',
+    vault.current_main,
+    mainRef,
+    git
+  );
+  if (mainRef !== vault.current_main && !mainTransition) {
     return { ok: false, error: 'vault main ref is inconsistent with metadata', vaultId };
   }
-  if (!(await git.commitExists(vaultId, vault.current_main))) {
+  const effectiveMain = mainTransition && mainRef ? mainRef : vault.current_main;
+  if (!(await git.commitExists(vaultId, effectiveMain))) {
     return { ok: false, error: 'vault main commit is missing from the Git store', vaultId };
   }
   if (!vault.root_commit || !(await git.commitExists(vaultId, vault.root_commit))) {
     return { ok: false, error: 'vault root commit is missing from the Git store', vaultId };
   }
-  if (!(await git.isAncestor(vaultId, vault.root_commit, vault.current_main))) {
+  if (!(await git.isAncestor(vaultId, vault.root_commit, effectiveMain))) {
     return { ok: false, error: 'vault root commit is not an ancestor of current main', vaultId };
   }
   const integrity = await git.checkIntegrity(vaultId);
@@ -2655,7 +2683,13 @@ async function checkVaultPersistentState(db: MetadataDb, vaultId: string, git: G
   }
   for (const device of db.devices.filter((candidate) => candidate.vault_id === vaultId)) {
     const deviceRef = await git.getRef(vaultId, device.device_ref);
-    if ((device.device_ref_head ?? null) !== deviceRef) {
+    if (
+      (device.device_ref_head ?? null) !== deviceRef &&
+      !(
+        allowPreparedTransitions &&
+        await preparedRefTransitionAllows(db, vaultId, device.device_ref, device.device_ref_head ?? null, deviceRef, git)
+      )
+    ) {
       return { ok: false, error: 'device ref is inconsistent with metadata', vaultId };
     }
     if (device.last_applied_main !== null && !(await git.commitExists(vaultId, device.last_applied_main))) {
@@ -2687,6 +2721,28 @@ async function checkVaultPersistentState(db: MetadataDb, vaultId: string, git: G
     }
   }
   return { ok: true };
+}
+
+async function preparedRefTransitionAllows(
+  db: MetadataDb,
+  vaultId: string,
+  ref: string,
+  metadataValue: string | null,
+  actualValue: string | null,
+  git: GitService
+): Promise<boolean> {
+  if (actualValue === null) return false;
+  for (const operation of db.sync_operations) {
+    if (operation.vault_id !== vaultId || operation.status !== 'prepared') continue;
+    const updatedAt = Date.parse(operation.updated_at);
+    const transitionAge = Date.now() - updatedAt;
+    if (!Number.isFinite(updatedAt) || transitionAge < 0 || transitionAge > LIVE_REF_TRANSITION_GRACE_MS) continue;
+    const target = new Map(recoverableTargetRefs(operation)).get(ref);
+    const expected = operation.expected_refs[ref] ?? null;
+    if (metadataValue !== expected || actualValue !== target) continue;
+    return await git.commitExists(vaultId, actualValue);
+  }
+  return false;
 }
 
 export async function repairVaultIntegrity(store: MetadataStore, git: GitService, vaultId: string): Promise<void> {

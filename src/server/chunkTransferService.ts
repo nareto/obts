@@ -224,6 +224,9 @@ export class ChunkTransferService {
   }
 
   private assertTransferAllowed(auth: AuthenticatedDevice): void {
+    if (auth.vault.status === 'blocked_integrity') {
+      throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+    }
     if (auth.device.status === 'review_needed' || auth.device.status === 'blocked_recovery') {
       throw new AuthError(409, 'device_blocked', 'Device requires review or recovery before transferring Git objects.');
     }

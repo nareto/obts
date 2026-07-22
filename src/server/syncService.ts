@@ -224,6 +224,11 @@ export class SyncService {
 
         if (staged) await staged.promote();
         else await this.git.importPack(auth.vault.vault_id, packfile);
+        await this.store.mutate((db) => {
+          const op = requireOperation(db, operation.operation_id);
+          if (op.status !== 'prepared') throw new Error('Sync operation is not prepared.');
+          op.updated_at = nowIso();
+        });
         await this.git.updateRef(auth.vault.vault_id, auth.device.device_ref, manifest.target_commit, currentDeviceRef);
 
         const refEventSeq = await this.store.mutate((db) => {

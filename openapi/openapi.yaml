@@ -1627,6 +1627,7 @@ components:
         - device_ref
         - server_device_ref
         - current_main
+        - vault_status
         - status
         - last_applied_main
         - event_seq
@@ -1649,6 +1650,9 @@ components:
         current_main:
           type: string
           pattern: "^[0-9a-f]{40}$"
+        vault_status:
+          type: string
+          enum: [active, blocked_integrity]
         status:
           type: string
           enum: [paired, synced, ahead, review_needed, blocked_recovery, revoked]
@@ -1667,7 +1671,7 @@ components:
       properties:
         point:
           type: string
-          enum: [onboarding_approved, bootstrap_response, multipart_pack, pack_persist_write, pack_persist_read, index_fs_stat, index_fs_read_file, index_fs_read, index_fs_write, index_pack, sync_request, apply, recovery, startup_metadata, startup_git, startup_state, recovery_journal, recovery_target_commit, recovery_target_tree, recovery_file_validation, recovery_bundle, recovery_file_apply, recovery_refs, recovery_state]
+          enum: [onboarding_approved, bootstrap_response, multipart_pack, pack_persist_write, pack_persist_read, index_fs_stat, index_fs_read_file, index_fs_read, index_fs_write, index_pack, sync_request, apply, upload_prepare, recovery, startup_metadata, startup_git, startup_state, recovery_journal, recovery_target_commit, recovery_target_tree, recovery_file_validation, recovery_bundle, recovery_file_apply, recovery_refs, recovery_state]
         outcome:
           type: string
           enum: [started, returned, succeeded, failed]
@@ -1801,12 +1805,15 @@ components:
             - type: object
     DeviceStatusResponse:
       type: object
-      required: [status, device_name, plugin]
+      required: [status, device_name, vault_status, plugin]
       properties:
         status:
           const: ok
         device_name:
           $ref: "#/components/schemas/DisplayName"
+        vault_status:
+          type: string
+          enum: [active, blocked_integrity]
         plugin:
           $ref: "#/components/schemas/PluginCompatibility"
     PluginCompatibility:

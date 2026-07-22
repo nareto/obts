@@ -235,15 +235,11 @@ export class LocalGitEngine {
     targetChunkBytes: number,
     maxChunkBytes: number
   ): Promise<string[][]> {
-    const oids = new Set(await this.collectReachableObjects(commit));
-    for (const exclude of excludeCommits) {
-      if (!(await this.commitExists(exclude))) continue;
-      for (const oid of await this.collectReachableObjects(exclude)) oids.delete(oid);
-    }
+    const oids = await this.collectIncrementalPackObjects(commit, excludeCommits);
     const groups: string[][] = [];
     let group: string[] = [];
     let groupBytes = 0;
-    for (const oid of [...oids].sort()) {
+    for (const oid of oids) {
       const result = await git.readObject({ fs, dir: this.vaultDir, gitdir: this.gitdir, oid, format: 'content' });
       const size = Buffer.from(result.object as Uint8Array).byteLength;
       const packHeadroom = Math.min(1_048_576, Math.max(64 * 1024, Math.floor(maxChunkBytes * 0.1)));
@@ -269,16 +265,7 @@ export class LocalGitEngine {
   }
 
   async createPackForCommit(commit: string, excludeCommits: string[] = []): Promise<Buffer> {
-    const oids = new Set(await this.collectReachableObjects(commit));
-    for (const exclude of excludeCommits) {
-      if (!(await this.commitExists(exclude))) {
-        continue;
-      }
-      for (const oid of await this.collectReachableObjects(exclude)) {
-        oids.delete(oid);
-      }
-    }
-    return await this.packObjects([...oids].sort());
+    return await this.packObjects(await this.collectIncrementalPackObjects(commit, excludeCommits));
   }
 
   async createRecoveryRefsPack(): Promise<Buffer> {
@@ -290,16 +277,67 @@ export class LocalGitEngine {
     if (mainCommit === localCommit) {
       return Buffer.alloc(0);
     }
-    const oids = new Set(await this.collectReachableObjects(localCommit));
-    if (mainCommit && await this.commitExists(mainCommit)) {
-      for (const oid of await this.collectReachableObjects(mainCommit)) {
-        oids.delete(oid);
-      }
-    }
-    if (oids.size === 0) {
+    const oids = await this.collectIncrementalPackObjects(localCommit, mainCommit ? [mainCommit] : []);
+    if (oids.length === 0) {
       return Buffer.alloc(0);
     }
-    return await this.packObjects([...oids].sort());
+    return await this.packObjects(oids);
+  }
+
+  private async collectIncrementalPackObjects(commit: string, excludeCommits: string[]): Promise<string[]> {
+    const stopCommits = new Set(excludeCommits);
+    const objects = new Set<string>();
+    const visitedCommits = new Set<string>();
+    const visitCommit = async (oid: string): Promise<void> => {
+      if (stopCommits.has(oid) || visitedCommits.has(oid)) {
+        return;
+      }
+      visitedCommits.add(oid);
+      const { commit: parsed } = await git.readCommit({ fs, dir: this.vaultDir, gitdir: this.gitdir, oid });
+      objects.add(oid);
+      let baseTree: string | null = null;
+      const firstParent = parsed.parent[0];
+      if (firstParent && await this.commitExists(firstParent)) {
+        baseTree = (await git.readCommit({ fs, dir: this.vaultDir, gitdir: this.gitdir, oid: firstParent })).commit.tree;
+      }
+      await this.collectChangedTreeObjects(parsed.tree, baseTree, objects);
+      for (const parent of parsed.parent) {
+        await visitCommit(parent);
+      }
+    };
+    await visitCommit(commit);
+    return [...objects].sort();
+  }
+
+  private async collectChangedTreeObjects(treeOid: string, baseTreeOid: string | null, objects: Set<string>): Promise<void> {
+    if (treeOid === baseTreeOid) {
+      return;
+    }
+    objects.add(treeOid);
+    const { tree } = await git.readTree({ fs, dir: this.vaultDir, gitdir: this.gitdir, oid: treeOid });
+    const baseEntries = new Map<string, TreeEntry>();
+    if (baseTreeOid) {
+      const { tree: baseTree } = await git.readTree({ fs, dir: this.vaultDir, gitdir: this.gitdir, oid: baseTreeOid });
+      for (const entry of baseTree) {
+        baseEntries.set(entry.path, entry as TreeEntry);
+      }
+    }
+    for (const rawEntry of tree) {
+      const entry = rawEntry as TreeEntry;
+      const baseEntry = baseEntries.get(entry.path);
+      if (baseEntry && baseEntry.type === entry.type && baseEntry.oid === entry.oid) {
+        continue;
+      }
+      if (entry.type === 'tree') {
+        await this.collectChangedTreeObjects(
+          entry.oid,
+          baseEntry?.type === 'tree' ? baseEntry.oid : null,
+          objects
+        );
+      } else {
+        objects.add(entry.oid);
+      }
+    }
   }
 
   private async packObjects(oids: string[]): Promise<Buffer> {
@@ -369,38 +407,6 @@ export class LocalGitEngine {
       return Buffer.from(result.blob);
     } catch {
       return null;
-    }
-  }
-
-  private async collectReachableObjects(commit: string): Promise<string[]> {
-    const seen = new Set<string>();
-    const visitCommit = async (oid: string): Promise<void> => {
-      if (seen.has(oid)) {
-        return;
-      }
-      seen.add(oid);
-      const { commit: parsed } = await git.readCommit({ fs, dir: this.vaultDir, gitdir: this.gitdir, oid });
-      await this.collectTreeObjects(parsed.tree, seen);
-      for (const parent of parsed.parent) {
-        await visitCommit(parent);
-      }
-    };
-    await visitCommit(commit);
-    return [...seen].sort();
-  }
-
-  private async collectTreeObjects(treeOid: string, seen: Set<string>): Promise<void> {
-    if (seen.has(treeOid)) {
-      return;
-    }
-    seen.add(treeOid);
-    const { tree } = await git.readTree({ fs, dir: this.vaultDir, gitdir: this.gitdir, oid: treeOid });
-    for (const entry of tree) {
-      if (entry.type === 'tree') {
-        await this.collectTreeObjects(entry.oid, seen);
-      } else {
-        seen.add(entry.oid);
-      }
     }
   }
 

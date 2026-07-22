@@ -57,6 +57,7 @@ export const diagnosticPoints = [
   'apply_write',
   'apply_verify',
   'local_snapshot',
+  'upload_prepare',
   'recovery',
   'startup_metadata',
   'startup_git',
