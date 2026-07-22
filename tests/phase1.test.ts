@@ -9,7 +9,7 @@ import { ObtsPluginClient, PluginBlockedError } from '../obsidian-plugin/src/cor
 import { LocalGitEngine } from '../obsidian-plugin/src/core/localGit.js';
 import { TransportClient } from '../obsidian-plugin/src/core/transport.js';
 import { runCli } from '../src/cli.js';
-import { createObtsServer, type ObtsServer } from '../src/server/app.js';
+import { createObtsServer, repairVaultIntegrity, type ObtsServer } from '../src/server/app.js';
 import { MetadataStore } from '../src/server/metadataStore.js';
 import { __syncServiceTestInternals } from '../src/server/syncService.js';
 import {
@@ -3566,6 +3566,174 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(after.status).toBe(503);
     const body = (await after.json()) as { checks: { persistent_state: boolean } };
     expect(body.checks.persistent_state).toBe(false);
+  });
+
+  it('keeps readiness healthy while a prepared main ref update is committing metadata', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'live-ref-transition-device');
+    await mkdirp(deviceDir);
+    await writeFile(join(deviceDir, 'base.md'), 'base\n');
+    const plugin = await pairPlugin(admin, deviceDir, 'live-ref-transition-device');
+    await plugin.syncOnce({ confirmInitialImport: true });
+
+    const originalUpdateRef = server.git.updateRef.bind(server.git);
+    let releaseRefUpdate!: () => void;
+    let refMoved!: () => void;
+    const refUpdateGate = new Promise<void>((resolve) => { releaseRefUpdate = resolve; });
+    const refMovedPromise = new Promise<void>((resolve) => { refMoved = resolve; });
+    let paused = false;
+    server.git.updateRef = async (...args: Parameters<typeof server.git.updateRef>) => {
+      await originalUpdateRef(...args);
+      if (!paused && args[1] === 'refs/heads/main') {
+        paused = true;
+        refMoved();
+        await refUpdateGate;
+      }
+    };
+
+    const originalSnapshot = server.store.snapshot.bind(server.store);
+    let injectReadinessRace = false;
+    let raceInjected = false;
+    let syncing: ReturnType<typeof plugin.syncOnce> | null = null;
+    server.store.snapshot = async () => {
+      const snapshot = await originalSnapshot();
+      if (injectReadinessRace && !raceInjected) {
+        raceInjected = true;
+        syncing = plugin.syncOnce();
+        await refMovedPromise;
+      }
+      return snapshot;
+    };
+
+    await writeFile(join(deviceDir, 'next.md'), 'next\n');
+    injectReadinessRace = true;
+    try {
+      const ready = await fetch(`${baseUrl}/health/ready`);
+      expect(ready.status).toBe(200);
+      expect((await ready.json()) as Json).toMatchObject({ checks: { persistent_state: true } });
+      expect((await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)?.status).toBe('active');
+      await server.store.mutate((db) => {
+        const vault = db.vaults.find((candidate) => candidate.vault_id === admin.vaultId);
+        expect(vault).toBeDefined();
+        vault!.status = 'blocked_integrity';
+      });
+      await expect(repairVaultIntegrity(server.store, server.git, admin.vaultId)).rejects.toThrow(
+        'Vault integrity remains inconsistent: vault main ref is inconsistent with metadata'
+      );
+      await server.store.mutate((db) => {
+        const vault = db.vaults.find((candidate) => candidate.vault_id === admin.vaultId);
+        expect(vault).toBeDefined();
+        vault!.status = 'active';
+      });
+    } finally {
+      releaseRefUpdate();
+      server.git.updateRef = originalUpdateRef;
+      server.store.snapshot = originalSnapshot;
+    }
+    expect(raceInjected).toBe(true);
+    await expect(syncing).resolves.toMatchObject({ status: 'Synced' });
+  });
+
+  it('refreshes a prepared device-ref transition after slow object promotion', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'slow-promotion-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'slow-promotion-device');
+    await writeFile(join(deviceDir, 'after-promotion.md'), 'content\n');
+
+    const originalPromote = server.git.promoteTransferObjects.bind(server.git);
+    const originalUpdateRef = server.git.updateRef.bind(server.git);
+    let staleTimestampInjected = false;
+    let freshTimestampObserved = false;
+    server.git.promoteTransferObjects = async (...args: Parameters<typeof server.git.promoteTransferObjects>) => {
+      await originalPromote(...args);
+      await server.store.mutate((db) => {
+        const operation = db.sync_operations.find((candidate) =>
+          candidate.vault_id === admin.vaultId &&
+          candidate.status === 'prepared' &&
+          candidate.operation_type === 'device_push'
+        );
+        expect(operation).toBeDefined();
+        operation!.updated_at = '2000-01-01T00:00:00.000Z';
+        staleTimestampInjected = true;
+      });
+    };
+    server.git.updateRef = async (...args: Parameters<typeof server.git.updateRef>) => {
+      if (args[1].startsWith('refs/obts/devices/')) {
+        const operation = (await server.store.snapshot()).sync_operations.find((candidate) =>
+          candidate.vault_id === admin.vaultId &&
+          candidate.status === 'prepared' &&
+          candidate.operation_type === 'device_push'
+        );
+        freshTimestampObserved = Boolean(operation && Date.now() - Date.parse(operation.updated_at) < 5_000);
+      }
+      await originalUpdateRef(...args);
+    };
+
+    try {
+      await expect(plugin.syncOnce()).resolves.toMatchObject({ status: 'Synced' });
+      expect(staleTimestampInjected).toBe(true);
+      expect(freshTimestampObserved).toBe(true);
+    } finally {
+      server.git.promoteTransferObjects = originalPromote;
+      server.git.updateRef = originalUpdateRef;
+    }
+  });
+
+  it('stops before pack planning on an integrity block and resumes after validated repair', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'integrity-repair-resume-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'integrity-repair-resume-device');
+    await server.store.mutate((db) => {
+      const vault = db.vaults.find((candidate) => candidate.vault_id === admin.vaultId);
+      expect(vault).toBeDefined();
+      vault!.status = 'blocked_integrity';
+    });
+    await writeFile(join(deviceDir, 'queued.md'), 'preserve while blocked\n');
+
+    const internal = (plugin as unknown as { client: Record<string, any> }).client;
+    const originalPlan = internal.planPackChunks.bind(internal);
+    let planCalls = 0;
+    internal.planPackChunks = async (...args: unknown[]) => {
+      planCalls += 1;
+      return await originalPlan(...args);
+    };
+
+    await expect(plugin.syncOnce()).rejects.toMatchObject({ code: 'blocked_integrity' });
+    expect(planCalls).toBe(0);
+    const blockedState = await plugin.readState();
+    expect(blockedState).toMatchObject({ status_label: 'Unsafe local state', last_error_code: 'blocked_integrity' });
+    expect(await plugin.readQueue()).toMatchObject({ status: 'queued_local', pending_commit: expect.stringMatching(/^[0-9a-f]{40}$/u) });
+
+    const blockedTransfer = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/push-transfers`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${await readDeviceToken(deviceDir)}`,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        api_version: API_VERSION,
+        plugin_version: RECOMMENDED_PLUGIN_VERSION,
+        vault_id: admin.vaultId,
+        device_id: blockedState.device_id,
+        expected_device_ref: blockedState.server_device_ref,
+        target_commit: blockedState.local_head,
+        client_known_main: blockedState.local_main,
+        attempt_id: 'blocked-integrity-attempt',
+        chunk_count: 1,
+        plan_sha256: '0'.repeat(64)
+      })
+    });
+    expect(blockedTransfer.status).toBe(409);
+    await expect(blockedTransfer.json()).resolves.toMatchObject({ error: { code: 'blocked_integrity' } });
+
+    await repairVaultIntegrity(server.store, server.git, admin.vaultId);
+    await internal.reportDeviceStatus();
+    expect(await plugin.readState()).toMatchObject({ status_label: 'Ahead', last_error_code: null });
+    expect(internal.plugin.syncQueued).toBe(true);
+    internal.plugin.syncQueued = false;
+    await expect(plugin.syncOnce()).resolves.toMatchObject({ status: 'Synced' });
   });
 
   it('rolls forward a prepared merge operation when startup finds main already advanced', async () => {

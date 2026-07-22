@@ -702,7 +702,43 @@ describe('mobile plugin artifact', () => {
     expect((runtimePlugin as any).lastFullScanCompletedAt).toEqual(expect.any(Number));
     await (runtimePlugin as any).runBackgroundSync();
     expect(fullScans).toBe(1);
-    expect(lightweightPolls).toBe(11);
+    expect(lightweightPolls).toBe(10);
+    expect((runtimePlugin as any).automaticRetryNotBefore).toBeGreaterThan(Date.now());
+    (runtimePlugin as any).clearTransientSyncFailures();
+
+    runtimeClient.syncOnce = async () => {
+      fullScans += 1;
+      const TransportError = (module.exports as any).TransportError;
+      throw new TransportError(409, 'blocked_integrity', 'vault integrity repair required');
+    };
+    (runtimePlugin as any).lastFullScanCompletedAt = null;
+    await (runtimePlugin as any).runBackgroundSync();
+    expect(await runtimeClient.readState()).toMatchObject({
+      status_label: 'Unsafe local state',
+      last_error_code: 'blocked_integrity'
+    });
+    expect((runtimePlugin as any).automaticRetryNotBefore).toBe(0);
+    await (runtimePlugin as any).runUserAction(async () => {
+      const TransportError = (module.exports as any).TransportError;
+      throw new TransportError(409, 'blocked_integrity', 'vault integrity repair required');
+    }, false);
+    expect(await runtimeClient.readState()).toMatchObject({
+      status_label: 'Unsafe local state',
+      last_error_code: 'blocked_integrity'
+    });
+    await runtimeClient.writeState({
+      ...(await runtimeClient.readState()),
+      status_label: 'Synced',
+      last_error_code: null,
+      updated_at: new Date().toISOString()
+    });
+    (runtimePlugin as any).clearTransientSyncFailures();
+    await (runtimePlugin as any).runUserAction(async () => {
+      const TransportError = (module.exports as any).TransportError;
+      throw new TransportError(503, 'server_unavailable', 'server temporarily unavailable');
+    }, false);
+    expect((runtimePlugin as any).currentStatusLabel).toBe('Checking (server unavailable; retrying)');
+    expect((runtimePlugin as any).automaticRetryNotBefore).toBeGreaterThan(Date.now());
 
     (plugin as any).client = new runtimeClient.constructor(plugin);
     await (plugin as any).client.initialize();

@@ -9,8 +9,7 @@ Implemented runtime pieces:
 - `obts` CLI entrypoint for first-run setup, vault creation, device listing,
   conflict listing, readiness checks, serving the API,
   and local admin password-reset recovery.
-- OCI image definition with native `git`, persistent-state volume, readiness
-  healthcheck, and `obts serve` startup command.
+- OCI image definition with native `git`, persistent-state volume, process-local liveness healthcheck, and `obts serve` startup command. Readiness remains a separate deep consistency signal so one blocked vault cannot remove the dashboard and repair surface from routing.
 - Manual operations and smoke-test guides in `docs/phase1-operations.md` and
   `docs/phase1-smoke-test.md`.
 - Installable Obsidian plugin package in `obsidian-plugin/`; its source and
@@ -32,7 +31,7 @@ Implemented runtime pieces:
 - Full-vault sync includes `.trash/**`, attachments, community plugin files, and other `.obsidian/**` state that passes the hard path policy.
 - Server-side automatic merge for disjoint path changes, clean native Git merges of overlapping Markdown, and conservative semantic merges for safe overlapping JSON Canvas and Obsidian Bases files even when line-based Git merge cannot cleanly merge the compact source text. Merge decisions include deterministic Canvas JSON output, deterministic Bases YAML output, durable operation records, blocked-device rejection, and durable conflict records with validator results for unsafe overlapping or file/directory hierarchy-collision changes.
 - Same-path binary and attachment edits merge automatically only when the accepted server version and uploaded device version have identical blob content; otherwise they remain review-needed conflicts.
-- Merge operations persist the exact target commit and target ref in the prepared operation manifest before advancing `refs/heads/main`; startup reconciliation aborts unprepared writes, rolls forward prepared writes whose Git refs already moved, resumes merged-or-conflicted processing for recovered device ref updates, and marks unreconcilable vault state as `blocked_integrity`.
+- Merge operations persist the exact target commit and target ref in the prepared operation manifest before advancing `refs/heads/main`; live readiness recognizes that bounded prepared transition instead of falsely blocking between the ref and metadata writes. Startup reconciliation aborts unprepared writes, rolls forward prepared writes whose Git refs already moved, resumes merged-or-conflicted processing for recovered device ref updates, and marks stale or unreconcilable vault state as `blocked_integrity`.
 - Vault event polling retains 30 days or 100,000 events per vault, returns `410 event_cursor_expired` when a client cursor predates retained history, and includes the current and oldest available event cursors in the redacted error details.
 - Paired devices can poll the same redacted vault event stream through
   `GET /api/v1/vaults/{vault_id}/sync/events` with their device token, so the
@@ -40,7 +39,9 @@ Implemented runtime pieces:
   without a dashboard session cookie.
 - Plugin-side `.obts/` state with `isomorphic-git`, device token storage, durable watcher change hints, queue state, explicit directory-intent state for empty folder creation/deletion, recovery bundles with file snapshots, text patches, local-only Git refs packs, and artifact checksums, local apply lock, apply journal, local commit creation, device-token metadata rehydration when `state.json` is lost, multipart push, multipart pull, safe apply, safe incomplete-journal replay with recovery blocking when replay is unsafe, explicit replace-local-with-server recovery, and explicit rebuild from current server `main`.
 - One sync decision performs one coherent pre-sync content snapshot, revalidates only queued/affected state around pull, and labels its single post-apply preservation snapshot as verification instead of repeating full-vault `Checking` passes.
-- Long local operations retain `Checking` or `Applying`, report device status every 30 seconds, and surface a taking-longer detail; only transport unavailability produces `Offline`.
+- Long local operations retain `Checking`, `Preparing upload`, or `Applying`, report device status every 30 seconds, and surface a taking-longer detail; only transport unavailability produces `Offline`.
+- Uploads preflight server vault status before object planning, preserve permanent rejection codes, back off transient retries, cache repeated plans, and pack only commits plus changed tree/blob objects relative to acknowledged bases. Large deletion packs therefore scale with retained/changed structure rather than deleted content history.
+- Validated operator integrity repair is advertised through device-status responses; clients blocked specifically on `blocked_integrity` automatically clear that local block, record a fresh scan hint, and resume without reset or reconnect.
 - Large-vault file checks, recovery staging, validation, directory traversal, and dependency-safe apply batches use bounded concurrency. Active source buffers are budgeted at 64 MiB on desktop and 16 MiB on mobile. The Git/DataAdapter APIs return whole blobs and expose target size only after reading, so apply peak memory may additionally include one producer-held target blob; the concurrency cap prevents multiple unbudgeted producer blobs, and oversized writes become exclusive once their size is known.
 - Rebuild classifies repeated, same-device fast-forward, snapshot-only, and divergent local history: fast-forward commits stay queued, snapshot-only edits become a new recovery commit based on rebuilt `main`, and divergent same-device history blocks for export plus reset or reconnect.
 - Plugin sync records server-created conflicts as a local `Review needed` blocking state, so later automatic sync or pull/apply attempts stop before replacing local review content.
@@ -107,7 +108,8 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - cross-user access to vault main, dashboard, conflicts, device sync push/pull,
   and events returns `404`;
 - restored metadata that points at missing Git state makes `/health/ready` return `503` and surfaces a not-ready dashboard health summary;
-- prepared sync operations recover deterministically on restart when Git refs already moved, resume pending device ref merges, or abort safely before ref mutation;
+- prepared sync operations remain readiness-safe during the live ref-to-metadata commit window and recover deterministically on restart when Git refs already moved, resume pending device ref merges, or abort safely before ref mutation;
+- integrity-blocked uploads stop before pack planning, preserve their queued commits and permanent error, then resume from a fresh scan after validated repair;
 - event polling returns `410` for expired cursors after retention pruning;
 - incomplete apply journals replay idempotently on restart when the target commit is present and affected files still match preflight or target content;
 - unreplayable apply journals block sync on restart instead of attempting an unsafe apply;
