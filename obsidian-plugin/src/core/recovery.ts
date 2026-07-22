@@ -12,7 +12,7 @@ export type ApplyFingerprint = {
 };
 
 export type ApplyJournal = {
-  journal_version?: 1 | 2;
+  journal_version?: 1 | 2 | 3;
   apply_id: string;
   operation_type: 'pull_apply' | 'initial_import' | 'replace_local_with_server' | 'rebuild_from_server';
   target_main: string;
@@ -22,6 +22,12 @@ export type ApplyJournal = {
   affected_paths: string[];
   preflight_sha256: Record<string, string | null>;
   preflight_fingerprints?: Record<string, ApplyFingerprint>;
+  directory_intents?: Array<{ op: 'create' | 'delete'; path: string }>;
+  explicit_directories?: string[];
+  pre_apply_directories?: string[];
+  pre_apply_directory_ctimes?: Record<string, number | null>;
+  preserve_local_changes?: boolean;
+  event_seq?: number | null;
   recovery_bundle_id: string | null;
   last_completed_step: string | null;
   redacted_error_category: string | null;
@@ -188,8 +194,12 @@ function parseApplyJournal(value: unknown): ApplyJournal {
   const preflight = journal.preflight_sha256;
   const journalVersion = journal.journal_version === undefined ? 1 : journal.journal_version;
   const typedPreflight = journal.preflight_fingerprints;
+  const directoryIntents = journal.directory_intents;
+  const explicitDirectories = journal.explicit_directories;
+  const preApplyDirectories = journal.pre_apply_directories;
+  const preApplyDirectoryCtimes = journal.pre_apply_directory_ctimes;
   if (
-    journalVersion !== 1 && journalVersion !== 2 ||
+    journalVersion !== 1 && journalVersion !== 2 && journalVersion !== 3 ||
     typeof journal.apply_id !== 'string' || journal.apply_id.length === 0 ||
     typeof journal.operation_type !== 'string' || !operations.has(journal.operation_type) ||
     typeof journal.target_main !== 'string' || !/^[0-9a-f]{40}$/u.test(journal.target_main) ||
@@ -200,10 +210,28 @@ function parseApplyJournal(value: unknown): ApplyJournal {
     new Set(affectedPaths).size !== affectedPaths.length ||
     !preflight || typeof preflight !== 'object' || Array.isArray(preflight) ||
     affectedPaths.some((path) => !Object.hasOwn(preflight, path) || !isNullableSha256((preflight as Record<string, unknown>)[path])) ||
-    journalVersion === 2 && (
+    journalVersion >= 2 && (
       !typedPreflight || typeof typedPreflight !== 'object' || Array.isArray(typedPreflight) ||
       affectedPaths.some((path) => !Object.hasOwn(typedPreflight, path) ||
         !isApplyFingerprint((typedPreflight as Record<string, unknown>)[path]))
+    ) ||
+    journalVersion === 3 && (
+      !Array.isArray(directoryIntents) || directoryIntents.some((intent) => {
+        if (!intent || typeof intent !== 'object' || Array.isArray(intent)) return true;
+        const candidate = intent as Record<string, unknown>;
+        return (candidate.op !== 'create' && candidate.op !== 'delete') ||
+          typeof candidate.path !== 'string' || !isSafeJournalPath(candidate.path);
+      }) ||
+      !Array.isArray(explicitDirectories) || explicitDirectories.some((path) => typeof path !== 'string' || !isSafeJournalPath(path)) ||
+      new Set(explicitDirectories).size !== explicitDirectories.length ||
+      !Array.isArray(preApplyDirectories) || preApplyDirectories.some((path) => typeof path !== 'string' || !isSafeJournalPath(path)) ||
+      new Set(preApplyDirectories).size !== preApplyDirectories.length ||
+      !preApplyDirectoryCtimes || typeof preApplyDirectoryCtimes !== 'object' || Array.isArray(preApplyDirectoryCtimes) ||
+      Object.keys(preApplyDirectoryCtimes).length !== preApplyDirectories.length ||
+      preApplyDirectories.some((path) => !Object.hasOwn(preApplyDirectoryCtimes, path) ||
+        !isNullableNonNegativeNumber((preApplyDirectoryCtimes as Record<string, unknown>)[path])) ||
+      typeof journal.preserve_local_changes !== 'boolean' ||
+      !(journal.event_seq === null || Number.isSafeInteger(journal.event_seq) && Number(journal.event_seq) >= 0)
     ) ||
     !isNullableString(journal.recovery_bundle_id) ||
     !isNullableString(journal.last_completed_step) ||
@@ -225,6 +253,10 @@ function isNullableString(value: unknown): boolean {
 
 function isNullableSha256(value: unknown): boolean {
   return value === null || typeof value === 'string' && /^[0-9a-f]{64}$/u.test(value);
+}
+
+function isNullableNonNegativeNumber(value: unknown): boolean {
+  return value === null || typeof value === 'number' && Number.isFinite(value) && value >= 0;
 }
 
 function isApplyFingerprint(value: unknown): value is ApplyFingerprint {

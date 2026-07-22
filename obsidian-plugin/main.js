@@ -21895,7 +21895,7 @@ var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var { createByteBudget, runBoundedWork } = require_work_pool();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.19";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.20";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_FULL_SCAN_INTERVAL_MS = 5 * 60 * 1e3;
@@ -22868,6 +22868,21 @@ var ObtsObsidianClient = class {
     const journal = await readApplyJournalStrict(this.fsp, this.applyJournalPath);
     if (journal) this.plugin.setInitializationStage("Recovering an interrupted apply", "recovery_journal");
     if (journal && journal.phase === "committed") {
+      let preservedLocalChangePaths = [];
+      let preservedLocalSnapshot = null;
+      let pendingDirectoryIntents = [];
+      if (journal.preserve_local_changes) {
+        this.plugin.setInitializationStage("Validating recovered local changes", "recovery_file_validation");
+        const targetEntries = await this.listTreeBlobOids(journal.target_main);
+        const preserved = await this.localChangedPathsFromTree(targetEntries, true);
+        preservedLocalChangePaths = preserved.paths;
+        preservedLocalSnapshot = preserved.snapshot;
+        pendingDirectoryIntents = (await this.readDirectoryState()).pending_intents;
+        if (preservedLocalChangePaths.length > 0) {
+          this.plugin.setInitializationStage("Writing recovered local change bundle", "recovery_bundle");
+          await this.createRecoveryBundle("rebuild_from_server", journal.target_main, preservedLocalChangePaths);
+        }
+      }
       this.plugin.setInitializationStage("Restoring recovered refs", "recovery_refs");
       await this.updateRef("refs/heads/main", journal.target_main, null, true);
       await this.updateRef("refs/heads/local", journal.target_main, null, true);
@@ -22877,9 +22892,16 @@ var ObtsObsidianClient = class {
         local_head: journal.target_main,
         status_label: "Synced",
         last_error_code: null,
+        last_event_seq: Math.max(state.last_event_seq || 0, journal.event_seq || 0),
         updated_at: nowIso()
       }));
+      if (!journal.preserve_local_changes) await this.refreshDirectoryStateFromDisk();
       await this.clearApplyState();
+      if (preservedLocalChangePaths.length > 0) {
+        await this.queuePreservedLocalChanges(journal.target_main, state.server_device_ref, preservedLocalSnapshot);
+      } else if (pendingDirectoryIntents.length > 0) {
+        await this.queuePreservedDirectoryChanges(journal.target_main, state.server_device_ref);
+      }
       return;
     }
     if (journal && await this.recoverBlockedApplyWithPreservedLocalChanges(journal, state)) {
@@ -24031,7 +24053,7 @@ var ObtsObsidianClient = class {
     }));
     this.reportOperationProgress("Applying", "apply_recovery_prepare");
     const journal = {
-      journal_version: 2,
+      journal_version: 3,
       apply_id: applyId,
       operation_type: "pull_apply",
       target_main: targetMain,
@@ -24041,6 +24063,12 @@ var ObtsObsidianClient = class {
       affected_paths: [],
       preflight_sha256: {},
       preflight_fingerprints: {},
+      directory_intents: compactedDirectoryIntents,
+      explicit_directories: explicitDirectorySet,
+      pre_apply_directories: [],
+      pre_apply_directory_ctimes: {},
+      preserve_local_changes: requireCleanVisibleState,
+      event_seq: Number.isSafeInteger(eventSeq) && eventSeq >= 0 ? eventSeq : null,
       recovery_bundle_id: null,
       last_completed_step: null,
       redacted_error_category: null
@@ -24059,7 +24087,11 @@ var ObtsObsidianClient = class {
       for (const localPath of extraAffectedPaths) {
         affected.add(localPath);
       }
-      const localVaultFiles = await this.listLocalVaultFiles();
+      const localVaultInventory = await this.listLocalVaultInventory("");
+      const localVaultFiles = localVaultInventory.files;
+      const preApplyDirectories = new Set(localVaultInventory.directories);
+      journal.pre_apply_directories = [...preApplyDirectories].sort();
+      journal.pre_apply_directory_ctimes = await this.captureDirectoryCreationTimes(journal.pre_apply_directories);
       for (const conflictPath of materializationConflictFiles(/* @__PURE__ */ new Set([...targetFiles, ...affected]), localVaultFiles)) {
         affected.add(conflictPath);
       }
@@ -24176,7 +24208,12 @@ var ObtsObsidianClient = class {
       journal.phase = "writing_files";
       await writeJson(this.fsp, this.applyJournalPath, journal);
       await this.writeTargetFilesFromJournal(journal, targetEntries, /* @__PURE__ */ new Set());
-      await this.applyDirectoryChanges(compactedDirectoryIntents, explicitDirectorySet);
+      const residualTombstoneDirectories = await this.applyDirectoryChanges(
+        compactedDirectoryIntents,
+        explicitDirectorySet,
+        preApplyDirectories,
+        journal.pre_apply_directory_ctimes
+      );
       journal.phase = "verifying";
       journal.last_completed_step = "files_written";
       await writeJson(this.fsp, this.applyJournalPath, journal);
@@ -24214,7 +24251,11 @@ var ObtsObsidianClient = class {
         if (preservedLocalChangePaths.length > 0) {
           await this.createRecoveryBundle("rebuild_from_server", targetMain, preservedLocalChangePaths);
         }
-        preservedDirectoryIntents = await this.preserveDirectoryChangesFromTarget(targetEntries, explicitDirectorySet);
+        preservedDirectoryIntents = await this.preserveDirectoryChangesFromTarget(
+          targetEntries,
+          explicitDirectorySet,
+          residualTombstoneDirectories
+        );
       }
       await this.updateRef("refs/heads/main", targetMain, null, true);
       await this.updateRef("refs/heads/local", targetMain, null, true);
@@ -24252,8 +24293,11 @@ var ObtsObsidianClient = class {
     const targetEntries = await this.listTreeBlobOids(journal.target_main);
     this.plugin.setInitializationStage("Validating interrupted apply files", "recovery_file_validation");
     let preservedLocalChangePaths = [];
+    let preservedLocalSnapshot = null;
     if (canRecoverFinalVisibleTree) {
-      preservedLocalChangePaths = await this.localChangedPathsFromTree(targetEntries);
+      const preserved = await this.localChangedPathsFromTree(targetEntries, true);
+      preservedLocalChangePaths = preserved.paths;
+      preservedLocalSnapshot = preserved.snapshot;
     } else {
       if (!await this.affectedApplyPathsMatchTarget(journal, targetEntries)) {
         return false;
@@ -24271,6 +24315,18 @@ var ObtsObsidianClient = class {
         this.plugin.setInitializationStage("Writing interrupted apply recovery bundle", "recovery_bundle");
         await this.createRecoveryBundle("rebuild_from_server", journal.target_main, preservedLocalChangePaths);
       }
+      this.plugin.setInitializationStage("Restoring interrupted directory changes", "recovery_file_apply");
+      const residualTombstoneDirectories = await this.applyDirectoryChanges(
+        journal.directory_intents || [],
+        journal.explicit_directories || [],
+        new Set(journal.pre_apply_directories || []),
+        journal.pre_apply_directory_ctimes || {}
+      );
+      const preservedDirectoryIntents = journal.preserve_local_changes ? await this.preserveDirectoryChangesFromTarget(
+        targetEntries,
+        journal.explicit_directories || [],
+        residualTombstoneDirectories
+      ) : [];
       this.plugin.setInitializationStage("Restoring interrupted apply refs", "recovery_refs");
       await this.updateRef("refs/heads/main", journal.target_main, null, true);
       await this.updateRef("refs/heads/local", journal.target_main, null, true);
@@ -24284,11 +24340,15 @@ var ObtsObsidianClient = class {
         local_head: journal.target_main,
         status_label: "Synced",
         last_error_code: null,
+        last_event_seq: Math.max(state.last_event_seq || 0, journal.event_seq || 0),
         updated_at: nowIso()
       }));
+      if (!journal.preserve_local_changes) await this.refreshDirectoryStateFromDisk();
       await this.clearApplyState();
       if (preservedLocalChangePaths.length > 0) {
-        await this.queuePreservedLocalChanges(journal.target_main, state.server_device_ref);
+        await this.queuePreservedLocalChanges(journal.target_main, state.server_device_ref, preservedLocalSnapshot);
+      } else if (preservedDirectoryIntents.length > 0) {
+        await this.queuePreservedDirectoryChanges(journal.target_main, state.server_device_ref);
       }
       return true;
     } catch (error) {
@@ -24334,15 +24394,38 @@ var ObtsObsidianClient = class {
       await writeJson(this.fsp, this.applyJournalPath, journal);
       this.plugin.setInitializationStage("Restoring interrupted apply files", "recovery_file_apply");
       await this.writeTargetFilesFromJournal(journal, targetEntries, validation.targetMatchedPaths);
+      const residualTombstoneDirectories = await this.applyDirectoryChanges(
+        journal.directory_intents || [],
+        journal.explicit_directories || [],
+        new Set(journal.pre_apply_directories || []),
+        journal.pre_apply_directory_ctimes || {}
+      );
       journal.phase = "verifying";
       journal.last_completed_step = "files_written";
       await writeJson(this.fsp, this.applyJournalPath, journal);
       this.plugin.setInitializationStage("Revalidating interrupted apply files", "recovery_file_validation");
-      if (!await this.affectedApplyPathsMatchTarget(journal, targetEntries)) {
+      if (!journal.preserve_local_changes && !await this.affectedApplyPathsMatchTarget(journal, targetEntries)) {
         journal.phase = "blocked_recovery";
         journal.redacted_error_category = "local_changed_during_apply";
         await writeJson(this.fsp, this.applyJournalPath, journal);
         return false;
+      }
+      let preservedLocalChangePaths = [];
+      let preservedLocalSnapshot = null;
+      let preservedDirectoryIntents = [];
+      if (journal.preserve_local_changes) {
+        const preserved = await this.localChangedPathsFromTree(targetEntries, true);
+        preservedLocalChangePaths = preserved.paths;
+        preservedLocalSnapshot = preserved.snapshot;
+        if (preservedLocalChangePaths.length > 0) {
+          this.plugin.setInitializationStage("Writing recovered local change bundle", "recovery_bundle");
+          await this.createRecoveryBundle("rebuild_from_server", journal.target_main, preservedLocalChangePaths);
+        }
+        preservedDirectoryIntents = await this.preserveDirectoryChangesFromTarget(
+          targetEntries,
+          journal.explicit_directories || [],
+          residualTombstoneDirectories
+        );
       }
       this.plugin.setInitializationStage("Restoring interrupted apply refs", "recovery_refs");
       await this.updateRef("refs/heads/main", journal.target_main, null, true);
@@ -24356,9 +24439,16 @@ var ObtsObsidianClient = class {
         local_head: journal.target_main,
         status_label: "Synced",
         last_error_code: null,
+        last_event_seq: Math.max(state.last_event_seq || 0, journal.event_seq || 0),
         updated_at: nowIso()
       }));
+      if (!journal.preserve_local_changes) await this.refreshDirectoryStateFromDisk();
       await this.clearApplyState();
+      if (preservedLocalChangePaths.length > 0) {
+        await this.queuePreservedLocalChanges(journal.target_main, state.server_device_ref, preservedLocalSnapshot);
+      } else if (preservedDirectoryIntents.length > 0) {
+        await this.queuePreservedDirectoryChanges(journal.target_main, state.server_device_ref);
+      }
       return true;
     } catch (error) {
       journal.redacted_error_category = categorizeRecoveryError(error);
@@ -26149,7 +26239,7 @@ var ObtsObsidianClient = class {
   async clearPendingDirectoryIntents() {
     await this.refreshDirectoryStateFromDisk([]);
   }
-  async preserveDirectoryChangesFromTarget(targetEntries, explicitDirectories) {
+  async preserveDirectoryChangesFromTarget(targetEntries, explicitDirectories, residualTombstoneDirectories = /* @__PURE__ */ new Set()) {
     const previous = await this.readDirectoryState();
     const inventory = await this.listLocalVaultInventory("");
     const currentFiles = assertNoCaseCollisions(inventory.files.filter((filePath) => isSyncableVaultPath(filePath)).sort());
@@ -26159,7 +26249,7 @@ var ObtsObsidianClient = class {
       for (const dirPath of directoryPrefixes(filePath)) expectedDirs.add(dirPath);
     }
     const currentDirSet = new Set(currentDirs);
-    const createdIntents = explicitEmptyDirectories(currentDirs, currentFiles).filter((dirPath) => !expectedDirs.has(dirPath)).map((dirPath) => ({ op: "create", path: dirPath }));
+    const createdIntents = explicitEmptyDirectories(currentDirs, currentFiles).filter((dirPath) => !expectedDirs.has(dirPath) && !residualTombstoneDirectories.has(dirPath)).map((dirPath) => ({ op: "create", path: dirPath }));
     const deletedIntents = topmostDirectories([...expectedDirs].filter((dirPath) => !currentDirSet.has(dirPath))).map((dirPath) => ({ op: "delete", path: dirPath }));
     const pendingIntents = compactDirectoryIntents([...previous.pending_intents, ...createdIntents, ...deletedIntents]);
     await this.writeDirectoryState({
@@ -26185,22 +26275,60 @@ var ObtsObsidianClient = class {
     for (const intent of directoryIntents) {
       const isDirectory = await this.adapterIsDirectory(intent.path);
       if (intent.op === "create" && !isDirectory) return true;
-      if (intent.op === "delete" && isDirectory && await this.adapterDirectoryIsEmpty(intent.path)) return true;
+      if (intent.op === "delete" && isDirectory) return true;
     }
     for (const dirPath of explicitDirectories) {
       if (!await this.adapterIsDirectory(dirPath)) return true;
     }
     return false;
   }
-  async applyDirectoryChanges(directoryIntents, explicitDirectories) {
+  async applyDirectoryChanges(directoryIntents, explicitDirectories, preApplyDirectories = /* @__PURE__ */ new Set(), preApplyDirectoryCtimes = {}) {
+    const residualTombstoneDirectories = /* @__PURE__ */ new Set();
     for (const intent of directoryIntents.filter((entry) => entry.op === "delete").sort((left, right) => right.path.length - left.path.length)) {
-      if (await this.adapterIsDirectory(intent.path) && await this.adapterDirectoryIsEmpty(intent.path)) {
-        await this.adapterRemove(intent.path);
+      const replacedDirectories = await this.pruneEmptyDirectoryTree(
+        intent.path,
+        preApplyDirectories,
+        preApplyDirectoryCtimes
+      );
+      if (await this.adapterIsDirectoryStrict(intent.path)) {
+        let residual;
+        try {
+          residual = await this.listLocalVaultInventory(intent.path);
+        } catch (error) {
+          if (error instanceof ObtsBlockedError) throw error;
+          throw new ObtsBlockedError("directory_inspection_failed", "A directory tree could not be inspected safely.");
+        }
+        for (const dirPath of [intent.path, ...residual.directories]) {
+          if (preApplyDirectories.has(dirPath) && !replacedDirectories.has(dirPath)) {
+            residualTombstoneDirectories.add(dirPath);
+          }
+        }
       }
     }
     for (const dirPath of Array.from(new Set(explicitDirectories)).sort((left, right) => left.length - right.length)) {
       await ensureAdapterDir(this.adapter, dirPath);
     }
+    return residualTombstoneDirectories;
+  }
+  async pruneEmptyDirectoryTree(filePath, preApplyDirectories, preApplyDirectoryCtimes) {
+    const replacedDirectories = /* @__PURE__ */ new Set();
+    if (!await this.adapterIsDirectoryStrict(filePath)) return replacedDirectories;
+    let inventory;
+    try {
+      inventory = await this.listLocalVaultInventory(filePath);
+    } catch (error) {
+      if (error instanceof ObtsBlockedError) throw error;
+      throw new ObtsBlockedError("directory_inspection_failed", "A directory tree could not be inspected safely.");
+    }
+    const directories = [filePath, ...inventory.directories].filter((dirPath) => preApplyDirectories.has(dirPath)).sort(compareDeepestPathFirst);
+    for (const dirPath of directories) {
+      const outcome = await this.adapterRemovePreexistingEmptyDirectory(
+        dirPath,
+        preApplyDirectoryCtimes[dirPath]
+      );
+      if (outcome === "replaced") replacedDirectories.add(dirPath);
+    }
+    return replacedDirectories;
   }
   async readDeviceToken() {
     const tokenFile = await readJson(this.fsp, this.authPath, {});
@@ -26254,6 +26382,79 @@ var ObtsObsidianClient = class {
       }
     } catch {
     }
+  }
+  async captureDirectoryCreationTimes(directories) {
+    const values = await runBoundedWork(directories, {
+      concurrency: this.fileWorkConcurrency,
+      yieldEvery: FILE_WORK_YIELD_EVERY
+    }, async (dirPath) => await this.adapterDirectoryCreationTime(dirPath));
+    return Object.fromEntries(directories.map((dirPath, index2) => [dirPath, values[index2]]));
+  }
+  async adapterDirectoryCreationTime(filePath) {
+    if (typeof this.adapter.stat !== "function") return null;
+    try {
+      const stat = await this.adapter.stat(filePath);
+      const ctime = Number(stat && stat.type === "folder" ? stat.ctime : NaN);
+      return Number.isFinite(ctime) && ctime > 0 ? ctime : null;
+    } catch (error) {
+      if (error && (error.code === "ENOENT" || error.code === "ENOTDIR")) return null;
+      throw new ObtsBlockedError("directory_inspection_failed", "A directory could not be inspected safely.");
+    }
+  }
+  async adapterIsDirectoryStrict(filePath) {
+    if (!filePath || filePath === ".") return true;
+    try {
+      const stat = typeof this.adapter.stat === "function" ? await this.adapter.stat(filePath) : null;
+      if (stat) return stat.type === "folder";
+      if (typeof this.adapter.stat === "function") return false;
+      await this.adapter.list(filePath);
+      return true;
+    } catch (error) {
+      if (error && (error.code === "ENOENT" || error.code === "ENOTDIR")) return false;
+      throw new ObtsBlockedError("directory_inspection_failed", "A directory could not be inspected safely.");
+    }
+  }
+  async adapterDirectoryIsEmptyStrict(filePath) {
+    try {
+      const listing = await this.adapter.list(filePath);
+      return (listing.files || []).length === 0 && (listing.folders || []).length === 0;
+    } catch (error) {
+      if (error && (error.code === "ENOENT" || error.code === "ENOTDIR")) return false;
+      throw new ObtsBlockedError("directory_inspection_failed", "A directory could not be inspected safely.");
+    }
+  }
+  async adapterRemovePreexistingEmptyDirectory(filePath, expectedCtime) {
+    if (typeof this.adapter.rmdir !== "function") {
+      throw new ObtsBlockedError("directory_delete_failed", "The vault adapter cannot safely remove an empty directory.");
+    }
+    if (!await this.adapterIsDirectoryStrict(filePath)) return "missing";
+    if (!(typeof expectedCtime === "number" && Number.isFinite(expectedCtime) && expectedCtime > 0)) {
+      throw new ObtsBlockedError("directory_identity_unavailable", "A directory identity could not be verified before deletion.");
+    }
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const currentCtime = await this.adapterDirectoryCreationTime(filePath);
+      if (currentCtime === null) {
+        if (!await this.adapterIsDirectoryStrict(filePath)) return "missing";
+        throw new ObtsBlockedError("directory_identity_unavailable", "A directory identity could not be verified before deletion.");
+      }
+      if (currentCtime !== expectedCtime) return "replaced";
+      if (!await this.adapterDirectoryIsEmptyStrict(filePath)) return "nonempty";
+      const verifiedCtime = await this.adapterDirectoryCreationTime(filePath);
+      if (verifiedCtime === null) {
+        if (!await this.adapterIsDirectoryStrict(filePath)) return "missing";
+        throw new ObtsBlockedError("directory_identity_unavailable", "A directory identity could not be verified before deletion.");
+      }
+      if (verifiedCtime !== expectedCtime) return "replaced";
+      try {
+        await this.adapter.rmdir(filePath, false);
+        return "removed";
+      } catch {
+        if (!await this.adapterIsDirectoryStrict(filePath)) return "removed";
+        if (!await this.adapterDirectoryIsEmptyStrict(filePath)) return "nonempty";
+        if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    }
+    throw new ObtsBlockedError("directory_delete_failed", "An empty directory could not be removed safely.");
   }
   async adapterSha256(filePath) {
     const data = await this.adapterReadBinary(filePath);
@@ -27029,6 +27230,14 @@ async function ensureAdapterDir(adapter, dir) {
     try {
       await adapter.mkdir(current);
     } catch {
+      let existing = null;
+      try {
+        existing = typeof adapter.stat === "function" ? await adapter.stat(current) : null;
+      } catch {
+        existing = null;
+      }
+      if (existing && existing.type === "folder") continue;
+      throw new ObtsBlockedError("directory_materialization_failed", "An authoritative directory could not be created safely.");
     }
   }
 }
@@ -27313,10 +27522,23 @@ function parseApplyJournal(value) {
   const preflight = value.preflight_sha256;
   const journalVersion = value.journal_version === void 0 ? 1 : value.journal_version;
   const typedPreflight = value.preflight_fingerprints;
-  if (journalVersion !== 1 && journalVersion !== 2 || typeof value.apply_id !== "string" || value.apply_id.length === 0 || typeof value.operation_type !== "string" || !operations.has(value.operation_type) || typeof value.target_main !== "string" || !/^[0-9a-f]{40}$/u.test(value.target_main) || !isNullableString(value.expected_prior_local_main) || !isNullableString(value.expected_prior_local_device_ref) || typeof value.phase !== "string" || !phases.has(value.phase) || !Array.isArray(affectedPaths) || affectedPaths.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath)) || new Set(affectedPaths).size !== affectedPaths.length || !preflight || typeof preflight !== "object" || Array.isArray(preflight) || affectedPaths.some((filePath) => !Object.hasOwn(preflight, filePath) || !isNullableSha256(preflight[filePath])) || journalVersion === 2 && (!typedPreflight || typeof typedPreflight !== "object" || Array.isArray(typedPreflight) || affectedPaths.some((filePath) => !Object.hasOwn(typedPreflight, filePath) || !isPreflightFingerprint(typedPreflight[filePath]))) || !isNullableString(value.recovery_bundle_id) || !isNullableString(value.last_completed_step) || !isNullableString(value.redacted_error_category)) {
+  const directoryIntents = value.directory_intents;
+  const explicitDirectories = value.explicit_directories;
+  const preApplyDirectories = value.pre_apply_directories;
+  const preApplyDirectoryCtimes = value.pre_apply_directory_ctimes;
+  if (journalVersion !== 1 && journalVersion !== 2 && journalVersion !== 3 || typeof value.apply_id !== "string" || value.apply_id.length === 0 || typeof value.operation_type !== "string" || !operations.has(value.operation_type) || typeof value.target_main !== "string" || !/^[0-9a-f]{40}$/u.test(value.target_main) || !isNullableString(value.expected_prior_local_main) || !isNullableString(value.expected_prior_local_device_ref) || typeof value.phase !== "string" || !phases.has(value.phase) || !Array.isArray(affectedPaths) || affectedPaths.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath)) || new Set(affectedPaths).size !== affectedPaths.length || !preflight || typeof preflight !== "object" || Array.isArray(preflight) || affectedPaths.some((filePath) => !Object.hasOwn(preflight, filePath) || !isNullableSha256(preflight[filePath])) || journalVersion >= 2 && (!typedPreflight || typeof typedPreflight !== "object" || Array.isArray(typedPreflight) || affectedPaths.some((filePath) => !Object.hasOwn(typedPreflight, filePath) || !isPreflightFingerprint(typedPreflight[filePath]))) || journalVersion === 3 && (!Array.isArray(directoryIntents) || directoryIntents.some(
+    (intent) => !intent || typeof intent !== "object" || Array.isArray(intent) || intent.op !== "create" && intent.op !== "delete" || typeof intent.path !== "string" || !isSafeJournalPath(intent.path)
+  ) || !Array.isArray(explicitDirectories) || explicitDirectories.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath)) || new Set(explicitDirectories).size !== explicitDirectories.length || !Array.isArray(preApplyDirectories) || preApplyDirectories.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath)) || new Set(preApplyDirectories).size !== preApplyDirectories.length || !preApplyDirectoryCtimes || typeof preApplyDirectoryCtimes !== "object" || Array.isArray(preApplyDirectoryCtimes) || Object.keys(preApplyDirectoryCtimes).length !== preApplyDirectories.length || preApplyDirectories.some((filePath) => !Object.hasOwn(preApplyDirectoryCtimes, filePath) || !isNullableNonNegativeNumber(preApplyDirectoryCtimes[filePath])) || typeof value.preserve_local_changes !== "boolean" || !(value.event_seq === null || Number.isSafeInteger(value.event_seq) && value.event_seq >= 0)) || !isNullableString(value.recovery_bundle_id) || !isNullableString(value.last_completed_step) || !isNullableString(value.redacted_error_category)) {
     throw new Error("Apply journal is invalid.");
   }
-  return value;
+  return Object.assign({
+    directory_intents: [],
+    explicit_directories: [],
+    pre_apply_directories: [],
+    pre_apply_directory_ctimes: {},
+    preserve_local_changes: false,
+    event_seq: null
+  }, value);
 }
 function isSafeJournalPath(filePath) {
   return normalizePath2(filePath) === filePath && isValidVaultPath(filePath);
@@ -27326,6 +27548,9 @@ function isNullableString(value) {
 }
 function isNullableSha256(value) {
   return value === null || typeof value === "string" && /^[0-9a-f]{64}$/u.test(value);
+}
+function isNullableNonNegativeNumber(value) {
+  return value === null || typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 function isPreflightFingerprint(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
