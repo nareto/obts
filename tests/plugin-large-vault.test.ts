@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import git from 'isomorphic-git';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { ObtsPluginClient } from '../src/client/core.js';
@@ -74,6 +75,104 @@ describe('large-vault client checkpoints', () => {
     await restored.core.importPack(deltaPack);
     await expect(restored.core.commitExists(localTip)).resolves.toBe(true);
     await expect(restored.core.listTreeBlobOids(localTip)).resolves.toEqual(await core.listTreeBlobOids(localTip));
+  });
+
+  it('plans a large deletion from changed tree objects and caches retries', async () => {
+    const { root, core } = await clientFixture();
+    await mkdir(join(root, 'notes'));
+    for (let index = 0; index < 120; index += 1) {
+      await writeFile(join(root, 'notes', `${index}.md`), `note ${index}\n`);
+    }
+    const base = await core.createLocalCommit('large deletion base');
+    const basePack = await core.packObjects(await core.collectReachableObjects(base));
+    await core.updateRef('refs/heads/main', base, null, true);
+    for (let index = 0; index < 110; index += 1) {
+      await rm(join(root, 'notes', `${index}.md`));
+    }
+    const deleted = await core.createLocalCommit('large deletion');
+    const incrementalObjects = await core.collectIncrementalPackObjects(deleted, [base]);
+    expect(incrementalObjects.length).toBeLessThan(10);
+
+    const originalCollect = core.collectIncrementalPackObjects.bind(core);
+    let collectCalls = 0;
+    core.collectIncrementalPackObjects = async (...args: unknown[]) => {
+      collectCalls += 1;
+      return await originalCollect(...args);
+    };
+    const first = await core.planPackChunks(deleted, [base], 128, 2 * 1024 * 1024);
+    const second = await core.planPackChunks(deleted, [base], 128, 2 * 1024 * 1024);
+    expect(first).toEqual(second);
+    expect(first.length).toBeGreaterThan(1);
+    expect(collectCalls).toBe(1);
+
+    const restored = await clientFixture();
+    await restored.core.importPack(basePack);
+    for (const group of first) await restored.core.importPack(await core.packObjectChunk(group, 2 * 1024 * 1024));
+    await expect(restored.core.commitExists(deleted)).resolves.toBe(true);
+    await expect(restored.core.listTreeBlobOids(deleted)).resolves.toEqual(await core.listTreeBlobOids(deleted));
+  });
+
+  it('reconstructs merge and file-tree replacement packs from the excluded base', async () => {
+    const { root, core } = await clientFixture();
+    await mkdir(join(root, 'nested'));
+    await writeFile(join(root, 'shared.md'), 'base\n');
+    await writeFile(join(root, 'nested', 'old.md'), 'old\n');
+    const base = await core.createLocalCommit('merge base');
+    const basePack = await core.packObjects(await core.collectReachableObjects(base));
+    await core.updateRef('refs/heads/main', base, null, true);
+
+    await rm(join(root, 'nested'), { recursive: true, force: true });
+    await writeFile(join(root, 'nested'), 'replacement file\n');
+    await writeFile(join(root, 'shared.md'), 'left\n');
+    const left = await core.createLocalCommit('left branch');
+
+    await core.updateRef('refs/heads/local', base, left, true);
+    await rm(join(root, 'nested'), { force: true });
+    await mkdir(join(root, 'nested'));
+    await writeFile(join(root, 'nested', 'old.md'), 'old\n');
+    await writeFile(join(root, 'shared.md'), 'base\n');
+    await writeFile(join(root, 'right.md'), 'right\n');
+    const right = await core.createLocalCommit('right branch');
+
+    await core.updateRef('refs/heads/local', left, right, true);
+    await rm(join(root, 'nested'), { recursive: true, force: true });
+    await writeFile(join(root, 'nested'), 'replacement file\n');
+    await writeFile(join(root, 'shared.md'), 'left\n');
+    const combined = await core.createLocalCommit('combined tree');
+    const combinedCommit = await git.readCommit({
+      fs: core.fs,
+      dir: core.vaultDir,
+      gitdir: core.gitdir,
+      oid: combined
+    });
+    const signature = {
+      name: 'obts test',
+      email: 'obts-test@example.invalid',
+      timestamp: Math.floor(Date.now() / 1000),
+      timezoneOffset: 0
+    };
+    const merge = await git.writeCommit({
+      fs: core.fs,
+      dir: core.vaultDir,
+      gitdir: core.gitdir,
+      commit: {
+        tree: combinedCommit.commit.tree,
+        parent: [left, right],
+        author: signature,
+        committer: signature,
+        message: 'merge closure\n'
+      }
+    });
+
+    const groups = await core.planPackChunks(merge, [base], 128, 2 * 1024 * 1024);
+    expect(groups.length).toBeGreaterThan(1);
+    const restored = await clientFixture();
+    await restored.core.importPack(basePack);
+    for (const group of groups) await restored.core.importPack(await core.packObjectChunk(group, 2 * 1024 * 1024));
+    await expect(restored.core.commitExists(left)).resolves.toBe(true);
+    await expect(restored.core.commitExists(right)).resolves.toBe(true);
+    await expect(restored.core.commitExists(merge)).resolves.toBe(true);
+    await expect(restored.core.listTreeBlobOids(merge)).resolves.toEqual(await core.listTreeBlobOids(merge));
   });
 
   it('drains bounded apply writes before returning', async () => {

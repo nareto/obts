@@ -124,9 +124,10 @@ The operator deploys the server with Postgres, a server Git store, temporary wor
 
 Acceptance criteria:
 
-- `GET /health/live` works without dependencies.
+- `GET /health/live` works without dependencies and is the container-routing health signal; it never opens a second metadata/Git coordinator process.
 - `GET /health/ready` checks Postgres, server Git store, temp workspace, filesystem permissions, migrations, and native `git` CLI readiness.
-- Missing or inconsistent restored persistent state fails closed.
+- Readiness recognizes the bounded prepared-operation window between a compare-and-swap Git ref update and its metadata commit, while stale or irreconcilable transitions still fail closed.
+- Missing or inconsistent restored persistent state fails closed without removing the authenticated dashboard and repair surface from routing.
 - The first admin setup cannot be repeated after setup is complete.
 
 ### 3.3 Browser-Assisted Vault And Device Onboarding
@@ -175,7 +176,9 @@ Acceptance criteria:
 - One sync decision reuses its coherent local snapshot instead of repeating whole-vault content checks around network transfer; apply revalidates affected paths immediately before writes and performs one explicitly labelled post-apply preservation scan.
 - If `state.json` is missing, corrupt, or incomplete but the device token and local Git journal are intact, the plugin rehydrates non-secret identity/ref metadata from the server and resumes normal commit/upload behavior without reset or reconnect.
 - `.obts/` is excluded from vault sync, Git worktree content, and manifest/path scanning.
-- Retrying an upload of the same Git commit is idempotent.
+- Retrying an upload of the same Git commit is idempotent, uses bounded exponential backoff for transient failures, and preserves permanent server rejection codes instead of relabelling them as retryable interruption.
+- Before expensive object planning, the client performs a lightweight authenticated vault-status preflight. Incremental upload plans include only commits, changed tree objects, and blobs not already available from acknowledged bases; retrying the same plan reuses its in-memory object grouping.
+- Upload preparation reports object-planning and chunk-packing progress separately from bytes already sent.
 - A new local edit creates a new Git commit with normal Git ancestry.
 - Git commit hashes and parent links, not timestamps, determine content identity and ancestry.
 - Server stores uploaded Git state in the server Git store after authorization.
@@ -195,7 +198,8 @@ Acceptance criteria:
 - Watcher events caused by `obts` apply writes are suppressed or tagged so they are not recommitted as new local edits.
 - On restart, the plugin inspects the apply journal and either finishes an idempotent apply, rolls forward to target `main`, or blocks with recovery options.
 - If a file changed unexpectedly after preflight, apply stops and surfaces recovery instead of overwriting.
-- Long-running checking and apply phases continue reporting device heartbeats and retain their truthful active status; elapsed local work alone never changes status to `Offline`.
+- Long-running checking, upload preparation, and apply phases continue reporting device heartbeats and retain their truthful active status; elapsed local work alone never changes status to `Offline`.
+- A server integrity block stops upload preparation without discarding the queued commit. After an operator validates and clears that block, the next device-status heartbeat clears only the matching local `blocked_integrity` state, records a fresh full-scan hint, and resumes sync automatically.
 - The plugin can recover after crash during apply.
 - The plugin has one v1 apply behavior: automatically pull and apply server `main` after preflight, apply journal creation, recovery bundle creation, and watcher suppression setup succeed.
 - If automatic apply cannot proceed safely, the plugin blocks sync, preserves local state, surfaces the blocked status, and directs the owner to the dashboard conflict or recovery workflow.

@@ -21895,10 +21895,11 @@ var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var { createByteBudget, runBoundedWork } = require_work_pool();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.18";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.19";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_FULL_SCAN_INTERVAL_MS = 5 * 60 * 1e3;
+var AUTOMATIC_RETRY_MAX_MS = 5 * 60 * 1e3;
 var OPERATION_STATUS_HEARTBEAT_MS = 30 * 1e3;
 var STATUS_LAG_NOTICE_DELAY_MS = 30 * 1e3;
 var STATUS_NOTICE_DURATION_MS = 15 * 1e3;
@@ -21963,6 +21964,8 @@ module.exports = class ObtsPlugin extends Plugin {
     }
     this.syncQueued = false;
     this.syncRunning = false;
+    this.transientSyncFailures = 0;
+    this.automaticRetryNotBefore = 0;
     this.lastFullScanCompletedAt = null;
     this.lastCheckingProgressAt = 0;
     this.isApplying = false;
@@ -22503,6 +22506,11 @@ module.exports = class ObtsPlugin extends Plugin {
   }
   async runQueuedSync() {
     if (this.unloaded || !this.syncQueued || !await this.ensureClientReady()) return;
+    const retryDelay = this.automaticRetryNotBefore - Date.now();
+    if (retryDelay > 0) {
+      this.scheduleQueuedSync(retryDelay);
+      return;
+    }
     if (this.isSyncInProgress()) {
       this.scheduleQueuedSync(SYNC_DEBOUNCE_MS);
       return;
@@ -22546,6 +22554,7 @@ module.exports = class ObtsPlugin extends Plugin {
     if (!this.layoutStarted || this.unloaded || typeof document !== "undefined" && document.hidden || !await this.ensureClientReady()) {
       return;
     }
+    if (Date.now() < this.automaticRetryNotBefore) return;
     if (this.syncQueued) {
       await this.runQueuedSync();
       return;
@@ -22573,6 +22582,7 @@ module.exports = class ObtsPlugin extends Plugin {
     if (!this.beginSync()) return;
     try {
       await this.client.pollRemoteEventsAndApply();
+      this.clearTransientSyncFailures();
       this.setStatus((await this.client.readState()).status_label);
       await this.client.reportDeviceStatus().catch(() => void 0);
     } catch (error) {
@@ -22601,6 +22611,7 @@ module.exports = class ObtsPlugin extends Plugin {
         return;
       }
       await this.syncOnceOrPollResolvedConflict({ confirmInitialImport: false });
+      this.clearTransientSyncFailures();
       this.setStatus((await this.client.readState()).status_label);
       await this.client.reportDeviceStatus().catch(() => void 0);
     } catch (error) {
@@ -22613,30 +22624,54 @@ module.exports = class ObtsPlugin extends Plugin {
   async handleAutomaticSyncError(error) {
     void this.reportDeviceError(error);
     if (error instanceof ObtsBlockedError) {
+      this.clearTransientSyncFailures();
       await this.client.markBlocked(error.code, error.details);
       this.setStatus((await this.client.readState()).status_label);
       await this.client.reportDeviceStatus().catch(() => void 0);
       return;
     }
-    const currentState = await this.client.readState();
-    if (currentState.last_error_code && isRetryableLocalError(currentState.last_error_code)) {
-      this.setStatus(currentState.status_label);
-      await this.client.reportDeviceStatus().catch(() => void 0);
-      return;
-    }
     if (isOfflineTransportError(error)) {
+      this.recordTransientSyncFailure();
       this.setStatus("Offline");
       return;
     }
     if (isRetryableServerError(error)) {
+      this.recordTransientSyncFailure();
       this.setStatus("Checking (server unavailable; retrying)");
       return;
     }
-    const code = error instanceof ObtsTransportError ? error.code : "sync_error";
-    const details = error instanceof ObtsTransportError ? error.details : void 0;
-    await this.client.markBlocked(code, details);
+    if (error instanceof ObtsTransportError) {
+      this.clearTransientSyncFailures();
+      await this.client.markBlocked(error.code, error.details);
+      this.setStatus((await this.client.readState()).status_label, { notify: false });
+      await this.client.reportDeviceStatus().catch(() => void 0);
+      return;
+    }
+    const currentState = await this.client.readState();
+    if (currentState.last_error_code && isRetryableLocalError(currentState.last_error_code)) {
+      if (currentState.last_error_code === "upload_interrupted" || currentState.last_error_code === "pack_preparation_failed") {
+        this.recordTransientSyncFailure();
+      }
+      this.setStatus(currentState.status_label);
+      await this.client.reportDeviceStatus().catch(() => void 0);
+      return;
+    }
+    this.clearTransientSyncFailures();
+    await this.client.markBlocked("sync_error");
     this.setStatus((await this.client.readState()).status_label, { notify: false });
     await this.client.reportDeviceStatus().catch(() => void 0);
+  }
+  recordTransientSyncFailure() {
+    this.transientSyncFailures += 1;
+    const delay = Math.min(
+      BACKGROUND_SYNC_INTERVAL_MS * 2 ** Math.min(10, Math.max(0, this.transientSyncFailures - 1)),
+      AUTOMATIC_RETRY_MAX_MS
+    );
+    this.automaticRetryNotBefore = Date.now() + delay;
+  }
+  clearTransientSyncFailures() {
+    this.transientSyncFailures = 0;
+    this.automaticRetryNotBefore = 0;
   }
   async runUserAction(fn, showNotice = true) {
     if (!await this.ensureClientReady() || this.isSyncInProgress()) {
@@ -22648,15 +22683,20 @@ module.exports = class ObtsPlugin extends Plugin {
       this.setStatus((await this.client.readState()).status_label);
       return result;
     } catch (error) {
-      void this.reportDeviceError(error);
-      const code = error instanceof ObtsBlockedError ? error.code : "sync_error";
       const message = error instanceof Error ? error.message : "obts sync failed.";
-      await this.client.markBlocked(code, error instanceof ObtsBlockedError ? error.details : void 0);
+      if (error instanceof ObtsTransportError && !isPermanentTransportError(error)) {
+        await this.handleAutomaticSyncError(error);
+        if (showNotice) new Notice(message);
+        return;
+      }
+      void this.reportDeviceError(error);
+      const preserveError = error instanceof ObtsBlockedError || isPermanentTransportError(error);
+      const code = preserveError ? error.code : "sync_error";
+      await this.client.markBlocked(code, preserveError ? error.details : void 0);
       const blockedState = await this.client.readState();
-      const useStatusNotice = error instanceof ObtsBlockedError;
-      this.setStatus(blockedState.status_label, { notify: useStatusNotice });
+      this.setStatus(blockedState.status_label, { notify: preserveError });
       await this.client.reportDeviceStatus().catch(() => void 0);
-      if (showNotice && (!useStatusNotice || shouldShowRoutineStatusNotice(blockedState.status_label))) {
+      if (showNotice && (!preserveError || shouldShowRoutineStatusNotice(blockedState.status_label))) {
         new Notice(message);
       }
     } finally {
@@ -22811,6 +22851,7 @@ var ObtsObsidianClient = class {
     this.pullTransferPath = path.join(this.obtsDir, "pull-transfer.json");
     this.onboardingOperation = false;
     this.queueMutation = Promise.resolve();
+    this.packPlanCache = /* @__PURE__ */ new Map();
   }
   async initialize() {
     this.plugin.setInitializationStage("Recovering metadata replacements", "startup_metadata");
@@ -23583,6 +23624,8 @@ var ObtsObsidianClient = class {
     const pendingDirectoryIntents = (await this.readDirectoryState()).pending_intents;
     let result;
     try {
+      const serverState = await this.getDeviceSelf(token);
+      await this.reconcileServerVaultStatus(serverState.vault_status, true);
       const capabilities = await this.syncCapabilities();
       if (capabilities) {
         result = await this.pushInChunks(state, queue, token, pendingDirectoryIntents, capabilities);
@@ -23617,13 +23660,16 @@ var ObtsObsidianClient = class {
     } catch (error) {
       const latestQueue = await this.readQueue();
       if (latestQueue.pending_commit === queue.pending_commit && latestQueue.status !== "blocked_recovery") {
+        const permanentTransport = error instanceof ObtsTransportError && !isOfflineTransportError(error) && !isRetryableServerError(error);
+        const errorCode = permanentTransport ? error.code : latestQueue.attempts > queue.attempts ? "upload_interrupted" : "pack_preparation_failed";
+        const statusLabel = permanentTransport ? blockStatusLabel(errorCode) : "Ahead";
         await this.writeQueue(Object.assign({}, latestQueue, { status: "queued_local", updated_at: nowIso() }));
         await this.writeState(Object.assign({}, await this.readState(), {
-          status_label: "Ahead",
-          last_error_code: latestQueue.attempts > queue.attempts ? "upload_interrupted" : "pack_preparation_failed",
+          status_label: statusLabel,
+          last_error_code: errorCode,
           updated_at: nowIso()
         }));
-        this.plugin.setStatus("Ahead");
+        this.plugin.setStatus(statusLabel);
         await this.reportDeviceStatus().catch(() => void 0);
       }
       throw error;
@@ -23674,6 +23720,7 @@ var ObtsObsidianClient = class {
     if (!response.ok) await throwResponseError(response);
   }
   async pushInChunks(state, queue, token, directoryIntents, capabilities, allowStaleRetry = true) {
+    this.reportOperationProgress("Preparing upload (planning objects)", "upload_prepare");
     const groups = await this.planPackChunks(
       queue.pending_commit,
       [queue.expected_device_ref, state.local_main].filter(Boolean),
@@ -23719,6 +23766,10 @@ var ObtsObsidianClient = class {
       this.plugin.setStatus(`Uploading ${uploadedChunks}/${groups.length}`);
       for (let index2 = 0; index2 < groups.length; index2 += 1) {
         if (received.has(index2)) continue;
+        this.reportOperationProgress(
+          `Preparing upload (packing chunk ${index2 + 1}/${groups.length})`,
+          "upload_prepare"
+        );
         const packfile = await this.packObjectChunk(groups[index2], capabilities.max_chunk_bytes);
         await this.putPushChunk({
           vaultId: state.vault_id,
@@ -24910,24 +24961,71 @@ var ObtsObsidianClient = class {
     if (!localCommit) return Buffer2.alloc(0);
     const mainCommit = await this.resolveRef("refs/heads/main");
     if (mainCommit === localCommit) return Buffer2.alloc(0);
-    const oids = new Set(await this.collectReachableObjects(localCommit));
-    if (mainCommit && await this.commitExists(mainCommit)) {
-      for (const oid of await this.collectReachableObjects(mainCommit)) oids.delete(oid);
+    const oids = await this.collectIncrementalPackObjects(localCommit, mainCommit ? [mainCommit] : []);
+    return oids.length ? await this.packObjects(oids) : Buffer2.alloc(0);
+  }
+  async collectIncrementalPackObjects(commit2, excludeCommits = []) {
+    const stopCommits = new Set(excludeCommits.filter(Boolean));
+    const objects = /* @__PURE__ */ new Set();
+    const visitedCommits = /* @__PURE__ */ new Set();
+    const visitCommit = async (oid) => {
+      if (stopCommits.has(oid) || visitedCommits.has(oid)) return;
+      visitedCommits.add(oid);
+      const { commit: parsed } = await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid });
+      objects.add(oid);
+      let baseTree = null;
+      const firstParent = parsed.parent[0];
+      if (firstParent && await this.commitExists(firstParent)) {
+        baseTree = (await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: firstParent })).commit.tree;
+      }
+      await this.collectChangedTreeObjects(parsed.tree, baseTree, objects);
+      for (const parent of parsed.parent) await visitCommit(parent);
+    };
+    await visitCommit(commit2);
+    return [...objects].sort();
+  }
+  async collectChangedTreeObjects(treeOid, baseTreeOid, objects) {
+    if (treeOid === baseTreeOid) return;
+    objects.add(treeOid);
+    const { tree } = await git.readTree({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: treeOid });
+    let baseEntries = /* @__PURE__ */ new Map();
+    if (baseTreeOid) {
+      const { tree: baseTree } = await git.readTree({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: baseTreeOid });
+      baseEntries = new Map(baseTree.map((entry) => [entry.path, entry]));
     }
-    return oids.size ? await this.packObjects([...oids].sort()) : Buffer2.alloc(0);
+    for (const entry of tree) {
+      const baseEntry = baseEntries.get(entry.path);
+      if (baseEntry && baseEntry.type === entry.type && baseEntry.oid === entry.oid) continue;
+      if (entry.type === "tree") {
+        await this.collectChangedTreeObjects(entry.oid, baseEntry && baseEntry.type === "tree" ? baseEntry.oid : null, objects);
+      } else {
+        objects.add(entry.oid);
+      }
+    }
   }
   async planPackChunks(commit2, excludeCommits, targetChunkBytes, maxChunkBytes) {
-    const oids = new Set(await this.collectReachableObjects(commit2));
-    for (const exclude of excludeCommits) {
-      if (!await this.commitExists(exclude)) continue;
-      for (const oid of await this.collectReachableObjects(exclude)) oids.delete(oid);
+    const cacheKey = JSON.stringify([commit2, [...excludeCommits].sort(), targetChunkBytes, maxChunkBytes]);
+    const cached = this.packPlanCache.get(cacheKey);
+    if (cached) return cached.map((group2) => group2.slice());
+    const oids = await this.collectIncrementalPackObjects(commit2, excludeCommits);
+    const sizes = [];
+    for (let index2 = 0; index2 < oids.length; index2 += 1) {
+      const result = await git.readObject({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: oids[index2], format: "content" });
+      sizes.push(result.object.byteLength);
+      this.reportOperationProgress(
+        `Preparing upload (planning objects) ${index2 + 1}/${oids.length}`,
+        "upload_prepare"
+      );
+      if ((index2 + 1) % FILE_WORK_YIELD_EVERY === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
     }
     const groups = [];
     let group = [];
     let groupBytes = 0;
-    for (const oid of [...oids].sort()) {
-      const result = await git.readObject({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid, format: "content" });
-      const size = Buffer2.from(result.object).byteLength;
+    for (let index2 = 0; index2 < oids.length; index2 += 1) {
+      const oid = oids[index2];
+      const size = sizes[index2];
       const packHeadroom = Math.min(1024 * 1024, Math.max(64 * 1024, Math.floor(maxChunkBytes * 0.1)));
       if (size > maxChunkBytes - packHeadroom) {
         throw new ObtsBlockedError("object_too_large_for_chunk", "A file is too large for bounded mobile transfer.");
@@ -24941,6 +25039,8 @@ var ObtsObsidianClient = class {
       groupBytes += size;
     }
     if (group.length > 0) groups.push(group);
+    if (this.packPlanCache.size >= 4) this.packPlanCache.delete(this.packPlanCache.keys().next().value);
+    this.packPlanCache.set(cacheKey, groups.map((entry) => entry.slice()));
     return groups;
   }
   async packObjectChunk(oids, maxChunkBytes) {
@@ -24951,12 +25051,7 @@ var ObtsObsidianClient = class {
     return packfile;
   }
   async createPackForCommit(commit2, excludeCommits = []) {
-    const oids = new Set(await this.collectReachableObjects(commit2));
-    for (const exclude of excludeCommits) {
-      if (!await this.commitExists(exclude)) continue;
-      for (const oid of await this.collectReachableObjects(exclude)) oids.delete(oid);
-    }
-    return await this.packObjects([...oids].sort());
+    return await this.packObjects(await this.collectIncrementalPackObjects(commit2, excludeCommits));
   }
   async packObjects(oids) {
     const { packfile } = await git.packObjects({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oids });
@@ -25182,6 +25277,34 @@ var ObtsObsidianClient = class {
     }
     return await response.json();
   }
+  async reconcileServerVaultStatus(vaultStatus, throwIfBlocked = false) {
+    if (vaultStatus !== "active" && vaultStatus !== "blocked_integrity") return true;
+    const state = await this.readState();
+    if (vaultStatus === "blocked_integrity") {
+      if (state.last_error_code !== "blocked_integrity") {
+        await this.markBlocked("blocked_integrity");
+        this.plugin.setStatus((await this.readState()).status_label, { notify: false });
+      }
+      if (throwIfBlocked) {
+        throw new ObtsTransportError(409, "blocked_integrity", "Vault persistent state failed integrity checks.");
+      }
+      return false;
+    }
+    if (state.last_error_code === "blocked_integrity") {
+      await this.writeState(Object.assign({}, state, {
+        status_label: "Checking",
+        last_error_code: null,
+        updated_at: nowIso()
+      }));
+      await this.recordLocalChangeHint();
+      this.plugin.syncQueued = true;
+      if (typeof this.plugin.clearTransientSyncFailures === "function") this.plugin.clearTransientSyncFailures();
+      const resumedState = await this.readState();
+      this.plugin.setStatus(resumedState.status_label, { notify: false });
+      if (typeof this.plugin.scheduleQueuedSync === "function") this.plugin.scheduleQueuedSync(0);
+    }
+    return true;
+  }
   async renameCurrentDevice(deviceName) {
     await this.initialize();
     const normalized = normalizeDisplayName(deviceName);
@@ -25377,6 +25500,7 @@ var ObtsObsidianClient = class {
         await this.writeState(Object.assign({}, latestState, { device_name: normalizedName, updated_at: nowIso() }));
       }
     }
+    await this.reconcileServerVaultStatus(result.vault_status);
     this.plugin.handlePluginCompatibility(result.plugin);
     return result;
   }
@@ -27100,9 +27224,12 @@ function isOfflineTransportError(error) {
 function isRetryableServerError(error) {
   return error instanceof ObtsTransportError && (error.status === 408 || error.status === 425 || error.status === 429 || error.status >= 500);
 }
+function isPermanentTransportError(error) {
+  return error instanceof ObtsTransportError && !isOfflineTransportError(error) && !isRetryableServerError(error);
+}
 function statusBaseLabel(label) {
   const normalized = typeof label === "string" && label.trim().length > 0 ? label.trim() : "Checking";
-  for (const base of ["Checking", "Uploading", "Applying"]) {
+  for (const base of ["Checking", "Preparing upload", "Uploading", "Applying"]) {
     if (normalized === base || normalized.startsWith(`${base} `)) return base;
   }
   return normalized;
@@ -27345,15 +27472,15 @@ function diagnosticContextForError(error) {
 function buildStalledOperationDiagnostic(diagnosticPoint) {
   const recovery = diagnosticPoint.startsWith("recovery_");
   const apply = diagnosticPoint.startsWith("apply_");
-  const snapshot = diagnosticPoint === "local_snapshot";
+  const sync = diagnosticPoint === "local_snapshot" || diagnosticPoint === "upload_prepare";
   return {
     schema_version: 1,
     event_id: `dgr_${randomHex(16)}`,
     plugin_version: PLUGIN_VERSION,
     obsidian_version: typeof apiVersion === "string" && apiVersion ? apiVersion : "unknown",
     platform_family: Platform && Platform.isIosApp ? "ios" : Platform && Platform.isAndroidApp ? "android" : "desktop",
-    flow: recovery ? "recovery" : apply ? "apply" : snapshot ? "sync" : "plugin",
-    stage: recovery ? "recovery" : apply ? "apply" : snapshot ? "sync_request" : "plugin_lifecycle",
+    flow: recovery ? "recovery" : apply ? "apply" : sync ? "sync" : "plugin",
+    stage: recovery ? "recovery" : apply ? "apply" : sync ? "sync_request" : "plugin_lifecycle",
     failure_code: "operation_stalled",
     error_class: "unknown",
     retryable: true,
@@ -27384,7 +27511,7 @@ function buildDiagnosticReport(error) {
     stage: context && context.stage ? context.stage : lifecycleFailure ? "plugin_lifecycle" : transport ? "sync_request" : "unknown",
     failure_code: failureCode,
     error_class: transport ? "transport_error" : blocked ? "blocked_error" : error instanceof TypeError ? "type_error" : error instanceof Error ? "error" : "unknown",
-    retryable: transport ? error.status >= 500 : false,
+    retryable: transport ? isOfflineTransportError(error) || isRetryableServerError(error) : false,
     breadcrumbs: context && Array.isArray(context.breadcrumbs) ? context.breadcrumbs.slice(0, 16).map(normalizeDiagnosticBreadcrumb) : []
   };
 }
@@ -27398,7 +27525,7 @@ function makeDiagnosticBreadcrumb(point, outcome, value = void 0, errorCode = "n
   });
 }
 function normalizeDiagnosticBreadcrumb(event) {
-  const points = /* @__PURE__ */ new Set(["onboarding_approved", "bootstrap_response", "multipart_pack", "pack_persist_write", "pack_persist_read", "index_fs_stat", "index_fs_read_file", "index_fs_read", "index_fs_write", "index_pack", "sync_request", "apply", "apply_recovery_prepare", "apply_preflight_revalidate", "apply_write", "apply_verify", "local_snapshot", "recovery"]);
+  const points = /* @__PURE__ */ new Set(["onboarding_approved", "bootstrap_response", "multipart_pack", "pack_persist_write", "pack_persist_read", "index_fs_stat", "index_fs_read_file", "index_fs_read", "index_fs_write", "index_pack", "sync_request", "apply", "apply_recovery_prepare", "apply_preflight_revalidate", "apply_write", "apply_verify", "local_snapshot", "upload_prepare", "recovery"]);
   const outcomes = /* @__PURE__ */ new Set(["started", "returned", "succeeded", "failed"]);
   const valueKinds = /* @__PURE__ */ new Set(["buffer", "uint8array", "arraybuffer", "string", "null", "other", "unknown"]);
   const sizeBuckets = /* @__PURE__ */ new Set(["empty", "under_64k", "under_1m", "under_16m", "under_64m", "over_64m", "unknown"]);
