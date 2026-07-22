@@ -66,6 +66,11 @@ export type DeviceRow = {
   device_ref_head: string | null;
   status: 'paired' | 'synced' | 'ahead' | 'review_needed' | 'blocked_recovery' | 'revoked';
   last_applied_main: string | null;
+  last_applied_event_seq: number;
+  last_applied_explicit_dirs: string[] | null;
+  pending_applied_main: string | null;
+  pending_applied_event_seq: number;
+  pending_applied_explicit_dirs: string[] | null;
   last_seen_at: string | null;
   last_successful_sync_at: string | null;
   local_status_label: string | null;
@@ -189,7 +194,7 @@ export type DerivedHistoryIndexRow = {
 };
 
 export type MetadataDb = {
-  schema_version: 4;
+  schema_version: 5;
   setup_complete: boolean;
   users: UserRow[];
   sessions: SessionRow[];
@@ -327,7 +332,7 @@ export class MetadataStore {
 
   private normalizeLoadedDb(db: MetadataDb): boolean {
     const legacyDb = db as MetadataDb & {
-      schema_version: 1 | 2 | 3 | 4;
+      schema_version: 1 | 2 | 3 | 4 | 5;
       connections?: ConnectionRequestRow[];
       login_attempts?: LoginAttemptRow[];
       diagnostic_events?: DiagnosticEventRow[];
@@ -376,8 +381,8 @@ export class MetadataStore {
       changed = true;
     }
     const schema = legacyDb as unknown as { schema_version: number };
-    if (schema.schema_version < 4) {
-      schema.schema_version = 4;
+    if (schema.schema_version < 5) {
+      schema.schema_version = 5;
       changed = true;
     }
     for (const vault of db.vaults) {
@@ -399,6 +404,11 @@ export class MetadataStore {
       }
       const legacyDevice = device as DeviceRow & {
         last_applied_main?: string | null;
+        last_applied_event_seq?: number;
+        last_applied_explicit_dirs?: string[] | null;
+        pending_applied_main?: string | null;
+        pending_applied_event_seq?: number;
+        pending_applied_explicit_dirs?: string[] | null;
         local_status_label?: string | null;
         local_error_code?: string | null;
         local_error_details?: Record<string, unknown> | null;
@@ -417,6 +427,26 @@ export class MetadataStore {
       };
       if (!Object.prototype.hasOwnProperty.call(legacyDevice, 'last_applied_main')) {
         legacyDevice.last_applied_main = null;
+        changed = true;
+      }
+      if (
+        !Number.isSafeInteger(legacyDevice.last_applied_event_seq) ||
+        !Object.prototype.hasOwnProperty.call(legacyDevice, 'last_applied_explicit_dirs') ||
+        !(legacyDevice.last_applied_explicit_dirs === null || Array.isArray(legacyDevice.last_applied_explicit_dirs))
+      ) {
+        const snapshot = metadataDirectorySnapshotForMain(db, device.vault_id, legacyDevice.last_applied_main ?? null);
+        legacyDevice.last_applied_event_seq = snapshot.eventSeq;
+        legacyDevice.last_applied_explicit_dirs = snapshot.explicitDirectories;
+        changed = true;
+      }
+      if (
+        !Object.prototype.hasOwnProperty.call(legacyDevice, 'pending_applied_main') ||
+        !Number.isSafeInteger(legacyDevice.pending_applied_event_seq) ||
+        !(legacyDevice.pending_applied_explicit_dirs === null || Array.isArray(legacyDevice.pending_applied_explicit_dirs))
+      ) {
+        legacyDevice.pending_applied_main = null;
+        legacyDevice.pending_applied_event_seq = 0;
+        legacyDevice.pending_applied_explicit_dirs = null;
         changed = true;
       }
       if (Object.prototype.hasOwnProperty.call(legacyDevice, 'local_error_details')) {
@@ -476,6 +506,46 @@ export class MetadataStore {
   }
 }
 
+function metadataDirectorySnapshotForMain(
+  db: MetadataDb,
+  vaultId: string,
+  main: string | null
+): { eventSeq: number; explicitDirectories: string[] | null } {
+  if (!main) return { eventSeq: 0, explicitDirectories: [] };
+  const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
+  if (vault?.current_main === main) {
+    return {
+      eventSeq: db.event_seq_by_vault[vaultId] ?? 0,
+      explicitDirectories: [...(db.directory_state_by_vault[vaultId]?.explicit_dirs ?? [])].sort()
+    };
+  }
+  const events = db.events
+    .filter((event) => event.vault_id === vaultId)
+    .sort((left, right) => left.event_seq - right.event_seq);
+  const mainEvent = [...events].reverse().find((event) =>
+    event.event_type === 'main_advanced' && event.commit_cursors.main === main
+  );
+  if (!mainEvent || (events[0]?.event_seq ?? 1) > 1) return { eventSeq: 0, explicitDirectories: null };
+  const explicit = new Set<string>();
+  for (const event of events) {
+    if (event.event_seq > mainEvent.event_seq) break;
+    const intents = Array.isArray(event.payload.directory_intents) ? event.payload.directory_intents : [];
+    for (const rawIntent of intents) {
+      if (!rawIntent || typeof rawIntent !== 'object' || Array.isArray(rawIntent)) continue;
+      const intent = rawIntent as { op?: unknown; path?: unknown };
+      if ((intent.op !== 'create' && intent.op !== 'delete') || typeof intent.path !== 'string') continue;
+      if (intent.op === 'delete') {
+        for (const candidate of [...explicit]) {
+          if (candidate === intent.path || candidate.startsWith(`${intent.path}/`)) explicit.delete(candidate);
+        }
+      } else {
+        explicit.add(intent.path);
+      }
+    }
+  }
+  return { eventSeq: mainEvent.event_seq, explicitDirectories: [...explicit].sort() };
+}
+
 function migrateDisplayName(value: unknown, fallback: string): string {
   const normalized = normalizeDisplayName(value);
   if (normalized !== null) {
@@ -493,7 +563,7 @@ function migrateDisplayName(value: unknown, fallback: string): string {
 
 function createEmptyDb(): MetadataDb {
   return {
-    schema_version: 4,
+    schema_version: 5,
     setup_complete: false,
     users: [],
     sessions: [],

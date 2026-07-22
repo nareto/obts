@@ -919,6 +919,49 @@ paths:
           $ref: "#/components/responses/Error"
         "410":
           $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/sync/applied:
+    post:
+      summary: Acknowledge that a paired device durably completed applying a main commit.
+      security:
+        - deviceBearer: []
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [applied_main]
+              properties:
+                applied_main:
+                  type: string
+                  pattern: "^[0-9a-f]{40}$"
+      responses:
+        "200":
+          description: Applied main acknowledged.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, applied_main, applied_event_seq]
+                properties:
+                  status:
+                    const: ok
+                  applied_main:
+                    type: string
+                    pattern: "^[0-9a-f]{40}$"
+                  applied_event_seq:
+                    type: integer
+                    minimum: 0
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
   /vaults/{vault_id}/onboarding/complete:
     post:
       summary: Mark the registered device onboarding workflow complete after applying server main.
@@ -1630,6 +1673,7 @@ components:
         - vault_status
         - status
         - last_applied_main
+        - last_applied_event_seq
         - event_seq
       properties:
         user_id:
@@ -1661,6 +1705,9 @@ components:
             - type: "null"
             - type: string
               pattern: "^[0-9a-f]{40}$"
+        last_applied_event_seq:
+          type: integer
+          minimum: 0
         event_seq:
           type: integer
           minimum: 0

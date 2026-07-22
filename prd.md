@@ -174,6 +174,8 @@ Acceptance criteria:
 - Watcher hints remain `Checking` until a scan proves a local commit exists; an unchanged scan clears its durable hint, and only a real unmerged local commit is `Ahead`.
 - Frequent remote event polling does not rescan vault contents. Full local scans run on startup, after watcher hints, and on a slower fallback cadence to catch missed events.
 - One sync decision reuses its coherent local snapshot instead of repeating whole-vault content checks around network transfer; apply revalidates affected paths immediately before writes and performs one explicitly labelled post-apply preservation scan.
+- The client persists separate seen-event and durably-applied-event cursors. Pulling data never acknowledges application for current-protocol clients; the server advances a device's `last_applied_main` only after an explicit post-apply acknowledgement, while a version-gated legacy pull acknowledgement remains during rollout.
+- Metadata durably pairs each device's acknowledged main/event cursor with its authoritative explicit-directory snapshot so replay does not depend on the bounded event-polling log. Migration blocks ambiguous behind-device snapshots rather than inventing an empty baseline.
 - If `state.json` is missing, corrupt, or incomplete but the device token and local Git journal are intact, the plugin rehydrates non-secret identity/ref metadata from the server and resumes normal commit/upload behavior without reset or reconnect.
 - `.obts/` is excluded from vault sync, Git worktree content, and manifest/path scanning.
 - Retrying an upload of the same Git commit is idempotent, uses bounded exponential backoff for transient failures, and preserves permanent server rejection codes instead of relabelling them as retryable interruption.
@@ -217,6 +219,7 @@ Behavior:
 5. Accepted directory intents are stored in server metadata and emitted with the accepted `main` event and pull manifest.
 6. Remote apply materializes explicit empty directories after file writes/deletes.
 7. Remote apply prunes the pre-existing tombstoned hierarchy deepest-first after file apply, removing each directory only through a non-recursive empty-directory operation. Non-empty local directories and genuinely new concurrent directories are never recursively removed by a directory tombstone.
+8. If plugin reload interrupts post-apply preservation, the apply journal remains durable, nonce-owned ref staging prevents cross-runtime lock reuse, and unacknowledged authoritative directory state replays before local directory intents can upload. Legacy create intents are discarded only when local creation identities prove they predate every locally materialized remote-create marker from that apply; missing or ambiguous provenance blocks safely.
 8. Historical states that predate directory intents cannot infer right-click folder-delete intent from the Git file tree alone.
 
 Acceptance criteria:
@@ -1014,6 +1017,7 @@ Conflict review lifecycle:
 - `GET /api/v1/vaults/{vault_id}/main`: return current `main` metadata and authorized summary.
 - `POST /api/v1/vaults/{vault_id}/sync/push`: upload a push manifest and Git packfile, optionally naming a trusted `base_commit`, then request an actor device ref update.
 - `POST /api/v1/vaults/{vault_id}/sync/pull`: request a target `main` and receive a pull manifest plus Git packfile needed to reach it.
+- `POST /api/v1/vaults/{vault_id}/sync/applied`: monotonically acknowledge that the device durably applied a trusted main and its directory snapshot.
 - `POST /api/v1/vaults/{vault_id}/history/query`: list note history for an authorized path supplied in a redacted request body.
 - `POST /api/v1/vaults/{vault_id}/history/version`: fetch a historical note version or diff source for a commit/path supplied in a redacted request body.
 - `POST /api/v1/vaults/{vault_id}/history/restore`: restore a historical note version through a new Git-backed merge/resolution commit.
@@ -1112,7 +1116,7 @@ Rules:
 - `.trash/**`, attachments, community plugin files outside `.obsidian/plugins/obts` and `.obsidian/plugins/obts/**`, and all other `.obsidian/**` files are normal vault content.
 - The server enforces a documented maximum upload byte limit through `OBTS_MAX_UPLOAD_BYTES`; files larger than that limit block upload/apply for the affected file with a clear error.
 - Plugin files are executable/sensitive content. When synced, they are Git-backed vault state and participate in file-level history, recovery, and conflict handling. Diagnostics exports and note-history UI redact plugin file content by default.
-- Already-loaded plugin code may continue to run until Obsidian or the plugin reloads; `obts` does not force that reload as part of sync.
+- Already-loaded plugin code may continue to run until Obsidian or the plugin reloads; `obts` does not force that reload as part of sync. Reload can interrupt any await boundary, so ref updates, apply finalization, and post-apply preservation are restart-recoverable and never rely on unload completing asynchronously.
 - `obts` must not update its own running plugin code through normal vault sync.
 
 ### 8.2 Note History And Restore
@@ -1152,7 +1156,7 @@ v1 retains all commits reachable from `main`, device refs, unresolved conflict r
 
 Before destructive local apply or rebuild, the plugin writes a local recovery bundle under `.obts/recovery/{bundle_id}/`. Recovery bundles are local sensitive state and are not synced as vault content.
 
-The apply journal is stored at `.obts/apply-journal.json` and contains a schema version, apply ID, operation type, target `main`, expected prior local `main`, expected prior local device ref, phase, affected paths, per-path typed preflight fingerprints, backward-compatible per-file SHA-256 values, directory intents, authoritative explicit directories, the pre-apply directory inventory and creation-time identities, local-preservation policy, target event cursor, recovery bundle ID, last completed step, and redacted error category. A typed fingerprint distinguishes `missing`, `file`, `directory`, and `other`; file fingerprints include SHA-256 and Git blob identity. Version 3 makes directory apply crash-replayable, while journal readers continue accepting version 1 SHA-only and version 2 typed-fingerprint forms. The phase value is one of `planned`, `recovery_bundle_written`, `writing_files`, `verifying`, `committed`, or `blocked_recovery`.
+The apply journal is stored at `.obts/apply-journal.json` and contains a schema version, apply ID, operation type, target `main`, expected prior local `main`, expected prior local device ref, phase, affected paths, per-path typed preflight fingerprints, backward-compatible per-file SHA-256 values, directory intents, authoritative explicit directories, the pre-apply directory inventory and creation-time identities, local-preservation policy, target event cursor, recovery bundle ID, last completed step, and redacted error category. A typed fingerprint distinguishes `missing`, `file`, `directory`, and `other`; file fingerprints include SHA-256 and Git blob identity. Version 3 makes directory apply crash-replayable and remains present through preserved file/directory queue finalization; readers continue accepting version 1 SHA-only and version 2 typed-fingerprint forms. The phase value is one of `planned`, `recovery_bundle_written`, `writing_files`, `verifying`, `committed`, or `blocked_recovery`. A `committed` journal is cleared only after refs, local state, preserved-change queueing, and the local applied-event cursor are durable; a missing subsequent server acknowledgement is recovered from the separate server-side cursor.
 
 Every recovery bundle contains:
 

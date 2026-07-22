@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -738,6 +738,146 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(directoryState?.explicit_dirs.some((path) => path === 'Main Vault' || path.startsWith('Main Vault/'))).toBe(false);
   });
 
+  it('recovers a legacy folder-delete apply interrupted by a BRAT reload', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const sourceDir = join(root, 'reload-delete-source');
+    const receiverDir = join(root, 'reload-delete-receiver');
+    await mkdirp(sourceDir);
+    await mkdirp(receiverDir);
+    await writeFile(join(sourceDir, 'base.md'), 'base\n');
+    const source = await pairPlugin(admin, sourceDir, 'reload-delete-source');
+    expect((await source.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+    const receiver = await pairPlugin(admin, receiverDir, 'reload-delete-receiver');
+    await mkdirp(join(sourceDir, 'mainvault', 'Nested', 'Empty Leaf'));
+    expect((await source.syncOnce()).status).toBe('Synced');
+    expect((await receiver.syncOnce()).status).toBe('Synced');
+    expect(await isDirectory(join(receiverDir, 'mainvault', 'Nested', 'Empty Leaf'))).toBe(true);
+
+    await mkdirp(join(sourceDir, '.trash'));
+    await rename(join(sourceDir, 'mainvault'), join(sourceDir, '.trash', 'mainvault'));
+    expect((await source.syncOnce()).status).toBe('Synced');
+    const targetMain = (await source.readState()).local_main!;
+    const receiverInternal = (receiver as unknown as { client: Record<string, any> }).client;
+    const currentApplyDirectoryChanges = receiverInternal.applyDirectoryChanges.bind(receiverInternal);
+    receiverInternal.applyDirectoryChanges = async (_intents: unknown, explicitDirectories: string[]) =>
+      await currentApplyDirectoryChanges([], explicitDirectories);
+    const originalUpdateRef = receiverInternal.updateRef.bind(receiverInternal);
+    receiverInternal.updateRef = async (ref: string, target: string, expected: string | null, force = false) => {
+      if (ref === 'refs/heads/local' && expected && !force) {
+        await writeFile(join(receiverDir, '.obts', 'git', 'refs', 'heads', 'local.lock'), `${target}\n`);
+        throw new Error('simulated BRAT reload during preserved directory ref update');
+      }
+      return await originalUpdateRef(ref, target, expected, force);
+    };
+    await expect(receiver.syncOnce()).rejects.toThrow('simulated BRAT reload');
+    expect(await exists(join(receiverDir, 'mainvault'))).toBe(true);
+    expect((JSON.parse(await readFile(join(receiverDir, '.obts', 'directory-state.json'), 'utf8')) as { pending_intents: unknown[] }).pending_intents).toEqual(expect.arrayContaining([
+      { op: 'create', path: 'mainvault' },
+      { op: 'create', path: 'mainvault/Nested' },
+      { op: 'create', path: 'mainvault/Nested/Empty Leaf' }
+    ]));
+    expect(JSON.parse(await readFile(join(receiverDir, '.obts', 'apply-journal.json'), 'utf8'))).toMatchObject({
+      phase: 'committed',
+      last_completed_step: 'refs_updated'
+    });
+
+    // Emulate the legacy client, which cleared its apply journal before queue finalization.
+    await rm(join(receiverDir, '.obts', 'apply-journal.json'), { force: true });
+    const statePath = join(receiverDir, '.obts', 'state.json');
+    const interruptedState = JSON.parse(await readFile(statePath, 'utf8')) as Json;
+    delete interruptedState.last_applied_event_seq;
+    await writeFile(statePath, `${JSON.stringify({
+      ...interruptedState,
+      status_label: 'Unsafe local state',
+      last_error_code: 'sync_error',
+      updated_at: new Date().toISOString()
+    }, null, 2)}\n`);
+    const refLockPath = join(receiverDir, '.obts', 'git', 'refs', 'heads', 'local.lock');
+    const staleTime = new Date(Date.now() - 60_000);
+    await utimes(refLockPath, staleTime, staleTime);
+
+    const restarted = new ObtsPluginClient(receiverDir, { serverUrl: baseUrl, deviceName: 'reload-delete-receiver' });
+    await restarted.initialize();
+    expect(await exists(refLockPath)).toBe(false);
+    expect((await restarted.syncOnce()).status).toBe('Synced');
+    expect(await exists(join(receiverDir, 'mainvault'))).toBe(false);
+    expect(await restarted.readQueue()).toMatchObject({ status: 'idle', pending_commit: null });
+    expect((JSON.parse(await readFile(join(receiverDir, '.obts', 'directory-state.json'), 'utf8')) as { pending_intents: unknown[] }).pending_intents).toEqual([]);
+    expect(await restarted.readState()).toMatchObject({
+      local_main: targetMain,
+      local_head: targetMain,
+      status_label: 'Synced',
+      last_error_code: null,
+      last_applied_event_seq: expect.any(Number)
+    });
+    const finalState = await restarted.readState();
+    const device = (await server.store.snapshot()).devices.find((entry) => entry.device_id === finalState.device_id);
+    expect(device?.last_applied_main).toBe(targetMain);
+    expect((await server.store.snapshot()).directory_state_by_vault[admin.vaultId]?.explicit_dirs).not.toEqual(
+      expect.arrayContaining(['mainvault'])
+    );
+  });
+
+  it('replays directory state from the acknowledged snapshot after event retention', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const sourceDir = join(root, 'retained-directory-source');
+    const receiverDir = join(root, 'retained-directory-receiver');
+    await mkdirp(sourceDir);
+    await mkdirp(receiverDir);
+    await writeFile(join(sourceDir, 'base.md'), 'base\n');
+    const source = await pairPlugin(admin, sourceDir, 'retained-directory-source');
+    expect((await source.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+    const receiver = await pairPlugin(admin, receiverDir, 'retained-directory-receiver');
+    await mkdirp(join(sourceDir, 'mainvault', 'Nested'));
+    expect((await source.syncOnce()).status).toBe('Synced');
+    expect((await receiver.syncOnce()).status).toBe('Synced');
+    expect(await isDirectory(join(receiverDir, 'mainvault', 'Nested'))).toBe(true);
+
+    await mkdirp(join(sourceDir, '.trash'));
+    await rename(join(sourceDir, 'mainvault'), join(sourceDir, '.trash', 'mainvault'));
+    expect((await source.syncOnce()).status).toBe('Synced');
+    await server.store.mutate((db) => {
+      db.events = db.events.filter((event) => event.vault_id !== admin.vaultId);
+    });
+
+    expect((await receiver.syncOnce()).status).toBe('Synced');
+    expect(await exists(join(receiverDir, 'mainvault'))).toBe(false);
+    expect(await isDirectory(join(receiverDir, '.trash', 'mainvault', 'Nested'))).toBe(true);
+    const state = await receiver.readState();
+    const device = (await server.store.snapshot()).devices.find((candidate) => candidate.device_id === state.device_id);
+    expect(device?.last_applied_main).toBe(state.local_main);
+    expect(device?.last_applied_explicit_dirs).toEqual(expect.arrayContaining(['.trash/mainvault', '.trash/mainvault/Nested']));
+  });
+
+  it('preserves directory creates newer than a legacy apply materialization boundary', async () => {
+    const deviceDir = join(root, 'directory-recovery-provenance');
+    await mkdirp(join(deviceDir, 'stale-tree'));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await mkdirp(join(deviceDir, '.trash', 'remote-marker'));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await mkdirp(join(deviceDir, 'new-tree'));
+    const plugin = new ObtsPluginClient(deviceDir, { serverUrl: baseUrl, deviceName: 'directory-recovery-provenance' });
+    await plugin.initialize();
+    await writeFile(join(deviceDir, '.obts', 'directory-state.json'), `${JSON.stringify({
+      observed_dirs: ['.trash', '.trash/remote-marker', 'new-tree', 'stale-tree'],
+      explicit_empty_dirs: ['.trash/remote-marker', 'new-tree', 'stale-tree'],
+      pending_intents: [
+        { op: 'create', path: 'stale-tree' },
+        { op: 'create', path: 'new-tree' }
+      ],
+      updated_at: new Date().toISOString()
+    }, null, 2)}\n`);
+    const internals = (plugin as unknown as { client: Record<string, any> }).client;
+    const remaining = await internals.dropSupersededDirectoryIntentsForRecovery([
+      { op: 'create', path: '.trash/remote-marker' },
+      { op: 'delete', path: 'stale-tree' },
+      { op: 'delete', path: 'new-tree' }
+    ]);
+    expect(remaining).toEqual([{ op: 'create', path: 'new-tree' }]);
+    expect(await isDirectory(join(deviceDir, 'stale-tree'))).toBe(true);
+    expect(await isDirectory(join(deviceDir, 'new-tree'))).toBe(true);
+  });
+
   it('replays nested directory tombstones after a crash before pruning', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const sourceDir = join(root, 'tombstone-crash-source');
@@ -782,6 +922,58 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect((await restarted.syncOnce()).status).toBe('Synced');
     expect(await exists(join(receiverDir, 'Crash Tree'))).toBe(false);
     expect(await server.git.listTreePaths(admin.vaultId, (await restarted.readState()).local_main!)).toContain('local-after-crash.md');
+  });
+
+  it('retries a durable applied-main acknowledgement after reload', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const sourceDir = join(root, 'pending-ack-source');
+    const receiverDir = join(root, 'pending-ack-receiver');
+    await mkdirp(sourceDir);
+    await mkdirp(receiverDir);
+    await writeFile(join(sourceDir, 'base.md'), 'base\n');
+    const source = await pairPlugin(admin, sourceDir, 'pending-ack-source');
+    expect((await source.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+    const receiver = await pairPlugin(admin, receiverDir, 'pending-ack-receiver');
+    await writeFile(join(sourceDir, 'after.md'), 'after\n');
+    expect((await source.syncOnce()).status).toBe('Synced');
+    const targetMain = (await source.readState()).local_main!;
+    const receiverInternal = (receiver as unknown as { client: Record<string, any> }).client;
+    receiverInternal.acknowledgeAppliedMain = async () => {
+      throw new Error('simulated reload before server apply acknowledgement');
+    };
+
+    await expect(receiver.syncOnce()).rejects.toThrow('simulated reload before server apply acknowledgement');
+    expect(await exists(join(receiverDir, '.obts', 'apply-journal.json'))).toBe(false);
+    expect(JSON.parse(await readFile(join(receiverDir, '.obts', 'pending-applied-ack.json'), 'utf8'))).toMatchObject({
+      target_main: targetMain,
+      event_seq: expect.any(Number)
+    });
+    const interruptedState = await receiver.readState();
+    const interruptedDevice = (await server.store.snapshot()).devices.find((device) => device.device_id === interruptedState.device_id);
+    expect(interruptedDevice?.last_applied_main).not.toBe(targetMain);
+    const committedAck = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/applied`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${await readDeviceToken(receiverDir)}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ applied_main: targetMain })
+    });
+    expect(committedAck.status).toBe(200);
+    expect(await exists(join(receiverDir, '.obts', 'pending-applied-ack.json'))).toBe(true);
+
+    await writeFile(join(sourceDir, 'newer.md'), 'newer while acknowledgement is pending\n');
+    expect((await source.syncOnce()).status).toBe('Synced');
+    const newestMain = (await source.readState()).local_main!;
+    expect(newestMain).not.toBe(targetMain);
+    await server.store.mutate((db) => {
+      db.events = db.events.filter((event) => event.vault_id !== admin.vaultId);
+    });
+
+    const restarted = new ObtsPluginClient(receiverDir, { serverUrl: baseUrl, deviceName: 'pending-ack-receiver' });
+    expect((await restarted.syncOnce()).status).toBe('Synced');
+    expect(await exists(join(receiverDir, '.obts', 'pending-applied-ack.json'))).toBe(false);
+    const finalState = await restarted.readState();
+    expect(finalState).toMatchObject({ local_main: newestMain, last_applied_event_seq: expect.any(Number) });
+    const recoveredDevice = (await server.store.snapshot()).devices.find((device) => device.device_id === finalState.device_id);
+    expect(recoveredDevice?.last_applied_main).toBe(newestMain);
   });
 
   it('finishes committed v3 directory recovery with the target event cursor', async () => {
@@ -855,12 +1047,13 @@ describe('Phase 1 sync without conflict resolution', () => {
       await mkdirp(join(receiverDir, 'Delete Tree', 'New Local Empty'));
     };
 
-    expect((await receiver.syncOnce()).status).toBe('Ahead');
+    const preservedResult = await receiver.syncOnce();
     expect(await exists(join(receiverDir, 'Delete Tree', 'Old Branch'))).toBe(false);
     expect(await isDirectory(join(receiverDir, 'Delete Tree', 'New Local Empty'))).toBe(true);
-    expect(await receiver.readQueue()).toMatchObject({ status: 'queued_local', pending_commit: expect.any(String) });
-    expect((await receiver.syncOnce()).status).toBe('Synced');
+    expect((JSON.parse(await readFile(join(receiverDir, '.obts', 'directory-state.json'), 'utf8')) as { pending_intents: unknown[] }).pending_intents).toEqual([]);
     expect(await receiver.readQueue()).toMatchObject({ status: 'idle', pending_commit: null });
+    expect(preservedResult.status).toBe('Synced');
+    expect((await server.store.snapshot()).directory_state_by_vault[admin.vaultId]?.explicit_dirs).toContain('Delete Tree/New Local Empty');
 
     expect((await source.syncOnce()).status).toBe('Synced');
     expect(await exists(join(sourceDir, 'Delete Tree', 'Old Branch'))).toBe(false);
@@ -1691,7 +1884,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
   });
 
-  it('marks an active device synced when it acknowledges the current main after a recovered ahead state', async () => {
+  it('marks an active device synced only after an explicit durable-apply acknowledgement', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'pull-ack-ahead-device');
     await mkdirp(deviceDir);
@@ -1715,6 +1908,13 @@ describe('Phase 1 sync without conflict resolution', () => {
       currentLocalMain: state.local_main
     });
     expect(pulled.manifest.target_main).toBe(state.local_main);
+    expect((await server.store.snapshot()).devices.find((device) => device.device_id === state.device_id)?.status).toBe('ahead');
+    const acknowledgement = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/applied`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ applied_main: state.local_main })
+    });
+    expect(acknowledgement.status).toBe(200);
 
     const dashboard = await admin.get<{
       devices: Array<{
@@ -1730,6 +1930,30 @@ describe('Phase 1 sync without conflict resolution', () => {
       behind_main: false,
       last_successful_sync_at: expect.any(String)
     });
+
+    await writeFile(join(deviceDir, 'newer.md'), 'newer\n');
+    expect((await plugin.syncOnce()).status).toBe('Synced');
+    const newerMain = (await plugin.readState()).local_main!;
+    expect(newerMain).not.toBe(state.local_main);
+    const staleAck = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/applied`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ applied_main: state.local_main })
+    });
+    expect(staleAck.status).toBe(409);
+    expect((await staleAck.json() as { error: { code: string } }).error.code).toBe('stale_applied_main');
+
+    await server.store.mutate((db) => {
+      const device = db.devices.find((candidate) => candidate.device_id === state.device_id);
+      if (device) device.status = 'blocked_recovery';
+    });
+    const blockedAck = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/applied`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ applied_main: newerMain })
+    });
+    expect(blockedAck.status).toBe(409);
+    expect((await blockedAck.json() as { error: { code: string } }).error.code).toBe('device_blocked');
   });
 
   it('requires recent dashboard authentication for admin account creation', async () => {
@@ -4422,6 +4646,47 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect((await plugin.syncOnce()).status).toBe('Synced');
     expect(await exists(join(deviceDir, '.obts', 'apply-journal.json'))).toBe(false);
     expect(await exists(join(deviceDir, '.obts', 'apply.lock'))).toBe(false);
+  });
+
+  it('fails closed when a legacy ref lock has no trustworthy age', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'ambiguous-ref-lock-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'ambiguous-ref-lock-device');
+    const state = await plugin.readState();
+    const refPath = join(deviceDir, '.obts', 'git', 'refs', 'heads', 'local');
+    const lockPath = `${refPath}.lock`;
+    await writeFile(lockPath, `${state.local_main}\n`);
+    await utimes(lockPath, new Date(0), new Date(0));
+
+    const restarted = new ObtsPluginClient(deviceDir, { serverUrl: baseUrl, deviceName: 'ambiguous-ref-lock-device' });
+    await expect(restarted.initialize()).rejects.toMatchObject({ code: 'local_ref_recovery_required' });
+    expect(await readFile(lockPath, 'utf8')).toBe(`${state.local_main}\n`);
+    expect(await readFile(refPath, 'utf8')).toBe(`${state.local_main}\n`);
+  });
+
+  it('does not promote a ref stage after losing its ownership lease', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'ref-lease-owner-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'ref-lease-owner-device');
+    const state = await plugin.readState();
+    const internals = (plugin as unknown as { client: Record<string, any> }).client;
+    const originalAssertOwner = internals.assertRefLeaseOwner.bind(internals);
+    let ownershipChecks = 0;
+    internals.assertRefLeaseOwner = async (leasePath: string, nonce: string) => {
+      ownershipChecks += 1;
+      if (ownershipChecks === 2) {
+        await internals.fsp.writeFile(leasePath, `${JSON.stringify({ nonce: 'f'.repeat(16), target: state.local_main })}\n`);
+      }
+      return await originalAssertOwner(leasePath, nonce);
+    };
+
+    await expect(internals.updateRef('refs/heads/local', state.local_main, state.local_main)).rejects.toMatchObject({
+      code: 'local_ref_lease_lost'
+    });
+    expect(await readFile(join(deviceDir, '.obts', 'git', 'refs', 'heads', 'local'), 'utf8')).toBe(`${state.local_main}\n`);
+    expect(ownershipChecks).toBe(2);
   });
 
   it('uses a local apply lock before applying pulled server changes', async () => {

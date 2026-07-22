@@ -200,7 +200,7 @@ describe('opt-in error diagnostics backend', () => {
     legacy.schema_version = 3;
     legacy.devices = [{
       device_id: 'dev_legacy', vault_id: 'vlt_legacy', user_id: 'usr_legacy', device_name: 'legacy', device_ref: 'refs/legacy',
-      device_ref_head: null, status: 'paired', last_applied_main: null, last_seen_at: null, last_successful_sync_at: null,
+      device_ref_head: null, status: 'paired', last_applied_main: null, last_applied_event_seq: 0, last_applied_explicit_dirs: [], pending_applied_main: null, pending_applied_event_seq: 0, pending_applied_explicit_dirs: null, last_seen_at: null, last_successful_sync_at: null,
       local_status_label: 'Blocked', local_error_code: 'legacy', local_error_details: { path: 'private-note.md', secret: 'diagnostic-secret-body' },
       local_queue_status: null, local_main: null, local_head: null, plugin_version: null, path_capabilities: null,
       last_status_report_at: null, onboarding_status: null, onboarding_mode: null, initial_proposal_kind: null,
@@ -212,7 +212,7 @@ describe('opt-in error diagnostics backend', () => {
     const migrated = await createObtsServer({ dataDir: root });
     servers.push(migrated);
     const serialized = JSON.stringify(await migrated.store.snapshot());
-    expect((await migrated.store.snapshot()).schema_version).toBe(4);
+    expect((await migrated.store.snapshot()).schema_version).toBe(5);
     expect(serialized).not.toContain('private-note.md');
     expect(serialized).not.toContain('diagnostic-secret-body');
   });

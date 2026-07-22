@@ -21895,7 +21895,7 @@ var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var { createByteBudget, runBoundedWork } = require_work_pool();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.20";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.21";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_FULL_SCAN_INTERVAL_MS = 5 * 60 * 1e3;
@@ -21913,6 +21913,7 @@ var FILE_WORK_YIELD_EVERY = 25;
 var MOBILE_PACK_READ_ATTEMPTS = 5;
 var MOBILE_PACK_READ_RETRY_MS = 100;
 var RETIRED_OPERATION_GRACE_MS = 1500;
+var REF_LOCK_STALE_MS = 30 * 1e3;
 var PLUGIN_UPDATE_URL = "obsidian://brat?plugin=nareto%2Fobts";
 var DIAGNOSTIC_CONSENT_VERSION = 1;
 var DIAGNOSTIC_CONTEXT = /* @__PURE__ */ Symbol("obtsDiagnosticContext");
@@ -22849,6 +22850,7 @@ var ObtsObsidianClient = class {
     this.pendingConnectionPath = path.join(this.obtsDir, "auth", "pending-connection.json");
     this.bootstrapTransferPath = path.join(this.obtsDir, "bootstrap-transfer.json");
     this.pullTransferPath = path.join(this.obtsDir, "pull-transfer.json");
+    this.pendingAppliedAckPath = path.join(this.obtsDir, "pending-applied-ack.json");
     this.onboardingOperation = false;
     this.queueMutation = Promise.resolve();
     this.packPlanCache = /* @__PURE__ */ new Map();
@@ -22860,6 +22862,7 @@ var ObtsObsidianClient = class {
     await this.fsp.mkdir(path.join(this.obtsDir, "auth"), { recursive: true, mode: 448 });
     await git.init({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, defaultBranch: "local" });
     await git.writeRef({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, ref: "HEAD", value: "refs/heads/local", symbolic: true, force: true });
+    await this.recoverInterruptedRefLocks();
     await this.fsp.mkdir(path.join(this.gitdir, "info"), { recursive: true, mode: 448 });
     await this.fsp.writeFile(path.join(this.gitdir, "info", "exclude"), ".obts/\n.git/\n", { mode: 384 });
     this.plugin.setInitializationStage("Reading local sync state", "startup_state");
@@ -22893,15 +22896,17 @@ var ObtsObsidianClient = class {
         status_label: "Synced",
         last_error_code: null,
         last_event_seq: Math.max(state.last_event_seq || 0, journal.event_seq || 0),
+        last_applied_event_seq: Math.max(state.last_applied_event_seq || 0, journal.event_seq || 0),
         updated_at: nowIso()
       }));
       if (!journal.preserve_local_changes) await this.refreshDirectoryStateFromDisk();
-      await this.clearApplyState();
       if (preservedLocalChangePaths.length > 0) {
         await this.queuePreservedLocalChanges(journal.target_main, state.server_device_ref, preservedLocalSnapshot);
       } else if (pendingDirectoryIntents.length > 0) {
         await this.queuePreservedDirectoryChanges(journal.target_main, state.server_device_ref);
       }
+      await this.writePendingAppliedAcknowledgement(journal.target_main, journal.event_seq || 0);
+      await this.clearApplyState();
       return;
     }
     if (journal && await this.recoverBlockedApplyWithPreservedLocalChanges(journal, state)) {
@@ -23201,6 +23206,7 @@ var ObtsObsidianClient = class {
       status_label: "Checking",
       last_error_code: null,
       last_event_seq: 0,
+      last_applied_event_seq: 0,
       unpaired_baseline_vault_id: null,
       unpaired_baseline_main: null,
       updated_at: nowIso()
@@ -23290,7 +23296,7 @@ var ObtsObsidianClient = class {
     }
     if (mode === "use_server") {
       await this.createRecoveryBundle("replace_local_with_server", self.current_main, localFiles);
-      const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main, "latest", state.last_event_seq || 0);
+      const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main, "latest", state.last_applied_event_seq || 0);
       await this.importPack(pulled.packfile);
       await this.applyTargetMain(
         pulled.manifest.target_main,
@@ -23317,7 +23323,7 @@ var ObtsObsidianClient = class {
     if (!self.server_device_ref) return null;
     await this.createRecoveryBundle("initial_import", self.current_main, localFiles);
     try {
-      const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main, "latest", state.last_event_seq || 0);
+      const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main, "latest", state.last_applied_event_seq || 0);
       await this.importPack(pulled.packfile);
     } catch (error) {
       if (!(error instanceof ObtsTransportError && error.code === "device_blocked")) throw error;
@@ -23391,6 +23397,8 @@ var ObtsObsidianClient = class {
       throw new ObtsBlockedError("not_paired", "Device is not paired.");
     }
     this.throwIfSyncBlocked(state);
+    await this.retryPendingAppliedAcknowledgement();
+    await this.recoverUnacknowledgedServerApply();
     await this.flushEditorBuffersToDisk();
     await this.reconcileQueueWithLocalHead(await this.readState());
     const queueBeforeScan = await this.readQueue();
@@ -23488,7 +23496,7 @@ var ObtsObsidianClient = class {
     }
     const token = await this.readDeviceToken();
     const localFiles = await this.scanSyncableFiles();
-    const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main, "latest", state.last_event_seq || 0);
+    const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main, "latest", state.last_applied_event_seq || 0);
     await this.importPack(pulled.packfile);
     await this.applyTargetMain(
       pulled.manifest.target_main,
@@ -23526,7 +23534,7 @@ var ObtsObsidianClient = class {
     const queue = await this.readQueue();
     const localFiles = await this.scanSyncableFiles();
     const localSnapshot = await this.readFileSnapshot(localFiles);
-    const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main, "latest", state.last_event_seq || 0);
+    const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main, "latest", state.last_applied_event_seq || 0);
     await this.importPack(pulled.packfile);
     const priorLocalFiles = state.local_main ? await this.listTreeFiles(state.local_main) : [];
     const pendingClassification = await this.classifyPendingCommit(queue.pending_commit, state.server_device_ref, pulled.manifest.target_main);
@@ -23845,6 +23853,61 @@ var ObtsObsidianClient = class {
       expected_device_ref: recoveredRef
     }), packfile);
   }
+  async recoverUnacknowledgedServerApply() {
+    const state = await this.readState();
+    const queue = await this.readQueue();
+    if (!state.vault_id || !state.device_id || !state.local_main || state.local_head !== state.local_main || queue.pending_commit || queue.status !== "idle") {
+      return false;
+    }
+    const mayNeedRecovery = state.last_error_code === "sync_error" || (state.last_applied_event_seq || 0) < (state.last_event_seq || 0);
+    if (!mayNeedRecovery) return false;
+    const token = await this.readDeviceToken();
+    const self = await this.getDeviceSelf(token);
+    await this.reconcileServerVaultStatus(self.vault_status, true);
+    if (self.last_applied_main === state.local_main && (self.last_applied_event_seq || 0) > (state.last_applied_event_seq || 0)) {
+      await this.writeState(Object.assign({}, state, {
+        last_applied_event_seq: self.last_applied_event_seq,
+        updated_at: nowIso()
+      }));
+    }
+    if (self.current_main !== state.local_main || self.last_applied_main === self.current_main) {
+      return false;
+    }
+    const pulled = await this.pull(
+      state.vault_id,
+      state.device_id,
+      token,
+      state.local_main,
+      "latest",
+      Number.isSafeInteger(self.last_applied_event_seq) ? self.last_applied_event_seq : 0
+    );
+    await this.importPack(pulled.packfile);
+    const remainingIntents = await this.dropSupersededDirectoryIntentsForRecovery(
+      pulled.manifest.directory_intents || []
+    );
+    if (remainingIntents.length > 0) {
+      throw new ObtsBlockedError(
+        "directory_recovery_ambiguous",
+        "Local directory changes must be synchronized before an interrupted server apply can resume."
+      );
+    }
+    const applied = await this.applyTargetMain(
+      pulled.manifest.target_main,
+      pulled.manifest.changed_paths,
+      true,
+      [],
+      true,
+      pulled.manifest.directory_intents || [],
+      pulled.manifest.explicit_directories || [],
+      pulled.manifest.event_seq,
+      false
+    );
+    if (!applied) return false;
+    await this.acknowledgeAppliedMain(pulled.manifest.target_main);
+    await this.clearResolvedConflictQueue();
+    await this.settleAppliedQueue();
+    return true;
+  }
   async pullAndApply(allowDestructive) {
     let state = await this.readState();
     if (!state.vault_id || !state.device_id) {
@@ -23856,13 +23919,20 @@ var ObtsObsidianClient = class {
     }
     state = await this.readState();
     const token = await this.readDeviceToken();
-    const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main, "latest", state.last_event_seq || 0);
+    const pulled = await this.pull(
+      state.vault_id,
+      state.device_id,
+      token,
+      state.local_main,
+      "latest",
+      state.last_applied_event_seq || 0
+    );
     await this.importPack(pulled.packfile);
     state = await this.readState();
     if (!await this.ensureNoQueuedLocalChangesBeforeApply(state)) {
       return false;
     }
-    await this.applyTargetMain(
+    const applied = await this.applyTargetMain(
       pulled.manifest.target_main,
       pulled.manifest.changed_paths,
       allowDestructive,
@@ -23873,9 +23943,8 @@ var ObtsObsidianClient = class {
       pulled.manifest.event_seq,
       true
     );
-    if (state.local_main !== pulled.manifest.target_main) {
-      await this.acknowledgeAppliedMain(pulled.manifest.target_main);
-    }
+    if (!applied) return false;
+    await this.acknowledgeAppliedMain(pulled.manifest.target_main);
     await this.clearResolvedConflictQueue();
     await this.settleAppliedQueue();
     return true;
@@ -23931,10 +24000,11 @@ var ObtsObsidianClient = class {
     const shouldPull = page.events.some((event) => {
       const main = event && event.commit_cursors ? event.commit_cursors.main : null;
       const hasNewMain = typeof main === "string" && main !== currentState.local_main;
+      const hasDirectoryChanges = Array.isArray(event && event.payload && event.payload.directory_intents) && event.payload.directory_intents.length > 0 && event.event_seq > (currentState.last_applied_event_seq || 0);
       if (wasConflictBlocked) {
-        return event.event_type === "conflict_resolved" && hasNewMain;
+        return event.event_type === "conflict_resolved" && (hasNewMain || hasDirectoryChanges);
       }
-      return (event.event_type === "main_advanced" || event.event_type === "conflict_resolved") && hasNewMain;
+      return (event.event_type === "main_advanced" || event.event_type === "conflict_resolved") && (hasNewMain || hasDirectoryChanges);
     });
     if (!shouldPull) {
       await this.writeState(Object.assign({}, currentState, { last_event_seq: page.current_event_seq, updated_at: nowIso() }));
@@ -23989,6 +24059,7 @@ var ObtsObsidianClient = class {
       status_label: "Not paired",
       last_error_code: null,
       last_event_seq: 0,
+      last_applied_event_seq: 0,
       unpaired_baseline_vault_id: state.vault_id,
       unpaired_baseline_main: baselineMain,
       updated_at: nowIso()
@@ -24020,6 +24091,7 @@ var ObtsObsidianClient = class {
       status_label: "Not paired",
       last_error_code: null,
       last_event_seq: 0,
+      last_applied_event_seq: 0,
       unpaired_baseline_vault_id: null,
       unpaired_baseline_main: null,
       updated_at: nowIso()
@@ -24028,20 +24100,22 @@ var ObtsObsidianClient = class {
   }
   async applyTargetMain(targetMain, changedPaths, allowDestructive, extraAffectedPaths = [], requireCleanVisibleState = false, directoryIntents = [], explicitDirectories = [], eventSeq = void 0, cleanVisibleStateVerified = false) {
     const state = await this.readState();
-    const compactedDirectoryIntents = compactDirectoryIntents(directoryIntents);
+    let compactedDirectoryIntents = compactDirectoryIntents(directoryIntents);
     const explicitDirectorySet = Array.from(new Set(explicitDirectories)).sort();
     const hasDirectoryWork = await this.hasActionableDirectoryWork(compactedDirectoryIntents, explicitDirectorySet);
     if (state.local_main === targetMain && extraAffectedPaths.length === 0 && !hasDirectoryWork) {
+      await this.writePendingAppliedAcknowledgement(targetMain, eventSeq || 0);
       await this.writeState(Object.assign({}, state, {
         status_label: "Synced",
         last_error_code: null,
         last_event_seq: Math.max(state.last_event_seq || 0, eventSeq || 0),
+        last_applied_event_seq: Math.max(state.last_applied_event_seq || 0, eventSeq || 0),
         updated_at: nowIso()
       }));
-      return;
+      return true;
     }
     if (requireCleanVisibleState && !cleanVisibleStateVerified && !await this.ensureNoLocalChangesBeforeApply(state)) {
-      return;
+      return false;
     }
     const applyId = `apply_${Date.now()}_${randomHex(8)}`;
     await this.acquireApplyLock(applyId);
@@ -24077,12 +24151,19 @@ var ObtsObsidianClient = class {
       const targetEntries = await this.listTreeBlobOids(targetMain);
       const targetFiles = new Set(targetEntries.keys());
       const affected = new Set(changedPaths || []);
-      if (state.local_main) {
-        for (const previousPath of await this.listTreeFiles(state.local_main)) {
-          if (!targetFiles.has(previousPath)) {
-            affected.add(previousPath);
-          }
-        }
+      const previousFiles = state.local_main ? await this.listTreeFiles(state.local_main) : [];
+      const previousMaterializedDirectories = new Set(previousFiles.flatMap((filePath) => directoryPrefixes(filePath)));
+      const targetMaterializedDirectories = new Set(explicitDirectorySet);
+      for (const filePath of targetFiles) {
+        for (const dirPath of directoryPrefixes(filePath)) targetMaterializedDirectories.add(dirPath);
+      }
+      const impliedDirectoryDeletes = topmostDirectories(
+        [...previousMaterializedDirectories].filter((dirPath) => !targetMaterializedDirectories.has(dirPath))
+      ).map((dirPath) => ({ op: "delete", path: dirPath }));
+      compactedDirectoryIntents = compactDirectoryIntents([...compactedDirectoryIntents, ...impliedDirectoryDeletes]);
+      journal.directory_intents = compactedDirectoryIntents;
+      for (const previousPath of previousFiles) {
+        if (!targetFiles.has(previousPath)) affected.add(previousPath);
       }
       for (const localPath of extraAffectedPaths) {
         affected.add(localPath);
@@ -24130,7 +24211,7 @@ var ObtsObsidianClient = class {
           await this.fsp.rm(stagedRecovery.partialDir, { recursive: true, force: true }).catch(() => void 0);
           this.plugin.isApplying = false;
           await this.deferApplyForLocalChanges(state);
-          return;
+          return false;
         }
       }
       await writeJson(this.fsp, this.applyJournalPath, journal);
@@ -24198,7 +24279,7 @@ var ObtsObsidianClient = class {
           this.plugin.isApplying = false;
           await this.fsp.rm(this.applyJournalPath, { force: true });
           await this.deferApplyForLocalChanges(state);
-          return;
+          return false;
         }
         journal.phase = "blocked_recovery";
         journal.redacted_error_category = "preflight_hash_changed";
@@ -24268,15 +24349,18 @@ var ObtsObsidianClient = class {
         status_label: "Synced",
         last_error_code: null,
         last_event_seq: Math.max(state.last_event_seq || 0, eventSeq || 0),
+        last_applied_event_seq: Math.max(state.last_applied_event_seq || 0, eventSeq || 0),
         updated_at: nowIso()
       }));
       if (!requireCleanVisibleState) await this.refreshDirectoryStateFromDisk();
-      await this.clearApplyState();
       if (preservedLocalChangePaths.length > 0) {
         await this.queuePreservedLocalChanges(targetMain, state.server_device_ref, preservedLocalSnapshot);
       } else if (preservedDirectoryIntents.length > 0) {
         await this.queuePreservedDirectoryChanges(targetMain, state.server_device_ref);
       }
+      await this.writePendingAppliedAcknowledgement(targetMain, eventSeq || 0);
+      await this.clearApplyState();
+      return true;
     } finally {
       this.plugin.isApplying = false;
       await this.fsp.rm(this.applyLockPath, { force: true });
@@ -24341,15 +24425,17 @@ var ObtsObsidianClient = class {
         status_label: "Synced",
         last_error_code: null,
         last_event_seq: Math.max(state.last_event_seq || 0, journal.event_seq || 0),
+        last_applied_event_seq: Math.max(state.last_applied_event_seq || 0, journal.event_seq || 0),
         updated_at: nowIso()
       }));
       if (!journal.preserve_local_changes) await this.refreshDirectoryStateFromDisk();
-      await this.clearApplyState();
       if (preservedLocalChangePaths.length > 0) {
         await this.queuePreservedLocalChanges(journal.target_main, state.server_device_ref, preservedLocalSnapshot);
       } else if (preservedDirectoryIntents.length > 0) {
         await this.queuePreservedDirectoryChanges(journal.target_main, state.server_device_ref);
       }
+      await this.writePendingAppliedAcknowledgement(journal.target_main, journal.event_seq || 0);
+      await this.clearApplyState();
       return true;
     } catch (error) {
       journal.redacted_error_category = categorizeRecoveryError(error);
@@ -24440,15 +24526,17 @@ var ObtsObsidianClient = class {
         status_label: "Synced",
         last_error_code: null,
         last_event_seq: Math.max(state.last_event_seq || 0, journal.event_seq || 0),
+        last_applied_event_seq: Math.max(state.last_applied_event_seq || 0, journal.event_seq || 0),
         updated_at: nowIso()
       }));
       if (!journal.preserve_local_changes) await this.refreshDirectoryStateFromDisk();
-      await this.clearApplyState();
       if (preservedLocalChangePaths.length > 0) {
         await this.queuePreservedLocalChanges(journal.target_main, state.server_device_ref, preservedLocalSnapshot);
       } else if (preservedDirectoryIntents.length > 0) {
         await this.queuePreservedDirectoryChanges(journal.target_main, state.server_device_ref);
       }
+      await this.writePendingAppliedAcknowledgement(journal.target_main, journal.event_seq || 0);
+      await this.clearApplyState();
       return true;
     } catch (error) {
       journal.redacted_error_category = categorizeRecoveryError(error);
@@ -25455,7 +25543,7 @@ var ObtsObsidianClient = class {
     const capabilities = await this.syncCapabilities();
     if (capabilities) {
       const checkpoint = await readJson(this.fsp, this.pullTransferPath, null);
-      const checkpointMatches = checkpoint && checkpoint.vault_id === vaultId && checkpoint.device_id === deviceId && checkpoint.current_local_main === currentLocalMain && (requestedTarget === "latest" || requestedTarget === checkpoint.target_main);
+      const checkpointMatches = checkpoint && checkpoint.vault_id === vaultId && checkpoint.device_id === deviceId && checkpoint.current_local_main === currentLocalMain && checkpoint.current_event_seq === (currentEventSeq || 0) && (requestedTarget === "latest" || requestedTarget === checkpoint.target_main);
       let cursor = checkpointMatches ? checkpoint.next_cursor : 0;
       let target = checkpointMatches ? checkpoint.target_main : requestedTarget;
       if (checkpoint && !checkpointMatches) await this.fsp.rm(this.pullTransferPath, { force: true });
@@ -25493,6 +25581,7 @@ var ObtsObsidianClient = class {
           vault_id: vaultId,
           device_id: deviceId,
           current_local_main: currentLocalMain,
+          current_event_seq: currentEventSeq || 0,
           target_main: target,
           next_cursor: cursor,
           received_chunks: chunkCount,
@@ -25616,18 +25705,80 @@ var ObtsObsidianClient = class {
     }
     return await response.json();
   }
-  async acknowledgeAppliedMain(targetMain) {
+  async writePendingAppliedAcknowledgement(targetMain, eventSeq) {
+    const existing = await readJson(this.fsp, this.pendingAppliedAckPath, null);
+    if (existing && existing.target_main !== targetMain) {
+      throw new ObtsBlockedError("applied_main_acknowledgement_failed", "A different applied main acknowledgement is still pending.");
+    }
+    await writeJson(this.fsp, this.pendingAppliedAckPath, {
+      target_main: targetMain,
+      event_seq: Number.isSafeInteger(eventSeq) && eventSeq >= 0 ? eventSeq : 0,
+      created_at: existing && typeof existing.created_at === "string" ? existing.created_at : nowIso()
+    });
+  }
+  async readPendingAppliedAcknowledgement() {
+    const pending = await readJson(this.fsp, this.pendingAppliedAckPath, null);
+    if (pending === null) return null;
+    if (!pending || typeof pending !== "object" || !/^[0-9a-f]{40}$/u.test(pending.target_main || "") || !Number.isSafeInteger(pending.event_seq) || pending.event_seq < 0) {
+      throw new ObtsBlockedError("applied_main_acknowledgement_failed", "The pending applied main acknowledgement is invalid.");
+    }
+    return pending;
+  }
+  async retryPendingAppliedAcknowledgement() {
+    const pending = await this.readPendingAppliedAcknowledgement();
+    if (!pending) return false;
     const state = await this.readState();
-    if (!state.vault_id || !state.device_id) {
+    if (state.local_main !== pending.target_main) {
+      throw new ObtsBlockedError("applied_main_acknowledgement_failed", "Local state does not match the pending applied main acknowledgement.");
+    }
+    if ((state.last_applied_event_seq || 0) < pending.event_seq) {
+      await this.writeState(Object.assign({}, state, {
+        last_event_seq: Math.max(state.last_event_seq || 0, pending.event_seq),
+        last_applied_event_seq: pending.event_seq,
+        updated_at: nowIso()
+      }));
+    }
+    await this.completePendingAppliedAcknowledgement(pending, await this.readState());
+    return true;
+  }
+  async completePendingAppliedAcknowledgement(pending, state = void 0) {
+    const currentState = state || await this.readState();
+    if (!currentState.vault_id || !currentState.device_id) return;
+    const token = await this.readDeviceToken();
+    let response;
+    try {
+      response = await postJsonWithBearer(
+        this.url(`/api/v1/vaults/${currentState.vault_id}/sync/applied`),
+        token,
+        { applied_main: pending.target_main }
+      );
+    } catch (error) {
+      if (!(error instanceof ObtsTransportError && error.status === 404)) throw error;
+      let self = await this.getDeviceSelf(token);
+      if (self.last_applied_main !== pending.target_main) {
+        await postJsonWithBearer(
+          this.url(`/api/v1/vaults/${currentState.vault_id}/onboarding/complete`),
+          token,
+          { applied_main: pending.target_main }
+        );
+        self = await this.getDeviceSelf(token);
+      }
+      if (self.last_applied_main !== pending.target_main) {
+        throw new ObtsBlockedError("applied_main_acknowledgement_failed", "The legacy server did not acknowledge the applied main commit.");
+      }
+      await this.fsp.rm(this.pendingAppliedAckPath, { force: true });
       return;
     }
-    try {
-      await this.pull(state.vault_id, state.device_id, await this.readDeviceToken(), targetMain, targetMain, state.last_event_seq || 0);
-    } catch (error) {
-      if (!(error instanceof ObtsTransportError && error.status === 404)) {
-        throw error;
-      }
+    if (response.applied_main !== pending.target_main || response.applied_event_seq < pending.event_seq) {
+      throw new ObtsBlockedError("applied_main_acknowledgement_failed", "The server did not durably acknowledge the applied main commit.");
     }
+    await this.fsp.rm(this.pendingAppliedAckPath, { force: true });
+  }
+  async acknowledgeAppliedMain(targetMain) {
+    const state = await this.readState();
+    if (!state.vault_id || !state.device_id) return;
+    await this.writePendingAppliedAcknowledgement(targetMain, state.last_applied_event_seq || 0);
+    await this.retryPendingAppliedAcknowledgement();
   }
   async ensureNoQueuedLocalChangesBeforeApply(state) {
     const flushedPaths = await this.flushEditorBuffersToDisk();
@@ -25837,24 +25988,130 @@ var ObtsObsidianClient = class {
     await this.fsp.rm(this.applyJournalPath, { force: true });
     await this.fsp.rm(this.applyLockPath, { force: true });
   }
-  async updateRef(ref, target, expected, force = false) {
+  async recoverInterruptedRefLocks() {
+    for (const ref of ["refs/heads/main", "refs/heads/local"]) {
+      await this.recoverLegacyRefLock(ref);
+      await this.recoverOwnedRefLease(ref);
+    }
+  }
+  async validateRecoverableRefTarget(ref, target) {
+    if (!/^[0-9a-f]{40}$/u.test(target) || !await this.commitExists(target)) {
+      throw new ObtsBlockedError("local_ref_recovery_required", "A stale local Git ref lock does not reference a valid commit.");
+    }
+    const current = await this.resolveRefPointer(ref);
+    if (!current) {
+      throw new ObtsBlockedError("local_ref_recovery_required", "A stale local Git ref lock has no safe current ref baseline.");
+    }
+    if (current !== target && !await this.isAncestor(current, target)) {
+      throw new ObtsBlockedError("local_ref_recovery_required", "A stale local Git ref lock diverges from the current ref.");
+    }
+  }
+  async recoverLegacyRefLock(ref) {
+    const lockPath = `${path.join(this.gitdir, ref)}.lock`;
+    let lockStat;
+    try {
+      lockStat = await this.fsp.stat(lockPath);
+    } catch (error) {
+      if (error && error.code === "ENOENT") return "absent";
+      throw new ObtsBlockedError("local_ref_recovery_required", "A local Git ref lock could not be inspected safely.");
+    }
+    const modifiedAt = Number(lockStat.mtimeMs);
+    if (!Number.isFinite(modifiedAt) || modifiedAt <= 0) {
+      throw new ObtsBlockedError("local_ref_recovery_required", "A local Git ref lock has no trustworthy age.");
+    }
+    if (Date.now() - modifiedAt < REF_LOCK_STALE_MS) return "active";
+    let target;
+    try {
+      target = String(await this.fsp.readFile(lockPath, "utf8")).trim();
+    } catch {
+      throw new ObtsBlockedError("local_ref_recovery_required", "A stale local Git ref lock could not be read safely.");
+    }
+    await this.validateRecoverableRefTarget(ref, target);
+    await this.fsp.rm(lockPath, { force: true });
+    return "recovered";
+  }
+  async recoverOwnedRefLease(ref) {
     const refPath = path.join(this.gitdir, ref);
-    const lockPath = `${refPath}.lock`;
+    const leasePath = `${refPath}.obts-lock`;
+    let leaseStat;
+    try {
+      leaseStat = await this.fsp.stat(leasePath);
+    } catch (error) {
+      if (error && error.code === "ENOENT") return "absent";
+      throw new ObtsBlockedError("local_ref_recovery_required", "A local Git ref lease could not be inspected safely.");
+    }
+    const modifiedAt = Number(leaseStat.mtimeMs);
+    if (!Number.isFinite(modifiedAt) || modifiedAt <= 0) {
+      throw new ObtsBlockedError("local_ref_recovery_required", "A local Git ref lease has no trustworthy age.");
+    }
+    if (Date.now() - modifiedAt < REF_LOCK_STALE_MS) return "active";
+    let lease;
+    try {
+      lease = JSON.parse(await this.fsp.readFile(leasePath, "utf8"));
+    } catch {
+      throw new ObtsBlockedError("local_ref_recovery_required", "A stale local Git ref lease is invalid.");
+    }
+    if (!lease || !/^[0-9a-f]{16}$/u.test(lease.nonce || "") || typeof lease.target !== "string") {
+      throw new ObtsBlockedError("local_ref_recovery_required", "A stale local Git ref lease is invalid.");
+    }
+    await this.validateRecoverableRefTarget(ref, lease.target);
+    await this.fsp.rm(leasePath, { force: true });
+    await this.fsp.rm(`${refPath}.obts-stage-${lease.nonce}`, { force: true }).catch(() => void 0);
+    return "recovered";
+  }
+  async assertRefLeaseOwner(leasePath, nonce) {
+    let lease;
+    try {
+      lease = JSON.parse(await this.fsp.readFile(leasePath, "utf8"));
+    } catch {
+      throw new ObtsBlockedError("local_ref_lease_lost", "A local Git ref update lost its ownership lease.");
+    }
+    if (!lease || lease.nonce !== nonce) {
+      throw new ObtsBlockedError("local_ref_lease_lost", "A local Git ref update lost its ownership lease.");
+    }
+  }
+  async releaseRefLease(leasePath, nonce) {
+    try {
+      const lease = JSON.parse(await this.fsp.readFile(leasePath, "utf8"));
+      if (lease && lease.nonce === nonce) await this.fsp.rm(leasePath, { force: true });
+    } catch {
+    }
+  }
+  async updateRef(ref, target, expected, force = false, recoveredLease = false) {
+    const refPath = path.join(this.gitdir, ref);
+    const legacy = await this.recoverLegacyRefLock(ref);
+    if (legacy === "active") {
+      throw new ObtsBlockedError("local_ref_lock_active", "A legacy local Git ref update is still active or was interrupted recently.");
+    }
+    const nonce = randomHex(8);
+    const leasePath = `${refPath}.obts-lock`;
+    const stagePath = `${refPath}.obts-stage-${nonce}`;
     await this.fsp.mkdir(path.dirname(refPath), { recursive: true });
     try {
-      await this.fsp.writeFile(lockPath, `${target}
+      await this.fsp.writeFile(leasePath, `${JSON.stringify({ nonce, target, created_at: nowIso() })}
 `, { flag: "wx", mode: 384 });
     } catch (error) {
-      throw new Error(`Local ref ${ref} is locked by another operation.`, { cause: error });
+      if (!recoveredLease && error && error.code === "EEXIST" && await this.recoverOwnedRefLease(ref) === "recovered") {
+        return await this.updateRef(ref, target, expected, force, true);
+      }
+      if (error && error.code === "EEXIST") {
+        throw new ObtsBlockedError("local_ref_lock_active", "A local Git ref update is still active or was interrupted recently.");
+      }
+      throw error;
     }
     try {
+      await this.fsp.writeFile(stagePath, `${target}
+`, { flag: "wx", mode: 384 });
+      await this.assertRefLeaseOwner(leasePath, nonce);
       if (!force && expected) {
         const current = await this.resolveRef(ref);
-        if (current !== expected) throw new Error(`Local ref ${ref} changed while updating it.`);
+        if (current !== expected) throw new ObtsBlockedError("local_ref_changed", "A local Git ref changed while it was being updated.");
       }
-      await this.fsp.rename(lockPath, refPath);
+      await this.assertRefLeaseOwner(leasePath, nonce);
+      await this.fsp.rename(stagePath, refPath);
     } finally {
-      await this.fsp.rm(lockPath, { force: true }).catch(() => void 0);
+      await this.fsp.rm(stagePath, { force: true }).catch(() => void 0);
+      await this.releaseRefLease(leasePath, nonce);
     }
   }
   async resolveRef(ref) {
@@ -25906,9 +26163,9 @@ var ObtsObsidianClient = class {
     try {
       const state = JSON.parse(await this.fsp.readFile(this.statePath, "utf8"));
       if (await this.hasActiveTokenWithoutIdentity(state)) {
-        return await this.readBackupState() || this.localStateIncomplete(state);
+        return this.normalizeStateEventCursors(await this.readBackupState() || this.localStateIncomplete(state));
       }
-      return await this.preferRecoverableBackupState(state);
+      return this.normalizeStateEventCursors(await this.preferRecoverableBackupState(state));
     } catch {
       if (await exists(this.fsp, this.authPath)) {
         const backupState = await this.readBackupState();
@@ -25927,14 +26184,21 @@ var ObtsObsidianClient = class {
         status_label: "Checking",
         last_error_code: null,
         last_event_seq: 0,
+        last_applied_event_seq: 0,
         unpaired_baseline_vault_id: null,
         unpaired_baseline_main: null,
         updated_at: nowIso()
       };
     }
   }
+  normalizeStateEventCursors(state) {
+    return Object.assign({}, state, {
+      last_event_seq: Number.isSafeInteger(state && state.last_event_seq) && state.last_event_seq >= 0 ? state.last_event_seq : 0,
+      last_applied_event_seq: Number.isSafeInteger(state && state.last_applied_event_seq) && state.last_applied_event_seq >= 0 ? state.last_applied_event_seq : 0
+    });
+  }
   async writeState(state) {
-    const guardedState = await this.guardStateCursorRegression(state);
+    const guardedState = await this.guardStateCursorRegression(this.normalizeStateEventCursors(state));
     await this.backupExistingState();
     await writeJson(this.fsp, this.statePath, guardedState);
   }
@@ -25962,6 +26226,9 @@ var ObtsObsidianClient = class {
     }
     if (currentState.last_event_seq > guardedState.last_event_seq) {
       guardedState.last_event_seq = currentState.last_event_seq;
+    }
+    if (guardedState.local_main === currentState.local_main && (currentState.last_applied_event_seq || 0) > guardedState.last_applied_event_seq) {
+      guardedState.last_applied_event_seq = currentState.last_applied_event_seq;
     }
     if (cursorRegressed) {
       guardedState.status_label = currentState.status_label;
@@ -26010,6 +26277,7 @@ var ObtsObsidianClient = class {
       server_device_ref: backupMatchesQueue ? backupState.server_device_ref : primaryState.server_device_ref,
       initial_import_confirmed: Boolean(primaryState.initial_import_confirmed || backupState.initial_import_confirmed),
       last_event_seq: Math.max(primaryState.last_event_seq || 0, backupState.last_event_seq || 0),
+      last_applied_event_seq: backupState.last_applied_event_seq || 0,
       updated_at: nowIso()
     });
     if (recovered.server_device_ref === primaryState.server_device_ref && primaryState.server_device_ref !== backupState.server_device_ref) {
@@ -26091,6 +26359,7 @@ var ObtsObsidianClient = class {
         status_label: self.status === "review_needed" || self.status === "blocked_recovery" ? "Needs recovery" : "Checking",
         last_error_code: self.status === "review_needed" || self.status === "blocked_recovery" ? "device_blocked" : null,
         last_event_seq: self.event_seq,
+        last_applied_event_seq: self.last_applied_event_seq || 0,
         unpaired_baseline_vault_id: null,
         unpaired_baseline_main: null,
         updated_at: nowIso()
@@ -26145,6 +26414,7 @@ var ObtsObsidianClient = class {
       status_label: "Needs recovery",
       last_error_code: "local_state_incomplete",
       last_event_seq: state && state.last_event_seq || 0,
+      last_applied_event_seq: state && state.last_applied_event_seq || 0,
       unpaired_baseline_vault_id: state && state.unpaired_baseline_vault_id || null,
       unpaired_baseline_main: state && state.unpaired_baseline_main || null,
       updated_at: nowIso()
@@ -26238,6 +26508,56 @@ var ObtsObsidianClient = class {
   }
   async clearPendingDirectoryIntents() {
     await this.refreshDirectoryStateFromDisk([]);
+  }
+  async dropSupersededDirectoryIntentsForRecovery(remoteIntents) {
+    const directoryState = await this.readDirectoryState();
+    if (directoryState.pending_intents.length === 0) return [];
+    const deletePaths = remoteIntents.filter((intent) => intent.op === "delete").map((intent) => intent.path);
+    if (deletePaths.length === 0) return directoryState.pending_intents;
+    const remoteCreateIntents = remoteIntents.filter((candidate) => candidate.op === "create");
+    const remoteCreateTimes = [];
+    for (const intent of remoteCreateIntents) {
+      if (!await this.adapterIsDirectoryStrict(intent.path)) {
+        throw new ObtsBlockedError(
+          "directory_recovery_ambiguous",
+          "A remote directory materialization marker is missing during legacy recovery."
+        );
+      }
+      const creationTime = await this.adapterDirectoryCreationTime(intent.path);
+      if (creationTime === null) {
+        throw new ObtsBlockedError(
+          "directory_recovery_ambiguous",
+          "A remote directory materialization marker has no trustworthy identity."
+        );
+      }
+      remoteCreateTimes.push(creationTime);
+    }
+    const localApplyBoundary = remoteCreateTimes.length > 0 ? Math.min(...remoteCreateTimes) : null;
+    if (localApplyBoundary === null) {
+      throw new ObtsBlockedError(
+        "directory_recovery_ambiguous",
+        "The legacy directory apply has no local materialization boundary for safe recovery."
+      );
+    }
+    const remaining = [];
+    for (const intent of directoryState.pending_intents) {
+      const coveredByRemoteDelete = intent.op === "create" && deletePaths.some(
+        (deletedPath) => intent.path === deletedPath || intent.path.startsWith(`${deletedPath}/`)
+      );
+      if (!coveredByRemoteDelete) {
+        remaining.push(intent);
+        continue;
+      }
+      const isDirectory = await this.adapterIsDirectoryStrict(intent.path);
+      if (!isDirectory) continue;
+      const creationTime = await this.adapterDirectoryCreationTime(intent.path);
+      if (creationTime === null || creationTime >= localApplyBoundary) remaining.push(intent);
+    }
+    await this.writeDirectoryState(Object.assign({}, directoryState, {
+      pending_intents: remaining,
+      updated_at: nowIso()
+    }));
+    return remaining;
   }
   async preserveDirectoryChangesFromTarget(targetEntries, explicitDirectories, residualTombstoneDirectories = /* @__PURE__ */ new Set()) {
     const previous = await this.readDirectoryState();

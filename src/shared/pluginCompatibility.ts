@@ -1,6 +1,6 @@
 export const MINIMUM_PLUGIN_VERSION = '0.2.0';
 // Updated by scripts/plugin-version.mjs after a release version is selected.
-export const RECOMMENDED_PLUGIN_VERSION = '0.4.20';
+export const RECOMMENDED_PLUGIN_VERSION = '0.4.21';
 export const PLUGIN_UPDATE_URL = 'obsidian://brat?plugin=nareto%2Fobts';
 export const LEGACY_PLUGIN_VERSION = '0.1.17-phase3';
 
@@ -19,6 +19,13 @@ type ParsedVersion = {
   patch: number;
   prerelease: string[];
 };
+
+export function isPluginVersionAtLeast(version: string | undefined, minimumVersion: string): boolean {
+  if (!version) return false;
+  const current = parseVersion(version);
+  const minimum = parseVersion(minimumVersion);
+  return current !== null && minimum !== null && compareVersions(current, minimum) >= 0;
+}
 
 export function describePluginCompatibility(version: string): PluginCompatibility {
   const current = parseVersion(version);

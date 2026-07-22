@@ -11,6 +11,7 @@ import { newId, nowIso } from '../shared/ids.js';
 import { isSyncableVaultPath } from '../shared/pathPolicy.js';
 import {
   describePluginCompatibility,
+  isPluginVersionAtLeast,
   LEGACY_PLUGIN_VERSION,
   type PluginCompatibility
 } from '../shared/pluginCompatibility.js';
@@ -685,6 +686,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       vault_status: deviceAuth.vault.status,
       status: deviceAuth.device.status,
       last_applied_main: deviceAuth.device.last_applied_main,
+      last_applied_event_seq: deviceAuth.device.last_applied_event_seq,
       event_seq: db.event_seq_by_vault[deviceAuth.vault.vault_id] ?? 0
     };
   });
@@ -801,7 +803,22 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       : (await git.changedPaths(vaultId, have, targetMain)).map((entry) => entry.path);
     const db = await store.snapshot();
     const currentEventSeq = Number.isSafeInteger(pullRequest.current_event_seq) ? pullRequest.current_event_seq ?? 0 : 0;
-    const eventSnapshot = eventSnapshotForTarget(db, vaultId, targetMain, currentEventSeq);
+    const usesAcknowledgedDirectorySnapshot = currentEventSeq === deviceAuth.device.last_applied_event_seq;
+    if (
+      usesAcknowledgedDirectorySnapshot && deviceAuth.device.last_applied_explicit_dirs === null &&
+      isPluginVersionAtLeast(pullRequest.plugin_version, '0.4.21')
+    ) {
+      throw new AuthError(409, 'directory_snapshot_unavailable', 'The acknowledged directory snapshot is unavailable for safe replay.');
+    }
+    const eventSnapshot = eventSnapshotForTarget(
+      db,
+      vaultId,
+      targetMain,
+      currentEventSeq,
+      usesAcknowledgedDirectorySnapshot && Array.isArray(deviceAuth.device.last_applied_explicit_dirs)
+        ? deviceAuth.device.last_applied_explicit_dirs
+        : undefined
+    );
     const chunk = await createPullObjectChunk(git, vaultId, targetMain, have, pullRequest.cursor, config);
     const manifest: ChunkPullManifest = {
       api_version: API_VERSION,
@@ -820,12 +837,27 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       chunk_sha256: sha256Hex(chunk.packfile),
       chunk_bytes: chunk.packfile.byteLength
     };
-    if (pullRequest.current_local_main === targetMain && chunk.complete) {
+    if (isPluginVersionAtLeast(pullRequest.plugin_version, '0.4.21') && chunk.complete) {
+      await store.mutate((mutableDb) => {
+        const device = mutableDb.devices.find((candidate) => candidate.device_id === deviceAuth.device.device_id);
+        if (device) {
+          device.pending_applied_main = targetMain;
+          device.pending_applied_event_seq = eventSnapshot.eventSeq;
+          device.pending_applied_explicit_dirs = eventSnapshot.explicitDirectories;
+        }
+      });
+    }
+    if (
+      !isPluginVersionAtLeast(pullRequest.plugin_version, '0.4.21') &&
+      pullRequest.current_local_main === targetMain && targetMain === deviceAuth.vault.current_main && chunk.complete
+    ) {
       await store.mutate((mutableDb) => {
         const device = mutableDb.devices.find((candidate) => candidate.device_id === deviceAuth.device.device_id);
         if (device && device.status !== 'revoked' && device.status !== 'review_needed' && device.status !== 'blocked_recovery') {
           device.status = 'synced';
           device.last_applied_main = targetMain;
+          device.last_applied_event_seq = eventSnapshot.eventSeq;
+          device.last_applied_explicit_dirs = eventSnapshot.explicitDirectories;
           device.last_successful_sync_at = nowIso();
         }
       });
@@ -866,8 +898,22 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const changedPaths = allChangedPaths.filter((path) => isSyncableVaultPath(path));
     const db = await store.snapshot();
     const currentEventSeq = Number.isSafeInteger(pullRequest.current_event_seq) ? pullRequest.current_event_seq ?? 0 : 0;
-    const directoryEvents = db.events.filter((event) => event.vault_id === vaultId && event.event_seq > currentEventSeq);
-    const directoryState = db.directory_state_by_vault[vaultId];
+    const usesAcknowledgedDirectorySnapshot = currentEventSeq === deviceAuth.device.last_applied_event_seq;
+    if (
+      usesAcknowledgedDirectorySnapshot && deviceAuth.device.last_applied_explicit_dirs === null &&
+      isPluginVersionAtLeast(pullRequest.plugin_version, '0.4.21')
+    ) {
+      throw new AuthError(409, 'directory_snapshot_unavailable', 'The acknowledged directory snapshot is unavailable for safe replay.');
+    }
+    const eventSnapshot = eventSnapshotForTarget(
+      db,
+      vaultId,
+      targetMain,
+      currentEventSeq,
+      usesAcknowledgedDirectorySnapshot && Array.isArray(deviceAuth.device.last_applied_explicit_dirs)
+        ? deviceAuth.device.last_applied_explicit_dirs
+        : undefined
+    );
     const manifest: DevicePullManifest = {
       api_version: API_VERSION,
       vault_id: vaultId,
@@ -875,17 +921,32 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       target_main: targetMain,
       changed_paths: [...new Set(changedPaths)].sort(),
       current_local_main_is_ancestor: currentLocalMainIsAncestor,
-      event_seq: db.event_seq_by_vault[vaultId] ?? 0,
-      directory_intents: directoryIntentsFromEvents(directoryEvents),
-      explicit_directories: directoryState?.explicit_dirs ?? []
+      event_seq: eventSnapshot.eventSeq,
+      directory_intents: eventSnapshot.directoryIntents,
+      explicit_directories: eventSnapshot.explicitDirectories
     };
     const packfile = await git.exportPack(vaultId, targetMain, have);
-    if (pullRequest.current_local_main === targetMain) {
+    if (isPluginVersionAtLeast(pullRequest.plugin_version, '0.4.21')) {
+      await store.mutate((mutableDb) => {
+        const device = mutableDb.devices.find((candidate) => candidate.device_id === deviceAuth.device.device_id);
+        if (device) {
+          device.pending_applied_main = targetMain;
+          device.pending_applied_event_seq = eventSnapshot.eventSeq;
+          device.pending_applied_explicit_dirs = eventSnapshot.explicitDirectories;
+        }
+      });
+    }
+    if (
+      !isPluginVersionAtLeast(pullRequest.plugin_version, '0.4.21') &&
+      pullRequest.current_local_main === targetMain && targetMain === deviceAuth.vault.current_main
+    ) {
       await store.mutate((mutableDb) => {
         const device = mutableDb.devices.find((candidate) => candidate.device_id === deviceAuth.device.device_id);
         if (device && device.status !== 'revoked' && device.status !== 'review_needed' && device.status !== 'blocked_recovery') {
           device.status = 'synced';
           device.last_applied_main = targetMain;
+          device.last_applied_event_seq = eventSnapshot.eventSeq;
+          device.last_applied_explicit_dirs = eventSnapshot.explicitDirectories;
           device.last_successful_sync_at = nowIso();
         }
       });
@@ -928,6 +989,71 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     };
   });
 
+  app.post('/api/v1/vaults/:vaultId/sync/applied', async (request) => {
+    const { vaultId } = pathParams(request);
+    return await sync.runWithVaultLock(vaultId, async () => {
+      const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+      const appliedMain = readCommitId(requestBody(request), 'applied_main');
+      if (deviceAuth.vault.status === 'blocked_integrity') {
+        throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+      }
+      if (!(await git.commitExists(vaultId, appliedMain)) || !(await git.isAncestor(vaultId, appliedMain, deviceAuth.vault.current_main))) {
+        throw new AuthError(409, 'invalid_applied_main', 'Applied main is not trusted vault history.');
+      }
+      const expectedAppliedMain = deviceAuth.device.last_applied_main;
+      if (expectedAppliedMain && !(await git.isAncestor(vaultId, expectedAppliedMain, appliedMain))) {
+        throw new AuthError(409, 'stale_applied_main', 'Applied main acknowledgement would regress the device cursor.');
+      }
+      const acknowledged = await store.mutate((db) => {
+        const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
+        const device = db.devices.find((candidate) => candidate.device_id === deviceAuth.device.device_id);
+        if (!vault || vault.status === 'blocked_integrity') {
+          throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+        }
+        if (!device || device.last_applied_main !== expectedAppliedMain) {
+          throw new AuthError(409, 'stale_applied_main', 'Device applied main changed while acknowledging it.');
+        }
+        if (device.status === 'revoked' || device.status === 'review_needed' || device.status === 'blocked_recovery') {
+          throw new AuthError(409, 'device_blocked', 'Device requires review or recovery before acknowledging server state.');
+        }
+        const snapshot = device.last_applied_main === appliedMain && Array.isArray(device.last_applied_explicit_dirs)
+          ? {
+              eventSeq: device.last_applied_event_seq,
+              directoryIntents: [],
+              explicitDirectories: device.last_applied_explicit_dirs
+            }
+          : appliedMain === vault.current_main
+            ? eventSnapshotForTarget(db, vaultId, appliedMain, device.last_applied_event_seq)
+            : device.pending_applied_main === appliedMain && Array.isArray(device.pending_applied_explicit_dirs)
+              ? {
+                  eventSeq: device.pending_applied_event_seq,
+                  directoryIntents: [],
+                  explicitDirectories: device.pending_applied_explicit_dirs
+                }
+              : null;
+        if (!snapshot) {
+          throw new AuthError(409, 'applied_snapshot_unavailable', 'The delivered directory snapshot for this applied main is unavailable.');
+        }
+        device.last_applied_main = appliedMain;
+        device.last_applied_event_seq = snapshot.eventSeq;
+        device.last_applied_explicit_dirs = snapshot.explicitDirectories;
+        if (device.pending_applied_main === appliedMain) {
+          device.pending_applied_main = null;
+          device.pending_applied_event_seq = 0;
+          device.pending_applied_explicit_dirs = null;
+        }
+        device.status = appliedMain === vault.current_main ? 'synced' : 'paired';
+        device.last_successful_sync_at = nowIso();
+        return snapshot;
+      });
+      return {
+        status: 'ok',
+        applied_main: appliedMain,
+        applied_event_seq: acknowledged.eventSeq
+      };
+    });
+  });
+
   app.post('/api/v1/vaults/:vaultId/onboarding/complete', async (request) => {
     const { vaultId } = pathParams(request);
     const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
@@ -936,14 +1062,35 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     if (!(await git.commitExists(vaultId, appliedMain)) || !(await git.isAncestor(vaultId, appliedMain, deviceAuth.vault.current_main))) {
       throw new AuthError(409, 'invalid_applied_main', 'Applied main is not trusted vault history.');
     }
-    await connections.markComplete(deviceAuth.device.device_id);
     await store.mutate((db) => {
+      const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
       const device = db.devices.find((candidate) => candidate.device_id === deviceAuth.device.device_id);
-      if (device) {
+      if (device && vault) {
+        const snapshot = device.last_applied_main === appliedMain && Array.isArray(device.last_applied_explicit_dirs)
+          ? {
+              eventSeq: device.last_applied_event_seq,
+              directoryIntents: [],
+              explicitDirectories: device.last_applied_explicit_dirs
+            }
+          : appliedMain === vault.current_main
+            ? eventSnapshotForTarget(db, vaultId, appliedMain, device.last_applied_event_seq)
+            : device.pending_applied_main === appliedMain && Array.isArray(device.pending_applied_explicit_dirs)
+              ? {
+                  eventSeq: device.pending_applied_event_seq,
+                  directoryIntents: [],
+                  explicitDirectories: device.pending_applied_explicit_dirs
+                }
+              : null;
+        if (!snapshot) {
+          throw new AuthError(409, 'applied_snapshot_unavailable', 'The delivered directory snapshot for this applied main is unavailable.');
+        }
         device.last_applied_main = appliedMain;
-        device.status = appliedMain === deviceAuth.vault.current_main ? 'synced' : 'paired';
+        device.last_applied_event_seq = snapshot.eventSeq;
+        device.last_applied_explicit_dirs = snapshot.explicitDirectories;
+        device.status = appliedMain === vault.current_main ? 'synced' : 'paired';
       }
     });
+    await connections.markComplete(deviceAuth.device.device_id);
     return { status: 'ok' };
   });
 
@@ -1843,8 +1990,26 @@ function eventSnapshotForTarget(
   db: MetadataDb,
   vaultId: string,
   targetMain: string,
-  afterEventSeq: number
+  afterEventSeq: number,
+  baseExplicitDirectories?: string[]
 ): { eventSeq: number; directoryIntents: DirectoryIntent[]; explicitDirectories: string[] } {
+  const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
+  const currentDirectoryState = db.directory_state_by_vault[vaultId];
+  if (vault?.current_main === targetMain) {
+    const explicitDirectories = [...(currentDirectoryState?.explicit_dirs ?? [])].sort();
+    const eventSeq = db.event_seq_by_vault[vaultId] ?? currentDirectoryState?.last_event_seq ?? 0;
+    const directoryIntents = baseExplicitDirectories === undefined
+      ? directoryIntentsFromEvents(db.events.filter((event) =>
+        event.vault_id === vaultId && event.event_seq > afterEventSeq && event.event_seq <= eventSeq
+      ))
+      : directoryIntentsBetweenSnapshots(baseExplicitDirectories, explicitDirectories);
+    return {
+      eventSeq,
+      directoryIntents,
+      explicitDirectories
+    };
+  }
+
   const vaultEvents = db.events
     .filter((event) => event.vault_id === vaultId)
     .sort((left, right) => left.event_seq - right.event_seq);
@@ -1867,6 +2032,19 @@ function eventSnapshotForTarget(
     }
   }
   return { eventSeq, directoryIntents, explicitDirectories: [...explicit].sort() };
+}
+
+function directoryIntentsBetweenSnapshots(previous: string[], current: string[]): DirectoryIntent[] {
+  const previousSet = new Set(previous);
+  const currentSet = new Set(current);
+  const deleted = previous
+    .filter((path) => !currentSet.has(path))
+    .filter((path) => !previous.some((candidate) => candidate !== path && path.startsWith(`${candidate}/`) && !currentSet.has(candidate)))
+    .map((path) => ({ op: 'delete' as const, path }));
+  const created = current
+    .filter((path) => !previousSet.has(path))
+    .map((path) => ({ op: 'create' as const, path }));
+  return compactDirectoryIntents([...deleted, ...created]);
 }
 
 function directoryIntentsFromEvents(events: Array<{ payload: Record<string, unknown> }>): DirectoryIntent[] {
@@ -2560,7 +2738,7 @@ async function buildReadinessSummary(
     metadata_store: metadataStoreReady,
     git: gitReady.ok,
     setup_complete: db.setup_complete,
-    migrations: db.schema_version === 4,
+    migrations: db.schema_version === 5,
     git_store: gitStoreReady.ok,
     temp_workspace: tempWorkspaceReady.ok,
     filesystem_permissions: filesystemPermissions,
@@ -2617,7 +2795,7 @@ function checkEventDelivery(db: MetadataDb): { ok: true } | { ok: false; error: 
 type PersistentStateCheck = { ok: true } | { ok: false; error: string; vaultId?: string };
 
 async function checkPersistentState(db: MetadataDb, git: GitService): Promise<PersistentStateCheck> {
-  if (db.schema_version !== 4) {
+  if (db.schema_version !== 5) {
     return { ok: false, error: 'metadata schema version is unsupported' };
   }
   try {

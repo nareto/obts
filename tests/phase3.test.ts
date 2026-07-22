@@ -49,12 +49,12 @@ describe('Phase 3 deployable history state', () => {
     const store = new MetadataStore(root);
     await store.initialize();
     const upgraded = await store.snapshot();
-    expect(upgraded.schema_version).toBe(4);
+    expect(upgraded.schema_version).toBe(5);
     expect(upgraded.derived_history_by_vault).toEqual({});
     expect(upgraded.diagnostic_events).toEqual([]);
 
     expect(JSON.parse(await readFile(join(metadataDir, 'phase1.json'), 'utf8'))).toMatchObject({
-      schema_version: 4,
+      schema_version: 5,
       connections: [],
       diagnostic_events: [],
       derived_history_by_vault: {}
@@ -63,10 +63,79 @@ describe('Phase 3 deployable history state', () => {
     const reloaded = new MetadataStore(root);
     await reloaded.initialize();
     expect(await reloaded.snapshot()).toMatchObject({
-      schema_version: 4,
+      schema_version: 5,
       connections: [],
       diagnostic_events: [],
       derived_history_by_vault: {}
+    });
+  });
+
+  it('migrates current directory snapshots and marks truncated behind snapshots ambiguous', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'obts-phase3-directory-snapshot-upgrade-'));
+    roots.push(root);
+    const metadataDir = join(root, 'metadata');
+    await mkdir(metadataDir, { recursive: true });
+    const device = (deviceId: string, lastAppliedMain: string) => ({
+      device_id: deviceId,
+      vault_id: 'vlt_snapshot',
+      user_id: 'usr_snapshot',
+      device_name: deviceId,
+      device_ref: `refs/obts/devices/${deviceId}`,
+      device_ref_head: null,
+      status: 'synced',
+      last_applied_main: lastAppliedMain,
+      last_seen_at: null,
+      last_successful_sync_at: null,
+      local_status_label: null,
+      local_error_code: null,
+      local_queue_status: null,
+      local_main: lastAppliedMain,
+      local_head: lastAppliedMain,
+      plugin_version: '0.4.20',
+      path_capabilities: null,
+      last_status_report_at: null,
+      onboarding_status: 'complete',
+      onboarding_mode: 'initialize',
+      initial_proposal_kind: null,
+      initial_proposal_base: null,
+      onboarding_connection_id: null,
+      onboarding_completed_at: null,
+      created_at: new Date().toISOString(),
+      revoked_at: null
+    });
+    const currentMain = 'c'.repeat(40);
+    const behindMain = 'b'.repeat(40);
+    await writeFile(join(metadataDir, 'phase1.json'), `${JSON.stringify({
+      schema_version: 4,
+      setup_complete: false,
+      users: [],
+      sessions: [],
+      vaults: [{
+        vault_id: 'vlt_snapshot', owner_user_id: 'usr_snapshot', display_name: 'Snapshot', status: 'active',
+        root_commit: 'a'.repeat(40), current_main: currentMain, created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+      }],
+      devices: [device('dev_current', currentMain), device('dev_behind', behindMain)],
+      connections: [], tokens: [], login_attempts: [], sync_operations: [], conflicts: [], audit_log: [], diagnostic_events: [],
+      events: [{
+        event_id: 'evt_current', event_seq: 10, created_at: new Date().toISOString(), event_type: 'main_advanced', vault_id: 'vlt_snapshot',
+        resource_ids: {}, commit_cursors: { main: currentMain, previous_main: behindMain }, payload: { directory_intents: [{ op: 'create', path: '.trash/current' }] }
+      }],
+      event_seq_by_vault: { vlt_snapshot: 10 },
+      merge_sequence_by_vault: {},
+      directory_state_by_vault: { vlt_snapshot: { explicit_dirs: ['.trash/current'], updated_at: new Date().toISOString(), last_event_seq: 10 } },
+      derived_history_by_vault: {}
+    }, null, 2)}\n`);
+
+    const store = new MetadataStore(root);
+    await store.initialize();
+    const migrated = await store.snapshot();
+    expect(migrated.devices.find((entry) => entry.device_id === 'dev_current')).toMatchObject({
+      last_applied_event_seq: 10,
+      last_applied_explicit_dirs: ['.trash/current']
+    });
+    expect(migrated.devices.find((entry) => entry.device_id === 'dev_behind')).toMatchObject({
+      last_applied_event_seq: 0,
+      last_applied_explicit_dirs: null
     });
   });
 
