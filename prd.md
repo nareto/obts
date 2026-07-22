@@ -172,6 +172,7 @@ Acceptance criteria:
 - On startup and before sync decisions, the scanner commits visible filesystem differences to the local Git journal when path policy validation passes.
 - Watcher hints remain `Checking` until a scan proves a local commit exists; an unchanged scan clears its durable hint, and only a real unmerged local commit is `Ahead`.
 - Frequent remote event polling does not rescan vault contents. Full local scans run on startup, after watcher hints, and on a slower fallback cadence to catch missed events.
+- One sync decision reuses its coherent local snapshot instead of repeating whole-vault content checks around network transfer; apply revalidates affected paths immediately before writes and performs one explicitly labelled post-apply preservation scan.
 - If `state.json` is missing, corrupt, or incomplete but the device token and local Git journal are intact, the plugin rehydrates non-secret identity/ref metadata from the server and resumes normal commit/upload behavior without reset or reconnect.
 - `.obts/` is excluded from vault sync, Git worktree content, and manifest/path scanning.
 - Retrying an upload of the same Git commit is idempotent.
@@ -194,6 +195,7 @@ Acceptance criteria:
 - Watcher events caused by `obts` apply writes are suppressed or tagged so they are not recommitted as new local edits.
 - On restart, the plugin inspects the apply journal and either finishes an idempotent apply, rolls forward to target `main`, or blocks with recovery options.
 - If a file changed unexpectedly after preflight, apply stops and surfaces recovery instead of overwriting.
+- Long-running checking and apply phases continue reporting device heartbeats and retain their truthful active status; elapsed local work alone never changes status to `Offline`.
 - The plugin can recover after crash during apply.
 - The plugin has one v1 apply behavior: automatically pull and apply server `main` after preflight, apply journal creation, recovery bundle creation, and watcher suppression setup succeed.
 - If automatic apply cannot proceed safely, the plugin blocks sync, preserves local state, surfaces the blocked status, and directs the owner to the dashboard conflict or recovery workflow.
@@ -279,6 +281,8 @@ Acceptance criteria:
 - Conflict resolution submission requires a valid dashboard session and CSRF token, but does not require password re-authentication beyond the normal session.
 
 ### 3.8 Device Dashboard
+
+The dashboard refreshes the selected vault status at least every 15 seconds while visible and immediately after regaining focus. Device convergence and report freshness come from the latest server response; the browser does not independently age cached `Synced` rows into `Status unknown` without first refetching.
 
 The dashboard shows:
 
@@ -440,6 +444,8 @@ Dashboard and plugin status labels must use this shared vocabulary:
 | Needs recovery | Danger | A recovery bundle or reset/reconnect flow is required. |
 | Unsafe local state | Danger | Local apply or upload is blocked to avoid data loss. |
 | Integrity failure | Danger | Persistent state is inconsistent and mutations are blocked. |
+
+A progressing operation that exceeds its normal duration remains `Checking` or `Applying` with a taking-longer detail and periodic status heartbeat. `Offline` is reserved for transport unavailability or an expired server-observed device heartbeat, never elapsed local processing time. A stale foreground-mobile report may therefore be `Status unknown` without implying failed synchronization.
 
 #### 3.9.5 Overview Page Wireframe
 
@@ -1147,7 +1153,7 @@ Every recovery bundle contains:
 
 - `manifest.json` with bundle ID, vault ID, device ID, created timestamp, operation type, target `main`, prior local `main`, prior local device ref, affected paths, platform, plugin version, and checksum manifest;
 - `files/` with pre-apply snapshots of every file that will be deleted, overwritten, or renamed;
-- `git/local-refs.pack` with local commits and refs needed to recover pending local history;
+- `git/local-refs.pack` with only local commits and objects not already reachable from the recorded prior local `main`; the file is empty when no local-only history exists;
 - `patches/` with text patch series for changed Markdown, `.canvas`, `.base`, and text configuration files;
 - `journal/apply-journal.json` with the apply journal state at bundle creation;
 - `checksums.sha256` covering every file in the bundle.
@@ -1158,6 +1164,7 @@ Local apply/recovery rules:
 - recovery bundles are staged under an incomplete temporary name and become eligible for journal publication only after their files, patches, refs pack, manifest, checksums, and completion marker are durable; startup may remove incomplete unreferenced staging directories;
 - recovery bundles are created before file deletes, overwrites, renames, replace-local, rebuild, reset, or any operation that removes or overwrites local content;
 - recovery bundle creation failure blocks the destructive operation;
+- a delta refs pack is restored against the recorded prior local `main`; initial import or detached history without that base retains the complete required local closure;
 - recovery bundles are retained until the user explicitly deletes them;
 - diagnostics exports must redact or omit recovery bundle content unless the owner explicitly requests a content-bearing export.
 

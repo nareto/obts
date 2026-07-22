@@ -689,7 +689,8 @@ describe('mobile plugin artifact', () => {
     runtimeClient.syncOnce = async () => {
       fullScans += 1;
       (runtimePlugin as any).markFullScanCompleted();
-      throw new Error('network unavailable after scan');
+      const TransportError = (module.exports as any).TransportError;
+      throw new TransportError(0, 'network_error', 'network unavailable after scan');
     };
     (runtimePlugin as any).lastFullScanCompletedAt = Date.now();
     for (let index = 0; index < 10; index += 1) await (runtimePlugin as any).runBackgroundSync();
@@ -799,9 +800,28 @@ describe('mobile plugin artifact', () => {
 
     const replacement = new PluginClass();
     replacement.app = plugin.app;
+    const originalOperationSetTimeout = (context as any).setTimeout;
+    const operationTimerCallbacks: Array<() => void> = [];
+    (context as any).setTimeout = (callback: () => void, milliseconds: number) => {
+      if (milliseconds === 30 * 1000) {
+        operationTimerCallbacks.push(callback);
+        return 90_000 + operationTimerCallbacks.length;
+      }
+      return originalOperationSetTimeout(callback, milliseconds);
+    };
+    let operationStatusReports = 0;
+    (plugin as any).client.reportDeviceStatus = async () => { operationStatusReports += 1; };
     expect((plugin as any).beginSync()).toBe(true);
-    (plugin as any).syncRunningSince = Date.now() - 60 * 60 * 1000;
+    (plugin as any).setOperationProgress('Applying 1/2', 'apply_write');
+    expect((plugin as any).operationStatusHeartbeatTimer).not.toBeNull();
     expect((plugin as any).isSyncInProgress()).toBe(true);
+    expect(statusItem.text).toBe('obts: Applying 1/2');
+    for (const callback of operationTimerCallbacks) callback();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(operationStatusReports).toBe(1);
+    expect(statusItem.text).toContain('taking longer than expected');
+    (context as any).setTimeout = originalOperationSetTimeout;
     await (replacement as any).onload();
     expect((replacement as any).clientReady).toBe(false);
     expect((replacement as any).beginSync()).toBe(false);

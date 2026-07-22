@@ -22,11 +22,11 @@
     NoteHistoryVersion,
     NoteHistoryVersionResponse,
     Session,
-    StatusLabel,
     VaultSummary
   } from './api/types';
 
   const api = new DashboardApi();
+  const DASHBOARD_REFRESH_INTERVAL_MS = 15 * 1000;
   const nav = ['Overview', 'Devices', 'Conflicts', 'History', 'Maintenance', 'Settings'] as const;
   type Page = (typeof nav)[number];
 
@@ -69,35 +69,29 @@
   let actionError = '';
   let lastRefreshed: string | null = null;
   let nowMs = Date.now();
+  let dashboardRefreshInFlight = false;
+  let dashboardRefreshGeneration = 0;
+  let dashboardStatusCurrent = true;
 
   $: selectedVault = vaults.find((vault) => vault.vault_id === vaultId) ?? null;
-  $: unresolvedCount = conflicts.filter((conflict) => conflict.status === 'open').length || dashboard?.unresolved_conflict_count || 0;
+  $: unresolvedCount = dashboard?.unresolved_conflict_count ?? conflicts.filter((conflict) => conflict.status === 'open').length;
   $: selectedConflict = conflicts.find((conflict) => conflict.conflict_id === selectedConflictId) ?? null;
   $: recentAuthValid = session ? Date.parse(session.recent_auth_expires_at) > nowMs : false;
-  $: syncSummary = dashboardSyncSummary(dashboard, nowMs);
+  $: syncSummary = dashboardSyncSummary(dashboard, dashboardStatusCurrent);
 
-  function effectiveStatusLabel(device: DashboardDevice, currentTime: number): StatusLabel {
-    if (
-      device.status_label === 'Synced' &&
-      (!device.last_status_report_at || currentTime - Date.parse(device.last_status_report_at) > 5 * 60 * 1000)
-    ) {
-      return 'Status unknown';
-    }
-    return device.status_label;
-  }
-
-  function dashboardSyncSummary(value: DashboardSummary | null, currentTime: number): {
+  function dashboardSyncSummary(value: DashboardSummary | null, statusCurrent: boolean): {
     label: string;
     role: 'success' | 'info' | 'warning' | 'danger' | 'neutral';
   } {
     if (!value) return { label: 'Checking', role: 'neutral' };
+    if (!statusCurrent) return { label: 'Status unknown', role: 'warning' };
     if (value.vault.status !== 'active') return { label: 'Integrity failure', role: 'danger' };
     if (value.devices.length === 0) return { label: 'Status unknown', role: 'warning' };
-    if (value.devices.every((device) => effectiveStatusLabel(device, currentTime) === 'Synced')) return { label: 'Synced', role: 'success' };
-    if (value.devices.some((device) => ['Blocked', 'Needs recovery', 'Unsafe local state', 'Integrity failure'].includes(effectiveStatusLabel(device, currentTime)))) {
+    if (value.devices.every((device) => device.status_label === 'Synced')) return { label: 'Synced', role: 'success' };
+    if (value.devices.some((device) => ['Blocked', 'Needs recovery', 'Unsafe local state', 'Integrity failure'].includes(device.status_label))) {
       return { label: 'Attention required', role: 'danger' };
     }
-    if (value.devices.some((device) => ['Preparing upload', 'Uploading', 'Applying', 'Merging'].includes(effectiveStatusLabel(device, currentTime)))) {
+    if (value.devices.some((device) => ['Preparing upload', 'Uploading', 'Applying', 'Merging'].includes(device.status_label))) {
       return { label: 'Sync in progress', role: 'info' };
     }
     return { label: 'Not converged', role: 'warning' };
@@ -105,10 +99,23 @@
 
   onMount(() => {
     void bootstrap();
-    const interval = window.setInterval(() => {
+    const clockInterval = window.setInterval(() => {
       nowMs = Date.now();
     }, 1000);
-    return () => window.clearInterval(interval);
+    const dashboardInterval = window.setInterval(() => {
+      if (!document.hidden) void refreshDashboardStatus();
+    }, DASHBOARD_REFRESH_INTERVAL_MS);
+    const refreshWhenVisible = () => {
+      if (!document.hidden) void refreshDashboardStatus();
+    };
+    document.addEventListener('visibilitychange', refreshWhenVisible);
+    window.addEventListener('focus', refreshWhenVisible);
+    return () => {
+      window.clearInterval(clockInterval);
+      window.clearInterval(dashboardInterval);
+      document.removeEventListener('visibilitychange', refreshWhenVisible);
+      window.removeEventListener('focus', refreshWhenVisible);
+    };
   });
 
   async function bootstrap() {
@@ -202,13 +209,7 @@
     });
   }
 
-  async function refreshVault() {
-    if (!vaultId) return;
-    [dashboard, conflicts] = await Promise.all([api.dashboard(vaultId), api.conflicts(vaultId).then((value) => value.conflicts)]);
-    conflicts = [...conflicts].sort((left, right) => {
-      if (left.status !== right.status) return left.status === 'open' ? -1 : 1;
-      return right.created_at.localeCompare(left.created_at);
-    });
+  function reconcileConflictSelection() {
     const currentConflictExists = conflicts.some((conflict) => conflict.conflict_id === selectedConflictId);
     if (!currentConflictExists) {
       selectedConflictId = '';
@@ -217,12 +218,56 @@
     if (!selectedConflictId) {
       selectedConflictId = conflicts.find((conflict) => conflict.status === 'open')?.conflict_id ?? '';
     }
-    if (selectedConflictId) {
-      await loadReview(selectedConflictId);
-    } else {
-      review = null;
+  }
+
+  async function refreshDashboardStatus() {
+    if (!session || !vaultId || connectionId || dashboardRefreshInFlight) return;
+    const requestedVaultId = vaultId;
+    const requestGeneration = ++dashboardRefreshGeneration;
+    dashboardRefreshInFlight = true;
+    try {
+      const [refreshedDashboard, refreshedConflicts] = await Promise.all([
+        api.dashboard(requestedVaultId),
+        api.conflicts(requestedVaultId).then((value) => value.conflicts)
+      ]);
+      if (vaultId !== requestedVaultId || requestGeneration !== dashboardRefreshGeneration) return;
+      dashboard = refreshedDashboard;
+      conflicts = sortConflicts(refreshedConflicts);
+      reconcileConflictSelection();
+      dashboardStatusCurrent = true;
+      lastRefreshed = new Date().toLocaleTimeString();
+    } catch (error) {
+      if (requestGeneration === dashboardRefreshGeneration) dashboardStatusCurrent = false;
+      if (error instanceof ApiError && error.status === 401) session = null;
+    } finally {
+      dashboardRefreshInFlight = false;
     }
-    lastRefreshed = new Date().toLocaleTimeString();
+  }
+
+  async function refreshVault() {
+    if (!vaultId) return;
+    const requestedVaultId = vaultId;
+    const requestGeneration = ++dashboardRefreshGeneration;
+    try {
+      const [refreshedDashboard, refreshedConflicts] = await Promise.all([
+        api.dashboard(requestedVaultId),
+        api.conflicts(requestedVaultId).then((value) => value.conflicts)
+      ]);
+      if (vaultId !== requestedVaultId || requestGeneration !== dashboardRefreshGeneration) return;
+      dashboard = refreshedDashboard;
+      conflicts = sortConflicts(refreshedConflicts);
+      reconcileConflictSelection();
+      dashboardStatusCurrent = true;
+      if (selectedConflictId) {
+        await loadReview(selectedConflictId);
+      } else {
+        review = null;
+      }
+      lastRefreshed = new Date().toLocaleTimeString();
+    } catch (error) {
+      if (requestGeneration === dashboardRefreshGeneration) dashboardStatusCurrent = false;
+      throw error;
+    }
   }
 
   async function createVault() {
@@ -644,7 +689,7 @@
           <Summary title="Health/readiness" value={dashboard.health.status === 'ready' ? 'Synced' : 'Integrity failure'} role={dashboard.health.status === 'ready' ? 'success' : 'danger'} detail={dashboard.health.detail ?? dashboard.health.git_version} />
           <section class="panel wide">
             <h2>Devices</h2>
-            <DeviceTable devices={dashboard.devices} nowMs={nowMs} onRename={renameDevice} onRevoke={revokeDevice} />
+            <DeviceTable devices={dashboard.devices} statusCurrent={dashboardStatusCurrent} onRename={renameDevice} onRevoke={revokeDevice} />
           </section>
           <section class="panel narrow">
             <h2>Attention</h2>
@@ -677,7 +722,7 @@
         <main class="page">
           <section class="panel full">
             <h2>Devices</h2>
-            <DeviceTable devices={dashboard.devices} nowMs={nowMs} onRename={renameDevice} onRevoke={revokeDevice} />
+            <DeviceTable devices={dashboard.devices} statusCurrent={dashboardStatusCurrent} onRename={renameDevice} onRevoke={revokeDevice} />
           </section>
         </main>
       {:else if page === 'Conflicts'}
