@@ -423,7 +423,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
             device.local_head !== device.local_main;
           const convergenceProven = localStatusFresh &&
             localStatusLabel === 'Synced' &&
-            localQueueStatus === 'idle' &&
+            (localQueueStatus === 'idle' || localQueueStatus === 'merged') &&
             device.local_main === vault.current_main &&
             device.local_head === vault.current_main &&
             device.last_applied_main === vault.current_main;

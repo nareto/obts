@@ -53,6 +53,29 @@ describe('large-vault client checkpoints', () => {
     expect(maximum).toBe(3);
   });
 
+  it('packs only local history that is not already reachable from main', async () => {
+    const { root, core } = await clientFixture();
+    await writeFile(join(root, 'large.bin'), Buffer.alloc(2 * 1024 * 1024, 7));
+    await writeFile(join(root, 'note.md'), 'base\n');
+    const base = await core.createLocalCommit('base checkpoint');
+    await core.updateRef('refs/heads/main', base, null, true);
+
+    await expect(core.createRecoveryRefsPack()).resolves.toHaveLength(0);
+
+    const basePack = await core.packObjects(await core.collectReachableObjects(base));
+    await writeFile(join(root, 'note.md'), 'small local change\n');
+    const localTip = await core.createLocalCommit('local-only checkpoint');
+    const deltaPack = await core.createRecoveryRefsPack();
+    expect(deltaPack.byteLength).toBeGreaterThan(0);
+    expect(deltaPack.byteLength).toBeLessThan(256 * 1024);
+
+    const restored = await clientFixture();
+    await restored.core.importPack(basePack);
+    await restored.core.importPack(deltaPack);
+    await expect(restored.core.commitExists(localTip)).resolves.toBe(true);
+    await expect(restored.core.listTreeBlobOids(localTip)).resolves.toEqual(await core.listTreeBlobOids(localTip));
+  });
+
   it('drains bounded apply writes before returning', async () => {
     const { root, core } = await clientFixture();
     await mkdir(join(root, 'incoming'));

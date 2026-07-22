@@ -940,7 +940,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(applyResult.status).toBe('Synced');
     expect(await readFile(join(fixtureBDir, 'incoming', 'keep', 'a.md'), 'utf8')).toBe('keep a\n');
     expect(await exists(join(fixtureBDir, 'incoming', 'remove', 'b.md'))).toBe(false);
-    expect(await fixtureB.readQueue()).toMatchObject({ status: 'merged' });
+    expect(await fixtureB.readQueue()).toMatchObject({ status: 'idle' });
     expect(await exists(join(fixtureBDir, '.obts', 'apply-journal.json'))).toBe(false);
 
     expect((await fixtureB.syncOnce()).status).toBe('Synced');
@@ -1244,6 +1244,35 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(dashboard.body.devices.find((device) => device.device_name === 'stale-laptop')).toMatchObject({
       status_label: 'Status unknown',
       status_report_fresh: false
+    });
+  });
+
+  it('treats the terminal merged queue state as converged during rolling upgrades', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'merged-status-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'merged-laptop');
+    const state = await plugin.readState();
+
+    await server.store.mutate((db) => {
+      const device = db.devices.find((candidate) => candidate.device_name === 'merged-laptop');
+      expect(device).toBeDefined();
+      device!.status = 'synced';
+      device!.last_applied_main = state.local_main;
+      device!.local_status_label = 'Synced';
+      device!.local_queue_status = 'merged';
+      device!.local_main = state.local_main;
+      device!.local_head = state.local_main;
+      device!.last_status_report_at = new Date().toISOString();
+    });
+
+    const dashboard = await admin.get<{
+      devices: Array<{ device_name: string; status_label: string; status_report_fresh: boolean; local_queue_status: string }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+    expect(dashboard.body.devices.find((device) => device.device_name === 'merged-laptop')).toMatchObject({
+      status_label: 'Synced',
+      status_report_fresh: true,
+      local_queue_status: 'merged'
     });
   });
 
@@ -4278,12 +4307,60 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(manifest.checksum_manifest.some((entry) => entry.endsWith('  files/shared.md'))).toBe(true);
     expect(await readFile(join(bundleDir, 'files', 'shared.md'), 'utf8')).toBe('base\n');
     expect(await readFile(join(bundleDir, 'patches', 'shared.md.patch'), 'utf8')).toContain('+base');
-    expect((await stat(join(bundleDir, 'git', 'local-refs.pack'))).size).toBeGreaterThan(0);
+    expect((await stat(join(bundleDir, 'git', 'local-refs.pack'))).size).toBe(0);
     const checksums = await readFile(join(bundleDir, 'checksums.sha256'), 'utf8');
     expect(checksums).toContain('  manifest.json');
     expect(checksums).toContain('  files/shared.md');
     expect(checksums).toContain('  patches/shared.md.patch');
     expect(checksums).toContain('  git/local-refs.pack');
+  });
+
+  it('preserves an empty folder created while remote files are being applied', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const device1Dir = join(root, 'directory-during-apply-device-1');
+    const device2Dir = join(root, 'directory-during-apply-device-2');
+    await mkdirp(device1Dir);
+    await mkdirp(device2Dir);
+    await writeFile(join(device1Dir, 'shared.md'), 'base\n');
+    const plugin1 = await pairPlugin(admin, device1Dir, 'directory-during-apply-device-1');
+    await plugin1.syncOnce({ confirmInitialImport: true });
+    const plugin2 = await pairPlugin(admin, device2Dir, 'directory-during-apply-device-2');
+
+    await writeFile(join(device1Dir, 'shared.md'), 'remote update\n');
+    expect((await plugin1.syncOnce()).status).toBe('Synced');
+
+    const internal = (plugin2 as unknown as { client: Record<string, any> }).client;
+    const originalWriteTargetFiles = internal.writeTargetFilesFromJournal.bind(internal);
+    internal.writeTargetFilesFromJournal = async (...args: unknown[]) => {
+      await originalWriteTargetFiles(...args);
+      await mkdirp(join(device2Dir, 'local-empty'));
+    };
+
+    expect((await plugin2.syncOnce()).status).toBe('Synced');
+    expect(await plugin2.readQueue()).toMatchObject({ status: 'idle', pending_commit: null });
+    expect((await plugin1.syncOnce()).status).toBe('Synced');
+    expect(await isDirectory(join(device1Dir, 'local-empty'))).toBe(true);
+  });
+
+  it('uses one pre-sync snapshot and one labelled post-apply preservation snapshot', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const { plugin2 } = await preparePullApplyScenario(root, admin, 'scan-count-device-1', 'scan-count-device-2');
+    const internal = (plugin2 as unknown as { client: Record<string, any> }).client;
+    const originalCapture = internal.captureLocalFileSnapshot.bind(internal);
+    const diagnosticPoints: string[] = [];
+    let snapshotCount = 0;
+    internal.captureLocalFileSnapshot = async (...args: unknown[]) => {
+      snapshotCount += 1;
+      return await originalCapture(...args);
+    };
+    internal.plugin.setOperationProgress = (_label: string, diagnosticPoint: string) => {
+      diagnosticPoints.push(diagnosticPoint);
+    };
+
+    expect((await plugin2.syncOnce()).status).toBe('Synced');
+    expect(snapshotCount).toBe(2);
+    expect(diagnosticPoints).toContain('local_snapshot');
+    expect(diagnosticPoints).toContain('apply_verify');
   });
 
   it('rebuilds from server main and turns snapshot-only local edits into a recovery commit', async () => {
@@ -4998,7 +5075,9 @@ describe('Phase 1 sync without conflict resolution', () => {
     const automaticSync = sourceSection(pluginMain, 'async runAutomaticSync()', 'async handleAutomaticSyncError');
     expect(automaticSync).toContain('readPendingOnboarding()');
     expect(automaticSync).toContain('syncOnceOrPollResolvedConflict');
-    expect(pluginMain).toContain('SYNC_STALE_MS');
+    expect(pluginMain).toContain('OPERATION_STATUS_HEARTBEAT_MS');
+    expect(pluginMain).not.toContain('SYNC_STALE_MS');
+    expect(pluginMain).toContain('ensureNoQueuedLocalChangesBeforeApply');
     expect(pluginMain).toContain('fetchWithTimeout');
     const eventPoll = sourceSection(pluginMain, 'async pollRemoteEventsAndApply()', 'async unpairCurrentDevice()');
     expect(eventPoll).toContain('wasConflictBlocked');

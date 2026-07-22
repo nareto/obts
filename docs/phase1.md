@@ -38,14 +38,16 @@ Implemented runtime pieces:
   `GET /api/v1/vaults/{vault_id}/sync/events` with their device token, so the
   plugin can observe `main_advanced`, conflict, rejection, and recovery events
   without a dashboard session cookie.
-- Plugin-side `.obts/` state with `isomorphic-git`, device token storage, durable watcher change hints, queue state, explicit directory-intent state for empty folder creation/deletion, recovery bundles with file snapshots, text patches, local Git refs packs, and artifact checksums, local apply lock, apply journal, local commit creation, device-token metadata rehydration when `state.json` is lost, multipart push, multipart pull, safe apply, safe incomplete-journal replay with recovery blocking when replay is unsafe, explicit replace-local-with-server recovery, and explicit rebuild from current server `main`.
+- Plugin-side `.obts/` state with `isomorphic-git`, device token storage, durable watcher change hints, queue state, explicit directory-intent state for empty folder creation/deletion, recovery bundles with file snapshots, text patches, local-only Git refs packs, and artifact checksums, local apply lock, apply journal, local commit creation, device-token metadata rehydration when `state.json` is lost, multipart push, multipart pull, safe apply, safe incomplete-journal replay with recovery blocking when replay is unsafe, explicit replace-local-with-server recovery, and explicit rebuild from current server `main`.
+- One sync decision performs one coherent pre-sync content snapshot, revalidates only queued/affected state around pull, and labels its single post-apply preservation snapshot as verification instead of repeating full-vault `Checking` passes.
+- Long local operations retain `Checking` or `Applying`, report device status every 30 seconds, and surface a taking-longer detail; only transport unavailability produces `Offline`.
 - Large-vault file checks, recovery staging, validation, directory traversal, and dependency-safe apply batches use bounded concurrency. Active source buffers are budgeted at 64 MiB on desktop and 16 MiB on mobile. The Git/DataAdapter APIs return whole blobs and expose target size only after reading, so apply peak memory may additionally include one producer-held target blob; the concurrency cap prevents multiple unbudgeted producer blobs, and oversized writes become exclusive once their size is known.
 - Rebuild classifies repeated, same-device fast-forward, snapshot-only, and divergent local history: fast-forward commits stay queued, snapshot-only edits become a new recovery commit based on rebuilt `main`, and divergent same-device history blocks for export plus reset or reconnect.
 - Plugin sync records server-created conflicts as a local `Review needed` blocking state, so later automatic sync or pull/apply attempts stop before replacing local review content.
 - The sync pull API also rejects devices marked `review_needed` or `blocked_recovery`, so a stale or reset plugin cannot bypass server-known conflict/recovery blocks and apply server state over review content.
 - Authenticated API status summary for vault/device/conflict health; Phase 1
   exposes browser-assisted onboarding through the dashboard while retaining CLI workflows for setup, vault, device, conflict, and health inspection.
-- Dashboard device behind/synced state is derived from each device's acknowledged `last_applied_main` commit cursor rather than timestamps; timestamps remain display metadata only.
+- Dashboard device behind/synced state is derived from fresh client convergence reports and each device's acknowledged `last_applied_main` commit cursor; both `idle` and the legacy terminal `merged` queue state are settled. The SPA refreshes this server-derived state every 15 seconds while visible and on focus instead of ageing cached rows locally.
 - Safe browser onboarding applies and acknowledges the current server `main` immediately, so an empty or already-matching paired device appears Synced before the next manual sync command.
 - Readiness checks that fail closed when metadata, Git refs, conflict commits, writable storage, or native Git readiness are inconsistent.
 
@@ -112,7 +114,7 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - committed apply journals replay idempotently on restart and clear stale local apply locks;
 - local apply lock contention blocks before a destructive pull apply starts;
 - recovery bundle creation failures leave a blocked apply journal and do not write files;
-- recovery bundles written before destructive apply contain affected file snapshots, text patch artifacts, local Git refs packs, and checksums for generated artifacts;
+- recovery bundles written before destructive apply contain affected file snapshots, text patch artifacts, checksums, and only Git objects not already reachable from the recorded prior local `main`; clean devices produce an empty refs pack;
 - rebuild from server `main` preserves queued fast-forward commits, turns snapshot-only local edits into a recovery commit, and refuses to upload divergent same-device history;
 - files changed after apply preflight block before overwrite;
 - shared path policy rejects `.obts/`, visible `.git`, traversal, empty path segments, NUL/control characters, unapproved `.obsidian` files, and non-regular Git tree entries while leaving OS-specific filename limits to device capability handling.
