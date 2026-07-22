@@ -47,7 +47,7 @@ export class NodeDataAdapter {
       return {
         type: metadata.isDirectory() ? 'folder' : 'file',
         size: metadata.size,
-        ctime: metadata.ctimeMs,
+        ctime: metadata.birthtimeMs,
         mtime: metadata.mtimeMs
       };
     } catch (error) {

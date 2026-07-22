@@ -3,6 +3,8 @@ export class MemoryDataAdapter {
   failOnRenameCall: number | null = null;
   private readonly files = new Map<string, Uint8Array>();
   private readonly folders = new Set<string>(['']);
+  private readonly folderCtimes = new Map<string, number>([['', 0]]);
+  private nextFolderCtime = 1;
 
   async readBinary(filePath: string): Promise<ArrayBuffer> {
     const data = this.files.get(clean(filePath));
@@ -22,6 +24,7 @@ export class MemoryDataAdapter {
     if (this.files.has(normalized) || this.folders.has(normalized)) throw codedError('EEXIST');
     if (!this.folders.has(parentPath(normalized))) throw codedError('ENOENT');
     this.folders.add(normalized);
+    this.folderCtimes.set(normalized, this.nextFolderCtime++);
   }
 
   async exists(filePath: string): Promise<boolean> {
@@ -33,7 +36,7 @@ export class MemoryDataAdapter {
     const normalized = clean(filePath);
     const data = this.files.get(normalized);
     if (data) return { type: 'file', ctime: 0, mtime: 0, size: data.byteLength };
-    if (this.folders.has(normalized)) return { type: 'folder', ctime: 0, mtime: 0, size: 0 };
+    if (this.folders.has(normalized)) return { type: 'folder', ctime: this.folderCtimes.get(normalized) ?? 0, mtime: 0, size: 0 };
     return null;
   }
 
@@ -56,7 +59,12 @@ export class MemoryDataAdapter {
     const descendants = (entry: string) => entry.startsWith(`${normalized}/`);
     if (!recursive && ([...this.files.keys()].some(descendants) || [...this.folders].some(descendants))) throw codedError('ENOTEMPTY');
     for (const file of [...this.files.keys()]) if (descendants(file)) this.files.delete(file);
-    for (const folder of [...this.folders]) if (folder === normalized || descendants(folder)) this.folders.delete(folder);
+    for (const folder of [...this.folders]) {
+      if (folder === normalized || descendants(folder)) {
+        this.folders.delete(folder);
+        this.folderCtimes.delete(folder);
+      }
+    }
   }
 
   async rename(oldPath: string, newPath: string): Promise<void> {
@@ -74,9 +82,16 @@ export class MemoryDataAdapter {
     const remap = (entry: string) => `${destination}${entry.slice(source.length)}`;
     const files = [...this.files.entries()].filter(([entry]) => entry.startsWith(`${source}/`));
     const folders = [...this.folders].filter((entry) => entry === source || entry.startsWith(`${source}/`));
+    const ctimes = new Map(folders.map((entry) => [entry, this.folderCtimes.get(entry) ?? 0]));
     for (const [entry] of files) this.files.delete(entry);
-    for (const entry of folders) this.folders.delete(entry);
-    for (const entry of folders) this.folders.add(remap(entry));
+    for (const entry of folders) {
+      this.folders.delete(entry);
+      this.folderCtimes.delete(entry);
+    }
+    for (const entry of folders) {
+      this.folders.add(remap(entry));
+      this.folderCtimes.set(remap(entry), ctimes.get(entry) ?? 0);
+    }
     for (const [entry, data] of files) this.files.set(remap(entry), data);
   }
 }
