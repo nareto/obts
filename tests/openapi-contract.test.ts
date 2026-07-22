@@ -48,6 +48,7 @@ describe('OpenAPI Phase 3 contract', () => {
       '/vaults/{vault_id}/sync/push',
       '/vaults/{vault_id}/sync/pull',
       '/vaults/{vault_id}/sync/device-status',
+      '/vaults/{vault_id}/sync/applied',
       '/vaults/{vault_id}/sync/events',
       '/vaults/{vault_id}/sync/unpair',
       '/vaults/{vault_id}/conflicts',
