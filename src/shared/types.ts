@@ -140,6 +140,7 @@ export type DeviceSelfResponse = {
   vault_status: 'active' | 'blocked_integrity';
   status: 'paired' | 'synced' | 'ahead' | 'review_needed' | 'blocked_recovery' | 'revoked';
   last_applied_main: string | null;
+  last_applied_event_seq: number;
   event_seq: number;
 };
 

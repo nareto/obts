@@ -175,6 +175,11 @@ describe('mobile plugin artifact', () => {
       apiVersion: '1.9.12',
       requestUrl: async (options: Record<string, unknown>) => {
         requests.push(options);
+        if (typeof options.url === 'string' && options.url.endsWith('/sync/applied')) {
+          const body = JSON.parse(String(options.body || '{}')) as { applied_main?: string };
+          const json = { status: 'ok', applied_main: body.applied_main, applied_event_seq: 1_000_000 };
+          return { status: 200, headers: {}, json, text: JSON.stringify(json), arrayBuffer: new ArrayBuffer(0) };
+        }
         return { status: 202, headers: {}, json: { status: 'accepted' }, text: '{"status":"accepted"}', arrayBuffer: new ArrayBuffer(0) };
       }
     };
@@ -832,6 +837,7 @@ describe('mobile plugin artifact', () => {
 
     (plugin as any).client = new runtimeClient.constructor(plugin);
     await (plugin as any).client.initialize();
+    requests.length = 0;
 
     const diagnosticError = vm.runInContext(
       "new TypeError(\"null is not an object (evaluating 'pack.slice') private-note.md obts_dev_secret\")",

@@ -9,7 +9,7 @@ Git maintenance to the deployable Phase 2 server and dashboard.
    metadata file and every per-vault Git repository.
 2. Deploy the Phase 3 image or build output without replacing `OBTS_DATA_DIR`.
 3. Start the server. The file-backed metadata adapter upgrades existing state
-   to schema version 4, initializes rebuildable derived-history indexes, creates
+   to schema version 5, initializes durable per-device acknowledged and pending-delivery directory snapshots plus rebuildable derived-history indexes, creates
    the bounded diagnostic-event store, and deletes legacy unrestricted device
    error-detail objects. Existing
    unresolved conflicts receive internal protection refs without changing
