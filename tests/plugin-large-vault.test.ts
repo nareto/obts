@@ -235,13 +235,16 @@ describe('large-vault client checkpoints', () => {
     core.fileWorkConcurrency = 3;
     const adapterWriteBinary = core.adapterWriteBinary.bind(core);
     const started: string[] = [];
+    let releaseInitialBatch!: () => void;
+    const initialBatchStarted = new Promise<void>((resolve) => { releaseInitialBatch = resolve; });
     let active = 0;
     core.adapterWriteBinary = async (path: string, content: Buffer) => {
       started.push(path);
+      if (started.length === 3) releaseInitialBatch();
       active += 1;
       try {
+        await initialBatchStarted;
         if (path === 'incoming/0.md') {
-          await delay(5);
           throw new Error('simulated apply write failure');
         }
         await delay(20);
