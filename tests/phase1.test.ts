@@ -772,9 +772,9 @@ describe('Phase 1 sync without conflict resolution', () => {
     await expect(receiver.syncOnce()).rejects.toThrow('simulated BRAT reload');
     expect(await exists(join(receiverDir, 'mainvault'))).toBe(true);
     expect((JSON.parse(await readFile(join(receiverDir, '.obts', 'directory-state.json'), 'utf8')) as { pending_intents: unknown[] }).pending_intents).toEqual(expect.arrayContaining([
-      { op: 'create', path: 'mainvault' },
-      { op: 'create', path: 'mainvault/Nested' },
-      { op: 'create', path: 'mainvault/Nested/Empty Leaf' }
+      expect.objectContaining({ op: 'create', path: 'mainvault' }),
+      expect.objectContaining({ op: 'create', path: 'mainvault/Nested' }),
+      expect.objectContaining({ op: 'create', path: 'mainvault/Nested/Empty Leaf' })
     ]));
     expect(JSON.parse(await readFile(join(receiverDir, '.obts', 'apply-journal.json'), 'utf8'))).toMatchObject({
       phase: 'committed',
@@ -799,18 +799,68 @@ describe('Phase 1 sync without conflict resolution', () => {
     const restarted = new ObtsPluginClient(receiverDir, { serverUrl: baseUrl, deviceName: 'reload-delete-receiver' });
     await restarted.initialize();
     expect(await exists(refLockPath)).toBe(false);
-    expect((await restarted.syncOnce()).status).toBe('Synced');
+    await expect(restarted.syncOnce()).rejects.toMatchObject({ code: 'directory_recovery_decision_required' });
+    const recovery = JSON.parse(await readFile(join(receiverDir, '.obts', 'directory-recovery.json'), 'utf8')) as Json;
+    expect(recovery).toMatchObject({
+      version: 1,
+      phase: 'awaiting_decision',
+      target_main: targetMain,
+      ambiguous_roots: ['mainvault'],
+      ambiguous_intents: expect.arrayContaining([
+        expect.objectContaining({ op: 'create', path: 'mainvault', provenance: 'local_v2' })
+      ])
+    });
+    expect(await exists(join(receiverDir, 'mainvault'))).toBe(true);
+    const restartedInternal = (restarted as unknown as { client: Record<string, any> }).client;
+    const originalApplyTargetMain = restartedInternal.applyTargetMain.bind(restartedInternal);
+    let interruptedDecision = false;
+    restartedInternal.applyTargetMain = async (...args: unknown[]) => {
+      const result = await originalApplyTargetMain(...args);
+      if (!interruptedDecision) {
+        interruptedDecision = true;
+        throw new Error('simulated reload after directory apply completed');
+      }
+      return result;
+    };
+    await expect(restarted.resolveDirectoryRecovery({ mainvault: 'accept_server' })).rejects.toThrow('simulated reload');
+    expect(JSON.parse(await readFile(join(receiverDir, '.obts', 'directory-recovery.json'), 'utf8'))).toMatchObject({
+      phase: 'executing',
+      decisions: { mainvault: 'accept_server' },
+      archived: true,
+      last_completed_step: 'intent_state_written'
+    });
     expect(await exists(join(receiverDir, 'mainvault'))).toBe(false);
-    expect(await restarted.readQueue()).toMatchObject({ status: 'idle', pending_commit: null });
+    const resumed = new ObtsPluginClient(receiverDir, { serverUrl: baseUrl, deviceName: 'reload-delete-receiver' });
+    const resumedInternal = (resumed as unknown as { client: Record<string, any> }).client;
+    const originalAcknowledge = resumedInternal.acknowledgeAppliedMain.bind(resumedInternal);
+    let interruptedAcknowledgement = false;
+    resumedInternal.acknowledgeAppliedMain = async (...args: unknown[]) => {
+      const result = await originalAcknowledge(...args);
+      if (!interruptedAcknowledgement) {
+        interruptedAcknowledgement = true;
+        throw new Error('simulated lost acknowledgement response during directory recovery');
+      }
+      return result;
+    };
+    await expect(resumed.initialize()).rejects.toThrow('simulated lost acknowledgement');
+    expect(JSON.parse(await readFile(join(receiverDir, '.obts', 'directory-recovery.json'), 'utf8'))).toMatchObject({
+      phase: 'executing',
+      last_completed_step: 'apply_completed'
+    });
+    const acknowledged = new ObtsPluginClient(receiverDir, { serverUrl: baseUrl, deviceName: 'reload-delete-receiver' });
+    await acknowledged.initialize();
+    expect(await exists(join(receiverDir, '.obts', 'directory-recovery.json'))).toBe(false);
+    expect(await exists(join(receiverDir, 'mainvault'))).toBe(false);
+    expect(await acknowledged.readQueue()).toMatchObject({ status: 'idle', pending_commit: null });
     expect((JSON.parse(await readFile(join(receiverDir, '.obts', 'directory-state.json'), 'utf8')) as { pending_intents: unknown[] }).pending_intents).toEqual([]);
-    expect(await restarted.readState()).toMatchObject({
+    expect(await acknowledged.readState()).toMatchObject({
       local_main: targetMain,
       local_head: targetMain,
       status_label: 'Synced',
       last_error_code: null,
       last_applied_event_seq: expect.any(Number)
     });
-    const finalState = await restarted.readState();
+    const finalState = await acknowledged.readState();
     const device = (await server.store.snapshot()).devices.find((entry) => entry.device_id === finalState.device_id);
     expect(device?.last_applied_main).toBe(targetMain);
     expect((await server.store.snapshot()).directory_state_by_vault[admin.vaultId]?.explicit_dirs).not.toEqual(
@@ -849,16 +899,15 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(device?.last_applied_explicit_dirs).toEqual(expect.arrayContaining(['.trash/mainvault', '.trash/mainvault/Nested']));
   });
 
-  it('preserves directory creates newer than a legacy apply materialization boundary', async () => {
+  it('classifies legacy directory creates without mutating evidence or trusting timestamps', async () => {
     const deviceDir = join(root, 'directory-recovery-provenance');
-    await mkdirp(join(deviceDir, 'stale-tree'));
-    await new Promise((resolve) => setTimeout(resolve, 20));
     await mkdirp(join(deviceDir, '.trash', 'remote-marker'));
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await mkdirp(join(deviceDir, 'stale-tree'));
     await mkdirp(join(deviceDir, 'new-tree'));
     const plugin = new ObtsPluginClient(deviceDir, { serverUrl: baseUrl, deviceName: 'directory-recovery-provenance' });
     await plugin.initialize();
-    await writeFile(join(deviceDir, '.obts', 'directory-state.json'), `${JSON.stringify({
+    const directoryStatePath = join(deviceDir, '.obts', 'directory-state.json');
+    await writeFile(directoryStatePath, `${JSON.stringify({
       observed_dirs: ['.trash', '.trash/remote-marker', 'new-tree', 'stale-tree'],
       explicit_empty_dirs: ['.trash/remote-marker', 'new-tree', 'stale-tree'],
       pending_intents: [
@@ -867,15 +916,185 @@ describe('Phase 1 sync without conflict resolution', () => {
       ],
       updated_at: new Date().toISOString()
     }, null, 2)}\n`);
+    const before = await readFile(directoryStatePath, 'utf8');
     const internals = (plugin as unknown as { client: Record<string, any> }).client;
-    const remaining = await internals.dropSupersededDirectoryIntentsForRecovery([
+    const classification = await internals.classifyDirectoryIntentsForRecovery([
+      { op: 'create', path: '.trash' },
       { op: 'create', path: '.trash/remote-marker' },
       { op: 'delete', path: 'stale-tree' },
       { op: 'delete', path: 'new-tree' }
     ]);
-    expect(remaining).toEqual([{ op: 'create', path: 'new-tree' }]);
-    expect(await isDirectory(join(deviceDir, 'stale-tree'))).toBe(true);
-    expect(await isDirectory(join(deviceDir, 'new-tree'))).toBe(true);
+    expect(classification.superseded).toEqual([]);
+    expect(classification.ambiguous).toEqual(expect.arrayContaining([
+      expect.objectContaining({ op: 'create', path: 'stale-tree', provenance: 'legacy' }),
+      expect.objectContaining({ op: 'create', path: 'new-tree', provenance: 'legacy' })
+    ]));
+    expect(await readFile(directoryStatePath, 'utf8')).toBe(before);
+  });
+
+  it('fails closed on malformed or path-traversing directory recovery journals', async () => {
+    const deviceDir = join(root, 'directory-recovery-invalid-journal');
+    await mkdirp(deviceDir);
+    const plugin = new ObtsPluginClient(deviceDir, { serverUrl: baseUrl, deviceName: 'directory-recovery-invalid-journal' });
+    await plugin.initialize();
+    const recoveryPath = join(deviceDir, '.obts', 'directory-recovery.json');
+    await writeFile(recoveryPath, '{malformed');
+    await expect(plugin.readDirectoryRecoveryDecision()).rejects.toMatchObject({ code: 'directory_recovery_journal_invalid' });
+    expect(await readFile(recoveryPath, 'utf8')).toBe('{malformed');
+
+    await mkdirp(join(deviceDir, 'Ambiguous'));
+    await writeFile(join(deviceDir, '.obts', 'directory-state.json'), `${JSON.stringify({
+      observed_dirs: ['Ambiguous'],
+      explicit_empty_dirs: ['Ambiguous'],
+      pending_intents: [{ op: 'create', path: 'Ambiguous' }],
+      updated_at: new Date().toISOString()
+    }, null, 2)}\n`);
+    await rm(recoveryPath, { force: true });
+    const internals = (plugin as unknown as { client: Record<string, any> }).client;
+    const remoteIntents = [{ op: 'delete', path: 'Ambiguous' }];
+    const classification = await internals.classifyDirectoryIntentsForRecovery(remoteIntents);
+    const valid = await internals.stageDirectoryRecoveryDecision({
+      state: { local_main: 'a'.repeat(40), local_head: 'a'.repeat(40) },
+      serverState: { last_applied_main: '9'.repeat(40) },
+      manifest: { target_main: 'a'.repeat(40), event_seq: 1, changed_paths: [], directory_intents: remoteIntents, explicit_directories: [] },
+      classification
+    });
+    await writeFile(recoveryPath, `${JSON.stringify({ ...valid, recovery_id: '../escape' }, null, 2)}\n`);
+    await expect(plugin.readDirectoryRecoveryDecision()).rejects.toMatchObject({ code: 'directory_recovery_journal_invalid' });
+    expect(await exists(join(deviceDir, 'escape'))).toBe(false);
+
+    const substituted = JSON.parse(JSON.stringify(valid)) as any;
+    substituted.ambiguous_intents[0].path = 'Different Tree';
+    substituted.ambiguous_roots = ['Different Tree'];
+    substituted.directory_intents = [{ op: 'delete', path: 'Different Tree' }];
+    await writeFile(recoveryPath, `${JSON.stringify(substituted, null, 2)}\n`);
+    await expect(plugin.readDirectoryRecoveryDecision()).rejects.toMatchObject({ code: 'directory_recovery_journal_invalid' });
+
+    const categorySwap = JSON.parse(JSON.stringify(valid)) as any;
+    categorySwap.superseded_intents = categorySwap.ambiguous_intents;
+    categorySwap.ambiguous_intents = [];
+    categorySwap.ambiguous_roots = [];
+    await writeFile(recoveryPath, `${JSON.stringify(categorySwap, null, 2)}\n`);
+    await expect(plugin.readDirectoryRecoveryDecision()).rejects.toMatchObject({ code: 'directory_recovery_journal_invalid' });
+  });
+
+  it('clears only acknowledged directory intent generations and retains recreation provenance', async () => {
+    const deviceDir = join(root, 'directory-intent-generations');
+    await mkdirp(join(deviceDir, 'Recreated'));
+    const plugin = new ObtsPluginClient(deviceDir, { serverUrl: baseUrl, deviceName: 'directory-intent-generations' });
+    await plugin.initialize();
+    const internals = (plugin as unknown as { client: Record<string, any> }).client;
+    const statePath = join(deviceDir, '.obts', 'directory-state.json');
+    const originalCtime = (await stat(join(deviceDir, 'Recreated'))).birthtimeMs;
+    await writeFile(statePath, `${JSON.stringify({
+      version: 2,
+      next_generation: 4,
+      observed_dirs: ['Recreated'],
+      observed_directory_ctimes: { Recreated: originalCtime },
+      explicit_empty_dirs: ['Recreated'],
+      pending_intents: [
+        { op: 'create', path: 'Sent', intent_id: 'dir_sent', generation: 1, provenance: 'local_v2' },
+        { op: 'delete', path: 'Recreated', intent_id: 'dir_delete', generation: 2, provenance: 'local_v2' },
+        { op: 'create', path: 'Recreated', intent_id: 'dir_recreated', generation: 3, provenance: 'local_v2' }
+      ],
+      updated_at: new Date().toISOString()
+    }, null, 2)}\n`);
+    const directoryState = await internals.readDirectoryState();
+    expect(directoryState.pending_intents).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        path: 'Recreated',
+        intent_id: 'dir_recreated',
+        replaces_intent_id: 'dir_delete',
+        recreated_after_delete: true
+      })
+    ]));
+    await rm(join(deviceDir, 'Recreated'), { recursive: true, force: true });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await mkdirp(join(deviceDir, 'Recreated'));
+    await internals.clearAcknowledgedDirectoryIntents([
+      { op: 'create', path: 'Sent', intent_id: 'dir_sent', generation: 1, provenance: 'local_v2' }
+    ]);
+    const persisted = JSON.parse(await readFile(statePath, 'utf8')) as { next_generation: number; pending_intents: Array<Record<string, unknown>> };
+    expect(persisted.pending_intents).toHaveLength(1);
+    expect(persisted.pending_intents[0]).toMatchObject({ path: 'Recreated', generation: 4, recreated_after_delete: true });
+    expect(persisted.pending_intents[0]?.intent_id).not.toBe('dir_recreated');
+    expect(persisted.next_generation).toBe(5);
+  });
+
+  it('preserves changed local directories through an explicit keep-local recovery decision', async () => {
+    const deviceDir = join(root, 'directory-recovery-keep-local');
+    await mkdirp(join(deviceDir, 'Keep Tree', 'Empty Child'));
+    await writeFile(join(deviceDir, 'base.md'), 'base\n');
+    const plugin = new ObtsPluginClient(deviceDir, { serverUrl: baseUrl, deviceName: 'directory-recovery-keep-local' });
+    await plugin.initialize();
+    const internals = (plugin as unknown as { client: Record<string, any> }).client;
+    const targetMain = await internals.createLocalCommit('directory recovery base');
+    await internals.updateRef('refs/heads/main', targetMain, null, true);
+    await plugin.writeState({
+      ...(await plugin.readState()),
+      user_id: 'usr_recovery',
+      vault_id: 'vlt_recovery',
+      device_id: 'dev_recovery',
+      device_ref: 'refs/obts/devices/dev_recovery',
+      server_device_ref: targetMain,
+      local_main: targetMain,
+      local_head: targetMain,
+      initial_import_confirmed: true,
+      status_label: 'Synced',
+      last_error_code: null,
+      last_event_seq: 11,
+      last_applied_event_seq: 11,
+      updated_at: new Date().toISOString()
+    });
+    const directoryStatePath = join(deviceDir, '.obts', 'directory-state.json');
+    await writeFile(directoryStatePath, `${JSON.stringify({
+      observed_dirs: ['Keep Tree', 'Keep Tree/Empty Child'],
+      explicit_empty_dirs: ['Keep Tree', 'Keep Tree/Empty Child'],
+      pending_intents: [{ op: 'create', path: 'Keep Tree' }, { op: 'create', path: 'Keep Tree/Empty Child' }],
+      updated_at: new Date().toISOString()
+    }, null, 2)}\n`);
+    const remoteIntents = [{ op: 'delete', path: 'Keep Tree' }];
+    const classification = await internals.classifyDirectoryIntentsForRecovery(remoteIntents);
+    await internals.stageDirectoryRecoveryDecision({
+      state: await plugin.readState(),
+      serverState: { last_applied_main: '9'.repeat(40) },
+      manifest: {
+        target_main: targetMain,
+        event_seq: 12,
+        changed_paths: [],
+        directory_intents: remoteIntents,
+        explicit_directories: []
+      },
+      classification
+    });
+
+    await writeFile(join(deviceDir, 'Keep Tree', 'new.md'), 'created while the decision was open\n');
+    await expect(plugin.resolveDirectoryRecovery({ 'Keep Tree': 'accept_server' })).rejects.toMatchObject({
+      code: 'directory_recovery_changed'
+    });
+    expect(JSON.parse(await readFile(join(deviceDir, '.obts', 'directory-recovery.json'), 'utf8'))).toMatchObject({
+      phase: 'awaiting_decision',
+      archived: false,
+      inventory: { files: [expect.objectContaining({ path: 'Keep Tree/new.md' })] }
+    });
+    expect((JSON.parse(await readFile(directoryStatePath, 'utf8')) as { pending_intents: unknown[] }).pending_intents).toHaveLength(2);
+
+    let appliedDirectoryIntents: unknown[] | null = null;
+    const applyTargetMain = internals.applyTargetMain.bind(internals);
+    internals.applyTargetMain = async (...args: unknown[]) => {
+      appliedDirectoryIntents = args[5] as unknown[];
+      return await applyTargetMain(...args);
+    };
+    internals.acknowledgeAppliedMain = async () => undefined;
+    expect((await plugin.resolveDirectoryRecovery({ 'Keep Tree': 'keep_local' })).status).toBe('Ahead');
+    expect(appliedDirectoryIntents).toEqual([]);
+    expect(await plugin.readQueue()).toMatchObject({ status: 'queued_local', pending_commit: expect.any(String) });
+    expect(await readFile(join(deviceDir, 'Keep Tree', 'new.md'), 'utf8')).toBe('created while the decision was open\n');
+    expect((JSON.parse(await readFile(directoryStatePath, 'utf8')) as { pending_intents: unknown[] }).pending_intents).toEqual(expect.arrayContaining([
+      expect.objectContaining({ op: 'create', path: 'Keep Tree' }),
+      expect.objectContaining({ op: 'create', path: 'Keep Tree/Empty Child' })
+    ]));
+    expect(await exists(join(deviceDir, '.obts', 'directory-recovery.json'))).toBe(false);
   });
 
   it('replays nested directory tombstones after a crash before pruning', async () => {

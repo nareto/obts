@@ -1757,7 +1757,7 @@ components:
           enum: [browser_handoff, approval_poll, bootstrap_request, multipart_parse, pack_persist, pack_index, tree_read, sync_request, apply, recovery, plugin_lifecycle, unknown]
         failure_code:
           type: string
-          enum: [invalid_json, missing_buffer_dependency, operation_interrupted_by_reload, sync_lease_blocked, null_pack_slice, pack_index_failed, adapter_read_failed, adapter_write_failed, adapter_stat_failed, multipart_parse_failed, request_failed, onboarding_failed, sync_failed, recovery_failed, operation_stalled, unknown]
+          enum: [invalid_json, missing_buffer_dependency, operation_interrupted_by_reload, sync_lease_blocked, null_pack_slice, pack_index_failed, adapter_read_failed, adapter_write_failed, adapter_stat_failed, multipart_parse_failed, request_failed, onboarding_failed, sync_failed, directory_recovery_decision_required, directory_recovery_changed, directory_recovery_journal_invalid, recovery_failed, operation_stalled, unknown]
         error_class:
           type: string
           enum: [type_error, transport_error, blocked_error, error, unknown]
