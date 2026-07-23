@@ -219,8 +219,10 @@ Behavior:
 5. Accepted directory intents are stored in server metadata and emitted with the accepted `main` event and pull manifest.
 6. Remote apply materializes explicit empty directories after file writes/deletes.
 7. Remote apply prunes the pre-existing tombstoned hierarchy deepest-first after file apply, removing each directory only through a non-recursive empty-directory operation. Non-empty local directories and genuinely new concurrent directories are never recursively removed by a directory tombstone.
-8. If plugin reload interrupts post-apply preservation, the apply journal remains durable, nonce-owned ref staging prevents cross-runtime lock reuse, and unacknowledged authoritative directory state replays before local directory intents can upload. Legacy create intents are discarded only when local creation identities prove they predate every locally materialized remote-create marker from that apply; missing or ambiguous provenance blocks safely.
-8. Historical states that predate directory intents cannot infer right-click folder-delete intent from the Git file tree alone.
+8. If plugin reload interrupts post-apply preservation, the apply journal remains durable, nonce-owned ref staging prevents cross-runtime lock reuse, and unacknowledged authoritative directory state replays before local directory intents can upload.
+9. Directory intents carry stable IDs, monotonic generations, base main/event provenance, and delete-then-create ancestry. Upload acknowledgement clears only the exact sent generations, so a newer watcher intent cannot be erased by an older request.
+10. Legacy `{op,path}` create intents opposed by a remote delete are never discarded from timestamp ordering alone. Absent paths may resolve automatically; indistinguishable existing directories require a durable per-subtree keep-local or accept-server decision with an unchanged-inventory check.
+11. Historical states that predate directory intents cannot infer right-click folder-delete intent from the Git file tree alone.
 
 Acceptance criteria:
 
@@ -228,6 +230,7 @@ Acceptance criteria:
 - Repeated authoritative directory state is idempotent: an unchanged `main` with already-present explicit directories does not enter `Applying`.
 - Right-click folder deletion removes the complete nested empty folder hierarchy on other devices after file deletes are applied.
 - Tombstone apply prunes directories deepest-first with non-recursive empty-directory removals, verifies the pre-apply directory creation identity immediately before removal, and fails closed when identity, inspection, removal, or authoritative directory creation cannot be verified; it never force-deletes a subtree that may have gained local content.
+- Ambiguous legacy recovery classification is read-only. Before a confirmed decision mutates intent state, the client durably records the target main/event, authoritative directory delta, original intent generations, affected subtree inventory, and user choices in `.obts/directory-recovery.json`; approved execution is restart-resumable and archives an empty-directory recovery manifest.
 - Individually emptying a folder preserves that empty folder on other devices.
 - A remote folder tombstone never deletes non-empty local content, and a genuinely new empty folder created concurrently with apply is preserved rather than confused with a stale tombstoned shell.
 

@@ -160,6 +160,23 @@ module.exports = class ObtsPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: "obts-resolve-directory-recovery",
+      name: "Resolve directory recovery",
+      callback: async () => {
+        if (!(await this.ensureClientReady())) {
+          new Notice(`obts: ${this.syncBlockedMessage()}`, 15000);
+          return;
+        }
+        const recovery = await this.client.readDirectoryRecoveryDecision();
+        if (!recovery) {
+          new Notice("obts: No directory recovery decision is pending.");
+          return;
+        }
+        new ObtsDirectoryRecoveryModal(this.app, this, recovery).open();
+      }
+    });
+
+    this.addCommand({
       id: "obts-update-plugin-via-brat",
       name: "Update plugin with BRAT",
       callback: () => {
@@ -208,7 +225,7 @@ module.exports = class ObtsPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("delete", (file) => this.queueSyncFromWatcher(file && file.path)));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.queueSyncFromWatcher([file && file.path, oldPath])));
     if (this.operationAvailability() === "available") {
-      void this.initializeClient().catch(() => this.handleClientInitializationFailure());
+      void this.initializeClient().catch((error) => this.handleClientInitializationFailure(error));
     } else {
       this.observeRetiredOperation();
     }
@@ -267,12 +284,13 @@ module.exports = class ObtsPlugin extends Plugin {
     }
   }
 
-  handleClientInitializationFailure() {
+  handleClientInitializationFailure(error = null) {
     if (this.unloaded) return;
     this.clearInitializationWatchdog();
     this.initializationDiagnosticToken = null;
     this.clientReady = false;
     this.setStatus("Recovery required");
+    if (error) void this.reportDeviceError(error);
     new Notice("obts could not finish local recovery after the plugin update. Fully restart Obsidian, then open obts settings.", 15000);
   }
 
@@ -283,8 +301,8 @@ module.exports = class ObtsPlugin extends Plugin {
       try {
         await this.clientInitialization;
         return this.clientReady;
-      } catch {
-        this.handleClientInitializationFailure();
+      } catch (error) {
+        this.handleClientInitializationFailure(error);
         return false;
       }
     }
@@ -295,8 +313,8 @@ module.exports = class ObtsPlugin extends Plugin {
     try {
       await this.initializeClient();
       return this.clientReady;
-    } catch {
-      this.handleClientInitializationFailure();
+    } catch (error) {
+      this.handleClientInitializationFailure(error);
       return false;
     }
   }
@@ -976,8 +994,8 @@ module.exports = class ObtsPlugin extends Plugin {
         try {
           await this.initializeClient();
           void this.runBackgroundSync();
-        } catch {
-          this.handleClientInitializationFailure();
+        } catch (error) {
+          this.handleClientInitializationFailure(error);
         }
       });
     }
@@ -989,7 +1007,7 @@ module.exports = class ObtsPlugin extends Plugin {
         this.observedRetiredLease = null;
         void this.initializeClient()
           .then(() => this.runBackgroundSync())
-          .catch(() => this.handleClientInitializationFailure());
+          .catch((error) => this.handleClientInitializationFailure(error));
         return;
       }
       if (availability === "busy") {
@@ -1084,6 +1102,7 @@ class ObtsObsidianClient {
     this.bootstrapTransferPath = path.join(this.obtsDir, "bootstrap-transfer.json");
     this.pullTransferPath = path.join(this.obtsDir, "pull-transfer.json");
     this.pendingAppliedAckPath = path.join(this.obtsDir, "pending-applied-ack.json");
+    this.directoryRecoveryPath = path.join(this.obtsDir, "directory-recovery.json");
     this.onboardingOperation = false;
     this.queueMutation = Promise.resolve();
     this.packPlanCache = new Map();
@@ -1156,6 +1175,31 @@ class ObtsObsidianClient {
       await this.writeState(Object.assign({}, state, {
         status_label: "Unsafe local state",
         last_error_code: "apply_journal_recovery_required",
+        updated_at: nowIso()
+      }));
+      return;
+    }
+    let directoryRecovery;
+    try {
+      directoryRecovery = await this.readDirectoryRecoveryDecision();
+    } catch (error) {
+      await this.writeState(Object.assign({}, state, {
+        status_label: "Unsafe local state",
+        last_error_code: "directory_recovery_journal_invalid",
+        updated_at: nowIso()
+      }));
+      await this.plugin.reportDeviceError(error).catch(() => undefined);
+      return;
+    }
+    if (directoryRecovery && directoryRecovery.phase === "executing") {
+      this.plugin.setInitializationStage("Resuming directory recovery", "recovery_directory_decision");
+      await this.executeDirectoryRecoveryDecision(directoryRecovery);
+      return;
+    }
+    if (directoryRecovery) {
+      await this.writeState(Object.assign({}, state, {
+        status_label: "Directory decision required",
+        last_error_code: "directory_recovery_decision_required",
         updated_at: nowIso()
       }));
       return;
@@ -1986,7 +2030,7 @@ class ObtsObsidianClient {
           packfile_bytes: packfile.byteLength,
           client_known_main: state.local_main,
           ...(queue.expected_device_ref === null && state.local_main ? { base_commit: state.local_main } : {}),
-          ...(pendingDirectoryIntents.length > 0 ? { directory_intents: pendingDirectoryIntents } : {}),
+          ...(pendingDirectoryIntents.length > 0 ? { directory_intents: pendingDirectoryIntents.map(toWireDirectoryIntent) } : {}),
           attempt_id: `sync_${Date.now()}_${randomHex(8)}`
         };
         await this.writeQueue(Object.assign({}, queue, { status: "uploading", attempts: queue.attempts + 1, updated_at: nowIso() }));
@@ -2050,7 +2094,7 @@ class ObtsObsidianClient {
         last_event_seq: Math.max(state.last_event_seq || 0, result.event_seq || 0),
         updated_at: nowIso()
       }));
-      await this.clearPendingDirectoryIntents();
+      await this.clearAcknowledgedDirectoryIntents(pendingDirectoryIntents);
     }
     return result;
   }
@@ -2083,7 +2127,20 @@ class ObtsObsidianClient {
       throw new ObtsBlockedError("invalid_transfer_plan", "Git transfer plan is empty or exceeds the server chunk limit.");
     }
     const planSha256 = sha256(Buffer.from(JSON.stringify(groups)));
-    const attemptId = `xfer_${sha256(Buffer.from(`${state.device_id}:${queue.pending_commit}:${queue.expected_device_ref || "none"}:${planSha256}`)).slice(0, 32)}`;
+    const transferRequest = {
+      api_version: API_VERSION,
+      plugin_version: PLUGIN_VERSION,
+      vault_id: state.vault_id,
+      device_id: state.device_id,
+      expected_device_ref: queue.expected_device_ref,
+      target_commit: queue.pending_commit,
+      client_known_main: state.local_main,
+      ...(queue.expected_device_ref === null && state.local_main ? { base_commit: state.local_main } : {}),
+      ...(directoryIntents.length > 0 ? { directory_intents: directoryIntents.map(toWireDirectoryIntent) } : {}),
+      chunk_count: groups.length,
+      plan_sha256: planSha256
+    };
+    const attemptId = `xfer_${sha256(Buffer.from(stableJson(transferRequest))).slice(0, 32)}`;
     await this.writeQueue(Object.assign({}, queue, { status: "uploading", attempts: queue.attempts + 1, updated_at: nowIso() }));
     await this.writeState(Object.assign({}, state, { status_label: "Uploading", last_error_code: null, updated_at: nowIso() }));
     this.plugin.setStatus("Uploading");
@@ -2092,20 +2149,7 @@ class ObtsObsidianClient {
       const createResponse = await fetchWithTimeout(this.url(`/api/v1/vaults/${state.vault_id}/sync/push-transfers`), {
         method: "POST",
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-        body: JSON.stringify({
-          api_version: API_VERSION,
-          plugin_version: PLUGIN_VERSION,
-          vault_id: state.vault_id,
-          device_id: state.device_id,
-          expected_device_ref: queue.expected_device_ref,
-          target_commit: queue.pending_commit,
-          client_known_main: state.local_main,
-          ...(queue.expected_device_ref === null && state.local_main ? { base_commit: state.local_main } : {}),
-          ...(directoryIntents.length > 0 ? { directory_intents: directoryIntents } : {}),
-          attempt_id: attemptId,
-          chunk_count: groups.length,
-          plan_sha256: planSha256
-        })
+        body: JSON.stringify(Object.assign({}, transferRequest, { attempt_id: attemptId }))
       });
       if (!createResponse.ok) await throwResponseError(createResponse);
       const descriptor = await createResponse.json();
@@ -2210,14 +2254,35 @@ class ObtsObsidianClient {
       Number.isSafeInteger(self.last_applied_event_seq) ? self.last_applied_event_seq : 0
     );
     await this.importPack(pulled.packfile);
-    const remainingIntents = await this.dropSupersededDirectoryIntentsForRecovery(
+    const directoryClassification = await this.classifyDirectoryIntentsForRecovery(
       pulled.manifest.directory_intents || []
     );
-    if (remainingIntents.length > 0) {
+    if (directoryClassification.ambiguous.length > 0) {
+      const recovery = await this.stageDirectoryRecoveryDecision({
+        state,
+        serverState: self,
+        manifest: pulled.manifest,
+        classification: directoryClassification
+      });
+      await this.markBlocked("directory_recovery_decision_required", {
+        ambiguous_roots: recovery.ambiguous_roots.length,
+        ambiguous_directories: recovery.ambiguous_intents.length
+      });
       throw new ObtsBlockedError(
-        "directory_recovery_ambiguous",
-        "Local directory changes must be synchronized before an interrupted server apply can resume."
+        "directory_recovery_decision_required",
+        "Choose whether to keep local empty directories or accept the server deletion in obts settings."
       );
+    }
+    if (directoryClassification.superseded.length > 0) {
+      const recovery = await this.stageDirectoryRecoveryDecision({
+        state,
+        serverState: self,
+        manifest: pulled.manifest,
+        classification: directoryClassification,
+        automatic: true
+      });
+      await this.executeDirectoryRecoveryDecision(recovery);
+      return true;
     }
     const applied = await this.applyTargetMain(
       pulled.manifest.target_main,
@@ -2443,7 +2508,8 @@ class ObtsObsidianClient {
     directoryIntents = [],
     explicitDirectories = [],
     eventSeq = undefined,
-    cleanVisibleStateVerified = false
+    cleanVisibleStateVerified = false,
+    confirmedDirectoryRecovery = null
   ) {
     const state = await this.readState();
     let compactedDirectoryIntents = compactDirectoryIntents(directoryIntents);
@@ -2487,6 +2553,8 @@ class ObtsObsidianClient {
       explicit_directories: explicitDirectorySet,
       pre_apply_directories: [],
       pre_apply_directory_ctimes: {},
+      confirmed_directory_roots: confirmedDirectoryRecovery ? confirmedDirectoryRecovery.roots : [],
+      confirmed_directory_inventory: confirmedDirectoryRecovery ? confirmedDirectoryRecovery.inventory : null,
       preserve_local_changes: requireCleanVisibleState,
       event_seq: Number.isSafeInteger(eventSeq) && eventSeq >= 0 ? eventSeq : null,
       recovery_bundle_id: null,
@@ -2637,14 +2705,29 @@ class ObtsObsidianClient {
         await writeJson(this.fsp, this.applyJournalPath, journal);
         await this.block("unsafe_local_state", "A local file changed during apply preflight.");
       }
+      if (confirmedDirectoryRecovery) {
+        const confirmedInventory = await this.captureDirectoryRecoveryInventory(confirmedDirectoryRecovery.roots);
+        if (stableJson(confirmedInventory) !== stableJson(confirmedDirectoryRecovery.inventory)) {
+          this.plugin.isApplying = false;
+          await this.fsp.rm(this.applyJournalPath, { force: true });
+          return false;
+        }
+      }
       journal.phase = "writing_files";
       await writeJson(this.fsp, this.applyJournalPath, journal);
       await this.writeTargetFilesFromJournal(journal, targetEntries, new Set());
+      const confirmedDirectoryCtimes = confirmedDirectoryRecovery
+        ? Object.fromEntries(confirmedDirectoryRecovery.inventory.directories.map((entry) => [entry.path, entry.creation_time]))
+        : journal.pre_apply_directory_ctimes;
+      const removableDirectories = confirmedDirectoryRecovery
+        ? new Set(confirmedDirectoryRecovery.inventory.directories.map((entry) => entry.path))
+        : preApplyDirectories;
       const residualTombstoneDirectories = await this.applyDirectoryChanges(
         compactedDirectoryIntents,
         explicitDirectorySet,
         preApplyDirectories,
-        journal.pre_apply_directory_ctimes
+        confirmedDirectoryCtimes,
+        removableDirectories
       );
 
       journal.phase = "verifying";
@@ -2757,7 +2840,12 @@ class ObtsObsidianClient {
         journal.directory_intents || [],
         journal.explicit_directories || [],
         new Set(journal.pre_apply_directories || []),
-        journal.pre_apply_directory_ctimes || {}
+        journal.confirmed_directory_inventory
+          ? Object.fromEntries(journal.confirmed_directory_inventory.directories.map((entry) => [entry.path, entry.creation_time]))
+          : journal.pre_apply_directory_ctimes || {},
+        journal.confirmed_directory_inventory
+          ? new Set(journal.confirmed_directory_inventory.directories.map((entry) => entry.path))
+          : new Set(journal.pre_apply_directories || [])
       );
       const preservedDirectoryIntents = journal.preserve_local_changes
         ? await this.preserveDirectoryChangesFromTarget(
@@ -2840,7 +2928,12 @@ class ObtsObsidianClient {
         journal.directory_intents || [],
         journal.explicit_directories || [],
         new Set(journal.pre_apply_directories || []),
-        journal.pre_apply_directory_ctimes || {}
+        journal.confirmed_directory_inventory
+          ? Object.fromEntries(journal.confirmed_directory_inventory.directories.map((entry) => [entry.path, entry.creation_time]))
+          : journal.pre_apply_directory_ctimes || {},
+        journal.confirmed_directory_inventory
+          ? new Set(journal.confirmed_directory_inventory.directories.map((entry) => entry.path))
+          : new Set(journal.pre_apply_directories || [])
       );
       journal.phase = "verifying";
       journal.last_completed_step = "files_written";
@@ -5043,23 +5136,70 @@ class ObtsObsidianClient {
   async readDirectoryState() {
     const state = await readJson(this.fsp, this.directoryStatePath, null);
     if (!state) {
-      return { observed_dirs: [], explicit_empty_dirs: [], pending_intents: [], updated_at: nowIso() };
+      return { version: 2, next_generation: 1, observed_dirs: [], observed_directory_ctimes: {}, explicit_empty_dirs: [], pending_intents: [], updated_at: nowIso() };
     }
+    const pendingIntents = normalizeStoredDirectoryIntents(Array.isArray(state.pending_intents) ? state.pending_intents : []);
+    const highestGeneration = pendingIntents.reduce((maximum, intent) => Math.max(maximum, intent.generation || 0), 0);
     return {
+      version: 2,
+      next_generation: Number.isSafeInteger(state.next_generation) && state.next_generation > highestGeneration
+        ? state.next_generation
+        : highestGeneration + 1,
       observed_dirs: Array.isArray(state.observed_dirs) ? state.observed_dirs : [],
+      observed_directory_ctimes: state.observed_directory_ctimes && typeof state.observed_directory_ctimes === "object" && !Array.isArray(state.observed_directory_ctimes)
+        ? state.observed_directory_ctimes
+        : {},
       explicit_empty_dirs: Array.isArray(state.explicit_empty_dirs) ? state.explicit_empty_dirs : [],
-      pending_intents: compactDirectoryIntents(Array.isArray(state.pending_intents) ? state.pending_intents : []),
+      pending_intents: compactDirectoryIntents(pendingIntents),
       updated_at: typeof state.updated_at === "string" ? state.updated_at : nowIso()
     };
   }
 
   async writeDirectoryState(state) {
+    const pendingIntents = compactDirectoryIntents(normalizeStoredDirectoryIntents(state.pending_intents));
+    const highestGeneration = pendingIntents.reduce((maximum, intent) => Math.max(maximum, intent.generation || 0), 0);
     await writeJson(this.fsp, this.directoryStatePath, {
+      version: 2,
+      next_generation: Number.isSafeInteger(state.next_generation) && state.next_generation > highestGeneration
+        ? state.next_generation
+        : highestGeneration + 1,
       observed_dirs: Array.from(new Set(state.observed_dirs)).sort(),
+      observed_directory_ctimes: Object.fromEntries(Array.from(new Set(state.observed_dirs)).sort().map((dirPath) => [
+        dirPath,
+        state.observed_directory_ctimes && Object.hasOwn(state.observed_directory_ctimes, dirPath)
+          ? state.observed_directory_ctimes[dirPath]
+          : null
+      ])),
       explicit_empty_dirs: Array.from(new Set(state.explicit_empty_dirs)).sort(),
-      pending_intents: compactDirectoryIntents(state.pending_intents),
+      pending_intents: pendingIntents,
       updated_at: state.updated_at
     });
+  }
+
+  async createDirectoryIntents(previous, changes) {
+    if (changes.length === 0) return { intents: [], nextGeneration: previous.next_generation };
+    const state = await this.readState();
+    let generation = previous.next_generation;
+    const byPath = new Map(previous.pending_intents.map((intent) => [intent.path, intent]));
+    const intents = changes.map((change) => {
+      const replaced = byPath.get(change.path) || null;
+      const intent = {
+        op: change.op,
+        path: change.path,
+        intent_id: `dir_${Date.now()}_${generation}_${randomHex(6)}`,
+        generation,
+        provenance: "local_v2",
+        base_main: state.local_main || null,
+        base_event_seq: state.last_applied_event_seq || 0,
+        replaces_intent_id: replaced && replaced.intent_id || null,
+        recreated_after_delete: Boolean(change.recreated_after_delete || change.op === "create" && replaced && replaced.op === "delete"),
+        created_at: nowIso()
+      };
+      generation += 1;
+      byPath.set(change.path, intent);
+      return intent;
+    });
+    return { intents, nextGeneration: generation };
   }
 
   async reconcileDirectoryState(knownLocalFiles = undefined, knownLocalDirectories = undefined) {
@@ -5074,16 +5214,32 @@ class ObtsObsidianClient {
     const previousDirs = new Set(previous.observed_dirs);
     const previousExplicitDirs = new Set(previous.explicit_empty_dirs);
     const currentDirSet = new Set(currentDirs);
-    const createdIntents = explicitDirs
-      .filter((dirPath) => !previousDirs.has(dirPath) || !previousExplicitDirs.has(dirPath))
-      .map((dirPath) => ({ op: "create", path: dirPath }));
-    const deletedIntents = topmostDirectories(previous.observed_dirs.filter((dirPath) => !currentDirSet.has(dirPath)))
-      .map((dirPath) => ({ op: "delete", path: dirPath }));
-    const pendingIntents = compactDirectoryIntents([...previous.pending_intents, ...createdIntents, ...deletedIntents]);
+    const currentDirectoryCtimes = await this.captureDirectoryCreationTimes(currentDirs);
+    const changes = [
+      ...explicitDirs
+        .filter((dirPath) => {
+          const identityChanged = Object.hasOwn(previous.observed_directory_ctimes, dirPath) &&
+            previous.observed_directory_ctimes[dirPath] !== null &&
+            currentDirectoryCtimes[dirPath] !== null &&
+            previous.observed_directory_ctimes[dirPath] !== currentDirectoryCtimes[dirPath];
+          return !previousDirs.has(dirPath) || !previousExplicitDirs.has(dirPath) || identityChanged;
+        })
+        .map((dirPath) => ({
+          op: "create",
+          path: dirPath,
+          recreated_after_delete: previousDirs.has(dirPath) && previous.observed_directory_ctimes[dirPath] !== currentDirectoryCtimes[dirPath]
+        })),
+      ...topmostDirectories(previous.observed_dirs.filter((dirPath) => !currentDirSet.has(dirPath)))
+        .map((dirPath) => ({ op: "delete", path: dirPath }))
+    ];
+    const created = await this.createDirectoryIntents(previous, changes);
+    const pendingIntents = compactDirectoryIntents([...previous.pending_intents, ...created.intents]);
     await this.writeDirectoryState({
       observed_dirs: currentDirs,
+      observed_directory_ctimes: currentDirectoryCtimes,
       explicit_empty_dirs: explicitDirs,
       pending_intents: pendingIntents,
+      next_generation: created.nextGeneration,
       updated_at: nowIso()
     });
     return pendingIntents;
@@ -5093,57 +5249,269 @@ class ObtsObsidianClient {
     await this.refreshDirectoryStateFromDisk([]);
   }
 
-  async dropSupersededDirectoryIntentsForRecovery(remoteIntents) {
+  async clearAcknowledgedDirectoryIntents(sentIntents) {
+    await this.reconcileDirectoryState();
     const directoryState = await this.readDirectoryState();
-    if (directoryState.pending_intents.length === 0) return [];
-    const deletePaths = remoteIntents
-      .filter((intent) => intent.op === "delete")
-      .map((intent) => intent.path);
-    if (deletePaths.length === 0) return directoryState.pending_intents;
-    const remoteCreateIntents = remoteIntents.filter((candidate) => candidate.op === "create");
-    const remoteCreateTimes = [];
-    for (const intent of remoteCreateIntents) {
-      if (!(await this.adapterIsDirectoryStrict(intent.path))) {
-        throw new ObtsBlockedError(
-          "directory_recovery_ambiguous",
-          "A remote directory materialization marker is missing during legacy recovery."
-        );
-      }
-      const creationTime = await this.adapterDirectoryCreationTime(intent.path);
-      if (creationTime === null) {
-        throw new ObtsBlockedError(
-          "directory_recovery_ambiguous",
-          "A remote directory materialization marker has no trustworthy identity."
-        );
-      }
-      remoteCreateTimes.push(creationTime);
-    }
-    const localApplyBoundary = remoteCreateTimes.length > 0 ? Math.min(...remoteCreateTimes) : null;
-    if (localApplyBoundary === null) {
-      throw new ObtsBlockedError(
-        "directory_recovery_ambiguous",
-        "The legacy directory apply has no local materialization boundary for safe recovery."
-      );
-    }
-    const remaining = [];
+    const sentKeys = new Set(normalizeStoredDirectoryIntents(sentIntents).map(directoryIntentIdentityKey));
+    const remaining = directoryState.pending_intents.filter((intent) => !sentKeys.has(directoryIntentIdentityKey(intent)));
+    await this.writeDirectoryState(Object.assign({}, directoryState, {
+      pending_intents: remaining,
+      updated_at: nowIso()
+    }));
+  }
+
+  async classifyDirectoryIntentsForRecovery(remoteIntents) {
+    const directoryState = await this.readDirectoryState();
+    const deletePaths = remoteIntents.filter((intent) => intent.op === "delete").map((intent) => intent.path);
+    const classification = { directoryState, unrelated: [], superseded: [], ambiguous: [] };
     for (const intent of directoryState.pending_intents) {
       const coveredByRemoteDelete = intent.op === "create" && deletePaths.some((deletedPath) =>
         intent.path === deletedPath || intent.path.startsWith(`${deletedPath}/`)
       );
       if (!coveredByRemoteDelete) {
-        remaining.push(intent);
+        classification.unrelated.push(intent);
         continue;
       }
-      const isDirectory = await this.adapterIsDirectoryStrict(intent.path);
-      if (!isDirectory) continue;
-      const creationTime = await this.adapterDirectoryCreationTime(intent.path);
-      if (creationTime === null || creationTime >= localApplyBoundary) remaining.push(intent);
+      if (!(await this.adapterIsDirectoryStrict(intent.path))) {
+        classification.superseded.push(intent);
+        continue;
+      }
+      classification.ambiguous.push(intent);
     }
+    return classification;
+  }
+
+  async readDirectoryRecoveryDecision() {
+    try {
+      return parseDirectoryRecoveryDecision(JSON.parse(await this.fsp.readFile(this.directoryRecoveryPath, "utf8")));
+    } catch (error) {
+      if (error && error.code === "ENOENT") return null;
+      if (error instanceof ObtsBlockedError) throw error;
+      throw new ObtsBlockedError("directory_recovery_journal_invalid", "The directory recovery journal is invalid.");
+    }
+  }
+
+  async captureDirectoryRecoveryInventory(roots) {
+    const inventory = await this.listLocalVaultInventory("");
+    const covered = (filePath) => roots.some((root) => filePath === root || filePath.startsWith(`${root}/`));
+    const directories = [];
+    for (const dirPath of inventory.directories.filter(covered).sort()) {
+      directories.push({ path: dirPath, creation_time: await this.adapterDirectoryCreationTime(dirPath) });
+    }
+    const files = [];
+    for (const filePath of inventory.files.filter((candidate) => covered(candidate) && isSyncableVaultPath(candidate)).sort()) {
+      files.push({ path: filePath, fingerprint: await this.recoveryFileFingerprint(filePath) });
+    }
+    return { directories, files };
+  }
+
+  async stageDirectoryRecoveryDecision({ state, serverState, manifest, classification, automatic = false }) {
+    const existing = await this.readDirectoryRecoveryDecision();
+    if (existing) {
+      if (existing.target_main !== manifest.target_main || existing.event_seq !== (manifest.event_seq || 0)) {
+        throw new ObtsBlockedError("directory_recovery_journal_mismatch", "A different directory recovery decision is already pending.");
+      }
+      return existing;
+    }
+    const ambiguousRoots = topmostDirectories(classification.ambiguous.map((intent) => intent.path));
+    const supersededRoots = topmostDirectories(classification.superseded.map((intent) => intent.path));
+    const roots = topmostDirectories([...ambiguousRoots, ...supersededRoots]);
+    const decisions = automatic ? Object.fromEntries(ambiguousRoots.map((root) => [root, "accept_server"])) : null;
+    const recovery = {
+      version: 1,
+      recovery_id: `dirrec_${Date.now()}_${randomHex(8)}`,
+      phase: automatic ? "executing" : "awaiting_decision",
+      base_main: serverState.last_applied_main || state.local_main,
+      target_main: manifest.target_main,
+      local_main_at_decision: state.local_main,
+      local_head_at_decision: state.local_head,
+      event_seq: manifest.event_seq || 0,
+      changed_paths: manifest.changed_paths || [],
+      directory_intents: (manifest.directory_intents || []).map(toWireDirectoryIntent),
+      explicit_directories: manifest.explicit_directories || [],
+      original_pending_intents: classification.directoryState.pending_intents,
+      next_generation: classification.directoryState.next_generation,
+      ambiguous_intents: classification.ambiguous,
+      superseded_intents: classification.superseded,
+      ambiguous_roots: ambiguousRoots,
+      decisions,
+      inventory: await this.captureDirectoryRecoveryInventory(roots),
+      archived: false,
+      last_completed_step: "decision_recorded",
+      created_at: nowIso(),
+      updated_at: nowIso()
+    };
+    await writeJson(this.fsp, this.directoryRecoveryPath, recovery);
+    return recovery;
+  }
+
+  async resolveDirectoryRecovery(decisions) {
+    const recovery = await this.readDirectoryRecoveryDecision();
+    if (!recovery || recovery.phase !== "awaiting_decision") {
+      throw new ObtsBlockedError("directory_recovery_not_pending", "No directory recovery decision is pending.");
+    }
+    const normalized = {};
+    for (const root of recovery.ambiguous_roots) {
+      const choice = decisions && decisions[root];
+      if (choice !== "keep_local" && choice !== "accept_server") {
+        throw new ObtsBlockedError("directory_recovery_choice_invalid", "Every ambiguous directory subtree requires a recovery choice.");
+      }
+      normalized[root] = choice;
+    }
+    const executing = Object.assign({}, recovery, { phase: "executing", decisions: normalized, updated_at: nowIso() });
+    await writeJson(this.fsp, this.directoryRecoveryPath, executing);
+    return await this.executeDirectoryRecoveryDecision(executing);
+  }
+
+  async resetDirectoryRecoveryAfterChange(recovery) {
+    const directoryState = await this.readDirectoryState();
+    const pendingByPath = new Map(directoryState.pending_intents.map((intent) => [intent.path, intent]));
+    for (const intent of recovery.original_pending_intents) {
+      if (!pendingByPath.has(intent.path)) pendingByPath.set(intent.path, intent);
+    }
+    const restoredPending = compactDirectoryIntents([...pendingByPath.values()]);
     await this.writeDirectoryState(Object.assign({}, directoryState, {
-      pending_intents: remaining,
+      pending_intents: restoredPending,
+      next_generation: Math.max(directoryState.next_generation, recovery.next_generation),
       updated_at: nowIso()
     }));
-    return remaining;
+    const classification = await this.classifyDirectoryIntentsForRecovery(recovery.directory_intents);
+    const ambiguousRoots = topmostDirectories(classification.ambiguous.map((intent) => intent.path));
+    const roots = topmostDirectories([...ambiguousRoots, ...classification.superseded.map((intent) => intent.path)]);
+    const awaiting = Object.assign({}, recovery, {
+      recovery_id: `dirrec_${Date.now()}_${randomHex(8)}`,
+      phase: "awaiting_decision",
+      decisions: null,
+      original_pending_intents: classification.directoryState.pending_intents,
+      next_generation: classification.directoryState.next_generation,
+      ambiguous_intents: classification.ambiguous,
+      superseded_intents: classification.superseded,
+      ambiguous_roots: ambiguousRoots,
+      inventory: await this.captureDirectoryRecoveryInventory(roots),
+      archived: false,
+      last_completed_step: "decision_recorded",
+      updated_at: nowIso()
+    });
+    await writeJson(this.fsp, this.directoryRecoveryPath, awaiting);
+    await this.markBlocked("directory_recovery_changed", {
+      ambiguous_roots: awaiting.ambiguous_roots.length,
+      ambiguous_directories: awaiting.ambiguous_intents.length
+    });
+    throw new ObtsBlockedError("directory_recovery_changed", "Local directories changed after the recovery decision. Review them again.");
+  }
+
+  async queueConfirmedKeptChanges(recovery) {
+    const queue = await this.readQueue();
+    if (queue.pending_commit) return;
+    const targetEntries = await this.listTreeBlobOids(recovery.target_main);
+    const preserved = await this.localChangedPathsFromTree(targetEntries, true, { reportOperationProgress: true });
+    const pendingDirectoryIntents = (await this.readDirectoryState()).pending_intents;
+    const state = await this.readState();
+    if (preserved.paths.length > 0) {
+      await this.createRecoveryBundle("rebuild_from_server", recovery.target_main, preserved.paths);
+      await this.queuePreservedLocalChanges(recovery.target_main, state.server_device_ref, preserved.snapshot);
+    } else if (pendingDirectoryIntents.length > 0) {
+      await this.queuePreservedDirectoryChanges(recovery.target_main, state.server_device_ref);
+    }
+  }
+
+  async executeDirectoryRecoveryDecision(recovery) {
+    const recoveryRoots = topmostDirectories([
+      ...recovery.ambiguous_roots,
+      ...recovery.superseded_intents.map((intent) => intent.path)
+    ]);
+    const state = await this.readState();
+    if (state.local_main !== recovery.local_main_at_decision && state.local_main !== recovery.target_main) {
+      throw new ObtsBlockedError("directory_recovery_journal_mismatch", "Local main changed outside the pending directory recovery.");
+    }
+    if (
+      (recovery.last_completed_step === "apply_completed" || recovery.last_completed_step === "acknowledged") &&
+      (state.local_main !== recovery.target_main || (state.last_applied_event_seq || 0) < recovery.event_seq)
+    ) {
+      throw new ObtsBlockedError("directory_recovery_journal_invalid", "The directory recovery journal claims an apply step that local state does not prove.");
+    }
+    if (recovery.last_completed_step === "decision_recorded") {
+      const currentInventory = await this.captureDirectoryRecoveryInventory(recoveryRoots);
+      if (stableJson(currentInventory) !== stableJson(recovery.inventory)) {
+        return await this.resetDirectoryRecoveryAfterChange(recovery);
+      }
+      const acceptedDirectories = new Set(recovery.inventory.directories.map((entry) => entry.path));
+      const acceptedRoots = recovery.ambiguous_roots.filter((root) => recovery.decisions && recovery.decisions[root] === "accept_server");
+      if (acceptedRoots.some((root) => [...acceptedDirectories].some((dirPath) =>
+        (dirPath === root || dirPath.startsWith(`${root}/`)) &&
+        recovery.inventory.directories.find((entry) => entry.path === dirPath).creation_time === null
+      ))) {
+        return await this.resetDirectoryRecoveryAfterChange(recovery);
+      }
+      if (!recovery.archived) {
+        const archiveDir = path.join(this.obtsDir, "recovery", recovery.recovery_id);
+        const archivePath = path.join(archiveDir, "directory-recovery.json");
+        await this.fsp.mkdir(archiveDir, { recursive: true, mode: 0o700 });
+        if (!(await exists(this.fsp, archivePath))) await writeJson(this.fsp, archivePath, recovery);
+        recovery = Object.assign({}, recovery, { archived: true, updated_at: nowIso() });
+        await writeJson(this.fsp, this.directoryRecoveryPath, recovery);
+      }
+      const removedIntentIds = new Set([
+        ...recovery.superseded_intents.map((intent) => intent.intent_id),
+        ...recovery.ambiguous_intents
+          .filter((intent) => acceptedRoots.some((root) => intent.path === root || intent.path.startsWith(`${root}/`)))
+          .map((intent) => intent.intent_id)
+      ]);
+      const directoryState = await this.readDirectoryState();
+      const originalIntentIds = new Set(recovery.original_pending_intents.map((intent) => intent.intent_id));
+      if (directoryState.pending_intents.some((intent) =>
+        !originalIntentIds.has(intent.intent_id) && recovery.ambiguous_roots.some((root) => intent.path === root || intent.path.startsWith(`${root}/`))
+      )) return await this.resetDirectoryRecoveryAfterChange(recovery);
+      await this.writeDirectoryState(Object.assign({}, directoryState, {
+        pending_intents: directoryState.pending_intents.filter((intent) => !removedIntentIds.has(intent.intent_id)),
+        next_generation: Math.max(directoryState.next_generation, recovery.next_generation),
+        updated_at: nowIso()
+      }));
+      recovery = Object.assign({}, recovery, { last_completed_step: "intent_state_written", updated_at: nowIso() });
+      await writeJson(this.fsp, this.directoryRecoveryPath, recovery);
+    }
+    if (recovery.last_completed_step === "intent_state_written") {
+      const appliedState = await this.readState();
+      if (appliedState.local_main === recovery.target_main && (appliedState.last_applied_event_seq || 0) >= recovery.event_seq) {
+        recovery = Object.assign({}, recovery, { last_completed_step: "apply_completed", updated_at: nowIso() });
+        await writeJson(this.fsp, this.directoryRecoveryPath, recovery);
+      } else {
+        const currentInventory = await this.captureDirectoryRecoveryInventory(recoveryRoots);
+        if (stableJson(currentInventory) !== stableJson(recovery.inventory)) {
+          return await this.resetDirectoryRecoveryAfterChange(recovery);
+        }
+        const keptRoots = recovery.ambiguous_roots.filter((root) => recovery.decisions[root] === "keep_local");
+        const directoryIntents = recovery.directory_intents.filter((intent) => !(
+          intent.op === "delete" && keptRoots.some((root) => root === intent.path || root.startsWith(`${intent.path}/`))
+        ));
+        const applied = await this.applyTargetMain(
+          recovery.target_main,
+          recovery.changed_paths,
+          true,
+          [],
+          true,
+          directoryIntents,
+          recovery.explicit_directories,
+          recovery.event_seq,
+          true,
+          { roots: recoveryRoots, inventory: recovery.inventory }
+        );
+        if (!applied) return await this.resetDirectoryRecoveryAfterChange(recovery);
+        recovery = Object.assign({}, recovery, { last_completed_step: "apply_completed", updated_at: nowIso() });
+        await writeJson(this.fsp, this.directoryRecoveryPath, recovery);
+      }
+    }
+    const keptRoots = recovery.ambiguous_roots.filter((root) => recovery.decisions[root] === "keep_local");
+    if (recovery.last_completed_step === "apply_completed") {
+      if (keptRoots.length > 0) await this.queueConfirmedKeptChanges(recovery);
+      await this.acknowledgeAppliedMain(recovery.target_main);
+      recovery = Object.assign({}, recovery, { last_completed_step: "acknowledged", updated_at: nowIso() });
+      await writeJson(this.fsp, this.directoryRecoveryPath, recovery);
+    }
+    await this.clearResolvedConflictQueue();
+    await this.settleAppliedQueue();
+    await this.fsp.rm(this.directoryRecoveryPath, { force: true });
+    return { status: keptRoots.length > 0 ? "Ahead" : "Synced", main: recovery.target_main };
   }
 
   async preserveDirectoryChangesFromTarget(targetEntries, explicitDirectories, residualTombstoneDirectories = new Set()) {
@@ -5156,16 +5524,22 @@ class ObtsObsidianClient {
       for (const dirPath of directoryPrefixes(filePath)) expectedDirs.add(dirPath);
     }
     const currentDirSet = new Set(currentDirs);
-    const createdIntents = explicitEmptyDirectories(currentDirs, currentFiles)
-      .filter((dirPath) => !expectedDirs.has(dirPath) && !residualTombstoneDirectories.has(dirPath))
-      .map((dirPath) => ({ op: "create", path: dirPath }));
-    const deletedIntents = topmostDirectories([...expectedDirs].filter((dirPath) => !currentDirSet.has(dirPath)))
-      .map((dirPath) => ({ op: "delete", path: dirPath }));
-    const pendingIntents = compactDirectoryIntents([...previous.pending_intents, ...createdIntents, ...deletedIntents]);
+    const currentDirectoryCtimes = await this.captureDirectoryCreationTimes(currentDirs);
+    const changes = [
+      ...explicitEmptyDirectories(currentDirs, currentFiles)
+        .filter((dirPath) => !expectedDirs.has(dirPath) && !residualTombstoneDirectories.has(dirPath))
+        .map((dirPath) => ({ op: "create", path: dirPath })),
+      ...topmostDirectories([...expectedDirs].filter((dirPath) => !currentDirSet.has(dirPath)))
+        .map((dirPath) => ({ op: "delete", path: dirPath }))
+    ];
+    const created = await this.createDirectoryIntents(previous, changes);
+    const pendingIntents = compactDirectoryIntents([...previous.pending_intents, ...created.intents]);
     await this.writeDirectoryState({
       observed_dirs: currentDirs,
+      observed_directory_ctimes: currentDirectoryCtimes,
       explicit_empty_dirs: explicitEmptyDirectories(currentDirs, currentFiles),
       pending_intents: pendingIntents,
+      next_generation: created.nextGeneration,
       updated_at: nowIso()
     });
     return pendingIntents;
@@ -5175,10 +5549,13 @@ class ObtsObsidianClient {
     const previous = await this.readDirectoryState();
     const currentDirs = knownLocalDirectories || await this.listLocalVaultDirectories();
     const currentFiles = knownLocalFiles || await this.scanSyncableFiles();
+    const currentDirectoryCtimes = await this.captureDirectoryCreationTimes(currentDirs);
     await this.writeDirectoryState({
       observed_dirs: currentDirs,
+      observed_directory_ctimes: currentDirectoryCtimes,
       explicit_empty_dirs: explicitEmptyDirectories(currentDirs, currentFiles),
       pending_intents: pendingIntents === undefined ? previous.pending_intents : pendingIntents,
+      next_generation: previous.next_generation,
       updated_at: nowIso()
     });
   }
@@ -5199,14 +5576,16 @@ class ObtsObsidianClient {
     directoryIntents,
     explicitDirectories,
     preApplyDirectories = new Set(),
-    preApplyDirectoryCtimes = {}
+    preApplyDirectoryCtimes = {},
+    removableDirectories = preApplyDirectories
   ) {
     const residualTombstoneDirectories = new Set();
     for (const intent of directoryIntents.filter((entry) => entry.op === "delete").sort((left, right) => right.path.length - left.path.length)) {
       const replacedDirectories = await this.pruneEmptyDirectoryTree(
         intent.path,
         preApplyDirectories,
-        preApplyDirectoryCtimes
+        preApplyDirectoryCtimes,
+        removableDirectories
       );
       if (await this.adapterIsDirectoryStrict(intent.path)) {
         let residual;
@@ -5229,7 +5608,7 @@ class ObtsObsidianClient {
     return residualTombstoneDirectories;
   }
 
-  async pruneEmptyDirectoryTree(filePath, preApplyDirectories, preApplyDirectoryCtimes) {
+  async pruneEmptyDirectoryTree(filePath, preApplyDirectories, preApplyDirectoryCtimes, removableDirectories = preApplyDirectories) {
     const replacedDirectories = new Set();
     if (!(await this.adapterIsDirectoryStrict(filePath))) return replacedDirectories;
     let inventory;
@@ -5240,7 +5619,7 @@ class ObtsObsidianClient {
       throw new ObtsBlockedError("directory_inspection_failed", "A directory tree could not be inspected safely.");
     }
     const directories = [filePath, ...inventory.directories]
-      .filter((dirPath) => preApplyDirectories.has(dirPath))
+      .filter((dirPath) => preApplyDirectories.has(dirPath) && removableDirectories.has(dirPath))
       .sort(compareDeepestPathFirst);
     for (const dirPath of directories) {
       const outcome = await this.adapterRemovePreexistingEmptyDirectory(
@@ -5507,6 +5886,12 @@ class ObtsObsidianClient {
     if (state.last_error_code === "apply_journal_recovery_required") {
       throw new ObtsBlockedError("apply_journal_recovery_required", "An incomplete apply journal requires recovery before sync can continue.");
     }
+    if (state.last_error_code === "directory_recovery_decision_required" || state.last_error_code === "directory_recovery_changed") {
+      throw new ObtsBlockedError(state.last_error_code, "Review the pending directory recovery decision in obts settings.");
+    }
+    if (state.last_error_code === "directory_recovery_journal_invalid") {
+      throw new ObtsBlockedError(state.last_error_code, "The directory recovery journal is invalid and must be preserved for recovery support.");
+    }
     if (state.last_error_code === "same_device_non_fast_forward" || state.last_error_code === "stale_device_ref" || state.last_error_code === "device_blocked" || state.last_error_code === "local_state_incomplete") {
       throw new ObtsBlockedError(state.last_error_code, "Device sync is blocked until recovery completes.");
     }
@@ -5525,6 +5910,86 @@ class ObtsObsidianClient {
       updated_at: nowIso()
     }));
     await this.reportDeviceStatus().catch(() => undefined);
+  }
+}
+
+class ObtsDirectoryRecoveryModal extends Modal {
+  constructor(app, plugin, recovery) {
+    super(app);
+    this.plugin = plugin;
+    this.recovery = recovery;
+    this.inventoryChanged = false;
+    this.decisions = Object.fromEntries(recovery.ambiguous_roots.map((root) => [root, "keep_local"]));
+  }
+
+  async onOpen() {
+    const latest = await this.plugin.client.readDirectoryRecoveryDecision();
+    if (!latest) {
+      this.contentEl.empty();
+      this.contentEl.createEl("h2", { text: "Directory recovery is complete" });
+      return;
+    }
+    this.recovery = latest;
+    this.render();
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+
+  render() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("obts-onboarding");
+    contentEl.createEl("h2", { text: "Resolve directory recovery" });
+    contentEl.createEl("p", {
+      text: this.inventoryChanged
+        ? "The affected directories changed while the prior decision was open. Choices were reset to keep local; review the new inventory before confirming again."
+        : "A plugin update interrupted an older directory-only apply. The legacy record cannot prove whether these empty folders are stale or were intentionally recreated. Review each subtree before sync continues."
+    });
+    const summary = contentEl.createDiv({ cls: "obts-onboarding-summary" });
+    summary.createEl("strong", { text: `${this.recovery.ambiguous_intents.length} ambiguous directories` });
+    summary.createEl("span", { text: `${this.recovery.ambiguous_roots.length} independent subtrees` });
+    for (const root of this.recovery.ambiguous_roots) {
+      new Setting(contentEl)
+        .setName(root)
+        .setDesc("Keep uploads this empty subtree as a fresh local change. Accept removes it only if the recorded directory inventory is unchanged.")
+        .addDropdown((dropdown) => dropdown
+          .addOption("keep_local", "Keep local directories")
+          .addOption("accept_server", "Accept server deletion")
+          .setValue(this.decisions[root] || "keep_local")
+          .onChange((value) => {
+            this.decisions[root] = value;
+          }));
+    }
+    const feedback = contentEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
+    new Setting(contentEl)
+      .addButton((button) => button.setButtonText("Cancel").onClick(() => this.close()))
+      .addButton((button) => button.setButtonText("Apply recovery decision").setCta().onClick(async () => {
+        const accepted = Object.values(this.decisions).filter((choice) => choice === "accept_server").length;
+        if (!window.confirm(`Apply these directory recovery choices? ${accepted} subtree${accepted === 1 ? "" : "s"} will accept the server deletion after a final safety check.`)) return;
+        button.setDisabled(true);
+        setFeedback(feedback, "Validating and applying the recovery decision...", "muted");
+        try {
+          const result = await this.plugin.runExclusiveAction(() => this.plugin.client.resolveDirectoryRecovery(this.decisions));
+          this.plugin.setStatus((await this.plugin.client.readState()).status_label);
+          new Notice(`obts directory recovery completed: ${result.status}.`, 10000);
+          this.close();
+        } catch (error) {
+          if (error && error.code === "directory_recovery_changed") {
+            const latest = await this.plugin.client.readDirectoryRecoveryDecision();
+            if (latest) {
+              this.recovery = latest;
+              this.inventoryChanged = true;
+              this.decisions = Object.fromEntries(latest.ambiguous_roots.map((root) => [root, "keep_local"]));
+              this.render();
+              return;
+            }
+          }
+          setFeedback(feedback, error instanceof Error ? error.message : "Directory recovery failed safely.", "error");
+          button.setDisabled(false);
+        }
+      }));
   }
 }
 
@@ -6038,6 +6503,27 @@ class ObtsSettingTab extends PluginSettingTab {
       new Setting(containerEl)
         .setName("Status")
         .setDesc(state.last_error_code ? blockStatusLabel(state.last_error_code) : state.status_label || "Checking");
+      if (state.last_error_code === "directory_recovery_journal_invalid") {
+        new Setting(containerEl)
+          .setName("Directory recovery journal is invalid")
+          .setDesc("Sync is blocked without modifying the journal or vault. Send diagnostics and preserve `.obts/directory-recovery.json` for recovery support.");
+      }
+      if (state.last_error_code === "directory_recovery_decision_required" || state.last_error_code === "directory_recovery_changed") {
+        new Setting(containerEl)
+          .setName("Directory recovery decision required")
+          .setDesc("An interrupted legacy apply cannot distinguish stale empty-directory intents from intentional recreations. Review the affected subtrees before sync continues.")
+          .addButton((button) => button
+            .setButtonText("Review directory recovery")
+            .setCta()
+            .onClick(async () => {
+              const recovery = await this.plugin.client.readDirectoryRecoveryDecision();
+              if (!recovery) {
+                new Notice("obts: No directory recovery decision is pending.");
+                return;
+              }
+              new ObtsDirectoryRecoveryModal(this.app, this.plugin, recovery).open();
+            }));
+      }
       new Setting(containerEl)
         .setName("Actions")
         .addButton((button) =>
@@ -6493,11 +6979,198 @@ function topmostDirectories(directories) {
   return result;
 }
 
+function normalizeStoredDirectoryIntents(intents) {
+  return (Array.isArray(intents) ? intents : []).map((intent) => {
+    if (!intent || (intent.op !== "create" && intent.op !== "delete") || !isSyncableVaultPath(intent.path)) return intent;
+    if (
+      typeof intent.intent_id === "string" && intent.intent_id.length > 0 &&
+      Number.isSafeInteger(intent.generation) && intent.generation >= 0 &&
+      (intent.provenance === "legacy" || intent.provenance === "local_v2")
+    ) return intent;
+    return Object.assign({}, intent, {
+      intent_id: `legacy_${sha256(Buffer.from(`${intent.op}\0${intent.path}`, "utf8")).slice(0, 24)}`,
+      generation: 0,
+      provenance: "legacy",
+      base_main: null,
+      base_event_seq: 0,
+      replaces_intent_id: null,
+      recreated_after_delete: false,
+      created_at: null
+    });
+  });
+}
+
+function directoryIntentOperationKey(intent) {
+  return `${intent.op}\0${intent.path}`;
+}
+
+function directoryIntentIdentityKey(intent) {
+  return `${intent.intent_id || "legacy"}\0${intent.generation || 0}\0${directoryIntentOperationKey(intent)}`;
+}
+
+function directoryIntentRecordKey(intent) {
+  return stableJson([
+    intent.intent_id,
+    intent.generation,
+    intent.op,
+    intent.path,
+    intent.provenance,
+    intent.base_main,
+    intent.base_event_seq,
+    intent.replaces_intent_id,
+    intent.recreated_after_delete,
+    intent.created_at
+  ]);
+}
+
+function toWireDirectoryIntent(intent) {
+  return { op: intent.op, path: intent.path };
+}
+
+function stableJson(value) {
+  return JSON.stringify(value);
+}
+
+function isGitObjectId(value) {
+  return typeof value === "string" && /^[0-9a-f]{40}$/u.test(value);
+}
+
+function isStoredDirectoryIntent(value) {
+  return Boolean(
+    value && typeof value === "object" && !Array.isArray(value) &&
+    (value.op === "create" || value.op === "delete") &&
+    typeof value.path === "string" && isSafeJournalPath(value.path) &&
+    typeof value.intent_id === "string" && /^(?:dir_[0-9]+_[0-9]+_[0-9a-f]{12}|legacy_[0-9a-f]{24})$/u.test(value.intent_id) &&
+    Number.isSafeInteger(value.generation) && value.generation >= 0 &&
+    (value.provenance === "legacy" || value.provenance === "local_v2") &&
+    (value.base_main === null || isGitObjectId(value.base_main)) &&
+    Number.isSafeInteger(value.base_event_seq) && value.base_event_seq >= 0 &&
+    (value.replaces_intent_id === null || typeof value.replaces_intent_id === "string") &&
+    typeof value.recreated_after_delete === "boolean" &&
+    (value.created_at === null || typeof value.created_at === "string")
+  );
+}
+
+function isValidDirectoryRecoveryInventory(inventory, roots) {
+  if (!inventory || typeof inventory !== "object" || Array.isArray(inventory) || !Array.isArray(inventory.directories) || !Array.isArray(inventory.files)) return false;
+  const covered = (filePath) => roots.some((root) => filePath === root || filePath.startsWith(`${root}/`));
+  const directoryPaths = new Set();
+  for (const entry of inventory.directories) {
+    if (
+      !entry || typeof entry !== "object" || Array.isArray(entry) ||
+      typeof entry.path !== "string" || !isSafeJournalPath(entry.path) || !covered(entry.path) ||
+      !(entry.creation_time === null || Number.isFinite(entry.creation_time) && entry.creation_time > 0) ||
+      directoryPaths.has(entry.path)
+    ) return false;
+    directoryPaths.add(entry.path);
+  }
+  const filePaths = new Set();
+  for (const entry of inventory.files) {
+    if (
+      !entry || typeof entry !== "object" || Array.isArray(entry) ||
+      typeof entry.path !== "string" || !isSafeJournalPath(entry.path) || !covered(entry.path) ||
+      !isPreflightFingerprint(entry.fingerprint) || filePaths.has(entry.path)
+    ) return false;
+    filePaths.add(entry.path);
+  }
+  return true;
+}
+
+function parseDirectoryRecoveryDecision(value) {
+  const fail = () => {
+    throw new ObtsBlockedError("directory_recovery_journal_invalid", "The directory recovery journal is invalid.");
+  };
+  if (!value || typeof value !== "object" || Array.isArray(value)) fail();
+  const phases = new Set(["awaiting_decision", "executing"]);
+  const steps = new Set(["decision_recorded", "intent_state_written", "apply_completed", "acknowledged"]);
+  const pathArray = (items) => Array.isArray(items) && items.every((item) => typeof item === "string" && isSafeJournalPath(item)) && new Set(items).size === items.length;
+  if (
+    value.version !== 1 || !phases.has(value.phase) ||
+    typeof value.recovery_id !== "string" || !/^dirrec_[0-9]+_[0-9a-f]{16}$/u.test(value.recovery_id) ||
+    !isGitObjectId(value.target_main) || !isGitObjectId(value.local_main_at_decision) || !isGitObjectId(value.local_head_at_decision) ||
+    !(value.base_main === null || isGitObjectId(value.base_main)) ||
+    !Number.isSafeInteger(value.event_seq) || value.event_seq < 0 ||
+    !pathArray(value.changed_paths) || !pathArray(value.explicit_directories) || !pathArray(value.ambiguous_roots) ||
+    !Array.isArray(value.directory_intents) || value.directory_intents.some((intent) =>
+      !intent || typeof intent !== "object" || Array.isArray(intent) ||
+      (intent.op !== "create" && intent.op !== "delete") || typeof intent.path !== "string" || !isSafeJournalPath(intent.path)
+    ) ||
+    !Array.isArray(value.original_pending_intents) || value.original_pending_intents.some((intent) => !isStoredDirectoryIntent(intent)) ||
+    !Array.isArray(value.ambiguous_intents) || value.ambiguous_intents.some((intent) => !isStoredDirectoryIntent(intent)) ||
+    !Array.isArray(value.superseded_intents) || value.superseded_intents.some((intent) => !isStoredDirectoryIntent(intent)) ||
+    !Number.isSafeInteger(value.next_generation) || value.next_generation < 1 ||
+    typeof value.archived !== "boolean" || !steps.has(value.last_completed_step) ||
+    typeof value.created_at !== "string" || typeof value.updated_at !== "string" ||
+    !value.inventory || typeof value.inventory !== "object" || Array.isArray(value.inventory) ||
+    !Array.isArray(value.inventory.directories) || !Array.isArray(value.inventory.files)
+  ) fail();
+  const originalById = new Map(value.original_pending_intents.map((intent) => [intent.intent_id, intent]));
+  if (originalById.size !== value.original_pending_intents.length) fail();
+  const classified = [...value.ambiguous_intents, ...value.superseded_intents];
+  if (classified.some((intent) => {
+    const original = originalById.get(intent.intent_id);
+    return !original || directoryIntentRecordKey(original) !== directoryIntentRecordKey(intent);
+  })) fail();
+  if (new Set(classified.map((intent) => intent.intent_id)).size !== classified.length) fail();
+  const deletePaths = value.directory_intents.filter((intent) => intent.op === "delete").map((intent) => intent.path);
+  const coveredByRemoteDelete = (intent) => intent.op === "create" && deletePaths.some((deletedPath) =>
+    intent.path === deletedPath || intent.path.startsWith(`${deletedPath}/`)
+  );
+  if (classified.some((intent) => !coveredByRemoteDelete(intent))) fail();
+  const coveredOriginalIds = value.original_pending_intents.filter(coveredByRemoteDelete).map((intent) => intent.intent_id).sort();
+  if (stableJson(coveredOriginalIds) !== stableJson(classified.map((intent) => intent.intent_id).sort())) fail();
+  const derivedAmbiguousRoots = topmostDirectories(value.ambiguous_intents.map((intent) => intent.path));
+  if (stableJson(derivedAmbiguousRoots) !== stableJson(value.ambiguous_roots)) fail();
+  const inventoryRoots = topmostDirectories([
+    ...value.ambiguous_roots,
+    ...value.superseded_intents.map((intent) => intent.path)
+  ]);
+  const covered = (filePath) => inventoryRoots.some((root) => filePath === root || filePath.startsWith(`${root}/`));
+  const directoryPaths = new Set();
+  for (const entry of value.inventory.directories) {
+    if (
+      !entry || typeof entry !== "object" || Array.isArray(entry) ||
+      typeof entry.path !== "string" || !isSafeJournalPath(entry.path) || !covered(entry.path) ||
+      !(entry.creation_time === null || Number.isFinite(entry.creation_time) && entry.creation_time > 0) ||
+      directoryPaths.has(entry.path)
+    ) fail();
+    directoryPaths.add(entry.path);
+  }
+  const filePaths = new Set();
+  for (const entry of value.inventory.files) {
+    if (
+      !entry || typeof entry !== "object" || Array.isArray(entry) ||
+      typeof entry.path !== "string" || !isSafeJournalPath(entry.path) || !covered(entry.path) ||
+      !isPreflightFingerprint(entry.fingerprint) || filePaths.has(entry.path)
+    ) fail();
+    filePaths.add(entry.path);
+  }
+  if (value.ambiguous_intents.some((intent) => !directoryPaths.has(intent.path))) fail();
+  if (value.superseded_intents.some((intent) => [...directoryPaths, ...filePaths].some((entryPath) =>
+    entryPath === intent.path || entryPath.startsWith(`${intent.path}/`)
+  ))) fail();
+  if (value.phase === "executing") {
+    if (!value.decisions || typeof value.decisions !== "object" || Array.isArray(value.decisions)) fail();
+    if (value.last_completed_step !== "decision_recorded" && !value.archived) fail();
+    if (stableJson(Object.keys(value.decisions).sort()) !== stableJson(value.ambiguous_roots.slice().sort())) fail();
+    if (Object.values(value.decisions).some((choice) => choice !== "keep_local" && choice !== "accept_server")) fail();
+  } else if (value.decisions !== null || value.last_completed_step !== "decision_recorded" || value.archived) fail();
+  return value;
+}
+
 function compactDirectoryIntents(intents) {
   const byPath = new Map();
-  for (const intent of intents) {
-    if (!intent || (intent.op !== "create" && intent.op !== "delete") || !isSyncableVaultPath(intent.path)) {
+  for (const original of intents) {
+    if (!original || (original.op !== "create" && original.op !== "delete") || !isSyncableVaultPath(original.path)) {
       continue;
+    }
+    let intent = original;
+    const replaced = byPath.get(intent.path);
+    if (intent.op === "create" && replaced && replaced.op === "delete" && !intent.recreated_after_delete) {
+      intent = Object.assign({}, intent, {
+        replaces_intent_id: intent.replaces_intent_id || replaced.intent_id || null,
+        recreated_after_delete: true
+      });
     }
     if (intent.op === "delete") {
       for (const dirPath of Array.from(byPath.keys())) {
@@ -6639,6 +7312,9 @@ function blockStatusLabel(code) {
   if (code === "conflict_review_required") {
     return "Review needed";
   }
+  if (code === "directory_recovery_decision_required" || code === "directory_recovery_changed") {
+    return "Directory decision required";
+  }
   if (code === "replace_local_with_server_required" || code === "device_blocked" || code === "stale_device_ref" || code === "same_device_non_fast_forward" || code === "local_state_incomplete") {
     return "Needs recovery";
   }
@@ -6680,6 +7356,8 @@ function parseApplyJournal(value) {
   const explicitDirectories = value.explicit_directories;
   const preApplyDirectories = value.pre_apply_directories;
   const preApplyDirectoryCtimes = value.pre_apply_directory_ctimes;
+  const confirmedDirectoryRoots = value.confirmed_directory_roots === undefined ? [] : value.confirmed_directory_roots;
+  const confirmedDirectoryInventory = value.confirmed_directory_inventory === undefined ? null : value.confirmed_directory_inventory;
   if (
     (journalVersion !== 1 && journalVersion !== 2 && journalVersion !== 3) ||
     typeof value.apply_id !== "string" || value.apply_id.length === 0 ||
@@ -6708,6 +7386,10 @@ function parseApplyJournal(value) {
       !preApplyDirectoryCtimes || typeof preApplyDirectoryCtimes !== "object" || Array.isArray(preApplyDirectoryCtimes) ||
       Object.keys(preApplyDirectoryCtimes).length !== preApplyDirectories.length ||
       preApplyDirectories.some((filePath) => !Object.hasOwn(preApplyDirectoryCtimes, filePath) || !isNullableNonNegativeNumber(preApplyDirectoryCtimes[filePath])) ||
+      !Array.isArray(confirmedDirectoryRoots) || confirmedDirectoryRoots.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath)) ||
+      new Set(confirmedDirectoryRoots).size !== confirmedDirectoryRoots.length ||
+      !(confirmedDirectoryInventory === null || isValidDirectoryRecoveryInventory(confirmedDirectoryInventory, confirmedDirectoryRoots)) ||
+      (confirmedDirectoryInventory === null && confirmedDirectoryRoots.length > 0) ||
       typeof value.preserve_local_changes !== "boolean" ||
       !(value.event_seq === null || Number.isSafeInteger(value.event_seq) && value.event_seq >= 0)
     )) ||
@@ -6722,6 +7404,8 @@ function parseApplyJournal(value) {
     explicit_directories: [],
     pre_apply_directories: [],
     pre_apply_directory_ctimes: {},
+    confirmed_directory_roots: [],
+    confirmed_directory_inventory: null,
     preserve_local_changes: false,
     event_seq: null
   }, value);
@@ -6931,6 +7615,7 @@ function buildDiagnosticReport(error) {
   const transport = error instanceof ObtsTransportError;
   const blocked = error instanceof ObtsBlockedError;
   const lifecycleFailure = safeErrorCode === "operation_interrupted_by_reload" || safeErrorCode === "sync_lease_blocked";
+  const directoryRecoveryFailure = safeErrorCode === "directory_recovery_decision_required" || safeErrorCode === "directory_recovery_changed" || safeErrorCode === "directory_recovery_journal_invalid";
   const failureCode = context && context.failureCode
     ? context.failureCode
     : safeErrorCode === "invalid_json"
@@ -6941,7 +7626,9 @@ function buildDiagnosticReport(error) {
       ? "missing_buffer_dependency"
       : message.includes("pack.slice")
         ? "null_pack_slice"
-        : transport
+        : directoryRecoveryFailure
+          ? safeErrorCode
+          : transport
         ? "request_failed"
         : blocked
           ? "sync_failed"
@@ -6952,8 +7639,8 @@ function buildDiagnosticReport(error) {
     plugin_version: PLUGIN_VERSION,
     obsidian_version: typeof apiVersion === "string" && apiVersion ? apiVersion : "unknown",
     platform_family: Platform && Platform.isIosApp ? "ios" : Platform && Platform.isAndroidApp ? "android" : "desktop",
-    flow: context && context.flow ? context.flow : lifecycleFailure ? "plugin" : blocked || transport ? "sync" : "plugin",
-    stage: context && context.stage ? context.stage : lifecycleFailure ? "plugin_lifecycle" : transport ? "sync_request" : "unknown",
+    flow: context && context.flow ? context.flow : directoryRecoveryFailure ? "recovery" : lifecycleFailure ? "plugin" : blocked || transport ? "sync" : "plugin",
+    stage: context && context.stage ? context.stage : directoryRecoveryFailure ? "recovery" : lifecycleFailure ? "plugin_lifecycle" : transport ? "sync_request" : "unknown",
     failure_code: failureCode,
     error_class: transport ? "transport_error" : blocked ? "blocked_error" : error instanceof TypeError ? "type_error" : error instanceof Error ? "error" : "unknown",
     retryable: transport ? isOfflineTransportError(error) || isRetryableServerError(error) : false,

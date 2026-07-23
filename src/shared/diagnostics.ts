@@ -34,6 +34,9 @@ export const diagnosticFailureCodes = [
   'request_failed',
   'onboarding_failed',
   'sync_failed',
+  'directory_recovery_decision_required',
+  'directory_recovery_changed',
+  'directory_recovery_journal_invalid',
   'recovery_failed',
   'operation_stalled',
   'unknown'

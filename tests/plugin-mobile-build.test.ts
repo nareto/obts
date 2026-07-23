@@ -42,6 +42,9 @@ describe('mobile plugin artifact', () => {
     expect(browserHandoff).not.toContain('setFeedback(feedback, error instanceof Error');
     expect(source).not.toContain('runExclusiveAction(() => this.plugin.setDiagnosticSharing');
     expect(source).toContain('await this.plugin.setDiagnosticSharing(value)');
+    expect(source).toContain('const transferRequest = {');
+    expect(source).toContain('plugin_version: PLUGIN_VERSION');
+    expect(source).toContain('sha256(Buffer.from(stableJson(transferRequest)))');
   });
 
   it('loads with only the Obsidian API external and browser globals', async () => {
@@ -774,6 +777,40 @@ describe('mobile plugin artifact', () => {
     runtimeClient.createLocalCommit = createLocalCommit;
     await runtimeClient.syncOnce({ confirmInitialImport: false });
     expect(await runtimeClient.readQueue()).toMatchObject({ pending_commit: null, status: 'idle' });
+
+    await runtimeAdapter.mkdir('mobile-directory-recovery');
+    await runtimeAdapter.mkdir('mobile-directory-recovery/nested');
+    const mobileRecoveryState = await runtimeClient.readDirectoryState();
+    await runtimeClient.writeDirectoryState({
+      ...mobileRecoveryState,
+      observed_dirs: [...mobileRecoveryState.observed_dirs, 'mobile-directory-recovery', 'mobile-directory-recovery/nested'],
+      explicit_empty_dirs: [...mobileRecoveryState.explicit_empty_dirs, 'mobile-directory-recovery', 'mobile-directory-recovery/nested'],
+      pending_intents: [
+        ...mobileRecoveryState.pending_intents,
+        { op: 'create', path: 'mobile-directory-recovery' },
+        { op: 'create', path: 'mobile-directory-recovery/nested' }
+      ],
+      updated_at: new Date().toISOString()
+    });
+    const mobileRemoteIntents = [{ op: 'delete', path: 'mobile-directory-recovery' }];
+    const mobileClassification = await runtimeClient.classifyDirectoryIntentsForRecovery(mobileRemoteIntents);
+    expect(mobileClassification.ambiguous).toHaveLength(2);
+    const mobileDecision = await runtimeClient.stageDirectoryRecoveryDecision({
+      state: await runtimeClient.readState(),
+      serverState: { last_applied_main: runtimeMain },
+      manifest: {
+        target_main: runtimeMain,
+        event_seq: 1,
+        changed_paths: [],
+        directory_intents: mobileRemoteIntents,
+        explicit_directories: mobileRecoveryState.explicit_empty_dirs
+      },
+      classification: mobileClassification
+    });
+    expect(mobileDecision).toMatchObject({ phase: 'awaiting_decision', ambiguous_roots: ['mobile-directory-recovery'] });
+    expect((await runtimeClient.resolveDirectoryRecovery({ 'mobile-directory-recovery': 'accept_server' })).status).toBe('Synced');
+    expect(await runtimeAdapter.exists('mobile-directory-recovery')).toBe(false);
+    expect(await runtimeAdapter.exists('.obts/directory-recovery.json')).toBe(false);
 
     let lightweightPolls = 0;
     let fullScans = 0;
