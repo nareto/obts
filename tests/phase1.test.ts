@@ -5380,7 +5380,51 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await server.git.isAncestor(admin.vaultId, commit!, result.main)).toBe(true);
   });
 
-  it('rejects attempts to adopt another device ref as the actor device cursor', async () => {
+  it('accepts a same-device fast-forward after the expected ref becomes stale', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'stale-fast-forward-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'stale-fast-forward-device');
+    const pairedState = await plugin.readState();
+    const localGit = new LocalGitEngine(deviceDir);
+    const token = await readDeviceToken(deviceDir);
+    const auth = await server.auth.authenticateDevice(`Bearer ${token}`, admin.vaultId);
+
+    await writeFile(join(deviceDir, 'first.md'), 'first accepted proposal\n');
+    const firstCommit = await localGit.createLocalCommit('obts: first accepted proposal');
+    const firstPack = await localGit.createPackForCommit(firstCommit!);
+    const first = await server.sync.pushDeviceCommit(auth, {
+      api_version: API_VERSION,
+      vault_id: admin.vaultId,
+      device_id: pairedState.device_id!,
+      expected_device_ref: pairedState.server_device_ref,
+      target_commit: firstCommit!,
+      packfile_sha256: sha256(firstPack),
+      packfile_bytes: firstPack.byteLength,
+      client_known_main: pairedState.local_main
+    }, firstPack);
+    expect(first.status).toBe('merged');
+
+    await writeFile(join(deviceDir, 'second.md'), 'descendant proposal\n');
+    const secondCommit = await localGit.createLocalCommit('obts: stale expected ref descendant');
+    const secondPack = await localGit.createPackForCommit(secondCommit!);
+    const second = await server.sync.pushDeviceCommit(auth, {
+      api_version: API_VERSION,
+      vault_id: admin.vaultId,
+      device_id: pairedState.device_id!,
+      expected_device_ref: pairedState.server_device_ref,
+      target_commit: secondCommit!,
+      packfile_sha256: sha256(secondPack),
+      packfile_bytes: secondPack.byteLength,
+      client_known_main: pairedState.local_main
+    }, secondPack);
+
+    expect(second.status).toBe('merged');
+    const db = await server.store.snapshot();
+    expect(db.devices.find((device) => device.device_id === pairedState.device_id)?.device_ref_head).toBe(secondCommit);
+  });
+
+  it('treats an expected ref as advisory without adopting another device ref', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const desktopDir = join(root, 'adopt-ref-desktop');
     await mkdirp(desktopDir);
@@ -5400,7 +5444,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     const phoneState = await phone.readState();
     const phoneAuth = await server.auth.authenticateDevice(`Bearer ${await readDeviceToken(phoneDir)}`, admin.vaultId);
 
-    const rejected = await server.sync.pushDeviceCommit(
+    const accepted = await server.sync.pushDeviceCommit(
       phoneAuth,
       {
         api_version: API_VERSION,
@@ -5415,10 +5459,11 @@ describe('Phase 1 sync without conflict resolution', () => {
       },
       phonePack
     );
-    expect(rejected).toMatchObject({ status: 'rejected', code: 'stale_device_ref' });
+    expect(accepted.status).toBe('merged');
     const db = await server.store.snapshot();
     const phoneRow = db.devices.find((device) => device.device_id === phoneState.device_id);
-    expect(phoneRow?.device_ref_head).toBeNull();
+    expect(phoneRow?.device_ref_head).toBe(phoneCommit);
+    expect(phoneRow?.device_ref_head).not.toBe(desktopState.server_device_ref);
   });
 
   it('rejects untrusted proposal base commits without advancing refs', async () => {
@@ -5455,7 +5500,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(db.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(state.local_main);
   });
 
-  it('keeps same-device non-fast-forward blocks active until recovery', async () => {
+  it('preserves divergent same-device history as a reviewable conflict', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'non-fast-forward-device');
     await mkdirp(deviceDir);
@@ -5496,7 +5541,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     const divergentCommit = await localGit.createLocalCommit('obts: divergent same-device history');
     expect(divergentCommit).toMatch(/^[0-9a-f]{40}$/u);
     const divergentPack = await localGit.createPackForCommit(divergentCommit!);
-    const rejected = await server.sync.pushDeviceCommit(
+    const preserved = await server.sync.pushDeviceCommit(
       auth,
       {
         api_version: API_VERSION,
@@ -5510,15 +5555,19 @@ describe('Phase 1 sync without conflict resolution', () => {
       },
       divergentPack
     );
-    expect(rejected).toMatchObject({
-      status: 'rejected',
-      code: 'same_device_non_fast_forward'
+    expect(preserved).toMatchObject({
+      status: 'conflicted',
+      device_ref: firstPush.device_ref,
+      conflict_id: expect.stringMatching(/^conf_/u)
     });
     let db = await server.store.snapshot();
     let device = db.devices.find((candidate) => candidate.device_id === pairedState.device_id);
     expect(device).toMatchObject({
       device_ref_head: firstPush.device_ref,
-      status: 'blocked_recovery'
+      status: 'review_needed'
+    });
+    expect(db.conflicts.find((conflict) => conflict.device_commit === divergentCommit)?.validator_summary).toMatchObject({
+      reason: 'same_device_history_divergence'
     });
 
     const emptyPack = Buffer.alloc(0);
@@ -5537,15 +5586,88 @@ describe('Phase 1 sync without conflict resolution', () => {
       emptyPack
     );
     expect(retryCurrentRef).toMatchObject({
-      status: 'rejected',
-      code: 'device_blocked'
+      status: 'noop',
+      device_ref: firstPush.device_ref
     });
     db = await server.store.snapshot();
     device = db.devices.find((candidate) => candidate.device_id === pairedState.device_id);
     expect(device).toMatchObject({
       device_ref_head: firstPush.device_ref,
-      status: 'blocked_recovery'
+      status: 'review_needed'
     });
+  });
+
+  it('validates and merges large disjoint trees without per-file Git processes or worktree checkout', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'batched-tree-device');
+    await mkdirp(join(deviceDir, 'notes'));
+    const plugin = await pairPlugin(admin, deviceDir, 'batched-tree-device');
+    for (let index = 0; index < 300; index += 1) {
+      await writeFile(join(deviceDir, 'notes', `${index}.md`), `note ${index}\n`);
+    }
+
+    const gitService = server.git as unknown as { exec: (...args: any[]) => Promise<any> };
+    const originalExec = gitService.exec.bind(gitService);
+    const commands: string[][] = [];
+    gitService.exec = async (...args: any[]) => {
+      if (Array.isArray(args[1])) commands.push(args[1]);
+      return await originalExec(...args);
+    };
+    try {
+      await expect(plugin.syncOnce()).resolves.toMatchObject({ status: 'Synced' });
+    } finally {
+      gitService.exec = originalExec;
+    }
+
+    expect(commands.some((args) => args[0] === 'cat-file' && args[1] === '-s')).toBe(false);
+    expect(commands.some((args) => args.includes('checkout-index'))).toBe(false);
+    expect(commands.some((args) => args[0] === 'ls-tree' && args.includes('-l'))).toBe(true);
+    expect(commands.some((args) => args[0] === 'merge-tree')).toBe(true);
+  });
+
+  it('retrieves a committed async transfer outcome without rescanning or re-uploading', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'lost-finalize-result-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'lost-finalize-result-device');
+    await writeFile(join(deviceDir, 'large.bin'), randomBytes(2 * 1024 * 1024));
+    await mkdirp(join(deviceDir, 'Explicit Empty Folder'));
+
+    const core = (plugin as unknown as { client: Record<string, any> }).client;
+    const originalPoll = core.pollPushTransfer.bind(core);
+    const originalPut = core.putPushChunk.bind(core);
+    let uploadedChunks = 0;
+    let observedProcessing = false;
+    core.putPushChunk = async (...args: unknown[]) => {
+      uploadedChunks += 1;
+      return await originalPut(...args);
+    };
+    core.pollPushTransfer = async (state: unknown, token: unknown, descriptor: { status: string }) => {
+      observedProcessing = descriptor.status === 'processing';
+      await originalPoll(state, token, descriptor);
+      throw new Error('simulated lost finalization response');
+    };
+
+    await expect(plugin.syncOnce()).rejects.toThrow('simulated lost finalization response');
+    expect(observedProcessing).toBe(true);
+    const interruptedQueue = await plugin.readQueue();
+    const interruptedHead = (await plugin.readState()).local_head;
+    expect(interruptedQueue).toMatchObject({ pending_commit: interruptedHead, status: 'queued_local' });
+    expect(JSON.parse(await readFile(join(deviceDir, '.obts', 'upload-transfer.json'), 'utf8'))).toMatchObject({
+      target_commit: interruptedHead,
+      transfer_id: expect.stringMatching(/^trn_/u)
+    });
+    const chunksAfterFirstAttempt = uploadedChunks;
+    const transfersAfterFirstAttempt = await readdir(server.config.transferDir);
+
+    core.pollPushTransfer = originalPoll;
+    await expect(plugin.syncOnce()).resolves.toMatchObject({ status: 'Synced' });
+    expect(uploadedChunks).toBe(chunksAfterFirstAttempt);
+    expect(await readdir(server.config.transferDir)).toEqual(transfersAfterFirstAttempt);
+    await expect(stat(join(deviceDir, '.obts', 'upload-transfer.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    const settledHead = (await plugin.readState()).local_head;
+    expect(settledHead).toMatch(/^[0-9a-f]{40}$/u);
+    expect(await core.isAncestor(interruptedHead, settledHead)).toBe(true);
   });
 
   it('resumes a multi-pack upload whose aggregate exceeds the legacy request limit', async () => {

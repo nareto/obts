@@ -748,6 +748,11 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const { vaultId } = pathParams(request);
     const transferId = (request.params as { transferId?: string }).transferId ?? '';
     const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+    const prefer = Array.isArray(request.headers.prefer) ? request.headers.prefer.join(',') : request.headers.prefer ?? '';
+    if (prefer.split(',').some((value) => value.trim() === 'respond-async')) {
+      const descriptor = await chunkTransfers.beginFinalizePush(deviceAuth, transferId);
+      return reply.status(descriptor.status === 'processing' ? 202 : 200).send(descriptor);
+    }
     const result = await chunkTransfers.finalizePush(deviceAuth, transferId);
     if (result.status === 'rejected') {
       const status = result.code === 'not_found' ? 404 : result.code === 'malformed_packfile' ? 400 : 409;

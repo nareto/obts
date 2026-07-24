@@ -46,6 +46,7 @@ type GitTreeEntry = {
   mode: string;
   type: string;
   oid: string;
+  size: number | null;
   path: string;
 };
 
@@ -370,22 +371,23 @@ export class GitService {
   }
 
   private async listTreeEntriesInRepo(repo: string, commit: string): Promise<GitTreeEntry[]> {
-    const { stdout } = await this.exec(repo, ['ls-tree', '-r', '-z', commit], undefined, undefined, {
+    const { stdout } = await this.exec(repo, ['ls-tree', '-r', '-l', '-z', commit], undefined, undefined, {
       encoding: 'buffer'
     });
     const data = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
     return splitNul(data)
       .filter((entry) => entry.length > 0)
       .map((entry) => {
-        const match = /^(\d{6}) (\S+) ([0-9a-f]+)\t(.+)$/u.exec(entry);
-        if (!match?.[1] || !match[2] || !match[3] || !match[4]) {
+        const match = /^(\d{6}) (\S+) ([0-9a-f]+)\s+(-|\d+)\t(.+)$/u.exec(entry);
+        if (!match?.[1] || !match[2] || !match[3] || !match[4] || !match[5]) {
           throw new GitCommandError('Malformed git tree output.', '');
         }
         return {
           mode: match[1],
           type: match[2],
           oid: match[3],
-          path: match[4]
+          size: match[4] === '-' ? null : Number.parseInt(match[4], 10),
+          path: match[5]
         };
       });
   }
@@ -408,8 +410,10 @@ export class GitService {
           'Git tree entries must be regular files; symlinks and submodules cannot be synced.'
         );
       }
-      const blobSize = await this.objectSizeInRepo(repo, `${commit}:${entry.path}`);
-      if (blobSize > maxBlobBytes) {
+      if (entry.size === null || !Number.isSafeInteger(entry.size) || entry.size < 0) {
+        throw new PathPolicyViolation('invalid_blob_size', 'Git tree entries must expose a valid blob size.');
+      }
+      if (entry.size > maxBlobBytes) {
         throw new PathPolicyViolation('file_too_large', 'A file exceeds the configured upload byte limit.', {
           max_upload_bytes: maxBlobBytes
         });
@@ -597,6 +601,28 @@ export class GitService {
           : {})
       }
     };
+  }
+
+  async createDisjointMergeTree(
+    vaultId: string,
+    base: string,
+    currentMain: string,
+    deviceCommit: string
+  ): Promise<string> {
+    const repo = this.repoPath(vaultId);
+    const { stdout } = await this.exec(repo, [
+      'merge-tree',
+      '--write-tree',
+      '--no-messages',
+      '--merge-base',
+      base,
+      currentMain,
+      deviceCommit
+    ]);
+    const tree = asText(stdout).trim();
+    if (!/^[0-9a-f]{40}$/u.test(tree)) throw new GitCommandError('Git did not produce a disjoint merge tree.', '');
+    await this.validateTreePathPolicy(vaultId, tree);
+    return tree;
   }
 
   async createMergeCommitFromTree(input: {

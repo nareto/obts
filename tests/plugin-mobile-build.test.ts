@@ -42,9 +42,12 @@ describe('mobile plugin artifact', () => {
     expect(browserHandoff).not.toContain('setFeedback(feedback, error instanceof Error');
     expect(source).not.toContain('runExclusiveAction(() => this.plugin.setDiagnosticSharing');
     expect(source).toContain('await this.plugin.setDiagnosticSharing(value)');
-    expect(source).toContain('const transferRequest = {');
+    expect(source).toContain('transferRequest = {');
     expect(source).toContain('directory_proposal: directoryProposal');
     expect(source).toContain('directory-proposals-v2');
+    expect(source).toContain('async-push-finalize-v1');
+    expect(source).toContain('upload-transfer.json');
+    expect(source).toContain('prefer: "respond-async"');
     expect(source).not.toContain('id: "obts-resolve-directory-recovery"');
     expect(source).not.toContain('class ObtsDirectoryRecoveryModal');
     expect(source).not.toContain('Review directory recovery');

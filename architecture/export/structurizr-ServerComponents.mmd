@@ -2,69 +2,38 @@ graph LR
 
   subgraph diagram ["Component View: Obsidian True Sync - Server API and CLI"]
 
-    5["Deployment secret source [Software System]"]
+    subgraph 5 ["Obsidian True Sync"]
 
-    subgraph 6 ["Obsidian True Sync"]
+      subgraph 20 ["Server API and CLI"]
 
-      subgraph 7 ["Server API and CLI"]
-
-        10["VaultService [Component: TypeScript]"]
-        11["DeviceService [Component: TypeScript]"]
-        12["AtRestKeyManager [Component: TypeScript, Node crypto]"]
-        13["ContentStoreService [Component: TypeScript]"]
-        14["ProposalService [Component: TypeScript]"]
-        15["HistoryService [Component: TypeScript]"]
-        16["MergeCoordinator [Component: TypeScript]"]
-        17["SemanticMergeService [Component: TypeScript]"]
-        18["ConflictService [Component: TypeScript]"]
-        19["NotificationHub [Component: TypeScript]"]
-        20["BackupService [Component: TypeScript]"]
-        21["AuditLogService [Component: TypeScript]"]
-        22["HealthService [Component: TypeScript]"]
-        8["AuthService [Component: TypeScript]"]
-        9["ConnectionService [Component: TypeScript]"]
+        21["Auth service [Component: TypeScript]"]
+        22["Connection service [Component: TypeScript]"]
+        23["Chunk transfer service [Component: TypeScript]"]
+        24["Sync service [Component: TypeScript]"]
+        25["Git service [Component: Native Git]"]
+        26["Metadata store [Component: TypeScript]"]
+        27["Diagnostic service [Component: TypeScript]"]
+        28["Dashboard host [Component: Fastify]"]
       end
 
-      23["Dashboard SPA [Container: TypeScript, static SPA]"]
-      31["Obsidian plugin [Container: TypeScript, Obsidian Plugin API]"]
-      47[("Server metadata database [Container: PostgreSQL]")]
-      48["Encrypted-at-rest content store [Container: Local filesystem]"]
-      49["Internal history store [Container: Git-compatible local filesystem]"]
-      50["Temporary merge workspace [Container: Local filesystem]"]
+      15["Dashboard SPA [Container: Svelte, TypeScript, Vite]"]
+      31[("Metadata store [Container: JSON file adapter]")]
+      32["Vault Git stores [Container: Native Git bare repositories]"]
+      33["Transfer quarantine [Container: Filesystem, temporary bare Git repositories]"]
+      34["Semantic merge workspace [Container: Temporary filesystem]"]
+      6["Obsidian plugin [Container: JavaScript, TypeScript, Obsidian Plugin API]"]
     end
 
-    22-. "Checks internal history store accessibility. [Filesystem]" .->49
-    22-. "Checks key-manager readiness and master key availability. [TypeScript calls]" .->12
-    31-. "Starts and polls connection requests, downloads bootstrap state, completes device registration, and acknowledges onboarding. [HTTPS]" .->9
-    23-. "Reviews, approves, or denies browser connection requests. [HTTPS]" .->9
-    9-. "Stores hashed connection secrets, approval selection, expiry, and onboarding lifecycle state. [Metadata adapter calls]" .->47
-    8-. "Reads users and token hashes; writes auth audit metadata. [SQL]" .->47
-    10-. "Manages vault records, setup state, owner isolation, and wrapped key metadata. [SQL]" .->47
-    10-. "Requests per-vault data key creation for new vaults. [TypeScript calls]" .->12
-    11-. "Registers, updates, and revokes devices. [SQL]" .->47
-    12-. "Reads runtime master key material without printing or persisting it. [Environment variable, secret mount, or KMS API]" .->5
-    12-. "Stores and reads wrapped per-vault data keys and key version metadata. [SQL]" .->47
-    13-. "Requests per-vault data keys for encryption/decryption at persistence boundaries. [TypeScript calls]" .->12
-    13-. "Writes encrypted-at-rest content bytes and reads them for authorized workflows. [Filesystem]" .->48
-    13-. "Records content catalog metadata, hashes, sizes, and storage refs. [SQL]" .->47
-    14-. "Persists uploaded content before accepting proposals. [TypeScript calls]" .->13
-    14-. "Submits actor-device proposal manifests for server-side merge or conflict routing without adopting another device ref. [TypeScript calls]" .->16
-    15-. "Reads and writes commit graph, manifests, refs, and merge provenance. [Filesystem]" .->49
-    15-. "Records main refs, commit indexes, and transaction state. [SQL]" .->47
-    16-. "Reads base/current/proposed manifests and advances main after clean merge or resolution. [TypeScript calls]" .->15
-    16-. "Decrypts candidate content for merge and persists merged results encrypted at rest. [TypeScript calls]" .->13
-    16-. "Checks out transaction-scoped plaintext working trees for content-aware merge. [Filesystem]" .->50
-    16-. "Requests conservative text and Markdown merge for same-path changes. [TypeScript calls]" .->17
-    17-. "Reads and writes plaintext merge candidates inside the transaction workspace. [Filesystem]" .->50
-    16-. "Creates conflict records when server-side merge is ambiguous or unsafe. [TypeScript calls]" .->18
-    18-. "Stores conflict state, affected paths, base/current/proposed refs, and resolution refs. [SQL]" .->47
-    18-. "Reads conflict variants and persists resolution content encrypted at rest. [TypeScript calls]" .->13
-    19-. "Emits main advancement, conflict, device state, and maintenance events. [WebSocket]" .->31
-    20-. "Reads or snapshots server metadata and wrapped key metadata for backup and restore. [SQL]" .->47
-    20-. "Copies encrypted-at-rest content during backup and restore. [Filesystem]" .->48
-    20-. "Copies internal history state during backup and restore. [Filesystem]" .->49
-    21-. "Writes redacted audit events without raw tokens, passwords, key material, or full note bodies. [SQL]" .->47
-    22-. "Checks database readiness. [SQL]" .->47
-    22-. "Checks encrypted content store writability. [Filesystem]" .->48
+    6-. "Creates/resumes transfers, uploads missing packs, requests async processing, and polls [HTTPS]" .->23
+    23-. "Stores receipts, staged objects, processing state, and terminal results [Filesystem]" .->33
+    23-. "Queues a validated immutable proposal for canonical integration [In-process calls]" .->24
+    24-. "Checks ancestry, validates trees, and creates merge or protected conflict history [In-process calls]" .->25
+    24-. "Persists operation phases, merge order, events, acknowledgements, and conflicts [In-process calls]" .->26
+    25-. "Runs batched tree inspection, object promotion, merge-tree, commit-tree, and ref CAS [Native Git]" .->32
+    25-. "Reads validated staged objects and promotes them after policy checks [Git alternates and filesystem]" .->33
+    25-. "Materializes semantic overlap candidates only [Filesystem]" .->34
+    26-. "Atomically reads and replaces durable metadata [Filesystem]" .->31
+    28-. "Serves built assets [HTTP]" .->15
+    27-. "Stores consented redacted diagnostic events [Filesystem]" .->31
 
   end

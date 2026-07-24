@@ -282,10 +282,15 @@ export type DevicePullManifest = {
 };
 
 export const CHUNK_TRANSFER_CAPABILITY = 'git-object-pack-chunks-v1' as const;
+export const ASYNC_PUSH_FINALIZE_CAPABILITY = 'async-push-finalize-v1' as const;
 export const DIRECTORY_PROPOSAL_CAPABILITY = 'directory-proposals-v2' as const;
 
 export type SyncCapabilities = {
-  capabilities: Array<typeof CHUNK_TRANSFER_CAPABILITY | typeof DIRECTORY_PROPOSAL_CAPABILITY>;
+  capabilities: Array<
+    | typeof CHUNK_TRANSFER_CAPABILITY
+    | typeof ASYNC_PUSH_FINALIZE_CAPABILITY
+    | typeof DIRECTORY_PROPOSAL_CAPABILITY
+  >;
   max_chunk_bytes: number;
   target_chunk_bytes: number;
   max_transfer_bytes: number;
@@ -311,13 +316,14 @@ export type ChunkPushCreateRequest = {
 export type ChunkPushDescriptor = {
   transfer_id: string;
   capability: typeof CHUNK_TRANSFER_CAPABILITY;
-  status: 'open' | 'completed' | 'aborted';
+  status: 'open' | 'processing' | 'completed' | 'rejected' | 'aborted';
   target_commit: string;
   chunk_count: number;
   received_chunks: number[];
   max_chunk_bytes: number;
   max_transfer_bytes: number;
   expires_at: string;
+  poll_after_ms?: number;
   result?: PushResult;
 };
 

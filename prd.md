@@ -179,11 +179,17 @@ Acceptance criteria:
 - If `state.json` is missing, corrupt, or incomplete but the device token and local Git journal are intact, the plugin rehydrates non-secret identity/ref metadata from the server and resumes normal commit/upload behavior without reset or reconnect.
 - `.obts/` is excluded from vault sync, Git worktree content, and manifest/path scanning.
 - Retrying an upload of the same Git commit is idempotent, uses bounded exponential backoff for transient failures, and preserves permanent server rejection codes instead of relabelling them as retryable interruption.
-- Before expensive object planning, the client performs a lightweight authenticated vault-status preflight. Incremental upload plans include only commits, changed tree objects, and blobs not already available from acknowledged bases; retrying the same plan reuses its in-memory object grouping.
-- Upload preparation reports object-planning and chunk-packing progress separately from bytes already sent.
-- A new local edit creates a new Git commit with normal Git ancestry.
+- One in-flight upload has an immutable durable identity comprising its target commit, expected device ref, proposal base, directory proposal, object plan, attempt ID, and transfer ID. Watcher hints and later local edits queue follow-up work but never replace or extend that target until the client has consumed an authoritative terminal result.
+- Before expensive object planning, the client performs a lightweight authenticated device/vault preflight. It reconciles an ancestry-safe newer server device ref before planning, and checks a persisted transfer descriptor before rescanning or uploading so a lost completion response becomes result retrieval rather than a new proposal.
+- Incremental upload plans include only commits, changed tree objects, and blobs not already available from acknowledged bases. The plan is durable across reload and reused for the exact attempt until completion.
+- Upload preparation reports object-planning and chunk-packing progress separately from bytes already sent, while the top-level operation remains monotonic: preparing, uploading, server processing, then applying or settled.
+- A new local edit creates a new Git commit with normal Git ancestry, after any prior immutable in-flight target reaches a terminal result.
 - Git commit hashes and parent links, not timestamps, determine content identity and ancestry.
 - Server stores uploaded Git state in the server Git store after authorization.
+- Ref movement changes how a valid authenticated proposal is integrated, never whether its already-uploaded bytes are retained: stale `main` is merged against the latest canonical state; an ancestry-safe stale device ref is accepted; an already-covered target is an idempotent no-op; and divergent same-device history is preserved as a dashboard conflict without moving the protected device ref.
+- Rejection is reserved for authentication/authorization failure, malformed or unsafe Git state, untrusted proposal provenance, configured object or storage limits, abuse controls, revoked/blocked devices, or persistent-integrity failure.
+- Transfer receipt is decoupled from integration. After all chunks are durable, capable clients receive a prompt asynchronous processing descriptor and poll a restart-recoverable terminal result instead of holding a proxy request open through validation and merge.
+- Expensive proposal validation happens outside client request lifetime, and canonical per-vault integration is fairly serialized. Tree-size validation and clean disjoint merges use bounded Git operations rather than one subprocess or plaintext worktree write per vault file.
 
 ### 3.5 Pull And Apply Server Main
 
@@ -243,19 +249,21 @@ The server receives Git updates from multiple devices and advances `main` only t
 
 Behavior:
 
-1. A device upload carries a Git packfile and an expected current device ref.
-2. If the uploaded commit is already present and the device ref already points to it, the server treats the upload as an idempotent no-op.
-3. If the uploaded commit is a fast-forward of the device ref, the server advances `refs/obts/devices/{device_id}`.
-4. If the uploaded commit is not a descendant of the current device ref, the server blocks that device and requires recovery.
-5. The server classifies the device ref as merge-eligible only after authentication, object validation, path-policy validation, fast-forward ref update, device-not-blocked checks, not-already-merged checks, not-already-conflicted checks, and assignment of a server `merge_sequence`.
-6. The server enqueues merge-eligible device refs in the per-vault merge queue ordered by `merge_sequence`.
-7. The server processes one merge transaction at a time under the per-vault lock.
-8. Disjoint path changes merge automatically when Git and `obts` policy agree they are safe.
-9. Same-path Markdown, `.canvas`, `.base`, and selected text file changes are checked out into an ephemeral server merge workspace.
-10. The merge service uses Git merge machinery plus conservative Markdown, JSON Canvas, and Obsidian Bases semantic merge validation.
-11. Clean merges advance `main` with a merge commit.
-12. Ambiguous or unsafe file, directory, or mixed merges create a conflict record before `main` or canonical directory state advances.
-13. A directory proposal and its Git commit are accepted or conflicted atomically; retries and startup recovery cannot apply only one half.
+1. A device upload carries an immutable Git object proposal, an advisory expected device ref, and its acknowledged proposal base.
+2. Once all chunks are durable, the server records the proposal as received and processes it asynchronously; client disconnect, proxy timeout, retry, or server restart does not change its identity.
+3. If the uploaded target is already present and covered by the current device ref, the server returns the durable prior outcome or an idempotent no-op.
+4. If the current device ref is an ancestor of the uploaded target, the server accepts the ancestry-safe fast-forward even when the advisory expected ref is stale, then advances `refs/obts/devices/{device_id}` by compare-and-swap.
+5. If the uploaded target is an ancestor of the current device ref, the server treats it as an accepted superseded proposal and never moves the ref backwards.
+6. If the uploaded target and current device ref diverge, the server promotes the validated objects into protected conflict history, leaves the device ref unchanged, and creates a dashboard conflict instead of discarding the upload.
+7. The server classifies a proposal as merge-eligible only after authentication, object validation, path-policy validation, device-not-blocked checks, not-already-merged checks, not-already-conflicted checks, and assignment of a server `merge_sequence`.
+8. The server fairly serializes merge-eligible proposals per vault; `merge_sequence` records the canonical integration order.
+9. The server processes one canonical ref transaction at a time under the per-vault lock. `main` movement before a proposal's turn changes its merge input, not its acceptance.
+10. Disjoint path changes merge automatically through object-level Git tree operations when Git and `obts` policy agree they are safe.
+11. Only overlapping Markdown, `.canvas`, `.base`, and selected text file changes requiring semantic validation are materialized in an ephemeral server merge workspace.
+12. The merge service uses Git merge machinery plus conservative Markdown, JSON Canvas, and Obsidian Bases semantic merge validation.
+13. Clean merges advance `main` with a merge commit.
+14. Ambiguous or unsafe file, directory, mixed, or same-device-history merges create a conflict record before `main` or canonical directory state advances.
+15. A directory proposal and its Git commit are accepted or conflicted atomically; retries and startup recovery cannot apply only one half.
 
 Acceptance criteria:
 

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import { newId, nowIso } from '../shared/ids.js';
 import {
+  ASYNC_PUSH_FINALIZE_CAPABILITY,
   CHUNK_TRANSFER_CAPABILITY,
   DIRECTORY_PROPOSAL_CAPABILITY,
   type ChunkPushCreateRequest,
@@ -35,7 +36,8 @@ type PushSession = {
   chunk_count: number;
   receipts: ChunkReceipt[];
   total_bytes: number;
-  status: 'open' | 'completed' | 'aborted';
+  stored_bytes?: number;
+  status: 'open' | 'processing' | 'completed' | 'rejected' | 'aborted';
   result: PushResult | null;
   created_at: string;
   updated_at: string;
@@ -44,6 +46,8 @@ type PushSession = {
 
 export class ChunkTransferService {
   private readonly locks = new Map<string, Promise<void>>();
+  private readonly processors = new Map<string, Promise<void>>();
+  private storedBytes: number | null = null;
 
   constructor(
     private readonly config: ServerConfig,
@@ -53,7 +57,7 @@ export class ChunkTransferService {
 
   capabilities() {
     return {
-      capabilities: [CHUNK_TRANSFER_CAPABILITY, DIRECTORY_PROPOSAL_CAPABILITY],
+      capabilities: [CHUNK_TRANSFER_CAPABILITY, ASYNC_PUSH_FINALIZE_CAPABILITY, DIRECTORY_PROPOSAL_CAPABILITY],
       max_chunk_bytes: this.config.transferChunkBytes,
       target_chunk_bytes: Math.max(1_048_576, Math.floor(this.config.transferChunkBytes * 0.85)),
       max_transfer_bytes: this.config.maxTransferBytes,
@@ -80,9 +84,19 @@ export class ChunkTransferService {
       if (existing.request_sha256 !== requestSha256) throw new AuthError(409, 'attempt_mismatch', 'Transfer attempt does not match its original request.');
       return { descriptor: this.descriptor(existing), created: false };
     }
-    const open = sessions.filter((session) =>
-      session.device_id === auth.device.device_id && session.status === 'open' && !this.expired(session)
-    );
+    const currentDeviceRef = await this.git.getRef(auth.vault.vault_id, auth.device.device_ref);
+    const open: PushSession[] = [];
+    for (const session of sessions) {
+      if (
+        session.device_id !== auth.device.device_id ||
+        (session.status !== 'open' && session.status !== 'processing') ||
+        this.expired(session)
+      ) continue;
+      const alreadyCovered = currentDeviceRef !== null &&
+        await this.git.commitExists(auth.vault.vault_id, session.manifest.target_commit) &&
+        await this.git.isAncestor(auth.vault.vault_id, session.manifest.target_commit, currentDeviceRef);
+      if (!alreadyCovered) open.push(session);
+    }
     if (open.length >= MAX_OPEN_TRANSFERS_PER_DEVICE) {
       throw new AuthError(429, 'too_many_transfers', 'Too many open transfers for this device.');
     }
@@ -114,6 +128,7 @@ export class ChunkTransferService {
       chunk_count: request.chunk_count,
       receipts: [],
       total_bytes: 0,
+      stored_bytes: 0,
       status: 'open',
       result: null,
       created_at: createdAt,
@@ -122,13 +137,17 @@ export class ChunkTransferService {
     };
     await mkdir(this.sessionDir(transferId), { recursive: true, mode: 0o700 });
     await this.git.initializeTransferRepo(auth.vault.vault_id, this.repoDir(transferId));
+    session.stored_bytes = await this.directoryBytes(this.sessionDir(transferId));
+    this.storedBytes = null;
     await this.writeSession(session);
     return { descriptor: this.descriptor(session), created: true };
     });
   }
 
   async getPush(auth: AuthenticatedDevice, transferId: string): Promise<ChunkPushDescriptor> {
-    return this.descriptor(await this.requireSession(auth, transferId));
+    const session = await this.requireSession(auth, transferId);
+    if (session.status === 'processing') this.startProcessing(auth, transferId);
+    return this.descriptor(session);
   }
 
   async putChunk(
@@ -161,8 +180,9 @@ export class ChunkTransferService {
         throw new AuthError(413, 'transfer_too_large', 'Transfer exceeds the configured aggregate limit.');
       }
       await this.withLock('__storage__', async () => {
-        const storedBytes = await this.directoryBytes(this.config.transferDir);
-        if (storedBytes + data.byteLength > this.config.maxTransferStorageBytes) {
+        if (this.storedBytes === null) this.storedBytes = await this.directoryBytes(this.config.transferDir);
+        const previousSessionBytes = session.stored_bytes ?? await this.directoryBytes(this.sessionDir(transferId));
+        if (this.storedBytes + data.byteLength > this.config.maxTransferStorageBytes) {
           throw new AuthError(507, 'transfer_storage_full', 'Transfer quarantine storage is full.');
         }
         const chunkDir = join(this.sessionDir(transferId), 'chunks');
@@ -172,13 +192,16 @@ export class ChunkTransferService {
         await writeFile(temporary, data, { mode: 0o600 });
         try {
           await this.git.importPackIntoRepo(this.repoDir(transferId), data);
+          await rm(temporary, { force: true });
           const transferStoredBytes = await this.directoryBytes(this.sessionDir(transferId));
-          const aggregateBytes = await this.directoryBytes(this.config.transferDir);
+          const aggregateBytes = this.storedBytes - previousSessionBytes + transferStoredBytes;
           if (transferStoredBytes > this.config.maxTransferBytes || aggregateBytes > this.config.maxTransferStorageBytes) {
             await rm(this.sessionDir(transferId), { recursive: true, force: true });
+            this.storedBytes = null;
             throw new AuthError(413, 'transfer_too_large', 'Transfer expanded beyond its configured quarantine limit.');
           }
-          await rm(temporary, { force: true });
+          session.stored_bytes = transferStoredBytes;
+          this.storedBytes = aggregateBytes;
         } catch (error) {
           await rm(temporary, { force: true });
           if (error instanceof AuthError) throw error;
@@ -199,17 +222,17 @@ export class ChunkTransferService {
     return await this.withLock(transferId, async () => {
       this.assertTransferAllowed(auth);
       const session = await this.requireSession(auth, transferId);
-      if (session.status === 'completed' || session.status === 'aborted') {
+      if (session.status === 'completed' || session.status === 'rejected' || session.status === 'aborted') {
         if (!session.result) throw new AuthError(409, 'transfer_closed', 'Transfer is no longer open.');
         return session.result;
+      }
+      if (session.status === 'processing') {
+        throw new AuthError(409, 'transfer_processing', 'Transfer finalization is already processing.');
       }
       if (session.receipts.length !== session.chunk_count) {
         throw new AuthError(409, 'transfer_incomplete', 'Transfer is missing one or more chunks.');
       }
-      const result = await this.sync.pushDeviceCommit(auth, session.manifest, Buffer.alloc(0), {
-        reader: this.git.readerForRepo(this.repoDir(transferId)),
-        promote: async () => await this.git.promoteTransferObjects(auth.vault.vault_id, this.repoDir(transferId))
-      });
+      const result = await this.processPush(auth, session);
       session.result = result.status === 'rejected' ? null : result;
       session.status = result.status === 'rejected' ? 'open' : 'completed';
       session.updated_at = nowIso();
@@ -218,10 +241,69 @@ export class ChunkTransferService {
     });
   }
 
+  async beginFinalizePush(auth: AuthenticatedDevice, transferId: string): Promise<ChunkPushDescriptor> {
+    const session = await this.withLock(transferId, async () => {
+      this.assertTransferAllowed(auth);
+      const current = await this.requireSession(auth, transferId);
+      if (current.status === 'completed' || current.status === 'rejected' || current.status === 'aborted') return current;
+      if (current.receipts.length !== current.chunk_count) {
+        throw new AuthError(409, 'transfer_incomplete', 'Transfer is missing one or more chunks.');
+      }
+      current.status = 'processing';
+      current.updated_at = nowIso();
+      current.expires_at = new Date(Date.now() + this.config.transferTtlSeconds * 1000).toISOString();
+      await this.writeSession(current);
+      return current;
+    });
+    if (session.status === 'processing') this.startProcessing(auth, transferId);
+    return this.descriptor(session);
+  }
+
   async deletePush(auth: AuthenticatedDevice, transferId: string): Promise<void> {
     await this.withLock(transferId, async () => {
-      await this.requireSession(auth, transferId);
+      const session = await this.requireSession(auth, transferId);
+      if (session.status === 'processing') throw new AuthError(409, 'transfer_processing', 'A processing transfer cannot be deleted.');
       await rm(this.sessionDir(transferId), { recursive: true, force: true });
+      this.storedBytes = null;
+    });
+  }
+
+  private startProcessing(auth: AuthenticatedDevice, transferId: string): void {
+    if (this.processors.has(transferId)) return;
+    const processing = this.processPendingPush(auth, transferId)
+      .catch(() => undefined)
+      .finally(() => this.processors.delete(transferId));
+    this.processors.set(transferId, processing);
+  }
+
+  private async processPendingPush(auth: AuthenticatedDevice, transferId: string): Promise<void> {
+    const session = await this.requireSession(auth, transferId);
+    if (session.status !== 'processing') return;
+    try {
+      const result = await this.processPush(auth, session);
+      await this.withLock(transferId, async () => {
+        const latest = await this.requireSession(auth, transferId);
+        if (latest.status !== 'processing') return;
+        latest.result = result;
+        latest.status = result.status === 'rejected' ? 'rejected' : 'completed';
+        latest.updated_at = nowIso();
+        await this.writeSession(latest);
+      });
+    } catch {
+      await this.withLock(transferId, async () => {
+        const latest = await this.requireSession(auth, transferId);
+        if (latest.status !== 'processing') return;
+        latest.status = 'open';
+        latest.updated_at = nowIso();
+        await this.writeSession(latest);
+      });
+    }
+  }
+
+  private async processPush(auth: AuthenticatedDevice, session: PushSession): Promise<PushResult> {
+    return await this.sync.pushDeviceCommit(auth, session.manifest, Buffer.alloc(0), {
+      reader: this.git.readerForRepo(this.repoDir(session.transfer_id)),
+      promote: async () => await this.git.promoteTransferObjects(auth.vault.vault_id, this.repoDir(session.transfer_id))
     });
   }
 
@@ -245,6 +327,7 @@ export class ChunkTransferService {
       max_chunk_bytes: this.config.transferChunkBytes,
       max_transfer_bytes: this.config.maxTransferBytes,
       expires_at: session.expires_at,
+      ...(session.status === 'processing' ? { poll_after_ms: 1000 } : {}),
       ...(session.result ? { result: session.result } : {})
     };
   }
@@ -257,19 +340,24 @@ export class ChunkTransferService {
     }
     if (this.expired(session)) {
       await rm(this.sessionDir(transferId), { recursive: true, force: true });
+      this.storedBytes = null;
       throw new AuthError(410, 'transfer_expired', 'Transfer expired.');
     }
     return session;
   }
 
   private expired(session: PushSession): boolean {
-    return Date.parse(session.expires_at) <= Date.now();
+    return session.status !== 'processing' && Date.parse(session.expires_at) <= Date.now();
   }
 
   private async pruneExpired(): Promise<void> {
+    let removed = false;
     for (const session of await this.listSessions()) {
-      if (this.expired(session)) await rm(this.sessionDir(session.transfer_id), { recursive: true, force: true });
+      if (!this.expired(session)) continue;
+      await rm(this.sessionDir(session.transfer_id), { recursive: true, force: true });
+      removed = true;
     }
+    if (removed) this.storedBytes = null;
   }
 
   private async listSessions(): Promise<PushSession[]> {
