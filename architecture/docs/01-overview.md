@@ -22,12 +22,14 @@ and other `.obsidian/**` files are normal synced vault content. OS-specific
 filename limits are handled as device capability/apply problems instead of
 server-wide vault rejections.
 
-Empty directories are represented outside Git. The plugin records explicit
-Obsidian directory intents under `.obts/directory-state.json`; accepted uploads
-carry those intents with the device proposal, and the server stores the current
-explicit-directory set in metadata. Pull/apply receives directory deltas and the
-current explicit set, creates missing empty folders, and removes tombstoned
-folders only when they are empty after file materialization.
+Empty directories are represented outside Git. The plugin records causal
+Obsidian directory proposals under `.obts/directory-state.json`; uploads preserve
+stable proposal/intent identity and the acknowledged main/event baseline. The
+server classifies directory overlap before advancing canonical state, merges safe
+operations automatically, and routes directory or mixed ambiguity to dashboard
+conflicts. Pull/apply receives only accepted directory deltas and the current
+explicit set, creates missing empty folders, and removes tombstoned folders only
+through non-recursive empty-directory operations.
 
 At-rest protection follows the current PRD: persistent server state is normal
 sensitive application state protected by deployment-managed storage controls.
@@ -35,7 +37,7 @@ The implementation does not claim app-level encrypted persistence.
 
 Key architectural constraints:
 
-- The server maintains the canonical `main` vault state.
+- The server maintains canonical Git and explicit-directory state and owns every semantic conflict decision.
 - Clients upload device commits and never advance `main` directly.
 - Every paired device syncs the same full-vault content set after hard
   exclusions.
@@ -46,6 +48,6 @@ Key architectural constraints:
 - Account and vault authorization prevent users from reading each other's notes.
 - Default errors and events avoid raw tokens, Git pack data, blobs, and note
   bodies.
-- `.obts/` is client-local runtime state and is excluded from vault sync.
+- `.obts/` is client-local runtime state and is excluded from vault sync; recovery journals never become a client-side winner-selection UI.
 - Internal history exists only under the server Git store and `.obts/git`; no
   visible vault `.git` directory is created.

@@ -13,6 +13,8 @@ describe('conflict workbench UI contract', () => {
     expect(component).toContain('class="conflict-resolution-toolbar"');
     expect(component).toContain('class="conflict-file-navigator"');
     expect(component).toContain('class="diff-hunk-header"');
+    expect(component).toContain('class="directory-conflict-panel"');
+    expect(component).toContain('Choose the canonical directory outcome');
     expect(component).toContain('No content delta');
     expect(component).toContain("aria-current={activePath === file.path ? 'location' : undefined}");
     expect(component).not.toContain('class="rail right resolution-rail"');
@@ -22,6 +24,7 @@ describe('conflict workbench UI contract', () => {
     expect(app).toContain('class="conflict-queue-toolbar"');
     expect(styles).toContain('grid-template-columns: 240px minmax(0, 1fr)');
     expect(styles).toContain('@container (max-width: 1150px)');
+    expect(styles).toContain('.directory-conflict-panel');
     expect(styles).toContain('.conflict-review-body');
     expect(styles).toContain('grid-template-columns: 280px minmax(0, 1fr)');
   });

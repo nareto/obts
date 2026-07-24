@@ -40,17 +40,18 @@
   const fileNodes = new Map<string, HTMLElement>();
   let fileObserver: IntersectionObserver | null = null;
 
-  $: reviewKey = `${review.conflict.conflict_id}:${review.expected_main}:${review.files.map((file) => file.path).join('|')}`;
+  $: reviewKey = `${review.conflict.conflict_id}:${review.expected_main}:${review.files.map((file) => file.path).join('|')}:${review.directory_conflicts.map((group) => group.root).join('|')}`;
   $: if (reviewKey !== initializedKey) initializeReview();
   $: structuralGroups = review.path_conflicts.filter(hasStructuralChange);
   $: titleGroups = review.path_conflicts.filter(hasTitleConflict);
   $: hasBinary = review.files.some((file) => file.content_kind === 'binary');
   $: hasLargeText = review.files.some((file) => file.content_kind === 'large_text');
+  $: hasDirectoryConflicts = review.directory_conflicts.length > 0;
   $: hasNonInteractiveContent = hasBinary || hasLargeText;
   $: hasUnlineableText = review.files.some(
     (file) => file.content_kind === 'text' && changedRows(diffs[file.path] ?? []).length === 0 && file.server_content !== file.device_content
   );
-  $: individualAvailable = !hasNonInteractiveContent && !hasUnlineableText && titleGroups.length === 0;
+  $: individualAvailable = !hasDirectoryConflicts && !hasNonInteractiveContent && !hasUnlineableText && titleGroups.length === 0;
   $: unresolved = unresolvedLineCount(diffs, lineChoices);
   $: reviewResolved = review.conflict.status === 'resolved';
   $: manualPlanError = mode === 'whole' && resolutionKind === 'manual' ? validateManualPlan() : '';
@@ -225,8 +226,8 @@
 
   function choiceLabel(choice: ConflictResolutionKind): string {
     switch (choice) {
-      case 'keep_server': return 'Keep server version';
-      case 'use_device': return 'Use device version';
+      case 'keep_server': return hasDirectoryConflicts ? 'Keep server directory state' : 'Keep server version';
+      case 'use_device': return hasDirectoryConflicts ? 'Use device directory state' : 'Use device version';
       case 'keep_both_files': return 'Keep both notes/files';
       case 'insert_both_blocks': return 'Insert both blocks';
       case 'manual': return 'Edit complete final files';
@@ -266,7 +267,10 @@
     <div class="conflict-review-title">
       <p class="eyebrow">Conflict review</p>
       <h2>{conflictType}</h2>
-      <p>Changes from <strong>{review.device_name}</strong> overlap server main across {review.files.length} file{review.files.length === 1 ? '' : 's'}.</p>
+      <p>
+        Changes from <strong>{review.device_name}</strong> overlap server main across
+        {review.files.length} file{review.files.length === 1 ? '' : 's'}{hasDirectoryConflicts ? ` and ${review.directory_conflicts.length} directory subtree${review.directory_conflicts.length === 1 ? '' : 's'}` : ''}.
+      </p>
     </div>
     <div class="conflict-compare" aria-label="Compared revisions">
       <div><span>Server</span><code>{review.expected_main.slice(0, 10)}</code></div>
@@ -284,14 +288,18 @@
   {/if}
 
   <section class="conflict-resolution-toolbar" aria-label="Conflict resolution controls">
-    <label class="conflict-file-jump">
-      <span>Jump to file</span>
-      <select value={activePath} on:change={jumpToSelectedFile}>
-        {#each review.files as file}
-          <option value={file.path}>{file.path}</option>
-        {/each}
-      </select>
-    </label>
+    {#if review.files.length > 0}
+      <label class="conflict-file-jump">
+        <span>Jump to file</span>
+        <select value={activePath} on:change={jumpToSelectedFile}>
+          {#each review.files as file}
+            <option value={file.path}>{file.path}</option>
+          {/each}
+        </select>
+      </label>
+    {:else}
+      <div class="conflict-file-jump"><span>Directory conflict</span><strong>{review.directory_conflicts.length} subtree{review.directory_conflicts.length === 1 ? '' : 's'}</strong></div>
+    {/if}
 
     {#if reviewResolved}
       <div class="resolved-summary">
@@ -335,13 +343,34 @@
   </section>
 
   {#if manualPlanError}<p class="warning resolution-banner">{manualPlanError}</p>{/if}
-  {#if !reviewResolved && !individualAvailable}
+
+  {#if hasDirectoryConflicts}
+    <section class="directory-conflict-panel" aria-label="Directory conflicts">
+      <div>
+        <p class="eyebrow">Directory state</p>
+        <h3>Choose the canonical directory outcome</h3>
+        <p>The server records the decision. Devices only perform non-recursive, empty-directory-safe materialization.</p>
+      </div>
+      <div class="directory-conflict-list">
+        {#each review.directory_conflicts as group}
+          <article>
+            <code>{group.root}</code>
+            <span>Server: <strong>{group.server_state}</strong></span>
+            <span>Device: <strong>{group.device_state}</strong></span>
+          </article>
+        {/each}
+      </div>
+    </section>
+  {/if}
+
+  {#if !reviewResolved && !individualAvailable && !hasDirectoryConflicts}
     <p class="resolution-banner">
       Line-by-line resolution is unavailable for {hasBinary ? 'binary content' : hasLargeText ? 'large text content' : hasUnlineableText ? 'an empty-file add/delete' : 'path or rename conflicts'}.
       Choose a whole-conflict policy so bytes and paths remain safe.
     </p>
   {/if}
 
+  {#if review.files.length > 0}
   <div class="conflict-review-body">
     <aside class="conflict-file-navigator">
       <div class="file-navigator-heading">
@@ -549,4 +578,5 @@
     </div>
     </section>
   </div>
+  {/if}
 </section>

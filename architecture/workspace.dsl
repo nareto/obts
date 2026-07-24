@@ -22,9 +22,9 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
         contentStoreService = component "ContentStoreService" "Encrypts/decrypts vault content at persistence boundaries and maintains content catalog metadata." "TypeScript"
         proposalService = component "ProposalService" "Receives idempotent per-device proposals, validates actor device refs separately from proposal base commits, and records their lifecycle." "TypeScript"
         historyService = component "HistoryService" "Maintains canonical main, commit graph, manifests, refs, and merge provenance." "TypeScript"
-        mergeCoordinator = component "MergeCoordinator" "Runs server-side merge and resolution transactions, advancing main or routing ambiguous changes to conflicts." "TypeScript"
+        mergeCoordinator = component "MergeCoordinator" "Classifies Git and causal directory proposals atomically, advancing canonical state or routing file, directory, and mixed ambiguity to conflicts." "TypeScript"
         semanticMergeService = component "SemanticMergeService" "Performs conservative text, Markdown, frontmatter, and block-aware merge in a server temp workspace." "TypeScript"
-        conflictService = component "ConflictService" "Creates, lists, renders, and resolves structured conflict records." "TypeScript"
+        conflictService = component "ConflictService" "Creates, lists, renders, refreshes, and resolves structured content, directory, and mixed conflict records for dashboard review." "TypeScript"
         notificationHub = component "NotificationHub" "Publishes main, conflict, device, and maintenance events with polling fallback." "TypeScript"
         backupService = component "BackupService" "Creates and restores consistent server backups across metadata, wrapped keys, encrypted content, and history." "TypeScript"
         auditLogService = component "AuditLogService" "Writes redacted operational audit events." "TypeScript"
@@ -52,8 +52,8 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
         localQueue = component "LocalQueue" "Stores pending proposal, retry, cache, recovery, lock, diagnostic, and managed-config state under .obts." "TypeScript"
         localContentCache = component "LocalContentCache" "Caches content needed for retry, pull, apply, and recovery." "TypeScript"
         metadataRepair = component "MetadataRepair" "Uses device-token auth and local Git refs to rehydrate lost state.json metadata before normal sync decisions." "TypeScript"
-        transportClient = component "TransportClient" "Calls server APIs, rehydrates device identity metadata, uploads full-vault content/proposals, pulls diffs, and subscribes to events with polling fallback." "TypeScript"
-        applyEngine = component "ApplyEngine" "Applies accepted server main changes inside the full-vault path policy after creating local recovery snapshots." "TypeScript, Obsidian Vault API"
+        transportClient = component "TransportClient" "Calls server APIs, rehydrates device identity metadata, uploads Git and causal directory proposals, receives exact intent acknowledgements, pulls accepted state, and subscribes to events." "TypeScript"
+        applyEngine = component "ApplyEngine" "Applies accepted server state after local recovery snapshots and enforces deepest-first non-recursive empty-directory deletion without choosing semantic winners." "TypeScript, Obsidian Vault API"
         diagnosticsExporter = component "DiagnosticsExporter" "Exports redacted diagnostics for support and recovery workflows." "TypeScript"
       }
 
@@ -525,7 +525,7 @@ workspace "Obsidian True Sync (obts)" "PRD-derived architecture model for the do
       }
     }
 
-    obts.plugin.transportClient -> obts.server "Calls device self metadata repair, uploads full-vault content and actor-device proposals with base_commit metadata, pulls diffs, lists conflict state, and subscribes to events." "HTTPS/WSS" {
+    obts.plugin.transportClient -> obts.server "Calls device self metadata repair, uploads full-vault and causal directory proposals, pulls accepted diffs and exact acknowledgements, observes dashboard conflict state, and subscribes to events." "HTTPS/WSS" {
       properties {
         "ops" "read,write,consume"
         "protocol" "HTTPS,WSS"

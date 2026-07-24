@@ -23,6 +23,7 @@ import {
   type DevicePullManifest,
   type DevicePullRequest,
   type DirectoryIntent,
+  type DirectoryIntentAcknowledgement,
   type ManualFilePlanEntry,
   type NoteHistoryVersion
 } from '../shared/types.js';
@@ -49,7 +50,11 @@ import { createServerConfig, ensureServerDirectories, type ServerConfig } from '
 import { DiagnosticService } from './diagnosticService.js';
 import { GitCommandError, GitService, sha256Hex } from './gitService.js';
 import { MetadataStore, type MetadataDb, type SyncOperationRow } from './metadataStore.js';
-import { SyncService } from './syncService.js';
+import {
+  commitRecoveredDirectoryState,
+  recoveredDirectoryEventPayload,
+  SyncService
+} from './syncService.js';
 
 export type ObtsServer = {
   app: FastifyInstance;
@@ -589,7 +594,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       throw new AuthError(404, 'not_found', 'Resource not found.');
     }
     const chunk = await createPullObjectChunk(git, metadata.vaultId, requestedTarget, null, chunkRequest.cursor, config);
-    const eventSnapshot = eventSnapshotForTarget(await store.snapshot(), metadata.vaultId, requestedTarget, 0);
+    const eventSnapshot = eventSnapshotForTarget(await store.snapshot(), metadata.vaultId, '', requestedTarget, 0);
     const manifest: ChunkBootstrapManifest = {
       api_version: API_VERSION,
       connection_id: connectionId,
@@ -813,6 +818,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const eventSnapshot = eventSnapshotForTarget(
       db,
       vaultId,
+      deviceAuth.device.device_id,
       targetMain,
       currentEventSeq,
       usesAcknowledgedDirectorySnapshot && Array.isArray(deviceAuth.device.last_applied_explicit_dirs)
@@ -830,6 +836,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       event_seq: eventSnapshot.eventSeq,
       directory_intents: eventSnapshot.directoryIntents,
       explicit_directories: eventSnapshot.explicitDirectories,
+      directory_acknowledgements: eventSnapshot.directoryAcknowledgements,
       capability: CHUNK_TRANSFER_CAPABILITY,
       cursor: pullRequest.cursor,
       next_cursor: chunk.nextCursor,
@@ -908,6 +915,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const eventSnapshot = eventSnapshotForTarget(
       db,
       vaultId,
+      deviceAuth.device.device_id,
       targetMain,
       currentEventSeq,
       usesAcknowledgedDirectorySnapshot && Array.isArray(deviceAuth.device.last_applied_explicit_dirs)
@@ -923,7 +931,8 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       current_local_main_is_ancestor: currentLocalMainIsAncestor,
       event_seq: eventSnapshot.eventSeq,
       directory_intents: eventSnapshot.directoryIntents,
-      explicit_directories: eventSnapshot.explicitDirectories
+      explicit_directories: eventSnapshot.explicitDirectories,
+      directory_acknowledgements: eventSnapshot.directoryAcknowledgements
     };
     const packfile = await git.exportPack(vaultId, targetMain, have);
     if (isPluginVersionAtLeast(pullRequest.plugin_version, '0.4.21')) {
@@ -1023,7 +1032,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
               explicitDirectories: device.last_applied_explicit_dirs
             }
           : appliedMain === vault.current_main
-            ? eventSnapshotForTarget(db, vaultId, appliedMain, device.last_applied_event_seq)
+            ? eventSnapshotForTarget(db, vaultId, device.device_id, appliedMain, device.last_applied_event_seq)
             : device.pending_applied_main === appliedMain && Array.isArray(device.pending_applied_explicit_dirs)
               ? {
                   eventSeq: device.pending_applied_event_seq,
@@ -1044,6 +1053,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         }
         device.status = appliedMain === vault.current_main ? 'synced' : 'paired';
         device.last_successful_sync_at = nowIso();
+        store.pruneDirectoryProposalResults(db, vaultId);
         return snapshot;
       });
       return {
@@ -1073,7 +1083,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
               explicitDirectories: device.last_applied_explicit_dirs
             }
           : appliedMain === vault.current_main
-            ? eventSnapshotForTarget(db, vaultId, appliedMain, device.last_applied_event_seq)
+            ? eventSnapshotForTarget(db, vaultId, device.device_id, appliedMain, device.last_applied_event_seq)
             : device.pending_applied_main === appliedMain && Array.isArray(device.pending_applied_explicit_dirs)
               ? {
                   eventSeq: device.pending_applied_event_seq,
@@ -1088,6 +1098,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         device.last_applied_event_seq = snapshot.eventSeq;
         device.last_applied_explicit_dirs = snapshot.explicitDirectories;
         device.status = appliedMain === vault.current_main ? 'synced' : 'paired';
+        store.pruneDirectoryProposalResults(db, vaultId);
       }
     });
     await connections.markComplete(deviceAuth.device.device_id);
@@ -1566,7 +1577,11 @@ function buildDashboardConflicts(
     .filter((conflict) => conflict.vault_id === vaultId)
     .map((conflict) => {
       const device = db.devices.find((candidate) => candidate.device_id === conflict.device_id);
-      const stale = conflict.status === 'open' && conflict.expected_main !== currentMain;
+      const currentDirectoryEventSeq = db.directory_state_by_vault[vaultId]?.last_event_seq ?? 0;
+      const stale = conflict.status === 'open' && (
+        conflict.expected_main !== currentMain ||
+        (conflict.directory_context !== undefined && conflict.directory_context.expected_event_seq !== currentDirectoryEventSeq)
+      );
       return {
         ...conflict,
         device_name: device?.device_name ?? 'Unknown device',
@@ -1584,6 +1599,8 @@ function buildDashboardConflicts(
 }
 
 function conflictType(conflict: MetadataDb['conflicts'][number]): string {
+  if (conflict.conflict_kind === 'directory') return 'Directory overlap';
+  if (conflict.conflict_kind === 'mixed') return 'File and directory overlap';
   const reason = conflict.validator_results.reason ?? conflict.validator_summary.reason;
   if (typeof reason === 'string') {
     return reason.replaceAll('_', ' ');
@@ -1989,24 +2006,36 @@ function readEventCursor(request: FastifyRequest): number {
 function eventSnapshotForTarget(
   db: MetadataDb,
   vaultId: string,
+  deviceId: string,
   targetMain: string,
   afterEventSeq: number,
   baseExplicitDirectories?: string[]
-): { eventSeq: number; directoryIntents: DirectoryIntent[]; explicitDirectories: string[] } {
+): {
+  eventSeq: number;
+  directoryIntents: DirectoryIntent[];
+  explicitDirectories: string[];
+  directoryAcknowledgements: DirectoryIntentAcknowledgement[];
+} {
   const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
   const currentDirectoryState = db.directory_state_by_vault[vaultId];
   if (vault?.current_main === targetMain) {
     const explicitDirectories = [...(currentDirectoryState?.explicit_dirs ?? [])].sort();
     const eventSeq = db.event_seq_by_vault[vaultId] ?? currentDirectoryState?.last_event_seq ?? 0;
+    const relevantEvents = db.events.filter((event) =>
+      event.vault_id === vaultId && event.event_seq > afterEventSeq && event.event_seq <= eventSeq
+    );
+    const eventDirectoryIntents = directoryIntentsFromEvents(relevantEvents);
     const directoryIntents = baseExplicitDirectories === undefined
-      ? directoryIntentsFromEvents(db.events.filter((event) =>
-        event.vault_id === vaultId && event.event_seq > afterEventSeq && event.event_seq <= eventSeq
-      ))
-      : directoryIntentsBetweenSnapshots(baseExplicitDirectories, explicitDirectories);
+      ? eventDirectoryIntents
+      : compactDirectoryIntents([
+          ...directoryIntentsBetweenSnapshots(baseExplicitDirectories, explicitDirectories),
+          ...eventDirectoryIntents
+        ]);
     return {
       eventSeq,
       directoryIntents,
-      explicitDirectories
+      explicitDirectories,
+      directoryAcknowledgements: directoryAcknowledgementsForDevice(db, relevantEvents, vaultId, deviceId, afterEventSeq, eventSeq)
     };
   }
 
@@ -2031,7 +2060,61 @@ function eventSnapshotForTarget(
       explicit.add(intent.path);
     }
   }
-  return { eventSeq, directoryIntents, explicitDirectories: [...explicit].sort() };
+  return {
+    eventSeq,
+    directoryIntents,
+    explicitDirectories: [...explicit].sort(),
+    directoryAcknowledgements: directoryAcknowledgementsForDevice(
+      db,
+      throughTarget.filter((event) => event.event_seq > afterEventSeq),
+      vaultId,
+      deviceId,
+      afterEventSeq,
+      eventSeq
+    )
+  };
+}
+
+function directoryAcknowledgementsForDevice(
+  db: MetadataDb,
+  events: Array<{ payload: Record<string, unknown> }>,
+  vaultId: string,
+  deviceId: string,
+  afterEventSeq: number,
+  throughEventSeq: number
+): DirectoryIntentAcknowledgement[] {
+  const acknowledgements = new Map<string, DirectoryIntentAcknowledgement>();
+  for (const event of events) {
+    const raw = event.payload.directory_acknowledgements;
+    if (!Array.isArray(raw)) continue;
+    for (const entry of raw) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+      const value = entry as { device_id?: unknown; intent_id?: unknown; generation?: unknown };
+      if (
+        value.device_id !== deviceId ||
+        typeof value.intent_id !== 'string' ||
+        !Number.isSafeInteger(value.generation) ||
+        (value.generation as number) < 0
+      ) continue;
+      acknowledgements.set(`${value.intent_id}\0${value.generation}`, {
+        intent_id: value.intent_id,
+        generation: value.generation as number
+      });
+    }
+  }
+  for (const result of db.directory_proposal_results) {
+    if (
+      result.vault_id !== vaultId ||
+      result.device_id !== deviceId ||
+      result.event_seq <= afterEventSeq ||
+      result.event_seq > throughEventSeq ||
+      (result.status !== 'accepted' && result.status !== 'resolved')
+    ) continue;
+    for (const acknowledgement of result.acknowledged_intents) {
+      acknowledgements.set(`${acknowledgement.intent_id}\0${acknowledgement.generation}`, acknowledgement);
+    }
+  }
+  return [...acknowledgements.values()];
 }
 
 function directoryIntentsBetweenSnapshots(previous: string[], current: string[]): DirectoryIntent[] {
@@ -2738,7 +2821,7 @@ async function buildReadinessSummary(
     metadata_store: metadataStoreReady,
     git: gitReady.ok,
     setup_complete: db.setup_complete,
-    migrations: db.schema_version === 5,
+    migrations: db.schema_version === 6,
     git_store: gitStoreReady.ok,
     temp_workspace: tempWorkspaceReady.ok,
     filesystem_permissions: filesystemPermissions,
@@ -2795,7 +2878,7 @@ function checkEventDelivery(db: MetadataDb): { ok: true } | { ok: false; error: 
 type PersistentStateCheck = { ok: true } | { ok: false; error: string; vaultId?: string };
 
 async function checkPersistentState(db: MetadataDb, git: GitService): Promise<PersistentStateCheck> {
-  if (db.schema_version !== 5) {
+  if (db.schema_version !== 6) {
     return { ok: false, error: 'metadata schema version is unsupported' };
   }
   try {
@@ -3277,7 +3360,7 @@ async function rollForwardPreparedOperation(store: MetadataStore, operationId: s
         reconciled_after_startup: true
       };
       operation.updated_at = nowIso();
-      store.appendEvent(db, {
+      const recoveredEvent = store.appendEvent(db, {
         event_type: 'main_advanced',
         vault_id: operation.vault_id,
         resource_ids: {
@@ -3298,9 +3381,11 @@ async function rollForwardPreparedOperation(store: MetadataStore, operationId: s
                 : 'merged',
           merge_sequence: manifest.merge_sequence ?? null,
           merge_policy_version: manifest.merge_policy_version ?? null,
-          reconciled_after_startup: true
+          reconciled_after_startup: true,
+          ...recoveredDirectoryEventPayload(operation)
         }
       });
+      commitRecoveredDirectoryState(db, operation, recoveredEvent.event_seq);
       if (operation.operation_type === 'note_restore') {
         store.appendEvent(db, {
           event_type: 'note_restored',

@@ -1591,6 +1591,47 @@ pre {
   color: var(--danger);
 }
 
+.directory-conflict-panel {
+  display: grid;
+  grid-template-columns: minmax(240px, 0.8fr) minmax(0, 1.2fr);
+  gap: 20px;
+  padding: 18px;
+  background: color-mix(in srgb, var(--conflict-blue) 6%, var(--surface));
+  border: 1px solid var(--conflict-border);
+  border-top: 0;
+}
+
+.directory-conflict-panel h3,
+.directory-conflict-panel p {
+  margin: 4px 0;
+}
+
+.directory-conflict-list {
+  display: grid;
+  gap: 8px;
+}
+
+.directory-conflict-list article {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 14px;
+  align-items: center;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--conflict-border);
+  border-radius: 7px;
+}
+
+.directory-conflict-list code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.directory-conflict-list span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
 .conflict-review-body {
   display: grid;
   grid-template-columns: 280px minmax(0, 1fr);
@@ -2038,6 +2079,10 @@ pre {
 }
 
 @container (max-width: 820px) {
+  .directory-conflict-panel {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .conflict-review-header {
     grid-template-columns: minmax(0, 1fr) auto;
   }
@@ -2116,6 +2161,11 @@ pre {
 
   .review-bulk-actions {
     overflow-x: auto;
+  }
+
+  .directory-conflict-list article {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 5px;
   }
 
   .conflict-file-header {

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { newId, nowIso } from '../shared/ids.js';
 import {
   CHUNK_TRANSFER_CAPABILITY,
+  DIRECTORY_PROPOSAL_CAPABILITY,
   type ChunkPushCreateRequest,
   type ChunkPushDescriptor,
   type ChunkPushReceipt,
@@ -52,7 +53,7 @@ export class ChunkTransferService {
 
   capabilities() {
     return {
-      capabilities: [CHUNK_TRANSFER_CAPABILITY] as [typeof CHUNK_TRANSFER_CAPABILITY],
+      capabilities: [CHUNK_TRANSFER_CAPABILITY, DIRECTORY_PROPOSAL_CAPABILITY],
       max_chunk_bytes: this.config.transferChunkBytes,
       target_chunk_bytes: Math.max(1_048_576, Math.floor(this.config.transferChunkBytes * 0.85)),
       max_transfer_bytes: this.config.maxTransferBytes,
@@ -106,6 +107,7 @@ export class ChunkTransferService {
         client_known_main: request.client_known_main,
         ...(request.base_commit === undefined ? {} : { base_commit: request.base_commit }),
         ...(request.directory_intents === undefined ? {} : { directory_intents: request.directory_intents }),
+        ...(request.directory_proposal === undefined ? {} : { directory_proposal: request.directory_proposal }),
         attempt_id: request.attempt_id
       },
       plan_sha256: request.plan_sha256,

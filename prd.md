@@ -204,7 +204,7 @@ Acceptance criteria:
 - A server integrity block stops upload preparation without discarding the queued commit. After an operator validates and clears that block, the next device-status heartbeat clears only the matching local `blocked_integrity` state, records a fresh full-scan hint, and resumes sync automatically.
 - The plugin can recover after crash during apply.
 - The plugin has one v1 apply behavior: automatically pull and apply server `main` after preflight, apply journal creation, recovery bundle creation, and watcher suppression setup succeed.
-- If automatic apply cannot proceed safely, the plugin blocks sync, preserves local state, surfaces the blocked status, and directs the owner to the dashboard conflict or recovery workflow.
+- If automatic apply cannot proceed mechanically, the plugin blocks without choosing a semantic winner and preserves local state. Semantic file or directory ambiguity is always persisted by the server and reviewed in the dashboard; local recovery UI never asks which synchronized state should win.
 
 ### 3.6 Directory Intent Sync
 
@@ -219,10 +219,12 @@ Behavior:
 5. Accepted directory intents are stored in server metadata and emitted with the accepted `main` event and pull manifest.
 6. Remote apply materializes explicit empty directories after file writes/deletes.
 7. Remote apply prunes the pre-existing tombstoned hierarchy deepest-first after file apply, removing each directory only through a non-recursive empty-directory operation. Non-empty local directories and genuinely new concurrent directories are never recursively removed by a directory tombstone.
-8. If plugin reload interrupts post-apply preservation, the apply journal remains durable, nonce-owned ref staging prevents cross-runtime lock reuse, and unacknowledged authoritative directory state replays before local directory intents can upload.
-9. Directory intents carry stable IDs, monotonic generations, base main/event provenance, and delete-then-create ancestry. Upload acknowledgement clears only the exact sent generations, so a newer watcher intent cannot be erased by an older request.
-10. Legacy `{op,path}` create intents opposed by a remote delete are never discarded from timestamp ordering alone. Absent paths may resolve automatically; indistinguishable existing directories require a durable per-subtree keep-local or accept-server decision with an unchanged-inventory check.
-11. Historical states that predate directory intents cannot infer right-click folder-delete intent from the Git file tree alone.
+8. If plugin reload interrupts post-apply preservation, the apply journal remains durable, nonce-owned ref staging prevents cross-runtime lock reuse, and unacknowledged authoritative directory state replays before local directory proposals can upload.
+9. Directory proposals carry a stable proposal ID plus intent IDs, generations, base main/event provenance, and delete-then-create ancestry. The server persists one outcome per proposal ID, and acknowledgement clears only the exact intent generations covered by that outcome.
+10. Before advancing `main`, the server compares each proposal with the device's acknowledged directory snapshot and current canonical directory state. Disjoint or equivalent operations merge automatically; opposing create/delete operations on the same or ancestor/descendant paths create a durable directory or mixed conflict.
+11. Directory conflicts, including unknown-base legacy proposals, are resolved only through the dashboard. The plugin never presents keep-local or accept-server directory choices.
+12. Historical client recovery journals automatically discard absent superseded shells, but preserve existing ambiguous directories as legacy proposals for dashboard review. Local filesystem safety remains fail-closed and non-recursive, so non-empty content is preserved as new local work rather than recursively deleted.
+13. Historical states that predate directory intents cannot infer right-click folder-delete intent from the Git file tree alone.
 
 Acceptance criteria:
 
@@ -230,7 +232,8 @@ Acceptance criteria:
 - Repeated authoritative directory state is idempotent: an unchanged `main` with already-present explicit directories does not enter `Applying`.
 - Right-click folder deletion removes the complete nested empty folder hierarchy on other devices after file deletes are applied.
 - Tombstone apply prunes directories deepest-first with non-recursive empty-directory removals, verifies the pre-apply directory creation identity immediately before removal, and fails closed when identity, inspection, removal, or authoritative directory creation cannot be verified; it never force-deletes a subtree that may have gained local content.
-- Ambiguous legacy recovery classification is read-only. Before a confirmed decision mutates intent state, the client durably records the target main/event, authoritative directory delta, original intent generations, affected subtree inventory, and user choices in `.obts/directory-recovery.json`; approved execution is restart-resumable and archives an empty-directory recovery manifest.
+- The client sends full causal directory proposals only when the server advertises `directory-proposals-v2`; it never falls back to a protocol that would discard provenance.
+- Legacy `.obts/directory-recovery.json` journals remain private migration evidence. They are resumed automatically without a user decision flow and removed only after safe apply and server acknowledgement.
 - Individually emptying a folder preserves that empty folder on other devices.
 - A remote folder tombstone never deletes non-empty local content, and a genuinely new empty folder created concurrently with apply is preserved rather than confused with a stale tombstoned shell.
 
@@ -251,7 +254,8 @@ Behavior:
 9. Same-path Markdown, `.canvas`, `.base`, and selected text file changes are checked out into an ephemeral server merge workspace.
 10. The merge service uses Git merge machinery plus conservative Markdown, JSON Canvas, and Obsidian Bases semantic merge validation.
 11. Clean merges advance `main` with a merge commit.
-12. Ambiguous or unsafe merges create a conflict record.
+12. Ambiguous or unsafe file, directory, or mixed merges create a conflict record before `main` or canonical directory state advances.
+13. A directory proposal and its Git commit are accepted or conflicted atomically; retries and startup recovery cannot apply only one half.
 
 Acceptance criteria:
 
@@ -271,8 +275,8 @@ Behavior:
 2. Server authorizes the user for the vault.
 3. Server materializes the relevant Git state in a temporary workspace.
 4. Server returns conflict metadata and content needed for review over HTTPS.
-5. Dashboard displays rendered Markdown diff, source diff, affected paths, path/title variants for structural conflicts, and available merge choices.
-6. User accepts current `main`, accepts device version, keeps both, inserts both blocks, or manually edits a final result. For path/title conflicts such as rename-vs-rename, manual resolution includes the final vault path plus final file content, not only body text at existing affected paths.
+5. Dashboard displays rendered Markdown diff, source diff, affected paths, path/title variants for structural conflicts, directory subtree outcomes for directory conflicts, and available merge choices.
+6. User accepts current `main` or the device version for directory conflicts. Content-only conflicts also support keep-both, insert-both, and manual final results. For path/title conflicts such as rename-vs-rename, manual resolution includes the final vault path plus final file content, not only body text at existing affected paths.
 7. Dashboard submits the selected resolution with the conflict ID, CSRF token, and expected current `main`; a normal authenticated session is sufficient.
 8. Server accepts the resolution only if current `main` still matches the expected commit.
 9. If `main` advanced, the review package is marked stale and the dashboard must refresh or regenerate it before resolution.
@@ -283,7 +287,7 @@ Behavior:
 Acceptance criteria:
 
 - Unauthorized users cannot list, view, or resolve conflicts for another vault.
-- Conflict review packages include path/title metadata for structural conflicts: base path, current server path, device path, per-side path operation, and affected paths.
+- Conflict review packages include path/title metadata for structural conflicts and server/device subtree outcomes for directory conflicts.
 - Resolution commits are merge commits that reference the conflict they resolved.
 - Accepting current `main` keeps the server version only for affected review paths and preserves non-conflicting device-side changes from the same device commit.
 - When there are no non-conflicting device-side changes to preserve, accepting current `main` creates a same-tree merge commit with parent 1 set to `expected_main` and parent 2 set to the conflicted device commit.

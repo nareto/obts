@@ -9,14 +9,25 @@ import type {
   ConflictReviewPackage,
   ConflictReviewPath,
   DevicePushManifest,
+  DirectoryConflictContext,
   DirectoryIntent,
+  DirectoryIntentAcknowledgement,
+  DirectoryProposal,
+  DirectoryProposalAcknowledgement,
+  DirectoryProposalIntent,
   ManualFilePlanEntry,
   PushResult,
   ResolveConflictResponse
 } from '../shared/types.js';
 import { AuthError, type AuthenticatedDevice } from './authService.js';
 import { GitCommandError, GitService, sha256Hex, type GitDiffEntry, type GitObjectReader } from './gitService.js';
-import type { DeviceRow, MetadataDb, MetadataStore, SyncOperationRow } from './metadataStore.js';
+import type {
+  DeviceRow,
+  DirectoryProposalResultRow,
+  MetadataDb,
+  MetadataStore,
+  SyncOperationRow
+} from './metadataStore.js';
 
 const MERGE_POLICY_VERSION = 'phase2.semantic-merge.v1';
 const SIMILAR_RENAME_THRESHOLD = 0.72;
@@ -53,6 +64,17 @@ type RenamePair = {
   basePath: string;
   targetPath: string;
   confidence: RenameConfidence;
+};
+
+type DirectoryMergePlan = {
+  proposal: DirectoryProposal;
+  requestSha256: string;
+  baseExplicitDirs: string[];
+  serverExplicitDirs: string[];
+  cleanIntents: DirectoryProposalIntent[];
+  conflictingIntents: DirectoryProposalIntent[];
+  affectedRoots: string[];
+  expectedEventSeq: number;
 };
 
 export class SyncService {
@@ -108,7 +130,10 @@ export class SyncService {
           vault.vault_id,
           device.device_id,
           operation.target_commit!,
-          this.latestEventSeq(vault.vault_id, currentDb)
+          this.latestEventSeq(vault.vault_id, currentDb),
+          null,
+          false,
+          storedDirectoryProposal(operation.prepared_manifest?.directory_proposal)
         );
       });
     }
@@ -159,6 +184,12 @@ export class SyncService {
         });
         operationId = operation.operation_id;
 
+        const directoryProposal = await this.normalizeDirectoryProposal(
+          auth.device.device_id,
+          manifest.target_commit,
+          manifest.directory_proposal,
+          manifest.directory_intents ?? []
+        );
         const currentDeviceRef = await this.git.getRef(auth.vault.vault_id, auth.device.device_ref);
         const currentMain = await this.git.getRef(auth.vault.vault_id, 'refs/heads/main');
         if (!currentMain) {
@@ -169,7 +200,7 @@ export class SyncService {
           return await this.rejectDevicePush(auth, operation.operation_id, deviceBlock.code, deviceBlock.message);
         }
         if (currentDeviceRef === manifest.target_commit) {
-          return await this.finishExistingDeviceCommit(auth, operation, manifest.target_commit);
+          return await this.finishExistingDeviceCommit(auth, operation, manifest.target_commit, directoryProposal);
         }
         if ((manifest.expected_device_ref ?? null) !== currentDeviceRef) {
           return await this.rejectDevicePush(
@@ -217,7 +248,8 @@ export class SyncService {
               changed_path_policy: 'ok',
               fast_forward: 'ok',
               base_commit: manifest.base_commit ?? null
-            }
+            },
+            directory_proposal: directoryProposal
           };
           op.updated_at = nowIso();
         });
@@ -273,7 +305,7 @@ export class SyncService {
           refEventSeq,
           manifest.base_commit ?? null,
           detachedProposal,
-          manifest.directory_intents ?? []
+          directoryProposal
         );
       } catch (error) {
         if (operationId) {
@@ -285,6 +317,118 @@ export class SyncService {
         throw error;
       }
     });
+  }
+
+  private async normalizeDirectoryProposal(
+    deviceId: string,
+    targetCommit: string,
+    proposal: DirectoryProposal | undefined,
+    legacyIntents: DirectoryIntent[]
+  ): Promise<DirectoryProposal | null> {
+    const db = await this.store.snapshot();
+    const device = requireDevice(db, deviceId);
+    if (proposal) {
+      this.findDirectoryProposalResult(db, device.vault_id, deviceId, proposal);
+      if (
+        proposal.base_main !== device.last_applied_main ||
+        proposal.base_event_seq !== device.last_applied_event_seq ||
+        !Array.isArray(device.last_applied_explicit_dirs)
+      ) {
+        throw new AuthError(409, 'stale_directory_proposal_base', 'Directory proposal does not match the device acknowledged baseline.');
+      }
+      return proposal;
+    }
+    if (legacyIntents.length === 0) return null;
+    if (!Array.isArray(device.last_applied_explicit_dirs)) {
+      throw new AuthError(409, 'directory_snapshot_unavailable', 'The device directory baseline is unavailable.');
+    }
+    const intents = legacyIntents.map((intent, index): DirectoryProposalIntent => ({
+      ...intent,
+      intent_id: `legacy_${sha256Hex(Buffer.from(`${intent.op}\0${intent.path}\0${index}`, 'utf8')).slice(0, 24)}`,
+      generation: index,
+      provenance: 'legacy',
+      base_main: device.last_applied_main,
+      base_event_seq: device.last_applied_event_seq,
+      replaces_intent_id: null,
+      recreated_after_delete: false,
+      created_at: null
+    }));
+    const proposalBody = {
+      schema_version: 2 as const,
+      base_main: device.last_applied_main,
+      base_event_seq: device.last_applied_event_seq,
+      intents
+    };
+    return {
+      ...proposalBody,
+      proposal_id: `dirprop_${sha256Hex(Buffer.from(stableJson([deviceId, targetCommit, proposalBody]), 'utf8'))}`
+    };
+  }
+
+  private async classifyDirectoryProposal(
+    vaultId: string,
+    deviceId: string,
+    proposal: DirectoryProposal
+  ): Promise<DirectoryMergePlan> {
+    const db = await this.store.snapshot();
+    const device = requireDevice(db, deviceId);
+    if (
+      proposal.base_main !== device.last_applied_main ||
+      proposal.base_event_seq !== device.last_applied_event_seq ||
+      !Array.isArray(device.last_applied_explicit_dirs)
+    ) {
+      throw new AuthError(409, 'stale_directory_proposal_base', 'Directory proposal does not match the device acknowledged baseline.');
+    }
+    const requestSha256 = directoryProposalRequestSha256(proposal);
+    this.findDirectoryProposalResult(db, vaultId, deviceId, proposal);
+    const baseExplicitDirs = [...device.last_applied_explicit_dirs].sort();
+    const serverState = db.directory_state_by_vault[vaultId];
+    const serverExplicitDirs = [...(serverState?.explicit_dirs ?? [])].sort();
+    const serverIntents = directoryIntentsBetweenSnapshots(baseExplicitDirs, serverExplicitDirs);
+    const conflictingIntents = proposal.intents.filter((intent) => {
+      const serverHasPath = serverExplicitDirs.some((path) => path === intent.path || path.startsWith(`${intent.path}/`));
+      const unknownLegacyOutcome = intent.provenance === 'legacy' && (
+        (intent.op === 'create' && !serverHasPath) ||
+        (intent.op === 'delete' && serverHasPath)
+      );
+      return unknownLegacyOutcome || serverIntents.some((serverIntent) =>
+        serverIntent.op !== intent.op && pathsOverlap(serverIntent.path, intent.path)
+      );
+    });
+    const conflictingIds = new Set(conflictingIntents.map((intent) => intent.intent_id));
+    const affectedRoots = topmostDirectoryPaths(conflictingIntents.flatMap((intent) => [
+      intent.path,
+      ...serverIntents.filter((serverIntent) => serverIntent.op !== intent.op && pathsOverlap(serverIntent.path, intent.path))
+        .map((serverIntent) => serverIntent.path)
+    ]));
+    return {
+      proposal,
+      requestSha256,
+      baseExplicitDirs,
+      serverExplicitDirs,
+      cleanIntents: proposal.intents.filter((intent) => !conflictingIds.has(intent.intent_id)),
+      conflictingIntents,
+      affectedRoots,
+      expectedEventSeq: serverState?.last_event_seq ?? 0
+    };
+  }
+
+  private findDirectoryProposalResult(
+    db: MetadataDb,
+    vaultId: string,
+    deviceId: string,
+    proposal: DirectoryProposal
+  ): DirectoryProposalResultRow | null {
+    const result = db.directory_proposal_results.find((candidate) => candidate.proposal_id === proposal.proposal_id) ?? null;
+    if (!result) return null;
+    if (
+      result.vault_id !== vaultId ||
+      result.device_id !== deviceId ||
+      result.request_sha256 !== directoryProposalRequestSha256(proposal)
+    ) {
+      throw new AuthError(409, 'directory_proposal_mismatch', 'Directory proposal ID was reused with different content.');
+    }
+    return result;
   }
 
   async getConflictReviewPackage(vaultId: string, conflictId: string): Promise<ConflictReviewPackage> {
@@ -303,6 +447,7 @@ export class SyncService {
         this.readOptionalBlob(vaultId, conflict.current_main, path),
         this.readOptionalBlob(vaultId, conflict.device_commit, path)
       ]);
+      if (baseBlob === null && serverBlob === null && deviceBlob === null) continue;
       const baseContent = decodeReviewText(baseBlob);
       const serverContent = decodeReviewText(serverBlob);
       const deviceContent = decodeReviewText(deviceBlob);
@@ -334,15 +479,33 @@ export class SyncService {
         rendered_markdown_diff: contentKind === 'text' && path.endsWith('.md') ? buildMarkdownReview(serverContent, deviceContent) : null
       });
     }
+    const directoryContext = conflict.directory_context;
+    const deviceExplicitDirs = directoryContext
+      ? applyDirectoryIntentsToSnapshot(directoryContext.base_explicit_dirs, directoryContext.proposal.intents)
+      : [];
+    const directoryConflicts = (directoryContext?.affected_roots ?? []).map((root) => ({
+      root,
+      server_state: snapshotContainsDirectory(directoryContext?.server_explicit_dirs ?? [], root) ? 'present' as const : 'deleted' as const,
+      device_state: snapshotContainsDirectory(deviceExplicitDirs, root) ? 'present' as const : 'deleted' as const,
+      affected_paths: [...new Set([
+        root,
+        ...(directoryContext?.proposal.intents ?? []).filter((intent) => pathsOverlap(intent.path, root)).map((intent) => intent.path)
+      ])].sort()
+    }));
+    const directoryStale = directoryContext !== undefined &&
+      (db.directory_state_by_vault[vaultId]?.last_event_seq ?? 0) !== directoryContext.expected_event_seq;
     return {
       conflict,
-      stale: conflict.status === 'open' && vault.current_main !== conflict.expected_main,
+      stale: conflict.status === 'open' && (vault.current_main !== conflict.expected_main || directoryStale),
       expected_main: conflict.expected_main,
       current_main: vault.current_main,
       device_name: device.device_name,
       path_conflicts: pathConflicts,
       files,
-      choices: ['keep_server', 'use_device', 'keep_both_files', 'insert_both_blocks', 'manual']
+      directory_conflicts: directoryConflicts,
+      choices: conflict.conflict_kind === 'directory' || conflict.conflict_kind === 'mixed'
+        ? ['keep_server', 'use_device']
+        : ['keep_server', 'use_device', 'keep_both_files', 'insert_both_blocks', 'manual']
     };
   }
 
@@ -360,12 +523,30 @@ export class SyncService {
       if (!snapshotConflict) {
         throw new AuthError(404, 'not_found', 'Resource not found.');
       }
+      const currentDirectoryState = snapshot.directory_state_by_vault[input.vaultId];
+      const needsDirectoryRefresh = snapshotConflict.directory_context !== undefined &&
+        snapshotConflict.directory_context.expected_event_seq !== (currentDirectoryState?.last_event_seq ?? 0);
       const needsRefresh =
         snapshotConflict.status === 'open' &&
-        (snapshotConflict.expected_main !== snapshotVault.current_main || snapshotConflict.current_main !== snapshotVault.current_main);
-      const refreshedAffectedPaths = needsRefresh
+        (snapshotConflict.expected_main !== snapshotVault.current_main ||
+          snapshotConflict.current_main !== snapshotVault.current_main ||
+          needsDirectoryRefresh);
+      const refreshedDirectoryContext = needsDirectoryRefresh && snapshotConflict.directory_context
+        ? reclassifyDirectoryContext(
+            snapshotConflict.directory_context,
+            currentDirectoryState?.explicit_dirs ?? [],
+            currentDirectoryState?.last_event_seq ?? 0
+          )
+        : snapshotConflict.directory_context;
+      const priorDirectoryRoots = new Set(snapshotConflict.directory_context?.affected_roots ?? []);
+      const refreshedFilePaths = (needsRefresh
         ? await this.refreshedAffectedPaths(snapshotConflict, snapshotVault.current_main)
-        : snapshotConflict.affected_paths;
+        : snapshotConflict.affected_paths)
+        .filter((path) => !priorDirectoryRoots.has(path));
+      const refreshedAffectedPaths = [...new Set([
+        ...refreshedFilePaths,
+        ...(refreshedDirectoryContext?.affected_roots ?? [])
+      ])].sort();
       await this.store.mutate((db) => {
         const vault = requireVault(db, input.vaultId);
         const conflict = db.conflicts.find(
@@ -377,7 +558,12 @@ export class SyncService {
         if (conflict.status !== 'open') {
           return;
         }
-        if (conflict.expected_main === vault.current_main && conflict.current_main === vault.current_main) {
+        const currentDirectoryEventSeq = db.directory_state_by_vault[input.vaultId]?.last_event_seq ?? 0;
+        if (
+          conflict.expected_main === vault.current_main &&
+          conflict.current_main === vault.current_main &&
+          (conflict.directory_context?.expected_event_seq ?? currentDirectoryEventSeq) === currentDirectoryEventSeq
+        ) {
           return;
         }
         const previousExpectedMain = conflict.expected_main;
@@ -385,6 +571,7 @@ export class SyncService {
         conflict.expected_main = vault.current_main;
         conflict.affected_paths = refreshedAffectedPaths;
         conflict.affected_path_count = refreshedAffectedPaths.length;
+        if (refreshedDirectoryContext) conflict.directory_context = refreshedDirectoryContext;
         conflict.validator_results = {
           ...conflict.validator_results,
           review_refreshed_from: previousExpectedMain,
@@ -474,9 +661,21 @@ export class SyncService {
         }
         throw new AuthError(409, 'conflict_already_resolved', 'Conflict has already been resolved.');
       }
-      if (conflict.expected_main !== input.expectedMain || vault.current_main !== input.expectedMain) {
+      const currentDirectoryEventSeq = snapshot.directory_state_by_vault[input.vaultId]?.last_event_seq ?? 0;
+      if (
+        conflict.expected_main !== input.expectedMain ||
+        vault.current_main !== input.expectedMain ||
+        (conflict.directory_context !== undefined && conflict.directory_context.expected_event_seq !== currentDirectoryEventSeq)
+      ) {
         throw new AuthError(409, 'stale_conflict_review', 'Conflict review is stale; refresh before resolving.');
       }
+      if (
+        (conflict.conflict_kind === 'directory' || conflict.conflict_kind === 'mixed') &&
+        input.resolutionKind !== 'keep_server' && input.resolutionKind !== 'use_device'
+      ) {
+        throw new AuthError(400, 'invalid_resolution', 'Directory conflicts require a server or device resolution.');
+      }
+      const resolvedDirectoryIntents = resolvedConflictDirectoryIntents(conflict, input.resolutionKind);
 
       const tree = await this.buildResolutionTree(conflict, input.resolutionKind, input.manualFiles, input.manualFilePlan);
       await this.git.validateTreePathPolicy(input.vaultId, tree, this.maxUploadBytes);
@@ -510,7 +709,9 @@ export class SyncService {
           validator_results: {
             accepted_tree: tree,
             expected_main_matches: true
-          }
+          },
+          resolved_directory_intents: resolvedDirectoryIntents,
+          directory_proposal: conflict.directory_context?.proposal ?? null
         };
         operation.updated_at = nowIso();
         return { operationId: operation.operation_id };
@@ -582,9 +783,12 @@ export class SyncService {
             conflict_id: input.conflictId,
             resolution_kind: input.resolutionKind,
             merge_sequence: mutableConflict.merge_sequence,
-            merge_policy_version: mutableConflict.merge_policy_version
+            merge_policy_version: mutableConflict.merge_policy_version,
+            ...directoryResolutionEventPayload(mutableConflict, resolvedDirectoryIntents)
           }
         });
+        applyDirectoryIntents(db, input.vaultId, resolvedDirectoryIntents, mainEvent.event_seq);
+        resolveDirectoryProposalResult(db, mutableConflict, mainEvent.event_seq);
         this.store.appendEvent(db, {
           event_type: 'conflict_resolved',
           vault_id: input.vaultId,
@@ -598,7 +802,10 @@ export class SyncService {
             device_commit: mutableConflict.device_commit
           },
           payload: {
-            resolution_kind: input.resolutionKind
+            resolution_kind: input.resolutionKind,
+            ...(mutableConflict.directory_context
+              ? { directory_proposal_id: mutableConflict.directory_context.proposal.proposal_id }
+              : {})
           }
         });
         db.audit_log.push({
@@ -628,38 +835,66 @@ export class SyncService {
   private async finishExistingDeviceCommit(
     auth: AuthenticatedDevice,
     operation: SyncOperationRow,
-    targetCommit: string
+    targetCommit: string,
+    directoryProposal: DirectoryProposal | null
   ): Promise<PushResult> {
     const main = await this.git.getRef(auth.vault.vault_id, 'refs/heads/main');
     if (!main) {
       await this.abortOperation(operation.operation_id, 'missing_main');
       return { status: 'rejected', code: 'missing_main', message: 'Server main is missing.' };
     }
+    const snapshot = await this.store.snapshot();
+    const existingResult = directoryProposal
+      ? this.findDirectoryProposalResult(snapshot, auth.vault.vault_id, auth.device.device_id, directoryProposal)
+      : null;
     const existingConflict = await this.findOpenConflict(auth.vault.vault_id, auth.device.device_id, targetCommit);
-    const fallbackEventSeq = this.latestEventSeq(auth.vault.vault_id, await this.store.snapshot());
+    const fallbackEventSeq = this.latestEventSeq(auth.vault.vault_id, snapshot);
     await this.store.mutate((db) => {
       const op = requireOperation(db, operation.operation_id);
       op.status = 'committed';
       op.result = { idempotent: true, target_commit: targetCommit };
       op.updated_at = nowIso();
     });
-    if (existingConflict) {
+    if (existingConflict || existingResult?.status === 'conflicted') {
+      const conflictId = existingConflict?.conflict_id ?? existingResult?.conflict_id;
+      if (!conflictId) throw new Error('Conflicted directory proposal is missing its conflict ID.');
       return {
         status: 'conflicted',
-        conflict_id: existingConflict.conflict_id,
+        conflict_id: conflictId,
         device_ref: targetCommit,
         main,
-        event_seq: fallbackEventSeq
+        event_seq: existingResult?.event_seq ?? fallbackEventSeq,
+        ...(directoryProposal ? { directory_ack: proposalAcknowledgement(directoryProposal, 'conflicted') } : {})
       };
     }
     if (!(await this.git.isAncestor(auth.vault.vault_id, targetCommit, main))) {
-      return await this.mergeDeviceCommit(auth.vault.vault_id, auth.device.device_id, targetCommit, fallbackEventSeq);
+      return await this.mergeDeviceCommit(
+        auth.vault.vault_id,
+        auth.device.device_id,
+        targetCommit,
+        fallbackEventSeq,
+        null,
+        false,
+        directoryProposal
+      );
+    }
+    if (directoryProposal && !existingResult) {
+      return await this.mergeDeviceCommit(
+        auth.vault.vault_id,
+        auth.device.device_id,
+        targetCommit,
+        fallbackEventSeq,
+        null,
+        false,
+        directoryProposal
+      );
     }
     return {
       status: 'noop',
       device_ref: targetCommit,
       main,
-      event_seq: fallbackEventSeq
+      event_seq: existingResult?.event_seq ?? fallbackEventSeq,
+      ...(directoryProposal ? { directory_ack: proposalAcknowledgement(directoryProposal, 'duplicate') } : {})
     };
   }
 
@@ -735,19 +970,67 @@ export class SyncService {
     fallbackEventSeq: number,
     proposalBase: string | null = null,
     detachedProposal = false,
-    directoryIntents: DirectoryIntent[] = []
+    directoryProposal: DirectoryProposal | null = null
   ): Promise<PushResult> {
     const main = await this.git.getRef(vaultId, 'refs/heads/main');
     if (!main) {
       return { status: 'rejected', code: 'missing_main', message: 'Server main is missing.' };
     }
     if (await this.git.isAncestor(vaultId, deviceCommit, main)) {
+      const snapshot = await this.store.snapshot();
+      const proposalResult = directoryProposal
+        ? this.findDirectoryProposalResult(snapshot, vaultId, deviceId, directoryProposal)
+        : null;
+      if (directoryProposal && !proposalResult) {
+        const directoryPlan = await this.classifyDirectoryProposal(vaultId, deviceId, directoryProposal);
+        if (directoryPlan.affectedRoots.length > 0) {
+          return await this.createConflict(
+            vaultId,
+            deviceId,
+            directoryProposal.base_main ?? main,
+            main,
+            deviceCommit,
+            directoryPlan.affectedRoots,
+            'directory_overlap',
+            directoryPlan
+          );
+        }
+        const acceptedEventSeq = await this.store.mutate((db) => {
+          const device = requireDevice(db, deviceId);
+          device.status = 'synced';
+          const event = this.store.appendEvent(db, {
+            event_type: 'main_advanced',
+            vault_id: vaultId,
+            resource_ids: { device_id: deviceId },
+            commit_cursors: { previous_main: main, main, device_commit: deviceCommit },
+            payload: {
+              decision: 'directory_metadata_merged',
+              ...directoryEventPayload(directoryPlan, deviceId)
+            }
+          });
+          commitDirectoryPlan(db, vaultId, deviceId, deviceCommit, directoryPlan, event.event_seq);
+          return event.event_seq;
+        });
+        return {
+          status: 'noop',
+          device_ref: deviceCommit,
+          main,
+          event_seq: acceptedEventSeq,
+          directory_ack: proposalAcknowledgement(directoryProposal, 'accepted')
+        };
+      }
       const eventSeq = await this.store.mutate((db) => {
         const device = requireDevice(db, deviceId);
         device.status = 'synced';
         return this.latestEventSeq(vaultId, db);
       });
-      return { status: 'noop', device_ref: deviceCommit, main, event_seq: eventSeq || fallbackEventSeq };
+      return {
+        status: 'noop',
+        device_ref: deviceCommit,
+        main,
+        event_seq: (proposalResult?.event_seq ?? eventSeq) || fallbackEventSeq,
+        ...(directoryProposal ? { directory_ack: proposalAcknowledgement(directoryProposal, 'duplicate') } : {})
+      };
     }
 
     const existingConflict = await this.findOpenConflict(vaultId, deviceId, deviceCommit);
@@ -777,6 +1060,9 @@ export class SyncService {
       return await this.createConflict(vaultId, deviceId, '', main, deviceCommit, [], 'no_merge_base');
     }
 
+    const directoryPlan = directoryProposal
+      ? await this.classifyDirectoryProposal(vaultId, deviceId, directoryProposal)
+      : null;
     const mainChanges = await this.git.changedPaths(vaultId, base, main);
     const deviceChanges = await this.git.changedPaths(vaultId, base, deviceCommit);
     if (detachedProposal && hasDestructiveChanges(deviceChanges)) {
@@ -787,7 +1073,8 @@ export class SyncService {
         main,
         deviceCommit,
         destructiveChangedPaths(deviceChanges),
-        'detached_proposal_deletes'
+        'detached_proposal_deletes',
+        directoryPlan
       );
     }
     const structuralConflict = await this.classifyStructuralMergeConflict(
@@ -799,17 +1086,34 @@ export class SyncService {
       deviceChanges
     );
     if (structuralConflict) {
+      const affectedPaths = directoryPlan && directoryPlan.affectedRoots.length > 0
+        ? [...new Set([...structuralConflict.affectedPaths, ...directoryPlan.affectedRoots])].sort()
+        : structuralConflict.affectedPaths;
       return await this.createConflict(
         vaultId,
         deviceId,
         base,
         main,
         deviceCommit,
-        structuralConflict.affectedPaths,
-        structuralConflict.reason
+        affectedPaths,
+        directoryPlan && directoryPlan.affectedRoots.length > 0 ? 'mixed_directory_overlap' : structuralConflict.reason,
+        directoryPlan
       );
     }
     const overlapping = intersectChangedPaths(mainChanges, deviceChanges);
+    if (directoryPlan && directoryPlan.affectedRoots.length > 0) {
+      const fileAffected = overlapping;
+      return await this.createConflict(
+        vaultId,
+        deviceId,
+        base,
+        main,
+        deviceCommit,
+        [...new Set([...fileAffected, ...directoryPlan.affectedRoots])].sort(),
+        fileAffected.length > 0 ? 'mixed_directory_overlap' : 'directory_overlap',
+        directoryPlan
+      );
+    }
     if (overlapping.length > 0) {
       const identityMerge = await this.tryIdentityOverlappingMerge(
         vaultId,
@@ -819,7 +1123,7 @@ export class SyncService {
         deviceCommit,
         deviceChanges,
         overlapping,
-        directoryIntents
+        directoryPlan
       );
       if (identityMerge) {
         return identityMerge;
@@ -832,12 +1136,12 @@ export class SyncService {
         deviceCommit,
         deviceChanges,
         overlapping,
-        directoryIntents
+        directoryPlan
       );
       if (cleanMerge) {
         return cleanMerge;
       }
-      return await this.createConflict(vaultId, deviceId, base, main, deviceCommit, overlapping, 'overlapping_paths');
+      return await this.createConflict(vaultId, deviceId, base, main, deviceCommit, overlapping, 'overlapping_paths', directoryPlan);
     }
 
     const mergePreparation = await this.store.mutate((db) => {
@@ -867,7 +1171,8 @@ export class SyncService {
         validator_results: {
           disjoint_paths: 'ok',
           overlapping_path_count: 0
-        }
+        },
+        directory_plan: storedDirectoryPlan(directoryPlan)
       };
       operation.updated_at = nowIso();
       return { mergeSequence, operationId: operation.operation_id };
@@ -929,10 +1234,10 @@ export class SyncService {
             overlapping_path_count: 0
           },
           changed_path_count: changedPathSet(deviceChanges).size,
-          directory_intents: directoryIntents
+          ...directoryEventPayload(directoryPlan, deviceId)
         }
       });
-      applyDirectoryIntents(db, vaultId, directoryIntents, event.event_seq);
+      commitDirectoryPlan(db, vaultId, deviceId, deviceCommit, directoryPlan, event.event_seq);
       db.audit_log.push({
         audit_id: newId('aud'),
         actor_user_id: device.user_id,
@@ -950,7 +1255,8 @@ export class SyncService {
       device_ref: deviceCommit,
       main: mergeCommit,
       merge_commit: mergeCommit,
-      event_seq: eventSeq
+      event_seq: eventSeq,
+      ...(directoryPlan ? { directory_ack: proposalAcknowledgement(directoryPlan.proposal, 'accepted') } : {})
     };
   }
 
@@ -1047,7 +1353,7 @@ export class SyncService {
     deviceCommit: string,
     deviceChanges: GitDiffEntry[],
     overlapping: string[],
-    directoryIntents: DirectoryIntent[] = []
+    directoryPlan: DirectoryMergePlan | null = null
   ): Promise<PushResult | null> {
     for (const path of overlapping) {
       const currentContent = await this.readOptionalBlob(vaultId, currentMain, path);
@@ -1087,7 +1393,8 @@ export class SyncService {
         validator_results: {
           identity_only_merge: 'ok',
           overlapping_path_count: overlapping.length
-        }
+        },
+        directory_plan: storedDirectoryPlan(directoryPlan)
       };
       operation.updated_at = nowIso();
       return { mergeSequence, operationId: operation.operation_id };
@@ -1151,10 +1458,10 @@ export class SyncService {
             overlapping_path_count: overlapping.length
           },
           changed_path_count: changedPathSet(deviceChanges).size,
-          directory_intents: directoryIntents
+          ...directoryEventPayload(directoryPlan, deviceId)
         }
       });
-      applyDirectoryIntents(db, vaultId, directoryIntents, event.event_seq);
+      commitDirectoryPlan(db, vaultId, deviceId, deviceCommit, directoryPlan, event.event_seq);
       db.audit_log.push({
         audit_id: newId('aud'),
         actor_user_id: device.user_id,
@@ -1173,7 +1480,8 @@ export class SyncService {
       device_ref: deviceCommit,
       main: mergeCommit,
       merge_commit: mergeCommit,
-      event_seq: eventSeq
+      event_seq: eventSeq,
+      ...(directoryPlan ? { directory_ack: proposalAcknowledgement(directoryPlan.proposal, 'accepted') } : {})
     };
   }
 
@@ -1197,6 +1505,7 @@ export class SyncService {
     manualFilePlan: ManualFilePlanEntry[] | undefined
   ): Promise<string> {
     const sourceTree = await this.resolutionSourceTree(conflict);
+    const fileAffectedPaths = await this.conflictFileAffectedPaths(conflict);
     if (resolutionKind === 'keep_server') {
       return sourceTree;
     }
@@ -1205,10 +1514,12 @@ export class SyncService {
     const deletes: string[] = [];
 
     if (resolutionKind === 'use_device') {
-      if (conflict.affected_paths.length === 0) {
-        return await this.git.treeHash(conflict.vault_id, conflict.device_commit);
+      if (fileAffectedPaths.length === 0) {
+        return conflict.directory_context
+          ? sourceTree
+          : await this.git.treeHash(conflict.vault_id, conflict.device_commit);
       }
-      for (const path of conflict.affected_paths) {
+      for (const path of fileAffectedPaths) {
         const deviceBlob = await this.readOptionalBlob(conflict.vault_id, conflict.device_commit, path);
         if (deviceBlob === null) {
           deletes.push(path);
@@ -1369,12 +1680,25 @@ export class SyncService {
     });
   }
 
+  private async conflictFileAffectedPaths(conflict: ConflictRecord): Promise<string[]> {
+    const filePathSets = await Promise.all([
+      this.git.listTreePaths(conflict.vault_id, conflict.base_commit),
+      this.git.listTreePaths(conflict.vault_id, conflict.expected_main),
+      this.git.listTreePaths(conflict.vault_id, conflict.device_commit)
+    ]).then((pathLists) => pathLists.map((paths) => new Set(paths)));
+    return conflict.affected_paths.filter((path) => filePathSets.some((paths) => paths.has(path)));
+  }
+
   private async resolutionSourceTree(conflict: ConflictRecord): Promise<string> {
-    if (conflict.affected_paths.length === 0 || !(await this.git.commitExists(conflict.vault_id, conflict.base_commit))) {
+    if (!(await this.git.commitExists(conflict.vault_id, conflict.base_commit))) {
+      return await this.git.treeHash(conflict.vault_id, conflict.expected_main);
+    }
+    const fileAffectedPaths = await this.conflictFileAffectedPaths(conflict);
+    if (!conflict.directory_context && fileAffectedPaths.length === 0) {
       return await this.git.treeHash(conflict.vault_id, conflict.expected_main);
     }
     const deviceChanges = await this.git.changedPaths(conflict.vault_id, conflict.base_commit, conflict.device_commit);
-    const nonConflictingDeviceChanges = changesOutsideAffectedPaths(deviceChanges, conflict.affected_paths);
+    const nonConflictingDeviceChanges = changesOutsideAffectedPaths(deviceChanges, fileAffectedPaths);
     if (nonConflictingDeviceChanges.length === 0) {
       return await this.git.treeHash(conflict.vault_id, conflict.expected_main);
     }
@@ -1394,7 +1718,7 @@ export class SyncService {
     deviceCommit: string,
     deviceChanges: GitDiffEntry[],
     overlapping: string[],
-    directoryIntents: DirectoryIntent[] = []
+    directoryPlan: DirectoryMergePlan | null = null
   ): Promise<PushResult | null> {
     if (!overlapping.every(isNativeTextMergePath)) {
       return null;
@@ -1429,7 +1753,8 @@ export class SyncService {
         current_main: currentMain,
         device_commit: deviceCommit,
         decision: 'merge',
-        validator_results: mergeTree.validatorResults
+        validator_results: mergeTree.validatorResults,
+        directory_plan: storedDirectoryPlan(directoryPlan)
       };
       operation.updated_at = nowIso();
       return { mergeSequence, operationId: operation.operation_id };
@@ -1491,10 +1816,10 @@ export class SyncService {
           device_commit: deviceCommit,
           validator_results: mergeTree.validatorResults,
           changed_path_count: changedPathSet(deviceChanges).size,
-          directory_intents: directoryIntents
+          ...directoryEventPayload(directoryPlan, deviceId)
         }
       });
-      applyDirectoryIntents(db, vaultId, directoryIntents, event.event_seq);
+      commitDirectoryPlan(db, vaultId, deviceId, deviceCommit, directoryPlan, event.event_seq);
       db.audit_log.push({
         audit_id: newId('aud'),
         actor_user_id: device.user_id,
@@ -1513,7 +1838,8 @@ export class SyncService {
       device_ref: deviceCommit,
       main: mergeCommit,
       merge_commit: mergeCommit,
-      event_seq: eventSeq
+      event_seq: eventSeq,
+      ...(directoryPlan ? { directory_ack: proposalAcknowledgement(directoryPlan.proposal, 'accepted') } : {})
     };
   }
 
@@ -1524,10 +1850,17 @@ export class SyncService {
     currentMain: string,
     deviceCommit: string,
     affectedPaths: string[],
-    reason: string
+    reason: string,
+    directoryPlan: DirectoryMergePlan | null = null
   ): Promise<PushResult> {
     const conflictId = newId('conf');
     const mergeSequence = await this.store.mutate((db) => this.store.nextMergeSequence(db, vaultId));
+    const directoryContext = directoryPlan ? directoryConflictContext(directoryPlan) : undefined;
+    const conflictKind: ConflictRecord['conflict_kind'] = reason === 'directory_overlap'
+      ? 'directory'
+      : reason === 'mixed_directory_overlap'
+        ? 'mixed'
+        : 'content';
     const eventSeq = await this.store.mutate((db) => {
       const device = requireDevice(db, deviceId);
       const operation = this.store.startOperation(db, {
@@ -1553,7 +1886,8 @@ export class SyncService {
           reason,
           affected_paths: affectedPaths,
           affected_path_count: affectedPaths.length
-        }
+        },
+        directory_plan: storedDirectoryPlan(directoryPlan)
       };
       operation.result = {
         decision: 'conflict',
@@ -1573,6 +1907,8 @@ export class SyncService {
         affected_path_count: affectedPaths.length,
         merge_sequence: mergeSequence,
         merge_policy_version: MERGE_POLICY_VERSION,
+        conflict_kind: conflictKind,
+        ...(directoryContext ? { directory_context: directoryContext } : {}),
         validator_results: {
           reason,
           affected_paths: affectedPaths,
@@ -1586,6 +1922,21 @@ export class SyncService {
         created_at: nowIso()
       };
       db.conflicts.push(conflict);
+      if (directoryPlan) {
+        upsertDirectoryProposalResult(db, {
+          proposal_id: directoryPlan.proposal.proposal_id,
+          request_sha256: directoryPlan.requestSha256,
+          vault_id: vaultId,
+          device_id: deviceId,
+          target_commit: deviceCommit,
+          status: 'conflicted',
+          conflict_id: conflictId,
+          event_seq: 0,
+          acknowledged_intents: proposalIntentAcknowledgements(directoryPlan.proposal),
+          created_at: nowIso(),
+          updated_at: nowIso()
+        });
+      }
       device.status = 'review_needed';
       const event = this.store.appendEvent(db, {
         event_type: 'conflict_created',
@@ -1603,9 +1954,15 @@ export class SyncService {
           reason,
           path_count: affectedPaths.length,
           merge_sequence: mergeSequence,
-          merge_policy_version: MERGE_POLICY_VERSION
+          merge_policy_version: MERGE_POLICY_VERSION,
+          conflict_kind: conflictKind,
+          ...(directoryPlan ? { directory_proposal_id: directoryPlan.proposal.proposal_id } : {})
         }
       });
+      if (directoryPlan) {
+        const result = db.directory_proposal_results.find((candidate) => candidate.proposal_id === directoryPlan.proposal.proposal_id);
+        if (result) result.event_seq = event.event_seq;
+      }
       db.audit_log.push({
         audit_id: newId('aud'),
         actor_user_id: device.user_id,
@@ -1635,7 +1992,8 @@ export class SyncService {
       conflict_id: conflictId,
       device_ref: deviceCommit,
       main: currentMain,
-      event_seq: eventSeq
+      event_seq: eventSeq,
+      ...(directoryPlan ? { directory_ack: proposalAcknowledgement(directoryPlan.proposal, 'conflicted') } : {})
     };
   }
 
@@ -2422,6 +2780,308 @@ function intersectChangedPaths(left: GitDiffEntry[], right: GitDiffEntry[]): str
 
 function changedPathsConflict(left: string, right: string): boolean {
   return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
+
+export function recoveredDirectoryEventPayload(operation: SyncOperationRow): Record<string, unknown> {
+  const plan = recoveredDirectoryPlan(operation.prepared_manifest?.directory_plan);
+  if (plan && operation.device_id) return directoryEventPayload(plan, operation.device_id);
+  const proposal = storedDirectoryProposal(operation.prepared_manifest?.directory_proposal);
+  const intents = storedDirectoryIntents(operation.prepared_manifest?.resolved_directory_intents);
+  if (!proposal || !operation.device_id) return {};
+  return {
+    directory_intents: intents,
+    directory_proposal_id: proposal.proposal_id,
+    directory_acknowledgements: proposalIntentAcknowledgements(proposal).map((ack) => ({
+      ...ack,
+      device_id: operation.device_id
+    }))
+  };
+}
+
+export function commitRecoveredDirectoryState(db: MetadataDb, operation: SyncOperationRow, eventSeq: number): void {
+  const plan = recoveredDirectoryPlan(operation.prepared_manifest?.directory_plan);
+  if (plan && operation.device_id && operation.target_commit) {
+    commitDirectoryPlan(db, operation.vault_id, operation.device_id, operation.target_commit, plan, eventSeq);
+    return;
+  }
+  const proposal = storedDirectoryProposal(operation.prepared_manifest?.directory_proposal);
+  const intents = storedDirectoryIntents(operation.prepared_manifest?.resolved_directory_intents);
+  if (!proposal) return;
+  applyDirectoryIntents(db, operation.vault_id, intents, eventSeq);
+  const conflictId = typeof operation.prepared_manifest?.conflict_id === 'string'
+    ? operation.prepared_manifest.conflict_id
+    : null;
+  if (conflictId) {
+    const conflict = db.conflicts.find((candidate) => candidate.conflict_id === conflictId);
+    if (conflict) resolveDirectoryProposalResult(db, conflict, eventSeq);
+  }
+}
+
+function recoveredDirectoryPlan(value: unknown): DirectoryMergePlan | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const proposal = storedDirectoryProposal(record.proposal);
+  if (
+    !proposal ||
+    typeof record.request_sha256 !== 'string' ||
+    !Array.isArray(record.base_explicit_dirs) ||
+    !Array.isArray(record.server_explicit_dirs) ||
+    !Array.isArray(record.clean_intent_ids) ||
+    !Array.isArray(record.conflicting_intent_ids) ||
+    !Array.isArray(record.affected_roots) ||
+    !Number.isSafeInteger(record.expected_event_seq)
+  ) return null;
+  const cleanIds = new Set(record.clean_intent_ids.filter((item): item is string => typeof item === 'string'));
+  const conflictingIds = new Set(record.conflicting_intent_ids.filter((item): item is string => typeof item === 'string'));
+  return {
+    proposal,
+    requestSha256: record.request_sha256,
+    baseExplicitDirs: record.base_explicit_dirs.filter((item): item is string => typeof item === 'string'),
+    serverExplicitDirs: record.server_explicit_dirs.filter((item): item is string => typeof item === 'string'),
+    cleanIntents: proposal.intents.filter((intent) => cleanIds.has(intent.intent_id)),
+    conflictingIntents: proposal.intents.filter((intent) => conflictingIds.has(intent.intent_id)),
+    affectedRoots: record.affected_roots.filter((item): item is string => typeof item === 'string'),
+    expectedEventSeq: record.expected_event_seq as number
+  };
+}
+
+function storedDirectoryIntents(value: unknown): DirectoryIntent[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
+    const record = item as { op?: unknown; path?: unknown };
+    return (record.op === 'create' || record.op === 'delete') && typeof record.path === 'string'
+      ? [{ op: record.op, path: record.path }]
+      : [];
+  });
+}
+
+function directoryProposalRequestSha256(proposal: DirectoryProposal): string {
+  return sha256Hex(Buffer.from(stableJson(proposal), 'utf8'));
+}
+
+function proposalIntentAcknowledgements(proposal: DirectoryProposal): DirectoryIntentAcknowledgement[] {
+  return proposal.intents.map((intent) => ({ intent_id: intent.intent_id, generation: intent.generation }));
+}
+
+function proposalAcknowledgement(
+  proposal: DirectoryProposal,
+  status: DirectoryProposalAcknowledgement['status']
+): DirectoryProposalAcknowledgement {
+  return {
+    proposal_id: proposal.proposal_id,
+    status,
+    acknowledged_intents: proposalIntentAcknowledgements(proposal)
+  };
+}
+
+function storedDirectoryProposal(value: unknown): DirectoryProposal | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const candidate = value as Partial<DirectoryProposal>;
+  return candidate.schema_version === 2 && typeof candidate.proposal_id === 'string' && Array.isArray(candidate.intents)
+    ? candidate as DirectoryProposal
+    : null;
+}
+
+function storedDirectoryPlan(plan: DirectoryMergePlan | null): Record<string, unknown> | null {
+  if (!plan) return null;
+  return {
+    proposal: plan.proposal,
+    request_sha256: plan.requestSha256,
+    base_explicit_dirs: plan.baseExplicitDirs,
+    server_explicit_dirs: plan.serverExplicitDirs,
+    clean_intent_ids: plan.cleanIntents.map((intent) => intent.intent_id),
+    conflicting_intent_ids: plan.conflictingIntents.map((intent) => intent.intent_id),
+    affected_roots: plan.affectedRoots,
+    expected_event_seq: plan.expectedEventSeq
+  };
+}
+
+function directoryConflictContext(plan: DirectoryMergePlan): DirectoryConflictContext {
+  return {
+    proposal: plan.proposal,
+    base_explicit_dirs: plan.baseExplicitDirs,
+    server_explicit_dirs: plan.serverExplicitDirs,
+    clean_intent_ids: plan.cleanIntents.map((intent) => intent.intent_id),
+    conflicting_intent_ids: plan.conflictingIntents.map((intent) => intent.intent_id),
+    affected_roots: plan.affectedRoots,
+    expected_event_seq: plan.expectedEventSeq
+  };
+}
+
+function directoryEventPayload(plan: DirectoryMergePlan | null, deviceId: string): Record<string, unknown> {
+  if (!plan) return {};
+  return {
+    directory_intents: plan.proposal.intents.map(({ op, path }) => ({ op, path })),
+    directory_proposal_id: plan.proposal.proposal_id,
+    directory_acknowledgements: proposalIntentAcknowledgements(plan.proposal).map((ack) => ({ ...ack, device_id: deviceId }))
+  };
+}
+
+function directoryResolutionEventPayload(
+  conflict: ConflictRecord,
+  resolvedIntents: DirectoryIntent[]
+): Record<string, unknown> {
+  const context = conflict.directory_context;
+  if (!context) return {};
+  return {
+    directory_intents: resolvedIntents,
+    directory_proposal_id: context.proposal.proposal_id,
+    directory_acknowledgements: proposalIntentAcknowledgements(context.proposal).map((ack) => ({
+      ...ack,
+      device_id: conflict.device_id
+    }))
+  };
+}
+
+function commitDirectoryPlan(
+  db: MetadataDb,
+  vaultId: string,
+  deviceId: string,
+  deviceCommit: string,
+  plan: DirectoryMergePlan | null,
+  eventSeq: number
+): void {
+  if (!plan) return;
+  applyDirectoryIntents(db, vaultId, plan.proposal.intents, eventSeq);
+  upsertDirectoryProposalResult(db, {
+    proposal_id: plan.proposal.proposal_id,
+    request_sha256: plan.requestSha256,
+    vault_id: vaultId,
+    device_id: deviceId,
+    target_commit: deviceCommit,
+    status: 'accepted',
+    conflict_id: null,
+    event_seq: eventSeq,
+    acknowledged_intents: proposalIntentAcknowledgements(plan.proposal),
+    created_at: nowIso(),
+    updated_at: nowIso()
+  });
+}
+
+function upsertDirectoryProposalResult(db: MetadataDb, result: DirectoryProposalResultRow): void {
+  const existing = db.directory_proposal_results.find((candidate) => candidate.proposal_id === result.proposal_id);
+  if (existing) Object.assign(existing, result, { created_at: existing.created_at });
+  else db.directory_proposal_results.push(result);
+}
+
+function resolveDirectoryProposalResult(db: MetadataDb, conflict: ConflictRecord, eventSeq: number): void {
+  const context = conflict.directory_context;
+  if (!context) return;
+  const result = db.directory_proposal_results.find((candidate) => candidate.proposal_id === context.proposal.proposal_id);
+  if (result) {
+    result.status = 'resolved';
+    result.event_seq = eventSeq;
+    result.updated_at = nowIso();
+  }
+}
+
+function resolvedConflictDirectoryIntents(
+  conflict: ConflictRecord,
+  resolutionKind: ConflictResolutionKind
+): DirectoryIntent[] {
+  const context = conflict.directory_context;
+  if (!context) return [];
+  const cleanIds = new Set(context.clean_intent_ids);
+  if (resolutionKind === 'use_device') {
+    return context.proposal.intents.map(({ op, path }) => ({ op, path }));
+  }
+  const cleanIntents = context.proposal.intents
+    .filter((intent) => cleanIds.has(intent.intent_id))
+    .map(({ op, path }) => ({ op, path }));
+  const deviceExplicitDirs = applyDirectoryIntentsToSnapshot(context.base_explicit_dirs, context.proposal.intents);
+  const serverReassertions = directoryIntentsBetweenSnapshots(deviceExplicitDirs, context.server_explicit_dirs)
+    .filter((intent) => context.affected_roots.some((root) => pathsOverlap(root, intent.path)));
+  return compactDirectoryIntents([...cleanIntents, ...serverReassertions]);
+}
+
+function reclassifyDirectoryContext(
+  context: DirectoryConflictContext,
+  serverExplicitDirs: string[],
+  expectedEventSeq: number
+): DirectoryConflictContext {
+  const serverIntents = directoryIntentsBetweenSnapshots(context.base_explicit_dirs, serverExplicitDirs);
+  const conflicting = context.proposal.intents.filter((intent) => {
+    const serverHasPath = serverExplicitDirs.some((path) => path === intent.path || path.startsWith(`${intent.path}/`));
+    const unknownLegacyOutcome = intent.provenance === 'legacy' && (
+      (intent.op === 'create' && !serverHasPath) ||
+      (intent.op === 'delete' && serverHasPath)
+    );
+    return unknownLegacyOutcome || serverIntents.some((serverIntent) =>
+      serverIntent.op !== intent.op && pathsOverlap(serverIntent.path, intent.path)
+    );
+  });
+  const conflictingIds = new Set(conflicting.map((intent) => intent.intent_id));
+  return {
+    ...context,
+    server_explicit_dirs: [...serverExplicitDirs].sort(),
+    clean_intent_ids: context.proposal.intents.filter((intent) => !conflictingIds.has(intent.intent_id)).map((intent) => intent.intent_id),
+    conflicting_intent_ids: conflicting.map((intent) => intent.intent_id),
+    affected_roots: topmostDirectoryPaths(conflicting.flatMap((intent) => [
+      intent.path,
+      ...serverIntents.filter((serverIntent) => serverIntent.op !== intent.op && pathsOverlap(serverIntent.path, intent.path))
+        .map((serverIntent) => serverIntent.path)
+    ])),
+    expected_event_seq: expectedEventSeq
+  };
+}
+
+function directoryIntentsBetweenSnapshots(previous: string[], current: string[]): DirectoryIntent[] {
+  const previousSet = new Set(previous);
+  const currentSet = new Set(current);
+  const deleted = previous
+    .filter((path) => !currentSet.has(path))
+    .filter((path) => !previous.some((candidate) => candidate !== path && path.startsWith(`${candidate}/`) && !currentSet.has(candidate)))
+    .map((path) => ({ op: 'delete' as const, path }));
+  const created = current
+    .filter((path) => !previousSet.has(path))
+    .map((path) => ({ op: 'create' as const, path }));
+  return compactDirectoryIntents([...deleted, ...created]);
+}
+
+function applyDirectoryIntentsToSnapshot(previous: string[], intents: DirectoryIntent[]): string[] {
+  const explicit = new Set(previous);
+  for (const intent of intents) {
+    if (intent.op === 'delete') {
+      for (const path of [...explicit]) {
+        if (pathsOverlapWithinRoot(path, intent.path)) explicit.delete(path);
+      }
+    } else {
+      for (const prefix of directoryPrefixes(intent.path)) explicit.add(prefix);
+      explicit.add(intent.path);
+    }
+  }
+  return [...explicit].sort();
+}
+
+function snapshotContainsDirectory(snapshot: string[], root: string): boolean {
+  return snapshot.some((path) => pathsOverlapWithinRoot(path, root));
+}
+
+function pathsOverlap(left: string, right: string): boolean {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
+
+function pathsOverlapWithinRoot(path: string, root: string): boolean {
+  return path === root || path.startsWith(`${root}/`);
+}
+
+function topmostDirectoryPaths(paths: string[]): string[] {
+  const sorted = [...new Set(paths)].sort((left, right) => left.length - right.length || left.localeCompare(right));
+  return sorted.filter((path, index) => !sorted.some((candidate, candidateIndex) =>
+    candidateIndex < index && path.startsWith(`${candidate}/`)
+  ));
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
 }
 
 function applyDirectoryIntents(db: MetadataDb, vaultId: string, intents: DirectoryIntent[], eventSeq: number): void {

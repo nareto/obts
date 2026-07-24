@@ -6,7 +6,9 @@ import {
   type ChunkPushCreateRequest,
   type DevicePullRequest,
   type DevicePushManifest,
-  type DirectoryIntent
+  type DirectoryIntent,
+  type DirectoryProposal,
+  type DirectoryProposalIntent
 } from './types.js';
 
 const COMMIT_ID_PATTERN = /^[0-9a-f]{40}$/u;
@@ -163,13 +165,86 @@ export function parseDevicePushManifest(value: unknown): DevicePushManifest {
     : undefined;
   const attemptId = readOptionalString(value, 'attempt_id');
   const directoryIntents = readOptionalDirectoryIntents(value, 'directory_intents');
+  const directoryProposal = readOptionalDirectoryProposal(value, 'directory_proposal');
+  if (directoryIntents !== undefined && directoryProposal !== undefined) {
+    throw new ValidationError('invalid_request', 'Use either legacy directory intents or a directory proposal, not both.');
+  }
   return {
     ...manifest,
     ...(pluginVersion === undefined ? {} : { plugin_version: pluginVersion }),
     ...(baseCommit === undefined ? {} : { base_commit: baseCommit }),
     ...(attemptId === undefined ? {} : { attempt_id: attemptId }),
-    ...(directoryIntents === undefined ? {} : { directory_intents: directoryIntents })
+    ...(directoryIntents === undefined ? {} : { directory_intents: directoryIntents }),
+    ...(directoryProposal === undefined ? {} : { directory_proposal: directoryProposal })
   };
+}
+
+function readOptionalDirectoryProposal(record: Record<string, unknown>, field: string): DirectoryProposal | undefined {
+  const value = record[field];
+  if (value === undefined) return undefined;
+  assertRecord(value);
+  if (value.schema_version !== 2) {
+    throw new ValidationError('invalid_request', 'Unsupported directory proposal schema.', { field: 'schema_version' });
+  }
+  const proposalId = readString(value, 'proposal_id');
+  if (!/^dirprop_[0-9a-f]{64}$/u.test(proposalId)) {
+    throw new ValidationError('invalid_request', 'Invalid directory proposal ID.', { field: 'proposal_id' });
+  }
+  const baseMain = readNullableCommitId(value, 'base_main');
+  const baseEventSeq = readNonNegativeInteger(value, 'base_event_seq');
+  if (!Array.isArray(value.intents) || value.intents.length === 0 || value.intents.length > 5000) {
+    throw new ValidationError('invalid_request', 'Invalid directory proposal intents.', { field: 'intents' });
+  }
+  const identities = new Set<string>();
+  const intents: DirectoryProposalIntent[] = value.intents.map((item) => {
+    assertRecord(item);
+    const op = readString(item, 'op');
+    if (op !== 'create' && op !== 'delete') {
+      throw new ValidationError('invalid_request', 'Invalid directory intent operation.', { field: 'op' });
+    }
+    const normalized = normalizeVaultPath(readString(item, 'path'));
+    if (!normalized.ok || !isSyncableVaultPath(normalized.path)) {
+      throw new ValidationError('invalid_request', 'Invalid directory intent path.', { field: 'path' });
+    }
+    const intentId = readString(item, 'intent_id');
+    if (!/^(?:dir_[0-9]+_[0-9]+_[0-9a-f]{12}|legacy_[0-9a-f]{24})$/u.test(intentId)) {
+      throw new ValidationError('invalid_request', 'Invalid directory intent ID.', { field: 'intent_id' });
+    }
+    const generation = readNonNegativeInteger(item, 'generation');
+    const provenance = readString(item, 'provenance');
+    if (provenance !== 'legacy' && provenance !== 'local_v2') {
+      throw new ValidationError('invalid_request', 'Invalid directory intent provenance.', { field: 'provenance' });
+    }
+    const intentBaseMain = readNullableCommitId(item, 'base_main');
+    const intentBaseEventSeq = readNonNegativeInteger(item, 'base_event_seq');
+    const replacesIntentId = item.replaces_intent_id === null ? null : readString(item, 'replaces_intent_id');
+    const recreatedAfterDelete = item.recreated_after_delete;
+    const createdAt = item.created_at;
+    if (typeof recreatedAfterDelete !== 'boolean' || !(createdAt === null || typeof createdAt === 'string')) {
+      throw new ValidationError('invalid_request', 'Invalid directory intent provenance fields.');
+    }
+    if (intentBaseMain !== baseMain || intentBaseEventSeq !== baseEventSeq) {
+      throw new ValidationError('invalid_request', 'Directory intent base does not match its proposal.');
+    }
+    const identity = `${intentId}\0${generation}`;
+    if (identities.has(identity)) {
+      throw new ValidationError('invalid_request', 'Directory proposal contains duplicate intent generations.');
+    }
+    identities.add(identity);
+    return {
+      op,
+      path: normalized.path,
+      intent_id: intentId,
+      generation,
+      provenance,
+      base_main: intentBaseMain,
+      base_event_seq: intentBaseEventSeq,
+      replaces_intent_id: replacesIntentId,
+      recreated_after_delete: recreatedAfterDelete,
+      created_at: createdAt
+    };
+  });
+  return { schema_version: 2, proposal_id: proposalId, base_main: baseMain, base_event_seq: baseEventSeq, intents };
 }
 
 function readOptionalDirectoryIntents(record: Record<string, unknown>, field: string): DirectoryIntent[] | undefined {
@@ -257,6 +332,10 @@ export function parseChunkPushCreateRequest(value: unknown): ChunkPushCreateRequ
     ? readNullableCommitId(value, 'base_commit')
     : undefined;
   const directoryIntents = readOptionalDirectoryIntents(value, 'directory_intents');
+  const directoryProposal = readOptionalDirectoryProposal(value, 'directory_proposal');
+  if (directoryIntents !== undefined && directoryProposal !== undefined) {
+    throw new ValidationError('invalid_request', 'Use either legacy directory intents or a directory proposal, not both.');
+  }
   return {
     api_version: API_VERSION,
     ...(pluginVersion === undefined ? {} : { plugin_version: pluginVersion }),
@@ -267,6 +346,7 @@ export function parseChunkPushCreateRequest(value: unknown): ChunkPushCreateRequ
     client_known_main: readNullableCommitId(value, 'client_known_main'),
     ...(baseCommit === undefined ? {} : { base_commit: baseCommit }),
     ...(directoryIntents === undefined ? {} : { directory_intents: directoryIntents }),
+    ...(directoryProposal === undefined ? {} : { directory_proposal: directoryProposal }),
     attempt_id: attemptId,
     chunk_count: chunkCount,
     plan_sha256: planSha256
