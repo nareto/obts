@@ -1927,9 +1927,12 @@ components:
         attempt_id:
           type: string
         directory_intents:
+          description: Legacy directory side channel accepted conservatively during rolling upgrades.
           type: array
           items:
             $ref: "#/components/schemas/DirectoryIntent"
+        directory_proposal:
+          $ref: "#/components/schemas/DirectoryProposal"
     DevicePullRequest:
       type: object
       required: [api_version, vault_id, device_id, current_local_main, requested_target]
@@ -1986,16 +1989,20 @@ components:
           type: array
           items:
             type: string
+        directory_acknowledgements:
+          type: array
+          items:
+            $ref: "#/components/schemas/DirectoryIntentAcknowledgement"
     SyncCapabilities:
       type: object
       required: [capabilities, max_chunk_bytes, target_chunk_bytes, max_transfer_bytes, max_transfer_chunks]
       properties:
         capabilities:
           type: array
-          prefixItems:
-            - const: git-object-pack-chunks-v1
-          minItems: 1
-          maxItems: 1
+          items:
+            enum: [git-object-pack-chunks-v1, directory-proposals-v2]
+          minItems: 2
+          uniqueItems: true
         max_chunk_bytes:
           type: integer
           minimum: 1048576
@@ -2037,9 +2044,12 @@ components:
             - type: string
               pattern: "^[0-9a-f]{40}$"
         directory_intents:
+          description: Legacy directory side channel accepted conservatively during rolling upgrades.
           type: array
           items:
             $ref: "#/components/schemas/DirectoryIntent"
+        directory_proposal:
+          $ref: "#/components/schemas/DirectoryProposal"
         attempt_id:
           type: string
           pattern: "^[A-Za-z0-9_-]{8,128}$"
@@ -2165,6 +2175,70 @@ components:
           enum: [create, delete]
         path:
           type: string
+    DirectoryProposalIntent:
+      allOf:
+        - $ref: "#/components/schemas/DirectoryIntent"
+        - type: object
+          required: [intent_id, generation, provenance, base_main, base_event_seq, replaces_intent_id, recreated_after_delete, created_at]
+          properties:
+            intent_id:
+              type: string
+            generation:
+              type: integer
+              minimum: 0
+            provenance:
+              enum: [legacy, local_v2]
+            base_main:
+              oneOf:
+                - type: "null"
+                - type: string
+                  pattern: "^[0-9a-f]{40}$"
+            base_event_seq:
+              type: integer
+              minimum: 0
+            replaces_intent_id:
+              oneOf:
+                - type: "null"
+                - type: string
+            recreated_after_delete:
+              type: boolean
+            created_at:
+              oneOf:
+                - type: "null"
+                - type: string
+                  format: date-time
+    DirectoryProposal:
+      type: object
+      required: [schema_version, proposal_id, base_main, base_event_seq, intents]
+      properties:
+        schema_version:
+          const: 2
+        proposal_id:
+          type: string
+          pattern: "^dirprop_[0-9a-f]{64}$"
+        base_main:
+          oneOf:
+            - type: "null"
+            - type: string
+              pattern: "^[0-9a-f]{40}$"
+        base_event_seq:
+          type: integer
+          minimum: 0
+        intents:
+          type: array
+          minItems: 1
+          maxItems: 5000
+          items:
+            $ref: "#/components/schemas/DirectoryProposalIntent"
+    DirectoryIntentAcknowledgement:
+      type: object
+      required: [intent_id, generation]
+      properties:
+        intent_id:
+          type: string
+        generation:
+          type: integer
+          minimum: 0
     EventPage:
       type: object
       required: [events, current_event_seq]
@@ -2526,7 +2600,7 @@ components:
             - type: string
     ConflictReviewPackage:
       type: object
-      required: [conflict, stale, expected_main, current_main, device_name, path_conflicts, files, choices]
+      required: [conflict, stale, expected_main, current_main, device_name, path_conflicts, files, directory_conflicts, choices]
       properties:
         conflict:
           $ref: "#/components/schemas/ConflictRecord"
@@ -2548,6 +2622,22 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ConflictReviewFile"
+        directory_conflicts:
+          type: array
+          items:
+            type: object
+            required: [root, server_state, device_state, affected_paths]
+            properties:
+              root:
+                type: string
+              server_state:
+                enum: [present, deleted]
+              device_state:
+                enum: [present, deleted]
+              affected_paths:
+                type: array
+                items:
+                  type: string
         choices:
           type: array
           items:
@@ -2805,6 +2895,7 @@ components:
         - affected_path_count
         - merge_sequence
         - merge_policy_version
+        - conflict_kind
         - validator_results
         - validator_summary
         - created_at
@@ -2845,6 +2936,37 @@ components:
           minimum: 1
         merge_policy_version:
           type: string
+        conflict_kind:
+          enum: [content, directory, mixed]
+        directory_context:
+          type: object
+          required: [proposal, base_explicit_dirs, server_explicit_dirs, clean_intent_ids, conflicting_intent_ids, affected_roots, expected_event_seq]
+          properties:
+            proposal:
+              $ref: "#/components/schemas/DirectoryProposal"
+            base_explicit_dirs:
+              type: array
+              items:
+                type: string
+            server_explicit_dirs:
+              type: array
+              items:
+                type: string
+            clean_intent_ids:
+              type: array
+              items:
+                type: string
+            conflicting_intent_ids:
+              type: array
+              items:
+                type: string
+            affected_roots:
+              type: array
+              items:
+                type: string
+            expected_event_seq:
+              type: integer
+              minimum: 0
         validator_results:
           type: object
         validator_summary:

@@ -152,6 +152,11 @@ describe('OpenAPI Phase 3 contract', () => {
     expect(contract).toContain('/vaults/{vault_id}/sync/push-transfers');
     expect(contract).toContain('/vaults/{vault_id}/sync/pull-chunk');
     expect(contract).toContain('git-object-pack-chunks-v1');
+    expect(contract).toContain('directory-proposals-v2');
+    expect(contract).toContain('DirectoryProposal');
+    expect(contract).toContain('directory_acknowledgements');
+    expect(contract).toContain('directory_conflicts');
+    expect(contract).toContain('conflict_kind');
 
     const deviceEventsSection = contract.slice(
       contract.indexOf('/vaults/{vault_id}/sync/events'),

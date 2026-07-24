@@ -23,7 +23,7 @@ Each vault has a canonical Git history on the server. Devices submit their own c
 - **Rename-aware history** with source and rendered Markdown diffs.
 - **Safe restoration** that creates a new commit rather than rewriting existing history.
 - **Recovery before replacement** through local snapshots, patches, ref packs, checksums, and replayable apply journals.
-- **Empty-folder synchronization** using explicit directory intent outside Git.
+- **Empty-folder synchronization** using causal directory proposals outside Git, with automatic merges and dashboard-only directory conflict resolution.
 - **Integrity-first operations** with readiness checks, redacted diagnostics, and non-destructive Git maintenance.
 - **Multi-user isolation** where each vault has exactly one owner.
 - **Editable display names** for vaults in the dashboard and devices from either the dashboard or the paired plugin, without renaming local vault folders.

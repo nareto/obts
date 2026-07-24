@@ -4,7 +4,12 @@ import { dirname, join } from 'node:path';
 import { newId, nowIso } from '../shared/ids.js';
 import { DISPLAY_NAME_MAX_LENGTH, normalizeDisplayName } from '../shared/validators.js';
 import type { DiagnosticEventV1 } from '../shared/diagnostics.js';
-import type { ConflictRecord, EventEnvelope, NoteHistoryVersion } from '../shared/types.js';
+import type {
+  ConflictRecord,
+  DirectoryIntentAcknowledgement,
+  EventEnvelope,
+  NoteHistoryVersion
+} from '../shared/types.js';
 
 const EVENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const EVENT_RETENTION_LIMIT = 100_000;
@@ -186,6 +191,20 @@ export type DirectoryStateRow = {
   last_event_seq: number;
 };
 
+export type DirectoryProposalResultRow = {
+  proposal_id: string;
+  request_sha256: string;
+  vault_id: string;
+  device_id: string;
+  target_commit: string;
+  status: 'accepted' | 'conflicted' | 'resolved';
+  conflict_id: string | null;
+  event_seq: number;
+  acknowledged_intents: DirectoryIntentAcknowledgement[];
+  created_at: string;
+  updated_at: string;
+};
+
 export type DerivedHistoryIndexRow = {
   path: string;
   current_main: string;
@@ -194,7 +213,7 @@ export type DerivedHistoryIndexRow = {
 };
 
 export type MetadataDb = {
-  schema_version: 5;
+  schema_version: 6;
   setup_complete: boolean;
   users: UserRow[];
   sessions: SessionRow[];
@@ -211,6 +230,7 @@ export type MetadataDb = {
   event_seq_by_vault: Record<string, number>;
   merge_sequence_by_vault: Record<string, number>;
   directory_state_by_vault: Record<string, DirectoryStateRow>;
+  directory_proposal_results: DirectoryProposalResultRow[];
   derived_history_by_vault: Record<string, DerivedHistoryIndexRow[]>;
 };
 
@@ -332,11 +352,12 @@ export class MetadataStore {
 
   private normalizeLoadedDb(db: MetadataDb): boolean {
     const legacyDb = db as MetadataDb & {
-      schema_version: 1 | 2 | 3 | 4 | 5;
+      schema_version: 1 | 2 | 3 | 4 | 5 | 6;
       connections?: ConnectionRequestRow[];
       login_attempts?: LoginAttemptRow[];
       diagnostic_events?: DiagnosticEventRow[];
       directory_state_by_vault?: Record<string, DirectoryStateRow>;
+      directory_proposal_results?: DirectoryProposalResultRow[];
       derived_history_by_vault?: Record<string, DerivedHistoryIndexRow[]>;
     };
     let changed = false;
@@ -376,13 +397,17 @@ export class MetadataStore {
       legacyDb.directory_state_by_vault = {};
       changed = true;
     }
+    if (!Array.isArray(legacyDb.directory_proposal_results)) {
+      legacyDb.directory_proposal_results = [];
+      changed = true;
+    }
     if (legacyDb.derived_history_by_vault === undefined) {
       legacyDb.derived_history_by_vault = {};
       changed = true;
     }
     const schema = legacyDb as unknown as { schema_version: number };
-    if (schema.schema_version < 5) {
-      schema.schema_version = 5;
+    if (schema.schema_version < 6) {
+      schema.schema_version = 6;
       changed = true;
     }
     for (const vault of db.vaults) {
@@ -476,7 +501,14 @@ export class MetadataStore {
       }
     }
     for (const conflict of db.conflicts) {
-      const legacyConflict = conflict as ConflictRecord & { validator_results?: Record<string, unknown> };
+      const legacyConflict = conflict as ConflictRecord & {
+        conflict_kind?: 'content' | 'directory' | 'mixed';
+        validator_results?: Record<string, unknown>;
+      };
+      if (!Object.prototype.hasOwnProperty.call(legacyConflict, 'conflict_kind')) {
+        legacyConflict.conflict_kind = 'content';
+        changed = true;
+      }
       if (!Object.prototype.hasOwnProperty.call(legacyConflict, 'validator_results')) {
         legacyConflict.validator_results = {
           reason:
@@ -490,6 +522,18 @@ export class MetadataStore {
       }
     }
     return changed;
+  }
+
+  pruneDirectoryProposalResults(db: MetadataDb, vaultId: string): void {
+    const devices = new Map(
+      db.devices.filter((device) => device.vault_id === vaultId).map((device) => [device.device_id, device])
+    );
+    db.directory_proposal_results = db.directory_proposal_results.filter((result) => {
+      if (result.vault_id !== vaultId || result.status === 'conflicted') return true;
+      const device = devices.get(result.device_id);
+      if (!device) return true;
+      return result.event_seq > device.last_applied_event_seq;
+    });
   }
 
   private pruneVaultEvents(db: MetadataDb, vaultId: string): void {
@@ -563,7 +607,7 @@ function migrateDisplayName(value: unknown, fallback: string): string {
 
 function createEmptyDb(): MetadataDb {
   return {
-    schema_version: 5,
+    schema_version: 6,
     setup_complete: false,
     users: [],
     sessions: [],
@@ -580,6 +624,7 @@ function createEmptyDb(): MetadataDb {
     event_seq_by_vault: {},
     merge_sequence_by_vault: {},
     directory_state_by_vault: {},
+    directory_proposal_results: [],
     derived_history_by_vault: {}
   };
 }
