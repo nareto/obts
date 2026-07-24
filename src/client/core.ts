@@ -117,8 +117,6 @@ type SharedClientCore = {
   readBackupState(): Promise<LocalPluginState | null>;
   readQueue(): Promise<QueueState>;
   readPendingOnboarding(): Promise<{ journal: OnboardingJournal; secret: string } | null>;
-  readDirectoryRecoveryDecision(): Promise<Record<string, any> | null>;
-  resolveDirectoryRecovery(decisions: Record<string, 'keep_local' | 'accept_server'>): Promise<SyncResult>;
   readDeviceToken(): Promise<string>;
   startOnboarding(): Promise<CreateConnectionResponse>;
   pollOnboarding(connectionId: string, secret: string): Promise<ConnectionStatusResponse>;
@@ -233,14 +231,6 @@ export class ObtsPluginClient {
 
   readPendingOnboarding(): Promise<{ journal: OnboardingJournal; secret: string } | null> {
     return this.client.readPendingOnboarding();
-  }
-
-  readDirectoryRecoveryDecision(): Promise<Record<string, any> | null> {
-    return this.client.readDirectoryRecoveryDecision();
-  }
-
-  resolveDirectoryRecovery(decisions: Record<string, 'keep_local' | 'accept_server'>): Promise<SyncResult> {
-    return this.client.resolveDirectoryRecovery(decisions);
   }
 
   readDeviceToken(): Promise<string> {

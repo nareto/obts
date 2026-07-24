@@ -212,7 +212,7 @@ describe('opt-in error diagnostics backend', () => {
     const migrated = await createObtsServer({ dataDir: root });
     servers.push(migrated);
     const serialized = JSON.stringify(await migrated.store.snapshot());
-    expect((await migrated.store.snapshot()).schema_version).toBe(5);
+    expect((await migrated.store.snapshot()).schema_version).toBe(6);
     expect(serialized).not.toContain('private-note.md');
     expect(serialized).not.toContain('diagnostic-secret-body');
   });

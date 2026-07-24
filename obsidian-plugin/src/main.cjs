@@ -160,23 +160,6 @@ module.exports = class ObtsPlugin extends Plugin {
     });
 
     this.addCommand({
-      id: "obts-resolve-directory-recovery",
-      name: "Resolve directory recovery",
-      callback: async () => {
-        if (!(await this.ensureClientReady())) {
-          new Notice(`obts: ${this.syncBlockedMessage()}`, 15000);
-          return;
-        }
-        const recovery = await this.client.readDirectoryRecoveryDecision();
-        if (!recovery) {
-          new Notice("obts: No directory recovery decision is pending.");
-          return;
-        }
-        new ObtsDirectoryRecoveryModal(this.app, this, recovery).open();
-      }
-    });
-
-    this.addCommand({
       id: "obts-update-plugin-via-brat",
       name: "Update plugin with BRAT",
       callback: () => {
@@ -1191,17 +1174,17 @@ class ObtsObsidianClient {
       await this.plugin.reportDeviceError(error).catch(() => undefined);
       return;
     }
-    if (directoryRecovery && directoryRecovery.phase === "executing") {
-      this.plugin.setInitializationStage("Resuming directory recovery", "recovery_directory_decision");
-      await this.executeDirectoryRecoveryDecision(directoryRecovery);
-      return;
-    }
     if (directoryRecovery) {
-      await this.writeState(Object.assign({}, state, {
-        status_label: "Directory decision required",
-        last_error_code: "directory_recovery_decision_required",
-        updated_at: nowIso()
-      }));
+      this.plugin.setInitializationStage("Resuming directory recovery", "recovery_directory_decision");
+      if (directoryRecovery.phase === "awaiting_decision") {
+        directoryRecovery = Object.assign({}, directoryRecovery, {
+          phase: "executing",
+          decisions: Object.fromEntries(directoryRecovery.ambiguous_roots.map((root) => [root, "keep_local"])),
+          updated_at: nowIso()
+        });
+        await writeJson(this.fsp, this.directoryRecoveryPath, directoryRecovery);
+      }
+      await this.executeDirectoryRecoveryDecision(directoryRecovery);
       return;
     }
     this.plugin.setInitializationStage("Persisting recovered metadata", "startup_state");
@@ -1327,9 +1310,7 @@ class ObtsObsidianClient {
       if (response.status === 404) return null;
       if (!response.ok) await throwResponseError(response);
       const capabilities = await response.json();
-      return Array.isArray(capabilities.capabilities) && capabilities.capabilities.includes("git-object-pack-chunks-v1")
-        ? capabilities
-        : null;
+      return Array.isArray(capabilities.capabilities) ? capabilities : null;
     } catch (error) {
       if (error instanceof ObtsTransportError && error.status === 404) return null;
       throw error;
@@ -1528,6 +1509,7 @@ class ObtsObsidianClient {
     const pulled = await this.pull(completion.vault_id, completion.device_id, completion.device_token, null, "latest", 0);
     await this.importPack(pulled.packfile);
     if (mode === "use_server") {
+      await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
       await this.applyTargetMain(
         pulled.manifest.target_main,
         pulled.manifest.changed_paths,
@@ -1539,6 +1521,7 @@ class ObtsObsidianClient {
         pulled.manifest.event_seq
       );
       await this.acknowledgeAppliedMain(pulled.manifest.target_main);
+      await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
       await postJsonWithBearer(this.url(`/api/v1/vaults/${completion.vault_id}/onboarding/complete`), completion.device_token, {
         applied_main: pulled.manifest.target_main
       });
@@ -1629,6 +1612,7 @@ class ObtsObsidianClient {
       await this.createRecoveryBundle("replace_local_with_server", self.current_main, localFiles);
       const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main, "latest", state.last_applied_event_seq || 0);
       await this.importPack(pulled.packfile);
+      await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
       await this.applyTargetMain(
         pulled.manifest.target_main,
         pulled.manifest.changed_paths,
@@ -1640,6 +1624,7 @@ class ObtsObsidianClient {
         pulled.manifest.event_seq
       );
       await this.acknowledgeAppliedMain(pulled.manifest.target_main);
+      await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
       await postJsonWithBearer(this.url(`/api/v1/vaults/${state.vault_id}/onboarding/complete`), token, {
         applied_main: pulled.manifest.target_main
       });
@@ -1843,6 +1828,7 @@ class ObtsObsidianClient {
     const localFiles = await this.scanSyncableFiles();
     const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main, "latest", state.last_applied_event_seq || 0);
     await this.importPack(pulled.packfile);
+    await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
     await this.applyTargetMain(
       pulled.manifest.target_main,
       pulled.manifest.changed_paths,
@@ -1854,6 +1840,7 @@ class ObtsObsidianClient {
       pulled.manifest.event_seq
     );
     await this.acknowledgeAppliedMain(pulled.manifest.target_main);
+    await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
     await this.writeQueue({ pending_commit: null, expected_device_ref: state.server_device_ref, status: "idle", attempts: 0, updated_at: nowIso() });
     await this.writeState(Object.assign({}, await this.readState(), {
       initial_import_confirmed: true,
@@ -1883,6 +1870,7 @@ class ObtsObsidianClient {
     const localSnapshot = await this.readFileSnapshot(localFiles);
     const pulled = await this.pull(state.vault_id, state.device_id, token, state.local_main, "latest", state.last_applied_event_seq || 0);
     await this.importPack(pulled.packfile);
+    await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
     const priorLocalFiles = state.local_main ? await this.listTreeFiles(state.local_main) : [];
     const pendingClassification = await this.classifyPendingCommit(queue.pending_commit, state.server_device_ref, pulled.manifest.target_main);
 
@@ -1899,6 +1887,7 @@ class ObtsObsidianClient {
     if (state.local_main !== pulled.manifest.target_main) {
       await this.acknowledgeAppliedMain(pulled.manifest.target_main);
     }
+    await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
 
     if (pendingClassification === "divergent") {
       await this.createRecoveryBundle("rebuild_from_server", pulled.manifest.target_main, localFiles);
@@ -2010,13 +1999,20 @@ class ObtsObsidianClient {
     this.plugin.setStatus("Preparing upload");
     await this.reportDeviceStatus().catch(() => undefined);
     const pendingDirectoryIntents = (await this.readDirectoryState()).pending_intents;
+    let directoryProposal = null;
     let result;
     try {
       const serverState = await this.getDeviceSelf(token);
       await this.reconcileServerVaultStatus(serverState.vault_status, true);
       const capabilities = await this.syncCapabilities();
-      if (capabilities) {
-        result = await this.pushInChunks(state, queue, token, pendingDirectoryIntents, capabilities);
+      directoryProposal = pendingDirectoryIntents.length > 0
+        ? buildDirectoryProposal(state, queue.pending_commit, pendingDirectoryIntents)
+        : null;
+      if (directoryProposal && !(capabilities && capabilities.capabilities.includes("directory-proposals-v2"))) {
+        throw new ObtsBlockedError("server_update_required", "The server must be updated before directory changes can sync safely.");
+      }
+      if (capabilities && capabilities.capabilities.includes("git-object-pack-chunks-v1")) {
+        result = await this.pushInChunks(state, queue, token, directoryProposal, capabilities);
       } else {
         const packfile = await this.createPackForCommit(queue.pending_commit, [queue.expected_device_ref, state.local_main].filter(Boolean));
         const manifest = {
@@ -2030,7 +2026,7 @@ class ObtsObsidianClient {
           packfile_bytes: packfile.byteLength,
           client_known_main: state.local_main,
           ...(queue.expected_device_ref === null && state.local_main ? { base_commit: state.local_main } : {}),
-          ...(pendingDirectoryIntents.length > 0 ? { directory_intents: pendingDirectoryIntents.map(toWireDirectoryIntent) } : {}),
+          ...(directoryProposal ? { directory_proposal: directoryProposal } : {}),
           attempt_id: `sync_${Date.now()}_${randomHex(8)}`
         };
         await this.writeQueue(Object.assign({}, queue, { status: "uploading", attempts: queue.attempts + 1, updated_at: nowIso() }));
@@ -2079,6 +2075,36 @@ class ObtsObsidianClient {
       return result;
     }
     if (result.status === "merged" || result.status === "noop") {
+      const acknowledgement = result.directory_ack;
+      const expectedAcknowledgementKeys = new Set(
+        (directoryProposal?.intents || []).map(directoryIntentGenerationKey)
+      );
+      const receivedAcknowledgementKeys = new Set(
+        (Array.isArray(acknowledgement?.acknowledged_intents) ? acknowledgement.acknowledged_intents : [])
+          .map(directoryIntentGenerationKey)
+      );
+      const exactAcknowledgement = Boolean(
+        directoryProposal &&
+        acknowledgement &&
+        acknowledgement.proposal_id === directoryProposal.proposal_id &&
+        (result.status === "merged"
+          ? acknowledgement.status === "accepted"
+          : acknowledgement.status === "accepted" || acknowledgement.status === "duplicate") &&
+        receivedAcknowledgementKeys.size === expectedAcknowledgementKeys.size &&
+        [...expectedAcknowledgementKeys].every((key) => receivedAcknowledgementKeys.has(key))
+      );
+      if (pendingDirectoryIntents.length > 0 && !exactAcknowledgement) {
+        await this.writeQueue(Object.assign({}, queue, { status: "queued_local", updated_at: nowIso() }));
+        await this.writeState(Object.assign({}, state, {
+          status_label: "Ahead",
+          last_error_code: "directory_acknowledgement_missing",
+          updated_at: nowIso()
+        }));
+        throw new ObtsBlockedError(
+          "directory_acknowledgement_missing",
+          "The server accepted directory work without an exact acknowledgement. The proposal remains queued for retry."
+        );
+      }
       await this.writeQueue({
         pending_commit: null,
         expected_device_ref: result.device_ref,
@@ -2094,7 +2120,7 @@ class ObtsObsidianClient {
         last_event_seq: Math.max(state.last_event_seq || 0, result.event_seq || 0),
         updated_at: nowIso()
       }));
-      await this.clearAcknowledgedDirectoryIntents(pendingDirectoryIntents);
+      await this.clearAcknowledgedDirectoryIntents(acknowledgement?.acknowledged_intents ?? []);
     }
     return result;
   }
@@ -2115,7 +2141,7 @@ class ObtsObsidianClient {
     if (!response.ok) await throwResponseError(response);
   }
 
-  async pushInChunks(state, queue, token, directoryIntents, capabilities, allowStaleRetry = true) {
+  async pushInChunks(state, queue, token, directoryProposal, capabilities, allowStaleRetry = true) {
     this.reportOperationProgress("Preparing upload (planning objects)", "upload_prepare");
     const groups = await this.planPackChunks(
       queue.pending_commit,
@@ -2136,7 +2162,7 @@ class ObtsObsidianClient {
       target_commit: queue.pending_commit,
       client_known_main: state.local_main,
       ...(queue.expected_device_ref === null && state.local_main ? { base_commit: state.local_main } : {}),
-      ...(directoryIntents.length > 0 ? { directory_intents: directoryIntents.map(toWireDirectoryIntent) } : {}),
+      ...(directoryProposal ? { directory_proposal: directoryProposal } : {}),
       chunk_count: groups.length,
       plan_sha256: planSha256
     };
@@ -2192,7 +2218,7 @@ class ObtsObsidianClient {
           const recoveredQueue = Object.assign({}, queue, { expected_device_ref: recoveredRef, status: "uploading", updated_at: nowIso() });
           await this.writeQueue(recoveredQueue);
           await this.writeState(Object.assign({}, state, { server_device_ref: recoveredRef, status_label: "Preparing upload", updated_at: nowIso() }));
-          return await this.pushInChunks(Object.assign({}, state, { server_device_ref: recoveredRef }), recoveredQueue, token, directoryIntents, capabilities, false);
+          return await this.pushInChunks(Object.assign({}, state, { server_device_ref: recoveredRef }), recoveredQueue, token, directoryProposal, capabilities, false);
         }
       }
       throw error;
@@ -2254,26 +2280,11 @@ class ObtsObsidianClient {
       Number.isSafeInteger(self.last_applied_event_seq) ? self.last_applied_event_seq : 0
     );
     await this.importPack(pulled.packfile);
+    await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
     const directoryClassification = await this.classifyDirectoryIntentsForRecovery(
       pulled.manifest.directory_intents || []
     );
-    if (directoryClassification.ambiguous.length > 0) {
-      const recovery = await this.stageDirectoryRecoveryDecision({
-        state,
-        serverState: self,
-        manifest: pulled.manifest,
-        classification: directoryClassification
-      });
-      await this.markBlocked("directory_recovery_decision_required", {
-        ambiguous_roots: recovery.ambiguous_roots.length,
-        ambiguous_directories: recovery.ambiguous_intents.length
-      });
-      throw new ObtsBlockedError(
-        "directory_recovery_decision_required",
-        "Choose whether to keep local empty directories or accept the server deletion in obts settings."
-      );
-    }
-    if (directoryClassification.superseded.length > 0) {
+    if (directoryClassification.ambiguous.length > 0 || directoryClassification.superseded.length > 0) {
       const recovery = await this.stageDirectoryRecoveryDecision({
         state,
         serverState: self,
@@ -2297,6 +2308,7 @@ class ObtsObsidianClient {
     );
     if (!applied) return false;
     await this.acknowledgeAppliedMain(pulled.manifest.target_main);
+    await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
     await this.clearResolvedConflictQueue();
     await this.settleAppliedQueue();
     return true;
@@ -2322,6 +2334,7 @@ class ObtsObsidianClient {
       state.last_applied_event_seq || 0
     );
     await this.importPack(pulled.packfile);
+    await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
     state = await this.readState();
     if (!(await this.ensureNoQueuedLocalChangesBeforeApply(state))) {
       return false;
@@ -2339,6 +2352,7 @@ class ObtsObsidianClient {
     );
     if (!applied) return false;
     await this.acknowledgeAppliedMain(pulled.manifest.target_main);
+    await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
     await this.clearResolvedConflictQueue();
     await this.settleAppliedQueue();
     return true;
@@ -5183,12 +5197,18 @@ class ObtsObsidianClient {
     const byPath = new Map(previous.pending_intents.map((intent) => [intent.path, intent]));
     const intents = changes.map((change) => {
       const replaced = byPath.get(change.path) || null;
+      const preserveLegacyProvenance = Boolean(
+        replaced &&
+        replaced.provenance === "legacy" &&
+        replaced.op === change.op &&
+        !change.recreated_after_delete
+      );
       const intent = {
         op: change.op,
         path: change.path,
         intent_id: `dir_${Date.now()}_${generation}_${randomHex(6)}`,
         generation,
-        provenance: "local_v2",
+        provenance: preserveLegacyProvenance ? "legacy" : "local_v2",
         base_main: state.local_main || null,
         base_event_seq: state.last_applied_event_seq || 0,
         replaces_intent_id: replaced && replaced.intent_id || null,
@@ -5249,11 +5269,13 @@ class ObtsObsidianClient {
     await this.refreshDirectoryStateFromDisk([]);
   }
 
-  async clearAcknowledgedDirectoryIntents(sentIntents) {
+  async clearAcknowledgedDirectoryIntents(acknowledgedIntents) {
     await this.reconcileDirectoryState();
     const directoryState = await this.readDirectoryState();
-    const sentKeys = new Set(normalizeStoredDirectoryIntents(sentIntents).map(directoryIntentIdentityKey));
-    const remaining = directoryState.pending_intents.filter((intent) => !sentKeys.has(directoryIntentIdentityKey(intent)));
+    const acknowledgedKeys = new Set((Array.isArray(acknowledgedIntents) ? acknowledgedIntents : [])
+      .filter((intent) => intent && typeof intent.intent_id === "string" && Number.isSafeInteger(intent.generation))
+      .map(directoryIntentGenerationKey));
+    const remaining = directoryState.pending_intents.filter((intent) => !acknowledgedKeys.has(directoryIntentGenerationKey(intent)));
     await this.writeDirectoryState(Object.assign({}, directoryState, {
       pending_intents: remaining,
       updated_at: nowIso()
@@ -5316,7 +5338,7 @@ class ObtsObsidianClient {
     const ambiguousRoots = topmostDirectories(classification.ambiguous.map((intent) => intent.path));
     const supersededRoots = topmostDirectories(classification.superseded.map((intent) => intent.path));
     const roots = topmostDirectories([...ambiguousRoots, ...supersededRoots]);
-    const decisions = automatic ? Object.fromEntries(ambiguousRoots.map((root) => [root, "accept_server"])) : null;
+    const decisions = automatic ? Object.fromEntries(ambiguousRoots.map((root) => [root, "keep_local"])) : null;
     const recovery = {
       version: 1,
       recovery_id: `dirrec_${Date.now()}_${randomHex(8)}`,
@@ -5327,7 +5349,7 @@ class ObtsObsidianClient {
       local_head_at_decision: state.local_head,
       event_seq: manifest.event_seq || 0,
       changed_paths: manifest.changed_paths || [],
-      directory_intents: (manifest.directory_intents || []).map(toWireDirectoryIntent),
+      directory_intents: (manifest.directory_intents || []).map((intent) => ({ op: intent.op, path: intent.path })),
       explicit_directories: manifest.explicit_directories || [],
       original_pending_intents: classification.directoryState.pending_intents,
       next_generation: classification.directoryState.next_generation,
@@ -5400,6 +5422,22 @@ class ObtsObsidianClient {
     throw new ObtsBlockedError("directory_recovery_changed", "Local directories changed after the recovery decision. Review them again.");
   }
 
+  async preserveLegacyRecoveryIntents(recovery, keptRoots) {
+    const directoryState = await this.readDirectoryState();
+    const pendingByPath = new Map(directoryState.pending_intents.map((intent) => [intent.path, intent]));
+    for (const legacyIntent of recovery.ambiguous_intents.filter((intent) =>
+      keptRoots.some((root) => intent.path === root || intent.path.startsWith(`${root}/`))
+    )) {
+      const current = pendingByPath.get(legacyIntent.path);
+      if (current && current.op !== legacyIntent.op) continue;
+      pendingByPath.set(legacyIntent.path, Object.assign({}, current || legacyIntent, { provenance: "legacy" }));
+    }
+    await this.writeDirectoryState(Object.assign({}, directoryState, {
+      pending_intents: [...pendingByPath.values()],
+      updated_at: nowIso()
+    }));
+  }
+
   async queueConfirmedKeptChanges(recovery) {
     const queue = await this.readQueue();
     if (queue.pending_commit) return;
@@ -5441,7 +5479,13 @@ class ObtsObsidianClient {
         (dirPath === root || dirPath.startsWith(`${root}/`)) &&
         recovery.inventory.directories.find((entry) => entry.path === dirPath).creation_time === null
       ))) {
-        return await this.resetDirectoryRecoveryAfterChange(recovery);
+        await this.markBlocked("directory_identity_unavailable", {
+          recovery_roots: acceptedRoots.length
+        });
+        throw new ObtsBlockedError(
+          "directory_identity_unavailable",
+          "Automatic directory recovery cannot verify a directory identity on this filesystem."
+        );
       }
       if (!recovery.archived) {
         const archiveDir = path.join(this.obtsDir, "recovery", recovery.recovery_id);
@@ -5503,7 +5547,10 @@ class ObtsObsidianClient {
     }
     const keptRoots = recovery.ambiguous_roots.filter((root) => recovery.decisions[root] === "keep_local");
     if (recovery.last_completed_step === "apply_completed") {
-      if (keptRoots.length > 0) await this.queueConfirmedKeptChanges(recovery);
+      if (keptRoots.length > 0) {
+        await this.preserveLegacyRecoveryIntents(recovery, keptRoots);
+        await this.queueConfirmedKeptChanges(recovery);
+      }
       await this.acknowledgeAppliedMain(recovery.target_main);
       recovery = Object.assign({}, recovery, { last_completed_step: "acknowledged", updated_at: nowIso() });
       await writeJson(this.fsp, this.directoryRecoveryPath, recovery);
@@ -5887,7 +5934,7 @@ class ObtsObsidianClient {
       throw new ObtsBlockedError("apply_journal_recovery_required", "An incomplete apply journal requires recovery before sync can continue.");
     }
     if (state.last_error_code === "directory_recovery_decision_required" || state.last_error_code === "directory_recovery_changed") {
-      throw new ObtsBlockedError(state.last_error_code, "Review the pending directory recovery decision in obts settings.");
+      throw new ObtsBlockedError(state.last_error_code, "Automatic directory recovery will retry after the plugin reloads.");
     }
     if (state.last_error_code === "directory_recovery_journal_invalid") {
       throw new ObtsBlockedError(state.last_error_code, "The directory recovery journal is invalid and must be preserved for recovery support.");
@@ -5910,86 +5957,6 @@ class ObtsObsidianClient {
       updated_at: nowIso()
     }));
     await this.reportDeviceStatus().catch(() => undefined);
-  }
-}
-
-class ObtsDirectoryRecoveryModal extends Modal {
-  constructor(app, plugin, recovery) {
-    super(app);
-    this.plugin = plugin;
-    this.recovery = recovery;
-    this.inventoryChanged = false;
-    this.decisions = Object.fromEntries(recovery.ambiguous_roots.map((root) => [root, "keep_local"]));
-  }
-
-  async onOpen() {
-    const latest = await this.plugin.client.readDirectoryRecoveryDecision();
-    if (!latest) {
-      this.contentEl.empty();
-      this.contentEl.createEl("h2", { text: "Directory recovery is complete" });
-      return;
-    }
-    this.recovery = latest;
-    this.render();
-  }
-
-  onClose() {
-    this.contentEl.empty();
-  }
-
-  render() {
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.addClass("obts-onboarding");
-    contentEl.createEl("h2", { text: "Resolve directory recovery" });
-    contentEl.createEl("p", {
-      text: this.inventoryChanged
-        ? "The affected directories changed while the prior decision was open. Choices were reset to keep local; review the new inventory before confirming again."
-        : "A plugin update interrupted an older directory-only apply. The legacy record cannot prove whether these empty folders are stale or were intentionally recreated. Review each subtree before sync continues."
-    });
-    const summary = contentEl.createDiv({ cls: "obts-onboarding-summary" });
-    summary.createEl("strong", { text: `${this.recovery.ambiguous_intents.length} ambiguous directories` });
-    summary.createEl("span", { text: `${this.recovery.ambiguous_roots.length} independent subtrees` });
-    for (const root of this.recovery.ambiguous_roots) {
-      new Setting(contentEl)
-        .setName(root)
-        .setDesc("Keep uploads this empty subtree as a fresh local change. Accept removes it only if the recorded directory inventory is unchanged.")
-        .addDropdown((dropdown) => dropdown
-          .addOption("keep_local", "Keep local directories")
-          .addOption("accept_server", "Accept server deletion")
-          .setValue(this.decisions[root] || "keep_local")
-          .onChange((value) => {
-            this.decisions[root] = value;
-          }));
-    }
-    const feedback = contentEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
-    new Setting(contentEl)
-      .addButton((button) => button.setButtonText("Cancel").onClick(() => this.close()))
-      .addButton((button) => button.setButtonText("Apply recovery decision").setCta().onClick(async () => {
-        const accepted = Object.values(this.decisions).filter((choice) => choice === "accept_server").length;
-        if (!window.confirm(`Apply these directory recovery choices? ${accepted} subtree${accepted === 1 ? "" : "s"} will accept the server deletion after a final safety check.`)) return;
-        button.setDisabled(true);
-        setFeedback(feedback, "Validating and applying the recovery decision...", "muted");
-        try {
-          const result = await this.plugin.runExclusiveAction(() => this.plugin.client.resolveDirectoryRecovery(this.decisions));
-          this.plugin.setStatus((await this.plugin.client.readState()).status_label);
-          new Notice(`obts directory recovery completed: ${result.status}.`, 10000);
-          this.close();
-        } catch (error) {
-          if (error && error.code === "directory_recovery_changed") {
-            const latest = await this.plugin.client.readDirectoryRecoveryDecision();
-            if (latest) {
-              this.recovery = latest;
-              this.inventoryChanged = true;
-              this.decisions = Object.fromEntries(latest.ambiguous_roots.map((root) => [root, "keep_local"]));
-              this.render();
-              return;
-            }
-          }
-          setFeedback(feedback, error instanceof Error ? error.message : "Directory recovery failed safely.", "error");
-          button.setDisabled(false);
-        }
-      }));
   }
 }
 
@@ -6508,22 +6475,6 @@ class ObtsSettingTab extends PluginSettingTab {
           .setName("Directory recovery journal is invalid")
           .setDesc("Sync is blocked without modifying the journal or vault. Send diagnostics and preserve `.obts/directory-recovery.json` for recovery support.");
       }
-      if (state.last_error_code === "directory_recovery_decision_required" || state.last_error_code === "directory_recovery_changed") {
-        new Setting(containerEl)
-          .setName("Directory recovery decision required")
-          .setDesc("An interrupted legacy apply cannot distinguish stale empty-directory intents from intentional recreations. Review the affected subtrees before sync continues.")
-          .addButton((button) => button
-            .setButtonText("Review directory recovery")
-            .setCta()
-            .onClick(async () => {
-              const recovery = await this.plugin.client.readDirectoryRecoveryDecision();
-              if (!recovery) {
-                new Notice("obts: No directory recovery decision is pending.");
-                return;
-              }
-              new ObtsDirectoryRecoveryModal(this.app, this.plugin, recovery).open();
-            }));
-      }
       new Setting(containerEl)
         .setName("Actions")
         .addButton((button) =>
@@ -7008,6 +6959,10 @@ function directoryIntentIdentityKey(intent) {
   return `${intent.intent_id || "legacy"}\0${intent.generation || 0}\0${directoryIntentOperationKey(intent)}`;
 }
 
+function directoryIntentGenerationKey(intent) {
+  return `${intent.intent_id || "legacy"}\0${intent.generation || 0}`;
+}
+
 function directoryIntentRecordKey(intent) {
   return stableJson([
     intent.intent_id,
@@ -7023,8 +6978,22 @@ function directoryIntentRecordKey(intent) {
   ]);
 }
 
-function toWireDirectoryIntent(intent) {
-  return { op: intent.op, path: intent.path };
+function buildDirectoryProposal(state, targetCommit, pendingIntents) {
+  const baseMain = state.local_main || null;
+  const baseEventSeq = Number.isSafeInteger(state.last_applied_event_seq) ? state.last_applied_event_seq : 0;
+  const intents = normalizeStoredDirectoryIntents(pendingIntents).map((intent) => Object.assign({}, intent, {
+    base_main: baseMain,
+    base_event_seq: baseEventSeq
+  }));
+  const proposalBody = {
+    schema_version: 2,
+    base_main: baseMain,
+    base_event_seq: baseEventSeq,
+    intents
+  };
+  return Object.assign({}, proposalBody, {
+    proposal_id: `dirprop_${sha256(Buffer.from(stableJson([state.device_id, targetCommit, proposalBody]), "utf8"))}`
+  });
 }
 
 function stableJson(value) {
@@ -7228,7 +7197,7 @@ function sameStringArray(left, right) {
 }
 
 function isRetryableLocalError(code) {
-  return code === "local_snapshot_changed" || code === "upload_interrupted" || code === "pack_preparation_failed" || code === "invalid_path" || code === "path_collision" || code === "excluded_git_path" || code === "excluded_internal_path" || code === "excluded_path" || code === "unsupported_file_mode";
+  return code === "local_snapshot_changed" || code === "upload_interrupted" || code === "pack_preparation_failed" || code === "directory_acknowledgement_missing" || code === "invalid_path" || code === "path_collision" || code === "excluded_git_path" || code === "excluded_internal_path" || code === "excluded_path" || code === "unsupported_file_mode";
 }
 
 function isOfflineTransportError(error) {

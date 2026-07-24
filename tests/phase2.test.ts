@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -227,6 +227,114 @@ describe('Phase 2 dashboard conflict resolution', () => {
         resource_id: result.conflictId
       })
     );
+  });
+
+  it('routes concurrent directory recreation to the dashboard and applies the server decision', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const sourceDir = join(root, 'directory-conflict-source');
+    const receiverDir = join(root, 'directory-conflict-receiver');
+    await mkdir(join(sourceDir, 'Scratch'), { recursive: true });
+    await mkdir(receiverDir, { recursive: true });
+    await writeFile(join(sourceDir, 'base.md'), 'base\n');
+    const source = await pairPlugin(admin, sourceDir, 'directory-conflict-source');
+    expect((await source.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+    const receiver = await pairPlugin(admin, receiverDir, 'directory-conflict-receiver');
+    expect(await isDirectory(join(receiverDir, 'Scratch'))).toBe(true);
+
+    await rm(join(receiverDir, 'Scratch'), { recursive: true, force: true });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await mkdir(join(receiverDir, 'Scratch'));
+    await rm(join(sourceDir, 'Scratch'), { recursive: true, force: true });
+    expect((await source.syncOnce()).status).toBe('Synced');
+
+    const conflicted = await receiver.syncOnce();
+    expect(conflicted.status).toBe('Review needed');
+    expect(conflicted.conflictId).toMatch(/^conf_/u);
+    const review = await admin.get<{
+      conflict: { expected_main: string; conflict_kind: string };
+      files: unknown[];
+      directory_conflicts: Array<{ root: string; server_state: string; device_state: string }>;
+      choices: string[];
+    }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}`);
+    expect(review.status).toBe(200);
+    expect(review.body).toMatchObject({
+      conflict: { conflict_kind: 'directory' },
+      files: [],
+      directory_conflicts: [{ root: 'Scratch', server_state: 'deleted', device_state: 'present' }],
+      choices: ['keep_server', 'use_device']
+    });
+
+    const resolved = await admin.post<{ resolution_commit: string }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}/resolve`,
+      { expected_main: review.body.conflict.expected_main, resolution_kind: 'keep_server' }
+    );
+    expect(resolved.status).toBe(200);
+    expect(await receiver.pollRemoteEventsAndApply()).toMatchObject({ applied: true, status: 'Synced' });
+    expect(await isDirectory(join(receiverDir, 'Scratch'))).toBe(false);
+    expect((JSON.parse(await readFile(join(receiverDir, '.obts', 'directory-state.json'), 'utf8')) as { pending_intents: unknown[] }).pending_intents).toEqual([]);
+    const finalMetadata = await server.store.snapshot();
+    expect(finalMetadata.directory_state_by_vault[admin.vaultId]?.explicit_dirs).not.toContain('Scratch');
+    expect(finalMetadata.directory_proposal_results.some((result) => result.conflict_id === conflicted.conflictId)).toBe(false);
+  });
+
+  it('can keep a concurrently recreated directory through dashboard resolution', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const sourceDir = join(root, 'directory-device-source');
+    const receiverDir = join(root, 'directory-device-receiver');
+    await mkdir(join(sourceDir, 'Scratch'), { recursive: true });
+    await mkdir(receiverDir, { recursive: true });
+    await writeFile(join(sourceDir, 'base.md'), 'base\n');
+    const source = await pairPlugin(admin, sourceDir, 'directory-device-source');
+    expect((await source.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+    const receiver = await pairPlugin(admin, receiverDir, 'directory-device-receiver');
+
+    await rm(join(receiverDir, 'Scratch'), { recursive: true, force: true });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await mkdir(join(receiverDir, 'Scratch'));
+    await rm(join(sourceDir, 'Scratch'), { recursive: true, force: true });
+    expect((await source.syncOnce()).status).toBe('Synced');
+
+    const conflicted = await receiver.syncOnce();
+    expect(conflicted.status).toBe('Review needed');
+
+    // Both server-only and device-only descendants must survive directory-only resolution.
+    await forceConflictDeviceFile(server, admin.vaultId, conflicted.conflictId!, 'Scratch/local.md', 'device-only\n');
+    await forceServerFileCommit(server, admin.vaultId, 'Scratch/server.md', 'server-only\n');
+    const stale = await admin.get<{ stale: boolean }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}`
+    );
+    expect(stale.body.stale).toBe(true);
+    const review = await admin.post<{
+      conflict: { expected_main: string; affected_paths: string[]; conflict_kind: string };
+      directory_conflicts: unknown[];
+      choices: string[];
+    }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}/refresh`, {});
+    expect(review.body).toMatchObject({
+      conflict: { affected_paths: ['Scratch'], conflict_kind: 'directory' },
+      directory_conflicts: [{ root: 'Scratch', server_state: 'deleted', device_state: 'present' }],
+      choices: ['keep_server', 'use_device']
+    });
+    expect(
+      (await server.git.readBlobAtPathIfPresent(admin.vaultId, review.body.conflict.expected_main, 'Scratch/server.md'))?.toString('utf8')
+    ).toBe('server-only\n');
+    const resolved = await admin.post<{ resolution_commit: string }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}/resolve`,
+      { expected_main: review.body.conflict.expected_main, resolution_kind: 'use_device' }
+    );
+    expect(resolved.status).toBe(200);
+    expect(
+      (await server.git.readBlobAtPathIfPresent(admin.vaultId, resolved.body.resolution_commit, 'Scratch/server.md'))?.toString('utf8')
+    ).toBe('server-only\n');
+    expect(
+      (await server.git.readBlobAtPathIfPresent(admin.vaultId, resolved.body.resolution_commit, 'Scratch/local.md'))?.toString('utf8')
+    ).toBe('device-only\n');
+    expect(await receiver.pollRemoteEventsAndApply()).toMatchObject({ applied: true, status: 'Synced' });
+    expect(await isDirectory(join(receiverDir, 'Scratch'))).toBe(true);
+    expect(await readFile(join(receiverDir, 'Scratch', 'server.md'), 'utf8')).toBe('server-only\n');
+    expect(await readFile(join(receiverDir, 'Scratch', 'local.md'), 'utf8')).toBe('device-only\n');
+    expect((await server.store.snapshot()).directory_state_by_vault[admin.vaultId]?.explicit_dirs).toContain('Scratch');
+    expect((await source.syncOnce()).status).toBe('Synced');
+    expect(await isDirectory(join(sourceDir, 'Scratch'))).toBe(true);
   });
 
   it('resumes onboarding conflict review without resubmitting or losing a reconstructed same-tree proposal', async () => {
@@ -1515,6 +1623,95 @@ describe('Phase 2 dashboard conflict resolution', () => {
     });
   });
 });
+
+async function isDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+async function forceConflictDeviceFile(
+  server: ObtsServer,
+  vaultId: string,
+  conflictId: string,
+  path: string,
+  content: string
+): Promise<string> {
+  const snapshot = await server.store.snapshot();
+  const conflict = snapshot.conflicts.find((candidate) => candidate.conflict_id === conflictId && candidate.vault_id === vaultId);
+  if (!conflict) throw new Error(`Conflict not found: ${conflictId}`);
+  const device = snapshot.devices.find((candidate) => candidate.device_id === conflict.device_id);
+  if (!device) throw new Error(`Device not found: ${conflict.device_id}`);
+  const sourceTree = await server.git.treeHash(vaultId, conflict.device_commit);
+  const tree = await server.git.createTreeFromTreeWithChanges({
+    vaultId,
+    sourceTree,
+    writes: new Map([[path, Buffer.from(content, 'utf8')]])
+  });
+  const commit = await server.git.createMainCommitFromTree({
+    vaultId,
+    tree,
+    parentMain: conflict.device_commit,
+    subject: 'test: device-only conflict file',
+    body: `path=${path}`,
+    actor: 'obts-test'
+  });
+  await server.git.updateRef(vaultId, device.device_ref, commit, conflict.device_commit);
+  await server.git.updateRef(vaultId, `refs/obts/conflicts/${conflictId}/device`, commit, conflict.device_commit);
+  await server.store.mutate((db) => {
+    const mutableConflict = db.conflicts.find((candidate) => candidate.conflict_id === conflictId && candidate.vault_id === vaultId);
+    const mutableDevice = db.devices.find((candidate) => candidate.device_id === conflict.device_id);
+    if (!mutableConflict || !mutableDevice) throw new Error(`Conflict not found: ${conflictId}`);
+    mutableConflict.device_commit = commit;
+    mutableDevice.device_ref_head = commit;
+    const proposalResult = db.directory_proposal_results.find((candidate) => candidate.conflict_id === conflictId);
+    if (proposalResult) proposalResult.target_commit = commit;
+  });
+  return commit;
+}
+
+async function forceServerFileCommit(
+  server: ObtsServer,
+  vaultId: string,
+  path: string,
+  content: string
+): Promise<string> {
+  const snapshot = await server.store.snapshot();
+  const vault = snapshot.vaults.find((candidate) => candidate.vault_id === vaultId);
+  if (!vault?.current_main) throw new Error(`Vault main not found: ${vaultId}`);
+  const previousMain = vault.current_main;
+  const sourceTree = await server.git.treeHash(vaultId, previousMain);
+  const tree = await server.git.createTreeFromTreeWithChanges({
+    vaultId,
+    sourceTree,
+    writes: new Map([[path, Buffer.from(content, 'utf8')]])
+  });
+  const commit = await server.git.createMainCommitFromTree({
+    vaultId,
+    tree,
+    parentMain: previousMain,
+    subject: 'test: server-only file',
+    body: `path=${path}`,
+    actor: 'obts-test'
+  });
+  await server.git.updateRef(vaultId, 'refs/heads/main', commit, previousMain);
+  await server.store.mutate((db) => {
+    const mutableVault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
+    if (!mutableVault) throw new Error(`Vault not found: ${vaultId}`);
+    mutableVault.current_main = commit;
+    mutableVault.updated_at = new Date().toISOString();
+    server.store.appendEvent(db, {
+      event_type: 'main_advanced',
+      vault_id: vaultId,
+      resource_ids: {},
+      commit_cursors: { previous_main: previousMain, main: commit },
+      payload: { decision: 'test_server_file' }
+    });
+  });
+  return commit;
+}
 
 async function forceLegacyKeepServerResolution(server: ObtsServer, vaultId: string, conflictId: string): Promise<string> {
   const snapshot = await server.store.snapshot();

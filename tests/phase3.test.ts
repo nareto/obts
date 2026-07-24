@@ -49,12 +49,12 @@ describe('Phase 3 deployable history state', () => {
     const store = new MetadataStore(root);
     await store.initialize();
     const upgraded = await store.snapshot();
-    expect(upgraded.schema_version).toBe(5);
+    expect(upgraded.schema_version).toBe(6);
     expect(upgraded.derived_history_by_vault).toEqual({});
     expect(upgraded.diagnostic_events).toEqual([]);
 
     expect(JSON.parse(await readFile(join(metadataDir, 'phase1.json'), 'utf8'))).toMatchObject({
-      schema_version: 5,
+      schema_version: 6,
       connections: [],
       diagnostic_events: [],
       derived_history_by_vault: {}
@@ -63,7 +63,7 @@ describe('Phase 3 deployable history state', () => {
     const reloaded = new MetadataStore(root);
     await reloaded.initialize();
     expect(await reloaded.snapshot()).toMatchObject({
-      schema_version: 5,
+      schema_version: 6,
       connections: [],
       diagnostic_events: [],
       derived_history_by_vault: {}
@@ -390,6 +390,7 @@ describe('Phase 3 deployable history state', () => {
         affected_path_count: 1,
         merge_sequence: 1,
         merge_policy_version: 'phase2.semantic-merge.v1',
+        conflict_kind: 'content',
         validator_results: { reason: 'backup_fixture' },
         validator_summary: { reason: 'backup_fixture' },
         created_at: timestamp

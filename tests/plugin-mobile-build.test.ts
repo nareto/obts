@@ -43,6 +43,11 @@ describe('mobile plugin artifact', () => {
     expect(source).not.toContain('runExclusiveAction(() => this.plugin.setDiagnosticSharing');
     expect(source).toContain('await this.plugin.setDiagnosticSharing(value)');
     expect(source).toContain('const transferRequest = {');
+    expect(source).toContain('directory_proposal: directoryProposal');
+    expect(source).toContain('directory-proposals-v2');
+    expect(source).not.toContain('id: "obts-resolve-directory-recovery"');
+    expect(source).not.toContain('class ObtsDirectoryRecoveryModal');
+    expect(source).not.toContain('Review directory recovery');
     expect(source).toContain('plugin_version: PLUGIN_VERSION');
     expect(source).toContain('sha256(Buffer.from(stableJson(transferRequest)))');
   });
@@ -805,12 +810,31 @@ describe('mobile plugin artifact', () => {
         directory_intents: mobileRemoteIntents,
         explicit_directories: mobileRecoveryState.explicit_empty_dirs
       },
-      classification: mobileClassification
+      classification: mobileClassification,
+      automatic: true
     });
-    expect(mobileDecision).toMatchObject({ phase: 'awaiting_decision', ambiguous_roots: ['mobile-directory-recovery'] });
-    expect((await runtimeClient.resolveDirectoryRecovery({ 'mobile-directory-recovery': 'accept_server' })).status).toBe('Synced');
-    expect(await runtimeAdapter.exists('mobile-directory-recovery')).toBe(false);
+    expect(mobileDecision).toMatchObject({ phase: 'executing', ambiguous_roots: ['mobile-directory-recovery'] });
+    expect((await runtimeClient.executeDirectoryRecoveryDecision(mobileDecision)).status).toBe('Ahead');
+    expect(await runtimeAdapter.exists('mobile-directory-recovery')).toBe(true);
     expect(await runtimeAdapter.exists('.obts/directory-recovery.json')).toBe(false);
+    expect((await runtimeClient.readDirectoryState()).pending_intents).toEqual(expect.arrayContaining([
+      expect.objectContaining({ op: 'create', path: 'mobile-directory-recovery', provenance: 'legacy' })
+    ]));
+    await runtimeClient.clearPendingDirectoryIntents();
+    const postRecoveryState = await runtimeClient.readState();
+    await runtimeClient.writeQueue({
+      pending_commit: null,
+      expected_device_ref: postRecoveryState.server_device_ref,
+      status: 'idle',
+      attempts: 0,
+      updated_at: new Date().toISOString()
+    });
+    await runtimeClient.writeState({
+      ...postRecoveryState,
+      local_head: postRecoveryState.local_main,
+      status_label: 'Synced',
+      last_error_code: null
+    });
 
     let lightweightPolls = 0;
     let fullScans = 0;

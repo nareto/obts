@@ -182,6 +182,36 @@ export type DirectoryIntent = {
   path: string;
 };
 
+export type DirectoryProposalIntent = DirectoryIntent & {
+  intent_id: string;
+  generation: number;
+  provenance: 'legacy' | 'local_v2';
+  base_main: string | null;
+  base_event_seq: number;
+  replaces_intent_id: string | null;
+  recreated_after_delete: boolean;
+  created_at: string | null;
+};
+
+export type DirectoryProposal = {
+  schema_version: 2;
+  proposal_id: string;
+  base_main: string | null;
+  base_event_seq: number;
+  intents: DirectoryProposalIntent[];
+};
+
+export type DirectoryIntentAcknowledgement = {
+  intent_id: string;
+  generation: number;
+};
+
+export type DirectoryProposalAcknowledgement = {
+  proposal_id: string;
+  status: 'accepted' | 'conflicted' | 'duplicate';
+  acknowledged_intents: DirectoryIntentAcknowledgement[];
+};
+
 export type DevicePushManifest = {
   api_version: typeof API_VERSION;
   plugin_version?: string;
@@ -195,6 +225,7 @@ export type DevicePushManifest = {
   base_commit?: string | null;
   attempt_id?: string;
   directory_intents?: DirectoryIntent[];
+  directory_proposal?: DirectoryProposal;
 };
 
 export type PushResult =
@@ -203,6 +234,7 @@ export type PushResult =
       device_ref: string;
       main: string;
       event_seq: number;
+      directory_ack?: DirectoryProposalAcknowledgement;
     }
   | {
       status: 'merged';
@@ -210,6 +242,7 @@ export type PushResult =
       main: string;
       merge_commit: string;
       event_seq: number;
+      directory_ack?: DirectoryProposalAcknowledgement;
     }
   | {
       status: 'conflicted';
@@ -217,6 +250,7 @@ export type PushResult =
       main: string;
       conflict_id: string;
       event_seq: number;
+      directory_ack?: DirectoryProposalAcknowledgement;
     }
   | {
       status: 'rejected';
@@ -244,12 +278,14 @@ export type DevicePullManifest = {
   event_seq: number;
   directory_intents?: DirectoryIntent[];
   explicit_directories?: string[];
+  directory_acknowledgements?: DirectoryIntentAcknowledgement[];
 };
 
 export const CHUNK_TRANSFER_CAPABILITY = 'git-object-pack-chunks-v1' as const;
+export const DIRECTORY_PROPOSAL_CAPABILITY = 'directory-proposals-v2' as const;
 
 export type SyncCapabilities = {
-  capabilities: [typeof CHUNK_TRANSFER_CAPABILITY];
+  capabilities: Array<typeof CHUNK_TRANSFER_CAPABILITY | typeof DIRECTORY_PROPOSAL_CAPABILITY>;
   max_chunk_bytes: number;
   target_chunk_bytes: number;
   max_transfer_bytes: number;
@@ -266,6 +302,7 @@ export type ChunkPushCreateRequest = {
   client_known_main: string | null;
   base_commit?: string | null;
   directory_intents?: DirectoryIntent[];
+  directory_proposal?: DirectoryProposal;
   attempt_id: string;
   chunk_count: number;
   plan_sha256: string;
@@ -321,6 +358,16 @@ export type ChunkBootstrapManifest = ConnectionBootstrapManifest & {
   chunk_bytes: number;
 };
 
+export type DirectoryConflictContext = {
+  proposal: DirectoryProposal;
+  base_explicit_dirs: string[];
+  server_explicit_dirs: string[];
+  clean_intent_ids: string[];
+  conflicting_intent_ids: string[];
+  affected_roots: string[];
+  expected_event_seq: number;
+};
+
 export type ConflictRecord = {
   conflict_id: string;
   vault_id: string;
@@ -334,6 +381,8 @@ export type ConflictRecord = {
   affected_path_count: number;
   merge_sequence: number;
   merge_policy_version: string;
+  conflict_kind: 'content' | 'directory' | 'mixed';
+  directory_context?: DirectoryConflictContext;
   validator_results: Record<string, unknown>;
   validator_summary: Record<string, unknown>;
   created_at: string;
@@ -380,6 +429,13 @@ export type ConflictReviewFile = {
   rendered_markdown_diff: string | null;
 };
 
+export type DirectoryConflictReview = {
+  root: string;
+  server_state: 'present' | 'deleted';
+  device_state: 'present' | 'deleted';
+  affected_paths: string[];
+};
+
 export type ConflictReviewPackage = {
   conflict: ConflictRecord;
   stale: boolean;
@@ -388,6 +444,7 @@ export type ConflictReviewPackage = {
   device_name: string;
   path_conflicts: ConflictReviewPath[];
   files: ConflictReviewFile[];
+  directory_conflicts: DirectoryConflictReview[];
   choices: ConflictResolutionKind[];
 };
 

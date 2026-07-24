@@ -152,6 +152,19 @@ export type ConflictResolutionKind =
   | 'insert_both_blocks'
   | 'manual';
 
+export type DirectoryProposalIntent = {
+  intent_id: string;
+  generation: number;
+  op: 'create' | 'delete';
+  path: string;
+};
+
+export type DirectoryConflictContext = {
+  proposal: { proposal_id: string; intents: DirectoryProposalIntent[] };
+  affected_roots: string[];
+  expected_event_seq: number;
+};
+
 export type ConflictRecord = {
   conflict_id: string;
   vault_id: string;
@@ -165,6 +178,8 @@ export type ConflictRecord = {
   affected_path_count: number;
   merge_sequence: number;
   merge_policy_version: string;
+  conflict_kind: 'content' | 'directory' | 'mixed';
+  directory_context?: DirectoryConflictContext;
   validator_results: Record<string, unknown>;
   validator_summary: Record<string, unknown>;
   created_at: string;
@@ -202,6 +217,13 @@ export type ConflictReviewFile = {
   rendered_markdown_diff: string | null;
 };
 
+export type DirectoryConflictReview = {
+  root: string;
+  server_state: 'present' | 'deleted';
+  device_state: 'present' | 'deleted';
+  affected_paths: string[];
+};
+
 export type ConflictReviewPackage = {
   conflict: ConflictRecord;
   stale: boolean;
@@ -210,6 +232,7 @@ export type ConflictReviewPackage = {
   device_name: string;
   path_conflicts: ConflictReviewPath[];
   files: ConflictReviewFile[];
+  directory_conflicts: DirectoryConflictReview[];
   choices: ConflictResolutionKind[];
 };
 
