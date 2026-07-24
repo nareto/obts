@@ -324,7 +324,7 @@ export function parseChunkPushCreateRequest(value: unknown): ChunkPushCreateRequ
   }
   const planSha256 = readSha256(value, 'plan_sha256');
   const chunkCount = readNonNegativeInteger(value, 'chunk_count');
-  if (chunkCount < 1 || chunkCount > 4096) {
+  if (chunkCount > 4096) {
     throw new ValidationError('invalid_request', 'Invalid chunk count.', { field: 'chunk_count' });
   }
   const pluginVersion = readOptionalString(value, 'plugin_version');

@@ -66,6 +66,11 @@ type RenamePair = {
   confidence: RenameConfidence;
 };
 
+type UploadValidation = {
+  rejection: PushResult | null;
+  deviceRelation: 'initial' | 'fast_forward' | 'superseded' | 'divergent';
+};
+
 type DirectoryMergePlan = {
   proposal: DirectoryProposal;
   requestSha256: string;
@@ -202,14 +207,6 @@ export class SyncService {
         if (currentDeviceRef === manifest.target_commit) {
           return await this.finishExistingDeviceCommit(auth, operation, manifest.target_commit, directoryProposal);
         }
-        if ((manifest.expected_device_ref ?? null) !== currentDeviceRef) {
-          return await this.rejectDevicePush(
-            auth,
-            operation.operation_id,
-            'stale_device_ref',
-            'Device ref changed before this upload.'
-          );
-        }
         if (deviceBlock) {
           return await this.rejectDevicePush(auth, operation.operation_id, deviceBlock.code, deviceBlock.message);
         }
@@ -227,16 +224,21 @@ export class SyncService {
           }
         }
 
-        const quarantineResult = staged
+        const validation = staged
           ? await this.validateUploadReader(auth, operation, manifest, staged.reader, currentDeviceRef, currentMain)
           : await this.validateQuarantinedUpload(auth, operation, manifest, packfile, currentDeviceRef, currentMain);
-        if (quarantineResult !== null) {
-          return quarantineResult;
+        if (validation.rejection !== null) return validation.rejection;
+        if (validation.deviceRelation === 'superseded' && currentDeviceRef) {
+          const result = await this.finishExistingDeviceCommit(auth, operation, manifest.target_commit, directoryProposal);
+          return result.status === 'rejected' ? result : { ...result, device_ref: currentDeviceRef };
         }
 
         await this.store.mutate((db) => {
           const op = requireOperation(db, operation.operation_id);
           op.status = 'prepared';
+          op.expected_refs = {
+            [auth.device.device_ref]: currentDeviceRef
+          };
           op.prepared_manifest = {
             actor: { user_id: auth.user.user_id, device_id: auth.device.device_id },
             operation_type: 'device_push',
@@ -246,7 +248,7 @@ export class SyncService {
               object_integrity: 'ok',
               path_policy: 'ok',
               changed_path_policy: 'ok',
-              fast_forward: 'ok',
+              fast_forward: validation.deviceRelation,
               base_commit: manifest.base_commit ?? null
             },
             directory_proposal: directoryProposal
@@ -256,6 +258,16 @@ export class SyncService {
 
         if (staged) await staged.promote();
         else await this.git.importPack(auth.vault.vault_id, packfile);
+        if (validation.deviceRelation === 'divergent' && currentDeviceRef) {
+          return await this.acceptDivergentDeviceCommit(
+            auth,
+            operation.operation_id,
+            currentDeviceRef,
+            currentMain,
+            manifest.target_commit,
+            directoryProposal
+          );
+        }
         await this.store.mutate((db) => {
           const op = requireOperation(db, operation.operation_id);
           if (op.status !== 'prepared') throw new Error('Sync operation is not prepared.');
@@ -905,13 +917,16 @@ export class SyncService {
     packfile: Buffer,
     currentDeviceRef: string | null,
     currentMain: string
-  ): Promise<PushResult | null> {
+  ): Promise<UploadValidation> {
     try {
       return await this.git.withQuarantinedPack(auth.vault.vault_id, packfile, async (reader) =>
         await this.validateUploadReader(auth, operation, manifest, reader, currentDeviceRef, currentMain)
       );
     } catch {
-      return await this.rejectDevicePush(auth, operation.operation_id, 'malformed_packfile', 'Malformed Git packfile.');
+      return {
+        rejection: await this.rejectDevicePush(auth, operation.operation_id, 'malformed_packfile', 'Malformed Git packfile.'),
+        deviceRelation: 'divergent'
+      };
     }
   }
 
@@ -922,44 +937,66 @@ export class SyncService {
     reader: GitObjectReader,
     currentDeviceRef: string | null,
     currentMain: string
-  ): Promise<PushResult | null> {
+  ): Promise<UploadValidation> {
     try {
-        if (!(await reader.commitExists(auth.vault.vault_id, manifest.target_commit))) {
-          return await this.rejectDevicePush(
+      if (!(await reader.commitExists(auth.vault.vault_id, manifest.target_commit))) {
+        return {
+          rejection: await this.rejectDevicePush(
             auth,
             operation.operation_id,
             'missing_target_commit',
             'Target commit is not present.'
-          );
-        }
-        try {
-          await reader.validateTreePathPolicy(auth.vault.vault_id, manifest.target_commit, this.maxUploadBytes);
-        } catch (error) {
-          const code = error instanceof PathPolicyViolation ? error.code : 'path_policy_rejected';
-          return await this.rejectDevicePush(
+          ),
+          deviceRelation: 'divergent'
+        };
+      }
+      try {
+        await reader.validateTreePathPolicy(auth.vault.vault_id, manifest.target_commit, this.maxUploadBytes);
+      } catch (error) {
+        const code = error instanceof PathPolicyViolation ? error.code : 'path_policy_rejected';
+        return {
+          rejection: await this.rejectDevicePush(
             auth,
             operation.operation_id,
             code,
             'Uploaded commit violates the vault path policy.'
-          );
+          ),
+          deviceRelation: 'divergent'
+        };
+      }
+      if (manifest.base_commit) {
+        if (!(await reader.commitExists(auth.vault.vault_id, manifest.base_commit))) {
+          return {
+            rejection: await this.rejectDevicePush(auth, operation.operation_id, 'untrusted_base_commit', 'Proposal base is not trusted vault history.'),
+            deviceRelation: 'divergent'
+          };
         }
-        if (currentDeviceRef && !(await reader.isAncestor(auth.vault.vault_id, currentDeviceRef, manifest.target_commit))) {
-          return await this.blockDeviceForRecovery(auth, operation, currentDeviceRef, manifest.target_commit);
+        if (!(await reader.isAncestor(auth.vault.vault_id, manifest.base_commit, currentMain))) {
+          return {
+            rejection: await this.rejectDevicePush(auth, operation.operation_id, 'untrusted_base_commit', 'Proposal base is not trusted vault history.'),
+            deviceRelation: 'divergent'
+          };
         }
-        if (manifest.base_commit) {
-          if (!(await reader.commitExists(auth.vault.vault_id, manifest.base_commit))) {
-            return await this.rejectDevicePush(auth, operation.operation_id, 'untrusted_base_commit', 'Proposal base is not trusted vault history.');
-          }
-          if (!(await reader.isAncestor(auth.vault.vault_id, manifest.base_commit, currentMain))) {
-            return await this.rejectDevicePush(auth, operation.operation_id, 'untrusted_base_commit', 'Proposal base is not trusted vault history.');
-          }
-          if (!(await reader.isAncestor(auth.vault.vault_id, manifest.base_commit, manifest.target_commit))) {
-            return await this.rejectDevicePush(auth, operation.operation_id, 'invalid_base_commit', 'Proposal base is not an ancestor of the uploaded commit.');
-          }
+        if (!(await reader.isAncestor(auth.vault.vault_id, manifest.base_commit, manifest.target_commit))) {
+          return {
+            rejection: await this.rejectDevicePush(auth, operation.operation_id, 'invalid_base_commit', 'Proposal base is not an ancestor of the uploaded commit.'),
+            deviceRelation: 'divergent'
+          };
         }
-        return null;
+      }
+      const deviceRelation = currentDeviceRef === null
+        ? 'initial'
+        : await reader.isAncestor(auth.vault.vault_id, currentDeviceRef, manifest.target_commit)
+          ? 'fast_forward'
+          : await reader.isAncestor(auth.vault.vault_id, manifest.target_commit, currentDeviceRef)
+            ? 'superseded'
+            : 'divergent';
+      return { rejection: null, deviceRelation };
     } catch {
-      return await this.rejectDevicePush(auth, operation.operation_id, 'malformed_packfile', 'Malformed Git object set.');
+      return {
+        rejection: await this.rejectDevicePush(auth, operation.operation_id, 'malformed_packfile', 'Malformed Git object set.'),
+        deviceRelation: 'divergent'
+      };
     }
   }
 
@@ -1179,15 +1216,17 @@ export class SyncService {
     });
     let mergeCommit: string;
     try {
-      mergeCommit = await this.git.createOverlayMergeCommitObject(
+      const mergeTree = await this.git.createDisjointMergeTree(vaultId, base, main, deviceCommit);
+      mergeCommit = await this.git.createMergeCommitObjectFromTree({
         vaultId,
+        tree: mergeTree,
         base,
-        main,
+        currentMain: main,
         deviceCommit,
-        deviceChanges,
-        mergePreparation.mergeSequence,
-        deviceId
-      );
+        mergeSequence: mergePreparation.mergeSequence,
+        deviceId,
+        strategy: 'disjoint_overlay'
+      });
       await this.prepareMergeRefUpdate(mergePreparation.operationId, mergeCommit);
       await this.git.updateRef(vaultId, 'refs/heads/main', mergeCommit, main);
     } catch (error) {
@@ -1843,6 +1882,44 @@ export class SyncService {
     };
   }
 
+  private async acceptDivergentDeviceCommit(
+    auth: AuthenticatedDevice,
+    operationId: string,
+    currentDeviceRef: string,
+    currentMain: string,
+    deviceCommit: string,
+    directoryProposal: DirectoryProposal | null
+  ): Promise<PushResult> {
+    const sharedBase = await this.git.mergeBase(auth.vault.vault_id, currentDeviceRef, deviceCommit) ??
+      await this.git.mergeBase(auth.vault.vault_id, currentMain, deviceCommit);
+    const base = sharedBase ?? currentMain;
+    const changedPaths = sharedBase
+      ? changedPathSet(await this.git.changedPaths(auth.vault.vault_id, sharedBase, deviceCommit))
+      : new Set(await this.git.listTreePaths(auth.vault.vault_id, deviceCommit));
+    const directoryPlan = directoryProposal
+      ? await this.classifyDirectoryProposal(auth.vault.vault_id, auth.device.device_id, directoryProposal)
+      : null;
+    for (const path of directoryPlan?.affectedRoots ?? []) changedPaths.add(path);
+    const result = await this.createConflict(
+      auth.vault.vault_id,
+      auth.device.device_id,
+      base,
+      currentMain,
+      deviceCommit,
+      [...changedPaths].sort(),
+      'same_device_history_divergence',
+      directoryPlan,
+      currentDeviceRef
+    );
+    await this.store.mutate((db) => {
+      const operation = requireOperation(db, operationId);
+      operation.status = 'committed';
+      operation.result = { decision: 'conflict', conflict_id: result.status === 'conflicted' ? result.conflict_id : null };
+      operation.updated_at = nowIso();
+    });
+    return result;
+  }
+
   private async createConflict(
     vaultId: string,
     deviceId: string,
@@ -1851,14 +1928,15 @@ export class SyncService {
     deviceCommit: string,
     affectedPaths: string[],
     reason: string,
-    directoryPlan: DirectoryMergePlan | null = null
+    directoryPlan: DirectoryMergePlan | null = null,
+    resultDeviceRef: string = deviceCommit
   ): Promise<PushResult> {
     const conflictId = newId('conf');
     const mergeSequence = await this.store.mutate((db) => this.store.nextMergeSequence(db, vaultId));
     const directoryContext = directoryPlan ? directoryConflictContext(directoryPlan) : undefined;
     const conflictKind: ConflictRecord['conflict_kind'] = reason === 'directory_overlap'
       ? 'directory'
-      : reason === 'mixed_directory_overlap'
+      : reason === 'mixed_directory_overlap' || reason === 'same_device_history_divergence' && directoryPlan !== null
         ? 'mixed'
         : 'content';
     const eventSeq = await this.store.mutate((db) => {
@@ -1869,7 +1947,7 @@ export class SyncService {
         operation_type: 'conflict_create',
         expected_refs: {
           'refs/heads/main': currentMain,
-          [device.device_ref]: deviceCommit
+          [device.device_ref]: resultDeviceRef
         },
         target_refs: {},
         target_commit: deviceCommit
@@ -1990,57 +2068,10 @@ export class SyncService {
     return {
       status: 'conflicted',
       conflict_id: conflictId,
-      device_ref: deviceCommit,
+      device_ref: resultDeviceRef,
       main: currentMain,
       event_seq: eventSeq,
       ...(directoryPlan ? { directory_ack: proposalAcknowledgement(directoryPlan.proposal, 'conflicted') } : {})
-    };
-  }
-
-  private async blockDeviceForRecovery(
-    auth: AuthenticatedDevice,
-    operation: SyncOperationRow,
-    currentDeviceRef: string,
-    targetCommit: string
-  ): Promise<PushResult> {
-    await this.store.mutate((db) => {
-      const op = requireOperation(db, operation.operation_id);
-      op.status = 'committed';
-      op.result = {
-        rejected: 'same_device_non_fast_forward',
-        current_device_ref: currentDeviceRef,
-        target_commit: targetCommit
-      };
-      op.updated_at = nowIso();
-      const device = requireDevice(db, auth.device.device_id);
-      device.status = 'blocked_recovery';
-      this.store.appendEvent(db, {
-        event_type: 'device_recovery_required',
-        vault_id: auth.vault.vault_id,
-        resource_ids: { device_id: auth.device.device_id },
-        commit_cursors: {
-          current_device_ref: currentDeviceRef,
-          rejected_commit: targetCommit
-        },
-        payload: {
-          reason: 'same_device_non_fast_forward'
-        }
-      });
-      db.audit_log.push({
-        audit_id: newId('aud'),
-        actor_user_id: auth.user.user_id,
-        actor_device_id: auth.device.device_id,
-        vault_id: auth.vault.vault_id,
-        action: 'device_recovery_required',
-        resource_class: 'device',
-        resource_id: auth.device.device_id,
-        created_at: nowIso()
-      });
-    });
-    return {
-      status: 'rejected',
-      code: 'same_device_non_fast_forward',
-      message: 'Same-device non-fast-forward history requires recovery.'
     };
   }
 

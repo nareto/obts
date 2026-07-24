@@ -2,47 +2,37 @@ graph LR
 
   subgraph diagram ["Component View: Obsidian True Sync - Obsidian plugin"]
 
-    4["Obsidian [Software System]"]
+    subgraph 5 ["Obsidian True Sync"]
 
-    subgraph 6 ["Obsidian True Sync"]
+      subgraph 6 ["Obsidian plugin"]
 
-      subgraph 31 ["Obsidian plugin"]
-
-        32["SettingsView [Component: TypeScript]"]
-        33["OnboardingCoordinator [Component: TypeScript]"]
-        34["StatusBar [Component: TypeScript]"]
-        35["VaultWatcher [Component: TypeScript, Obsidian Vault API]"]
-        36["PeriodicScanner [Component: TypeScript]"]
-        37["PathNormalizer [Component: TypeScript]"]
-        38["SnapshotEngine [Component: TypeScript]"]
-        39["LocalQueue [Component: TypeScript]"]
-        40["LocalContentCache [Component: TypeScript]"]
-        41["MetadataRepair [Component: TypeScript]"]
-        42["TransportClient [Component: TypeScript]"]
-        43["ApplyEngine [Component: TypeScript, Obsidian Vault API]"]
-        44["DiagnosticsExporter [Component: TypeScript]"]
+        10["Upload journal [Component: JSON under .obts]"]
+        11["Transport client [Component: HTTPS]"]
+        12["Directory tracker [Component: JSON under .obts]"]
+        13["Apply and recovery engine [Component: Obsidian Vault API]"]
+        14["Status surface [Component: Obsidian UI]"]
+        7["Vault watcher [Component: Obsidian Vault API]"]
+        8["Sync coordinator [Component: JavaScript]"]
+        9["Snapshot engine [Component: isomorphic-git]"]
       end
 
-      45["User-visible vault files [Container: Obsidian Vault API and local filesystem]"]
-      46[".obts local store [Container: Local filesystem and platform secure storage]"]
-      7["Server API and CLI [Container: TypeScript, Node.js, Fastify]"]
+      20["Server API and CLI [Container: TypeScript, Node.js, Fastify]"]
+      29["Visible vault [Container: Obsidian Vault API, filesystem]"]
+      30[".obts local store [Container: Filesystem]"]
     end
 
-    32-. "Starts or resumes browser-assisted setup. [TypeScript calls]" .->33
-    33-. "Starts and polls connection requests, downloads bootstrap state, completes device registration, and acknowledges onboarding. [HTTPS]" .->7
-    35-. "Receives vault change notifications through supported APIs. [Obsidian Vault API]" .->4
-    36-. "Scans vault files to detect missed watcher events, commit filesystem differences, and drive crash recovery work. [Obsidian Vault API]" .->45
-    38-. "Canonicalizes vault-relative paths before proposal creation. [TypeScript calls]" .->37
-    38-. "Reads changed content before enqueueing proposal data. [Obsidian Vault API]" .->45
-    38-. "Persists proposal state before upload or destructive local apply. [TypeScript calls]" .->39
-    39-. "Stores queue state, proposal payloads, recovery bundles, locks, and diagnostics under .obts. [Filesystem]" .->46
-    40-. "Caches content required for retry, pull, apply, and recovery. [Filesystem]" .->46
-    41-. "Reads device token and local Git refs, then rewrites recoverable state.json metadata after server rehydration. [Filesystem]" .->46
-    41-. "Requests device self metadata without needing a vault ID from state.json. [TypeScript calls]" .->42
-    42-. "Calls device self metadata repair, uploads full-vault and causal directory proposals, pulls accepted diffs and exact acknowledgements, observes dashboard conflict state, and subscribes to events. [HTTPS/WSS]" .->7
-    43-. "Requires local recovery snapshot before applying destructive server changes. [TypeScript calls]" .->38
-    43-. "Materializes accepted server main entries into vault files and managed Obsidian configuration targets. [Obsidian Vault API]" .->45
-    34-. "Reads local queue state to show ahead, blocked, retry, and recovery statuses. [TypeScript calls]" .->39
-    44-. "Reads local state and writes redacted diagnostic bundles. [Filesystem]" .->46
+    7-. "Queues durable change hints [In-process calls]" .->8
+    8-. "Requests a coherent snapshot only when no upload target is in flight [In-process calls]" .->9
+    9-. "Reads syncable files [Obsidian DataAdapter]" .->29
+    9-. "Writes Git objects and local refs [isomorphic-git filesystem adapter]" .->30
+    8-. "Creates or resumes exactly one immutable attempt [In-process calls]" .->10
+    10-. "Persists upload-transfer.json until terminal result consumption [Filesystem]" .->30
+    8-. "Uploads or retrieves the journaled attempt before scanning later edits [In-process calls]" .->11
+    11-. "Creates/resumes transfers, uploads missing packs, requests async processing, and polls [HTTPS]" .->20
+    12-. "Persists observed directories and causal intent generations [Filesystem]" .->30
+    8-. "Applies canonical main only after pending proposal outcomes settle [In-process calls]" .->13
+    13-. "Writes accepted files and safely creates/removes explicit directories [Obsidian Vault API]" .->29
+    13-. "Stages recovery bundles and crash journals before mutation [Filesystem]" .->30
+    14-. "Observes monotonic operation progress [In-process calls]" .->8
 
   end
