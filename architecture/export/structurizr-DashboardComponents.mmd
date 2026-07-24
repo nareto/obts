@@ -2,28 +2,16 @@ graph LR
 
   subgraph diagram ["Component View: Obsidian True Sync - Dashboard SPA"]
 
-    subgraph 6 ["Obsidian True Sync"]
+    subgraph 5 ["Obsidian True Sync"]
 
-      subgraph 23 ["Dashboard SPA"]
+      subgraph 15 ["Dashboard SPA"]
 
-        24["AuthSession [Component: TypeScript]"]
-        25["ConnectionAuthorizationView [Component: Svelte, TypeScript]"]
-        26["DeviceDashboard [Component: TypeScript]"]
-        27["ConflictList [Component: TypeScript]"]
-        28["MarkdownDiffViewer [Component: TypeScript]"]
-        29["SourceDiffViewer [Component: TypeScript]"]
-        30["ResolutionEditor [Component: TypeScript]"]
+        16["API client [Component: TypeScript]"]
+        17["Device views [Component: Svelte]"]
+        18["Conflict workbench [Component: Svelte]"]
+        19["Diagnostics view [Component: Svelte]"]
       end
 
-      7["Server API and CLI [Container: TypeScript, Node.js, Fastify]"]
     end
-
-    25-. "Reviews, approves, or denies browser connection requests. [HTTPS]" .->7
-    24-. "Authenticates dashboard sessions and calls setup/admin APIs. [HTTPS]" .->7
-    26-. "Reads authorized device state, server main status, and maintenance summaries. [HTTPS]" .->7
-    27-. "Lists unresolved conflicts and fetches authorized conflict review content. [HTTPS]" .->7
-    28-. "Fetches Markdown conflict variants and merge previews for rendering. [HTTPS]" .->7
-    29-. "Fetches source-level conflict diffs for review. [HTTPS]" .->7
-    30-. "Submits selected or manually edited resolution content for server persistence and main advancement. [HTTPS]" .->7
 
   end

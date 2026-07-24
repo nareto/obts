@@ -79,7 +79,21 @@ system to keep Obsidian running in the background.
     reopen once more after the completed transfer; confirm the vault becomes
     interactive before background obts initialization finishes and subsequent
     sync can still read the imported history.
-12. Leave one device without a fresh status report for over five minutes while
+12. Delay server validation/merge beyond the public reverse proxy request window
+    while another device continues making small edits. Confirm finalization
+    promptly returns a processing descriptor, both proposals are durably
+    accepted, and each is eventually merged or conflicted against the canonical
+    state current at its integration turn.
+13. Drop the client's connection after the server commits a large transfer but
+    before the terminal response is consumed, with pending empty-directory
+    intents included. Reopen and confirm the client retrieves the original
+    transfer outcome without rescanning, creating a metadata-only descendant,
+    uploading another chunk, or changing the attempt/proposal identity.
+14. Exercise stale device refs where the uploaded target is equal to, descends
+    from, is covered by, and diverges from the server ref. Confirm the first
+    three are idempotently accepted and only divergence creates a protected
+    dashboard conflict without moving the device ref.
+15. Leave one device without a fresh status report for over five minutes while
     another device advances main. Confirm the dashboard shows **Status unknown**
     or **Behind**, never **Synced**, until the stale device freshly reports its
     local main, local head, and idle queue after applying the canonical main.

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Obsidian True Sync Phase 3 API
-  version: 0.3.9
+  version: 0.3.13
   summary: Deployable note history, restore, diagnostics, and maintenance.
 servers:
   - url: /api/v1
@@ -760,20 +760,36 @@ paths:
           $ref: "#/components/responses/Error"
   /vaults/{vault_id}/sync/push-transfers/{transfer_id}/finalize:
     post:
-      summary: Validate the complete quarantined object set and atomically apply the device ref update.
+      summary: Queue validation and integration of the immutable quarantined proposal.
+      description: >-
+        A valid proposal is accepted independently of later main or device-ref movement.
+        Send `Prefer: respond-async` when the async finalization capability is advertised;
+        poll the transfer descriptor until it is completed or rejected.
       security:
         - deviceBearer: []
       parameters:
         - $ref: "#/components/parameters/VaultId"
         - $ref: "#/components/parameters/TransferId"
+        - name: Prefer
+          in: header
+          required: false
+          schema:
+            type: string
+            enum: [respond-async]
       responses:
         "200":
-          description: Existing push result contract.
+          description: Terminal transfer descriptor for async callers or the existing push result for legacy callers.
+        "202":
+          description: Proposal durably queued for asynchronous validation and integration.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChunkPushDescriptor"
         "409":
           $ref: "#/components/responses/Error"
   /vaults/{vault_id}/sync/push:
     post:
-      summary: Upload a device commit pack and request a protected device-ref update.
+      summary: Upload an immutable device proposal for merge, conflict creation, or an idempotent no-op.
       security:
         - deviceBearer: []
       parameters:
@@ -2000,8 +2016,8 @@ components:
         capabilities:
           type: array
           items:
-            enum: [git-object-pack-chunks-v1, directory-proposals-v2]
-          minItems: 2
+            enum: [git-object-pack-chunks-v1, async-push-finalize-v1, directory-proposals-v2]
+          minItems: 3
           uniqueItems: true
         max_chunk_bytes:
           type: integer
@@ -2054,8 +2070,9 @@ components:
           type: string
           pattern: "^[A-Za-z0-9_-]{8,128}$"
         chunk_count:
+          description: May be zero when the target already exists server-side and only its authoritative outcome or directory acknowledgement is required.
           type: integer
-          minimum: 1
+          minimum: 0
           maximum: 4096
         plan_sha256:
           type: string
@@ -2070,7 +2087,7 @@ components:
         capability:
           const: git-object-pack-chunks-v1
         status:
-          enum: [open, completed, aborted]
+          enum: [open, processing, completed, rejected, aborted]
         target_commit:
           type: string
           pattern: "^[0-9a-f]{40}$"
@@ -2087,6 +2104,9 @@ components:
         expires_at:
           type: string
           format: date-time
+        poll_after_ms:
+          type: integer
+          minimum: 100
         result:
           type: object
     ChunkPushReceipt:
