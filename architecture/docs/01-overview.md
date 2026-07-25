@@ -35,15 +35,17 @@ Large uploads are immutable durable proposals. The plugin stores the target,
 directory proposal, object plan, attempt ID, and server transfer ID in
 `.obts/upload-transfer.json` and retrieves an existing processing or terminal
 outcome before scanning later edits. The server durably receives bounded chunks,
-returns prompt asynchronous finalization, and fairly serializes canonical
-integration per vault. Movement of `main` changes the merge input rather than
+returns prompt asynchronous finalization, retries internal processing failures
+with durable bounded backoff, and fairly serializes canonical integration per
+vault. Movement of `main` changes the merge input rather than
 invalidating accepted bytes; ancestry-safe device-ref movement is accepted, and
 genuine same-device divergence becomes protected conflict history.
 
 Server large-tree operations remain object-level. Tree paths and blob sizes are
-validated in a batched Git listing, clean disjoint merges use Git tree objects,
-and plaintext temporary worktrees are reserved for overlapping content that
-requires semantic validation.
+validated in a batched Git listing; clean disjoint merges use an explicit-base
+temporary Git index with `read-tree` and `write-tree`, compatible with the
+production Git 2.39 baseline. Plaintext temporary worktrees are reserved for
+overlapping content that requires semantic validation.
 
 At-rest protection follows the current PRD: persistent server state is normal
 sensitive application state protected by deployment-managed storage controls.

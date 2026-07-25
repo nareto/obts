@@ -89,11 +89,16 @@ system to keep Obsidian running in the background.
     intents included. Reopen and confirm the client retrieves the original
     transfer outcome without rescanning, creating a metadata-only descendant,
     uploading another chunk, or changing the attempt/proposal identity.
-14. Exercise stale device refs where the uploaded target is equal to, descends
+14. On the production Git 2.39 baseline, inject one internal Git failure while
+    integrating a disjoint proposal. Confirm the transfer remains in processing,
+    the plugin reports **Server retrying**, the same transfer succeeds after
+    bounded retry or server restart, and no chunk is uploaded again. Also confirm
+    a legacy terminal `git_error` descriptor is migrated back into processing.
+15. Exercise stale device refs where the uploaded target is equal to, descends
     from, is covered by, and diverges from the server ref. Confirm the first
     three are idempotently accepted and only divergence creates a protected
     dashboard conflict without moving the device ref.
-15. Leave one device without a fresh status report for over five minutes while
+16. Leave one device without a fresh status report for over five minutes while
     another device advances main. Confirm the dashboard shows **Status unknown**
     or **Behind**, never **Synced**, until the stale device freshly reports its
     local main, local head, and idle queue after applying the canonical main.

@@ -29,7 +29,7 @@ graph LR
     23-. "Queues a validated immutable proposal for canonical integration [In-process calls]" .->24
     24-. "Checks ancestry, validates trees, and creates merge or protected conflict history [In-process calls]" .->25
     24-. "Persists operation phases, merge order, events, acknowledgements, and conflicts [In-process calls]" .->26
-    25-. "Runs batched tree inspection, object promotion, merge-tree, commit-tree, and ref CAS [Native Git]" .->32
+    25-. "Runs batched tree inspection, object promotion, temporary-index read-tree/write-tree merges, commit-tree, and ref CAS [Native Git]" .->32
     25-. "Reads validated staged objects and promotes them after policy checks [Git alternates and filesystem]" .->33
     25-. "Materializes semantic overlap candidates only [Filesystem]" .->34
     26-. "Atomically reads and replaces durable metadata [Filesystem]" .->31

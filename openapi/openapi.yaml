@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Obsidian True Sync Phase 3 API
-  version: 0.3.13
+  version: 0.3.14
   summary: Deployable note history, restore, diagnostics, and maintenance.
 servers:
   - url: /api/v1
@@ -2107,6 +2107,12 @@ components:
         poll_after_ms:
           type: integer
           minimum: 100
+        processing_error_code:
+          description: Safe retry classification when the durable proposal remains in server processing after an internal failure.
+          enum: [server_git_error, server_processing_error]
+        processing_attempts:
+          type: integer
+          minimum: 0
         result:
           type: object
     ChunkPushReceipt:

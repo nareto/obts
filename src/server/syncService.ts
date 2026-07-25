@@ -323,9 +323,6 @@ export class SyncService {
         if (operationId) {
           await this.abortOperation(operationId, 'unexpected_error');
         }
-        if (error instanceof GitCommandError) {
-          return { status: 'rejected', code: 'git_error', message: 'Git operation failed.' };
-        }
         throw error;
       }
     });

@@ -48,6 +48,7 @@ describe('mobile plugin artifact', () => {
     expect(source).toContain('async-push-finalize-v1');
     expect(source).toContain('upload-transfer.json');
     expect(source).toContain('prefer: "respond-async"');
+    expect(source).toContain('descriptor.processing_error_code ? "Server retrying" : "Merging"');
     expect(source).not.toContain('id: "obts-resolve-directory-recovery"');
     expect(source).not.toContain('class ObtsDirectoryRecoveryModal');
     expect(source).not.toContain('Review directory recovery');
