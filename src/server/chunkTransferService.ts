@@ -16,7 +16,7 @@ import {
 import type { AuthenticatedDevice } from './authService.js';
 import { AuthError } from './authService.js';
 import type { ServerConfig } from './config.js';
-import { GitService, sha256Hex } from './gitService.js';
+import { GitCommandError, GitService, sha256Hex } from './gitService.js';
 import { SyncService } from './syncService.js';
 
 const SESSION_VERSION = 1;
@@ -39,6 +39,9 @@ type PushSession = {
   stored_bytes?: number;
   status: 'open' | 'processing' | 'completed' | 'rejected' | 'aborted';
   result: PushResult | null;
+  processing_attempts?: number;
+  processing_error_code?: 'server_git_error' | 'server_processing_error' | null;
+  retry_at?: string | null;
   created_at: string;
   updated_at: string;
   expires_at: string;
@@ -47,13 +50,37 @@ type PushSession = {
 export class ChunkTransferService {
   private readonly locks = new Map<string, Promise<void>>();
   private readonly processors = new Map<string, Promise<void>>();
+  private readonly retryWaiters = new Set<() => void>();
   private storedBytes: number | null = null;
+  private closed = false;
 
   constructor(
     private readonly config: ServerConfig,
     private readonly git: GitService,
     private readonly sync: SyncService
   ) {}
+
+  async initialize(): Promise<void> {
+    for (const session of await this.listSessions()) {
+      if (
+        this.expired(session) || session.status !== 'rejected' ||
+        session.result?.status !== 'rejected' || session.result.code !== 'git_error'
+      ) continue;
+      session.status = 'open';
+      session.result = null;
+      session.processing_attempts = 0;
+      session.processing_error_code = 'server_git_error';
+      session.retry_at = nowIso();
+      session.updated_at = nowIso();
+      await this.writeSession(session);
+    }
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+    for (const wake of [...this.retryWaiters]) wake();
+    await Promise.allSettled([...this.processors.values()]);
+  }
 
   capabilities() {
     return {
@@ -131,6 +158,9 @@ export class ChunkTransferService {
       stored_bytes: 0,
       status: 'open',
       result: null,
+      processing_attempts: 0,
+      processing_error_code: null,
+      retry_at: null,
       created_at: createdAt,
       updated_at: createdAt,
       expires_at: new Date(Date.now() + this.config.transferTtlSeconds * 1000).toISOString()
@@ -145,7 +175,19 @@ export class ChunkTransferService {
   }
 
   async getPush(auth: AuthenticatedDevice, transferId: string): Promise<ChunkPushDescriptor> {
-    const session = await this.requireSession(auth, transferId);
+    const session = await this.withLock(transferId, async () => {
+      const current = await this.requireSession(auth, transferId);
+      if (
+        current.status === 'open' && current.processing_error_code &&
+        current.receipts.length === current.chunk_count
+      ) {
+        current.status = 'processing';
+        current.updated_at = nowIso();
+        current.expires_at = new Date(Date.now() + this.config.transferTtlSeconds * 1000).toISOString();
+        await this.writeSession(current);
+      }
+      return current;
+    });
     if (session.status === 'processing') this.startProcessing(auth, transferId);
     return this.descriptor(session);
   }
@@ -269,7 +311,7 @@ export class ChunkTransferService {
   }
 
   private startProcessing(auth: AuthenticatedDevice, transferId: string): void {
-    if (this.processors.has(transferId)) return;
+    if (this.closed || this.processors.has(transferId)) return;
     const processing = this.processPendingPush(auth, transferId)
       .catch(() => undefined)
       .finally(() => this.processors.delete(transferId));
@@ -277,27 +319,73 @@ export class ChunkTransferService {
   }
 
   private async processPendingPush(auth: AuthenticatedDevice, transferId: string): Promise<void> {
-    const session = await this.requireSession(auth, transferId);
-    if (session.status !== 'processing') return;
-    try {
-      const result = await this.processPush(auth, session);
-      await this.withLock(transferId, async () => {
-        const latest = await this.requireSession(auth, transferId);
-        if (latest.status !== 'processing') return;
-        latest.result = result;
-        latest.status = result.status === 'rejected' ? 'rejected' : 'completed';
-        latest.updated_at = nowIso();
-        await this.writeSession(latest);
-      });
-    } catch {
-      await this.withLock(transferId, async () => {
-        const latest = await this.requireSession(auth, transferId);
-        if (latest.status !== 'processing') return;
-        latest.status = 'open';
-        latest.updated_at = nowIso();
-        await this.writeSession(latest);
-      });
+    while (!this.closed) {
+      let session = await this.requireSession(auth, transferId);
+      if (session.status !== 'processing') return;
+      const retryDelay = Math.max(0, Date.parse(session.retry_at ?? '') - Date.now());
+      if (retryDelay > 0) await this.waitForRetry(retryDelay);
+      if (this.closed) return;
+      session = await this.requireSession(auth, transferId);
+      if (session.status !== 'processing') return;
+      try {
+        const result = await this.processPush(auth, session);
+        if (result.status === 'rejected' && result.code === 'git_error') {
+          throw new GitCommandError('Server Git processing failed.', '');
+        }
+        await this.withLock(transferId, async () => {
+          const latest = await this.requireSession(auth, transferId);
+          if (latest.status !== 'processing') return;
+          latest.result = result;
+          latest.status = result.status === 'rejected' ? 'rejected' : 'completed';
+          latest.processing_error_code = null;
+          latest.retry_at = null;
+          latest.updated_at = nowIso();
+          await this.writeSession(latest);
+        });
+        return;
+      } catch (error) {
+        if (error instanceof AuthError) {
+          await this.withLock(transferId, async () => {
+            const latest = await this.requireSession(auth, transferId);
+            if (latest.status !== 'processing') return;
+            latest.result = { status: 'rejected', code: error.code, message: error.message };
+            latest.status = 'rejected';
+            latest.processing_error_code = null;
+            latest.retry_at = null;
+            latest.updated_at = nowIso();
+            await this.writeSession(latest);
+          });
+          return;
+        }
+        await this.withLock(transferId, async () => {
+          const latest = await this.requireSession(auth, transferId);
+          if (latest.status !== 'processing') return;
+          const attempts = (latest.processing_attempts ?? 0) + 1;
+          const retryMs = Math.min(60_000, 1_000 * (2 ** Math.min(attempts - 1, 6)));
+          latest.result = null;
+          latest.processing_attempts = attempts;
+          latest.processing_error_code = error instanceof GitCommandError ? 'server_git_error' : 'server_processing_error';
+          latest.retry_at = new Date(Date.now() + retryMs).toISOString();
+          latest.updated_at = nowIso();
+          latest.expires_at = new Date(Date.now() + this.config.transferTtlSeconds * 1000).toISOString();
+          await this.writeSession(latest);
+        });
+      }
     }
+  }
+
+  private async waitForRetry(delayMs: number): Promise<void> {
+    await new Promise<void>((resolve) => {
+      let timer: NodeJS.Timeout;
+      const wake = () => {
+        clearTimeout(timer);
+        this.retryWaiters.delete(wake);
+        resolve();
+      };
+      timer = setTimeout(wake, delayMs);
+      timer.unref();
+      this.retryWaiters.add(wake);
+    });
   }
 
   private async processPush(auth: AuthenticatedDevice, session: PushSession): Promise<PushResult> {
@@ -327,7 +415,13 @@ export class ChunkTransferService {
       max_chunk_bytes: this.config.transferChunkBytes,
       max_transfer_bytes: this.config.maxTransferBytes,
       expires_at: session.expires_at,
-      ...(session.status === 'processing' ? { poll_after_ms: 1000 } : {}),
+      ...(session.status === 'processing'
+        ? {
+            poll_after_ms: Math.max(1_000, Math.min(5_000, Date.parse(session.retry_at ?? '') - Date.now() || 1_000)),
+            ...(session.processing_error_code ? { processing_error_code: session.processing_error_code } : {}),
+            processing_attempts: session.processing_attempts ?? 0
+          }
+        : {}),
       ...(session.result ? { result: session.result } : {})
     };
   }

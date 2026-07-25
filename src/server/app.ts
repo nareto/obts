@@ -87,6 +87,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   await diagnostics.initialize();
   const sync = new SyncService(store, git, config.maxUploadBytes);
   const chunkTransfers = new ChunkTransferService(config, git, sync);
+  await chunkTransfers.initialize();
   const app = Fastify({
     logger: false,
     genReqId: () => newId('req')
@@ -108,6 +109,9 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
 
   app.addHook('onRequest', async (request, reply) => {
     setApiCorsHeaders(request, reply);
+  });
+  app.addHook('onClose', async () => {
+    await chunkTransfers.close();
   });
 
   app.setErrorHandler((error, request, reply) => {

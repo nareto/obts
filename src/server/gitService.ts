@@ -610,19 +610,46 @@ export class GitService {
     deviceCommit: string
   ): Promise<string> {
     const repo = this.repoPath(vaultId);
-    const { stdout } = await this.exec(repo, [
-      'merge-tree',
-      '--write-tree',
-      '--no-messages',
-      '--merge-base',
-      base,
-      currentMain,
-      deviceCommit
-    ]);
-    const tree = asText(stdout).trim();
-    if (!/^[0-9a-f]{40}$/u.test(tree)) throw new GitCommandError('Git did not produce a disjoint merge tree.', '');
-    await this.validateTreePathPolicy(vaultId, tree);
-    return tree;
+    const indexFile = join(this.config.tempDir, `merge-index-${randomBytes(12).toString('hex')}`);
+    const env = { GIT_INDEX_FILE: indexFile };
+    try {
+      await this.exec(repo, ['read-tree', currentMain], undefined, env);
+      const { stdout } = await this.exec(
+        repo,
+        ['diff-tree', '-r', '--raw', '-z', '--no-renames', base, deviceCommit],
+        undefined,
+        undefined,
+        { encoding: 'buffer' }
+      );
+      const parts = splitNul(Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout));
+      if (parts.at(-1) === '') parts.pop();
+      if (parts.length % 2 !== 0) throw new GitCommandError('Malformed raw Git tree diff.', '');
+      const indexEntries: Buffer[] = [];
+      for (let index = 0; index < parts.length; index += 2) {
+        const header = parts[index] ?? '';
+        const path = parts[index + 1];
+        const match = /^:\d{6} (\d{6}) [0-9a-f]{40} ([0-9a-f]{40}) ([A-Z])$/u.exec(header);
+        if (!match?.[1] || !match[2] || !match[3] || path === undefined || path.length === 0) {
+          throw new GitCommandError('Malformed raw Git tree diff.', '');
+        }
+        const entry = match[3] === 'D'
+          ? `0 ${ZERO_OID}\t${path}\0`
+          : `${match[1]} ${match[2]}\t${path}\0`;
+        indexEntries.push(Buffer.from(entry, 'utf8'));
+      }
+      if (indexEntries.length > 0) {
+        await this.exec(repo, ['update-index', '-z', '--index-info'], Buffer.concat(indexEntries), env);
+      }
+      const tree = asText((await this.exec(repo, ['write-tree'], undefined, env)).stdout).trim();
+      if (!/^[0-9a-f]{40}$/u.test(tree)) throw new GitCommandError('Git did not produce a disjoint merge tree.', '');
+      await this.validateTreePathPolicy(vaultId, tree);
+      return tree;
+    } finally {
+      await Promise.all([
+        rm(indexFile, { force: true }),
+        rm(`${indexFile}.lock`, { force: true })
+      ]);
+    }
   }
 
   async createMergeCommitFromTree(input: {

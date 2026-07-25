@@ -324,6 +324,8 @@ export type ChunkPushDescriptor = {
   max_transfer_bytes: number;
   expires_at: string;
   poll_after_ms?: number;
+  processing_error_code?: 'server_git_error' | 'server_processing_error';
+  processing_attempts?: number;
   result?: PushResult;
 };
 

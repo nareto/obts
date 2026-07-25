@@ -10,6 +10,8 @@ import { LocalGitEngine } from '../obsidian-plugin/src/core/localGit.js';
 import { TransportClient } from '../obsidian-plugin/src/core/transport.js';
 import { runCli } from '../src/cli.js';
 import { createObtsServer, repairVaultIntegrity, type ObtsServer } from '../src/server/app.js';
+import { AuthError } from '../src/server/authService.js';
+import { GitCommandError } from '../src/server/gitService.js';
 import { MetadataStore } from '../src/server/metadataStore.js';
 import { __syncServiceTestInternals } from '../src/server/syncService.js';
 import {
@@ -5609,8 +5611,13 @@ describe('Phase 1 sync without conflict resolution', () => {
     const gitService = server.git as unknown as { exec: (...args: any[]) => Promise<any> };
     const originalExec = gitService.exec.bind(gitService);
     const commands: string[][] = [];
+    let injectedServerGitFailure = false;
     gitService.exec = async (...args: any[]) => {
       if (Array.isArray(args[1])) commands.push(args[1]);
+      if (args[1]?.[0] === 'read-tree' && !injectedServerGitFailure) {
+        injectedServerGitFailure = true;
+        throw new GitCommandError('simulated production Git compatibility failure', '');
+      }
       return await originalExec(...args);
     };
     try {
@@ -5619,10 +5626,103 @@ describe('Phase 1 sync without conflict resolution', () => {
       gitService.exec = originalExec;
     }
 
+    expect(injectedServerGitFailure).toBe(true);
+    expect(commands.filter((args) => args[0] === 'read-tree').length).toBeGreaterThanOrEqual(2);
     expect(commands.some((args) => args[0] === 'cat-file' && args[1] === '-s')).toBe(false);
     expect(commands.some((args) => args.includes('checkout-index'))).toBe(false);
     expect(commands.some((args) => args[0] === 'ls-tree' && args.includes('-l'))).toBe(true);
-    expect(commands.some((args) => args[0] === 'merge-tree')).toBe(true);
+    expect(commands.some((args) => args[0] === 'merge-tree')).toBe(false);
+    expect(commands.some((args) => args[0] === 'read-tree' && !args.includes('-i') && !args.includes('-m'))).toBe(true);
+    expect(commands.some((args) => args[0] === 'diff-tree' && args.includes('--raw') && args.includes('--no-renames'))).toBe(true);
+    expect(commands.some((args) => args[0] === 'update-index' && args.includes('--index-info'))).toBe(true);
+    expect(commands.some((args) => args.includes('--merge-base') || args.includes('--no-messages'))).toBe(false);
+  });
+
+  it('recovers a legacy git-error transfer after restart without uploading another chunk', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'legacy-git-error-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'legacy-git-error-device');
+    await writeFile(join(deviceDir, 'queued.md'), 'queued proposal\n');
+
+    const core = (plugin as unknown as { client: Record<string, any> }).client;
+    const originalPoll = core.pollPushTransfer.bind(core);
+    const originalPut = core.putPushChunk.bind(core);
+    let uploadedChunks = 0;
+    core.putPushChunk = async (...args: unknown[]) => {
+      uploadedChunks += 1;
+      return await originalPut(...args);
+    };
+    core.pollPushTransfer = async () => {
+      throw new Error('simulated legacy terminal Git error');
+    };
+
+    await expect(plugin.syncOnce()).rejects.toThrow('simulated legacy terminal Git error');
+    const checkpoint = JSON.parse(await readFile(join(deviceDir, '.obts', 'upload-transfer.json'), 'utf8')) as {
+      transfer_id: string;
+    };
+    const chunksBeforeRestart = uploadedChunks;
+    const port = Number(new URL(baseUrl).port);
+    await server.app.close();
+
+    const sessionPath = join(server.config.transferDir, checkpoint.transfer_id, 'session.json');
+    const legacySession = JSON.parse(await readFile(sessionPath, 'utf8')) as Record<string, unknown>;
+    legacySession.status = 'rejected';
+    legacySession.result = { status: 'rejected', code: 'git_error', message: 'Git operation failed.' };
+    await writeFile(sessionPath, `${JSON.stringify(legacySession, null, 2)}\n`);
+
+    server = await createObtsServer({
+      dataDir: join(root, 'server-data'),
+      publicBaseUrl: `http://127.0.0.1:${port}`,
+      sessionSecret: 'test-session-secret-with-enough-entropy'
+    });
+    baseUrl = await server.app.listen({ port, host: '127.0.0.1' });
+    const migratedSession = JSON.parse(await readFile(sessionPath, 'utf8')) as Record<string, unknown>;
+    expect(migratedSession).toMatchObject({
+      status: 'open',
+      result: null,
+      processing_attempts: 0,
+      processing_error_code: 'server_git_error'
+    });
+
+    core.pollPushTransfer = originalPoll;
+    await expect(plugin.syncOnce()).resolves.toMatchObject({ status: 'Synced' });
+    expect(uploadedChunks).toBe(chunksBeforeRestart);
+    await expect(stat(join(deviceDir, '.obts', 'upload-transfer.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('keeps permanent async policy failures terminal instead of retrying them forever', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'terminal-policy-failure-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'terminal-policy-failure-device');
+    await writeFile(join(deviceDir, 'queued.md'), 'queued proposal\n');
+
+    const originalPush = server.sync.pushDeviceCommit.bind(server.sync);
+    server.sync.pushDeviceCommit = async () => {
+      throw new AuthError(409, 'stale_directory_proposal_base', 'Directory proposal baseline is stale.');
+    };
+    try {
+      await expect(plugin.syncOnce()).rejects.toMatchObject({ code: 'stale_directory_proposal_base' });
+    } finally {
+      server.sync.pushDeviceCommit = originalPush;
+    }
+
+    const checkpoint = JSON.parse(await readFile(join(deviceDir, '.obts', 'upload-transfer.json'), 'utf8')) as {
+      transfer_id: string;
+    };
+    const session = JSON.parse(
+      await readFile(join(server.config.transferDir, checkpoint.transfer_id, 'session.json'), 'utf8')
+    ) as Record<string, unknown>;
+    expect(session).toMatchObject({
+      status: 'rejected',
+      result: {
+        status: 'rejected',
+        code: 'stale_directory_proposal_base'
+      },
+      processing_error_code: null,
+      retry_at: null
+    });
   });
 
   it('retrieves a committed async transfer outcome without rescanning or re-uploading', async () => {

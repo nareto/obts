@@ -188,6 +188,7 @@ Acceptance criteria:
 - Server stores uploaded Git state in the server Git store after authorization.
 - Ref movement changes how a valid authenticated proposal is integrated, never whether its already-uploaded bytes are retained: stale `main` is merged against the latest canonical state; an ancestry-safe stale device ref is accepted; an already-covered target is an idempotent no-op; and divergent same-device history is preserved as a dashboard conflict without moving the protected device ref.
 - Rejection is reserved for authentication/authorization failure, malformed or unsafe Git state, untrusted proposal provenance, configured object or storage limits, abuse controls, revoked/blocked devices, or persistent-integrity failure.
+- An internal server Git or processing failure is not a proposal rejection. The server retains the durable proposal in processing, records only a safe retry classification, retries with bounded backoff across process restarts, and reports `Server retrying` without implying unsafe local state.
 - Transfer receipt is decoupled from integration. After all chunks are durable, capable clients receive a prompt asynchronous processing descriptor and poll a restart-recoverable terminal result instead of holding a proxy request open through validation and merge.
 - Expensive proposal validation happens outside client request lifetime, and canonical per-vault integration is fairly serialized. Tree-size validation and clean disjoint merges use bounded Git operations rather than one subprocess or plaintext worktree write per vault file.
 
@@ -407,7 +408,7 @@ Theme tokens:
 Status color roles:
 
 - Success: synced, healthy, completed;
-- Info: uploading, applying, checking, merging, maintenance running;
+- Info: uploading, applying, checking, merging, server retrying, maintenance running;
 - Warning: ahead, behind, offline, review needed, stale review;
 - Danger: blocked, needs recovery, unsafe local state, integrity failure,
   failed maintenance;
@@ -458,6 +459,7 @@ Dashboard and plugin status labels must use this shared vocabulary:
 | Applying | Info | Accepted server state is being written locally. |
 | Checking | Info | The server or client is verifying state. |
 | Merging | Info | The server is evaluating accepted device changes. |
+| Server retrying | Info | The durable proposal is retained while the server retries an internal processing failure. |
 | Ahead | Warning | The device has local committed changes not yet on server `main`. |
 | Behind | Warning | The device has not yet applied current server `main`. |
 | Offline | Warning | The device has not been seen within the configured offline window. |
@@ -468,7 +470,7 @@ Dashboard and plugin status labels must use this shared vocabulary:
 | Unsafe local state | Danger | Local apply or upload is blocked to avoid data loss. |
 | Integrity failure | Danger | Persistent state is inconsistent and mutations are blocked. |
 
-A progressing operation that exceeds its normal duration remains `Checking` or `Applying` with a taking-longer detail and periodic status heartbeat. `Offline` is reserved for transport unavailability or an expired server-observed device heartbeat, never elapsed local processing time. A stale foreground-mobile report may therefore be `Status unknown` without implying failed synchronization.
+A progressing operation that exceeds its normal duration remains `Checking`, `Applying`, or `Server retrying` with a taking-longer detail and periodic status heartbeat. `Offline` is reserved for transport unavailability or an expired server-observed device heartbeat, never elapsed local processing time. A stale foreground-mobile report may therefore be `Status unknown` without implying failed synchronization.
 
 #### 3.9.5 Overview Page Wireframe
 

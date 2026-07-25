@@ -33,7 +33,7 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
       server = container "Server API and CLI" "Authenticates clients, receives immutable proposals, fairly serializes canonical integration, merges Git history, persists conflicts, serves the dashboard, and exposes operator commands." "TypeScript, Node.js, Fastify" {
         authService = component "Auth service" "Authenticates dashboard sessions, connection requests, and vault-scoped device tokens." "TypeScript"
         connectionService = component "Connection service" "Runs browser-assisted device onboarding and idempotent registration." "TypeScript"
-        chunkTransferService = component "Chunk transfer service" "Persists bounded Git chunks and transfer descriptors, returns prompt asynchronous acceptance, and resumes processing when clients poll after restart." "TypeScript"
+        chunkTransferService = component "Chunk transfer service" "Persists bounded Git chunks and transfer descriptors, returns prompt asynchronous acceptance, and retries internal processing failures with durable bounded backoff across restarts." "TypeScript"
         syncService = component "Sync service" "Validates proposals and serializes each vault's integration. Ref movement changes merge classification rather than acceptance of valid uploaded bytes." "TypeScript"
         gitService = component "Git service" "Uses batched tree inspection and object-level merge operations for refs, validation, merge, history, and conflict retention." "Native Git"
         metadataStoreService = component "Metadata store" "Atomically persists users, vaults, devices, operations, transfer-independent proposal outcomes, events, and conflicts." "TypeScript"
@@ -244,7 +244,7 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
         "protocol" "in-process"
       }
     }
-    obts.server.gitService -> obts.gitStore "Runs batched tree inspection, object promotion, merge-tree, commit-tree, and ref CAS" "Native Git" {
+    obts.server.gitService -> obts.gitStore "Runs batched tree inspection, object promotion, temporary-index read-tree/write-tree merges, commit-tree, and ref CAS" "Native Git" {
       properties {
         "ops" "read,write"
         "protocol" "native-git"

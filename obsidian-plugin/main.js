@@ -21895,7 +21895,7 @@ var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var { createByteBudget, runBoundedWork } = require_work_pool();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.24";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.25";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_FULL_SCAN_INTERVAL_MS = 5 * 60 * 1e3;
@@ -23971,9 +23971,7 @@ var ObtsObsidianClient = class {
     }
   }
   async pollPushTransfer(state, token, descriptor) {
-    await this.writeState(Object.assign({}, await this.readState(), { status_label: "Merging", last_error_code: null, updated_at: nowIso() }));
-    this.reportOperationProgress("Merging on server", "upload_finalize");
-    await this.reportDeviceStatus().catch(() => void 0);
+    await this.updatePushProcessingStatus(descriptor);
     while (true) {
       if (descriptor.status === "completed") return this.completedTransferResult(descriptor);
       if (descriptor.status === "rejected") this.throwRejectedTransfer(descriptor);
@@ -23989,6 +23987,7 @@ var ObtsObsidianClient = class {
       if (descriptor.status !== "processing") {
         throw new ObtsBlockedError("transfer_closed", "The resumable transfer closed without an authoritative result.");
       }
+      await this.updatePushProcessingStatus(descriptor);
       await new Promise((resolve) => setTimeout(resolve, Math.max(100, descriptor.poll_after_ms || 1e3)));
       const response = await fetchWithTimeout(
         this.url(`/api/v1/vaults/${state.vault_id}/sync/push-transfers/${descriptor.transfer_id}`),
@@ -23997,6 +23996,16 @@ var ObtsObsidianClient = class {
       if (!response.ok) await throwResponseError(response);
       descriptor = await response.json();
     }
+  }
+  async updatePushProcessingStatus(descriptor) {
+    if (descriptor.status !== "processing") return;
+    const statusLabel = descriptor.processing_error_code ? "Server retrying" : "Merging";
+    const current = await this.readState();
+    if (current.status_label === statusLabel && current.last_error_code === null) return;
+    await this.writeState(Object.assign({}, current, { status_label: statusLabel, last_error_code: null, updated_at: nowIso() }));
+    this.plugin.setStatus(statusLabel);
+    this.reportOperationProgress(statusLabel === "Merging" ? "Merging on server" : statusLabel, "upload_finalize");
+    await this.reportDeviceStatus().catch(() => void 0);
   }
   completedTransferResult(descriptor) {
     if (!descriptor.result || descriptor.result.status === "rejected") {
@@ -28388,7 +28397,7 @@ function sameStringArray(left, right) {
   return left.length === right.length && left.every((value, index2) => value === right[index2]);
 }
 function isRetryableLocalError(code) {
-  return code === "local_snapshot_changed" || code === "upload_interrupted" || code === "pack_preparation_failed" || code === "directory_acknowledgement_missing" || code === "invalid_path" || code === "path_collision" || code === "excluded_git_path" || code === "excluded_internal_path" || code === "excluded_path" || code === "unsupported_file_mode";
+  return code === "local_snapshot_changed" || code === "upload_interrupted" || code === "pack_preparation_failed" || code === "git_error" || code === "server_git_error" || code === "server_processing_error" || code === "directory_acknowledgement_missing" || code === "invalid_path" || code === "path_collision" || code === "excluded_git_path" || code === "excluded_internal_path" || code === "excluded_path" || code === "unsupported_file_mode";
 }
 function isOfflineTransportError(error) {
   return error instanceof ObtsTransportError && error.status === 0;
@@ -28401,7 +28410,7 @@ function isPermanentTransportError(error) {
 }
 function statusBaseLabel(label) {
   const normalized = typeof label === "string" && label.trim().length > 0 ? label.trim() : "Checking";
-  for (const base of ["Checking", "Preparing upload", "Uploading", "Merging", "Applying"]) {
+  for (const base of ["Checking", "Preparing upload", "Uploading", "Merging", "Server retrying", "Applying"]) {
     if (normalized === base || normalized.startsWith(`${base} `)) return base;
   }
   return normalized;
@@ -28412,7 +28421,7 @@ function statusPresentation(label) {
   const action = base === "Review needed" ? "Click to open the conflict dashboard." : "Click to open obts settings.";
   let tone = "neutral";
   if (base === "Synced") tone = "success";
-  else if (["Checking", "Preparing upload", "Uploading", "Applying", "Merging", "Finishing update", "Waiting for operation"].includes(base)) tone = "active";
+  else if (["Checking", "Preparing upload", "Uploading", "Applying", "Merging", "Server retrying", "Finishing update", "Waiting for operation"].includes(base)) tone = "active";
   else if (["Ahead", "Behind", "Offline", "Review needed"].includes(base)) tone = "warning";
   else if (["Blocked", "Needs recovery", "Unsafe local state", "Integrity failure", "Recovery required", "Restart required"].includes(base)) tone = "danger";
   return {
@@ -28434,7 +28443,7 @@ function isPersistentAttentionStatus(base) {
   return ["Review needed", "Blocked", "Needs recovery", "Unsafe local state", "Integrity failure", "Recovery required", "Restart required"].includes(base);
 }
 function isActiveTransferStatus(base) {
-  return ["Preparing upload", "Uploading", "Applying", "Merging", "Finishing update", "Waiting for operation"].includes(base);
+  return ["Preparing upload", "Uploading", "Applying", "Merging", "Server retrying", "Finishing update", "Waiting for operation"].includes(base);
 }
 function shouldShowRoutineStatusNotice(label) {
   return !isPersistentAttentionStatus(statusBaseLabel(label));
@@ -28459,6 +28468,9 @@ function blockStatusLabel(code) {
   }
   if (code === "local_snapshot_changed") {
     return "Checking";
+  }
+  if (code === "git_error" || code === "server_git_error" || code === "server_processing_error") {
+    return "Server retrying";
   }
   if (code === "initial_import_confirmation_required") {
     return "Blocked";
