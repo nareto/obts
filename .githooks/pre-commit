@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+paths_file=$(mktemp)
+trap 'rm -f "$paths_file"' EXIT
+if ! git diff --cached --name-only --diff-filter=ACMR -z > "$paths_file"; then
+  printf 'Refusing to commit: failed to inspect staged paths.\n' >&2
+  exit 1
+fi
+while IFS= read -r -d '' path; do
+  case "$path" in
+    .pi-subagents|.pi-subagents/*|*/.pi-subagents|*/.pi-subagents/*)
+      printf 'Refusing to commit generated pi-subagents data: %s\n' "$path" >&2
+      exit 1
+      ;;
+  esac
+done < "$paths_file"

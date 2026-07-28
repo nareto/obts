@@ -1,9 +1,51 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
-while read -r local_ref local_sha remote_ref remote_sha; do
-  if [[ "$local_sha" =~ ^0+$ ]]; then
+zero_oid='0000000000000000000000000000000000000000'
+guard_tmp=$(mktemp -d)
+trap 'rm -rf "$guard_tmp"' EXIT
+paths_file="$guard_tmp/paths"
+commits_file="$guard_tmp/commits"
+
+reject_commit_paths() {
+  local commit=$1
+  local path
+  local rejected=0
+  if ! git diff-tree --root -m --no-commit-id --name-only --diff-filter=ACMR -r -z "$commit" > "$paths_file"; then
+    printf 'Refusing to push: failed to inspect commit %s.\n' "$commit" >&2
+    return 1
+  fi
+  while IFS= read -r -d '' path; do
+    case "$path" in
+      .pi-subagents|.pi-subagents/*|*/.pi-subagents|*/.pi-subagents/*)
+        printf 'Refusing to push commit %s containing generated pi-subagents data: %s\n' "${commit:0:12}" "$path" >&2
+        rejected=1
+        break
+        ;;
+    esac
+  done < "$paths_file"
+  return "$rejected"
+}
+
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  if [[ "$local_sha" == "$zero_oid" ]]; then
     continue
   fi
+
+  if [[ "$remote_sha" == "$zero_oid" ]]; then
+    range="$local_sha"
+  else
+    range="$remote_sha..$local_sha"
+  fi
+
+  if ! git rev-list "$range" > "$commits_file"; then
+    printf 'Refusing to push: failed to enumerate revision range %s.\n' "$range" >&2
+    exit 1
+  fi
+  while IFS= read -r commit; do
+    reject_commit_paths "$commit" || exit 1
+  done < "$commits_file"
+
   node scripts/check-plugin-release.mjs "$remote_sha" "$local_sha"
 done
