@@ -20,6 +20,11 @@ describe('dashboard live device status', () => {
     expect(deviceTable).toContain('<Status label={effectiveStatus(device)} />');
     expect(deviceTable).toContain("statusCurrent ? device.status_label : 'Status unknown'");
     expect(deviceTable).toContain('device.status_report_fresh');
+    expect(deviceTable).toContain('<th>Plugin</th>');
+    expect(deviceTable).toContain("{device.plugin_version ?? 'Unknown'}");
+    expect(deviceTable).toContain('class:success={device.plugin_version === recommendedPluginVersion}');
+    expect(deviceTable).toContain('class:warning={device.plugin_version !== recommendedPluginVersion}');
+    expect(app).toContain('recommendedPluginVersion={dashboard.recommended_plugin_version}');
     expect(deviceTable).not.toContain('nowMs');
     expect(deviceTable).not.toContain('Date.parse(device.last_status_report_at)');
   });

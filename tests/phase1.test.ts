@@ -1998,15 +1998,19 @@ describe('Phase 1 sync without conflict resolution', () => {
       const device = db.devices.find((candidate) => candidate.device_name === 'stale-laptop');
       expect(device).toBeDefined();
       device!.status = 'synced';
+      device!.plugin_version = '0.4.25';
       device!.last_status_report_at = new Date(Date.now() - 6 * 60 * 1000).toISOString();
     });
 
-    const dashboard = await admin.get<{ devices: Array<{ device_name: string; status_label: string; status_report_fresh: boolean }> }>(
-      `/api/v1/vaults/${admin.vaultId}/dashboard`
-    );
+    const dashboard = await admin.get<{
+      recommended_plugin_version: string;
+      devices: Array<{ device_name: string; status_label: string; status_report_fresh: boolean; plugin_version: string | null }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+    expect(dashboard.body.recommended_plugin_version).toBe(RECOMMENDED_PLUGIN_VERSION);
     expect(dashboard.body.devices.find((device) => device.device_name === 'stale-laptop')).toMatchObject({
       status_label: 'Status unknown',
-      status_report_fresh: false
+      status_report_fresh: false,
+      plugin_version: '0.4.25'
     });
   });
 

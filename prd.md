@@ -313,7 +313,8 @@ The dashboard refreshes the selected vault status at least every 15 seconds whil
 The dashboard shows:
 
 - paired devices;
-- device names and last-seen status;
+- device names, last-seen status, and each device's last reported plugin version;
+- the deployed server's recommended plugin version, with exact matches shown in green and missing or non-recommended versions shown in amber;
 - current server `main` commit;
 - each device ahead/behind/offline/blocked state;
 - unresolved conflicts;
@@ -514,11 +515,15 @@ Columns, in order:
 
 1. Device;
 2. Status;
-3. Last seen;
-4. Ahead/behind;
-5. Applied version;
-6. Last successful sync;
-7. Actions.
+3. Plugin;
+4. Last seen;
+5. Ahead/behind;
+6. Applied version;
+7. Local detail;
+8. Last successful sync;
+9. Actions.
+
+The `Plugin` column contains only the last reported version or `Unknown`. It remains visible when a device status report becomes stale. The server-provided recommended version is the comparison source; the dashboard does not infer latest from the connected-device maximum or query GitHub at runtime.
 
 The Actions column uses an overflow menu for secondary actions. Device
 revocation is always a danger action and requires recent authentication.

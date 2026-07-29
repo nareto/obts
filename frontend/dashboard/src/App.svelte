@@ -689,7 +689,7 @@
           <Summary title="Health/readiness" value={dashboard.health.status === 'ready' ? 'Synced' : 'Integrity failure'} role={dashboard.health.status === 'ready' ? 'success' : 'danger'} detail={dashboard.health.detail ?? dashboard.health.git_version} />
           <section class="panel wide">
             <h2>Devices</h2>
-            <DeviceTable devices={dashboard.devices} statusCurrent={dashboardStatusCurrent} onRename={renameDevice} onRevoke={revokeDevice} />
+            <DeviceTable devices={dashboard.devices} recommendedPluginVersion={dashboard.recommended_plugin_version} statusCurrent={dashboardStatusCurrent} onRename={renameDevice} onRevoke={revokeDevice} />
           </section>
           <section class="panel narrow">
             <h2>Attention</h2>
@@ -722,7 +722,7 @@
         <main class="page">
           <section class="panel full">
             <h2>Devices</h2>
-            <DeviceTable devices={dashboard.devices} statusCurrent={dashboardStatusCurrent} onRename={renameDevice} onRevoke={revokeDevice} />
+            <DeviceTable devices={dashboard.devices} recommendedPluginVersion={dashboard.recommended_plugin_version} statusCurrent={dashboardStatusCurrent} onRename={renameDevice} onRevoke={revokeDevice} />
           </section>
         </main>
       {:else if page === 'Conflicts'}
