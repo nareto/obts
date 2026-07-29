@@ -5,7 +5,7 @@ import { createRequire } from 'node:module';
 import vm from 'node:vm';
 
 import git from 'isomorphic-git';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { PLUGIN_VERSION } from '../obsidian-plugin/src/version.js';
 import { MemoryDataAdapter } from './helpers/memoryDataAdapter.js';
@@ -590,12 +590,16 @@ describe('mobile plugin artifact', () => {
 
     const runtimeAdapter = new MemoryDataAdapter();
     const runtimeLayoutReadyCallbacks: Array<() => void> = [];
+    const runtimeVaultCallbacks = new Map<string, (...args: any[]) => void>();
     const runtimePlugin = new PluginClass();
     runtimePlugin.app = {
       vault: {
         adapter: runtimeAdapter,
         getName: () => 'Runtime Test Vault',
-        on: () => ({}),
+        on: (event: string, callback: (...args: any[]) => void) => {
+          runtimeVaultCallbacks.set(event, callback);
+          return {};
+        },
         getAbstractFileByPath: () => null
       },
       workspace: {
@@ -639,6 +643,22 @@ describe('mobile plugin artifact', () => {
       attempts: 0,
       updated_at: new Date().toISOString()
     });
+    runtimeVaultCallbacks.get('modify')!({ path: 'note.md' });
+    await vi.waitFor(async () => {
+      expect(await runtimeClient.readQueue()).toMatchObject({
+        status: 'queued_local',
+        changed_paths: ['note.md']
+      });
+    });
+    await runtimeClient.writeQueue({
+      pending_commit: null,
+      expected_device_ref: runtimeMain,
+      status: 'idle',
+      attempts: 0,
+      changed_paths: [],
+      updated_at: new Date().toISOString()
+    });
+    (runtimePlugin as any).syncQueued = false;
     await runtimeClient.refreshDirectoryStateFromDisk([]);
     expect(await runtimeClient.readIndexDelta(null)).toMatchObject({
       head: runtimeMain,
@@ -841,37 +861,36 @@ describe('mobile plugin artifact', () => {
     });
 
     let lightweightPolls = 0;
-    let fullScans = 0;
+    let localScans = 0;
+    let scanDecision: { required: boolean; mode: string } = { required: false, mode: 'none' };
     runtimeClient.pollRemoteEventsAndApply = async () => {
       lightweightPolls += 1;
       return { applied: false, status: 'Synced' };
     };
-    runtimeClient.syncOnce = async () => {
-      fullScans += 1;
-      (runtimePlugin as any).markFullScanCompleted();
+    runtimeClient.backgroundScanDecision = async () => scanDecision;
+    runtimeClient.syncOnce = async (options: { fullAudit?: boolean }) => {
+      localScans += 1;
+      expect(options.fullAudit).toBe(true);
       const TransportError = (module.exports as any).TransportError;
       throw new TransportError(0, 'network_error', 'network unavailable after scan');
     };
-    (runtimePlugin as any).lastFullScanCompletedAt = Date.now();
     for (let index = 0; index < 10; index += 1) await (runtimePlugin as any).runBackgroundSync();
     expect(lightweightPolls).toBe(10);
-    expect(fullScans).toBe(0);
-    (runtimePlugin as any).lastFullScanCompletedAt = null;
+    expect(localScans).toBe(0);
+    scanDecision = { required: true, mode: 'full' };
     await (runtimePlugin as any).runBackgroundSync();
-    expect(fullScans).toBe(1);
-    expect((runtimePlugin as any).lastFullScanCompletedAt).toEqual(expect.any(Number));
+    expect(localScans).toBe(1);
     await (runtimePlugin as any).runBackgroundSync();
-    expect(fullScans).toBe(1);
+    expect(localScans).toBe(1);
     expect(lightweightPolls).toBe(10);
     expect((runtimePlugin as any).automaticRetryNotBefore).toBeGreaterThan(Date.now());
     (runtimePlugin as any).clearTransientSyncFailures();
 
     runtimeClient.syncOnce = async () => {
-      fullScans += 1;
+      localScans += 1;
       const TransportError = (module.exports as any).TransportError;
       throw new TransportError(409, 'blocked_integrity', 'vault integrity repair required');
     };
-    (runtimePlugin as any).lastFullScanCompletedAt = null;
     await (runtimePlugin as any).runBackgroundSync();
     expect(await runtimeClient.readState()).toMatchObject({
       status_label: 'Unsafe local state',

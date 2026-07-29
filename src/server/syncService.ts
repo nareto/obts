@@ -321,7 +321,8 @@ export class SyncService {
         );
       } catch (error) {
         if (operationId) {
-          await this.abortOperation(operationId, 'unexpected_error');
+          const reason = error instanceof AuthError ? error.code : error instanceof GitCommandError ? 'server_git_error' : 'unexpected_error';
+          await this.abortOperation(operationId, reason);
         }
         throw error;
       }

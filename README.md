@@ -107,6 +107,7 @@ Plugin commands include:
 
 - `Set up sync`
 - `Sync once`
+- `Verify local vault contents`
 - `Replace local with server state`
 - `Rebuild from server main`
 

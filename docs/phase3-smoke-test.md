@@ -53,10 +53,15 @@ system to keep Obsidian running in the background.
    confirm journal recovery either completes safely or blocks without replacing
    unpreserved local content.
 7. Leave Obsidian in the background long enough for mobile timers to suspend,
-   then foreground it and confirm scanning and sync resume without duplicate
-   operations. Update the plugin while a disposable operation is active and
-   confirm the replacement either waits for safe handoff or requires a full
-   Obsidian restart; it must never clear the lease by elapsed time.
+   then foreground it and confirm remote polling resumes without an automatic
+   whole-vault content scan. Modify one file and confirm watcher reconciliation
+   reads that path but does not reread unchanged large attachments. Reload the
+   plugin and confirm the persisted scan watermark avoids another traversal;
+   invoke `Verify local vault contents` and confirm the separately labelled
+   audit hashes every syncable file. Update the plugin while a disposable
+   operation is active and confirm the replacement either waits for safe handoff
+   or requires a full Obsidian restart; it must never clear the lease by elapsed
+   time.
 8. With diagnostic sharing still off, trigger a disposable error and confirm no
    diagnostic request or server record is created. Enable **Share error
    diagnostics with this obts server**, reproduce one failure, and confirm one
@@ -94,11 +99,22 @@ system to keep Obsidian running in the background.
     the plugin reports **Server retrying**, the same transfer succeeds after
     bounded retry or server restart, and no chunk is uploaded again. Also confirm
     a legacy terminal `git_error` descriptor is migrated back into processing.
-15. Exercise stale device refs where the uploaded target is equal to, descends
+15. Reproduce an upgraded mobile client whose server acknowledgement is event 65,
+    whose already-materialized canonical `local_main` is a descendant at event
+    67, whose local event cursor is zero, and whose queued descendant contains
+    stable empty-directory intents. Confirm the first proposal is rejected as
+    `stale_directory_proposal_base`, the operation records that exact reason,
+    and the UI changes to **Repairing baseline**. Interrupt recovery before the
+    applied-main acknowledgement, restart, and confirm the journal preserves the
+    rejected transfer ID, queued commit, refs, and original intent generations.
+    Resume and confirm only the causal baseline advances, visible files are not
+    rewritten, a fresh valid proposal converges, and unavailable history or
+    non-ancestor cursors fail closed.
+16. Exercise stale device refs where the uploaded target is equal to, descends
     from, is covered by, and diverges from the server ref. Confirm the first
     three are idempotently accepted and only divergence creates a protected
     dashboard conflict without moving the device ref.
-16. Leave one device without a fresh status report for over five minutes while
+17. Leave one device without a fresh status report for over five minutes while
     another device advances main. Confirm the dashboard shows **Status unknown**
     or **Behind**, never **Synced**, until the stale device freshly reports its
     local main, local head, and idle queue after applying the canonical main.

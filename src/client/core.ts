@@ -30,6 +30,7 @@ export type LocalPluginState = {
   last_error_code: string | null;
   last_error_details?: Record<string, unknown> | null;
   last_event_seq: number;
+  last_applied_event_seq: number;
   unpaired_baseline_vault_id?: string | null;
   unpaired_baseline_main?: string | null;
   updated_at: string;
@@ -85,6 +86,7 @@ export type QueueState = {
   status: 'idle' | 'queued_local' | 'uploading' | 'uploaded' | 'merged' | 'conflicted' | 'blocked_recovery';
   attempts: number;
   change_seq?: number;
+  changed_paths?: string[];
   updated_at: string;
 };
 
@@ -129,7 +131,7 @@ type SharedClientCore = {
   ): Promise<SyncResult>;
   cancelOnboarding(): Promise<void>;
   recordLocalChangeHint(paths: string[]): Promise<void>;
-  syncOnce(options?: { confirmInitialImport?: boolean }): Promise<SyncResult>;
+  syncOnce(options?: { confirmInitialImport?: boolean; fullAudit?: boolean }): Promise<SyncResult>;
   pullAndApply(allowDestructive: boolean): Promise<boolean>;
   pollRemoteEventsAndApply(): Promise<{ applied: boolean; status: string }>;
   replaceLocalWithServer(): Promise<{ status: string; main: string }>;
@@ -267,7 +269,7 @@ export class ObtsPluginClient {
     return this.client.recordLocalChangeHint(paths);
   }
 
-  syncOnce(options?: { confirmInitialImport?: boolean }): Promise<SyncResult> {
+  syncOnce(options?: { confirmInitialImport?: boolean; fullAudit?: boolean }): Promise<SyncResult> {
     return this.client.syncOnce(options);
   }
 
