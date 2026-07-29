@@ -50,7 +50,7 @@ Implemented runtime pieces:
 - The sync pull API also rejects devices marked `review_needed` or `blocked_recovery`, so a stale or reset plugin cannot bypass server-known conflict/recovery blocks and apply server state over review content.
 - Authenticated API status summary for vault/device/conflict health; Phase 1
   exposes browser-assisted onboarding through the dashboard while retaining CLI workflows for setup, vault, device, conflict, and health inspection.
-- Dashboard device behind/synced state is derived from fresh client convergence reports and each device's acknowledged `last_applied_main` commit cursor; both `idle` and the legacy terminal `merged` queue state are settled. The SPA refreshes this server-derived state every 15 seconds while visible and on focus instead of ageing cached rows locally.
+- Dashboard device behind/synced state is derived from fresh client convergence reports and each device's acknowledged `last_applied_main` commit cursor; both `idle` and the legacy terminal `merged` queue state are settled. The device table also shows each device's last-known plugin version even when its status report is stale, coloring an exact match to the server's build-time recommended version green and missing or different versions amber. The SPA refreshes this server-derived state every 15 seconds while visible and on focus instead of ageing cached rows locally or querying GitHub at runtime.
 - Safe browser onboarding applies and acknowledges the current server `main` immediately, so an empty or already-matching paired device appears Synced before the next manual sync command.
 - Readiness checks that fail closed when metadata, Git refs, conflict commits, writable storage, or native Git readiness are inconsistent.
 

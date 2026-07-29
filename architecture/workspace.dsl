@@ -26,7 +26,7 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
 
       dashboard = container "Dashboard SPA" "Authenticated device status, conflict review, diagnostics, history, and maintenance UI served by the server." "Svelte, TypeScript, Vite" {
         apiClient = component "API client" "Calls authenticated dashboard endpoints." "TypeScript"
-        deviceViews = component "Device views" "Shows fresh server-derived device convergence and health." "Svelte"
+        deviceViews = component "Device views" "Shows server-derived device convergence, last-known plugin versions against the recommended release, and health." "Svelte"
         conflictWorkbench = component "Conflict workbench" "Reviews and resolves content, directory, and mixed conflicts." "Svelte"
         diagnosticsView = component "Diagnostics view" "Shows consented redacted client diagnostics and operational status." "Svelte"
       }

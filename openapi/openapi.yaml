@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Obsidian True Sync Phase 3 API
-  version: 0.3.15
+  version: 0.3.16
   summary: Deployable note history, restore, diagnostics, and maintenance.
 servers:
   - url: /api/v1
@@ -2328,7 +2328,7 @@ components:
           format: date-time
     DashboardSummary:
       type: object
-      required: [vault, devices, unresolved_conflict_count, conflicts, recent_activity, maintenance, health]
+      required: [vault, devices, recommended_plugin_version, unresolved_conflict_count, conflicts, recent_activity, maintenance, health]
       properties:
         vault:
           type: object
@@ -2344,6 +2344,9 @@ components:
             status:
               type: string
               enum: [active, blocked_integrity]
+        recommended_plugin_version:
+          type: string
+          pattern: "^v?[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"
         devices:
           type: array
           items:

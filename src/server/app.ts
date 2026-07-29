@@ -13,6 +13,7 @@ import {
   describePluginCompatibility,
   isPluginVersionAtLeast,
   LEGACY_PLUGIN_VERSION,
+  RECOMMENDED_PLUGIN_VERSION,
   type PluginCompatibility
 } from '../shared/pluginCompatibility.js';
 import {
@@ -460,7 +461,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
             local_queue_status: localQueueStatus,
             local_main: localStatusFresh ? device.local_main : null,
             local_head: localStatusFresh ? device.local_head : null,
-            plugin_version: localStatusFresh ? device.plugin_version : null,
+            plugin_version: device.plugin_version,
             path_capabilities: localStatusFresh ? device.path_capabilities : null,
             last_status_report_at: device.last_status_report_at,
             status_report_fresh: localStatusFresh,
@@ -485,6 +486,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         status: vault.status
       },
       devices,
+      recommended_plugin_version: RECOMMENDED_PLUGIN_VERSION,
       unresolved_conflict_count: conflicts.length,
       conflicts: buildDashboardConflicts(db, vault.vault_id, vault.current_main, allConflicts),
       recent_activity: buildRecentActivity(db, vault.vault_id),

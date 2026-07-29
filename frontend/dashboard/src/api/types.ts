@@ -133,6 +133,7 @@ export type DiagnosticEventsResponse = {
 export type DashboardSummary = {
   vault: Pick<VaultSummary, 'vault_id' | 'display_name' | 'current_main' | 'status'>;
   devices: DashboardDevice[];
+  recommended_plugin_version: string;
   unresolved_conflict_count: number;
   conflicts: DashboardConflict[];
   recent_activity: DashboardActivity[];

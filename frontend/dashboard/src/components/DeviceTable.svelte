@@ -4,6 +4,7 @@
   import Status from './Status.svelte';
 
   export let devices: DashboardDevice[];
+  export let recommendedPluginVersion: string;
   export let statusCurrent: boolean;
   export let onRename: (device: DashboardDevice, deviceName: string) => void | Promise<void>;
   export let onRevoke: (device: DashboardDevice) => void | Promise<void>;
@@ -34,6 +35,12 @@
     if (device.ahead_of_main) return 'Ahead';
     if (device.behind_main) return 'Behind';
     return 'Current';
+  }
+
+  function pluginVersionTitle(device: DashboardDevice) {
+    if (!device.plugin_version) return `Plugin version unknown. Recommended version is ${recommendedPluginVersion}.`;
+    if (device.plugin_version === recommendedPluginVersion) return `Recommended plugin version ${recommendedPluginVersion}.`;
+    return `Plugin ${device.plugin_version}; recommended version is ${recommendedPluginVersion}.`;
   }
 
   function toggleMenu(deviceId: string) {
@@ -84,6 +91,7 @@
     <tr>
       <th>Device</th>
       <th>Status</th>
+      <th>Plugin</th>
       <th>Last seen</th>
       <th>Ahead/behind</th>
       <th>Applied version</th>
@@ -108,6 +116,13 @@
           {/if}
         </td>
         <td><Status label={effectiveStatus(device)} /></td>
+        <td
+          class="mono plugin-version"
+          class:success={device.plugin_version === recommendedPluginVersion}
+          class:warning={device.plugin_version !== recommendedPluginVersion}
+          title={pluginVersionTitle(device)}
+          aria-label={pluginVersionTitle(device)}
+        >{device.plugin_version ?? 'Unknown'}</td>
         <td>{device.last_seen_at ? new Date(device.last_seen_at).toLocaleString() : '-'}</td>
         <td>{relationDetail(device)}</td>
         <td class="mono">{shortId(device.last_applied_main)}</td>
