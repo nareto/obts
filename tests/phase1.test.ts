@@ -453,7 +453,11 @@ describe('Phase 1 sync without conflict resolution', () => {
     const plugin = await pairPlugin(admin, deviceDir, 'laptop');
 
     await writeFile(join(deviceDir, 'watched.md'), 'from watcher\n');
-    await plugin.recordLocalChangeHint(['watched.md', '.obts/state.json', '.git/config', '../outside.md']);
+    await writeFile(join(deviceDir, 'concurrent.md'), 'from concurrent watcher\n');
+    await Promise.all([
+      plugin.recordLocalChangeHint(['watched.md', '.obts/state.json', '.git/config', '../outside.md']),
+      plugin.recordLocalChangeHint(['concurrent.md'])
+    ]);
     expect(await plugin.readState()).toMatchObject({
       status_label: 'Checking',
       last_error_code: null
@@ -470,7 +474,8 @@ describe('Phase 1 sync without conflict resolution', () => {
     await restartedPlugin.initialize();
     expect(await restartedPlugin.readQueue()).toMatchObject({
       pending_commit: null,
-      status: 'queued_local'
+      status: 'queued_local',
+      changed_paths: ['concurrent.md', 'watched.md']
     });
 
     const sync = await restartedPlugin.syncOnce();
@@ -480,7 +485,9 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(finalQueue.status).not.toBe('queued_local');
     const main = (await restartedPlugin.readState()).local_main;
     expect(main).toMatch(/^[0-9a-f]{40}$/u);
-    expect(await server.git.listTreePaths(admin.vaultId, main!)).toContain('watched.md');
+    expect(await server.git.listTreePaths(admin.vaultId, main!)).toEqual(
+      expect.arrayContaining(['concurrent.md', 'watched.md'])
+    );
   });
 
   it('clears a watcher hint when the reconciled vault tree is unchanged', async () => {
@@ -495,6 +502,114 @@ describe('Phase 1 sync without conflict resolution', () => {
 
     expect((await plugin.syncOnce()).status).toBe('Synced');
     expect(await plugin.readQueue()).toMatchObject({ pending_commit: null, status: 'idle' });
+  });
+
+  it('persists scan watermarks and reads only watcher-invalidated files between full audits', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'incremental-scan-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'incremental-scan-device');
+    await writeFile(join(deviceDir, 'alpha.md'), 'alpha one\n');
+    await writeFile(join(deviceDir, 'beta.md'), 'beta one\n');
+    await plugin.recordLocalChangeHint(['alpha.md', 'beta.md']);
+    expect((await plugin.syncOnce()).status).toBe('Synced');
+
+    const core = (plugin as unknown as { client: Record<string, any> }).client;
+    const adapter = core.adapter as { readBinary: (filePath: string) => Promise<ArrayBuffer> };
+    const originalReadBinary = adapter.readBinary.bind(adapter);
+    const visibleReads: string[] = [];
+    adapter.readBinary = async (filePath: string) => {
+      if (filePath === 'alpha.md' || filePath === 'beta.md') visibleReads.push(filePath);
+      return await originalReadBinary(filePath);
+    };
+
+    expect((await plugin.syncOnce()).status).toBe('Synced');
+    visibleReads.length = 0;
+    expect((await plugin.syncOnce()).status).toBe('Synced');
+    expect(visibleReads).toEqual([]);
+    expect(await core.backgroundScanDecision()).toEqual({ required: false, mode: 'none' });
+
+    await writeFile(join(deviceDir, 'beta.md'), 'beta two\n');
+    expect((await plugin.syncOnce()).status).toBe('Synced');
+    expect(visibleReads.filter((filePath) => filePath === 'beta.md').length).toBeGreaterThan(0);
+    expect(visibleReads).not.toContain('alpha.md');
+    visibleReads.length = 0;
+    expect((await plugin.syncOnce()).status).toBe('Synced');
+    visibleReads.length = 0;
+
+    await writeFile(join(deviceDir, 'alpha.md'), 'alpha two\n');
+    await plugin.recordLocalChangeHint(['alpha.md']);
+    expect((await plugin.readQueue()).changed_paths).toEqual(['alpha.md']);
+    expect((await plugin.syncOnce()).status).toBe('Synced');
+    expect(visibleReads.filter((filePath) => filePath === 'alpha.md').length).toBeGreaterThan(0);
+    expect(visibleReads).not.toContain('beta.md');
+    expect(await plugin.readQueue()).toMatchObject({ status: 'idle', changed_paths: [] });
+
+    await writeFile(join(deviceDir, 'queued-before-audit.md'), 'settle before audit\n');
+    const queuedFiles = (await core.listLocalVaultInventory('')).files
+      .filter((filePath: string) => isSyncableVaultPath(filePath)).sort();
+    const queuedCommit = await core.createLocalCommit('test: pending commit before audit', queuedFiles);
+    expect(queuedCommit).toMatch(/^[0-9a-f]{40}$/u);
+    const queuedState = await core.readState();
+    await core.writeQueue({
+      pending_commit: queuedCommit,
+      expected_device_ref: queuedState.server_device_ref,
+      status: 'queued_local',
+      attempts: 0,
+      updated_at: new Date().toISOString()
+    });
+    await core.writeState({ ...queuedState, local_head: queuedCommit, status_label: 'Ahead' });
+    visibleReads.length = 0;
+    expect((await plugin.syncOnce({ fullAudit: true })).status).toBe('Synced');
+    expect(new Set(visibleReads)).toEqual(new Set(['alpha.md', 'beta.md']));
+
+    const restarted = new ObtsPluginClient(deviceDir, {
+      serverUrl: baseUrl,
+      deviceName: 'incremental-scan-device'
+    });
+    await restarted.initialize();
+    const restartedCore = (restarted as unknown as { client: Record<string, any> }).client;
+    expect(await restartedCore.backgroundScanDecision()).toEqual({ required: false, mode: 'none' });
+    const scanStatePath = join(deviceDir, '.obts', 'scan-state.json');
+    const recentScanState = JSON.parse(await readFile(scanStatePath, 'utf8')) as Record<string, unknown>;
+    await writeFile(scanStatePath, `${JSON.stringify({
+      ...recentScanState,
+      last_inventory_completed_at: new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString()
+    }, null, 2)}\n`);
+    expect(await restartedCore.backgroundScanDecision()).toEqual({ required: true, mode: 'incremental' });
+    await writeFile(scanStatePath, `${JSON.stringify({
+      ...recentScanState,
+      last_full_audit_completed_at: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString(),
+      next_full_audit_at: new Date(Date.now() - 60 * 1000).toISOString()
+    }, null, 2)}\n`);
+    expect(await restartedCore.backgroundScanDecision()).toEqual({ required: true, mode: 'full' });
+    const restartedAdapter = restartedCore.adapter as { readBinary: (filePath: string) => Promise<ArrayBuffer> };
+    const restartedReadBinary = restartedAdapter.readBinary.bind(restartedAdapter);
+    const auditReads: string[] = [];
+    restartedAdapter.readBinary = async (filePath: string) => {
+      if (filePath === 'alpha.md' || filePath === 'beta.md') auditReads.push(filePath);
+      return await restartedReadBinary(filePath);
+    };
+    expect((await restarted.syncOnce({ fullAudit: true })).status).toBe('Synced');
+    expect(auditReads.sort()).toEqual(['alpha.md', 'beta.md']);
+    expect(JSON.parse(await readFile(join(deviceDir, '.obts', 'scan-state.json'), 'utf8'))).toMatchObject({
+      version: 1,
+      scanner_schema: 1,
+      local_head: (await restarted.readState()).local_head,
+      last_full_audit_completed_at: expect.any(String),
+      next_full_audit_at: expect.any(String)
+    });
+
+    auditReads.length = 0;
+    await rm(join(deviceDir, '.obts', 'scan-state.json'), { force: true });
+    await rm(join(deviceDir, '.obts', 'scan-cache.json'), { force: true });
+    expect(await restartedCore.backgroundScanDecision()).toEqual({ required: false, mode: 'none' });
+    expect(auditReads).toEqual([]);
+    expect(JSON.parse(await readFile(join(deviceDir, '.obts', 'scan-state.json'), 'utf8'))).toMatchObject({
+      last_full_audit_completed_at: null,
+      next_full_audit_at: expect.any(String),
+      bootstrap_basis: 'legacy_converged_state'
+    });
   });
 
   it('does not clear a newer watcher hint that arrives during reconciliation', async () => {
@@ -525,6 +640,41 @@ describe('Phase 1 sync without conflict resolution', () => {
     internals.git.createLocalCommit = createLocalCommit;
     await plugin.syncOnce();
     expect(await plugin.readQueue()).toMatchObject({ pending_commit: null, status: 'idle' });
+  });
+
+  it('preserves watcher paths that arrive during chunk upload state transitions', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'watcher-during-upload-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'watcher-during-upload-device');
+    await writeFile(join(deviceDir, 'first.md'), 'first upload\n');
+    await plugin.recordLocalChangeHint(['first.md']);
+    const core = (plugin as unknown as { client: Record<string, any> }).client;
+    const putPushChunk = core.putPushChunk.bind(core);
+    let injected = false;
+    core.putPushChunk = async (...args: unknown[]) => {
+      if (!injected) {
+        injected = true;
+        await writeFile(join(deviceDir, 'during-upload.md'), 'must remain queued\n');
+        await plugin.recordLocalChangeHint(['during-upload.md']);
+      }
+      return await putPushChunk(...args);
+    };
+
+    await expect(plugin.syncOnce()).resolves.toMatchObject({ status: 'Checking' });
+    expect(injected).toBe(true);
+    expect(await plugin.readQueue()).toMatchObject({
+      pending_commit: null,
+      status: 'queued_local',
+      changed_paths: ['during-upload.md']
+    });
+    core.putPushChunk = putPushChunk;
+    await expect(plugin.syncOnce()).resolves.toMatchObject({ status: 'Ahead' });
+    await expect(plugin.syncOnce()).resolves.toMatchObject({ status: 'Synced' });
+    const finalMain = (await plugin.readState()).local_main;
+    expect(await server.git.listTreePaths(admin.vaultId, finalMain!)).toEqual(
+      expect.arrayContaining(['during-upload.md', 'first.md'])
+    );
   });
 
   it('syncs Obsidian-valid punctuation paths and large markdown directories', async () => {
@@ -1423,7 +1573,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     };
 
     const firstFixtureBSync = await fixtureB.syncOnce();
-    expect(firstFixtureBSync.status).toBe('Ahead');
+    expect(firstFixtureBSync.status).toBe('Checking');
     expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('fixtureB must survive\n');
     expect(await fixtureB.readQueue()).toMatchObject({
       pending_commit: null,
@@ -1505,7 +1655,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     };
 
     const firstFixtureBSync = await fixtureB.syncOnce();
-    expect(firstFixtureBSync.status).toBe('Ahead');
+    expect(firstFixtureBSync.status).toBe('Checking');
     expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('fixtureB during apply prep\n');
     expect(await exists(join(fixtureBDir, '.obts', 'apply-journal.json'))).toBe(false);
     expect(await fixtureB.readQueue()).toMatchObject({
@@ -5131,7 +5281,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       return bundleId;
     };
 
-    expect((await plugin2.syncOnce()).status).toBe('Ahead');
+    expect((await plugin2.syncOnce()).status).toBe('Checking');
     expect(await readFile(join(device2Dir, 'shared.md'), 'utf8')).toBe('changed after preflight\n');
     expect(await exists(join(device2Dir, '.obts', 'apply.lock'))).toBe(false);
     expect(await exists(join(device2Dir, '.obts', 'apply-journal.json'))).toBe(false);
@@ -5691,6 +5841,158 @@ describe('Phase 1 sync without conflict resolution', () => {
     await expect(stat(join(deviceDir, '.obts', 'upload-transfer.json'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  it('repairs a stale directory baseline without replacing queued local history', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const phoneDir = join(root, 'stale-directory-baseline-phone');
+    const writerDir = join(root, 'stale-directory-baseline-writer');
+    await mkdirp(phoneDir);
+    await mkdirp(writerDir);
+    const phone = await pairPlugin(admin, phoneDir, 'stale-directory-baseline-phone');
+    const initialPhoneState = await phone.readState();
+    const writer = await pairPlugin(admin, writerDir, 'stale-directory-baseline-writer');
+    await writeFile(join(writerDir, 'remote.md'), 'remote canonical change\n');
+    expect((await writer.syncOnce()).status).toBe('Synced');
+    expect((await phone.pollRemoteEventsAndApply()).applied).toBe(true);
+
+    const phoneCore = (phone as unknown as { client: Record<string, any> }).client;
+    const appliedState = await phone.readState();
+    expect(appliedState.local_main).not.toBe(initialPhoneState.local_main);
+    const metadata = await server.store.snapshot();
+    const phoneDevice = metadata.devices.find((device) => device.device_id === appliedState.device_id);
+    expect(phoneDevice).toBeDefined();
+    await server.store.mutate((db) => {
+      const device = db.devices.find((candidate) => candidate.device_id === appliedState.device_id);
+      if (!device) throw new Error('phone device disappeared');
+      device.last_applied_main = initialPhoneState.local_main;
+      device.last_applied_event_seq = initialPhoneState.last_applied_event_seq;
+      device.last_applied_explicit_dirs = [];
+      device.pending_applied_main = null;
+      device.pending_applied_event_seq = 0;
+      device.pending_applied_explicit_dirs = null;
+    });
+    await writeFile(join(phoneDir, '.obts', 'state.json'), `${JSON.stringify({
+      ...appliedState,
+      last_event_seq: 0,
+      last_applied_event_seq: 0
+    }, null, 2)}\n`);
+
+    await writeFile(join(phoneDir, 'queued-local.md'), 'preserve this queued commit\n');
+    await mkdirp(join(phoneDir, 'Queued Empty Directory'));
+    const inventory = await phoneCore.listLocalVaultInventory('');
+    const localFiles = inventory.files.filter((filePath: string) => isSyncableVaultPath(filePath)).sort();
+    const staleIntents = await phoneCore.reconcileDirectoryState(localFiles, inventory.directories);
+    const queuedCommit = await phoneCore.createLocalCommit('test: queued phone changes', localFiles);
+    expect(queuedCommit).toMatch(/^[0-9a-f]{40}$/u);
+    expect(staleIntents).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        op: 'create',
+        path: 'Queued Empty Directory',
+        base_main: appliedState.local_main,
+        base_event_seq: 0
+      })
+    ]));
+    await phoneCore.writeQueue({
+      pending_commit: queuedCommit,
+      expected_device_ref: appliedState.server_device_ref,
+      status: 'queued_local',
+      attempts: 0,
+      updated_at: new Date().toISOString()
+    });
+    await phoneCore.writeState({
+      ...await phoneCore.readState(),
+      local_head: queuedCommit,
+      status_label: 'Ahead'
+    });
+
+    await expect(phone.syncOnce()).rejects.toMatchObject({ code: 'stale_directory_proposal_base' });
+    const rejectedCheckpoint = JSON.parse(
+      await readFile(join(phoneDir, '.obts', 'upload-transfer.json'), 'utf8')
+    ) as { target_commit: string; transfer_id: string };
+    expect(rejectedCheckpoint.target_commit).toBe(queuedCommit);
+    const rejectedQueue = await phone.readQueue();
+    expect(rejectedQueue.pending_commit).toBe(queuedCommit);
+    const rejectedOperation = (await server.store.snapshot()).sync_operations
+      .find((candidate) => candidate.target_commit === queuedCommit && candidate.operation_type === 'device_push');
+    expect(rejectedOperation).toMatchObject({
+      status: 'aborted',
+      result: { reason: 'stale_directory_proposal_base' }
+    });
+
+    await writeFile(join(writerDir, 'later-remote.md'), 'make the phone baseline historical\n');
+    expect((await writer.syncOnce()).status).toBe('Synced');
+    const retainedEvents = (await server.store.snapshot()).events;
+    await server.store.mutate((db) => {
+      db.events = db.events.filter((event) =>
+        event.vault_id !== admin.vaultId || event.event_seq > initialPhoneState.last_applied_event_seq + 1
+      );
+    });
+    await expect(phone.syncOnce()).rejects.toMatchObject({ code: 'directory_snapshot_unavailable' });
+    expect(await phone.readQueue()).toMatchObject({ pending_commit: queuedCommit, status: 'queued_local' });
+    const baselineJournalPath = join(phoneDir, '.obts', 'directory-baseline-recovery.json');
+    const plannedJournal = JSON.parse(await readFile(baselineJournalPath, 'utf8')) as Record<string, unknown>;
+    expect(plannedJournal).toMatchObject({
+      phase: 'planned',
+      local_main: appliedState.local_main,
+      local_head: queuedCommit,
+      pending_commit: queuedCommit
+    });
+    await server.store.mutate((db) => {
+      db.events = retainedEvents;
+    });
+
+    await writeFile(baselineJournalPath, '{malformed');
+    await expect(phone.syncOnce()).rejects.toMatchObject({ code: 'directory_baseline_recovery_journal_invalid' });
+    await writeFile(baselineJournalPath, `${JSON.stringify(plannedJournal, null, 2)}\n`);
+    await writeFile(baselineJournalPath, `${JSON.stringify({ ...plannedJournal, checkpoint_removal_authorized: 'yes' }, null, 2)}\n`);
+    await expect(phone.syncOnce()).rejects.toMatchObject({ code: 'directory_baseline_recovery_journal_invalid' });
+    await writeFile(baselineJournalPath, `${JSON.stringify(plannedJournal, null, 2)}\n`);
+
+    const rejectedCheckpointPath = join(phoneDir, '.obts', 'upload-transfer.json');
+    const rejectedCheckpointContents = await readFile(rejectedCheckpointPath, 'utf8');
+    await writeFile(rejectedCheckpointPath, '{malformed');
+    await expect(phone.syncOnce()).rejects.toMatchObject({ code: 'directory_baseline_recovery_journal_invalid' });
+    await writeFile(rejectedCheckpointPath, rejectedCheckpointContents);
+    await writeFile(rejectedCheckpointPath, `${JSON.stringify({
+      ...JSON.parse(rejectedCheckpointContents),
+      identity: 'b'.repeat(64)
+    }, null, 2)}\n`);
+    await expect(phone.syncOnce()).rejects.toMatchObject({ code: 'directory_baseline_recovery_journal_invalid' });
+    await writeFile(rejectedCheckpointPath, rejectedCheckpointContents);
+
+    await writeFile(baselineJournalPath, `${JSON.stringify({ ...plannedJournal, local_head: 'a'.repeat(40) }, null, 2)}\n`);
+    await expect(phone.syncOnce()).rejects.toMatchObject({ code: 'directory_baseline_recovery_journal_invalid' });
+    await writeFile(baselineJournalPath, `${JSON.stringify(plannedJournal, null, 2)}\n`);
+
+    const completeAcknowledgement = phoneCore.completePendingAppliedAcknowledgement.bind(phoneCore);
+    let interruptedRepair = false;
+    phoneCore.completePendingAppliedAcknowledgement = async (...args: unknown[]) => {
+      if (!interruptedRepair) {
+        interruptedRepair = true;
+        throw new Error('simulated baseline repair interruption');
+      }
+      return await completeAcknowledgement(...args);
+    };
+    await expect(phone.syncOnce()).rejects.toThrow('simulated baseline repair interruption');
+    expect(await phone.readQueue()).toMatchObject({ pending_commit: queuedCommit, status: 'queued_local' });
+    expect(JSON.parse(await readFile(join(phoneDir, '.obts', 'directory-baseline-recovery.json'), 'utf8'))).toMatchObject({
+      version: 1,
+      local_main: appliedState.local_main,
+      pending_commit: queuedCommit,
+      rejected_transfer_id: rejectedCheckpoint.transfer_id
+    });
+    phoneCore.completePendingAppliedAcknowledgement = completeAcknowledgement;
+
+    await expect(phone.syncOnce()).resolves.toMatchObject({ status: 'Synced' });
+    expect(await readFile(join(phoneDir, 'queued-local.md'), 'utf8')).toBe('preserve this queued commit\n');
+    expect(await phone.readQueue()).toMatchObject({ pending_commit: null, status: 'idle' });
+    expect(await phone.readState()).toMatchObject({ last_error_code: null, local_head: expect.stringMatching(/^[0-9a-f]{40}$/u) });
+    await expect(stat(join(phoneDir, '.obts', 'directory-baseline-recovery.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(stat(join(phoneDir, '.obts', 'upload-transfer.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    const repairedDevice = (await server.store.snapshot()).devices.find((device) => device.device_id === appliedState.device_id);
+    expect(repairedDevice?.last_applied_event_seq).toBeGreaterThan(initialPhoneState.last_applied_event_seq);
+    expect(repairedDevice?.last_applied_main).not.toBe(initialPhoneState.local_main);
+  });
+
   it('keeps permanent async policy failures terminal instead of retrying them forever', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'terminal-policy-failure-device');
@@ -5710,6 +6012,7 @@ describe('Phase 1 sync without conflict resolution', () => {
 
     const checkpoint = JSON.parse(await readFile(join(deviceDir, '.obts', 'upload-transfer.json'), 'utf8')) as {
       transfer_id: string;
+      target_commit: string;
     };
     const session = JSON.parse(
       await readFile(join(server.config.transferDir, checkpoint.transfer_id, 'session.json'), 'utf8')
@@ -6129,7 +6432,10 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('this.app.vault.on("modify"');
     expect(pluginMain).toContain('adapter.writeBinary');
     expect(pluginMain).toContain('BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000');
-    expect(pluginMain).toContain('PERIODIC_FULL_SCAN_INTERVAL_MS = 5 * 60 * 1000');
+    expect(pluginMain).toContain('PERIODIC_INVENTORY_INTERVAL_MS = 6 * 60 * 60 * 1000');
+    expect(pluginMain).toContain('PERIODIC_FULL_AUDIT_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000');
+    expect(pluginMain).toContain('scan-state.json');
+    expect(pluginMain).toContain('scan-cache.json');
     expect(pluginMain).toContain('runBackgroundSync()');
     expect(pluginMain).toContain('runRemotePoll()');
     expect(pluginMain).toContain('runAutomaticSync()');
@@ -6140,12 +6446,13 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(queuedSync).toContain('if (this.isSyncInProgress())');
     expect(queuedSync).toContain('this.scheduleQueuedSync(SYNC_DEBOUNCE_MS)');
     expect(pluginMain).toContain('syncOnceOrPollResolvedConflict');
-    const backgroundSync = sourceSection(pluginMain, 'async runBackgroundSync()', 'async runAutomaticSync()');
+    const backgroundSync = sourceSection(pluginMain, 'async runBackgroundSync()', 'async runAutomaticSync(options = {})');
     expect(backgroundSync).toContain('isRetryableLocalError(state.last_error_code)');
-    expect(backgroundSync).toContain('await this.runAutomaticSync();');
+    expect(backgroundSync).toContain('backgroundScanDecision()');
+    expect(backgroundSync).toContain('scanDecision.required');
     expect(backgroundSync).toContain('await this.runRemotePoll();');
-    expect(backgroundSync).toContain('fullScanDue');
-    const automaticSync = sourceSection(pluginMain, 'async runAutomaticSync()', 'async handleAutomaticSyncError');
+    expect(backgroundSync).not.toContain('lastFullScanCompletedAt');
+    const automaticSync = sourceSection(pluginMain, 'async runAutomaticSync(options = {})', 'async handleAutomaticSyncError');
     expect(automaticSync).toContain('readPendingOnboarding()');
     expect(automaticSync).toContain('syncOnceOrPollResolvedConflict');
     expect(pluginMain).toContain('OPERATION_STATUS_HEARTBEAT_MS');
@@ -6167,7 +6474,9 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('handleStatusClick');
     expect(pluginMain).toContain('addRibbonIcon');
     expect(pluginMain).toContain('scheduleDegradedStatusNotice');
-    expect(pluginMain).toContain('Checking ${completed}/${total}');
+    expect(pluginMain).toContain('Checking changes');
+    expect(pluginMain).toContain('Verifying contents');
+    expect(pluginMain).toContain('obts-verify-local-vault');
     expect(pluginMain).toContain('Uploading ${uploadedChunks}/${groups.length}');
     expect(pluginMain).toContain('Applying ${completed}/${total}');
     expect(pluginMain).toContain('obts-settings-section-header');

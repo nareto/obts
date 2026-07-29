@@ -170,9 +170,10 @@ When a user edits local vault files, the visible local filesystem is the device'
 Acceptance criteria:
 
 - Local edits are durably committed or recoverably snapshotted before upload.
-- On startup and before sync decisions, the scanner commits visible filesystem differences to the local Git journal when path policy validation passes.
-- Watcher hints remain `Checking` until a scan proves a local commit exists; an unchanged scan clears its durable hint, and only a real unmerged local commit is `Ahead`.
-- Frequent remote event polling does not rescan vault contents. Full local scans run on startup, after watcher hints, and on a slower fallback cadence to catch missed events.
+- Watcher paths are persisted with the local queue and remain `Checking` until targeted reconciliation proves a local commit exists; an unchanged reconciliation clears the durable hint, and only a real unmerged local commit is `Ahead`.
+- Frequent remote event polling and plugin reload do not rescan vault contents. A schema-versioned `.obts/scan-state.json` watermark and `.obts/scan-cache.json` metadata/OID cache survive reload, and cache reuse requires both unchanged reliable filesystem identity metadata and the same Git blob identity.
+- Missed watcher events are a fallback concern rather than the normal sync path. Metadata inventory runs no more often than every six hours when no hint or cursor mismatch demands it; unchanged cached files are not reread. A complete byte-level audit runs weekly, can be requested explicitly through `Verify local vault contents`, and invalidates cache assumptions by hashing every syncable file.
+- Upgrading a converged, idle pre-watermark client seeds cache metadata only when its visible path set exactly matches its trusted local Git tree, without reading every file again. That migration evidence schedules the first byte-level audit within 24 hours; queued, blocked, divergent, or path-mismatched clients fail back to a full audit instead.
 - One sync decision reuses its coherent local snapshot instead of repeating whole-vault content checks around network transfer; apply revalidates affected paths immediately before writes and performs one explicitly labelled post-apply preservation scan.
 - The client persists separate seen-event and durably-applied-event cursors. Pulling data never acknowledges application for current-protocol clients; the server advances a device's `last_applied_main` only after an explicit post-apply acknowledgement, while a version-gated legacy pull acknowledgement remains during rollout.
 - Metadata durably pairs each device's acknowledged main/event cursor with its authoritative explicit-directory snapshot so replay does not depend on the bounded event-polling log. Migration blocks ambiguous behind-device snapshots rather than inventing an empty baseline.
@@ -229,7 +230,8 @@ Behavior:
 8. If plugin reload interrupts post-apply preservation, the apply journal remains durable, nonce-owned ref staging prevents cross-runtime lock reuse, and unacknowledged authoritative directory state replays before local directory proposals can upload.
 9. Directory proposals carry a stable proposal ID plus intent IDs, generations, base main/event provenance, and delete-then-create ancestry. The server persists one outcome per proposal ID, and acknowledgement clears only the exact intent generations covered by that outcome.
 10. Before advancing `main`, the server compares each proposal with the device's acknowledged directory snapshot and current canonical directory state. Disjoint or equivalent operations merge automatically; opposing create/delete operations on the same or ancestor/descendant paths create a durable directory or mixed conflict.
-11. Directory conflicts, including unknown-base legacy proposals, are resolved only through the dashboard. The plugin never presents keep-local or accept-server directory choices.
+11. A `stale_directory_proposal_base` rejection triggers causal baseline repair, not unsafe-local-state blocking. The client journals the rejected transfer, queued commit, refs, cursors, and original intent generations; proves the server-acknowledged main is an ancestor of trusted local main; retrieves the authoritative historical directory snapshot for local main; acknowledges only that already-materialized main; rebuilds effective intents against the recovered snapshot; and submits a fresh immutable proposal without replacing queued Git history or visible files. Missing history, invalid ancestry, or a mismatched recovery journal fails closed.
+12. Directory conflicts, including unknown-base legacy proposals, are resolved only through the dashboard. The plugin never presents keep-local or accept-server directory choices.
 12. Historical client recovery journals automatically discard absent superseded shells, but preserve existing ambiguous directories as legacy proposals for dashboard review. Local filesystem safety remains fail-closed and non-recursive, so non-empty content is preserved as new local work rather than recursively deleted.
 13. Historical states that predate directory intents cannot infer right-click folder-delete intent from the Git file tree alone.
 
@@ -457,7 +459,9 @@ Dashboard and plugin status labels must use this shared vocabulary:
 | Synced | Success | Device and server state are current. |
 | Uploading | Info | Device changes are being sent to the server. |
 | Applying | Info | Accepted server state is being written locally. |
-| Checking | Info | The server or client is verifying state. |
+| Checking | Info | The client is reconciling watcher-invalidated paths or filesystem metadata. |
+| Verifying contents | Info | The client is performing an explicit or scheduled byte-level vault audit. |
+| Repairing baseline | Info | The client is recovering authoritative directory causality while preserving queued local history. |
 | Merging | Info | The server is evaluating accepted device changes. |
 | Server retrying | Info | The durable proposal is retained while the server retries an internal processing failure. |
 | Ahead | Warning | The device has local committed changes not yet on server `main`. |
@@ -708,7 +712,7 @@ Acceptance criteria:
 - **SettingsView:** collects server URL and device name, launches the browser-assisted onboarding wizard, and shows resumable onboarding state.
 - **StatusBar:** displays Synced, Ahead, Behind, Uploading, Applying, Offline, Blocked, Unsafe local error, and Needs recovery.
 - **VaultWatcher:** observes local vault changes through Obsidian APIs.
-- **PeriodicScanner:** detects missed watcher events and crash recovery work.
+- **PeriodicScanner:** persists scan watermarks and file metadata/OID cache entries, runs bounded metadata inventories for missed watcher events, and reserves complete content hashing for scheduled or explicit integrity audits.
 - **PathNormalizer:** creates canonical vault-relative paths using `/` and normalized Unicode.
 - **LocalGitEngine:** uses `isomorphic-git` to maintain hidden Git state under `.obts/`, create commits from local vault changes, and import pulled server commits.
 - **ObsidianGitFsAdapter:** adapts `isomorphic-git` filesystem calls to Obsidian's `DataAdapter`, including mobile `CapacitorAdapter`.

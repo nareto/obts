@@ -4,36 +4,36 @@ graph LR
 
     subgraph 5 ["Obsidian True Sync"]
 
-      subgraph 20 ["Server API and CLI"]
+      subgraph 21 ["Server API and CLI"]
 
-        21["Auth service [Component: TypeScript]"]
-        22["Connection service [Component: TypeScript]"]
-        23["Chunk transfer service [Component: TypeScript]"]
-        24["Sync service [Component: TypeScript]"]
-        25["Git service [Component: Native Git]"]
-        26["Metadata store [Component: TypeScript]"]
-        27["Diagnostic service [Component: TypeScript]"]
-        28["Dashboard host [Component: Fastify]"]
+        22["Auth service [Component: TypeScript]"]
+        23["Connection service [Component: TypeScript]"]
+        24["Chunk transfer service [Component: TypeScript]"]
+        25["Sync service [Component: TypeScript]"]
+        26["Git service [Component: Native Git]"]
+        27["Metadata store [Component: TypeScript]"]
+        28["Diagnostic service [Component: TypeScript]"]
+        29["Dashboard host [Component: Fastify]"]
       end
 
-      15["Dashboard SPA [Container: Svelte, TypeScript, Vite]"]
-      31[("Metadata store [Container: JSON file adapter]")]
-      32["Vault Git stores [Container: Native Git bare repositories]"]
-      33["Transfer quarantine [Container: Filesystem, temporary bare Git repositories]"]
-      34["Semantic merge workspace [Container: Temporary filesystem]"]
+      16["Dashboard SPA [Container: Svelte, TypeScript, Vite]"]
+      32[("Metadata store [Container: JSON file adapter]")]
+      33["Vault Git stores [Container: Native Git bare repositories]"]
+      34["Transfer quarantine [Container: Filesystem, temporary bare Git repositories]"]
+      35["Semantic merge workspace [Container: Temporary filesystem]"]
       6["Obsidian plugin [Container: JavaScript, TypeScript, Obsidian Plugin API]"]
     end
 
-    6-. "Creates/resumes transfers, uploads missing packs, requests async processing, and polls [HTTPS]" .->23
-    23-. "Stores receipts, staged objects, processing state, and terminal results [Filesystem]" .->33
-    23-. "Queues a validated immutable proposal for canonical integration [In-process calls]" .->24
-    24-. "Checks ancestry, validates trees, and creates merge or protected conflict history [In-process calls]" .->25
-    24-. "Persists operation phases, merge order, events, acknowledgements, and conflicts [In-process calls]" .->26
-    25-. "Runs batched tree inspection, object promotion, temporary-index read-tree/write-tree merges, commit-tree, and ref CAS [Native Git]" .->32
-    25-. "Reads validated staged objects and promotes them after policy checks [Git alternates and filesystem]" .->33
-    25-. "Materializes semantic overlap candidates only [Filesystem]" .->34
-    26-. "Atomically reads and replaces durable metadata [Filesystem]" .->31
-    28-. "Serves built assets [HTTP]" .->15
-    27-. "Stores consented redacted diagnostic events [Filesystem]" .->31
+    6-. "Creates/resumes transfers, uploads missing packs, requests async processing, and polls [HTTPS]" .->24
+    24-. "Stores receipts, staged objects, processing state, and terminal results [Filesystem]" .->34
+    24-. "Queues a validated immutable proposal for canonical integration [In-process calls]" .->25
+    25-. "Checks ancestry, validates trees, and creates merge or protected conflict history [In-process calls]" .->26
+    25-. "Persists operation phases, merge order, events, acknowledgements, and conflicts [In-process calls]" .->27
+    26-. "Runs batched tree inspection, object promotion, temporary-index read-tree/write-tree merges, commit-tree, and ref CAS [Native Git]" .->33
+    26-. "Reads validated staged objects and promotes them after policy checks [Git alternates and filesystem]" .->34
+    26-. "Materializes semantic overlap candidates only [Filesystem]" .->35
+    27-. "Atomically reads and replaces durable metadata [Filesystem]" .->32
+    29-. "Serves built assets [HTTP]" .->16
+    28-. "Stores consented redacted diagnostic events [Filesystem]" .->32
 
   end

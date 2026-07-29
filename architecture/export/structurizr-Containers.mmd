@@ -9,29 +9,29 @@ graph LR
 
     subgraph 5 ["Obsidian True Sync"]
 
-      15["Dashboard SPA [Container: Svelte, TypeScript, Vite]"]
-      20["Server API and CLI [Container: TypeScript, Node.js, Fastify]"]
-      29["Visible vault [Container: Obsidian Vault API, filesystem]"]
-      30[".obts local store [Container: Filesystem]"]
-      31[("Metadata store [Container: JSON file adapter]")]
-      32["Vault Git stores [Container: Native Git bare repositories]"]
-      33["Transfer quarantine [Container: Filesystem, temporary bare Git repositories]"]
-      34["Semantic merge workspace [Container: Temporary filesystem]"]
+      16["Dashboard SPA [Container: Svelte, TypeScript, Vite]"]
+      21["Server API and CLI [Container: TypeScript, Node.js, Fastify]"]
+      30["Visible vault [Container: Obsidian Vault API, filesystem]"]
+      31[".obts local store [Container: Filesystem]"]
+      32[("Metadata store [Container: JSON file adapter]")]
+      33["Vault Git stores [Container: Native Git bare repositories]"]
+      34["Transfer quarantine [Container: Filesystem, temporary bare Git repositories]"]
+      35["Semantic merge workspace [Container: Temporary filesystem]"]
       6["Obsidian plugin [Container: JavaScript, TypeScript, Obsidian Plugin API]"]
     end
 
-    1-. "Connects devices and reviews conflicts [HTTPS]" .->15
+    1-. "Connects devices and reviews conflicts [HTTPS]" .->16
     2-. "Edits notes and observes synchronization [Obsidian UI]" .->6
-    3-. "Runs setup, health, repair, and maintenance commands [CLI and HTTPS]" .->20
+    3-. "Runs setup, health, repair, and maintenance commands [CLI and HTTPS]" .->21
     6-. "Uses plugin lifecycle, vault, workspace, request, and status APIs [Obsidian Plugin API]" .->4
-    20-. "Serves static dashboard assets [HTTP]" .->15
-    15-. "Calls authenticated dashboard and conflict APIs [HTTPS]" .->20
-    6-. "Uploads immutable Git/directory proposals, polls processing outcomes, pulls canonical state, and reports status [HTTPS]" .->20
-    6-. "Scans and safely applies visible vault content [Obsidian Vault API]" .->29
-    6-. "Persists local journal, immutable upload identity, credentials, cursors, and recovery evidence [Filesystem]" .->30
-    20-. "Reads and atomically replaces application metadata [Filesystem]" .->31
-    20-. "Validates objects and maintains canonical, device, and conflict refs [Git object and ref operations]" .->32
-    20-. "Persists resumable chunks, staged objects, and asynchronous terminal results [Filesystem]" .->33
-    20-. "Materializes only overlapping candidates requiring semantic validation [Filesystem]" .->34
+    21-. "Serves static dashboard assets [HTTP]" .->16
+    16-. "Calls authenticated dashboard and conflict APIs [HTTPS]" .->21
+    6-. "Uploads immutable Git/directory proposals, polls processing outcomes, pulls canonical state, and reports status [HTTPS]" .->21
+    6-. "Scans and safely applies visible vault content [Obsidian Vault API]" .->30
+    6-. "Persists local journal, immutable upload identity, credentials, cursors, and recovery evidence [Filesystem]" .->31
+    21-. "Reads and atomically replaces application metadata [Filesystem]" .->32
+    21-. "Validates objects and maintains canonical, device, and conflict refs [Git object and ref operations]" .->33
+    21-. "Persists resumable chunks, staged objects, and asynchronous terminal results [Filesystem]" .->34
+    21-. "Materializes only overlapping candidates requiring semantic validation [Filesystem]" .->35
 
   end

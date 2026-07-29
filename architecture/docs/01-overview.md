@@ -29,7 +29,24 @@ server classifies directory overlap before advancing canonical state, merges saf
 operations automatically, and routes directory or mixed ambiguity to dashboard
 conflicts. Pull/apply receives only accepted directory deltas and the current
 explicit set, creates missing empty folders, and removes tombstoned folders only
-through non-recursive empty-directory operations.
+through non-recursive empty-directory operations. A stale directory proposal
+baseline is repaired causally rather than treated as local corruption: the
+plugin journals and protects queued history, proves the server-acknowledged
+baseline is an ancestor of already-materialized local main, retrieves the
+historical authoritative directory snapshot, advances only that acknowledgement,
+and rebuilds effective intents. Invalid ancestry or unavailable history fails
+closed without writing visible files.
+
+Local change detection is watcher-first. The durable queue stores invalidated
+paths; `.obts/scan-cache.json` pairs reliable filesystem identity metadata with
+Git blob OIDs so reconciliation rereads only invalidated or metadata-changed
+files. `.obts/scan-state.json` persists the scanner schema, local cursor,
+directory generation, inventory watermark, and next complete-audit deadline
+across plugin reloads. Idle metadata inventory runs at a six-hour fallback
+cadence, while complete byte-level verification runs weekly or through the
+explicit verify command. A converged pre-watermark client may seed cache metadata
+only when its visible path set exactly equals trusted local Git, with a complete
+audit scheduled within 24 hours.
 
 Large uploads are immutable durable proposals. The plugin stores the target,
 directory proposal, object plan, attempt ID, and server transfer ID in
@@ -65,5 +82,6 @@ Key architectural constraints:
 - Default errors and events avoid raw tokens, Git pack data, blobs, and note
   bodies.
 - `.obts/` is client-local runtime state and is excluded from vault sync; recovery journals never become a client-side winner-selection UI.
+- Watcher hints drive normal local sync; bounded inventory and complete hashing are fallback integrity mechanisms, not ten-second or per-reload work.
 - Internal history exists only under the server Git store and `.obts/git`; no
   visible vault `.git` directory is created.

@@ -15,6 +15,7 @@ const state = {
   status_label: 'Checking',
   last_error_code: null,
   last_event_seq: 0,
+  last_applied_event_seq: 0,
   unpaired_baseline_vault_id: null,
   unpaired_baseline_main: null,
   updated_at: '2026-07-19T00:00:00.000Z'

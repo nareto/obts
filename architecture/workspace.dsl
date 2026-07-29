@@ -13,14 +13,15 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
       !adrs adrs
 
       plugin = container "Obsidian plugin" "Scans the visible vault, journals immutable local snapshots, uploads durable proposals, applies canonical main, and reports status." "JavaScript, TypeScript, Obsidian Plugin API" {
-        vaultWatcher = component "Vault watcher" "Records change hints without replacing an in-flight upload target." "Obsidian Vault API"
-        syncCoordinator = component "Sync coordinator" "Serializes local operations and drives scan, upload, result retrieval, pull, and apply phases." "JavaScript"
-        snapshotEngine = component "Snapshot engine" "Hashes visible files with bounded concurrency and writes local Git commits under .obts/git." "isomorphic-git"
+        vaultWatcher = component "Vault watcher" "Records durable invalidated paths without replacing an in-flight upload target." "Obsidian Vault API"
+        syncCoordinator = component "Sync coordinator" "Serializes local operations and drives targeted reconciliation, fallback audit, upload, result retrieval, causal baseline repair, pull, and apply phases." "JavaScript"
+        scanJournal = component "Scan journal" "Persists scanner schema, inventory/audit watermarks, filesystem identity metadata, and matching Git blob OIDs across reloads." "JSON under .obts"
+        snapshotEngine = component "Snapshot engine" "Reuses proven unchanged blob identities, hashes invalidated files with bounded concurrency, and writes local Git commits under .obts/git." "isomorphic-git"
         uploadJournal = component "Upload journal" "Persists one immutable target, directory proposal, object groups, attempt ID, and transfer ID until an authoritative result is consumed." "JSON under .obts"
         transportClient = component "Transport client" "Creates/resumes chunk transfers, uploads missing chunks, requests asynchronous finalization, and polls terminal outcomes." "HTTPS"
-        directoryTracker = component "Directory tracker" "Persists causal empty-directory intents and exact acknowledgement generations." "JSON under .obts"
+        directoryTracker = component "Directory tracker" "Persists causal empty-directory intents, exact acknowledgement generations, and crash-safe stale-baseline recovery evidence." "JSON under .obts"
         applyEngine = component "Apply and recovery engine" "Stages recovery evidence and safely materializes accepted files and explicit directories through Obsidian APIs." "Obsidian Vault API"
-        statusSurface = component "Status surface" "Shows monotonic checking, preparing, uploading, merging, applying, and settled states." "Obsidian UI"
+        statusSurface = component "Status surface" "Shows monotonic checking, content verification, baseline repair, preparing, uploading, merging, applying, and settled states." "Obsidian UI"
       }
 
       dashboard = container "Dashboard SPA" "Authenticated device status, conflict review, diagnostics, history, and maintenance UI served by the server." "Svelte, TypeScript, Vite" {
@@ -42,7 +43,7 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
       }
 
       localVault = container "Visible vault" "User-controlled Obsidian files. The filesystem is the device source of truth." "Obsidian Vault API, filesystem" "File System"
-      localStore = container ".obts local store" "Local Git journal, immutable upload journal, queue, causal directory state, apply journal, credentials, and recovery bundles. Excluded from synchronization." "Filesystem" "File System"
+      localStore = container ".obts local store" "Local Git journal, immutable upload journal, durable watcher paths, scan cache/watermark, causal directory and baseline-repair state, apply journal, credentials, and recovery bundles. Excluded from synchronization." "Filesystem" "File System"
       metadataStore = container "Metadata store" "Durable JSON metadata for accounts, devices, operations, events, conflicts, and directory proposal outcomes." "JSON file adapter" "Database"
       gitStore = container "Vault Git stores" "Bare repositories containing canonical main, protected device refs, conflict refs, and immutable Git objects." "Native Git bare repositories" "File System"
       transferStore = container "Transfer quarantine" "Durable resumable transfer sessions and validated staged Git objects, including processing and terminal outcomes." "Filesystem, temporary bare Git repositories" "File System"
@@ -136,19 +137,32 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
       }
     }
 
-    obts.plugin.vaultWatcher -> obts.plugin.syncCoordinator "Queues durable change hints" "In-process calls" {
+    obts.plugin.vaultWatcher -> obts.plugin.syncCoordinator "Queues durable invalidated paths" "In-process calls" {
       properties {
         "ops" "write"
         "protocol" "in-process"
       }
     }
-    obts.plugin.syncCoordinator -> obts.plugin.snapshotEngine "Requests a coherent snapshot only when no upload target is in flight" "In-process calls" {
+    obts.plugin.syncCoordinator -> obts.plugin.scanJournal "Checks durable inventory and complete-audit deadlines" "In-process calls" {
       properties {
         "ops" "read,write"
         "protocol" "in-process"
       }
     }
-    obts.plugin.snapshotEngine -> obts.localVault "Reads syncable files" "Obsidian DataAdapter" {
+    obts.plugin.scanJournal -> obts.localStore "Persists scan-state.json and scan-cache.json" "Filesystem" {
+      properties {
+        "ops" "read,write"
+        "protocol" "filesystem"
+        "write-surface" ".obts/scan-state.json,.obts/scan-cache.json"
+      }
+    }
+    obts.plugin.syncCoordinator -> obts.plugin.snapshotEngine "Requests targeted reconciliation or a fallback audit only when no upload target is in flight" "In-process calls" {
+      properties {
+        "ops" "read,write"
+        "protocol" "in-process"
+      }
+    }
+    obts.plugin.snapshotEngine -> obts.localVault "Inventories paths and reads only invalidated, metadata-changed, or audit-selected files" "Obsidian DataAdapter" {
       properties {
         "ops" "read"
         "protocol" "Obsidian DataAdapter"
@@ -187,11 +201,11 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
         "data" "attempt ID, plan digest, Git chunks, transfer status"
       }
     }
-    obts.plugin.directoryTracker -> obts.localStore "Persists observed directories and causal intent generations" "Filesystem" {
+    obts.plugin.directoryTracker -> obts.localStore "Persists observed directories, causal intent generations, and stale-baseline recovery journal" "Filesystem" {
       properties {
         "ops" "read,write"
         "protocol" "filesystem"
-        "write-surface" ".obts/directory-state.json"
+        "write-surface" ".obts/directory-state.json,.obts/directory-baseline-recovery.json"
       }
     }
     obts.plugin.syncCoordinator -> obts.plugin.applyEngine "Applies canonical main only after pending proposal outcomes settle" "In-process calls" {

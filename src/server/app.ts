@@ -2054,13 +2054,32 @@ function eventSnapshotForTarget(
   const mainEvent = [...vaultEvents].reverse().find((event) =>
     event.event_type === 'main_advanced' && event.commit_cursors.main === targetMain
   );
+  if (!mainEvent && targetMain !== vault?.root_commit) {
+    throw new AuthError(409, 'directory_snapshot_unavailable', 'Historical directory evidence for the requested main is unavailable.');
+  }
   const eventSeq = mainEvent?.event_seq ?? 0;
   const throughTarget = vaultEvents.filter((event) => event.event_seq <= eventSeq);
-  const directoryIntents = directoryIntentsFromEvents(
-    throughTarget.filter((event) => event.event_seq > afterEventSeq)
-  );
-  const explicit = new Set<string>();
-  for (const intent of directoryIntentsFromEvents(throughTarget)) {
+  const eventsAfterBaseline = throughTarget.filter((event) => event.event_seq > afterEventSeq);
+  if (eventSeq > afterEventSeq) {
+    let expectedEventSeq = afterEventSeq + 1;
+    for (const event of eventsAfterBaseline) {
+      if (event.event_seq !== expectedEventSeq) {
+        throw new AuthError(409, 'directory_snapshot_unavailable', 'Historical directory evidence is not contiguous through the requested main.');
+      }
+      expectedEventSeq += 1;
+    }
+    if (expectedEventSeq !== eventSeq + 1) {
+      throw new AuthError(409, 'directory_snapshot_unavailable', 'Historical directory evidence ends before the requested main.');
+    }
+  }
+  if (baseExplicitDirectories === undefined && eventSeq > 0 && throughTarget[0]?.event_seq !== 1) {
+    throw new AuthError(409, 'directory_snapshot_unavailable', 'Historical directory evidence does not include the initial directory baseline.');
+  }
+  const directoryIntents = directoryIntentsFromEvents(eventsAfterBaseline);
+  const explicit = new Set<string>(baseExplicitDirectories ?? []);
+  for (const intent of directoryIntentsFromEvents(
+    baseExplicitDirectories === undefined ? throughTarget : eventsAfterBaseline
+  )) {
     if (intent.op === 'delete') {
       for (const candidate of [...explicit]) {
         if (candidate === intent.path || candidate.startsWith(`${intent.path}/`)) explicit.delete(candidate);
