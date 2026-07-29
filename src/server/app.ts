@@ -427,8 +427,9 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
           const behindMain = device.status === 'synced' && device.last_applied_main !== vault.current_main;
           const offline = device.last_seen_at !== null && Date.now() - Date.parse(device.last_seen_at) > 24 * 60 * 60 * 1000;
           const localStatusFresh = isFreshDeviceStatus(device.last_status_report_at);
-          const localStatusLabel = localStatusFresh ? device.local_status_label : null;
-          const localErrorCode = localStatusFresh ? device.local_error_code : null;
+          const staleDeviceBlockReport = localStatusFresh && device.local_error_code === 'device_blocked';
+          const localStatusLabel = localStatusFresh && !staleDeviceBlockReport ? device.local_status_label : null;
+          const localErrorCode = localStatusFresh && !staleDeviceBlockReport ? device.local_error_code : null;
           const localQueueStatus = localStatusFresh ? device.local_queue_status : null;
           const pendingLocal = localStatusFresh &&
             device.local_head !== null &&

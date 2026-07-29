@@ -133,6 +133,7 @@ type SharedClientCore = {
   recordLocalChangeHint(paths: string[]): Promise<void>;
   syncOnce(options?: { confirmInitialImport?: boolean; fullAudit?: boolean }): Promise<SyncResult>;
   pullAndApply(allowDestructive: boolean): Promise<boolean>;
+  reconcileDeviceBlocked(fromCaughtError?: boolean): Promise<{ applied: boolean; status: string }>;
   pollRemoteEventsAndApply(): Promise<{ applied: boolean; status: string }>;
   replaceLocalWithServer(): Promise<{ status: string; main: string }>;
   rebuildFromServerMain(): Promise<RebuildResult>;
@@ -275,6 +276,10 @@ export class ObtsPluginClient {
 
   pullAndApply(options: { allowDestructive: boolean }): Promise<boolean> {
     return this.client.pullAndApply(options.allowDestructive);
+  }
+
+  reconcileDeviceBlocked(fromCaughtError = false): Promise<{ applied: boolean; status: string }> {
+    return this.client.reconcileDeviceBlocked(fromCaughtError);
   }
 
   pollRemoteEventsAndApply(): Promise<{ applied: boolean; status: string }> {
