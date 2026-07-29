@@ -1207,6 +1207,199 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(db.devices.find((candidate) => candidate.device_id === tabletState.device_id)?.status).toBe('synced');
   });
 
+  it('reconciles a delayed device block after keep-server resolution without resetting the device', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'desktop-delayed-device-block');
+    const tabletDir = join(root, 'tablet-delayed-device-block');
+    await mkdir(desktopDir, { recursive: true });
+    await mkdir(tabletDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await writeFile(join(desktopDir, 'shared.md'), 'base\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const tablet = await pairPlugin(admin, tabletDir, 'tablet');
+    await writeFile(join(desktopDir, 'shared.md'), 'server version\n');
+    await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const conflicted = await tablet.syncOnce();
+    expect(conflicted.status).toBe('Review needed');
+    const conflictState = await tablet.readState();
+
+    const review = await admin.get<{ conflict: { conflict_id: string; expected_main: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}`
+    );
+    await tablet.writeState({ ...conflictState, status_label: 'Behind', last_error_code: null });
+
+    let responseCaptured!: () => void;
+    const responseCapturedPromise = new Promise<void>((resolve) => {
+      responseCaptured = resolve;
+    });
+    let releaseResponse!: () => void;
+    const responseRelease = new Promise<void>((resolve) => {
+      releaseResponse = resolve;
+    });
+    const originalPull = tablet.transport.pull;
+    if (!originalPull) throw new Error('Pull transport is unavailable.');
+    tablet.transport.pull = async (input: Record<string, unknown>) => {
+      try {
+        return await originalPull(input);
+      } catch (error) {
+        responseCaptured();
+        await responseRelease;
+        throw error;
+      }
+    };
+    const delayedPull = tablet.pullAndApply({ allowDestructive: true }).then(
+      () => null,
+      (error: unknown) => error
+    );
+    await responseCapturedPromise;
+
+    await server.store.mutate((db) => {
+      const row = db.devices.find((candidate) => candidate.device_id === conflictState.device_id);
+      if (!row) return;
+      row.local_status_label = 'Needs recovery';
+      row.local_error_code = 'device_blocked';
+      row.local_queue_status = 'conflicted';
+      row.local_main = conflictState.local_main;
+      row.local_head = conflictState.local_head;
+      row.last_status_report_at = new Date().toISOString();
+    });
+    const openDashboard = await admin.get<{
+      devices: Array<{ device_name: string; status_label: string; local_error_code: string | null; blocked: boolean }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+    expect(openDashboard.body.devices.find((device) => device.device_name === 'tablet')).toMatchObject({
+      status_label: 'Review needed',
+      local_error_code: null,
+      blocked: true
+    });
+
+    const resolved = await admin.post<{ resolution_commit: string }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}/resolve`,
+      { expected_main: review.body.conflict.expected_main, resolution_kind: 'keep_server' }
+    );
+    expect(resolved.status).toBe(200);
+    const resolvedDashboard = await admin.get<{
+      devices: Array<{ device_name: string; status_label: string; local_error_code: string | null; blocked: boolean }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+    expect(resolvedDashboard.body.devices.find((device) => device.device_name === 'tablet')).toMatchObject({
+      status_label: 'Behind',
+      local_error_code: null,
+      blocked: false
+    });
+
+    releaseResponse();
+    const delayedError = await delayedPull;
+    tablet.transport.pull = originalPull;
+    expect(delayedError).toMatchObject({ code: 'device_blocked' });
+    expect((await tablet.readState()).last_error_code).toBeNull();
+
+    expect(await tablet.reconcileDeviceBlocked(true)).toMatchObject({ applied: true, status: 'Synced' });
+    const recoveredState = await tablet.readState();
+    expect(recoveredState).toMatchObject({
+      local_main: resolved.body.resolution_commit,
+      local_head: resolved.body.resolution_commit,
+      status_label: 'Synced',
+      last_error_code: null
+    });
+    expect(recoveredState.last_event_seq).toBeGreaterThanOrEqual(conflictState.last_event_seq);
+    expect(recoveredState.last_applied_event_seq).toBeGreaterThanOrEqual(conflictState.last_applied_event_seq);
+    expect(await tablet.readQueue()).toMatchObject({ pending_commit: null, status: 'idle' });
+    expect(await readFile(join(tabletDir, 'shared.md'), 'utf8')).toBe('server version\n');
+
+    await tablet.markBlocked('device_blocked');
+    const restarted = new ObtsPluginClient(tabletDir, { serverUrl: baseUrl, deviceName: 'tablet' });
+    await restarted.initialize();
+    expect((await restarted.readState()).last_error_code).toBe('device_blocked');
+    expect(await restarted.reconcileDeviceBlocked()).toMatchObject({ status: 'Synced' });
+    const restartedState = await restarted.readState();
+    expect(restartedState.last_event_seq).toBeGreaterThanOrEqual(recoveredState.last_event_seq);
+    expect(restartedState.last_applied_event_seq).toBeGreaterThanOrEqual(recoveredState.last_applied_event_seq);
+
+    await writeFile(join(tabletDir, 'after-recovery.md'), 'fast-forward after recovery\n');
+    expect((await restarted.syncOnce()).status).toBe('Synced');
+  });
+
+  it('preserves a genuine server recovery block during device-block reconciliation', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'server-recovery-block');
+    await mkdir(deviceDir, { recursive: true });
+    const device = await pairPlugin(admin, deviceDir, 'blocked-device');
+    const pairedState = await device.readState();
+    await server.store.mutate((db) => {
+      const row = db.devices.find((candidate) => candidate.device_id === pairedState.device_id);
+      if (row) row.status = 'blocked_recovery';
+    });
+
+    await device.markBlocked('device_blocked');
+    expect(await device.reconcileDeviceBlocked()).toEqual({ applied: false, status: 'Needs recovery' });
+    expect(await device.readState()).toMatchObject({
+      local_main: pairedState.local_main,
+      local_head: pairedState.local_head,
+      status_label: 'Needs recovery',
+      last_error_code: 'server_recovery_required'
+    });
+
+    const restarted = new ObtsPluginClient(deviceDir, { serverUrl: baseUrl, deviceName: 'blocked-device' });
+    await restarted.initialize();
+    expect(await restarted.readState()).toMatchObject({
+      status_label: 'Needs recovery',
+      last_error_code: 'server_recovery_required'
+    });
+    await expect(restarted.syncOnce()).rejects.toMatchObject({ code: 'server_recovery_required' });
+  });
+
+  it('does not overwrite newer local state while checking a stale device block', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'concurrent-device-block-recovery');
+    await mkdir(deviceDir, { recursive: true });
+    const device = await pairPlugin(admin, deviceDir, 'concurrent-device');
+    await device.markBlocked('device_blocked');
+
+    const internal = device.client as unknown as {
+      getDeviceSelf(token: string): Promise<Record<string, unknown>>;
+      pullAndApply(allowDestructive: boolean): Promise<boolean>;
+    };
+    const originalGetDeviceSelf = internal.getDeviceSelf.bind(internal);
+    const originalPullAndApply = internal.pullAndApply.bind(internal);
+    let responseCaptured!: () => void;
+    const responseCapturedPromise = new Promise<void>((resolve) => {
+      responseCaptured = resolve;
+    });
+    let releaseResponse!: () => void;
+    const responseRelease = new Promise<void>((resolve) => {
+      releaseResponse = resolve;
+    });
+    internal.getDeviceSelf = async (token) => {
+      const result = await originalGetDeviceSelf(token);
+      responseCaptured();
+      await responseRelease;
+      return result;
+    };
+    let pullAttempts = 0;
+    internal.pullAndApply = async () => {
+      pullAttempts += 1;
+      return false;
+    };
+
+    const reconciliation = device.reconcileDeviceBlocked();
+    await responseCapturedPromise;
+    const newerState = await device.readState();
+    await device.writeState({
+      ...newerState,
+      status_label: 'Synced',
+      last_error_code: null,
+      updated_at: new Date(Date.now() + 1_000).toISOString()
+    });
+    releaseResponse();
+
+    expect(await reconciliation).toEqual({ applied: false, status: 'Synced' });
+    expect(pullAttempts).toBe(0);
+    expect(await device.readState()).toMatchObject({ status_label: 'Synced', last_error_code: null });
+    internal.getDeviceSelf = originalGetDeviceSelf;
+    internal.pullAndApply = originalPullAndApply;
+  });
+
   it('serves note history, restores a version, and runs owner-scoped maintenance', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const desktopDir = join(root, 'desktop-history');

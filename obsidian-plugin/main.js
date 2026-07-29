@@ -21895,7 +21895,7 @@ var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var { createByteBudget, runBoundedWork } = require_work_pool();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.26";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.27";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_INVENTORY_INTERVAL_MS = 6 * 60 * 60 * 1e3;
@@ -22504,6 +22504,9 @@ module.exports = class ObtsPlugin extends Plugin {
     await this.flushWatcherHints();
     const state = await this.client.readState();
     if (!isPersistentAttentionStatus(statusBaseLabel(state.status_label))) this.setStatus("Checking");
+    if (state.last_error_code === "device_blocked") {
+      return await this.client.reconcileDeviceBlocked();
+    }
     if (state.last_error_code === "conflict_review_required") {
       return await this.client.pollRemoteEventsAndApply();
     }
@@ -22579,7 +22582,7 @@ module.exports = class ObtsPlugin extends Plugin {
     if (!state.vault_id || !state.device_id) {
       return;
     }
-    if (state.last_error_code && state.last_error_code !== "conflict_review_required" && !isRetryableLocalError(state.last_error_code)) {
+    if (state.last_error_code && state.last_error_code !== "conflict_review_required" && state.last_error_code !== "device_blocked" && !isRetryableLocalError(state.last_error_code)) {
       await this.client.reportDeviceStatus().catch(() => void 0);
       return;
     }
@@ -22616,7 +22619,7 @@ module.exports = class ObtsPlugin extends Plugin {
       if (!state.vault_id || !state.device_id) {
         return;
       }
-      if (state.last_error_code && state.last_error_code !== "conflict_review_required" && !isRetryableLocalError(state.last_error_code)) {
+      if (state.last_error_code && state.last_error_code !== "conflict_review_required" && state.last_error_code !== "device_blocked" && !isRetryableLocalError(state.last_error_code)) {
         await this.client.reportDeviceStatus().catch(() => void 0);
         return;
       }
@@ -22633,6 +22636,11 @@ module.exports = class ObtsPlugin extends Plugin {
   }
   async handleAutomaticSyncError(error) {
     void this.reportDeviceError(error);
+    try {
+      if (await this.tryReconcileDeviceBlocked(error)) return;
+    } catch (reconciliationError) {
+      error = reconciliationError;
+    }
     if (error instanceof ObtsBlockedError) {
       this.clearTransientSyncFailures();
       await this.client.markBlocked(error.code, error.details);
@@ -22671,6 +22679,16 @@ module.exports = class ObtsPlugin extends Plugin {
     this.setStatus((await this.client.readState()).status_label, { notify: false });
     await this.client.reportDeviceStatus().catch(() => void 0);
   }
+  async tryReconcileDeviceBlocked(error) {
+    if (!(error instanceof ObtsTransportError || error instanceof ObtsBlockedError) || error.code !== "device_blocked") {
+      return false;
+    }
+    await this.client.reconcileDeviceBlocked(true);
+    this.clearTransientSyncFailures();
+    this.setStatus((await this.client.readState()).status_label);
+    await this.client.reportDeviceStatus().catch(() => void 0);
+    return true;
+  }
   recordTransientSyncFailure() {
     this.transientSyncFailures += 1;
     const delay = Math.min(
@@ -22693,16 +22711,26 @@ module.exports = class ObtsPlugin extends Plugin {
       this.setStatus((await this.client.readState()).status_label);
       return result;
     } catch (error) {
+      let handledError = error;
       const message = error instanceof Error ? error.message : "obts sync failed.";
-      if (error instanceof ObtsTransportError && !isPermanentTransportError(error)) {
-        await this.handleAutomaticSyncError(error);
+      const deviceBlocked = (error instanceof ObtsTransportError || error instanceof ObtsBlockedError) && error.code === "device_blocked";
+      if (deviceBlocked) {
+        void this.reportDeviceError(error);
+        try {
+          if (await this.tryReconcileDeviceBlocked(error)) return;
+        } catch (reconciliationError) {
+          handledError = reconciliationError;
+        }
+      }
+      if (handledError instanceof ObtsTransportError && !isPermanentTransportError(handledError)) {
+        await this.handleAutomaticSyncError(handledError);
         if (showNotice) new Notice(message);
         return;
       }
-      void this.reportDeviceError(error);
-      const preserveError = error instanceof ObtsBlockedError || isPermanentTransportError(error);
-      const code = preserveError ? error.code : "sync_error";
-      await this.client.markBlocked(code, preserveError ? error.details : void 0);
+      if (!deviceBlocked || handledError !== error) void this.reportDeviceError(handledError);
+      const preserveError = handledError instanceof ObtsBlockedError || isPermanentTransportError(handledError);
+      const code = preserveError ? handledError.code : "sync_error";
+      await this.client.markBlocked(code, preserveError ? handledError.details : void 0);
       const blockedState = await this.client.readState();
       this.setStatus(blockedState.status_label, { notify: preserveError });
       await this.client.reportDeviceStatus().catch(() => void 0);
@@ -24100,6 +24128,56 @@ var ObtsObsidianClient = class {
     return await this.push(state.vault_id, token, Object.assign({}, manifest, {
       expected_device_ref: recoveredRef
     }), packfile);
+  }
+  async reconcileDeviceBlocked(fromCaughtError = false) {
+    const initialState = await this.readState();
+    if (!initialState.vault_id || !initialState.device_id) {
+      throw new ObtsBlockedError("not_paired", "Device is not paired.");
+    }
+    if (!fromCaughtError && initialState.last_error_code !== "device_blocked") {
+      return { applied: false, status: initialState.status_label };
+    }
+    const token = await this.readDeviceToken();
+    const self = await this.getDeviceSelf(token);
+    if (self.vault_id !== initialState.vault_id || self.device_id !== initialState.device_id) {
+      throw new ObtsBlockedError("device_identity_mismatch", "Server device identity does not match local sync state.");
+    }
+    await this.reconcileServerVaultStatus(self.vault_status, true);
+    const state = await this.readState();
+    const stateChangedDuringRequest = state.updated_at !== initialState.updated_at || state.last_error_code !== initialState.last_error_code || !sameStateCursors(state, initialState);
+    if (stateChangedDuringRequest || !fromCaughtError && state.last_error_code !== "device_blocked") {
+      return { applied: false, status: state.status_label };
+    }
+    if (self.status === "review_needed") {
+      await this.writeState(Object.assign({}, state, {
+        server_device_ref: self.server_device_ref,
+        status_label: "Review needed",
+        last_error_code: "conflict_review_required",
+        updated_at: nowIso()
+      }));
+      return { applied: false, status: "Review needed" };
+    }
+    if (self.status === "blocked_recovery") {
+      await this.writeState(Object.assign({}, state, {
+        server_device_ref: self.server_device_ref,
+        status_label: "Needs recovery",
+        last_error_code: "server_recovery_required",
+        updated_at: nowIso()
+      }));
+      return { applied: false, status: "Needs recovery" };
+    }
+    if (self.status === "revoked") {
+      throw new ObtsBlockedError("device_revoked", "This device has been revoked on the server.");
+    }
+    await this.writeState(Object.assign({}, state, {
+      server_device_ref: self.server_device_ref,
+      status_label: self.current_main === state.local_main ? "Checking" : "Behind",
+      last_error_code: null,
+      updated_at: nowIso()
+    }));
+    const applied = await this.pullAndApply(true);
+    const finalState = await this.readState();
+    return { applied, status: finalState.status_label };
   }
   async recoverUnacknowledgedServerApply() {
     const state = await this.readState();
@@ -26768,8 +26846,8 @@ var ObtsObsidianClient = class {
         local_main: repairedLocalMain,
         local_head: repairedLocalHead,
         initial_import_confirmed: true,
-        status_label: self.status === "review_needed" || self.status === "blocked_recovery" ? "Needs recovery" : "Checking",
-        last_error_code: self.status === "review_needed" || self.status === "blocked_recovery" ? "device_blocked" : null,
+        status_label: self.status === "review_needed" ? "Review needed" : self.status === "blocked_recovery" ? "Needs recovery" : "Checking",
+        last_error_code: self.status === "review_needed" ? "conflict_review_required" : self.status === "blocked_recovery" ? "server_recovery_required" : null,
         last_event_seq: self.event_seq,
         last_applied_event_seq: self.last_applied_event_seq || 0,
         unpaired_baseline_vault_id: null,
@@ -27826,7 +27904,7 @@ var ObtsObsidianClient = class {
     if (state.last_error_code === "directory_recovery_journal_invalid") {
       throw new ObtsBlockedError(state.last_error_code, "The directory recovery journal is invalid and must be preserved for recovery support.");
     }
-    if (state.last_error_code === "same_device_non_fast_forward" || state.last_error_code === "stale_device_ref" || state.last_error_code === "device_blocked" || state.last_error_code === "local_state_incomplete") {
+    if (state.last_error_code === "same_device_non_fast_forward" || state.last_error_code === "stale_device_ref" || state.last_error_code === "device_blocked" || state.last_error_code === "server_recovery_required" || state.last_error_code === "local_state_incomplete") {
       throw new ObtsBlockedError(state.last_error_code, "Device sync is blocked until recovery completes.");
     }
   }
@@ -28922,7 +29000,10 @@ function blockStatusLabel(code) {
   if (code === "directory_recovery_decision_required" || code === "directory_recovery_changed") {
     return "Directory decision required";
   }
-  if (code === "replace_local_with_server_required" || code === "device_blocked" || code === "stale_device_ref" || code === "same_device_non_fast_forward" || code === "local_state_incomplete") {
+  if (code === "device_blocked") {
+    return "Review needed";
+  }
+  if (code === "replace_local_with_server_required" || code === "server_recovery_required" || code === "stale_device_ref" || code === "same_device_non_fast_forward" || code === "local_state_incomplete") {
     return "Needs recovery";
   }
   if (code === "local_snapshot_changed") {
