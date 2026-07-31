@@ -108,8 +108,7 @@ export type DiagnosticBreadcrumb = {
   error_code: string;
 };
 
-export type DiagnosticEvent = {
-  schema_version: 1;
+type DiagnosticEventBase = {
   event_id: string;
   plugin_version: string;
   obsidian_version: string;
@@ -122,6 +121,45 @@ export type DiagnosticEvent = {
   breadcrumbs: DiagnosticBreadcrumb[];
   received_at: string;
 };
+
+export type TroubleshootingDiagnosticContext = {
+  attempt_id: string;
+  trigger: string;
+  phase: string;
+  outcome: string;
+  safe_error_code: string;
+  client_state: string;
+  lease_state: string;
+  state_source: string;
+  paired: boolean;
+  status_class: string;
+  queue_state: string;
+  apply_journal: string;
+  onboarding_journal: string;
+  transfer_journal: string;
+  pending_applied_ack: string;
+  cursor_guard: string;
+  reconcile_guard: string;
+  reconcile_timestamp: string;
+  reconcile_error: string;
+  reconcile_cursors: string;
+  server_device_status: string;
+  server_vault_status: string;
+  request_outcome: string;
+  http_status: string;
+  cursor_relations: {
+    local_head_to_local_main: string;
+    server_ref_to_local_head: string;
+    local_main_to_server_main: string;
+    event_to_applied: string;
+    event_to_server: string;
+  };
+};
+
+export type DiagnosticEvent = DiagnosticEventBase & (
+  | { schema_version: 1 }
+  | { schema_version: 2; context: TroubleshootingDiagnosticContext }
+);
 
 export type DiagnosticEventsResponse = {
   ingestion_enabled: boolean;

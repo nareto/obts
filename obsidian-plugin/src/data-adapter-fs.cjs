@@ -44,6 +44,27 @@ function createDataAdapterFs(adapter) {
       }
     },
 
+    async readFileBounded(filePath, maxBytes, options) {
+      const normalized = adapterPath(filePath);
+      return await withAdapterPathLocks(adapter, [normalized], async () => {
+        const metadata = await adapterStat(adapter, normalized);
+        if (!metadata) throw fsError("ENOENT", normalized);
+        if (metadata.type !== "file") throw fsError("EISDIR", normalized);
+        if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || metadata.size > maxBytes) {
+          throw fsError("EFBIG", normalized);
+        }
+        try {
+          const data = Buffer.from(await adapter.readBinary(normalized));
+          if (data.byteLength > maxBytes) throw fsError("EFBIG", normalized);
+          const encoding = typeof options === "string" ? options : options && options.encoding;
+          return encoding ? data.toString(encoding) : data;
+        } catch (error) {
+          if (error && error.code === "EFBIG") throw error;
+          throw await translateError(adapter, normalized, error, "ENOENT");
+        }
+      });
+    },
+
     async writeFile(filePath, data, options = {}) {
       const normalized = adapterPath(filePath);
       const flag = typeof options === "object" && options ? options.flag : undefined;

@@ -2,7 +2,7 @@ import {
   DIAGNOSTIC_MAX_BODY_BYTES,
   diagnosticPayloadBytes,
   parseDiagnosticEvent,
-  type DiagnosticEventV1
+  type DiagnosticEvent
 } from '../shared/diagnostics.js';
 import { nowIso } from '../shared/ids.js';
 import type { DiagnosticEventsResponse } from '../shared/types.js';
@@ -144,7 +144,7 @@ export class DiagnosticService {
     await this.store.mutate((db) => pruneRows(db, now));
   }
 
-  private parse(value: unknown): DiagnosticEventV1 {
+  private parse(value: unknown): DiagnosticEvent {
     if (diagnosticPayloadBytes(value) > DIAGNOSTIC_MAX_BODY_BYTES) {
       throw new AuthError(413, 'diagnostic_payload_too_large', 'Diagnostic report is too large.');
     }
@@ -178,7 +178,7 @@ export class DiagnosticService {
 
 function appendRow(
   db: MetadataDb,
-  event: DiagnosticEventV1,
+  event: DiagnosticEvent,
   retentionDays: number,
   association: { ownerUserId: string; connectionId: string | null; vaultId: string | null; deviceId: string | null }
 ): void {

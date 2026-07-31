@@ -100,6 +100,7 @@ describe('mobile plugin artifact', () => {
     const ribbonActions: Array<() => void> = [];
     const layoutReadyCallbacks: Array<() => void> = [];
     const settingTabs: any[] = [];
+    const commands = new Map<string, { callback: () => unknown }>();
     const renderedSettingNames: string[] = [];
     const renderedSettingDescriptions: string[] = [];
     const renderedElementTexts: string[] = [];
@@ -162,7 +163,7 @@ describe('mobile plugin artifact', () => {
         return item;
       }
       addSettingTab(tab: any) { settingTabs.push(tab); }
-      addCommand() {}
+      addCommand(command: { id: string; callback: () => unknown }) { commands.set(command.id, command); }
       registerEvent() {}
       registerInterval(id: ReturnType<typeof setInterval>) { clearInterval(id); }
       registerDomEvent(target: any, name: string, listener: (event: any) => void) {
@@ -535,7 +536,7 @@ describe('mobile plugin artifact', () => {
     (plugin as any).client.readDeviceToken = async () => 'test-device-token';
     (plugin as any).settings.shareErrorDiagnostics = true;
     (plugin as any).settings.diagnosticConsentServer = 'http://127.0.0.1:3000';
-    (plugin as any).settings.diagnosticConsentVersion = 1;
+    (plugin as any).settings.diagnosticConsentVersion = 2;
     (plugin as any).setInitializationStage('Starting local state checks', null);
     expect(stallWatchdog).toBeNull();
     await (plugin as any).prepareInitializationDiagnosticAuth();
@@ -933,6 +934,10 @@ describe('mobile plugin artifact', () => {
     });
     expect(requests).toHaveLength(0);
     await (plugin as any).setDiagnosticSharing(true);
+    (plugin as any).settings.diagnosticConsentVersion = 1;
+    expect((plugin as any).diagnosticSharingEnabled()).toBe(false);
+    (plugin as any).settings.diagnosticConsentVersion = 2;
+    expect((plugin as any).diagnosticSharingEnabled()).toBe(true);
     await (plugin as any).reportOnboardingError(diagnosticError, {
       connection_id: 'con_safe',
       connection_secret: 'obts_conn_private'
@@ -997,6 +1002,142 @@ describe('mobile plugin artifact', () => {
     });
     expect(JSON.stringify(lifecycleBody)).not.toContain('private lifecycle detail');
 
+    const diagnosticClient = (plugin as any).client;
+    const sensitiveCommit = 'a'.repeat(40);
+    await diagnosticClient.writeState({
+      ...(await diagnosticClient.readState()),
+      user_id: 'usr_diagnostic',
+      vault_id: 'vlt_diagnostic',
+      device_id: 'dev_diagnostic',
+      local_main: sensitiveCommit,
+      local_head: 'b'.repeat(40),
+      server_device_ref: 'b'.repeat(40),
+      status_label: 'Review needed',
+      last_error_code: 'device_blocked',
+      last_event_seq: 67,
+      last_applied_event_seq: 67,
+      updated_at: new Date().toISOString()
+    });
+    await adapter.writeBinary(
+      '.obts/auth/device-token.json',
+      new TextEncoder().encode(JSON.stringify({ device_token: 'obts_dev_snapshot_secret' })).buffer
+    );
+    await adapter.writeBinary('.obts/queue.json', new TextEncoder().encode(JSON.stringify({
+      pending_commit: 'b'.repeat(40),
+      expected_device_ref: 'b'.repeat(40),
+      status: 'conflicted',
+      changed_paths: ['private-note.md'],
+      attempts: 0,
+      change_seq: 1,
+      updated_at: new Date().toISOString()
+    })).buffer);
+    await adapter.writeBinary(
+      '.obts/onboarding.json',
+      new TextEncoder().encode(JSON.stringify({
+        version: 1,
+        stage: 'complete',
+        connection: { connection_id: 'con_diagnostic', secret: 'diagnostic-content-canary' },
+        selected_mode: null,
+        last_error_code: null,
+        updated_at: new Date().toISOString()
+      })).buffer
+    );
+    const writesBeforeSnapshot = vi.fn();
+    const originalAdapterWriteBinary = adapter.writeBinary.bind(adapter);
+    adapter.writeBinary = async (...args: Parameters<typeof adapter.writeBinary>) => {
+      writesBeforeSnapshot();
+      return await originalAdapterWriteBinary(...args);
+    };
+    const requestsBeforeSnapshot = requests.length;
+    expect((plugin as any).beginSync()).toBe(true);
+    expect(commands.has('obts-send-troubleshooting-snapshot')).toBe(true);
+    await Promise.all([
+      (plugin as any).sendTroubleshootingSnapshotNow(),
+      (plugin as any).sendTroubleshootingSnapshotNow()
+    ]);
+    (plugin as any).endSync();
+    expect(requests).toHaveLength(requestsBeforeSnapshot + 1);
+    expect(writesBeforeSnapshot).not.toHaveBeenCalled();
+    const snapshotBody = JSON.parse(String(requests.at(-1)?.body)) as Record<string, any>;
+    expect(snapshotBody).toMatchObject({
+      schema_version: 2,
+      failure_code: 'troubleshooting_snapshot',
+      context: {
+        trigger: 'manual',
+        safe_error_code: 'device_blocked',
+        lease_state: 'owned_active',
+        state_source: 'primary',
+        paired: true,
+        status_class: 'review',
+        queue_state: 'conflicted',
+        onboarding_journal: 'complete',
+        server_device_status: 'not_observed',
+        request_outcome: 'not_attempted',
+        cursor_relations: {
+          local_head_to_local_main: 'different',
+          server_ref_to_local_head: 'equal',
+          event_to_applied: 'equal'
+        }
+      }
+    });
+    const serializedSnapshot = JSON.stringify(snapshotBody);
+    expect(serializedSnapshot).not.toContain('private-note.md');
+    expect(serializedSnapshot).not.toContain('diagnostic-content-canary');
+    expect(serializedSnapshot).not.toContain('obts_dev_snapshot_secret');
+    expect(serializedSnapshot).not.toContain(sensitiveCommit);
+
+    const automaticDetails = {
+      phase: 'checking_guard',
+      outcome: 'skipped',
+      safeErrorCode: 'device_blocked',
+      reconcileGuard: 'timestamp_changed',
+      reconcileTimestamp: 'changed',
+      reconcileError: 'unchanged',
+      reconcileCursors: 'unchanged',
+      requestOutcome: 'succeeded',
+      httpStatus: 200,
+      serverSelf: { status: 'synced', vault_status: 'active', current_main: 'c'.repeat(40), event_seq: 81 }
+    };
+    const requestsBeforeAutomaticSnapshots = requests.length;
+    await (plugin as any).sendTroubleshootingSnapshot('reconcile_guard', { ...automaticDetails, attemptId: `rca_${'1'.repeat(32)}` });
+    await (plugin as any).sendTroubleshootingSnapshot('reconcile_guard', { ...automaticDetails, attemptId: `rca_${'2'.repeat(32)}` });
+    expect(requests).toHaveLength(requestsBeforeAutomaticSnapshots + 1);
+    await (plugin as any).sendTroubleshootingSnapshot('reconcile_guard', {
+      ...automaticDetails,
+      attemptId: `rca_${'3'.repeat(32)}`,
+      reconcileCursors: 'changed'
+    });
+    expect(requests).toHaveLength(requestsBeforeAutomaticSnapshots + 2);
+    (plugin as any).settings.serverUrl = 'https://replacement.example';
+    (plugin as any).settings.diagnosticConsentServer = 'https://replacement.example';
+    await (plugin as any).sendTroubleshootingSnapshot('reconcile_guard', {
+      ...automaticDetails,
+      attemptId: `rca_${'4'.repeat(32)}`,
+      reconcileCursors: 'changed'
+    });
+    expect(requests).toHaveLength(requestsBeforeAutomaticSnapshots + 3);
+    expect(requests.at(-1)?.url).toBe('https://replacement.example/api/v1/device/diagnostic-events');
+    (plugin as any).settings.serverUrl = 'http://127.0.0.1:3000';
+    (plugin as any).settings.diagnosticConsentServer = 'http://127.0.0.1:3000';
+    expect(writesBeforeSnapshot).not.toHaveBeenCalled();
+    expect(JSON.stringify(requests.slice(requestsBeforeAutomaticSnapshots))).not.toContain('c'.repeat(40));
+    adapter.writeBinary = originalAdapterWriteBinary;
+
+    const savedPrimaryState = await adapter.readBinary('.obts/state.json');
+    await adapter.writeBinary('.obts/state.json', new TextEncoder().encode('{"unexpected":"state"}').buffer);
+    expect(await diagnosticClient.collectTroubleshootingContext({ trigger: 'manual' })).toMatchObject({
+      state_source: 'backup',
+      paired: true
+    });
+    await adapter.writeBinary('.obts/state.json', savedPrimaryState);
+    await adapter.writeBinary('.obts/apply-journal.json', Uint8Array.from({ length: 256 * 1024 + 1 }, () => 97).buffer);
+    expect(await diagnosticClient.collectTroubleshootingContext({ trigger: 'manual' })).toMatchObject({
+      state_source: 'primary',
+      apply_journal: 'invalid'
+    });
+    await adapter.remove('.obts/apply-journal.json');
+    const requestsAfterTroubleshooting = requests.length;
+
     const originalReadState = (plugin as any).client.readState.bind((plugin as any).client);
     const currentState = await originalReadState();
     let resolveState!: (value: unknown) => void;
@@ -1010,7 +1151,7 @@ describe('mobile plugin artifact', () => {
     resolveState(currentState);
     await racedReport;
     (plugin as any).client.readState = originalReadState;
-    expect(requests).toHaveLength(4);
+    expect(requests).toHaveLength(requestsAfterTroubleshooting);
     expect((plugin as any).diagnosticSharingEnabled()).toBe(false);
     expect(savedSettings.length).toBeGreaterThan(0);
 
