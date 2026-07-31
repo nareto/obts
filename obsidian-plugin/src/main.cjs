@@ -32,7 +32,8 @@ const MOBILE_PACK_READ_RETRY_MS = 100;
 const RETIRED_OPERATION_GRACE_MS = 1500;
 const REF_LOCK_STALE_MS = 30 * 1000;
 const PLUGIN_UPDATE_URL = "obsidian://brat?plugin=nareto%2Fobts";
-const DIAGNOSTIC_CONSENT_VERSION = 1;
+const DIAGNOSTIC_CONSENT_VERSION = 2;
+const TROUBLESHOOTING_DEDUP_MS = 15 * 60 * 1000;
 const DIAGNOSTIC_CONTEXT = Symbol("obtsDiagnosticContext");
 
 const DEFAULT_SETTINGS = {
@@ -115,6 +116,9 @@ module.exports = class ObtsPlugin extends Plugin {
     this.reportedOperationStalls = new Set();
     this.layoutStarted = false;
     this.reportedDiagnosticErrors = new WeakSet();
+    this.reportedTroubleshootingTransitions = new Map();
+    this.pendingTroubleshootingTransitions = new Map();
+    this.manualTroubleshootingInFlight = null;
     this.diagnosticNoticeShown = false;
     this.deviceNameRevision = 0;
     this.setStatus("Checking");
@@ -167,6 +171,14 @@ module.exports = class ObtsPlugin extends Plugin {
       callback: async () => {
         const result = await this.runUserAction(() => this.client.rebuildFromServerMain());
         if (result && shouldShowRoutineStatusNotice(result.status)) new Notice(`obts: ${result.status}`);
+      }
+    });
+
+    this.addCommand({
+      id: "obts-send-troubleshooting-snapshot",
+      name: "Send troubleshooting snapshot now",
+      callback: async () => {
+        await this.sendTroubleshootingSnapshotNow();
       }
     });
 
@@ -516,6 +528,81 @@ module.exports = class ObtsPlugin extends Plugin {
       }
     } catch {
       // Diagnostic delivery is best effort and never changes sync behavior.
+    }
+  }
+
+  async sendTroubleshootingSnapshot(trigger, details = {}, manual = false) {
+    if (this.unloaded || !this.diagnosticSharingEnabled()) {
+      if (manual) new Notice("obts: Enable sanitized troubleshooting diagnostics for this server first.", 15000);
+      return false;
+    }
+    const consentDestination = this.settings.diagnosticConsentServer;
+    try {
+      const context = await this.client.collectTroubleshootingContext(Object.assign({}, details, { trigger }));
+      if (!context.paired) {
+        if (manual) new Notice("obts: Pair this device before sending a troubleshooting snapshot.", 15000);
+        return false;
+      }
+      const signature = `${consentDestination}:${troubleshootingTransitionSignature(context)}`;
+      const lastSentAt = this.reportedTroubleshootingTransitions.get(signature) || 0;
+      if (!manual && Date.now() - lastSentAt < TROUBLESHOOTING_DEDUP_MS) return false;
+      if (!manual && this.pendingTroubleshootingTransitions.has(signature)) {
+        return await this.pendingTroubleshootingTransitions.get(signature);
+      }
+      const delivery = (async () => {
+        const token = await this.client.readDeviceToken();
+        if (
+          this.unloaded ||
+          !this.diagnosticSharingEnabled() ||
+          this.settings.diagnosticConsentServer !== consentDestination
+        ) return false;
+        const report = buildTroubleshootingDiagnostic(context);
+        const response = await fetchWithTimeout(`${consentDestination}/api/v1/device/diagnostic-events`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+          body: JSON.stringify(report)
+        });
+        if (!response.ok) {
+          if (manual) new Notice("obts: The troubleshooting snapshot could not be accepted by the server.", 15000);
+          return false;
+        }
+        this.reportedTroubleshootingTransitions.set(signature, Date.now());
+        while (this.reportedTroubleshootingTransitions.size > 64) {
+          this.reportedTroubleshootingTransitions.delete(this.reportedTroubleshootingTransitions.keys().next().value);
+        }
+        if (manual) {
+          new Notice("obts: Sent a sanitized troubleshooting snapshot.");
+        } else if (!this.diagnosticNoticeShown) {
+          this.diagnosticNoticeShown = true;
+          new Notice(`obts sent a sanitized troubleshooting diagnostic to ${consentDestination}.`);
+        }
+        return true;
+      })();
+      if (!manual) this.pendingTroubleshootingTransitions.set(signature, delivery);
+      try {
+        return await delivery;
+      } finally {
+        if (this.pendingTroubleshootingTransitions.get(signature) === delivery) {
+          this.pendingTroubleshootingTransitions.delete(signature);
+        }
+      }
+    } catch {
+      if (manual) new Notice("obts: Troubleshooting snapshot unavailable; no diagnostic was sent.", 15000);
+      return false;
+    }
+  }
+
+  async sendTroubleshootingSnapshotNow() {
+    if (this.manualTroubleshootingInFlight) return await this.manualTroubleshootingInFlight;
+    this.manualTroubleshootingInFlight = this.sendTroubleshootingSnapshot("manual", {
+      attemptId: this.client.activeReconciliation && this.client.activeReconciliation.attemptId || "none",
+      phase: this.client.activeReconciliation && this.client.activeReconciliation.phase || "none",
+      outcome: "observed"
+    }, true);
+    try {
+      return await this.manualTroubleshootingInFlight;
+    } finally {
+      this.manualTroubleshootingInFlight = null;
     }
   }
 
@@ -911,7 +998,7 @@ module.exports = class ObtsPlugin extends Plugin {
     if (!(error instanceof ObtsTransportError || error instanceof ObtsBlockedError) || error.code !== "device_blocked") {
       return false;
     }
-    await this.client.reconcileDeviceBlocked(true);
+    await this.client.reconcileDeviceBlocked(true, error.code);
     this.clearTransientSyncFailures();
     this.setStatus((await this.client.readState()).status_label);
     await this.client.reportDeviceStatus().catch(() => undefined);
@@ -1141,6 +1228,69 @@ class ObtsObsidianClient {
     this.queueMutation = Promise.resolve();
     this.packPlanCache = new Map();
     this.lastSnapshotWasFullAudit = false;
+    this.activeReconciliation = null;
+    this.lastCursorGuardDiagnostic = "not_observed";
+  }
+
+  async collectTroubleshootingContext(details = {}) {
+    const [primaryState, backupState, queue, applyJournal, onboardingJournal, pendingAck, ...transferJournals] = await Promise.all([
+      readRawTroubleshootingJson(this.fsp, this.statePath, isTroubleshootingState),
+      readRawTroubleshootingJson(this.fsp, `${this.statePath}.bak`, isTroubleshootingState),
+      readRawTroubleshootingJson(this.fsp, this.queuePath, isTroubleshootingQueue),
+      readRawTroubleshootingJson(this.fsp, this.applyJournalPath, isTroubleshootingApplyJournal),
+      readRawTroubleshootingJson(this.fsp, this.onboardingJournalPath, isTroubleshootingOnboardingJournal),
+      readRawTroubleshootingJson(this.fsp, this.pendingAppliedAckPath, isTroubleshootingPendingAck),
+      readRawTroubleshootingJson(this.fsp, this.bootstrapTransferPath, isTroubleshootingBootstrapTransfer),
+      readRawTroubleshootingJson(this.fsp, this.pullTransferPath, isTroubleshootingPullTransfer),
+      readRawTroubleshootingJson(this.fsp, this.uploadTransferPath, isUploadTransferCheckpoint)
+    ]);
+    let state = null;
+    let stateSource = "default";
+    if (primaryState.kind === "valid") {
+      state = primaryState.value;
+      stateSource = "primary";
+    } else if (backupState.kind === "valid") {
+      state = backupState.value;
+      stateSource = "backup";
+    } else if (primaryState.kind !== "absent" || backupState.kind !== "absent") {
+      stateSource = "unreadable";
+    }
+    const server = details.serverSelf && typeof details.serverSelf === "object" ? details.serverSelf : null;
+    const capturedState = details.capturedState && typeof details.capturedState === "object" ? details.capturedState : state;
+    const safeErrorCode = troubleshootingSafeErrorCode(details.safeErrorCode || capturedState && capturedState.last_error_code);
+    return {
+      attempt_id: isTroubleshootingAttemptId(details.attemptId) ? details.attemptId : "none",
+      trigger: troubleshootingEnum(details.trigger, ["manual", "reconcile_start", "reconcile_guard", "reconcile_finish", "reconcile_failure"], "manual"),
+      phase: troubleshootingEnum(details.phase, ["none", "requesting_server", "checking_guard", "applying", "finished", "failed"], "none"),
+      outcome: troubleshootingEnum(details.outcome, ["observed", "succeeded", "skipped", "blocked", "failed"], "observed"),
+      safe_error_code: safeErrorCode,
+      client_state: this.plugin.unloaded ? "unloaded" : this.plugin.clientReady ? "ready" : this.plugin.clientInitialization ? "initializing" : "uninitialized",
+      lease_state: troubleshootingLeaseState(this.plugin),
+      state_source: stateSource,
+      paired: Boolean(capturedState && capturedState.vault_id && capturedState.device_id),
+      status_class: troubleshootingStatusClass(capturedState && capturedState.status_label),
+      queue_state: troubleshootingQueueState(queue),
+      apply_journal: troubleshootingApplyJournalState(applyJournal),
+      onboarding_journal: troubleshootingOnboardingState(onboardingJournal),
+      transfer_journal: troubleshootingCombinedPresence(transferJournals),
+      pending_applied_ack: troubleshootingPresence(pendingAck),
+      cursor_guard: troubleshootingEnum(details.cursorGuard || this.lastCursorGuardDiagnostic, ["not_observed", "no_preservation", "local_main", "local_head", "server_ref", "event_cursor", "multiple"], "not_observed"),
+      reconcile_guard: troubleshootingEnum(details.reconcileGuard, ["not_observed", "unchanged", "timestamp_changed", "error_changed", "cursor_changed", "multiple"], "not_observed"),
+      reconcile_timestamp: troubleshootingEnum(details.reconcileTimestamp, ["unchanged", "changed", "unknown"], "unknown"),
+      reconcile_error: troubleshootingEnum(details.reconcileError, ["unchanged", "changed", "unknown"], "unknown"),
+      reconcile_cursors: troubleshootingEnum(details.reconcileCursors, ["unchanged", "changed", "unknown"], "unknown"),
+      server_device_status: troubleshootingEnum(server && server.status, ["paired", "synced", "ahead", "review_needed", "blocked_recovery", "revoked"], server ? "unknown" : "not_observed"),
+      server_vault_status: troubleshootingEnum(server && server.vault_status, ["active", "blocked_integrity"], server ? "unknown" : "not_observed"),
+      request_outcome: troubleshootingEnum(details.requestOutcome, ["not_attempted", "succeeded", "blocked", "transport_failed", "http_failed", "failed"], "not_attempted"),
+      http_status: troubleshootingHttpStatus(details.httpStatus),
+      cursor_relations: details.cursorRelations || {
+        local_head_to_local_main: troubleshootingCursorRelation(capturedState && capturedState.local_head, capturedState && capturedState.local_main),
+        server_ref_to_local_head: troubleshootingCursorRelation(capturedState && capturedState.server_device_ref, capturedState && capturedState.local_head),
+        local_main_to_server_main: troubleshootingCursorRelation(capturedState && capturedState.local_main, server && server.current_main),
+        event_to_applied: troubleshootingSequenceRelation(capturedState && capturedState.last_event_seq, capturedState && capturedState.last_applied_event_seq),
+        event_to_server: troubleshootingSequenceRelation(capturedState && capturedState.last_event_seq, server && server.event_seq)
+      }
+    };
   }
 
   async initialize() {
@@ -2490,7 +2640,7 @@ class ObtsObsidianClient {
     }), packfile);
   }
 
-  async reconcileDeviceBlocked(fromCaughtError = false) {
+  async reconcileDeviceBlocked(fromCaughtError = false, triggeringErrorCode = null) {
     const initialState = await this.readState();
     if (!initialState.vault_id || !initialState.device_id) {
       throw new ObtsBlockedError("not_paired", "Device is not paired.");
@@ -2499,52 +2649,151 @@ class ObtsObsidianClient {
       return { applied: false, status: initialState.status_label };
     }
 
-    const token = await this.readDeviceToken();
-    const self = await this.getDeviceSelf(token);
-    if (self.vault_id !== initialState.vault_id || self.device_id !== initialState.device_id) {
-      throw new ObtsBlockedError("device_identity_mismatch", "Server device identity does not match local sync state.");
-    }
-    await this.reconcileServerVaultStatus(self.vault_status, true);
-
-    const state = await this.readState();
-    const stateChangedDuringRequest =
-      state.updated_at !== initialState.updated_at ||
-      state.last_error_code !== initialState.last_error_code ||
-      !sameStateCursors(state, initialState);
-    if (stateChangedDuringRequest || (!fromCaughtError && state.last_error_code !== "device_blocked")) {
-      return { applied: false, status: state.status_label };
-    }
-    if (self.status === "review_needed") {
-      await this.writeState(Object.assign({}, state, {
-        server_device_ref: self.server_device_ref,
-        status_label: "Review needed",
-        last_error_code: "conflict_review_required",
-        updated_at: nowIso()
-      }));
-      return { applied: false, status: "Review needed" };
-    }
-    if (self.status === "blocked_recovery") {
-      await this.writeState(Object.assign({}, state, {
-        server_device_ref: self.server_device_ref,
-        status_label: "Needs recovery",
-        last_error_code: "server_recovery_required",
-        updated_at: nowIso()
-      }));
-      return { applied: false, status: "Needs recovery" };
-    }
-    if (self.status === "revoked") {
-      throw new ObtsBlockedError("device_revoked", "This device has been revoked on the server.");
-    }
-
-    await this.writeState(Object.assign({}, state, {
-      server_device_ref: self.server_device_ref,
-      status_label: self.current_main === state.local_main ? "Checking" : "Behind",
-      last_error_code: null,
-      updated_at: nowIso()
+    const attemptId = `rca_${randomHex(16)}`;
+    const attempt = { attemptId, phase: "requesting_server", cursorGuard: "not_observed" };
+    this.activeReconciliation = attempt;
+    let self = null;
+    let capturedState = initialState;
+    let reconcileGuard = "not_observed";
+    let reconcileTimestamp = "unknown";
+    let reconcileError = "unknown";
+    let reconcileCursors = "unknown";
+    const diagnosticDetails = (details = {}) => Object.assign({
+      attemptId,
+      phase: attempt.phase,
+      cursorGuard: attempt.cursorGuard,
+      reconcileGuard,
+      reconcileTimestamp,
+      reconcileError,
+      reconcileCursors,
+      serverSelf: self,
+      ...(capturedState ? {
+        capturedState,
+        cursorRelations: troubleshootingCursorRelationsForState(capturedState, self)
+      } : {})
+    }, details);
+    void this.plugin.sendTroubleshootingSnapshot("reconcile_start", diagnosticDetails({
+      outcome: "observed",
+      safeErrorCode: triggeringErrorCode || initialState.last_error_code,
+      requestOutcome: "not_attempted"
     }));
-    const applied = await this.pullAndApply(true);
-    const finalState = await this.readState();
-    return { applied, status: finalState.status_label };
+    try {
+      const token = await this.readDeviceToken();
+      self = await this.getDeviceSelf(token);
+      attempt.phase = "checking_guard";
+      if (self.vault_id !== initialState.vault_id || self.device_id !== initialState.device_id) {
+        throw new ObtsBlockedError("device_identity_mismatch", "Server device identity does not match local sync state.");
+      }
+      await this.reconcileServerVaultStatus(self.vault_status, true);
+
+      const state = await this.readState();
+      capturedState = state;
+      const timestampChanged = state.updated_at !== initialState.updated_at;
+      const errorChanged = state.last_error_code !== initialState.last_error_code;
+      const cursorsChanged = !sameStateCursors(state, initialState);
+      reconcileTimestamp = timestampChanged ? "changed" : "unchanged";
+      reconcileError = errorChanged ? "changed" : "unchanged";
+      reconcileCursors = cursorsChanged ? "changed" : "unchanged";
+      const guardChanges = [timestampChanged, errorChanged, cursorsChanged].filter(Boolean).length;
+      reconcileGuard = guardChanges > 1
+        ? "multiple"
+        : timestampChanged
+          ? "timestamp_changed"
+          : errorChanged
+            ? "error_changed"
+            : cursorsChanged
+              ? "cursor_changed"
+              : "unchanged";
+      const stateChangedDuringRequest = timestampChanged || errorChanged || cursorsChanged;
+      void this.plugin.sendTroubleshootingSnapshot("reconcile_guard", diagnosticDetails({
+        outcome: stateChangedDuringRequest ? "skipped" : "observed",
+        safeErrorCode: state.last_error_code,
+        requestOutcome: "succeeded",
+        httpStatus: 200
+      }));
+      if (stateChangedDuringRequest || (!fromCaughtError && state.last_error_code !== "device_blocked")) {
+        return { applied: false, status: state.status_label };
+      }
+      if (self.status === "review_needed") {
+        const nextState = Object.assign({}, state, {
+          server_device_ref: self.server_device_ref,
+          status_label: "Review needed",
+          last_error_code: "conflict_review_required",
+          updated_at: nowIso()
+        });
+        await this.writeState(nextState);
+        capturedState = await this.readState();
+        attempt.phase = "finished";
+        void this.plugin.sendTroubleshootingSnapshot("reconcile_finish", diagnosticDetails({
+          outcome: "blocked",
+          safeErrorCode: "conflict_review_required",
+          requestOutcome: "succeeded",
+          httpStatus: 200
+        }));
+        return { applied: false, status: "Review needed" };
+      }
+      if (self.status === "blocked_recovery") {
+        const nextState = Object.assign({}, state, {
+          server_device_ref: self.server_device_ref,
+          status_label: "Needs recovery",
+          last_error_code: "server_recovery_required",
+          updated_at: nowIso()
+        });
+        await this.writeState(nextState);
+        capturedState = await this.readState();
+        attempt.phase = "finished";
+        void this.plugin.sendTroubleshootingSnapshot("reconcile_finish", diagnosticDetails({
+          outcome: "blocked",
+          safeErrorCode: "server_recovery_required",
+          requestOutcome: "succeeded",
+          httpStatus: 200
+        }));
+        return { applied: false, status: "Needs recovery" };
+      }
+      if (self.status === "revoked") {
+        throw new ObtsBlockedError("device_revoked", "This device has been revoked on the server.");
+      }
+
+      const nextState = Object.assign({}, state, {
+        server_device_ref: self.server_device_ref,
+        status_label: self.current_main === state.local_main ? "Checking" : "Behind",
+        last_error_code: null,
+        updated_at: nowIso()
+      });
+      await this.writeState(nextState);
+      capturedState = await this.readState();
+      attempt.phase = "applying";
+      const applied = await this.pullAndApply(true);
+      capturedState = await this.readState();
+      attempt.phase = "finished";
+      void this.plugin.sendTroubleshootingSnapshot("reconcile_finish", diagnosticDetails({
+        outcome: "succeeded",
+        safeErrorCode: capturedState.last_error_code,
+        requestOutcome: "succeeded",
+        httpStatus: 200
+      }));
+      return { applied, status: capturedState.status_label };
+    } catch (error) {
+      if (attempt.phase === "applying") capturedState = null;
+      const requestOutcome = error instanceof ObtsTransportError
+        ? error.status === 0
+          ? "transport_failed"
+          : isPermanentTransportError(error)
+            ? "blocked"
+            : "http_failed"
+        : self
+          ? "succeeded"
+          : "failed";
+      void this.plugin.sendTroubleshootingSnapshot("reconcile_failure", diagnosticDetails({
+        outcome: error instanceof ObtsBlockedError || isPermanentTransportError(error) ? "blocked" : "failed",
+        safeErrorCode: error && typeof error === "object" ? error.code : null,
+        requestOutcome,
+        httpStatus: error instanceof ObtsTransportError ? error.status : self ? 200 : null
+      }));
+      throw error;
+    } finally {
+      if (this.activeReconciliation === attempt) this.activeReconciliation = null;
+    }
   }
 
   async recoverUnacknowledgedServerApply() {
@@ -5335,20 +5584,25 @@ class ObtsObsidianClient {
   async guardStateCursorRegression(nextState) {
     const currentState = await this.readPrimaryState();
     if (!currentState || !samePairedDeviceState(currentState, nextState)) {
+      this.lastCursorGuardDiagnostic = "no_preservation";
       return nextState;
     }
     const guardedState = Object.assign({}, nextState);
+    const preserved = new Set();
     let cursorRegressed = false;
     if (await this.shouldPreserveCurrentCursor(nextState.local_main, currentState.local_main)) {
       guardedState.local_main = currentState.local_main;
+      preserved.add("local_main");
       cursorRegressed = true;
     }
     if (await this.shouldPreserveCurrentCursor(nextState.local_head, currentState.local_head)) {
       guardedState.local_head = currentState.local_head;
+      preserved.add("local_head");
       cursorRegressed = true;
     }
     if (await this.shouldPreserveCurrentCursor(nextState.server_device_ref, currentState.server_device_ref)) {
       guardedState.server_device_ref = currentState.server_device_ref;
+      preserved.add("server_ref");
       cursorRegressed = true;
     }
     if (currentState.initial_import_confirmed && !guardedState.initial_import_confirmed) {
@@ -5356,12 +5610,25 @@ class ObtsObsidianClient {
     }
     if (currentState.last_event_seq > guardedState.last_event_seq) {
       guardedState.last_event_seq = currentState.last_event_seq;
+      preserved.add("event_cursor");
     }
     if (
       guardedState.local_main === currentState.local_main &&
       (currentState.last_applied_event_seq || 0) > guardedState.last_applied_event_seq
     ) {
       guardedState.last_applied_event_seq = currentState.last_applied_event_seq;
+      preserved.add("event_cursor");
+    }
+    this.lastCursorGuardDiagnostic = preserved.size === 0
+      ? "no_preservation"
+      : preserved.size === 1
+        ? [...preserved][0]
+        : "multiple";
+    if (this.activeReconciliation) {
+      this.activeReconciliation.cursorGuard = combineTroubleshootingCursorGuards(
+        this.activeReconciliation.cursorGuard,
+        this.lastCursorGuardDiagnostic
+      );
     }
     if (cursorRegressed) {
       guardedState.status_label = currentState.status_label;
@@ -6839,7 +7106,7 @@ class ObtsOnboardingModal extends Modal {
         if (text.inputEl) text.inputEl.maxLength = 80;
       });
     new Setting(contentEl)
-      .setName("Share error diagnostics with this obts server")
+      .setName("Share sanitized troubleshooting diagnostics")
       .setDesc(diagnosticSharingDescription(this.plugin.settings.serverUrl))
       .addToggle((toggle) => toggle.setValue(this.plugin.diagnosticSharingEnabled()).onChange(async (value) => {
         try {
@@ -7147,7 +7414,7 @@ class ObtsSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Share error diagnostics with this obts server")
+      .setName("Share sanitized troubleshooting diagnostics")
       .setDesc(diagnosticSharingDescription(this.plugin.settings.serverUrl))
       .addToggle((toggle) => toggle.setValue(this.plugin.diagnosticSharingEnabled()).onChange(async (value) => {
         try {
@@ -7157,6 +7424,20 @@ class ObtsSettingTab extends PluginSettingTab {
         }
         await this.display();
       }));
+    new Setting(containerEl)
+      .setName("Troubleshooting snapshot")
+      .setDesc("Send the current sanitized sync-state classifications without waiting for another failure.")
+      .addButton((button) => button
+        .setButtonText("Send snapshot now")
+        .setDisabled(!this.plugin.diagnosticSharingEnabled())
+        .onClick(async () => {
+          button.setDisabled(true);
+          try {
+            await this.plugin.sendTroubleshootingSnapshotNow();
+          } finally {
+            button.setDisabled(!this.plugin.diagnosticSharingEnabled());
+          }
+        }));
 
     const sectionHeader = containerEl.createDiv({ cls: "obts-settings-section-header" });
     sectionHeader.createEl("h3", {
@@ -7408,7 +7689,7 @@ function normalizeDisplayName(value) {
 
 function diagnosticSharingDescription(serverUrl) {
   const destination = normalizedServerDestination(serverUrl) || "the configured obts backend";
-  return `When obts fails or a startup checkpoint stalls, send a small sanitized technical report to ${destination}. Reports include plugin and platform versions, the failing operation, fixed error codes, and diagnostic checkpoints. They never include note content, vault or file names, paths, credentials, Git objects, packfiles, or raw logs.`;
+  return `When obts fails, stalls, or reconciles a stale block, send a small sanitized technical report to ${destination}. Reports include plugin and platform versions, fixed error codes, coarse queue/journal/lease states, and cursor relationships without cursor values. They never include note content, vault or file names, paths, credentials, commit IDs, Git objects, packfiles, or raw logs.`;
 }
 
 function formatElapsed(milliseconds) {
@@ -8403,6 +8684,279 @@ function annotateDiagnosticError(error, context) {
   }
 }
 
+async function readRawTroubleshootingJson(fsp, filePath, validate = () => true) {
+  try {
+    const raw = await fsp.readFileBounded(filePath, 256 * 1024, "utf8");
+    if (typeof raw !== "string") return { kind: "invalid", value: null };
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !validate(parsed)) {
+      return { kind: "invalid", value: null };
+    }
+    return { kind: "valid", value: parsed };
+  } catch (error) {
+    if (error && typeof error === "object" && String(error.code || "").toLowerCase() === "enoent") {
+      return { kind: "absent", value: null };
+    }
+    if (error instanceof SyntaxError || error && typeof error === "object" && error.code === "EFBIG") {
+      return { kind: "invalid", value: null };
+    }
+    return { kind: "unreadable", value: null };
+  }
+}
+
+function isTroubleshootingState(value) {
+  const nullableString = (candidate) => candidate === null || typeof candidate === "string";
+  const pairedIdentity =
+    (typeof value.vault_id === "string" && typeof value.device_id === "string") ||
+    (value.vault_id === null && value.device_id === null);
+  return pairedIdentity &&
+    typeof value.status_label === "string" &&
+    nullableString(value.last_error_code) &&
+    nullableString(value.local_main) &&
+    nullableString(value.local_head) &&
+    nullableString(value.server_device_ref) &&
+    Number.isSafeInteger(value.last_event_seq) && value.last_event_seq >= 0 &&
+    Number.isSafeInteger(value.last_applied_event_seq) && value.last_applied_event_seq >= 0;
+}
+
+function isTroubleshootingQueue(value) {
+  return typeof value.status === "string" &&
+    (value.pending_commit === null || typeof value.pending_commit === "string") &&
+    Array.isArray(value.changed_paths);
+}
+
+function isTroubleshootingApplyJournal(value) {
+  try {
+    parseApplyJournal(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isTroubleshootingOnboardingJournal(value) {
+  const stages = new Set([
+    "awaiting_browser",
+    "approved",
+    "analyzing",
+    "awaiting_confirmation",
+    "registering",
+    "applying_uploading",
+    "uploading_proposal",
+    "awaiting_conflict",
+    "complete",
+    "blocked"
+  ]);
+  return value.version === 1 &&
+    typeof value.stage === "string" && stages.has(value.stage) &&
+    value.connection && typeof value.connection === "object" && !Array.isArray(value.connection) &&
+    Object.hasOwn(value, "selected_mode") &&
+    (value.last_error_code === null || typeof value.last_error_code === "string");
+}
+
+function isTroubleshootingPendingAck(value) {
+  return isGitObjectId(value.target_main) &&
+    Number.isSafeInteger(value.event_seq) && value.event_seq >= 0 &&
+    typeof value.created_at === "string";
+}
+
+function isTroubleshootingBootstrapTransfer(value) {
+  return typeof value.connection_id === "string" &&
+    isGitObjectId(value.target_main) &&
+    Number.isSafeInteger(value.next_cursor) && value.next_cursor >= 0 &&
+    Number.isSafeInteger(value.received_chunks) && value.received_chunks >= 0 &&
+    Number.isSafeInteger(value.transferred_bytes) && value.transferred_bytes >= 0 &&
+    typeof value.updated_at === "string";
+}
+
+function isTroubleshootingPullTransfer(value) {
+  return typeof value.vault_id === "string" && typeof value.device_id === "string" &&
+    (value.current_local_main === null || isGitObjectId(value.current_local_main)) &&
+    Number.isSafeInteger(value.current_event_seq) && value.current_event_seq >= 0 &&
+    isGitObjectId(value.target_main) &&
+    Number.isSafeInteger(value.next_cursor) && value.next_cursor >= 0 &&
+    Number.isSafeInteger(value.received_chunks) && value.received_chunks >= 0 &&
+    Number.isSafeInteger(value.transferred_bytes) && value.transferred_bytes >= 0 &&
+    typeof value.updated_at === "string";
+}
+
+function troubleshootingEnum(value, allowed, fallback) {
+  return allowed.includes(value) ? value : fallback;
+}
+
+function isTroubleshootingAttemptId(value) {
+  return typeof value === "string" && /^(?:none|rca_[0-9a-f]{32})$/u.test(value);
+}
+
+function troubleshootingSafeErrorCode(value) {
+  const allowed = new Set([
+    "none",
+    "device_blocked",
+    "conflict_review_required",
+    "server_recovery_required",
+    "blocked_integrity",
+    "device_revoked",
+    "device_identity_mismatch",
+    "not_paired",
+    "sync_lease_blocked",
+    "operation_interrupted_by_reload",
+    "local_state_incomplete",
+    "same_device_non_fast_forward",
+    "apply_recovery_required",
+    "directory_recovery_decision_required",
+    "directory_recovery_changed",
+    "directory_recovery_journal_invalid",
+    "network_error",
+    "http_error",
+    "sync_error",
+    "unknown"
+  ]);
+  if (value === null || value === undefined || value === "") return "none";
+  return allowed.has(value) ? value : "unknown";
+}
+
+function troubleshootingLeaseState(plugin) {
+  try {
+    const lease = operationRegistry().get(plugin.app.vault.adapter);
+    if (!lease) return "available";
+    const owner = operationLeaseOwner(lease);
+    if (lease.retiring) return "retiring";
+    if (owner && owner.unloaded) return "restart_required";
+    if (owner === plugin) return "owned_active";
+    return "other_active";
+  } catch {
+    return "unknown";
+  }
+}
+
+function troubleshootingStatusClass(label) {
+  if (label === null || label === undefined) return "unpaired";
+  if (label === "Checking" || label === "Applying" || label === "Uploading" || label === "Merging") return "checking";
+  if (label === "Synced") return "synced";
+  if (label === "Ahead") return "ahead";
+  if (label === "Behind") return "behind";
+  if (label === "Review needed" || label === "Stale review") return "review";
+  if (label === "Needs recovery") return "recovery";
+  if (label === "Unsafe local state" || label === "Blocked" || label === "Integrity failure") return "unsafe";
+  if (label === "Offline" || label === "Retrying" || label === "Server retrying") return "retrying";
+  return "other";
+}
+
+function troubleshootingQueueState(read) {
+  if (read.kind === "absent") return "absent";
+  if (read.kind === "invalid") return "invalid";
+  if (read.kind === "unreadable") return "unreadable";
+  const queue = read.value;
+  if (queue.status === "conflicted") return "conflicted";
+  if (typeof queue.pending_commit === "string" && queue.pending_commit) return "pending_upload";
+  if (Array.isArray(queue.changed_paths) && queue.changed_paths.length > 0) return "hint_only";
+  if (queue.status === "idle" || queue.status === "merged" || queue.status === "queued_local") return "idle";
+  return "invalid";
+}
+
+function troubleshootingApplyJournalState(read) {
+  if (read.kind !== "valid") return read.kind;
+  return troubleshootingEnum(read.value.phase, [
+    "planned",
+    "recovery_bundle_written",
+    "writing_files",
+    "verifying",
+    "committed",
+    "blocked_recovery"
+  ], "invalid");
+}
+
+function troubleshootingOnboardingState(read) {
+  if (read.kind !== "valid") return read.kind;
+  return troubleshootingEnum(read.value.stage, [
+    "awaiting_browser",
+    "approved",
+    "analyzing",
+    "awaiting_confirmation",
+    "awaiting_conflict",
+    "registered",
+    "blocked",
+    "complete"
+  ], "other");
+}
+
+function troubleshootingPresence(read) {
+  if (read.kind === "valid") return "present";
+  return read.kind;
+}
+
+function troubleshootingCombinedPresence(reads) {
+  if (reads.some((read) => read.kind === "unreadable")) return "unreadable";
+  if (reads.some((read) => read.kind === "invalid")) return "invalid";
+  if (reads.some((read) => read.kind === "valid")) return "present";
+  return "absent";
+}
+
+function combineTroubleshootingCursorGuards(current, next) {
+  if (!current || current === "not_observed") return next;
+  if (!next || next === "not_observed" || next === "no_preservation") return current;
+  if (current === "no_preservation") return next;
+  return current === next ? current : "multiple";
+}
+
+function troubleshootingCursorRelation(left, right) {
+  const leftMissing = left === null || left === undefined;
+  const rightMissing = right === null || right === undefined;
+  if (leftMissing && rightMissing) return "both_null";
+  if (leftMissing) return "left_null";
+  if (rightMissing) return "right_null";
+  if (typeof left !== "string" || typeof right !== "string") return "unknown";
+  return left === right ? "equal" : "different";
+}
+
+function troubleshootingSequenceRelation(left, right) {
+  if (!Number.isSafeInteger(left) || left < 0 || !Number.isSafeInteger(right) || right < 0) return "invalid";
+  if (left === right) return "equal";
+  return left < right ? "behind" : "ahead";
+}
+
+function troubleshootingCursorRelationsForState(state, server) {
+  return {
+    local_head_to_local_main: troubleshootingCursorRelation(state && state.local_head, state && state.local_main),
+    server_ref_to_local_head: troubleshootingCursorRelation(state && state.server_device_ref, state && state.local_head),
+    local_main_to_server_main: troubleshootingCursorRelation(state && state.local_main, server && server.current_main),
+    event_to_applied: troubleshootingSequenceRelation(state && state.last_event_seq, state && state.last_applied_event_seq),
+    event_to_server: troubleshootingSequenceRelation(state && state.last_event_seq, server && server.event_seq)
+  };
+}
+
+function troubleshootingHttpStatus(status) {
+  if (status === null || status === undefined) return "none";
+  if (status === 0) return "network";
+  if (Number.isInteger(status) && status >= 200 && status < 300) return "success";
+  if ([400, 401, 403, 404, 409, 413, 429, 500, 502, 503, 504].includes(status)) return `http_${status}`;
+  if (Number.isInteger(status) && status >= 400 && status < 500) return "other_4xx";
+  if (Number.isInteger(status) && status >= 500 && status < 600) return "other_5xx";
+  return "unknown";
+}
+
+function troubleshootingTransitionSignature(context) {
+  return JSON.stringify(Object.assign({}, context, { attempt_id: "none" }));
+}
+
+function buildTroubleshootingDiagnostic(context) {
+  const blocked = context.safe_error_code !== "none" && context.safe_error_code !== "unknown";
+  return {
+    schema_version: 2,
+    event_id: `dgr_${randomHex(16)}`,
+    plugin_version: PLUGIN_VERSION,
+    obsidian_version: typeof apiVersion === "string" && apiVersion ? apiVersion : "unknown",
+    platform_family: Platform && Platform.isIosApp ? "ios" : Platform && Platform.isAndroidApp ? "android" : "desktop",
+    flow: "recovery",
+    stage: "recovery",
+    failure_code: "troubleshooting_snapshot",
+    error_class: blocked ? "blocked_error" : "unknown",
+    retryable: false,
+    breadcrumbs: [],
+    context
+  };
+}
+
 function diagnosticContextForError(error) {
   let current = error;
   for (let depth = 0; depth < 5 && current && typeof current === "object"; depth += 1) {
@@ -8587,3 +9141,4 @@ function nowIso() {
 module.exports.ObtsClientCore = ObtsObsidianClient;
 module.exports.PluginBlockedError = ObtsBlockedError;
 module.exports.TransportError = ObtsTransportError;
+module.exports.buildTroubleshootingDiagnostic = buildTroubleshootingDiagnostic;

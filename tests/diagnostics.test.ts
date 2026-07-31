@@ -28,6 +28,50 @@ const report = {
   ]
 } as const;
 
+const troubleshootingReport = {
+  ...report,
+  schema_version: 2,
+  event_id: 'dgr_123456789abcdef0123456789abcdef0',
+  flow: 'recovery',
+  stage: 'recovery',
+  failure_code: 'troubleshooting_snapshot',
+  error_class: 'blocked_error',
+  breadcrumbs: [],
+  context: {
+    attempt_id: 'rca_123456789abcdef0123456789abcdef0',
+    trigger: 'reconcile_guard',
+    phase: 'checking_guard',
+    outcome: 'skipped',
+    safe_error_code: 'device_blocked',
+    client_state: 'ready',
+    lease_state: 'owned_active',
+    state_source: 'primary',
+    paired: true,
+    status_class: 'review',
+    queue_state: 'conflicted',
+    apply_journal: 'absent',
+    onboarding_journal: 'complete',
+    transfer_journal: 'absent',
+    pending_applied_ack: 'absent',
+    cursor_guard: 'no_preservation',
+    reconcile_guard: 'cursor_changed',
+    reconcile_timestamp: 'unchanged',
+    reconcile_error: 'unchanged',
+    reconcile_cursors: 'changed',
+    server_device_status: 'synced',
+    server_vault_status: 'active',
+    request_outcome: 'succeeded',
+    http_status: 'success',
+    cursor_relations: {
+      local_head_to_local_main: 'different',
+      server_ref_to_local_head: 'equal',
+      local_main_to_server_main: 'different',
+      event_to_applied: 'equal',
+      event_to_server: 'behind'
+    }
+  }
+} as const;
+
 describe('opt-in error diagnostics backend', () => {
   const roots: string[] = [];
   const servers: ObtsServer[] = [];
@@ -133,6 +177,29 @@ describe('opt-in error diagnostics backend', () => {
     expect((await fixture.server.store.snapshot()).diagnostic_events).toEqual([]);
   });
 
+  it('accepts troubleshooting schema v2 without changing schema v1 rows', async () => {
+    const fixture = await setupFixture(true);
+    const connection = await createConnection(fixture.baseUrl);
+    await approveNewVault(fixture, connection.connection_id);
+    const completion = await completeConnection(fixture.baseUrl, connection.connection_id, connection.connection_secret);
+
+    expect((await postDiagnostic(`${fixture.baseUrl}/api/v1/device/diagnostic-events`, completion.device_token, {
+      ...report,
+      plugin_version: '0.4.0-beta.1'
+    })).status).toBe(202);
+    expect((await postDiagnostic(
+      `${fixture.baseUrl}/api/v1/device/diagnostic-events`,
+      completion.device_token,
+      troubleshootingReport
+    )).status).toBe(202);
+
+    const listed = await fixture.adminGet('/api/v1/diagnostic-events');
+    expect((listed.body.events as Array<Record<string, unknown>>).map((event) => event.schema_version)).toEqual([2, 1]);
+    expect((listed.body.events as Array<Record<string, unknown>>)[0]).toMatchObject(troubleshootingReport);
+    const snapshot = await fixture.server.store.snapshot();
+    expect(snapshot.diagnostic_events.map((event) => event.schema_version).sort()).toEqual([1, 2]);
+  });
+
   it('rejects disabled ingestion, wrong credentials, extra fields, and privacy canaries', async () => {
     const disabled = await setupFixture(false);
     const disabledConnection = await createConnection(disabled.baseUrl);
@@ -164,6 +231,47 @@ describe('opt-in error diagnostics backend', () => {
     );
     expect(rejected.status).toBe(400);
     expect(JSON.stringify(await enabled.server.store.snapshot())).not.toContain('diagnostic-secret-body');
+
+    const troubleshootingCanary = {
+      ...troubleshootingReport,
+      event_id: 'dgr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      context: {
+        ...troubleshootingReport.context,
+        note_path: 'private-note.md'
+      }
+    };
+    const rejectedTroubleshooting = await postDiagnostic(
+      `${enabled.baseUrl}/api/v1/connections/${connection.connection_id}/diagnostic-events`,
+      connection.connection_secret,
+      troubleshootingCanary
+    );
+    expect(rejectedTroubleshooting.status).toBe(400);
+    const rejectedTroubleshootingValue = await postDiagnostic(
+      `${enabled.baseUrl}/api/v1/connections/${connection.connection_id}/diagnostic-events`,
+      connection.connection_secret,
+      {
+        ...troubleshootingReport,
+        event_id: 'dgr_cccccccccccccccccccccccccccccccc',
+        context: { ...troubleshootingReport.context, safe_error_code: 'private-note.md' }
+      }
+    );
+    expect(rejectedTroubleshootingValue.status).toBe(400);
+    expect((await postDiagnostic(
+      `${enabled.baseUrl}/api/v1/connections/${connection.connection_id}/diagnostic-events`,
+      connection.connection_secret,
+      { ...report, event_id: 'dgr_dddddddddddddddddddddddddddddddd', failure_code: 'troubleshooting_snapshot' }
+    )).status).toBe(400);
+    expect((await postDiagnostic(
+      `${enabled.baseUrl}/api/v1/connections/${connection.connection_id}/diagnostic-events`,
+      connection.connection_secret,
+      { ...troubleshootingReport, event_id: 'dgr_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', flow: 'sync' }
+    )).status).toBe(400);
+    expect((await postDiagnostic(
+      `${enabled.baseUrl}/api/v1/connections/${connection.connection_id}/diagnostic-events`,
+      connection.connection_secret,
+      { ...troubleshootingReport, event_id: 'dgr_ffffffffffffffffffffffffffffffff', plugin_version: '0.4.28-private-note.md' }
+    )).status).toBe(400);
+    expect(JSON.stringify(await enabled.server.store.snapshot())).not.toContain('private-note.md');
   });
 
   it('prunes reports by server retention time and rejects out-of-range retention configuration', async () => {

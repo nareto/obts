@@ -1082,6 +1082,32 @@ pre {
   font-size: 12px;
 }
 
+.diagnostic-context {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+  margin: 14px 0 0;
+}
+
+.diagnostic-context div {
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+
+.diagnostic-context dt {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.diagnostic-context dd {
+  margin: 3px 0 0;
+  font-size: 12px;
+}
+
 .diagnostic-trace {
   display: grid;
   gap: 6px;

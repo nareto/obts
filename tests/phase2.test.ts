@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { ObtsPluginClient } from '../obsidian-plugin/src/core/client.js';
+import { ObtsPluginClient, TransportError } from '../obsidian-plugin/src/core/client.js';
 import type { ApplyJournal } from '../obsidian-plugin/src/core/recovery.js';
 import { createObtsServer, type ObtsServer } from '../src/server/app.js';
 
@@ -1349,12 +1349,86 @@ describe('Phase 2 dashboard conflict resolution', () => {
     await expect(restarted.syncOnce()).rejects.toMatchObject({ code: 'server_recovery_required' });
   });
 
+  it('reports the exact reconciliation phase and safe code when the server check is blocked', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'instrumented-device-block-recovery');
+    await mkdir(deviceDir, { recursive: true });
+    const device = await pairPlugin(admin, deviceDir, 'instrumented-device');
+    await device.markBlocked('device_blocked');
+    const snapshots: Array<{ trigger: string; details: Record<string, unknown> }> = [];
+    (device as any).host.sendTroubleshootingSnapshot = async (trigger: string, details: Record<string, unknown>) => {
+      snapshots.push({ trigger, details });
+      return true;
+    };
+    const internal = device.client as unknown as { getDeviceSelf(token: string): Promise<Record<string, unknown>> };
+    const originalGetDeviceSelf = internal.getDeviceSelf.bind(internal);
+    internal.getDeviceSelf = async () => {
+      throw new TransportError(409, 'device_blocked', 'safe test message');
+    };
+
+    await expect(device.reconcileDeviceBlocked(true, 'device_blocked')).rejects.toMatchObject({ code: 'device_blocked' });
+    expect(snapshots.map((snapshot) => snapshot.trigger)).toEqual(['reconcile_start', 'reconcile_failure']);
+    expect(snapshots[1]?.details).toMatchObject({
+      phase: 'requesting_server',
+      outcome: 'blocked',
+      safeErrorCode: 'device_blocked',
+      reconcileGuard: 'not_observed',
+      reconcileTimestamp: 'unknown',
+      reconcileError: 'unknown',
+      reconcileCursors: 'unknown',
+      requestOutcome: 'blocked',
+      httpStatus: 409
+    });
+    expect(snapshots[0]?.details.attemptId).toBe(snapshots[1]?.details.attemptId);
+    internal.getDeviceSelf = originalGetDeviceSelf;
+  });
+
+  it('reports persisted state rather than intended state when reconciliation state write fails', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'instrumented-state-write-failure');
+    await mkdir(deviceDir, { recursive: true });
+    const device = await pairPlugin(admin, deviceDir, 'write-failure-device');
+    await device.markBlocked('device_blocked');
+    const snapshots: Array<{ trigger: string; details: Record<string, any> }> = [];
+    (device as any).host.sendTroubleshootingSnapshot = async (trigger: string, details: Record<string, unknown>) => {
+      snapshots.push({ trigger, details });
+      return true;
+    };
+    const internal = device.client as unknown as { writeState(state: Record<string, unknown>): Promise<void> };
+    const originalWriteState = internal.writeState.bind(internal);
+    internal.writeState = async () => {
+      throw new Error('simulated state write failure');
+    };
+
+    await expect(device.reconcileDeviceBlocked()).rejects.toThrow('simulated state write failure');
+    expect(snapshots.map((snapshot) => snapshot.trigger)).toEqual([
+      'reconcile_start',
+      'reconcile_guard',
+      'reconcile_failure'
+    ]);
+    expect(snapshots[2]?.details).toMatchObject({
+      phase: 'checking_guard',
+      requestOutcome: 'succeeded',
+      httpStatus: 200,
+      capturedState: {
+        status_label: 'Review needed',
+        last_error_code: 'device_blocked'
+      }
+    });
+    internal.writeState = originalWriteState;
+  });
+
   it('does not overwrite newer local state while checking a stale device block', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'concurrent-device-block-recovery');
     await mkdir(deviceDir, { recursive: true });
     const device = await pairPlugin(admin, deviceDir, 'concurrent-device');
     await device.markBlocked('device_blocked');
+    const snapshots: Array<{ trigger: string; details: Record<string, unknown> }> = [];
+    (device as any).host.sendTroubleshootingSnapshot = async (trigger: string, details: Record<string, unknown>) => {
+      snapshots.push({ trigger, details });
+      return true;
+    };
 
     const internal = device.client as unknown as {
       getDeviceSelf(token: string): Promise<Record<string, unknown>>;
@@ -1396,6 +1470,19 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(await reconciliation).toEqual({ applied: false, status: 'Synced' });
     expect(pullAttempts).toBe(0);
     expect(await device.readState()).toMatchObject({ status_label: 'Synced', last_error_code: null });
+    expect(snapshots.map((snapshot) => snapshot.trigger)).toEqual(['reconcile_start', 'reconcile_guard']);
+    expect(snapshots[1]?.details).toMatchObject({
+      phase: 'checking_guard',
+      outcome: 'skipped',
+      reconcileGuard: 'multiple',
+      reconcileTimestamp: 'changed',
+      reconcileError: 'changed',
+      reconcileCursors: 'unchanged',
+      requestOutcome: 'succeeded',
+      httpStatus: 200
+    });
+    expect(snapshots[0]?.details.attemptId).toBe(snapshots[1]?.details.attemptId);
+    expect(snapshots[0]?.details.attemptId).toMatch(/^rca_[0-9a-f]{32}$/u);
     internal.getDeviceSelf = originalGetDeviceSelf;
     internal.pullAndApply = originalPullAndApply;
   });

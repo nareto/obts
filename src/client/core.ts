@@ -133,7 +133,7 @@ type SharedClientCore = {
   recordLocalChangeHint(paths: string[]): Promise<void>;
   syncOnce(options?: { confirmInitialImport?: boolean; fullAudit?: boolean }): Promise<SyncResult>;
   pullAndApply(allowDestructive: boolean): Promise<boolean>;
-  reconcileDeviceBlocked(fromCaughtError?: boolean): Promise<{ applied: boolean; status: string }>;
+  reconcileDeviceBlocked(fromCaughtError?: boolean, triggeringErrorCode?: string | null): Promise<{ applied: boolean; status: string }>;
   pollRemoteEventsAndApply(): Promise<{ applied: boolean; status: string }>;
   replaceLocalWithServer(): Promise<{ status: string; main: string }>;
   rebuildFromServerMain(): Promise<RebuildResult>;
@@ -278,8 +278,8 @@ export class ObtsPluginClient {
     return this.client.pullAndApply(options.allowDestructive);
   }
 
-  reconcileDeviceBlocked(fromCaughtError = false): Promise<{ applied: boolean; status: string }> {
-    return this.client.reconcileDeviceBlocked(fromCaughtError);
+  reconcileDeviceBlocked(fromCaughtError = false, triggeringErrorCode: string | null = null): Promise<{ applied: boolean; status: string }> {
+    return this.client.reconcileDeviceBlocked(fromCaughtError, triggeringErrorCode);
   }
 
   pollRemoteEventsAndApply(): Promise<{ applied: boolean; status: string }> {
@@ -445,6 +445,8 @@ function createNodePluginHost(vaultDir: string, settings: ObtsPluginSettings) {
     unloaded: false,
     syncQueued: false,
     isApplying: false,
+    clientReady: true,
+    clientInitialization: null,
     lastCheckingProgressAt: 0,
     deviceNameRevision: 0,
     setInitializationStage: (_label: string, _diagnosticPoint?: string) => undefined,
@@ -453,6 +455,7 @@ function createNodePluginHost(vaultDir: string, settings: ObtsPluginSettings) {
     setStatus: (_status: string) => undefined,
     markFullScanCompleted: () => undefined,
     handlePluginCompatibility: (_compatibility: unknown) => undefined,
+    sendTroubleshootingSnapshot: async (_trigger: string, _details?: Record<string, unknown>) => false,
     flushOpenMarkdownEditorsToDisk: async (): Promise<void> => {},
     saveSettings: async (): Promise<void> => {}
   };

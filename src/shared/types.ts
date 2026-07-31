@@ -1,4 +1,4 @@
-import type { DiagnosticEventV1 } from './diagnostics.js';
+import type { DiagnosticEvent } from './diagnostics.js';
 
 export const API_VERSION = '2026-07-12.browser-onboarding';
 
@@ -166,7 +166,7 @@ export type DeviceStatusResponse = {
   plugin: import('./pluginCompatibility.js').PluginCompatibility;
 };
 
-export type DiagnosticEventView = DiagnosticEventV1 & {
+export type DiagnosticEventView = DiagnosticEvent & {
   received_at: string;
 };
 

@@ -93,8 +93,22 @@ describe('OpenAPI Phase 3 contract', () => {
     expect(document.components.schemas).toHaveProperty('DiagnosticEventFields');
     expect(document.components.schemas).toHaveProperty('DiagnosticEventView');
     expect(document.components.schemas).toHaveProperty('DiagnosticEventsResponse');
-    expect(document.components.schemas.DiagnosticEvent).toMatchObject({ unevaluatedProperties: false });
-    expect(document.components.schemas.DiagnosticEventView).toMatchObject({ unevaluatedProperties: false });
+    expect(document.components.schemas.DiagnosticEvent).toMatchObject({
+      oneOf: [
+        { $ref: '#/components/schemas/DiagnosticEventV1' },
+        { $ref: '#/components/schemas/DiagnosticEventV2' }
+      ]
+    });
+    expect(document.components.schemas.DiagnosticEventView).toMatchObject({
+      oneOf: [
+        { $ref: '#/components/schemas/DiagnosticEventV1View' },
+        { $ref: '#/components/schemas/DiagnosticEventV2View' }
+      ]
+    });
+    expect(document.components.schemas.DiagnosticEventV1).toMatchObject({ unevaluatedProperties: false });
+    expect(document.components.schemas.DiagnosticEventV2).toMatchObject({ unevaluatedProperties: false });
+    expect(document.components.schemas.TroubleshootingDiagnosticContext).toMatchObject({ additionalProperties: false });
+    expect(document.components.schemas.TroubleshootingCursorRelations).toMatchObject({ additionalProperties: false });
     expect(document.paths['/connections/{connection_id}/diagnostic-events']?.post?.security).toEqual([{ connectionBearer: [] }]);
     expect(document.paths['/device/diagnostic-events']?.post?.security).toEqual([{ deviceBearer: [] }]);
     expect(contract).not.toContain('local_error_details');

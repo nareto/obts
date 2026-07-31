@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Obsidian True Sync Phase 3 API
-  version: 0.3.17
+  version: 0.3.18
   summary: Deployable note history, restore, diagnostics, and maintenance.
 servers:
   - url: /api/v1
@@ -1734,7 +1734,7 @@ components:
       properties:
         point:
           type: string
-          enum: [onboarding_approved, bootstrap_response, multipart_pack, pack_persist_write, pack_persist_read, index_fs_stat, index_fs_read_file, index_fs_read, index_fs_write, index_pack, sync_request, apply, upload_prepare, recovery, startup_metadata, startup_git, startup_state, recovery_journal, recovery_target_commit, recovery_target_tree, recovery_file_validation, recovery_bundle, recovery_file_apply, recovery_refs, recovery_state]
+          enum: [onboarding_approved, bootstrap_response, multipart_pack, pack_persist_write, pack_persist_read, index_fs_stat, index_fs_read_file, index_fs_read, index_fs_write, index_pack, sync_request, apply, apply_recovery_prepare, apply_preflight_revalidate, apply_write, apply_verify, local_snapshot, upload_prepare, upload_finalize, recovery, startup_metadata, startup_git, startup_state, recovery_journal, recovery_target_commit, recovery_target_tree, recovery_file_validation, recovery_bundle, recovery_file_apply, recovery_refs, recovery_state]
         outcome:
           type: string
           enum: [started, returned, succeeded, failed]
@@ -1752,16 +1752,19 @@ components:
       required: [schema_version, event_id, plugin_version, obsidian_version, platform_family, flow, stage, failure_code, error_class, retryable, breadcrumbs]
       properties:
         schema_version:
-          const: 1
+          type: integer
+          enum: [1, 2]
         event_id:
           type: string
           pattern: "^dgr_[0-9a-f]{32}$"
         plugin_version:
           type: string
           maxLength: 80
+          pattern: "^(unknown|[0-9]+(\\.[0-9]+){1,3}([-+][0-9A-Za-z.-]+)?)$"
         obsidian_version:
           type: string
           maxLength: 80
+          pattern: "^(unknown|[0-9]+(\\.[0-9]+){1,3}([-+][0-9A-Za-z.-]+)?)$"
         platform_family:
           type: string
           enum: [ios, android, desktop, unknown]
@@ -1773,7 +1776,7 @@ components:
           enum: [browser_handoff, approval_poll, bootstrap_request, multipart_parse, pack_persist, pack_index, tree_read, sync_request, apply, recovery, plugin_lifecycle, unknown]
         failure_code:
           type: string
-          enum: [invalid_json, missing_buffer_dependency, operation_interrupted_by_reload, sync_lease_blocked, null_pack_slice, pack_index_failed, adapter_read_failed, adapter_write_failed, adapter_stat_failed, multipart_parse_failed, request_failed, onboarding_failed, sync_failed, directory_recovery_decision_required, directory_recovery_changed, directory_recovery_journal_invalid, recovery_failed, operation_stalled, unknown]
+          enum: [invalid_json, missing_buffer_dependency, operation_interrupted_by_reload, sync_lease_blocked, null_pack_slice, pack_index_failed, adapter_read_failed, adapter_write_failed, adapter_stat_failed, multipart_parse_failed, request_failed, onboarding_failed, sync_failed, directory_recovery_decision_required, directory_recovery_changed, directory_recovery_journal_invalid, recovery_failed, operation_stalled, troubleshooting_snapshot, unknown]
         error_class:
           type: string
           enum: [type_error, transport_error, blocked_error, error, unknown]
@@ -1784,10 +1787,151 @@ components:
           maxItems: 16
           items:
             $ref: "#/components/schemas/DiagnosticBreadcrumb"
-    DiagnosticEvent:
+    TroubleshootingCursorRelations:
+      type: object
+      additionalProperties: false
+      required: [local_head_to_local_main, server_ref_to_local_head, local_main_to_server_main, event_to_applied, event_to_server]
+      properties:
+        local_head_to_local_main:
+          type: string
+          enum: [both_null, left_null, right_null, equal, different, unknown]
+        server_ref_to_local_head:
+          type: string
+          enum: [both_null, left_null, right_null, equal, different, unknown]
+        local_main_to_server_main:
+          type: string
+          enum: [both_null, left_null, right_null, equal, different, unknown]
+        event_to_applied:
+          type: string
+          enum: [equal, ahead, behind, invalid, unknown]
+        event_to_server:
+          type: string
+          enum: [equal, ahead, behind, invalid, unknown]
+    TroubleshootingDiagnosticContext:
+      type: object
+      additionalProperties: false
+      required: [attempt_id, trigger, phase, outcome, safe_error_code, client_state, lease_state, state_source, paired, status_class, queue_state, apply_journal, onboarding_journal, transfer_journal, pending_applied_ack, cursor_guard, reconcile_guard, reconcile_timestamp, reconcile_error, reconcile_cursors, server_device_status, server_vault_status, request_outcome, http_status, cursor_relations]
+      properties:
+        attempt_id:
+          type: string
+          maxLength: 36
+          pattern: "^(none|rca_[0-9a-f]{32})$"
+        trigger:
+          type: string
+          enum: [manual, reconcile_start, reconcile_guard, reconcile_finish, reconcile_failure]
+        phase:
+          type: string
+          enum: [none, requesting_server, checking_guard, applying, finished, failed]
+        outcome:
+          type: string
+          enum: [observed, succeeded, skipped, blocked, failed]
+        safe_error_code:
+          type: string
+          enum: [none, device_blocked, conflict_review_required, server_recovery_required, blocked_integrity, device_revoked, device_identity_mismatch, not_paired, sync_lease_blocked, operation_interrupted_by_reload, local_state_incomplete, same_device_non_fast_forward, apply_recovery_required, directory_recovery_decision_required, directory_recovery_changed, directory_recovery_journal_invalid, network_error, http_error, sync_error, unknown]
+        client_state:
+          type: string
+          enum: [uninitialized, initializing, ready, unloaded]
+        lease_state:
+          type: string
+          enum: [available, owned_active, other_active, retiring, restart_required, unknown]
+        state_source:
+          type: string
+          enum: [primary, backup, default, unreadable]
+        paired:
+          type: boolean
+        status_class:
+          type: string
+          enum: [unpaired, checking, synced, ahead, behind, review, recovery, unsafe, retrying, other]
+        queue_state:
+          type: string
+          enum: [absent, idle, hint_only, pending_upload, conflicted, invalid, unreadable]
+        apply_journal:
+          type: string
+          enum: [absent, planned, recovery_bundle_written, writing_files, verifying, committed, blocked_recovery, invalid, unreadable]
+        onboarding_journal:
+          type: string
+          enum: [absent, awaiting_browser, approved, analyzing, awaiting_confirmation, awaiting_conflict, registered, blocked, complete, other, invalid, unreadable]
+        transfer_journal:
+          type: string
+          enum: [absent, present, invalid, unreadable]
+        pending_applied_ack:
+          type: string
+          enum: [absent, present, invalid, unreadable]
+        cursor_guard:
+          type: string
+          enum: [not_observed, no_preservation, local_main, local_head, server_ref, event_cursor, multiple]
+        reconcile_guard:
+          type: string
+          enum: [not_observed, unchanged, timestamp_changed, error_changed, cursor_changed, multiple]
+        reconcile_timestamp:
+          type: string
+          enum: [unchanged, changed, unknown]
+        reconcile_error:
+          type: string
+          enum: [unchanged, changed, unknown]
+        reconcile_cursors:
+          type: string
+          enum: [unchanged, changed, unknown]
+        server_device_status:
+          type: string
+          enum: [not_observed, paired, synced, ahead, review_needed, blocked_recovery, revoked, unknown]
+        server_vault_status:
+          type: string
+          enum: [not_observed, active, blocked_integrity, unknown]
+        request_outcome:
+          type: string
+          enum: [not_attempted, succeeded, blocked, transport_failed, http_failed, failed]
+        http_status:
+          type: string
+          enum: [none, success, http_400, http_401, http_403, http_404, http_409, http_413, http_429, http_500, http_502, http_503, http_504, other_4xx, other_5xx, network, unknown]
+        cursor_relations:
+          $ref: "#/components/schemas/TroubleshootingCursorRelations"
+    DiagnosticEventV1:
       allOf:
         - $ref: "#/components/schemas/DiagnosticEventFields"
+        - type: object
+          properties:
+            schema_version:
+              const: 1
+            failure_code:
+              type: string
+              enum: [invalid_json, missing_buffer_dependency, operation_interrupted_by_reload, sync_lease_blocked, null_pack_slice, pack_index_failed, adapter_read_failed, adapter_write_failed, adapter_stat_failed, multipart_parse_failed, request_failed, onboarding_failed, sync_failed, directory_recovery_decision_required, directory_recovery_changed, directory_recovery_journal_invalid, recovery_failed, operation_stalled, unknown]
       unevaluatedProperties: false
+    DiagnosticEventV2:
+      allOf:
+        - $ref: "#/components/schemas/DiagnosticEventFields"
+        - type: object
+          required: [context]
+          properties:
+            schema_version:
+              const: 2
+            plugin_version:
+              type: string
+              pattern: "^(unknown|[0-9]+(\\.[0-9]+){1,3})$"
+            obsidian_version:
+              type: string
+              pattern: "^(unknown|[0-9]+(\\.[0-9]+){1,3})$"
+            flow:
+              const: recovery
+            stage:
+              const: recovery
+            failure_code:
+              const: troubleshooting_snapshot
+            error_class:
+              type: string
+              enum: [blocked_error, unknown]
+            retryable:
+              const: false
+            breadcrumbs:
+              type: array
+              maxItems: 0
+            context:
+              $ref: "#/components/schemas/TroubleshootingDiagnosticContext"
+      unevaluatedProperties: false
+    DiagnosticEvent:
+      oneOf:
+        - $ref: "#/components/schemas/DiagnosticEventV1"
+        - $ref: "#/components/schemas/DiagnosticEventV2"
     DiagnosticIngestResponse:
       type: object
       additionalProperties: false
@@ -1799,16 +1943,59 @@ components:
         event_id:
           type: string
           pattern: "^dgr_[0-9a-f]{32}$"
-    DiagnosticEventView:
+    DiagnosticEventV1View:
       allOf:
         - $ref: "#/components/schemas/DiagnosticEventFields"
         - type: object
           required: [received_at]
           properties:
+            schema_version:
+              const: 1
+            failure_code:
+              type: string
+              enum: [invalid_json, missing_buffer_dependency, operation_interrupted_by_reload, sync_lease_blocked, null_pack_slice, pack_index_failed, adapter_read_failed, adapter_write_failed, adapter_stat_failed, multipart_parse_failed, request_failed, onboarding_failed, sync_failed, directory_recovery_decision_required, directory_recovery_changed, directory_recovery_journal_invalid, recovery_failed, operation_stalled, unknown]
             received_at:
               type: string
               format: date-time
       unevaluatedProperties: false
+    DiagnosticEventV2View:
+      allOf:
+        - $ref: "#/components/schemas/DiagnosticEventFields"
+        - type: object
+          required: [context, received_at]
+          properties:
+            schema_version:
+              const: 2
+            plugin_version:
+              type: string
+              pattern: "^(unknown|[0-9]+(\\.[0-9]+){1,3})$"
+            obsidian_version:
+              type: string
+              pattern: "^(unknown|[0-9]+(\\.[0-9]+){1,3})$"
+            flow:
+              const: recovery
+            stage:
+              const: recovery
+            failure_code:
+              const: troubleshooting_snapshot
+            error_class:
+              type: string
+              enum: [blocked_error, unknown]
+            retryable:
+              const: false
+            breadcrumbs:
+              type: array
+              maxItems: 0
+            context:
+              $ref: "#/components/schemas/TroubleshootingDiagnosticContext"
+            received_at:
+              type: string
+              format: date-time
+      unevaluatedProperties: false
+    DiagnosticEventView:
+      oneOf:
+        - $ref: "#/components/schemas/DiagnosticEventV1View"
+        - $ref: "#/components/schemas/DiagnosticEventV2View"
     DiagnosticEventsResponse:
       type: object
       additionalProperties: false

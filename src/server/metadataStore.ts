@@ -3,7 +3,7 @@ import { dirname, join } from 'node:path';
 
 import { newId, nowIso } from '../shared/ids.js';
 import { DISPLAY_NAME_MAX_LENGTH, normalizeDisplayName } from '../shared/validators.js';
-import type { DiagnosticEventV1 } from '../shared/diagnostics.js';
+import type { DiagnosticEvent } from '../shared/diagnostics.js';
 import type {
   ConflictRecord,
   DirectoryIntentAcknowledgement,
@@ -176,7 +176,7 @@ export type AuditRow = {
   created_at: string;
 };
 
-export type DiagnosticEventRow = DiagnosticEventV1 & {
+export type DiagnosticEventRow = DiagnosticEvent & {
   owner_user_id: string;
   connection_id: string | null;
   vault_id: string | null;

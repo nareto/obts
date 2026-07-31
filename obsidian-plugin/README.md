@@ -48,6 +48,6 @@ Commands:
 - `Replace local with server state`
 - `Rebuild from server main`
 
-Error diagnostics are optional and off by default. The **Share error diagnostics with this obts server** toggle sends failures and startup checkpoints that remain stalled for 30 seconds only to the configured backend using a fixed sanitized schema. Reports can include plugin/platform versions, operation stages, fixed error codes, and coarse binary-type/size checkpoints; they exclude note content, vault and file names, paths, credentials, Git objects, packfiles, stacks, and raw logs. Changing the backend URL turns sharing off.
+Troubleshooting diagnostics are optional and off by default. The **Share sanitized troubleshooting diagnostics** toggle sends failures, stalled startup checkpoints, and stale-block reconciliation snapshots only to the configured backend using fixed sanitized schemas. Reports can include plugin/platform versions, fixed error codes, coarse queue/journal/lease states, and cursor relationships without cursor values; they exclude note content, vault and file names, paths, credentials, commit IDs, Git objects, packfiles, stacks, and raw logs. Changing the backend URL or expanding the diagnostic schema turns sharing off until consent is renewed. Use **Send troubleshooting snapshot now** to report the current classifications without starting or interrupting sync.
 
 No visible vault `.git` directory is created.
