@@ -192,12 +192,22 @@ describe('opt-in error diagnostics backend', () => {
       completion.device_token,
       troubleshootingReport
     )).status).toBe(202);
+    const largeJournalReport = {
+      ...troubleshootingReport,
+      event_id: 'dgr_abcdef0123456789abcdef0123456789',
+      context: { ...troubleshootingReport.context, apply_journal: 'present_unclassified' }
+    };
+    expect((await postDiagnostic(
+      `${fixture.baseUrl}/api/v1/device/diagnostic-events`,
+      completion.device_token,
+      largeJournalReport
+    )).status).toBe(202);
 
     const listed = await fixture.adminGet('/api/v1/diagnostic-events');
-    expect((listed.body.events as Array<Record<string, unknown>>).map((event) => event.schema_version)).toEqual([2, 1]);
-    expect((listed.body.events as Array<Record<string, unknown>>)[0]).toMatchObject(troubleshootingReport);
+    expect((listed.body.events as Array<Record<string, unknown>>).map((event) => event.schema_version)).toEqual([2, 2, 1]);
+    expect((listed.body.events as Array<Record<string, unknown>>)[0]).toMatchObject(largeJournalReport);
     const snapshot = await fixture.server.store.snapshot();
-    expect(snapshot.diagnostic_events.map((event) => event.schema_version).sort()).toEqual([1, 2]);
+    expect(snapshot.diagnostic_events.map((event) => event.schema_version).sort()).toEqual([1, 2, 2]);
   });
 
   it('rejects disabled ingestion, wrong credentials, extra fields, and privacy canaries', async () => {

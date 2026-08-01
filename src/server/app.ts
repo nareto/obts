@@ -3518,20 +3518,35 @@ function isFreshDeviceStatus(reportedAt: string | null): boolean {
   return reportedAt !== null && Date.now() - Date.parse(reportedAt) <= 5 * 60 * 1000;
 }
 
+function localStatusBaseLabel(label: string | null): string | null {
+  if (label === null) return null;
+  for (const base of ['Verifying contents', 'Preparing upload', 'Uploading', 'Applying', 'Checking', 'Merging', 'Server retrying', 'Repairing baseline', 'Finishing update', 'Waiting for operation']) {
+    if (label === base || label.startsWith(`${base} `)) return base;
+  }
+  return label;
+}
+
 function isLocalStatusOverride(label: string | null, errorCode: string | null): boolean {
+  const base = localStatusBaseLabel(label);
   return Boolean(
     errorCode ||
-      label === 'Unsafe local state' ||
-      label === 'Needs recovery' ||
-      label === 'Blocked' ||
-      label === 'Preparing upload' ||
-      label === 'Uploading' ||
-      label === 'Applying' ||
-      label === 'Checking' ||
-      label === 'Behind' ||
-      label === 'Offline' ||
-      label === 'Ahead' ||
-      label === 'Review needed'
+      base === 'Unsafe local state' ||
+      base === 'Needs recovery' ||
+      base === 'Blocked' ||
+      base === 'Verifying contents' ||
+      base === 'Preparing upload' ||
+      base === 'Uploading' ||
+      base === 'Applying' ||
+      base === 'Checking' ||
+      base === 'Merging' ||
+      base === 'Server retrying' ||
+      base === 'Repairing baseline' ||
+      base === 'Finishing update' ||
+      base === 'Waiting for operation' ||
+      base === 'Behind' ||
+      base === 'Offline' ||
+      base === 'Ahead' ||
+      base === 'Review needed'
   );
 }
 
