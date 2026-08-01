@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Obsidian True Sync Phase 3 API
-  version: 0.3.19
+  version: 0.3.20
   summary: Deployable note history, restore, diagnostics, and maintenance.
 servers:
   - url: /api/v1
@@ -1847,7 +1847,7 @@ components:
           enum: [absent, idle, hint_only, pending_upload, conflicted, invalid, unreadable]
         apply_journal:
           type: string
-          enum: [absent, planned, recovery_bundle_written, writing_files, verifying, committed, blocked_recovery, invalid, unreadable]
+          enum: [absent, planned, recovery_bundle_written, writing_files, verifying, committed, blocked_recovery, present_unclassified, invalid, unreadable]
         onboarding_journal:
           type: string
           enum: [absent, awaiting_browser, approved, analyzing, awaiting_confirmation, awaiting_conflict, registered, blocked, complete, other, invalid, unreadable]

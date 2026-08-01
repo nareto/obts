@@ -164,6 +164,7 @@ export const troubleshootingJournalStates = [
   'verifying',
   'committed',
   'blocked_recovery',
+  'present_unclassified',
   'invalid',
   'unreadable'
 ] as const;

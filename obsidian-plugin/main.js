@@ -21915,7 +21915,7 @@ var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var { createByteBudget, runBoundedWork } = require_work_pool();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.29";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.30";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_INVENTORY_INTERVAL_MS = 6 * 60 * 60 * 1e3;
@@ -22027,7 +22027,8 @@ module.exports = class ObtsPlugin extends Plugin {
     this.deviceNameRevision = 0;
     this.setStatus("Checking");
     this.client = new ObtsObsidianClient(this);
-    this.addSettingTab(new ObtsSettingTab(this.app, this));
+    this.settingTab = new ObtsSettingTab(this.app, this);
+    this.addSettingTab(this.settingTab);
     this.addCommand({
       id: "obts-setup-sync",
       name: "Set up sync",
@@ -22051,7 +22052,11 @@ module.exports = class ObtsPlugin extends Plugin {
       id: "obts-verify-local-vault",
       name: "Verify local vault contents",
       callback: async () => {
-        const result = await this.runUserAction(() => this.syncOnceOrPollResolvedConflict({ confirmInitialImport: false, fullAudit: true }));
+        const result = await this.runUserAction(
+          () => this.syncOnceOrPollResolvedConflict({ confirmInitialImport: false, fullAudit: true }),
+          true,
+          "Verifying local vault"
+        );
         if (result && shouldShowRoutineStatusNotice(result.status)) new Notice(`obts: ${result.status}`);
       }
     });
@@ -22059,7 +22064,7 @@ module.exports = class ObtsPlugin extends Plugin {
       id: "obts-replace-local-with-server",
       name: "Replace local with server state",
       callback: async () => {
-        const result = await this.runUserAction(() => this.client.replaceLocalWithServer());
+        const result = await this.runUserAction(() => this.client.replaceLocalWithServer(), true, "Replacing local vault");
         if (result && shouldShowRoutineStatusNotice(result.status)) new Notice(`obts: ${result.status}`);
       }
     });
@@ -22067,7 +22072,7 @@ module.exports = class ObtsPlugin extends Plugin {
       id: "obts-rebuild-from-server-main",
       name: "Rebuild from server main",
       callback: async () => {
-        const result = await this.runUserAction(() => this.client.rebuildFromServerMain());
+        const result = await this.runUserAction(() => this.client.rebuildFromServerMain(), true, "Rebuilding from server");
         if (result && shouldShowRoutineStatusNotice(result.status)) new Notice(`obts: ${result.status}`);
       }
     });
@@ -22094,7 +22099,7 @@ module.exports = class ObtsPlugin extends Plugin {
             return;
           }
           return await this.client.resetLocalPairingState();
-        });
+        }, true, "Resetting local pairing");
         if (result && shouldShowRoutineStatusNotice(result.status)) new Notice(`obts: ${result.status}`);
       }
     });
@@ -22143,6 +22148,7 @@ module.exports = class ObtsPlugin extends Plugin {
     }
     this.clearInitializationWatchdog();
     this.initializationDiagnosticToken = null;
+    if (this.settingTab) this.settingTab.clearOperationRefreshTimer();
     this.clearOperationProgress();
     this.clearDegradedStatusTimer();
   }
@@ -22150,7 +22156,7 @@ module.exports = class ObtsPlugin extends Plugin {
     if (this.clientReady) return;
     if (!this.clientInitialization) {
       this.clientInitialization = (async () => {
-        if (this.unloaded || !this.beginSync()) {
+        if (this.unloaded || !this.beginSync("Initializing obts")) {
           throw new ObtsBlockedError("sync_lease_blocked", this.syncBlockedMessage());
         }
         try {
@@ -22216,6 +22222,7 @@ module.exports = class ObtsPlugin extends Plugin {
     this.initializationStage = label;
     this.initializationStageStartedAt = Date.now();
     this.initializationDiagnosticPoint = diagnosticPoint;
+    this.updateOwnedOperationDetails(label, diagnosticPoint);
     this.clearInitializationWatchdog();
     if (!diagnosticPoint || this.reportedInitializationStalls.has(diagnosticPoint)) return;
     this.initializationWatchdogTimer = window.setTimeout(() => {
@@ -22226,22 +22233,39 @@ module.exports = class ObtsPlugin extends Plugin {
     }, INITIALIZATION_STALL_DIAGNOSTIC_MS);
   }
   updateInitializationProgress(label) {
-    if (this.clientInitialization) this.initializationStage = label;
+    if (!this.clientInitialization) return;
+    this.initializationStage = label;
+    this.updateOwnedOperationDetails(label, this.initializationDiagnosticPoint);
+  }
+  updateOwnedOperationDetails(label, diagnosticPoint, changes = {}, markProgress = true) {
+    const lease = operationRegistry().get(this.app.vault.adapter);
+    if (!lease || operationLeaseOwner(lease) !== this || !lease.details) return;
+    if (typeof label === "string" && label.length > 0) lease.details.label = label;
+    lease.details.diagnosticPoint = diagnosticPoint || null;
+    if (markProgress) lease.details.progressUpdatedAt = Date.now();
+    Object.assign(lease.details, changes);
+  }
+  resetOperationWatchdog(diagnosticPoint, progressLabel) {
+    if (this.operationWatchdogTimer !== null) window.clearTimeout(this.operationWatchdogTimer);
+    this.operationWatchdogTimer = null;
+    if (!diagnosticPoint) return;
+    this.operationWatchdogTimer = window.setTimeout(() => {
+      this.operationWatchdogTimer = null;
+      if (this.unloaded || this.activeOperationDiagnosticPoint !== diagnosticPoint || this.activeOperationProgressLabel !== progressLabel) return;
+      this.updateOwnedOperationDetails(progressLabel, diagnosticPoint, { stalled: true }, false);
+      if (this.reportedOperationStalls.has(diagnosticPoint) || !this.diagnosticSharingEnabled()) return;
+      this.reportedOperationStalls.add(diagnosticPoint);
+      void this.reportOperationStall(diagnosticPoint);
+    }, INITIALIZATION_STALL_DIAGNOSTIC_MS);
   }
   setOperationProgress(label, diagnosticPoint) {
-    if (this.activeOperationDiagnosticPoint !== diagnosticPoint) {
-      this.clearOperationStage();
-      this.activeOperationDiagnosticPoint = diagnosticPoint || null;
-      if (diagnosticPoint) {
-        this.operationWatchdogTimer = window.setTimeout(() => {
-          this.operationWatchdogTimer = null;
-          if (this.unloaded || this.activeOperationDiagnosticPoint !== diagnosticPoint || this.reportedOperationStalls.has(diagnosticPoint) || !this.diagnosticSharingEnabled()) return;
-          this.reportedOperationStalls.add(diagnosticPoint);
-          void this.reportOperationStall(diagnosticPoint);
-        }, INITIALIZATION_STALL_DIAGNOSTIC_MS);
-      }
-    }
+    const progressAdvanced = this.activeOperationDiagnosticPoint !== diagnosticPoint || this.activeOperationProgressLabel !== label;
+    this.activeOperationDiagnosticPoint = diagnosticPoint || null;
     this.activeOperationProgressLabel = label;
+    if (progressAdvanced) {
+      this.updateOwnedOperationDetails(label, diagnosticPoint, { stalled: false });
+      this.resetOperationWatchdog(diagnosticPoint, label);
+    }
     this.setStatus(this.activeOperationSlow ? `${label} (taking longer than expected)` : label);
   }
   scheduleOperationStatusHeartbeat() {
@@ -22695,7 +22719,7 @@ module.exports = class ObtsPlugin extends Plugin {
     await this.runRemotePoll();
   }
   async runRemotePoll() {
-    if (!this.beginSync()) return;
+    if (!this.beginSync("Checking server")) return;
     try {
       await this.client.pollRemoteEventsAndApply();
       this.clearTransientSyncFailures();
@@ -22713,7 +22737,7 @@ module.exports = class ObtsPlugin extends Plugin {
       return;
     }
     if (await this.client.readPendingOnboarding()) return;
-    if (!this.beginSync()) return;
+    if (!this.beginSync("Background sync")) return;
     try {
       const state = await this.client.readState();
       if (!state.vault_id || !state.device_id) {
@@ -22801,11 +22825,11 @@ module.exports = class ObtsPlugin extends Plugin {
     this.transientSyncFailures = 0;
     this.automaticRetryNotBefore = 0;
   }
-  async runUserAction(fn, showNotice = true) {
+  async runUserAction(fn, showNotice = true, initialLabel = "Sync now") {
     if (!await this.ensureClientReady() || this.isSyncInProgress()) {
       return;
     }
-    if (!this.beginSync()) return;
+    if (!this.beginSync(initialLabel)) return;
     try {
       const result = await fn();
       this.setStatus((await this.client.readState()).status_label);
@@ -22841,8 +22865,8 @@ module.exports = class ObtsPlugin extends Plugin {
       this.endSync();
     }
   }
-  async runExclusiveAction(fn) {
-    if (!await this.ensureClientReady() || !this.beginSync()) {
+  async runExclusiveAction(fn, initialLabel = "Obts operation") {
+    if (!await this.ensureClientReady() || !this.beginSync(initialLabel)) {
       const code = this.operationAvailability() === "restart_required" || this.unloaded ? "operation_interrupted_by_reload" : "sync_lease_blocked";
       throw new ObtsBlockedError(code, this.syncBlockedMessage());
     }
@@ -22853,7 +22877,7 @@ module.exports = class ObtsPlugin extends Plugin {
     }
   }
   async runOnboardingAction(fn) {
-    return await this.runExclusiveAction(fn);
+    return await this.runExclusiveAction(fn, "Completing sync setup");
   }
   operationAvailability() {
     const lease = operationRegistry().get(this.app.vault.adapter);
@@ -22863,8 +22887,42 @@ module.exports = class ObtsPlugin extends Plugin {
     if (lease && lease.retiring || owner && owner.unloaded) return "restart_required";
     return "busy";
   }
+  operationDetails() {
+    const lease = operationRegistry().get(this.app.vault.adapter);
+    if (!lease) return { availability: "available", label: null, elapsedMs: 0, progressUpdatedAt: 0, progressAgeMs: 0, slow: false, stalled: false };
+    const owner = operationLeaseOwner(lease);
+    const availability = lease.retiring || owner && owner.unloaded ? "restart_required" : "busy";
+    const details = lease.details || {};
+    const startedAt = Number.isFinite(details.startedAt) ? details.startedAt : Date.now();
+    const progressUpdatedAt = Number.isFinite(details.progressUpdatedAt) ? details.progressUpdatedAt : startedAt;
+    const fallbackLabel = owner && (owner.activeOperationProgressLabel || owner.initializationStage) || "Obts operation";
+    return {
+      availability,
+      label: typeof details.label === "string" && details.label.length > 0 ? details.label : fallbackLabel,
+      elapsedMs: Math.max(0, Date.now() - startedAt),
+      progressUpdatedAt,
+      progressAgeMs: Math.max(0, Date.now() - progressUpdatedAt),
+      slow: Boolean(details.slow),
+      stalled: Boolean(details.stalled)
+    };
+  }
+  operationDescription(details = this.operationDetails()) {
+    if (details.availability === "available") return "No obts operation is running.";
+    const elapsed = formatElapsed(details.elapsedMs);
+    if (details.availability === "restart_required") {
+      return `${details.label} was interrupted by a plugin update after ${elapsed}. Fully restart Obsidian before continuing.`;
+    }
+    if (details.stalled) {
+      return `${details.label} has been running for ${elapsed} with no reported progress for ${formatElapsed(details.progressAgeMs)}. Keep Obsidian in the foreground; fully restart it if this does not change.`;
+    }
+    return `${details.label} has been running for ${elapsed}${details.slow ? " and is taking longer than expected" : ""}.`;
+  }
   syncBlockedMessage() {
-    return this.unloaded || this.operationAvailability() === "restart_required" ? "A plugin update interrupted an active operation. Fully restart Obsidian before continuing setup or sync." : "Another obts operation is still running.";
+    const details = this.operationDetails();
+    if (this.unloaded || details.availability === "restart_required") {
+      return details.availability === "available" ? "A plugin update interrupted an active operation. Fully restart Obsidian before continuing setup or sync." : this.operationDescription(details);
+    }
+    return details.availability === "available" ? "Another obts operation is still running." : `${this.operationDescription(details)} Wait for it to finish before syncing again.`;
   }
   observeRetiredOperation() {
     const registry = operationRegistry();
@@ -22923,24 +22981,39 @@ module.exports = class ObtsPlugin extends Plugin {
     if (availability === "restart_required") this.observeRetiredOperation();
     return true;
   }
-  beginSync() {
+  beginSync(initialLabel = "Obts operation") {
     const registry = operationRegistry();
     if (this.unloaded || registry.has(this.app.vault.adapter)) return false;
     let resolveCompletion;
     const completion = new Promise((resolve) => {
       resolveCompletion = resolve;
     });
+    const startedAt = Date.now();
     registry.set(this.app.vault.adapter, {
       owner: this,
       retiring: false,
       completion,
-      resolveCompletion
+      resolveCompletion,
+      details: {
+        label: initialLabel,
+        startedAt,
+        progressUpdatedAt: startedAt,
+        diagnosticPoint: null,
+        slow: false,
+        stalled: false
+      }
     });
     this.syncRunning = true;
+    this.activeOperationProgressLabel = initialLabel;
+    this.activeOperationDiagnosticPoint = null;
+    this.activeOperationSlow = false;
+    this.reportedOperationStalls.clear();
     this.operationSlowTimer = window.setTimeout(() => {
       this.operationSlowTimer = null;
       if (this.unloaded || !this.syncRunning) return;
       this.activeOperationSlow = true;
+      const lease = registry.get(this.app.vault.adapter);
+      if (lease && operationLeaseOwner(lease) === this && lease.details) lease.details.slow = true;
       if (this.activeOperationProgressLabel) {
         this.setStatus(`${this.activeOperationProgressLabel} (taking longer than expected)`, { notify: false });
       }
@@ -24061,10 +24134,11 @@ var ObtsObsidianClient = class {
         };
       });
       const hasFollowUpHints = (settledQueue.changed_paths || []).length > 0;
+      const serverMainIsAhead = typeof result.main === "string" && result.main !== state.local_main;
       await this.writeState(Object.assign({}, state, {
         server_device_ref: result.device_ref,
         local_head: queue.pending_commit,
-        status_label: hasFollowUpHints ? "Checking" : result.status === "merged" ? "Behind" : "Synced",
+        status_label: hasFollowUpHints ? "Checking" : serverMainIsAhead ? "Behind" : "Synced",
         last_error_code: null,
         last_event_seq: Math.max(state.last_event_seq || 0, result.event_seq || 0),
         updated_at: nowIso()
@@ -26396,6 +26470,10 @@ var ObtsObsidianClient = class {
       return;
     }
     const queue = await this.readQueue();
+    const operation = typeof this.plugin.operationDetails === "function" ? this.plugin.operationDetails() : null;
+    const stateUpdatedAt = Date.parse(state.updated_at || "");
+    const operationIsNewer = operation && (!Number.isFinite(stateUpdatedAt) || operation.progressUpdatedAt > stateUpdatedAt);
+    const activeStatusLabel = operation && operation.availability === "busy" && operation.label && operationIsNewer && isReportableOperationStatus(operation.label) ? `${operation.label}${operation.slow ? " (taking longer than expected)" : ""}`.slice(0, 80) : state.status_label || "Checking";
     const nameRevision = this.plugin.deviceNameRevision;
     const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${state.vault_id}/sync/device-status`), {
       method: "POST",
@@ -26405,7 +26483,7 @@ var ObtsObsidianClient = class {
       },
       body: JSON.stringify({
         plugin_version: PLUGIN_VERSION,
-        local_status_label: state.status_label || "Checking",
+        local_status_label: activeStatusLabel,
         local_error_code: state.last_error_code,
         local_queue_status: queue.status,
         local_main: state.local_main,
@@ -28275,7 +28353,7 @@ var ObtsOnboardingModal = class extends Modal {
           await this.plugin.runExclusiveAction(async () => {
             this.plugin.settings.deviceName = value.trim();
             await this.plugin.saveSettings();
-          });
+          }, "Updating device name");
         } catch (error) {
           new Notice(error instanceof Error ? error.message : "Unable to update the device name.");
         }
@@ -28299,7 +28377,7 @@ var ObtsOnboardingModal = class extends Modal {
       button.setDisabled(true);
       setFeedback(feedback, "Scanning the local vault...", "muted");
       try {
-        this.connection = await this.plugin.runExclusiveAction(() => this.plugin.client.startOnboarding());
+        this.connection = await this.plugin.runExclusiveAction(() => this.plugin.client.startOnboarding(), "Starting sync setup");
         if (this.cancelled || this.plugin.unloaded) return;
         window.open(this.connection.authorization_url);
         this.renderWaiting();
@@ -28340,14 +28418,14 @@ var ObtsOnboardingModal = class extends Modal {
       const status2 = await this.plugin.runExclusiveAction(() => this.plugin.client.pollOnboarding(
         this.connection.connection_id,
         this.connection.connection_secret
-      ));
+      ), "Checking sync setup approval");
       if (this.cancelled || this.plugin.unloaded) return;
       if (status2.status === "approved") {
         if (this.waitingFeedback) setFeedback(this.waitingFeedback, "Approved. Comparing local and server vaults...", "success");
         this.analysis = await this.plugin.runExclusiveAction(() => this.plugin.client.analyzeOnboarding(
           this.connection.connection_id,
           this.connection.connection_secret
-        ));
+        ), "Comparing local and server vaults");
         if (this.cancelled || this.plugin.unloaded) return;
         this.renderConfirmation();
         return;
@@ -28512,8 +28590,19 @@ var ObtsSettingTab = class extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
+    this.operationRefreshTimer = null;
+  }
+  clearOperationRefreshTimer() {
+    if (this.operationRefreshTimer !== null) {
+      window.clearInterval(this.operationRefreshTimer);
+      this.operationRefreshTimer = null;
+    }
+  }
+  hide() {
+    this.clearOperationRefreshTimer();
   }
   async display() {
+    this.clearOperationRefreshTimer();
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "Obsidian True Sync" });
@@ -28540,7 +28629,7 @@ var ObtsSettingTab = class extends PluginSettingTab {
           if (pendingOnboarding) {
             throw new ObtsBlockedError("onboarding_incomplete", "Finish or cancel onboarding before changing the server URL.");
           }
-          await this.plugin.runExclusiveAction(() => this.plugin.updateServerUrl(value));
+          await this.plugin.runExclusiveAction(() => this.plugin.updateServerUrl(value), "Updating server settings");
         } catch (error) {
           new Notice(error instanceof Error ? error.message : "Unable to update the server URL.");
           await this.display();
@@ -28604,7 +28693,7 @@ var ObtsSettingTab = class extends PluginSettingTab {
         button.setDisabled(true);
         setFeedback(renameFeedback, "Saving device name...", "muted");
         try {
-          const renamed = await this.plugin.runExclusiveAction(() => this.plugin.client.renameCurrentDevice(renameDraft));
+          const renamed = await this.plugin.runExclusiveAction(() => this.plugin.client.renameCurrentDevice(renameDraft), "Renaming device");
           renameDraft = renamed;
           setFeedback(renameFeedback, `Device renamed to ${renamed}.`, "success");
           new Notice(`obts device renamed to ${renamed}.`);
@@ -28616,13 +28705,21 @@ var ObtsSettingTab = class extends PluginSettingTab {
       }));
       const renameFeedback = containerEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
       new Setting(containerEl).setName("Status").setDesc(state.last_error_code ? blockStatusLabel(state.last_error_code) : state.status_label || "Checking");
+      const operationSetting = new Setting(containerEl).setName("Current operation");
+      let syncButton = null;
+      const refreshOperation = () => {
+        const operation = this.plugin.operationDetails();
+        operationSetting.setDesc(this.plugin.operationDescription(operation));
+        if (syncButton) syncButton.setDisabled(operation.availability !== "available");
+      };
       if (state.last_error_code === "directory_recovery_journal_invalid") {
         new Setting(containerEl).setName("Directory recovery journal is invalid").setDesc("Sync is blocked without modifying the journal or vault. Send diagnostics and preserve `.obts/directory-recovery.json` for recovery support.");
       }
-      new Setting(containerEl).setName("Actions").addButton(
-        (button) => button.setButtonText("Sync now").setCta().onClick(async () => {
+      new Setting(containerEl).setName("Actions").addButton((button) => {
+        syncButton = button;
+        return button.setButtonText("Sync now").setCta().setDisabled(this.plugin.operationAvailability() !== "available").onClick(async () => {
           button.setDisabled(true);
-          setFeedback(actionFeedback, "Syncing...", "muted");
+          setFeedback(actionFeedback, "Starting sync...", "muted");
           try {
             const result = await this.plugin.runUserAction(
               () => this.plugin.syncOnceOrPollResolvedConflict({ confirmInitialImport: false }),
@@ -28639,10 +28736,10 @@ var ObtsSettingTab = class extends PluginSettingTab {
           } catch (error) {
             setFeedback(actionFeedback, error instanceof Error ? error.message : "Sync failed.", "error");
           } finally {
-            button.setDisabled(false);
+            button.setDisabled(this.plugin.operationAvailability() !== "available");
           }
-        })
-      ).addButton((button) => {
+        });
+      }).addButton((button) => {
         button.setButtonText("Unpair...").onClick(async () => {
           if (!window.confirm("Unpair this device? The server device will be revoked and local sync credentials will be removed.")) {
             return;
@@ -28653,7 +28750,7 @@ var ObtsSettingTab = class extends PluginSettingTab {
             await this.plugin.runExclusiveAction(async () => {
               await this.plugin.client.unpairCurrentDevice();
               await this.plugin.saveSettings();
-            });
+            }, "Unpairing device");
             this.plugin.setStatus("Not paired");
             new Notice("obts unpaired this device.");
             await this.display();
@@ -28668,6 +28765,8 @@ var ObtsSettingTab = class extends PluginSettingTab {
         }
       });
       const actionFeedback = containerEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
+      refreshOperation();
+      this.operationRefreshTimer = window.setInterval(refreshOperation, 1e3);
     } else if (recoveryBlocked) {
       new Setting(containerEl).setName("Status").setDesc("Local sync metadata is incomplete. The device token is still present, so normal sync and pairing are blocked until you reset and re-pair.");
       new Setting(containerEl).setName("Recovery").addButton((button) => {
@@ -28681,7 +28780,7 @@ var ObtsSettingTab = class extends PluginSettingTab {
             await this.plugin.runExclusiveAction(async () => {
               await this.plugin.client.resetLocalPairingState();
               await this.plugin.saveSettings();
-            });
+            }, "Resetting local pairing");
             this.plugin.setStatus("Not paired");
             new Notice("obts reset local pairing state. Re-pair this device to resume sync.");
             await this.display();
@@ -28704,7 +28803,7 @@ var ObtsSettingTab = class extends PluginSettingTab {
             await this.plugin.runExclusiveAction(async () => {
               this.plugin.settings.deviceName = value.trim();
               await this.plugin.saveSettings();
-            });
+            }, "Updating device name");
           } catch (error) {
             new Notice(error instanceof Error ? error.message : "Unable to update the device name.");
             await this.display();
@@ -29276,6 +29375,10 @@ function isPersistentAttentionStatus(base) {
 function isActiveTransferStatus(base) {
   return ["Verifying contents", "Preparing upload", "Uploading", "Applying", "Merging", "Server retrying", "Repairing baseline", "Finishing update", "Waiting for operation"].includes(base);
 }
+function isReportableOperationStatus(label) {
+  const base = statusBaseLabel(label);
+  return base === "Checking" || isActiveTransferStatus(base);
+}
 function shouldShowRoutineStatusNotice(label) {
   return !isPersistentAttentionStatus(statusBaseLabel(label));
 }
@@ -29531,7 +29634,10 @@ async function readRawTroubleshootingJson(fsp, filePath, validate = () => true) 
     if (error && typeof error === "object" && String(error.code || "").toLowerCase() === "enoent") {
       return { kind: "absent", value: null };
     }
-    if (error instanceof SyntaxError || error && typeof error === "object" && error.code === "EFBIG") {
+    if (error && typeof error === "object" && error.code === "EFBIG") {
+      return { kind: "oversized", value: null };
+    }
+    if (error instanceof SyntaxError) {
       return { kind: "invalid", value: null };
     }
     return { kind: "unreadable", value: null };
@@ -29637,7 +29743,7 @@ function troubleshootingStatusClass(label) {
 function troubleshootingQueueState(read) {
   if (read.kind === "absent") return "absent";
   if (read.kind === "invalid") return "invalid";
-  if (read.kind === "unreadable") return "unreadable";
+  if (read.kind === "unreadable" || read.kind === "oversized") return "unreadable";
   const queue = read.value;
   if (queue.status === "conflicted") return "conflicted";
   if (typeof queue.pending_commit === "string" && queue.pending_commit) return "pending_upload";
@@ -29646,6 +29752,7 @@ function troubleshootingQueueState(read) {
   return "invalid";
 }
 function troubleshootingApplyJournalState(read) {
+  if (read.kind === "oversized") return "present_unclassified";
   if (read.kind !== "valid") return read.kind;
   return troubleshootingEnum(read.value.phase, [
     "planned",
@@ -29657,6 +29764,7 @@ function troubleshootingApplyJournalState(read) {
   ], "invalid");
 }
 function troubleshootingOnboardingState(read) {
+  if (read.kind === "oversized") return "unreadable";
   if (read.kind !== "valid") return read.kind;
   return troubleshootingEnum(read.value.stage, [
     "awaiting_browser",
@@ -29671,10 +29779,10 @@ function troubleshootingOnboardingState(read) {
 }
 function troubleshootingPresence(read) {
   if (read.kind === "valid") return "present";
-  return read.kind;
+  return read.kind === "oversized" ? "unreadable" : read.kind;
 }
 function troubleshootingCombinedPresence(reads) {
-  if (reads.some((read) => read.kind === "unreadable")) return "unreadable";
+  if (reads.some((read) => read.kind === "unreadable" || read.kind === "oversized")) return "unreadable";
   if (reads.some((read) => read.kind === "invalid")) return "invalid";
   if (reads.some((read) => read.kind === "valid")) return "present";
   return "absent";

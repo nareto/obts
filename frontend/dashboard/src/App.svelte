@@ -79,6 +79,12 @@
   $: recentAuthValid = session ? Date.parse(session.recent_auth_expires_at) > nowMs : false;
   $: syncSummary = dashboardSyncSummary(dashboard, dashboardStatusCurrent);
 
+  function isActiveStatusLabel(label: string) {
+    return ['Verifying contents', 'Preparing upload', 'Uploading', 'Applying', 'Checking', 'Merging', 'Server retrying', 'Repairing baseline', 'Finishing update', 'Waiting for operation'].some(
+      (base) => label === base || label.startsWith(`${base} `)
+    );
+  }
+
   function dashboardSyncSummary(value: DashboardSummary | null, statusCurrent: boolean): {
     label: string;
     role: 'success' | 'info' | 'warning' | 'danger' | 'neutral';
@@ -91,7 +97,7 @@
     if (value.devices.some((device) => ['Blocked', 'Needs recovery', 'Unsafe local state', 'Integrity failure'].includes(device.status_label))) {
       return { label: 'Attention required', role: 'danger' };
     }
-    if (value.devices.some((device) => ['Preparing upload', 'Uploading', 'Applying', 'Merging'].includes(device.status_label))) {
+    if (value.devices.some((device) => isActiveStatusLabel(device.status_label))) {
       return { label: 'Sync in progress', role: 'info' };
     }
     return { label: 'Not converged', role: 'warning' };

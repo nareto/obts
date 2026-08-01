@@ -1230,6 +1230,45 @@ describe('Phase 1 sync without conflict resolution', () => {
     ));
   });
 
+  it('keeps a no-op upload visibly behind when the returned server main is newer', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'noop-upload-behind');
+    await mkdirp(deviceDir);
+    await writeFile(join(deviceDir, 'base.md'), 'base\n');
+    const plugin = await pairPlugin(admin, deviceDir, 'noop-upload-behind');
+    expect((await plugin.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+    await writeFile(join(deviceDir, 'local.md'), 'local\n');
+    const internals = (plugin as unknown as { client: Record<string, any> }).client;
+    const state = await internals.readState();
+    const commit = await internals.createLocalCommit('test: noop upload while server main is newer');
+    const queue = {
+      pending_commit: commit,
+      expected_device_ref: state.server_device_ref,
+      status: 'queued_local',
+      attempts: 0,
+      updated_at: new Date().toISOString()
+    };
+    await internals.writeQueue(queue);
+    await internals.writeState({ ...state, local_head: commit, status_label: 'Ahead' });
+    internals.syncCapabilities = async () => ({ capabilities: ['git-object-pack-chunks-v1'] });
+    internals.pushInChunks = async () => ({
+      status: 'noop',
+      device_ref: commit,
+      main: 'f'.repeat(40),
+      event_seq: (state.last_event_seq || 0) + 1
+    });
+
+    await expect(internals.uploadQueuedCommit(queue)).resolves.toMatchObject({ status: 'noop' });
+    expect(await internals.readQueue()).toMatchObject({ pending_commit: null, status: 'idle' });
+    expect(await internals.readState()).toMatchObject({
+      local_main: state.local_main,
+      local_head: commit,
+      server_device_ref: commit,
+      status_label: 'Behind',
+      last_error_code: null
+    });
+  });
+
   it('does not expose directory recovery decisions as client actions', async () => {
     const deviceDir = join(root, 'directory-recovery-no-client-actions');
     await mkdirp(deviceDir);
@@ -2040,6 +2079,29 @@ describe('Phase 1 sync without conflict resolution', () => {
       status_label: 'Synced',
       status_report_fresh: true,
       local_queue_status: 'merged'
+    });
+  });
+
+  it('surfaces detailed active-operation progress as a live dashboard status', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'active-progress-status-device');
+    await mkdirp(deviceDir);
+    await pairPlugin(admin, deviceDir, 'active-progress-laptop');
+    await server.store.mutate((db) => {
+      const device = db.devices.find((candidate) => candidate.device_name === 'active-progress-laptop');
+      expect(device).toBeDefined();
+      device!.status = 'synced';
+      device!.local_status_label = 'Applying 120/6028 (taking longer than expected)';
+      device!.local_error_code = null;
+      device!.local_queue_status = 'idle';
+      device!.last_status_report_at = new Date().toISOString();
+    });
+
+    const dashboard = await admin.get<{ devices: Array<{ device_name: string; status_label: string }> }>(
+      `/api/v1/vaults/${admin.vaultId}/dashboard`
+    );
+    expect(dashboard.body.devices.find((device) => device.device_name === 'active-progress-laptop')).toMatchObject({
+      status_label: 'Applying 120/6028 (taking longer than expected)'
     });
   });
 

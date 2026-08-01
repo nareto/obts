@@ -104,11 +104,13 @@ describe('mobile plugin artifact', () => {
     const renderedSettingNames: string[] = [];
     const renderedSettingDescriptions: string[] = [];
     const renderedElementTexts: string[] = [];
+    const renderedButtons: Array<{ text: string; disabled: boolean }> = [];
     const createContainer = (): any => ({
       empty() {
         renderedSettingNames.length = 0;
         renderedSettingDescriptions.length = 0;
         renderedElementTexts.length = 0;
+        renderedButtons.length = 0;
       },
       createEl(_tag: string, options: { text?: string } = {}) {
         if (options.text) renderedElementTexts.push(options.text);
@@ -117,16 +119,18 @@ describe('mobile plugin artifact', () => {
       createDiv() { return createContainer(); }
     });
     const createControl = (): any => {
+      const rendered = { text: '', disabled: false };
       const control: any = {
         inputEl: {},
         setValue() { return control; },
         onChange() { return control; },
-        setButtonText() { return control; },
+        setButtonText(value: string) { rendered.text = value; return control; },
         setCta() { return control; },
-        setDisabled() { return control; },
+        setDisabled(value: boolean) { rendered.disabled = value; return control; },
         onClick() { return control; },
         setWarning() { return control; }
       };
+      renderedButtons.push(rendered);
       return control;
     };
     class PluginSettingTab {
@@ -188,6 +192,10 @@ describe('mobile plugin artifact', () => {
       apiVersion: '1.9.12',
       requestUrl: async (options: Record<string, unknown>) => {
         requests.push(options);
+        if (typeof options.url === 'string' && options.url.endsWith('/sync/device-status')) {
+          const json = { device_name: 'iPhone', vault_status: 'active' };
+          return { status: 200, headers: {}, json, text: JSON.stringify(json), arrayBuffer: new ArrayBuffer(0) };
+        }
         if (typeof options.url === 'string' && options.url.endsWith('/sync/applied')) {
           const body = JSON.parse(String(options.body || '{}')) as { applied_main?: string };
           const json = { status: 'ok', applied_main: body.applied_main, applied_event_seq: 1_000_000 };
@@ -1009,6 +1017,7 @@ describe('mobile plugin artifact', () => {
       user_id: 'usr_diagnostic',
       vault_id: 'vlt_diagnostic',
       device_id: 'dev_diagnostic',
+      device_name: 'iPhone',
       local_main: sensitiveCommit,
       local_head: 'b'.repeat(40),
       server_device_ref: 'b'.repeat(40),
@@ -1049,13 +1058,21 @@ describe('mobile plugin artifact', () => {
       return await originalAdapterWriteBinary(...args);
     };
     const requestsBeforeSnapshot = requests.length;
-    expect((plugin as any).beginSync()).toBe(true);
+    expect((plugin as any).beginSync('Applying server changes')).toBe(true);
+    (plugin as any).setOperationProgress('Applying 12/6028', 'apply_write');
+    await settingTabs[0]!.display();
+    expect(renderedSettingNames).toContain('Current operation');
+    expect(renderedSettingDescriptions.some((description) => description.includes('Applying 12/6028'))).toBe(true);
+    expect(renderedButtons.find((button) => button.text === 'Sync now')).toMatchObject({ disabled: true });
     expect(commands.has('obts-send-troubleshooting-snapshot')).toBe(true);
     await Promise.all([
       (plugin as any).sendTroubleshootingSnapshotNow(),
       (plugin as any).sendTroubleshootingSnapshotNow()
     ]);
     (plugin as any).endSync();
+    await settingTabs[0]!.display();
+    expect(renderedButtons.find((button) => button.text === 'Sync now')).toMatchObject({ disabled: false });
+    (settingTabs[0] as any).hide();
     expect(requests).toHaveLength(requestsBeforeSnapshot + 1);
     expect(writesBeforeSnapshot).not.toHaveBeenCalled();
     const snapshotBody = JSON.parse(String(requests.at(-1)?.body)) as Record<string, any>;
@@ -1133,6 +1150,10 @@ describe('mobile plugin artifact', () => {
     await adapter.writeBinary('.obts/apply-journal.json', Uint8Array.from({ length: 256 * 1024 + 1 }, () => 97).buffer);
     expect(await diagnosticClient.collectTroubleshootingContext({ trigger: 'manual' })).toMatchObject({
       state_source: 'primary',
+      apply_journal: 'present_unclassified'
+    });
+    await adapter.writeBinary('.obts/apply-journal.json', new TextEncoder().encode('{"unexpected":true}').buffer);
+    expect(await diagnosticClient.collectTroubleshootingContext({ trigger: 'manual' })).toMatchObject({
       apply_journal: 'invalid'
     });
     await adapter.remove('.obts/apply-journal.json');
@@ -1155,6 +1176,24 @@ describe('mobile plugin artifact', () => {
     expect((plugin as any).diagnosticSharingEnabled()).toBe(false);
     expect(savedSettings.length).toBeGreaterThan(0);
 
+    expect((plugin as any).beginSync('Sync now')).toBe(true);
+    (plugin as any).setOperationProgress('Applying 12/6028', 'apply_write');
+    await (plugin as any).client.reportDeviceStatus();
+    expect(JSON.parse(String(requests.at(-1)?.body))).toMatchObject({
+      local_status_label: 'Applying 12/6028'
+    });
+    await (plugin as any).client.writeState({
+      ...(await (plugin as any).client.readState()),
+      status_label: 'Synced',
+      last_error_code: null,
+      updated_at: new Date(Date.now() + 1000).toISOString()
+    });
+    await (plugin as any).client.reportDeviceStatus();
+    expect(JSON.parse(String(requests.at(-1)?.body))).toMatchObject({
+      local_status_label: 'Synced'
+    });
+    (plugin as any).endSync();
+
     const replacement = new PluginClass();
     replacement.app = plugin.app;
     const originalOperationSetTimeout = (context as any).setTimeout;
@@ -1168,15 +1207,33 @@ describe('mobile plugin artifact', () => {
     };
     let operationStatusReports = 0;
     (plugin as any).client.reportDeviceStatus = async () => { operationStatusReports += 1; };
-    expect((plugin as any).beginSync()).toBe(true);
+    expect((plugin as any).beginSync('Sync now')).toBe(true);
     (plugin as any).setOperationProgress('Applying 1/2', 'apply_write');
+    expect((plugin as any).operationDetails()).toMatchObject({
+      availability: 'busy',
+      label: 'Applying 1/2',
+      slow: false,
+      stalled: false
+    });
     expect((plugin as any).operationStatusHeartbeatTimer).not.toBeNull();
     expect((plugin as any).isSyncInProgress()).toBe(true);
     expect(statusItem.text).toBe('obts: Applying 1/2');
-    for (const callback of operationTimerCallbacks) callback();
+    const timersBeforeProgress = operationTimerCallbacks.slice();
+    (plugin as any).setOperationProgress('Applying 2/2', 'apply_write');
+    for (const callback of timersBeforeProgress) callback();
     await Promise.resolve();
     await Promise.resolve();
-    expect(operationStatusReports).toBe(1);
+    expect((plugin as any).reportedOperationStalls.size).toBe(0);
+    for (const callback of operationTimerCallbacks.slice(timersBeforeProgress.length)) callback();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(operationStatusReports).toBeGreaterThan(0);
+    expect((plugin as any).operationDetails()).toMatchObject({
+      label: 'Applying 2/2',
+      slow: true,
+      stalled: true
+    });
+    expect((plugin as any).syncBlockedMessage()).toContain('Applying 2/2');
     expect(statusItem.text).toContain('taking longer than expected');
     (context as any).setTimeout = originalOperationSetTimeout;
     await (replacement as any).onload();
@@ -1189,6 +1246,11 @@ describe('mobile plugin artifact', () => {
     expect((plugin as any).beginSync()).toBe(false);
     expect((replacement as any).beginSync()).toBe(false);
     expect((replacement as any).operationAvailability()).toBe('restart_required');
+    expect((replacement as any).operationDetails()).toMatchObject({
+      availability: 'restart_required',
+      label: 'Applying 2/2'
+    });
+    expect((replacement as any).syncBlockedMessage()).toContain('Applying 2/2');
     expect((replacement as any).syncBlockedMessage()).toContain('Fully restart Obsidian');
     await expect((replacement as any).runOnboardingAction(async () => undefined)).rejects.toMatchObject({
       code: 'operation_interrupted_by_reload'
