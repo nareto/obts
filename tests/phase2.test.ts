@@ -1218,6 +1218,9 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect((await desktop.syncOnce()).status).toBe('Synced');
 
     const tablet = await pairPlugin(admin, tabletDir, 'tablet');
+    await writeFile(join(tabletDir, 'tablet-history.md'), 'establish tablet device history\n');
+    expect((await tablet.syncOnce()).status).toBe('Synced');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
     await writeFile(join(desktopDir, 'shared.md'), 'server version\n');
     await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
     expect((await desktop.syncOnce()).status).toBe('Synced');
@@ -1294,8 +1297,58 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(delayedError).toMatchObject({ code: 'device_blocked' });
     expect((await tablet.readState()).last_error_code).toBeNull();
 
-    expect(await tablet.reconcileDeviceBlocked(true)).toMatchObject({ applied: true, status: 'Synced' });
-    const recoveredState = await tablet.readState();
+    const staleQueue = await tablet.readQueue();
+    const currentState = await tablet.readState();
+    expect(staleQueue).toMatchObject({
+      status: 'conflicted',
+      pending_commit: currentState.local_head,
+      expected_device_ref: currentState.server_device_ref
+    });
+    const authoritativeDevice = (await server.store.snapshot()).devices.find(
+      (candidate) => candidate.device_id === currentState.device_id
+    );
+    expect(authoritativeDevice?.device_ref_head).not.toBe(currentState.server_device_ref);
+
+    const internal = tablet.client as unknown as { pullAndApply(allowDestructive: boolean): Promise<boolean> };
+    const originalPullAndApply = internal.pullAndApply.bind(internal);
+    let caughtErrorPullAttempts = 0;
+    internal.pullAndApply = async () => {
+      caughtErrorPullAttempts += 1;
+      throw new Error('simulated interruption in caught-error reconciliation');
+    };
+    await expect(tablet.reconcileDeviceBlocked(true, 'device_blocked')).rejects.toThrow('caught-error reconciliation');
+    expect(caughtErrorPullAttempts).toBe(1);
+    internal.pullAndApply = originalPullAndApply;
+
+    const caughtErrorRestart = new ObtsPluginClient(tabletDir, { serverUrl: baseUrl, deviceName: 'tablet' });
+    await caughtErrorRestart.initialize();
+    const caughtErrorState = await caughtErrorRestart.readState();
+    expect(caughtErrorState).toMatchObject({
+      last_error_code: null,
+      server_device_ref: staleQueue.expected_device_ref
+    });
+    await writeFile(join(tabletDir, '.obts', 'state.json'), `${JSON.stringify({
+      ...caughtErrorState,
+      status_label: 'Review needed',
+      last_error_code: 'device_blocked',
+      updated_at: new Date().toISOString()
+    }, null, 2)}\n`);
+
+    internal.pullAndApply = async () => {
+      throw new Error('simulated interruption after authoritative state transition');
+    };
+    await expect(tablet.reconcileDeviceBlocked()).rejects.toThrow('simulated interruption');
+    internal.pullAndApply = originalPullAndApply;
+
+    const interrupted = new ObtsPluginClient(tabletDir, { serverUrl: baseUrl, deviceName: 'tablet' });
+    await interrupted.initialize();
+    expect(await interrupted.readState()).toMatchObject({
+      status_label: 'Review needed',
+      last_error_code: 'device_blocked',
+      server_device_ref: staleQueue.expected_device_ref
+    });
+    expect(await interrupted.reconcileDeviceBlocked()).toMatchObject({ applied: true, status: 'Synced' });
+    const recoveredState = await interrupted.readState();
     expect(recoveredState).toMatchObject({
       local_main: resolved.body.resolution_commit,
       local_head: resolved.body.resolution_commit,
@@ -1304,7 +1357,11 @@ describe('Phase 2 dashboard conflict resolution', () => {
     });
     expect(recoveredState.last_event_seq).toBeGreaterThanOrEqual(conflictState.last_event_seq);
     expect(recoveredState.last_applied_event_seq).toBeGreaterThanOrEqual(conflictState.last_applied_event_seq);
-    expect(await tablet.readQueue()).toMatchObject({ pending_commit: null, status: 'idle' });
+    expect(await interrupted.readQueue()).toMatchObject({
+      pending_commit: null,
+      expected_device_ref: recoveredState.server_device_ref,
+      status: 'idle'
+    });
     expect(await readFile(join(tabletDir, 'shared.md'), 'utf8')).toBe('server version\n');
 
     await tablet.markBlocked('device_blocked');
@@ -1347,6 +1404,87 @@ describe('Phase 2 dashboard conflict resolution', () => {
       last_error_code: 'server_recovery_required'
     });
     await expect(restarted.syncOnce()).rejects.toMatchObject({ code: 'server_recovery_required' });
+  });
+
+  it('does not trust near-match backups outside the exact authoritative reconciliation capability', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'authoritative-reconciliation-safety-boundary');
+    await mkdir(deviceDir, { recursive: true });
+    const device = await pairPlugin(admin, deviceDir, 'safety-boundary-device');
+    const state = await device.readState();
+    if (!state.local_head) throw new Error('Paired state did not have a local head.');
+    const backup = {
+      ...state,
+      server_device_ref: 'a'.repeat(40),
+      status_label: 'Review needed',
+      last_error_code: 'device_blocked',
+      updated_at: '2026-08-01T00:00:00.000Z'
+    };
+    const primary = {
+      ...backup,
+      server_device_ref: 'b'.repeat(40),
+      status_label: 'Behind',
+      last_error_code: null,
+      updated_at: '2026-08-01T00:00:01.000Z'
+    };
+    const expected = {
+      vaultId: state.vault_id,
+      deviceId: state.device_id,
+      primaryUpdatedAt: primary.updated_at,
+      primaryServerDeviceRef: primary.server_device_ref,
+      primaryStatusLabel: primary.status_label,
+      priorUpdatedAt: backup.updated_at,
+      priorServerDeviceRef: backup.server_device_ref,
+      priorErrorCode: backup.last_error_code,
+      triggeringErrorCode: 'device_blocked'
+    };
+    const exactQueue = {
+      pending_commit: state.local_head,
+      expected_device_ref: backup.server_device_ref,
+      status: 'conflicted'
+    };
+    const internal = device.client as any;
+    const originalReadQueue = internal.readQueue.bind(internal);
+    internal.activeReconciliation = { authoritativePrimary: expected };
+    internal.readQueue = async () => exactQueue;
+    expect(await internal.shouldUseAuthoritativeReconciliationPrimary(primary, backup)).toBe(true);
+    const caughtErrorBackup = { ...backup, last_error_code: null };
+    internal.activeReconciliation = {
+      authoritativePrimary: { ...expected, priorErrorCode: null }
+    };
+    expect(await internal.shouldUseAuthoritativeReconciliationPrimary(primary, caughtErrorBackup)).toBe(true);
+    internal.activeReconciliation = {
+      authoritativePrimary: { ...expected, priorErrorCode: null, triggeringErrorCode: null }
+    };
+    expect(await internal.shouldUseAuthoritativeReconciliationPrimary(primary, caughtErrorBackup)).toBe(false);
+    internal.activeReconciliation = { authoritativePrimary: expected };
+
+    const stateMismatches = [
+      [{ ...primary, updated_at: '2026-08-01T00:00:02.000Z' }, backup],
+      [{ ...primary, server_device_ref: 'c'.repeat(40) }, backup],
+      [{ ...primary, status_label: 'Checking' }, backup],
+      [{ ...primary, device_id: 'dev_other' }, backup],
+      [{ ...primary, local_head: 'd'.repeat(40) }, backup],
+      [primary, { ...backup, last_error_code: 'conflict_review_required' }],
+      [primary, { ...backup, updated_at: '2026-08-01T00:00:03.000Z' }],
+      [primary, { ...backup, server_device_ref: 'e'.repeat(40) }]
+    ];
+    for (const [candidatePrimary, candidateBackup] of stateMismatches) {
+      expect(await internal.shouldUseAuthoritativeReconciliationPrimary(candidatePrimary, candidateBackup)).toBe(false);
+    }
+
+    for (const queue of [
+      { ...exactQueue, status: 'idle' },
+      { ...exactQueue, pending_commit: 'f'.repeat(40) },
+      { ...exactQueue, expected_device_ref: 'f'.repeat(40) }
+    ]) {
+      internal.readQueue = async () => queue;
+      expect(await internal.shouldUseAuthoritativeReconciliationPrimary(primary, backup)).toBe(false);
+    }
+    internal.readQueue = async () => exactQueue;
+    internal.activeReconciliation = null;
+    expect(await internal.shouldUseAuthoritativeReconciliationPrimary(primary, backup)).toBe(false);
+    internal.readQueue = originalReadQueue;
   });
 
   it('reports the exact reconciliation phase and safe code when the server check is blocked', async () => {

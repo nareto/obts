@@ -2760,6 +2760,17 @@ class ObtsObsidianClient {
         last_error_code: null,
         updated_at: nowIso()
       });
+      attempt.authoritativePrimary = {
+        vaultId: state.vault_id,
+        deviceId: state.device_id,
+        primaryUpdatedAt: nextState.updated_at,
+        primaryServerDeviceRef: nextState.server_device_ref,
+        primaryStatusLabel: nextState.status_label,
+        priorUpdatedAt: state.updated_at,
+        priorServerDeviceRef: state.server_device_ref,
+        priorErrorCode: state.last_error_code,
+        triggeringErrorCode: triggeringErrorCode || state.last_error_code
+      };
       await this.writeState(nextState);
       capturedState = await this.readState();
       attempt.phase = "applying";
@@ -5644,6 +5655,9 @@ class ObtsObsidianClient {
       return primaryState;
     }
     if (sameStateCursors(primaryState, backupState)) return primaryState;
+    if (await this.shouldUseAuthoritativeReconciliationPrimary(primaryState, backupState)) {
+      return primaryState;
+    }
 
     const [localMain, localHead] = await Promise.all([
       this.resolveRefPointer("refs/heads/main"),
@@ -5673,6 +5687,37 @@ class ObtsObsidianClient {
       return backupState;
     }
     return primaryState;
+  }
+
+  async shouldUseAuthoritativeReconciliationPrimary(primaryState, backupState) {
+    const expected = this.activeReconciliation && this.activeReconciliation.authoritativePrimary;
+    if (
+      !expected ||
+      primaryState.vault_id !== expected.vaultId ||
+      primaryState.device_id !== expected.deviceId ||
+      primaryState.updated_at !== expected.primaryUpdatedAt ||
+      primaryState.server_device_ref !== expected.primaryServerDeviceRef ||
+      primaryState.status_label !== expected.primaryStatusLabel ||
+      primaryState.last_error_code !== null ||
+      backupState.vault_id !== expected.vaultId ||
+      backupState.device_id !== expected.deviceId ||
+      backupState.updated_at !== expected.priorUpdatedAt ||
+      backupState.server_device_ref !== expected.priorServerDeviceRef ||
+      expected.triggeringErrorCode !== "device_blocked" ||
+      (expected.priorErrorCode !== null && expected.priorErrorCode !== "device_blocked") ||
+      backupState.last_error_code !== expected.priorErrorCode ||
+      primaryState.local_main !== backupState.local_main ||
+      primaryState.local_head !== backupState.local_head
+    ) {
+      return false;
+    }
+    const queue = await this.readQueue();
+    return Boolean(
+      queue.status === "conflicted" &&
+      queue.pending_commit &&
+      queue.pending_commit === backupState.local_head &&
+      queue.expected_device_ref === backupState.server_device_ref
+    );
   }
 
   async restoreRecoveredBackupState(primaryState, backupState, knownExpectedDeviceRef = undefined) {
