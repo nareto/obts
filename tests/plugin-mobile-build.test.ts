@@ -54,6 +54,10 @@ describe('mobile plugin artifact', () => {
     expect(source).not.toContain('Review directory recovery');
     expect(source).toContain('plugin_version: PLUGIN_VERSION');
     expect(source).toContain('sha256(Buffer.from(stableJson(transferRequest)))');
+    const loadingSurface = source.slice(source.indexOf('if (clientUnavailable) {'), source.indexOf('} else if (pendingOnboarding) {'));
+    expect(loadingSurface.indexOf('window.setInterval(refreshLoadingStatus, 1000)')).toBeLessThan(
+      loadingSurface.indexOf('refreshLoadingStatus();')
+    );
   });
 
   it('loads with only the Obsidian API external and browser globals', async () => {
@@ -105,6 +109,24 @@ describe('mobile plugin artifact', () => {
     const renderedSettingDescriptions: string[] = [];
     const renderedElementTexts: string[] = [];
     const renderedButtons: Array<{ text: string; disabled: boolean }> = [];
+    const settingsRefreshCallbacks: Array<() => void> = [];
+    const clearedSyntheticIntervals = new Set<number>();
+    let nextSyntheticInterval = 100_000;
+    const testSetInterval = (callback: () => void, milliseconds: number) => {
+      if (milliseconds === 1000) {
+        settingsRefreshCallbacks.push(callback);
+        nextSyntheticInterval += 1;
+        return nextSyntheticInterval as unknown as ReturnType<typeof setInterval>;
+      }
+      return setInterval(callback, milliseconds);
+    };
+    const testClearInterval = (interval: ReturnType<typeof setInterval>) => {
+      if (typeof interval === 'number' && interval >= 100_000) {
+        clearedSyntheticIntervals.add(interval);
+        return;
+      }
+      clearInterval(interval);
+    };
     const createContainer = (): any => ({
       empty() {
         renderedSettingNames.length = 0;
@@ -225,8 +247,8 @@ describe('mobile plugin artifact', () => {
       AbortController,
       setTimeout,
       clearTimeout,
-      setInterval,
-      clearInterval,
+      setInterval: testSetInterval,
+      clearInterval: testClearInterval,
       open: (url: string) => openedUrls.push(url),
       document: { hidden: false },
       console
@@ -348,9 +370,10 @@ describe('mobile plugin artifact', () => {
     layoutReadyCallbacks.shift()!();
     await settingTabs[0]!.display();
     expect(renderedElementTexts).toContain('Loading obts');
-    expect(renderedSettingNames.some((value) => ['Starting local state checks', 'Recovering metadata replacements'].includes(value))).toBe(true);
-    expect(renderedSettingDescriptions.some((value) => value.includes('checkpoint has been running for'))).toBe(true);
-    expect(renderedSettingNames).not.toContain('Waiting for the previous operation');
+    expect(renderedSettingNames).toContain('Status');
+    expect(renderedSettingNames).toContain('Current operation');
+    expect(renderedSettingDescriptions.some((value) => value.includes('elapsed'))).toBe(true);
+    expect(renderedSettingDescriptions.every((value) => !value.includes('Close and reopen settings to refresh'))).toBe(true);
     expect(await (plugin as any).ensureClientReady()).toBe(true);
     expect(startupPackReads).toBe(0);
     expect(listedStartupPaths).not.toContain('.obts/git/objects');
@@ -1051,6 +1074,32 @@ describe('mobile plugin artifact', () => {
         updated_at: new Date().toISOString()
       })).buffer
     );
+
+    (plugin as any).clientReady = false;
+    (plugin as any).clientInitialization = new Promise(() => undefined);
+    expect((plugin as any).beginSync('Initializing obts')).toBe(true);
+    (plugin as any).setInitializationStage('Validating interrupted apply files 400/6028', 'recovery_file_validation');
+    await settingTabs[0]!.display();
+    expect(renderedSettingNames).toContain('Status');
+    expect(renderedSettingNames).toContain('Current operation');
+    expect(renderedSettingDescriptions.some((description) => description.includes('400/6028'))).toBe(true);
+    expect(renderedButtons.find((button) => button.text === 'Sync now')).toMatchObject({ disabled: true });
+    expect(renderedButtons.find((button) => button.text === 'Unpair...')).toMatchObject({ disabled: true });
+    const operationLease = (context as any).__obtsOperationRegistry.get(adapter);
+    operationLease.details.stageStartedAt = 1;
+    (plugin as any).setInitializationStage('Restoring interrupted apply metadata', 'recovery_file_validation');
+    expect(operationLease.details.stageStartedAt).toBeGreaterThan(1);
+    (plugin as any).setInitializationStage('Validating interrupted apply files 400/6028', 'recovery_file_validation');
+    (plugin as any).updateInitializationProgress('Validating interrupted apply files 401/6028');
+    settingsRefreshCallbacks.at(-1)!();
+    expect(renderedSettingDescriptions.some((description) => description.includes('401/6028'))).toBe(true);
+    const recoveryRefreshInterval = (settingTabs[0] as any).operationRefreshTimer as number;
+    (settingTabs[0] as any).hide();
+    expect(clearedSyntheticIntervals).toContain(recoveryRefreshInterval);
+    (plugin as any).clientInitialization = null;
+    (plugin as any).clientReady = true;
+    (plugin as any).endSync();
+
     const writesBeforeSnapshot = vi.fn();
     const originalAdapterWriteBinary = adapter.writeBinary.bind(adapter);
     adapter.writeBinary = async (...args: Parameters<typeof adapter.writeBinary>) => {

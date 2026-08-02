@@ -33,8 +33,9 @@ a matching mobile ribbon indicator where the status bar is unavailable. They
 show healthy, active, warning, and blocked states; report determinate
 upload/apply steps when available; and open the dashboard for conflict review
 or plugin settings for other states. Settings identify the current operation and
-its elapsed time, disable **Sync now** while that operation owns the vault lease,
-and distinguish slow progress from a reload that requires restart. Actionable
+its elapsed time, refresh progress while the tab remains open, keep **Sync now**
+and **Unpair** visible but disabled while recovery owns the vault lease, and
+distinguish slow progress from a reload that requires restart. Actionable
 transitions produce one notice, while brief routine polling and catch-up do not.
 
 A paired device can be renamed from plugin settings. The server owns the
