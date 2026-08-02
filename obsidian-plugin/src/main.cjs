@@ -335,7 +335,7 @@ module.exports = class ObtsPlugin extends Plugin {
     this.initializationStage = label;
     this.initializationStageStartedAt = Date.now();
     this.initializationDiagnosticPoint = diagnosticPoint;
-    this.updateOwnedOperationDetails(label, diagnosticPoint);
+    this.updateOwnedOperationDetails(label, diagnosticPoint, {}, true, true);
     this.clearInitializationWatchdog();
     if (!diagnosticPoint || this.reportedInitializationStalls.has(diagnosticPoint)) return;
     this.initializationWatchdogTimer = window.setTimeout(() => {
@@ -360,12 +360,15 @@ module.exports = class ObtsPlugin extends Plugin {
     this.updateOwnedOperationDetails(label, this.initializationDiagnosticPoint);
   }
 
-  updateOwnedOperationDetails(label, diagnosticPoint, changes = {}, markProgress = true) {
+  updateOwnedOperationDetails(label, diagnosticPoint, changes = {}, markProgress = true, resetStage = false) {
     const lease = operationRegistry().get(this.app.vault.adapter);
     if (!lease || operationLeaseOwner(lease) !== this || !lease.details) return;
+    const now = Date.now();
+    const nextPoint = diagnosticPoint || null;
+    if (resetStage || lease.details.diagnosticPoint !== nextPoint) lease.details.stageStartedAt = now;
     if (typeof label === "string" && label.length > 0) lease.details.label = label;
-    lease.details.diagnosticPoint = diagnosticPoint || null;
-    if (markProgress) lease.details.progressUpdatedAt = Date.now();
+    lease.details.diagnosticPoint = nextPoint;
+    if (markProgress) lease.details.progressUpdatedAt = now;
     Object.assign(lease.details, changes);
   }
 
@@ -1114,17 +1117,19 @@ module.exports = class ObtsPlugin extends Plugin {
 
   operationDetails() {
     const lease = operationRegistry().get(this.app.vault.adapter);
-    if (!lease) return { availability: "available", label: null, elapsedMs: 0, progressUpdatedAt: 0, progressAgeMs: 0, slow: false, stalled: false };
+    if (!lease) return { availability: "available", label: null, elapsedMs: 0, stageElapsedMs: 0, progressUpdatedAt: 0, progressAgeMs: 0, slow: false, stalled: false };
     const owner = operationLeaseOwner(lease);
     const availability = (lease.retiring || owner && owner.unloaded) ? "restart_required" : "busy";
     const details = lease.details || {};
     const startedAt = Number.isFinite(details.startedAt) ? details.startedAt : Date.now();
     const progressUpdatedAt = Number.isFinite(details.progressUpdatedAt) ? details.progressUpdatedAt : startedAt;
+    const stageStartedAt = Number.isFinite(details.stageStartedAt) ? details.stageStartedAt : startedAt;
     const fallbackLabel = owner && (owner.activeOperationProgressLabel || owner.initializationStage) || "Obts operation";
     return {
       availability,
       label: typeof details.label === "string" && details.label.length > 0 ? details.label : fallbackLabel,
       elapsedMs: Math.max(0, Date.now() - startedAt),
+      stageElapsedMs: Math.max(0, Date.now() - stageStartedAt),
       progressUpdatedAt,
       progressAgeMs: Math.max(0, Date.now() - progressUpdatedAt),
       slow: Boolean(details.slow),
@@ -1135,13 +1140,17 @@ module.exports = class ObtsPlugin extends Plugin {
   operationDescription(details = this.operationDetails()) {
     if (details.availability === "available") return "No obts operation is running.";
     const elapsed = formatElapsed(details.elapsedMs);
+    const stageElapsed = formatElapsed(details.stageElapsedMs);
+    const timing = Math.abs(details.elapsedMs - details.stageElapsedMs) >= 1000
+      ? `${stageElapsed} in this step · ${elapsed} total`
+      : `${elapsed} elapsed`;
     if (details.availability === "restart_required") {
-      return `${details.label} was interrupted by a plugin update after ${elapsed}. Fully restart Obsidian before continuing.`;
+      return `${details.label} · interrupted after ${elapsed}. Fully restart Obsidian before continuing.`;
     }
     if (details.stalled) {
-      return `${details.label} has been running for ${elapsed} with no reported progress for ${formatElapsed(details.progressAgeMs)}. Keep Obsidian in the foreground; fully restart it if this does not change.`;
+      return `${details.label} · ${timing} · no progress reported for ${formatElapsed(details.progressAgeMs)}. Keep Obsidian in the foreground; fully restart it if this does not change.`;
     }
-    return `${details.label} has been running for ${elapsed}${details.slow ? " and is taking longer than expected" : ""}.`;
+    return `${details.label} · ${timing}${details.slow ? " · taking longer than expected" : ""}.`;
   }
 
   syncBlockedMessage() {
@@ -1232,6 +1241,7 @@ module.exports = class ObtsPlugin extends Plugin {
         label: initialLabel,
         startedAt,
         progressUpdatedAt: startedAt,
+        stageStartedAt: startedAt,
         diagnosticPoint: null,
         slow: false,
         stalled: false
@@ -7525,22 +7535,28 @@ class ObtsSettingTab extends PluginSettingTab {
     containerEl.createEl("h2", { text: "Obsidian True Sync" });
     let availability = this.plugin.operationAvailability();
     if (!this.plugin.clientReady && availability === "available") {
-      await this.plugin.initializeClient();
+      void this.plugin.initializeClient().catch((error) => this.plugin.handleClientInitializationFailure(error));
       availability = this.plugin.operationAvailability();
     }
     const clientUnavailable = !this.plugin.clientReady;
-    const [state, pendingOnboarding] = clientUnavailable
-      ? [null, null]
-      : await Promise.all([
-          this.plugin.client.readState(),
-          this.plugin.client.readPendingOnboarding()
-        ]);
+    let state = null;
+    let pendingOnboarding = null;
+    if (clientUnavailable) {
+      try {
+        state = await this.plugin.client.readPrimaryState() || await this.plugin.client.readBackupState();
+      } catch {
+        // The loading surface remains available even when local state cannot yet be read.
+      }
+    } else {
+      [state, pendingOnboarding] = await Promise.all([
+        this.plugin.client.readState(),
+        this.plugin.client.readPendingOnboarding()
+      ]);
+    }
     const paired = Boolean(state && state.vault_id && state.device_id);
     const recoveryBlocked = Boolean(state && state.last_error_code === "local_state_incomplete");
     const restartRequired = availability === "restart_required";
     const initializationInProgress = clientUnavailable && Boolean(this.plugin.clientInitialization);
-    const initializationStage = this.plugin.initializationStage || "Checking local obts state";
-    const initializationElapsed = formatElapsed(Date.now() - (this.plugin.initializationStageStartedAt || Date.now()));
     const deviceName = this.plugin.settings.deviceName || state && state.device_name || "Obsidian device";
 
     new Setting(containerEl)
@@ -7587,13 +7603,15 @@ class ObtsSettingTab extends PluginSettingTab {
 
     const sectionHeader = containerEl.createDiv({ cls: "obts-settings-section-header" });
     sectionHeader.createEl("h3", {
-      text: clientUnavailable
-        ? restartRequired
-          ? "Restart required"
-          : initializationInProgress
-            ? "Loading obts"
-            : "Finishing update"
-        : pendingOnboarding
+      text: paired
+        ? "Device"
+        : clientUnavailable
+          ? restartRequired
+            ? "Restart required"
+            : initializationInProgress
+              ? "Loading obts"
+              : "Finishing update"
+          : pendingOnboarding
           ? "Setup incomplete"
           : recoveryBlocked
             ? "Recovery required"
@@ -7606,9 +7624,11 @@ class ObtsSettingTab extends PluginSettingTab {
       text: clientUnavailable
         ? restartRequired
           ? "Restart Obsidian"
-          : initializationInProgress
-            ? "Loading"
-            : "Please wait"
+          : paired
+            ? "Recovering"
+            : initializationInProgress
+              ? "Loading"
+              : "Please wait"
         : pendingOnboarding
           ? "Resume setup"
           : recoveryBlocked
@@ -7618,21 +7638,38 @@ class ObtsSettingTab extends PluginSettingTab {
               : "Not paired"
     });
     if (clientUnavailable) {
-      new Setting(containerEl)
-        .setName(
-          restartRequired
-            ? "Plugin update interrupted an operation"
-            : initializationInProgress
-              ? initializationStage
-              : "Waiting for the previous operation"
-        )
-        .setDesc(
-          restartRequired
-            ? "Fully close Obsidian and reopen it. obts will not clear the old operation lock because doing so could overlap vault writes."
-            : initializationInProgress
-              ? `This checkpoint has been running for ${initializationElapsed}. The vault remains available while it finishes. Close and reopen settings to refresh.`
-              : "obts will finish loading when the previous plugin instance releases its active vault operation."
-        );
+      const statusSetting = new Setting(containerEl).setName("Status");
+      const operationSetting = new Setting(containerEl).setName("Current operation");
+      const refreshLoadingStatus = () => {
+        if (this.plugin.clientReady) {
+          this.clearOperationRefreshTimer();
+          void this.display();
+          return;
+        }
+        const currentAvailability = this.plugin.operationAvailability();
+        const operation = this.plugin.operationDetails();
+        const status = restartRequired || currentAvailability === "restart_required"
+          ? "Restart required"
+          : this.plugin.clientInitialization
+            ? "Recovering local sync state"
+            : this.plugin.currentStatusLabel || state && state.status_label || "Loading";
+        statusSetting.setDesc(status);
+        operationSetting.setDesc(this.plugin.operationDescription(operation));
+      };
+      if (paired) {
+        new Setting(containerEl)
+          .setName("Device")
+          .setDesc(deviceName);
+        new Setting(containerEl)
+          .setName("Actions")
+          .addButton((button) => button.setButtonText("Sync now").setCta().setDisabled(true))
+          .addButton((button) => {
+            button.setButtonText("Unpair...").setDisabled(true);
+            if (typeof button.setWarning === "function") button.setWarning();
+          });
+      }
+      this.operationRefreshTimer = window.setInterval(refreshLoadingStatus, 1000);
+      refreshLoadingStatus();
     } else if (pendingOnboarding) {
       const conflictPending = pendingOnboarding.journal.stage === "awaiting_conflict";
       const canCancelPending = !paired && ["awaiting_browser", "approved", "analyzing", "awaiting_confirmation"].includes(pendingOnboarding.journal.stage);
