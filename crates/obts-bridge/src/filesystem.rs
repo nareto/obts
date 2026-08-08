@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Utc};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::task::JoinHandle;
@@ -16,13 +17,16 @@ use crate::headless::{HeadlessClient, HeadlessFilesystemGuard};
 use crate::model::NoteId;
 use crate::new_note::NewNoteFileType;
 use crate::persistence::{ObtsProjectionState, PostgresPersistence};
-use crate::store::{LocalProjectionOutcome, RecoveredVaultFileState, VaultStore};
+use crate::store::{
+    FilesystemProjectionStatus, LocalProjectionOutcome, RecoveredVaultFileState, VaultStore,
+};
 
 #[derive(Clone, Debug)]
 pub struct FilesystemSource {
     root: Arc<PathBuf>,
     watermark: Arc<RwLock<FilesystemWatermark>>,
     persistence: Option<Arc<PostgresPersistence>>,
+    max_text_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -32,6 +36,15 @@ struct FilesystemWatermark {
     generation: u64,
     observed_generation: u64,
     indexed_generation: u64,
+    indexed_files: BTreeMap<String, AttestedFile>,
+    projection_status: FilesystemProjectionStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AttestedFile {
+    oid: String,
+    revision: String,
+    bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -39,20 +52,36 @@ pub struct FilesystemFile {
     pub path: String,
     pub content: String,
     pub revision: String,
+    pub oid: String,
+    identity: FileIdentity,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
 impl FilesystemSource {
     pub fn new(root: impl AsRef<Path>) -> Result<Self, FilesystemError> {
-        Self::build(root, None)
+        Self::new_with_max_text_bytes(root, 512 * 1024 * 1024)
+    }
+
+    pub fn new_with_max_text_bytes(
+        root: impl AsRef<Path>,
+        max_text_bytes: u64,
+    ) -> Result<Self, FilesystemError> {
+        Self::build(root, None, max_text_bytes)
     }
 
     pub async fn new_with_persistence(
         root: impl AsRef<Path>,
         persistence: Arc<PostgresPersistence>,
+        max_text_bytes: u64,
     ) -> Result<Self, FilesystemError> {
-        let source = Self::build(root, Some(persistence))?;
+        let source = Self::build(root, Some(persistence), max_text_bytes)?;
         if let Some(state) = source
             .persistence
             .as_ref()
@@ -74,6 +103,7 @@ impl FilesystemSource {
     fn build(
         root: impl AsRef<Path>,
         persistence: Option<Arc<PostgresPersistence>>,
+        max_text_bytes: u64,
     ) -> Result<Self, FilesystemError> {
         fs::create_dir_all(root.as_ref())?;
         let root = root.as_ref().canonicalize()?;
@@ -81,6 +111,7 @@ impl FilesystemSource {
             root: Arc::new(root),
             watermark: Arc::new(RwLock::new(FilesystemWatermark::default())),
             persistence,
+            max_text_bytes,
         })
     }
 
@@ -94,10 +125,19 @@ impl FilesystemSource {
             .read()
             .expect("filesystem watermark lock")
             .generation;
-        let root = self.root.clone();
-        let files = tokio::task::spawn_blocking(move || scan_root(root.as_path()))
-            .await
-            .map_err(|error| FilesystemError::Task(error.to_string()))??;
+        let before = self.supported_metadata().await?;
+        self.ensure_runtime_size(before.values().map(|identity| identity.len))?;
+        let mut files = BTreeMap::new();
+        for (path, identity) in &before {
+            let file = self.read(path).await?;
+            if file.identity != *identity {
+                return Err(FilesystemError::ProjectionChanged);
+            }
+            files.insert(path.clone(), file);
+        }
+        if self.supported_metadata().await? != before {
+            return Err(FilesystemError::ProjectionChanged);
+        }
         let observed = snapshot_revision(&files);
         let mut watermark = self.watermark.write().expect("filesystem watermark lock");
         if watermark.generation == generation {
@@ -109,11 +149,50 @@ impl FilesystemSource {
         Ok(files)
     }
 
-    async fn snapshot_files(&self) -> Result<BTreeMap<String, FilesystemFile>, FilesystemError> {
+    async fn supported_metadata(&self) -> Result<BTreeMap<String, FileIdentity>, FilesystemError> {
         let root = self.root.clone();
-        tokio::task::spawn_blocking(move || scan_root(root.as_path()))
+        tokio::task::spawn_blocking(move || list_root_metadata(root.as_path()))
             .await
             .map_err(|error| FilesystemError::Task(error.to_string()))?
+    }
+
+    pub(crate) async fn ensure_projected_write_size(
+        &self,
+        path: &str,
+        replacement_bytes: u64,
+    ) -> Result<(), FilesystemError> {
+        let path = normalize_relative_path(path)?;
+        let metadata = self.supported_metadata().await?;
+        let current_bytes = metadata
+            .get(&path)
+            .map(|identity| identity.len)
+            .unwrap_or(0);
+        let total = metadata
+            .values()
+            .try_fold(0_u64, |total, identity| total.checked_add(identity.len))
+            .and_then(|total| total.checked_sub(current_bytes))
+            .and_then(|total| total.checked_add(replacement_bytes))
+            .ok_or(FilesystemError::ProjectionLimitExceeded {
+                limit: self.max_text_bytes,
+            })?;
+        self.ensure_runtime_size([total])
+    }
+
+    pub(crate) fn ensure_runtime_size<I>(&self, sizes: I) -> Result<(), FilesystemError>
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        let total = sizes.into_iter().try_fold(0_u64, u64::checked_add).ok_or(
+            FilesystemError::ProjectionLimitExceeded {
+                limit: self.max_text_bytes,
+            },
+        )?;
+        if total > self.max_text_bytes {
+            return Err(FilesystemError::ProjectionLimitExceeded {
+                limit: self.max_text_bytes,
+            });
+        }
+        Ok(())
     }
 
     pub fn is_index_current(&self) -> bool {
@@ -157,6 +236,7 @@ impl FilesystemSource {
             watermark.indexed.clear();
             watermark.observed_generation = watermark.generation;
             watermark.indexed_generation = 0;
+            watermark.indexed_files.clear();
         }
         self.persist_projection_state(ObtsProjectionState {
             indexed_commit: None,
@@ -194,6 +274,7 @@ impl FilesystemSource {
         &self,
         target: &str,
         generation: u64,
+        indexed_files: BTreeMap<String, AttestedFile>,
     ) -> Result<(), FilesystemError> {
         let previous = {
             let watermark = self.watermark.read().expect("filesystem watermark lock");
@@ -223,6 +304,7 @@ impl FilesystemSource {
             } else {
                 watermark.indexed = target.to_string();
                 watermark.indexed_generation = generation;
+                watermark.indexed_files = indexed_files;
                 false
             }
         };
@@ -272,29 +354,135 @@ impl FilesystemSource {
         if watermark.observed == indexed && watermark.observed_generation == watermark.generation {
             watermark.indexed = indexed;
             watermark.indexed_generation = watermark.generation;
+            watermark.indexed_files = files
+                .iter()
+                .map(|(path, file)| {
+                    (
+                        path.clone(),
+                        AttestedFile {
+                            oid: file.oid.clone(),
+                            revision: file.revision.clone(),
+                            bytes: file.identity.len,
+                        },
+                    )
+                })
+                .collect();
+        }
+    }
+
+    fn indexed_manifest(&self) -> BTreeMap<String, AttestedFile> {
+        self.watermark
+            .read()
+            .expect("filesystem watermark lock")
+            .indexed_files
+            .clone()
+    }
+
+    pub fn projection_status(&self) -> FilesystemProjectionStatus {
+        self.watermark
+            .read()
+            .expect("filesystem watermark lock")
+            .projection_status
+            .clone()
+    }
+
+    fn record_projection_result(&self, full_audit: bool, result: &Result<usize, FilesystemError>) {
+        let now = Utc::now();
+        let mut watermark = self.watermark.write().expect("filesystem watermark lock");
+        let status = &mut watermark.projection_status;
+        status.attempts_total = status.attempts_total.saturating_add(1);
+        match result {
+            Ok(_) => {
+                status.consecutive_failures = 0;
+                status.last_success_at = Some(now);
+                status.last_failure_code = None;
+                if full_audit {
+                    status.full_audits_total = status.full_audits_total.saturating_add(1);
+                    status.last_full_audit_at = Some(now);
+                }
+            }
+            Err(error) => {
+                status.failures_total = status.failures_total.saturating_add(1);
+                status.consecutive_failures = status.consecutive_failures.saturating_add(1);
+                status.last_failure_at = Some(now);
+                status.last_failure_code = Some(error.code().to_string());
+            }
         }
     }
 
     pub async fn read(&self, path: &str) -> Result<FilesystemFile, FilesystemError> {
         let target = self.safe_target(path)?;
         let path = normalize_relative_path(path)?;
+        let max_text_bytes = self.max_text_bytes;
         tokio::task::spawn_blocking(move || {
-            let bytes = fs::read(&target).map_err(|error| {
+            let before = fs::metadata(&target).map_err(|error| {
                 if error.kind() == io::ErrorKind::NotFound {
                     FilesystemError::NotFound
                 } else {
                     FilesystemError::Io(error)
                 }
             })?;
-            let content = String::from_utf8(bytes.clone())
-                .map_err(|_| FilesystemError::InvalidUtf8(path.clone()))?;
-            let metadata = fs::metadata(&target)?;
+            if before.len() > max_text_bytes {
+                return Err(FilesystemError::ProjectionLimitExceeded {
+                    limit: max_text_bytes,
+                });
+            }
+            let file = fs::File::open(&target).map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    FilesystemError::NotFound
+                } else {
+                    FilesystemError::Io(error)
+                }
+            })?;
+            let mut bytes = Vec::new();
+            file.take(max_text_bytes.saturating_add(1))
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > max_text_bytes {
+                return Err(FilesystemError::ProjectionLimitExceeded {
+                    limit: max_text_bytes,
+                });
+            }
+            let after = fs::metadata(&target)?;
+            if before.len() != after.len()
+                || before.modified().ok() != after.modified().ok()
+                || after.len() != bytes.len() as u64
+            {
+                return Err(FilesystemError::ProjectionChanged);
+            }
+            let revision = content_revision(&bytes);
+            let oid = git_blob_oid(&bytes);
+            let content =
+                String::from_utf8(bytes).map_err(|_| FilesystemError::InvalidUtf8(path.clone()))?;
             Ok(FilesystemFile {
                 path,
                 content,
-                revision: content_revision(&bytes),
-                created_at: system_time(metadata.created().ok()),
-                updated_at: system_time(metadata.modified().ok()).unwrap_or_else(Utc::now),
+                revision,
+                oid,
+                identity: FileIdentity {
+                    len: after.len(),
+                    modified: after.modified().ok(),
+                },
+                created_at: system_time(after.created().ok()),
+                updated_at: system_time(after.modified().ok()).unwrap_or_else(Utc::now),
+            })
+        })
+        .await
+        .map_err(|error| FilesystemError::Task(error.to_string()))?
+    }
+
+    async fn file_identity(&self, path: &str) -> Result<FileIdentity, FilesystemError> {
+        let target = self.safe_target(path)?;
+        tokio::task::spawn_blocking(move || {
+            let metadata = fs::metadata(&target).map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    FilesystemError::NotFound
+                } else {
+                    FilesystemError::Io(error)
+                }
+            })?;
+            Ok(FileIdentity {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
             })
         })
         .await
@@ -302,6 +490,7 @@ impl FilesystemSource {
     }
 
     pub async fn create(&self, path: &str, content: &str) -> Result<String, FilesystemError> {
+        self.ensure_runtime_size([content.len() as u64])?;
         let target = self.safe_target(path)?;
         let content = content.to_owned();
         let revision = content_revision(content.as_bytes());
@@ -318,18 +507,34 @@ impl FilesystemSource {
         content: &str,
         expected_revision: Option<&str>,
     ) -> Result<String, FilesystemError> {
+        self.ensure_runtime_size([content.len() as u64])?;
         let target = self.safe_target(path)?;
         let content = content.to_owned();
         let revision = content_revision(content.as_bytes());
         let expected_revision = expected_revision.map(ToOwned::to_owned);
+        let max_text_bytes = self.max_text_bytes;
         tokio::task::spawn_blocking(move || {
-            let current = fs::read(&target).map_err(|error| {
+            let metadata = fs::metadata(&target).map_err(|error| {
                 if error.kind() == io::ErrorKind::NotFound {
                     FilesystemError::NotFound
                 } else {
                     FilesystemError::Io(error)
                 }
             })?;
+            if metadata.len() > max_text_bytes {
+                return Err(FilesystemError::ProjectionLimitExceeded {
+                    limit: max_text_bytes,
+                });
+            }
+            let file = fs::File::open(&target)?;
+            let mut current = Vec::new();
+            file.take(max_text_bytes.saturating_add(1))
+                .read_to_end(&mut current)?;
+            if current.len() as u64 > max_text_bytes {
+                return Err(FilesystemError::ProjectionLimitExceeded {
+                    limit: max_text_bytes,
+                });
+            }
             let actual = content_revision(&current);
             if let Some(expected) = expected_revision
                 && expected != actual
@@ -348,6 +553,18 @@ impl FilesystemSource {
         let mut watermark = self.watermark.write().expect("filesystem watermark lock");
         watermark.generation = watermark.generation.wrapping_add(1);
         watermark.observed = "dirty".to_string();
+    }
+
+    async fn path_exists(&self, path: &str) -> Result<bool, FilesystemError> {
+        let path = normalize_relative_path(path)?;
+        let target = self.root.join(path);
+        tokio::task::spawn_blocking(move || match fs::symlink_metadata(target) {
+            Ok(metadata) => Ok(metadata.is_file()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(FilesystemError::Io(error)),
+        })
+        .await
+        .map_err(|error| FilesystemError::Task(error.to_string()))?
     }
 
     fn safe_target(&self, relative: &str) -> Result<PathBuf, FilesystemError> {
@@ -376,24 +593,25 @@ pub async fn hydrate_runtime_snapshot(
     store: &VaultStore,
     source: &FilesystemSource,
 ) -> Result<usize, FilesystemError> {
-    let files = source.snapshot_files().await?;
-    let recovered = files
-        .values()
-        .map(|file| RecoveredVaultFileState {
-            path: file.path.clone(),
-            content: file.content.clone(),
-            file_type: if file.path.ends_with(".md") {
-                NewNoteFileType::Md
-            } else {
-                NewNoteFileType::Base
-            },
-            couchdb_rev: file.revision.clone(),
-            created_at: file.created_at,
-            updated_at: file.updated_at,
-        })
-        .collect::<Vec<_>>();
-    let count = recovered.len();
-    store.hydrate_runtime_filesystem_snapshot(recovered).await;
+    let expected_metadata = source.supported_metadata().await?;
+    source.ensure_runtime_size(expected_metadata.values().map(|identity| identity.len))?;
+    let mut prepared = Vec::with_capacity(expected_metadata.len());
+    for (path, identity) in &expected_metadata {
+        let file = source.read(path).await?;
+        if file.identity != *identity {
+            return Err(FilesystemError::ProjectionChanged);
+        }
+        prepared.push(
+            store
+                .prepare_runtime_filesystem_file(recovered_file(file))
+                .await,
+        );
+    }
+    if source.supported_metadata().await? != expected_metadata {
+        return Err(FilesystemError::ProjectionChanged);
+    }
+    let count = prepared.len();
+    store.replace_runtime_filesystem_snapshot(prepared).await;
     Ok(count)
 }
 
@@ -402,16 +620,29 @@ pub async fn synchronize_commit_projection(
     source: &FilesystemSource,
     guard: &mut HeadlessFilesystemGuard<'_>,
     client: &HeadlessClient,
+    full_audit: bool,
+    hydrate_runtime: bool,
 ) -> Result<usize, FilesystemError> {
-    let indexed_commit = source.indexed_commit();
-    let delta = guard
-        .read_index_delta(client, indexed_commit.as_deref())
-        .await
-        .map_err(|error| FilesystemError::Headless(error.to_string()))?;
-    let changed = apply_commit_delta(store, source, indexed_commit, delta).await?;
-    hydrate_runtime_snapshot(store, source).await?;
-    source.purge_persisted_raw_content().await?;
-    Ok(changed)
+    let result = async {
+        let indexed_commit = source.indexed_commit();
+        let delta = guard
+            .read_index_delta(client, indexed_commit.as_deref())
+            .await
+            .map_err(|error| FilesystemError::Headless(error.to_string()))?;
+        let changed = apply_commit_delta(
+            store,
+            source,
+            indexed_commit,
+            delta,
+            full_audit,
+            hydrate_runtime,
+        )
+        .await?;
+        Ok(changed)
+    }
+    .await;
+    source.record_projection_result(full_audit, &result);
+    result
 }
 
 async fn apply_commit_delta(
@@ -419,6 +650,8 @@ async fn apply_commit_delta(
     source: &FilesystemSource,
     indexed_commit: Option<String>,
     delta: crate::headless::HeadlessIndexDelta,
+    full_audit: bool,
+    hydrate_runtime: bool,
 ) -> Result<usize, FilesystemError> {
     let Some(target_commit) = delta.head.clone() else {
         source.mark_dirty();
@@ -445,14 +678,8 @@ async fn apply_commit_delta(
             continue;
         }
         validate_commit_id(&file.oid)?;
-        if !is_content_revision(&file.content_sha256) {
-            return Err(FilesystemError::InvalidDelta(format!(
-                "{} has an invalid content digest",
-                file.path
-            )));
-        }
         if target_manifest
-            .insert(path.clone(), file.content_sha256.clone())
+            .insert(path.clone(), file.oid.clone())
             .is_some()
         {
             return Err(FilesystemError::InvalidDelta(format!(
@@ -463,98 +690,16 @@ async fn apply_commit_delta(
 
     let generation = source.begin_commit_projection(&target_commit).await?;
     let result = async {
-        let indexed = store.indexed_vault_file_revisions().await;
-        let mut changed = 0usize;
-        for change in &delta.changes {
-            let path = normalize_relative_path(&change.path)?;
-            if !is_supported_path(&path) || is_excluded_path(&path) {
-                continue;
-            }
-            match change.kind.as_str() {
-                "delete" => {
-                    if target_manifest.contains_key(&path) {
-                        return Err(FilesystemError::InvalidDelta(format!(
-                            "deleted path {} remains in the target manifest",
-                            change.path
-                        )));
-                    }
-                    store
-                        .delete_filesystem_file(&NoteId::new(path))
-                        .await
-                        .map_err(|error| FilesystemError::Projection(error.to_string()))?;
-                }
-                "add" | "modify" => {
-                    let expected = change.content_sha256.as_deref().ok_or_else(|| {
-                        FilesystemError::InvalidDelta(format!(
-                            "{} is missing its content digest",
-                            change.path
-                        ))
-                    })?;
-                    if target_manifest.get(&path).map(String::as_str) != Some(expected) {
-                        return Err(FilesystemError::InvalidDelta(format!(
-                            "{} does not match the target manifest",
-                            change.path
-                        )));
-                    }
-                    let file = source.read(&path).await?;
-                    if file.revision != expected {
-                        return Err(FilesystemError::CommitContentMismatch {
-                            path,
-                            expected: expected.to_string(),
-                            actual: file.revision,
-                        });
-                    }
-                    let outcome = store
-                        .project_filesystem_file(RecoveredVaultFileState {
-                            path: file.path.clone(),
-                            content: file.content,
-                            file_type: if file.path.ends_with(".md") {
-                                NewNoteFileType::Md
-                            } else {
-                                NewNoteFileType::Base
-                            },
-                            couchdb_rev: file.revision,
-                            created_at: file.created_at,
-                            updated_at: file.updated_at,
-                        })
-                        .await
-                        .map_err(|error| FilesystemError::Projection(error.to_string()))?;
-                    if !matches!(outcome, LocalProjectionOutcome::Applied) {
-                        return Err(FilesystemError::ProjectionPending);
-                    }
-                }
-                other => {
-                    return Err(FilesystemError::InvalidDelta(format!(
-                        "unsupported change kind {other}"
-                    )));
-                }
-            }
-            changed += 1;
-        }
-        if delta.mode == "rebuild" {
-            for path in indexed
-                .keys()
-                .filter(|path| !target_manifest.contains_key(*path))
-            {
-                store
-                    .delete_filesystem_file(&NoteId::new(path.clone()))
-                    .await
-                    .map_err(|error| FilesystemError::Projection(error.to_string()))?;
-                changed += 1;
-            }
-        }
-        let files = source.snapshot_files().await?;
-        let projected = store.indexed_vault_file_revisions().await;
-        let actual = files
-            .iter()
-            .map(|(path, file)| (path.clone(), file.revision.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let projected = projected.into_iter().collect::<BTreeMap<_, _>>();
-        if actual != target_manifest || projected != target_manifest {
-            return Err(FilesystemError::CommitSnapshotMismatch);
-        }
+        let runtime_hydration = hydrate_runtime || source.indexed_manifest().is_empty();
+        let force_full = full_audit || runtime_hydration || delta.mode == "rebuild";
+        let (changed, indexed_files) = if force_full {
+            reconcile_full_snapshot(store, source, &target_manifest, runtime_hydration).await?
+        } else {
+            reconcile_incremental_snapshot(store, source, &target_manifest, &delta.changes).await?
+        };
+        source.purge_persisted_raw_content().await?;
         source
-            .complete_commit_projection(&target_commit, generation)
+            .complete_commit_projection(&target_commit, generation, indexed_files)
             .await?;
         Ok(changed)
     }
@@ -565,6 +710,277 @@ async fn apply_commit_delta(
             .await;
     }
     result
+}
+
+async fn reconcile_full_snapshot(
+    store: &VaultStore,
+    source: &FilesystemSource,
+    target_manifest: &BTreeMap<String, String>,
+    hydrate_runtime: bool,
+) -> Result<(usize, BTreeMap<String, AttestedFile>), FilesystemError> {
+    let expected_metadata = source.supported_metadata().await?;
+    source.ensure_runtime_size(expected_metadata.values().map(|identity| identity.len))?;
+    if expected_metadata.keys().ne(target_manifest.keys()) {
+        return Err(FilesystemError::CommitSnapshotMismatch);
+    }
+    let mut projected = store.indexed_vault_file_revisions().await;
+    let mut prepared = Vec::with_capacity(if hydrate_runtime {
+        expected_metadata.len()
+    } else {
+        0
+    });
+    let mut indexed_files = BTreeMap::new();
+    let mut changed = 0usize;
+    for (path, identity) in &expected_metadata {
+        let expected_oid = target_manifest
+            .get(path)
+            .expect("validated target path must have an oid");
+        let file = source.read(path).await?;
+        if file.identity != *identity {
+            return Err(FilesystemError::ProjectionChanged);
+        }
+        verify_file_oid(&file, expected_oid)?;
+        let revision = file.revision.clone();
+        indexed_files.insert(
+            path.clone(),
+            AttestedFile {
+                oid: expected_oid.clone(),
+                revision: revision.clone(),
+                bytes: file.identity.len,
+            },
+        );
+        if projected.get(path) != Some(&revision) {
+            project_file(store, file.clone()).await?;
+            projected.insert(path.clone(), revision);
+            changed += 1;
+        }
+        if hydrate_runtime {
+            prepared.push(
+                store
+                    .prepare_runtime_filesystem_file(recovered_file(file))
+                    .await,
+            );
+        }
+    }
+    if source.supported_metadata().await? != expected_metadata {
+        return Err(FilesystemError::ProjectionChanged);
+    }
+    let extras = projected
+        .keys()
+        .filter(|path| !indexed_files.contains_key(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    for path in extras {
+        store
+            .delete_filesystem_file(&NoteId::new(path))
+            .await
+            .map_err(|error| FilesystemError::Projection(error.to_string()))?;
+        changed += 1;
+    }
+    if hydrate_runtime {
+        store.replace_runtime_filesystem_snapshot(prepared).await;
+    }
+    Ok((changed, indexed_files))
+}
+
+enum PlannedProjectionChange {
+    Delete(String),
+    Upsert {
+        path: String,
+        oid: String,
+        identity: FileIdentity,
+    },
+}
+
+async fn reconcile_incremental_snapshot(
+    store: &VaultStore,
+    source: &FilesystemSource,
+    target_manifest: &BTreeMap<String, String>,
+    changes: &[crate::headless::HeadlessIndexChange],
+) -> Result<(usize, BTreeMap<String, AttestedFile>), FilesystemError> {
+    let mut indexed_files = source.indexed_manifest();
+    let mut prospective_oids = indexed_files
+        .iter()
+        .map(|(path, file)| (path.clone(), file.oid.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut prospective_bytes = indexed_files
+        .values()
+        .fold(0u64, |total, file| total.saturating_add(file.bytes));
+    let mut planned = Vec::new();
+    let mut seen = HashSet::new();
+
+    // Validate the complete target size before reading or mutating runtime content.
+    for change in changes {
+        let path = normalize_relative_path(&change.path)?;
+        if !is_supported_path(&path) || is_excluded_path(&path) {
+            continue;
+        }
+        if !seen.insert(path.clone()) {
+            return Err(FilesystemError::InvalidDelta(format!(
+                "duplicate change path {path}"
+            )));
+        }
+        match change.kind.as_str() {
+            "delete" => {
+                if target_manifest.contains_key(&path) || source.path_exists(&path).await? {
+                    return Err(FilesystemError::CommitSnapshotMismatch);
+                }
+                if let Some(previous) = indexed_files.get(&path) {
+                    prospective_bytes = prospective_bytes.saturating_sub(previous.bytes);
+                }
+                prospective_oids.remove(&path);
+                planned.push(PlannedProjectionChange::Delete(path));
+            }
+            "add" | "modify" => {
+                let expected_oid = change.oid.as_deref().ok_or_else(|| {
+                    FilesystemError::InvalidDelta(format!(
+                        "{} is missing its target oid",
+                        change.path
+                    ))
+                })?;
+                validate_commit_id(expected_oid)?;
+                if target_manifest.get(&path).map(String::as_str) != Some(expected_oid) {
+                    return Err(FilesystemError::InvalidDelta(format!(
+                        "{} does not match the target manifest",
+                        change.path
+                    )));
+                }
+                let identity = source.file_identity(&path).await?;
+                if let Some(previous) = indexed_files.get(&path) {
+                    prospective_bytes = prospective_bytes.saturating_sub(previous.bytes);
+                }
+                prospective_bytes = prospective_bytes.saturating_add(identity.len);
+                prospective_oids.insert(path.clone(), expected_oid.to_string());
+                planned.push(PlannedProjectionChange::Upsert {
+                    path,
+                    oid: expected_oid.to_string(),
+                    identity,
+                });
+            }
+            other => {
+                return Err(FilesystemError::InvalidDelta(format!(
+                    "unsupported change kind {other}"
+                )));
+            }
+        }
+    }
+    source.ensure_runtime_size([prospective_bytes])?;
+    if prospective_oids != *target_manifest {
+        return Err(FilesystemError::CommitSnapshotMismatch);
+    }
+
+    let mut projected = store.indexed_vault_file_revisions().await;
+    let mut changed = 0usize;
+    for change in planned {
+        match change {
+            PlannedProjectionChange::Delete(path) => {
+                if source.path_exists(&path).await? {
+                    return Err(FilesystemError::ProjectionChanged);
+                }
+                indexed_files.remove(&path);
+                if projected.remove(&path).is_some() {
+                    store
+                        .delete_filesystem_file(&NoteId::new(path))
+                        .await
+                        .map_err(|error| FilesystemError::Projection(error.to_string()))?;
+                    changed += 1;
+                }
+            }
+            PlannedProjectionChange::Upsert {
+                path,
+                oid,
+                identity,
+            } => {
+                let file = source.read(&path).await?;
+                if file.identity != identity {
+                    return Err(FilesystemError::ProjectionChanged);
+                }
+                verify_file_oid(&file, &oid)?;
+                let revision = file.revision.clone();
+                indexed_files.insert(
+                    path.clone(),
+                    AttestedFile {
+                        oid,
+                        revision: revision.clone(),
+                        bytes: file.identity.len,
+                    },
+                );
+                if projected.get(&path) != Some(&revision) {
+                    project_file(store, file).await?;
+                    projected.insert(path, revision);
+                    changed += 1;
+                }
+            }
+        }
+    }
+
+    // A prior attempt may have updated the derived store without advancing the cursor.
+    for (path, expected) in &indexed_files {
+        if projected.get(path) == Some(&expected.revision) {
+            continue;
+        }
+        let file = source.read(path).await?;
+        verify_file_oid(&file, &expected.oid)?;
+        if file.revision != expected.revision {
+            return Err(FilesystemError::CommitSnapshotMismatch);
+        }
+        project_file(store, file).await?;
+        projected.insert(path.clone(), expected.revision.clone());
+        changed += 1;
+    }
+    let extras = projected
+        .keys()
+        .filter(|path| !indexed_files.contains_key(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    for path in extras {
+        store
+            .delete_filesystem_file(&NoteId::new(path.clone()))
+            .await
+            .map_err(|error| FilesystemError::Projection(error.to_string()))?;
+        projected.remove(&path);
+        changed += 1;
+    }
+    Ok((changed, indexed_files))
+}
+
+async fn project_file(store: &VaultStore, file: FilesystemFile) -> Result<(), FilesystemError> {
+    let outcome = store
+        .project_filesystem_file(recovered_file(file))
+        .await
+        .map_err(|error| FilesystemError::Projection(error.to_string()))?;
+    if matches!(outcome, LocalProjectionOutcome::Applied) {
+        Ok(())
+    } else {
+        Err(FilesystemError::ProjectionPending)
+    }
+}
+
+fn recovered_file(file: FilesystemFile) -> RecoveredVaultFileState {
+    RecoveredVaultFileState {
+        path: file.path.clone(),
+        content: file.content,
+        file_type: if file.path.ends_with(".md") {
+            NewNoteFileType::Md
+        } else {
+            NewNoteFileType::Base
+        },
+        couchdb_rev: file.revision,
+        created_at: file.created_at,
+        updated_at: file.updated_at,
+    }
+}
+
+fn verify_file_oid(file: &FilesystemFile, expected: &str) -> Result<(), FilesystemError> {
+    if file.oid == expected {
+        Ok(())
+    } else {
+        Err(FilesystemError::CommitContentMismatch {
+            path: file.path.clone(),
+            expected: expected.to_string(),
+            actual: file.oid.clone(),
+        })
+    }
 }
 
 pub async fn synchronize_snapshot(
@@ -618,16 +1034,40 @@ pub fn spawn_filesystem_worker(
     source: Arc<FilesystemSource>,
     headless: Option<HeadlessClient>,
     interval: Duration,
+    audit_interval: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut last_full_audit = Instant::now();
+        let mut projection_failures = 0_u32;
+        let mut next_projection_attempt = Instant::now();
         loop {
             if let Some(headless) = headless.as_ref() {
-                match headless.lock_filesystem().await {
-                    Ok(mut guard) => log_projection_result(
-                        synchronize_commit_projection(&store, &source, &mut guard, headless).await,
-                    ),
-                    Err(error) => {
-                        warn!(error = %error, "filesystem projection deferred; headless client unavailable")
+                let full_audit = last_full_audit.elapsed() >= audit_interval;
+                if projection_required(&source, full_audit)
+                    && Instant::now() >= next_projection_attempt
+                {
+                    match headless.lock_filesystem().await {
+                        Ok(mut guard) => {
+                            let result = synchronize_commit_projection(
+                                &store, &source, &mut guard, headless, full_audit, false,
+                            )
+                            .await;
+                            if result.is_ok() {
+                                projection_failures = 0;
+                                next_projection_attempt = Instant::now();
+                                if full_audit {
+                                    last_full_audit = Instant::now();
+                                }
+                            } else {
+                                projection_failures = projection_failures.saturating_add(1);
+                                next_projection_attempt = Instant::now()
+                                    + projection_retry_delay(interval, projection_failures);
+                            }
+                            log_projection_result(result);
+                        }
+                        Err(error) => {
+                            warn!(error = %error, "filesystem projection deferred; headless client unavailable")
+                        }
                     }
                 }
             } else {
@@ -636,6 +1076,21 @@ pub fn spawn_filesystem_worker(
             sleep(interval).await;
         }
     })
+}
+
+fn projection_required(source: &FilesystemSource, full_audit: bool) -> bool {
+    full_audit || !source.is_index_current()
+}
+
+fn projection_retry_delay(interval: Duration, failures: u32) -> Duration {
+    let exponent = failures.saturating_sub(1).min(8);
+    Duration::from_secs(
+        interval
+            .as_secs()
+            .max(1)
+            .saturating_mul(2_u64.saturating_pow(exponent))
+            .min(300),
+    )
 }
 
 fn log_projection_result(result: Result<usize, FilesystemError>) {
@@ -648,55 +1103,44 @@ fn log_projection_result(result: Result<usize, FilesystemError>) {
     }
 }
 
-fn scan_root(root: &Path) -> Result<BTreeMap<String, FilesystemFile>, FilesystemError> {
+fn list_root_metadata(root: &Path) -> Result<BTreeMap<String, FileIdentity>, FilesystemError> {
     let mut files = BTreeMap::new();
-    walk(root, root, &mut files)?;
+    walk_metadata(root, root, &mut files)?;
     Ok(files)
 }
 
-fn walk(
+fn walk_metadata(
     root: &Path,
     directory: &Path,
-    files: &mut BTreeMap<String, FilesystemFile>,
+    files: &mut BTreeMap<String, FileIdentity>,
 ) -> Result<(), FilesystemError> {
     let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
-        let metadata = entry.file_type()?;
-        if metadata.is_symlink() {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
             continue;
         }
         let path = entry.path();
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|_| FilesystemError::PathEscape)?;
-        let relative = path_to_slashes(relative)?;
+        let relative = path_to_slashes(
+            path.strip_prefix(root)
+                .map_err(|_| FilesystemError::PathEscape)?,
+        )?;
         if is_excluded_path(&relative) {
             continue;
         }
-        if metadata.is_dir() {
-            walk(root, &path, files)?;
-            continue;
+        if file_type.is_dir() {
+            walk_metadata(root, &path, files)?;
+        } else if file_type.is_file() && is_supported_path(&relative) {
+            let metadata = entry.metadata()?;
+            files.insert(
+                relative,
+                FileIdentity {
+                    len: metadata.len(),
+                    modified: metadata.modified().ok(),
+                },
+            );
         }
-        if !metadata.is_file() || !is_supported_path(&relative) {
-            continue;
-        }
-        let bytes = fs::read(&path)?;
-        let content = String::from_utf8(bytes.clone())
-            .map_err(|_| FilesystemError::InvalidUtf8(relative.clone()))?;
-        let metadata = entry.metadata()?;
-        let updated_at = system_time(metadata.modified().ok()).unwrap_or_else(Utc::now);
-        let created_at = system_time(metadata.created().ok());
-        files.insert(
-            relative.clone(),
-            FilesystemFile {
-                path: relative,
-                content,
-                revision: content_revision(&bytes),
-                created_at,
-                updated_at,
-            },
-        );
     }
     Ok(())
 }
@@ -736,6 +1180,13 @@ fn content_revision(content: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(content)))
 }
 
+fn git_blob_oid(content: &[u8]) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(format!("blob {}\0", content.len()).as_bytes());
+    hasher.update(content);
+    hex::encode(hasher.finalize())
+}
+
 fn snapshot_revision(files: &BTreeMap<String, FilesystemFile>) -> String {
     let mut hasher = Sha256::new();
     for file in files.values() {
@@ -745,12 +1196,6 @@ fn snapshot_revision(files: &BTreeMap<String, FilesystemFile>) -> String {
         hasher.update(b"\n");
     }
     format!("sha256:{}", hex::encode(hasher.finalize()))
-}
-
-fn is_content_revision(revision: &str) -> bool {
-    revision.len() == 71
-        && revision.starts_with("sha256:")
-        && revision[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn validate_commit_id(commit: &str) -> Result<(), FilesystemError> {
@@ -844,6 +1289,8 @@ pub enum FilesystemError {
     InvalidDelta(String),
     #[error("projection changed while indexing")]
     ProjectionChanged,
+    #[error("supported vault text exceeds the configured runtime limit of {limit} bytes")]
+    ProjectionLimitExceeded { limit: u64 },
     #[error("projection persistence is pending")]
     ProjectionPending,
     #[error("visible vault snapshot does not match the projected commit")]
@@ -864,6 +1311,7 @@ impl FilesystemError {
             Self::Headless(_) => "headless_error",
             Self::InvalidDelta(_) => "invalid_delta",
             Self::ProjectionChanged => "projection_changed",
+            Self::ProjectionLimitExceeded { .. } => "projection_limit_exceeded",
             Self::ProjectionPending => "projection_pending",
             Self::CommitSnapshotMismatch => "commit_snapshot_mismatch",
             Self::CommitContentMismatch { .. } => "commit_content_mismatch",
@@ -890,7 +1338,26 @@ mod tests {
     use crate::headless::{HeadlessIndexChange, HeadlessIndexDelta, HeadlessIndexFile};
     use crate::store::VaultStore;
 
-    use super::{FilesystemError, FilesystemSource, apply_commit_delta};
+    use super::{
+        FilesystemError, FilesystemSource, apply_commit_delta, git_blob_oid,
+        hydrate_runtime_snapshot, project_file, projection_required, projection_retry_delay,
+    };
+
+    #[test]
+    fn projection_failures_back_off_to_a_bounded_delay() {
+        assert_eq!(
+            projection_retry_delay(std::time::Duration::from_secs(2), 1).as_secs(),
+            2
+        );
+        assert_eq!(
+            projection_retry_delay(std::time::Duration::from_secs(2), 2).as_secs(),
+            4
+        );
+        assert_eq!(
+            projection_retry_delay(std::time::Duration::from_secs(2), 20).as_secs(),
+            300
+        );
+    }
 
     #[tokio::test]
     async fn writes_and_reads_supported_vault_files_with_revision_checks() {
@@ -920,6 +1387,27 @@ mod tests {
             source.read("Notes/test.md").await.expect("read").content,
             "# Second\n"
         );
+    }
+
+    #[tokio::test]
+    async fn full_hydration_fails_closed_above_the_runtime_text_limit() {
+        let root = tempdir().expect("tempdir");
+        std::fs::write(root.path().join("note.md"), "12345").expect("note");
+        let source = FilesystemSource::build(root.path(), None, 4).expect("source");
+        let store = VaultStore::new(10);
+
+        assert!(matches!(
+            source.scan().await,
+            Err(FilesystemError::ProjectionLimitExceeded { limit: 4 })
+        ));
+        assert!(matches!(
+            hydrate_runtime_snapshot(&store, &source).await,
+            Err(FilesystemError::ProjectionLimitExceeded { limit: 4 })
+        ));
+        assert!(matches!(
+            source.update("note.md", "1234", None).await,
+            Err(FilesystemError::ProjectionLimitExceeded { limit: 4 })
+        ));
     }
 
     #[tokio::test]
@@ -957,7 +1445,7 @@ mod tests {
         let source = FilesystemSource::new(root.path()).expect("source");
         let store = VaultStore::new(10);
         let first_revision = source.create("First.md", "first\n").await.expect("first");
-        let removed_revision = source
+        let _removed_revision = source
             .create("Removed.base", "filters: []\n")
             .await
             .expect("removed");
@@ -973,30 +1461,28 @@ mod tests {
                 files: vec![
                     HeadlessIndexFile {
                         path: "First.md".to_string(),
-                        oid: "a".repeat(40),
-                        content_sha256: first_revision.clone(),
+                        oid: git_blob_oid(b"first\n"),
                     },
                     HeadlessIndexFile {
                         path: "Removed.base".to_string(),
-                        oid: "b".repeat(40),
-                        content_sha256: removed_revision.clone(),
+                        oid: git_blob_oid(b"filters: []\n"),
                     },
                 ],
                 changes: vec![
                     HeadlessIndexChange {
                         path: "First.md".to_string(),
                         kind: "add".to_string(),
-                        oid: Some("a".repeat(40)),
-                        content_sha256: Some(first_revision.clone()),
+                        oid: Some(git_blob_oid(b"first\n")),
                     },
                     HeadlessIndexChange {
                         path: "Removed.base".to_string(),
                         kind: "add".to_string(),
-                        oid: Some("b".repeat(40)),
-                        content_sha256: Some(removed_revision.clone()),
+                        oid: Some(git_blob_oid(b"filters: []\n")),
                     },
                 ],
             },
+            false,
+            false,
         )
         .await
         .expect("rebuild");
@@ -1023,24 +1509,23 @@ mod tests {
                 mode: "incremental".to_string(),
                 files: vec![HeadlessIndexFile {
                     path: "First.md".to_string(),
-                    oid: "c".repeat(40),
-                    content_sha256: second_revision.clone(),
+                    oid: git_blob_oid(b"second\n"),
                 }],
                 changes: vec![
                     HeadlessIndexChange {
                         path: "First.md".to_string(),
                         kind: "modify".to_string(),
-                        oid: Some("c".repeat(40)),
-                        content_sha256: Some(second_revision.clone()),
+                        oid: Some(git_blob_oid(b"second\n")),
                     },
                     HeadlessIndexChange {
                         path: "Removed.base".to_string(),
                         kind: "delete".to_string(),
                         oid: None,
-                        content_sha256: None,
                     },
                 ],
             },
+            false,
+            false,
         )
         .await
         .expect("incremental");
@@ -1054,6 +1539,148 @@ mod tests {
             [("First.md".to_string(), second_revision)].into()
         );
         assert!(source.is_index_current());
+    }
+
+    #[tokio::test]
+    async fn incremental_projection_checks_the_runtime_limit_before_mutation() {
+        let root = tempdir().expect("tempdir");
+        let source = FilesystemSource::build(root.path(), None, 8).expect("source");
+        let store = VaultStore::new(10);
+        let first_revision = source.create("First.md", "first\n").await.expect("first");
+        let first_commit = "1".repeat(40);
+        apply_commit_delta(
+            &store,
+            &source,
+            None,
+            HeadlessIndexDelta {
+                head: Some(first_commit.clone()),
+                base: None,
+                mode: "rebuild".to_string(),
+                files: vec![HeadlessIndexFile {
+                    path: "First.md".to_string(),
+                    oid: git_blob_oid(b"first\n"),
+                }],
+                changes: vec![HeadlessIndexChange {
+                    path: "First.md".to_string(),
+                    kind: "add".to_string(),
+                    oid: Some(git_blob_oid(b"first\n")),
+                }],
+            },
+            false,
+            false,
+        )
+        .await
+        .expect("initial projection");
+
+        std::fs::write(root.path().join("First.md"), "too large").expect("large change");
+        source.mark_dirty();
+        let result = apply_commit_delta(
+            &store,
+            &source,
+            Some(first_commit.clone()),
+            HeadlessIndexDelta {
+                head: Some("2".repeat(40)),
+                base: Some(first_commit.clone()),
+                mode: "incremental".to_string(),
+                files: vec![HeadlessIndexFile {
+                    path: "First.md".to_string(),
+                    oid: git_blob_oid(b"too large"),
+                }],
+                changes: vec![HeadlessIndexChange {
+                    path: "First.md".to_string(),
+                    kind: "modify".to_string(),
+                    oid: Some(git_blob_oid(b"too large")),
+                }],
+            },
+            false,
+            false,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(FilesystemError::ProjectionLimitExceeded { limit: 8 })
+        ));
+        assert_eq!(
+            source.indexed_commit().as_deref(),
+            Some(first_commit.as_str())
+        );
+        assert_eq!(
+            store.indexed_vault_file_revisions().await,
+            [("First.md".to_string(), first_revision)].into()
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_projection_retry_repairs_a_later_tree_revert() {
+        let root = tempdir().expect("tempdir");
+        let source = FilesystemSource::new(root.path()).expect("source");
+        let store = VaultStore::new(10);
+        let first_revision = source.create("First.md", "first\n").await.expect("first");
+        let first_commit = "1".repeat(40);
+        apply_commit_delta(
+            &store,
+            &source,
+            None,
+            HeadlessIndexDelta {
+                head: Some(first_commit.clone()),
+                base: None,
+                mode: "rebuild".to_string(),
+                files: vec![HeadlessIndexFile {
+                    path: "First.md".to_string(),
+                    oid: git_blob_oid(b"first\n"),
+                }],
+                changes: vec![HeadlessIndexChange {
+                    path: "First.md".to_string(),
+                    kind: "add".to_string(),
+                    oid: Some(git_blob_oid(b"first\n")),
+                }],
+            },
+            false,
+            false,
+        )
+        .await
+        .expect("initial projection");
+
+        source
+            .update("First.md", "partial\n", Some(&first_revision))
+            .await
+            .expect("partial content");
+        project_file(&store, source.read("First.md").await.expect("partial file"))
+            .await
+            .expect("simulate partial derived write");
+        source
+            .update("First.md", "first\n", None)
+            .await
+            .expect("revert visible file");
+
+        let repaired = apply_commit_delta(
+            &store,
+            &source,
+            Some(first_commit.clone()),
+            HeadlessIndexDelta {
+                head: Some("2".repeat(40)),
+                base: Some(first_commit),
+                mode: "incremental".to_string(),
+                files: vec![HeadlessIndexFile {
+                    path: "First.md".to_string(),
+                    oid: git_blob_oid(b"first\n"),
+                }],
+                changes: vec![],
+            },
+            false,
+            false,
+        )
+        .await
+        .expect("repair projection");
+
+        assert_eq!(repaired, 1);
+        assert_eq!(
+            store.indexed_vault_file_revisions().await,
+            [("First.md".to_string(), first_revision)].into()
+        );
+        assert!(!projection_required(&source, false));
+        assert!(projection_required(&source, true));
     }
 
     #[tokio::test]
@@ -1073,15 +1700,15 @@ mod tests {
                 files: vec![HeadlessIndexFile {
                     path: "First.md".to_string(),
                     oid: "d".repeat(40),
-                    content_sha256: format!("sha256:{}", "0".repeat(64)),
                 }],
                 changes: vec![HeadlessIndexChange {
                     path: "First.md".to_string(),
                     kind: "add".to_string(),
                     oid: Some("d".repeat(40)),
-                    content_sha256: Some(format!("sha256:{}", "0".repeat(64))),
                 }],
             },
+            false,
+            false,
         )
         .await;
         assert!(matches!(

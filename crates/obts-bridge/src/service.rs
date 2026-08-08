@@ -28,6 +28,7 @@ pub struct VaultBridgeService {
     pub store: VaultStore,
     pub filesystem: Option<Arc<FilesystemSource>>,
     pub headless: Option<HeadlessClient>,
+    vault_write_lock: Arc<Mutex<()>>,
     vault_file_repair_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
 }
 
@@ -37,6 +38,7 @@ impl VaultBridgeService {
             store,
             filesystem: None,
             headless: None,
+            vault_write_lock: Arc::new(Mutex::new(())),
             vault_file_repair_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -50,6 +52,7 @@ impl VaultBridgeService {
             store,
             filesystem: Some(filesystem),
             headless,
+            vault_write_lock: Arc::new(Mutex::new(())),
             vault_file_repair_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -242,6 +245,7 @@ impl VaultBridgeService {
         auth: &AuthContext,
         request: NewNoteRequest,
     ) -> Result<NewNoteResponse, ServiceError> {
+        let _vault_write_guard = self.vault_write_lock.lock().await;
         let now = Utc::now();
         let path = self
             .store
@@ -267,7 +271,7 @@ impl VaultBridgeService {
             .filesystem
             .as_ref()
             .ok_or_else(|| ServiceError::BadRequest("filesystem source is disabled".to_string()))?;
-        let headless_guard = if let Some(headless) = self.headless.as_ref() {
+        let mut headless_guard = if let Some(headless) = self.headless.as_ref() {
             Some(
                 headless
                     .lock_filesystem()
@@ -277,13 +281,16 @@ impl VaultBridgeService {
         } else {
             None
         };
+        self.ensure_projected_write_within_limit(filesystem, &write.path, write.content.len())
+            .await?;
         let revision = filesystem
             .create(&write.path, &write.content)
             .await
             .map_err(ServiceError::FilesystemWrite)?;
-        self.notify_headless_write_locked(headless_guard, &write.path)
+        self.notify_headless_write_locked(headless_guard.as_mut(), &write.path)
             .await;
         let projection = self.finalize_prepared_write(write, &revision).await?;
+        drop(headless_guard);
         Ok(NewNoteResponse {
             id: response_id,
             status: projection.response_status("created"),
@@ -302,6 +309,7 @@ impl VaultBridgeService {
     ) -> Result<UpdateNoteResponse, ServiceError> {
         let write_lock = self.vault_file_repair_lock(note_id.as_str()).await;
         let _write_guard = write_lock.lock().await;
+        let _vault_write_guard = self.vault_write_lock.lock().await;
         self.refresh_vault_file_for_write(auth, note_id).await?;
         let now = Utc::now();
         let request = self
@@ -319,7 +327,7 @@ impl VaultBridgeService {
             .filesystem
             .as_ref()
             .ok_or_else(|| ServiceError::BadRequest("filesystem source is disabled".to_string()))?;
-        let headless_guard = if let Some(headless) = self.headless.as_ref() {
+        let mut headless_guard = if let Some(headless) = self.headless.as_ref() {
             Some(
                 headless
                     .lock_filesystem()
@@ -329,6 +337,8 @@ impl VaultBridgeService {
         } else {
             None
         };
+        self.ensure_projected_write_within_limit(filesystem, &write.path, write.content.len())
+            .await?;
         let revision = filesystem
             .update(
                 &write.path,
@@ -337,9 +347,10 @@ impl VaultBridgeService {
             )
             .await
             .map_err(ServiceError::FilesystemWrite)?;
-        self.notify_headless_write_locked(headless_guard, &write.path)
+        self.notify_headless_write_locked(headless_guard.as_mut(), &write.path)
             .await;
         let projection = self.finalize_prepared_write(write, &revision).await?;
+        drop(headless_guard);
         Ok(UpdateNoteResponse {
             id: note_id.clone(),
             status: projection.response_status("updated"),
@@ -351,14 +362,21 @@ impl VaultBridgeService {
     pub async fn status(&self) -> StatusResponse {
         let mut status = self.store.status().await;
         if let Some(headless) = self.headless.as_ref() {
-            status.dependencies.obts_client = if headless.is_paired() {
+            status.headless_process = headless.runtime_status();
+            status.dependencies.obts_client = if status.headless_process.up && headless.is_paired()
+            {
                 "healthy"
             } else {
                 status.status = "degraded";
-                "not_paired"
+                if status.headless_process.circuit_open {
+                    "circuit_open"
+                } else {
+                    "not_paired"
+                }
             };
         }
         if let Some(filesystem) = self.filesystem.as_ref() {
+            status.filesystem_projection = filesystem.projection_status();
             status.dependencies.headless_vault = if filesystem.is_index_current() {
                 "healthy"
             } else {
@@ -382,6 +400,7 @@ impl VaultBridgeService {
         auth: &AuthContext,
         request: NewNoteRequest,
     ) -> Result<NewNoteResponse, ServiceError> {
+        let _vault_write_guard = self.vault_write_lock.lock().await;
         let now = Utc::now();
         let path = self
             .store
@@ -407,7 +426,7 @@ impl VaultBridgeService {
             .filesystem
             .as_ref()
             .ok_or_else(|| ServiceError::BadRequest("filesystem source is disabled".to_string()))?;
-        let headless_guard = if let Some(headless) = self.headless.as_ref() {
+        let mut headless_guard = if let Some(headless) = self.headless.as_ref() {
             Some(
                 headless
                     .lock_filesystem()
@@ -417,13 +436,16 @@ impl VaultBridgeService {
         } else {
             None
         };
+        self.ensure_projected_write_within_limit(filesystem, &write.path, write.content.len())
+            .await?;
         let revision = filesystem
             .create(&write.path, &write.content)
             .await
             .map_err(ServiceError::FilesystemWrite)?;
-        self.notify_headless_write_locked(headless_guard, &write.path)
+        self.notify_headless_write_locked(headless_guard.as_mut(), &write.path)
             .await;
         let projection = self.finalize_prepared_write(write, &revision).await?;
+        drop(headless_guard);
         Ok(NewNoteResponse {
             id: response_id,
             status: projection.response_status("created"),
@@ -442,6 +464,7 @@ impl VaultBridgeService {
     ) -> Result<UpdateNoteResponse, ServiceError> {
         let write_lock = self.vault_file_repair_lock(file_id.as_str()).await;
         let _write_guard = write_lock.lock().await;
+        let _vault_write_guard = self.vault_write_lock.lock().await;
         self.refresh_vault_file_for_write(auth, file_id).await?;
         let now = Utc::now();
         let write = self
@@ -454,7 +477,7 @@ impl VaultBridgeService {
             .filesystem
             .as_ref()
             .ok_or_else(|| ServiceError::BadRequest("filesystem source is disabled".to_string()))?;
-        let headless_guard = if let Some(headless) = self.headless.as_ref() {
+        let mut headless_guard = if let Some(headless) = self.headless.as_ref() {
             Some(
                 headless
                     .lock_filesystem()
@@ -464,6 +487,8 @@ impl VaultBridgeService {
         } else {
             None
         };
+        self.ensure_projected_write_within_limit(filesystem, &write.path, write.content.len())
+            .await?;
         let revision = filesystem
             .update(
                 &write.path,
@@ -472,9 +497,10 @@ impl VaultBridgeService {
             )
             .await
             .map_err(ServiceError::FilesystemWrite)?;
-        self.notify_headless_write_locked(headless_guard, &write.path)
+        self.notify_headless_write_locked(headless_guard.as_mut(), &write.path)
             .await;
         let projection = self.finalize_prepared_write(write, &revision).await?;
+        drop(headless_guard);
         Ok(UpdateNoteResponse {
             id: file_id.clone(),
             status: projection.response_status("updated"),
@@ -483,9 +509,21 @@ impl VaultBridgeService {
         })
     }
 
+    async fn ensure_projected_write_within_limit(
+        &self,
+        filesystem: &FilesystemSource,
+        path: &str,
+        replacement_bytes: usize,
+    ) -> Result<(), ServiceError> {
+        filesystem
+            .ensure_projected_write_size(path, replacement_bytes as u64)
+            .await
+            .map_err(ServiceError::FilesystemWrite)
+    }
+
     async fn notify_headless_write_locked(
         &self,
-        guard: Option<HeadlessFilesystemGuard<'_>>,
+        guard: Option<&mut HeadlessFilesystemGuard<'_>>,
         path: &str,
     ) {
         let Some(headless) = self.headless.as_ref() else {
@@ -781,6 +819,44 @@ mod obts_tests {
             service.get_vault_file(&admin, &NoteId::new(path)).await,
             Err(ServiceError::IndexCatchingUp)
         ));
+    }
+
+    #[tokio::test]
+    async fn source_committed_writes_enforce_the_aggregate_runtime_limit() {
+        let store = VaultStore::new(10);
+        store
+            .project_filesystem_file(RecoveredVaultFileState {
+                path: "First.md".to_string(),
+                content: "1234".to_string(),
+                file_type: NewNoteFileType::Md,
+                couchdb_rev: "1-a".to_string(),
+                created_at: Some(Utc::now()),
+                updated_at: Utc::now(),
+            })
+            .await
+            .expect("project first file");
+        let root = tempdir().expect("vault root");
+        let source = Arc::new(
+            FilesystemSource::new_with_max_text_bytes(root.path(), 5).expect("filesystem source"),
+        );
+        source
+            .create("First.md", "1234")
+            .await
+            .expect("create first source file");
+        let service = VaultBridgeService::new_with_filesystem(store, source.clone(), None);
+
+        assert!(matches!(
+            service
+                .ensure_projected_write_within_limit(&source, "Second.md", 2)
+                .await,
+            Err(ServiceError::FilesystemWrite(
+                crate::filesystem::FilesystemError::ProjectionLimitExceeded { limit: 5 }
+            ))
+        ));
+        service
+            .ensure_projected_write_within_limit(&source, "First.md", 5)
+            .await
+            .expect("same-path replacement remains within limit");
     }
 
     #[tokio::test]

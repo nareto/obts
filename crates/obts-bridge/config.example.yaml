@@ -9,6 +9,12 @@ client:
   server_url: "${OBTS_SERVER_URL}"
   device_name: "obts-bridge"
   scan_interval_seconds: 2
+  projection_audit_interval_seconds: 604800
+  projection_max_text_bytes: 536870912
+  restart_failure_window_seconds: 900
+  restart_max_failures: 3
+  restart_base_backoff_seconds: 5
+  restart_max_backoff_seconds: 60
   auto_start: true
 
 database:

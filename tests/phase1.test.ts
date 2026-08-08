@@ -1306,7 +1306,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await exists(join(receiverDir, 'Crash Tree'))).toBe(true);
     expect(await exists(join(receiverDir, 'Crash Tree', 'Nested', 'note.md'))).toBe(false);
     expect(JSON.parse(await readFile(join(receiverDir, '.obts', 'apply-journal.json'), 'utf8'))).toMatchObject({
-      journal_version: 3,
+      journal_version: 4,
       phase: 'writing_files',
       directory_intents: [{ op: 'delete', path: 'Crash Tree' }],
       preserve_local_changes: true
@@ -1376,7 +1376,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(recoveredDevice?.last_applied_main).toBe(newestMain);
   });
 
-  it('finishes committed v3 directory recovery with the target event cursor', async () => {
+  it('finishes committed v4 directory recovery with the target event cursor', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const sourceDir = join(root, 'committed-tombstone-source');
     const receiverDir = join(root, 'committed-tombstone-receiver');
@@ -1411,7 +1411,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       phase: string;
       event_seq: number;
     };
-    expect(committedJournal).toMatchObject({ journal_version: 3, phase: 'committed', event_seq: expect.any(Number) });
+    expect(committedJournal).toMatchObject({ journal_version: 4, phase: 'committed', event_seq: expect.any(Number) });
     expect(await exists(join(receiverDir, 'Committed Tree'))).toBe(false);
 
     const restarted = new ObtsPluginClient(receiverDir, { serverUrl: baseUrl, deviceName: 'committed-tombstone-receiver' });
@@ -5149,6 +5149,7 @@ describe('Phase 1 sync without conflict resolution', () => {
           apply_id: 'apply_test_replay',
           operation_type: 'pull_apply',
           target_main: pulled.manifest.target_main,
+          target_file_sizes: pulled.manifest.target_file_sizes,
           expected_prior_local_main: state.local_main,
           expected_prior_local_device_ref: state.server_device_ref,
           phase: 'recovery_bundle_written',
@@ -5267,6 +5268,7 @@ describe('Phase 1 sync without conflict resolution', () => {
         apply_id: 'apply_test_directory_replay',
         operation_type: 'pull_apply',
         target_main: pulled.manifest.target_main,
+        target_file_sizes: pulled.manifest.target_file_sizes,
         expected_prior_local_main: state.local_main,
         expected_prior_local_device_ref: state.server_device_ref,
         phase: 'recovery_bundle_written',

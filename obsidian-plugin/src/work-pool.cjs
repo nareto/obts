@@ -7,6 +7,11 @@ class ByteBudget {
 
   async acquire(requestedBytes) {
     const bytes = Number.isFinite(requestedBytes) && requestedBytes > 0 ? Math.floor(requestedBytes) : 0;
+    if (Number.isFinite(this.maxBytes) && bytes > this.maxBytes) {
+      const error = new RangeError(`Work item requires ${bytes} bytes, above the ${this.maxBytes}-byte buffer limit.`);
+      error.code = "file_buffer_budget_exceeded";
+      throw error;
+    }
     if (this.canAcquire(bytes)) return this.reserve(bytes);
     return await new Promise((resolve) => {
       this.waiters.push({ bytes, resolve });
@@ -16,7 +21,6 @@ class ByteBudget {
 
   canAcquire(bytes) {
     if (!Number.isFinite(this.maxBytes)) return true;
-    if (bytes > this.maxBytes) return this.reservedBytes === 0;
     return this.reservedBytes + bytes <= this.maxBytes;
   }
 

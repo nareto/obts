@@ -536,6 +536,8 @@ pub struct ContextStats {
 pub struct StatusResponse {
     pub status: &'static str,
     pub dependencies: DependencyStatus,
+    pub headless_process: HeadlessProcessStatus,
+    pub filesystem_projection: FilesystemProjectionStatus,
     pub write_projection: WriteProjectionStatus,
     pub index: IndexStats,
     pub embedding: EmbeddingStatus,
@@ -550,6 +552,34 @@ pub struct DependencyStatus {
     pub couchdb: &'static str,
     pub obts_client: &'static str,
     pub headless_vault: &'static str,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct HeadlessProcessStatus {
+    pub up: bool,
+    pub restart_count: u64,
+    pub unexpected_exits: u64,
+    pub circuit_open: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_exit_signal: Option<i32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FilesystemProjectionStatus {
+    pub attempts_total: u64,
+    pub failures_total: u64,
+    pub consecutive_failures: u64,
+    pub full_audits_total: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_success_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_full_audit_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3301,18 +3331,21 @@ impl VaultStore {
         self.project_recovered_vault_file(recovered).await
     }
 
-    pub async fn hydrate_runtime_filesystem_snapshot(
+    pub(crate) async fn prepare_runtime_filesystem_file(
         &self,
-        recovered_files: Vec<RecoveredVaultFileState>,
+        recovered: RecoveredVaultFileState,
+    ) -> (PreparedVaultWrite, String) {
+        let revision = recovered.couchdb_rev.clone();
+        (
+            self.prepared_recovered_vault_file(recovered).await,
+            revision,
+        )
+    }
+
+    pub(crate) async fn replace_runtime_filesystem_snapshot(
+        &self,
+        prepared: Vec<(PreparedVaultWrite, String)>,
     ) {
-        let mut prepared = Vec::with_capacity(recovered_files.len());
-        for recovered in recovered_files {
-            let revision = recovered.couchdb_rev.clone();
-            prepared.push((
-                self.prepared_recovered_vault_file(recovered).await,
-                revision,
-            ));
-        }
         let now = Utc::now();
         let mut guard = self.inner.write().await;
         let embeddings = guard
@@ -5678,6 +5711,8 @@ fn status_from_inner(
             obts_client: "disabled",
             headless_vault: "disabled",
         },
+        headless_process: HeadlessProcessStatus::default(),
+        filesystem_projection: FilesystemProjectionStatus::default(),
         write_projection: WriteProjectionStatus {
             pending: 0,
             last_success_at: None,

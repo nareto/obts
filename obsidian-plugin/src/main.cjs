@@ -1808,7 +1808,10 @@ class ObtsObsidianClient {
         false,
         pulled.manifest.directory_intents || [],
         pulled.manifest.explicit_directories || [],
-        pulled.manifest.event_seq
+        pulled.manifest.event_seq,
+        false,
+        null,
+        pulled.manifest.target_file_sizes || {}
       );
       await this.acknowledgeAppliedMain(pulled.manifest.target_main);
       await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
@@ -1911,7 +1914,10 @@ class ObtsObsidianClient {
         false,
         pulled.manifest.directory_intents || [],
         pulled.manifest.explicit_directories || [],
-        pulled.manifest.event_seq
+        pulled.manifest.event_seq,
+        false,
+        null,
+        pulled.manifest.target_file_sizes || {}
       );
       await this.acknowledgeAppliedMain(pulled.manifest.target_main);
       await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
@@ -2151,7 +2157,10 @@ class ObtsObsidianClient {
       false,
       pulled.manifest.directory_intents || [],
       pulled.manifest.explicit_directories || [],
-      pulled.manifest.event_seq
+      pulled.manifest.event_seq,
+      false,
+      null,
+      pulled.manifest.target_file_sizes || {}
     );
     await this.acknowledgeAppliedMain(pulled.manifest.target_main);
     await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
@@ -2196,7 +2205,10 @@ class ObtsObsidianClient {
       false,
       pulled.manifest.directory_intents || [],
       pulled.manifest.explicit_directories || [],
-      pulled.manifest.event_seq
+      pulled.manifest.event_seq,
+      false,
+      null,
+      pulled.manifest.target_file_sizes || {}
     );
     if (state.local_main !== pulled.manifest.target_main) {
       await this.acknowledgeAppliedMain(pulled.manifest.target_main);
@@ -2953,7 +2965,9 @@ class ObtsObsidianClient {
       pulled.manifest.directory_intents || [],
       pulled.manifest.explicit_directories || [],
       pulled.manifest.event_seq,
-      false
+      false,
+      null,
+      pulled.manifest.target_file_sizes || {}
     );
     if (!applied) return false;
     await this.acknowledgeAppliedMain(pulled.manifest.target_main);
@@ -2997,7 +3011,9 @@ class ObtsObsidianClient {
       pulled.manifest.directory_intents || [],
       pulled.manifest.explicit_directories || [],
       pulled.manifest.event_seq,
-      true
+      true,
+      null,
+      pulled.manifest.target_file_sizes || {}
     );
     if (!applied) return false;
     await this.acknowledgeAppliedMain(pulled.manifest.target_main);
@@ -3172,7 +3188,8 @@ class ObtsObsidianClient {
     explicitDirectories = [],
     eventSeq = undefined,
     cleanVisibleStateVerified = false,
-    confirmedDirectoryRecovery = null
+    confirmedDirectoryRecovery = null,
+    targetFileSizes = {}
   ) {
     const state = await this.readState();
     let compactedDirectoryIntents = compactDirectoryIntents(directoryIntents);
@@ -3202,10 +3219,11 @@ class ObtsObsidianClient {
     }));
     this.reportOperationProgress("Applying", "apply_recovery_prepare");
     const journal = {
-      journal_version: 3,
+      journal_version: 4,
       apply_id: applyId,
       operation_type: "pull_apply",
       target_main: targetMain,
+      target_file_sizes: isTargetFileSizeMap(targetFileSizes) ? Object.assign({}, targetFileSizes) : {},
       expected_prior_local_main: state.local_main,
       expected_prior_local_device_ref: state.server_device_ref,
       phase: "planned",
@@ -3890,13 +3908,19 @@ class ObtsObsidianClient {
     }
 
     for (const filePath of writes) await this.removeBlockingMaterializationPaths(filePath);
-    await this.writeTargetFileBatch(writes, targetEntries, assertRecoveredDescendants, () => {
-      completed += 1;
-      reportProgress();
-    });
+    await this.writeTargetFileBatch(
+      writes,
+      targetEntries,
+      journal.target_file_sizes || {},
+      assertRecoveredDescendants,
+      () => {
+        completed += 1;
+        reportProgress();
+      }
+    );
   }
 
-  async writeTargetFileBatch(writes, targetEntries, assertRecoveredDescendants, onProgress) {
+  async writeTargetFileBatch(writes, targetEntries, targetFileSizes, assertRecoveredDescendants, onProgress) {
     const byteBudget = createByteBudget(this.fileBufferBudgetBytes);
     const active = new Set();
     let firstError = null;
@@ -3907,14 +3931,30 @@ class ObtsObsidianClient {
       if (firstError) break;
       await waitForCapacity();
       if (firstError) break;
+      const expectedBytes = targetFileSizes[filePath];
+      if (!Number.isSafeInteger(expectedBytes) || expectedBytes < 0) {
+        firstError = new ObtsBlockedError(
+          "target_blob_size_unavailable",
+          "The server did not provide a bounded size for a target file."
+        );
+        break;
+      }
       let content;
+      let releaseBytes;
       try {
+        releaseBytes = await byteBudget.acquire(expectedBytes);
         content = await this.readBlobOid(targetEntries.get(filePath));
+        if (content.byteLength !== expectedBytes) {
+          throw new ObtsBlockedError(
+            "target_blob_size_mismatch",
+            "A downloaded target file did not match its attested size."
+          );
+        }
       } catch (error) {
+        if (releaseBytes) releaseBytes();
         firstError = error;
         break;
       }
-      const releaseBytes = await byteBudget.acquire(content.byteLength);
       if (firstError) {
         releaseBytes();
         break;
@@ -6556,6 +6596,7 @@ class ObtsObsidianClient {
       local_head_at_decision: state.local_head,
       event_seq: manifest.event_seq || 0,
       changed_paths: manifest.changed_paths || [],
+      target_file_sizes: isTargetFileSizeMap(manifest.target_file_sizes) ? Object.assign({}, manifest.target_file_sizes) : {},
       directory_intents: (manifest.directory_intents || []).map((intent) => ({ op: intent.op, path: intent.path })),
       explicit_directories: manifest.explicit_directories || [],
       original_pending_intents: classification.directoryState.pending_intents,
@@ -6745,7 +6786,8 @@ class ObtsObsidianClient {
           recovery.explicit_directories,
           recovery.event_seq,
           true,
-          { roots: recoveryRoots, inventory: recovery.inventory }
+          { roots: recoveryRoots, inventory: recovery.inventory },
+          recovery.target_file_sizes || {}
         );
         if (!applied) return await this.resetDirectoryRecoveryAfterChange(recovery);
         recovery = Object.assign({}, recovery, { last_completed_step: "apply_completed", updated_at: nowIso() });
@@ -8350,7 +8392,8 @@ function parseDirectoryRecoveryDecision(value) {
     !isGitObjectId(value.target_main) || !isGitObjectId(value.local_main_at_decision) || !isGitObjectId(value.local_head_at_decision) ||
     !(value.base_main === null || isGitObjectId(value.base_main)) ||
     !Number.isSafeInteger(value.event_seq) || value.event_seq < 0 ||
-    !pathArray(value.changed_paths) || !pathArray(value.explicit_directories) || !pathArray(value.ambiguous_roots) ||
+    !pathArray(value.changed_paths) || !isTargetFileSizeMap(value.target_file_sizes || {}) ||
+    !pathArray(value.explicit_directories) || !pathArray(value.ambiguous_roots) ||
     !Array.isArray(value.directory_intents) || value.directory_intents.some((intent) =>
       !intent || typeof intent !== "object" || Array.isArray(intent) ||
       (intent.op !== "create" && intent.op !== "delete") || typeof intent.path !== "string" || !isSafeJournalPath(intent.path)
@@ -8667,8 +8710,9 @@ function parseApplyJournal(value) {
   const preApplyDirectoryCtimes = value.pre_apply_directory_ctimes;
   const confirmedDirectoryRoots = value.confirmed_directory_roots === undefined ? [] : value.confirmed_directory_roots;
   const confirmedDirectoryInventory = value.confirmed_directory_inventory === undefined ? null : value.confirmed_directory_inventory;
+  const targetFileSizes = value.target_file_sizes === undefined ? {} : value.target_file_sizes;
   if (
-    (journalVersion !== 1 && journalVersion !== 2 && journalVersion !== 3) ||
+    (journalVersion !== 1 && journalVersion !== 2 && journalVersion !== 3 && journalVersion !== 4) ||
     typeof value.apply_id !== "string" || value.apply_id.length === 0 ||
     typeof value.operation_type !== "string" || !operations.has(value.operation_type) ||
     typeof value.target_main !== "string" || !/^[0-9a-f]{40}$/u.test(value.target_main) ||
@@ -8683,7 +8727,7 @@ function parseApplyJournal(value) {
       !typedPreflight || typeof typedPreflight !== "object" || Array.isArray(typedPreflight) ||
       affectedPaths.some((filePath) => !Object.hasOwn(typedPreflight, filePath) || !isPreflightFingerprint(typedPreflight[filePath]))
     )) ||
-    (journalVersion === 3 && (
+    (journalVersion >= 3 && (
       !Array.isArray(directoryIntents) || directoryIntents.some((intent) =>
         !intent || typeof intent !== "object" || Array.isArray(intent) ||
         (intent.op !== "create" && intent.op !== "delete") || typeof intent.path !== "string" || !isSafeJournalPath(intent.path)
@@ -8702,6 +8746,7 @@ function parseApplyJournal(value) {
       typeof value.preserve_local_changes !== "boolean" ||
       !(value.event_seq === null || Number.isSafeInteger(value.event_seq) && value.event_seq >= 0)
     )) ||
+    (journalVersion >= 4 && !isTargetFileSizeMap(targetFileSizes)) ||
     !isNullableString(value.recovery_bundle_id) ||
     !isNullableString(value.last_completed_step) ||
     !isNullableString(value.redacted_error_category)
@@ -8715,9 +8760,17 @@ function parseApplyJournal(value) {
     pre_apply_directory_ctimes: {},
     confirmed_directory_roots: [],
     confirmed_directory_inventory: null,
+    target_file_sizes: {},
     preserve_local_changes: false,
     event_seq: null
   }, value);
+}
+
+function isTargetFileSizeMap(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value) &&
+    Object.entries(value).every(([filePath, bytes]) =>
+      isSafeJournalPath(filePath) && isSyncableVaultPath(filePath) && Number.isSafeInteger(bytes) && bytes >= 0
+    );
 }
 
 function isSafeJournalPath(filePath) {

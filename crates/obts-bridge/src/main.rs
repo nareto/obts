@@ -10,8 +10,7 @@ use tracing_subscriber::EnvFilter;
 use obts_bridge::api::{ApiTokenState, AppState, serve};
 use obts_bridge::config::AppConfig;
 use obts_bridge::filesystem::{
-    FilesystemSource, hydrate_runtime_snapshot, spawn_filesystem_worker,
-    synchronize_commit_projection, synchronize_snapshot,
+    FilesystemSource, spawn_filesystem_worker, synchronize_commit_projection, synchronize_snapshot,
 };
 use obts_bridge::headless::{HeadlessClient, spawn_maintenance};
 use obts_bridge::new_note::NewNotePathSettings;
@@ -101,12 +100,19 @@ async fn main() -> anyhow::Result<()> {
     configure_store(&store, &config).await;
 
     let filesystem = Arc::new(if let Some(persistence) = projection_persistence {
-        FilesystemSource::new_with_persistence(&config.client.vault_dir, persistence)
-            .await
-            .context("failed to initialize the durable headless vault projection")?
+        FilesystemSource::new_with_persistence(
+            &config.client.vault_dir,
+            persistence,
+            config.client.projection_max_text_bytes,
+        )
+        .await
+        .context("failed to initialize the durable headless vault projection")?
     } else {
-        FilesystemSource::new(&config.client.vault_dir)
-            .context("failed to initialize the headless vault filesystem")?
+        FilesystemSource::new_with_max_text_bytes(
+            &config.client.vault_dir,
+            config.client.projection_max_text_bytes,
+        )
+        .context("failed to initialize the headless vault filesystem")?
     });
     let headless = if config.client.auto_start {
         Some(
@@ -123,13 +129,9 @@ async fn main() -> anyhow::Result<()> {
             .lock_filesystem()
             .await
             .context("failed to coordinate the initial commit projection")?;
-        let had_cursor = filesystem.indexed_commit().is_some();
-        if had_cursor {
-            hydrate_runtime_snapshot(&store, &filesystem)
-                .await
-                .context("failed to hydrate runtime content from the headless vault")?;
-        }
-        match synchronize_commit_projection(&store, &filesystem, &mut guard, client).await {
+        match synchronize_commit_projection(&store, &filesystem, &mut guard, client, true, true)
+            .await
+        {
             Ok(projected) => info!(
                 projected,
                 vault_dir = %filesystem.root().display(),
@@ -144,9 +146,6 @@ async fn main() -> anyhow::Result<()> {
         let projected = synchronize_snapshot(&store, &filesystem)
             .await
             .context("failed to build the development filesystem projection")?;
-        hydrate_runtime_snapshot(&store, &filesystem)
-            .await
-            .context("failed to hydrate development runtime content")?;
         filesystem
             .purge_persisted_raw_content()
             .await
@@ -163,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
         filesystem.clone(),
         headless.clone(),
         Duration::from_secs(config.client.scan_interval_seconds.max(1)),
+        Duration::from_secs(config.client.projection_audit_interval_seconds.max(60)),
     )];
     if let Some(client) = headless.clone() {
         worker_handles.push(spawn_maintenance(

@@ -144,6 +144,12 @@ pub struct ClientConfig {
     pub server_url: String,
     pub device_name: String,
     pub scan_interval_seconds: u64,
+    pub projection_audit_interval_seconds: u64,
+    pub projection_max_text_bytes: u64,
+    pub restart_failure_window_seconds: u64,
+    pub restart_max_failures: u32,
+    pub restart_base_backoff_seconds: u64,
+    pub restart_max_backoff_seconds: u64,
     pub auto_start: bool,
 }
 
@@ -155,6 +161,12 @@ impl Default for ClientConfig {
             server_url: String::new(),
             device_name: "obts-bridge".to_string(),
             scan_interval_seconds: 2,
+            projection_audit_interval_seconds: 7 * 24 * 60 * 60,
+            projection_max_text_bytes: 512 * 1024 * 1024,
+            restart_failure_window_seconds: 15 * 60,
+            restart_max_failures: 3,
+            restart_base_backoff_seconds: 5,
+            restart_max_backoff_seconds: 60,
             auto_start: false,
         }
     }
@@ -180,6 +192,16 @@ impl ClientConfig {
         if self.device_name.trim().is_empty() {
             return Err(ConfigError::InvalidClient(
                 "client.device_name is required".to_string(),
+            ));
+        }
+        if self.projection_max_text_bytes == 0 {
+            return Err(ConfigError::InvalidClient(
+                "client.projection_max_text_bytes must be at least 1".to_string(),
+            ));
+        }
+        if self.restart_max_failures == 0 {
+            return Err(ConfigError::InvalidClient(
+                "client.restart_max_failures must be at least 1".to_string(),
             ));
         }
         Ok(())
