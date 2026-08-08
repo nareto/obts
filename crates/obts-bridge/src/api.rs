@@ -1092,6 +1092,74 @@ fn render_prometheus_metrics(status: &StatusResponse) -> String {
             "obts_bridge_dependency_up{{dependency=\"headless_vault\"}} {}",
             usize::from(status.dependencies.headless_vault == "healthy")
         ),
+        "# HELP obts_bridge_headless_process_up Whether the supervised headless child is available.".to_string(),
+        "# TYPE obts_bridge_headless_process_up gauge".to_string(),
+        format!(
+            "obts_bridge_headless_process_up {}",
+            usize::from(status.headless_process.up)
+        ),
+        "# HELP obts_bridge_headless_restarts_total Successful headless child restarts.".to_string(),
+        "# TYPE obts_bridge_headless_restarts_total counter".to_string(),
+        format!(
+            "obts_bridge_headless_restarts_total {}",
+            status.headless_process.restart_count
+        ),
+        "# HELP obts_bridge_headless_unexpected_exits_total Observed unexpected headless child exits.".to_string(),
+        "# TYPE obts_bridge_headless_unexpected_exits_total counter".to_string(),
+        format!(
+            "obts_bridge_headless_unexpected_exits_total {}",
+            status.headless_process.unexpected_exits
+        ),
+        "# HELP obts_bridge_headless_restart_circuit_open Whether repeated failures suppressed automatic restarts.".to_string(),
+        "# TYPE obts_bridge_headless_restart_circuit_open gauge".to_string(),
+        format!(
+            "obts_bridge_headless_restart_circuit_open {}",
+            usize::from(status.headless_process.circuit_open)
+        ),
+        "# HELP obts_bridge_filesystem_projection_attempts_total Commit-attested filesystem projection attempts.".to_string(),
+        "# TYPE obts_bridge_filesystem_projection_attempts_total counter".to_string(),
+        format!(
+            "obts_bridge_filesystem_projection_attempts_total {}",
+            status.filesystem_projection.attempts_total
+        ),
+        "# HELP obts_bridge_filesystem_projection_failures_total Failed commit-attested filesystem projection attempts.".to_string(),
+        "# TYPE obts_bridge_filesystem_projection_failures_total counter".to_string(),
+        format!(
+            "obts_bridge_filesystem_projection_failures_total {}",
+            status.filesystem_projection.failures_total
+        ),
+        "# HELP obts_bridge_filesystem_projection_consecutive_failures Current consecutive projection failures.".to_string(),
+        "# TYPE obts_bridge_filesystem_projection_consecutive_failures gauge".to_string(),
+        format!(
+            "obts_bridge_filesystem_projection_consecutive_failures {}",
+            status.filesystem_projection.consecutive_failures
+        ),
+        "# HELP obts_bridge_filesystem_projection_full_audits_total Successful full filesystem audits.".to_string(),
+        "# TYPE obts_bridge_filesystem_projection_full_audits_total counter".to_string(),
+        format!(
+            "obts_bridge_filesystem_projection_full_audits_total {}",
+            status.filesystem_projection.full_audits_total
+        ),
+        "# HELP obts_bridge_filesystem_projection_last_success_timestamp_seconds Last successful projection Unix timestamp.".to_string(),
+        "# TYPE obts_bridge_filesystem_projection_last_success_timestamp_seconds gauge".to_string(),
+        format!(
+            "obts_bridge_filesystem_projection_last_success_timestamp_seconds {}",
+            status
+                .filesystem_projection
+                .last_success_at
+                .map(|value| value.timestamp())
+                .unwrap_or(0)
+        ),
+        "# HELP obts_bridge_filesystem_projection_last_audit_timestamp_seconds Last successful full audit Unix timestamp.".to_string(),
+        "# TYPE obts_bridge_filesystem_projection_last_audit_timestamp_seconds gauge".to_string(),
+        format!(
+            "obts_bridge_filesystem_projection_last_audit_timestamp_seconds {}",
+            status
+                .filesystem_projection
+                .last_full_audit_at
+                .map(|value| value.timestamp())
+                .unwrap_or(0)
+        ),
         "# HELP obts_bridge_pending_write_projections Source-committed writes waiting for local PostgreSQL projection.".to_string(),
         "# TYPE obts_bridge_pending_write_projections gauge".to_string(),
         format!(
@@ -1348,13 +1416,13 @@ mod tests {
 
     use super::{
         ApiError, ApiTokenState, AppState, auth_from_headers, build_info_metric_line,
-        commit_from_image_tag, prometheus_label_escape, write_response,
+        commit_from_image_tag, prometheus_label_escape, render_prometheus_metrics, write_response,
     };
     use crate::config::{ApiTokenConfig, AppConfig};
     use crate::filesystem::FilesystemSource;
     use crate::runtime_config::{AuthConfigSnapshot, RuntimeConfigState};
     use crate::service::{ServiceError, VaultBridgeService};
-    use crate::store::VaultStore;
+    use crate::store::{HeadlessProcessStatus, VaultStore};
 
     async fn api_error_body(error: ApiError) -> (StatusCode, Value) {
         let response = error.into_response();
@@ -1456,6 +1524,34 @@ mod tests {
             write_response("applied", json!({"status": "updated"})).status(),
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    async fn metrics_expose_fixed_cardinality_headless_process_counters() {
+        let mut status = VaultStore::new(10).status().await;
+        status.headless_process = HeadlessProcessStatus {
+            up: false,
+            restart_count: 2,
+            unexpected_exits: 3,
+            circuit_open: true,
+            last_exit_code: None,
+            last_exit_signal: Some(9),
+        };
+        status.filesystem_projection.attempts_total = 7;
+        status.filesystem_projection.failures_total = 2;
+        status.filesystem_projection.consecutive_failures = 1;
+        status.filesystem_projection.full_audits_total = 3;
+
+        let metrics = render_prometheus_metrics(&status);
+
+        assert!(metrics.contains("obts_bridge_headless_process_up 0"));
+        assert!(metrics.contains("obts_bridge_headless_restarts_total 2"));
+        assert!(metrics.contains("obts_bridge_headless_unexpected_exits_total 3"));
+        assert!(metrics.contains("obts_bridge_headless_restart_circuit_open 1"));
+        assert!(metrics.contains("obts_bridge_filesystem_projection_attempts_total 7"));
+        assert!(metrics.contains("obts_bridge_filesystem_projection_failures_total 2"));
+        assert!(metrics.contains("obts_bridge_filesystem_projection_consecutive_failures 1"));
+        assert!(metrics.contains("obts_bridge_filesystem_projection_full_audits_total 3"));
     }
 
     #[test]

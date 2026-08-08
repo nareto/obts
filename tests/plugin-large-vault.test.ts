@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import git from 'isomorphic-git';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ObtsPluginClient } from '../src/client/core.js';
 
@@ -25,6 +25,21 @@ afterEach(async () => {
 });
 
 describe('large-vault client checkpoints', () => {
+  it('rejects an oversized target blob before materializing it', async () => {
+    const { core } = await clientFixture();
+    core.fileBufferBudgetBytes = 4;
+    core.readBlobOid = vi.fn(async () => Buffer.from('oversized'));
+
+    await expect(core.writeTargetFileBatch(
+      ['large.md'],
+      new Map([['large.md', 'a'.repeat(40)]]),
+      { 'large.md': 5 },
+      async () => undefined,
+      () => undefined
+    )).rejects.toMatchObject({ code: 'file_buffer_budget_exceeded' });
+    expect(core.readBlobOid).not.toHaveBeenCalled();
+  });
+
   it('checks files concurrently within the configured bound', async () => {
     const { root, core } = await clientFixture();
     await mkdir(join(root, 'notes'));
@@ -201,11 +216,15 @@ describe('large-vault client checkpoints', () => {
     };
 
     const paths = [...targetEntries.keys()];
+    const targetFileSizes = Object.fromEntries(await Promise.all(
+      [...targetEntries].map(async ([path, oid]) => [path, (await core.readBlobOid(oid)).byteLength])
+    ));
     await core.writeTargetFilesFromJournal({
       journal_version: 2,
       apply_id: 'apply_bounded_test',
       operation_type: 'pull_apply',
       target_main: target,
+      target_file_sizes: targetFileSizes,
       expected_prior_local_main: null,
       expected_prior_local_device_ref: null,
       phase: 'writing_files',
@@ -255,11 +274,15 @@ describe('large-vault client checkpoints', () => {
     };
 
     const paths = [...targetEntries.keys()];
+    const targetFileSizes = Object.fromEntries(await Promise.all(
+      [...targetEntries].map(async ([path, oid]) => [path, (await core.readBlobOid(oid)).byteLength])
+    ));
     await expect(core.writeTargetFilesFromJournal({
       journal_version: 2,
       apply_id: 'apply_failure_test',
       operation_type: 'pull_apply',
       target_main: target,
+      target_file_sizes: targetFileSizes,
       expected_prior_local_main: null,
       expected_prior_local_device_ref: null,
       phase: 'writing_files',

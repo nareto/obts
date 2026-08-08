@@ -674,10 +674,38 @@ pub(crate) fn openapi_spec() -> Value {
                 },
                 "DependencyStatus": {
                     "type": "object",
-                    "required": ["postgres", "couchdb"],
+                    "required": ["postgres", "couchdb", "obts_client", "headless_vault"],
                     "properties": {
                         "postgres": {"type": "string", "enum": ["healthy", "unavailable", "disabled"]},
-                        "couchdb": {"type": "string", "enum": ["healthy", "unavailable", "disabled"]}
+                        "couchdb": {"type": "string", "enum": ["healthy", "unavailable", "disabled"]},
+                        "obts_client": {"type": "string", "enum": ["healthy", "not_paired", "circuit_open", "disabled"]},
+                        "headless_vault": {"type": "string", "enum": ["healthy", "index_catching_up", "disabled"]}
+                    }
+                },
+                "HeadlessProcessStatus": {
+                    "type": "object",
+                    "required": ["up", "restart_count", "unexpected_exits", "circuit_open"],
+                    "properties": {
+                        "up": {"type": "boolean"},
+                        "restart_count": {"type": "integer", "minimum": 0},
+                        "unexpected_exits": {"type": "integer", "minimum": 0},
+                        "circuit_open": {"type": "boolean"},
+                        "last_exit_code": {"type": ["integer", "null"]},
+                        "last_exit_signal": {"type": ["integer", "null"]}
+                    }
+                },
+                "FilesystemProjectionStatus": {
+                    "type": "object",
+                    "required": ["attempts_total", "failures_total", "consecutive_failures", "full_audits_total"],
+                    "properties": {
+                        "attempts_total": {"type": "integer", "minimum": 0},
+                        "failures_total": {"type": "integer", "minimum": 0},
+                        "consecutive_failures": {"type": "integer", "minimum": 0},
+                        "full_audits_total": {"type": "integer", "minimum": 0},
+                        "last_success_at": {"type": ["string", "null"], "format": "date-time"},
+                        "last_failure_at": {"type": ["string", "null"], "format": "date-time"},
+                        "last_full_audit_at": {"type": ["string", "null"], "format": "date-time"},
+                        "last_failure_code": {"type": ["string", "null"]}
                     }
                 },
                 "WriteProjectionStatus": {
@@ -692,10 +720,12 @@ pub(crate) fn openapi_spec() -> Value {
                 },
                 "StatusResponse": {
                     "type": "object",
-                    "required": ["status", "dependencies", "write_projection", "index", "embedding", "sync", "context_stats", "config_reload"],
+                    "required": ["status", "dependencies", "headless_process", "filesystem_projection", "write_projection", "index", "embedding", "sync", "context_stats", "config_reload"],
                     "properties": {
                         "status": {"type": "string", "enum": ["ok", "degraded"]},
                         "dependencies": {"$ref": "#/components/schemas/DependencyStatus"},
+                        "headless_process": {"$ref": "#/components/schemas/HeadlessProcessStatus"},
+                        "filesystem_projection": {"$ref": "#/components/schemas/FilesystemProjectionStatus"},
                         "write_projection": {"$ref": "#/components/schemas/WriteProjectionStatus"},
                         "index": {"$ref": "#/components/schemas/IndexStats"},
                         "embedding": {"$ref": "#/components/schemas/EmbeddingStatus"},

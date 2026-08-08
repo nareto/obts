@@ -28,6 +28,7 @@ function fakeClient(overrides: Partial<HeadlessClient> = {}): HeadlessClient {
     readQueue: vi.fn(async () => ({ pending_commit: null, expected_device_ref: null, status: 'idle', attempts: 0, updated_at: state.updated_at })),
     readPendingOnboarding: vi.fn(async () => null),
     readIndexDelta: vi.fn(async () => ({ head: null, base: null, mode: 'unavailable', files: [], changes: [] })),
+    maintenanceTick: vi.fn(async () => ({ applied: false, sync_performed: false, scan_mode: 'none', status: 'Synced', local_head: null })),
     startOnboarding: vi.fn(async () => ({ connection_id: 'connection', connection_secret: 'secret', expires_at: state.updated_at, browser_url: 'https://example.test' })),
     pollOnboarding: vi.fn(async () => ({ status: 'pending' } as never)),
     analyzeOnboarding: vi.fn(async () => ({ classification: 'new_empty' } as never)),
@@ -109,12 +110,11 @@ describe('headless client protocol', () => {
       head: 'b'.repeat(40),
       base: 'a'.repeat(40),
       mode: 'incremental' as const,
-      files: [{ path: 'Notes/test.md', oid: 'c'.repeat(40), content_sha256: 'd'.repeat(64) }],
+      files: [{ path: 'Notes/test.md', oid: 'c'.repeat(40) }],
       changes: [{
         path: 'Notes/test.md',
         kind: 'modify' as const,
-        oid: 'c'.repeat(40),
-        content_sha256: 'd'.repeat(64)
+        oid: 'c'.repeat(40)
       }]
     }));
     const session = new HeadlessSession(fakeClient({ readIndexDelta }), async (message) => void messages.push(message));
@@ -123,6 +123,25 @@ describe('headless client protocol', () => {
 
     expect(readIndexDelta).toHaveBeenCalledWith('a'.repeat(40));
     expect(messages).toEqual([{ type: 'response', id: 1, ok: true, result: await readIndexDelta.mock.results[0]!.value }]);
+  });
+
+  it('runs one scheduler-controlled maintenance tick without an implicit sync command', async () => {
+    const messages: HeadlessMessage[] = [];
+    const maintenanceTick = vi.fn(async () => ({
+      applied: false,
+      sync_performed: false,
+      scan_mode: 'none' as const,
+      status: 'Synced',
+      local_head: 'a'.repeat(40)
+    }));
+    const client = fakeClient({ maintenanceTick });
+    const session = new HeadlessSession(client, async (message) => void messages.push(message));
+
+    await session.submit({ id: 1, command: 'maintenance-tick' });
+
+    expect(maintenanceTick).toHaveBeenCalledOnce();
+    expect(client.syncOnce).not.toHaveBeenCalled();
+    expect(messages).toEqual([{ type: 'response', id: 1, ok: true, result: await maintenanceTick.mock.results[0]!.value }]);
   });
 
   it('passes filesystem change hints and requests immediate synchronization', async () => {

@@ -72,6 +72,20 @@ export type ObtsServer = {
 let dashboardRootPromise: Promise<string> | null = null;
 const LIVE_REF_TRANSITION_GRACE_MS = 2 * 60 * 1000;
 
+async function syncableTargetFileSizes(
+  git: GitService,
+  vaultId: string,
+  commit: string
+): Promise<Record<string, number>> {
+  const sizes: Record<string, number> = {};
+  for (const entry of await git.listTreeEntries(vaultId, commit)) {
+    if (entry.type === 'blob' && entry.size !== null && isSyncableVaultPath(entry.path)) {
+      sizes[entry.path] = entry.size;
+    }
+  }
+  return sizes;
+}
+
 export async function createObtsServer(overrides: Partial<ServerConfig> & { dataDir: string }): Promise<ObtsServer> {
   const config = createServerConfig(overrides);
   await ensureServerDirectories(config);
@@ -585,6 +599,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         root_commit: result.rootCommit,
         target_main: result.targetMain,
         changed_paths: result.changedPaths.filter((path) => isSyncableVaultPath(path)),
+        target_file_sizes: await syncableTargetFileSizes(git, result.vaultId, result.targetMain),
         explicit_directories: result.explicitDirectories
       },
       packfile: result.packfile
@@ -612,6 +627,9 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       changed_paths: (requestedTarget === metadata.targetMain
         ? metadata.changedPaths
         : await git.listTreePaths(metadata.vaultId, requestedTarget)).filter((path) => isSyncableVaultPath(path)),
+      ...(chunk.complete
+        ? { target_file_sizes: await syncableTargetFileSizes(git, metadata.vaultId, requestedTarget) }
+        : {}),
       explicit_directories: eventSnapshot.explicitDirectories,
       capability: CHUNK_TRANSFER_CAPABILITY,
       cursor: chunkRequest.cursor,
@@ -844,6 +862,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       device_id: deviceAuth.device.device_id,
       target_main: targetMain,
       changed_paths: [...new Set(allChangedPaths.filter((path) => isSyncableVaultPath(path)))].sort(),
+      ...(chunk.complete ? { target_file_sizes: await syncableTargetFileSizes(git, vaultId, targetMain) } : {}),
       current_local_main_is_ancestor: currentLocalMainIsAncestor,
       event_seq: eventSnapshot.eventSeq,
       directory_intents: eventSnapshot.directoryIntents,
@@ -940,6 +959,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       device_id: deviceAuth.device.device_id,
       target_main: targetMain,
       changed_paths: [...new Set(changedPaths)].sort(),
+      target_file_sizes: await syncableTargetFileSizes(git, vaultId, targetMain),
       current_local_main_is_ancestor: currentLocalMainIsAncestor,
       event_seq: eventSnapshot.eventSeq,
       directory_intents: eventSnapshot.directoryIntents,

@@ -1,6 +1,8 @@
-use std::process::Stdio;
+use std::collections::VecDeque;
+use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -14,6 +16,7 @@ use tracing::{info, warn};
 
 use crate::config::ClientConfig;
 use crate::filesystem::FilesystemSource;
+use crate::store::HeadlessProcessStatus;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
@@ -25,6 +28,18 @@ pub struct HeadlessClient {
     state: Arc<RwLock<Value>>,
     healthy: Arc<AtomicBool>,
     config: Arc<ClientConfig>,
+    runtime: Arc<RwLock<HeadlessRuntimeState>>,
+}
+
+#[derive(Debug, Default)]
+struct HeadlessRuntimeState {
+    failures: VecDeque<Instant>,
+    restart_count: u64,
+    unexpected_exits: u64,
+    circuit_open: bool,
+    last_counted_exit_pid: Option<u32>,
+    last_exit_code: Option<i32>,
+    last_exit_signal: Option<i32>,
 }
 
 impl std::fmt::Debug for HeadlessClient {
@@ -37,6 +52,7 @@ impl std::fmt::Debug for HeadlessClient {
 
 struct HeadlessProcess {
     child: Child,
+    pid: Option<u32>,
     stdin: ChildStdin,
     stdout: Lines<BufReader<ChildStdout>>,
 }
@@ -58,7 +74,6 @@ pub struct HeadlessIndexDelta {
 pub struct HeadlessIndexFile {
     pub path: String,
     pub oid: String,
-    pub content_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -66,7 +81,6 @@ pub struct HeadlessIndexChange {
     pub path: String,
     pub kind: String,
     pub oid: Option<String>,
-    pub content_sha256: Option<String>,
 }
 
 impl HeadlessFilesystemGuard<'_> {
@@ -109,7 +123,7 @@ impl HeadlessFilesystemGuard<'_> {
     }
 
     pub async fn notify_local_change(
-        mut self,
+        &mut self,
         client: &HeadlessClient,
         path: &str,
     ) -> Result<Value, HeadlessError> {
@@ -162,6 +176,7 @@ impl HeadlessClient {
             state: Arc::new(RwLock::new(ready)),
             healthy: Arc::new(AtomicBool::new(true)),
             config: Arc::new(config.clone()),
+            runtime: Arc::new(RwLock::new(HeadlessRuntimeState::default())),
         })
     }
 
@@ -183,22 +198,44 @@ impl HeadlessClient {
             .map(ToOwned::to_owned)
     }
 
+    pub fn runtime_status(&self) -> HeadlessProcessStatus {
+        let runtime = self.runtime.read().expect("headless runtime lock");
+        HeadlessProcessStatus {
+            up: self.healthy.load(Ordering::Acquire) && !runtime.circuit_open,
+            restart_count: runtime.restart_count,
+            unexpected_exits: runtime.unexpected_exits,
+            circuit_open: runtime.circuit_open,
+            last_exit_code: runtime.last_exit_code,
+            last_exit_signal: runtime.last_exit_signal,
+        }
+    }
+
+    fn register_process_failure(&self, error: &HeadlessError) -> Option<Duration> {
+        let mut runtime = self.runtime.write().expect("headless runtime lock");
+        let backoff = register_failure(&mut runtime, &self.config, error, Instant::now());
+        if runtime.circuit_open {
+            self.healthy.store(false, Ordering::Release);
+        }
+        backoff
+    }
+
+    fn record_restart(&self) {
+        let mut runtime = self.runtime.write().expect("headless runtime lock");
+        runtime.restart_count = runtime.restart_count.saturating_add(1);
+    }
+
     pub async fn lock_filesystem(&self) -> Result<HeadlessFilesystemGuard<'_>, HeadlessError> {
         if !self.healthy.load(Ordering::Acquire) {
             return Err(HeadlessError::Unavailable);
         }
-        let mut process = match timeout(REQUEST_TIMEOUT, self.inner.lock()).await {
-            Ok(process) => process,
-            Err(_) => {
-                self.healthy.store(false, Ordering::Release);
-                return Err(HeadlessError::Timeout);
-            }
-        };
+        let mut process = timeout(REQUEST_TIMEOUT, self.inner.lock())
+            .await
+            .map_err(|_| HeadlessError::Busy)?;
         match process.child.try_wait() {
             Ok(None) => Ok(HeadlessFilesystemGuard { process }),
-            Ok(Some(_)) => {
+            Ok(Some(status)) => {
                 self.healthy.store(false, Ordering::Release);
-                Err(HeadlessError::Exited)
+                Err(exited_error(status, process.pid))
             }
             Err(error) => {
                 self.healthy.store(false, Ordering::Release);
@@ -222,11 +259,20 @@ impl HeadlessClient {
         *process = replacement;
         *self.state.write().expect("headless state lock") = ready.clone();
         self.healthy.store(true, Ordering::Release);
+        self.record_restart();
         info!(state = %redact_state(&ready), "headless client restarted");
         Ok(())
     }
 
     pub async fn request(&self, command: &str, arguments: Value) -> Result<Value, HeadlessError> {
+        if self
+            .runtime
+            .read()
+            .expect("headless runtime lock")
+            .circuit_open
+        {
+            return Err(HeadlessError::Unavailable);
+        }
         let result = self.request_inner(command, arguments).await;
         match result {
             Ok(value) => {
@@ -245,7 +291,7 @@ impl HeadlessClient {
     async fn request_inner(&self, command: &str, arguments: Value) -> Result<Value, HeadlessError> {
         let mut process = timeout(REQUEST_TIMEOUT, self.inner.lock())
             .await
-            .map_err(|_| HeadlessError::Timeout)?;
+            .map_err(|_| HeadlessError::Busy)?;
         let result = timeout(
             REQUEST_TIMEOUT,
             request_on_process(&mut process, &self.next_id, &self.state, command, arguments),
@@ -271,6 +317,44 @@ impl HeadlessClient {
     }
 }
 
+fn register_failure(
+    runtime: &mut HeadlessRuntimeState,
+    config: &ClientConfig,
+    error: &HeadlessError,
+    now: Instant,
+) -> Option<Duration> {
+    let window = Duration::from_secs(config.restart_failure_window_seconds.max(1));
+    while runtime
+        .failures
+        .front()
+        .is_some_and(|failure| now.duration_since(*failure) > window)
+    {
+        runtime.failures.pop_front();
+    }
+    runtime.failures.push_back(now);
+    if let HeadlessError::Exited {
+        pid, code, signal, ..
+    } = error
+        && runtime.last_counted_exit_pid != *pid
+    {
+        runtime.unexpected_exits = runtime.unexpected_exits.saturating_add(1);
+        runtime.last_counted_exit_pid = *pid;
+        runtime.last_exit_code = *code;
+        runtime.last_exit_signal = *signal;
+    }
+    if runtime.failures.len() >= config.restart_max_failures as usize {
+        runtime.circuit_open = true;
+        return None;
+    }
+    let exponent = runtime.failures.len().saturating_sub(1).min(10) as u32;
+    let delay = config
+        .restart_base_backoff_seconds
+        .max(1)
+        .saturating_mul(2_u64.saturating_pow(exponent))
+        .min(config.restart_max_backoff_seconds.max(1));
+    Some(Duration::from_secs(delay))
+}
+
 async fn quarantine_process(process: &mut HeadlessProcess) {
     if process.child.try_wait().ok().flatten().is_none() {
         let _ = process.child.start_kill();
@@ -285,8 +369,8 @@ async fn request_on_process(
     command: &str,
     arguments: Value,
 ) -> Result<Value, HeadlessError> {
-    if process.child.try_wait()?.is_some() {
-        return Err(HeadlessError::Exited);
+    if let Some(status) = process.child.try_wait()? {
+        return Err(exited_error(status, process.pid));
     }
     let id = next_id.fetch_add(1, Ordering::Relaxed);
     let mut request = match arguments {
@@ -308,11 +392,7 @@ async fn request_on_process(
     process.stdin.flush().await?;
 
     loop {
-        let line = process
-            .stdout
-            .next_line()
-            .await?
-            .ok_or(HeadlessError::Exited)?;
+        let line = next_process_line(process).await?;
         let message: Value = serde_json::from_str(&line)?;
         if message.get("type").and_then(Value::as_str) == Some("event") {
             if let Some(next_state) = message.get("state") {
@@ -329,6 +409,14 @@ async fn request_on_process(
             let result = message.get("result").cloned().unwrap_or(Value::Null);
             if command == "read-state" {
                 *state.write().expect("headless state lock") = result.clone();
+            } else if command == "maintenance-tick" {
+                let mut cached = state.write().expect("headless state lock");
+                if let Some(local_head) = result.get("local_head") {
+                    cached["local_head"] = local_head.clone();
+                }
+                if let Some(status) = result.get("status") {
+                    cached["status_label"] = status.clone();
+                }
             }
             return Ok(result);
         }
@@ -387,6 +475,7 @@ async fn spawn_process(config: &ClientConfig) -> Result<(HeadlessProcess, Value)
     });
 
     let mut process = HeadlessProcess {
+        pid: child.id(),
         child,
         stdin,
         stdout: BufReader::new(stdout).lines(),
@@ -404,39 +493,73 @@ pub fn spawn_maintenance(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let mut restart = false;
-            match client.request("poll-remote-events", Value::Null).await {
+            if client.runtime_status().circuit_open {
+                sleep(interval).await;
+                continue;
+            }
+            match client.request("maintenance-tick", Value::Null).await {
                 Ok(result) => {
-                    if result.get("applied").and_then(Value::as_bool) == Some(true) {
+                    let applied = result.get("applied").and_then(Value::as_bool) == Some(true);
+                    let local_head = result.get("local_head").and_then(Value::as_str);
+                    if applied || local_head != filesystem.indexed_commit().as_deref() {
                         filesystem.mark_dirty();
                     }
                 }
-                Err(error) if !error.is_unpaired() => {
-                    restart = error.is_process_failure();
-                    warn!(error = %error, "headless remote event poll failed");
-                }
-                Err(_) => {}
-            }
-            if !restart {
-                match client.request("sync-once", Value::Null).await {
-                    Ok(_) => {
-                        if client.local_head() != filesystem.indexed_commit() {
-                            filesystem.mark_dirty();
+                Err(error) if error.is_unpaired() => {}
+                Err(error) if error.is_process_failure() => {
+                    warn!(error = %error, "headless maintenance failed");
+                    match client.register_process_failure(&error) {
+                        Some(backoff) => {
+                            sleep(backoff).await;
+                            if let Err(restart_error) = client.restart().await {
+                                warn!(error = %restart_error, "headless client restart failed");
+                            }
+                        }
+                        None => {
+                            warn!("headless restart circuit opened after repeated failures");
                         }
                     }
-                    Err(error) if !error.is_unpaired() => {
-                        restart = error.is_process_failure();
-                        warn!(error = %error, "headless local sync failed");
-                    }
-                    Err(_) => {}
                 }
-            }
-            if restart && let Err(error) = client.restart().await {
-                warn!(error = %error, "headless client restart failed");
+                Err(error) => warn!(error = %error, "headless maintenance failed"),
             }
             sleep(interval).await;
         }
     })
+}
+
+async fn next_process_line(process: &mut HeadlessProcess) -> Result<String, HeadlessError> {
+    match process.stdout.next_line().await? {
+        Some(line) => Ok(line),
+        None => Err(process
+            .child
+            .try_wait()?
+            .map(|status| exited_error(status, process.pid))
+            .unwrap_or(HeadlessError::Exited {
+                pid: process.pid,
+                code: None,
+                signal: None,
+            })),
+    }
+}
+
+fn exited_error(status: ExitStatus, pid: Option<u32>) -> HeadlessError {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        HeadlessError::Exited {
+            pid,
+            code: status.code(),
+            signal: status.signal(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        HeadlessError::Exited {
+            pid,
+            code: status.code(),
+            signal: None,
+        }
+    }
 }
 
 async fn read_until_event(
@@ -444,11 +567,7 @@ async fn read_until_event(
     event: &str,
 ) -> Result<Value, HeadlessError> {
     loop {
-        let line = process
-            .stdout
-            .next_line()
-            .await?
-            .ok_or(HeadlessError::Exited)?;
+        let line = next_process_line(process).await?;
         let message: Value = serde_json::from_str(&line)?;
         if message.get("type").and_then(Value::as_str) == Some("fatal") {
             let detail = message
@@ -486,8 +605,14 @@ pub enum HeadlessError {
     Command(String),
     #[error("headless process is missing {0}")]
     MissingPipe(&'static str),
-    #[error("headless process exited")]
-    Exited,
+    #[error("headless process exited (pid={pid:?}, code={code:?}, signal={signal:?})")]
+    Exited {
+        pid: Option<u32>,
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
+    #[error("headless process is busy with another bounded operation")]
+    Busy,
     #[error("headless protocol failed: {0}")]
     Protocol(String),
     #[error("headless command timed out")]
@@ -510,12 +635,75 @@ impl HeadlessError {
     fn is_process_failure(&self) -> bool {
         matches!(
             self,
-            Self::Exited
+            Self::Exited { .. }
                 | Self::Io(_)
                 | Self::Json(_)
                 | Self::Protocol(_)
                 | Self::Timeout
                 | Self::Unavailable
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use crate::config::ClientConfig;
+
+    use super::{HeadlessError, HeadlessRuntimeState, register_failure};
+
+    #[test]
+    fn repeated_process_failures_back_off_and_open_the_circuit() {
+        let config = ClientConfig {
+            restart_max_failures: 3,
+            restart_base_backoff_seconds: 2,
+            restart_max_backoff_seconds: 30,
+            ..ClientConfig::default()
+        };
+        let mut runtime = HeadlessRuntimeState::default();
+        let start = Instant::now();
+        let error = HeadlessError::Exited {
+            pid: Some(42),
+            code: None,
+            signal: Some(9),
+        };
+
+        assert_eq!(
+            register_failure(&mut runtime, &config, &error, start),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            register_failure(
+                &mut runtime,
+                &config,
+                &error,
+                start + Duration::from_secs(1),
+            ),
+            Some(Duration::from_secs(4))
+        );
+        assert_eq!(
+            register_failure(
+                &mut runtime,
+                &config,
+                &error,
+                start + Duration::from_secs(2),
+            ),
+            None
+        );
+        assert!(runtime.circuit_open);
+        assert_eq!(runtime.unexpected_exits, 1);
+        assert_eq!(runtime.last_exit_signal, Some(9));
+    }
+
+    #[test]
+    fn business_errors_do_not_qualify_as_process_failures() {
+        let error = HeadlessError::Remote {
+            code: "not_paired".to_string(),
+            message: "not paired".to_string(),
+        };
+        assert!(error.is_unpaired());
+        assert!(!error.is_process_failure());
+        assert!(!HeadlessError::Busy.is_process_failure());
     }
 }

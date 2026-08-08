@@ -62,25 +62,25 @@ describe('bounded client work pool', () => {
     expect(finished).toEqual([1]);
   });
 
-  it('bounds retained bytes and runs one oversized item exclusively', async () => {
+  it('bounds retained bytes and rejects a single oversized item', async () => {
     const budget = createByteBudget(10);
     let retained = 0;
     let maximum = 0;
-    const observed: Array<[number, number]> = [];
 
-    await runBoundedWork([6, 6, 20, 4], { concurrency: 4 }, async (bytes) => {
+    await runBoundedWork([6, 4, 6, 4], { concurrency: 4 }, async (bytes) => {
       const release = await budget.acquire(bytes);
       retained += bytes;
       maximum = Math.max(maximum, retained);
-      observed.push([bytes, retained]);
       await delay(5);
       retained -= bytes;
       release();
       return bytes;
     });
 
-    expect(maximum).toBe(20);
-    expect(observed.find(([bytes]) => bytes === 20)).toEqual([20, 20]);
+    expect(maximum).toBeLessThanOrEqual(10);
+    await expect(budget.acquire(20)).rejects.toMatchObject({
+      code: 'file_buffer_budget_exceeded'
+    });
     expect(retained).toBe(0);
   });
 });

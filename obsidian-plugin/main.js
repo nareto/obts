@@ -21837,6 +21837,11 @@ var require_work_pool = __commonJS({
       }
       async acquire(requestedBytes) {
         const bytes = Number.isFinite(requestedBytes) && requestedBytes > 0 ? Math.floor(requestedBytes) : 0;
+        if (Number.isFinite(this.maxBytes) && bytes > this.maxBytes) {
+          const error = new RangeError(`Work item requires ${bytes} bytes, above the ${this.maxBytes}-byte buffer limit.`);
+          error.code = "file_buffer_budget_exceeded";
+          throw error;
+        }
         if (this.canAcquire(bytes)) return this.reserve(bytes);
         return await new Promise((resolve) => {
           this.waiters.push({ bytes, resolve });
@@ -21845,7 +21850,6 @@ var require_work_pool = __commonJS({
       }
       canAcquire(bytes) {
         if (!Number.isFinite(this.maxBytes)) return true;
-        if (bytes > this.maxBytes) return this.reservedBytes === 0;
         return this.reservedBytes + bytes <= this.maxBytes;
       }
       reserve(bytes) {
@@ -21915,7 +21919,7 @@ var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var { createByteBudget, runBoundedWork } = require_work_pool();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.31";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.32";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_INVENTORY_INTERVAL_MS = 6 * 60 * 60 * 1e3;
@@ -23541,7 +23545,10 @@ var ObtsObsidianClient = class {
         false,
         pulled.manifest.directory_intents || [],
         pulled.manifest.explicit_directories || [],
-        pulled.manifest.event_seq
+        pulled.manifest.event_seq,
+        false,
+        null,
+        pulled.manifest.target_file_sizes || {}
       );
       await this.acknowledgeAppliedMain(pulled.manifest.target_main);
       await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
@@ -23620,7 +23627,10 @@ var ObtsObsidianClient = class {
         false,
         pulled.manifest.directory_intents || [],
         pulled.manifest.explicit_directories || [],
-        pulled.manifest.event_seq
+        pulled.manifest.event_seq,
+        false,
+        null,
+        pulled.manifest.target_file_sizes || {}
       );
       await this.acknowledgeAppliedMain(pulled.manifest.target_main);
       await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
@@ -23844,7 +23854,10 @@ var ObtsObsidianClient = class {
       false,
       pulled.manifest.directory_intents || [],
       pulled.manifest.explicit_directories || [],
-      pulled.manifest.event_seq
+      pulled.manifest.event_seq,
+      false,
+      null,
+      pulled.manifest.target_file_sizes || {}
     );
     await this.acknowledgeAppliedMain(pulled.manifest.target_main);
     await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
@@ -23886,7 +23899,10 @@ var ObtsObsidianClient = class {
       false,
       pulled.manifest.directory_intents || [],
       pulled.manifest.explicit_directories || [],
-      pulled.manifest.event_seq
+      pulled.manifest.event_seq,
+      false,
+      null,
+      pulled.manifest.target_file_sizes || {}
     );
     if (state.local_main !== pulled.manifest.target_main) {
       await this.acknowledgeAppliedMain(pulled.manifest.target_main);
@@ -24573,7 +24589,9 @@ var ObtsObsidianClient = class {
       pulled.manifest.directory_intents || [],
       pulled.manifest.explicit_directories || [],
       pulled.manifest.event_seq,
-      false
+      false,
+      null,
+      pulled.manifest.target_file_sizes || {}
     );
     if (!applied) return false;
     await this.acknowledgeAppliedMain(pulled.manifest.target_main);
@@ -24616,7 +24634,9 @@ var ObtsObsidianClient = class {
       pulled.manifest.directory_intents || [],
       pulled.manifest.explicit_directories || [],
       pulled.manifest.event_seq,
-      true
+      true,
+      null,
+      pulled.manifest.target_file_sizes || {}
     );
     if (!applied) return false;
     await this.acknowledgeAppliedMain(pulled.manifest.target_main);
@@ -24774,7 +24794,7 @@ var ObtsObsidianClient = class {
     });
     return { status: "Not paired", recoveryBundleId };
   }
-  async applyTargetMain(targetMain, changedPaths, allowDestructive, extraAffectedPaths = [], requireCleanVisibleState = false, directoryIntents = [], explicitDirectories = [], eventSeq = void 0, cleanVisibleStateVerified = false, confirmedDirectoryRecovery = null) {
+  async applyTargetMain(targetMain, changedPaths, allowDestructive, extraAffectedPaths = [], requireCleanVisibleState = false, directoryIntents = [], explicitDirectories = [], eventSeq = void 0, cleanVisibleStateVerified = false, confirmedDirectoryRecovery = null, targetFileSizes = {}) {
     const state = await this.readState();
     let compactedDirectoryIntents = compactDirectoryIntents(directoryIntents);
     const explicitDirectorySet = Array.from(new Set(explicitDirectories)).sort();
@@ -24803,10 +24823,11 @@ var ObtsObsidianClient = class {
     }));
     this.reportOperationProgress("Applying", "apply_recovery_prepare");
     const journal = {
-      journal_version: 3,
+      journal_version: 4,
       apply_id: applyId,
       operation_type: "pull_apply",
       target_main: targetMain,
+      target_file_sizes: isTargetFileSizeMap(targetFileSizes) ? Object.assign({}, targetFileSizes) : {},
       expected_prior_local_main: state.local_main,
       expected_prior_local_device_ref: state.server_device_ref,
       phase: "planned",
@@ -25437,12 +25458,18 @@ var ObtsObsidianClient = class {
       });
     }
     for (const filePath of writes) await this.removeBlockingMaterializationPaths(filePath);
-    await this.writeTargetFileBatch(writes, targetEntries, assertRecoveredDescendants, () => {
-      completed += 1;
-      reportProgress();
-    });
+    await this.writeTargetFileBatch(
+      writes,
+      targetEntries,
+      journal.target_file_sizes || {},
+      assertRecoveredDescendants,
+      () => {
+        completed += 1;
+        reportProgress();
+      }
+    );
   }
-  async writeTargetFileBatch(writes, targetEntries, assertRecoveredDescendants, onProgress) {
+  async writeTargetFileBatch(writes, targetEntries, targetFileSizes, assertRecoveredDescendants, onProgress) {
     const byteBudget = createByteBudget(this.fileBufferBudgetBytes);
     const active = /* @__PURE__ */ new Set();
     let firstError = null;
@@ -25453,14 +25480,30 @@ var ObtsObsidianClient = class {
       if (firstError) break;
       await waitForCapacity();
       if (firstError) break;
+      const expectedBytes = targetFileSizes[filePath];
+      if (!Number.isSafeInteger(expectedBytes) || expectedBytes < 0) {
+        firstError = new ObtsBlockedError(
+          "target_blob_size_unavailable",
+          "The server did not provide a bounded size for a target file."
+        );
+        break;
+      }
       let content;
+      let releaseBytes;
       try {
+        releaseBytes = await byteBudget.acquire(expectedBytes);
         content = await this.readBlobOid(targetEntries.get(filePath));
+        if (content.byteLength !== expectedBytes) {
+          throw new ObtsBlockedError(
+            "target_blob_size_mismatch",
+            "A downloaded target file did not match its attested size."
+          );
+        }
       } catch (error) {
+        if (releaseBytes) releaseBytes();
         firstError = error;
         break;
       }
-      const releaseBytes = await byteBudget.acquire(content.byteLength);
       if (firstError) {
         releaseBytes();
         break;
@@ -27739,6 +27782,7 @@ var ObtsObsidianClient = class {
       local_head_at_decision: state.local_head,
       event_seq: manifest.event_seq || 0,
       changed_paths: manifest.changed_paths || [],
+      target_file_sizes: isTargetFileSizeMap(manifest.target_file_sizes) ? Object.assign({}, manifest.target_file_sizes) : {},
       directory_intents: (manifest.directory_intents || []).map((intent) => ({ op: intent.op, path: intent.path })),
       explicit_directories: manifest.explicit_directories || [],
       original_pending_intents: classification.directoryState.pending_intents,
@@ -27915,7 +27959,8 @@ var ObtsObsidianClient = class {
           recovery.explicit_directories,
           recovery.event_seq,
           true,
-          { roots: recoveryRoots, inventory: recovery.inventory }
+          { roots: recoveryRoots, inventory: recovery.inventory },
+          recovery.target_file_sizes || {}
         );
         if (!applied) return await this.resetDirectoryRecoveryAfterChange(recovery);
         recovery = Object.assign({}, recovery, { last_completed_step: "apply_completed", updated_at: nowIso() });
@@ -29236,7 +29281,7 @@ function parseDirectoryRecoveryDecision(value) {
   const phases = /* @__PURE__ */ new Set(["awaiting_decision", "executing"]);
   const steps = /* @__PURE__ */ new Set(["decision_recorded", "intent_state_written", "apply_completed", "acknowledged"]);
   const pathArray = (items) => Array.isArray(items) && items.every((item) => typeof item === "string" && isSafeJournalPath(item)) && new Set(items).size === items.length;
-  if (value.version !== 1 || !phases.has(value.phase) || typeof value.recovery_id !== "string" || !/^dirrec_[0-9]+_[0-9a-f]{16}$/u.test(value.recovery_id) || !isGitObjectId(value.target_main) || !isGitObjectId(value.local_main_at_decision) || !isGitObjectId(value.local_head_at_decision) || !(value.base_main === null || isGitObjectId(value.base_main)) || !Number.isSafeInteger(value.event_seq) || value.event_seq < 0 || !pathArray(value.changed_paths) || !pathArray(value.explicit_directories) || !pathArray(value.ambiguous_roots) || !Array.isArray(value.directory_intents) || value.directory_intents.some(
+  if (value.version !== 1 || !phases.has(value.phase) || typeof value.recovery_id !== "string" || !/^dirrec_[0-9]+_[0-9a-f]{16}$/u.test(value.recovery_id) || !isGitObjectId(value.target_main) || !isGitObjectId(value.local_main_at_decision) || !isGitObjectId(value.local_head_at_decision) || !(value.base_main === null || isGitObjectId(value.base_main)) || !Number.isSafeInteger(value.event_seq) || value.event_seq < 0 || !pathArray(value.changed_paths) || !isTargetFileSizeMap(value.target_file_sizes || {}) || !pathArray(value.explicit_directories) || !pathArray(value.ambiguous_roots) || !Array.isArray(value.directory_intents) || value.directory_intents.some(
     (intent) => !intent || typeof intent !== "object" || Array.isArray(intent) || intent.op !== "create" && intent.op !== "delete" || typeof intent.path !== "string" || !isSafeJournalPath(intent.path)
   ) || !Array.isArray(value.original_pending_intents) || value.original_pending_intents.some((intent) => !isStoredDirectoryIntent(intent)) || !Array.isArray(value.ambiguous_intents) || value.ambiguous_intents.some((intent) => !isStoredDirectoryIntent(intent)) || !Array.isArray(value.superseded_intents) || value.superseded_intents.some((intent) => !isStoredDirectoryIntent(intent)) || !Number.isSafeInteger(value.next_generation) || value.next_generation < 1 || typeof value.archived !== "boolean" || !steps.has(value.last_completed_step) || typeof value.created_at !== "string" || typeof value.updated_at !== "string" || !value.inventory || typeof value.inventory !== "object" || Array.isArray(value.inventory) || !Array.isArray(value.inventory.directories) || !Array.isArray(value.inventory.files)) fail();
   const originalById = new Map(value.original_pending_intents.map((intent) => [intent.intent_id, intent]));
@@ -29492,9 +29537,10 @@ function parseApplyJournal(value) {
   const preApplyDirectoryCtimes = value.pre_apply_directory_ctimes;
   const confirmedDirectoryRoots = value.confirmed_directory_roots === void 0 ? [] : value.confirmed_directory_roots;
   const confirmedDirectoryInventory = value.confirmed_directory_inventory === void 0 ? null : value.confirmed_directory_inventory;
-  if (journalVersion !== 1 && journalVersion !== 2 && journalVersion !== 3 || typeof value.apply_id !== "string" || value.apply_id.length === 0 || typeof value.operation_type !== "string" || !operations.has(value.operation_type) || typeof value.target_main !== "string" || !/^[0-9a-f]{40}$/u.test(value.target_main) || !isNullableString(value.expected_prior_local_main) || !isNullableString(value.expected_prior_local_device_ref) || typeof value.phase !== "string" || !phases.has(value.phase) || !Array.isArray(affectedPaths) || affectedPaths.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath)) || new Set(affectedPaths).size !== affectedPaths.length || !preflight || typeof preflight !== "object" || Array.isArray(preflight) || affectedPaths.some((filePath) => !Object.hasOwn(preflight, filePath) || !isNullableSha256(preflight[filePath])) || journalVersion >= 2 && (!typedPreflight || typeof typedPreflight !== "object" || Array.isArray(typedPreflight) || affectedPaths.some((filePath) => !Object.hasOwn(typedPreflight, filePath) || !isPreflightFingerprint(typedPreflight[filePath]))) || journalVersion === 3 && (!Array.isArray(directoryIntents) || directoryIntents.some(
+  const targetFileSizes = value.target_file_sizes === void 0 ? {} : value.target_file_sizes;
+  if (journalVersion !== 1 && journalVersion !== 2 && journalVersion !== 3 && journalVersion !== 4 || typeof value.apply_id !== "string" || value.apply_id.length === 0 || typeof value.operation_type !== "string" || !operations.has(value.operation_type) || typeof value.target_main !== "string" || !/^[0-9a-f]{40}$/u.test(value.target_main) || !isNullableString(value.expected_prior_local_main) || !isNullableString(value.expected_prior_local_device_ref) || typeof value.phase !== "string" || !phases.has(value.phase) || !Array.isArray(affectedPaths) || affectedPaths.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath)) || new Set(affectedPaths).size !== affectedPaths.length || !preflight || typeof preflight !== "object" || Array.isArray(preflight) || affectedPaths.some((filePath) => !Object.hasOwn(preflight, filePath) || !isNullableSha256(preflight[filePath])) || journalVersion >= 2 && (!typedPreflight || typeof typedPreflight !== "object" || Array.isArray(typedPreflight) || affectedPaths.some((filePath) => !Object.hasOwn(typedPreflight, filePath) || !isPreflightFingerprint(typedPreflight[filePath]))) || journalVersion >= 3 && (!Array.isArray(directoryIntents) || directoryIntents.some(
     (intent) => !intent || typeof intent !== "object" || Array.isArray(intent) || intent.op !== "create" && intent.op !== "delete" || typeof intent.path !== "string" || !isSafeJournalPath(intent.path)
-  ) || !Array.isArray(explicitDirectories) || explicitDirectories.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath)) || new Set(explicitDirectories).size !== explicitDirectories.length || !Array.isArray(preApplyDirectories) || preApplyDirectories.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath)) || new Set(preApplyDirectories).size !== preApplyDirectories.length || !preApplyDirectoryCtimes || typeof preApplyDirectoryCtimes !== "object" || Array.isArray(preApplyDirectoryCtimes) || Object.keys(preApplyDirectoryCtimes).length !== preApplyDirectories.length || preApplyDirectories.some((filePath) => !Object.hasOwn(preApplyDirectoryCtimes, filePath) || !isNullableNonNegativeNumber(preApplyDirectoryCtimes[filePath])) || !Array.isArray(confirmedDirectoryRoots) || confirmedDirectoryRoots.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath)) || new Set(confirmedDirectoryRoots).size !== confirmedDirectoryRoots.length || !(confirmedDirectoryInventory === null || isValidDirectoryRecoveryInventory(confirmedDirectoryInventory, confirmedDirectoryRoots)) || confirmedDirectoryInventory === null && confirmedDirectoryRoots.length > 0 || typeof value.preserve_local_changes !== "boolean" || !(value.event_seq === null || Number.isSafeInteger(value.event_seq) && value.event_seq >= 0)) || !isNullableString(value.recovery_bundle_id) || !isNullableString(value.last_completed_step) || !isNullableString(value.redacted_error_category)) {
+  ) || !Array.isArray(explicitDirectories) || explicitDirectories.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath)) || new Set(explicitDirectories).size !== explicitDirectories.length || !Array.isArray(preApplyDirectories) || preApplyDirectories.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath)) || new Set(preApplyDirectories).size !== preApplyDirectories.length || !preApplyDirectoryCtimes || typeof preApplyDirectoryCtimes !== "object" || Array.isArray(preApplyDirectoryCtimes) || Object.keys(preApplyDirectoryCtimes).length !== preApplyDirectories.length || preApplyDirectories.some((filePath) => !Object.hasOwn(preApplyDirectoryCtimes, filePath) || !isNullableNonNegativeNumber(preApplyDirectoryCtimes[filePath])) || !Array.isArray(confirmedDirectoryRoots) || confirmedDirectoryRoots.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath)) || new Set(confirmedDirectoryRoots).size !== confirmedDirectoryRoots.length || !(confirmedDirectoryInventory === null || isValidDirectoryRecoveryInventory(confirmedDirectoryInventory, confirmedDirectoryRoots)) || confirmedDirectoryInventory === null && confirmedDirectoryRoots.length > 0 || typeof value.preserve_local_changes !== "boolean" || !(value.event_seq === null || Number.isSafeInteger(value.event_seq) && value.event_seq >= 0)) || journalVersion >= 4 && !isTargetFileSizeMap(targetFileSizes) || !isNullableString(value.recovery_bundle_id) || !isNullableString(value.last_completed_step) || !isNullableString(value.redacted_error_category)) {
     throw new Error("Apply journal is invalid.");
   }
   return Object.assign({
@@ -29504,9 +29550,15 @@ function parseApplyJournal(value) {
     pre_apply_directory_ctimes: {},
     confirmed_directory_roots: [],
     confirmed_directory_inventory: null,
+    target_file_sizes: {},
     preserve_local_changes: false,
     event_seq: null
   }, value);
+}
+function isTargetFileSizeMap(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value) && Object.entries(value).every(
+    ([filePath, bytes]) => isSafeJournalPath(filePath) && isSyncableVaultPath(filePath) && Number.isSafeInteger(bytes) && bytes >= 0
+  );
 }
 function isSafeJournalPath(filePath) {
   return normalizePath2(filePath) === filePath && isValidVaultPath(filePath);

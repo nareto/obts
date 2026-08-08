@@ -103,13 +103,20 @@ export type IndexDelta = {
   head: string | null;
   base: string | null;
   mode: 'incremental' | 'rebuild' | 'diverged' | 'unavailable';
-  files: Array<{ path: string; oid: string; content_sha256: string }>;
+  files: Array<{ path: string; oid: string }>;
   changes: Array<{
     path: string;
     kind: 'add' | 'modify' | 'delete';
     oid: string | null;
-    content_sha256: string | null;
   }>;
+};
+
+export type HeadlessMaintenanceResult = {
+  applied: boolean;
+  sync_performed: boolean;
+  scan_mode: 'none' | 'incremental' | 'full';
+  status: string;
+  local_head: string | null;
 };
 
 type SharedClientCore = {
@@ -142,7 +149,7 @@ type SharedClientCore = {
   resetLocalPairingState(): Promise<{ status: 'Not paired'; recoveryBundleId: string | null }>;
   reportDeviceStatus(): Promise<void>;
   markBlocked(code: string, details?: Record<string, unknown>): Promise<void>;
-  readIndexDelta(fromCommit?: string | null): Promise<IndexDelta>;
+  backgroundScanDecision(): Promise<{ required: boolean; mode: 'none' | 'incremental' | 'full' }>;
 };
 
 type SharedClientInternals = SharedClientCore & {
@@ -157,6 +164,9 @@ type SharedClientInternals = SharedClientCore & {
   pullChunk(input: Record<string, unknown>): Promise<any>;
   putPushChunk(input: Record<string, unknown>): Promise<any>;
   completeConnection(...args: any[]): Promise<any>;
+  commitExists(commit: string): Promise<boolean>;
+  isAncestor(ancestor: string, descendant: string): Promise<boolean>;
+  listTreeBlobOids(commit: string): Promise<Map<string, string>>;
 };
 
 type MutableMethod = (...args: any[]) => any;
@@ -314,8 +324,61 @@ export class ObtsPluginClient {
     return this.client.markBlocked(code, details);
   }
 
-  readIndexDelta(fromCommit?: string | null): Promise<IndexDelta> {
-    return this.client.readIndexDelta(fromCommit);
+  async readIndexDelta(fromCommit: string | null = null): Promise<IndexDelta> {
+    const state = await this.client.readState();
+    const head = state.local_head;
+    if (!head || !(await this.client.commitExists(head))) {
+      return { head: null, base: null, mode: 'unavailable', files: [], changes: [] };
+    }
+    const targetEntries = await this.client.listTreeBlobOids(head);
+    let base: string | null = null;
+    let mode: IndexDelta['mode'] = 'rebuild';
+    let priorEntries = new Map<string, string>();
+    if (typeof fromCommit === 'string') {
+      if (!(await this.client.commitExists(fromCommit)) || !(await this.client.isAncestor(fromCommit, head))) {
+        return { head, base: fromCommit, mode: 'diverged', files: [], changes: [] };
+      }
+      base = fromCommit;
+      mode = 'incremental';
+      priorEntries = await this.client.listTreeBlobOids(fromCommit);
+    }
+    const files = [...targetEntries.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([path, oid]) => ({ path, oid }));
+    const paths = [...new Set([...priorEntries.keys(), ...targetEntries.keys()])].sort();
+    const changes: IndexDelta['changes'] = [];
+    for (const path of paths) {
+      const before = priorEntries.get(path);
+      const after = targetEntries.get(path);
+      if (before === after) continue;
+      changes.push({
+        path,
+        kind: before === undefined ? 'add' : after === undefined ? 'delete' : 'modify',
+        oid: after ?? null
+      });
+    }
+    return { head, base, mode, files, changes };
+  }
+
+  async maintenanceTick(): Promise<HeadlessMaintenanceResult> {
+    const [queue, decision] = await Promise.all([
+      this.client.readQueue(),
+      this.client.backgroundScanDecision()
+    ]);
+    const syncPerformed = Boolean(
+      queue.pending_commit || queue.status === 'queued_local' || decision.required
+    );
+    const result = syncPerformed
+      ? await this.client.syncOnce({ fullAudit: decision.mode === 'full' })
+      : await this.client.pollRemoteEventsAndApply();
+    const state = await this.client.readState();
+    return {
+      applied: !syncPerformed && Boolean((result as { applied?: boolean }).applied),
+      sync_performed: syncPerformed,
+      scan_mode: decision.mode,
+      status: state.status_label,
+      local_head: state.local_head
+    };
   }
 
   writeState(state: unknown): Promise<void> {

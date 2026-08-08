@@ -107,6 +107,7 @@ export type ConnectionBootstrapManifest = {
   root_commit: string;
   target_main: string;
   changed_paths: string[];
+  target_file_sizes?: Record<string, number>;
   explicit_directories: string[];
 };
 
@@ -274,6 +275,7 @@ export type DevicePullManifest = {
   device_id: string;
   target_main: string;
   changed_paths: string[];
+  target_file_sizes?: Record<string, number>;
   current_local_main_is_ancestor: boolean | null;
   event_seq: number;
   directory_intents?: DirectoryIntent[];

@@ -24,6 +24,7 @@ export type HeadlessClient = Pick<
   | 'readQueue'
   | 'readPendingOnboarding'
   | 'readIndexDelta'
+  | 'maintenanceTick'
   | 'startOnboarding'
   | 'pollOnboarding'
   | 'analyzeOnboarding'
@@ -102,6 +103,8 @@ export class HeadlessSession {
         return { result: await this.client.readPendingOnboarding(), stateChanged: false };
       case 'read-index-delta':
         return { result: await this.client.readIndexDelta(optionalString(request, 'fromCommit')), stateChanged: false };
+      case 'maintenance-tick':
+        return { result: await this.client.maintenanceTick(), stateChanged: false };
       case 'start-onboarding':
         return { result: await this.client.startOnboarding(requiredString(request, 'localVaultName')), stateChanged: true };
       case 'poll-onboarding':
