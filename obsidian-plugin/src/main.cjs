@@ -5454,6 +5454,9 @@ class ObtsObsidianClient {
     if (state.local_main && state.local_head === state.local_main) {
       return;
     }
+    if (state.server_device_ref && state.local_head === state.server_device_ref) {
+      return;
+    }
     if (state.local_main && await this.isAncestor(state.local_head, state.local_main)) {
       await this.writeState(Object.assign({}, state, {
         local_head: state.local_main,
@@ -5463,16 +5466,27 @@ class ObtsObsidianClient {
       }));
       return;
     }
+    if (queue.status !== "idle" || (queue.changed_paths || []).length > 0) {
+      return;
+    }
     const descendsFromDeviceRef = state.server_device_ref ? await this.isAncestor(state.server_device_ref, state.local_head) : false;
     const descendsFromLocalMain = state.local_main ? await this.isAncestor(state.local_main, state.local_head) : false;
     if (descendsFromDeviceRef || descendsFromLocalMain || (!state.server_device_ref && !state.local_main)) {
-      await this.writeQueue({
-        pending_commit: state.local_head,
-        expected_device_ref: state.server_device_ref,
-        status: "queued_local",
-        attempts: 0,
-        updated_at: nowIso()
+      const recoveredQueue = await this.updateQueue(async (current) => {
+        if (current.pending_commit || current.status !== "idle" || (current.changed_paths || []).length > 0) {
+          return current;
+        }
+        return Object.assign({}, current, {
+          pending_commit: state.local_head,
+          expected_device_ref: state.server_device_ref,
+          status: "queued_local",
+          attempts: 0,
+          updated_at: nowIso()
+        });
       });
+      if (recoveredQueue.pending_commit !== state.local_head) {
+        return;
+      }
       await this.writeState(Object.assign({}, state, {
         status_label: "Ahead",
         last_error_code: null,

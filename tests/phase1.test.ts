@@ -669,7 +669,6 @@ describe('Phase 1 sync without conflict resolution', () => {
       changed_paths: ['during-upload.md']
     });
     core.putPushChunk = putPushChunk;
-    await expect(plugin.syncOnce()).resolves.toMatchObject({ status: 'Ahead' });
     await expect(plugin.syncOnce()).resolves.toMatchObject({ status: 'Synced' });
     const finalMain = (await plugin.readState()).local_main;
     expect(await server.git.listTreePaths(admin.vaultId, finalMain!)).toEqual(
@@ -767,6 +766,49 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect((await plugin.syncOnce()).status).toBe('Synced');
     const main = (await plugin.readState()).local_main!;
     expect(await server.git.listTreePaths(admin.vaultId, main)).toContain('stranded.md');
+  });
+
+  it('does not replace a watcher hint that races stranded-commit recovery', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'stranded-commit-watcher-race');
+    await mkdirp(deviceDir);
+    await writeFile(join(deviceDir, 'base.md'), 'base\n');
+    const plugin = await pairPlugin(admin, deviceDir, 'stranded-commit-watcher-race');
+    expect((await plugin.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+
+    await writeFile(join(deviceDir, 'stranded.md'), 'stranded\n');
+    const internals = (plugin as unknown as { client: Record<string, any> }).client;
+    const state = await internals.readState();
+    const strandedCommit = await internals.createLocalCommit('test: stranded commit before watcher race');
+    await internals.writeState({ ...state, local_head: strandedCommit, status_label: 'Ahead' });
+    await internals.writeQueue({
+      pending_commit: null,
+      expected_device_ref: state.server_device_ref,
+      status: 'idle',
+      attempts: 0,
+      change_seq: 0,
+      changed_paths: [],
+      updated_at: new Date().toISOString()
+    });
+
+    const updateQueue = internals.updateQueue.bind(internals);
+    let injected = false;
+    internals.updateQueue = async (...args: unknown[]) => {
+      if (!injected) {
+        injected = true;
+        await plugin.recordLocalChangeHint(['raced.md']);
+      }
+      return await updateQueue(...args);
+    };
+
+    await internals.reconcileQueueWithLocalHead(await internals.readState());
+    expect(injected).toBe(true);
+    expect(await plugin.readQueue()).toMatchObject({
+      pending_commit: null,
+      status: 'queued_local',
+      change_seq: 1,
+      changed_paths: ['raced.md']
+    });
   });
 
   it('refreshes a stale local device ref after a previously accepted upload', async () => {
@@ -1267,6 +1309,55 @@ describe('Phase 1 sync without conflict resolution', () => {
       status_label: 'Behind',
       last_error_code: null
     });
+  });
+
+  it('uploads a follow-up edit instead of requeueing an accepted head while behind server main', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'accepted-head-follow-up');
+    await mkdirp(deviceDir);
+    await writeFile(join(deviceDir, 'shared.md'), 'base\n');
+    const plugin = await pairPlugin(admin, deviceDir, 'accepted-head-follow-up');
+    expect((await plugin.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+
+    await writeFile(join(deviceDir, 'shared.md'), 'first accepted edit\n');
+    const internals = (plugin as unknown as { client: Record<string, any> }).client;
+    const state = await internals.readState();
+    const acceptedCommit = await internals.createLocalCommit('test: accepted edit before server main apply');
+    const queue = {
+      pending_commit: acceptedCommit,
+      expected_device_ref: state.server_device_ref,
+      status: 'queued_local',
+      attempts: 0,
+      change_seq: 0,
+      changed_paths: [],
+      updated_at: new Date().toISOString()
+    };
+    await internals.writeQueue(queue);
+    await internals.writeState({ ...state, local_head: acceptedCommit, status_label: 'Ahead' });
+
+    await expect(internals.uploadQueuedCommit(queue)).resolves.toMatchObject({ status: 'merged' });
+    expect(await internals.readState()).toMatchObject({
+      local_main: state.local_main,
+      local_head: acceptedCommit,
+      server_device_ref: acceptedCommit,
+      status_label: 'Behind'
+    });
+
+    await writeFile(join(deviceDir, 'shared.md'), 'corrected follow-up edit\n');
+    await plugin.recordLocalChangeHint(['shared.md']);
+    expect(await plugin.readQueue()).toMatchObject({
+      pending_commit: null,
+      status: 'queued_local',
+      changed_paths: ['shared.md']
+    });
+
+    expect((await plugin.syncOnce()).status).toBe('Synced');
+    const finalState = await plugin.readState();
+    expect(finalState.local_head).toBe(finalState.local_main);
+    expect(await plugin.readQueue()).toMatchObject({ pending_commit: null, status: 'idle', changed_paths: [] });
+    expect((await server.git.readBlobAtPath(admin.vaultId, finalState.local_main!, 'shared.md')).toString('utf8')).toBe(
+      'corrected follow-up edit\n'
+    );
   });
 
   it('does not expose directory recovery decisions as client actions', async () => {
