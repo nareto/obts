@@ -527,6 +527,9 @@ export class SyncService {
     await this.withVaultLock(input.vaultId, async () => {
       const snapshot = await this.store.snapshot();
       const snapshotVault = requireVault(snapshot, input.vaultId);
+      if (snapshotVault.status === 'blocked_integrity') {
+        throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+      }
       const snapshotConflict = snapshot.conflicts.find(
         (candidate) => candidate.vault_id === input.vaultId && candidate.conflict_id === input.conflictId
       );
@@ -557,28 +560,87 @@ export class SyncService {
         ...refreshedFilePaths,
         ...(refreshedDirectoryContext?.affected_roots ?? [])
       ])].sort();
-      await this.store.mutate((db) => {
+      if (!needsRefresh) return;
+
+      const previousExpectedMain = snapshotConflict.expected_main;
+      const refreshedMain = snapshotVault.current_main;
+      const protectedCurrentRef = conflictProtectionRef(input.conflictId, 'current');
+      if ((await this.git.getRef(input.vaultId, protectedCurrentRef)) !== previousExpectedMain) {
+        await this.store.mutate((db) => {
+          const vault = requireVault(db, input.vaultId);
+          vault.status = 'blocked_integrity';
+          vault.updated_at = nowIso();
+        });
+        throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+      }
+
+      const operationId = await this.store.mutate((db) => {
         const vault = requireVault(db, input.vaultId);
-        const conflict = db.conflicts.find(
-          (candidate) => candidate.vault_id === input.vaultId && candidate.conflict_id === input.conflictId
-        );
-        if (!conflict) {
-          throw new AuthError(404, 'not_found', 'Resource not found.');
+        if (vault.status === 'blocked_integrity') {
+          throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
         }
-        if (conflict.status !== 'open') {
-          return;
-        }
-        const currentDirectoryEventSeq = db.directory_state_by_vault[input.vaultId]?.last_event_seq ?? 0;
+        const conflict = requireConflict(db, input.vaultId, input.conflictId);
         if (
-          conflict.expected_main === vault.current_main &&
-          conflict.current_main === vault.current_main &&
-          (conflict.directory_context?.expected_event_seq ?? currentDirectoryEventSeq) === currentDirectoryEventSeq
+          conflict.status !== 'open' ||
+          conflict.current_main !== previousExpectedMain ||
+          conflict.expected_main !== previousExpectedMain ||
+          vault.current_main !== refreshedMain
         ) {
-          return;
+          throw new AuthError(409, 'stale_conflict_review', 'Conflict review changed while it was being refreshed.');
         }
-        const previousExpectedMain = conflict.expected_main;
-        conflict.current_main = vault.current_main;
-        conflict.expected_main = vault.current_main;
+        const operation = this.store.startOperation(db, {
+          vault_id: input.vaultId,
+          device_id: conflict.device_id,
+          operation_type: 'conflict_refresh',
+          expected_refs: { [protectedCurrentRef]: previousExpectedMain },
+          target_refs: { [protectedCurrentRef]: refreshedMain },
+          target_commit: refreshedMain
+        });
+        operation.status = 'prepared';
+        operation.prepared_manifest = {
+          conflict_id: input.conflictId,
+          actor_user_id: input.actorUserId,
+          previous_main: previousExpectedMain,
+          refreshed_main: refreshedMain,
+          affected_paths: refreshedAffectedPaths,
+          refreshed_directory_context: refreshedDirectoryContext ?? null,
+          target_refs: { [protectedCurrentRef]: refreshedMain }
+        };
+        operation.updated_at = nowIso();
+        return operation.operation_id;
+      });
+
+      try {
+        await this.git.updateRef(input.vaultId, protectedCurrentRef, refreshedMain, previousExpectedMain);
+      } catch (error) {
+        const actualRef = await this.git.getRef(input.vaultId, protectedCurrentRef);
+        if (actualRef === previousExpectedMain) {
+          await this.abortOperation(operationId, 'conflict_refresh_ref_not_moved');
+          throw error;
+        }
+        if (actualRef !== refreshedMain) {
+          await this.blockPreparedOperationForIntegrity(operationId, 'conflict refresh ref cannot be reconciled');
+          throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+        }
+      }
+
+      await this.store.mutate((db) => {
+        const operation = requireOperation(db, operationId);
+        const vault = requireVault(db, input.vaultId);
+        const conflict = requireConflict(db, input.vaultId, input.conflictId);
+        if (vault.status === 'blocked_integrity') {
+          throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+        }
+        if (
+          operation.status !== 'prepared' ||
+          conflict.status !== 'open' ||
+          conflict.current_main !== previousExpectedMain ||
+          conflict.expected_main !== previousExpectedMain
+        ) {
+          throw new Error('Prepared conflict refresh metadata is no longer compatible.');
+        }
+        conflict.current_main = refreshedMain;
+        conflict.expected_main = refreshedMain;
         conflict.affected_paths = refreshedAffectedPaths;
         conflict.affected_path_count = refreshedAffectedPaths.length;
         if (refreshedDirectoryContext) conflict.directory_context = refreshedDirectoryContext;
@@ -604,12 +666,10 @@ export class SyncService {
           },
           commit_cursors: {
             previous_main: previousExpectedMain,
-            main: vault.current_main,
+            main: refreshedMain,
             device_commit: conflict.device_commit
           },
-          payload: {
-            conflict_id: input.conflictId
-          }
+          payload: { conflict_id: input.conflictId }
         });
         db.audit_log.push({
           audit_id: newId('aud'),
@@ -621,6 +681,14 @@ export class SyncService {
           resource_id: input.conflictId,
           created_at: nowIso()
         });
+        operation.status = 'committed';
+        operation.result = {
+          decision: 'refreshed',
+          conflict_id: input.conflictId,
+          previous_main: previousExpectedMain,
+          refreshed_main: refreshedMain
+        };
+        operation.updated_at = nowIso();
       });
     });
     return await this.getConflictReviewPackage(input.vaultId, input.conflictId);
@@ -652,6 +720,9 @@ export class SyncService {
     return await this.withVaultLock(input.vaultId, async () => {
       const snapshot = await this.store.snapshot();
       const vault = requireVault(snapshot, input.vaultId);
+      if (vault.status === 'blocked_integrity') {
+        throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+      }
       const conflict = snapshot.conflicts.find(
         (candidate) => candidate.vault_id === input.vaultId && candidate.conflict_id === input.conflictId
       );
@@ -691,6 +762,10 @@ export class SyncService {
       await this.git.validateTreePathPolicy(input.vaultId, tree, this.maxUploadBytes);
 
       const preparation = await this.store.mutate((db) => {
+        const mutableVault = requireVault(db, input.vaultId);
+        if (mutableVault.status === 'blocked_integrity') {
+          throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+        }
         const device = requireDevice(db, conflict.device_id);
         const operation = this.store.startOperation(db, {
           vault_id: input.vaultId,
@@ -2123,6 +2198,17 @@ export class SyncService {
     });
   }
 
+  private async blockPreparedOperationForIntegrity(operationId: string, reason: string): Promise<void> {
+    await this.store.mutate((db) => {
+      const operation = requireOperation(db, operationId);
+      operation.result = { reason };
+      operation.updated_at = nowIso();
+      const vault = requireVault(db, operation.vault_id);
+      vault.status = 'blocked_integrity';
+      vault.updated_at = nowIso();
+    });
+  }
+
   private async prepareMergeRefUpdate(operationId: string, mergeCommit: string): Promise<void> {
     await this.store.mutate((db) => {
       const operation = requireOperation(db, operationId);
@@ -3308,6 +3394,10 @@ export const __syncServiceTestInternals = {
   summarizeStructuralChanges,
   structuralMergeConflict
 };
+
+function conflictProtectionRef(conflictId: string, kind: 'base' | 'current' | 'device'): string {
+  return `refs/obts/conflicts/${conflictId}/${kind}`;
+}
 
 function resolutionRequestHash(input: {
   expectedMain: string;

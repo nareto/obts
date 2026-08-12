@@ -21919,7 +21919,7 @@ var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var { createByteBudget, runBoundedWork } = require_work_pool();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.33";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.34";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_INVENTORY_INTERVAL_MS = 6 * 60 * 60 * 1e3;
@@ -22933,7 +22933,7 @@ module.exports = class ObtsPlugin extends Plugin {
     if (this.unloaded || details.availability === "restart_required") {
       return details.availability === "available" ? "A plugin update interrupted an active operation. Fully restart Obsidian before continuing setup or sync." : this.operationDescription(details);
     }
-    return details.availability === "available" ? "Another obts operation is still running." : `${this.operationDescription(details)} Wait for it to finish before syncing again.`;
+    return details.availability === "available" ? "Obts could not start this action; check the current status for details." : `${this.operationDescription(details)} Wait for it to finish before syncing again.`;
   }
   observeRetiredOperation() {
     const registry = operationRegistry();
@@ -28818,7 +28818,17 @@ var ObtsSettingTab = class extends PluginSettingTab {
               false
             );
             if (!result) {
-              setFeedback(actionFeedback, this.plugin.syncBlockedMessage(), "muted");
+              const operation = this.plugin.operationDetails();
+              if (operation.availability !== "available") {
+                setFeedback(actionFeedback, this.plugin.syncBlockedMessage(), "muted");
+              } else {
+                const blockedState = await this.plugin.client.readState();
+                setFeedback(
+                  actionFeedback,
+                  blockedState.last_error_code ? `Sync stopped: ${blockStatusLabel(blockedState.last_error_code)}.` : "Sync did not complete; check the current status for details.",
+                  blockedState.last_error_code ? "error" : "muted"
+                );
+              }
               return;
             }
             this.plugin.setStatus((await this.plugin.client.readState()).status_label);
@@ -29445,7 +29455,7 @@ function statusPresentation(label) {
   if (base === "Synced") tone = "success";
   else if (["Checking", "Verifying contents", "Preparing upload", "Uploading", "Applying", "Merging", "Server retrying", "Repairing baseline", "Finishing update", "Waiting for operation"].includes(base)) tone = "active";
   else if (["Ahead", "Behind", "Offline", "Review needed"].includes(base)) tone = "warning";
-  else if (["Blocked", "Needs recovery", "Unsafe local state", "Integrity failure", "Recovery required", "Restart required"].includes(base)) tone = "danger";
+  else if (["Blocked", "Needs recovery", "Unsafe local state", "Server repair required", "Integrity failure", "Recovery required", "Restart required"].includes(base)) tone = "danger";
   return {
     label: normalized,
     base,
@@ -29459,10 +29469,11 @@ function statusAttentionMessage(base) {
   if (base === "Blocked") return "obts sync is blocked. Click the sync indicator to inspect the required action.";
   if (base === "Needs recovery") return "obts needs recovery before sync can continue. Click the sync indicator for recovery options.";
   if (base === "Unsafe local state") return "obts stopped to protect local changes. Click the sync indicator to inspect recovery options.";
+  if (base === "Server repair required") return "obts stopped because the server vault needs an integrity repair. Click the sync indicator for details.";
   return null;
 }
 function isPersistentAttentionStatus(base) {
-  return ["Review needed", "Blocked", "Needs recovery", "Unsafe local state", "Integrity failure", "Recovery required", "Restart required"].includes(base);
+  return ["Review needed", "Blocked", "Needs recovery", "Unsafe local state", "Server repair required", "Integrity failure", "Recovery required", "Restart required"].includes(base);
 }
 function isActiveTransferStatus(base) {
   return ["Verifying contents", "Preparing upload", "Uploading", "Applying", "Merging", "Server retrying", "Repairing baseline", "Finishing update", "Waiting for operation"].includes(base);
@@ -29506,6 +29517,9 @@ function blockStatusLabel(code) {
   }
   if (code === "initial_import_confirmation_required") {
     return "Blocked";
+  }
+  if (code === "blocked_integrity") {
+    return "Server repair required";
   }
   return "Unsafe local state";
 }

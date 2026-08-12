@@ -23,6 +23,7 @@ import {
   type ChunkPullManifest,
   type DevicePullManifest,
   type DevicePullRequest,
+  type DirectoryConflictContext,
   type DirectoryIntent,
   type DirectoryIntentAcknowledgement,
   type ManualFilePlanEntry,
@@ -3016,7 +3017,18 @@ async function checkVaultPersistentState(
     }
     if (conflict.status === 'open') {
       for (const [kind, commit] of conflictProtectedRefs(conflict)) {
-        if ((await git.getRef(vaultId, conflictRef(conflict.conflict_id, kind))) !== commit) {
+        const ref = conflictRef(conflict.conflict_id, kind);
+        const actualRef = await git.getRef(vaultId, ref);
+        const preparedTransition = allowPreparedTransitions && actualRef !== commit && await preparedConflictRefTransitionAllows(
+          db,
+          vaultId,
+          conflict.conflict_id,
+          kind,
+          commit,
+          actualRef,
+          git
+        );
+        if (actualRef !== commit && !preparedTransition) {
           return { ok: false, error: 'unresolved conflict protection ref is inconsistent with metadata', vaultId };
         }
       }
@@ -3052,6 +3064,40 @@ async function preparedRefTransitionAllows(
     const target = new Map(recoverableTargetRefs(operation)).get(ref);
     const expected = operation.expected_refs[ref] ?? null;
     if (metadataValue !== expected || actualValue !== target) continue;
+    return await git.commitExists(vaultId, actualValue);
+  }
+  return false;
+}
+
+async function preparedConflictRefTransitionAllows(
+  db: MetadataDb,
+  vaultId: string,
+  conflictId: string,
+  kind: string,
+  metadataValue: string,
+  actualValue: string | null,
+  git: GitService
+): Promise<boolean> {
+  if (kind !== 'current' || actualValue === null) return false;
+  const ref = conflictRef(conflictId, 'current');
+  for (const operation of db.sync_operations) {
+    if (
+      operation.vault_id !== vaultId ||
+      operation.operation_type !== 'conflict_refresh' ||
+      operation.status !== 'prepared' ||
+      stringValue(operation.prepared_manifest?.conflict_id) !== conflictId ||
+      Object.keys(operation.expected_refs).length !== 1
+    ) continue;
+    const updatedAt = Date.parse(operation.updated_at);
+    const transitionAge = Date.now() - updatedAt;
+    if (!Number.isFinite(updatedAt) || transitionAge < 0 || transitionAge > LIVE_REF_TRANSITION_GRACE_MS) continue;
+    const targets = recoverableTargetRefs(operation);
+    if (
+      targets.length !== 1 ||
+      targets[0]?.[0] !== ref ||
+      operation.expected_refs[ref] !== metadataValue ||
+      targets[0]?.[1] !== actualValue
+    ) continue;
     return await git.commitExists(vaultId, actualValue);
   }
   return false;
@@ -3297,6 +3343,117 @@ async function rollForwardPreparedOperation(store: MetadataStore, operationId: s
     if (!operation || operation.status !== 'prepared') {
       return;
     }
+    if (operation.operation_type === 'conflict_refresh') {
+      const manifest = operation.prepared_manifest ?? {};
+      const conflictId = stringValue(manifest.conflict_id);
+      const previousMain = stringValue(manifest.previous_main);
+      const refreshedMain = stringValue(manifest.refreshed_main);
+      const actorUserId = stringValue(manifest.actor_user_id);
+      const affectedPaths = stringArrayValue(manifest.affected_paths);
+      const rawDirectoryContext = manifest.refreshed_directory_context;
+      const refreshedDirectoryContext = rawDirectoryContext === null
+        ? null
+        : rawDirectoryContext && typeof rawDirectoryContext === 'object' && !Array.isArray(rawDirectoryContext)
+          ? rawDirectoryContext as DirectoryConflictContext
+          : undefined;
+      const protectedCurrentRef = conflictId ? conflictRef(conflictId, 'current') : null;
+      const targetMain = protectedCurrentRef ? operation.target_refs[protectedCurrentRef] : null;
+      const recoverableRefs = recoverableTargetRefs(operation);
+      const conflict = conflictId
+        ? db.conflicts.find(
+            (candidate) => candidate.vault_id === operation.vault_id && candidate.conflict_id === conflictId
+          )
+        : undefined;
+      const vault = db.vaults.find((candidate) => candidate.vault_id === operation.vault_id);
+      if (
+        !vault ||
+        conflictId === null ||
+        protectedCurrentRef === null ||
+        !conflict ||
+        conflict.status !== 'open' ||
+        previousMain === null ||
+        refreshedMain === null ||
+        actorUserId === null ||
+        affectedPaths === null ||
+        refreshedDirectoryContext === undefined ||
+        targetMain !== refreshedMain ||
+        operation.target_commit !== refreshedMain ||
+        operation.device_id !== conflict.device_id ||
+        Object.keys(operation.expected_refs).length !== 1 ||
+        operation.expected_refs[protectedCurrentRef] !== previousMain ||
+        recoverableRefs.length !== 1 ||
+        recoverableRefs[0]?.[0] !== protectedCurrentRef ||
+        recoverableRefs[0]?.[1] !== refreshedMain ||
+        conflict.current_main !== previousMain ||
+        conflict.expected_main !== previousMain
+      ) {
+        operation.result = { reason: 'conflict_refresh_reconciliation_failed' };
+        operation.updated_at = nowIso();
+        if (vault) {
+          vault.status = 'blocked_integrity';
+          vault.updated_at = nowIso();
+        }
+        return;
+      }
+
+      const refreshedAt = nowIso();
+      conflict.current_main = refreshedMain;
+      conflict.expected_main = refreshedMain;
+      conflict.affected_paths = affectedPaths;
+      conflict.affected_path_count = affectedPaths.length;
+      if (refreshedDirectoryContext) conflict.directory_context = refreshedDirectoryContext;
+      conflict.validator_results = {
+        ...conflict.validator_results,
+        review_refreshed_from: previousMain,
+        review_refreshed_at: refreshedAt,
+        affected_paths: affectedPaths,
+        affected_path_count: affectedPaths.length
+      };
+      conflict.validator_summary = {
+        ...conflict.validator_summary,
+        stale: false,
+        refreshed_from: previousMain,
+        path_count: affectedPaths.length
+      };
+      operation.status = 'committed';
+      operation.result = {
+        decision: 'refreshed',
+        conflict_id: conflictId,
+        previous_main: previousMain,
+        refreshed_main: refreshedMain,
+        reconciled_after_startup: true
+      };
+      operation.updated_at = refreshedAt;
+      store.appendEvent(db, {
+        event_type: 'conflict_review_refreshed',
+        vault_id: operation.vault_id,
+        resource_ids: {
+          conflict_id: conflictId,
+          device_id: conflict.device_id
+        },
+        commit_cursors: {
+          previous_main: previousMain,
+          main: refreshedMain,
+          device_commit: conflict.device_commit
+        },
+        payload: {
+          conflict_id: conflictId,
+          reconciled_after_startup: true
+        }
+      });
+      db.audit_log.push({
+        audit_id: newId('aud'),
+        actor_user_id: actorUserId,
+        actor_device_id: null,
+        vault_id: operation.vault_id,
+        action: 'conflict_review_refreshed',
+        resource_class: 'conflict',
+        resource_id: conflictId,
+        created_at: refreshedAt
+      });
+      return;
+    }
+
     if (operation.operation_type === 'device_push') {
       const deviceRefEntry = Object.entries(operation.target_refs).find(([ref, target]) => {
         return ref.startsWith('refs/obts/devices/') && typeof target === 'string';
@@ -3475,6 +3632,10 @@ async function rollForwardPreparedOperation(store: MetadataStore, operationId: s
 
 function stringValue(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
+}
+
+function stringArrayValue(value: unknown): string[] | null {
+  return Array.isArray(value) && value.every((entry) => typeof entry === 'string') ? value : null;
 }
 
 function firstDetail(details: Array<string | null | undefined>): string {

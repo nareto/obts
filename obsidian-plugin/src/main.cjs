@@ -1161,7 +1161,7 @@ module.exports = class ObtsPlugin extends Plugin {
         : this.operationDescription(details);
     }
     return details.availability === "available"
-      ? "Another obts operation is still running."
+      ? "Obts could not start this action; check the current status for details."
       : `${this.operationDescription(details)} Wait for it to finish before syncing again.`;
   }
 
@@ -7816,7 +7816,19 @@ class ObtsSettingTab extends PluginSettingTab {
                   false
                 );
                 if (!result) {
-                  setFeedback(actionFeedback, this.plugin.syncBlockedMessage(), "muted");
+                  const operation = this.plugin.operationDetails();
+                  if (operation.availability !== "available") {
+                    setFeedback(actionFeedback, this.plugin.syncBlockedMessage(), "muted");
+                  } else {
+                    const blockedState = await this.plugin.client.readState();
+                    setFeedback(
+                      actionFeedback,
+                      blockedState.last_error_code
+                        ? `Sync stopped: ${blockStatusLabel(blockedState.last_error_code)}.`
+                        : "Sync did not complete; check the current status for details.",
+                      blockedState.last_error_code ? "error" : "muted"
+                    );
+                  }
                   return;
                 }
                 this.plugin.setStatus((await this.plugin.client.readState()).status_label);
@@ -8597,7 +8609,7 @@ function statusPresentation(label) {
   if (base === "Synced") tone = "success";
   else if (["Checking", "Verifying contents", "Preparing upload", "Uploading", "Applying", "Merging", "Server retrying", "Repairing baseline", "Finishing update", "Waiting for operation"].includes(base)) tone = "active";
   else if (["Ahead", "Behind", "Offline", "Review needed"].includes(base)) tone = "warning";
-  else if (["Blocked", "Needs recovery", "Unsafe local state", "Integrity failure", "Recovery required", "Restart required"].includes(base)) tone = "danger";
+  else if (["Blocked", "Needs recovery", "Unsafe local state", "Server repair required", "Integrity failure", "Recovery required", "Restart required"].includes(base)) tone = "danger";
   return {
     label: normalized,
     base,
@@ -8612,11 +8624,12 @@ function statusAttentionMessage(base) {
   if (base === "Blocked") return "obts sync is blocked. Click the sync indicator to inspect the required action.";
   if (base === "Needs recovery") return "obts needs recovery before sync can continue. Click the sync indicator for recovery options.";
   if (base === "Unsafe local state") return "obts stopped to protect local changes. Click the sync indicator to inspect recovery options.";
+  if (base === "Server repair required") return "obts stopped because the server vault needs an integrity repair. Click the sync indicator for details.";
   return null;
 }
 
 function isPersistentAttentionStatus(base) {
-  return ["Review needed", "Blocked", "Needs recovery", "Unsafe local state", "Integrity failure", "Recovery required", "Restart required"].includes(base);
+  return ["Review needed", "Blocked", "Needs recovery", "Unsafe local state", "Server repair required", "Integrity failure", "Recovery required", "Restart required"].includes(base);
 }
 
 function isActiveTransferStatus(base) {
@@ -8675,6 +8688,9 @@ function blockStatusLabel(code) {
   }
   if (code === "initial_import_confirmation_required") {
     return "Blocked";
+  }
+  if (code === "blocked_integrity") {
+    return "Server repair required";
   }
   return "Unsafe local state";
 }

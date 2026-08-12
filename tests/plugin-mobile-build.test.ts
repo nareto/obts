@@ -65,6 +65,7 @@ describe('mobile plugin artifact', () => {
     const module = { exports: {} as unknown };
     const savedSettings: unknown[] = [];
     const requests: Array<Record<string, unknown>> = [];
+    let reportedVaultStatus: 'active' | 'blocked_integrity' = 'active';
     const notices: string[] = [];
     const openedUrls: string[] = [];
     const openedSettingTabs: string[] = [];
@@ -108,7 +109,8 @@ describe('mobile plugin artifact', () => {
     const renderedSettingNames: string[] = [];
     const renderedSettingDescriptions: string[] = [];
     const renderedElementTexts: string[] = [];
-    const renderedButtons: Array<{ text: string; disabled: boolean }> = [];
+    const renderedButtons: Array<{ text: string; disabled: boolean; click?: () => unknown }> = [];
+    const renderedContainers: Array<{ className?: string; textContent?: string }> = [];
     const settingsRefreshCallbacks: Array<() => void> = [];
     const clearedSyntheticIntervals = new Set<number>();
     let nextSyntheticInterval = 100_000;
@@ -127,21 +129,27 @@ describe('mobile plugin artifact', () => {
       }
       clearInterval(interval);
     };
-    const createContainer = (): any => ({
-      empty() {
-        renderedSettingNames.length = 0;
-        renderedSettingDescriptions.length = 0;
-        renderedElementTexts.length = 0;
-        renderedButtons.length = 0;
-      },
-      createEl(_tag: string, options: { text?: string } = {}) {
-        if (options.text) renderedElementTexts.push(options.text);
-        return createContainer();
-      },
-      createDiv() { return createContainer(); }
-    });
+    const createContainer = (): any => {
+      const container: any = {
+        className: '',
+        textContent: '',
+        empty() {
+          renderedSettingNames.length = 0;
+          renderedSettingDescriptions.length = 0;
+          renderedElementTexts.length = 0;
+          renderedButtons.length = 0;
+        },
+        createEl(_tag: string, options: { text?: string } = {}) {
+          if (options.text) renderedElementTexts.push(options.text);
+          return createContainer();
+        },
+        createDiv() { return createContainer(); }
+      };
+      renderedContainers.push(container);
+      return container;
+    };
     const createControl = (): any => {
-      const rendered = { text: '', disabled: false };
+      const rendered: { text: string; disabled: boolean; click?: () => unknown } = { text: '', disabled: false };
       const control: any = {
         inputEl: {},
         setValue() { return control; },
@@ -149,7 +157,7 @@ describe('mobile plugin artifact', () => {
         setButtonText(value: string) { rendered.text = value; return control; },
         setCta() { return control; },
         setDisabled(value: boolean) { rendered.disabled = value; return control; },
-        onClick() { return control; },
+        onClick(callback: () => unknown) { rendered.click = callback; return control; },
         setWarning() { return control; }
       };
       renderedButtons.push(rendered);
@@ -215,7 +223,7 @@ describe('mobile plugin artifact', () => {
       requestUrl: async (options: Record<string, unknown>) => {
         requests.push(options);
         if (typeof options.url === 'string' && options.url.endsWith('/sync/device-status')) {
-          const json = { device_name: 'iPhone', vault_status: 'active' };
+          const json = { device_name: 'iPhone', vault_status: reportedVaultStatus };
           return { status: 200, headers: {}, json, text: JSON.stringify(json), arrayBuffer: new ArrayBuffer(0) };
         }
         if (typeof options.url === 'string' && options.url.endsWith('/sync/applied')) {
@@ -925,7 +933,7 @@ describe('mobile plugin artifact', () => {
     };
     await (runtimePlugin as any).runBackgroundSync();
     expect(await runtimeClient.readState()).toMatchObject({
-      status_label: 'Unsafe local state',
+      status_label: 'Server repair required',
       last_error_code: 'blocked_integrity'
     });
     expect((runtimePlugin as any).automaticRetryNotBefore).toBe(0);
@@ -934,9 +942,11 @@ describe('mobile plugin artifact', () => {
       throw new TransportError(409, 'blocked_integrity', 'vault integrity repair required');
     }, false);
     expect(await runtimeClient.readState()).toMatchObject({
-      status_label: 'Unsafe local state',
+      status_label: 'Server repair required',
       last_error_code: 'blocked_integrity'
     });
+    expect((runtimePlugin as any).operationDescription()).toBe('No obts operation is running.');
+    expect((runtimePlugin as any).syncBlockedMessage()).not.toContain('Another obts operation');
     await runtimeClient.writeState({
       ...(await runtimeClient.readState()),
       status_label: 'Synced',
@@ -1242,6 +1252,24 @@ describe('mobile plugin artifact', () => {
       local_status_label: 'Synced'
     });
     (plugin as any).endSync();
+
+    (plugin as any).clientReady = true;
+    let blockedActionCalls = 0;
+    reportedVaultStatus = 'blocked_integrity';
+    (plugin as any).syncOnceOrPollResolvedConflict = async () => {
+      blockedActionCalls += 1;
+      const TransportError = (module.exports as any).TransportError;
+      throw new TransportError(409, 'blocked_integrity', 'vault integrity repair required');
+    };
+    await settingTabs[0]!.display();
+    const blockedSyncButton = renderedButtons.find((button) => button.text === 'Sync now');
+    expect(blockedSyncButton?.disabled).toBe(false);
+    await blockedSyncButton?.click?.();
+    expect(blockedActionCalls).toBe(1);
+    expect(JSON.stringify(renderedContainers.map((container) => container.textContent).filter(Boolean))).toContain('Sync stopped: Server repair required.');
+    expect(renderedContainers.every((container) => !container.textContent?.includes('Another obts operation'))).toBe(true);
+    expect((plugin as any).operationDescription()).toBe('No obts operation is running.');
+    reportedVaultStatus = 'active';
 
     const replacement = new PluginClass();
     replacement.app = plugin.app;
