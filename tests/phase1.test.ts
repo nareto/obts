@@ -4654,7 +4654,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     await expect(plugin.syncOnce()).rejects.toMatchObject({ code: 'blocked_integrity' });
     expect(planCalls).toBe(0);
     const blockedState = await plugin.readState();
-    expect(blockedState).toMatchObject({ status_label: 'Unsafe local state', last_error_code: 'blocked_integrity' });
+    expect(blockedState).toMatchObject({ status_label: 'Server repair required', last_error_code: 'blocked_integrity' });
     expect(await plugin.readQueue()).toMatchObject({ status: 'queued_local', pending_commit: expect.stringMatching(/^[0-9a-f]{40}$/u) });
 
     const blockedTransfer = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/push-transfers`, {
