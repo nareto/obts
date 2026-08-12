@@ -70,4 +70,4 @@ Explicit exclusions unless separately mitigated are malicious trusted operators,
 
 ## Formalization Policy
 
-Formal models may refine these IDs but never redefine them silently. The first candidate model should cover `OBTS-SAF-001`, `OBTS-SAF-002`, and `OBTS-SAF-005` for one client, one path, a concurrent local edit, recovery publication, apply phases, crash, and restart. A model action named `DurableWrite` must cite the concrete storage guarantee it assumes; otherwise the model would assume the property most in need of proof.
+Formal models may refine these IDs but never redefine them silently. `OBTS-FM-001` covers `OBTS-SAF-001`, `OBTS-SAF-002`, and `OBTS-SAF-005` for one client, one path, a concurrent local edit, recovery publication, apply phases, one crash, and restart. Its `PublishInitialBundle` and `PublishPostWriteBundle` actions explicitly state the complete, flushed, checksum-verifiable, atomically published storage guarantee they assume; the model does not prove that the implementation or a platform realizes that guarantee.

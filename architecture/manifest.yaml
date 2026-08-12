@@ -1,5 +1,5 @@
 schema_version: 1
-revision: 1
+revision: 2
 status: current
 updated: 2026-08-12
 authoritative_artifacts:
@@ -11,4 +11,12 @@ authoritative_artifacts:
   - architecture/migrations
   - architecture/workspace.dsl
   - openapi/openapi.yaml
-formal_models: []
+formal_models:
+  - id: OBTS-FM-001
+    status: accepted
+    path: architecture/models/formal/OBTSApplyRecovery.tla
+    architecture_revision: 2
+    refines:
+      - OBTS-SAF-001
+      - OBTS-SAF-002
+      - OBTS-SAF-005

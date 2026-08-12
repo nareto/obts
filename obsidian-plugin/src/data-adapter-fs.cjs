@@ -75,7 +75,11 @@ function createDataAdapterFs(adapter) {
         }
         await ensureParentDirectories(adapter, normalized);
         try {
-          await adapter.writeBinary(normalized, toArrayBuffer(bytes));
+          if (flag === "wx" && typeof adapter.writeBinaryExclusive === "function") {
+            await adapter.writeBinaryExclusive(normalized, toArrayBuffer(bytes));
+          } else {
+            await adapter.writeBinary(normalized, toArrayBuffer(bytes));
+          }
         } catch (error) {
           throw await translateError(adapter, normalized, error, "EIO");
         }

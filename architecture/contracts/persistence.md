@@ -36,6 +36,8 @@ A recovery bundle is complete only when its manifest, affected file snapshots, t
 
 The apply journal records schema version, operation identity, target main, expected prior refs/state, affected paths, typed preflight fingerprints, directory effects, preservation policy, target event cursor, recovery bundle, current phase, and last completed step.
 
+Immediately before destructive replacement, the client atomically displaces the validated current path into journal-addressed `.obts/apply-displaced/<apply-id>/` storage, verifies the displaced identity/content, and creates the target only through a non-overwriting primitive. Displaced entries remain discoverable across restart and are moved to `.obts/recovery-displaced/<apply-id>/` quarantine before journal cleanup; they are never automatically deleted because an open file descriptor could mutate a renamed inode after validation. Quarantine pruning requires a separately approved destructive-lifecycle design.
+
 Phases distinguish at least planning, recovery publication, file writes, verification, committed local refs/state, and blocked recovery. Journal cleanup occurs only after visible state, local refs, preservation queueing, and local applied-event cursor are durable. Missing server acknowledgement is recoverable independently.
 
 ## Backup Boundary

@@ -34,6 +34,8 @@ describe('large-vault client checkpoints', () => {
       ['large.md'],
       new Map([['large.md', 'a'.repeat(40)]]),
       { 'large.md': 5 },
+      {},
+      async () => undefined,
       async () => undefined,
       () => undefined
     )).rejects.toMatchObject({ code: 'file_buffer_budget_exceeded' });
@@ -201,15 +203,15 @@ describe('large-vault client checkpoints', () => {
     await rm(join(root, 'incoming'), { recursive: true, force: true });
 
     core.fileWorkConcurrency = 3;
-    const adapterWriteBinary = core.adapterWriteBinary.bind(core);
+    const adapterWriteBinaryExclusive = core.adapterWriteBinaryExclusive.bind(core);
     let active = 0;
     let maximum = 0;
-    core.adapterWriteBinary = async (path: string, content: Buffer) => {
+    core.adapterWriteBinaryExclusive = async (path: string, content: Buffer) => {
       active += 1;
       maximum = Math.max(maximum, active);
       await delay(10);
       try {
-        await adapterWriteBinary(path, content);
+        await adapterWriteBinaryExclusive(path, content);
       } finally {
         active -= 1;
       }
@@ -241,6 +243,409 @@ describe('large-vault client checkpoints', () => {
     expect(await readFile(join(root, 'incoming', '7.md'), 'utf8')).toBe('incoming 7\n');
   });
 
+  it('revalidates each path at the mutation seam', async () => {
+    const { root, core } = await clientFixture();
+    await writeFile(join(root, 'shared.md'), 'captured local bytes\n');
+    const preflight = await core.readRecoveryFileSnapshot('shared.md');
+
+    await writeFile(join(root, 'target-source.md'), 'server target bytes\n');
+    const target = await core.createLocalCommit('mutation revalidation target');
+    const targetEntries = await core.listTreeBlobOids(target);
+    const targetOid = targetEntries.get('target-source.md');
+    expect(targetOid).toMatch(/^[0-9a-f]{40}$/u);
+    const sharedTargetEntries = new Map([['shared.md', targetOid]]);
+    const targetSize = (await core.readBlobOid(targetOid)).byteLength;
+
+    const originalReadBlobOid = core.readBlobOid.bind(core);
+    core.readBlobOid = async (oid: string) => {
+      const content = await originalReadBlobOid(oid);
+      await writeFile(join(root, 'shared.md'), 'concurrent local edit\n');
+      return content;
+    };
+
+    await expect(core.writeTargetFilesFromJournal({
+      journal_version: 4,
+      apply_id: 'apply_mutation_revalidation',
+      operation_type: 'pull_apply',
+      target_main: target,
+      target_file_sizes: { 'shared.md': targetSize },
+      expected_prior_local_main: null,
+      expected_prior_local_device_ref: null,
+      phase: 'writing_files',
+      affected_paths: ['shared.md'],
+      preflight_sha256: { 'shared.md': preflight.fingerprint.sha256 },
+      preflight_fingerprints: { 'shared.md': preflight.fingerprint },
+      recovery_bundle_id: 'rec_mutation_revalidation',
+      last_completed_step: 'recovery_bundle',
+      redacted_error_category: null
+    }, sharedTargetEntries, new Set())).rejects.toMatchObject({ filePath: 'shared.md' });
+
+    expect(await readFile(join(root, 'shared.md'), 'utf8')).toBe('concurrent local edit\n');
+  });
+
+  it('preserves a path created at the exclusive-write boundary', async () => {
+    const { root, core } = await clientFixture();
+    await writeFile(join(root, 'shared.md'), 'captured local bytes\n');
+    const preflight = await core.readRecoveryFileSnapshot('shared.md');
+    await writeFile(join(root, 'target-source.md'), 'server target bytes\n');
+    const target = await core.createLocalCommit('exclusive write race target');
+    const targetEntries = await core.listTreeBlobOids(target);
+    const targetOid = targetEntries.get('target-source.md');
+    const targetSize = (await core.readBlobOid(targetOid)).byteLength;
+    const originalExclusiveWrite = core.adapterWriteBinaryExclusive.bind(core);
+    core.adapterWriteBinaryExclusive = async (path: string, content: Buffer) => {
+      await writeFile(join(root, path), 'last-moment local edit\n');
+      return await originalExclusiveWrite(path, content);
+    };
+
+    await expect(core.writeTargetFilesFromJournal({
+      journal_version: 4,
+      apply_id: 'apply_exclusive_write_race',
+      operation_type: 'pull_apply',
+      target_main: target,
+      target_file_sizes: { 'shared.md': targetSize },
+      expected_prior_local_main: null,
+      expected_prior_local_device_ref: null,
+      phase: 'writing_files',
+      affected_paths: ['shared.md'],
+      preflight_sha256: { 'shared.md': preflight.fingerprint.sha256 },
+      preflight_fingerprints: { 'shared.md': preflight.fingerprint },
+      recovery_bundle_id: 'rec_exclusive_write_race',
+      last_completed_step: 'recovery_bundle',
+      redacted_error_category: null
+    }, new Map([['shared.md', targetOid]]), new Set())).rejects.toMatchObject({ filePath: 'shared.md' });
+
+    expect(await readFile(join(root, 'shared.md'), 'utf8')).toBe('last-moment local edit\n');
+    expect(await readFile(join(
+      root,
+      '.obts',
+      'apply-displaced',
+      'apply_exclusive_write_race',
+      `${encodeURIComponent('shared.md')}.entry`
+    ), 'utf8')).toBe('captured local bytes\n');
+  });
+
+  it('replays a crash after displacement without losing the captured path', async () => {
+    const { root, core } = await clientFixture();
+    await writeFile(join(root, 'shared.md'), 'captured local bytes\n');
+    const preflight = await core.readRecoveryFileSnapshot('shared.md');
+    await writeFile(join(root, 'shared.md'), 'server target bytes\n');
+    const target = await core.createLocalCommit('displacement replay target');
+    const targetEntries = await core.listTreeBlobOids(target);
+    const targetOid = targetEntries.get('shared.md');
+    const targetSize = Buffer.byteLength('server target bytes\n');
+    await writeFile(join(root, 'shared.md'), 'captured local bytes\n');
+    const journal = {
+      journal_version: 4,
+      apply_id: 'apply_displacement_replay',
+      operation_type: 'pull_apply',
+      target_main: target,
+      target_file_sizes: { 'shared.md': targetSize },
+      expected_prior_local_main: null,
+      expected_prior_local_device_ref: null,
+      phase: 'writing_files',
+      affected_paths: ['shared.md'],
+      preflight_sha256: { 'shared.md': preflight.fingerprint.sha256 },
+      preflight_fingerprints: { 'shared.md': preflight.fingerprint },
+      directory_intents: [],
+      explicit_directories: [],
+      pre_apply_directories: [],
+      pre_apply_directory_ctimes: {},
+      confirmed_directory_roots: [],
+      confirmed_directory_inventory: null,
+      preserve_local_changes: false,
+      event_seq: null,
+      recovery_bundle_id: 'rec_displacement_replay',
+      last_completed_step: 'recovery_bundle',
+      redacted_error_category: null
+    };
+    await writeFile(join(root, '.obts', 'apply-journal.json'), `${JSON.stringify(journal)}\n`);
+    await core.adapter.rename(
+      'shared.md',
+      `.obts/apply-displaced/${journal.apply_id}/${encodeURIComponent('shared.md')}.entry`
+    );
+
+    const restarted = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'displacement-replay' });
+    await restarted.initialize();
+
+    expect(await restarted.readState()).not.toMatchObject({ last_error_code: 'apply_journal_recovery_required' });
+    expect(await readFile(join(root, 'shared.md'), 'utf8')).toBe('server target bytes\n');
+    expect(await readFile(join(
+      root,
+      '.obts',
+      'recovery-displaced',
+      journal.apply_id,
+      `${encodeURIComponent('shared.md')}.entry`
+    ), 'utf8')).toBe('captured local bytes\n');
+  });
+
+  it('rolls forward a crash after target creation and before phase advancement', async () => {
+    const { root, core } = await clientFixture();
+    await writeFile(join(root, 'shared.md'), 'captured local bytes\n');
+    const preflight = await core.readRecoveryFileSnapshot('shared.md');
+    await writeFile(join(root, 'shared.md'), 'server target bytes\n');
+    const target = await core.createLocalCommit('post-create crash target');
+    const targetEntries = await core.listTreeBlobOids(target);
+    const targetOid = targetEntries.get('shared.md');
+    await writeFile(join(root, 'shared.md'), 'captured local bytes\n');
+    const journal = {
+      journal_version: 4,
+      apply_id: 'apply_post_create_replay',
+      operation_type: 'pull_apply',
+      target_main: target,
+      target_file_sizes: { 'shared.md': Buffer.byteLength('server target bytes\n') },
+      expected_prior_local_main: null,
+      expected_prior_local_device_ref: null,
+      phase: 'writing_files',
+      affected_paths: ['shared.md'],
+      preflight_sha256: { 'shared.md': preflight.fingerprint.sha256 },
+      preflight_fingerprints: { 'shared.md': preflight.fingerprint },
+      directory_intents: [],
+      explicit_directories: [],
+      pre_apply_directories: [],
+      pre_apply_directory_ctimes: {},
+      confirmed_directory_roots: [],
+      confirmed_directory_inventory: null,
+      preserve_local_changes: false,
+      event_seq: null,
+      recovery_bundle_id: 'rec_post_create_replay',
+      last_completed_step: 'recovery_bundle',
+      redacted_error_category: null
+    };
+    await writeFile(join(root, '.obts', 'apply-journal.json'), `${JSON.stringify(journal)}\n`);
+    await core.adapter.rename(
+      'shared.md',
+      `.obts/apply-displaced/${journal.apply_id}/${encodeURIComponent('shared.md')}.entry`
+    );
+    await core.adapterWriteBinaryExclusive('shared.md', await core.readBlobOid(targetOid));
+
+    const restarted = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'post-create-replay' });
+    await restarted.initialize();
+
+    expect(await readFile(join(root, 'shared.md'), 'utf8')).toBe('server target bytes\n');
+    expect(await restarted.readState()).not.toMatchObject({ last_error_code: 'apply_journal_recovery_required' });
+    expect(await readFile(join(root, '.obts', 'apply-journal.json'), 'utf8').catch(() => null)).toBeNull();
+    expect(await readFile(join(
+      root,
+      '.obts',
+      'recovery-displaced',
+      journal.apply_id,
+      `${encodeURIComponent('shared.md')}.entry`
+    ), 'utf8')).toBe('captured local bytes\n');
+  });
+
+  it('does not delete a concurrent blocking ancestor before mutation', async () => {
+    const { root, core } = await clientFixture();
+    await mkdir(join(root, 'folder'));
+    await writeFile(join(root, 'folder', 'note.md'), 'server target bytes\n');
+    const target = await core.createLocalCommit('blocking ancestor target');
+    const targetEntries = await core.listTreeBlobOids(target);
+    const targetOid = targetEntries.get('folder/note.md');
+    const targetSize = (await core.readBlobOid(targetOid)).byteLength;
+    await rm(join(root, 'folder'), { recursive: true, force: true });
+
+    const originalReadBlobOid = core.readBlobOid.bind(core);
+    core.readBlobOid = async (oid: string) => {
+      const content = await originalReadBlobOid(oid);
+      await writeFile(join(root, 'folder'), 'concurrent ancestor edit\n');
+      return content;
+    };
+
+    await expect(core.writeTargetFilesFromJournal({
+      journal_version: 4,
+      apply_id: 'apply_blocking_ancestor',
+      operation_type: 'pull_apply',
+      target_main: target,
+      target_file_sizes: { 'folder/note.md': targetSize },
+      expected_prior_local_main: null,
+      expected_prior_local_device_ref: null,
+      phase: 'writing_files',
+      affected_paths: ['folder/note.md'],
+      preflight_sha256: { 'folder/note.md': null },
+      preflight_fingerprints: { 'folder/note.md': { kind: 'missing', sha256: null, oid: null } },
+      recovery_bundle_id: 'rec_blocking_ancestor',
+      last_completed_step: 'recovery_bundle',
+      redacted_error_category: null
+    }, new Map([['folder/note.md', targetOid]]), new Set())).rejects.toMatchObject({ filePath: 'folder' });
+
+    expect(await readFile(join(root, 'folder'), 'utf8')).toBe('concurrent ancestor edit\n');
+  });
+
+  it('materializes a target descendant after displacing a blocking file ancestor', async () => {
+    const { root, core } = await clientFixture();
+    await writeFile(join(root, 'folder'), 'captured blocking file\n');
+    const preflight = await core.readRecoveryFileSnapshot('folder');
+    await rm(join(root, 'folder'));
+    await mkdir(join(root, 'folder'));
+    await writeFile(join(root, 'folder', 'note.md'), 'server target bytes\n');
+    const target = await core.createLocalCommit('file to directory target');
+    const targetEntries = await core.listTreeBlobOids(target);
+    const targetOid = targetEntries.get('folder/note.md');
+    await rm(join(root, 'folder'), { recursive: true, force: true });
+    await writeFile(join(root, 'folder'), 'captured blocking file\n');
+    const journal = {
+      journal_version: 4,
+      apply_id: 'apply_file_to_directory',
+      operation_type: 'pull_apply',
+      target_main: target,
+      target_file_sizes: { 'folder/note.md': Buffer.byteLength('server target bytes\n') },
+      expected_prior_local_main: null,
+      expected_prior_local_device_ref: null,
+      phase: 'writing_files',
+      affected_paths: ['folder', 'folder/note.md'],
+      preflight_sha256: { folder: preflight.fingerprint.sha256, 'folder/note.md': null },
+      preflight_fingerprints: {
+        folder: preflight.fingerprint,
+        'folder/note.md': { kind: 'missing', sha256: null, oid: null }
+      },
+      recovery_bundle_id: 'rec_file_to_directory',
+      last_completed_step: 'recovery_bundle',
+      redacted_error_category: null
+    };
+
+    await core.writeTargetFilesFromJournal(journal, new Map([['folder/note.md', targetOid]]), new Set());
+
+    expect(await readFile(join(root, 'folder', 'note.md'), 'utf8')).toBe('server target bytes\n');
+    expect(await readFile(join(
+      root,
+      '.obts',
+      'apply-displaced',
+      journal.apply_id,
+      `${encodeURIComponent('folder')}.entry`
+    ), 'utf8')).toBe('captured blocking file\n');
+  });
+
+  it('replays file-to-directory materialization after displacing the ancestor', async () => {
+    const { root, core } = await clientFixture();
+    await writeFile(join(root, 'folder'), 'captured blocking file\n');
+    const preflight = await core.readRecoveryFileSnapshot('folder');
+    await rm(join(root, 'folder'));
+    await mkdir(join(root, 'folder'));
+    await writeFile(join(root, 'folder', 'note.md'), 'server target bytes\n');
+    const target = await core.createLocalCommit('file to directory replay target');
+    const targetEntries = await core.listTreeBlobOids(target);
+    const targetOid = targetEntries.get('folder/note.md');
+    await rm(join(root, 'folder'), { recursive: true, force: true });
+    await writeFile(join(root, 'folder'), 'captured blocking file\n');
+    const journal = {
+      journal_version: 4,
+      apply_id: 'apply_file_to_directory_replay',
+      operation_type: 'pull_apply',
+      target_main: target,
+      target_file_sizes: { 'folder/note.md': Buffer.byteLength('server target bytes\n') },
+      expected_prior_local_main: null,
+      expected_prior_local_device_ref: null,
+      phase: 'writing_files',
+      affected_paths: ['folder', 'folder/note.md'],
+      preflight_sha256: { folder: preflight.fingerprint.sha256, 'folder/note.md': null },
+      preflight_fingerprints: {
+        folder: preflight.fingerprint,
+        'folder/note.md': { kind: 'missing', sha256: null, oid: null }
+      },
+      directory_intents: [],
+      explicit_directories: [],
+      pre_apply_directories: [],
+      pre_apply_directory_ctimes: {},
+      confirmed_directory_roots: [],
+      confirmed_directory_inventory: null,
+      preserve_local_changes: false,
+      event_seq: null,
+      recovery_bundle_id: 'rec_file_to_directory_replay',
+      last_completed_step: 'recovery_bundle',
+      redacted_error_category: null
+    };
+    await writeFile(join(root, '.obts', 'apply-journal.json'), `${JSON.stringify(journal)}\n`);
+    await core.adapter.rename(
+      'folder',
+      `.obts/apply-displaced/${journal.apply_id}/${encodeURIComponent('folder')}.entry`
+    );
+    await core.adapter.mkdir('folder');
+
+    const restarted = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'file-directory-replay' });
+    await restarted.initialize();
+    expect(await readFile(join(root, 'folder', 'note.md'), 'utf8')).toBe('server target bytes\n');
+    expect(await readFile(join(root, '.obts', 'apply-journal.json'), 'utf8').catch(() => null)).toBeNull();
+  });
+
+  it('does not recursively delete recreated directory descendants', async () => {
+    const { root, core } = await clientFixture();
+    await writeFile(join(root, 'replacement-source.md'), 'server target bytes\n');
+    const target = await core.createLocalCommit('directory replacement target');
+    const targetEntries = await core.listTreeBlobOids(target);
+    const targetOid = targetEntries.get('replacement-source.md');
+    const targetSize = (await core.readBlobOid(targetOid)).byteLength;
+    await mkdir(join(root, 'replacement'));
+    const preflight = await core.readRecoveryFileSnapshot('replacement');
+    const preflightCtime = await core.adapterDirectoryCreationTime('replacement');
+
+    const originalReadBlobOid = core.readBlobOid.bind(core);
+    core.readBlobOid = async (oid: string) => {
+      const content = await originalReadBlobOid(oid);
+      await writeFile(join(root, 'replacement', 'new-local.md'), 'concurrent descendant edit\n');
+      return content;
+    };
+
+    await expect(core.writeTargetFilesFromJournal({
+      journal_version: 4,
+      apply_id: 'apply_recreated_descendant',
+      operation_type: 'pull_apply',
+      target_main: target,
+      target_file_sizes: { replacement: targetSize },
+      expected_prior_local_main: null,
+      expected_prior_local_device_ref: null,
+      phase: 'writing_files',
+      affected_paths: ['replacement'],
+      preflight_sha256: { replacement: null },
+      preflight_fingerprints: { replacement: preflight.fingerprint },
+      pre_apply_directory_ctimes: { replacement: preflightCtime },
+      recovery_bundle_id: 'rec_recreated_descendant',
+      last_completed_step: 'recovery_bundle',
+      redacted_error_category: null
+    }, new Map([['replacement', targetOid]]), new Set())).rejects.toMatchObject({ filePath: 'replacement' });
+
+    expect(await readFile(join(root, 'replacement', 'new-local.md'), 'utf8')).toBe('concurrent descendant edit\n');
+  });
+
+  it('does not replace a recreated empty directory', async () => {
+    const { root, core } = await clientFixture();
+    await writeFile(join(root, 'empty-source.md'), 'server target bytes\n');
+    const target = await core.createLocalCommit('empty directory replacement target');
+    const targetEntries = await core.listTreeBlobOids(target);
+    const targetOid = targetEntries.get('empty-source.md');
+    const targetSize = (await core.readBlobOid(targetOid)).byteLength;
+    await mkdir(join(root, 'replacement'));
+    const preflight = await core.readRecoveryFileSnapshot('replacement');
+    const preflightCtime = await core.adapterDirectoryCreationTime('replacement');
+
+    const originalReadBlobOid = core.readBlobOid.bind(core);
+    core.readBlobOid = async (oid: string) => {
+      const content = await originalReadBlobOid(oid);
+      await rm(join(root, 'replacement'), { recursive: true, force: true });
+      await mkdir(join(root, 'replacement'));
+      return content;
+    };
+
+    await expect(core.writeTargetFilesFromJournal({
+      journal_version: 4,
+      apply_id: 'apply_recreated_empty_directory',
+      operation_type: 'pull_apply',
+      target_main: target,
+      target_file_sizes: { replacement: targetSize },
+      expected_prior_local_main: null,
+      expected_prior_local_device_ref: null,
+      phase: 'writing_files',
+      affected_paths: ['replacement'],
+      preflight_sha256: { replacement: null },
+      preflight_fingerprints: { replacement: preflight.fingerprint },
+      pre_apply_directory_ctimes: { replacement: preflightCtime },
+      recovery_bundle_id: 'rec_recreated_empty_directory',
+      last_completed_step: 'recovery_bundle',
+      redacted_error_category: null
+    }, new Map([['replacement', targetOid]]), new Set())).rejects.toMatchObject({ filePath: 'replacement' });
+
+    expect((await core.adapter.stat('replacement')).type).toBe('folder');
+  });
+
   it('drains active apply writes and stops scheduling after a failure', async () => {
     const { root, core } = await clientFixture();
     await mkdir(join(root, 'incoming'));
@@ -252,12 +657,12 @@ describe('large-vault client checkpoints', () => {
     await rm(join(root, 'incoming'), { recursive: true, force: true });
 
     core.fileWorkConcurrency = 3;
-    const adapterWriteBinary = core.adapterWriteBinary.bind(core);
+    const adapterWriteBinaryExclusive = core.adapterWriteBinaryExclusive.bind(core);
     const started: string[] = [];
     let releaseInitialBatch!: () => void;
     const initialBatchStarted = new Promise<void>((resolve) => { releaseInitialBatch = resolve; });
     let active = 0;
-    core.adapterWriteBinary = async (path: string, content: Buffer) => {
+    core.adapterWriteBinaryExclusive = async (path: string, content: Buffer) => {
       started.push(path);
       if (started.length === 3) releaseInitialBatch();
       active += 1;
@@ -267,7 +672,7 @@ describe('large-vault client checkpoints', () => {
           throw new Error('simulated apply write failure');
         }
         await delay(20);
-        await adapterWriteBinary(path, content);
+        await adapterWriteBinaryExclusive(path, content);
       } finally {
         active -= 1;
       }

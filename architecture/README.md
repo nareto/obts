@@ -29,7 +29,7 @@ Normative behavior is owned by `contracts/*.md`; OpenAPI is authoritative for th
 - [`contracts/dashboard.md`](contracts/dashboard.md): dashboard information architecture, status vocabulary, and consequential workflows.
 - [`contracts/verification.md`](contracts/verification.md): required evidence, fault tests, real-device proof, and release assurance.
 - [`models/system-overview.md`](models/system-overview.md): current runtime allocation and state ownership.
-- [`models/formal/README.md`](models/formal/README.md): bounded formal-model policy; no formal model has yet been accepted.
+- [`models/formal/README.md`](models/formal/README.md): bounded formal-model policy and the accepted `OBTS-FM-001` local apply/recovery model.
 - [`../openapi/openapi.yaml`](../openapi/openapi.yaml): executable HTTP shape, schema, and error contract.
 
 ## Architecture Revision

@@ -1984,9 +1984,9 @@ describe('Phase 1 sync without conflict resolution', () => {
   it('keeps the installable Obsidian artifact on Obsidian APIs for visible-vault apply', async () => {
     const artifact = await readFile(join(process.cwd(), 'obsidian-plugin', 'main.js'), 'utf8');
     const applyWriter = sourceSection(artifact, 'async writeTargetFilesFromJournal', 'async createLocalCommit');
-    expect(applyWriter).toContain('this.adapterRemove');
-    expect(applyWriter).toContain('this.adapterWriteBinary');
-    expect(applyWriter).toContain('this.removeBlockingMaterializationPaths');
+    expect(applyWriter).toContain('this.displaceApplyPath');
+    expect(applyWriter).toContain('this.adapterWriteBinaryExclusive');
+    expect(applyWriter).not.toContain('this.adapterRemove');
     expect(applyWriter).not.toContain('fsp.rm');
     expect(applyWriter).not.toContain('path.join(this.vaultDir');
 
@@ -5120,7 +5120,20 @@ describe('Phase 1 sync without conflict resolution', () => {
       redacted_error_category: null
     });
     const journalPath = join(deviceDir, '.obts', 'apply-journal.json');
-    for (const malformedJournal of ['{"phase":"writing_files"', 'null', 'false', unsafePathJournal]) {
+    const unsafeApplyIdJournal = JSON.stringify({
+      apply_id: '../../outside',
+      operation_type: 'pull_apply',
+      target_main: state.local_main,
+      expected_prior_local_main: state.local_main,
+      expected_prior_local_device_ref: state.server_device_ref,
+      phase: 'writing_files',
+      affected_paths: [],
+      preflight_sha256: {},
+      recovery_bundle_id: null,
+      last_completed_step: null,
+      redacted_error_category: null
+    });
+    for (const malformedJournal of ['{"phase":"writing_files"', 'null', 'false', unsafePathJournal, unsafeApplyIdJournal]) {
       await writeFile(journalPath, malformedJournal);
       const restartedPlugin = new ObtsPluginClient(deviceDir, {
         serverUrl: baseUrl,

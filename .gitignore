@@ -7,3 +7,4 @@ target/
 .obts/
 tmp/
 /.pi-subagents/
+architecture/models/formal/.tlc/

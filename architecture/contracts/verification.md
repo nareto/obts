@@ -48,6 +48,8 @@ TLA+/PlusCal is an optional bounded technique inside the architecture model set.
 
 A green model checker does not prove implementation conformance, filesystem durability, byte/path correctness, performance, or operational recovery.
 
+The accepted bounded `OBTS-FM-001` model refines `OBTS-SAF-001`, `OBTS-SAF-002`, and `OBTS-SAF-005` for one-client, one-path apply/recovery. `npm run test:formal` checks its safety, liveness, and negative controls. Its exact bounds, assumptions, evidence, promoted regression, and omissions live in `architecture/models/formal/README.md` and ADR 0007.
+
 ## Manual And Deployment Evidence
 
 Before trusted primary-vault use:

@@ -38,6 +38,12 @@ export class NodeDataAdapter {
     await writeFile(target, new Uint8Array(data), { mode: 0o600 });
   }
 
+  async writeBinaryExclusive(adapterPath: string, data: ArrayBuffer): Promise<void> {
+    const target = this.resolvePath(adapterPath);
+    await mkdir(resolve(target, '..'), { recursive: true, mode: 0o700 });
+    await writeFile(target, new Uint8Array(data), { flag: 'wx', mode: 0o600 });
+  }
+
   async stat(adapterPath: string): Promise<AdapterStat | null> {
     try {
       const target = this.resolvePath(adapterPath);
