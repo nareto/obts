@@ -122,6 +122,112 @@ describe('Phase 2 dashboard conflict resolution', () => {
     };
   }
 
+  async function createConsumedResolutionFixture(prefix: string): Promise<{
+    admin: BrowserSession;
+    tablet: ObtsPluginClient;
+    tabletDir: string;
+    preResolutionMain: string;
+    deviceCommit: string;
+    resolutionCommit: string;
+    currentEventSeq: number;
+  }> {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, `${prefix}-desktop`);
+    const tabletDir = join(root, `${prefix}-tablet`);
+    await mkdir(desktopDir, { recursive: true });
+    await mkdir(tabletDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, `${prefix}-desktop`);
+    await writeFile(join(desktopDir, 'shared.md'), 'base\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const tablet = await pairPlugin(admin, tabletDir, `${prefix}-tablet`);
+    await writeFile(join(desktopDir, 'shared.md'), 'server version\n');
+    await writeFile(join(tabletDir, 'shared.md'), 'selected device version\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const conflicted = await tablet.syncOnce();
+    expect(conflicted.status).toBe('Review needed');
+    const conflictState = await tablet.readState();
+    const conflictQueue = await tablet.readQueue();
+    expect(conflictQueue).toMatchObject({
+      status: 'conflicted',
+      pending_commit: conflictState.local_head
+    });
+    if (!conflictState.local_main || !conflictState.local_head) {
+      throw new Error('Conflict state did not preserve both local cursors.');
+    }
+
+    const review = await admin.get<{ conflict: { expected_main: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}`
+    );
+    expect(review.status).toBe(200);
+    const resolved = await admin.post<{ resolution_commit: string }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}/resolve`,
+      { expected_main: review.body.conflict.expected_main, resolution_kind: 'use_device' }
+    );
+    expect(resolved.status).toBe(200);
+
+    const db = await server.store.snapshot();
+    const currentEventSeq = db.event_seq_by_vault[admin.vaultId] ?? 0;
+    const device = db.devices.find((candidate) => candidate.device_id === conflictState.device_id);
+    const vault = db.vaults.find((candidate) => candidate.vault_id === admin.vaultId);
+    expect(device).toMatchObject({
+      status: 'synced',
+      device_ref_head: conflictState.local_head,
+      last_applied_main: conflictState.local_main
+    });
+    expect(vault?.current_main).toBe(resolved.body.resolution_commit);
+    expect(db.events.filter((event) => event.vault_id === admin.vaultId && event.event_seq > currentEventSeq)).toEqual([]);
+    expect((await server.git.readBlobAtPath(admin.vaultId, conflictState.local_head, 'shared.md')).toString('utf8')).toBe(
+      'selected device version\n'
+    );
+    expect((await server.git.readBlobAtPath(admin.vaultId, resolved.body.resolution_commit, 'shared.md')).toString('utf8')).toBe(
+      'selected device version\n'
+    );
+
+    const internal = tablet.client as any;
+    await internal.writeQueue({
+      pending_commit: null,
+      expected_device_ref: device?.device_ref_head ?? conflictState.local_head,
+      status: 'idle',
+      attempts: 0,
+      change_seq: conflictQueue.change_seq,
+      changed_paths: [],
+      updated_at: new Date().toISOString()
+    });
+    await tablet.writeState({
+      ...conflictState,
+      server_device_ref: device?.device_ref_head ?? conflictState.local_head,
+      status_label: 'Behind',
+      last_error_code: null,
+      last_event_seq: currentEventSeq,
+      updated_at: new Date().toISOString()
+    });
+    expect(await tablet.readState()).toMatchObject({
+      local_main: conflictState.local_main,
+      local_head: conflictState.local_head,
+      server_device_ref: conflictState.local_head,
+      status_label: 'Behind',
+      last_error_code: null,
+      last_event_seq: currentEventSeq,
+      last_applied_event_seq: conflictState.last_applied_event_seq
+    });
+    expect(await tablet.readQueue()).toMatchObject({
+      pending_commit: null,
+      status: 'idle',
+      changed_paths: []
+    });
+
+    return {
+      admin,
+      tablet,
+      tabletDir,
+      preResolutionMain: conflictState.local_main,
+      deviceCommit: conflictState.local_head,
+      resolutionCommit: resolved.body.resolution_commit,
+      currentEventSeq
+    };
+  }
+
   function rewindConflictRefreshMetadata(
     db: MetadataDb,
     beforeRefresh: MetadataDb,
@@ -1576,6 +1682,97 @@ describe('Phase 2 dashboard conflict resolution', () => {
     const tabletState = await tablet.readState();
     const db = await server.store.snapshot();
     expect(db.devices.find((candidate) => candidate.device_id === tabletState.device_id)?.status).toBe('synced');
+  });
+
+  it('applies canonical main after its conflict-resolution event was seen but not applied', async () => {
+    const fixture = await createConsumedResolutionFixture('consumed-resolution');
+    const internal = fixture.tablet.client as any;
+    const originalUploadQueuedCommit = internal.uploadQueuedCommit.bind(internal);
+    const originalGetDeviceSelf = internal.getDeviceSelf.bind(internal);
+    let uploadAttempts = 0;
+    let authoritativeChecks = 0;
+    internal.uploadQueuedCommit = async (...args: unknown[]) => {
+      uploadAttempts += 1;
+      return await originalUploadQueuedCommit(...args);
+    };
+    internal.getDeviceSelf = async (...args: unknown[]) => {
+      authoritativeChecks += 1;
+      return await originalGetDeviceSelf(...args);
+    };
+
+    expect((await fixture.tablet.syncOnce()).status).toBe('Synced');
+    expect(uploadAttempts).toBe(0);
+    expect(authoritativeChecks).toBe(1);
+    const converged = await fixture.tablet.readState();
+    expect(converged).toMatchObject({
+      local_main: fixture.resolutionCommit,
+      local_head: fixture.resolutionCommit,
+      server_device_ref: fixture.deviceCommit,
+      status_label: 'Synced',
+      last_error_code: null,
+      last_event_seq: fixture.currentEventSeq,
+      last_applied_event_seq: fixture.currentEventSeq
+    });
+    expect(await fixture.tablet.readQueue()).toMatchObject({
+      pending_commit: null,
+      expected_device_ref: fixture.deviceCommit,
+      status: 'idle',
+      changed_paths: []
+    });
+    expect(await readFile(join(fixture.tabletDir, 'shared.md'), 'utf8')).toBe('selected device version\n');
+    const appliedDevice = (await server.store.snapshot()).devices.find(
+      (candidate) => candidate.device_id === converged.device_id
+    );
+    expect(appliedDevice).toMatchObject({
+      device_ref_head: fixture.deviceCommit,
+      last_applied_main: fixture.resolutionCommit,
+      last_applied_event_seq: fixture.currentEventSeq
+    });
+
+    expect((await fixture.tablet.syncOnce()).status).toBe('Synced');
+    expect(uploadAttempts).toBe(0);
+    expect(authoritativeChecks).toBe(1);
+    expect(await readFile(join(fixture.tabletDir, 'shared.md'), 'utf8')).toBe('selected device version\n');
+  });
+
+  it('defers authoritative-main reconciliation when a local watcher hint is queued', async () => {
+    const fixture = await createConsumedResolutionFixture('consumed-resolution-local-hint');
+    await fixture.tablet.recordLocalChangeHint(['shared.md']);
+
+    expect(await fixture.tablet.pollRemoteEventsAndApply()).toMatchObject({ applied: false, status: 'Ahead' });
+    expect(await fixture.tablet.readState()).toMatchObject({
+      local_main: fixture.preResolutionMain,
+      local_head: fixture.deviceCommit,
+      status_label: 'Ahead',
+      last_error_code: null
+    });
+    expect(await fixture.tablet.readQueue()).toMatchObject({
+      pending_commit: null,
+      status: 'queued_local',
+      changed_paths: ['shared.md']
+    });
+    expect(await readFile(join(fixture.tabletDir, 'shared.md'), 'utf8')).toBe('selected device version\n');
+  });
+
+  it('preserves an unreported visible edit while deferring authoritative-main reconciliation', async () => {
+    const fixture = await createConsumedResolutionFixture('consumed-resolution-missed-watcher');
+    await writeFile(join(fixture.tabletDir, 'shared.md'), 'unreported newer local edit\n');
+
+    expect(await fixture.tablet.pollRemoteEventsAndApply()).toMatchObject({ applied: false, status: 'Checking' });
+    expect(await fixture.tablet.readState()).toMatchObject({
+      local_main: fixture.preResolutionMain,
+      local_head: fixture.deviceCommit,
+      status_label: 'Checking',
+      last_error_code: null
+    });
+    expect(await fixture.tablet.readQueue()).toMatchObject({
+      pending_commit: null,
+      status: 'queued_local'
+    });
+    expect(await readFile(join(fixture.tabletDir, 'shared.md'), 'utf8')).toBe('unreported newer local edit\n');
+    expect((await server.git.readBlobAtPath(fixture.admin.vaultId, fixture.resolutionCommit, 'shared.md')).toString('utf8')).toBe(
+      'selected device version\n'
+    );
   });
 
   it('reconciles a delayed device block after keep-server resolution without resetting the device', async () => {

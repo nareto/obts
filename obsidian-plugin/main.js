@@ -21919,7 +21919,7 @@ var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var { createByteBudget, runBoundedWork } = require_work_pool();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.34";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.35";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_INVENTORY_INTERVAL_MS = 6 * 60 * 60 * 1e3;
@@ -24704,7 +24704,48 @@ var ObtsObsidianClient = class {
     });
     if (!shouldPull) {
       await this.writeState(Object.assign({}, currentState, { last_event_seq: page.current_event_seq, updated_at: nowIso() }));
-      return { applied: false, status: currentState.status_label };
+      if (currentState.status_label !== "Behind" && !wasConflictBlocked) {
+        return { applied: false, status: currentState.status_label };
+      }
+      const self = await this.getDeviceSelf(token);
+      if (self.vault_id !== currentState.vault_id || self.device_id !== currentState.device_id) {
+        throw new ObtsBlockedError("device_identity_mismatch", "Server device identity does not match local sync state.");
+      }
+      await this.reconcileServerVaultStatus(self.vault_status, true);
+      const authoritativeState = await this.readState();
+      if (self.status === "review_needed") {
+        await this.writeState(Object.assign({}, authoritativeState, {
+          server_device_ref: self.server_device_ref,
+          status_label: "Review needed",
+          last_error_code: "conflict_review_required",
+          updated_at: nowIso()
+        }));
+        return { applied: false, status: "Review needed" };
+      }
+      if (self.status === "blocked_recovery") {
+        await this.writeState(Object.assign({}, authoritativeState, {
+          server_device_ref: self.server_device_ref,
+          status_label: "Needs recovery",
+          last_error_code: "server_recovery_required",
+          updated_at: nowIso()
+        }));
+        return { applied: false, status: "Needs recovery" };
+      }
+      if (self.status === "revoked") {
+        throw new ObtsBlockedError("device_revoked", "This device has been revoked on the server.");
+      }
+      if (self.current_main === authoritativeState.local_main) {
+        return { applied: false, status: authoritativeState.status_label };
+      }
+      await this.writeState(Object.assign({}, authoritativeState, {
+        server_device_ref: self.server_device_ref,
+        status_label: "Behind",
+        last_error_code: null,
+        updated_at: nowIso()
+      }));
+      const applied2 = await this.pullAndApply(true);
+      const finalState2 = await this.uploadAutoPreservedChanges(applied2);
+      return { applied: applied2, status: finalState2.status_label };
     }
     if (wasConflictBlocked && currentState.last_error_code === "conflict_review_required") {
       await this.writeState(Object.assign({}, currentState, {
