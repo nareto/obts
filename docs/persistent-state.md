@@ -75,8 +75,10 @@ operation manifests. Opted-in plugin error diagnostics use a closed schema,
 expire after 14 days by default, and can be deleted by their owner from the
 Settings page. Expired or deleted records can remain in historical backups until
 backup rotation removes them. Treat even redacted diagnostics as sensitive
-application state. Community-plugin file history is metadata-only by default; revealing a
-selected body is an explicit owner action protected by recent authentication.
+application state. Community-plugin file history is metadata-only by default. The current
+implementation protects revealing a selected body with recent password
+authentication; architecture revision 1 replaces that UX with explicit target
+confirmation, tracked in Forgejo issue 18.
 
 Git maintenance verifies object integrity before and after repacking and prunes
 only unreachable objects. Commits reachable from `main`, device refs,

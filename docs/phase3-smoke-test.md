@@ -15,7 +15,7 @@ the note owner.
 5. Select an earlier version and restore it. Confirm `main` advances to a new
    commit and a paired client applies it through normal safe apply.
 6. Sync a community-plugin data file. Confirm its history preview is redacted
-   until the owner explicitly reveals it after recent authentication.
+   until the owner explicitly reveals it through the current recent-authentication flow; after Forgejo issue 18 lands, verify the replacement target-confirmation flow instead.
 7. Export diagnostics. Confirm note bodies, raw paths, plugin bodies/settings,
    tokens, Git payloads, recovery content, and operation manifests are absent.
 8. Run Git maintenance. Re-query and preview the earlier version, confirm open

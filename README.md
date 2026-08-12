@@ -162,11 +162,10 @@ Included examples:
 Always excluded:
 
 - `.obts/**`;
-- visible `.git/**` repositories;
 - Obsidian cache and workspace files;
 - `.obsidian/plugins/obts/**`.
 
-Community plugin history is metadata-only by default in the dashboard; revealing a selected historical body requires an explicit, recently authenticated action.
+A visible `.git` path is not silently excluded: it blocks synchronization with an explicit safety error. Community plugin history is metadata-only by default in the dashboard; the current implementation requires recent password authentication to reveal a selected body, while architecture revision 1 replaces that UX with explicit target confirmation under Forgejo issue 18.
 
 ## Operations And Documentation
 
@@ -175,9 +174,9 @@ Community plugin history is metadata-only by default in the dashboard; revealing
 - [Phase 3 operations](docs/phase3-operations.md) — history, restore, diagnostics, integrity, and maintenance
 - [Persistent state and backup](docs/persistent-state.md) — authoritative state and consistency requirements
 - [OBTS Bridge](docs/obts-bridge.md) — headless client, scoped REST/MCP, indexing, and agent access
-- [OpenAPI contract](openapi/openapi.yaml) — HTTP API definition
-- [Architecture overview](architecture/docs/01-overview.md) — system boundaries and Git model
-- [Product requirements](prd.md) — detailed behavior and design constraints
+- [Architecture authority](architecture/README.md) — source-of-truth map for behavior, safety, structure, and decisions
+- [Architecture overview](architecture/docs/01-overview.md) — current system boundaries, state ownership, and Git model
+- [OpenAPI contract](openapi/openapi.yaml) — executable HTTP shape, schema, and error contract
 
 ## Current Boundaries
 

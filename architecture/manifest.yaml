@@ -1,0 +1,14 @@
+schema_version: 1
+revision: 1
+status: current
+updated: 2026-08-12
+authoritative_artifacts:
+  - architecture/manifest.yaml
+  - architecture/README.md
+  - architecture/contracts
+  - architecture/models
+  - architecture/adrs
+  - architecture/migrations
+  - architecture/workspace.dsl
+  - openapi/openapi.yaml
+formal_models: []

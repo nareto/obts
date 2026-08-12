@@ -4,13 +4,11 @@ Date: 2026-06-29
 
 ## Status
 
-Accepted
+Accepted historical implementation decision; Phase 1 is complete.
 
 ## Context
 
-`prd.md` defines Phase 1 as "Sync Without Conflict Resolution": pair devices,
-move vault changes through Git-backed server state, auto-merge safe changes, and
-create durable conflict records when human judgment is required.
+The proof-of-concept delivery plan defined Phase 1 as "Sync Without Conflict Resolution": pair devices, move vault changes through Git-backed server state, auto-merge safe changes, and create durable conflict records when human judgment is required.
 
 The repository did not previously contain an executable implementation or a
 local Postgres test fixture.
@@ -37,4 +35,4 @@ The repository can run and test the full Phase 1 user-facing workflow without a
 database service. A production Postgres adapter remains future work before the
 full v1 storage contract is complete.
 
-At-rest protection remains deployment-managed, matching the current PRD.
+At-rest protection remains deployment-managed under ADR 0002 and `architecture/contracts/security.md`.

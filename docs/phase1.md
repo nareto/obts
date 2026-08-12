@@ -1,7 +1,6 @@
 # Phase 1 Implementation
 
-This repository now contains the first vertical sync slice from `prd.md`:
-Sync Without Conflict Resolution.
+This document records the first historical vertical sync slice: Sync Without Conflict Resolution. Current normative behavior lives under `architecture/contracts/`.
 
 Implemented runtime pieces:
 
@@ -19,7 +18,7 @@ Implemented runtime pieces:
 - Fastify server with first-run setup, Argon2id password storage, login/logout sessions, CSRF-protected dashboard mutations, admin user creation, vault creation, browser connection requests, device tokens, multipart push, multipart pull, events, conflicts, and health checks.
 - Phase 1 admin lifecycle APIs for redacted account listing, user disable/re-enable, admin grant/revoke with final-admin protection, one-time password reset tokens, failed-login backoff, and individual device revocation. User disable and device revocation immediately invalidate the affected dashboard sessions, approved connections, and device tokens.
 - Dashboard sessions use a browser-compatible `obts_session` cookie for HTTP/dev deployments and the hardened `__Host-obts_session` Secure cookie when `publicBaseUrl` is HTTPS.
-- Recent-auth enforcement covers sensitive dashboard mutations such as browser connection approval and admin account creation. Connection completion preserves the approved device name and vault selection when registering a device.
+- The historical Phase 1 implementation introduced recent-auth enforcement for sensitive dashboard mutations. Architecture revision 1 supersedes that UX with session authentication plus explicit operation-specific confirmation; implementation migration is tracked separately. Connection completion preserves the approved device name and vault selection when registering a device.
 - Multipart sync manifests reject non-commit ref strings and malformed SHA-256 packfile digests before Git ref mutation logic runs.
 - Uploaded packfiles are unpacked into a temporary quarantine repo for commit,
   path-policy, ancestry, and blob-size validation. Only accepted
@@ -56,7 +55,7 @@ Implemented runtime pieces:
 
 The Phase 1 server uses a durable JSON metadata adapter in `OBTS_DATA_DIR/metadata/phase1.json` so the product slice can run without requiring a local Postgres service in this repository. The service boundaries are deliberately named around metadata and sync operations so a Postgres adapter can replace the file adapter without changing the Git sync model.
 
-Conflict package rendering, manual resolution, note history, restore, and rendered diff UI are intentionally not implemented; those are Phase 2 and later PRD slices.
+At the time of this historical Phase 1 slice, conflict package rendering, manual resolution, note history, restore, and rendered diff UI were intentionally deferred to later phases; they are now implemented.
 
 ## Acceptance Coverage
 
@@ -68,7 +67,7 @@ The Vitest suite in `tests/phase1.test.ts` proves:
   admin recovery token from persistent state, and create a recovery admin only
   when no enabled admin account remains;
 - two paired devices sync non-conflicting vault changes through server `main`;
-- dashboard passwords are stored as Argon2id hashes using the PRD v1 minimum parameters;
+- dashboard passwords are stored as Argon2id hashes using the architecture security-contract minimum parameters;
 - repeated failed dashboard logins are audited and rate-limited by account plus source IP;
 - sensitive admin account creation requires recent dashboard authentication;
 - admin lifecycle mutations require recent dashboard authentication, preserve one enabled admin, expose only account metadata plus owned-vault counts, and immediately revoke disabled users' auth state;
@@ -79,7 +78,7 @@ The Vitest suite in `tests/phase1.test.ts` proves:
 - first-device import of existing local content creates a recovery bundle and requires confirmation;
 - empty or already-matching paired devices acknowledge the current server `main`
   immediately and appear Synced without needing a later manual sync;
-- watcher paths and directory-intent evidence for syncable vault paths survive plugin restart and are consumed by the next normal Git-backed reconciliation, while internal `.obts` and visible `.git` paths are ignored;
+- watcher paths and directory-intent evidence for syncable vault paths survive plugin restart and are consumed by the next normal Git-backed reconciliation, while internal `.obts` paths are ignored and visible `.git` paths block synchronization;
 - unchanged watcher hints converge back to an idle queue, frequent event polling and recent plugin reload avoid vault rescans, unchanged cached files avoid content reads, six-hour inventories catch ordinary missed events, weekly or explicit audits hash every file, and repeated already-materialized directory state remains a no-op;
 - a converged idle client upgrading from the former five-minute scanner seeds metadata/OID cache entries only when its visible path set exactly equals local Git, then performs its first complete audit within 24 hours; any queued work, path mismatch, or unsafe state forces full verification instead;
 - stale directory proposal recovery survives interruption, preserves the exact queued commit and visible files, advances only an ancestry-proven already-materialized baseline, records the specific abort reason server-side, and fails closed when historical evidence is unavailable;

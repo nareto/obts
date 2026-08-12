@@ -1361,7 +1361,7 @@ impl VaultStore {
     /// Sync Worker A primitive: ingest a debounced batch of CouchDB changes.
     ///
     /// The full batch is applied while holding a single write lock, mirroring
-    /// the PRD requirement that rename cascades become atomic from API readers'
+    /// the architecture requirement that rename cascades become atomic from API readers'
     /// perspective.
     pub async fn ingest_changes_batch(
         &self,

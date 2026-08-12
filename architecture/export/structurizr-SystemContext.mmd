@@ -5,12 +5,14 @@ graph LR
     1["Vault owner [Person]"]
     2["Device user [Person]"]
     3["Operator [Person]"]
-    4["Obsidian [Software System]"]
-    5["Obsidian True Sync [Software System]"]
+    4["Automation agent [Person]"]
+    5["Obsidian [Software System]"]
+    6["Obsidian True Sync [Software System]"]
 
-    1-. "Connects devices and reviews conflicts [HTTPS]" .->5
-    2-. "Edits notes and observes synchronization [Obsidian UI]" .->5
-    3-. "Runs setup, health, repair, and maintenance commands [CLI and HTTPS]" .->5
-    5-. "Uses plugin lifecycle, vault, workspace, request, and status APIs [Obsidian Plugin API]" .->4
+    1-. "Connects devices and reviews conflicts [HTTPS]" .->6
+    2-. "Edits notes and observes synchronization [Obsidian UI]" .->6
+    3-. "Runs setup, health, repair, and maintenance commands [CLI and HTTPS]" .->6
+    4-. "Uses context-scoped note, search, graph, Base, create, and edit tools [REST, MCP]" .->6
+    6-. "Uses plugin lifecycle, vault, workspace, request, and status APIs [Obsidian Plugin API]" .->5
 
   end

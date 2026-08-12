@@ -5,6 +5,7 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
     vaultOwner = person "Vault owner" "Connects devices, reviews conflicts, and operates the self-hosted service."
     deviceUser = person "Device user" "Edits notes in Obsidian and observes synchronization state."
     operator = person "Operator" "Deploys, upgrades, diagnoses, backs up, and repairs the service."
+    automationAgent = person "Automation agent" "Reads and writes authorized vault content through scoped REST or MCP tools."
 
     obsidian = softwareSystem "Obsidian" "Desktop and mobile note-taking application hosting the obts community plugin."
 
@@ -24,11 +25,13 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
         statusSurface = component "Status surface" "Shows monotonic checking, content verification, baseline repair, preparing, uploading, merging, applying, and settled states." "Obsidian UI"
       }
 
-      dashboard = container "Dashboard SPA" "Authenticated device status, conflict review, diagnostics, history, and maintenance UI served by the server." "Svelte, TypeScript, Vite" {
-        apiClient = component "API client" "Calls authenticated dashboard endpoints." "TypeScript"
-        deviceViews = component "Device views" "Shows server-derived device convergence, last-known plugin versions against the recommended release, and health." "Svelte"
-        conflictWorkbench = component "Conflict workbench" "Reviews and resolves content, directory, and mixed conflicts." "Svelte"
-        diagnosticsView = component "Diagnostics view" "Shows consented redacted client diagnostics and operational status." "Svelte"
+      dashboard = container "Dashboard SPA" "Authenticated vault selection, device status, conflict review, diagnostics, history, and maintenance UI served by the server." "Svelte, TypeScript, Vite" {
+        apiClient = component "API client" "Calls authenticated dashboard endpoints with session and CSRF state." "TypeScript"
+        shellState = component "Session and vault state" "Maintains authenticated navigation, validated selected-vault context, refresh generation, notices, and explicit confirmations." "Svelte"
+        deviceViews = component "Overview and device views" "Shows server-derived convergence, plugin compatibility, health, activity, and device actions." "Svelte"
+        conflictWorkbench = component "Conflict workbench" "Reviews and resolves content, path, directory, and mixed conflicts with explicit server/device provenance." "Svelte"
+        historyView = component "History and restore view" "Queries canonical note history and submits forward-only restores." "Svelte"
+        diagnosticsView = component "Diagnostics and maintenance views" "Shows consented redacted diagnostics, readiness, backup contract, and maintenance state." "Svelte"
       }
 
       server = container "Server API and CLI" "Authenticates clients, receives immutable proposals, fairly serializes canonical integration, merges Git history, persists conflicts, serves the dashboard, and exposes operator commands." "TypeScript, Node.js, Fastify" {
@@ -42,6 +45,10 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
         dashboardHost = component "Dashboard host" "Serves the built SPA and dashboard APIs." "Fastify"
       }
 
+      bridge = container "OBTS Bridge API and indexer" "Exposes scoped REST/MCP tools, enforces ACLs and revisions, mutates ordinary headless-vault files, and maintains PostgreSQL query/audit state." "Rust, Axum, SQLx"
+      headlessClient = container "Headless OBTS client" "Runs the shared client core without Obsidian and owns pairing, hidden Git, queues, transfer, apply, and recovery for the agent-facing device." "Node.js, TypeScript"
+      bridgeVault = container "Bridge visible vault and .obts state" "Authoritative persistent headless device state; may contain the only copy of a pending agent edit." "Filesystem" "File System"
+      bridgeProjection = container "Bridge PostgreSQL state" "Rebuildable content-derived query/projection rows plus retained non-reconstructable access and audit history." "PostgreSQL, pgvector" "Database"
       localVault = container "Visible vault" "User-controlled Obsidian files. The filesystem is the device source of truth." "Obsidian Vault API, filesystem" "File System"
       localStore = container ".obts local store" "Local Git journal, immutable upload journal, durable watcher paths, scan cache/watermark, causal directory and baseline-repair state, apply journal, credentials, and recovery bundles. Excluded from synchronization." "Filesystem" "File System"
       metadataStore = container "Metadata store" "Durable JSON metadata for accounts, devices, operations, events, conflicts, and directory proposal outcomes." "JSON file adapter" "Database"
@@ -68,6 +75,12 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
         "protocol" "CLI,HTTPS"
       }
     }
+    automationAgent -> obts.bridge "Uses context-scoped note, search, graph, Base, create, and edit tools" "REST, MCP" {
+      properties {
+        "ops" "read,write"
+        "protocol" "HTTPS,MCP"
+      }
+    }
     obts.plugin -> obsidian "Uses plugin lifecycle, vault, workspace, request, and status APIs" "Obsidian Plugin API" {
       properties {
         "ops" "read,write"
@@ -88,6 +101,38 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
       }
     }
     obts.plugin -> obts.server "Uploads immutable Git/directory proposals, polls processing outcomes, pulls canonical state, and reports status" "HTTPS" {
+      properties {
+        "ops" "read,write"
+        "protocol" "HTTPS"
+        "data" "Git object chunks, proposal metadata, directory intents, pull packs, events"
+      }
+    }
+    obts.bridge -> obts.headlessClient "Supervises lifecycle and sends administrative or synchronization commands" "JSON Lines over stdin/stdout" {
+      properties {
+        "ops" "admin,read"
+        "protocol" "stdio"
+      }
+    }
+    obts.bridge -> obts.bridgeVault "Reads and atomically writes authorized ordinary vault files" "Filesystem" {
+      properties {
+        "ops" "read,write"
+        "protocol" "filesystem"
+        "write-surface" "visible vault excluding .obts"
+      }
+    }
+    obts.bridge -> obts.bridgeProjection "Updates verified content projections and retained access/audit records" "PostgreSQL" {
+      properties {
+        "ops" "read,write"
+        "protocol" "SQL"
+      }
+    }
+    obts.headlessClient -> obts.bridgeVault "Owns visible-state reconciliation, hidden Git, credentials, journals, queues, apply, and recovery" "Filesystem" {
+      properties {
+        "ops" "read,write"
+        "protocol" "filesystem"
+      }
+    }
+    obts.headlessClient -> obts.server "Pairs and synchronizes as a normal protected OBTS device" "HTTPS" {
       properties {
         "ops" "read,write"
         "protocol" "HTTPS"

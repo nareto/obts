@@ -3,6 +3,10 @@ info:
   title: Obsidian True Sync Phase 3 API
   version: 0.3.21
   summary: Deployable note history, restore, diagnostics, and maintenance.
+  description: >-
+    This contract describes the currently executable HTTP surface. Operations
+    annotated with x-obts-architecture-deviation temporarily differ from the
+    normative architecture contracts and name the tracked migration issue.
 servers:
   - url: /api/v1
 security:
@@ -51,6 +55,12 @@ paths:
   /auth/reauthenticate:
     post:
       summary: Refresh recent authentication on the current dashboard session.
+      deprecated: true
+      x-obts-architecture-deviation:
+        contract: architecture/contracts/security.md
+        issue: 18
+        status: implementation-migration-pending
+        detail: Active dashboard sessions must move from password re-entry to operation-specific confirmation.
       parameters:
         - $ref: "#/components/parameters/CsrfHeader"
       requestBody:
@@ -344,6 +354,11 @@ paths:
   /connections/{connection_id}/approve:
     post:
       summary: Approve a connection for a new or existing owned vault after recent authentication.
+      x-obts-architecture-deviation:
+        contract: architecture/contracts/security.md
+        issue: 18
+        status: implementation-migration-pending
+        detail: Current recent-password enforcement must be replaced by the approved confirmation policy.
       parameters:
         - $ref: "#/components/parameters/ConnectionId"
         - $ref: "#/components/parameters/CsrfHeader"
@@ -574,6 +589,11 @@ paths:
           $ref: "#/components/responses/Error"
     delete:
       summary: Delete all diagnostic events owned by the current dashboard user after recent authentication.
+      x-obts-architecture-deviation:
+        contract: architecture/contracts/security.md
+        issue: 18
+        status: implementation-migration-pending
+        detail: Current recent-password enforcement must be replaced by explicit deletion confirmation.
       parameters:
         - $ref: "#/components/parameters/CsrfHeader"
       responses:
@@ -1146,7 +1166,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/NoteHistoryVersionResponse"
         "403":
-          description: Recent authentication or CSRF verification failed for an explicit plugin-content request.
+          description: Recent authentication or CSRF verification failed for an explicit plugin-content request; recent-password enforcement is a tracked architecture deviation under issue 18.
           content:
             application/json:
               schema:

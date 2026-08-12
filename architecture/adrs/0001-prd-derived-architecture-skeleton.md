@@ -4,7 +4,7 @@ Date: 2026-06-25
 
 ## Status
 
-Accepted
+Superseded by the architecture authority migration at revision 1.
 
 ## Context
 
@@ -18,6 +18,6 @@ When implementation lands, the model must be refreshed from source code, manifes
 
 ## Consequences
 
-This gives agents and maintainers a concrete C4 starting point before code exists, while preserving the distinction between intended architecture and implemented architecture.
+This gave agents and maintainers a concrete C4 starting point before code existed, while preserving the distinction between intended architecture and implemented architecture.
 
-Future updates may remove, rename, or split elements if the codebase proves a different runtime shape.
+The proof-of-concept PRD was retired after implementation. `architecture/README.md` now defines the authoritative contract/model/ADR structure, and `workspace.dsl` is maintained from current runtime evidence rather than PRD intent.

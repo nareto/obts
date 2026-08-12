@@ -9,7 +9,7 @@ Git maintenance to the deployable Phase 2 server and dashboard.
    metadata file and every per-vault Git repository.
 2. Deploy the Phase 3 image or build output without replacing `OBTS_DATA_DIR`.
 3. Start the server. The file-backed metadata adapter upgrades existing state
-   to schema version 5, initializes durable per-device acknowledged and pending-delivery directory snapshots plus rebuildable derived-history indexes, creates
+   to schema version 6, initializes durable per-device acknowledged and pending-delivery directory snapshots plus rebuildable derived-history indexes, creates
    the bounded diagnostic-event store, and deletes legacy unrestricted device
    error-detail objects. Existing
    unresolved conflicts receive internal protection refs without changing
@@ -40,11 +40,15 @@ restores remain explicit provenance entries even when a resolution keeps the
 first-parent file content unchanged. Cache entries are rebuildable; Git remains
 authoritative. Markdown versions expose source and rendered diff views;
 `.canvas` and `.base` versions expose source diffs. Community-plugin files show
-metadata only until the owner explicitly reveals one selected version after
-recent authentication.
+metadata only until the owner explicitly reveals one selected version. The
+current implementation requires recent password authentication; architecture
+revision 1 replaces that UX with explicit target confirmation, tracked in
+Forgejo issue 18.
 
-Restore requires the reviewed `expected_main`, CSRF protection, and recent
-authentication. It writes a new two-parent Git commit and advances `main` with
+Restore requires the reviewed `expected_main` and CSRF protection. The current
+implementation also requires recent password authentication; migration to
+explicit target confirmation is tracked in Forgejo issue 18. Restore writes a
+new two-parent Git commit and advances `main` with
 a compare-and-swap ref update. The source commit and historical path must belong
 to the canonical history of the requested target path. Restore and maintenance
 share the same per-vault mutation lock as device sync and conflict resolution.
@@ -66,10 +70,13 @@ connections and paired devices authenticate to separate ingestion routes. The
 server rejects unknown payload fields, enforces byte/rate/quota limits, retains
 reports for `OBTS_DIAGNOSTIC_RETENTION_DAYS` (14 by default, 90 maximum), and
 never persists request credentials. Owners inspect and delete their reports on
-the dashboard Settings page. Deletion requires CSRF protection and recent
-authentication; backup rotation governs residual copies.
+the dashboard Settings page. Deletion currently requires CSRF protection and
+recent password authentication; explicit confirmation migration is tracked in
+Forgejo issue 18. Backup rotation governs residual copies.
 
-Git maintenance requires recent owner authentication. It verifies Git objects,
+Git maintenance currently requires recent owner password authentication;
+architecture revision 1 replaces that UX with explicit confirmation, tracked in
+Forgejo issue 18. It verifies Git objects,
 ensures unresolved-conflict protection refs exist, repacks reachable objects,
 prunes only unreachable objects, and verifies integrity again. It does not
 truncate visible history. Maintenance start and completion are persisted as

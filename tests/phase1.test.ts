@@ -2007,7 +2007,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(adapterRemove).toContain('this.adapter.remove');
   });
 
-  it('stores new dashboard passwords with the PRD Argon2id parameters', async () => {
+  it('stores new dashboard passwords with the architecture security-contract Argon2id parameters', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const db = await server.store.snapshot();
     const user = db.users.find((candidate) => candidate.username === 'admin');

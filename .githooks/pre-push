@@ -28,7 +28,7 @@ reject_commit_paths() {
   return "$rejected"
 }
 
-while read -r _local_ref local_sha _remote_ref remote_sha; do
+while read -r _local_ref local_sha remote_ref remote_sha; do
   if [[ "$local_sha" == "$zero_oid" ]]; then
     continue
   fi
@@ -48,4 +48,10 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
   done < "$commits_file"
 
   node scripts/check-plugin-release.mjs "$remote_sha" "$local_sha"
+  if [[ "$remote_sha" == "$zero_oid" ]]; then
+    architecture_mode=create
+  else
+    architecture_mode=update
+  fi
+  node scripts/check-architecture-impact.mjs "$remote_sha" "$local_sha" "$architecture_mode" "$remote_ref"
 done

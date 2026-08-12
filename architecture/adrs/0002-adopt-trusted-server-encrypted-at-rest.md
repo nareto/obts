@@ -1,27 +1,29 @@
-# 2. Adopt trusted-server encrypted-at-rest v1 architecture
+# 2. Adopt a trusted-server, deployment-protected architecture
 
 Date: 2026-06-26
 
 ## Status
 
-Accepted
+Accepted; corrected by architecture revision 1 to match the implemented storage boundary.
 
 ## Context
 
-The first PRD-derived architecture modeled `obts` as a true end-to-end encrypted system. That model forced browser/plugin key derivation, vault passphrase prompts, client-side conflict decrypt/re-encrypt flows, HMAC path IDs, and client-side semantic merge. Those choices made server-side Git-style merge and simple dashboard UX substantially harder.
+The first proof-of-concept architecture modeled OBTS as a true end-to-end encrypted system. That forced browser/plugin key derivation, vault passphrase prompts, client-side conflict decryption/re-encryption, opaque path identifiers, and client-side semantic merge. Those choices made server-side Git merge, dashboard review, history, and recovery substantially harder.
 
-The intended v1 deployment is self-hosted. The server operator is trusted, but different users on the same server must remain isolated from each other.
+The intended deployment is self-hosted. The server operator is trusted, but users on the same server remain isolated from one another.
+
+An earlier version of this ADR incorrectly retained application-managed per-vault data keys after the implementation and product contract had adopted deployment-managed at-rest protection. That contradiction is removed here.
 
 ## Decision
 
-v1 uses a trusted-server model with encrypted-at-rest storage.
+OBTS uses a trusted-server model. The server is authorized to read plaintext vault paths, content, Git state, and sensitive metadata for authorized sync, merge, conflict review, history, maintenance, backup validation, and recovery.
 
-The server is authorized to decrypt vault content for sync, merge, conflict review, backup, and recovery. Persistent vault content is encrypted with per-vault data keys wrapped by server master key material. The dashboard does not require a separate vault passphrase after normal login.
+Persistent server and Bridge client state is ordinary sensitive application data. Restrictive permissions plus deployment-managed disk, volume, snapshot, database-backup, and offsite-storage encryption provide at-rest protection where required. OBTS does not implement per-vault application data keys, a server master content key, app-managed key rotation, true E2EE, or zero knowledge.
 
-Account and vault authorization, TLS, token handling, log redaction, backup discipline, and server key management are the v1 security boundary. True E2EE is not a v1 requirement.
+The dashboard does not require a separate vault passphrase. Account/vault authorization, scoped device credentials, TLS, redaction, backup discipline, and operator access controls define the security boundary.
 
 ## Consequences
 
-Server-side semantic merge, dashboard conflict review, and recovery become simpler and more coherent.
+Server-side semantic merge, dashboard conflict review, history, and recovery remain coherent.
 
-Offline database, content-store, and backup copies are less useful without server key material, but a compromised live server or operator with runtime key access can read vault content. This is an accepted v1 tradeoff and must be documented honestly.
+Copied plaintext application stores or dumps are readable unless deployment controls protect them. A compromised live server or operator with runtime/storage access can read vault content. This is an explicit accepted tradeoff, not an encryption claim.
