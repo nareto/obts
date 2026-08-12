@@ -53,7 +53,7 @@ jobs:
         if: steps.version.outputs.needed == 'true'
         run: npm test
 
-      - name: Create prerelease
+      - name: Create release
         if: steps.version.outputs.needed == 'true'
         run: |
           set -euo pipefail
@@ -64,7 +64,6 @@ jobs:
             obsidian-plugin/styles.css \
             --target "$GITHUB_SHA" \
             --title "$version" \
-            --generate-notes \
-            --prerelease
+            --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}
