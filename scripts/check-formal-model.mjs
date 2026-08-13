@@ -23,7 +23,7 @@ const requiredChecks = new Map([
   ...['observe', 'bridge-proposal', 'plugin2-proposal', 'rust-write', 'network-fault', 'recovery', 'conflict', 'apply-ack',
     'equal', 'covered', 'divergent', 'reply-loss', 'conflict-partial', 'directory-delete', 'projection', 'proposal-trigger',
     'bridge-trigger', 'recovery-trigger', 'apply-trigger', 'apply-refinement'].map((id) => [`fm002-reach-${id}`, 'reachability']),
-  ['fm002-server-recovery-implementation', 'candidate-counterexample'],
+  ['fm002-server-recovery-implementation', 'positive-safety'],
   ...['replace-inflight', 'drop-accepted', 'ref-rewind', 'discard-divergence', 'main-before-effects', 'early-ack',
     'overwrite-bridge', 'recursive-delete', 'restart-abort', 'duplicate-processing', 'retry-identity',
     'conflict-without-protection', 'cas-uncertain-abort', 'cursor-ack-conflation', 'projection-cursor-early']
@@ -43,7 +43,7 @@ try {
     runSany(manifest);
     const summaries = manifest.checks.map((check) => runCheck(manifest, check));
     validateArchitectureStatus(manifest, summaries);
-    printSummary(summaries);
+    printSummary(manifest, summaries);
   }
 } finally {
   rmSync(runRoot, { recursive: true, force: true });
@@ -339,11 +339,11 @@ function parseStats(output) {
   return { generated: Number(state[1].replaceAll(',', '')), distinct: Number(state[2].replaceAll(',', '')), depth: Number(depth[1].replaceAll(',', '')) };
 }
 
-function printSummary(summaries) {
+function printSummary(manifest, summaries) {
   console.log('Formal model evidence:');
   for (const summary of summaries) console.log(`${summary.id}: ${summary.outcome}; generated=${summary.generated}; distinct=${summary.distinct}; depth=${summary.depth}; time=${summary.elapsedMs}ms`);
   const candidates = summaries.filter((summary) => summary.outcome === 'CANDIDATE').length;
-  console.log(`Formal checks complete: ${summaries.length} required checks; ${candidates} current candidate counterexample(s); OBTS-FM-002 status remains candidate.`);
+  console.log(`Formal checks complete: ${summaries.length} required checks; ${candidates} current candidate counterexample(s); OBTS-FM-002 status is ${manifest.architectureStatus}.`);
 }
 
 function fail(message, result) {

@@ -4,7 +4,7 @@ INSTANCE OBTSApplyRefinement
 INSTANCE OBTSSafety
 
 (***************************************************************************
-OBTS-FM-002, architecture revision 3. This is a bounded refinement of the
+OBTS-FM-002, architecture revision 4. This is a bounded refinement of the
 architecture contracts, not a definition of product behavior. Persist/commit
 steps assume their named durable facts survive restart. Git ancestry, bytes,
 flush semantics, process kill, and runtime trace conformance remain external.
@@ -48,7 +48,6 @@ IdentityType == {<<v, e, b, d, p, a, t>> :
   b \in Versions \cup {NoVersion}, d \in ProposalIds, p \in Plans,
   a \in AttemptIds \cup {NoId}, t \in TransferIds \cup {NoId}}
 AllResolutionEffects == EffectNames
-RecoveryImplementedEffects == {"main_event", "directory_result"}
 
 ASSUME Plugin1 # Plugin2 /\ Plugin1 # BridgeNode /\ Plugin2 # BridgeNode
 ASSUME PathA # PathB
@@ -679,7 +678,7 @@ PrepareConflictResolutionOperation ==
 RecoverServerOperation ==
   /\ server.up /\ server.recovering
   /\ IF server.casActual = server.casTarget /\ server.casKind = "main" /\ server.opType = "conflict_resolve"
-       THEN server' = [server EXCEPT !.recovering = FALSE, !.opPhase = "Committed", !.mainEpoch = @ + 1, !.mainTree[server.opPath] = @ \cup {server.opTarget}, !.mainHistory = @ \cup {server.opTarget}, !.eventSeq = @ + 1, !.eventTree = [server.mainTree EXCEPT ![server.opPath] = @ \cup {server.opTarget}], !.committedEffects = IF Scenario = "server-recovery-implementation" THEN RecoveryImplementedEffects ELSE server.expectedEffects, !.reviewNeeded = FALSE]
+       THEN server' = [server EXCEPT !.recovering = FALSE, !.opPhase = "Committed", !.mainEpoch = @ + 1, !.mainTree[server.opPath] = @ \cup {server.opTarget}, !.mainHistory = @ \cup {server.opTarget}, !.eventSeq = @ + 1, !.eventTree = [server.mainTree EXCEPT ![server.opPath] = @ \cup {server.opTarget}], !.committedEffects = server.expectedEffects, !.reviewNeeded = FALSE]
        ELSE IF server.casActual = server.casOld
          THEN server' = [server EXCEPT !.recovering = FALSE, !.opPhase = "Aborted"]
          ELSE server' = [server EXCEPT !.recovering = FALSE, !.opPhase = "Blocked", !.blocked = TRUE]

@@ -20,7 +20,7 @@
   "properties": {
     "schemaVersion": { "const": 1 },
     "modelId": { "const": "OBTS-FM-002" },
-    "architectureRevision": { "const": 3 },
+    "architectureRevision": { "const": 4 },
     "scenarioId": { "type": "string", "minLength": 1 },
     "runId": { "type": "string", "minLength": 1 },
     "sequence": { "type": "integer", "minimum": 0 },

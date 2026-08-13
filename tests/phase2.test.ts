@@ -1179,6 +1179,141 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(await server.git.getRef(fixture.admin.vaultId, protectedRef)).toBe(beforeRef);
   });
 
+  it('rolls forward every prepared conflict-resolution effect after main moves', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'recover-conflict-resolution-desktop');
+    const tabletDir = join(root, 'recover-conflict-resolution-tablet');
+    await mkdir(desktopDir, { recursive: true });
+    await mkdir(tabletDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, 'recover-conflict-resolution-desktop');
+    await writeFile(join(desktopDir, 'shared.md'), 'base\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const tablet = await pairPlugin(admin, tabletDir, 'recover-conflict-resolution-tablet');
+    await writeFile(join(desktopDir, 'shared.md'), 'server version\n');
+    await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const conflicted = await tablet.syncOnce();
+    expect(conflicted.status).toBe('Review needed');
+
+    const review = await admin.get<{ conflict: { expected_main: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}`
+    );
+    expect(review.status).toBe(200);
+    const beforeResolution = await server.store.snapshot();
+    const resolved = await admin.post<{ resolution_commit: string }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}/resolve`,
+      { expected_main: review.body.conflict.expected_main, resolution_kind: 'keep_server' }
+    );
+    expect(resolved.status).toBe(200);
+
+    const committedDb = await server.store.snapshot();
+    const resolutionOperation = committedDb.sync_operations.findLast(
+      (operation) => operation.operation_type === 'conflict_resolve'
+    );
+    const committedConflict = committedDb.conflicts.find(
+      (conflict) => conflict.conflict_id === conflicted.conflictId
+    );
+    expect(resolutionOperation).toMatchObject({
+      status: 'committed',
+      prepared_manifest: { actor_user_id: expect.any(String) }
+    });
+    expect(committedConflict).toMatchObject({
+      status: 'resolved',
+      resolved_by_user_id: expect.any(String)
+    });
+    const actorUserId = committedConflict!.resolved_by_user_id;
+    const deviceId = committedConflict!.device_id;
+
+    await server.store.mutate((db) => {
+      const operation = db.sync_operations.find(
+        (candidate) => candidate.operation_id === resolutionOperation!.operation_id
+      );
+      const vault = db.vaults.find((candidate) => candidate.vault_id === admin.vaultId);
+      const conflict = db.conflicts.find((candidate) => candidate.conflict_id === conflicted.conflictId);
+      const device = db.devices.find((candidate) => candidate.device_id === deviceId);
+      const originalVault = beforeResolution.vaults.find((candidate) => candidate.vault_id === admin.vaultId);
+      const originalConflict = beforeResolution.conflicts.find((candidate) => candidate.conflict_id === conflicted.conflictId);
+      const originalDevice = beforeResolution.devices.find((candidate) => candidate.device_id === deviceId);
+      expect(operation).toBeDefined();
+      expect(vault).toBeDefined();
+      expect(conflict).toBeDefined();
+      expect(device).toBeDefined();
+      expect(originalVault).toBeDefined();
+      expect(originalConflict).toBeDefined();
+      expect(originalDevice).toBeDefined();
+      operation!.status = 'prepared';
+      operation!.result = null;
+      Object.assign(vault!, structuredClone(originalVault!));
+      Object.assign(conflict!, structuredClone(originalConflict!));
+      Object.assign(device!, structuredClone(originalDevice!));
+      db.events = structuredClone(beforeResolution.events);
+      db.audit_log = structuredClone(beforeResolution.audit_log);
+      db.event_seq_by_vault = structuredClone(beforeResolution.event_seq_by_vault);
+    });
+
+    await server.app.close();
+    server = await createObtsServer({
+      dataDir: join(root, 'server-data'),
+      publicBaseUrl: 'http://127.0.0.1:0',
+      sessionSecret: 'test-session-secret-with-enough-entropy'
+    });
+    baseUrl = await server.app.listen({ port: 0, host: '127.0.0.1' });
+
+    expect((await fetch(`${baseUrl}/health/ready`)).status).toBe(200);
+    const recoveredDb = await server.store.snapshot();
+    expect(recoveredDb.vaults.find((vault) => vault.vault_id === admin.vaultId)).toMatchObject({
+      status: 'active',
+      current_main: resolved.body.resolution_commit
+    });
+    expect(recoveredDb.conflicts.find((conflict) => conflict.conflict_id === conflicted.conflictId)).toMatchObject({
+      status: 'resolved',
+      resolved_by_user_id: actorUserId,
+      resolution_kind: 'keep_server',
+      resolution_commit: resolved.body.resolution_commit,
+      resolution_request_hash: expect.any(String)
+    });
+    expect(recoveredDb.devices.find((device) => device.device_id === deviceId)).toMatchObject({
+      status: 'synced',
+      last_successful_sync_at: expect.any(String)
+    });
+    expect(recoveredDb.sync_operations.find(
+      (operation) => operation.operation_id === resolutionOperation!.operation_id
+    )).toMatchObject({
+      status: 'committed',
+      result: {
+        decision: 'resolved',
+        conflict_id: conflicted.conflictId,
+        resolution_kind: 'keep_server',
+        resolution_commit: resolved.body.resolution_commit,
+        reconciled_after_startup: true
+      }
+    });
+    const recoveredEvents = recoveredDb.events.filter(
+      (event) => event.resource_ids.conflict_id === conflicted.conflictId && event.payload.reconciled_after_startup === true
+    );
+    expect(recoveredEvents).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        event_type: 'main_advanced',
+        payload: expect.objectContaining({
+          conflict_id: conflicted.conflictId,
+          resolution_kind: 'keep_server'
+        })
+      }),
+      expect.objectContaining({
+        event_type: 'conflict_resolved',
+        payload: expect.objectContaining({ resolution_kind: 'keep_server' })
+      })
+    ]));
+    expect(recoveredDb.audit_log).toContainEqual(expect.objectContaining({
+      actor_user_id: actorUserId,
+      actor_device_id: null,
+      vault_id: admin.vaultId,
+      action: 'conflict_resolved',
+      resource_class: 'conflict',
+      resource_id: conflicted.conflictId
+    }));
+  });
+
   it('rolls forward a prepared conflict refresh when startup finds its protected ref already moved', async () => {
     const fixture = await createStaleConflictFixture('recover-conflict-refresh');
     const protectedRef = `refs/obts/conflicts/${fixture.conflictId}/current`;

@@ -102,7 +102,7 @@ describe('formal manifest and traceability validation', () => {
   });
 
   it('rejects candidate/accepted mismatch', () => {
-    const fixture = mutateManifest((manifest) => { manifest.architectureStatus = 'accepted'; });
+    const fixture = mutateManifest((manifest) => { manifest.architectureStatus = 'candidate'; });
     const result = run(['--validate-only'], fixture.env);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain('disagrees with architecture/manifest.yaml');
@@ -194,7 +194,7 @@ describe('TLC result gates', () => {
   it('rejects stale candidate evidence', () => {
     const result = fixtureRun({ kind: 'candidate-counterexample', output: counterexample('ExpectedInvariant', 'WitnessAction', 3), status: 12,
       check: { expectedInvariant: 'ExpectedInvariant', requiredWitness: 'WitnessAction', minimumTraceDepth: 3,
-        evidence: 'evidence/server-recovery-exact-effects.json', implementationDiscrepancy: 'fixture discrepancy' } });
+        evidence: 'checks.json', implementationDiscrepancy: 'fixture discrepancy' } });
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain('evidence is stale or unrelated');
   });

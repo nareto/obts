@@ -73,8 +73,8 @@ The model does not cover directories, multiple paths, write concurrency, editor-
 
 | Field | Value |
 | --- | --- |
-| Status | Candidate; one implementation-faithful counterexample remains required |
-| Architecture revision | 3 |
+| Status | Accepted bounded composed model |
+| Architecture revision | 4 |
 | Refined contracts | `OBTS-SAF-001` through `OBTS-SAF-006`, `OBTS-SYNC-IMM-001`, `OBTS-SYNC-ACK-001`, `OBTS-PER-OP-001`, `OBTS-BRG-PROJ-001` |
 | Root specification | `OBTSDistributedSync.tla` |
 | Check matrix | `checks.json` (exactly 52 required checks) |
@@ -96,22 +96,17 @@ Local apply state projects non-vacuously through `modules/OBTSApplyRefinement.tl
 
 ### Check matrix and assumptions
 
-The required matrix contains six FM-001 checks; six FM-002 positive safety checks; four separately fair liveness checks; twenty trigger/action reachability checks; one candidate counterexample; and fifteen distributed negative controls. Removing or retyping any required check fails validation. Candidate architecture status requires at least one required candidate check; accepted status requires zero candidates and all required positives.
+The required matrix contains six FM-001 checks; seven FM-002 positive safety checks; four separately fair liveness checks; twenty trigger/action reachability checks; and fifteen distributed negative controls. Removing or retyping any required check fails validation. Accepted architecture status requires zero candidate counterexamples and all required positives.
 
 Liveness is conditional on bounded edits/crashes, eventual restart, retry/delivery, and no permanent storage failure. Fairness is attached to the concrete action/actor sequence for proposal/result consumption, Rust write to Node capture, server restart/recovery, and main event to durable apply/server acknowledgement. Each obligation has a separate reachable-trigger check; there is no broad fairness disjunction.
 
 The safety bounds include two same-path plugin edits; two disjoint Plugin1/Bridge paths; meaningful client/server/Rust crash seams; and at most two symbolic message copies. The all-actors bound retains every claimed interaction but causally orders the three proposals and bounds each crash/network fault to one relevant seam. Equal, covered, and divergent classifications are independently reachable; divergence never moves the device ref.
 
-### Candidate counterexample
+### Implementation recovery check
 
-`configs/server-recovery-implementation.cfg` constructs a real divergent second proposal, commits conflict metadata and all three protection refs, prepares a `conflict_resolve` operation, moves `main`, crashes, and recovers from the target ref reading. `ExactPreparedOperationRecovery` then fails because startup recovery models exactly the concrete production omissions relative to online resolution:
+`configs/server-recovery-implementation.cfg` constructs a real divergent second proposal, commits conflict metadata and all three protection refs, prepares a `conflict_resolve` operation, moves `main`, crashes, and recovers from the target ref reading. Startup recovery now commits the complete prepared effect set: resolving-user attribution, audit, both resolution events, device last-success time, and directory result. `ExactPreparedOperationRecovery` passes across 11,389 generated and 3,772 distinct states at depth 56.
 
-- resolving-user attribution;
-- audit row;
-- secondary `conflict_resolved` event;
-- device last-success time.
-
-Online effects are evidenced at `src/server/syncService.ts:827-880`; startup reconstruction is evidenced at `src/server/app.ts:3492-3596`. `evidence/server-recovery-exact-effects.json` is generated from current TLC output and binds the model, config, check definition, invariant, witness sequence, statistics, TLC version, and run hash. The checker rejects stale or unrelated evidence. This discrepancy keeps `OBTS-FM-002` candidate; no production implementation changed in this milestone.
+The production regression in `tests/phase2.test.ts` performs a genuine conflict resolution, retains the moved Git `main`, rewinds metadata to the prepared state, restarts the server, and verifies the same effects. New conflict-resolution operations persist the resolving user in their prepared manifest; incomplete legacy manifests fail closed rather than fabricating attribution.
 
 ### Negative controls and harness
 
@@ -123,7 +118,7 @@ The checker requires the exact invariant, witness action, and minimum meaningful
 
 Final checked run: TLC 2.19, Java 21, one worker, fingerprint polynomial 0. Baselines and lower/upper gates are authoritative in `checks.json`.
 
-| Positive/candidate check | Generated | Distinct | Depth |
+| Positive check | Generated | Distinct | Depth |
 | --- | ---: | ---: | ---: |
 | FM-001 safety / liveness (each) | 237 | 163 | 20 |
 | same-path safety | 116,864 | 28,029 | 77 |
@@ -136,7 +131,7 @@ Final checked run: TLC 2.19, Java 21, one worker, fingerprint polynomial 0. Base
 | Bridge liveness | 16,963 | 2,846 | 39 |
 | server-recovery liveness | 871 | 307 | 48 |
 | apply/ack liveness | 484 | 151 | 34 |
-| implementation candidate | 2,678 | 1,086 | 41 |
+| implementation recovery | 11,389 | 3,772 | 56 |
 
 All twenty reachability checks produced their required witness. All four FM-001 and fifteen FM-002 negative controls violated exactly their intended invariant with the required meaningful prefix. See the executable summary from `npm run test:formal` for every generated/distinct/depth tuple.
 

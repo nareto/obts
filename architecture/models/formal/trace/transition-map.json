@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "modelId": "OBTS-FM-002",
-  "architectureRevision": 3,
+  "architectureRevision": 4,
   "rootModule": "OBTSDistributedSync.tla",
   "traceSchema": "trace/trace-schema.json",
   "instrumentationStatus": "static-map-only; runtime emission and replay are omitted and no implementation conformance is claimed",
@@ -25,7 +25,7 @@
     ],
     "casUncertainty": [
       "src/server/syncService.ts:560-625",
-      "src/server/app.ts:3450-3600",
+      "src/server/app.ts:3450-3665",
       "tests/phase2.test.ts:1182-1400"
     ],
     "bridgeProjectionReadiness": [
@@ -288,7 +288,7 @@
       "code": [
         "src/server/syncService.ts:955-1170",
         "src/server/syncService.ts:2020-2140",
-        "src/server/app.ts:3450-3600"
+        "src/server/app.ts:3450-3665"
       ],
       "tests": [
         "tests/phase1.test.ts:4522-4950",
@@ -307,7 +307,7 @@
       "code": [
         "src/server/syncService.ts:955-1170",
         "src/server/syncService.ts:2020-2140",
-        "src/server/app.ts:3450-3600"
+        "src/server/app.ts:3450-3665"
       ],
       "tests": [
         "tests/phase1.test.ts:4522-4950",
@@ -326,7 +326,7 @@
       "code": [
         "src/server/syncService.ts:955-1170",
         "src/server/syncService.ts:2020-2140",
-        "src/server/app.ts:3450-3600"
+        "src/server/app.ts:3450-3665"
       ],
       "tests": [
         "tests/phase1.test.ts:4522-4950",
@@ -345,7 +345,7 @@
       "code": [
         "src/server/syncService.ts:955-1170",
         "src/server/syncService.ts:2020-2140",
-        "src/server/app.ts:3450-3600"
+        "src/server/app.ts:3450-3665"
       ],
       "tests": [
         "tests/phase1.test.ts:4522-4950",
@@ -364,7 +364,7 @@
       "code": [
         "src/server/syncService.ts:955-1170",
         "src/server/syncService.ts:2020-2140",
-        "src/server/app.ts:3450-3600"
+        "src/server/app.ts:3450-3665"
       ],
       "tests": [
         "tests/phase1.test.ts:4522-4950",
@@ -383,7 +383,7 @@
       "code": [
         "src/server/syncService.ts:955-1170",
         "src/server/syncService.ts:2020-2140",
-        "src/server/app.ts:3450-3600"
+        "src/server/app.ts:3450-3665"
       ],
       "tests": [
         "tests/phase1.test.ts:4522-4950",
@@ -402,7 +402,7 @@
       "code": [
         "src/server/syncService.ts:955-1170",
         "src/server/syncService.ts:2020-2140",
-        "src/server/app.ts:3450-3600"
+        "src/server/app.ts:3450-3665"
       ],
       "tests": [
         "tests/phase1.test.ts:4522-4950",
@@ -421,7 +421,7 @@
       "code": [
         "src/server/syncService.ts:955-1170",
         "src/server/syncService.ts:2020-2140",
-        "src/server/app.ts:3450-3600"
+        "src/server/app.ts:3450-3665"
       ],
       "tests": [
         "tests/phase1.test.ts:4522-4950",
@@ -440,7 +440,7 @@
       "code": [
         "src/server/syncService.ts:955-1170",
         "src/server/syncService.ts:2020-2140",
-        "src/server/app.ts:3450-3600"
+        "src/server/app.ts:3450-3665"
       ],
       "tests": [
         "tests/phase1.test.ts:4522-4950",
@@ -459,7 +459,7 @@
       "code": [
         "src/server/syncService.ts:955-1170",
         "src/server/syncService.ts:2020-2140",
-        "src/server/app.ts:3450-3600"
+        "src/server/app.ts:3450-3665"
       ],
       "tests": [
         "tests/phase1.test.ts:4522-4950",
@@ -478,7 +478,7 @@
       "code": [
         "src/server/syncService.ts:955-1170",
         "src/server/syncService.ts:2020-2140",
-        "src/server/app.ts:3450-3600"
+        "src/server/app.ts:3450-3665"
       ],
       "tests": [
         "tests/phase1.test.ts:4522-4950",
@@ -497,7 +497,7 @@
       "code": [
         "src/server/syncService.ts:955-1170",
         "src/server/syncService.ts:2020-2140",
-        "src/server/app.ts:3450-3600"
+        "src/server/app.ts:3450-3665"
       ],
       "tests": [
         "tests/phase1.test.ts:4522-4950",
@@ -516,7 +516,7 @@
       "code": [
         "src/server/syncService.ts:955-1170",
         "src/server/syncService.ts:2020-2140",
-        "src/server/app.ts:3450-3600"
+        "src/server/app.ts:3450-3665"
       ],
       "tests": [
         "tests/phase1.test.ts:4522-4950",
@@ -535,7 +535,7 @@
       "code": [
         "src/server/syncService.ts:955-1170",
         "src/server/syncService.ts:2020-2140",
-        "src/server/app.ts:3450-3600"
+        "src/server/app.ts:3450-3665"
       ],
       "tests": [
         "tests/phase1.test.ts:4522-4950",
@@ -554,7 +554,7 @@
       "code": [
         "src/server/syncService.ts:955-1170",
         "src/server/syncService.ts:2020-2140",
-        "src/server/app.ts:3450-3600"
+        "src/server/app.ts:3450-3665"
       ],
       "tests": [
         "tests/phase1.test.ts:4522-4950",
@@ -594,7 +594,7 @@
       "code": [
         "src/server/syncService.ts:955-1170",
         "src/server/syncService.ts:2020-2140",
-        "src/server/app.ts:3450-3600"
+        "src/server/app.ts:3450-3665"
       ],
       "tests": [
         "tests/phase1.test.ts:4522-4950",
@@ -1212,7 +1212,7 @@
       "code": [
         "src/server/syncService.ts:955-1170",
         "src/server/syncService.ts:2020-2140",
-        "src/server/app.ts:3450-3600"
+        "src/server/app.ts:3450-3665"
       ],
       "tests": [
         "tests/phase1.test.ts:4522-4950",
@@ -1231,7 +1231,7 @@
       "code": [
         "src/server/syncService.ts:955-1170",
         "src/server/syncService.ts:2020-2140",
-        "src/server/app.ts:3450-3600"
+        "src/server/app.ts:3450-3665"
       ],
       "tests": [
         "tests/phase1.test.ts:4522-4950",
@@ -1271,7 +1271,7 @@
       "code": [
         "src/server/syncService.ts:955-1170",
         "src/server/syncService.ts:2020-2140",
-        "src/server/app.ts:3450-3600"
+        "src/server/app.ts:3450-3665"
       ],
       "tests": [
         "tests/phase1.test.ts:4522-4950",

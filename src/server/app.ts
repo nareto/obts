@@ -3515,36 +3515,50 @@ async function rollForwardPreparedOperation(store: MetadataStore, operationId: s
       const device = operation.device_id
         ? db.devices.find((candidate) => candidate.device_id === operation.device_id)
         : undefined;
-      vault.current_main = targetMain;
-      vault.updated_at = nowIso();
-      if (device) {
-        device.status = 'synced';
-      }
       const manifest = operation.prepared_manifest ?? {};
       const conflictId = stringValue(manifest.conflict_id);
-      if (operation.operation_type === 'conflict_resolve' && conflictId) {
-        const conflict = db.conflicts.find(
-          (candidate) => candidate.vault_id === operation.vault_id && candidate.conflict_id === conflictId
-        );
-        if (conflict) {
-          conflict.status = 'resolved';
-          conflict.resolved_at = nowIso();
-          const resolutionKind =
-            manifest.resolution_kind === 'keep_server' ||
-            manifest.resolution_kind === 'use_device' ||
-            manifest.resolution_kind === 'keep_both_files' ||
-            manifest.resolution_kind === 'insert_both_blocks' ||
-            manifest.resolution_kind === 'manual'
-              ? manifest.resolution_kind
-              : undefined;
-          if (resolutionKind !== undefined) {
-            conflict.resolution_kind = resolutionKind;
-          }
-          conflict.resolution_commit = targetMain;
-          const requestHash = stringValue(manifest.resolution_request_hash);
-          if (requestHash !== null) {
-            conflict.resolution_request_hash = requestHash;
-          }
+      const actorUserId = stringValue(manifest.actor_user_id);
+      const resolutionKind =
+        manifest.resolution_kind === 'keep_server' ||
+        manifest.resolution_kind === 'use_device' ||
+        manifest.resolution_kind === 'keep_both_files' ||
+        manifest.resolution_kind === 'insert_both_blocks' ||
+        manifest.resolution_kind === 'manual'
+          ? manifest.resolution_kind
+          : undefined;
+      const resolutionConflict = operation.operation_type === 'conflict_resolve' && conflictId
+        ? db.conflicts.find(
+            (candidate) => candidate.vault_id === operation.vault_id && candidate.conflict_id === conflictId
+          )
+        : undefined;
+      if (
+        operation.operation_type === 'conflict_resolve' &&
+        (!conflictId || !actorUserId || !resolutionKind || !resolutionConflict || !device)
+      ) {
+        operation.result = { reason: 'conflict_resolution_reconciliation_failed' };
+        operation.updated_at = nowIso();
+        vault.status = 'blocked_integrity';
+        vault.updated_at = nowIso();
+        return;
+      }
+      const recoveredAt = nowIso();
+      vault.current_main = targetMain;
+      vault.updated_at = recoveredAt;
+      if (device && device.status !== 'revoked') {
+        device.status = 'synced';
+        if (operation.operation_type === 'conflict_resolve') {
+          device.last_successful_sync_at = recoveredAt;
+        }
+      }
+      if (resolutionConflict && actorUserId && resolutionKind) {
+        resolutionConflict.status = 'resolved';
+        resolutionConflict.resolved_at = recoveredAt;
+        resolutionConflict.resolved_by_user_id = actorUserId;
+        resolutionConflict.resolution_kind = resolutionKind;
+        resolutionConflict.resolution_commit = targetMain;
+        const requestHash = stringValue(manifest.resolution_request_hash);
+        if (requestHash !== null) {
+          resolutionConflict.resolution_request_hash = requestHash;
         }
       }
       operation.status = 'committed';
@@ -3557,7 +3571,7 @@ async function rollForwardPreparedOperation(store: MetadataStore, operationId: s
               ? 'note_restored'
               : 'merged',
         ...(operation.operation_type === 'conflict_resolve'
-          ? { conflict_id: conflictId, resolution_commit: targetMain }
+          ? { conflict_id: conflictId, resolution_kind: resolutionKind, resolution_commit: targetMain }
           : operation.operation_type === 'note_restore'
             ? {
                 restore_commit: targetMain,
@@ -3589,11 +3603,49 @@ async function rollForwardPreparedOperation(store: MetadataStore, operationId: s
                 : 'merged',
           merge_sequence: manifest.merge_sequence ?? null,
           merge_policy_version: manifest.merge_policy_version ?? null,
+          ...(operation.operation_type === 'conflict_resolve'
+            ? { conflict_id: conflictId, resolution_kind: resolutionKind }
+            : {}),
           reconciled_after_startup: true,
           ...recoveredDirectoryEventPayload(operation)
         }
       });
       commitRecoveredDirectoryState(db, operation, recoveredEvent.event_seq);
+      if (operation.operation_type === 'conflict_resolve' && conflictId && resolutionKind) {
+        const conflict = db.conflicts.find(
+          (candidate) => candidate.vault_id === operation.vault_id && candidate.conflict_id === conflictId
+        );
+        store.appendEvent(db, {
+          event_type: 'conflict_resolved',
+          vault_id: operation.vault_id,
+          resource_ids: {
+            conflict_id: conflictId,
+            ...(device ? { device_id: device.device_id } : {})
+          },
+          commit_cursors: {
+            main: targetMain,
+            previous_main: previousMain,
+            device_commit: stringValue(manifest.device_commit)
+          },
+          payload: {
+            resolution_kind: resolutionKind,
+            ...(conflict?.directory_context
+              ? { directory_proposal_id: conflict.directory_context.proposal.proposal_id }
+              : {}),
+            reconciled_after_startup: true
+          }
+        });
+        db.audit_log.push({
+          audit_id: newId('aud'),
+          actor_user_id: actorUserId,
+          actor_device_id: null,
+          vault_id: operation.vault_id,
+          action: 'conflict_resolved',
+          resource_class: 'conflict',
+          resource_id: conflictId,
+          created_at: recoveredAt
+        });
+      }
       if (operation.operation_type === 'note_restore') {
         store.appendEvent(db, {
           event_type: 'note_restored',

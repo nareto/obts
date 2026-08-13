@@ -788,6 +788,7 @@ export class SyncService {
           current_main: input.expectedMain,
           device_commit: conflict.device_commit,
           conflict_id: conflict.conflict_id,
+          actor_user_id: input.actorUserId,
           decision: 'resolved',
           resolution_kind: input.resolutionKind,
           resolution_request_hash: requestHash,

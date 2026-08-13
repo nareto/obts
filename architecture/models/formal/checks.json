@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "modelId": "OBTS-FM-002",
-  "architectureStatus": "candidate",
+  "architectureStatus": "accepted",
   "tooling": {
     "workers": 1,
     "fingerprintPolynomial": 0,
@@ -552,16 +552,19 @@
       "id": "fm002-server-recovery-implementation",
       "model": "OBTSDistributedSync",
       "config": "configs/server-recovery-implementation.cfg",
-      "kind": "candidate-counterexample",
+      "kind": "positive-safety",
       "timeoutMs": 180000,
       "heapMb": 2048,
       "maximumDistinctStates": 200000,
       "maximumDepth": 200,
-      "expectedInvariant": "ExactPreparedOperationRecovery",
-      "requiredWitness": "RecoverServerOperation",
-      "minimumTraceDepth": 38,
-      "evidence": "evidence/server-recovery-exact-effects.json",
-      "implementationDiscrepancy": "src/server/app.ts:3492-3596 omits conflict-resolve attribution, audit, conflict_resolved event, and last-success effects committed online by src/server/syncService.ts:827-880."
+      "baseline": {
+        "generated": 11389,
+        "distinct": 3772,
+        "depth": 56,
+        "minGenerated": 5694,
+        "minDistinct": 1886,
+        "minDepth": 28
+      }
     },
     {
       "id": "fm002-negative-replace-inflight",
