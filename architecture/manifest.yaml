@@ -1,7 +1,7 @@
 schema_version: 1
-revision: 2
+revision: 3
 status: current
-updated: 2026-08-12
+updated: 2026-08-13
 authoritative_artifacts:
   - architecture/manifest.yaml
   - architecture/README.md
@@ -20,3 +20,21 @@ formal_models:
       - OBTS-SAF-001
       - OBTS-SAF-002
       - OBTS-SAF-005
+  - id: OBTS-FM-002
+    status: candidate
+    path: architecture/models/formal/OBTSDistributedSync.tla
+    architecture_revision: 3
+    checks: architecture/models/formal/checks.json
+    transition_map: architecture/models/formal/trace/transition-map.json
+    trace_schema: architecture/models/formal/trace/trace-schema.json
+    refines:
+      - OBTS-SAF-001
+      - OBTS-SAF-002
+      - OBTS-SAF-003
+      - OBTS-SAF-004
+      - OBTS-SAF-005
+      - OBTS-SAF-006
+      - OBTS-SYNC-IMM-001
+      - OBTS-SYNC-ACK-001
+      - OBTS-PER-OP-001
+      - OBTS-BRG-PROJ-001

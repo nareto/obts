@@ -50,6 +50,8 @@ A green model checker does not prove implementation conformance, filesystem dura
 
 The accepted bounded `OBTS-FM-001` model refines `OBTS-SAF-001`, `OBTS-SAF-002`, and `OBTS-SAF-005` for one-client, one-path apply/recovery. `npm run test:formal` checks its safety, liveness, and negative controls. Its exact bounds, assumptions, evidence, promoted regression, and omissions live in `architecture/models/formal/README.md` and ADR 0007.
 
+The candidate `OBTS-FM-002` composed distributed model adds multiple bounded safety scenarios, conditional per-obligation liveness, deliberate negative controls, and a machine-readable action-to-contract/code/test map. Candidate counterexamples are successful discrepancy evidence but prevent architectural acceptance; the model becomes accepted only when every positive gate passes, every negative control fails for its exact invariant and witness, and independent review approves the result. The trace schema and conformance boundary do not claim runtime instrumentation or implementation proof until executable trace replay is delivered.
+
 ## Manual And Deployment Evidence
 
 Before trusted primary-vault use:

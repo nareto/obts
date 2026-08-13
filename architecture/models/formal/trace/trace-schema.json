@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "OBTS-FM-002-trace-v1",
+  "title": "OBTS distributed transition trace",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "modelId",
+    "architectureRevision",
+    "scenarioId",
+    "runId",
+    "sequence",
+    "actor",
+    "action",
+    "operationId",
+    "faultPoint",
+    "postState"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "modelId": { "const": "OBTS-FM-002" },
+    "architectureRevision": { "const": 3 },
+    "scenarioId": { "type": "string", "minLength": 1 },
+    "runId": { "type": "string", "minLength": 1 },
+    "sequence": { "type": "integer", "minimum": 0 },
+    "actor": {
+      "enum": ["plugin-1", "plugin-2", "bridge-node", "bridge-rust", "server"]
+    },
+    "action": { "type": "string", "minLength": 1 },
+    "operationId": { "type": ["string", "null"] },
+    "attemptId": { "type": ["string", "null"] },
+    "transferId": { "type": ["string", "null"] },
+    "faultPoint": { "type": ["string", "null"] },
+    "postState": {
+      "type": "object",
+      "description": "Attested read-back projection from durable filesystem, Git, metadata, or PostgreSQL state; never only the intended function result.",
+      "additionalProperties": false,
+      "required": [
+        "visibleVersion",
+        "localHead",
+        "queueTarget",
+        "serverMain",
+        "deviceRef",
+        "operationPhase",
+        "eventSequence",
+        "seenSequence",
+        "appliedSequence",
+        "lastAppliedMain",
+        "recoveryRooted",
+        "projectionCursor"
+      ],
+      "properties": {
+        "visibleVersion": { "type": ["string", "null"] },
+        "localHead": { "type": ["string", "null"] },
+        "queueTarget": { "type": ["string", "null"] },
+        "serverMain": { "type": ["string", "null"] },
+        "deviceRef": { "type": ["string", "null"] },
+        "operationPhase": { "type": ["string", "null"] },
+        "eventSequence": { "type": ["integer", "null"], "minimum": 0 },
+        "seenSequence": { "type": ["integer", "null"], "minimum": 0 },
+        "appliedSequence": { "type": ["integer", "null"], "minimum": 0 },
+        "lastAppliedMain": { "type": ["string", "null"] },
+        "recoveryRooted": { "type": ["boolean", "null"] },
+        "projectionCursor": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

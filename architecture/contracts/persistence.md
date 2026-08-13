@@ -9,9 +9,11 @@
 - **OBTS Bridge device state:** its persistent visible headless vault and `.obts/` state; these may hold the only copy of a pending agent edit.
 - **OBTS Bridge PostgreSQL:** mixed state. Content-derived note, file, link, block, search, embedding, revision, and projection-cursor rows are rebuildable from verified headless state; retained access/audit history is not reconstructable and remains authoritative for its retention window. Neither class replaces or repairs uncertain headless client state.
 
+### OBTS-BRG-PROJ-001: Derived-Only Bridge Projection
+
 Derived indexes may accelerate history, search, graph, or projection but never override Git or visible headless content. Rebuilding content projection must preserve retained non-derived access/audit records.
 
-## Server Write Protocol
+## OBTS-PER-OP-001: Server Write Protocol
 
 Every operation capable of changing Git refs and associated metadata uses one durable operation record:
 

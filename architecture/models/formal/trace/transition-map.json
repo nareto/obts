@@ -1,0 +1,1511 @@
+{
+  "schemaVersion": 2,
+  "modelId": "OBTS-FM-002",
+  "architectureRevision": 3,
+  "rootModule": "OBTSDistributedSync.tla",
+  "traceSchema": "trace/trace-schema.json",
+  "instrumentationStatus": "static-map-only; runtime emission and replay are omitted and no implementation conformance is claimed",
+  "productionFamilies": {
+    "classifications": [
+      "src/server/syncService.ts:1039-1170",
+      "tests/phase1.test.ts:4522-4950"
+    ],
+    "transferRetryQuery": [
+      "src/server/chunkTransferService.ts:106-370",
+      "obsidian-plugin/src/main.cjs:2328-2693",
+      "tests/phase1.test.ts:5963-6329"
+    ],
+    "eventExpiry": [
+      "obsidian-plugin/src/main.cjs:3035-3088",
+      "tests/phase1.test.ts:6329-6500"
+    ],
+    "conflictMetadataProtection": [
+      "src/server/syncService.ts:2020-2140",
+      "tests/phase2.test.ts:1182-1400"
+    ],
+    "casUncertainty": [
+      "src/server/syncService.ts:560-625",
+      "src/server/app.ts:3450-3600",
+      "tests/phase2.test.ts:1182-1400"
+    ],
+    "bridgeProjectionReadiness": [
+      "crates/obts-bridge/src/workers.rs:2460-2920",
+      "crates/obts-bridge/src/persistence.rs:1420-1740",
+      "tests/headless-protocol.test.ts:1-157"
+    ],
+    "clientRestartApplyAck": [
+      "obsidian-plugin/src/main.cjs:2920-3711",
+      "obsidian-plugin/src/main.cjs:5247-5323",
+      "tests/plugin-large-vault.test.ts:300-724"
+    ],
+    "directoryCausality": [
+      "obsidian-plugin/src/main.cjs:3242-3711",
+      "src/server/syncService.ts:2020-2140",
+      "tests/plugin-large-vault.test.ts:480-650"
+    ]
+  },
+  "actions": {
+    "ObservePluginEdit": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-002",
+        "OBTS-SAF-005",
+        "OBTS-SYNC-IMM-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:1301-1435",
+        "obsidian-plugin/src/main.cjs:2015-2693",
+        "obsidian-plugin/src/main.cjs:2920-3711",
+        "obsidian-plugin/src/main.cjs:5047-5323"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329",
+        "tests/plugin-large-vault.test.ts:300-724"
+      ]
+    },
+    "RustValidateWrite": {
+      "category": "bridge",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-005",
+        "OBTS-BRG-PROJ-001"
+      ],
+      "code": [
+        "crates/obts-bridge/src/service.rs:243-539",
+        "crates/obts-bridge/src/workers.rs:2460-2920",
+        "crates/obts-bridge/src/persistence.rs:1420-1740"
+      ],
+      "tests": [
+        "tests/headless-protocol.test.ts:1-157"
+      ]
+    },
+    "RustAtomicVisibleWrite": {
+      "category": "bridge",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-005",
+        "OBTS-BRG-PROJ-001"
+      ],
+      "code": [
+        "crates/obts-bridge/src/service.rs:243-539",
+        "crates/obts-bridge/src/workers.rs:2460-2920",
+        "crates/obts-bridge/src/persistence.rs:1420-1740"
+      ],
+      "tests": [
+        "tests/headless-protocol.test.ts:1-157"
+      ]
+    },
+    "NodePersistBridgeHint": {
+      "category": "bridge",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-005",
+        "OBTS-BRG-PROJ-001"
+      ],
+      "code": [
+        "crates/obts-bridge/src/service.rs:243-539",
+        "crates/obts-bridge/src/workers.rs:2460-2920",
+        "crates/obts-bridge/src/persistence.rs:1420-1740"
+      ],
+      "tests": [
+        "tests/headless-protocol.test.ts:1-157"
+      ]
+    },
+    "CaptureLocalCommit": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-002",
+        "OBTS-SAF-005",
+        "OBTS-SYNC-IMM-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:1301-1435",
+        "obsidian-plugin/src/main.cjs:2015-2693",
+        "obsidian-plugin/src/main.cjs:2920-3711",
+        "obsidian-plugin/src/main.cjs:5047-5323"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329",
+        "tests/plugin-large-vault.test.ts:300-724"
+      ]
+    },
+    "PersistImmutableProposal": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-002",
+        "OBTS-SAF-005",
+        "OBTS-SYNC-IMM-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:1301-1435",
+        "obsidian-plugin/src/main.cjs:2015-2693",
+        "obsidian-plugin/src/main.cjs:2920-3711",
+        "obsidian-plugin/src/main.cjs:5047-5323"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329",
+        "tests/plugin-large-vault.test.ts:300-724"
+      ]
+    },
+    "PersistEqualRetry": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-002",
+        "OBTS-SAF-005",
+        "OBTS-SYNC-IMM-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:1301-1435",
+        "obsidian-plugin/src/main.cjs:2015-2693",
+        "obsidian-plugin/src/main.cjs:2920-3711",
+        "obsidian-plugin/src/main.cjs:5047-5323"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329",
+        "tests/plugin-large-vault.test.ts:300-724"
+      ]
+    },
+    "PersistCoveredQuery": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-002",
+        "OBTS-SAF-005",
+        "OBTS-SYNC-IMM-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:1301-1435",
+        "obsidian-plugin/src/main.cjs:2015-2693",
+        "obsidian-plugin/src/main.cjs:2920-3711",
+        "obsidian-plugin/src/main.cjs:5047-5323"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329",
+        "tests/plugin-large-vault.test.ts:300-724"
+      ]
+    },
+    "SendProposalRequest": {
+      "category": "network",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SYNC-IMM-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:2328-2693",
+        "src/server/chunkTransferService.ts:106-370"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329"
+      ]
+    },
+    "DelayProposalRequest": {
+      "category": "network",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SYNC-IMM-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:2328-2693",
+        "src/server/chunkTransferService.ts:106-370"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329"
+      ]
+    },
+    "DuplicateProposalRequest": {
+      "category": "network",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SYNC-IMM-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:2328-2693",
+        "src/server/chunkTransferService.ts:106-370"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329"
+      ]
+    },
+    "DropProposalRequest": {
+      "category": "network",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SYNC-IMM-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:2328-2693",
+        "src/server/chunkTransferService.ts:106-370"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329"
+      ]
+    },
+    "DeliverProposalRequest": {
+      "category": "network",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SYNC-IMM-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:2328-2693",
+        "src/server/chunkTransferService.ts:106-370"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329"
+      ]
+    },
+    "ServerStartProposal": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SAF-004",
+        "OBTS-SAF-005",
+        "OBTS-PER-OP-001"
+      ],
+      "code": [
+        "src/server/syncService.ts:955-1170",
+        "src/server/syncService.ts:2020-2140",
+        "src/server/app.ts:3450-3600"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:4522-4950",
+        "tests/phase2.test.ts:1182-1400"
+      ]
+    },
+    "ServerValidateProposal": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SAF-004",
+        "OBTS-SAF-005",
+        "OBTS-PER-OP-001"
+      ],
+      "code": [
+        "src/server/syncService.ts:955-1170",
+        "src/server/syncService.ts:2020-2140",
+        "src/server/app.ts:3450-3600"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:4522-4950",
+        "tests/phase2.test.ts:1182-1400"
+      ]
+    },
+    "ClassifyProposal": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SAF-004",
+        "OBTS-SAF-005",
+        "OBTS-PER-OP-001"
+      ],
+      "code": [
+        "src/server/syncService.ts:955-1170",
+        "src/server/syncService.ts:2020-2140",
+        "src/server/app.ts:3450-3600"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:4522-4950",
+        "tests/phase2.test.ts:1182-1400"
+      ]
+    },
+    "PrepareDeviceCAS": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SAF-004",
+        "OBTS-SAF-005",
+        "OBTS-PER-OP-001"
+      ],
+      "code": [
+        "src/server/syncService.ts:955-1170",
+        "src/server/syncService.ts:2020-2140",
+        "src/server/app.ts:3450-3600"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:4522-4950",
+        "tests/phase2.test.ts:1182-1400"
+      ]
+    },
+    "ApplyCASSideEffect": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SAF-004",
+        "OBTS-SAF-005",
+        "OBTS-PER-OP-001"
+      ],
+      "code": [
+        "src/server/syncService.ts:955-1170",
+        "src/server/syncService.ts:2020-2140",
+        "src/server/app.ts:3450-3600"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:4522-4950",
+        "tests/phase2.test.ts:1182-1400"
+      ]
+    },
+    "ObserveCASResult": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SAF-004",
+        "OBTS-SAF-005",
+        "OBTS-PER-OP-001"
+      ],
+      "code": [
+        "src/server/syncService.ts:955-1170",
+        "src/server/syncService.ts:2020-2140",
+        "src/server/app.ts:3450-3600"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:4522-4950",
+        "tests/phase2.test.ts:1182-1400"
+      ]
+    },
+    "CommitCASMetadata": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SAF-004",
+        "OBTS-SAF-005",
+        "OBTS-PER-OP-001"
+      ],
+      "code": [
+        "src/server/syncService.ts:955-1170",
+        "src/server/syncService.ts:2020-2140",
+        "src/server/app.ts:3450-3600"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:4522-4950",
+        "tests/phase2.test.ts:1182-1400"
+      ]
+    },
+    "HandleEqualOrCovered": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SAF-004",
+        "OBTS-SAF-005",
+        "OBTS-PER-OP-001"
+      ],
+      "code": [
+        "src/server/syncService.ts:955-1170",
+        "src/server/syncService.ts:2020-2140",
+        "src/server/app.ts:3450-3600"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:4522-4950",
+        "tests/phase2.test.ts:1182-1400"
+      ]
+    },
+    "ServerPrepareIntegration": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SAF-004",
+        "OBTS-SAF-005",
+        "OBTS-PER-OP-001"
+      ],
+      "code": [
+        "src/server/syncService.ts:955-1170",
+        "src/server/syncService.ts:2020-2140",
+        "src/server/app.ts:3450-3600"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:4522-4950",
+        "tests/phase2.test.ts:1182-1400"
+      ]
+    },
+    "PrepareMainCAS": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SAF-004",
+        "OBTS-SAF-005",
+        "OBTS-PER-OP-001"
+      ],
+      "code": [
+        "src/server/syncService.ts:955-1170",
+        "src/server/syncService.ts:2020-2140",
+        "src/server/app.ts:3450-3600"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:4522-4950",
+        "tests/phase2.test.ts:1182-1400"
+      ]
+    },
+    "BeginConflictMetadata": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SAF-004",
+        "OBTS-SAF-005",
+        "OBTS-PER-OP-001"
+      ],
+      "code": [
+        "src/server/syncService.ts:955-1170",
+        "src/server/syncService.ts:2020-2140",
+        "src/server/app.ts:3450-3600"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:4522-4950",
+        "tests/phase2.test.ts:1182-1400"
+      ]
+    },
+    "ProtectConflictBase": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SAF-004",
+        "OBTS-SAF-005",
+        "OBTS-PER-OP-001"
+      ],
+      "code": [
+        "src/server/syncService.ts:955-1170",
+        "src/server/syncService.ts:2020-2140",
+        "src/server/app.ts:3450-3600"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:4522-4950",
+        "tests/phase2.test.ts:1182-1400"
+      ]
+    },
+    "ProtectConflictCurrent": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SAF-004",
+        "OBTS-SAF-005",
+        "OBTS-PER-OP-001"
+      ],
+      "code": [
+        "src/server/syncService.ts:955-1170",
+        "src/server/syncService.ts:2020-2140",
+        "src/server/app.ts:3450-3600"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:4522-4950",
+        "tests/phase2.test.ts:1182-1400"
+      ]
+    },
+    "ProtectConflictDevice": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SAF-004",
+        "OBTS-SAF-005",
+        "OBTS-PER-OP-001"
+      ],
+      "code": [
+        "src/server/syncService.ts:955-1170",
+        "src/server/syncService.ts:2020-2140",
+        "src/server/app.ts:3450-3600"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:4522-4950",
+        "tests/phase2.test.ts:1182-1400"
+      ]
+    },
+    "CommitConflictResult": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SAF-004",
+        "OBTS-SAF-005",
+        "OBTS-PER-OP-001"
+      ],
+      "code": [
+        "src/server/syncService.ts:955-1170",
+        "src/server/syncService.ts:2020-2140",
+        "src/server/app.ts:3450-3600"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:4522-4950",
+        "tests/phase2.test.ts:1182-1400"
+      ]
+    },
+    "CommitIntegrationEffects": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-002",
+        "OBTS-SAF-005",
+        "OBTS-SYNC-IMM-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:1301-1435",
+        "obsidian-plugin/src/main.cjs:2015-2693",
+        "obsidian-plugin/src/main.cjs:2920-3711",
+        "obsidian-plugin/src/main.cjs:5047-5323"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329",
+        "tests/plugin-large-vault.test.ts:300-724"
+      ]
+    },
+    "CommitConflictResolutionEffects": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SAF-004",
+        "OBTS-SAF-005",
+        "OBTS-PER-OP-001"
+      ],
+      "code": [
+        "src/server/syncService.ts:955-1170",
+        "src/server/syncService.ts:2020-2140",
+        "src/server/app.ts:3450-3600"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:4522-4950",
+        "tests/phase2.test.ts:1182-1400"
+      ]
+    },
+    "SendStoredReply": {
+      "category": "network",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SYNC-IMM-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:2328-2693",
+        "src/server/chunkTransferService.ts:106-370"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329"
+      ]
+    },
+    "DuplicateProposalReply": {
+      "category": "network",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SYNC-IMM-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:2328-2693",
+        "src/server/chunkTransferService.ts:106-370"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329"
+      ]
+    },
+    "DelayProposalReply": {
+      "category": "network",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SYNC-IMM-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:2328-2693",
+        "src/server/chunkTransferService.ts:106-370"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329"
+      ]
+    },
+    "DropProposalReply": {
+      "category": "network",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SYNC-IMM-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:2328-2693",
+        "src/server/chunkTransferService.ts:106-370"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329"
+      ]
+    },
+    "DeliverProposalReply": {
+      "category": "network",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SYNC-IMM-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:2328-2693",
+        "src/server/chunkTransferService.ts:106-370"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329"
+      ]
+    },
+    "RetryOrQueryStable": {
+      "category": "network",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SYNC-IMM-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:2328-2693",
+        "src/server/chunkTransferService.ts:106-370"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329"
+      ]
+    },
+    "ConsumeProposalResult": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-002",
+        "OBTS-SAF-005",
+        "OBTS-SYNC-IMM-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:1301-1435",
+        "obsidian-plugin/src/main.cjs:2015-2693",
+        "obsidian-plugin/src/main.cjs:2920-3711",
+        "obsidian-plugin/src/main.cjs:5047-5323"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329",
+        "tests/plugin-large-vault.test.ts:300-724"
+      ]
+    },
+    "PollCommittedEvent": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-002",
+        "OBTS-SAF-005",
+        "OBTS-SYNC-IMM-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:1301-1435",
+        "obsidian-plugin/src/main.cjs:2015-2693",
+        "obsidian-plugin/src/main.cjs:2920-3711",
+        "obsidian-plugin/src/main.cjs:5047-5323"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329",
+        "tests/plugin-large-vault.test.ts:300-724"
+      ]
+    },
+    "PlanLocalApply": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-002",
+        "OBTS-SAF-005",
+        "OBTS-SYNC-IMM-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:1301-1435",
+        "obsidian-plugin/src/main.cjs:2015-2693",
+        "obsidian-plugin/src/main.cjs:2920-3711",
+        "obsidian-plugin/src/main.cjs:5047-5323"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329",
+        "tests/plugin-large-vault.test.ts:300-724"
+      ]
+    },
+    "PublishApplyRecovery": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-002",
+        "OBTS-SAF-005",
+        "OBTS-SYNC-IMM-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:1301-1435",
+        "obsidian-plugin/src/main.cjs:2015-2693",
+        "obsidian-plugin/src/main.cjs:2920-3711",
+        "obsidian-plugin/src/main.cjs:5047-5323"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329",
+        "tests/plugin-large-vault.test.ts:300-724"
+      ]
+    },
+    "BeginLocalMutation": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-002",
+        "OBTS-SAF-005",
+        "OBTS-SYNC-IMM-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:1301-1435",
+        "obsidian-plugin/src/main.cjs:2015-2693",
+        "obsidian-plugin/src/main.cjs:2920-3711",
+        "obsidian-plugin/src/main.cjs:5047-5323"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329",
+        "tests/plugin-large-vault.test.ts:300-724"
+      ]
+    },
+    "MutateWithFreshIdentity": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-002",
+        "OBTS-SAF-005",
+        "OBTS-SYNC-IMM-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:1301-1435",
+        "obsidian-plugin/src/main.cjs:2015-2693",
+        "obsidian-plugin/src/main.cjs:2920-3711",
+        "obsidian-plugin/src/main.cjs:5047-5323"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329",
+        "tests/plugin-large-vault.test.ts:300-724"
+      ]
+    },
+    "VerifyLocalApply": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-002",
+        "OBTS-SAF-005",
+        "OBTS-SYNC-IMM-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:1301-1435",
+        "obsidian-plugin/src/main.cjs:2015-2693",
+        "obsidian-plugin/src/main.cjs:2920-3711",
+        "obsidian-plugin/src/main.cjs:5047-5323"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329",
+        "tests/plugin-large-vault.test.ts:300-724"
+      ]
+    },
+    "CommitLocalCoordination": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-002",
+        "OBTS-SAF-005",
+        "OBTS-SYNC-IMM-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:1301-1435",
+        "obsidian-plugin/src/main.cjs:2015-2693",
+        "obsidian-plugin/src/main.cjs:2920-3711",
+        "obsidian-plugin/src/main.cjs:5047-5323"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329",
+        "tests/plugin-large-vault.test.ts:300-724"
+      ]
+    },
+    "PersistApplyAckIntent": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-002",
+        "OBTS-SAF-005",
+        "OBTS-SYNC-IMM-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:1301-1435",
+        "obsidian-plugin/src/main.cjs:2015-2693",
+        "obsidian-plugin/src/main.cjs:2920-3711",
+        "obsidian-plugin/src/main.cjs:5047-5323"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329",
+        "tests/plugin-large-vault.test.ts:300-724"
+      ]
+    },
+    "CleanupApplyJournal": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-002",
+        "OBTS-SAF-005",
+        "OBTS-SYNC-IMM-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:1301-1435",
+        "obsidian-plugin/src/main.cjs:2015-2693",
+        "obsidian-plugin/src/main.cjs:2920-3711",
+        "obsidian-plugin/src/main.cjs:5047-5323"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329",
+        "tests/plugin-large-vault.test.ts:300-724"
+      ]
+    },
+    "AcknowledgeDurableApply": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-002",
+        "OBTS-SAF-005",
+        "OBTS-SYNC-IMM-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:1301-1435",
+        "obsidian-plugin/src/main.cjs:2015-2693",
+        "obsidian-plugin/src/main.cjs:2920-3711",
+        "obsidian-plugin/src/main.cjs:5047-5323"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329",
+        "tests/plugin-large-vault.test.ts:300-724"
+      ]
+    },
+    "PrepareDirectoryTombstone": {
+      "category": "directory",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-004",
+        "OBTS-SAF-006"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:3242-3711",
+        "src/server/syncService.ts:2020-2140"
+      ],
+      "tests": [
+        "tests/plugin-large-vault.test.ts:480-650",
+        "tests/phase1.test.ts:845-933"
+      ]
+    },
+    "CommitDirectoryTombstone": {
+      "category": "directory",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-004",
+        "OBTS-SAF-006"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:3242-3711",
+        "src/server/syncService.ts:2020-2140"
+      ],
+      "tests": [
+        "tests/plugin-large-vault.test.ts:480-650",
+        "tests/phase1.test.ts:845-933"
+      ]
+    },
+    "ObserveDirectoryDescendant": {
+      "category": "directory",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-004",
+        "OBTS-SAF-006"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:3242-3711",
+        "src/server/syncService.ts:2020-2140"
+      ],
+      "tests": [
+        "tests/plugin-large-vault.test.ts:480-650",
+        "tests/phase1.test.ts:845-933"
+      ]
+    },
+    "RemoveDirectoryDescendant": {
+      "category": "directory",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-004",
+        "OBTS-SAF-006"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:3242-3711",
+        "src/server/syncService.ts:2020-2140"
+      ],
+      "tests": [
+        "tests/plugin-large-vault.test.ts:480-650",
+        "tests/phase1.test.ts:845-933"
+      ]
+    },
+    "PreflightEmptyDirectory": {
+      "category": "directory",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-004",
+        "OBTS-SAF-006"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:3242-3711",
+        "src/server/syncService.ts:2020-2140"
+      ],
+      "tests": [
+        "tests/plugin-large-vault.test.ts:480-650",
+        "tests/phase1.test.ts:845-933"
+      ]
+    },
+    "DeleteEmptyDirectory": {
+      "category": "directory",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-004",
+        "OBTS-SAF-006"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:3242-3711",
+        "src/server/syncService.ts:2020-2140"
+      ],
+      "tests": [
+        "tests/plugin-large-vault.test.ts:480-650",
+        "tests/phase1.test.ts:845-933"
+      ]
+    },
+    "BeginProjection": {
+      "category": "bridge",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-005",
+        "OBTS-BRG-PROJ-001"
+      ],
+      "code": [
+        "crates/obts-bridge/src/service.rs:243-539",
+        "crates/obts-bridge/src/workers.rs:2460-2920",
+        "crates/obts-bridge/src/persistence.rs:1420-1740"
+      ],
+      "tests": [
+        "tests/headless-protocol.test.ts:1-157"
+      ]
+    },
+    "VerifyProjectionManifest": {
+      "category": "bridge",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-005",
+        "OBTS-BRG-PROJ-001"
+      ],
+      "code": [
+        "crates/obts-bridge/src/service.rs:243-539",
+        "crates/obts-bridge/src/workers.rs:2460-2920",
+        "crates/obts-bridge/src/persistence.rs:1420-1740"
+      ],
+      "tests": [
+        "tests/headless-protocol.test.ts:1-157"
+      ]
+    },
+    "VerifyProjectionBase": {
+      "category": "bridge",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-005",
+        "OBTS-BRG-PROJ-001"
+      ],
+      "code": [
+        "crates/obts-bridge/src/service.rs:243-539",
+        "crates/obts-bridge/src/workers.rs:2460-2920",
+        "crates/obts-bridge/src/persistence.rs:1420-1740"
+      ],
+      "tests": [
+        "tests/headless-protocol.test.ts:1-157"
+      ]
+    },
+    "VerifyProjectionPathOids": {
+      "category": "bridge",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-005",
+        "OBTS-BRG-PROJ-001"
+      ],
+      "code": [
+        "crates/obts-bridge/src/service.rs:243-539",
+        "crates/obts-bridge/src/workers.rs:2460-2920",
+        "crates/obts-bridge/src/persistence.rs:1420-1740"
+      ],
+      "tests": [
+        "tests/headless-protocol.test.ts:1-157"
+      ]
+    },
+    "WriteDerivedProjection": {
+      "category": "bridge",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-005",
+        "OBTS-BRG-PROJ-001"
+      ],
+      "code": [
+        "crates/obts-bridge/src/service.rs:243-539",
+        "crates/obts-bridge/src/workers.rs:2460-2920",
+        "crates/obts-bridge/src/persistence.rs:1420-1740"
+      ],
+      "tests": [
+        "tests/headless-protocol.test.ts:1-157"
+      ]
+    },
+    "AdvanceProjectionCursor": {
+      "category": "bridge",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-005",
+        "OBTS-BRG-PROJ-001"
+      ],
+      "code": [
+        "crates/obts-bridge/src/service.rs:243-539",
+        "crates/obts-bridge/src/workers.rs:2460-2920",
+        "crates/obts-bridge/src/persistence.rs:1420-1740"
+      ],
+      "tests": [
+        "tests/headless-protocol.test.ts:1-157"
+      ]
+    },
+    "FailProjection": {
+      "category": "bridge",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-005",
+        "OBTS-BRG-PROJ-001"
+      ],
+      "code": [
+        "crates/obts-bridge/src/service.rs:243-539",
+        "crates/obts-bridge/src/workers.rs:2460-2920",
+        "crates/obts-bridge/src/persistence.rs:1420-1740"
+      ],
+      "tests": [
+        "tests/headless-protocol.test.ts:1-157"
+      ]
+    },
+    "CrashClient": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-002",
+        "OBTS-SAF-005",
+        "OBTS-SYNC-IMM-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:1301-1435",
+        "obsidian-plugin/src/main.cjs:2015-2693",
+        "obsidian-plugin/src/main.cjs:2920-3711",
+        "obsidian-plugin/src/main.cjs:5047-5323"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329",
+        "tests/plugin-large-vault.test.ts:300-724"
+      ]
+    },
+    "RestartClient": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-002",
+        "OBTS-SAF-005",
+        "OBTS-SYNC-IMM-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:1301-1435",
+        "obsidian-plugin/src/main.cjs:2015-2693",
+        "obsidian-plugin/src/main.cjs:2920-3711",
+        "obsidian-plugin/src/main.cjs:5047-5323"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329",
+        "tests/plugin-large-vault.test.ts:300-724"
+      ]
+    },
+    "ClassifyClientRestart": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-002",
+        "OBTS-SAF-005",
+        "OBTS-SYNC-IMM-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:1301-1435",
+        "obsidian-plugin/src/main.cjs:2015-2693",
+        "obsidian-plugin/src/main.cjs:2920-3711",
+        "obsidian-plugin/src/main.cjs:5047-5323"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329",
+        "tests/plugin-large-vault.test.ts:300-724"
+      ]
+    },
+    "CrashServer": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SAF-004",
+        "OBTS-SAF-005",
+        "OBTS-PER-OP-001"
+      ],
+      "code": [
+        "src/server/syncService.ts:955-1170",
+        "src/server/syncService.ts:2020-2140",
+        "src/server/app.ts:3450-3600"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:4522-4950",
+        "tests/phase2.test.ts:1182-1400"
+      ]
+    },
+    "RestartServer": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SAF-004",
+        "OBTS-SAF-005",
+        "OBTS-PER-OP-001"
+      ],
+      "code": [
+        "src/server/syncService.ts:955-1170",
+        "src/server/syncService.ts:2020-2140",
+        "src/server/app.ts:3450-3600"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:4522-4950",
+        "tests/phase2.test.ts:1182-1400"
+      ]
+    },
+    "PrepareConflictResolutionOperation": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-002",
+        "OBTS-SAF-005",
+        "OBTS-SYNC-IMM-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:1301-1435",
+        "obsidian-plugin/src/main.cjs:2015-2693",
+        "obsidian-plugin/src/main.cjs:2920-3711",
+        "obsidian-plugin/src/main.cjs:5047-5323"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:5963-6329",
+        "tests/plugin-large-vault.test.ts:300-724"
+      ]
+    },
+    "RecoverServerOperation": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-003",
+        "OBTS-SAF-004",
+        "OBTS-SAF-005",
+        "OBTS-PER-OP-001"
+      ],
+      "code": [
+        "src/server/syncService.ts:955-1170",
+        "src/server/syncService.ts:2020-2140",
+        "src/server/app.ts:3450-3600"
+      ],
+      "tests": [
+        "tests/phase1.test.ts:4522-4950",
+        "tests/phase2.test.ts:1182-1400"
+      ]
+    },
+    "CrashRust": {
+      "category": "bridge",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-005",
+        "OBTS-BRG-PROJ-001"
+      ],
+      "code": [
+        "crates/obts-bridge/src/service.rs:243-539",
+        "crates/obts-bridge/src/workers.rs:2460-2920",
+        "crates/obts-bridge/src/persistence.rs:1420-1740"
+      ],
+      "tests": [
+        "tests/headless-protocol.test.ts:1-157"
+      ]
+    },
+    "RestartRust": {
+      "category": "bridge",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SAF-001",
+        "OBTS-SAF-005",
+        "OBTS-BRG-PROJ-001"
+      ],
+      "code": [
+        "crates/obts-bridge/src/service.rs:243-539",
+        "crates/obts-bridge/src/workers.rs:2460-2920",
+        "crates/obts-bridge/src/persistence.rs:1420-1740"
+      ],
+      "tests": [
+        "tests/headless-protocol.test.ts:1-157"
+      ]
+    },
+    "ReplaceInflightTarget": {
+      "category": "control",
+      "controlOnly": true,
+      "contracts": [
+        "OBTS-SAF-001"
+      ],
+      "code": [
+        "architecture/models/formal/OBTSDistributedSync.tla:690-810"
+      ],
+      "tests": [
+        "tests/formal-checker.test.ts:1-54"
+      ]
+    },
+    "DropAcceptedProposal": {
+      "category": "control",
+      "controlOnly": true,
+      "contracts": [
+        "OBTS-SAF-001"
+      ],
+      "code": [
+        "architecture/models/formal/OBTSDistributedSync.tla:690-810"
+      ],
+      "tests": [
+        "tests/formal-checker.test.ts:1-54"
+      ]
+    },
+    "MoveCoveredRefBackward": {
+      "category": "control",
+      "controlOnly": true,
+      "contracts": [
+        "OBTS-SAF-001"
+      ],
+      "code": [
+        "architecture/models/formal/OBTSDistributedSync.tla:690-810"
+      ],
+      "tests": [
+        "tests/formal-checker.test.ts:1-54"
+      ]
+    },
+    "DiscardDivergence": {
+      "category": "control",
+      "controlOnly": true,
+      "contracts": [
+        "OBTS-SAF-001"
+      ],
+      "code": [
+        "architecture/models/formal/OBTSDistributedSync.tla:690-810"
+      ],
+      "tests": [
+        "tests/formal-checker.test.ts:1-54"
+      ]
+    },
+    "MoveMainBeforePreparedEffects": {
+      "category": "control",
+      "controlOnly": true,
+      "contracts": [
+        "OBTS-SAF-001"
+      ],
+      "code": [
+        "architecture/models/formal/OBTSDistributedSync.tla:690-810"
+      ],
+      "tests": [
+        "tests/formal-checker.test.ts:1-54"
+      ]
+    },
+    "AckBeforeDurableApply": {
+      "category": "control",
+      "controlOnly": true,
+      "contracts": [
+        "OBTS-SAF-001"
+      ],
+      "code": [
+        "architecture/models/formal/OBTSDistributedSync.tla:690-810"
+      ],
+      "tests": [
+        "tests/formal-checker.test.ts:1-54"
+      ]
+    },
+    "OverwriteUncapturedBridgeWrite": {
+      "category": "control",
+      "controlOnly": true,
+      "contracts": [
+        "OBTS-SAF-001"
+      ],
+      "code": [
+        "architecture/models/formal/OBTSDistributedSync.tla:690-810"
+      ],
+      "tests": [
+        "tests/formal-checker.test.ts:1-54"
+      ]
+    },
+    "RecursiveDirectoryDelete": {
+      "category": "control",
+      "controlOnly": true,
+      "contracts": [
+        "OBTS-SAF-001"
+      ],
+      "code": [
+        "architecture/models/formal/OBTSDistributedSync.tla:690-810"
+      ],
+      "tests": [
+        "tests/formal-checker.test.ts:1-54"
+      ]
+    },
+    "RestartAbortsMovedRef": {
+      "category": "control",
+      "controlOnly": true,
+      "contracts": [
+        "OBTS-SAF-001"
+      ],
+      "code": [
+        "architecture/models/formal/OBTSDistributedSync.tla:690-810"
+      ],
+      "tests": [
+        "tests/formal-checker.test.ts:1-54"
+      ]
+    },
+    "DuplicateNonIdempotentProcessing": {
+      "category": "control",
+      "controlOnly": true,
+      "contracts": [
+        "OBTS-SAF-001"
+      ],
+      "code": [
+        "architecture/models/formal/OBTSDistributedSync.tla:690-810"
+      ],
+      "tests": [
+        "tests/formal-checker.test.ts:1-54"
+      ]
+    },
+    "MutateRetryIdentity": {
+      "category": "control",
+      "controlOnly": true,
+      "contracts": [
+        "OBTS-SAF-001"
+      ],
+      "code": [
+        "architecture/models/formal/OBTSDistributedSync.tla:690-810"
+      ],
+      "tests": [
+        "tests/formal-checker.test.ts:1-54"
+      ]
+    },
+    "LoseConflictProtection": {
+      "category": "control",
+      "controlOnly": true,
+      "contracts": [
+        "OBTS-SAF-001"
+      ],
+      "code": [
+        "architecture/models/formal/OBTSDistributedSync.tla:690-810"
+      ],
+      "tests": [
+        "tests/formal-checker.test.ts:1-54"
+      ]
+    },
+    "AbortUncertainCAS": {
+      "category": "control",
+      "controlOnly": true,
+      "contracts": [
+        "OBTS-SAF-001"
+      ],
+      "code": [
+        "architecture/models/formal/OBTSDistributedSync.tla:690-810"
+      ],
+      "tests": [
+        "tests/formal-checker.test.ts:1-54"
+      ]
+    },
+    "ConflateSeenAndApplied": {
+      "category": "control",
+      "controlOnly": true,
+      "contracts": [
+        "OBTS-SAF-001"
+      ],
+      "code": [
+        "architecture/models/formal/OBTSDistributedSync.tla:690-810"
+      ],
+      "tests": [
+        "tests/formal-checker.test.ts:1-54"
+      ]
+    },
+    "AdvanceProjectionCursorEarly": {
+      "category": "control",
+      "controlOnly": true,
+      "contracts": [
+        "OBTS-SAF-001"
+      ],
+      "code": [
+        "architecture/models/formal/OBTSDistributedSync.tla:690-810"
+      ],
+      "tests": [
+        "tests/formal-checker.test.ts:1-54"
+      ]
+    }
+  }
+}

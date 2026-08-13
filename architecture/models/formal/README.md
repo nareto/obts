@@ -68,3 +68,80 @@ On `tla-tools` 1.7.4 / TLC 2.19 with one worker and fingerprint polynomial 0:
 ### Known omissions
 
 The model does not cover directories, multiple paths, write concurrency, editor-buffer capture, Git object structure, network/server acknowledgement, byte/checksum implementation, mobile lifecycle, process kill, power loss, filesystem semantics, corrupted finalized bundles, or competing client instances. Those require executable fault tests and platform evidence; a green TLC result makes no claim about them.
+
+## OBTS-FM-002: Composed Distributed Synchronization
+
+| Field | Value |
+| --- | --- |
+| Status | Candidate; one implementation-faithful counterexample remains required |
+| Architecture revision | 3 |
+| Refined contracts | `OBTS-SAF-001` through `OBTS-SAF-006`, `OBTS-SYNC-IMM-001`, `OBTS-SYNC-ACK-001`, `OBTS-PER-OP-001`, `OBTS-BRG-PROJ-001` |
+| Root specification | `OBTSDistributedSync.tla` |
+| Check matrix | `checks.json` (exactly 52 required checks) |
+| Static transition map / future trace schema | `trace/transition-map.json`, `trace/trace-schema.json` |
+| Executable check | `npm run test:formal` |
+
+`OBTSDistributedSync.tla` is the sole composed `Init`, `CoreNext`/`Next`, safety, and liveness authority. Every positive scenario uses the same composed transition relation; scenario constants and guards bound edits, messages, faults, and their meaningful causal seams without state constraints or scenario-specific action whitelists. The composition always contains Plugin1, Plugin2, Bridge Node, Rust Bridge write/projection, server proposal/classification/CAS/conflict/recovery, client apply/ack, directory, and bounded request/reply bag actions. Focused reachability configurations prove claimed triggers rather than relying on one explosive scenario to establish all coverage.
+
+### Durable state and abstraction boundary
+
+- Canonical content is a per-path finite tree. Clean disjoint proposals union their path versions, while same-path divergence enters conflict metadata and three separately durable protection refs.
+- Observation and watcher hints are not capture. `ghost.captured` advances only after local Git and coordination publication; restart classifies durable journal, roots, queue/ref, and visible facts as resume, roll-forward, or block.
+- Immutable attempts include target, expected device ref, base, directory proposal, object plan, attempt ID, and transfer ID. Bounded message bags permit delay, duplication, request/reply loss, stable retry/query, server idempotence, and reply loss after durable outcome.
+- Device/main CAS preparation, side effect, observed old/target/foreign/uncertain reading, and metadata commit are independent. Recovery classifies the durable ref reading rather than trusting an operation phase.
+- Directory proposal/intent identity, generation, acknowledged main/event baseline, prepared/committed result, event identity, and target local deletion are journaled. Physical deletion requires a committed canonical tombstone plus identity and emptiness revalidation.
+- Projection separately verifies manifest, base, and path OIDs, writes complete derived rows, then publishes the cursor/readiness. Failure retains the prior cursor; PostgreSQL never preserves or repairs client state. Audit retention is not modeled or claimed.
+
+Local apply state projects non-vacuously through `modules/OBTSApplyRefinement.tla`; `fm002-apply-refinement` is a positive projection check and `fm002-reach-apply-refinement` proves durable coordination is reachable. This remains a state projection, not a claimed full temporal refinement. Accepted `OBTS-FM-001` continues to run independently with its safety, liveness, and four original controls.
+
+### Check matrix and assumptions
+
+The required matrix contains six FM-001 checks; six FM-002 positive safety checks; four separately fair liveness checks; twenty trigger/action reachability checks; one candidate counterexample; and fifteen distributed negative controls. Removing or retyping any required check fails validation. Candidate architecture status requires at least one required candidate check; accepted status requires zero candidates and all required positives.
+
+Liveness is conditional on bounded edits/crashes, eventual restart, retry/delivery, and no permanent storage failure. Fairness is attached to the concrete action/actor sequence for proposal/result consumption, Rust write to Node capture, server restart/recovery, and main event to durable apply/server acknowledgement. Each obligation has a separate reachable-trigger check; there is no broad fairness disjunction.
+
+The safety bounds include two same-path plugin edits; two disjoint Plugin1/Bridge paths; meaningful client/server/Rust crash seams; and at most two symbolic message copies. The all-actors bound retains every claimed interaction but causally orders the three proposals and bounds each crash/network fault to one relevant seam. Equal, covered, and divergent classifications are independently reachable; divergence never moves the device ref.
+
+### Candidate counterexample
+
+`configs/server-recovery-implementation.cfg` constructs a real divergent second proposal, commits conflict metadata and all three protection refs, prepares a `conflict_resolve` operation, moves `main`, crashes, and recovers from the target ref reading. `ExactPreparedOperationRecovery` then fails because startup recovery models exactly the concrete production omissions relative to online resolution:
+
+- resolving-user attribution;
+- audit row;
+- secondary `conflict_resolved` event;
+- device last-success time.
+
+Online effects are evidenced at `src/server/syncService.ts:827-880`; startup reconstruction is evidenced at `src/server/app.ts:3492-3596`. `evidence/server-recovery-exact-effects.json` is generated from current TLC output and binds the model, config, check definition, invariant, witness sequence, statistics, TLC version, and run hash. The checker rejects stale or unrelated evidence. This discrepancy keeps `OBTS-FM-002` candidate; no production implementation changed in this milestone.
+
+### Negative controls and harness
+
+The fifteen distributed controls mutate one behavior after realistic setup: in-flight target replacement, accepted-root loss, covered-ref rewind, divergent-proposal discard, main move without preparation, early apply acknowledgement, uncaptured Bridge overwrite, recursive tombstone deletion, moved-ref abort, duplicate non-idempotent processing, retry identity mutation, conflict metadata without complete protection, uncertain-CAS abort, seen/applied cursor conflation, and projection cursor publication before complete verification.
+
+The checker requires the exact invariant, witness action, and minimum meaningful trace depth. It rejects timeout, parse/semantic failure, deadlock, wrong invariant, absent/shallow witness, state/depth overflow, required-matrix removal, status mismatch, stale evidence, path traversal, invalid source ranges, state-space collapse, and unexplained greater-than-twofold growth. `tests/formal-checker.test.ts` covers these gates; formal CI runs it before TLC.
+
+### TLC evidence
+
+Final checked run: TLC 2.19, Java 21, one worker, fingerprint polynomial 0. Baselines and lower/upper gates are authoritative in `checks.json`.
+
+| Positive/candidate check | Generated | Distinct | Depth |
+| --- | ---: | ---: | ---: |
+| FM-001 safety / liveness (each) | 237 | 163 | 20 |
+| same-path safety | 116,864 | 28,029 | 77 |
+| disjoint/directory safety | 383,858 | 47,581 | 73 |
+| server recovery contract | 188,452 | 62,080 | 80 |
+| Bridge handoff safety | 378,569 | 61,396 | 44 |
+| all-actors safety | 2,071,813 | 385,576 | 95 |
+| apply projection safety | 496 | 157 | 34 |
+| proposal liveness | 106 | 42 | 27 |
+| Bridge liveness | 16,963 | 2,846 | 39 |
+| server-recovery liveness | 871 | 307 | 48 |
+| apply/ack liveness | 484 | 151 | 34 |
+| implementation candidate | 2,678 | 1,086 | 41 |
+
+All twenty reachability checks produced their required witness. All four FM-001 and fifteen FM-002 negative controls violated exactly their intended invariant with the required meaningful prefix. See the executable summary from `npm run test:formal` for every generated/distinct/depth tuple.
+
+### Traceability and omissions
+
+`trace/transition-map.json` maps every root action and the required production families to existing, range-validated code/test evidence. It cites `obsidian-plugin/src/main.cjs` only within its current 9,652 lines. The schema/map are static design artifacts only: runtime transition instrumentation and replay do not exist, so no runtime trace conformance or implementation proof is claimed.
+
+FM-002 remains bounded and does not prove byte/checksum correctness, Git ancestry implementation, semantic merge formats, filesystem/power-loss durability, editor-buffer flushing, authorization, onboarding, restore, event-pruning recovery, transfer expiry, rename graphs, garbage collection, backup/restore, or real process supervision. Transfer expiry and event-cursor expiry appear in the static production-family map but are not modeled transitions. Audit retention is omitted. The contract-required integrated server/Rust/Node/PostgreSQL deployment fault test remains outstanding.

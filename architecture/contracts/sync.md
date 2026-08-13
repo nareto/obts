@@ -26,7 +26,7 @@ The visible local vault is the device source of truth; coordination metadata is 
 - Missing or corrupt `state.json` is repaired from the valid device token and intact local Git journal before destructive work.
 - Local edits are committed or recoverably snapshotted before upload.
 
-## Immutable Transfer And Integration
+## OBTS-SYNC-IMM-001: Immutable Transfer And Integration
 
 One upload attempt has immutable target commit, expected device ref, proposal base, directory proposal, object plan, attempt ID, and transfer ID until an authoritative outcome is consumed.
 
@@ -76,6 +76,8 @@ When explicit replacement/rebuild is required, OBTS publishes a recovery bundle,
 Reset/reconnect without a trusted same-device cursor treats valid local content as an independent proposal from a trusted vault base, never as another device's ref identity.
 
 ## Pull And Apply
+
+### OBTS-SYNC-ACK-001: Durable Apply Acknowledgement
 
 A client pulls required objects and a manifest for canonical `main`, then applies through Obsidian `Vault`/`DataAdapter` APIs under a local lock and durable apply journal.
 
