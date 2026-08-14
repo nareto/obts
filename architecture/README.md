@@ -19,6 +19,17 @@ This directory is the source of truth for OBTS product boundaries, safety proper
 
 Normative behavior is owned by `contracts/*.md`; OpenAPI is authoritative for the currently executable HTTP surface. When OpenAPI temporarily realizes behavior that conflicts with a normative contract, the affected operation must carry an explicit architecture-deviation annotation linked to its migration issue. Unannotated disagreements are defects: identify whether the discrepancy is an implementation defect, stale model, obsolete decision, or unapproved product change and reconcile it explicitly, normally with an ADR when ownership, protocol, trust, or lifecycle semantics change.
 
+## Artifact Roles And Synchronization
+
+The contracts are the semantic hub. Other artifacts are complementary projections of those contracts and change only when their represented surface changes; they are not duplicate specifications that must all be edited mechanically.
+
+- Authored C4 in `workspace.dsl` describes static structure: people, software systems, containers, components, responsibilities, and relationships. Update it when allocation, ownership, trust boundaries, or deployment relationships change.
+- TLA+ under `models/formal/` describes bounded dynamic behavior: transitions, ordering, concurrency, retries, crashes, and recovery. Each accepted model refines named contract IDs and records its implementation and test mapping.
+- OpenAPI describes the executable HTTP operations, schemas, and errors. It must remain semantically consistent with the contracts or carry a tracked deviation.
+- Production code realizes these artifacts, while executable tests and formal checks provide evidence. Neither code nor a green check silently changes product semantics or proves complete implementation conformance.
+
+The mandatory coding workflow for keeping these artifacts synchronized is defined in root [`AGENTS.md`](../AGENTS.md). This file defines what the architecture artifacts mean; `AGENTS.md` defines what an agent must do when fixing bugs, implementing features, or refactoring production behavior.
+
 ## Contract Set
 
 - [`contracts/product.md`](contracts/product.md): purpose, actors, supported boundary, and non-goals.
@@ -47,7 +58,7 @@ The acknowledgement is commit-local: an unrelated architecture update elsewhere 
 
 The installed pre-push hook can reject a nonconforming local push before ref movement. Forgejo Actions runs the same check after every push as a visible audit; a post-push workflow cannot undo or reject a direct push. Mechanical server-side rejection would require a protected workflow or pre-receive policy, which is outside this repository. Neither mechanism proves semantic synchronization.
 
-Future TLA+ files live under `models/formal/`, refine named contract IDs, and declare the architecture revision they implement. They are analysis artifacts inside this authority system, not a parallel source of product behavior.
+TLA+ files live under `models/formal/`, refine named contract IDs, and declare the latest architecture revision that changed or reviewed their modeled behavior. A model revision may trail the global architecture revision when later changes do not affect that model. Formal models are analysis artifacts inside this authority system, not a parallel source of product behavior.
 
 ## Change Classification
 
