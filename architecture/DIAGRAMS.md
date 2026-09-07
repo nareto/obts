@@ -41,8 +41,8 @@ graph LR
     17-. "Calls authenticated dashboard and conflict APIs [HTTPS]" .->24
     7-. "Uploads immutable Git/directory proposals, polls processing outcomes, pulls canonical state, and reports status [HTTPS]" .->24
     33-. "Supervises lifecycle and sends administrative or synchronization commands [JSON Lines over stdin/stdout]" .->34
-    33-. "Reads and atomically writes authorized ordinary vault files [Filesystem]" .->35
-    33-. "Updates verified content projections and retained access/audit records [PostgreSQL]" .->36
+    33-. "Reads selected ordinary files under the shared headless/filesystem lock, verifies revision/OID, and atomically writes authorized files; releases bounded body work after each operation [Filesystem]" .->35
+    33-. "Queries paginated ACL-visible metadata and candidates, writes verified derived batches/cursors, and retains access/audit records without a full snapshot or raw-body fallback [PostgreSQL]" .->36
     34-. "Owns visible-state reconciliation, hidden Git, credentials, journals, queues, apply, and recovery [Filesystem]" .->35
     34-. "Pairs and synchronizes as a normal protected OBTS device [HTTPS]" .->24
     7-. "Scans and safely applies visible vault content [Obsidian Vault API]" .->37

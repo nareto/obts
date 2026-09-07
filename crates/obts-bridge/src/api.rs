@@ -42,6 +42,7 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[cfg(test)]
     pub async fn with_seed_data() -> Self {
         let config = crate::config::AppConfig::default();
         let runtime_config = RuntimeConfigState::for_tests(&config);
@@ -600,7 +601,11 @@ async fn search_notes(
     }
     let mode = params.mode.unwrap_or_default();
     let limit = params.limit.unwrap_or(20).min(50);
-    let response = state.service.search(&auth, &params.q, mode, limit).await;
+    let response = state
+        .service
+        .search(&auth, &params.q, mode, limit)
+        .await
+        .map_err(map_service_error)?;
     let ids = response
         .results
         .iter()
@@ -655,7 +660,11 @@ async fn query_notes(
     let auth = auth_from_headers(&state, &headers).await?;
     let request = decode_json(payload)?;
     let request_log = json!(&request);
-    let response = state.service.query_notes(&auth, request).await;
+    let response = state
+        .service
+        .query_notes(&auth, request)
+        .await
+        .map_err(map_service_error)?;
     let ids = response
         .notes
         .iter()
@@ -758,7 +767,11 @@ async fn assemble_context_endpoint(
     let auth = auth_from_headers(&state, &headers).await?;
     let request = decode_json(payload)?;
     let request_log = serde_json::to_value(&request).unwrap_or_else(|_| json!({}));
-    let response = state.service.assemble_context(&auth, request).await;
+    let response = state
+        .service
+        .assemble_context(&auth, request)
+        .await
+        .map_err(map_service_error)?;
     let ids = response
         .notes
         .iter()
@@ -784,7 +797,11 @@ async fn find_path(
     let params = decode_query(query)?;
     let from = NoteId::new(params.from);
     let to = NoteId::new(params.to);
-    let response = state.service.shortest_path(&auth, &from, &to).await;
+    let response = state
+        .service
+        .shortest_path(&auth, &from, &to)
+        .await
+        .map_err(map_service_error)?;
     let ids = response.path.clone().unwrap_or_default();
     log_access(
         &state,
@@ -806,7 +823,11 @@ async fn list_tags(
     let params = decode_query(query)?;
     let filter = parse_time_filter(params)?;
     let request_log = json!(&filter);
-    let response = state.service.list_tags(&auth, filter).await;
+    let response = state
+        .service
+        .list_tags(&auth, filter)
+        .await
+        .map_err(map_service_error)?;
     log_access(&state, &auth, "/api/v1/tags", &request_log, &[]).await;
     Ok(Json(response))
 }
@@ -1044,6 +1065,7 @@ fn parse_named_datetime_option(
 
 fn parse_time_filter(params: TimeFilterParams) -> Result<NoteTimeFilter, ApiError> {
     Ok(NoteTimeFilter {
+        updated_strictly_after: None,
         created_after: parse_named_datetime_option(
             "created_after",
             params.created_after.as_deref(),

@@ -1,3 +1,5 @@
+mod sql;
+pub(crate) use sql::embedding::EmbeddingNoteToken;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -116,6 +118,7 @@ pub struct LinkInput {
 
 #[derive(Debug, Clone)]
 pub struct PreparedVaultWrite {
+    pub(crate) body_lease: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub(crate) path: String,
     pub(crate) content: String,
     pub(crate) file_type: NewNoteFileType,
@@ -220,6 +223,8 @@ pub struct RecentNoteSummary {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RecentNotesResponse {
+    #[serde(skip)]
+    pub(crate) _body_lease: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub notes: Vec<RecentNoteSummary>,
     pub total: usize,
     pub total_filtered: usize,
@@ -244,6 +249,8 @@ pub enum SortOrder {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct NoteTimeFilter {
+    #[serde(skip)]
+    pub(crate) updated_strictly_after: Option<DateTime<Utc>>,
     #[serde(default)]
     pub created_after: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -405,6 +412,7 @@ impl UnscopedRecentNoteSummary {
 impl RecentNotesResponse {
     fn new(notes: Vec<RecentNoteSummary>, total: usize, total_filtered: usize) -> Self {
         Self {
+            _body_lease: None,
             notes,
             total,
             total_filtered,
@@ -810,8 +818,14 @@ pub struct VaultStore {
     #[cfg(test)]
     forced_projection_failure: Arc<RwLock<Option<PersistenceFailureKind>>>,
     persistence: Option<Arc<PostgresPersistence>>,
+    source: Option<Arc<crate::filesystem::FilesystemSource>>,
+    projection_batch_rows: usize,
+    projection_batch_bytes: usize,
+    projection_singleton: Arc<tokio::sync::Semaphore>,
+    projection_metrics: Arc<sql::projection::ProjectionMetrics>,
 }
 
+#[cfg(test)]
 impl Default for VaultStore {
     fn default() -> Self {
         Self::new(20)
@@ -819,6 +833,7 @@ impl Default for VaultStore {
 }
 
 impl VaultStore {
+    #[cfg(test)]
     pub fn new(hub_note_threshold: usize) -> Self {
         Self::new_with_optional_persistence_and_auth_config(
             hub_note_threshold,
@@ -827,6 +842,7 @@ impl VaultStore {
         )
     }
 
+    #[cfg(test)]
     pub fn new_with_auth_config(
         hub_note_threshold: usize,
         authorization: RuntimeAuthConfig,
@@ -834,6 +850,7 @@ impl VaultStore {
         Self::new_with_optional_persistence_and_auth_config(hub_note_threshold, None, authorization)
     }
 
+    #[cfg(test)]
     pub fn new_with_persistence(
         hub_note_threshold: usize,
         persistence: Arc<PostgresPersistence>,
@@ -916,7 +933,34 @@ impl VaultStore {
             #[cfg(test)]
             forced_projection_failure: Arc::new(RwLock::new(None)),
             persistence,
+            source: None,
+            projection_batch_rows: 128,
+            projection_batch_bytes: 8 * 1024 * 1024,
+            projection_singleton: Arc::new(tokio::sync::Semaphore::new(1)),
+            projection_metrics: Arc::new(sql::projection::ProjectionMetrics::default()),
         }
+    }
+
+    pub fn with_filesystem(mut self, source: Arc<crate::filesystem::FilesystemSource>) -> Self {
+        assert!(
+            self.persistence.is_some(),
+            "SQL filesystem backend requires PostgreSQL"
+        );
+        self.filesystem_content_authoritative
+            .store(true, Ordering::Release);
+        self.source = Some(source);
+        self
+    }
+
+    pub fn with_projection_budgets(mut self, rows: usize, bytes: u64) -> Self {
+        assert!(rows > 0 && bytes > 0);
+        self.projection_batch_rows = rows;
+        self.projection_batch_bytes = bytes.min(usize::MAX as u64) as usize;
+        self
+    }
+
+    pub fn uses_sql_backend(&self) -> bool {
+        self.source.is_some()
     }
 
     async fn ensure_read_cache_fresh(&self) -> Result<(), crate::persistence::PersistenceError> {
@@ -982,6 +1026,12 @@ impl VaultStore {
     pub async fn hydrate_from_persistence(
         &self,
     ) -> Result<(), crate::persistence::PersistenceError> {
+        if self.uses_sql_backend() {
+            return Err(sqlx::Error::Protocol(
+                "body snapshots are disabled for the SQL filesystem backend".to_string(),
+            )
+            .into());
+        }
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(());
         };
@@ -2418,6 +2468,9 @@ impl VaultStore {
         let now = Utc::now();
         let mut outgoing_links: HashMap<NoteId, Vec<String>> = HashMap::new();
         for link in &guard.links {
+            if !note_readable_for_policy_from_inner(&guard, &config, auth, &link.target_id, now) {
+                continue;
+            }
             outgoing_links
                 .entry(link.source_id.clone())
                 .or_default()
@@ -2829,6 +2882,11 @@ impl VaultStore {
                 Ok(true) => return Err(WriteError::AlreadyExists { path }),
                 Ok(false) => {}
                 Err(error) => {
+                    if self.uses_sql_backend() {
+                        return Err(WriteError::Persistence {
+                            kind: error.failure_kind(),
+                        });
+                    }
                     warn!(
                         error = %error,
                         note_id = %note_id,
@@ -2898,6 +2956,32 @@ impl VaultStore {
             return Ok(());
         };
 
+        if self.uses_sql_backend() && request.file_type.is_markdown() {
+            let template = self
+                .sql_authorized(auth, &NoteId::new(template_id))
+                .await
+                .map_err(|error| match error {
+                    crate::service::ServiceError::NotFound => WriteError::TemplateNotFound {
+                        path: template_id.to_string(),
+                    },
+                    _ => WriteError::Persistence {
+                        kind: PersistenceFailureKind::DatabaseUnavailable,
+                    },
+                })?;
+            let template = self
+                .sql_metadata(&template.id)
+                .await
+                .map_err(|_| WriteError::Persistence {
+                    kind: PersistenceFailureKind::DatabaseUnavailable,
+                })?
+                .ok_or_else(|| WriteError::TemplateNotFound {
+                    path: template_id.to_string(),
+                })?;
+            return validate_markdown_content_against_template(
+                &request.content,
+                &template.frontmatter,
+            );
+        }
         match request.file_type {
             NewNoteFileType::Md => {
                 let template = self
@@ -2956,6 +3040,7 @@ impl VaultStore {
 
         let operation_id = write_operation_id(&path, &request.content, now);
         Ok(PreparedVaultWrite {
+            body_lease: None,
             path,
             content: request.content,
             file_type: request.file_type,
@@ -2999,6 +3084,39 @@ impl VaultStore {
         couchdb_rev: &str,
         publish_after_persistence_failure: bool,
     ) -> Result<LocalProjectionOutcome, WriteError> {
+        if self.uses_sql_backend() {
+            let store = self.clone();
+            let revision = couchdb_rev.to_string();
+            let path = write.path.clone();
+            let coordination = self.read_refresh_lock.clone().lock_owned().await;
+            let result = tokio::spawn(async move {
+                let result = store
+                    .sql_project_write(write, revision, &coordination)
+                    .await;
+                drop(coordination);
+                result
+            })
+            .await
+            .map_err(|_| WriteError::Persistence {
+                kind: PersistenceFailureKind::Unknown,
+            })?;
+            match result {
+                Err(WriteError::Persistence { kind }) if publish_after_persistence_failure => {
+                    let mut health = self.projection_health.write().await;
+                    health.pending.insert(path, couchdb_rev.to_string());
+                    health.last_failure_at = Some(Utc::now());
+                    health.last_failure_kind = Some(kind);
+                    return Ok(LocalProjectionOutcome::Pending { failure_kind: kind });
+                }
+                Ok(outcome) => {
+                    let mut health = self.projection_health.write().await;
+                    health.pending.remove(&path);
+                    health.last_success_at = Some(Utc::now());
+                    return Ok(outcome);
+                }
+                Err(error) => return Err(error),
+            }
+        }
         let couchdb_rev = couchdb_rev.to_string();
         if let Some(note) = write.note.as_mut() {
             note.couchdb_rev = couchdb_rev.clone();
@@ -3081,7 +3199,7 @@ impl VaultStore {
                 prepared.note.content.clone(),
             )
         });
-        {
+        if !self.uses_sql_backend() {
             let mut guard = self.inner.write().await;
             if write.mark_created {
                 guard.created_file_paths.insert(write.path.clone());
@@ -3099,7 +3217,7 @@ impl VaultStore {
 
         let outcome = if let Some(failure_kind) = persistence_failure {
             let mut health = self.projection_health.write().await;
-            health.pending.insert(target_path, couchdb_rev);
+            health.pending.insert(target_path.clone(), couchdb_rev);
             health.last_failure_at = Some(Utc::now());
             health.last_failure_kind = Some(failure_kind);
             LocalProjectionOutcome::Pending { failure_kind }
@@ -3220,6 +3338,7 @@ impl VaultStore {
 
         let operation_id = write_operation_id(&path, &markdown, now);
         Ok(PreparedVaultWrite {
+            body_lease: None,
             path,
             content: markdown,
             file_type: NewNoteFileType::Md,
@@ -3313,6 +3432,15 @@ impl VaultStore {
             .find(|target| target.note_path == file_id.as_str())
     }
 
+    pub(crate) async fn projection_revisions(
+        &self,
+    ) -> Result<HashMap<String, String>, crate::persistence::PersistenceError> {
+        if self.uses_sql_backend() {
+            return self.sql_revisions().await;
+        }
+        Ok(self.indexed_vault_file_revisions().await)
+    }
+
     pub async fn indexed_vault_file_revisions(&self) -> HashMap<String, String> {
         self.prepare_cached_read("filesystem revision snapshot")
             .await;
@@ -3383,7 +3511,26 @@ impl VaultStore {
             .store(true, Ordering::Release);
     }
 
+    pub(crate) async fn drain_projection_writes(&self) {
+        // Lock order is filesystem coordination, then write coordination; detached work never needs the former.
+        let _coordination = self.read_refresh_lock.lock().await;
+    }
+
     pub async fn delete_filesystem_file(&self, file_id: &NoteId) -> Result<(), WriteError> {
+        if self.uses_sql_backend() {
+            let store = self.clone();
+            let path = file_id.to_string();
+            let coordination = self.read_refresh_lock.clone().lock_owned().await;
+            return tokio::spawn(async move {
+                let result = store.sql_delete_projection(&path, &coordination).await;
+                drop(coordination);
+                result
+            })
+            .await
+            .map_err(|_| WriteError::Persistence {
+                kind: PersistenceFailureKind::Unknown,
+            })?;
+        }
         self.commit_confirmed_vault_file_deletion(file_id).await
     }
 
@@ -3417,6 +3564,7 @@ impl VaultStore {
         let operation_id =
             write_operation_id(&recovered.path, &recovered.content, recovered.updated_at);
         PreparedVaultWrite {
+            body_lease: None,
             path: recovered.path,
             content: recovered.content,
             file_type: recovered.file_type,
@@ -3611,6 +3759,34 @@ impl VaultStore {
             )
         };
 
+        self.prepare_edit_from_parts(
+            auth,
+            request,
+            now,
+            path,
+            file_type,
+            existing_content,
+            existing_created_at,
+            existing_frontmatter,
+            policy_note,
+            expected_couchdb_rev,
+        )
+        .await
+    }
+
+    async fn prepare_edit_from_parts(
+        &self,
+        auth: &AuthContext,
+        request: UpdateNoteRequest,
+        now: DateTime<Utc>,
+        path: String,
+        file_type: NewNoteFileType,
+        existing_content: String,
+        existing_created_at: Option<DateTime<Utc>>,
+        existing_frontmatter: Option<Value>,
+        policy_note: PolicyNote,
+        expected_couchdb_rev: String,
+    ) -> Result<PreparedVaultWrite, WriteError> {
         let actual_sha256 = hex::encode(Sha256::digest(existing_content.as_bytes()));
         if let Some(expected) = request.expected_sha256.as_deref() {
             let expected = expected.strip_prefix("sha256:").unwrap_or(expected);
@@ -3690,6 +3866,7 @@ impl VaultStore {
 
         let operation_id = write_operation_id(&path, &content, now);
         Ok(PreparedVaultWrite {
+            body_lease: None,
             path,
             content,
             file_type,
@@ -3728,6 +3905,7 @@ impl VaultStore {
     }
 
     /// Worker B primitive: claim a batch of notes that still need embeddings.
+    #[cfg(test)]
     pub async fn pending_embedding_ids(&self, limit: usize) -> Vec<NoteId> {
         if let Some(persistence) = self.persistence.as_ref() {
             match persistence
@@ -3762,6 +3940,7 @@ impl VaultStore {
     }
 
     /// Worker B primitive: fetch note bodies needing embeddings (with breadcrumb prefix).
+    #[cfg(test)]
     pub async fn pending_embedding_batch(
         &self,
         limit: usize,
@@ -3819,6 +3998,7 @@ impl VaultStore {
     }
 
     /// Record an embedding failure for a note (increments failure counter).
+    #[cfg(test)]
     pub async fn record_embedding_failure(&self, note_id: &NoteId) {
         if let Some(persistence) = self.persistence.as_ref()
             && let Err(error) = persistence.record_embedding_failure(note_id.as_str()).await
@@ -3832,6 +4012,7 @@ impl VaultStore {
     }
 
     /// Worker B primitive: persist embeddings from an external provider.
+    #[cfg(test)]
     pub async fn set_embeddings(&self, updates: Vec<(NoteId, Vec<f32>)>) -> usize {
         let persistence = self.persistence.clone();
         let persisted_updates = updates
@@ -3875,6 +4056,7 @@ impl VaultStore {
     }
 
     /// Worker B primitive: fetch blocks needing embeddings (persistence-only).
+    #[cfg(test)]
     pub async fn pending_block_embedding_batch(
         &self,
         limit: usize,
@@ -3914,6 +4096,7 @@ impl VaultStore {
     }
 
     /// Worker B primitive: persist block embeddings from an external provider.
+    #[cfg(test)]
     pub async fn set_block_embeddings(&self, updates: Vec<(String, Vec<f32>)>) -> usize {
         let count = updates.len();
         let Some(persistence) = self.persistence.as_ref() else {
@@ -3926,6 +4109,7 @@ impl VaultStore {
         count
     }
 
+    #[cfg(test)]
     pub async fn record_block_embedding_failure(&self, block_id: &str, message: &str) {
         if let Some(persistence) = self.persistence.as_ref()
             && let Err(error) = persistence
@@ -3963,7 +4147,20 @@ impl VaultStore {
     }
 
     /// Sync blocks for a note after upsert. Persistence-only, no in-memory state.
-    async fn sync_blocks_for_note(&self, note_id: &str, path: &str, title: &str, content: &str) {
+    async fn sync_blocks_for_note(
+        &self,
+        _note_id: &str,
+        _path: &str,
+        _title: &str,
+        _content: &str,
+    ) {
+        #[cfg(test)]
+        self.sync_fixture_blocks(_note_id, _path, _title, _content)
+            .await;
+    }
+
+    #[cfg(test)]
+    async fn sync_fixture_blocks(&self, note_id: &str, path: &str, title: &str, content: &str) {
         let Some(persistence) = self.persistence.as_ref() else {
             return;
         };
@@ -4000,6 +4197,7 @@ impl VaultStore {
 
     /// Worker B primitive: embed up to `batch_size` pending notes.
     /// Returns the number of notes updated in this pass.
+    #[cfg(test)]
     pub async fn run_embedding_pass(&self, batch_size: usize, dimensions: usize) -> usize {
         let effective_batch = batch_size.max(1);
         let effective_dimensions = dimensions.max(1);
@@ -4083,7 +4281,13 @@ impl VaultStore {
             block_embedding_stats.last_error,
         );
         drop(guard);
-        self.apply_projection_health_to_status(&mut status, "healthy")
+        let postgres_state =
+            if self.uses_sql_backend() && self.sql_status_metrics(&mut status).await.is_err() {
+                "unavailable"
+            } else {
+                "healthy"
+            };
+        self.apply_projection_health_to_status(&mut status, postgres_state)
             .await;
         status
     }
@@ -4468,6 +4672,7 @@ impl VaultStore {
             let updated_at = note.updated_at;
             let operation_id = write_operation_id(&path, &raw_content, updated_at);
             let write = PreparedVaultWrite {
+                body_lease: None,
                 path,
                 content: raw_content,
                 file_type: NewNoteFileType::Md,
@@ -4672,6 +4877,7 @@ fn delete_vault_file_locked(guard: &mut StoreInner, path: &str) -> bool {
 fn get_vault_file_from_inner(guard: &StoreInner, path: &str) -> Option<VaultFile> {
     let file = guard.vault_files.get(path)?;
     Some(VaultFile {
+        _body_lease: None,
         id: NoteId::new(path),
         path: path.to_string(),
         file_type: file_type_from_path(path),

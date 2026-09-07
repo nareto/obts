@@ -45,10 +45,10 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
         dashboardHost = component "Dashboard host" "Serves the built SPA and dashboard APIs." "Fastify"
       }
 
-      bridge = container "OBTS Bridge API and indexer" "Exposes scoped REST/MCP tools, enforces ACLs and revisions, mutates ordinary headless-vault files, and maintains PostgreSQL query/audit state." "Rust, Axum, SQLx"
+      bridge = container "OBTS Bridge API and indexer" "Exposes scoped REST/MCP tools, performs SQL-first ACL/metadata query planning, mutates ordinary headless-vault files, and hydrates only selected attested bodies within finite per-file/in-flight/batch budgets." "Rust, Axum, SQLx"
       headlessClient = container "Headless OBTS client" "Runs the shared client core without Obsidian and owns pairing, hidden Git, queues, transfer, apply, and recovery for the agent-facing device." "Node.js, TypeScript"
       bridgeVault = container "Bridge visible vault and .obts state" "Authoritative persistent headless device state; may contain the only copy of a pending agent edit." "Filesystem" "File System"
-      bridgeProjection = container "Bridge PostgreSQL state" "Rebuildable content-derived query/projection rows plus retained non-reconstructable access and audit history." "PostgreSQL, pgvector" "Database"
+      bridgeProjection = container "Bridge PostgreSQL state" "Paginated metadata, ACL/search/graph/Base/revision/OID projection rows and bounded worker cursors, plus retained non-reconstructable access and audit history; never the raw-body source of truth." "PostgreSQL, pgvector" "Database"
       localVault = container "Visible vault" "User-controlled Obsidian files. The filesystem is the device source of truth." "Obsidian Vault API, filesystem" "File System"
       localStore = container ".obts local store" "Local Git journal, immutable upload journal, durable watcher paths, scan cache/watermark, causal directory and baseline-repair state, apply journal, credentials, and recovery bundles. Excluded from synchronization." "Filesystem" "File System"
       metadataStore = container "Metadata store" "Durable JSON metadata for accounts, devices, operations, events, conflicts, and directory proposal outcomes." "JSON file adapter" "Database"
@@ -113,14 +113,14 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
         "protocol" "stdio"
       }
     }
-    obts.bridge -> obts.bridgeVault "Reads and atomically writes authorized ordinary vault files" "Filesystem" {
+    obts.bridge -> obts.bridgeVault "Reads selected ordinary files under the shared headless/filesystem lock, verifies revision/OID, and atomically writes authorized files; releases bounded body work after each operation" "Filesystem" {
       properties {
         "ops" "read,write"
         "protocol" "filesystem"
         "write-surface" "visible vault excluding .obts"
       }
     }
-    obts.bridge -> obts.bridgeProjection "Updates verified content projections and retained access/audit records" "PostgreSQL" {
+    obts.bridge -> obts.bridgeProjection "Queries paginated ACL-visible metadata and candidates, writes verified derived batches/cursors, and retains access/audit records without a full snapshot or raw-body fallback" "PostgreSQL" {
       properties {
         "ops" "read,write"
         "protocol" "SQL"

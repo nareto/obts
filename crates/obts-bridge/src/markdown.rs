@@ -1,3 +1,6 @@
+mod stream;
+pub use stream::semantic_blocks;
+
 use std::ops::Range;
 
 use comrak::{

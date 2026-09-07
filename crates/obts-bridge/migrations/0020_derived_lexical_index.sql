@@ -1,0 +1,10 @@
+ALTER TABLE notes ADD COLUMN lexical_title TEXT;
+ALTER TABLE notes ADD COLUMN lexical_plaintext TEXT;
+ALTER TABLE vault_files ALTER COLUMN projected_row_count TYPE BIGINT;
+UPDATE vault_files SET projection_complete=FALSE;
+ALTER TABLE notes ADD COLUMN policy_owner TEXT;
+ALTER TABLE notes ADD COLUMN policy_title_ascii TEXT;
+ALTER TABLE notes ADD COLUMN projection_hub BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE tags ADD COLUMN policy_tag TEXT;
+CREATE INDEX ON tags(policy_tag,note_id);
+ALTER TABLE notes ADD COLUMN body_bytes BIGINT NOT NULL DEFAULT 0;

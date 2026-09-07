@@ -1,7 +1,7 @@
 schema_version: 1
-revision: 5
+revision: 6
 status: current
-updated: 2026-08-14
+updated: 2026-09-05
 authoritative_artifacts:
   - architecture/manifest.yaml
   - architecture/README.md
@@ -38,3 +38,18 @@ formal_models:
       - OBTS-SYNC-ACK-001
       - OBTS-PER-OP-001
       - OBTS-BRG-PROJ-001
+  - id: OBTS-FM-003
+    status: accepted
+    path: architecture/models/formal/OBTSBridgeBoundedBody.tla
+    architecture_revision: 6
+    checks: architecture/models/formal/checks-fm003.json
+    trace_map: architecture/models/formal/trace/fm003-trace-map.json
+    companion_path: architecture/models/formal/OBTSBridgeEmbeddingWorker.tla
+    companion_checks: architecture/models/formal/checks-fm003-workers.json
+    companion_trace_map: architecture/models/formal/trace/fm003-worker-trace-map.json
+    companion_action_coverage: architecture/models/formal/trace/fm003-worker-action-coverage.json
+    refines:
+      - OBTS-BRG-PROJ-001
+      - OBTS-BRG-BODY-001
+      - OBTS-BRG-QUERY-001
+      - OBTS-BRG-EMBED-001

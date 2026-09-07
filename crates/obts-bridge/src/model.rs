@@ -52,6 +52,8 @@ pub struct UnscopedNote {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Note {
+    #[serde(skip)]
+    pub(crate) _body_lease: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub id: NoteId,
     pub path: String,
     pub title: String,
@@ -73,6 +75,8 @@ pub struct Note {
 /// are available through the existing note-index APIs for .md files.
 #[derive(Debug, Clone, Serialize)]
 pub struct VaultFile {
+    #[serde(skip)]
+    pub(crate) _body_lease: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub id: NoteId,
     pub path: String,
     pub file_type: NewNoteFileType,
@@ -87,6 +91,7 @@ pub struct VaultFile {
 impl UnscopedNote {
     pub fn into_note(self) -> Note {
         Note {
+            _body_lease: None,
             id: self.id.clone(),
             path: self.path,
             title: self.title,

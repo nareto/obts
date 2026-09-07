@@ -1,0 +1,937 @@
+{
+  "schemaVersion": 1,
+  "modelId": "OBTS-FM-003",
+  "architectureRevision": 6,
+  "architectureStatus": "accepted",
+  "tooling": {
+    "workers": 1,
+    "fingerprintPolynomial": 0,
+    "defaultTimeoutMs": 60000,
+    "defaultHeapMb": 1024,
+    "defaultMaximumDistinctStates": 100000,
+    "moduleLibrary": "modules",
+    "traceMap": "trace/fm003-worker-trace-map.json",
+    "counterexamples": "trace/fm003-worker-counterexamples.json",
+    "actionCoverage": "trace/fm003-worker-action-coverage.json"
+  },
+  "model": "OBTSBridgeEmbeddingWorker.tla",
+  "checks": [
+    {
+      "id": "fm003-worker-note-safety",
+      "config": "worker-configs/fm003-worker-note-safety.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "baseline": {
+        "generated": 287,
+        "distinct": 196,
+        "depth": 30,
+        "minGenerated": 143,
+        "minDistinct": 98,
+        "minDepth": 15
+      }
+    },
+    {
+      "id": "fm003-worker-note-liveness",
+      "config": "worker-configs/fm003-worker-note-liveness.cfg",
+      "kind": "positive-liveness",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "baseline": {
+        "generated": 287,
+        "distinct": 196,
+        "depth": 30,
+        "minGenerated": 143,
+        "minDistinct": 98,
+        "minDepth": 15
+      }
+    },
+    {
+      "id": "fm003-worker-block-hash-safety",
+      "config": "worker-configs/fm003-worker-block-hash-safety.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "baseline": {
+        "generated": 141,
+        "distinct": 104,
+        "depth": 29,
+        "minGenerated": 70,
+        "minDistinct": 52,
+        "minDepth": 14
+      }
+    },
+    {
+      "id": "fm003-worker-block-hash-liveness",
+      "config": "worker-configs/fm003-worker-block-hash-liveness.cfg",
+      "kind": "positive-liveness",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "baseline": {
+        "generated": 141,
+        "distinct": 104,
+        "depth": 29,
+        "minGenerated": 70,
+        "minDistinct": 52,
+        "minDepth": 14
+      }
+    },
+    {
+      "id": "fm003-worker-block-epoch-safety",
+      "config": "worker-configs/fm003-worker-block-epoch-safety.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "baseline": {
+        "generated": 141,
+        "distinct": 104,
+        "depth": 29,
+        "minGenerated": 70,
+        "minDistinct": 52,
+        "minDepth": 14
+      }
+    },
+    {
+      "id": "fm003-worker-block-epoch-liveness",
+      "config": "worker-configs/fm003-worker-block-epoch-liveness.cfg",
+      "kind": "positive-liveness",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "baseline": {
+        "generated": 141,
+        "distinct": 104,
+        "depth": 29,
+        "minGenerated": 70,
+        "minDistinct": 52,
+        "minDepth": 14
+      }
+    },
+    {
+      "id": "fm003-worker-failure-safety",
+      "config": "worker-configs/fm003-worker-failure-safety.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "baseline": {
+        "generated": 1334,
+        "distinct": 908,
+        "depth": 39,
+        "minGenerated": 667,
+        "minDistinct": 454,
+        "minDepth": 19
+      }
+    },
+    {
+      "id": "fm003-worker-failure-liveness",
+      "config": "worker-configs/fm003-worker-failure-liveness.cfg",
+      "kind": "positive-liveness",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "baseline": {
+        "generated": 1334,
+        "distinct": 908,
+        "depth": 39,
+        "minGenerated": 667,
+        "minDistinct": 454,
+        "minDepth": 19
+      }
+    },
+    {
+      "id": "fm003-worker-cancel-safety",
+      "config": "worker-configs/fm003-worker-cancel-safety.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "baseline": {
+        "generated": 1126,
+        "distinct": 759,
+        "depth": 38,
+        "minGenerated": 563,
+        "minDistinct": 379,
+        "minDepth": 19
+      }
+    },
+    {
+      "id": "fm003-worker-cancel-liveness",
+      "config": "worker-configs/fm003-worker-cancel-liveness.cfg",
+      "kind": "positive-liveness",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "baseline": {
+        "generated": 1126,
+        "distinct": 759,
+        "depth": 38,
+        "minGenerated": 563,
+        "minDistinct": 379,
+        "minDepth": 19
+      }
+    },
+    {
+      "id": "fm003-worker-reindex-safety",
+      "config": "worker-configs/fm003-worker-reindex-safety.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "baseline": {
+        "generated": 287,
+        "distinct": 196,
+        "depth": 30,
+        "minGenerated": 143,
+        "minDistinct": 98,
+        "minDepth": 15
+      }
+    },
+    {
+      "id": "fm003-worker-reindex-liveness",
+      "config": "worker-configs/fm003-worker-reindex-liveness.cfg",
+      "kind": "positive-liveness",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "baseline": {
+        "generated": 287,
+        "distinct": 196,
+        "depth": 30,
+        "minGenerated": 143,
+        "minDistinct": 98,
+        "minDepth": 15
+      }
+    },
+    {
+      "id": "fm003-worker-reach-stale-note-success",
+      "config": "worker-configs/fm003-worker-reach-stale-note-success.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "requiredWitness": "CompleteSQL",
+      "minimumTraceDepth": 13,
+      "expectedInvariant": "NeverStaleSuccess",
+      "baseline": {
+        "generated": 118,
+        "distinct": 76,
+        "depth": 14,
+        "minGenerated": 59,
+        "minDistinct": 38,
+        "minDepth": 7
+      }
+    },
+    {
+      "id": "fm003-worker-reach-stale-block-success",
+      "config": "worker-configs/fm003-worker-reach-stale-block-success.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "requiredWitness": "CompleteSQL",
+      "minimumTraceDepth": 12,
+      "expectedInvariant": "NeverStaleSuccess",
+      "baseline": {
+        "generated": 63,
+        "distinct": 47,
+        "depth": 13,
+        "minGenerated": 31,
+        "minDistinct": 23,
+        "minDepth": 6
+      }
+    },
+    {
+      "id": "fm003-worker-reach-stale-note-failure",
+      "config": "worker-configs/fm003-worker-reach-stale-note-failure.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "requiredWitness": "CompleteSQL",
+      "minimumTraceDepth": 10,
+      "expectedInvariant": "NeverStaleFailure",
+      "baseline": {
+        "generated": 119,
+        "distinct": 84,
+        "depth": 11,
+        "minGenerated": 59,
+        "minDistinct": 42,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm003-worker-reach-stale-block-failure",
+      "config": "worker-configs/fm003-worker-reach-stale-block-failure.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "requiredWitness": "CompleteSQL",
+      "minimumTraceDepth": 9,
+      "expectedInvariant": "NeverStaleFailure",
+      "baseline": {
+        "generated": 56,
+        "distinct": 46,
+        "depth": 10,
+        "minGenerated": 28,
+        "minDistinct": 23,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm003-worker-reach-old-source-result",
+      "config": "worker-configs/fm003-worker-reach-old-source-result.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "requiredWitness": "CompleteSQL",
+      "minimumTraceDepth": 12,
+      "expectedInvariant": "NeverOldSourceResult",
+      "baseline": {
+        "generated": 101,
+        "distinct": 68,
+        "depth": 13,
+        "minGenerated": 50,
+        "minDistinct": 34,
+        "minDepth": 6
+      }
+    },
+    {
+      "id": "fm003-worker-reach-late-cancelled-result",
+      "config": "worker-configs/fm003-worker-reach-late-cancelled-result.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "requiredWitness": "LateReply",
+      "minimumTraceDepth": 7,
+      "expectedInvariant": "NeverLateIgnored",
+      "baseline": {
+        "generated": 19,
+        "distinct": 19,
+        "depth": 8,
+        "minGenerated": 9,
+        "minDistinct": 9,
+        "minDepth": 4
+      }
+    },
+    {
+      "id": "fm003-worker-reach-new-generation-retry",
+      "config": "worker-configs/fm003-worker-reach-new-generation-retry.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "requiredWitness": "CompleteSQL",
+      "minimumTraceDepth": 22,
+      "expectedInvariant": "NeverNewReady",
+      "baseline": {
+        "generated": 793,
+        "distinct": 529,
+        "depth": 23,
+        "minGenerated": 396,
+        "minDistinct": 264,
+        "minDepth": 11
+      }
+    },
+    {
+      "id": "fm003-worker-reach-api-wait",
+      "config": "worker-configs/fm003-worker-reach-api-wait.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "requiredWitness": "ApiHeadless",
+      "minimumTraceDepth": 6,
+      "expectedInvariant": "NeverApiWait",
+      "baseline": {
+        "generated": 9,
+        "distinct": 9,
+        "depth": 7,
+        "minGenerated": 4,
+        "minDistinct": 4,
+        "minDepth": 3
+      }
+    },
+    {
+      "id": "fm003-worker-reach-attestation-reject",
+      "config": "worker-configs/fm003-worker-reach-attestation-reject.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "requiredWitness": "RejectAttestation",
+      "minimumTraceDepth": 14,
+      "expectedInvariant": "NeverRejected",
+      "baseline": {
+        "generated": 338,
+        "distinct": 222,
+        "depth": 15,
+        "minGenerated": 169,
+        "minDistinct": 111,
+        "minDepth": 7
+      }
+    },
+    {
+      "id": "fm003-worker-negative-empty-inner",
+      "config": "worker-configs/fm003-worker-negative-empty-inner.cfg",
+      "kind": "negative-liveness",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "requiredWitness": "LegacyEmptySnapshot",
+      "minimumTraceDepth": 2,
+      "expectedProperty": "EventuallyReady",
+      "baseline": {
+        "generated": 3,
+        "distinct": 2,
+        "depth": 2,
+        "minGenerated": 1,
+        "minDistinct": 1,
+        "minDepth": 1
+      }
+    },
+    {
+      "id": "fm003-worker-negative-id-success",
+      "config": "worker-configs/fm003-worker-negative-id-success.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "requiredWitness": "CompleteSQL",
+      "minimumTraceDepth": 13,
+      "expectedInvariant": "GenerationSafe",
+      "baseline": {
+        "generated": 118,
+        "distinct": 76,
+        "depth": 14,
+        "minGenerated": 59,
+        "minDistinct": 38,
+        "minDepth": 7
+      }
+    },
+    {
+      "id": "fm003-worker-negative-id-failure",
+      "config": "worker-configs/fm003-worker-negative-id-failure.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "requiredWitness": "CompleteSQL",
+      "minimumTraceDepth": 10,
+      "expectedInvariant": "GenerationSafe",
+      "baseline": {
+        "generated": 119,
+        "distinct": 84,
+        "depth": 11,
+        "minGenerated": 59,
+        "minDistinct": 42,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm003-worker-negative-ignored-hash",
+      "config": "worker-configs/fm003-worker-negative-ignored-hash.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "requiredWitness": "CompleteSQL",
+      "minimumTraceDepth": 12,
+      "expectedInvariant": "GenerationSafe",
+      "baseline": {
+        "generated": 63,
+        "distinct": 47,
+        "depth": 13,
+        "minGenerated": 31,
+        "minDistinct": 23,
+        "minDepth": 6
+      }
+    },
+    {
+      "id": "fm003-worker-negative-ignored-epoch",
+      "config": "worker-configs/fm003-worker-negative-ignored-epoch.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "requiredWitness": "CompleteSQL",
+      "minimumTraceDepth": 12,
+      "expectedInvariant": "GenerationSafe",
+      "baseline": {
+        "generated": 63,
+        "distinct": 47,
+        "depth": 13,
+        "minGenerated": 31,
+        "minDistinct": 23,
+        "minDepth": 6
+      }
+    },
+    {
+      "id": "fm003-worker-negative-reindex-id",
+      "config": "worker-configs/fm003-worker-negative-reindex-id.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "requiredWitness": "CompleteSQL",
+      "minimumTraceDepth": 13,
+      "expectedInvariant": "GenerationSafe",
+      "baseline": {
+        "generated": 118,
+        "distinct": 76,
+        "depth": 14,
+        "minGenerated": 59,
+        "minDistinct": 38,
+        "minDepth": 7
+      }
+    },
+    {
+      "id": "fm003-worker-negative-cancelled-result",
+      "config": "worker-configs/fm003-worker-negative-cancelled-result.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "requiredWitness": "LateReply",
+      "minimumTraceDepth": 7,
+      "expectedInvariant": "CancelledSafe",
+      "baseline": {
+        "generated": 19,
+        "distinct": 19,
+        "depth": 8,
+        "minGenerated": 9,
+        "minDistinct": 9,
+        "minDepth": 4
+      }
+    },
+    {
+      "id": "fm003-worker-negative-inverse-acquire",
+      "config": "worker-configs/fm003-worker-negative-inverse-acquire.cfg",
+      "kind": "negative-deadlock",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "requiredWitness": "ApiHeadless",
+      "minimumTraceDepth": 3,
+      "requiredState": [
+        "body |-> \"worker\"",
+        "headless |-> \"api\"",
+        "api |-> \"WaitBody\"",
+        "w |-> \"WantHeadless\""
+      ],
+      "baseline": {
+        "generated": 6,
+        "distinct": 6,
+        "depth": 5,
+        "minGenerated": 3,
+        "minDistinct": 3,
+        "minDepth": 2
+      }
+    },
+    {
+      "id": "fm003-worker-negative-completion-lock",
+      "config": "worker-configs/fm003-worker-negative-completion-lock.cfg",
+      "kind": "negative-deadlock",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "requiredWitness": "ApiHeadless",
+      "minimumTraceDepth": 11,
+      "requiredState": [
+        "body |-> \"worker\"",
+        "headless |-> \"api\"",
+        "api |-> \"WaitBody\"",
+        "w |-> \"Complete\""
+      ],
+      "baseline": {
+        "generated": 32,
+        "distinct": 27,
+        "depth": 13,
+        "minGenerated": 16,
+        "minDistinct": 13,
+        "minDepth": 6
+      }
+    },
+    {
+      "id": "fm003-worker-schema-note-safety",
+      "config": "worker-configs/fm003-worker-schema-note-safety.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "baseline": {
+        "generated": 924,
+        "distinct": 671,
+        "depth": 38,
+        "minGenerated": 462,
+        "minDistinct": 335,
+        "minDepth": 19
+      }
+    },
+    {
+      "id": "fm003-worker-schema-note-liveness",
+      "config": "worker-configs/fm003-worker-schema-note-liveness.cfg",
+      "kind": "positive-liveness",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "baseline": {
+        "generated": 924,
+        "distinct": 671,
+        "depth": 38,
+        "minGenerated": 462,
+        "minDistinct": 335,
+        "minDepth": 19
+      }
+    },
+    {
+      "id": "fm003-worker-schema-block-safety",
+      "config": "worker-configs/fm003-worker-schema-block-safety.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "baseline": {
+        "generated": 924,
+        "distinct": 671,
+        "depth": 38,
+        "minGenerated": 462,
+        "minDistinct": 335,
+        "minDepth": 19
+      }
+    },
+    {
+      "id": "fm003-worker-schema-block-liveness",
+      "config": "worker-configs/fm003-worker-schema-block-liveness.cfg",
+      "kind": "positive-liveness",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "baseline": {
+        "generated": 924,
+        "distinct": 671,
+        "depth": 38,
+        "minGenerated": 462,
+        "minDistinct": 335,
+        "minDepth": 19
+      }
+    },
+    {
+      "id": "fm003-worker-schema-reindex-safety",
+      "config": "worker-configs/fm003-worker-schema-reindex-safety.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "baseline": {
+        "generated": 924,
+        "distinct": 671,
+        "depth": 38,
+        "minGenerated": 462,
+        "minDistinct": 335,
+        "minDepth": 19
+      }
+    },
+    {
+      "id": "fm003-worker-schema-reindex-liveness",
+      "config": "worker-configs/fm003-worker-schema-reindex-liveness.cfg",
+      "kind": "positive-liveness",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "baseline": {
+        "generated": 924,
+        "distinct": 671,
+        "depth": 38,
+        "minGenerated": 462,
+        "minDistinct": 335,
+        "minDepth": 19
+      }
+    },
+    {
+      "id": "fm003-worker-reach-schema-note-success",
+      "config": "worker-configs/fm003-worker-reach-schema-note-success.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "expectedInvariant": "NeverStaleSuccess",
+      "requiredWitness": "CompleteSQL",
+      "minimumTraceDepth": 12,
+      "baseline": {
+        "generated": 128,
+        "distinct": 93,
+        "depth": 13,
+        "minGenerated": 64,
+        "minDistinct": 46,
+        "minDepth": 6
+      }
+    },
+    {
+      "id": "fm003-worker-reach-schema-note-failure",
+      "config": "worker-configs/fm003-worker-reach-schema-note-failure.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "expectedInvariant": "NeverStaleFailure",
+      "requiredWitness": "CompleteSQL",
+      "minimumTraceDepth": 9,
+      "baseline": {
+        "generated": 50,
+        "distinct": 41,
+        "depth": 10,
+        "minGenerated": 25,
+        "minDistinct": 20,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm003-worker-reach-schema-block-success",
+      "config": "worker-configs/fm003-worker-reach-schema-block-success.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "expectedInvariant": "NeverStaleSuccess",
+      "requiredWitness": "CompleteSQL",
+      "minimumTraceDepth": 12,
+      "baseline": {
+        "generated": 128,
+        "distinct": 93,
+        "depth": 13,
+        "minGenerated": 64,
+        "minDistinct": 46,
+        "minDepth": 6
+      }
+    },
+    {
+      "id": "fm003-worker-reach-schema-block-failure",
+      "config": "worker-configs/fm003-worker-reach-schema-block-failure.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "expectedInvariant": "NeverStaleFailure",
+      "requiredWitness": "CompleteSQL",
+      "minimumTraceDepth": 9,
+      "baseline": {
+        "generated": 50,
+        "distinct": 41,
+        "depth": 10,
+        "minGenerated": 25,
+        "minDistinct": 20,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm003-worker-reach-schema-retry",
+      "config": "worker-configs/fm003-worker-reach-schema-retry.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "expectedInvariant": "NeverSchemaReady",
+      "requiredWitness": "CompleteSQL",
+      "minimumTraceDepth": 21,
+      "baseline": {
+        "generated": 437,
+        "distinct": 325,
+        "depth": 22,
+        "minGenerated": 218,
+        "minDistinct": 162,
+        "minDepth": 11
+      }
+    },
+    {
+      "id": "fm003-worker-reach-schema-pending-sql",
+      "config": "worker-configs/fm003-worker-reach-schema-pending-sql.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "expectedInvariant": "NeverResetPendingSQL",
+      "requiredWitness": "SchemaReset",
+      "minimumTraceDepth": 8,
+      "baseline": {
+        "generated": 29,
+        "distinct": 26,
+        "depth": 9,
+        "minGenerated": 14,
+        "minDistinct": 13,
+        "minDepth": 4
+      }
+    },
+    {
+      "id": "fm003-worker-reach-inverse-headless",
+      "config": "worker-configs/fm003-worker-reach-inverse-headless.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "expectedInvariant": "NeverInverseHeadless",
+      "requiredWitness": "InverseHeadless",
+      "minimumTraceDepth": 3,
+      "baseline": {
+        "generated": 4,
+        "distinct": 4,
+        "depth": 4,
+        "minGenerated": 2,
+        "minDistinct": 2,
+        "minDepth": 2
+      }
+    },
+    {
+      "id": "fm003-worker-negative-schema-note-success",
+      "config": "worker-configs/fm003-worker-negative-schema-note-success.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "expectedInvariant": "GenerationSafe",
+      "requiredWitness": "CompleteSQL",
+      "minimumTraceDepth": 12,
+      "baseline": {
+        "generated": 128,
+        "distinct": 93,
+        "depth": 13,
+        "minGenerated": 64,
+        "minDistinct": 46,
+        "minDepth": 6
+      }
+    },
+    {
+      "id": "fm003-worker-negative-schema-note-failure",
+      "config": "worker-configs/fm003-worker-negative-schema-note-failure.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "expectedInvariant": "GenerationSafe",
+      "requiredWitness": "CompleteSQL",
+      "minimumTraceDepth": 9,
+      "baseline": {
+        "generated": 50,
+        "distinct": 41,
+        "depth": 10,
+        "minGenerated": 25,
+        "minDistinct": 20,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm003-worker-negative-schema-block-success",
+      "config": "worker-configs/fm003-worker-negative-schema-block-success.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "expectedInvariant": "GenerationSafe",
+      "requiredWitness": "CompleteSQL",
+      "minimumTraceDepth": 12,
+      "baseline": {
+        "generated": 128,
+        "distinct": 93,
+        "depth": 13,
+        "minGenerated": 64,
+        "minDistinct": 46,
+        "minDepth": 6
+      }
+    },
+    {
+      "id": "fm003-worker-negative-schema-block-failure",
+      "config": "worker-configs/fm003-worker-negative-schema-block-failure.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "expectedInvariant": "GenerationSafe",
+      "requiredWitness": "CompleteSQL",
+      "minimumTraceDepth": 9,
+      "baseline": {
+        "generated": 50,
+        "distinct": 41,
+        "depth": 10,
+        "minGenerated": 25,
+        "minDistinct": 20,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm003-worker-negative-schema-reindex",
+      "config": "worker-configs/fm003-worker-negative-schema-reindex.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "expectedInvariant": "GenerationSafe",
+      "requiredWitness": "CompleteSQL",
+      "minimumTraceDepth": 12,
+      "baseline": {
+        "generated": 128,
+        "distinct": 93,
+        "depth": 13,
+        "minGenerated": 64,
+        "minDistinct": 46,
+        "minDepth": 6
+      }
+    }
+  ],
+  "companion": "embedding-worker"
+}

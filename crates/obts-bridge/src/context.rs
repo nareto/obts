@@ -31,6 +31,8 @@ pub struct AssembleContextRequest {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AssembleContextResponse {
+    #[serde(skip)]
+    pub(crate) _body_lease: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub graph_summary: Option<String>,
     pub notes: Vec<ContextNote>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -188,6 +190,7 @@ pub fn assemble_context(
         .then(|| build_flat_context(graph_summary.as_deref(), &notes));
 
     AssembleContextResponse {
+        _body_lease: None,
         graph_summary,
         notes,
         flat_context,
@@ -203,7 +206,7 @@ pub fn assemble_context(
 /// Betweenness centrality adds a topology signal so connector notes are ranked
 /// higher as navigation context, while hub notes are still summarized later by
 /// the token-budget phase.
-fn candidate_score(
+pub(crate) fn candidate_score(
     candidate: &ContextCandidate,
     query_embedding: Option<&[f32]>,
     centrality_score: f32,
@@ -222,31 +225,30 @@ fn candidate_score(
     depth_score * 0.5 + semantic_score * 0.3 + centrality_score * 0.2 + hub_navigation_boost
 }
 
-fn betweenness_centrality_scores(candidates: &[ContextCandidate]) -> HashMap<NoteId, f32> {
-    let mut nodes = candidates
-        .iter()
-        .map(|candidate| candidate.id.clone())
-        .collect::<Vec<_>>();
-    nodes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-    nodes.dedup();
+pub(crate) fn betweenness_centrality_scores(
+    candidates: &[ContextCandidate],
+) -> HashMap<NoteId, f32> {
+    betweenness_centrality_for_links(
+        candidates
+            .iter()
+            .map(|c| (c.id.clone(), c.links_to.clone()))
+            .collect(),
+    )
+}
 
+pub(crate) fn betweenness_centrality_for_links(
+    mut adjacency: HashMap<NoteId, Vec<NoteId>>,
+) -> HashMap<NoteId, f32> {
+    let mut nodes = adjacency.keys().cloned().collect::<Vec<_>>();
+    nodes.sort();
     if nodes.is_empty() {
         return HashMap::new();
     }
-
     let node_set = nodes.iter().cloned().collect::<HashSet<_>>();
-    let mut adjacency: HashMap<NoteId, Vec<NoteId>> = HashMap::new();
-
-    for candidate in candidates {
-        let mut neighbors = candidate
-            .links_to
-            .iter()
-            .filter(|id| node_set.contains(*id))
-            .cloned()
-            .collect::<Vec<_>>();
-        neighbors.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    for neighbors in adjacency.values_mut() {
+        neighbors.retain(|id| node_set.contains(id));
+        neighbors.sort();
         neighbors.dedup();
-        adjacency.insert(candidate.id.clone(), neighbors);
     }
 
     let mut centrality = nodes
@@ -343,7 +345,7 @@ fn betweenness_centrality_scores(candidates: &[ContextCandidate]) -> HashMap<Not
     centrality
 }
 
-fn build_graph_summary(notes: &[ContextNote]) -> String {
+pub(crate) fn build_graph_summary(notes: &[ContextNote]) -> String {
     if notes.is_empty() {
         return "No notes matched the requested context.".to_string();
     }
@@ -387,7 +389,7 @@ pub fn edge_list(notes: &[ContextCandidate]) -> HashMap<NoteId, Vec<NoteId>> {
         .collect()
 }
 
-fn build_flat_context(graph_summary: Option<&str>, notes: &[ContextNote]) -> String {
+pub(crate) fn build_flat_context(graph_summary: Option<&str>, notes: &[ContextNote]) -> String {
     let mut sections = Vec::new();
 
     if let Some(summary) = graph_summary

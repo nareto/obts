@@ -71,49 +71,40 @@ async fn main() -> anyhow::Result<()> {
                 "embedding schema updated"
             );
         }
+        // Remove any raw material left by pre-bounded versions before serving
+        // requests; derived search vectors remain intact.
+        persistence
+            .purge_raw_projection_content()
+            .await
+            .context("failed to purge legacy raw projection content")?;
         Some(persistence)
     } else {
-        warn!(
-            "database persistence is disabled; semantic and durable indexed operation is not production-ready"
-        );
-        None
+        anyhow::bail!("PostgreSQL is required for the filesystem query backend");
     };
 
-    let projection_persistence = persistence.clone();
-    let store = if let Some(persistence) = persistence {
-        let store = obts_bridge::store::VaultStore::new_with_persistence_and_auth_config(
-            config.indexer.hub_note_threshold,
-            persistence,
-            runtime_config.auth_config(),
-        );
-        store
-            .hydrate_from_persistence()
-            .await
-            .context("failed to hydrate the bridge index")?;
-        store
-    } else {
-        obts_bridge::store::VaultStore::new_with_auth_config(
-            config.indexer.hub_note_threshold,
-            runtime_config.auth_config(),
-        )
-    };
+    let persistence = persistence.expect("PostgreSQL is required");
+    let store = obts_bridge::store::VaultStore::new_with_persistence_and_auth_config(
+        config.indexer.hub_note_threshold,
+        persistence.clone(),
+        runtime_config.auth_config(),
+    );
     configure_store(&store, &config).await;
-
-    let filesystem = Arc::new(if let Some(persistence) = projection_persistence {
-        FilesystemSource::new_with_persistence(
+    let filesystem = Arc::new(
+        FilesystemSource::new_with_persistence_and_budgets(
             &config.client.vault_dir,
             persistence,
-            config.client.projection_max_text_bytes,
+            config.client.projection_max_file_text_bytes,
+            config.client.projection_max_inflight_bodies,
         )
         .await
-        .context("failed to initialize the durable headless vault projection")?
-    } else {
-        FilesystemSource::new_with_max_text_bytes(
-            &config.client.vault_dir,
-            config.client.projection_max_text_bytes,
-        )
-        .context("failed to initialize the headless vault filesystem")?
-    });
+        .context("failed to initialize the durable headless vault projection")?,
+    );
+    let store = store
+        .with_filesystem(filesystem.clone())
+        .with_projection_budgets(
+            config.client.projection_batch_rows,
+            config.client.projection_batch_bytes,
+        );
     let headless = if config.client.auto_start {
         Some(
             HeadlessClient::spawn(&config.client)
@@ -129,7 +120,7 @@ async fn main() -> anyhow::Result<()> {
             .lock_filesystem()
             .await
             .context("failed to coordinate the initial commit projection")?;
-        match synchronize_commit_projection(&store, &filesystem, &mut guard, client, true, true)
+        match synchronize_commit_projection(&store, &filesystem, &mut guard, client, true, false)
             .await
         {
             Ok(projected) => info!(
@@ -171,7 +162,8 @@ async fn main() -> anyhow::Result<()> {
             Duration::from_secs(config.client.scan_interval_seconds.max(1)),
         ));
     }
-    if let Some(handle) = spawn_embedding_worker(store.clone(), &config) {
+    let service = VaultBridgeService::new_with_filesystem(store, filesystem, headless);
+    if let Some(handle) = spawn_embedding_worker(service.clone(), &config) {
         worker_handles.push(handle);
     }
     enable_config_reload(
@@ -181,7 +173,6 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    let service = VaultBridgeService::new_with_filesystem(store, filesystem, headless);
     let api_tokens = ApiTokenState::from_env_with_auth_config(runtime_config.auth_config());
     let mcp = Some(obts_bridge::mcp::McpState::from_env_with_auth_config(
         service.clone(),

@@ -190,6 +190,316 @@ pub fn execute_query_base(
     })
 }
 
+pub(crate) struct BaseQueryAccumulator {
+    request: QueryBaseRequest,
+    document: ParsedBaseDocument,
+    candidates: Vec<BaseQueryCandidate>,
+    total: usize,
+    presorted: bool,
+    types: HashMap<String, BaseQueryValueType>,
+    max_limit: usize,
+    now: DateTime<Utc>,
+}
+
+impl BaseQueryAccumulator {
+    pub(crate) fn new(
+        request: QueryBaseRequest,
+        max_limit: usize,
+        now: DateTime<Utc>,
+    ) -> Result<Self, BaseQueryError> {
+        if request.base_query.trim().is_empty() {
+            return Err(BaseQueryError::EmptyQuery);
+        }
+        let document = parse_base_document(&request.base_query, request.view.as_deref())?;
+        Ok(Self {
+            request,
+            document,
+            candidates: Vec::new(),
+            total: 0,
+            presorted: false,
+            types: HashMap::new(),
+            max_limit,
+            now,
+        })
+    }
+    pub(crate) fn numeric_sort(&self) -> Option<Vec<(Vec<String>, bool)>> {
+        self.document
+            .view
+            .sort
+            .as_ref()
+            .map(|sort| {
+                sort.iter()
+                    .map(|s| {
+                        if s.property_id.starts_with("file.")
+                            || s.property_id.starts_with("formula.")
+                        {
+                            return None;
+                        }
+                        Some((
+                            s.property_id
+                                .strip_prefix("note.")
+                                .unwrap_or(&s.property_id)
+                                .split('.')
+                                .map(str::to_string)
+                                .collect(),
+                            matches!(s.direction, SortDirection::Desc),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or(Some(Vec::new()))
+    }
+    pub(crate) fn set_presorted(&mut self) {
+        self.presorted = true;
+    }
+
+    pub(crate) fn needs_links(&self) -> bool {
+        fn expr(e: &Expr) -> bool {
+            match e {
+                Expr::Member(root, field) => {
+                    (matches!(root.as_ref(),Expr::Identifier(id) if id=="file")
+                        && ["links", "hasLink"].contains(&field.as_str()))
+                        || expr(root)
+                }
+                Expr::Call(root, args) => expr(root) || args.iter().any(expr),
+                Expr::Index(a, b) | Expr::Binary(a, _, b) => expr(a) || expr(b),
+                Expr::UnaryNot(e) => expr(e),
+                _ => false,
+            }
+        }
+        fn filter(f: &FilterNode) -> bool {
+            match f {
+                FilterNode::Expr(e) => expr(e),
+                FilterNode::And(fs) | FilterNode::Or(fs) => fs.iter().any(filter),
+                FilterNode::Not(f) => filter(f),
+            }
+        }
+        self.document
+            .view
+            .order
+            .iter()
+            .any(|p| p.id == "file.links")
+            || self
+                .document
+                .view
+                .sort
+                .iter()
+                .flatten()
+                .any(|p| p.property_id == "file.links")
+            || self.document.filter.as_ref().is_some_and(filter)
+    }
+
+    pub(crate) fn projection_keys(&self) -> Option<Vec<String>> {
+        fn property(id: &str, keys: &mut std::collections::BTreeSet<String>) -> bool {
+            if id == "file.properties" {
+                return false;
+            }
+            if !id.starts_with("file.") && !id.starts_with("formula.") {
+                keys.insert(
+                    id.strip_prefix("note.")
+                        .unwrap_or(id)
+                        .split('.')
+                        .next()
+                        .unwrap_or(id)
+                        .to_string(),
+                );
+            }
+            true
+        }
+        fn expr(e: &Expr, keys: &mut std::collections::BTreeSet<String>) -> bool {
+            match e {
+                Expr::Identifier(id) => {
+                    if ["note", "file", "formula"].contains(&id.as_str()) {
+                        true
+                    } else {
+                        property(id, keys)
+                    }
+                }
+                Expr::Member(root, field) => {
+                    if let Expr::Identifier(id) = root.as_ref() {
+                        if id == "note" {
+                            return property(field, keys);
+                        }
+                        if id == "file" {
+                            return field != "properties";
+                        }
+                    }
+                    expr(root, keys)
+                }
+                Expr::Index(root, index) => {
+                    if matches!(root.as_ref(),Expr::Identifier(id) if id == "note") {
+                        if let Expr::Literal(EvalValue::String(key)) = index.as_ref() {
+                            keys.insert(key.clone());
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        expr(root, keys) && expr(index, keys)
+                    }
+                }
+                Expr::Call(root, args) => {
+                    (matches!(root.as_ref(), Expr::Identifier(_)) || expr(root, keys))
+                        && args.iter().all(|e| expr(e, keys))
+                }
+                Expr::UnaryNot(e) => expr(e, keys),
+                Expr::Binary(a, _, b) => expr(a, keys) && expr(b, keys),
+                _ => true,
+            }
+        }
+        fn filter(f: &FilterNode, keys: &mut std::collections::BTreeSet<String>) -> bool {
+            match f {
+                FilterNode::Expr(e) => expr(e, keys),
+                FilterNode::And(fs) | FilterNode::Or(fs) => fs.iter().all(|f| filter(f, keys)),
+                FilterNode::Not(f) => filter(f, keys),
+            }
+        }
+        let mut keys = std::collections::BTreeSet::new();
+        for p in &self.document.view.order {
+            if !property(&p.id, &mut keys) {
+                return None;
+            }
+        }
+        for p in self.document.view.sort.iter().flatten() {
+            if !property(&p.property_id, &mut keys) {
+                return None;
+            }
+        }
+        if self
+            .document
+            .filter
+            .as_ref()
+            .is_some_and(|f| !filter(f, &mut keys))
+        {
+            return None;
+        }
+        Some(keys.into_iter().collect())
+    }
+
+    pub(crate) fn push_sql_filter(&self, q: &mut sqlx::QueryBuilder<'_, sqlx::Postgres>) {
+        fn expr(e: &Expr, q: &mut sqlx::QueryBuilder<'_, sqlx::Postgres>) {
+            if let Expr::Call(callee, args) = e {
+                if let (Expr::Member(root, method), [Expr::Literal(EvalValue::String(value))]) =
+                    (callee.as_ref(), args.as_slice())
+                {
+                    if matches!(root.as_ref(),Expr::Identifier(id) if id == "file") {
+                        match method.as_str() {
+                            "hasTag" => {
+                                let value = value.trim_start_matches('#');
+                                q.push(
+                                    "EXISTS(SELECT 1 FROM tags t WHERE t.note_id=n.id AND (t.tag=",
+                                )
+                                .push_bind(value.to_string())
+                                .push(" OR starts_with(t.tag,")
+                                .push_bind(format!("{value}/"))
+                                .push(")))");
+                                return;
+                            }
+                            "hasLink" => {
+                                q.push("EXISTS(SELECT 1 FROM links l JOIN bridge_scope s ON s.id=l.target_id JOIN notes target ON target.id=l.target_id WHERE l.source_id=n.id AND (l.target_id=").push_bind(value.trim().to_string()).push(" OR target.policy_title_ascii=").push_bind(value.trim().to_ascii_lowercase()).push("))");
+                                return;
+                            }
+                            _ => (),
+                        }
+                    }
+                }
+            }
+            q.push("TRUE");
+        }
+        fn filter(f: &FilterNode, q: &mut sqlx::QueryBuilder<'_, sqlx::Postgres>) {
+            match f {
+                FilterNode::Expr(e) => expr(e, q),
+                FilterNode::And(fs) | FilterNode::Or(fs) => {
+                    q.push("(");
+                    for (i, child) in fs.iter().enumerate() {
+                        if i > 0 {
+                            q.push(if matches!(f, FilterNode::And(_)) {
+                                " AND "
+                            } else {
+                                " OR "
+                            });
+                        }
+                        filter(child, q);
+                    }
+                    if fs.is_empty() {
+                        q.push("TRUE");
+                    }
+                    q.push(")");
+                }
+                FilterNode::Not(_) => {
+                    q.push("TRUE");
+                }
+            }
+        }
+        if let Some(f) = &self.document.filter {
+            q.push(" AND ");
+            filter(f, q);
+        }
+    }
+
+    pub(crate) fn push(&mut self, candidate: BaseQueryCandidate) -> Result<(), BaseQueryError> {
+        let context = EvalContext {
+            candidate: &candidate,
+            now: self.now,
+        };
+        if let Some(filter) = &self.document.filter {
+            if !eval_filter(filter, &context)? {
+                return Ok(());
+            }
+        }
+        self.total += 1;
+        for property in &self.document.view.order {
+            let value = evaluate_property_id(&property.id, &context)?.into_json();
+            if let Some(value_type) = json_value_type(&value) {
+                self.types
+                    .entry(property.id.clone())
+                    .and_modify(|old| {
+                        if *old != value_type {
+                            *old = BaseQueryValueType::Mixed;
+                        }
+                    })
+                    .or_insert(value_type);
+            }
+        }
+        if self.presorted {
+            let limit = self
+                .max_limit
+                .min(self.request.limit.unwrap_or(self.max_limit))
+                .min(self.document.view.limit.unwrap_or(DEFAULT_BASE_QUERY_LIMIT));
+            if self.candidates.len() < limit {
+                self.candidates.push(candidate);
+            }
+            return Ok(());
+        }
+        self.candidates.push(candidate);
+        self.candidates.sort_by(|a, b| {
+            self.document
+                .view
+                .sort
+                .as_ref()
+                .map(|sort| compare_candidates(a, b, sort, self.now))
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        self.candidates.truncate(self.max_limit);
+        Ok(())
+    }
+    pub(crate) fn finish(self) -> Result<QueryBaseResponse, BaseQueryError> {
+        let mut result =
+            execute_query_base(self.request, self.candidates, self.max_limit, self.now)?;
+        result.total = self.total;
+        result.truncated = result.returned < self.total;
+        for column in &mut result.columns {
+            column.value_type = self
+                .types
+                .get(&column.id)
+                .copied()
+                .unwrap_or(BaseQueryValueType::Empty);
+        }
+        Ok(result)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ParsedBaseDocument {
     filter: Option<FilterNode>,

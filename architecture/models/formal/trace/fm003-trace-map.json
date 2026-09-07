@@ -1,0 +1,381 @@
+{
+  "schemaVersion": 1,
+  "modelId": "OBTS-FM-003",
+  "architectureRevision": 6,
+  "implementationEvidenceStatus": "partial-stage2-request-projection",
+  "statusMeaning": "Checked SQL/request/projection component evidence. The independently reviewed worker and final synthetic stack/RSS receipts live in fm003-worker-trace-map.json and docs/bridge-embedding-worker-evidence.md. Neither component tests nor finite models establish universal RSS, power-loss durability or live deployment acceptance.",
+  "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla",
+  "checks": "architecture/models/formal/checks-fm003.json",
+  "currentImplementationContext": [
+    {
+      "path": "crates/obts-bridge/src/store/sql/projection.rs",
+      "range": "1-272",
+      "status": "checked shared SQLx-encoded normal/singleton writer for file, note, lexical, tags, links, blocks, cleanup/deletion and expected completion rows; detached owned work drains cancellation"
+    },
+    {
+      "path": "crates/obts-bridge/src/store/sql/predicates.rs",
+      "range": "1-234",
+      "status": "checked current-policy SQL scope and known metadata filters; compact Rust fallback retains authoritative regex semantics"
+    },
+    {
+      "path": "crates/obts-bridge/src/store/sql.rs",
+      "range": "1-1370",
+      "status": "checked lexical substring/title-weight, FTS separation, complete adjacency/counts, SQL-ranked context candidates and referenced Base properties; ID-only topology remains for exact centrality"
+    },
+    {
+      "path": "crates/obts-bridge/migrations/0020_derived_lexical_index.sql",
+      "range": "1-10",
+      "status": "checked actual upgrade invalidates old same-commit complete markers without cursor/audit mutation"
+    },
+    {
+      "path": "crates/obts-bridge/src/mcp.rs",
+      "range": "1085-1136",
+      "status": "checked leased ToolValue survives file/query-notes conversion, sanitization and final response creation/drop"
+    },
+    {
+      "path": "crates/obts-bridge/src/store/sql/tests.rs",
+      "range": "1-1928",
+      "status": "thirteen real synthetic PostgreSQL checks, including four regression-first fixes from review 75cb546a, fresh subprocess replay and actual pre-0020 schema upgrade"
+    },
+    {
+      "path": "crates/obts-bridge/src/workers.rs",
+      "range": "1492-1602",
+      "status": "embedding-worker hydration/reindex redesign remains forthcoming"
+    }
+  ],
+  "stage2CodeEvidence": [
+    "Core production SQL projection bypasses legacy apply_content_delta and block-only batching; actual SQLx PostgreSQL encoded parameter lengths (including length prefixes) govern shared normal transactions and isolated oversized operations. No per-vault encoded/body queue is introduced.",
+    "File completion is invalidated before partial writes, every tag/link/block cleanup effect is budgeted, expected full row counts are verified before complete markers, and the complete revision manifest is checked before publishing a cursor. Retained audit rows are untouched.",
+    "Review 75cb546a cancellation fix: acquire owned write coordination before detaching note/deletion work, retain it through SQL/body cleanup, and drain under filesystem coordination before inventory reconciliation and final manifest verification/publication. Detached writers never reacquire the outer filesystem lock; an empty-delta revert cannot publish over a pending pre-invalidation write.",
+    "Normalized lowercase plaintext and legacy filename-title projection preserve arbitrary non-overlapping substring counts and title weight 2. PostgreSQL FTS /search remains separate. Raw content/search_text/block-body columns remain blank; lexical plaintext deliberately does not.",
+    "Current runtime-policy-derived SQL scope precedes filters/order/pagination. Regex rules use compact Rust policy evaluation; Base fetches referenced properties, scopes link targets before projection/evaluation, and pushes default/numeric ordering into SQL. Heterogeneous/complex Base ordering retains bounded evaluator fallback for exact legacy semantics.",
+    "Review 75cb546a query fixes: context authorization/adjacency/hub/similarity/summary lookups share the existing transaction connection, supporting max_connections=1. Base bare date/today/now identifiers select frontmatter properties, while function callees remain builtins. Backlinks and graph BFS use endpoint ID ordering without changing positional exact-note references or hub fanout.",
+    "Graph/link/backlink output IDs are complete and output-proportional; counts are scalar SQL. Exact centrality retains ID-only topology, not note metadata/embeddings/frontmatter/bodies. Scalar context candidates rank/page in SQL, and projected token sizes precede selected input hydration.",
+    "Exact file leases survive MCP conversion/sanitization/wrapping. Multi-note context and selected search/query-note snippets use a retained operation lease for sequential attested inputs and response processing; full input/parse is discarded before the next acquisition. No wire fields added.",
+    "Forthcoming: production embedding-worker ownership/reindex, whole-process RSS/parser/encoding/driver costing, full-stack startup/kill/restart/golden tests and deployment activation. Component tests and synthetic encoded highwaters do not establish these obligations or a numerical singleton/RSS ceiling."
+  ],
+  "stage2TestEvidence": [
+    "cargo check -p obts_bridge passed with CARGO_TARGET_DIR=/tmp/obts-bounded-memory-target.",
+    "cargo test -p obts_bridge: 157 passed, 13 explicitly PostgreSQL-dependent checks ignored (59.25s); includes all prior unit checks.",
+    "Follow-up explicit PostgreSQL command cargo test -p obts_bridge postgres_ -- --ignored --nocapture passed all 13 checks in 109.23s, including nested subprocess replay. A final four-test focused rerun with strengthened revision/audit assertions passed in 0.46s. All owned bounded_* synthetic databases were removed; the supplied parent database/container was not removed.",
+    "Explicit actual PostgreSQL checks: postgres_projection_reads_queries_acl_edits_and_faults; postgres_failed_block_batch_retains_cursor_and_revert_replays; postgres_paged_totals_semantic_blocks_and_successful_cas_writes; postgres_distributed_corpus_above_64_mib_has_no_body_mirror.",
+    "Added actual PostgreSQL checks: postgres_default_budget_accepts_9mib_frontmatter_and_lexical_singletons; postgres_tiny_batches_fanout_failure_restart_revert_and_upgrade; postgres_lexical_order_recent_and_acl_base_differential; postgres_complete_graph_counts_late_context_hub_and_single_slot_response; postgres_cancel_singleton_drains_owned_body_before_replay.",
+    "Observed default fixture highwaters: normal 128 rows / 18,560 encoded parameter bytes; largest singleton 10,000,040 bytes; two singleton operations including 9 MiB frontmatter. Tiny 3-row/256-byte settings: 3 rows / 203 normal encoded bytes / 4,345 singleton bytes. These fixture values are not parser/RSS ceilings.",
+    "The distributed fixture totals 72,194,048 synthetic bytes (~68.85 MiB), not 72 MiB. Private notes project without caller principals, denied Base link targets do not leak, and missing selected FS text does not fall back to lexical storage.",
+    "Failure tests cover partially committed link/tag/block work, omitted-tag success-without-row rejection, old cursor/audit preservation, a fresh subprocess replay using only the persistent DB/files, revert cleanup, and actual migration 0020 from a recreated pre-migration complete same-commit schema.",
+    "Graph fixture checks 505 links/backlinks/nodes and 1,010 edges, scalar counts, positional hub fanout, negative semantic scores, a late high-ranked non-seed candidate beyond the old cap, one-slot multi-note context with active input highwater 1, response/drop/cancel and source-failure lease release.",
+    "FM003 model/check matrix unchanged in this core lane. Earlier 39 FM003 and 52 baseline TLC checks were parent-reported architecture-gate evidence, not rerun implementation conformance proof here. Full-stack abrupt-process-kill, embeddings and measured RSS remain separate evidence.",
+    "Final scope also checks source-committed local edit projection failure retains accepted/pending response semantics, and non-object YAML frontmatter preserves key-filter/Base behavior without loading arbitrary values into policy pages.",
+    "Regression-first review 75cb546a: postgres_review_cancel_before_invalidation_blocks_noop_revert_publication, postgres_review_context_uses_single_connection_pool, postgres_review_base_bare_builtin_names_are_properties and postgres_review_endpoint_specific_backlink_and_diamond_order all failed before production edits and passed afterward. The cancellation test starts zero-change replay while the old writer is still PG-row-lock blocked, asserts unfinished/not-ready/old-cursor before release, then verifies restored revision inventory, rows and nonempty retained audits. Query tests cover a nonempty scoped/semantic/hub context at pool size one, bare date/today/now and correct function calls, ID-ordered backlinks/diamond BFS, and preserved positional exact-note references."
+  ],
+  "actions": {
+    "Init": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:67-85",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "forthcoming-stage2",
+      "evidenceBoundary": "SQL fixture constructors prove no resident body maps; real complete production startup/embedding/runtime delivery proof remains separate."
+    },
+    "BeginProjection": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:87-94",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-request-projection-lane",
+      "implementation": "crates/obts-bridge/src/store.rs; crates/obts-bridge/src/store/sql/projection.rs; crates/obts-bridge/src/filesystem.rs; crates/obts-bridge/src/store/sql.rs",
+      "tests": "crates/obts-bridge/src/store/sql/tests.rs",
+      "evidenceBoundary": "Component regression mapping, not instrumented TLA action trace replay or embedding/deployment acceptance."
+    },
+    "PrepareReplay": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:96-107",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-request-projection-lane",
+      "implementation": "crates/obts-bridge/src/store.rs; crates/obts-bridge/src/store/sql/projection.rs; crates/obts-bridge/src/filesystem.rs; crates/obts-bridge/src/store/sql.rs",
+      "tests": "crates/obts-bridge/src/store/sql/tests.rs",
+      "evidenceBoundary": "Component regression mapping, not instrumented TLA action trace replay or embedding/deployment acceptance."
+    },
+    "AcquireBody": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:109-117",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-request-projection-lane",
+      "implementation": "crates/obts-bridge/src/store/sql/projection.rs; crates/obts-bridge/src/filesystem.rs; crates/obts-bridge/src/store/sql.rs",
+      "tests": "crates/obts-bridge/src/store/sql/tests.rs",
+      "evidenceBoundary": "Component regression mapping, not instrumented TLA action trace replay or embedding/deployment acceptance."
+    },
+    "VerifyBody": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:119-126",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-request-projection-lane",
+      "implementation": "crates/obts-bridge/src/store/sql/projection.rs; crates/obts-bridge/src/filesystem.rs; crates/obts-bridge/src/store/sql.rs",
+      "tests": "crates/obts-bridge/src/store/sql/tests.rs",
+      "evidenceBoundary": "Component regression mapping, not instrumented TLA action trace replay or embedding/deployment acceptance."
+    },
+    "EnqueueRow": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:128-138",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-request-projection-lane",
+      "implementation": "crates/obts-bridge/src/store/sql/projection.rs; crates/obts-bridge/src/filesystem.rs; crates/obts-bridge/src/store/sql.rs",
+      "tests": "crates/obts-bridge/src/store/sql/tests.rs",
+      "evidenceBoundary": "Component regression mapping, not instrumented TLA action trace replay or embedding/deployment acceptance."
+    },
+    "EnqueueSingleton": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:140-150",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-request-projection-lane",
+      "implementation": "crates/obts-bridge/src/store/sql/projection.rs; crates/obts-bridge/src/filesystem.rs; crates/obts-bridge/src/store/sql.rs",
+      "tests": "crates/obts-bridge/src/store/sql/tests.rs",
+      "evidenceBoundary": "Component regression mapping, not instrumented TLA action trace replay or embedding/deployment acceptance."
+    },
+    "CommitBatch": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:152-160",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-request-projection-lane",
+      "implementation": "crates/obts-bridge/src/store/sql/projection.rs; crates/obts-bridge/src/filesystem.rs; crates/obts-bridge/src/store/sql.rs",
+      "tests": "crates/obts-bridge/src/store/sql/tests.rs",
+      "evidenceBoundary": "Component regression mapping, not instrumented TLA action trace replay or embedding/deployment acceptance."
+    },
+    "FinishSingleton": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:162-169",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-request-projection-lane",
+      "implementation": "crates/obts-bridge/src/store/sql/projection.rs; crates/obts-bridge/src/filesystem.rs; crates/obts-bridge/src/store/sql.rs",
+      "tests": "crates/obts-bridge/src/store/sql/tests.rs",
+      "evidenceBoundary": "Component regression mapping, not instrumented TLA action trace replay or embedding/deployment acceptance."
+    },
+    "ReleaseBody": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:171-178",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-request-projection-lane",
+      "implementation": "crates/obts-bridge/src/store/sql/projection.rs; crates/obts-bridge/src/filesystem.rs; crates/obts-bridge/src/store/sql.rs",
+      "tests": "crates/obts-bridge/src/store/sql/tests.rs",
+      "evidenceBoundary": "Component regression mapping, not instrumented TLA action trace replay or embedding/deployment acceptance."
+    },
+    "CleanupProjection": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:180-188",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-request-projection-lane",
+      "implementation": "crates/obts-bridge/src/store.rs; crates/obts-bridge/src/store/sql/projection.rs; crates/obts-bridge/src/filesystem.rs; crates/obts-bridge/src/store/sql.rs",
+      "tests": "crates/obts-bridge/src/store/sql/tests.rs",
+      "evidenceBoundary": "Component regression mapping, not instrumented TLA action trace replay or embedding/deployment acceptance."
+    },
+    "AdvanceCursor": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:190-198",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-request-projection-lane",
+      "implementation": "crates/obts-bridge/src/store.rs; crates/obts-bridge/src/store/sql/projection.rs; crates/obts-bridge/src/filesystem.rs; crates/obts-bridge/src/store/sql.rs",
+      "tests": "crates/obts-bridge/src/store/sql/tests.rs",
+      "evidenceBoundary": "Component regression mapping, not instrumented TLA action trace replay or embedding/deployment acceptance."
+    },
+    "DriftRevision": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:200-207",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-request-projection-lane",
+      "implementation": "crates/obts-bridge/src/store/sql/projection.rs; crates/obts-bridge/src/filesystem.rs; crates/obts-bridge/src/store/sql.rs",
+      "tests": "crates/obts-bridge/src/store/sql/tests.rs",
+      "evidenceBoundary": "Component regression mapping, not instrumented TLA action trace replay or embedding/deployment acceptance."
+    },
+    "FailBodyVerification": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:209-216",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-request-projection-lane",
+      "implementation": "crates/obts-bridge/src/store/sql/projection.rs; crates/obts-bridge/src/filesystem.rs; crates/obts-bridge/src/store/sql.rs",
+      "tests": "crates/obts-bridge/src/store/sql/tests.rs",
+      "evidenceBoundary": "Component regression mapping, not instrumented TLA action trace replay or embedding/deployment acceptance."
+    },
+    "FailBodyAcquisition": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:218-225",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-request-projection-lane",
+      "implementation": "crates/obts-bridge/src/store/sql/projection.rs; crates/obts-bridge/src/filesystem.rs; crates/obts-bridge/src/store/sql.rs",
+      "tests": "crates/obts-bridge/src/store/sql/tests.rs",
+      "evidenceBoundary": "Component regression mapping, not instrumented TLA action trace replay or embedding/deployment acceptance."
+    },
+    "CallerDenied": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:227-232",
+      "contracts": [
+        "OBTS-BRG-QUERY-001"
+      ],
+      "codeStatus": "checked-request-projection-lane",
+      "implementation": "crates/obts-bridge/src/store/sql/projection.rs; crates/obts-bridge/src/filesystem.rs; crates/obts-bridge/src/store/sql.rs",
+      "tests": "crates/obts-bridge/src/store/sql/tests.rs",
+      "evidenceBoundary": "Component regression mapping, not instrumented TLA action trace replay or embedding/deployment acceptance."
+    },
+    "FailBatchCommit": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:234-240",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-request-projection-lane",
+      "implementation": "crates/obts-bridge/src/store/sql/projection.rs; crates/obts-bridge/src/filesystem.rs; crates/obts-bridge/src/store/sql.rs",
+      "tests": "crates/obts-bridge/src/store/sql/tests.rs",
+      "evidenceBoundary": "Component regression mapping, not instrumented TLA action trace replay or embedding/deployment acceptance."
+    },
+    "CancelProjection": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:242-248",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-request-projection-lane",
+      "implementation": "crates/obts-bridge/src/store.rs; crates/obts-bridge/src/store/sql/projection.rs; crates/obts-bridge/src/filesystem.rs; crates/obts-bridge/src/store/sql.rs",
+      "tests": "crates/obts-bridge/src/store/sql/tests.rs",
+      "evidenceBoundary": "Component regression mapping, not instrumented TLA action trace replay or embedding/deployment acceptance."
+    },
+    "DrainPending": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:250-257",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-request-projection-lane",
+      "implementation": "crates/obts-bridge/src/store.rs; crates/obts-bridge/src/store/sql/projection.rs; crates/obts-bridge/src/filesystem.rs; crates/obts-bridge/src/store/sql.rs",
+      "tests": "crates/obts-bridge/src/store/sql/tests.rs",
+      "evidenceBoundary": "Component regression mapping, not instrumented TLA action trace replay or embedding/deployment acceptance."
+    },
+    "FinishDrain": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:259-265",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-request-projection-lane",
+      "implementation": "crates/obts-bridge/src/store.rs; crates/obts-bridge/src/store/sql/projection.rs; crates/obts-bridge/src/filesystem.rs; crates/obts-bridge/src/store/sql.rs",
+      "tests": "crates/obts-bridge/src/store/sql/tests.rs",
+      "evidenceBoundary": "Component regression mapping, not instrumented TLA action trace replay or embedding/deployment acceptance."
+    },
+    "RestartProjection": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:267-275",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-request-projection-lane",
+      "implementation": "crates/obts-bridge/src/store.rs; crates/obts-bridge/src/store/sql/projection.rs; crates/obts-bridge/src/filesystem.rs; crates/obts-bridge/src/store/sql.rs",
+      "tests": "crates/obts-bridge/src/store/sql/tests.rs",
+      "evidenceBoundary": "Component regression mapping, not instrumented TLA action trace replay or embedding/deployment acceptance."
+    },
+    "RejectByCorpusTotal": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:277-282",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "negative-control-only"
+    },
+    "RetainAllCorpusBodies": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:284-289",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "negative-control-only"
+    },
+    "CommitUnverifiedRows": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:291-298",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "negative-control-only"
+    },
+    "SkipReleaseOnFailure": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:300-305",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "negative-control-only"
+    },
+    "AdvanceCursorEarly": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:307-313",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "negative-control-only"
+    },
+    "DropAuditRecords": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:315-320",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "negative-control-only"
+    },
+    "EnqueueLegacyFanout": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:322-331",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "negative-control-only"
+    },
+    "MixOversizedRow": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:333-342",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "negative-control-only"
+    },
+    "ReleasePermitEarly": {
+      "model": "architecture/models/formal/OBTSBridgeBoundedBody.tla:344-350",
+      "contracts": [
+        "OBTS-BRG-PROJ-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "negative-control-only"
+    }
+  },
+  "modelBoundary": [
+    "Four files, thirteen independent required rows: F1 metadata plus two tags/two links/two blocks; F2 and F4 oversized metadata; finite body sizes are independent of encoded row sizes. Fixture sizes are not a parser expansion ratio.",
+    "Ordered file acquisition and per-file row enqueue reduce interleavings; two simultaneous bodies, normal byte pressure, isolated singleton execution/cleanup and cancellation during singleton ownership are explicitly reached.",
+    "One interrupted target is replayed after partial commits with durable rows retained; a healthy run separately reaches cursor 3 from cursor 1. Superseded/deleted-row cleanup is an abstract completion action, not a proof of production SQL deletion/revert semantics.",
+    "Oversized-starvation disables singleton admission while keeping supported inputs and fair normal actions: TLC must violate the sole configured completion property. It is a liveness counterexample, not a made-up rejection invariant.",
+    "SingletonPermitClean/SingletonOwned model shared ownership through commit then cleanup; concrete parser/driver disposal, SQL/compiler, API format/order and lexical equivalence are executable-test obligations, not TLA proofs."
+  ],
+  "finalAcceptanceReference": "architecture/models/formal/trace/fm003-worker-trace-map.json:localAcceptance"
+}

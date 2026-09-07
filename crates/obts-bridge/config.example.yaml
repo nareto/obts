@@ -10,7 +10,10 @@ client:
   device_name: "obts-bridge"
   scan_interval_seconds: 2
   projection_audit_interval_seconds: 604800
-  projection_max_text_bytes: 536870912
+  projection_max_file_text_bytes: 67108864
+  projection_max_inflight_bodies: 2
+  projection_batch_rows: 128
+  projection_batch_bytes: 8388608
   restart_failure_window_seconds: 900
   restart_max_failures: 3
   restart_base_backoff_seconds: 5

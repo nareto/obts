@@ -33,6 +33,7 @@ pub struct VaultBridgeService {
 }
 
 impl VaultBridgeService {
+    #[cfg(test)]
     pub fn new_for_tests(store: VaultStore) -> Self {
         Self {
             store,
@@ -75,11 +76,65 @@ impl VaultBridgeService {
         Ok(())
     }
 
+    async fn sql_read_guard(
+        &self,
+    ) -> Result<
+        (
+            tokio::sync::MutexGuard<'_, ()>,
+            Option<HeadlessFilesystemGuard<'_>>,
+            tokio::sync::RwLockReadGuard<'_, ()>,
+        ),
+        ServiceError,
+    > {
+        let lock = self.vault_write_lock.lock().await;
+        let headless = if let Some(client) = &self.headless {
+            Some(
+                client
+                    .lock_filesystem()
+                    .await
+                    .map_err(ServiceError::Headless)?,
+            )
+        } else {
+            None
+        };
+        let projection = self
+            .filesystem
+            .as_ref()
+            .expect("SQL filesystem")
+            .projection_lock
+            .read()
+            .await;
+        self.ensure_index_current()?;
+        Ok((lock, headless, projection))
+    }
+
+    pub(crate) async fn capture_embedding_source(
+        &self,
+        token: &crate::store::EmbeddingNoteToken,
+    ) -> Result<Option<(crate::filesystem::FilesystemFile, String)>, ServiceError> {
+        let _guard = self.sql_read_guard().await?;
+        let Some((path, title)) = self.store.embedding_source(token).await? else {
+            return Ok(None);
+        };
+        let file = self
+            .filesystem
+            .as_ref()
+            .expect("worker filesystem")
+            .read_attested(&path, &token.revision)
+            .await
+            .map_err(|_| ServiceError::IndexCatchingUp)?;
+        Ok(Some((file, title)))
+    }
+
     pub async fn get_note(
         &self,
         auth: &AuthContext,
         note_id: &NoteId,
     ) -> Result<Note, ServiceError> {
+        if self.store.uses_sql_backend() {
+            let _guard = self.sql_read_guard().await?;
+            return self.store.sql_get_note(auth, note_id).await;
+        }
         if let Some(note) = self.store.get_note_for_policy(auth, note_id).await {
             return Ok(note);
         }
@@ -94,6 +149,10 @@ impl VaultBridgeService {
         auth: &AuthContext,
         title: &str,
     ) -> Result<Note, ServiceError> {
+        if self.store.uses_sql_backend() {
+            let _guard = self.sql_read_guard().await?;
+            return self.store.sql_get_title(auth, title).await;
+        }
         if let Some(note) = self.store.get_note_by_title_for_policy(auth, title).await {
             return Ok(note);
         }
@@ -109,8 +168,12 @@ impl VaultBridgeService {
         query: &str,
         mode: SearchMode,
         limit: usize,
-    ) -> SearchResponse {
-        self.store.search_for_policy(auth, query, mode, limit).await
+    ) -> Result<SearchResponse, ServiceError> {
+        if self.store.uses_sql_backend() {
+            let _guard = self.sql_read_guard().await?;
+            return self.store.sql_search(auth, query, mode, limit).await;
+        }
+        Ok(self.store.search_for_policy(auth, query, mode, limit).await)
     }
 
     pub async fn recent_notes(
@@ -120,6 +183,37 @@ impl VaultBridgeService {
         last_n_days: Option<i64>,
         limit: usize,
     ) -> Result<RecentNotesResponse, ServiceError> {
+        if self.store.uses_sql_backend() {
+            let threshold = if let Some(since) = since {
+                since
+            } else if let Some(days) = last_n_days {
+                if days <= 0 {
+                    return Err(ServiceError::BadRequest(
+                        "last_n_days must be positive".to_string(),
+                    ));
+                }
+                Utc::now() - chrono::Duration::days(days)
+            } else {
+                return Err(ServiceError::BadRequest(
+                    "one of since or last_n_days is required".to_string(),
+                ));
+            };
+            let _guard = self.sql_read_guard().await?;
+            return self
+                .store
+                .sql_query_notes(
+                    auth,
+                    QueryNotesRequest {
+                        time_filter: NoteTimeFilter {
+                            updated_strictly_after: Some(threshold),
+                            ..Default::default()
+                        },
+                        limit: Some(limit),
+                        ..Default::default()
+                    },
+                )
+                .await;
+        }
         self.store
             .recent_notes_for_policy(auth, since, last_n_days, limit)
             .await
@@ -130,8 +224,12 @@ impl VaultBridgeService {
         &self,
         auth: &AuthContext,
         request: QueryNotesRequest,
-    ) -> RecentNotesResponse {
-        self.store.query_notes_for_policy(auth, request).await
+    ) -> Result<RecentNotesResponse, ServiceError> {
+        if self.store.uses_sql_backend() {
+            let _guard = self.sql_read_guard().await?;
+            return self.store.sql_query_notes(auth, request).await;
+        }
+        Ok(self.store.query_notes_for_policy(auth, request).await)
     }
 
     pub async fn query_base(
@@ -139,6 +237,10 @@ impl VaultBridgeService {
         auth: &AuthContext,
         request: QueryBaseRequest,
     ) -> Result<QueryBaseResponse, ServiceError> {
+        if self.store.uses_sql_backend() {
+            let _guard = self.sql_read_guard().await?;
+            return self.store.sql_base(auth, request).await;
+        }
         self.store
             .query_base_for_policy(auth, request)
             .await
@@ -152,6 +254,13 @@ impl VaultBridgeService {
         depth: usize,
         direction: NeighborDirection,
     ) -> Result<NeighborsResponse, ServiceError> {
+        if self.store.uses_sql_backend() {
+            let _guard = self.sql_read_guard().await?;
+            return self
+                .store
+                .sql_neighbors(auth, note_id, depth, direction)
+                .await;
+        }
         self.store
             .neighbors_for_policy(auth, note_id, depth, direction)
             .await
@@ -163,6 +272,10 @@ impl VaultBridgeService {
         auth: &AuthContext,
         note_id: &NoteId,
     ) -> Result<BacklinksResponse, ServiceError> {
+        if self.store.uses_sql_backend() {
+            let _guard = self.sql_read_guard().await?;
+            return self.store.sql_backlinks(auth, note_id).await;
+        }
         self.store
             .backlinks_for_policy(auth, note_id)
             .await
@@ -174,20 +287,36 @@ impl VaultBridgeService {
         auth: &AuthContext,
         from: &NoteId,
         to: &NoteId,
-    ) -> PathResponse {
-        self.store.shortest_path_for_policy(auth, from, to).await
+    ) -> Result<PathResponse, ServiceError> {
+        if self.store.uses_sql_backend() {
+            let _guard = self.sql_read_guard().await?;
+            return self.store.sql_path(auth, from, to).await;
+        }
+        Ok(self.store.shortest_path_for_policy(auth, from, to).await)
     }
 
     pub async fn assemble_context(
         &self,
         auth: &AuthContext,
         request: AssembleContextRequest,
-    ) -> AssembleContextResponse {
-        self.store.assemble_context_for_policy(auth, request).await
+    ) -> Result<AssembleContextResponse, ServiceError> {
+        if self.store.uses_sql_backend() {
+            let _guard = self.sql_read_guard().await?;
+            return self.store.sql_context(auth, request).await;
+        }
+        Ok(self.store.assemble_context_for_policy(auth, request).await)
     }
 
-    pub async fn list_tags(&self, auth: &AuthContext, filter: NoteTimeFilter) -> TagsResponse {
-        self.store.tags_for_policy(auth, filter).await
+    pub async fn list_tags(
+        &self,
+        auth: &AuthContext,
+        filter: NoteTimeFilter,
+    ) -> Result<TagsResponse, ServiceError> {
+        if self.store.uses_sql_backend() {
+            let _guard = self.sql_read_guard().await?;
+            return self.store.sql_tags(auth, filter).await;
+        }
+        Ok(self.store.tags_for_policy(auth, filter).await)
     }
 
     pub async fn headless_command(
@@ -281,6 +410,7 @@ impl VaultBridgeService {
         } else {
             None
         };
+        let _projection_guard = filesystem.projection_lock.write().await;
         self.ensure_projected_write_within_limit(filesystem, &write.path, write.content.len())
             .await?;
         let revision = filesystem
@@ -307,6 +437,9 @@ impl VaultBridgeService {
         note_id: &NoteId,
         request: UpdateNoteRequest,
     ) -> Result<UpdateNoteResponse, ServiceError> {
+        if self.store.uses_sql_backend() {
+            return self.sql_update(auth, note_id, request, false).await;
+        }
         let write_lock = self.vault_file_repair_lock(note_id.as_str()).await;
         let _write_guard = write_lock.lock().await;
         let _vault_write_guard = self.vault_write_lock.lock().await;
@@ -337,6 +470,7 @@ impl VaultBridgeService {
         } else {
             None
         };
+        let _projection_guard = filesystem.projection_lock.write().await;
         self.ensure_projected_write_within_limit(filesystem, &write.path, write.content.len())
             .await?;
         let revision = filesystem
@@ -436,6 +570,7 @@ impl VaultBridgeService {
         } else {
             None
         };
+        let _projection_guard = filesystem.projection_lock.write().await;
         self.ensure_projected_write_within_limit(filesystem, &write.path, write.content.len())
             .await?;
         let revision = filesystem
@@ -462,6 +597,9 @@ impl VaultBridgeService {
         file_id: &NoteId,
         request: UpdateNoteRequest,
     ) -> Result<UpdateNoteResponse, ServiceError> {
+        if self.store.uses_sql_backend() {
+            return self.sql_update(auth, file_id, request, true).await;
+        }
         let write_lock = self.vault_file_repair_lock(file_id.as_str()).await;
         let _write_guard = write_lock.lock().await;
         let _vault_write_guard = self.vault_write_lock.lock().await;
@@ -487,6 +625,7 @@ impl VaultBridgeService {
         } else {
             None
         };
+        let _projection_guard = filesystem.projection_lock.write().await;
         self.ensure_projected_write_within_limit(filesystem, &write.path, write.content.len())
             .await?;
         let revision = filesystem
@@ -503,6 +642,56 @@ impl VaultBridgeService {
         drop(headless_guard);
         Ok(UpdateNoteResponse {
             id: file_id.clone(),
+            status: projection.response_status("updated"),
+            local_projection: projection.state(),
+            operation_id,
+        })
+    }
+
+    async fn sql_update(
+        &self,
+        auth: &AuthContext,
+        id: &NoteId,
+        request: UpdateNoteRequest,
+        raw: bool,
+    ) -> Result<UpdateNoteResponse, ServiceError> {
+        let _write_guard = self.vault_write_lock.lock().await;
+        let mut headless_guard = if let Some(client) = &self.headless {
+            Some(
+                client
+                    .lock_filesystem()
+                    .await
+                    .map_err(ServiceError::Headless)?,
+            )
+        } else {
+            None
+        };
+        let _projection = self
+            .filesystem
+            .as_ref()
+            .expect("SQL filesystem")
+            .projection_lock
+            .write()
+            .await;
+        self.ensure_index_current()?;
+        let write = self.store.sql_prepare_write(auth, id, request, raw).await?;
+        let operation_id = write.operation_id.clone();
+        let source = self.filesystem.as_ref().expect("SQL filesystem");
+        self.ensure_projected_write_within_limit(source, &write.path, write.content.len())
+            .await?;
+        let revision = source
+            .update(
+                &write.path,
+                &write.content,
+                write.expected_couchdb_rev.as_deref(),
+            )
+            .await
+            .map_err(ServiceError::FilesystemWrite)?;
+        self.notify_headless_write_locked(headless_guard.as_mut(), &write.path)
+            .await;
+        let projection = self.finalize_prepared_write(write, &revision).await?;
+        Ok(UpdateNoteResponse {
+            id: id.clone(),
             status: projection.response_status("updated"),
             local_projection: projection.state(),
             operation_id,
@@ -541,9 +730,22 @@ impl VaultBridgeService {
 
     async fn finalize_prepared_write(
         &self,
-        write: PreparedVaultWrite,
+        mut write: PreparedVaultWrite,
         revision: &str,
     ) -> Result<LocalProjectionOutcome, ServiceError> {
+        if self.store.uses_sql_backend() && write.body_lease.is_none() {
+            let file = self
+                .filesystem
+                .as_ref()
+                .expect("source")
+                .read(&write.path)
+                .await
+                .map_err(ServiceError::FilesystemWrite)?;
+            if file.revision != revision {
+                return Err(ServiceError::IndexCatchingUp);
+            }
+            write.body_lease = file.lease.clone();
+        }
         self.store
             .project_source_committed_vault_write(write, revision)
             .await
@@ -555,6 +757,10 @@ impl VaultBridgeService {
         auth: &AuthContext,
         file_id: &NoteId,
     ) -> Result<VaultFile, ServiceError> {
+        if self.store.uses_sql_backend() {
+            let _guard = self.sql_read_guard().await?;
+            return self.store.sql_get_file(auth, file_id).await;
+        }
         if let Some(file) = self.store.get_vault_file_for_policy(auth, file_id).await {
             if let Some(filesystem) = self.filesystem.as_ref() {
                 let _headless_guard = if let Some(headless) = self.headless.as_ref() {
@@ -581,6 +787,7 @@ impl VaultBridgeService {
                     return Err(ServiceError::IndexCatchingUp);
                 }
                 return Ok(VaultFile {
+                    _body_lease: current.lease.clone(),
                     id: file_id.clone(),
                     path: current.path.clone(),
                     file_type: if current.path.ends_with(".md") {
@@ -822,7 +1029,7 @@ mod obts_tests {
     }
 
     #[tokio::test]
-    async fn source_committed_writes_enforce_the_aggregate_runtime_limit() {
+    async fn source_committed_writes_enforce_the_per_file_runtime_limit() {
         let store = VaultStore::new(10);
         store
             .project_filesystem_file(RecoveredVaultFileState {
@@ -845,18 +1052,18 @@ mod obts_tests {
             .expect("create first source file");
         let service = VaultBridgeService::new_with_filesystem(store, source.clone(), None);
 
+        service
+            .ensure_projected_write_within_limit(&source, "Second.md", 2)
+            .await
+            .expect("a second file is independent of the corpus total");
         assert!(matches!(
             service
-                .ensure_projected_write_within_limit(&source, "Second.md", 2)
+                .ensure_projected_write_within_limit(&source, "First.md", 6)
                 .await,
             Err(ServiceError::FilesystemWrite(
                 crate::filesystem::FilesystemError::ProjectionLimitExceeded { limit: 5 }
             ))
         ));
-        service
-            .ensure_projected_write_within_limit(&source, "First.md", 5)
-            .await
-            .expect("same-path replacement remains within limit");
     }
 
     #[tokio::test]

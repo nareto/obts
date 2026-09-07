@@ -50,6 +50,8 @@ pub struct SearchHit {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResponse {
+    #[serde(skip)]
+    pub(crate) _body_lease: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub results: Vec<SearchHit>,
     pub total_filtered: usize,
 }
@@ -80,6 +82,7 @@ impl UnscopedSearchHit {
 impl SearchResponse {
     pub fn new(results: Vec<SearchHit>, total_filtered: usize) -> Self {
         Self {
+            _body_lease: None,
             results,
             total_filtered,
         }

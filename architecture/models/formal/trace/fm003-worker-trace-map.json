@@ -1,0 +1,698 @@
+{
+  "schemaVersion": 1,
+  "modelId": "OBTS-FM-003",
+  "architectureRevision": 6,
+  "implementationEvidenceStatus": "checked-worker",
+  "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla",
+  "checks": "architecture/models/formal/checks-fm003-workers.json",
+  "currentImplementationContext": [
+    {
+      "path": "crates/obts-bridge/src/main.rs",
+      "range": "145-178",
+      "status": "Production workers now receive the same already-constructed VaultBridgeService as API/MCP."
+    },
+    {
+      "path": "crates/obts-bridge/src/service.rs",
+      "range": "79-127",
+      "status": "Trusted principal-independent capture uses existing headless-before-body order and attested filesystem source; guard released before provider."
+    },
+    {
+      "path": "crates/obts-bridge/src/workers/embedding.rs",
+      "range": "1-287",
+      "status": "Implemented shared Local/LocalAI thin-page loop, one captured file across block pages, SQL-only matched completion, owned cancellation/drain task. Local PG evidence available; independent implementation review and both synthetic stack profiles passed."
+    },
+    {
+      "path": "crates/obts-bridge/src/workers.rs",
+      "range": "1538-1676",
+      "status": "Incremental two-pass chunk selection before allocation and streaming byte-weighted aggregation; legacy all-chunk helpers/loops are test-only."
+    },
+    {
+      "path": "crates/obts-bridge/src/markdown/stream.rs",
+      "range": "1-277",
+      "status": "Incremental semantic block/paragraph emission reused by verified projection and worker. One-file parser/heading metadata cost remains, not a numerical RSS bound."
+    },
+    {
+      "path": "crates/obts-bridge/src/store/sql/embedding.rs",
+      "range": "1-241",
+      "status": "Thin tokens capture global schema and target epochs. Completion/invalidation lock the matching global schema row FOR SHARE before parent/target rows, serializing with reset FOR UPDATE and fencing new rows inserted after reset scans; Pool1 supported."
+    },
+    {
+      "path": "crates/obts-bridge/migrations/0021_embedding_generations.sql",
+      "range": "1-41",
+      "status": "Unlanded migration supplies global schema epoch plus non-reusable target epochs and source/hash invalidation triggers."
+    },
+    {
+      "path": "crates/obts-bridge/src/persistence.rs",
+      "range": "399-577",
+      "status": "Schema reset obtains schema-row FOR UPDATE before target rows and atomically advances global plus existing-row epochs, including NULL/pending rows. Late tokens from newly inserted rows are rejected by the held schema guard."
+    },
+    {
+      "path": "crates/obts-bridge/src/store/sql/projection.rs",
+      "range": "155-226",
+      "status": "Verified bounded projection consumes incremental semantic blocks, binds source revision and uses target generation triggers; existing deletion/replay/cursor path reused."
+    },
+    {
+      "path": "crates/obts-bridge/src/store/sql/tests/embedding.rs",
+      "range": "1-1206",
+      "status": "Worker and independent-review PG regressions: provider races, reset insertion phantom fencing, real full-content context Pool1/body1 completion, killed-owner backend, private/empty inputs, reindex, near63MiB and outages. Parent module retains two initial epoch regressions and all13 core PG tests."
+    },
+    {
+      "path": "crates/obts-bridge/src/store/sql/tests.rs",
+      "range": "1925-1992",
+      "status": "Two regression-first PG epoch invalidation tests; all 13 prior core PG regressions preserved."
+    },
+    {
+      "path": "docs/bridge-embedding-worker-evidence.md",
+      "range": "1-75",
+      "status": "Exact local commands, measured counters, scope and review, measured stack RSS and remaining live-delivery evidence."
+    },
+    {
+      "path": "crates/obts-bridge/src/store/sql.rs",
+      "range": "955-1207",
+      "status": "P1A correction: context operation body lease precedes planning transaction; same lease reused for selected full-body hydration."
+    },
+    {
+      "path": "crates/obts-bridge/src/filesystem.rs",
+      "range": "455-493",
+      "status": "Shared body-lease acquisition can reserve an operation slot before SQL; raw attested reads use the same helper."
+    },
+    {
+      "path": "crates/obts-bridge/src/workers.rs",
+      "range": "2894-2932",
+      "status": "Small-fixture input-dependent HTTP golden checks production streaming selection and raw-byte weighting against legacy sample/aggregate."
+    },
+    {
+      "path": "docs/bridge-bounded-memory-evidence/stack-disabled.json",
+      "range": "1-83",
+      "status": "Sanitized synthetic stack report: exact tested binary hash, configured workload, valid RSS observations and owned-resource cleanup."
+    },
+    {
+      "path": "docs/bridge-bounded-memory-evidence/stack-local.json",
+      "range": "1-87",
+      "status": "Sanitized synthetic stack report: exact tested binary hash, configured workload, valid RSS observations and owned-resource cleanup."
+    }
+  ],
+  "actions": {
+    "TakeQueue": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:32-37",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-worker",
+      "checks": [
+        "fm003-worker-note-safety",
+        "fm003-worker-note-liveness"
+      ],
+      "evidenceBoundary": "Reviewed local implementation, PostgreSQL regressions and synthetic full-stack evidence. Static action mapping is not instrumented runtime trace replay or a universal memory/durability proof.",
+      "localImplementation": [
+        "crates/obts-bridge/src/store/sql/embedding.rs:1-74",
+        "crates/obts-bridge/src/main.rs:145-178"
+      ],
+      "localRegressions": [
+        "postgres_worker_private_note_block_localai_and_local_empty_queue",
+        "postgres_worker_multipage_queue_blocks_reindex_delete_and_attestation",
+        "postgres_worker_sql_outage_has_no_empty_inner_fallback"
+      ]
+    },
+    "LegacyEmptySnapshot": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:38-40",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "negative-control-only",
+      "checks": [
+        "fm003-worker-negative-empty-inner"
+      ],
+      "evidenceBoundary": "Finite-model negative control, not production behavior. Runtime regressions and reviewed implementation are recorded separately."
+    },
+    "WorkerHeadless": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:41-43",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-worker",
+      "checks": [
+        "fm003-worker-note-safety",
+        "fm003-worker-note-liveness"
+      ],
+      "evidenceBoundary": "Reviewed local implementation, PostgreSQL regressions and synthetic full-stack evidence. Static action mapping is not instrumented runtime trace replay or a universal memory/durability proof.",
+      "localImplementation": [
+        "crates/obts-bridge/src/service.rs:79-127",
+        "crates/obts-bridge/src/workers/embedding.rs:67-287"
+      ],
+      "localRegression": "postgres_worker_real_shared_headless_single_slot_and_cancel_drain"
+    },
+    "WorkerBody": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:44-46",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-worker",
+      "checks": [
+        "fm003-worker-note-safety",
+        "fm003-worker-note-liveness"
+      ],
+      "evidenceBoundary": "Reviewed local implementation, PostgreSQL regressions and synthetic full-stack evidence. Static action mapping is not instrumented runtime trace replay or a universal memory/durability proof.",
+      "localImplementation": [
+        "crates/obts-bridge/src/service.rs:79-127",
+        "crates/obts-bridge/src/workers/embedding.rs:67-287"
+      ],
+      "localRegression": "postgres_worker_real_shared_headless_single_slot_and_cancel_drain",
+      "localRegressions": [
+        "postgres_review_context_provider_pool_body_order"
+      ]
+    },
+    "InverseBody": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:47-49",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "negative-control-only",
+      "checks": [
+        "fm003-worker-negative-inverse-acquire",
+        "fm003-worker-reach-inverse-headless"
+      ],
+      "evidenceBoundary": "Finite-model negative control, not production behavior. Runtime regressions and reviewed implementation are recorded separately."
+    },
+    "InverseHeadless": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:50-52",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "negative-control-only",
+      "checks": [
+        "fm003-worker-reach-inverse-headless"
+      ],
+      "evidenceBoundary": "Finite-model negative control, not production behavior. Runtime regressions and reviewed implementation are recorded separately."
+    },
+    "AttestBody": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:53-56",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-worker",
+      "checks": [
+        "fm003-worker-note-safety",
+        "fm003-worker-note-liveness"
+      ],
+      "evidenceBoundary": "Reviewed local implementation, PostgreSQL regressions and synthetic full-stack evidence. Static action mapping is not instrumented runtime trace replay or a universal memory/durability proof.",
+      "localImplementation": [
+        "crates/obts-bridge/src/service.rs:79-127",
+        "crates/obts-bridge/src/workers/embedding.rs:67-287"
+      ],
+      "localRegression": "postgres_worker_real_shared_headless_single_slot_and_cancel_drain"
+    },
+    "RejectAttestation": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:57-60",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-worker",
+      "checks": [
+        "fm003-worker-failure-safety",
+        "fm003-worker-failure-liveness",
+        "fm003-worker-reach-attestation-reject"
+      ],
+      "evidenceBoundary": "Reviewed local implementation, PostgreSQL regressions and synthetic full-stack evidence. Static action mapping is not instrumented runtime trace replay or a universal memory/durability proof.",
+      "localImplementation": [
+        "crates/obts-bridge/src/service.rs:79-127",
+        "crates/obts-bridge/src/workers/embedding.rs:67-287"
+      ],
+      "localRegression": "postgres_worker_multipage_queue_blocks_reindex_delete_and_attestation"
+    },
+    "BuildBatch": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:61-64",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-worker",
+      "checks": [
+        "fm003-worker-note-safety",
+        "fm003-worker-note-liveness"
+      ],
+      "evidenceBoundary": "Reviewed local implementation, PostgreSQL regressions and synthetic full-stack evidence. Static action mapping is not instrumented runtime trace replay or a universal memory/durability proof.",
+      "localImplementation": [
+        "crates/obts-bridge/src/workers.rs:1538-1676",
+        "crates/obts-bridge/src/workers/embedding.rs:126-287"
+      ],
+      "localRegressions": [
+        "incremental_note_chunks_match_legacy_boundaries",
+        "streaming_blocks_match_legacy",
+        "postgres_worker_near_64mib_bounded_selection_no_corpus_admission",
+        "postgres_worker_provider_stale_success_failure_source_hash_epoch_schema"
+      ]
+    },
+    "ProviderReply": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:65-67",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-worker",
+      "checks": [
+        "fm003-worker-note-safety",
+        "fm003-worker-note-liveness"
+      ],
+      "evidenceBoundary": "Reviewed local implementation, PostgreSQL regressions and synthetic full-stack evidence. Static action mapping is not instrumented runtime trace replay or a universal memory/durability proof.",
+      "localImplementation": [
+        "crates/obts-bridge/src/workers.rs:1538-1676",
+        "crates/obts-bridge/src/workers/embedding.rs:126-287"
+      ],
+      "localRegressions": [
+        "incremental_note_chunks_match_legacy_boundaries",
+        "streaming_blocks_match_legacy",
+        "postgres_worker_near_64mib_bounded_selection_no_corpus_admission",
+        "postgres_worker_provider_stale_success_failure_source_hash_epoch_schema"
+      ]
+    },
+    "ProviderFailure": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:68-71",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-worker",
+      "checks": [
+        "fm003-worker-failure-safety",
+        "fm003-worker-failure-liveness",
+        "fm003-worker-schema-note-safety",
+        "fm003-worker-schema-block-safety"
+      ],
+      "evidenceBoundary": "Reviewed local implementation, PostgreSQL regressions and synthetic full-stack evidence. Static action mapping is not instrumented runtime trace replay or a universal memory/durability proof.",
+      "localImplementation": [
+        "crates/obts-bridge/src/workers.rs:1538-1676",
+        "crates/obts-bridge/src/workers/embedding.rs:126-287"
+      ],
+      "localRegressions": [
+        "incremental_note_chunks_match_legacy_boundaries",
+        "streaming_blocks_match_legacy",
+        "postgres_worker_near_64mib_bounded_selection_no_corpus_admission",
+        "postgres_worker_provider_stale_success_failure_source_hash_epoch_schema"
+      ]
+    },
+    "ConsumeReply": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:72-76",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-worker",
+      "checks": [
+        "fm003-worker-note-safety",
+        "fm003-worker-note-liveness"
+      ],
+      "evidenceBoundary": "Reviewed local implementation, PostgreSQL regressions and synthetic full-stack evidence. Static action mapping is not instrumented runtime trace replay or a universal memory/durability proof.",
+      "localImplementation": [
+        "crates/obts-bridge/src/workers.rs:1538-1676",
+        "crates/obts-bridge/src/workers/embedding.rs:126-287"
+      ],
+      "localRegressions": [
+        "incremental_note_chunks_match_legacy_boundaries",
+        "streaming_blocks_match_legacy",
+        "postgres_worker_near_64mib_bounded_selection_no_corpus_admission",
+        "postgres_worker_provider_stale_success_failure_source_hash_epoch_schema"
+      ]
+    },
+    "SourceEdit": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:77-79",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-worker",
+      "checks": [
+        "fm003-worker-note-safety",
+        "fm003-worker-note-liveness"
+      ],
+      "evidenceBoundary": "Reviewed local implementation, PostgreSQL regressions and synthetic full-stack evidence. Static action mapping is not instrumented runtime trace replay or a universal memory/durability proof.",
+      "localImplementation": [
+        "crates/obts-bridge/src/store/sql/embedding.rs:1-241",
+        "crates/obts-bridge/migrations/0021_embedding_generations.sql:1-41",
+        "crates/obts-bridge/src/persistence.rs:399-577"
+      ],
+      "localRegressions": [
+        "postgres_worker_provider_stale_success_failure_source_hash_epoch_schema",
+        "postgres_worker_blocked_completion_sql_schema_reset_already_null_pool_one",
+        "postgres_worker_blocked_parent_replacement_and_combined_guards",
+        "postgres_worker_old_backend_statement_survives_owner_exit"
+      ]
+    },
+    "PublishProjection": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:80-85",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-worker",
+      "checks": [
+        "fm003-worker-note-safety",
+        "fm003-worker-note-liveness"
+      ],
+      "evidenceBoundary": "Reviewed local implementation, PostgreSQL regressions and synthetic full-stack evidence. Static action mapping is not instrumented runtime trace replay or a universal memory/durability proof.",
+      "localImplementation": [
+        "crates/obts-bridge/src/store/sql/embedding.rs:1-241",
+        "crates/obts-bridge/migrations/0021_embedding_generations.sql:1-41",
+        "crates/obts-bridge/src/persistence.rs:399-577"
+      ],
+      "localRegressions": [
+        "postgres_worker_provider_stale_success_failure_source_hash_epoch_schema",
+        "postgres_worker_blocked_completion_sql_schema_reset_already_null_pool_one",
+        "postgres_worker_blocked_parent_replacement_and_combined_guards",
+        "postgres_worker_old_backend_statement_survives_owner_exit",
+        "postgres_review_insert_during_schema_reset_fences_new_note_and_block"
+      ]
+    },
+    "ReplaceBlock": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:86-93",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-worker",
+      "checks": [
+        "fm003-worker-block-hash-safety",
+        "fm003-worker-block-hash-liveness",
+        "fm003-worker-block-epoch-safety",
+        "fm003-worker-block-epoch-liveness"
+      ],
+      "evidenceBoundary": "Reviewed local implementation, PostgreSQL regressions and synthetic full-stack evidence. Static action mapping is not instrumented runtime trace replay or a universal memory/durability proof.",
+      "localImplementation": [
+        "crates/obts-bridge/src/store/sql/embedding.rs:1-241",
+        "crates/obts-bridge/migrations/0021_embedding_generations.sql:1-41",
+        "crates/obts-bridge/src/persistence.rs:399-577"
+      ],
+      "localRegressions": [
+        "postgres_worker_provider_stale_success_failure_source_hash_epoch_schema",
+        "postgres_worker_blocked_completion_sql_schema_reset_already_null_pool_one",
+        "postgres_worker_blocked_parent_replacement_and_combined_guards",
+        "postgres_worker_old_backend_statement_survives_owner_exit",
+        "postgres_review_insert_during_schema_reset_fences_new_note_and_block"
+      ]
+    },
+    "CompleteSQL": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:100-120",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-worker",
+      "checks": [
+        "fm003-worker-reach-stale-note-success",
+        "fm003-worker-reach-stale-block-success",
+        "fm003-worker-reach-stale-note-failure",
+        "fm003-worker-reach-stale-block-failure",
+        "fm003-worker-reach-old-source-result",
+        "fm003-worker-reach-new-generation-retry",
+        "fm003-worker-negative-id-success",
+        "fm003-worker-negative-id-failure",
+        "fm003-worker-negative-ignored-hash",
+        "fm003-worker-negative-ignored-epoch",
+        "fm003-worker-negative-reindex-id",
+        "fm003-worker-schema-note-safety",
+        "fm003-worker-schema-block-safety",
+        "fm003-worker-negative-schema-note-success",
+        "fm003-worker-negative-schema-note-failure",
+        "fm003-worker-negative-schema-block-success",
+        "fm003-worker-negative-schema-block-failure",
+        "fm003-worker-negative-schema-reindex",
+        "fm003-worker-reach-schema-retry"
+      ],
+      "evidenceBoundary": "Reviewed local implementation, PostgreSQL regressions and synthetic full-stack evidence. Static action mapping is not instrumented runtime trace replay or a universal memory/durability proof.",
+      "localImplementation": [
+        "crates/obts-bridge/src/store/sql/embedding.rs:1-241",
+        "crates/obts-bridge/migrations/0021_embedding_generations.sql:1-41",
+        "crates/obts-bridge/src/persistence.rs:399-577"
+      ],
+      "localRegressions": [
+        "postgres_worker_provider_stale_success_failure_source_hash_epoch_schema",
+        "postgres_worker_blocked_completion_sql_schema_reset_already_null_pool_one",
+        "postgres_worker_blocked_parent_replacement_and_combined_guards",
+        "postgres_worker_old_backend_statement_survives_owner_exit",
+        "postgres_review_insert_during_schema_reset_fences_new_note_and_block"
+      ]
+    },
+    "Cancel": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:121-124",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-worker",
+      "checks": [
+        "fm003-worker-cancel-safety",
+        "fm003-worker-cancel-liveness"
+      ],
+      "evidenceBoundary": "Reviewed local implementation, PostgreSQL regressions and synthetic full-stack evidence. Static action mapping is not instrumented runtime trace replay or a universal memory/durability proof.",
+      "localImplementation": [
+        "crates/obts-bridge/src/service.rs:79-127",
+        "crates/obts-bridge/src/workers/embedding.rs:67-287"
+      ],
+      "localRegression": "postgres_worker_real_shared_headless_single_slot_and_cancel_drain"
+    },
+    "LateReply": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:125-128",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-worker",
+      "checks": [
+        "fm003-worker-reach-late-cancelled-result",
+        "fm003-worker-negative-cancelled-result"
+      ],
+      "evidenceBoundary": "Reviewed local implementation, PostgreSQL regressions and synthetic full-stack evidence. Static action mapping is not instrumented runtime trace replay or a universal memory/durability proof.",
+      "localImplementation": [
+        "crates/obts-bridge/src/service.rs:79-127",
+        "crates/obts-bridge/src/workers/embedding.rs:67-287"
+      ],
+      "localRegression": "postgres_worker_real_shared_headless_single_slot_and_cancel_drain"
+    },
+    "Drain": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:129-132",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-worker",
+      "checks": [
+        "fm003-worker-note-safety",
+        "fm003-worker-note-liveness"
+      ],
+      "evidenceBoundary": "Reviewed local implementation, PostgreSQL regressions and synthetic full-stack evidence. Static action mapping is not instrumented runtime trace replay or a universal memory/durability proof.",
+      "localImplementation": [
+        "crates/obts-bridge/src/service.rs:79-127",
+        "crates/obts-bridge/src/workers/embedding.rs:67-287"
+      ],
+      "localRegression": "postgres_worker_real_shared_headless_single_slot_and_cancel_drain",
+      "localRegressions": [
+        "postgres_review_context_provider_pool_body_order"
+      ]
+    },
+    "ApiHeadless": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:133-135",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-worker",
+      "checks": [
+        "fm003-worker-reach-api-wait",
+        "fm003-worker-negative-inverse-acquire",
+        "fm003-worker-negative-completion-lock"
+      ],
+      "evidenceBoundary": "Reviewed local implementation, PostgreSQL regressions and synthetic full-stack evidence. Static action mapping is not instrumented runtime trace replay or a universal memory/durability proof.",
+      "localImplementation": [
+        "crates/obts-bridge/src/service.rs:79-127",
+        "crates/obts-bridge/src/workers/embedding.rs:67-287"
+      ],
+      "localRegression": "postgres_worker_real_shared_headless_single_slot_and_cancel_drain"
+    },
+    "ApiBody": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:136-138",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-worker",
+      "checks": [
+        "fm003-worker-note-safety",
+        "fm003-worker-note-liveness"
+      ],
+      "evidenceBoundary": "Reviewed local implementation, PostgreSQL regressions and synthetic full-stack evidence. Static action mapping is not instrumented runtime trace replay or a universal memory/durability proof.",
+      "localImplementation": [
+        "crates/obts-bridge/src/service.rs:79-127",
+        "crates/obts-bridge/src/workers/embedding.rs:67-287"
+      ],
+      "localRegression": "postgres_worker_real_shared_headless_single_slot_and_cancel_drain",
+      "localRegressions": [
+        "postgres_review_context_provider_pool_body_order"
+      ]
+    },
+    "ApiRelease": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:139-142",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-worker",
+      "checks": [
+        "fm003-worker-note-safety",
+        "fm003-worker-note-liveness"
+      ],
+      "evidenceBoundary": "Reviewed local implementation, PostgreSQL regressions and synthetic full-stack evidence. Static action mapping is not instrumented runtime trace replay or a universal memory/durability proof.",
+      "localImplementation": [
+        "crates/obts-bridge/src/service.rs:79-127",
+        "crates/obts-bridge/src/workers/embedding.rs:67-287"
+      ],
+      "localRegression": "postgres_worker_real_shared_headless_single_slot_and_cancel_drain"
+    },
+    "Terminal": {
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:143-146",
+      "contracts": [
+        "OBTS-BRG-EMBED-001",
+        "OBTS-BRG-BODY-001"
+      ],
+      "codeStatus": "checked-worker",
+      "checks": [
+        "fm003-worker-note-safety",
+        "fm003-worker-note-liveness"
+      ],
+      "evidenceBoundary": "Reviewed local implementation, PostgreSQL regressions and synthetic full-stack evidence. Static action mapping is not instrumented runtime trace replay or a universal memory/durability proof.",
+      "localImplementation": [
+        "crates/obts-bridge/src/service.rs:79-127",
+        "crates/obts-bridge/src/workers/embedding.rs:67-287"
+      ],
+      "localRegression": "postgres_worker_real_shared_headless_single_slot_and_cancel_drain"
+    },
+    "SchemaReset": {
+      "contracts": [
+        "OBTS-BRG-EMBED-001"
+      ],
+      "codeStatus": "checked-worker",
+      "checks": [
+        "fm003-worker-schema-note-safety",
+        "fm003-worker-schema-note-liveness",
+        "fm003-worker-schema-block-safety",
+        "fm003-worker-schema-block-liveness",
+        "fm003-worker-schema-reindex-safety",
+        "fm003-worker-reach-schema-pending-sql"
+      ],
+      "evidenceBoundary": "Reviewed local implementation, PostgreSQL regressions and synthetic full-stack evidence. Static action mapping is not instrumented runtime trace replay or a universal memory/durability proof.",
+      "model": "architecture/models/formal/OBTSBridgeEmbeddingWorker.tla:94-99",
+      "localImplementation": [
+        "crates/obts-bridge/src/store/sql/embedding.rs:1-241",
+        "crates/obts-bridge/migrations/0021_embedding_generations.sql:1-41",
+        "crates/obts-bridge/src/persistence.rs:399-577"
+      ],
+      "localRegressions": [
+        "postgres_worker_provider_stale_success_failure_source_hash_epoch_schema",
+        "postgres_worker_blocked_completion_sql_schema_reset_already_null_pool_one",
+        "postgres_worker_blocked_parent_replacement_and_combined_guards",
+        "postgres_worker_old_backend_statement_survives_owner_exit",
+        "postgres_review_insert_during_schema_reset_fences_new_note_and_block"
+      ]
+    }
+  },
+  "implementationObligations": [
+    "Actual PostgreSQL plus paused fake LocalAI: replace note SQL generation after capture; stale success and stale failure both return matched zero and preserve replacement vector/readiness/retries. Repeat for hash-only and epoch-only block replacement, reused block IDs, reindex/backfill and concurrent parent update.",
+    "READ COMMITTED UPDATE blocks JOIN notes expected revision is not enough by itself: serialize parent note replacement transactionally (consistent parent lock), or compare target-row source epoch with a coordinated replacement protocol. TLC CompleteSQL is atomic; concrete transaction isolation is NOT proved.",
+    "Private note/block acquisition has no caller ACL; SQL outage propagates with no empty StoreInner/all-text fallback. Bounded keyset pages, one captured file, incremental sampling before allocation, bounded provider batches and streaming vector aggregation in both provider modes.",
+    "Actual shared-headless max_body_slots=1 schedule: provider owns body, API holds headless waiting for body, completion/failure is SQL-only, dispose input/payload/permit, API completes. Also cancellation, late reply, shutdown/drain and current stable-generation retry.",
+    "Source edit while old projection remains: source/OID attestation refuses new capture against old token; an already-attested old completion may match old SQL until publication invalidates it. SQL token alone is not source authority.",
+    "Near-64-MiB single-file input and separately measured parser, driver, HTTP encoding, RSS highwaters; final full-stack rerun after workers. Existing parent-reported 157 units/13 PG, Node 299, 52+39 formal and 30 stack checks do not establish worker conformance.",
+    "Capture embedding schema/model epoch in every thin note/block/reindex token and compare it atomically with success AND failure writes. Same-dimension model changes do not change raw note revision; filesystem SHA/OID attestation must remain independent of model identity.",
+    "ensure_embedding_schema must invalidate target-row epochs even for already-empty rows with zero retries and a provider result still pending. Serialize reset with mutation using target-row epoch CAS or consistent transactional guarding, not a separate preflight/global-fingerprint snapshot. Preserve the independent block-parent READ COMMITTED guard obligation. Add actual-PG paused note/block SQL success/failure, schema reset, old backend statement after process death, matched-zero and new-schema retry tests."
+  ],
+  "modelBoundary": [
+    "One symbolic private-capable note, one reusable block ID, one worker, one API, one global body slot; thin queue length one, source/SQL revisions 1/2, block hash and epoch independently 1/2, embedding schema epoch 1/2 and captured/vector/retry schema tokens 0/1/2, two incremental chunks, one symbolic payload unit per batch. No byte expansion factor or numerical RSS claim.",
+    "At most one source OR hash OR block-epoch OR embedding-schema update, one provider failure OR cancellation and one API operation. Source/schema replacement are separate configurations. SchemaReset is allowed during Provider or Complete (SQL pending before atomic mutation), without source revision changes. No cursor/audit variables: unchanged FM003 projection remains authority.",
+    "Weak fairness for each enabled queue/capture/attestation/build/reply/consume/SQL completion/publication/drain/API continuation; optional edits, failure, cancellation and API start are not forced. Provider eventually responds, SQL/source available, generations stabilize; cancellation models retained ownership through late reply then disposal, not unresponsive transport termination.",
+    "CompleteSQL and PublishProjection/ReplaceBlock are atomic abstract linearization points. SQL locks/MVCC, actual SHA/OID computation, chunk text/embedding arithmetic, provider parsing, filesystem failures/power loss, multiworker scheduling, parser/driver/HTTP allocation and RSS are omitted. Negative lock schedules are abstract lock-graph evidence, not proof of production synchronization.",
+    "Static action mapping only; no runtime instrumentation, trace replay or complete worker implementation conformance claim.",
+    "SchemaGenerationRetry checks stable current-schema progress. CompleteSQL abstracts one atomic epoch check plus mutation, including a late old statement; PostgreSQL MVCC and process/backend lifecycle are not modeled. Filesystem attestation never checks an embedding model fingerprint.",
+    "Review 9e4558bf blocked false mapping to disabled configs. Every mapped action/check pair now requires actual TLC generated-successor count > 0; recorded coverage is SHA-256-bound to the model and config, and each live matrix run checks fresh coverage. A separate inverse-headless reach check proves the non-deadlocking inverse acquisition action is reachable. This is finite-model exercise, not implementation conformance."
+  ],
+  "previousGateValidation": [
+    "npm run test:formal:bridge: actual SANY/TLC passed all 39 unchanged projection checks plus 30 worker companion checks (12 positive, 9 reachability, 9 negative); largest worker positive 1334 generated / 908 distinct / depth 39.",
+    "npx vitest run tests/formal-checker.test.ts tests/formal-bounded-body.test.ts tests/formal-embedding-worker.test.ts: 28 passed (17 baseline, 1 projection, 10 new worker harness/integration tests).",
+    "npx tsc -p tsconfig.json --noEmit: passed.",
+    "All three checker --validate-only modes passed: 52 baseline / 39 projection / 30 worker checks and source/trace ranges. Unchanged 52 baseline TLC not rerun at this gate.",
+    "Default npm test:formal and the formal-specific Forgejo workflow now include all matrices; focused tests assert that integration. Workflow was only locally edited, not dispatched.",
+    "git diff --check and git diff --cached --quiet passed; architecture revision remains 6, crate remains 0.1.3. No production Rust/TS, parent stack script/docs, staging, commit, remote or live changes by this gate.",
+    "Initial companion checker run rejected an actual record-formatted deadlock because its expected-field matcher used scalar formatting; corrected the harness matcher and reran all affected checks successfully. This was a gate defect, not an ignored model counterexample.",
+    "Independent review is required next. Worker implementation/actual-PG fake-provider regressions, near-64-MiB input measurement and final post-worker stack acceptance remain forthcoming."
+  ],
+  "gateValidation": [
+    "Architecture-only follow-up to independent review 9e4558bf: corrected action/config attribution, added embedding schema/model epoch to current note/block/reindex generations, and retained revision 6 / crate 0.1.3.",
+    "npm run test:formal:workers: actual SANY/TLC passed all 48 checks (18 positive, 16 reachability, 14 negative), including fresh TLC generated-successor validation for every mapped action/check pair.",
+    "All original 30 worker state-space baselines remain unchanged. Each schema note/block/reindex safety/liveness check with failure enabled: 924 generated / 671 distinct / depth 38. Largest full-worker positive remains 1334 / 908 / 39.",
+    "Schema-stale success controls/witnesses: 128 / 93 / 13; schema-stale failures: 50 / 41 / 10. Current-schema retry: 437 / 325 / 22. Pending-SQL schema reset: 29 / 26 / 9. Explicit inverse-headless acquisition: 4 / 4 / 4.",
+    "npx vitest run tests/formal-checker.test.ts tests/formal-bounded-body.test.ts tests/formal-embedding-worker.test.ts: 38 passed (17 baseline, 1 projection, 20 worker), including disabled-action mappings, stale model/config digests and generated-successor evidence gates. npx tsc -p tsconfig.json --noEmit passed.",
+    "Default npm/CI commands already include the full companion matrix; focused integration assertions retain 52 + 39 + 48 = 139 checks. This follow-up does not modify parent-owned package/stack scripts/docs or the workflow.",
+    "Precise bounds: one note/block/worker/API/body slot and queue token; two chunks with one symbolic provider-payload unit; source/SQL/block hash/block epoch/schema epoch each 1/2; at most one source OR hash OR block epoch OR schema reset and one failure OR cancellation. Schema reset occurs in Provider or Complete, leaving source revision unchanged. Optional reset is not forced; fair queue/provider/SQL/drain/API continuation and stable generations underpin liveness.",
+    "No production changes or implementation conformance claim. Pending old SQL after reset is modeled at atomic mutation, not actual MVCC/backend lifecycle or process death. Actual-PG paused statement/reset and old-backend-after-process-death evidence remain required; no numerical RSS/parser/driver guarantee."
+  ],
+  "localImplementationEvidenceStatus": "independently-reviewed-and-synthetic-stack-checked",
+  "legacyGateFieldNote": "The preimplementation-only status restriction was promoted after independent implementation review and passing disabled/local-worker stack profiles. No instrumented TLA refinement or live-delivery proof is implied.",
+  "implementationValidation": [
+    "CARGO_TARGET_DIR=/tmp/obts-bounded-memory-target cargo check -p obts_bridge: passed without warnings.",
+    "CARGO_TARGET_DIR=/tmp/obts-bounded-memory-target cargo test -p obts_bridge: 159 passed, 25 opt-in PG ignored, 0 failures.",
+    "CARGO_TARGET_DIR=/tmp/obts-bounded-memory-target OBTS_SYNTHETIC_POSTGRES_URL=postgresql://obts_bridge_test@127.0.0.1:32785/obts_bridge_test cargo test -p obts_bridge postgres_ -- --ignored --nocapture: 25 passed (13 preserved core +12 new worker), 105.41s. Initial red epoch tests failed before implementation. An earlier combined validation shell timed out at 210s; an isolated full PG rerun passed under a 300s tool timeout, and the final check/unit/25-PG rerun passed after the provider-outage fix.",
+    "Near63MiB measured: input 66060288 bytes; captured-input highwater1; selected note chunks256; raw chunk4096 bytes; provider batch8; requests32; normalized provider input20 bytes for opaque synthetic text; normal projection rows128/encoded24594 bytes; largest singleton66560317 bytes; resident raw note/file/link maps0. No isolated RSS/parser/JSON/driver allocation measurement or hard RSS/singleton-byte ceiling.",
+    "Real shared Rust HeadlessClient mutex backed by synthetic Node ready-event process: note/block x success/failure x normal/cancel single-slot API-interleaving schedules passed. Synthetic lock harness does not replace full Node sync/restore stack evidence.",
+    "Four note/block success/failure process-death schedules: SIGKILL actual Rust client while its PostgreSQL parent-guard SELECT remains blocked, verify backend survives owner exit, reset same-dimension model, drain old statement without mutation, then retry current schema successfully. Concrete two-statement transaction guard, not an ID-only joined UPDATE.",
+    "No model/configuration/harness changes, TLC reruns, version bumps, staged files, commits, remotes, credentials or live deployment changes. Own uniquely identified red/interrupted fixture DBs cleaned with FORCE; parent PostgreSQL container preserved. Parent-owned stack script/package/docs sections untouched.",
+    "Independent implementation review, final worker-inclusive stack and isolated near-limit RSS evidence remain pending. Optional /usr/bin/time unavailable; parent explicitly retains measurement in its existing stack harness. See docs/bridge-embedding-worker-evidence.md.",
+    "Regression-first provider-outage check initially failed (block retry count1 instead of0), then passed after preserving legacy health-probe classification; final full25-PG rerun passed and the unique red fixture database was cleaned.",
+    "node scripts/check-bridge-bounded-model.mjs --worker-companion --validate-only:48 manifest/action/trace checks passed. npx vitest run tests/formal-embedding-worker.test.ts:20 passed after trace updates; no TLC matrix rerun. git diff --check and git diff --cached --quiet passed."
+  ],
+  "reviewCorrectionValidation": [
+    "Review6dafa023 P1A/P1B are concrete violations of already-correct BODY/QUERY/EMBED contracts and atomic CompleteSQL/SchemaReset; no model/harness/status promotion or new formal behavior.",
+    "Red-first actual PG: postgres_review_context_provider_pool_body_order failed 3-second progress (pool1/body1); postgres_review_insert_during_schema_reset_fences_new_note_and_block accepted stale success matched1. Both cleaned their databases and then passed after fixes.",
+    "P1A: acquire operation body lease before context planning TX. Four success/failure x normal/forced-singleton provider/context schedules now finish; SQL acquisition timeout is not used as progress. Audit found other first-body acquisitions release pooled metadata transactions first, metadata-only transactions never acquire body, and singleton acquisition precedes completion pool TX or follows projection flush.",
+    "P1B: queued note token carries global schema epoch; block work inherits it. Success/failure and projection invalidation lock matching schema row FOR SHARE then parent/target; reset locks schema FOR UPDATE before target scans and advances epoch atomically. Newly projected notes/blocks may exist outside scan snapshots but old schema tokens cannot mutate them. Four note/block success/failure insertion-during-reset schedules return0 and retry current schema successfully.",
+    "Optional input-dependent HTTP golden: >256 unequal chunks, batch7, legacy small-fixture sampled/byte-weighted aggregate equals production streaming output; unweighted aggregate differs. No near-limit legacy chunk allocation.",
+    "CARGO_TARGET_DIR=/tmp/obts-bounded-memory-target cargo check -p obts_bridge: passed without warnings. cargo test -p obts_bridge with same target:160 passed,27 opt-in PG ignored. OBTS_SYNTHETIC_POSTGRES_URL=postgresql://obts_bridge_test@127.0.0.1:32785/obts_bridge_test cargo test -p obts_bridge postgres_ -- --ignored --nocapture with same target:27 passed (all25 prior+2 correction tests),109.79s. Prior killed-owner, schema, private, headless and near63MiB regressions preserved.",
+    "Near-limit highwaters reproduced unchanged:66060288 input bytes;1 captured input;256 sampled;4096 raw chunk bytes;8 provider batch;32 requests;24594 normal encoded bytes;66560317 singleton bytes. RSS not measured here.",
+    "Unlanded migration0021 amended to add global schema epoch; revision6/crate0.1.3 unchanged. Fresh PG/upgrade fixtures passed. Earlier unlanded migration checksums require parent disposable-harness lifecycle rather than silent reuse. No staged/committed/remote/live or parent-harness changes; independent re-review and final worker-inclusive stack remain required."
+  ],
+  "localAcceptance": {
+    "independentReview": "passed",
+    "reviewRuns": [
+      "6dafa023-963e-429a-a4ea-27bffbbed52e:memory",
+      "41fe65ca-cc15-41a7-8e00-441f30281e90:correctness",
+      "84673254-c97c-4dc9-b638-2048414640e0:harness",
+      "f94f5ad1-0f34-4a02-aa99-4fefd56fe086:evidence-gates"
+    ],
+    "unitTests": 160,
+    "postgresTests": 27,
+    "nodeTests": 333,
+    "formalChecks": {
+      "baseline": 52,
+      "projection": 39,
+      "worker": 48
+    },
+    "stackReports": [
+      "docs/bridge-bounded-memory-evidence/stack-disabled.json",
+      "docs/bridge-bounded-memory-evidence/stack-local.json"
+    ],
+    "scope": "Reviewed implementation and disposable local stack only; deployment/live client acceptance, soak, isolated near-limit RSS and power-loss durability remain separate."
+  },
+  "finalAcceptanceValidation": [
+    "Independent worker memory/semantics review passed; independent concurrency re-review cleared both P1 fixes and reran the two new PostgreSQL regressions.",
+    "Final post-format cargo fmt/check/build passed;160 units and27 actual PostgreSQL tests passed (104.19s PG). Final npm test:333 tests in20 files and52 baseline+39 projection+48 worker actual TLC checks passed. Logs:/tmp/obts-final-closeout-{fmt,check,build,units,pg,node-formal}.log.",
+    "Final same-binary stack profiles passed: disabled30 checks; local34 checks, including private note/block embedding and complete queues at8/72MiB and after pending-write SIGKILL/client-volume restore. All owned per-run resources removed.",
+    "Final rebuilt local-worker profile measured steady Rust77246464->75120640 bytes; Node168542208->177414144 bytes. Sampled maxima are lower bounds and exclude PostgreSQL/server/controller; independent-run GC/allocator variation is not a memory-reduction claim. No isolated near63MiB RSS or universal bound.",
+    "Historical gate/implementation arrays above describe their respective earlier stages. This final receipt supersedes their then-pending review/stack language; no live activation, commit or push occurred.",
+    "Scoped rustfmt was the final Rust change; trace source ranges were mechanically remapped. Both stack profiles were rerun after rebuilding, and saved reports refreshed to binary2bec139895bc978caa297e8def65a64fd1353a47032c9a9b1f17c21ab4ba72ce. Disabled30/local34 checks passed again, with1046/1523 samples respectively and complete owned per-run cleanup."
+  ]
+}

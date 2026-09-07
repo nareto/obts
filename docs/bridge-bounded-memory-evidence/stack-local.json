@@ -1,0 +1,87 @@
+{
+  "passed": true,
+  "checks": [
+    "peer paired to the disposable server",
+    "small corpus published by a real client",
+    "unauthenticated REST request denied",
+    "Rust-supervised Node paired with cookie/CSRF owner approval and became ready",
+    "small-profile note and block embeddings complete",
+    "trusted worker embeds the private note and its blocks",
+    "raw REST file matches peer source SHA-256",
+    "reported raw SHA-256 matches response bytes",
+    "private exact body denied to scoped reader",
+    "private lexical result excluded",
+    "legacy substring query works through the live SQL backend",
+    "Base link projection excludes denied target IDs",
+    "large corpus published by a real client",
+    "large-profile note and block embeddings complete",
+    "more than 64 MiB synchronized and served by the real stack",
+    "REST create accepted",
+    "revision-safe REST edit accepted",
+    "stale REST revision rejected with 409",
+    "REST edit synchronized back to peer",
+    "peer and REST edit bytes agree",
+    "MCP initialization succeeds",
+    "MCP raw file matches REST exactly",
+    "derived projection reset preserves access audit",
+    "same-commit rebuild recovers exact bytes",
+    "legacy raw SQL body fields stay empty (derived lexical plaintext is separate)",
+    "REST edit remains accepted while the sync server is unavailable",
+    "pending edit exists in authoritative client files before termination",
+    "client volume copied and restored only after forced runtime termination",
+    "restored client publishes pending work to the peer",
+    "pending edit survives SIGKILL, client-volume restore and resynchronization",
+    "runtime restart and client restore preserve retained SQL audit",
+    "disposable file deleted through the peer",
+    "peer deletion projects to REST 404",
+    "embeddings complete after reset, pending-write restore and deletion"
+  ],
+  "corpus": {
+    "smallFixtureBytes": 8388608,
+    "largeFixtureBytes": 75497472
+  },
+  "memory": {
+    "smallSteady": {
+      "rustRss": 77246464,
+      "rustAnon": 51163136,
+      "nodeRss": 168542208,
+      "nodeAnon": 80416768
+    },
+    "largeSteady": {
+      "rustRss": 75120640,
+      "rustAnon": 48906240,
+      "nodeRss": 177414144,
+      "nodeAnon": 89288704
+    },
+    "smallPeak": {
+      "rustValidSamples": 152,
+      "rustRss": 83865600,
+      "rustAnon": 57782272,
+      "nodeValidSamples": 152,
+      "nodeRss": 176156672,
+      "nodeAnon": 88031232
+    },
+    "largePeak": {
+      "rustValidSamples": 1371,
+      "rustRss": 81735680,
+      "rustAnon": 55521280,
+      "nodeValidSamples": 1371,
+      "nodeRss": 241815552,
+      "nodeAnon": 153690112
+    },
+    "sampleCount": 1523,
+    "note": "Rust and supervised Node process bytes only; sampled maxima are lower bounds on actual peaks. Missing observations are null, not zero. No numerical parser, allocator, singleton or RSS ceiling is established."
+  },
+  "embeddingMode": "local",
+  "stack": "Rust Bridge + supervised Node + TypeScript server + synthetic PostgreSQL; HTTP cookie/CSRF approval, not visual browser UI",
+  "bridgeBinarySha256": "2bec139895bc978caa297e8def65a64fd1353a47032c9a9b1f17c21ab4ba72ce",
+  "nodeVersion": "v24.14.1",
+  "embeddingConfiguration": {
+    "mode": "local",
+    "dimensions": 64,
+    "pollIntervalSeconds": 1,
+    "blockChunkBytes": 4096
+  },
+  "cleanupFailures": [],
+  "syntheticResourcesRemoved": true
+}

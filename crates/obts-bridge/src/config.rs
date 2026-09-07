@@ -145,7 +145,12 @@ pub struct ClientConfig {
     pub device_name: String,
     pub scan_interval_seconds: u64,
     pub projection_audit_interval_seconds: u64,
-    pub projection_max_text_bytes: u64,
+    pub projection_max_file_text_bytes: u64,
+    pub projection_max_inflight_bodies: usize,
+    pub projection_batch_rows: usize,
+    pub projection_batch_bytes: u64,
+    #[serde(rename = "projection_max_text_bytes", default)]
+    pub legacy_projection_max_text_bytes: Option<u64>,
     pub restart_failure_window_seconds: u64,
     pub restart_max_failures: u32,
     pub restart_base_backoff_seconds: u64,
@@ -162,7 +167,11 @@ impl Default for ClientConfig {
             device_name: "obts-bridge".to_string(),
             scan_interval_seconds: 2,
             projection_audit_interval_seconds: 7 * 24 * 60 * 60,
-            projection_max_text_bytes: 512 * 1024 * 1024,
+            projection_max_file_text_bytes: 64 * 1024 * 1024,
+            projection_max_inflight_bodies: 2,
+            projection_batch_rows: 128,
+            projection_batch_bytes: 8 * 1024 * 1024,
+            legacy_projection_max_text_bytes: None,
             restart_failure_window_seconds: 15 * 60,
             restart_max_failures: 3,
             restart_base_backoff_seconds: 5,
@@ -194,9 +203,29 @@ impl ClientConfig {
                 "client.device_name is required".to_string(),
             ));
         }
-        if self.projection_max_text_bytes == 0 {
+        if self.legacy_projection_max_text_bytes.is_some() {
             return Err(ConfigError::InvalidClient(
-                "client.projection_max_text_bytes must be at least 1".to_string(),
+                "client.projection_max_text_bytes is obsolete; use projection_max_file_text_bytes (the old aggregate setting is not migrated implicitly)".to_string(),
+            ));
+        }
+        if self.projection_max_file_text_bytes == 0 {
+            return Err(ConfigError::InvalidClient(
+                "client.projection_max_file_text_bytes must be at least 1".to_string(),
+            ));
+        }
+        if self.projection_max_inflight_bodies == 0 {
+            return Err(ConfigError::InvalidClient(
+                "client.projection_max_inflight_bodies must be at least 1".to_string(),
+            ));
+        }
+        if self.projection_batch_rows == 0 {
+            return Err(ConfigError::InvalidClient(
+                "client.projection_batch_rows must be at least 1".to_string(),
+            ));
+        }
+        if self.projection_batch_bytes == 0 {
+            return Err(ConfigError::InvalidClient(
+                "client.projection_batch_bytes must be at least 1".to_string(),
             ));
         }
         if self.restart_max_failures == 0 {
@@ -919,6 +948,33 @@ mod tests {
             assert_eq!(cfg.embedding.note_chunk_bytes, 800);
             assert_eq!(cfg.embedding.mode, EmbeddingMode::Local);
         });
+    }
+
+    #[test]
+    fn rejects_legacy_aggregate_projection_limit() {
+        let mut file = NamedTempFile::new().expect("temp file");
+        writeln!(
+            file,
+            "client:\n  projection_max_text_bytes: 123\ncontexts:\n  smoke:\n    read: []\n    create: []\n    edit: []\n"
+        )
+        .expect("write config");
+
+        let error = AppConfig::load_from_path(file.path()).expect_err("legacy setting must fail");
+        assert!(
+            matches!(error, ConfigError::InvalidClient(message) if message.contains("obsolete"))
+        );
+    }
+
+    #[test]
+    fn uses_bounded_per_file_projection_defaults() {
+        let config = AppConfig::default();
+        assert_eq!(
+            config.client.projection_max_file_text_bytes,
+            64 * 1024 * 1024
+        );
+        assert_eq!(config.client.projection_max_inflight_bodies, 2);
+        assert_eq!(config.client.projection_batch_rows, 128);
+        assert_eq!(config.client.projection_batch_bytes, 8 * 1024 * 1024);
     }
 
     #[test]

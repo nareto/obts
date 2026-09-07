@@ -11,12 +11,12 @@ use thiserror::Error;
 use crate::config::DatabaseConfig;
 use crate::new_note::PersistenceFailureKind;
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
-const MAX_INDEXED_SEARCH_TEXT_BYTES: usize = 500_000;
+pub(crate) const MAX_INDEXED_SEARCH_TEXT_BYTES: usize = 500_000;
 pub const RECOVERY_KIND_FILE_ALIAS: &str = "file_alias";
 
 #[derive(Clone, Debug)]
 pub struct PostgresPersistence {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
 }
 
 #[derive(Debug, Clone)]
@@ -349,7 +349,7 @@ impl PostgresPersistence {
         &self.pool
     }
 
-    async fn prepare_embedding_column_for_migrations(
+    pub(crate) async fn prepare_embedding_column_for_migrations(
         &self,
         target_embedding_dimensions: usize,
     ) -> Result<(), PersistenceError> {
@@ -418,8 +418,11 @@ impl PostgresPersistence {
 
         let mut tx = self.pool.begin().await?;
 
+        sqlx::query("SELECT pg_advisory_xact_lock(724190021)")
+            .execute(&mut *tx)
+            .await?;
         let metadata_row = sqlx::query(
-            "SELECT model, dimensions, hnsw_m, hnsw_ef_construction FROM embedding_schema WHERE id = 1",
+            "SELECT model, dimensions, hnsw_m, hnsw_ef_construction FROM embedding_schema WHERE id = 1 FOR UPDATE",
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -469,11 +472,9 @@ impl PostgresPersistence {
                 WITH cleared AS (
                     UPDATE notes
                     SET embedding = NULL,
+                        embedding_epoch = nextval('bridge_embedding_generation'),
                         embedding_failures = 0,
                         embedding_failed_at = NULL
-                    WHERE embedding IS NOT NULL
-                       OR embedding_failures <> 0
-                       OR embedding_failed_at IS NOT NULL
                     RETURNING 1
                 )
                 SELECT COUNT(*) FROM cleared
@@ -491,13 +492,10 @@ impl PostgresPersistence {
                 r#"
                 UPDATE blocks
                 SET embedding = NULL,
+                    embedding_epoch = nextval('bridge_embedding_generation'),
                     embedding_failures = 0,
                     embedding_failed_at = NULL,
                     last_embedding_error = NULL
-                WHERE embedding IS NOT NULL
-                   OR embedding_failures <> 0
-                   OR embedding_failed_at IS NOT NULL
-                   OR last_embedding_error IS NOT NULL
                 "#,
             )
             .execute(&mut *tx)
@@ -552,6 +550,7 @@ impl PostgresPersistence {
                 dimensions = EXCLUDED.dimensions,
                 hnsw_m = EXCLUDED.hnsw_m,
                 hnsw_ef_construction = EXCLUDED.hnsw_ef_construction,
+                epoch = CASE WHEN $5 THEN nextval('bridge_embedding_generation') ELSE embedding_schema.epoch END,
                 updated_at = EXCLUDED.updated_at
             "#,
         )
@@ -559,6 +558,7 @@ impl PostgresPersistence {
         .bind(target_dimensions_i32)
         .bind(target_hnsw_m_i32)
         .bind(target_hnsw_ef_construction_i32)
+        .bind(dimensions_changed || block_dimensions_changed || model_changed)
         .execute(&mut *tx)
         .await?;
 
@@ -996,6 +996,7 @@ impl PostgresPersistence {
         Ok(exists)
     }
 
+    #[cfg(test)]
     pub async fn pending_embedding_batch(
         &self,
         limit: usize,
@@ -1458,6 +1459,7 @@ impl PostgresPersistence {
         Ok(pending.max(0) as usize)
     }
 
+    #[cfg(test)]
     pub async fn set_embeddings(
         &self,
         updates: Vec<(String, Vec<f32>)>,
@@ -1489,6 +1491,7 @@ impl PostgresPersistence {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn record_embedding_failure(&self, note_id: &str) -> Result<(), PersistenceError> {
         sqlx::query(
             r#"
@@ -2175,6 +2178,7 @@ impl PostgresPersistence {
     // Block persistence
     // ------------------------------------------------------------------
 
+    #[cfg(test)]
     pub async fn sync_blocks_for_note(
         &self,
         note_id: &str,
@@ -2293,6 +2297,7 @@ impl PostgresPersistence {
         })
     }
 
+    #[cfg(test)]
     pub async fn pending_block_embedding_batch(
         &self,
         limit: usize,
@@ -2328,6 +2333,7 @@ impl PostgresPersistence {
             .map_err(PersistenceError::Sqlx)
     }
 
+    #[cfg(test)]
     pub async fn set_block_embeddings(
         &self,
         updates: Vec<(String, Vec<f32>)>,
@@ -2397,6 +2403,7 @@ impl PostgresPersistence {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn record_block_embedding_failure(
         &self,
         block_id: &str,
@@ -2557,275 +2564,6 @@ impl PostgresPersistence {
             .collect::<Result<Vec<_>, sqlx::Error>>()
             .map_err(PersistenceError::Sqlx)
     }
-
-    pub async fn load_all_notes_for_block_reindex(
-        &self,
-    ) -> Result<Vec<(String, String, String, String)>, PersistenceError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, path, title, content
-            FROM notes
-            ORDER BY id
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter()
-            .map(|row| {
-                Ok((
-                    row.try_get("id")?,
-                    row.try_get("path")?,
-                    row.try_get("title")?,
-                    row.try_get("content")?,
-                ))
-            })
-            .collect::<Result<Vec<_>, sqlx::Error>>()
-            .map_err(PersistenceError::Sqlx)
-    }
-
-    /// Backfill: load notes that have no blocks yet.
-    pub async fn notes_without_blocks(
-        &self,
-    ) -> Result<Vec<(String, String, String, String)>, PersistenceError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, path, title, content
-            FROM notes
-            WHERE id NOT IN (SELECT DISTINCT note_id FROM blocks)
-            ORDER BY id
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter()
-            .map(|row| {
-                Ok((
-                    row.try_get("id")?,
-                    row.try_get("path")?,
-                    row.try_get("title")?,
-                    row.try_get("content")?,
-                ))
-            })
-            .collect::<Result<Vec<_>, sqlx::Error>>()
-            .map_err(PersistenceError::Sqlx)
-    }
-
-    /// Null out all note embeddings so they get re-embedded with breadcrumbs.
-    pub async fn clear_all_note_embeddings(&self) -> Result<usize, PersistenceError> {
-        let result = sqlx::query(
-            r#"
-            UPDATE notes
-            SET embedding = NULL,
-                embedding_failures = 0,
-                embedding_failed_at = NULL
-            WHERE embedding IS NOT NULL
-               OR embedding_failures <> 0
-               OR embedding_failed_at IS NOT NULL
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() as usize)
-    }
-
-    pub async fn unblock_embeddings(
-        &self,
-        selector: &EmbeddingUnblockSelector,
-        dry_run: bool,
-    ) -> Result<EmbeddingUnblockResult, PersistenceError> {
-        let note_ids = self.unblock_note_ids(selector).await?;
-        let block_ids = self.unblock_block_ids(selector).await?;
-
-        let mut result = EmbeddingUnblockResult {
-            dry_run,
-            notes_matched: note_ids.len(),
-            blocks_matched: block_ids.len(),
-            ..Default::default()
-        };
-
-        if dry_run {
-            return Ok(result);
-        }
-
-        if !note_ids.is_empty() {
-            let updated = sqlx::query(
-                r#"
-                UPDATE notes
-                SET embedding_failures = 0,
-                    embedding_failed_at = NULL
-                WHERE id = ANY($1)
-                "#,
-            )
-            .bind(&note_ids)
-            .execute(&self.pool)
-            .await?;
-            result.notes_reset = updated.rows_affected() as usize;
-        }
-
-        if !block_ids.is_empty() {
-            let updated = sqlx::query(
-                r#"
-                UPDATE blocks
-                SET embedding_failures = 0,
-                    embedding_failed_at = NULL,
-                    last_embedding_error = NULL
-                WHERE id = ANY($1)
-                "#,
-            )
-            .bind(&block_ids)
-            .execute(&self.pool)
-            .await?;
-            result.blocks_reset = updated.rows_affected() as usize;
-        }
-
-        Ok(result)
-    }
-
-    async fn unblock_note_ids(
-        &self,
-        selector: &EmbeddingUnblockSelector,
-    ) -> Result<Vec<String>, PersistenceError> {
-        let limit = selector.limit.unwrap_or(usize::MAX).min(i32::MAX as usize) as i32;
-
-        let rows = if let Some(note_id) = selector.note_id.as_deref() {
-            sqlx::query(
-                r#"
-                SELECT id
-                FROM notes
-                WHERE id = $1
-                  AND embedding_failures > 0
-                ORDER BY id
-                LIMIT $2
-                "#,
-            )
-            .bind(note_id)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else if let Some(path_prefix) = selector.path_prefix.as_deref() {
-            sqlx::query(
-                r#"
-                SELECT id
-                FROM notes
-                WHERE path LIKE ($1 || '%')
-                  AND embedding_failures > 0
-                ORDER BY id
-                LIMIT $2
-                "#,
-            )
-            .bind(path_prefix)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else if selector.block_id.is_some() {
-            Vec::new()
-        } else if selector.all {
-            sqlx::query(
-                r#"
-                SELECT id
-                FROM notes
-                WHERE embedding_failures > 0
-                ORDER BY id
-                LIMIT $1
-                "#,
-            )
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            Vec::new()
-        };
-
-        rows.into_iter()
-            .map(|row| row.try_get("id").map_err(PersistenceError::Sqlx))
-            .collect()
-    }
-
-    async fn unblock_block_ids(
-        &self,
-        selector: &EmbeddingUnblockSelector,
-    ) -> Result<Vec<String>, PersistenceError> {
-        let limit = selector.limit.unwrap_or(usize::MAX).min(i32::MAX as usize) as i32;
-
-        let rows = if let Some(block_id) = selector.block_id.as_deref() {
-            sqlx::query(
-                r#"
-                SELECT id
-                FROM blocks
-                WHERE id = $1
-                  AND embedding_failures > 0
-                ORDER BY id
-                LIMIT $2
-                "#,
-            )
-            .bind(block_id)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else if let Some(note_id) = selector.note_id.as_deref() {
-            sqlx::query(
-                r#"
-                SELECT id
-                FROM blocks
-                WHERE note_id = $1
-                  AND embedding_failures > 0
-                ORDER BY note_id, block_index
-                LIMIT $2
-                "#,
-            )
-            .bind(note_id)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else if let Some(path_prefix) = selector.path_prefix.as_deref() {
-            sqlx::query(
-                r#"
-                SELECT blocks.id
-                FROM blocks
-                JOIN notes ON notes.id = blocks.note_id
-                WHERE notes.path LIKE ($1 || '%')
-                  AND blocks.embedding_failures > 0
-                ORDER BY blocks.note_id, blocks.block_index
-                LIMIT $2
-                "#,
-            )
-            .bind(path_prefix)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else if selector.all {
-            sqlx::query(
-                r#"
-                SELECT id
-                FROM blocks
-                WHERE embedding_failures > 0
-                ORDER BY note_id, block_index
-                LIMIT $1
-                "#,
-            )
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            Vec::new()
-        };
-
-        rows.into_iter()
-            .map(|row| row.try_get("id").map_err(PersistenceError::Sqlx))
-            .collect()
-    }
-
-    #[cfg(test)]
-    pub async fn reset_for_test(&self) -> Result<(), PersistenceError> {
-        sqlx::query(
-            "TRUNCATE TABLE access_log, api_keys, links, tags, blocks, notes, vault_files, sync_state, store_state, sync_recovery_queue, chunk_staging, file_aliases RESTART IDENTITY CASCADE",
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
 }
 
 fn create_hnsw_embedding_index_sql(m: i32, ef_construction: i32) -> String {
@@ -2895,6 +2633,7 @@ async fn upsert_vault_file_tx(
         ON CONFLICT (path)
         DO UPDATE SET
             content = EXCLUDED.content,
+            projection_complete = FALSE,
             couchdb_rev = EXCLUDED.couchdb_rev,
             created_at = EXCLUDED.created_at,
             updated_at = EXCLUDED.updated_at,
@@ -2952,19 +2691,20 @@ async fn upsert_note_tx(
         INSERT INTO notes (
             id, path, title, content, search_text, search_vector, summary, frontmatter,
             embedding, couchdb_rev, created_at, updated_at, indexed_at,
-            embedding_failures, embedding_failed_at
+            embedding_failures, embedding_failed_at, heading_title
         )
-        VALUES ($1, $2, $3, '', '', to_tsvector('simple', $4), $5, $6, $7, $8, $9, $10, $11, 0, NULL)
+        VALUES ($1, $2, $3, '', '', to_tsvector('simple', $4), $5, $6, $7, $8, $9, $10, $11, 0, NULL, $12)
         ON CONFLICT (id)
         DO UPDATE SET
             path = EXCLUDED.path,
             title = EXCLUDED.title,
+            heading_title = EXCLUDED.heading_title,
             content = '',
             search_text = '',
             search_vector = EXCLUDED.search_vector,
             summary = EXCLUDED.summary,
             frontmatter = EXCLUDED.frontmatter,
-            embedding = EXCLUDED.embedding,
+            embedding = CASE WHEN notes.couchdb_rev = EXCLUDED.couchdb_rev THEN COALESCE(EXCLUDED.embedding, notes.embedding) ELSE EXCLUDED.embedding END,
             couchdb_rev = EXCLUDED.couchdb_rev,
             created_at = EXCLUDED.created_at,
             updated_at = EXCLUDED.updated_at,
@@ -2984,6 +2724,7 @@ async fn upsert_note_tx(
     .bind(note.created_at)
     .bind(note.updated_at)
     .bind(note.indexed_at)
+    .bind(crate::markdown::first_h1_title(&note.content))
     .execute(&mut **tx)
     .await?;
 

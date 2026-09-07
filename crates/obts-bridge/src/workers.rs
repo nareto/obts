@@ -1,3 +1,8 @@
+mod embedding;
+#[cfg(test)]
+pub(crate) use embedding::run_trusted_embedding_pass;
+pub use embedding::spawn_embedding_worker;
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -1489,7 +1494,8 @@ async fn queue_path_scan_recovery(
     );
 }
 
-pub fn spawn_embedding_worker(store: VaultStore, config: &AppConfig) -> Option<JoinHandle<()>> {
+#[cfg(test)]
+fn spawn_fixture_embedding_worker(store: VaultStore, config: &AppConfig) -> Option<JoinHandle<()>> {
     let embedding_config = config.embedding.clone();
     if embedding_config.mode == EmbeddingMode::Disabled {
         return None;
@@ -1513,6 +1519,7 @@ struct ChunkedNoteEmbedding {
     failed_chunk_count: usize,
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct BlockEmbeddingOutcome {
     updated: usize,
@@ -1534,31 +1541,54 @@ async fn embed_note_with_chunks(
     chunk_bytes: usize,
     request_batch_size: usize,
 ) -> Result<ChunkedNoteEmbedding, WorkerError> {
-    const MAX_NOTE_EMBEDDING_CHUNKS: usize = 256;
-
-    let chunks = split_note_for_localai(note_text, chunk_bytes.max(1));
-    let total_chunk_count = chunks.len();
-    let (chunks, skipped_chunk_count) =
-        sample_note_chunks_for_embedding(chunks, MAX_NOTE_EMBEDDING_CHUNKS);
-    let mut vectors = Vec::with_capacity(chunks.len());
-    let mut failed_chunk_count = 0usize;
-    let mut last_chunk_error = None;
-
-    for chunk_batch in chunks.chunks(request_batch_size.max(1)) {
-        let mut queue = vec![chunk_batch.to_vec()];
-        while let Some(mut batch) = queue.pop() {
-            if batch.is_empty() {
-                continue;
+    let total = note_chunks(note_text, chunk_bytes).count();
+    let selected = total.min(256);
+    let mut slot = 0usize;
+    let mut inputs = note_chunks(note_text, chunk_bytes)
+        .enumerate()
+        .filter_map(|(index, text)| {
+            let wanted = if selected <= 1 {
+                0
+            } else {
+                slot * (total - 1) / (selected - 1)
+            };
+            if slot < selected && index == wanted {
+                slot += 1;
+                Some(text)
+            } else {
+                None
             }
-
+        });
+    let mut aggregate = vec![0.0; client.dimensions];
+    let mut weight = 0.0f32;
+    let mut failed = 0;
+    let mut max_bytes = 0;
+    loop {
+        let batch: Vec<String> = inputs
+            .by_ref()
+            .take(request_batch_size.clamp(1, 128))
+            .map(str::to_string)
+            .collect();
+        if batch.is_empty() {
+            break;
+        }
+        max_bytes = max_bytes.max(batch.iter().map(String::len).max().unwrap_or(0));
+        let mut queue = vec![batch];
+        while let Some(mut batch) = queue.pop() {
             match client.embed_batch(&batch).await {
-                Ok(batch_vectors) if batch_vectors.len() == batch.len() => {
-                    vectors.extend(batch.into_iter().zip(batch_vectors));
+                Ok(vectors) if vectors.len() == batch.len() => {
+                    for (text, vector) in batch.into_iter().zip(vectors) {
+                        let w = text.len().max(1) as f32;
+                        weight += w;
+                        for (target, value) in aggregate.iter_mut().zip(vector) {
+                            *target += value * w;
+                        }
+                    }
                 }
-                Ok(batch_vectors) => {
+                Ok(vectors) => {
                     return Err(WorkerError::LocalAiBatchSizeMismatch {
                         expected: batch.len(),
-                        got: batch_vectors.len(),
+                        got: vectors.len(),
                     });
                 }
                 Err(error) if should_split_note_chunk_failure(&error, batch.len()) => {
@@ -1566,39 +1596,79 @@ async fn embed_note_with_chunks(
                     queue.push(right);
                     queue.push(batch);
                 }
-                Err(error) if chunks.len() > 1 && error.may_be_payload_specific() => {
-                    failed_chunk_count += 1;
-                    last_chunk_error = Some(error.to_string());
-                    warn!(
-                        error = %error,
-                        "embedding worker: skipping isolated failed note chunk"
-                    );
+                Err(error) if selected > 1 && error.may_be_payload_specific() => {
+                    failed += 1;
                 }
                 Err(error) => return Err(error),
             }
         }
     }
-
-    if vectors.is_empty() {
+    if weight == 0.0 {
         return Err(WorkerError::LocalAiNoteChunksFailed {
-            failed: failed_chunk_count,
-            total: chunks.len(),
-            last_error: last_chunk_error.unwrap_or_else(|| "unknown LocalAI error".to_string()),
+            failed,
+            total: selected,
+            last_error: "provider request failed".into(),
         });
     }
-
-    let (weights, embeddings): (Vec<_>, Vec<_>) = vectors
-        .into_iter()
-        .map(|(chunk, embedding)| (chunk.len(), embedding))
-        .unzip();
-    let embedding = aggregate_chunk_embeddings(&embeddings, &weights, client.dimensions)?;
-
+    for value in &mut aggregate {
+        *value /= weight;
+    }
     Ok(ChunkedNoteEmbedding {
-        embedding,
-        chunk_count: total_chunk_count,
-        skipped_chunk_count,
-        max_chunk_bytes: chunks.iter().map(|chunk| chunk.len()).max().unwrap_or(0),
-        failed_chunk_count,
+        embedding: aggregate,
+        chunk_count: total,
+        skipped_chunk_count: total - selected,
+        max_chunk_bytes: max_bytes,
+        failed_chunk_count: failed,
+    })
+}
+
+fn note_chunks(text: &str, max_bytes: usize) -> impl Iterator<Item = &str> {
+    let limit = max_bytes.max(1);
+    let mut start = 0;
+    let mut emitted = false;
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        if text.len() <= limit {
+            done = true;
+            return Some(text);
+        }
+        while start < text.len() {
+            let remaining = &text[start..];
+            if remaining.len() <= limit {
+                done = true;
+                let tail = remaining.trim_end();
+                return if !tail.is_empty() || !emitted {
+                    Some(tail)
+                } else {
+                    None
+                };
+            }
+            let mut end = preferred_chunk_boundary(remaining, limit);
+            if end == 0 {
+                end = floor_char_boundary(remaining, limit);
+            }
+            if end == 0 {
+                end = remaining.chars().next().unwrap().len_utf8();
+            }
+            let chunk = remaining[..end].trim_end();
+            start += end;
+            while start < text.len() {
+                let ch = text[start..].chars().next().unwrap();
+                if !ch.is_whitespace() {
+                    break;
+                }
+                start += ch.len_utf8();
+            }
+            if !chunk.is_empty() {
+                emitted = true;
+                return Some(chunk);
+            }
+        }
+        done = true;
+        if emitted { None } else { Some("") }
     })
 }
 
@@ -1606,6 +1676,7 @@ fn should_split_note_chunk_failure(error: &WorkerError, batch_len: usize) -> boo
     batch_len > 1 && error.may_be_payload_specific()
 }
 
+#[cfg(test)]
 fn sample_note_chunks_for_embedding(
     chunks: Vec<String>,
     max_chunks: usize,
@@ -1635,6 +1706,7 @@ fn sample_note_chunks_for_embedding(
     (sampled, skipped)
 }
 
+#[cfg(test)]
 fn split_note_for_localai(text: &str, max_bytes: usize) -> Vec<String> {
     let limit = max_bytes.max(1);
     if text.len() <= limit {
@@ -1727,6 +1799,7 @@ fn floor_char_boundary(text: &str, idx: usize) -> usize {
     boundary
 }
 
+#[cfg(test)]
 fn aggregate_chunk_embeddings(
     vectors: &[Vec<f32>],
     weights: &[usize],
@@ -1763,6 +1836,7 @@ fn aggregate_chunk_embeddings(
     Ok(aggregated)
 }
 
+#[cfg(test)]
 async fn embed_block_batch_safely(
     client: &LocalAiEmbeddingClient,
     store: &VaultStore,
@@ -1861,6 +1935,7 @@ async fn embed_block_batch_safely(
     outcome
 }
 
+#[cfg(test)]
 async fn run_localai_embedding_loop(store: VaultStore, config: EmbeddingConfig) {
     let client = match LocalAiEmbeddingClient::new(&config) {
         Ok(client) => client,
@@ -2036,6 +2111,7 @@ async fn run_localai_embedding_loop(store: VaultStore, config: EmbeddingConfig) 
     }
 }
 
+#[cfg(test)]
 async fn run_simulated_embedding_loop(store: VaultStore, config: EmbeddingConfig) {
     let poll_interval = config.poll_interval();
     let block_embedding_enabled = config.block_embedding_enabled;
@@ -2283,8 +2359,9 @@ mod tests {
         queue_parent_recovery, recover_stale_chunk_staging_cooperatively,
         recover_stale_file_aliases_cooperatively, recovery_child_doc_ids_for_stale_file_targets,
         recovery_lookup_ids_for_stale_file_targets, sample_note_chunks_for_embedding,
-        sequence_is_caught_up, should_flush_pending, spawn_embedding_worker, spawn_sync_worker,
-        split_note_for_localai, take_change_batch, take_stale_file_recovery_targets,
+        sequence_is_caught_up, should_flush_pending, spawn_fixture_embedding_worker,
+        spawn_sync_worker, split_note_for_localai, take_change_batch,
+        take_stale_file_recovery_targets,
     };
     use crate::authorization::{AccessPolicy, AuthContext, ContextName};
     use crate::config::{
@@ -2728,6 +2805,26 @@ mod tests {
         assert!(error.to_string().contains("invalid embedding dimensions"));
     }
 
+    #[test]
+    fn incremental_note_chunks_match_legacy_boundaries() {
+        for text in [
+            String::new(),
+            "  ".into(),
+            " ".repeat(100),
+            "αβ𐀀 hello\n\nother tail ".repeat(100),
+            "x".repeat(10000),
+        ] {
+            for limit in [1, 2, 3, 32, 127, 512, 20000] {
+                assert_eq!(
+                    super::note_chunks(&text, limit)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>(),
+                    super::split_note_for_localai(&text, limit)
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn localai_embedding_client_sends_dimensions_when_configured() {
         let (mock_url, state) = spawn_mock_localai(1024).await;
@@ -2753,6 +2850,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(test)]
     fn split_note_for_localai_respects_max_bytes() {
         let text = "folder > long-note\nThis is a deliberately long paragraph that should be split before it reaches the LocalAI backend hard limit.";
         let chunks = split_note_for_localai(text, 48);
@@ -2766,6 +2864,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(test)]
     fn sample_note_chunks_for_embedding_preserves_coverage() {
         let chunks = (0..10)
             .map(|idx| format!("chunk-{idx}"))
@@ -2790,6 +2889,41 @@ mod tests {
         assert!(normalized.contains("[embedded-data]"));
         assert!(!normalized.contains(&opaque_token));
         assert!(!normalized.contains(&image_uri));
+    }
+
+    #[tokio::test]
+    async fn localai_streamed_sampling_matches_input_dependent_weighted_golden() {
+        let (mock_url, _) = spawn_mock_localai_with_failure(1024, "NEVER_FAIL").await;
+        let config = EmbeddingConfig {
+            mode: EmbeddingMode::Localai,
+            localai: LocalAiEmbeddingConfig {
+                url: mock_url,
+                model: "synthetic".into(),
+                request_dimensions: false,
+            },
+            dimensions: 2,
+            ..EmbeddingConfig::default()
+        };
+        let text = (0..900)
+            .map(|i| format!("line{i:04} {}\n", "word ".repeat(i % 19 + 1)))
+            .collect::<String>();
+        let all = split_note_for_localai(&text, 128);
+        assert!(all.len() > 256);
+        let (sampled, skipped) = sample_note_chunks_for_embedding(all, 256);
+        let weights = sampled.iter().map(String::len).collect::<Vec<_>>();
+        let vectors = sampled
+            .iter()
+            .map(|s| vec![normalize_localai_embedding_input(s).len() as f32, 1.0])
+            .collect::<Vec<_>>();
+        let expected = aggregate_chunk_embeddings(&vectors, &weights, 2).unwrap();
+        let unweighted = aggregate_chunk_embeddings(&vectors, &vec![1; vectors.len()], 2).unwrap();
+        assert!((expected[0] - unweighted[0]).abs() > 0.1);
+        let client = LocalAiEmbeddingClient::new(&config).unwrap();
+        let actual = embed_note_with_chunks(&client, &text, 128, 7)
+            .await
+            .unwrap();
+        assert_eq!(actual.skipped_chunk_count, skipped);
+        assert_eq!(actual.embedding, expected);
     }
 
     #[tokio::test]
@@ -2819,6 +2953,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(test)]
     fn aggregate_chunk_embeddings_weights_by_chunk_size() {
         let aggregated = aggregate_chunk_embeddings(&[vec![1.0, 0.0], vec![0.0, 1.0]], &[3, 1], 2)
             .expect("aggregate chunk embeddings");
@@ -2887,7 +3022,7 @@ mod tests {
             })
             .await;
 
-        let handle = spawn_embedding_worker(store.clone(), &config)
+        let handle = spawn_fixture_embedding_worker(store.clone(), &config)
             .expect("localai embedding mode should start worker");
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {

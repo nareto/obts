@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::State;
@@ -577,32 +578,27 @@ async fn mcp_endpoint(
                     }
                 };
 
-            let (response, sanitization_report) =
-                match sanitize_tool_response(&params.name, &params.arguments, response) {
-                    Ok(result) => result,
-                    Err(error) => {
-                        return respond_with_log(
-                            "/mcp",
-                            "tools/call",
-                            Some(params.name.as_str()),
-                            tool_error_response(
-                                id,
-                                error
-                                    .with_tool(&params.name)
-                                    .to_error_metadata(Some(&params.name)),
-                            ),
-                            true,
-                        );
-                    }
-                };
-
-            respond_with_log(
-                "/mcp",
-                "tools/call",
-                Some(params.name.as_str()),
-                tool_success_response(id, response, sanitization_report),
-                true,
-            )
+            match response.finish(id.clone(), &params.name, &params.arguments) {
+                Ok(response) => respond_with_log(
+                    "/mcp",
+                    "tools/call",
+                    Some(params.name.as_str()),
+                    response,
+                    true,
+                ),
+                Err(error) => respond_with_log(
+                    "/mcp",
+                    "tools/call",
+                    Some(params.name.as_str()),
+                    tool_error_response(
+                        id,
+                        error
+                            .with_tool(&params.name)
+                            .to_error_metadata(Some(&params.name)),
+                    ),
+                    true,
+                ),
+            }
         }
         method if method.starts_with("notifications/") => respond_with_log(
             "/mcp",
@@ -958,7 +954,7 @@ async fn execute_tool_call(
     auth: &AuthContext,
     tool_name: &str,
     arguments: &Value,
-) -> Result<Value, McpError> {
+) -> Result<ToolValue, McpError> {
     state
         .service
         .ensure_index_current()
@@ -971,7 +967,7 @@ async fn execute_tool_call(
                 .get_vault_file(auth, &NoteId::new(id))
                 .await
                 .map_err(McpError::Service)?;
-            to_tool_value(file)
+            ToolValue::file(file)
         }
         "query_notes" => {
             let request = deserialize_arguments::<QueryNotesRequest>(tool_name, arguments)?;
@@ -982,7 +978,13 @@ async fn execute_tool_call(
                 0,
                 MAX_NOTE_LIST_LIMIT,
             )?;
-            to_tool_value(state.service.query_notes(auth, request).await)
+            ToolValue::notes(
+                state
+                    .service
+                    .query_notes(auth, request)
+                    .await
+                    .map_err(McpError::Service)?,
+            )
         }
         "query_base" => {
             let request = deserialize_arguments::<QueryBaseRequest>(tool_name, arguments)?;
@@ -1025,7 +1027,13 @@ async fn execute_tool_call(
         }
         "list_tags" => {
             let filter = deserialize_arguments::<NoteTimeFilter>(tool_name, arguments)?;
-            to_tool_value(state.service.list_tags(auth, filter).await)
+            to_tool_value(
+                state
+                    .service
+                    .list_tags(auth, filter)
+                    .await
+                    .map_err(McpError::Service)?,
+            )
         }
         "create_vault_file" => {
             let request = deserialize_arguments::<NewNoteRequest>(tool_name, arguments)?;
@@ -1074,11 +1082,47 @@ where
     })
 }
 
-fn to_tool_value<T>(value: T) -> Result<Value, McpError>
+struct ToolValue {
+    value: Value,
+    lease: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+}
+
+impl ToolValue {
+    fn file(file: crate::model::VaultFile) -> Result<Self, McpError> {
+        let lease = file._body_lease.clone();
+        let mut response = to_tool_value(file)?;
+        response.lease = lease;
+        Ok(response)
+    }
+    fn notes(notes: crate::store::RecentNotesResponse) -> Result<Self, McpError> {
+        let lease = notes._body_lease.clone();
+        let mut response = to_tool_value(notes)?;
+        response.lease = lease;
+        Ok(response)
+    }
+    fn finish(
+        self,
+        id: Option<Value>,
+        tool: &str,
+        arguments: &Value,
+    ) -> Result<Response, McpError> {
+        let Self { value, lease } = self;
+        let (value, report) = sanitize_tool_response(tool, arguments, value)?;
+        let mut response = tool_success_response(id, value, report);
+        if let Some(lease) = lease {
+            response.extensions_mut().insert(lease);
+        }
+        Ok(response)
+    }
+}
+
+fn to_tool_value<T>(value: T) -> Result<ToolValue, McpError>
 where
     T: Serialize,
 {
-    serde_json::to_value(value).map_err(McpError::Serialization)
+    serde_json::to_value(value)
+        .map(|value| ToolValue { value, lease: None })
+        .map_err(McpError::Serialization)
 }
 
 fn respond_with_log(
@@ -2303,5 +2347,81 @@ mod tests {
         assert!(output.contains("rpc_method=\"tools/call\""));
         assert!(output.contains("tool_name=\"get_vault_file\""));
         assert!(output.contains("status=204"));
+    }
+}
+
+#[cfg(test)]
+mod body_ownership_tests {
+    use super::*;
+    async fn leased_file(slots: &Arc<tokio::sync::Semaphore>) -> crate::model::VaultFile {
+        crate::model::VaultFile {
+            _body_lease: Some(Arc::new(slots.clone().acquire_owned().await.unwrap())),
+            id: NoteId::new("Lease.md"),
+            path: "Lease.md".into(),
+            file_type: crate::new_note::NewNoteFileType::Md,
+            content: "# leased body".into(),
+            content_sha256: "synthetic".into(),
+            size_bytes: 13,
+            created_at: None,
+            updated_at: chrono::Utc::now(),
+        }
+    }
+    #[tokio::test]
+    async fn mcp_file_lease_survives_conversion_sanitization_and_final_response() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let file = leased_file(&slots).await;
+        let response = ToolValue::file(file).unwrap();
+        assert_eq!(slots.available_permits(), 0);
+        assert!(response.value.get("_body_lease").is_none());
+        let response = response.finish(None, "get_vault_file", &json!({})).unwrap();
+        assert_eq!(slots.available_permits(), 0);
+        drop(response);
+        assert_eq!(slots.available_permits(), 1);
+        let response = ToolValue::file(leased_file(&slots).await).unwrap();
+        assert!(
+            response
+                .finish(None, "get_vault_file", &json!({"raw":"invalid"}))
+                .is_err()
+        );
+        assert_eq!(slots.available_permits(), 1);
+        let response = ToolValue::file(leased_file(&slots).await).unwrap();
+        drop(response);
+        assert_eq!(slots.available_permits(), 1);
+    }
+    #[tokio::test]
+    async fn mcp_query_notes_operation_lease_survives_json_conversion() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let file = leased_file(&slots).await;
+        let notes = crate::store::RecentNotesResponse {
+            _body_lease: file._body_lease.clone(),
+            notes: Vec::new(),
+            total: 0,
+            total_filtered: 0,
+        };
+        drop(file);
+        let response = ToolValue::notes(notes).unwrap();
+        assert_eq!(slots.available_permits(), 0);
+        assert!(response.value.get("_body_lease").is_none());
+        let response = response.finish(None, "query_notes", &json!({})).unwrap();
+        assert_eq!(slots.available_permits(), 0);
+        drop(response);
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn rest_json_serialization_owns_file_until_response_encoding_finishes() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let json = Json(leased_file(&slots).await);
+        assert_eq!(slots.available_permits(), 0);
+        let response = json.into_response();
+        assert_eq!(slots.available_permits(), 1);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8(bytes.to_vec())
+                .unwrap()
+                .contains("_body_lease")
+        );
     }
 }

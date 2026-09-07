@@ -140,3 +140,97 @@ All twenty reachability checks produced their required witness. All four FM-001 
 `trace/transition-map.json` maps every root action and the required production families to existing, range-validated code/test evidence. It cites `obsidian-plugin/src/main.cjs` only within its current 9,652 lines. The schema/map are static design artifacts only: runtime transition instrumentation and replay do not exist, so no runtime trace conformance or implementation proof is claimed.
 
 FM-002 remains bounded and does not prove byte/checksum correctness, Git ancestry implementation, semantic merge formats, filesystem/power-loss durability, editor-buffer flushing, authorization, onboarding, restore, event-pruning recovery, transfer expiry, rename graphs, garbage collection, backup/restore, or real process supervision. Transfer expiry and event-cursor expiry appear in the static production-family map but are not modeled transitions. Audit retention is omitted. The contract-required integrated server/Rust/Node/PostgreSQL deployment fault test remains outstanding.
+
+## OBTS-FM-003: Focused Bridge Bounded-Body Projection
+
+| Field | Value |
+| --- | --- |
+| Status | Accepted bounded architecture model; independently reviewed implementation and synthetic-stack receipts recorded separately |
+| Architecture revision | 6 (same unlanded change) |
+| Refined contracts | `OBTS-BRG-PROJ-001`, `OBTS-BRG-BODY-001`, ownership aspects of `OBTS-BRG-QUERY-001` |
+| Specification | `OBTSBridgeBoundedBody.tla` |
+| Check matrix | `checks-fm003.json` (39 required checks: original 22 retained and 17 added) |
+| Executable check | `npm run test:formal:bridge`; also in default `npm run test:formal` |
+| Trace map | `trace/fm003-trace-map.json` |
+
+### Bounds and correction
+
+The original agent-authored draft equated one row with one file and its body size; that abstraction could not expose reviewed tag/link row overflow or oversized metadata starvation. The corrected model has four files (including a private file), two body slots, input sizes 1/3/2/4, input-file limit 4, shared in-flight input budget 6 and aggregate 10 above the retired limit 6. Thirteen independently identified/kinded/sized rows include F1 metadata plus two tags, two links and two blocks; F2/F4 metadata sizes 9/8 exceed the normal batch-byte budget 6. Normal rows obey count 2 and bytes 6; two normal block rows of size 4 make byte pressure non-vacuous. These are symbolic fixtures, not MiB conversion factors or a parser expansion ratio.
+
+Acquisition and revision/OID verification are separate from row enqueue and commit. A normal batch must flush before a singleton can acquire the shared permit; the singleton retains both permit and file body ownership through commit and cleanup. Failed/cancelled work drains before settling. Required rows are independent of the implementation's completion predicate: the omitted-row control deliberately omits row 13 from that predicate while the cursor invariant still demands all thirteen. Cursor publication additionally requires empty pending work, no body leases/singleton owner and cleanup completion.
+
+File acquisition and each file's row stream are ordered to bound the search while allowing two bodies and interleaved row streams. Healthy projection begins at cursor 1 and reaches cursor 3 through a second target; restart scenarios instead replay one interrupted target with previously committed rows retained. Partial/superseded-row deletion is abstract cleanup, not a proof of SQL deletion or revert behavior. Weak fairness applies to each finite acquisition/verification/release/enqueue action and commit, singleton cleanup, failure drain, restart and completion. Source-failure drain additionally uses the existing source-failure fairness. No liveness guarantee is made under endless external cancellation or unavailable source/DB.
+
+### Checked evidence
+
+The corrected run used actual TLC 2.19 / Java 21, one worker and fingerprint polynomial 0, with SANY first. All original 52 FM001/FM002 checks remain unchanged and passing. FM003 has nine positive checks and thirty reachability/negative controls. Positive generated/distinct/depth baselines and half-baseline floors are recorded in the manifest; the largest positive search is 23,798 distinct states (below the 100,000 ceiling), not an unbounded production proof.
+
+| Positive checks | Generated | Distinct | Depth |
+| --- | ---: | ---: | ---: |
+| bounded safety / liveness | 7,602 | 2,506 | 78 |
+| source-failure safety / drain | 64,088 | 23,798 | 78 |
+| caller-denial safety | 16,884 | 4,166 | 78 |
+| cancellation safety / drain | 34,884 | 12,416 | 78 |
+| partial-restart safety / liveness | 54,999 | 18,063 | 51 |
+
+New reachability witnesses include singleton enqueue/cleanup (depths 6/8), partial restart (10), replay reaching Ready (45), cancellation while owning a singleton (8), all seven F1 rows committed (15), second target cursor (78), and normal byte pressure (13). Existing failure-release checks now require release while actually Failed rather than accepting an unrelated successful release.
+
+| New negative control | Required violation | Generated / distinct / depth |
+| --- | --- | --- |
+| old unbatched metadata/tag/link fanout | `BatchBounded` via `EnqueueLegacyFanout` | 11 / 8 / 5 |
+| oversized row has no singleton admission | `ProjectionCompletes` temporal counterexample with fair normal actions and supported input | 448 / 160 / 24 |
+| oversized row mixed with normal rows | `BatchBytesBounded` via `MixOversizedRow` | 50 / 29 / 8 |
+| omitted row / premature completion | `CursorAfterVerifiedRows` via `AdvanceCursor` | 3,488 / 1,148 / 37 |
+| permit released after commit but before singleton cleanup | `SingletonOwned` via `ReleasePermitEarly` | 79 / 40 / 8 |
+
+The old fanout control enqueues five normal metadata/tag/link rows totaling five bytes: it isolates row-count overflow without violating the six-byte budget. The starvation check requires the sole configured temporal property to fail, an actual verification prefix and a complete finite search; the harness distinguishes temporal counterexamples from invariant failures. It does not turn a hand-authored rejection into alleged starvation evidence. All six original negative controls still reach their declared violations.
+
+```text
+npm run test:formal
+Formal checks complete: 52 required checks; 0 current candidate counterexample(s).
+FM003 passed: 39 checks; 9 positive, 30 reachability/negative controls.
+```
+
+### Conformance boundary
+
+Hard obligations concern input-file bytes, finite body ownership, normal encoded-parameter payload/row count and singleton concurrency/ownership. There is no numerical encoded-singleton ceiling or hard RSS bound: parser trees, normalization/encoding, derived singletons and driver/response copies require separate costing and high-water measurements. The model does not prove the SQL compiler/authorization implementation, legacy lexical equivalence, graph completeness, context ranking, response format/order, parser behavior or physical durability.
+
+The independently cleared core 0.1.3 lane has since corrected those original gaps: normal/singleton batching, lexical equivalence, complete graph queries and response ownership have component evidence in `trace/fm003-trace-map.json` (157 units and 13 actual-PostgreSQL checks, parent-reported). The parent also reports Node 299 and 30 local full-stack checks including distributed 8-to-72-MiB RSS, pending-edit SIGKILL and client-volume restore. This architecture-only worker gate does not rerun or reinterpret that evidence as worker acceptance. Worker implementation, near-64-MiB input counters and the final post-worker stack were subsequently completed; see `trace/fm003-worker-trace-map.json` and `docs/bridge-embedding-worker-evidence.md`. Its `checked-worker` status requires independent-review attribution and passing disabled/local stack reports for the same binary. Isolated near-limit RSS, live delivery and complete runtime/TLA trace conformance are not claimed. Derived normalized plaintext in PostgreSQL/backups remains permitted query projection, never raw body authority; output metadata remains output-proportional, not capped at an internal page size.
+
+### FM003 independent embedding-worker companion
+
+| Field | Value |
+| --- | --- |
+| Contract / revision | `OBTS-BRG-EMBED-001`, `OBTS-BRG-BODY-001`; revision 6, unchanged |
+| Specification | `OBTSBridgeEmbeddingWorker.tla` |
+| Matrix | `checks-fm003-workers.json`: 48 required checks, independent of the unchanged 39 projection and 52 baseline checks |
+| Entry point | `npm run test:formal:workers`; included in `test:formal:bridge` and default `test:formal` |
+| Mapping / reduced actual traces | `trace/fm003-worker-trace-map.json`, `trace/fm003-worker-counterexamples.json` |
+| Actual action exercise | `trace/fm003-worker-action-coverage.json`, bound to model/configuration digests |
+| Implementation status | Forthcoming; static mapping only, not runtime trace replay |
+
+**Why separate:** projection `DriftRevision` only permits an unverified file to drift. It cannot expose updates after capture while a provider is pending, nor a headless/body lock cycle. The companion keeps the already-correct complete-row/cursor/audit projection model unchanged rather than exploding its thirteen-row state space or implying temporal composition.
+
+**Exact finite bounds:** one symbolic note (trusted background, no caller/private-note exclusion), one reused block ID, one worker, one API operation and one shared body slot. A queue contains at most one thin expected note-revision/embedding-schema-epoch/block-epoch/hash tuple, not a body. Source and SQL revisions each range over 1/2; block hash and epoch independently range over 1/2. Each attempt extracts two chunks sequentially with one symbolic payload unit per provider batch. The embedding schema/model epoch independently ranges over 1/2, with captured/vector/retry schema tokens over 0/1/2. There is at most one source OR hash OR block-epoch OR embedding-schema replacement, one failure OR cancellation, and one API operation. Source and schema replacement are checked in separate configurations, not concurrently combined. There is no numerical connection from these symbolic units to input MiB, encoded bytes or RSS; the existing 64-MiB default input and normal derived-write/singleton contracts are unchanged.
+
+**Actions and ownership:** `TakeQueue`, `WorkerHeadless`, `WorkerBody`, `AttestBody` acquire in headless-before-body order and release headless before `BuildBatch`/`ProviderReply`/`ProviderFailure`. Input and payload stay under the body permit until consumption/disposal; `Drain` releases before another capture. `SourceEdit` occurs while provider input is already captured; `PublishProjection` may precede or follow result completion and invalidates prior vectors/retries. `ReplaceBlock` independently changes hash or epoch even with unchanged parent note revision. `CompleteSQL` atomically compares captured SQL-generation tokens, including the embedding schema/model epoch for notes AND blocks, returns matched zero and preserves current vector/readiness/retries for stale success/failure. An old attested source result may match an old SQL projection until publication; `RejectAttestation` prevents a fresh capture against an obsolete source token. Reindex uses the same abstract guarded block publication, not a concrete SQL block-stream proof. `SchemaReset` may occur during `Provider` or `Complete` (completion SQL pending before its atomic mutation), advances only the SQL embedding epoch and invalidates vectors/readiness/retries. These schema configurations keep source revision, note revision, block hash and block epoch unchanged: the old model result must not apply even for equal dimensions. `AttestBody` deliberately checks only source revision, not the embedding epoch or a filesystem model fingerprint. The pending SQL abstraction covers an old statement reaching its mutation after reset; process death/backend lifecycle and actual MVCC interleavings are not modeled.
+
+`Cancel` retains input/payload ownership while `LateReply` ignores the result, then `Drain` disposes it. The model does not prove that an unresponsive transport is interruptible: actual shutdown/cancellation must either dispose transport ownership or safely retain-and-drain it. Positive `ApiProgress` checks an API holding headless while waiting for the provider-owned sole body slot; correct completion is SQL-only. The inverse-acquisition mutant takes body before headless; the completion-lock mutant waits for headless before releasing body. Both reach actual TLC deadlocks with `body=worker`, `headless=api`, `api=WaitBody`, and worker respectively `WantHeadless` or `Complete`.
+
+**Fairness:** safety uses no fairness. Liveness adds individual weak fairness for queue/capture/attestation/build/provider reply/consume/SQL completion/projection publication/drain/API continuation (and the legacy empty-snapshot action in its negative control). Edits, schema reset, failure, cancellation and API start are optional, not forced. Source/SQL remain available, provider replies eventually, external mutations/faults are finite and generations stabilize. Checked temporal obligations are eventual stable readiness, drain, waiting-API progress and retry of pending new source and schema SQL generations. Sixteen reachability checks prevent vacuity: the original nine cover stale note/block success and failure, old-source result before index catch-up, late cancelled reply, new-generation retry, API wait and fresh-capture attestation rejection. Seven added checks cover schema-stale note/block success and failure, current-schema retry, reset while completion SQL is pending and actual inverse-order headless acquisition.
+
+**Actual TLC evidence:** TLC 2.19, one worker, fp 0, SANY before each normal matrix run. All 48 pass their declared outcome. Eighteen positive checks pair safety/liveness; sixteen reachability checks and fourteen negative controls require exact outcomes/witnesses and meaningful trace depth. State-space baselines/floors and budgets live in the matrix; largest positive is 908 distinct states.
+
+| Positive pair (each) | Generated | Distinct | Depth |
+| --- | ---: | ---: | ---: |
+| note / reindex (each pair) | 287 | 196 | 30 |
+| block hash / block epoch (each pair) | 141 | 104 | 29 |
+| provider failure | 1,334 | 908 | 39 |
+| cancellation | 1,126 | 759 | 38 |
+| schema note / block / reindex (each pair, failure enabled) | 924 | 671 | 38 |
+
+Negative controls reproduce empty-inner starvation (`EventuallyReady`), ID-only success/failure and reindex, independently ignored hash and epoch (`GenerationSafe`), late cancelled matched result (`CancelledSafe`), and the two real lock-cycle deadlocks. Their generated/distinct/depth tuples are respectively 3/2/2, 118/76/14, 119/84/11, 118/76/14, 63/47/13, 63/47/13, 19/19/8, 6/6/5 and 32/27/13. Reduced actual TLC traces are retained for review, not claimed as implementation regression replay. Five added ignore-schema controls fail `GenerationSafe`: note success, block success and reindex each explore 128/93/13; note/block failure each explore 50/41/10. Same-source schema retry reaches 437/325/22; pending-SQL reset reaches 29/26/9; inverse headless reaches 4/4/4. All original 30 worker baselines remain unchanged.
+
+Review 9e4558bf identified false action-to-check attribution despite correct model semantics. The corrected mapping uses inverse-acquisition, failure, hash/epoch and cancellation configurations that actually exercise those actions, plus failure/drift for attestation rejection. Every mapped action/check pair must have nonzero generated-successor coverage from TLC, not merely a known ID or syntactically present action. `--validate-only` verifies stored coverage and exact model/configuration SHA-256 digests; normal TLC runs independently enforce mappings against fresh `-coverage 1` output. This is finite model-action exercise, not implementation coverage or trace conformance. Default npm and formal CI entry points include 52 + 39 + 48 = 139 checks without modifying the baseline or projection models.
+
+**Omissions and handoff:** `CompleteSQL` and replacement are atomic abstract linearization points. A READ COMMITTED `UPDATE blocks ... FROM notes` revision predicate alone does not prove that atomicity: use a parent-row transactional guard/consistent lock order or a target-row epoch and coordinated replacement. Schema/model invalidation must likewise serialize with note/block mutation: update a target-row schema epoch with invalidation or use consistent transactional guarding. A source-only CAS or separate global-schema preflight/snapshot does not protect against an old SQL statement completing after a reset, including after process death. Multiworker scheduling, backend/process lifecycle, combined source-plus-schema changes, SQL/MVCC execution, source SHA/OID computation, filesystem faults/durability, block cleanup details, embedding arithmetic/quality, parser/HTTP encoding/driver allocations and RSS are not proved. The worker trace map gives exact existing seams and actual-PG/fake-provider/shared-headless regressions still required; neither core evidence nor green TLC establishes worker implementation conformance.
