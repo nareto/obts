@@ -20,7 +20,9 @@ import type {
   ResolveConflictResponse
 } from '../shared/types.js';
 import { AuthError, type AuthenticatedDevice } from './authService.js';
-import { GitCommandError, GitService, sha256Hex, type GitDiffEntry, type GitObjectReader } from './gitService.js';
+import { GitCommandError, GitDurabilityError, GitService, sha256Hex, type GitDiffEntry, type GitObjectReader } from './gitService.js';
+import { hasDurableDeletionRecord } from './metadataStore.js';
+import type { VaultLifecycleCoordinator } from './vaultLifecycleCoordinator.js';
 import type {
   DeviceRow,
   DirectoryProposalResultRow,
@@ -88,7 +90,8 @@ export class SyncService {
   constructor(
     private readonly store: MetadataStore,
     private readonly git: GitService,
-    private readonly maxUploadBytes: number
+    private readonly maxUploadBytes: number,
+    private readonly lifecycle?: VaultLifecycleCoordinator
   ) {}
 
   async runWithVaultLock<T>(vaultId: string, fn: () => Promise<T>): Promise<T> {
@@ -109,12 +112,14 @@ export class SyncService {
       .sort((left, right) => left.created_at.localeCompare(right.created_at) || left.operation_id.localeCompare(right.operation_id));
 
     for (const operation of candidates) {
+      if (hasDurableDeletionRecord(db, operation.vault_id)) continue;
       await this.withVaultLock(operation.vault_id, async () => {
         const currentDb = await this.store.snapshot();
         const vault = currentDb.vaults.find((candidate) => candidate.vault_id === operation.vault_id);
         const device = currentDb.devices.find((candidate) => candidate.device_id === operation.device_id);
         if (
           !vault ||
+          hasDurableDeletionRecord(currentDb, operation.vault_id) ||
           vault.status === 'blocked_integrity' ||
           !device ||
           device.status === 'revoked' ||
@@ -150,6 +155,9 @@ export class SyncService {
     packfile: Buffer,
     staged?: { reader: GitObjectReader; promote: () => Promise<void> }
   ): Promise<PushResult> {
+    if (this.isGitDurabilityUnavailable()) {
+      throw new AuthError(503, 'transfer_unavailable', 'Transfer storage is unavailable.');
+    }
     if (auth.vault.status === 'blocked_integrity') {
       return {
         status: 'rejected',
@@ -320,11 +328,14 @@ export class SyncService {
           directoryProposal
         );
       } catch (error) {
+        const mappedError = error instanceof GitDurabilityError
+          ? new AuthError(503, 'transfer_unavailable', 'Transfer storage is unavailable.')
+          : error;
         if (operationId) {
-          const reason = error instanceof AuthError ? error.code : error instanceof GitCommandError ? 'server_git_error' : 'unexpected_error';
+          const reason = mappedError instanceof AuthError ? mappedError.code : mappedError instanceof GitCommandError ? 'server_git_error' : 'unexpected_error';
           await this.abortOperation(operationId, reason);
         }
-        throw error;
+        throw mappedError;
       }
     });
   }
@@ -2284,6 +2295,11 @@ export class SyncService {
     return { status: 'rejected', code, message };
   }
 
+  private isGitDurabilityUnavailable(): boolean {
+    const checker = (this.git as unknown as { isDurabilityUnavailable?: () => boolean }).isDurabilityUnavailable;
+    return checker?.call(this.git) ?? false;
+  }
+
   private async withVaultLock<T>(vaultId: string, fn: () => Promise<T>): Promise<T> {
     const previous = this.locks.get(vaultId) ?? Promise.resolve();
     let release!: () => void;
@@ -2294,7 +2310,7 @@ export class SyncService {
     this.locks.set(vaultId, chained);
     await previous;
     try {
-      return await fn();
+      return await (this.lifecycle ? this.lifecycle.withAdmission(vaultId, fn) : fn());
     } finally {
       release();
       if (this.locks.get(vaultId) === chained) {

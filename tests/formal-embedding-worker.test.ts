@@ -44,12 +44,13 @@ describe('FM003 embedding-worker companion gate', () => {
     expect(result.stdout).toContain('48 required checks');
   });
 
-  it('includes all three matrices in default formal validation without dropping the parent stack command', () => {
+  it('includes all four matrices in default formal validation without dropping the parent stack command', () => {
     const { scripts } = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
     expect(scripts['test:formal'].split(' && ')).toEqual([
       'node scripts/check-formal-model.mjs',
       'node scripts/check-bridge-bounded-model.mjs',
-      'node scripts/check-bridge-bounded-model.mjs --worker-companion'
+      'node scripts/check-bridge-bounded-model.mjs --worker-companion',
+      'node scripts/check-deletion-model.mjs'
     ]);
     expect(scripts['test:formal:bridge'].split(' && ')).toEqual([
       'node scripts/check-bridge-bounded-model.mjs',

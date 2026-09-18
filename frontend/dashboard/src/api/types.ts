@@ -1,5 +1,6 @@
 export type StatusLabel =
   | 'Synced'
+  | 'Deleting'
   | 'Preparing upload'
   | 'Uploading'
   | 'Applying'
@@ -27,9 +28,23 @@ export type VaultSummary = {
   display_name: string;
   owner_user_id: string;
   current_main: string;
-  status: 'active' | 'blocked_integrity';
+  status: 'active' | 'blocked_integrity' | 'deleting';
   created_at: string;
   updated_at: string;
+};
+
+export type VaultDeletionStatus = {
+  vault_id: string;
+  status: 'deleting' | 'deleted';
+  requested_at: string;
+  completed_at: string | null;
+  receipt_expires_at: string | null;
+  retry_at: string | null;
+  error_code: 'storage_unavailable' | 'unattributed_residue' | 'metadata_unavailable' | null;
+};
+
+export type VaultDeletionListResponse = {
+  deletions: VaultDeletionStatus[];
 };
 
 export type ConnectionReview = {

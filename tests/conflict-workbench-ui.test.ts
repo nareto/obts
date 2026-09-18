@@ -4,9 +4,10 @@ import { describe, expect, it } from 'vitest';
 
 describe('conflict workbench UI contract', () => {
   it('keeps the diff dominant and removes the clipped three-rail layout', async () => {
-    const [app, component, styles] = await Promise.all([
+    const [app, component, queue, styles] = await Promise.all([
       readFile('frontend/dashboard/src/App.svelte', 'utf8'),
       readFile('frontend/dashboard/src/components/ConflictWorkbench.svelte', 'utf8'),
+      readFile('frontend/dashboard/src/components/ConflictQueue.svelte', 'utf8'),
       readFile('frontend/dashboard/src/style.css', 'utf8')
     ]);
 
@@ -20,8 +21,10 @@ describe('conflict workbench UI contract', () => {
     expect(component).not.toContain('class="rail right resolution-rail"');
     expect(component).not.toContain('<b>{index + 1}</b>');
 
-    expect(app).toContain('{#if conflictListOpen || !review}');
-    expect(app).toContain('class="conflict-queue-toolbar"');
+    expect(app).toContain('showList={conflictListOpen || !review}');
+    expect(queue).toContain('class="conflict-queue-toolbar"');
+    expect(queue).toContain('class="conflict-queue-cards"');
+    expect(queue).toContain('Review conflict');
     expect(styles).toContain('grid-template-columns: 240px minmax(0, 1fr)');
     expect(styles).toContain('@container (max-width: 1150px)');
     expect(styles).toContain('.directory-conflict-panel');

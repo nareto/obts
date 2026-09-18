@@ -9,6 +9,8 @@ import type {
   NoteHistoryQueryResponse,
   NoteHistoryVersionResponse,
   Session,
+  VaultDeletionListResponse,
+  VaultDeletionStatus,
   VaultSummary
 } from './types';
 
@@ -43,13 +45,13 @@ export class DashboardApi {
     return session;
   }
 
-  async reauthenticate(username: string, password: string): Promise<Session> {
+  async reauthenticate(username: string, password: string, options: { publishCsrfToken?: boolean } = {}): Promise<Session> {
     const session = await this.request<Session>('/auth/reauthenticate', {
       method: 'POST',
       csrf: true,
       body: { username, password }
     });
-    this.csrfToken = session.csrf_token;
+    if (options.publishCsrfToken !== false) this.csrfToken = session.csrf_token;
     return session;
   }
 
@@ -77,6 +79,22 @@ export class DashboardApi {
       method: 'POST',
       csrf: true,
       body: { display_name: displayName }
+    });
+  }
+
+  async vaultDeletions(): Promise<VaultDeletionListResponse> {
+    return await this.request('/vault-deletions');
+  }
+
+  async vaultDeletion(vaultId: string): Promise<VaultDeletionStatus> {
+    return await this.request(`/vault-deletions/${vaultId}`);
+  }
+
+  async deleteVault(vaultId: string, confirmation: string): Promise<VaultDeletionStatus> {
+    return await this.request(`/vaults/${vaultId}`, {
+      method: 'DELETE',
+      csrf: true,
+      body: { confirmation }
     });
   }
 

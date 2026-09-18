@@ -1,8 +1,9 @@
 import { randomBytes } from 'node:crypto';
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { newId, nowIso } from '../shared/ids.js';
+import { parseDevicePushManifest } from '../shared/validators.js';
 import {
   ASYNC_PUSH_FINALIZE_CAPABILITY,
   CHUNK_TRANSFER_CAPABILITY,
@@ -16,11 +17,32 @@ import {
 import type { AuthenticatedDevice } from './authService.js';
 import { AuthError } from './authService.js';
 import type { ServerConfig } from './config.js';
-import { GitCommandError, GitService, sha256Hex } from './gitService.js';
+import { GitCommandError, GitDurabilityError, GitService, sha256Hex } from './gitService.js';
 import { SyncService } from './syncService.js';
+import {
+  assertDeletionRootUnchanged,
+  closeDeletionRoot,
+  openDeletionRoot,
+  readDeletionRootEntries,
+  removeDeletionRootDirectoryChild,
+  syncDeletionRoot,
+  type DeletionRoot
+} from './deletionRoot.js';
+import { fsyncDurableDirectory, fsyncDurableFile, writeDurableFile, type DurableFilePersistence } from './durableFile.js';
+import type { VaultLifecycleCoordinator } from './vaultLifecycleCoordinator.js';
 
 const SESSION_VERSION = 1;
 const MAX_OPEN_TRANSFERS_PER_DEVICE = 2;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
+const COMMIT_PATTERN = /^[0-9a-f]{40}$/u;
+const IDENTIFIER_PATTERN = /^[A-Za-z0-9_:-]{1,256}$/u;
+const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
+const MAX_PROCESSING_ATTEMPTS = 64;
+const MAX_RESULT_CODE_LENGTH = 128;
+const MAX_RESULT_MESSAGE_LENGTH = 2048;
+const MAX_DEVICE_REF_LENGTH = 512;
+
+export type PersistedDeviceResolver = (session: PushSession) => Promise<AuthenticatedDevice | null>;
 
 type ChunkReceipt = { index: number; bytes: number; sha256: string };
 
@@ -53,18 +75,80 @@ export class ChunkTransferService {
   private readonly retryWaiters = new Set<() => void>();
   private storedBytes: number | null = null;
   private closed = false;
+  private transferUnavailable = false;
 
   constructor(
     private readonly config: ServerConfig,
     private readonly git: GitService,
-    private readonly sync: SyncService
+    private readonly sync: SyncService,
+    private readonly lifecycle?: VaultLifecycleCoordinator,
+    private readonly persistence: Partial<DurableFilePersistence> = {}
   ) {}
 
-  async initialize(): Promise<void> {
-    for (const session of await this.listSessions()) {
+  isReady(): boolean {
+    return !this.closed && !this.transferUnavailable && !this.isGitDurabilityUnavailable();
+  }
+
+  async checkReady(): Promise<{ ok: true } | { ok: false; error: string }> {
+    if (!this.isReady()) return { ok: false, error: 'transfer storage is unavailable' };
+    try {
+      await this.withStorageLock(async () => {
+        const sessions = await this.listSessions();
+        for (const session of sessions) {
+          if (!(await this.validTransferRepository(session.transfer_id, session.vault_id))) {
+            this.transferUnavailable = true;
+            throw new TransferStorageError('Transfer repository is unavailable.');
+          }
+        }
+      });
+      return { ok: true };
+    } catch {
+      return { ok: false, error: 'transfer storage is unavailable' };
+    }
+  }
+
+  async initialize(resolvePersistedDevice?: PersistedDeviceResolver): Promise<void> {
+    if (this.isGitDurabilityUnavailable()) {
+      this.transferUnavailable = true;
+      return;
+    }
+    let sessions: PushSession[];
+    try {
+      sessions = await this.listSessions(true);
+    } catch {
+      this.transferUnavailable = true;
+      return;
+    }
+    for (const session of sessions) {
+      if (!(await this.validTransferRepository(session.transfer_id, session.vault_id))) {
+        this.transferUnavailable = true;
+        return;
+      }
+      if (session.status === 'processing' && session.receipts.length !== session.chunk_count) {
+        this.transferUnavailable = true;
+        return;
+      }
+    }
+    for (const session of sessions) {
+      if (session.status === 'processing') {
+        const auth = resolvePersistedDevice ? await resolvePersistedDevice(session) : null;
+        const deletionBlocked = this.lifecycle?.isBlocked(session.vault_id) ?? false;
+        if (
+          auth && auth.vault.vault_id === session.vault_id && auth.vault.status === 'active' &&
+          auth.device.device_id === session.device_id && auth.device.revoked_at === null && auth.device.status !== 'revoked' &&
+          !auth.user.disabled
+        ) {
+          this.startProcessing(auth, session.transfer_id);
+        } else if (!deletionBlocked) {
+          this.transferUnavailable = true;
+          return;
+        }
+        continue;
+      }
       if (
         this.expired(session) || session.status !== 'rejected' ||
-        session.result?.status !== 'rejected' || session.result.code !== 'git_error'
+        session.result?.status !== 'rejected' || session.result.code !== 'git_error' ||
+        this.lifecycle?.isBlocked(session.vault_id)
       ) continue;
       session.status = 'open';
       session.result = null;
@@ -72,7 +156,7 @@ export class ChunkTransferService {
       session.processing_error_code = 'server_git_error';
       session.retry_at = nowIso();
       session.updated_at = nowIso();
-      await this.writeSession(session);
+      await this.withStorageLock(async () => await this.writeSession(session, session.transfer_id));
     }
   }
 
@@ -80,6 +164,152 @@ export class ChunkTransferService {
     this.closed = true;
     for (const wake of [...this.retryWaiters]) wake();
     await Promise.allSettled([...this.processors.values()]);
+  }
+
+  async drainVault(vaultId: string): Promise<void> {
+    const sessions = await this.listSessionsIncludingMalformed();
+    for (const session of sessions) {
+      if (session.value?.vault_id !== vaultId) continue;
+      await this.withLock(session.transferId, async () => {
+        const current = await this.readSession(session.transferId);
+        if (!current || current.vault_id !== vaultId) return;
+        if (current.status === 'processing' || current.status === 'open') {
+          current.status = 'aborted';
+          current.result = null;
+          current.processing_error_code = null;
+          current.retry_at = null;
+          current.updated_at = nowIso();
+          await this.withStorageLock(async () => await this.writeSession(current, session.transferId));
+        }
+      });
+    }
+    for (const wake of [...this.retryWaiters]) wake();
+    await Promise.allSettled([...this.processors.entries()]
+      .filter(([transferId]) => sessions.some((session) => session.transferId === transferId && session.value?.vault_id === vaultId))
+      .map(([, processor]) => processor));
+  }
+
+  async inventoryVaultResidue(vaultId: string): Promise<{ attributable: string[]; unattributed: boolean }> {
+    let root: DeletionRoot;
+    try {
+      root = await openDeletionRoot(this.config.transferDir);
+    } catch (error) {
+      if (isMissing(error)) {
+        if (this.transferUnavailable) throw new TransferStorageError('Transfer storage is unavailable.');
+        return { attributable: [], unattributed: false };
+      }
+      throw error;
+    }
+    try {
+      const entries = await readDeletionRootEntries(root);
+      const attributable: string[] = [];
+      let unattributed = false;
+      for (const entry of entries) {
+        if (!entry.name.startsWith('trn_') || !/^trn_[A-Za-z0-9]+$/u.test(entry.name) || !entry.isDirectory() || entry.isSymbolicLink()) {
+          unattributed = true;
+          continue;
+        }
+        const transferId = entry.name;
+        const inspection = await this.inspectSessionAt(root, transferId);
+        const marker = await this.inspectOwnerMarkerAt(root, transferId);
+        if (inspection.kind === 'valid' && marker.kind === 'valid' && marker.vaultId === inspection.value.vault_id) {
+          if (inspection.value.vault_id === vaultId) attributable.push(this.sessionDir(transferId));
+        } else if (inspection.kind === 'missing' && marker.kind === 'valid' && marker.vaultId === vaultId) {
+          attributable.push(this.sessionDir(transferId));
+        } else {
+          unattributed = true;
+        }
+      }
+      await assertDeletionRootUnchanged(root);
+      return { attributable, unattributed };
+    } finally {
+      await closeDeletionRoot(root);
+    }
+  }
+
+  async eraseVaultResidue(vaultId: string): Promise<{ unattributed: boolean }> {
+    return await this.withStorageLock(async () => await this.eraseVaultResidueUnderStorage(vaultId));
+  }
+
+  private async eraseVaultResidueUnderStorage(vaultId: string): Promise<{ unattributed: boolean }> {
+    let root: DeletionRoot;
+    try {
+      root = await openDeletionRoot(this.config.transferDir);
+    } catch (error) {
+      if (isMissing(error)) {
+        this.storedBytes = null;
+        if (this.transferUnavailable) throw new TransferStorageError('Transfer storage is unavailable.');
+        return { unattributed: false };
+      }
+      throw error;
+    }
+    try {
+      const entries = await readDeletionRootEntries(root);
+      const targetNames: string[] = [];
+      for (const entry of entries) {
+        if (!entry.name.startsWith('trn_') || !/^trn_[A-Za-z0-9]+$/u.test(entry.name) || !entry.isDirectory() || entry.isSymbolicLink()) {
+          return { unattributed: true };
+        }
+        const inspection = await this.inspectSessionAt(root, entry.name);
+        const marker = await this.inspectOwnerMarkerAt(root, entry.name);
+        if (inspection.kind === 'valid' && marker.kind === 'valid' && marker.vaultId === inspection.value.vault_id) {
+          if (inspection.value.vault_id === vaultId) targetNames.push(entry.name);
+        } else if (inspection.kind === 'missing' && marker.kind === 'valid' && marker.vaultId === vaultId) {
+          targetNames.push(entry.name);
+        } else {
+          return { unattributed: true };
+        }
+      }
+      await assertDeletionRootUnchanged(root);
+      for (const name of targetNames) await removeDeletionRootDirectoryChild(root, name);
+      if (targetNames.length > 0) {
+        await syncDeletionRoot(root);
+        this.storedBytes = null;
+      }
+      for (const entry of await readDeletionRootEntries(root)) {
+        if (!entry.name.startsWith('trn_') || !/^trn_[A-Za-z0-9]+$/u.test(entry.name) || !entry.isDirectory() || entry.isSymbolicLink()) {
+          return { unattributed: true };
+        }
+        const inspection = await this.inspectSessionAt(root, entry.name);
+        const marker = await this.inspectOwnerMarkerAt(root, entry.name);
+        if (inspection.kind === 'valid' && marker.kind === 'valid' && marker.vaultId === inspection.value.vault_id) {
+          if (inspection.value.vault_id === vaultId) return { unattributed: true };
+        } else if (inspection.kind === 'missing' && marker.kind === 'valid' && marker.vaultId === vaultId) {
+          return { unattributed: true };
+        } else if (inspection.kind !== 'valid' || marker.kind !== 'valid') {
+          return { unattributed: true };
+        }
+      }
+      await assertDeletionRootUnchanged(root);
+      return { unattributed: false };
+    } finally {
+      await closeDeletionRoot(root);
+    }
+  }
+
+  private async listSessionsIncludingMalformed(): Promise<Array<{ transferId: string; value: PushSession | null }>> {
+    let root: DeletionRoot;
+    try {
+      root = await openDeletionRoot(this.config.transferDir);
+    } catch (error) {
+      if (isMissing(error)) return [];
+      throw error;
+    }
+    try {
+      const entries = await readDeletionRootEntries(root);
+      const sessions: Array<{ transferId: string; value: PushSession | null }> = [];
+      for (const entry of entries) {
+        if (!entry.isDirectory() || entry.isSymbolicLink() || !entry.name.startsWith('trn_')) {
+          sessions.push({ transferId: entry.name, value: null });
+          continue;
+        }
+        sessions.push({ transferId: entry.name, value: await this.inspectSessionAt(root, entry.name).then((inspection) =>
+          inspection.kind === 'valid' ? inspection.value : null) });
+      }
+      return sessions;
+    } finally {
+      await closeDeletionRoot(root);
+    }
   }
 
   capabilities() {
@@ -93,7 +323,7 @@ export class ChunkTransferService {
   }
 
   async createPush(auth: AuthenticatedDevice, request: ChunkPushCreateRequest): Promise<{ descriptor: ChunkPushDescriptor; created: boolean }> {
-    return await this.withLock('__create__', async () => {
+    const operation = async () => await this.withLock('__create__', async () => {
     this.assertTransferAllowed(auth);
     if (request.vault_id !== auth.vault.vault_id || request.device_id !== auth.device.device_id) {
       throw new AuthError(404, 'not_found', 'Resource not found.');
@@ -165,17 +395,38 @@ export class ChunkTransferService {
       updated_at: createdAt,
       expires_at: new Date(Date.now() + this.config.transferTtlSeconds * 1000).toISOString()
     };
-    await mkdir(this.sessionDir(transferId), { recursive: true, mode: 0o700 });
-    await this.git.initializeTransferRepo(auth.vault.vault_id, this.repoDir(transferId));
-    session.stored_bytes = await this.directoryBytes(this.sessionDir(transferId));
-    this.storedBytes = null;
-    await this.writeSession(session);
+    await this.withStorageLock(async () => {
+      await mkdir(this.sessionDir(transferId), { recursive: true, mode: 0o700 });
+      try {
+        await fsyncDurableDirectory(this.config.transferDir, this.persistence);
+      } catch (error) {
+        this.transferUnavailable = true;
+        throw error;
+      }
+      await this.writeOwnerMarker(transferId, auth.vault.vault_id);
+      try {
+        await this.git.initializeTransferRepo(auth.vault.vault_id, this.repoDir(transferId));
+      } catch (error) {
+        if (error instanceof GitDurabilityError) {
+          this.transferUnavailable = true;
+          throw new AuthError(503, 'transfer_unavailable', 'Transfer storage is unavailable.');
+        }
+        throw error;
+      }
+      session.stored_bytes = await this.directoryBytes(this.sessionDir(transferId), false, true);
+      this.storedBytes = null;
+      await this.writeSession(session, transferId);
+    });
     return { descriptor: this.descriptor(session), created: true };
     });
+    return this.lifecycle
+      ? await this.lifecycle.withAdmission(auth.vault.vault_id, operation)
+      : await operation();
   }
 
   async getPush(auth: AuthenticatedDevice, transferId: string): Promise<ChunkPushDescriptor> {
-    const session = await this.withLock(transferId, async () => {
+    const read = async () => await this.withLock(transferId, async () => {
+      this.assertTransferAllowed(auth);
       const current = await this.requireSession(auth, transferId);
       if (
         current.status === 'open' && current.processing_error_code &&
@@ -184,10 +435,13 @@ export class ChunkTransferService {
         current.status = 'processing';
         current.updated_at = nowIso();
         current.expires_at = new Date(Date.now() + this.config.transferTtlSeconds * 1000).toISOString();
-        await this.writeSession(current);
+        await this.withStorageLock(async () => await this.writeSession(current, transferId));
       }
       return current;
     });
+    const session = this.lifecycle
+      ? await this.lifecycle.withAdmission(auth.vault.vault_id, read)
+      : await read();
     if (session.status === 'processing') this.startProcessing(auth, transferId);
     return this.descriptor(session);
   }
@@ -199,7 +453,7 @@ export class ChunkTransferService {
     data: Buffer,
     digest: string
   ): Promise<ChunkPushReceipt> {
-    return await this.withLock(transferId, async () => {
+    const operation = async () => await this.withLock(transferId, async () => {
       this.assertTransferAllowed(auth);
       const session = await this.requireSession(auth, transferId);
       if (session.status !== 'open') throw new AuthError(409, 'transfer_closed', 'Transfer is no longer open.');
@@ -221,9 +475,11 @@ export class ChunkTransferService {
       if (session.total_bytes + data.byteLength > this.config.maxTransferBytes) {
         throw new AuthError(413, 'transfer_too_large', 'Transfer exceeds the configured aggregate limit.');
       }
-      await this.withLock('__storage__', async () => {
-        if (this.storedBytes === null) this.storedBytes = await this.directoryBytes(this.config.transferDir);
-        const previousSessionBytes = session.stored_bytes ?? await this.directoryBytes(this.sessionDir(transferId));
+      return await this.withStorageLock(async () => {
+        const actualSessionBytes = await this.verifySessionAccounting(session);
+        await this.listSessions();
+        this.storedBytes = await this.directoryBytes(this.config.transferDir, true, true);
+        const previousSessionBytes = actualSessionBytes;
         if (this.storedBytes + data.byteLength > this.config.maxTransferStorageBytes) {
           throw new AuthError(507, 'transfer_storage_full', 'Transfer quarantine storage is full.');
         }
@@ -233,12 +489,23 @@ export class ChunkTransferService {
         const temporary = `${destination}.tmp-${randomBytes(6).toString('hex')}`;
         await writeFile(temporary, data, { mode: 0o600 });
         try {
-          await this.git.importPackIntoRepo(this.repoDir(transferId), data);
+          try {
+            await fsyncDurableFile(temporary, this.persistence);
+          } catch (error) {
+            this.transferUnavailable = true;
+            throw new AuthError(503, 'transfer_unavailable', 'Transfer storage is unavailable.');
+          }
+          const canonicalRepoPath = (this.git as unknown as { repoPath?: (vaultId: string) => string }).repoPath?.call(this.git, session.vault_id);
+          await this.git.importPackIntoRepo(
+            this.repoDir(transferId),
+            data,
+            canonicalRepoPath === undefined ? undefined : join(canonicalRepoPath, 'objects')
+          );
           await rm(temporary, { force: true });
-          const transferStoredBytes = await this.directoryBytes(this.sessionDir(transferId));
+          const transferStoredBytes = await this.directoryBytes(this.sessionDir(transferId), false, true);
           const aggregateBytes = this.storedBytes - previousSessionBytes + transferStoredBytes;
           if (transferStoredBytes > this.config.maxTransferBytes || aggregateBytes > this.config.maxTransferStorageBytes) {
-            await rm(this.sessionDir(transferId), { recursive: true, force: true });
+            await this.removeSessionDirectoryUnderStorage(transferId);
             this.storedBytes = null;
             throw new AuthError(413, 'transfer_too_large', 'Transfer expanded beyond its configured quarantine limit.');
           }
@@ -247,21 +514,28 @@ export class ChunkTransferService {
         } catch (error) {
           await rm(temporary, { force: true });
           if (error instanceof AuthError) throw error;
+          if (error instanceof GitDurabilityError) {
+            this.transferUnavailable = true;
+            throw new AuthError(503, 'transfer_unavailable', 'Transfer storage is unavailable.');
+          }
           throw new AuthError(422, 'malformed_packfile', 'Chunk is not a valid Git pack.');
         }
+        session.receipts.push({ index, bytes: data.byteLength, sha256: digest });
+        session.receipts.sort((left, right) => left.index - right.index);
+        session.total_bytes += data.byteLength;
+        session.updated_at = nowIso();
+        session.expires_at = new Date(Date.now() + this.config.transferTtlSeconds * 1000).toISOString();
+        await this.writeSession(session, transferId);
+        return { transfer_id: transferId, chunk_index: index, chunk_sha256: digest, received_bytes: data.byteLength, idempotent: false };
       });
-      session.receipts.push({ index, bytes: data.byteLength, sha256: digest });
-      session.receipts.sort((left, right) => left.index - right.index);
-      session.total_bytes += data.byteLength;
-      session.updated_at = nowIso();
-      session.expires_at = new Date(Date.now() + this.config.transferTtlSeconds * 1000).toISOString();
-      await this.writeSession(session);
-      return { transfer_id: transferId, chunk_index: index, chunk_sha256: digest, received_bytes: data.byteLength, idempotent: false };
     });
+    return this.lifecycle
+      ? await this.lifecycle.withAdmission(auth.vault.vault_id, operation)
+      : await operation();
   }
 
   async finalizePush(auth: AuthenticatedDevice, transferId: string): Promise<PushResult> {
-    return await this.withLock(transferId, async () => {
+    const operation = async () => await this.withLock(transferId, async () => {
       this.assertTransferAllowed(auth);
       const session = await this.requireSession(auth, transferId);
       if (session.status === 'completed' || session.status === 'rejected' || session.status === 'aborted') {
@@ -274,17 +548,20 @@ export class ChunkTransferService {
       if (session.receipts.length !== session.chunk_count) {
         throw new AuthError(409, 'transfer_incomplete', 'Transfer is missing one or more chunks.');
       }
-      const result = await this.processPush(auth, session);
+      const result = await this.processPush(auth, session, transferId);
       session.result = result.status === 'rejected' ? null : result;
       session.status = result.status === 'rejected' ? 'open' : 'completed';
       session.updated_at = nowIso();
-      await this.writeSession(session);
+      await this.withStorageLock(async () => await this.writeSessionWithAdmission(auth, session, transferId));
       return result;
     });
+    return this.lifecycle
+      ? await this.lifecycle.withAdmission(auth.vault.vault_id, operation)
+      : await operation();
   }
 
   async beginFinalizePush(auth: AuthenticatedDevice, transferId: string): Promise<ChunkPushDescriptor> {
-    const session = await this.withLock(transferId, async () => {
+    const operation = async () => await this.withLock(transferId, async () => {
       this.assertTransferAllowed(auth);
       const current = await this.requireSession(auth, transferId);
       if (current.status === 'completed' || current.status === 'rejected' || current.status === 'aborted') return current;
@@ -294,20 +571,48 @@ export class ChunkTransferService {
       current.status = 'processing';
       current.updated_at = nowIso();
       current.expires_at = new Date(Date.now() + this.config.transferTtlSeconds * 1000).toISOString();
-      await this.writeSession(current);
+      if (this.lifecycle) {
+        await this.lifecycle.withAdmission(auth.vault.vault_id, async () =>
+          await this.withStorageLock(async () => await this.writeSession(current, transferId)));
+      } else {
+        await this.withStorageLock(async () => await this.writeSession(current, transferId));
+      }
       return current;
     });
+    const session = this.lifecycle
+      ? await this.lifecycle.withAdmission(auth.vault.vault_id, operation)
+      : await operation();
     if (session.status === 'processing') this.startProcessing(auth, transferId);
     return this.descriptor(session);
   }
 
   async deletePush(auth: AuthenticatedDevice, transferId: string): Promise<void> {
-    await this.withLock(transferId, async () => {
+    const operation = async () => await this.withLock(transferId, async () => {
+      this.assertTransferAllowed(auth);
       const session = await this.requireSession(auth, transferId);
       if (session.status === 'processing') throw new AuthError(409, 'transfer_processing', 'A processing transfer cannot be deleted.');
-      await rm(this.sessionDir(transferId), { recursive: true, force: true });
-      this.storedBytes = null;
+      await this.withStorageLock(async () => {
+        let root: DeletionRoot;
+        try {
+          root = await openDeletionRoot(this.config.transferDir);
+        } catch (error) {
+          if (isMissing(error)) {
+            this.storedBytes = null;
+            return;
+          }
+          throw error;
+        }
+        try {
+          await removeDeletionRootDirectoryChild(root, transferId);
+          await syncDeletionRoot(root);
+        } finally {
+          await closeDeletionRoot(root);
+        }
+        this.storedBytes = null;
+      });
     });
+    if (this.lifecycle) await this.lifecycle.withAdmission(auth.vault.vault_id, operation);
+    else await operation();
   }
 
   private startProcessing(auth: AuthenticatedDevice, transferId: string): void {
@@ -328,7 +633,9 @@ export class ChunkTransferService {
       session = await this.requireSession(auth, transferId);
       if (session.status !== 'processing') return;
       try {
-        const result = await this.processPush(auth, session);
+        const result = this.lifecycle
+          ? await this.lifecycle.withAdmission(auth.vault.vault_id, async () => await this.processPush(auth, session, transferId))
+          : await this.processPush(auth, session, transferId);
         if (result.status === 'rejected' && result.code === 'git_error') {
           throw new GitCommandError('Server Git processing failed.', '');
         }
@@ -340,10 +647,14 @@ export class ChunkTransferService {
           latest.processing_error_code = null;
           latest.retry_at = null;
           latest.updated_at = nowIso();
-          await this.writeSession(latest);
+          await this.withStorageLock(async () => await this.writeSessionWithAdmission(auth, latest, transferId));
         });
         return;
       } catch (error) {
+        if (error instanceof GitDurabilityError || error instanceof AuthError && error.code === 'transfer_unavailable') {
+          this.transferUnavailable = true;
+          return;
+        }
         if (error instanceof AuthError) {
           await this.withLock(transferId, async () => {
             const latest = await this.requireSession(auth, transferId);
@@ -353,7 +664,7 @@ export class ChunkTransferService {
             latest.processing_error_code = null;
             latest.retry_at = null;
             latest.updated_at = nowIso();
-            await this.writeSession(latest);
+            await this.withStorageLock(async () => await this.writeSessionWithAdmission(auth, latest, transferId));
           });
           return;
         }
@@ -368,7 +679,7 @@ export class ChunkTransferService {
           latest.retry_at = new Date(Date.now() + retryMs).toISOString();
           latest.updated_at = nowIso();
           latest.expires_at = new Date(Date.now() + this.config.transferTtlSeconds * 1000).toISOString();
-          await this.writeSession(latest);
+          await this.withStorageLock(async () => await this.writeSessionWithAdmission(auth, latest, transferId));
         });
       }
     }
@@ -388,19 +699,26 @@ export class ChunkTransferService {
     });
   }
 
-  private async processPush(auth: AuthenticatedDevice, session: PushSession): Promise<PushResult> {
+  private async processPush(auth: AuthenticatedDevice, session: PushSession, transferId: string): Promise<PushResult> {
+    if (this.isGitDurabilityUnavailable()) {
+      throw new GitDurabilityError('Git repository durability could not be confirmed.');
+    }
+    const canonicalRepoPath = (this.git as unknown as { repoPath?: (vaultId: string) => string }).repoPath?.call(this.git, session.vault_id);
     return await this.sync.pushDeviceCommit(auth, session.manifest, Buffer.alloc(0), {
-      reader: this.git.readerForRepo(this.repoDir(session.transfer_id)),
-      promote: async () => await this.git.promoteTransferObjects(auth.vault.vault_id, this.repoDir(session.transfer_id))
+      reader: this.git.readerForRepo(this.repoDir(transferId), canonicalRepoPath === undefined ? undefined : join(canonicalRepoPath, 'objects')),
+      promote: async () => await this.git.promoteTransferObjects(auth.vault.vault_id, this.repoDir(transferId))
     });
   }
 
   private assertTransferAllowed(auth: AuthenticatedDevice): void {
+    if (this.transferUnavailable || this.isGitDurabilityUnavailable()) {
+      throw new AuthError(503, 'transfer_unavailable', 'Transfer storage is unavailable.');
+    }
+    if (this.lifecycle?.isBlocked(auth.vault.vault_id)) {
+      throw new AuthError(404, 'not_found', 'Resource not found.');
+    }
     if (auth.vault.status === 'blocked_integrity') {
       throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
-    }
-    if (auth.device.status === 'review_needed' || auth.device.status === 'blocked_recovery') {
-      throw new AuthError(409, 'device_blocked', 'Device requires review or recovery before transferring Git objects.');
     }
   }
 
@@ -433,9 +751,16 @@ export class ChunkTransferService {
       throw new AuthError(404, 'not_found', 'Resource not found.');
     }
     if (this.expired(session)) {
-      await rm(this.sessionDir(transferId), { recursive: true, force: true });
-      this.storedBytes = null;
+      try {
+        await this.removeSessionDirectory(transferId);
+      } catch (error) {
+        if (!isMissing(error)) throw error;
+      }
       throw new AuthError(410, 'transfer_expired', 'Transfer expired.');
+    }
+    if (!(await this.validTransferRepository(transferId, session.vault_id))) {
+      this.transferUnavailable = true;
+      throw new AuthError(503, 'transfer_unavailable', 'Transfer storage is unavailable.');
     }
     return session;
   }
@@ -445,45 +770,229 @@ export class ChunkTransferService {
   }
 
   private async pruneExpired(): Promise<void> {
-    let removed = false;
-    for (const session of await this.listSessions()) {
-      if (!this.expired(session)) continue;
-      await rm(this.sessionDir(session.transfer_id), { recursive: true, force: true });
-      removed = true;
-    }
-    if (removed) this.storedBytes = null;
+    await this.withStorageLock(async () => {
+      let removed = false;
+      let root: DeletionRoot;
+      try {
+        root = await openDeletionRoot(this.config.transferDir);
+      } catch (error) {
+        if (isMissing(error)) return;
+        throw error;
+      }
+      try {
+        for (const session of await this.listSessions()) {
+          if (!this.expired(session)) continue;
+          await removeDeletionRootDirectoryChild(root, session.transfer_id);
+          removed = true;
+        }
+        if (removed) await syncDeletionRoot(root);
+      } finally {
+        await closeDeletionRoot(root);
+      }
+      if (removed) this.storedBytes = null;
+    });
   }
 
-  private async listSessions(): Promise<PushSession[]> {
-    let entries;
+  private async listSessions(rejectTemporary = false): Promise<PushSession[]> {
+    if (this.transferUnavailable) throw new TransferStorageError('Transfer storage is unavailable.');
+    let root: DeletionRoot;
     try {
-      entries = await readdir(this.config.transferDir, { withFileTypes: true });
-    } catch {
-      return [];
+      root = await openDeletionRoot(this.config.transferDir);
+    } catch (error) {
+      this.transferUnavailable = true;
+      if (isMissing(error)) throw new TransferStorageError('Transfer storage is unavailable.');
+      throw error;
     }
-    const sessions: PushSession[] = [];
-    for (const entry of entries) {
-      if (!entry.isDirectory() || !entry.name.startsWith('trn_')) continue;
-      const session = await this.readSession(entry.name);
-      if (session) sessions.push(session);
+    try {
+      const entries = await readDeletionRootEntries(root);
+      const sessions: PushSession[] = [];
+      for (const entry of entries) {
+        if (!entry.isDirectory() || entry.isSymbolicLink() || !/^trn_[A-Za-z0-9]+$/u.test(entry.name)) {
+          throw new TransferStorageError('Transfer storage contains unattributed residue.');
+        }
+        const inspection = await this.inspectSessionAt(root, entry.name);
+        const marker = await this.inspectOwnerMarkerAt(root, entry.name);
+        if (inspection.kind !== 'valid' || marker.kind !== 'valid' || marker.vaultId !== inspection.value.vault_id) {
+          throw new TransferStorageError('Transfer session ownership is unavailable.');
+        }
+        if (rejectTemporary && await this.hasStatePublicationTemporary(root, entry.name)) {
+          throw new TransferStorageError('Transfer state publication is incomplete.');
+        }
+        sessions.push(inspection.value);
+      }
+      for (const session of sessions) await this.verifySessionAccounting(session);
+      await assertDeletionRootUnchanged(root);
+      return sessions;
+    } catch (error) {
+      this.transferUnavailable = true;
+      throw error;
+    } finally {
+      await closeDeletionRoot(root);
     }
-    return sessions;
   }
 
   private async readSession(transferId: string): Promise<PushSession | null> {
+    const inspection = await this.inspectSession(transferId);
+    if (inspection.kind === 'valid') {
+      await this.verifySessionAccounting(inspection.value);
+      return inspection.value;
+    }
+    if (inspection.kind === 'missing') return null;
+    this.transferUnavailable = true;
+    return null;
+  }
+
+  private async inspectSession(transferId: string): Promise<
+    { kind: 'valid'; value: PushSession } |
+    { kind: 'missing' } |
+    { kind: 'malformed' } |
+    { kind: 'unreadable' }
+  > {
+    return await this.inspectSessionPath(join(this.sessionDir(transferId), 'session.json'), transferId);
+  }
+
+  private async inspectSessionAt(root: DeletionRoot, transferId: string): Promise<
+    { kind: 'valid'; value: PushSession } |
+    { kind: 'missing' } |
+    { kind: 'malformed' } |
+    { kind: 'unreadable' }
+  > {
+    return await this.inspectSessionPath(join(root.fdPath, transferId, 'session.json'), transferId);
+  }
+
+  private async inspectSessionPath(path: string, transferId: string): Promise<
+    { kind: 'valid'; value: PushSession } |
+    { kind: 'missing' } |
+    { kind: 'malformed' } |
+    { kind: 'unreadable' }
+  > {
+    let info;
     try {
-      const parsed = JSON.parse(await readFile(join(this.sessionDir(transferId), 'session.json'), 'utf8')) as PushSession;
-      return parsed.version === SESSION_VERSION ? parsed : null;
-    } catch {
-      return null;
+      info = await lstat(path);
+    } catch (error) {
+      return isMissing(error) ? { kind: 'missing' } : { kind: 'unreadable' };
+    }
+    if (info.isSymbolicLink() || !info.isFile()) return { kind: 'unreadable' };
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await readFile(path, 'utf8')) as unknown;
+    } catch (error) {
+      return isMissing(error) ? { kind: 'missing' } : { kind: 'malformed' };
+    }
+    const value = parsePersistedPushSession(parsed, transferId);
+    return value === null ? { kind: 'malformed' } : { kind: 'valid', value };
+  }
+
+  private async inspectOwnerMarker(transferId: string): Promise<
+    { kind: 'valid'; vaultId: string } | { kind: 'missing' } | { kind: 'malformed' } | { kind: 'unreadable' }
+  > {
+    return await this.inspectOwnerMarkerPath(this.ownerMarker(transferId));
+  }
+
+  private async inspectOwnerMarkerAt(root: DeletionRoot, transferId: string): Promise<
+    { kind: 'valid'; vaultId: string } | { kind: 'missing' } | { kind: 'malformed' } | { kind: 'unreadable' }
+  > {
+    return await this.inspectOwnerMarkerPath(join(root.fdPath, transferId, 'owner.json'));
+  }
+
+  private async inspectOwnerMarkerPath(path: string): Promise<
+    { kind: 'valid'; vaultId: string } | { kind: 'missing' } | { kind: 'malformed' } | { kind: 'unreadable' }
+  > {
+    try {
+      const info = await lstat(path);
+      if (info.isSymbolicLink() || !info.isFile()) return { kind: 'unreadable' };
+      const value = JSON.parse(await readFile(path, 'utf8')) as unknown;
+      return isRecord(value) && hasOnlyFields(value, ['vault_id']) && isBoundedIdentifier(value.vault_id)
+        ? { kind: 'valid', vaultId: value.vault_id }
+        : { kind: 'malformed' };
+    } catch (error) {
+      return isMissing(error) ? { kind: 'missing' } : { kind: 'unreadable' };
     }
   }
 
-  private async writeSession(session: PushSession): Promise<void> {
-    const destination = join(this.sessionDir(session.transfer_id), 'session.json');
-    const temporary = `${destination}.tmp-${randomBytes(6).toString('hex')}`;
-    await writeFile(temporary, `${JSON.stringify(session, null, 2)}\n`, { mode: 0o600 });
-    await rename(temporary, destination);
+  private async writeSessionWithAdmission(auth: AuthenticatedDevice, session: PushSession, transferId: string): Promise<void> {
+    if (this.lifecycle) {
+      await this.lifecycle.withAdmission(auth.vault.vault_id, async () => await this.writeSession(session, transferId));
+    } else {
+      await this.writeSession(session, transferId);
+    }
+  }
+
+  private async writeOwnerMarker(transferId: string, vaultId: string): Promise<void> {
+    try {
+      await writeDurableFile(
+        this.ownerMarker(transferId),
+        `${JSON.stringify({ vault_id: vaultId })}\n`,
+        this.persistence
+      );
+    } catch (error) {
+      this.transferUnavailable = true;
+      throw error;
+    }
+  }
+
+  private async writeSession(session: PushSession, transferId: string): Promise<void> {
+    try {
+      await writeDurableFile(
+        join(this.sessionDir(transferId), 'session.json'),
+        `${JSON.stringify(session, null, 2)}\n`,
+        this.persistence
+      );
+    } catch (error) {
+      this.transferUnavailable = true;
+      throw error;
+    }
+  }
+
+  private isGitDurabilityUnavailable(): boolean {
+    const checker = (this.git as unknown as { isDurabilityUnavailable?: () => boolean }).isDurabilityUnavailable;
+    return checker?.call(this.git) ?? false;
+  }
+
+  private async validTransferRepository(transferId: string, vaultId?: string): Promise<boolean> {
+    try {
+      const info = await lstat(this.repoDir(transferId));
+      if (!info.isDirectory() || info.isSymbolicLink()) return false;
+      const transferIntegrityValidator = (this.git as unknown as {
+        checkTransferRepositoryIntegrity?: (path: string, targetVaultId: string) => Promise<boolean>;
+      }).checkTransferRepositoryIntegrity;
+      if (transferIntegrityValidator && vaultId !== undefined) {
+        return await transferIntegrityValidator.call(this.git, this.repoDir(transferId), vaultId);
+      }
+      const integrityValidator = (this.git as unknown as {
+        checkBareRepositoryIntegrity?: (path: string) => Promise<boolean>;
+      }).checkBareRepositoryIntegrity;
+      if (integrityValidator) return await integrityValidator.call(this.git, this.repoDir(transferId));
+      const shapeValidator = (this.git as unknown as { isBareRepositoryShape?: (path: string) => Promise<boolean> }).isBareRepositoryShape;
+      return shapeValidator ? await shapeValidator.call(this.git, this.repoDir(transferId)) : true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async removeSessionDirectory(transferId: string): Promise<void> {
+    await this.withStorageLock(async () => {
+      try {
+        await this.removeSessionDirectoryUnderStorage(transferId);
+      } finally {
+        this.storedBytes = null;
+      }
+    });
+  }
+
+  private async removeSessionDirectoryUnderStorage(transferId: string): Promise<void> {
+    const root = await openDeletionRoot(this.config.transferDir);
+    try {
+      await removeDeletionRootDirectoryChild(root, transferId);
+      await syncDeletionRoot(root);
+    } finally {
+      await closeDeletionRoot(root);
+    }
+  }
+
+  private async hasStatePublicationTemporary(root: DeletionRoot, transferId: string): Promise<boolean> {
+    const entries = await readdir(join(root.fdPath, transferId), { withFileTypes: true });
+    return entries.some((entry) => entry.name.startsWith('owner.json.tmp-') || entry.name.startsWith('session.json.tmp-'));
   }
 
   private sessionDir(transferId: string): string {
@@ -494,20 +1003,62 @@ export class ChunkTransferService {
     return join(this.sessionDir(transferId), 'repo.git');
   }
 
-  private async directoryBytes(root: string): Promise<number> {
+  private ownerMarker(transferId: string): string {
+    return join(this.sessionDir(transferId), 'owner.json');
+  }
+
+  private async directoryBytes(root: string, transferRoot = true, excludeState = false, sessionRoot = !transferRoot): Promise<number> {
     let entries;
     try {
       entries = await readdir(root, { withFileTypes: true });
-    } catch {
-      return 0;
+    } catch (error) {
+      if (transferRoot && isMissing(error)) return 0;
+      throw error;
     }
     let total = 0;
     for (const entry of entries) {
+      if (entry.isSymbolicLink() || (!entry.isDirectory() && !entry.isFile())) {
+        throw new TransferStorageError('Transfer storage contains an unreadable entry.');
+      }
+      if (transferRoot && (!entry.isDirectory() || !/^trn_[A-Za-z0-9]+$/u.test(entry.name))) {
+        throw new TransferStorageError('Transfer storage contains unattributed residue.');
+      }
+      if (excludeState && sessionRoot && (entry.name === 'owner.json' || entry.name === 'session.json')) continue;
       const entryPath = join(root, entry.name);
-      if (entry.isDirectory()) total += await this.directoryBytes(entryPath);
-      else if (entry.isFile()) total += (await stat(entryPath)).size;
+      if (entry.isDirectory()) total += await this.directoryBytes(entryPath, false, excludeState, transferRoot);
+      else total += (await stat(entryPath)).size;
     }
     return total;
+  }
+
+  private async verifySessionAccounting(session: PushSession): Promise<number> {
+    if (
+      session.chunk_count > this.config.maxTransferChunks ||
+      session.total_bytes > this.config.maxTransferBytes ||
+      (session.stored_bytes !== undefined && session.stored_bytes > this.config.maxTransferStorageBytes) ||
+      session.receipts.some((receipt) => receipt.bytes > this.config.transferChunkBytes)
+    ) {
+      this.transferUnavailable = true;
+      throw new TransferStorageError('Persisted transfer session exceeds configured limits.');
+    }
+    const actual = await this.directoryBytes(this.sessionDir(session.transfer_id), false, true);
+    if (actual > this.config.maxTransferBytes || actual > this.config.maxTransferStorageBytes) {
+      this.transferUnavailable = true;
+      throw new TransferStorageError('Persisted transfer storage exceeds configured limits.');
+    }
+    if (session.stored_bytes !== undefined && session.stored_bytes !== actual) {
+      this.transferUnavailable = true;
+      throw new TransferStorageError('Persisted transfer storage accounting does not match transfer material.');
+    }
+    if ((session.status === 'completed' || session.status === 'rejected') && session.receipts.length !== session.chunk_count) {
+      this.transferUnavailable = true;
+      throw new TransferStorageError('Persisted terminal transfer is missing chunk receipts.');
+    }
+    return actual;
+  }
+
+  private async withStorageLock<T>(fn: () => Promise<T>): Promise<T> {
+    return await this.withLock('__storage__', fn);
   }
 
   private async withLock<T>(transferId: string, fn: () => Promise<T>): Promise<T> {
@@ -524,4 +1075,169 @@ export class ChunkTransferService {
       if (this.locks.get(transferId) === tail) this.locks.delete(transferId);
     }
   }
+}
+
+class TransferStorageError extends Error {
+  constructor(message: string) {
+    super(message);
+  }
+}
+
+function parsePersistedPushSession(value: unknown, transferId: string): PushSession | null {
+  if (!isRecord(value) || value.version !== SESSION_VERSION) return null;
+  if (!hasOnlyFields(value, [
+    'version', 'transfer_id', 'vault_id', 'device_id', 'attempt_id', 'request_sha256', 'manifest', 'plan_sha256',
+    'chunk_count', 'receipts', 'total_bytes', 'stored_bytes', 'status', 'result', 'processing_attempts',
+    'processing_error_code', 'retry_at', 'created_at', 'updated_at', 'expires_at'
+  ]) ||
+    typeof value.transfer_id !== 'string' || value.transfer_id !== transferId || !/^trn_[A-Za-z0-9_]+$/u.test(value.transfer_id) ||
+    !isBoundedIdentifier(value.vault_id) || !isBoundedIdentifier(value.device_id) ||
+    typeof value.attempt_id !== 'string' || !/^[A-Za-z0-9_-]{8,128}$/u.test(value.attempt_id) ||
+    typeof value.request_sha256 !== 'string' || !SHA256_PATTERN.test(value.request_sha256) ||
+    typeof value.plan_sha256 !== 'string' || !SHA256_PATTERN.test(value.plan_sha256) ||
+    !isBoundedCounter(value.chunk_count) ||
+    !isBoundedByteCount(value.total_bytes) ||
+    (value.stored_bytes !== undefined && !isBoundedByteCount(value.stored_bytes, 17_179_869_184)) ||
+    !isSessionStatus(value.status) ||
+    !isIsoTimestamp(value.created_at) || !isIsoTimestamp(value.updated_at) || !isIsoTimestamp(value.expires_at) ||
+    Date.parse(value.updated_at as string) < Date.parse(value.created_at as string) ||
+    !Array.isArray(value.receipts) || value.receipts.length > value.chunk_count ||
+    !isSessionResultCombination(value.status, value.result) ||
+    (value.processing_attempts !== undefined && !isBoundedCounter(value.processing_attempts, MAX_PROCESSING_ATTEMPTS)) ||
+    (value.processing_error_code !== undefined && value.processing_error_code !== null &&
+      value.processing_error_code !== 'server_git_error' && value.processing_error_code !== 'server_processing_error') ||
+    (value.retry_at !== undefined && value.retry_at !== null && !isIsoTimestamp(value.retry_at)) ||
+    !isRetryCombination(value.status, value.processing_error_code, value.retry_at)
+  ) return null;
+  let manifest: DevicePushManifest;
+  try {
+    manifest = parseDevicePushManifest(value.manifest);
+  } catch {
+    return null;
+  }
+  if (manifest.vault_id !== value.vault_id || manifest.device_id !== value.device_id || manifest.attempt_id !== value.attempt_id) return null;
+  const receipts: ChunkReceipt[] = [];
+  const indexes = new Set<number>();
+  let receiptBytes = 0;
+  for (const receipt of value.receipts) {
+    if (!isRecord(receipt) || !hasOnlyFields(receipt, ['index', 'bytes', 'sha256']) || !isBoundedCounter(receipt.index) || receipt.index >= value.chunk_count ||
+      indexes.has(receipt.index) || !isBoundedByteCount(receipt.bytes, 8_589_934_592) ||
+      typeof receipt.sha256 !== 'string' || !SHA256_PATTERN.test(receipt.sha256) ||
+      receiptBytes > Number.MAX_SAFE_INTEGER - receipt.bytes) return null;
+    indexes.add(receipt.index);
+    receiptBytes += receipt.bytes;
+    receipts.push({ index: receipt.index, bytes: receipt.bytes, sha256: receipt.sha256 });
+  }
+  if (receiptBytes !== value.total_bytes || (value.status === 'processing' && receipts.length !== value.chunk_count)) return null;
+  return {
+    version: SESSION_VERSION,
+    transfer_id: transferId,
+    vault_id: value.vault_id,
+    device_id: value.device_id,
+    attempt_id: value.attempt_id,
+    request_sha256: value.request_sha256,
+    manifest,
+    plan_sha256: value.plan_sha256,
+    chunk_count: value.chunk_count,
+    receipts,
+    total_bytes: value.total_bytes,
+    ...(value.stored_bytes === undefined ? {} : { stored_bytes: value.stored_bytes }),
+    status: value.status,
+    result: value.result,
+    ...(value.processing_attempts === undefined ? {} : { processing_attempts: value.processing_attempts }),
+    ...(value.processing_error_code === undefined ? {} : { processing_error_code: value.processing_error_code }),
+    ...(value.retry_at === undefined ? {} : { retry_at: value.retry_at }),
+    created_at: value.created_at,
+    updated_at: value.updated_at,
+    expires_at: value.expires_at
+  };
+}
+
+function isSessionStatus(value: unknown): value is PushSession['status'] {
+  return value === 'open' || value === 'processing' || value === 'completed' || value === 'rejected' || value === 'aborted';
+}
+
+function isSessionResultCombination(status: PushSession['status'], result: unknown): result is PushResult | null {
+  if (status === 'completed') return isPushResult(result) && result.status !== 'rejected';
+  if (status === 'rejected') return isPushResult(result) && result.status === 'rejected';
+  return result === null;
+}
+
+function isRetryCombination(
+  status: PushSession['status'],
+  processingErrorCode: unknown,
+  retryAt: unknown
+): boolean {
+  if (status === 'completed' || status === 'rejected' || status === 'aborted') {
+    return (processingErrorCode === undefined || processingErrorCode === null) && (retryAt === undefined || retryAt === null);
+  }
+  const hasError = processingErrorCode !== undefined && processingErrorCode !== null;
+  const hasRetry = retryAt !== undefined && retryAt !== null;
+  return hasError === hasRetry;
+}
+
+function isPushResult(value: unknown): value is PushResult {
+  if (!isRecord(value) || typeof value.status !== 'string') return false;
+  if (value.status === 'rejected') {
+    return hasOnlyFields(value, ['status', 'code', 'message']) &&
+      typeof value.code === 'string' && value.code.length > 0 && value.code.length <= MAX_RESULT_CODE_LENGTH &&
+      typeof value.message === 'string' && value.message.length > 0 && value.message.length <= MAX_RESULT_MESSAGE_LENGTH;
+  }
+  if (value.status !== 'noop' && value.status !== 'merged' && value.status !== 'conflicted') return false;
+  if (
+    !hasOnlyFields(value, value.status === 'noop'
+      ? ['status', 'device_ref', 'main', 'event_seq', 'directory_ack']
+      : value.status === 'merged'
+        ? ['status', 'device_ref', 'main', 'merge_commit', 'event_seq', 'directory_ack']
+        : ['status', 'device_ref', 'main', 'conflict_id', 'event_seq', 'directory_ack']) ||
+    typeof value.device_ref !== 'string' || value.device_ref.length === 0 || value.device_ref.length > MAX_DEVICE_REF_LENGTH ||
+    !COMMIT_PATTERN.test(value.main) || !isBoundedCounter(value.event_seq) ||
+    (value.directory_ack !== undefined && !isDirectoryAcknowledgement(value.directory_ack))
+  ) return false;
+  if (value.status === 'merged') return typeof value.merge_commit === 'string' && COMMIT_PATTERN.test(value.merge_commit);
+  if (value.status === 'conflicted') return typeof value.conflict_id === 'string' && IDENTIFIER_PATTERN.test(value.conflict_id);
+  return true;
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string' || !ISO_TIMESTAMP_PATTERN.test(value)) return false;
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp) || timestamp < 0 || timestamp > 8_640_000_000_000_000) return false;
+  return new Date(timestamp).toISOString() === value;
+}
+
+function isBoundedIdentifier(value: unknown): value is string {
+  return typeof value === 'string' && IDENTIFIER_PATTERN.test(value);
+}
+
+function isBoundedCounter(value: unknown, maximum = Number.MAX_SAFE_INTEGER): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= maximum;
+}
+
+function isBoundedByteCount(value: unknown, maximum = 8_589_934_592): value is number {
+  return isBoundedCounter(value, maximum);
+}
+
+function isDirectoryAcknowledgement(value: unknown): boolean {
+  if (!isRecord(value) || !hasOnlyFields(value, ['proposal_id', 'status', 'acknowledged_intents']) ||
+    typeof value.proposal_id !== 'string' || !/^dirprop_[0-9a-f]{64}$/u.test(value.proposal_id) ||
+    (value.status !== 'accepted' && value.status !== 'conflicted' && value.status !== 'duplicate') ||
+    !Array.isArray(value.acknowledged_intents) || value.acknowledged_intents.length > 5000) return false;
+  return value.acknowledged_intents.every((acknowledgement) =>
+    isRecord(acknowledgement) && hasOnlyFields(acknowledgement, ['intent_id', 'generation']) &&
+    isBoundedIdentifier(acknowledgement.intent_id) && isBoundedCounter(acknowledgement.generation)
+  );
+}
+
+function hasOnlyFields(value: Record<string, unknown>, fields: string[]): boolean {
+  const allowed = new Set(fields);
+  return Object.keys(value).every((field) => allowed.has(field));
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isMissing(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT';
 }

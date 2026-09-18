@@ -1,7 +1,9 @@
 <script lang="ts">
+  import Icon, { type IconName } from './Icon.svelte';
+
   export let label: string;
 
-  const activeStatusBases = ['Verifying contents', 'Preparing upload', 'Uploading', 'Applying', 'Checking', 'Merging', 'Server retrying', 'Repairing baseline', 'Finishing update', 'Waiting for operation'];
+  const activeStatusBases = ['Deleting', 'Verifying contents', 'Preparing upload', 'Uploading', 'Applying', 'Checking', 'Merging', 'Server retrying', 'Repairing baseline', 'Finishing update', 'Waiting for operation'];
 
   $: role = statusRole(label);
   $: icon = statusIcon(label);
@@ -15,28 +17,24 @@
 
   function statusRole(value: string) {
     const base = baseLabel(value);
-    if (base === 'Synced') return 'success';
+    if (base === 'Synced' || base === 'Current') return 'success';
     if (activeStatusBases.includes(base)) return 'info';
     if (['Ahead', 'Behind', 'Offline', 'Status unknown', 'Review needed', 'Stale review'].includes(base)) return 'warning';
-    if (['Blocked', 'Needs recovery', 'Unsafe local state', 'Integrity failure'].includes(base)) return 'danger';
+    if (['Blocked', 'Needs recovery', 'Unsafe local state', 'Integrity failure', 'Revoked'].includes(base)) return 'danger';
     return 'neutral';
   }
 
-  function statusIcon(value: string) {
+  function statusIcon(value: string): IconName {
     const base = baseLabel(value);
-    if (base === 'Synced') return '✓';
-    if (base === 'Preparing upload') return '…';
-    if (base === 'Uploading') return '↑';
-    if (base === 'Applying') return '↓';
-    if (base === 'Merging') return '↔';
-    if (activeStatusBases.includes(base)) return '…';
-    if (base === 'Ahead') return '↑';
-    if (base === 'Behind') return '↓';
-    if (base === 'Offline' || base === 'Status unknown') return '○';
-    if (base === 'Review needed' || base === 'Stale review') return '!';
-    if (base === 'Blocked' || base === 'Needs recovery' || base === 'Unsafe local state' || base === 'Integrity failure') return '×';
-    return '•';
+    if (base === 'Synced' || base === 'Current') return 'check';
+    if (base === 'Preparing upload' || base === 'Uploading' || activeStatusBases.includes(base)) return 'info';
+    if (base === 'Applying' || base === 'Behind') return 'info';
+    if (base === 'Ahead') return 'warning';
+    if (base === 'Offline' || base === 'Status unknown') return 'dot';
+    if (base === 'Review needed' || base === 'Stale review') return 'warning';
+    if (base === 'Blocked' || base === 'Needs recovery' || base === 'Unsafe local state' || base === 'Integrity failure' || base === 'Revoked') return 'danger';
+    return 'dot';
   }
 </script>
 
-<span class="status {role}"><i aria-hidden="true">{icon}</i>{label}</span>
+<span class="status {role}"><Icon name={icon} size={14} />{label}</span>

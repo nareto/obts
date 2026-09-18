@@ -1,14 +1,20 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { ApiError, DashboardApi } from './api/client';
-  import Attention from './components/Attention.svelte';
   import type { AttentionItem } from './components/Attention.svelte';
-  import Checklist from './components/Checklist.svelte';
+  import AuthScreen from './components/AuthScreen.svelte';
+  import ConflictQueue from './components/ConflictQueue.svelte';
   import ConflictWorkbench from './components/ConflictWorkbench.svelte';
+  import ConnectionScreen from './components/ConnectionScreen.svelte';
   import DeviceTable from './components/DeviceTable.svelte';
-  import Diagnostics from './components/Diagnostics.svelte';
+  import HistoryPage from './components/HistoryPage.svelte';
+  import MaintenancePage from './components/MaintenancePage.svelte';
+  import Overview from './components/Overview.svelte';
+  import ReauthModal from './components/ReauthModal.svelte';
+  import SettingsPage from './components/SettingsPage.svelte';
+  import Shell from './components/Shell.svelte';
   import Status from './components/Status.svelte';
-  import Summary from './components/Summary.svelte';
+  import VaultDeletionModal from './components/VaultDeletionModal.svelte';
   import type {
     DashboardConflict,
     ConnectionReview,
@@ -17,6 +23,7 @@
     DashboardDevice,
     DashboardSummary,
     DiagnosticEventsResponse,
+    VaultDeletionStatus,
     MaintenanceRow,
     NoteHistoryQueryResponse,
     NoteHistoryVersion,
@@ -36,8 +43,8 @@
   let password = '';
   let authError = '';
   let page: Page = 'Overview';
-  let mobileNavOpen = false;
   let vaults: VaultSummary[] = [];
+  let deletions: VaultDeletionStatus[] = [];
   let vaultId = '';
   let newVaultName = '';
   let createVaultOpen = false;
@@ -46,6 +53,8 @@
   let renameVaultOpen = false;
   let dashboard: DashboardSummary | null = null;
   let diagnostics: DiagnosticEventsResponse | null = null;
+  let diagnosticsError = '';
+  let diagnosticsLoading = false;
   let conflicts: DashboardConflict[] = [];
   let selectedConflictId = '';
   let conflictListOpen = false;
@@ -56,6 +65,9 @@
   let connectionVaultId = '';
   let connectionVaultName = '';
   let connectionApproved = false;
+  let connectionOperationGeneration = 0;
+  let connectionOperationInFlight = false;
+  let connectionRequestGeneration = 0;
   let reauthOpen = false;
   let reauthAction: (() => Promise<void>) | null = null;
   let historyPath = '';
@@ -63,6 +75,8 @@
   let selectedHistory: NoteHistoryVersion | null = null;
   let historyVersion: NoteHistoryVersionResponse | null = null;
   let historyDiffTab: 'rendered' | 'source' = 'source';
+  let historyError = '';
+  let historyLoading = false;
   let maintenanceDetailOpen = false;
   let busy = false;
   let notice = '';
@@ -71,16 +85,153 @@
   let nowMs = Date.now();
   let dashboardRefreshInFlight = false;
   let dashboardRefreshGeneration = 0;
+  let dashboardRefreshOwner: { vaultId: string; epoch: number; generation: number } | null = null;
   let dashboardStatusCurrent = true;
+  let stateEpoch = 0;
+  let logoutInFlight = false;
+  let logoutFailed = false;
+  let accountEpoch = 0;
+  let reviewRequestGeneration = 0;
+  let historyRequestGeneration = 0;
+  let diagnosticsRequestGeneration = 0;
+  let diagnosticsDeleteGeneration = 0;
+  let diagnosticsDeleteInFlight = false;
+  let deletionModalOpen = false;
+  let deletionTarget: { vaultId: string; displayName: string; epoch: number; account: number; userId: string; generation: number } | null = null;
+  let deletionError = '';
+  let deletionRequestGeneration = 0;
+  let deletionRequestInFlight = false;
+  let deletionRefreshGeneration = 0;
+  let deletionRefreshInFlight = false;
 
   $: selectedVault = vaults.find((vault) => vault.vault_id === vaultId) ?? null;
   $: unresolvedCount = dashboard?.unresolved_conflict_count ?? conflicts.filter((conflict) => conflict.status === 'open').length;
   $: selectedConflict = conflicts.find((conflict) => conflict.conflict_id === selectedConflictId) ?? null;
+  $: selectedDeletion = deletions.find((deletion) => deletion.vault_id === vaultId) ?? null;
+  $: selectedVaultDeleting = selectedVault?.status === 'deleting' || selectedDeletion?.status === 'deleting';
   $: recentAuthValid = session ? Date.parse(session.recent_auth_expires_at) > nowMs : false;
   $: syncSummary = dashboardSyncSummary(dashboard, dashboardStatusCurrent);
 
+  function clearScopedState(clearAccount = false) {
+    stateEpoch += 1;
+    dashboardRefreshGeneration += 1;
+    reviewRequestGeneration += 1;
+    historyRequestGeneration += 1;
+    diagnosticsRequestGeneration += 1;
+    diagnosticsDeleteGeneration += 1;
+    deletionRequestGeneration += 1;
+    deletionRefreshGeneration += 1;
+    connectionRequestGeneration += 1;
+    connectionOperationGeneration += 1;
+    connectionOperationInFlight = false;
+    diagnosticsDeleteInFlight = false;
+    deletionModalOpen = false;
+    deletionTarget = null;
+    deletionError = '';
+    deletionRequestInFlight = false;
+    deletionRefreshInFlight = false;
+    dashboardRefreshOwner = null;
+    dashboardRefreshInFlight = false;
+    dashboard = null;
+    if (clearAccount) {
+      accountEpoch += 1;
+      diagnostics = null;
+      diagnosticsError = '';
+      connectionReview = null;
+      connectionApproved = false;
+      connectionVaultId = '';
+      connectionVaultName = '';
+      vaults = [];
+      deletions = [];
+      vaultId = '';
+      page = 'Overview';
+    }
+    createVaultOpen = false;
+    renameVaultOpen = false;
+    renameVaultId = '';
+    conflictListOpen = false;
+    conflicts = [];
+    selectedConflictId = '';
+    review = null;
+    reauthAction = null;
+    reauthOpen = false;
+    historyPath = '';
+    history = null;
+    selectedHistory = null;
+    historyVersion = null;
+    historyError = '';
+    historyLoading = false;
+    lastRefreshed = null;
+    notice = '';
+    actionError = '';
+    dashboardStatusCurrent = false;
+    maintenanceDetailOpen = false;
+  }
+
+  function currentRequest(vault: string, epoch: number, generation?: number) {
+    return vaultId === vault && stateEpoch === epoch && (generation === undefined || dashboardRefreshGeneration === generation) && !!session;
+  }
+
+  function currentConnectionAction(target: { connectionId: string; epoch: number; account: number; userId: string }, generation: number) {
+    return connectionId === target.connectionId && connectionReview?.connection_id === target.connectionId && stateEpoch === target.epoch && accountEpoch === target.account && session?.user_id === target.userId && connectionOperationGeneration === generation;
+  }
+
+  function currentDiagnosticsDelete(target: { epoch: number; account: number; userId: string }, generation: number) {
+    return stateEpoch === target.epoch && accountEpoch === target.account && session?.user_id === target.userId && diagnosticsDeleteGeneration === generation;
+  }
+
+  function currentDeletionTarget(target: NonNullable<typeof deletionTarget>, generation = target.generation) {
+    return deletionTarget?.vaultId === target.vaultId && deletionTarget.generation === generation && vaultId === target.vaultId && stateEpoch === target.epoch && accountEpoch === target.account && session?.user_id === target.userId;
+  }
+
+  function clearTargetPresentation(targetVaultId: string) {
+    if (vaultId !== targetVaultId) return;
+    stateEpoch += 1;
+    dashboardRefreshGeneration += 1;
+    reviewRequestGeneration += 1;
+    historyRequestGeneration += 1;
+    diagnosticsRequestGeneration += 1;
+    deletionRequestGeneration += 1;
+    deletionRefreshGeneration += 1;
+    dashboardRefreshOwner = null;
+    dashboardRefreshInFlight = false;
+    deletionRefreshInFlight = false;
+    dashboard = null;
+    conflicts = [];
+    selectedConflictId = '';
+    conflictListOpen = false;
+    review = null;
+    historyPath = '';
+    history = null;
+    selectedHistory = null;
+    historyVersion = null;
+    historyError = '';
+    historyLoading = false;
+    dashboardStatusCurrent = false;
+    lastRefreshed = null;
+    actionError = '';
+    deletionModalOpen = false;
+    deletionTarget = null;
+    deletionError = '';
+    deletionRequestInFlight = false;
+    vaultId = '';
+  }
+
+  function reportAsyncError(error: unknown, fallback: string, epoch = stateEpoch) {
+    if (stateEpoch !== epoch) return;
+    if (error instanceof ApiError && error.status === 401) {
+      session = null;
+      clearScopedState(true);
+      api.csrfToken = '';
+      authError = 'Your session ended. Sign in to continue.';
+      busy = false;
+      return;
+    }
+    actionError = error instanceof Error ? error.message : fallback;
+  }
+
   function isActiveStatusLabel(label: string) {
-    return ['Verifying contents', 'Preparing upload', 'Uploading', 'Applying', 'Checking', 'Merging', 'Server retrying', 'Repairing baseline', 'Finishing update', 'Waiting for operation'].some(
+    return ['Deleting', 'Verifying contents', 'Preparing upload', 'Uploading', 'Applying', 'Checking', 'Merging', 'Server retrying', 'Repairing baseline', 'Finishing update', 'Waiting for operation'].some(
       (base) => label === base || label.startsWith(`${base} `)
     );
   }
@@ -91,7 +242,8 @@
   } {
     if (!value) return { label: 'Checking', role: 'neutral' };
     if (!statusCurrent) return { label: 'Status unknown', role: 'warning' };
-    if (value.vault.status !== 'active') return { label: 'Integrity failure', role: 'danger' };
+    if (value.vault.status === 'deleting') return { label: 'Deleting', role: 'info' };
+    if (value.vault.status === 'blocked_integrity') return { label: 'Integrity blocked', role: 'danger' };
     if (value.devices.length === 0) return { label: 'Status unknown', role: 'warning' };
     if (value.devices.every((device) => device.status_label === 'Synced')) return { label: 'Synced', role: 'success' };
     if (value.devices.some((device) => ['Blocked', 'Needs recovery', 'Unsafe local state', 'Integrity failure'].includes(device.status_label))) {
@@ -125,92 +277,262 @@
   });
 
   async function bootstrap() {
+    const epoch = stateEpoch;
+    busy = true;
     try {
-      setupComplete = (await api.setupStatus()).setup_complete;
+      const setup = await api.setupStatus();
+      if (stateEpoch !== epoch) return;
+      setupComplete = setup.setup_complete;
       if (setupComplete) {
-        session = await api.session();
+        const restoredSession = await api.session();
+        if (stateEpoch !== epoch) return;
+        session = restoredSession;
         await refreshAll();
       }
     } catch (error) {
+      if (stateEpoch !== epoch) return;
       if (error instanceof ApiError && error.status === 401) {
         session = null;
         return;
       }
       authError = error instanceof Error ? error.message : 'Unable to load dashboard.';
+    } finally {
+      if (stateEpoch === epoch || !session) busy = false;
     }
   }
 
   async function authenticate() {
+    if (logoutInFlight) {
+      authError = 'Signing out is still in progress. Please wait.';
+      return;
+    }
+    if (busy) return;
     authError = '';
     busy = true;
+    const requestEpoch = stateEpoch;
+    const requestAccountEpoch = accountEpoch;
+    const requestUserId = session?.user_id ?? '';
+    const pendingAction = reauthAction;
+    let operationEpoch = requestEpoch;
     try {
-      if (reauthAction && session) {
-        session = await api.reauthenticate(username, password);
-        const action = reauthAction;
+      if (pendingAction && session) {
+        const nextSession = await api.reauthenticate(username, password, { publishCsrfToken: false });
+        const sameSession = stateEpoch === requestEpoch && accountEpoch === requestAccountEpoch && session?.user_id === requestUserId && nextSession.user_id === requestUserId;
+        if (!sameSession) return;
+        api.csrfToken = nextSession.csrf_token;
+        const actionStillOwned = reauthAction === pendingAction;
+        session = nextSession;
+        if (!actionStillOwned) return;
         username = '';
         password = '';
         reauthAction = null;
         reauthOpen = false;
-        await action();
+        await pendingAction();
       } else {
-        session = setupComplete ? await api.login(username, password) : await api.setup(username, password);
+        clearScopedState(true);
+        operationEpoch = stateEpoch;
+        const nextSession = setupComplete ? await api.login(username, password) : await api.setup(username, password);
+        if (stateEpoch !== operationEpoch || logoutInFlight) return;
+        session = nextSession;
+        logoutFailed = false;
         setupComplete = true;
         username = '';
         password = '';
         await refreshAll();
       }
     } catch (error) {
-      authError = error instanceof Error ? error.message : 'Authentication failed.';
+      if (stateEpoch === operationEpoch && (pendingAction ? accountEpoch === requestAccountEpoch && session?.user_id === requestUserId && reauthAction === pendingAction : true)) {
+        authError = error instanceof Error ? error.message : 'Authentication failed.';
+      }
     } finally {
-      busy = false;
+      if (stateEpoch === operationEpoch && (pendingAction ? accountEpoch === requestAccountEpoch : true)) busy = false;
     }
   }
 
   async function refreshAll() {
     if (!session) return;
+    const epoch = stateEpoch;
+    const account = accountEpoch;
+    const userId = session.user_id;
+    const deletionGeneration = ++deletionRefreshGeneration;
     if (connectionId) {
-      connectionReview = await api.connectionReview(connectionId);
+      const generation = ++connectionRequestGeneration;
+      const connection = await api.connectionReview(connectionId);
+      if (!session || stateEpoch !== epoch || accountEpoch !== account || session.user_id !== userId || generation !== connectionRequestGeneration) return;
+      connectionReview = connection;
       connectionVaultName ||= connectionReview.local_vault_name;
       connectionVaultId ||= connectionReview.vaults.find((vault) => vault.status === 'active')?.vault_id ?? '';
       return;
     }
-    const listed = await api.vaults();
-    vaults = listed.vaults;
-    if (!vaultId && vaults[0]) {
-      vaultId = vaults[0].vault_id;
-    }
+    const [listed, deletionList] = await Promise.all([api.vaults(), api.vaultDeletions()]);
+    if (!session || stateEpoch !== epoch || accountEpoch !== account || session.user_id !== userId || deletionRefreshGeneration !== deletionGeneration) return;
+    const completedIds = new Set(deletionList.deletions.filter((deletion) => deletion.status === 'deleted').map((deletion) => deletion.vault_id));
+    const nextVaults = listed.vaults
+      .filter((vault) => !completedIds.has(vault.vault_id))
+      .map((vault) => deletionList.deletions.some((deletion) => deletion.vault_id === vault.vault_id && deletion.status === 'deleting')
+        ? { ...vault, status: 'deleting' as const }
+        : vault);
+    const previousVaultId = vaultId;
+    if (previousVaultId && !nextVaults.some((vault) => vault.vault_id === previousVaultId)) clearTargetPresentation(previousVaultId);
+    vaults = nextVaults;
+    if (!vaults.some((vault) => vault.vault_id === vaultId)) vaultId = vaults[0]?.vault_id ?? '';
+    deletions = deletionList.deletions;
+    if (vaults.length === 0 && deletions.length > 0) page = 'Settings';
     await Promise.all([refreshVault(), refreshDiagnostics()]);
   }
 
   async function refreshDiagnostics() {
-    diagnostics = await api.diagnosticEvents();
+    const epoch = accountEpoch;
+    const userId = session?.user_id ?? '';
+    const generation = ++diagnosticsRequestGeneration;
+    diagnosticsError = '';
+    diagnosticsLoading = true;
+    try {
+      const next = await api.diagnosticEvents();
+      if (session && session.user_id === userId && accountEpoch === epoch && generation === diagnosticsRequestGeneration) diagnostics = next;
+    } catch (error) {
+      if (session && session.user_id === userId && accountEpoch === epoch && generation === diagnosticsRequestGeneration) {
+        if (error instanceof ApiError && error.status === 401) {
+          reportAsyncError(error, 'Unable to load diagnostics.');
+        } else {
+          diagnosticsError = error instanceof Error ? error.message : 'Unable to load diagnostics.';
+        }
+      }
+    } finally {
+      if (accountEpoch === epoch && generation === diagnosticsRequestGeneration) diagnosticsLoading = false;
+    }
+  }
+
+  async function requestRefreshDiagnostics() {
+    if (!session || diagnosticsLoading) return;
+    await refreshDiagnostics();
+  }
+
+  function openVaultDeletion() {
+    if (!session || !selectedVault || selectedVaultDeleting || deletionRequestInFlight) return;
+    deletionError = '';
+    deletionTarget = {
+      vaultId: selectedVault.vault_id,
+      displayName: selectedVault.display_name,
+      epoch: stateEpoch,
+      account: accountEpoch,
+      userId: session.user_id,
+      generation: deletionRequestGeneration
+    };
+    deletionModalOpen = true;
+  }
+
+  function cancelVaultDeletion() {
+    deletionRequestGeneration += 1;
+    deletionTarget = null;
+    deletionModalOpen = false;
+    deletionError = '';
+  }
+
+  async function publishDeletionStatus(status: VaultDeletionStatus, targetVaultId: string) {
+    const nextDeletions = [status, ...deletions.filter((deletion) => deletion.vault_id !== targetVaultId)];
+    const nextVaults = vaults
+      .filter((vault) => vault.vault_id !== targetVaultId || status.status !== 'deleted')
+      .map((vault) => vault.vault_id === targetVaultId ? { ...vault, status: 'deleting' as const } : vault);
+    clearTargetPresentation(targetVaultId);
+    deletions = nextDeletions;
+    vaults = nextVaults;
+    if (status.status === 'deleting') {
+      vaultId = targetVaultId;
+      dashboardStatusCurrent = true;
+      notice = 'Vault deletion accepted. The server is still deleting it; completion is not yet confirmed.';
+      return;
+    }
+    const nextActive = nextVaults.find((vault) => vault.status === 'active');
+    if (nextActive) {
+      vaultId = nextActive.vault_id;
+      await refreshVault();
+    } else {
+      page = 'Settings';
+    }
+    notice = 'Vault deletion completed. The 30-day receipt remains available in Settings.';
+  }
+
+  async function submitVaultDeletion(confirmation: string) {
+    const target = deletionTarget;
+    if (!target || deletionRequestInFlight || busy) return;
+    if (confirmation !== `DELETE ${target.vaultId}`) {
+      deletionError = 'Type the exact confirmation phrase shown above.';
+      return;
+    }
+    if (!currentDeletionTarget(target)) {
+      deletionError = 'The selected vault changed. Close this dialog and review the current vault.';
+      return;
+    }
+    deletionRequestInFlight = true;
+    busy = true;
+    deletionError = '';
+    try {
+      const status = await api.deleteVault(target.vaultId, confirmation);
+      if (!currentDeletionTarget(target)) return;
+      deletionRequestInFlight = false;
+      busy = false;
+      await publishDeletionStatus(status, target.vaultId);
+      deletionTarget = null;
+      deletionModalOpen = false;
+    } catch (error) {
+      if (!currentDeletionTarget(target)) return;
+      deletionRequestInFlight = false;
+      busy = false;
+      if (error instanceof ApiError && error.status === 401) reportAsyncError(error, 'Unable to delete this vault.', target.epoch);
+      else deletionError = error instanceof Error ? error.message : 'Unable to delete this vault.';
+    }
   }
 
   async function loadMoreDiagnostics() {
-    if (!diagnostics?.next_cursor) return;
-    busy = true;
+    if (!diagnostics?.next_cursor || !session || diagnosticsLoading) return;
+    const epoch = accountEpoch;
+    const userId = session.user_id;
+    const cursor = diagnostics.next_cursor;
+    const generation = ++diagnosticsRequestGeneration;
+    diagnosticsLoading = true;
+    diagnosticsError = '';
     try {
-      const next = await api.diagnosticEvents(diagnostics.next_cursor);
-      diagnostics = { ...next, events: [...diagnostics.events, ...next.events] };
+      const next = await api.diagnosticEvents(cursor);
+      if (session && session.user_id === userId && accountEpoch === epoch && generation === diagnosticsRequestGeneration && diagnostics?.next_cursor === cursor) {
+        diagnostics = { ...next, events: [...diagnostics.events, ...next.events] };
+      }
     } catch (error) {
-      actionError = error instanceof Error ? error.message : 'Unable to load more diagnostics.';
+      if (session && session.user_id === userId && accountEpoch === epoch && generation === diagnosticsRequestGeneration) {
+        if (error instanceof ApiError && error.status === 401) {
+          reportAsyncError(error, 'Unable to load more diagnostics.');
+        } else {
+          diagnosticsError = error instanceof Error ? error.message : 'Unable to load more diagnostics.';
+        }
+      }
     } finally {
-      busy = false;
+      if (accountEpoch === epoch && generation === diagnosticsRequestGeneration) diagnosticsLoading = false;
     }
   }
 
   function deleteDiagnostics() {
+    if (!session || diagnosticsDeleteInFlight) return;
+    const target = { epoch: stateEpoch, account: accountEpoch, userId: session.user_id };
+    const generation = ++diagnosticsDeleteGeneration;
+    diagnosticsDeleteInFlight = true;
     withRecentAuth(async () => {
-      if (!confirm('Delete all error diagnostics shared with this server?')) return;
-      busy = true;
       try {
+        if (!currentDiagnosticsDelete(target, generation)) return;
+        if (!confirm('Delete all error diagnostics shared with this server?')) return;
+        busy = true;
         const result = await api.deleteDiagnosticEvents();
+        if (!currentDiagnosticsDelete(target, generation)) return;
         notice = `Deleted ${result.deleted_count} error diagnostic${result.deleted_count === 1 ? '' : 's'}.`;
         await refreshDiagnostics();
       } catch (error) {
-        actionError = error instanceof Error ? error.message : 'Unable to delete diagnostics.';
+        if (!currentDiagnosticsDelete(target, generation)) return;
+        if (error instanceof ApiError && error.status === 401) reportAsyncError(error, 'Unable to delete diagnostics.', target.epoch);
+        else actionError = error instanceof Error ? error.message : 'Unable to delete diagnostics.';
       } finally {
-        busy = false;
+        if (currentDiagnosticsDelete(target, generation)) {
+          diagnosticsDeleteInFlight = false;
+          busy = false;
+        }
       }
     });
   }
@@ -226,41 +548,180 @@
     }
   }
 
-  async function refreshDashboardStatus() {
-    if (!session || !vaultId || connectionId || dashboardRefreshInFlight) return;
-    const requestedVaultId = vaultId;
-    const requestGeneration = ++dashboardRefreshGeneration;
-    dashboardRefreshInFlight = true;
+  function clearDashboardPresentation() {
+    dashboard = null;
+    conflicts = [];
+    selectedConflictId = '';
+    conflictListOpen = false;
+    review = null;
+    historyPath = '';
+    history = null;
+    selectedHistory = null;
+    historyVersion = null;
+    historyError = '';
+    historyLoading = false;
+    dashboardStatusCurrent = false;
+  }
+
+  async function moveFromDeletedVault(targetVaultId: string, nextVaults: VaultSummary[]) {
+    const wasSelected = vaultId === targetVaultId;
+    vaults = nextVaults.filter((vault) => vault.vault_id !== targetVaultId);
+    if (!wasSelected) return;
+    clearTargetPresentation(targetVaultId);
+    vaults = nextVaults.filter((vault) => vault.vault_id !== targetVaultId);
+    const nextActive = vaults.find((vault) => vault.status === 'active');
+    if (nextActive) {
+      vaultId = nextActive.vault_id;
+      await refreshVault();
+    } else {
+      page = 'Settings';
+    }
+  }
+
+  async function refreshDeletionRecords() {
+    if (!session || connectionId || deletionRefreshInFlight) return;
+    const epoch = stateEpoch;
+    const account = accountEpoch;
+    const userId = session.user_id;
+    const generation = ++deletionRefreshGeneration;
+    deletionRefreshInFlight = true;
     try {
-      const [refreshedDashboard, refreshedConflicts] = await Promise.all([
-        api.dashboard(requestedVaultId),
-        api.conflicts(requestedVaultId).then((value) => value.conflicts)
-      ]);
-      if (vaultId !== requestedVaultId || requestGeneration !== dashboardRefreshGeneration) return;
-      dashboard = refreshedDashboard;
-      conflicts = sortConflicts(refreshedConflicts);
-      reconcileConflictSelection();
-      dashboardStatusCurrent = true;
-      lastRefreshed = new Date().toLocaleTimeString();
+      const result = await api.vaultDeletions();
+      if (!session || session.user_id !== userId || stateEpoch !== epoch || accountEpoch !== account || generation !== deletionRefreshGeneration) return;
+      deletions = result.deletions;
+      if (vaults.length === 0 && deletions.length > 0) page = 'Settings';
     } catch (error) {
-      if (requestGeneration === dashboardRefreshGeneration) dashboardStatusCurrent = false;
-      if (error instanceof ApiError && error.status === 401) session = null;
+      if (session && session.user_id === userId && stateEpoch === epoch && accountEpoch === account && generation === deletionRefreshGeneration) {
+        if (error instanceof ApiError && error.status === 401) reportAsyncError(error, 'Unable to refresh vault deletion status.', epoch);
+        else actionError = error instanceof Error ? error.message : 'Unable to refresh vault deletion status.';
+      }
     } finally {
-      dashboardRefreshInFlight = false;
+      if (generation === deletionRefreshGeneration) deletionRefreshInFlight = false;
+    }
+  }
+
+  async function refreshDashboardStatus(supersede = false) {
+    if (!session || connectionId || (dashboardRefreshInFlight && !supersede)) return;
+    if (!vaultId) {
+      await refreshDeletionRecords();
+      return;
+    }
+    const requestedVaultId = vaultId;
+    const epoch = stateEpoch;
+    const account = accountEpoch;
+    const userId = session.user_id;
+    const requestGeneration = ++dashboardRefreshGeneration;
+    const deletionGeneration = ++deletionRefreshGeneration;
+    const deletionBefore = deletions;
+    dashboardRefreshOwner = { vaultId: requestedVaultId, epoch, generation: requestGeneration };
+    dashboardRefreshInFlight = true;
+    deletionRefreshInFlight = true;
+    try {
+      const deletionPromise = api.vaultDeletions();
+      const dashboardPromise = selectedVaultDeleting
+        ? Promise.resolve(null)
+        : Promise.all([
+          api.dashboard(requestedVaultId),
+          api.conflicts(requestedVaultId).then((value) => value.conflicts)
+        ]);
+      const [deletionResult, dashboardResult] = await Promise.allSettled([deletionPromise, dashboardPromise]);
+      const owned = !!session && session.user_id === userId && accountEpoch === account && stateEpoch === epoch && vaultId === requestedVaultId && deletionGeneration === deletionRefreshGeneration && currentRequest(requestedVaultId, epoch, requestGeneration);
+      if (!owned) return;
+      let nextVaults = vaults;
+      if (deletionResult.status === 'fulfilled') {
+        const nextDeletions = deletionResult.value.deletions;
+        const previousTarget = deletionBefore.find((deletion) => deletion.vault_id === requestedVaultId);
+        const nextTarget = nextDeletions.find((deletion) => deletion.vault_id === requestedVaultId);
+        const targetCompleted = nextTarget?.status === 'deleted' || ((previousTarget?.status === 'deleting' || previousTarget?.status === 'deleted') && !nextTarget);
+        const completedIds = new Set(nextDeletions.filter((deletion) => deletion.status === 'deleted').map((deletion) => deletion.vault_id));
+        const expiredIds = previousTarget?.status === 'deleted' && !nextTarget ? new Set([requestedVaultId]) : new Set<string>();
+        nextVaults = vaults
+          .filter((vault) => !completedIds.has(vault.vault_id) && !expiredIds.has(vault.vault_id) && !(previousTarget?.status === 'deleting' && !nextTarget && vault.vault_id === requestedVaultId))
+          .map((vault) => nextDeletions.some((deletion) => deletion.vault_id === vault.vault_id && deletion.status === 'deleting')
+            ? { ...vault, status: 'deleting' as const }
+            : vault);
+        deletions = nextDeletions;
+        vaults = nextVaults;
+        if (targetCompleted) {
+          await moveFromDeletedVault(requestedVaultId, nextVaults);
+          return;
+        }
+        if (nextTarget?.status === 'deleting' && !previousTarget?.status) clearDashboardPresentation();
+        lastRefreshed = new Date().toLocaleTimeString();
+      } else if (deletionResult.reason instanceof ApiError && deletionResult.reason.status === 401) {
+        reportAsyncError(deletionResult.reason, 'Unable to refresh vault deletion status.', epoch);
+        return;
+      } else {
+        actionError = deletionResult.reason instanceof Error ? deletionResult.reason.message : 'Unable to refresh vault deletion status.';
+      }
+      if (dashboardResult.status === 'fulfilled') {
+        if (!dashboardResult.value) {
+          dashboardStatusCurrent = true;
+          return;
+        }
+        reviewRequestGeneration += 1;
+        dashboard = dashboardResult.value[0];
+        conflicts = sortConflicts(dashboardResult.value[1]);
+        const selected = conflicts.find((conflict) => conflict.conflict_id === selectedConflictId);
+        if (review && selectedConflictId && (!selected || selected.status !== 'open' || selected.stale || selected.current_main !== review.expected_main)) {
+          review = { ...review, stale: true };
+          if (selected) selected.status_label = 'Stale review';
+          actionError = selected ? 'This conflict changed while it was open. Refresh before submitting.' : 'This conflict is no longer available. Refresh the conflict queue.';
+        }
+        dashboardStatusCurrent = true;
+        lastRefreshed = new Date().toLocaleTimeString();
+      } else if (dashboardResult.reason instanceof ApiError && (dashboardResult.reason.status === 409 || dashboardResult.reason.code === 'vault_deleting')) {
+        vaults = vaults.map((vault) => vault.vault_id === requestedVaultId ? { ...vault, status: 'deleting' as const } : vault);
+        clearDashboardPresentation();
+        dashboardStatusCurrent = true;
+        lastRefreshed = new Date().toLocaleTimeString();
+      } else if (dashboardResult.reason instanceof ApiError && dashboardResult.reason.status === 404) {
+        await moveFromDeletedVault(requestedVaultId, nextVaults);
+      } else {
+        dashboardStatusCurrent = false;
+        reportAsyncError(dashboardResult.reason, 'Unable to refresh dashboard status.', epoch);
+      }
+    } finally {
+      if (deletionRefreshGeneration === deletionGeneration) deletionRefreshInFlight = false;
+      if (dashboardRefreshOwner?.generation === requestGeneration) {
+        dashboardRefreshInFlight = false;
+        dashboardRefreshOwner = null;
+      }
     }
   }
 
   async function refreshVault() {
-    if (!vaultId) return;
+    if (!vaultId || !session) return;
     const requestedVaultId = vaultId;
+    const epoch = stateEpoch;
+    const account = accountEpoch;
+    const userId = session.user_id;
     const requestGeneration = ++dashboardRefreshGeneration;
+    const deletionGeneration = ++deletionRefreshGeneration;
+    dashboardRefreshOwner = { vaultId: requestedVaultId, epoch, generation: requestGeneration };
+    dashboardRefreshInFlight = true;
+    deletionRefreshInFlight = true;
     try {
-      const [refreshedDashboard, refreshedConflicts] = await Promise.all([
+      const [dashboardResult, refreshedConflicts, deletionList] = await Promise.all([
         api.dashboard(requestedVaultId),
-        api.conflicts(requestedVaultId).then((value) => value.conflicts)
+        api.conflicts(requestedVaultId).then((value) => value.conflicts),
+        api.vaultDeletions()
       ]);
-      if (vaultId !== requestedVaultId || requestGeneration !== dashboardRefreshGeneration) return;
-      dashboard = refreshedDashboard;
+      if (!session || session.user_id !== userId || accountEpoch !== account || !currentRequest(requestedVaultId, epoch, requestGeneration) || deletionGeneration !== deletionRefreshGeneration) return;
+      const completedIds = new Set(deletionList.deletions.filter((deletion) => deletion.status === 'deleted').map((deletion) => deletion.vault_id));
+      const targetDeletion = deletionList.deletions.find((deletion) => deletion.vault_id === requestedVaultId);
+      deletions = deletionList.deletions;
+      if (targetDeletion?.status === 'deleted' || completedIds.has(requestedVaultId)) {
+        await moveFromDeletedVault(requestedVaultId, vaults);
+        return;
+      }
+      if (targetDeletion?.status === 'deleting' || dashboardResult.vault.status === 'deleting') {
+        vaults = vaults.map((vault) => vault.vault_id === requestedVaultId ? { ...vault, status: 'deleting' as const } : vault);
+        clearDashboardPresentation();
+        lastRefreshed = new Date().toLocaleTimeString();
+        return;
+      }
+      dashboard = dashboardResult;
       conflicts = sortConflicts(refreshedConflicts);
       reconcileConflictSelection();
       dashboardStatusCurrent = true;
@@ -269,22 +730,90 @@
       } else {
         review = null;
       }
-      lastRefreshed = new Date().toLocaleTimeString();
+      if (currentRequest(requestedVaultId, epoch, requestGeneration)) lastRefreshed = new Date().toLocaleTimeString();
     } catch (error) {
-      if (requestGeneration === dashboardRefreshGeneration) dashboardStatusCurrent = false;
+      if (!currentRequest(requestedVaultId, epoch, requestGeneration) || accountEpoch !== account || session?.user_id !== userId) return;
+      if (error instanceof ApiError && (error.status === 409 || error.code === 'vault_deleting')) {
+        vaults = vaults.map((vault) => vault.vault_id === requestedVaultId ? { ...vault, status: 'deleting' as const } : vault);
+        clearDashboardPresentation();
+        dashboardStatusCurrent = true;
+        return;
+      }
+      if (error instanceof ApiError && error.status === 404) {
+        try {
+          const deletionList = await api.vaultDeletions();
+          if (!session || session.user_id !== userId || accountEpoch !== account || !currentRequest(requestedVaultId, epoch, requestGeneration)) return;
+          deletions = deletionList.deletions;
+        } catch {
+          if (!session || session.user_id !== userId || accountEpoch !== account || !currentRequest(requestedVaultId, epoch, requestGeneration)) return;
+        }
+        await moveFromDeletedVault(requestedVaultId, vaults);
+        return;
+      }
+      dashboardStatusCurrent = false;
+      reportAsyncError(error, 'Unable to load this vault.', epoch);
       throw error;
+    } finally {
+      if (deletionRefreshGeneration === deletionGeneration) deletionRefreshInFlight = false;
+      if (dashboardRefreshOwner?.generation === requestGeneration) {
+        dashboardRefreshInFlight = false;
+        dashboardRefreshOwner = null;
+      }
+    }
+  }
+
+  async function selectVault(nextVaultId: string) {
+    if (nextVaultId === vaultId) return;
+    vaultId = nextVaultId;
+    renameVaultOpen = false;
+    renameVaultId = '';
+    clearScopedState();
+    const epoch = stateEpoch;
+    busy = true;
+    try {
+      await refreshVault();
+    } catch (error) {
+      reportAsyncError(error, 'Unable to load this vault.', epoch);
+    } finally {
+      if (stateEpoch === epoch) busy = false;
+    }
+  }
+
+  async function requestRefreshVault() {
+    if (selectedVaultDeleting) return;
+    const epoch = stateEpoch;
+    actionError = '';
+    busy = true;
+    try {
+      await refreshVault();
+    } catch (error) {
+      reportAsyncError(error, 'Unable to refresh this vault.', epoch);
+    } finally {
+      if (stateEpoch === epoch) busy = false;
     }
   }
 
   async function createVault() {
-    if (!newVaultName.trim()) return;
-    const created = await api.createVault(newVaultName.trim());
-    vaults = [...vaults, created];
-    vaultId = created.vault_id;
-    newVaultName = '';
-    createVaultOpen = false;
-    notice = 'Vault created.';
-    await refreshVault();
+    if (!session || busy || !newVaultName.trim()) return;
+    let epoch = stateEpoch;
+    const account = accountEpoch;
+    busy = true;
+    actionError = '';
+    try {
+      const created = await api.createVault(newVaultName.trim());
+      if (!session || stateEpoch !== epoch || accountEpoch !== account) return;
+      vaults = [...vaults, created];
+      vaultId = created.vault_id;
+      clearScopedState();
+      epoch = stateEpoch;
+      newVaultName = '';
+      notice = 'Vault created.';
+      await refreshVault();
+    } catch (error) {
+      if (accountEpoch === account) reportAsyncError(error, 'Unable to create this vault.', epoch);
+    } finally {
+      if (stateEpoch === epoch && accountEpoch === account) busy = false;
+    }
   }
 
   function openVaultRename() {
@@ -296,11 +825,15 @@
   }
 
   async function renameVault() {
-    if (!renameVaultId || !renameVaultName.trim()) return;
+    if (!session || busy || selectedVaultDeleting || !renameVaultId || !renameVaultName.trim()) return;
+    const epoch = stateEpoch;
+    const account = accountEpoch;
+    const target = renameVaultId;
     actionError = '';
     busy = true;
     try {
-      const renamed = await api.renameVault(renameVaultId, renameVaultName);
+      const renamed = await api.renameVault(target, renameVaultName);
+      if (!session || stateEpoch !== epoch || accountEpoch !== account) return;
       vaults = vaults.map((vault) => vault.vault_id === renamed.vault_id ? renamed : vault);
       if (dashboard?.vault.vault_id === renamed.vault_id) {
         dashboard = { ...dashboard, vault: { ...dashboard.vault, display_name: renamed.display_name } };
@@ -308,17 +841,27 @@
       renameVaultOpen = false;
       renameVaultId = '';
       notice = `Vault renamed to ${renamed.display_name}.`;
+      await refreshDashboardStatus(true);
     } catch (error) {
-      actionError = error instanceof Error ? error.message : 'Unable to rename this vault.';
+      if (accountEpoch === account) reportAsyncError(error, 'Unable to rename this vault.', epoch);
     } finally {
-      busy = false;
+      if (stateEpoch === epoch && accountEpoch === account) busy = false;
     }
   }
 
   async function loadReview(conflictId: string) {
-    if (!vaultId) return;
+    if (!vaultId || !session) return;
+    const requestedVaultId = vaultId;
+    const epoch = stateEpoch;
+    const generation = ++reviewRequestGeneration;
     selectedConflictId = conflictId;
-    setReview(await api.conflict(vaultId, conflictId));
+    review = review?.conflict.conflict_id === conflictId ? { ...review, stale: true } : null;
+    try {
+      const nextReview = await api.conflict(requestedVaultId, conflictId);
+      if (currentRequest(requestedVaultId, epoch) && generation === reviewRequestGeneration && selectedConflictId === conflictId) setReview(nextReview);
+    } catch (error) {
+      if (currentRequest(requestedVaultId, epoch) && generation === reviewRequestGeneration && selectedConflictId === conflictId) reportAsyncError(error, 'Unable to load conflict review.', epoch);
+    }
   }
 
   function setReview(nextReview: ConflictReviewPackage) {
@@ -331,12 +874,24 @@
   }
 
   async function refreshConflictReview(conflictId: string) {
-    if (!vaultId) return;
+    if (!vaultId || !session) return;
     actionError = '';
+    const requestedVaultId = vaultId;
+    const epoch = stateEpoch;
+    const generation = ++reviewRequestGeneration;
     selectedConflictId = conflictId;
-    setReview(await api.refreshConflict(vaultId, conflictId));
-    conflicts = sortConflicts((await api.conflicts(vaultId)).conflicts);
-    notice = 'Conflict review refreshed.';
+    review = review?.conflict.conflict_id === conflictId ? { ...review, stale: true } : null;
+    try {
+      const nextReview = await api.refreshConflict(requestedVaultId, conflictId);
+      if (!currentRequest(requestedVaultId, epoch) || generation !== reviewRequestGeneration) return;
+      const listed = await api.conflicts(requestedVaultId);
+      if (!currentRequest(requestedVaultId, epoch) || generation !== reviewRequestGeneration || selectedConflictId !== conflictId) return;
+      setReview(nextReview);
+      conflicts = sortConflicts(listed.conflicts);
+      notice = 'Conflict review refreshed.';
+    } catch (error) {
+      if (currentRequest(requestedVaultId, epoch) && generation === reviewRequestGeneration && selectedConflictId === conflictId) reportAsyncError(error, 'Unable to refresh conflict review.', epoch);
+    }
   }
 
   async function openConflictFromList(conflict: DashboardConflict) {
@@ -371,91 +926,170 @@
     await loadReview(item.conflictId);
   }
 
-  function withRecentAuth(action: () => Promise<void>) {
+  async function withRecentAuth(action: () => Promise<void>) {
+    const epoch = stateEpoch;
+    const run = async () => {
+      if (!session || stateEpoch !== epoch) return;
+      try {
+        await action();
+      } catch (error) {
+        reportAsyncError(error, 'Action failed.', epoch);
+      }
+    };
     if (recentAuthValid) {
-      void action();
+      await run();
       return;
     }
     authError = '';
-    reauthAction = action;
+    reauthAction = run;
     reauthOpen = true;
   }
 
+  function cancelReauth() {
+    reauthAction = null;
+    reauthOpen = false;
+    username = '';
+    password = '';
+    authError = '';
+    connectionOperationGeneration += 1;
+    connectionOperationInFlight = false;
+    diagnosticsDeleteGeneration += 1;
+    diagnosticsDeleteInFlight = false;
+    busy = false;
+  }
+
   async function approvePendingConnection() {
-    if (!connectionReview) return;
-    withRecentAuth(async () => {
-      actionError = '';
-      if (connectionSelection === 'new_vault') {
-        if (!connectionVaultName.trim()) return;
-        await api.approveConnection(connectionReview!.connection_id, {
-          selection: 'new_vault',
-          display_name: connectionVaultName.trim()
-        });
-      } else {
-        if (!connectionVaultId) return;
-        await api.approveConnection(connectionReview!.connection_id, {
-          selection: 'existing_vault',
-          vault_id: connectionVaultId
-        });
+    if (!connectionReview || connectionOperationInFlight) return;
+    const target = {
+      connectionId: connectionReview.connection_id,
+      selection: connectionSelection,
+      vaultId: connectionVaultId,
+      vaultName: connectionVaultName.trim(),
+      existingVaultActive: connectionSelection === 'existing_vault' && connectionReview.vaults.some((vault) => vault.vault_id === connectionVaultId && vault.status === 'active'),
+      epoch: stateEpoch,
+      account: accountEpoch,
+      userId: session?.user_id ?? ''
+    };
+    const generation = ++connectionOperationGeneration;
+    connectionOperationInFlight = true;
+    await withRecentAuth(async () => {
+      try {
+        if (!currentConnectionAction(target, generation)) return;
+        actionError = '';
+        if (target.selection === 'new_vault') {
+          if (!target.vaultName) {
+            actionError = 'Enter a vault name before approving this connection.';
+            return;
+          }
+          await api.approveConnection(target.connectionId, {
+            selection: 'new_vault',
+            display_name: target.vaultName
+          });
+        } else {
+          if (!target.existingVaultActive) {
+            actionError = 'Choose an active server vault before approving this connection.';
+            return;
+          }
+          await api.approveConnection(target.connectionId, {
+            selection: 'existing_vault',
+            vault_id: target.vaultId
+          });
+        }
+        if (currentConnectionAction(target, generation)) connectionApproved = true;
+      } catch (error) {
+        if (currentConnectionAction(target, generation)) {
+          if (error instanceof ApiError && error.status === 401) reportAsyncError(error, 'Unable to approve this connection.', target.epoch);
+          else actionError = error instanceof Error ? error.message : 'Unable to approve this connection.';
+        }
+      } finally {
+        if (connectionOperationGeneration === generation) connectionOperationInFlight = false;
       }
-      connectionApproved = true;
     });
   }
 
   async function denyPendingConnection() {
-    if (!connectionReview) return;
-    await api.denyConnection(connectionReview.connection_id);
-    connectionReview = { ...connectionReview, status: 'denied' };
+    if (!connectionReview || connectionOperationInFlight) return;
+    const target = {
+      connectionId: connectionReview.connection_id,
+      epoch: stateEpoch,
+      account: accountEpoch,
+      userId: session?.user_id ?? ''
+    };
+    const generation = ++connectionOperationGeneration;
+    connectionOperationInFlight = true;
+    actionError = '';
+    try {
+      await api.denyConnection(target.connectionId);
+      if (currentConnectionAction(target, generation)) connectionReview = { ...connectionReview, status: 'denied' };
+    } catch (error) {
+      if (currentConnectionAction(target, generation)) {
+        if (error instanceof ApiError && error.status === 401) reportAsyncError(error, 'Unable to deny this connection.', target.epoch);
+        else actionError = error instanceof Error ? error.message : 'Unable to deny this connection.';
+      }
+    } finally {
+      if (connectionOperationGeneration === generation) connectionOperationInFlight = false;
+    }
   }
 
   async function renameDevice(device: DashboardDevice, deviceName: string) {
-    if (!vaultId) return;
+    if (!vaultId || selectedVaultDeleting) return;
+    const requestedVaultId = vaultId;
+    const epoch = stateEpoch;
     actionError = '';
-    const renamed = await api.renameDevice(vaultId, device.device_id, deviceName);
-    if (dashboard) {
+    try {
+      const renamed = await api.renameDevice(requestedVaultId, device.device_id, deviceName);
+      if (!currentRequest(requestedVaultId, epoch) || !dashboard) return;
       dashboard = {
         ...dashboard,
-        devices: dashboard.devices.map((candidate) =>
-          candidate.device_id === renamed.device_id ? { ...candidate, device_name: renamed.device_name } : candidate
-        )
+        devices: dashboard.devices.map((candidate) => candidate.device_id === renamed.device_id ? { ...candidate, device_name: renamed.device_name } : candidate)
       };
+      conflicts = conflicts.map((conflict) => conflict.device_id === renamed.device_id ? { ...conflict, device_name: renamed.device_name } : conflict);
+      if (review?.conflict.device_id === renamed.device_id) review = { ...review, device_name: renamed.device_name };
+      notice = `Device renamed to ${renamed.device_name}.`;
+      await refreshDashboardStatus(true);
+    } catch (error) {
+      if (!currentRequest(requestedVaultId, epoch)) return;
+      if (error instanceof ApiError && error.status === 401) reportAsyncError(error, 'Unable to rename this device.', epoch);
+      throw error;
     }
-    conflicts = conflicts.map((conflict) =>
-      conflict.device_id === renamed.device_id ? { ...conflict, device_name: renamed.device_name } : conflict
-    );
-    if (review?.conflict.device_id === renamed.device_id) {
-      review = { ...review, device_name: renamed.device_name };
-    }
-    notice = `Device renamed to ${renamed.device_name}.`;
   }
 
   async function revokeDevice(device: DashboardDevice) {
-    if (!vaultId) return;
-    withRecentAuth(async () => {
-      if (!confirm(`Revoke ${device.device_name}?`)) return;
-      await api.revokeDevice(vaultId, device.device_id);
+    if (!vaultId || selectedVaultDeleting) return;
+    const requestedVaultId = vaultId;
+    const epoch = stateEpoch;
+    const deviceId = device.device_id;
+    const deviceName = device.device_name;
+    return withRecentAuth(async () => {
+      if (!confirm(`Revoke ${deviceName}? This stops its sync access. Local vault files are not deleted.`)) return;
+      await api.revokeDevice(requestedVaultId, deviceId);
+      if (!currentRequest(requestedVaultId, epoch)) return;
       notice = 'Device revoked.';
       await refreshVault();
     });
   }
 
   async function submitResolution(submission: ConflictResolutionSubmission) {
-    if (!vaultId || !review || review.stale) return;
+    if (!vaultId || selectedVaultDeleting || !review || review.stale) return;
     actionError = '';
     notice = '';
     const conflictId = review.conflict.conflict_id;
+    const requestedVaultId = vaultId;
+    const epoch = stateEpoch;
     try {
       await api.resolveConflict({
-        vaultId,
+        vaultId: requestedVaultId,
         conflictId,
         expectedMain: review.expected_main,
         ...submission
       });
+      if (!currentRequest(requestedVaultId, epoch) || selectedConflictId !== conflictId) return;
       notice = 'Conflict resolved.';
       selectedConflictId = '';
       review = null;
       await refreshVault();
     } catch (error) {
+      if (!currentRequest(requestedVaultId, epoch) || selectedConflictId !== conflictId) return;
       if (error instanceof ApiError && error.code === 'stale_conflict_review' && review?.conflict.conflict_id === conflictId) {
         review = { ...review, stale: true };
         conflicts = conflicts.map((conflict) =>
@@ -464,65 +1098,153 @@
         actionError = 'This conflict review is stale. Refresh it before submitting a resolution.';
         return;
       }
-      actionError = error instanceof Error ? error.message : 'Unable to resolve this conflict.';
+      reportAsyncError(error, 'Unable to resolve this conflict.', epoch);
     }
   }
 
-  async function searchHistory() {
-    if (!vaultId || !historyPath.trim()) return;
-    history = await api.historyQuery(vaultId, historyPath.trim());
-    selectedHistory = history.versions[0] ?? null;
+  async function searchHistory(force = false) {
+    if (!vaultId || selectedVaultDeleting || !historyPath.trim() || (busy && !force)) return;
+    const requestedVaultId = vaultId;
+    const epoch = stateEpoch;
+    const account = accountEpoch;
+    const userId = session?.user_id ?? '';
+    const path = historyPath.trim();
+    const generation = ++historyRequestGeneration;
+    history = null;
+    selectedHistory = null;
     historyVersion = null;
-    if (selectedHistory) {
-      await loadHistoryVersion(selectedHistory);
+    historyError = '';
+    historyLoading = true;
+    try {
+      const nextHistory = await api.historyQuery(requestedVaultId, path);
+      if (!currentRequest(requestedVaultId, epoch) || accountEpoch !== account || session?.user_id !== userId || generation !== historyRequestGeneration || historyPath.trim() !== path) return;
+      history = nextHistory;
+      selectedHistory = nextHistory.versions[0] ?? null;
+      historyVersion = null;
+      if (selectedHistory) await loadHistoryVersion(selectedHistory);
+    } catch (error) {
+      if (currentRequest(requestedVaultId, epoch) && accountEpoch === account && session?.user_id === userId && generation === historyRequestGeneration) {
+        if (error instanceof ApiError && error.status === 401) {
+          reportAsyncError(error, 'Unable to search note history.', epoch);
+        } else {
+          historyError = error instanceof Error ? error.message : 'Unable to search note history.';
+        }
+      }
+    } finally {
+      if (stateEpoch === epoch && accountEpoch === account && generation === historyRequestGeneration) historyLoading = false;
     }
   }
 
   async function loadHistoryVersion(version: NoteHistoryVersion) {
-    if (!vaultId || !history) return;
+    if (!vaultId || selectedVaultDeleting || !history || busy) return;
+    const requestedVaultId = vaultId;
+    const epoch = stateEpoch;
+    const account = accountEpoch;
+    const userId = session?.user_id ?? '';
+    const commit = version.commit;
+    const path = version.path;
+    const generation = ++historyRequestGeneration;
     selectedHistory = version;
-    historyVersion = await api.historyVersion(vaultId, version.path, version.commit);
-    historyDiffTab = historyVersion.rendered_markdown_diff ? 'rendered' : 'source';
+    historyVersion = null;
+    historyError = '';
+    historyLoading = true;
+    try {
+      const nextVersion = await api.historyVersion(requestedVaultId, path, commit);
+      if (!currentRequest(requestedVaultId, epoch) || accountEpoch !== account || session?.user_id !== userId || generation !== historyRequestGeneration || selectedHistory?.commit !== commit || selectedHistory.path !== path) return;
+      historyVersion = nextVersion;
+      historyDiffTab = nextVersion.rendered_markdown_diff ? 'rendered' : 'source';
+    } catch (error) {
+      if (currentRequest(requestedVaultId, epoch) && accountEpoch === account && session?.user_id === userId && generation === historyRequestGeneration) {
+        if (error instanceof ApiError && error.status === 401) {
+          reportAsyncError(error, 'Unable to load history version.', epoch);
+        } else {
+          historyError = error instanceof Error ? error.message : 'Unable to load history version.';
+        }
+      }
+    } finally {
+      if (stateEpoch === epoch && accountEpoch === account && generation === historyRequestGeneration) historyLoading = false;
+    }
   }
 
   function revealPluginHistoryContent() {
-    if (!vaultId || !selectedHistory) return;
+    if (!vaultId || selectedVaultDeleting || !selectedHistory || busy) return;
+    const requestedVaultId = vaultId;
+    const epoch = stateEpoch;
+    const account = accountEpoch;
+    const userId = session?.user_id ?? '';
+    const selected = { path: selectedHistory.path, commit: selectedHistory.commit };
     withRecentAuth(async () => {
-      historyVersion = await api.historyVersion(vaultId, selectedHistory!.path, selectedHistory!.commit, true);
+      if (!currentRequest(requestedVaultId, epoch) || accountEpoch !== account || session?.user_id !== userId || selectedHistory?.commit !== selected.commit || selectedHistory.path !== selected.path) return;
+      const generation = ++historyRequestGeneration;
+      const revealed = await api.historyVersion(requestedVaultId, selected.path, selected.commit, true);
+      if (!currentRequest(requestedVaultId, epoch) || accountEpoch !== account || session?.user_id !== userId || generation !== historyRequestGeneration || selectedHistory?.commit !== selected.commit || selectedHistory.path !== selected.path) return;
+      historyVersion = revealed;
       historyDiffTab = 'source';
       notice = 'Sensitive plugin file content revealed for this selected version.';
     });
   }
 
   async function restoreSelectedVersion() {
-    if (!vaultId || !history || !selectedHistory) return;
-    withRecentAuth(async () => {
-      await api.restoreHistoryVersion(vaultId, history!.path, selectedHistory!.commit, history!.current_main, selectedHistory!.path);
-      notice = 'Note restored.';
-      await refreshVault();
-      await searchHistory();
+    if (!vaultId || selectedVaultDeleting || !history || !selectedHistory || busy) return;
+    const requestedVaultId = vaultId;
+    const epoch = stateEpoch;
+    const account = accountEpoch;
+    const target = { path: history.path, sourcePath: selectedHistory.path, commit: selectedHistory.commit, expectedMain: history.current_main };
+    await withRecentAuth(async () => {
+      if (!currentRequest(requestedVaultId, epoch) || accountEpoch !== account || history?.path !== target.path || selectedHistory?.path !== target.sourcePath || selectedHistory.commit !== target.commit) return;
+      if (!confirm(`Restore ${target.sourcePath} from commit ${target.commit} to ${target.path}? This creates a new history entry and does not rewrite existing history.`)) return;
+      busy = true;
+      try {
+        await api.restoreHistoryVersion(requestedVaultId, target.path, target.commit, target.expectedMain, target.sourcePath);
+        if (!currentRequest(requestedVaultId, epoch) || accountEpoch !== account) return;
+        notice = 'Note restored.';
+        await refreshVault();
+        if (currentRequest(requestedVaultId, epoch) && accountEpoch === account) await searchHistory(true);
+      } finally {
+        if (stateEpoch === epoch && accountEpoch === account) busy = false;
+      }
     });
   }
 
   function handleMaintenanceAction(action: NonNullable<MaintenanceRow['action']>) {
     if (action === 'view_backup_contract') {
-      maintenanceDetailOpen = !maintenanceDetailOpen;
+      maintenanceDetailOpen = page !== 'Maintenance' || !maintenanceDetailOpen;
+      page = 'Maintenance';
       return;
     }
-    if (!vaultId) return;
+    if (!vaultId || selectedVaultDeleting) return;
+    const requestedVaultId = vaultId;
+    const epoch = stateEpoch;
     withRecentAuth(async () => {
-      const result = await api.startGitMaintenance(vaultId);
+      const result = await api.startGitMaintenance(requestedVaultId);
+      if (!currentRequest(requestedVaultId, epoch)) return;
       notice = result.detail;
       await refreshVault();
     });
   }
 
   async function logout() {
-    await api.logout();
+    if (logoutInFlight) return;
+    logoutInFlight = true;
+    busy = true;
+    clearScopedState(true);
     session = null;
-    dashboard = null;
-    diagnostics = null;
-    vaults = [];
+    username = '';
+    password = '';
+    authError = '';
+    logoutFailed = false;
+    try {
+      await api.logout();
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 401)) {
+        logoutFailed = true;
+        authError = 'The local view was cleared, but server sign-out failed. Retry signing out.';
+      }
+    } finally {
+      api.csrfToken = '';
+      logoutInFlight = false;
+      busy = false;
+    }
   }
 
   function shortId(value: string | null | undefined) {
@@ -539,120 +1261,59 @@
 </script>
 
 {#if !session}
-  <main class="auth">
-    <form class="auth-panel" on:submit|preventDefault={authenticate}>
-      <h1>{setupComplete ? 'Sign in' : 'Initial setup'}</h1>
-      <label>
-        Username
-        <input bind:value={username} autocomplete="username" />
-      </label>
-      <label>
-        Password
-        <input bind:value={password} type="password" autocomplete={setupComplete ? 'current-password' : 'new-password'} />
-      </label>
-      {#if authError}<p class="error">{authError}</p>{/if}
-      <button class="primary" disabled={busy}>{setupComplete ? 'Sign in' : 'Create admin'}</button>
-    </form>
-  </main>
+  <AuthScreen
+    setupComplete={setupComplete}
+    bind:username
+    bind:password
+    authError={authError}
+    {busy}
+    {logoutFailed}
+    {logoutInFlight}
+    onSubmit={authenticate}
+    onRetryLogout={logout}
+  />
 {:else if connectionId}
-  <main class="connection-page">
-    <section class="connection-panel">
-      {#if connectionApproved || connectionReview?.status === 'approved' || connectionReview?.status === 'consumed'}
-        <p class="eyebrow">Device authorized</p>
-        <h1>Return to Obsidian</h1>
-        <p>The plugin will compare the local and server vaults and ask how to handle their contents. You can close this browser tab.</p>
-        <div class="connection-code"><span>Verification code</span><strong>{connectionReview?.verification_code}</strong></div>
-      {:else if connectionReview?.status === 'denied' || connectionReview?.status === 'expired'}
-        <p class="eyebrow">Connection {connectionReview.status}</p>
-        <h1>This request cannot continue</h1>
-        <p>Return to Obsidian and start setup again.</p>
-      {:else if connectionReview}
-        <p class="eyebrow">Authorize Obsidian device</p>
-        <h1>Connect {connectionReview.local_vault_name}</h1>
-        <p>Review the identity shown in Obsidian before approving this request.</p>
-        <div class="connection-code"><span>Verification code</span><strong>{connectionReview.verification_code}</strong></div>
-        <dl class="connection-details">
-          <div><dt>Device</dt><dd>{connectionReview.device_name}</dd></div>
-          <div><dt>Plugin</dt><dd>{connectionReview.plugin_version}</dd></div>
-          <div><dt>Local content</dt><dd>{connectionReview.local_summary.syncable_file_count.toLocaleString()} files</dd></div>
-        </dl>
-        <fieldset class="connection-choice">
-          <legend>Server vault</legend>
-          <label>
-            <input type="radio" bind:group={connectionSelection} value="new_vault" />
-            <span><strong>Create a new synced vault</strong><small>The local plugin will confirm its initial upload separately.</small></span>
-          </label>
-          {#if connectionSelection === 'new_vault'}
-            <label>Vault name<input bind:value={connectionVaultName} /></label>
-          {/if}
-          <label>
-            <input type="radio" bind:group={connectionSelection} value="existing_vault" />
-            <span><strong>Connect to an existing vault</strong><small>The plugin will compare content before changing anything.</small></span>
-          </label>
-          {#if connectionSelection === 'existing_vault'}
-            <label>
-              Existing vault
-              <select bind:value={connectionVaultId}>
-                {#each connectionReview.vaults as vault}
-                  <option value={vault.vault_id} disabled={vault.status !== 'active'}>{vault.display_name}{vault.status !== 'active' ? ' — integrity blocked' : ''}</option>
-                {/each}
-              </select>
-            </label>
-          {/if}
-        </fieldset>
-        {#if actionError}<p class="action-error">{actionError}</p>{/if}
-        <div class="actions">
-          <button class="secondary" on:click={denyPendingConnection}>Deny</button>
-          <button class="primary" on:click={approvePendingConnection}>Approve connection</button>
-        </div>
-      {:else}
-        <h1>Loading connection request</h1>
-      {/if}
-    </section>
-  </main>
+  <ConnectionScreen
+    bind:connectionReview
+    bind:connectionSelection
+    bind:connectionVaultId
+    bind:connectionVaultName
+    {connectionApproved}
+    operationPending={connectionOperationInFlight}
+    modalOpen={reauthOpen}
+    {actionError}
+    onApprove={approvePendingConnection}
+    onDeny={denyPendingConnection}
+  />
 {:else}
-  <div class="shell">
-    <aside class="app-sidebar" class:open={mobileNavOpen}>
-      <select
-        bind:value={vaultId}
-        disabled={busy}
-        on:change={() => { renameVaultOpen = false; renameVaultId = ''; void refreshVault(); }}
-        aria-label="Current vault"
-      >
-        {#each vaults as vault}
-          <option value={vault.vault_id}>{vault.display_name}</option>
-        {/each}
-      </select>
-      <nav>
-        {#each nav as item}
-          <button class:active={page === item} on:click={() => { page = item; mobileNavOpen = false; }}>
-            <span>{item}</span>
-            {#if item === 'Conflicts' && unresolvedCount > 0}<b>{unresolvedCount}</b>{/if}
-          </button>
-        {/each}
-      </nav>
-      <button class="secondary bottom" on:click={logout}>Sign out</button>
-    </aside>
+  <Shell
+    {page}
+    {nav}
+    {vaults}
+    {vaultId}
+    {selectedVault}
+    {dashboard}
+    {unresolvedCount}
+    {lastRefreshed}
+    {dashboardStatusCurrent}
+    {busy}
+    modalOpen={reauthOpen || deletionModalOpen}
+    vaultDeleting={selectedVaultDeleting}
+    refreshing={dashboardRefreshInFlight || deletionRefreshInFlight}
+    onPageChange={(nextPage) => (page = nextPage as Page)}
+    onVaultChange={selectVault}
+    onRefresh={requestRefreshVault}
+    onLogout={logout}
+  >
+    <svelte:fragment slot="actions">
+      {#if page === 'Overview'}
+        <button class="secondary" disabled={busy || !selectedVault || selectedVaultDeleting} on:click={openVaultRename}>Rename vault</button>
+        <button class="primary" disabled={busy} on:click={() => { renameVaultOpen = false; createVaultOpen = true; newVaultName = ''; }}>New vault</button>
+      {/if}
+    </svelte:fragment>
 
-    <section class="content">
-      <header class="app-header">
-        <button class="icon" title="Open navigation" aria-label="Open navigation" on:click={() => (mobileNavOpen = !mobileNavOpen)}>
-          <span aria-hidden="true">☰</span>
-        </button>
-        <div>
-          <h1>{page}</h1>
-          <p>{selectedVault?.display_name ?? 'No vault selected'}{dashboard ? ` / ${dashboard.vault.status}` : ''}</p>
-        </div>
-        <span class="refresh">Refreshed {lastRefreshed ?? '-'}</span>
-        <button class="secondary" on:click={refreshVault}>Refresh</button>
-        {#if page === 'Overview'}
-          <button class="secondary" disabled={!selectedVault} on:click={openVaultRename}>Rename vault</button>
-          <button class="primary" on:click={() => { renameVaultOpen = false; createVaultOpen = true; newVaultName = ''; }}>New vault</button>
-        {/if}
-      </header>
-
-      {#if notice}<p class="notice">{notice}</p>{/if}
-      {#if actionError}<p class="action-error">{actionError}</p>{/if}
+    {#if notice}<p class="notice" role="status">{notice}</p>{/if}
+      {#if actionError}<p class="action-error" role="alert">{actionError}</p>{/if}
 
       {#if renameVaultOpen}
         <main class="page">
@@ -666,14 +1327,48 @@
             </form>
           </section>
         </main>
+      {:else if page === 'Settings'}
+        <SettingsPage
+          {session}
+          recentAuthValid={recentAuthValid}
+          {diagnostics}
+          {diagnosticsError}
+          {diagnosticsLoading}
+          {busy}
+          onRefreshDiagnostics={requestRefreshDiagnostics}
+          onLoadMoreDiagnostics={() => void loadMoreDiagnostics()}
+          onDeleteDiagnostics={deleteDiagnostics}
+          onSignOut={logout}
+          {deletions}
+          {selectedVault}
+          vaultDeleting={selectedVaultDeleting}
+          deletionBusy={deletionRequestInFlight}
+          onOpenVaultDeletion={openVaultDeletion}
+        >
+          <svelte:fragment slot="destructive-actions">
+            <section class="panel settings-create-panel" aria-labelledby="settings-create-vault-title">
+              {#if createVaultOpen}
+                <h2 id="settings-create-vault-title">Create vault</h2>
+                <form class="inline-form" on:submit|preventDefault={createVault}>
+                  <label>Vault name<input bind:value={newVaultName} maxlength="80" disabled={busy} /></label>
+                  <button type="button" class="secondary" disabled={busy} on:click={() => (createVaultOpen = false)}>Cancel</button>
+                  <button class="primary" disabled={busy || !newVaultName.trim()}>Create vault</button>
+                </form>
+              {:else}
+                <div class="section-heading"><div><p class="eyebrow">Server scope</p><h2 id="settings-create-vault-title">Create a vault</h2></div><button class="secondary" disabled={busy} on:click={() => { createVaultOpen = true; newVaultName = ''; }}>New vault</button></div>
+                <p class="muted">Creating a new server vault does not restore a deleted vault or its receipt.</p>
+              {/if}
+            </section>
+          </svelte:fragment>
+        </SettingsPage>
       {:else if createVaultOpen}
         <main class="page">
           <section class="panel full">
             <h2>Create vault</h2>
             <form class="inline-form" on:submit|preventDefault={createVault}>
-              <label>Vault name<input bind:value={newVaultName} maxlength="80" /></label>
-              <button type="button" class="secondary" on:click={() => (createVaultOpen = false)}>Cancel</button>
-              <button class="primary">Create vault</button>
+              <label>Vault name<input bind:value={newVaultName} maxlength="80" disabled={busy} /></label>
+              <button type="button" class="secondary" disabled={busy} on:click={() => (createVaultOpen = false)}>Cancel</button>
+              <button class="primary" disabled={busy || !newVaultName.trim()}>Create vault</button>
             </form>
           </section>
         </main>
@@ -682,48 +1377,33 @@
           <section class="panel full">
             <h2>Create vault</h2>
             <form class="inline-form" on:submit|preventDefault={createVault}>
-              <label>Vault name<input bind:value={newVaultName} maxlength="80" /></label>
-              <button class="primary">Create vault</button>
+              <label>Vault name<input bind:value={newVaultName} maxlength="80" disabled={busy} /></label>
+              <button class="primary" disabled={busy || !newVaultName.trim()}>Create vault</button>
             </form>
           </section>
         </main>
-      {:else if page === 'Overview' && dashboard}
-        <main class="grid">
-          <Summary title="Sync status" value={syncSummary.label} role={syncSummary.role} detail={shortId(dashboard.vault.current_main)} />
-          <Summary title="Unresolved conflicts" value={String(unresolvedCount)} role={unresolvedCount ? 'warning' : 'success'} detail="Review queue" />
-          <Summary title="Paired devices" value={String(dashboard.devices.length)} role="neutral" detail="Registered devices" />
-          <Summary title="Health/readiness" value={dashboard.health.status === 'ready' ? 'Synced' : 'Integrity failure'} role={dashboard.health.status === 'ready' ? 'success' : 'danger'} detail={dashboard.health.detail ?? dashboard.health.git_version} />
-          <section class="panel wide">
-            <h2>Devices</h2>
-            <DeviceTable devices={dashboard.devices} recommendedPluginVersion={dashboard.recommended_plugin_version} statusCurrent={dashboardStatusCurrent} onRename={renameDevice} onRevoke={revokeDevice} />
-          </section>
-          <section class="panel narrow">
-            <h2>Attention</h2>
-            <Attention {dashboard} {conflicts} onAction={handleAttentionAction} />
-          </section>
-          <section class="panel wide">
-            <h2>Recent activity</h2>
-            <table>
-              <thead><tr><th>Event</th><th>When</th><th>Main</th><th>Resource</th></tr></thead>
-              <tbody>
-                {#each dashboard.recent_activity as event}
-                  <tr>
-                    <td>{event.label}</td>
-                    <td>{new Date(event.created_at).toLocaleString()}</td>
-                    <td class="mono">{shortId(event.main)}</td>
-                    <td class="mono">{shortId(event.conflict_id ?? event.device_id)}</td>
-                  </tr>
-                {:else}
-                  <tr><td colspan="4" class="muted">No activity yet.</td></tr>
-                {/each}
-              </tbody>
-            </table>
-          </section>
-          <section class="panel narrow">
-            <h2>Maintenance and backup</h2>
-            <Checklist health={dashboard.health} rows={dashboard.maintenance} onAction={handleMaintenanceAction} />
+      {:else if selectedVaultDeleting && page !== 'Settings'}
+        <main class="page">
+          <section class="panel full deletion-progress" aria-live="polite">
+            <span class="eyebrow">Server vault operation</span>
+            <h2>Vault deletion in progress</h2>
+            <Status label="Deleting" />
+            <p class="muted">The server accepted this deletion and is still working. Dashboard, devices, conflicts, history, and other target actions are unavailable until completion is reported.</p>
+            <button class="secondary" on:click={() => (page = 'Settings')}>View deletion status in Settings</button>
           </section>
         </main>
+      {:else if page === 'Overview' && dashboard}
+        <Overview
+          {dashboard}
+          {conflicts}
+          {unresolvedCount}
+          statusCurrent={dashboardStatusCurrent}
+          {syncSummary}
+          onAttention={handleAttentionAction}
+          onMaintenance={handleMaintenanceAction}
+          onRename={renameDevice}
+          onRevoke={revokeDevice}
+        />
       {:else if page === 'Devices' && dashboard}
         <main class="page">
           <section class="panel full">
@@ -733,49 +1413,17 @@
         </main>
       {:else if page === 'Conflicts'}
         <main class="conflict-layout">
-          <section class="conflict-queue-toolbar">
-            <div>
-              <strong>Conflict queue</strong>
-              <span>{unresolvedCount} open / {conflicts.length} total</span>
-            </div>
-            {#if conflicts.length > 0}
-              <label>
-                <span>Current review</span>
-                <select value={selectedConflictId} on:change={selectConflict}>
-                  {#each conflicts as conflict}
-                    <option value={conflict.conflict_id}>
-                      {conflict.affected_paths[0] ?? 'Path conflict'} - {conflict.device_name} - {conflict.status_label}
-                    </option>
-                  {/each}
-                </select>
-              </label>
-              <button class="secondary" aria-expanded={conflictListOpen} on:click={() => (conflictListOpen = !conflictListOpen)}>
-                {conflictListOpen ? 'Hide queue' : 'Browse queue'}
-              </button>
-            {/if}
-          </section>
-
-          {#if conflictListOpen || !review}
-            <section class="panel conflict-queue-list">
-              <table>
-                <thead><tr><th>Path</th><th>Device</th><th>Conflict type</th><th>Created</th><th>Status</th><th>Action</th></tr></thead>
-                <tbody>
-                  {#each conflicts as conflict}
-                    <tr>
-                      <td>{conflict.affected_paths[0] ?? '-'}</td>
-                      <td>{conflict.device_name}</td>
-                      <td>{conflict.conflict_type}</td>
-                      <td>{new Date(conflict.created_at).toLocaleString()}</td>
-                      <td><Status label={conflict.status_label} /></td>
-                      <td><button class="secondary" on:click={() => openConflictFromList(conflict)}>{conflict.stale ? 'Refresh' : 'Review'}</button></td>
-                    </tr>
-                  {:else}
-                    <tr><td colspan="6" class="muted">No conflicts.</td></tr>
-                  {/each}
-                </tbody>
-              </table>
-            </section>
-          {/if}
+          <ConflictQueue
+            {conflicts}
+            {unresolvedCount}
+            selectedConflictId={selectedConflictId}
+            listOpen={conflictListOpen}
+            showList={conflictListOpen || !review}
+            onSelect={selectConflict}
+            onOpen={openConflictFromList}
+            onToggleList={() => (conflictListOpen = !conflictListOpen)}
+          />
+          {#if conflictListOpen || !review}<span class="visually-hidden">Conflict queue list shown.</span>{/if}
 
           {#if review}
             <ConflictWorkbench
@@ -789,101 +1437,75 @@
           {/if}
         </main>
       {:else if page === 'History'}
-        <main class="history-layout">
-          <section class="panel history-search">
-            <h2>Note history</h2>
-            <form class="inline-form" on:submit|preventDefault={searchHistory}>
-              <label>Path<input bind:value={historyPath} placeholder="notes/example.md" /></label>
-              <button class="primary">Search</button>
-            </form>
-            {#if history}
-              <p class="muted">Current main <code>{shortId(history.current_main)}</code></p>
-            {/if}
-          </section>
-          <section class="timeline">
-            <h2>Versions</h2>
-            {#if history}
-              {#each history.versions as version}
-                <button class:active={selectedHistory?.commit === version.commit} on:click={() => loadHistoryVersion(version)}>
-                  <span>{version.operation_type}</span>
-                  <small>{new Date(version.timestamp).toLocaleString()}</small>
-                  {#if version.previous_path}<small>{version.previous_path} → {version.path}</small>{/if}
-                  {#if version.device_id}<small>Device {shortId(version.device_id)}</small>{/if}
-                  {#if version.user_id}<small>User {shortId(version.user_id)}</small>{/if}
-                  {#if version.conflict_id}<small>Conflict {shortId(version.conflict_id)}</small>{/if}
-                  {#if version.merge_sequence}<small>Merge #{version.merge_sequence}</small>{/if}
-                  <code>{shortId(version.commit)}</code>
-                </button>
-              {:else}
-                <p class="muted">No versions found for this path.</p>
-              {/each}
-            {:else}
-              <p class="muted">Search for a vault path to inspect its versions.</p>
-            {/if}
-          </section>
-          <section class="preview">
-            <h2>Preview</h2>
-            {#if historyVersion}
-              <p class="mono">{shortId(historyVersion.commit)} / {historyVersion.path}</p>
-              {#if historyVersion.content_redacted}
-                <p class="muted">Plugin file content is redacted by default. Revealing it is an explicit, recently authenticated owner action.</p>
-                <button class="secondary" on:click={revealPluginHistoryContent}>Reveal plugin content</button>
-              {:else}
-                <div class="tabs">
-                  <button class:active={historyDiffTab === 'rendered'} disabled={!historyVersion.rendered_markdown_diff} on:click={() => (historyDiffTab = 'rendered')}>Rendered</button>
-                  <button class:active={historyDiffTab === 'source'} on:click={() => (historyDiffTab = 'source')}>Source</button>
-                </div>
-                {#if historyDiffTab === 'rendered' && historyVersion.rendered_markdown_diff}
-                  <div class="rendered">{@html historyVersion.rendered_markdown_diff}</div>
-                {:else}
-                  <pre>{historyVersion.source_diff || historyVersion.content || 'The selected version deletes this path.'}</pre>
-                {/if}
-              {/if}
-              <button class="primary" disabled={!selectedHistory} on:click={restoreSelectedVersion}>Restore version</button>
-            {:else}
-              <p class="muted">Select a version to preview it.</p>
-            {/if}
-          </section>
-        </main>
+        <HistoryPage
+          bind:historyPath
+          {history}
+          {selectedHistory}
+          {historyVersion}
+          bind:historyDiffTab
+          {historyError}
+          {historyLoading}
+          {busy}
+          onSearch={searchHistory}
+          onSelectVersion={loadHistoryVersion}
+          onReveal={revealPluginHistoryContent}
+          onRestore={restoreSelectedVersion}
+        />
       {:else if page === 'Maintenance' && dashboard}
+        <MaintenancePage
+          health={dashboard.health}
+          rows={dashboard.maintenance}
+          detailOpen={maintenanceDetailOpen}
+          onAction={handleMaintenanceAction}
+        />
+      {:else if page !== 'Settings' && !dashboard}
         <main class="page">
-          <section class="panel full">
-            <h2>Maintenance</h2>
-            <Checklist health={dashboard.health} rows={dashboard.maintenance} onAction={handleMaintenanceAction} />
-            {#if maintenanceDetailOpen}
-              <p class="muted">Backups must cover metadata and the server Git store at the same point in time, and deployment storage controls are responsible for at-rest protection.</p>
-            {/if}
+          <section class="panel full loading-state" aria-live="polite">
+            <span class="eyebrow">Vault status</span>
+            <h2>Loading current vault</h2>
+            <p class="muted">The previous vault view is cleared until this vault reports fresh server status.</p>
           </section>
         </main>
       {:else}
-        <main class="page">
-          {#if diagnostics}
-            <Diagnostics
-              {diagnostics}
-              {busy}
-              onLoadMore={() => void loadMoreDiagnostics()}
-              onDelete={deleteDiagnostics}
-            />
-          {:else}
-            <section class="panel full"><p class="muted">Loading error diagnostics...</p></section>
-          {/if}
-        </main>
+        <SettingsPage
+          {session}
+          recentAuthValid={recentAuthValid}
+          {diagnostics}
+          {diagnosticsError}
+          {diagnosticsLoading}
+          {busy}
+          onRefreshDiagnostics={requestRefreshDiagnostics}
+          onLoadMoreDiagnostics={() => void loadMoreDiagnostics()}
+          onDeleteDiagnostics={deleteDiagnostics}
+          onSignOut={logout}
+          {deletions}
+          {selectedVault}
+          vaultDeleting={selectedVaultDeleting}
+          deletionBusy={deletionRequestInFlight}
+          onOpenVaultDeletion={openVaultDeletion}
+        />
       {/if}
-    </section>
-  </div>
+  </Shell>
 {/if}
 
 {#if reauthOpen}
-  <div class="modal">
-    <form class="dialog" on:submit|preventDefault={authenticate}>
-      <h2>Recent authentication</h2>
-      <label>Username<input bind:value={username} autocomplete="username" /></label>
-      <label>Password<input bind:value={password} type="password" autocomplete="current-password" /></label>
-      {#if authError}<p class="error">{authError}</p>{/if}
-      <div class="actions">
-        <button type="button" class="secondary" on:click={() => { reauthOpen = false; reauthAction = null; }}>Cancel</button>
-        <button class="primary">Continue</button>
-      </div>
-    </form>
-  </div>
+  <ReauthModal
+    bind:username
+    bind:password
+    {authError}
+    {busy}
+    onSubmit={authenticate}
+    onCancel={cancelReauth}
+  />
+{/if}
+
+{#if deletionModalOpen && deletionTarget}
+  <VaultDeletionModal
+    displayName={deletionTarget.displayName}
+    vaultId={deletionTarget.vaultId}
+    busy={deletionRequestInFlight}
+    error={deletionError}
+    onSubmit={submitVaultDeletion}
+    onCancel={cancelVaultDeletion}
+  />
 {/if}

@@ -50,8 +50,16 @@ import { ChunkTransferService } from './chunkTransferService.js';
 import { ConnectionService } from './connectionService.js';
 import { createServerConfig, ensureServerDirectories, type ServerConfig } from './config.js';
 import { DiagnosticService } from './diagnosticService.js';
-import { GitCommandError, GitService, sha256Hex } from './gitService.js';
-import { MetadataStore, type MetadataDb, type SyncOperationRow } from './metadataStore.js';
+import { GitCommandError, GitDurabilityError, GitService, sha256Hex } from './gitService.js';
+import {
+  hasDurableDeletionRecord,
+  MetadataCleanupError,
+  MetadataPublicationError,
+  MetadataStore,
+  type MetadataDb,
+  type SyncOperationRow
+} from './metadataStore.js';
+import { VaultLifecycleCoordinator } from './vaultLifecycleCoordinator.js';
 import {
   commitRecoveredDirectoryState,
   recoveredDirectoryEventPayload,
@@ -68,6 +76,7 @@ export type ObtsServer = {
   diagnostics: DiagnosticService;
   sync: SyncService;
   chunkTransfers: ChunkTransferService;
+  lifecycle: VaultLifecycleCoordinator;
 };
 
 let dashboardRootPromise: Promise<string> | null = null;
@@ -93,17 +102,39 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   const store = new MetadataStore(config.dataDir);
   await store.initialize();
   const git = new GitService(config);
+  const lifecycle = new VaultLifecycleCoordinator(store, git, config);
+  lifecycle.restoreDurableBarriers(await store.snapshot());
+  await lifecycle.reconcileDeletingVaultRows();
+  lifecycle.restoreDurableBarriers(await store.snapshot());
+  await lifecycle.expireReceipts();
   await populateVaultRootCommits(store, git);
   await reconcileStartupOperations(store, git);
   await ensureProtectedConflictRefs(store, git);
   await markInconsistentVaults(store, git);
   const auth = new AuthService(store);
-  const connections = new ConnectionService(store, git, config.publicBaseUrl);
+  const connections = new ConnectionService(store, git, config.publicBaseUrl, lifecycle);
   const diagnostics = new DiagnosticService(store, config);
   await diagnostics.initialize();
-  const sync = new SyncService(store, git, config.maxUploadBytes);
-  const chunkTransfers = new ChunkTransferService(config, git, sync);
-  await chunkTransfers.initialize();
+  const sync = new SyncService(store, git, config.maxUploadBytes, lifecycle);
+  const chunkTransfers = new ChunkTransferService(config, git, sync, lifecycle);
+  lifecycle.attachTransferLifecycle(chunkTransfers);
+  await chunkTransfers.initialize(async (session) => {
+    const db = await store.snapshot();
+    const vault = db.vaults.find((candidate) => candidate.vault_id === session.vault_id);
+    const device = db.devices.find((candidate) => candidate.device_id === session.device_id);
+    const user = device ? db.users.find((candidate) => candidate.user_id === device.user_id) : undefined;
+    const token = device
+      ? db.tokens.find((candidate) => candidate.kind === 'device' && candidate.device_id === device.device_id && candidate.revoked_at === null)
+      : undefined;
+    if (
+      !vault || vault.status !== 'active' || hasDurableDeletionRecord(db, vault.vault_id) ||
+      !device || device.vault_id !== vault.vault_id || device.status === 'revoked' || device.revoked_at !== null ||
+      !user || user.disabled || user.user_id !== vault.owner_user_id ||
+      !token || token.user_id !== user.user_id || token.vault_id !== vault.vault_id
+    ) return null;
+    return { user, vault, device, token };
+  });
+  await lifecycle.startPendingJobs();
   const app = Fastify({
     logger: false,
     genReqId: () => newId('req')
@@ -123,15 +154,58 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
   await sync.resumePendingMerges();
 
+  const activeAdmissions = new WeakMap<FastifyRequest, { release(): void }>();
   app.addHook('onRequest', async (request, reply) => {
     setApiCorsHeaders(request, reply);
+    const params = request.params as { vaultId?: string };
+    const vaultId = params.vaultId;
+    const path = request.url.split('?')[0] ?? request.url;
+    if (!vaultId || path.startsWith('/api/v1/vault-deletions/') ||
+      (request.method === 'DELETE' && /^\/api\/v1\/vaults\/[^/]+$/u.test(path)) ||
+      isSyncLifecycleLockingRoute(request.method, path)) return;
+    const sessionCookie = request.cookies[config.sessionCookieName];
+    const authorization = request.headers.authorization;
+    if (sessionCookie) {
+      const session = await auth.authenticateSession(sessionCookie);
+      const db = await store.snapshot();
+      const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId && candidate.owner_user_id === session.user.user_id);
+      if (!vault) throw new AuthError(404, 'not_found', 'Resource not found.');
+      activeAdmissions.set(request, await lifecycle.acquireAdmission(vaultId));
+      return;
+    }
+    if (authorization) {
+      const device = await auth.authenticateDevice(authorization, vaultId);
+      activeAdmissions.set(request, await lifecycle.acquireAdmission(device.vault.vault_id));
+    }
   });
+  app.addHook('onError', async (request) => {
+    activeAdmissions.get(request)?.release();
+    activeAdmissions.delete(request);
+  });
+  app.addHook('onResponse', async (request) => {
+    activeAdmissions.get(request)?.release();
+    activeAdmissions.delete(request);
+  });
+  lifecycle.startReceiptExpiryMaintenance();
   app.addHook('onClose', async () => {
     await chunkTransfers.close();
+    await lifecycle.close();
   });
 
   app.setErrorHandler((error, request, reply) => {
-    void sendError(error instanceof Error ? error : new Error('Unknown error'), request, reply);
+    const normalized = error instanceof Error ? error : new Error('Unknown error');
+    const deletionMetadataFailure = isVaultDeletionMutation(request) &&
+      (normalized instanceof MetadataCleanupError || normalized instanceof MetadataPublicationError);
+    const transferDurabilityFailure = isTransferDurabilityRoute(request) && normalized instanceof GitDurabilityError;
+    void sendError(
+      deletionMetadataFailure
+        ? new AuthError(503, 'deletion_unavailable', 'Deletion lifecycle metadata is unavailable.')
+        : transferDurabilityFailure
+          ? new AuthError(503, 'transfer_unavailable', 'Transfer storage is unavailable.')
+          : normalized,
+      request,
+      reply
+    );
   });
 
   app.options('/api/v1/*', async (_request, reply) => reply.status(204).send());
@@ -141,7 +215,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   app.get('/health/live', async () => ({ status: 'ok' }));
 
   app.get('/health/ready', async (_request, reply) => {
-    const readiness = await buildReadinessSummary(config, store, git);
+    const readiness = await buildReadinessSummary(config, store, git, lifecycle, chunkTransfers);
     if (readiness.status !== 'ready') {
       return reply.status(503).send({
         status: readiness.status,
@@ -362,6 +436,31 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     return { status: 'ok', deleted_count: await diagnostics.deleteOwnerEvents(session.user.user_id) };
   });
 
+  app.get('/api/v1/vault-deletions', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    return await lifecycle.listDeletions(session.user.user_id);
+  });
+
+  app.get('/api/v1/vault-deletions/:vaultId', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const { vaultId } = pathParams(request);
+    return await lifecycle.getDeletion(session.user.user_id, vaultId);
+  });
+
+  app.delete('/api/v1/vaults/:vaultId', async (request, reply) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
+    const { vaultId } = pathParams(request);
+    const body = requestBody(request);
+    const confirmation = typeof body.confirmation === 'string' ? body.confirmation : undefined;
+    const result = await lifecycle.beginDeletion({
+      ownerUserId: session.user.user_id,
+      vaultId,
+      ...(confirmation === undefined ? {} : { confirmation })
+    });
+    return reply.status(result.status === 'deleting' ? 202 : 200).send(result);
+  });
+
   app.post('/api/v1/vaults', async (request, reply) => {
     const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
@@ -493,7 +592,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     );
     const allConflicts = db.conflicts.filter((conflict) => conflict.vault_id === vault.vault_id);
     const conflicts = allConflicts.filter((conflict) => conflict.status === 'open');
-    const health = await buildReadinessSummary(config, store, git);
+    const health = await buildReadinessSummary(config, store, git, lifecycle, chunkTransfers);
     return {
       vault: {
         vault_id: vault.vault_id,
@@ -540,9 +639,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   app.get('/api/v1/connections/:connectionId/review', async (request) => {
     const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     const { connectionId } = connectionPathParams(request);
-    const connection = await connections.review(connectionId);
-    const db = await store.snapshot();
-    return {
+    const renderReview = (connection: Awaited<ReturnType<typeof connections.review>>, db: MetadataDb) => ({
       connection_id: connection.connection_id,
       verification_code: connection.verification_code,
       status: connection.status,
@@ -558,7 +655,43 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
           current_main: vault.current_main,
           status: vault.status
         }))
-    };
+    });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const initial = await store.snapshot();
+      const initialConnection = initial.connections.find((candidate) => candidate.connection_id === connectionId);
+      if (!initialConnection) return renderReview(await connections.review(connectionId), initial);
+      const targetVaultId = connectionReviewTargetVaultId(initial, initialConnection);
+      if (!targetVaultId) {
+        const reviewed = await connections.review(connectionId);
+        const after = await store.snapshot();
+        const afterConnection = after.connections.find((candidate) => candidate.connection_id === connectionId);
+        if (!afterConnection || connectionReviewTargetVaultId(after, afterConnection) !== null) {
+          throw new AuthError(409, 'connection_changed', 'Connection state changed while it was being reviewed.');
+        }
+        return renderReview(reviewed, after);
+      }
+      return await lifecycle.withAdmission(targetVaultId, async () => {
+        const before = await store.snapshot();
+        const beforeConnection = before.connections.find((candidate) => candidate.connection_id === connectionId);
+        const beforeTarget = beforeConnection ? connectionReviewTargetVaultId(before, beforeConnection) : null;
+        const beforeVault = before.vaults.find((candidate) => candidate.vault_id === targetVaultId);
+        if (!beforeConnection || beforeTarget !== targetVaultId || !beforeVault || hasDurableDeletionRecord(before, targetVaultId)) {
+          throw new AuthError(409, 'vault_deleting', 'Vault deletion is in progress.');
+        }
+        const reviewed = await connections.review(connectionId);
+        const after = await store.snapshot();
+        const afterConnection = after.connections.find((candidate) => candidate.connection_id === connectionId);
+        const afterVault = after.vaults.find((candidate) => candidate.vault_id === targetVaultId);
+        if (
+          !afterConnection || connectionReviewTargetVaultId(after, afterConnection) !== targetVaultId ||
+          !afterVault || hasDurableDeletionRecord(after, targetVaultId)
+        ) {
+          throw new AuthError(409, 'vault_deleting', 'Vault deletion is in progress.');
+        }
+        return renderReview(reviewed, after);
+      });
+    }
+    throw new AuthError(409, 'connection_changed', 'Connection state changed while it was being reviewed.');
   });
 
   app.post('/api/v1/connections/:connectionId/approve', async (request) => {
@@ -591,7 +724,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   app.post('/api/v1/connections/:connectionId/bootstrap', async (request, reply) => {
     const { connectionId } = connectionPathParams(request);
     const result = await connections.bootstrap(connectionId, readBearerToken(request.headers.authorization));
-    return sendMultipart(reply, {
+    const sendBootstrap = async () => await sendMultipart(reply, {
       manifest: {
         api_version: API_VERSION,
         connection_id: connectionId,
@@ -605,6 +738,10 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       },
       packfile: result.packfile
     });
+    if (!result.connection.approved_user_id) {
+      throw new AuthError(409, 'connection_inconsistent', 'Connection state is incomplete.');
+    }
+    return await lifecycle.withOwnerVault(result.connection.approved_user_id, result.vaultId, sendBootstrap);
   });
 
   app.post('/api/v1/connections/:connectionId/bootstrap-chunk', async (request, reply) => {
@@ -612,34 +749,39 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const chunkRequest = parseChunkBootstrapRequest(requestBody(request));
     requireCompatiblePlugin(chunkRequest.plugin_version, null);
     const metadata = await connections.bootstrapMetadata(connectionId, readBearerToken(request.headers.authorization));
-    const requestedTarget = chunkRequest.requested_target === 'latest' ? metadata.targetMain : chunkRequest.requested_target;
-    if (!(await git.commitExists(metadata.vaultId, requestedTarget)) || !(await git.isAncestor(metadata.vaultId, requestedTarget, metadata.targetMain))) {
-      throw new AuthError(404, 'not_found', 'Resource not found.');
-    }
-    const chunk = await createPullObjectChunk(git, metadata.vaultId, requestedTarget, null, chunkRequest.cursor, config);
-    const eventSnapshot = eventSnapshotForTarget(await store.snapshot(), metadata.vaultId, '', requestedTarget, 0);
-    const manifest: ChunkBootstrapManifest = {
-      api_version: API_VERSION,
-      connection_id: connectionId,
-      vault_id: metadata.vaultId,
-      vault_name: metadata.vaultName,
-      root_commit: metadata.rootCommit,
-      target_main: requestedTarget,
-      changed_paths: (requestedTarget === metadata.targetMain
-        ? metadata.changedPaths
-        : await git.listTreePaths(metadata.vaultId, requestedTarget)).filter((path) => isSyncableVaultPath(path)),
-      ...(chunk.complete
-        ? { target_file_sizes: await syncableTargetFileSizes(git, metadata.vaultId, requestedTarget) }
-        : {}),
-      explicit_directories: eventSnapshot.explicitDirectories,
-      capability: CHUNK_TRANSFER_CAPABILITY,
-      cursor: chunkRequest.cursor,
-      next_cursor: chunk.nextCursor,
-      complete: chunk.complete,
-      chunk_sha256: sha256Hex(chunk.packfile),
-      chunk_bytes: chunk.packfile.byteLength
+    const buildChunk = async () => {
+      const requestedTarget = chunkRequest.requested_target === 'latest' ? metadata.targetMain : chunkRequest.requested_target;
+      if (!(await git.commitExists(metadata.vaultId, requestedTarget)) || !(await git.isAncestor(metadata.vaultId, requestedTarget, metadata.targetMain))) {
+        throw new AuthError(404, 'not_found', 'Resource not found.');
+      }
+      const chunk = await createPullObjectChunk(git, metadata.vaultId, requestedTarget, null, chunkRequest.cursor, config);
+      const eventSnapshot = eventSnapshotForTarget(await store.snapshot(), metadata.vaultId, '', requestedTarget, 0);
+      const manifest: ChunkBootstrapManifest = {
+        api_version: API_VERSION,
+        connection_id: connectionId,
+        vault_id: metadata.vaultId,
+        vault_name: metadata.vaultName,
+        root_commit: metadata.rootCommit,
+        target_main: requestedTarget,
+        changed_paths: (requestedTarget === metadata.targetMain
+          ? metadata.changedPaths
+          : await git.listTreePaths(metadata.vaultId, requestedTarget)).filter((path) => isSyncableVaultPath(path)),
+        ...(chunk.complete
+          ? { target_file_sizes: await syncableTargetFileSizes(git, metadata.vaultId, requestedTarget) }
+          : {}),
+        explicit_directories: eventSnapshot.explicitDirectories,
+        capability: CHUNK_TRANSFER_CAPABILITY,
+        cursor: chunkRequest.cursor,
+        next_cursor: chunk.nextCursor,
+        complete: chunk.complete,
+        chunk_sha256: sha256Hex(chunk.packfile),
+        chunk_bytes: chunk.packfile.byteLength
+      };
+      return await sendMultipart(reply, { manifest, packfile: chunk.packfile });
     };
-    return sendMultipart(reply, { manifest, packfile: chunk.packfile });
+    return metadata.connection.approved_user_id
+      ? await lifecycle.withOwnerVault(metadata.connection.approved_user_id, metadata.vaultId, buildChunk)
+      : await buildChunk();
   });
 
   app.post('/api/v1/connections/:connectionId/diagnostic-events', { bodyLimit: DIAGNOSTIC_MAX_BODY_BYTES }, async (request, reply) => {
@@ -648,7 +790,10 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       connectionId,
       readBearerToken(request.headers.authorization)
     );
-    const result = await diagnostics.ingestConnection(connectionAuth, request.body, request.ip);
+    const ingest = async () => await diagnostics.ingestConnection(connectionAuth, request.body, request.ip);
+    const result = connectionAuth.connection.selected_vault_id && connectionAuth.connection.approved_user_id
+      ? await lifecycle.withOwnerVault(connectionAuth.connection.approved_user_id, connectionAuth.connection.selected_vault_id, ingest)
+      : await ingest();
     return reply.status(result.status === 'accepted' ? 202 : 200).send(result);
   });
 
@@ -705,38 +850,62 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
 
   app.get('/api/v1/device/self', async (request) => {
     const deviceAuth = await auth.authenticateDeviceAnyVault(request.headers.authorization);
-    const db = await store.snapshot();
-    return {
-      user_id: deviceAuth.user.user_id,
-      vault_id: deviceAuth.vault.vault_id,
-      device_id: deviceAuth.device.device_id,
-      device_name: deviceAuth.device.device_name,
-      device_ref: deviceAuth.device.device_ref,
-      server_device_ref: deviceAuth.device.device_ref_head,
-      current_main: deviceAuth.vault.current_main,
-      vault_status: deviceAuth.vault.status,
-      status: deviceAuth.device.status,
-      last_applied_main: deviceAuth.device.last_applied_main,
-      last_applied_event_seq: deviceAuth.device.last_applied_event_seq,
-      event_seq: db.event_seq_by_vault[deviceAuth.vault.vault_id] ?? 0
-    };
+    return await lifecycle.withDeviceAdmission(
+      deviceAuth.vault.vault_id,
+      deviceAuth.user.user_id,
+      deviceAuth.device.device_id,
+      async () => {
+        const db = await store.snapshot();
+        const vault = db.vaults.find((candidate) => candidate.vault_id === deviceAuth.vault.vault_id);
+        const device = db.devices.find((candidate) => candidate.device_id === deviceAuth.device.device_id);
+        const user = db.users.find((candidate) => candidate.user_id === deviceAuth.user.user_id);
+        if (!vault || !device || !user) throw new AuthError(404, 'not_found', 'Resource not found.');
+        return {
+          user_id: user.user_id,
+          vault_id: vault.vault_id,
+          device_id: device.device_id,
+          device_name: device.device_name,
+          device_ref: device.device_ref,
+          server_device_ref: device.device_ref_head,
+          current_main: vault.current_main,
+          vault_status: vault.status,
+          status: device.status,
+          last_applied_main: device.last_applied_main,
+          last_applied_event_seq: device.last_applied_event_seq,
+          event_seq: db.event_seq_by_vault[vault.vault_id] ?? 0
+        };
+      },
+      deviceAuth.token.token_id
+    );
   });
 
   app.patch('/api/v1/device/self', async (request) => {
     const deviceAuth = await auth.authenticateDeviceAnyVault(request.headers.authorization);
-    const device = await auth.renameDevice({
-      actorUserId: deviceAuth.user.user_id,
-      actorDeviceId: deviceAuth.device.device_id,
-      vaultId: deviceAuth.vault.vault_id,
-      deviceId: deviceAuth.device.device_id,
-      deviceName: readDisplayName(requestBody(request), 'device_name')
-    });
+    const device = await lifecycle.withDeviceAdmission(
+      deviceAuth.vault.vault_id,
+      deviceAuth.user.user_id,
+      deviceAuth.device.device_id,
+      async () => await auth.renameDevice({
+        actorUserId: deviceAuth.user.user_id,
+        actorDeviceId: deviceAuth.device.device_id,
+        vaultId: deviceAuth.vault.vault_id,
+        deviceId: deviceAuth.device.device_id,
+        deviceName: readDisplayName(requestBody(request), 'device_name')
+      }),
+      deviceAuth.token.token_id
+    );
     return { device_id: device.device_id, device_name: device.device_name };
   });
 
   app.post('/api/v1/device/diagnostic-events', { bodyLimit: DIAGNOSTIC_MAX_BODY_BYTES }, async (request, reply) => {
     const deviceAuth = await auth.authenticateDeviceAnyVault(request.headers.authorization);
-    const result = await diagnostics.ingestDevice(deviceAuth, request.body, request.ip);
+    const result = await lifecycle.withDeviceAdmission(
+      deviceAuth.vault.vault_id,
+      deviceAuth.user.user_id,
+      deviceAuth.device.device_id,
+      async () => await diagnostics.ingestDevice(deviceAuth, request.body, request.ip),
+      deviceAuth.token.token_id
+    );
     return reply.status(result.status === 'accepted' ? 202 : 200).send(result);
   });
 
@@ -1303,7 +1472,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const { vaultId } = pathParams(request);
     const db = await store.snapshot();
     const vault = ownedVaultOrThrow(db, session.user.user_id, vaultId);
-    const health = await buildReadinessSummary(config, store, git);
+    const health = await buildReadinessSummary(config, store, git, lifecycle, chunkTransfers);
     return buildRedactedDiagnostics(db, vault.vault_id, health);
   });
 
@@ -1597,7 +1766,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   diagnosticPruneTimer.unref();
   app.addHook('onClose', async () => clearInterval(diagnosticPruneTimer));
 
-  return { app, config, store, git, auth, connections, diagnostics, sync, chunkTransfers };
+  return { app, config, store, git, auth, connections, diagnostics, sync, chunkTransfers, lifecycle };
 }
 
 function buildDashboardConflicts(
@@ -1751,9 +1920,12 @@ function readHistoryLimit(record: Record<string, unknown>): number {
   return record.limit;
 }
 
-function requireHistoryAvailable(status: 'active' | 'blocked_integrity'): void {
+function requireHistoryAvailable(status: 'active' | 'blocked_integrity' | 'deleting'): void {
   if (status === 'blocked_integrity') {
     throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+  }
+  if (status === 'deleting') {
+    throw new AuthError(409, 'vault_deleting', 'Vault deletion is in progress.');
   }
 }
 
@@ -1771,7 +1943,7 @@ function buildRedactedDiagnostics(
   health: Awaited<ReturnType<typeof buildReadinessSummary>>
 ): {
   generated_at: string;
-  vault: { vault_id: string; status: 'active' | 'blocked_integrity'; current_main: string };
+  vault: { vault_id: string; status: 'active' | 'blocked_integrity' | 'deleting'; current_main: string };
   devices: Array<Record<string, unknown>>;
   connection_counts: Record<string, number>;
   conflicts: Array<Record<string, unknown>>;
@@ -2395,6 +2567,27 @@ function readRequiredBoolean(record: Record<string, unknown>, field: string): bo
   return value;
 }
 
+function connectionReviewTargetVaultId(
+  db: MetadataDb,
+  connection: MetadataDb['connections'][number]
+): string | null {
+  if (connection.selected_vault_id) return connection.selected_vault_id;
+  if (!connection.created_device_id) return null;
+  return db.devices.find((device) => device.device_id === connection.created_device_id)?.vault_id ?? null;
+}
+
+function isSyncLifecycleLockingRoute(method: string, path: string): boolean {
+  if (method === 'POST' && (
+    /^\/api\/v1\/vaults\/[^/]+\/sync\/push$/u.test(path) ||
+    /^\/api\/v1\/vaults\/[^/]+\/sync\/applied$/u.test(path) ||
+    /^\/api\/v1\/vaults\/[^/]+\/history\/restore$/u.test(path) ||
+    /^\/api\/v1\/vaults\/[^/]+\/maintenance\/git-gc\/start$/u.test(path) ||
+    /^\/api\/v1\/vaults\/[^/]+\/conflicts\/[^/]+\/(?:refresh|resolve)$/u.test(path) ||
+    /^\/api\/v1\/vaults\/[^/]+\/sync\/push-transfers\/[^/]+\/finalize$/u.test(path)
+  )) return true;
+  return method === 'GET' && /^\/api\/v1\/vaults\/[^/]+\/sync\/push-transfers\/[^/]+$/u.test(path);
+}
+
 function pathParams(request: FastifyRequest): { vaultId: string } {
   const params = request.params as { vaultId?: string };
   if (!params.vaultId) {
@@ -2717,6 +2910,16 @@ function requireCompatiblePlugin(reportedVersion: string | undefined, storedVers
   return compatibility;
 }
 
+function isVaultDeletionMutation(request: FastifyRequest): boolean {
+  const path = request.url.split('?')[0] ?? request.url;
+  return request.method === 'DELETE' && /^\/api\/v1\/vaults\/[^/]+$/u.test(path);
+}
+
+function isTransferDurabilityRoute(request: FastifyRequest): boolean {
+  const path = request.url.split('?')[0] ?? request.url;
+  return request.method === 'POST' && /^\/api\/v1\/vaults\/[^/]+\/sync\/(?:push|pull|pull-chunk)$/u.test(path);
+}
+
 async function sendError(error: Error, request: FastifyRequest, reply: FastifyReply): Promise<void> {
   if (reply.sent) {
     return;
@@ -2841,17 +3044,43 @@ type ReadinessSummary = {
 async function buildReadinessSummary(
   config: ServerConfig,
   store: MetadataStore,
-  git: GitService
+  git: GitService,
+  lifecycle?: VaultLifecycleCoordinator,
+  transfer?: ChunkTransferService
 ): Promise<ReadinessSummary> {
+  if (!store.isReady() || lifecycle && !lifecycle.isReady()) {
+    return {
+      status: 'not_ready',
+      checks: {
+        metadata: true,
+        metadata_store: false,
+        git: false,
+        setup_complete: false,
+        migrations: false,
+        git_store: false,
+        temp_workspace: false,
+        filesystem_permissions: false,
+        event_delivery: false,
+        persistent_state: false
+      },
+      detail: 'metadata lifecycle durability is unavailable',
+      git_version: 'unknown'
+    };
+  }
   const gitReady = await git.checkReady();
   const db = await store.snapshot();
   const dataDirectoryReady = await checkWritableDirectory(config.dataDir);
   const metadataDirectoryReady = await checkWritableDirectory(join(config.dataDir, 'metadata'));
   const metadataFileReady = await checkRestrictedFile(join(config.dataDir, 'metadata', 'phase1.json'));
-  const metadataStoreReady = metadataDirectoryReady.ok && metadataFileReady.ok;
+  const metadataStoreReady = metadataDirectoryReady.ok && metadataFileReady.ok && store.isReady() && (lifecycle?.isReady() ?? true);
   const gitStoreReady = await checkWritableDirectory(config.gitStoreDir);
   const tempWorkspaceReady = await checkWritableDirectory(config.tempDir);
-  let persistentState = await checkPersistentState(db, git);
+  const transferCheck = transfer === undefined
+    ? { ok: true as const }
+    : await transfer.checkReady();
+  let persistentState = transferCheck.ok
+    ? await checkPersistentState(db, git)
+    : { ok: false as const, error: transferCheck.error };
   if (!persistentState.ok && persistentState.vaultId) {
     // Hold metadata mutation while rechecking so a newly prepared ref transition cannot race the durable block.
     persistentState = await store.mutate(async (mutableDb) => {
@@ -2873,7 +3102,7 @@ async function buildReadinessSummary(
     metadata_store: metadataStoreReady,
     git: gitReady.ok,
     setup_complete: db.setup_complete,
-    migrations: db.schema_version === 6,
+    migrations: db.schema_version === 7,
     git_store: gitStoreReady.ok,
     temp_workspace: tempWorkspaceReady.ok,
     filesystem_permissions: filesystemPermissions,
@@ -2930,11 +3159,15 @@ function checkEventDelivery(db: MetadataDb): { ok: true } | { ok: false; error: 
 type PersistentStateCheck = { ok: true } | { ok: false; error: string; vaultId?: string };
 
 async function checkPersistentState(db: MetadataDb, git: GitService): Promise<PersistentStateCheck> {
-  if (db.schema_version !== 6) {
+  if (db.schema_version !== 7) {
     return { ok: false, error: 'metadata schema version is unsupported' };
   }
   try {
-    const metadataVaultIds = new Set(db.vaults.map((vault) => vault.vault_id));
+    const metadataVaultIds = new Set([
+      ...db.vaults.map((vault) => vault.vault_id),
+      ...db.deletion_jobs.map((job) => job.vault_id),
+      ...db.deletion_receipts.map((receipt) => receipt.vault_id)
+    ]);
     const orphanRepository = (await git.listVaultRepositoryIds()).find((vaultId) => !metadataVaultIds.has(vaultId));
     if (orphanRepository) {
       return { ok: false, error: 'server Git store contains a vault repository missing from metadata' };
@@ -2943,6 +3176,7 @@ async function checkPersistentState(db: MetadataDb, git: GitService): Promise<Pe
     return { ok: false, error: 'server Git store cannot be enumerated' };
   }
   for (const vault of db.vaults) {
+    if (hasDurableDeletionRecord(db, vault.vault_id)) continue;
     const result = await checkVaultPersistentState(db, vault.vault_id, git, true);
     if (!result.ok) {
       return result;
@@ -2960,6 +3194,9 @@ async function checkVaultPersistentState(
   const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
   if (!vault) {
     return { ok: false, error: 'vault metadata is missing' };
+  }
+  if (hasDurableDeletionRecord(db, vaultId)) {
+    return { ok: true };
   }
   if (vault.status === 'blocked_integrity') {
     return { ok: false, error: 'vault persistent state is blocked by an integrity failure' };
@@ -3109,6 +3346,9 @@ export async function repairVaultIntegrity(store: MetadataStore, git: GitService
     if (!mutableVault) {
       throw new Error('Vault metadata is missing.');
     }
+    if (hasDurableDeletionRecord(mutableDb, vaultId)) {
+      throw new Error('Vault deletion lifecycle is active.');
+    }
     if (mutableVault.status !== 'blocked_integrity') {
       throw new Error('Vault is not blocked by an integrity failure.');
     }
@@ -3144,7 +3384,7 @@ async function markInconsistentVaults(store: MetadataStore, git: GitService): Pr
     return;
   }
   const db = await store.snapshot();
-  for (const vault of db.vaults.filter((candidate) => candidate.status === 'active')) {
+  for (const vault of db.vaults.filter((candidate) => candidate.status === 'active' && !hasDurableDeletionRecord(db, candidate.vault_id))) {
     const result = await checkVaultPersistentState(db, vault.vault_id, git);
     if (!result.ok) {
       await blockVaultForIntegrity(store, vault.vault_id);
@@ -3177,7 +3417,8 @@ function conflictProtectedRefs(conflict: MetadataDb['conflicts'][number]): Array
 async function ensureProtectedConflictRefs(store: MetadataStore, git: GitService, onlyVaultId?: string): Promise<void> {
   const db = await store.snapshot();
   for (const conflict of db.conflicts.filter(
-    (candidate) => candidate.status === 'open' && (onlyVaultId === undefined || candidate.vault_id === onlyVaultId)
+    (candidate) => candidate.status === 'open' && (onlyVaultId === undefined || candidate.vault_id === onlyVaultId) &&
+      !hasDurableDeletionRecord(db, candidate.vault_id)
   )) {
     try {
       for (const [kind, commit] of conflictProtectedRefs(conflict)) {
@@ -3202,6 +3443,7 @@ async function populateVaultRootCommits(store: MetadataStore, git: GitService): 
   const db = await store.snapshot();
   const roots = new Map<string, string>();
   for (const vault of db.vaults) {
+    if (hasDurableDeletionRecord(db, vault.vault_id)) continue;
     if (vault.root_commit === null) {
       roots.set(vault.vault_id, await git.rootCommit(vault.vault_id, vault.current_main));
     }
@@ -3222,13 +3464,16 @@ async function populateVaultRootCommits(store: MetadataStore, git: GitService): 
 async function reconcileStartupOperations(store: MetadataStore, git: GitService): Promise<void> {
   const db = await store.snapshot();
   for (const operation of db.sync_operations) {
+    if (hasDurableDeletionRecord(db, operation.vault_id)) continue;
     if (operation.status === 'started' && operation.prepared_manifest === null) {
       await abortStartupOperation(store, operation.operation_id, 'startup_unprepared_operation');
     }
   }
 
   const latest = await store.snapshot();
-  for (const operation of latest.sync_operations.filter((candidate) => candidate.status === 'prepared')) {
+  for (const operation of latest.sync_operations.filter(
+    (candidate) => candidate.status === 'prepared' && !hasDurableDeletionRecord(latest, candidate.vault_id)
+  )) {
     const targetRefs = recoverableTargetRefs(operation);
     if (targetRefs.length === 0) {
       if (await expectedRefsStillCurrent(git, operation)) {

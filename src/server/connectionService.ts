@@ -10,7 +10,8 @@ import type {
 } from '../shared/types.js';
 import { AuthError, hashToken, ownedVaultOrThrow } from './authService.js';
 import type { GitService } from './gitService.js';
-import type { ConnectionRequestRow, MetadataStore, UserRow } from './metadataStore.js';
+import { hasDurableDeletionRecord, type ConnectionRequestRow, type MetadataStore, type UserRow } from './metadataStore.js';
+import type { VaultLifecycleCoordinator } from './vaultLifecycleCoordinator.js';
 
 const CONNECTION_TTL_MS = 10 * 60 * 1000;
 const POLL_INTERVAL_MS = 2_000;
@@ -27,7 +28,8 @@ export class ConnectionService {
   constructor(
     private readonly store: MetadataStore,
     private readonly git: GitService,
-    private readonly publicBaseUrl: string
+    private readonly publicBaseUrl: string,
+    private readonly lifecycle?: VaultLifecycleCoordinator
   ) {}
 
   async create(input: CreateConnectionRequest, origin = 'unknown'): Promise<CreateConnectionResponse> {
@@ -75,6 +77,41 @@ export class ConnectionService {
   }
 
   async status(connectionId: string, secret: string, origin = 'unknown'): Promise<ConnectionStatusResponse> {
+    if (this.lifecycle) {
+      const db = await this.store.snapshot();
+      const connection = authenticatedConnection(db.connections, connectionId, secret);
+      const targetVaultId = connection.selected_vault_id ??
+        (connection.created_device_id
+          ? db.devices.find((device) => device.device_id === connection.created_device_id)?.vault_id ?? null
+          : null);
+      const ownerUserId = connection.approved_user_id ??
+        (connection.created_device_id
+          ? db.devices.find((device) => device.device_id === connection.created_device_id)?.user_id ?? null
+          : null);
+      if (targetVaultId && ownerUserId) {
+        return await this.lifecycle.withOwnerVault(ownerUserId, targetVaultId, async () => {
+          const before = await this.store.snapshot();
+          const beforeConnection = authenticatedConnection(before.connections, connectionId, secret);
+          if (connectionTargetVaultId(before, beforeConnection) !== targetVaultId) {
+            throw new AuthError(409, 'connection_changed', 'Connection state changed while it was being read.');
+          }
+          const result = await this.statusInternal(connectionId, secret, origin);
+          const after = await this.store.snapshot();
+          const afterConnection = after.connections.find((candidate) => candidate.connection_id === connectionId);
+          if (
+            !afterConnection || connectionTargetVaultId(after, afterConnection) !== targetVaultId ||
+            hasDurableDeletionRecord(after, targetVaultId)
+          ) {
+            throw new AuthError(409, 'vault_deleting', 'Vault deletion is in progress.');
+          }
+          return result;
+        });
+      }
+    }
+    return await this.statusInternal(connectionId, secret, origin);
+  }
+
+  private async statusInternal(connectionId: string, secret: string, origin: string): Promise<ConnectionStatusResponse> {
     return await this.store.mutate((db) => {
       expireConnections(db.connections);
       const connection = authenticatedConnection(db.connections, connectionId, secret);
@@ -126,7 +163,7 @@ export class ConnectionService {
     vaultId?: string;
     displayName?: string;
   }): Promise<void> {
-    await this.store.mutate((db) => {
+    const mutate = async (): Promise<void> => await this.store.mutate((db) => {
       expireConnections(db.connections);
       const connection = db.connections.find((candidate) => candidate.connection_id === input.connectionId);
       if (!connection || connection.status !== 'pending') {
@@ -164,6 +201,17 @@ export class ConnectionService {
         created_at: nowIso()
       });
     });
+    if (input.selection === 'existing_vault' && input.vaultId && this.lifecycle) {
+      await this.lifecycle.withOwnerVault(input.user.user_id, input.vaultId, async () => {
+        await mutate();
+        const after = await this.store.snapshot();
+        if (hasDurableDeletionRecord(after, input.vaultId!)) {
+          throw new AuthError(409, 'vault_deleting', 'Vault deletion is in progress.');
+        }
+      });
+    } else {
+      await mutate();
+    }
   }
 
   async deny(connectionId: string, user: UserRow): Promise<void> {
@@ -208,15 +256,18 @@ export class ConnectionService {
     if (vault.status !== 'active' || !vault.root_commit) {
       throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
     }
-    return {
+    const buildMetadata = async () => ({
       connection,
       vaultId: vault.vault_id,
       vaultName: vault.display_name,
-      rootCommit: vault.root_commit,
+      rootCommit: vault.root_commit!,
       targetMain: vault.current_main,
       changedPaths: await this.git.listTreePaths(vault.vault_id, vault.current_main),
       explicitDirectories: db.directory_state_by_vault[vault.vault_id]?.explicit_dirs ?? []
-    };
+    });
+    return this.lifecycle
+      ? await this.lifecycle.withOwnerVault(requireValue(connection.approved_user_id), vault.vault_id, buildMetadata)
+      : await buildMetadata();
   }
 
   async bootstrap(connectionId: string, secret: string): Promise<{
@@ -230,13 +281,52 @@ export class ConnectionService {
     packfile: Buffer;
   }> {
     const metadata = await this.bootstrapMetadata(connectionId, secret);
-    return {
-      ...metadata,
-      packfile: await this.git.exportPack(metadata.vaultId, metadata.targetMain, null)
-    };
+    const packfile = this.lifecycle
+      ? await this.lifecycle.withOwnerVault(
+          requireValue(metadata.connection.approved_user_id),
+          metadata.vaultId,
+          async () => await this.git.exportPack(metadata.vaultId, metadata.targetMain, null)
+        )
+      : await this.git.exportPack(metadata.vaultId, metadata.targetMain, null);
+    return { ...metadata, packfile };
   }
 
   async complete(
+    connectionId: string,
+    secret: string,
+    request: CompleteConnectionRequest
+  ): Promise<CompleteConnectionResponse> {
+    if (this.lifecycle) {
+      const db = await this.store.snapshot();
+      const connection = authenticatedConnection(db.connections, connectionId, secret);
+      const targetVaultId = connectionTargetVaultId(db, connection);
+      if (targetVaultId && connection.approved_user_id) {
+        return await this.lifecycle.withOwnerVault(connection.approved_user_id, targetVaultId, async () => {
+          const before = await this.store.snapshot();
+          const beforeConnection = authenticatedConnection(before.connections, connectionId, secret);
+          if (
+            connectionTargetVaultId(before, beforeConnection) !== targetVaultId ||
+            beforeConnection.approved_user_id !== connection.approved_user_id
+          ) {
+            throw new AuthError(409, 'connection_changed', 'Connection state changed while it was being completed.');
+          }
+          const result = await this.completeInternal(connectionId, secret, request);
+          const after = await this.store.snapshot();
+          const afterConnection = after.connections.find((candidate) => candidate.connection_id === connectionId);
+          if (
+            !afterConnection || connectionTargetVaultId(after, afterConnection) !== targetVaultId ||
+            hasDurableDeletionRecord(after, targetVaultId)
+          ) {
+            throw new AuthError(409, 'vault_deleting', 'Vault deletion is in progress.');
+          }
+          return result;
+        });
+      }
+    }
+    return await this.completeInternal(connectionId, secret, request);
+  }
+
+  private async completeInternal(
     connectionId: string,
     secret: string,
     request: CompleteConnectionRequest
@@ -255,27 +345,35 @@ export class ConnectionService {
 
     let vaultId = connection.selected_vault_id;
     let rootCommit: string;
-    if (connection.selection === 'new_vault') {
-      if (request.mode !== 'initialize' && request.mode !== 'use_server') {
-        throw new AuthError(400, 'invalid_onboarding_mode', 'New vault onboarding mode is invalid.');
+    let targetAdmission: { release(): void } | null = null;
+    try {
+      if (connection.selection === 'new_vault') {
+        if (request.mode !== 'initialize' && request.mode !== 'use_server') {
+          throw new AuthError(400, 'invalid_onboarding_mode', 'New vault onboarding mode is invalid.');
+        }
+        const materializedVaultId = newId('vlt');
+        vaultId = materializedVaultId;
+        if (this.lifecycle) targetAdmission = await this.lifecycle.acquireAdmission(materializedVaultId);
+        rootCommit = await this.git.initializeVault(materializedVaultId);
+      } else {
+        const vault = ownedVaultOrThrow(snapshot, connection.approved_user_id, vaultId ?? '');
+        if (vault.status !== 'active') {
+          throw new AuthError(409, vault.status === 'deleting' ? 'vault_deleting' : 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+        }
+        if (!vault.root_commit) {
+          throw new AuthError(409, 'blocked_integrity', 'Vault root commit is unavailable.');
+        }
+        if (request.expected_main !== connection.expected_main || request.expected_main !== vault.current_main) {
+          throw new AuthError(409, 'onboarding_target_stale', 'Server vault changed; analyze it again before continuing.');
+        }
+        rootCommit = vault.root_commit;
       }
-      vaultId = newId('vlt');
-      rootCommit = await this.git.initializeVault(vaultId);
-    } else {
-      const vault = ownedVaultOrThrow(snapshot, connection.approved_user_id, vaultId ?? '');
-      if (!vault.root_commit) {
-        throw new AuthError(409, 'blocked_integrity', 'Vault root commit is unavailable.');
-      }
-      if (request.expected_main !== connection.expected_main || request.expected_main !== vault.current_main) {
-        throw new AuthError(409, 'onboarding_target_stale', 'Server vault changed; analyze it again before continuing.');
-      }
-      rootCommit = vault.root_commit;
-    }
 
-    if (!vaultId) {
-      throw new AuthError(409, 'connection_inconsistent', 'Connection target is incomplete.');
-    }
-    const proposal = await this.validateProposal(snapshot, connection, vaultId, rootCommit, request);
+      if (!vaultId) {
+        throw new AuthError(409, 'connection_inconsistent', 'Connection target is incomplete.');
+      }
+      const targetVaultId = vaultId;
+      const proposal = await this.validateProposal(snapshot, connection, targetVaultId, rootCommit, request);
     const tokenHash = hashToken(deviceToken);
     const timestamp = nowIso();
     const deviceId = newId('dev');
@@ -284,10 +382,16 @@ export class ConnectionService {
       if (mutableConnection.status !== 'approved') {
         throw new AuthError(409, 'connection_not_approved', 'Connection has already been consumed.');
       }
-      let vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
+      if (hasDurableDeletionRecord(db, targetVaultId)) {
+        throw new AuthError(409, 'vault_deleting', 'Vault deletion is in progress.');
+      }
+      let vault = db.vaults.find((candidate) => candidate.vault_id === targetVaultId);
+      if (vault && (vault.owner_user_id !== mutableConnection.approved_user_id || vault.status !== 'active')) {
+        throw new AuthError(409, vault.status === 'deleting' ? 'vault_deleting' : 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+      }
       if (!vault) {
         vault = {
-          vault_id: vaultId,
+          vault_id: targetVaultId,
           owner_user_id: requireValue(mutableConnection.approved_user_id),
           display_name: requireValue(mutableConnection.new_vault_display_name),
           status: 'active',
@@ -339,8 +443,9 @@ export class ConnectionService {
         revoked_at: null
       };
       db.devices.push(device);
+      const tokenId = newId('tok');
       db.tokens.push({
-        token_id: newId('tok'),
+        token_id: tokenId,
         kind: 'device',
         lookup_prefix: tokenHash.lookupPrefix,
         token_hash: tokenHash.hash,
@@ -375,9 +480,28 @@ export class ConnectionService {
         resource_id: device.device_id,
         created_at: timestamp
       });
-      return { vault, device };
+      if (!vault) throw new AuthError(409, 'connection_inconsistent', 'Connection target is incomplete.');
+      return { vault, device, tokenId };
     });
-    return responseFor(result.vault, result.device, deviceToken, request.mode);
+    const authoritative = await this.store.snapshot();
+    const authoritativeVault = authoritative.vaults.find((candidate) => candidate.vault_id === targetVaultId);
+    const authoritativeDevice = authoritative.devices.find((candidate) => candidate.device_id === result.device.device_id);
+    const authoritativeToken = authoritative.tokens.find((candidate) => candidate.token_id === result.tokenId);
+    if (
+      hasDurableDeletionRecord(authoritative, targetVaultId) ||
+      !authoritativeVault || authoritativeVault.status !== 'active' || authoritativeVault.owner_user_id !== connection.approved_user_id ||
+      !authoritativeDevice || authoritativeDevice.vault_id !== targetVaultId || authoritativeDevice.user_id !== connection.approved_user_id ||
+      authoritativeDevice.revoked_at !== null || authoritativeDevice.status === 'revoked' ||
+      !authoritativeToken || authoritativeToken.kind !== 'device' || authoritativeToken.vault_id !== targetVaultId ||
+      authoritativeToken.device_id !== authoritativeDevice.device_id || authoritativeToken.user_id !== connection.approved_user_id ||
+      authoritativeToken.revoked_at !== null || authoritativeToken.consumed_at !== null
+    ) {
+      throw new AuthError(409, 'vault_deleting', 'Vault deletion is in progress.');
+    }
+    return responseFor(authoritativeVault, authoritativeDevice, deviceToken, request.mode);
+    } finally {
+      targetAdmission?.release();
+    }
   }
 
   async authenticateDiagnostics(connectionId: string, secret: string): Promise<{
@@ -428,6 +552,16 @@ export class ConnectionService {
     const device = db.devices.find((candidate) => candidate.device_id === connection.created_device_id);
     const vault = device ? db.vaults.find((candidate) => candidate.vault_id === device.vault_id) : null;
     if (!device || !vault || !device.onboarding_mode || !vault.root_commit) {
+      throw new AuthError(409, 'connection_inconsistent', 'Connection state is incomplete.');
+    }
+    if (vault.status !== 'active' || hasDurableDeletionRecord(db, vault.vault_id)) {
+      throw new AuthError(409, vault.status === 'deleting' ? 'vault_deleting' : 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+    }
+    const token = db.tokens.find((candidate) =>
+      candidate.kind === 'device' && candidate.device_id === device.device_id && candidate.vault_id === vault.vault_id &&
+      candidate.user_id === device.user_id && candidate.revoked_at === null && candidate.consumed_at === null
+    );
+    if (!token || device.status === 'revoked' || device.revoked_at !== null || device.user_id !== vault.owner_user_id) {
       throw new AuthError(409, 'connection_inconsistent', 'Connection state is incomplete.');
     }
     return responseFor(vault, device, deviceToken, device.onboarding_mode);
@@ -490,6 +624,15 @@ export class ConnectionService {
     }
     return { kind: expectedKind, base: request.proposal_base };
   }
+}
+
+function connectionTargetVaultId(
+  db: Awaited<ReturnType<MetadataStore['snapshot']>>,
+  connection: ConnectionRequestRow
+): string | null {
+  if (connection.selected_vault_id) return connection.selected_vault_id;
+  if (!connection.created_device_id) return null;
+  return db.devices.find((device) => device.device_id === connection.created_device_id)?.vault_id ?? null;
 }
 
 function authenticatedConnection(connections: ConnectionRequestRow[], connectionId: string, secret: string): ConnectionRequestRow {

@@ -1,5 +1,7 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { lstat, mkdir, open, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { basename, dirname, join, resolve } from 'node:path';
+
+import { assertNoSymlinkComponents } from './deletionRoot.js';
 
 import { newId, nowIso } from '../shared/ids.js';
 import { DISPLAY_NAME_MAX_LENGTH, normalizeDisplayName } from '../shared/validators.js';
@@ -55,7 +57,7 @@ export type VaultRow = {
   vault_id: string;
   owner_user_id: string;
   display_name: string;
-  status: 'active' | 'blocked_integrity';
+  status: 'active' | 'blocked_integrity' | 'deleting';
   root_commit?: string | null;
   current_main: string;
   created_at: string;
@@ -212,8 +214,27 @@ export type DerivedHistoryIndexRow = {
   indexed_at: string;
 };
 
+export type DeletionErrorCode = 'storage_unavailable' | 'unattributed_residue' | 'metadata_unavailable';
+
+export type DeletionJob = {
+  vault_id: string;
+  owner_user_id: string;
+  requested_at: string;
+  phase: 'intent' | 'draining' | 'erasing' | 'finalizing';
+  retry_at: string | null;
+  error_code: DeletionErrorCode | null;
+};
+
+export type DeletionReceipt = {
+  vault_id: string;
+  owner_user_id: string;
+  requested_at: string;
+  completed_at: string;
+  status: 'deleted';
+};
+
 export type MetadataDb = {
-  schema_version: 6;
+  schema_version: 7;
   setup_complete: boolean;
   users: UserRow[];
   sessions: SessionRow[];
@@ -232,39 +253,136 @@ export type MetadataDb = {
   directory_state_by_vault: Record<string, DirectoryStateRow>;
   directory_proposal_results: DirectoryProposalResultRow[];
   derived_history_by_vault: Record<string, DerivedHistoryIndexRow[]>;
+  deletion_jobs: DeletionJob[];
+  deletion_receipts: DeletionReceipt[];
+};
+
+export type MetadataPersistenceAdapter = {
+  readDirectory(path: string): Promise<string[]>;
+  writeFile(path: string, data: string): Promise<void>;
+  fsyncFile(path: string): Promise<void>;
+  rename(source: string, destination: string): Promise<void>;
+  fsyncDirectory(path: string): Promise<void>;
+  remove(path: string): Promise<void>;
+};
+
+const defaultPersistenceAdapter: MetadataPersistenceAdapter = {
+  readDirectory: async (path) => await readdir(path),
+  writeFile: async (path, data) => await writeFile(path, data, { mode: 0o600, flag: 'wx' }),
+  fsyncFile: async (path) => {
+    const file = await open(path, 'r');
+    try {
+      await file.sync();
+    } finally {
+      await file.close();
+    }
+  },
+  rename,
+  fsyncDirectory: async (path) => {
+    const directory = await open(path, 'r');
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
+  },
+  remove: async (path) => await rm(path, { force: true })
 };
 
 export class MetadataStore {
   private db: MetadataDb | null = null;
   private pending: Promise<void> = Promise.resolve();
+  private durabilityUncertain = false;
+  private cleanupFailed = false;
+  private cleanupDirectorySyncRequired = false;
+  private readonly persistence: MetadataPersistenceAdapter;
 
-  constructor(private readonly dataDir: string) {}
+  constructor(private readonly dataDir: string, persistence?: Partial<MetadataPersistenceAdapter>) {
+    this.persistence = { ...defaultPersistenceAdapter, ...persistence };
+  }
+
+  isReady(): boolean {
+    return !this.durabilityUncertain && !this.cleanupFailed;
+  }
+
+  isDurabilityUncertain(): boolean {
+    return this.durabilityUncertain;
+  }
 
   async initialize(): Promise<void> {
+    await assertNoSymlinkComponents(resolve(dirname(this.filePath)));
     await mkdir(dirname(this.filePath), { recursive: true, mode: 0o700 });
+    const metadataDirectory = await lstat(dirname(this.filePath));
+    if (!metadataDirectory.isDirectory() || metadataDirectory.isSymbolicLink()) {
+      throw new MetadataCleanupError();
+    }
+    let loaded = false;
     try {
       const raw = await readFile(this.filePath, 'utf8');
       this.db = JSON.parse(raw) as MetadataDb;
-      if (this.normalizeLoadedDb(this.db)) {
-        await this.persist();
-      }
+      loaded = true;
     } catch (error) {
-      if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') {
-        this.db = createEmptyDb();
-        await this.persist();
-        return;
-      }
-      throw error;
+      if (!isMissing(error)) throw error;
+      this.db = createEmptyDb();
     }
+    if (this.normalizeLoadedDb(this.requireDb())) {
+      await this.persist();
+    } else if (!loaded) {
+      await this.persist();
+    }
+    await this.removeStalePersistenceTemps();
   }
 
   async snapshot(): Promise<MetadataDb> {
     await this.pending;
     await this.ensureLoaded();
+    this.assertOperational();
     return clone(this.requireDb());
   }
 
   async mutate<T>(fn: (db: MetadataDb) => T | Promise<T>): Promise<T> {
+    return await this.enqueue(async () => {
+      await this.ensureLoaded();
+      this.assertOperational();
+      const candidate = clone(this.requireDb());
+      const result = await fn(candidate);
+      try {
+        await this.persist(candidate);
+      } catch (error) {
+        if (error instanceof MetadataPublicationError) this.durabilityUncertain = true;
+        throw error;
+      }
+      this.db = candidate;
+      return result;
+    });
+  }
+
+  async mutateDurably<T>(fn: (db: MetadataDb) => T | Promise<T>): Promise<T> {
+    return await this.enqueue(async () => {
+      await this.ensureLoaded();
+      this.assertOperational();
+      const candidate = clone(this.requireDb());
+      const result = await fn(candidate);
+      try {
+        await this.persist(candidate);
+      } catch (error) {
+        if (error instanceof MetadataPublicationError) this.durabilityUncertain = true;
+        throw error;
+      }
+      this.db = candidate;
+      return result;
+    });
+  }
+
+  async cleanupPersistenceTemps(): Promise<void> {
+    await this.enqueue(async () => {
+      await this.ensureLoaded();
+      if (this.durabilityUncertain) throw new MetadataPublicationError();
+      await this.removeStalePersistenceTemps();
+    });
+  }
+
+  private async enqueue<T>(fn: () => Promise<T>): Promise<T> {
     const previous = this.pending;
     let release!: () => void;
     this.pending = new Promise((resolve) => {
@@ -272,10 +390,7 @@ export class MetadataStore {
     });
     await previous;
     try {
-      await this.ensureLoaded();
-      const result = await fn(this.requireDb());
-      await this.persist();
-      return result;
+      return await fn();
     } finally {
       release();
     }
@@ -286,6 +401,11 @@ export class MetadataStore {
       throw new Error('Metadata store is not initialized.');
     }
     return this.db;
+  }
+
+  private assertOperational(): void {
+    if (this.durabilityUncertain) throw new MetadataPublicationError();
+    if (this.cleanupFailed) throw new MetadataCleanupError();
   }
 
   nextMergeSequence(db: MetadataDb, vaultId: string): number {
@@ -339,20 +459,92 @@ export class MetadataStore {
     }
   }
 
-  private async persist(): Promise<void> {
-    if (this.db === null) {
-      throw new Error('Metadata store is not initialized.');
+  private async persist(db = this.requireDb()): Promise<void> {
+    const serialized = `${JSON.stringify(db, null, 2)}\n`;
+    const tempFile = `${this.filePath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+    try {
+      await mkdir(dirname(this.filePath), { recursive: true, mode: 0o700 });
+    } catch (error) {
+      this.cleanupFailed = true;
+      throw new MetadataCleanupError(error);
     }
-    const serialized = `${JSON.stringify(this.db, null, 2)}\n`;
-    const tempFile = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
-    await mkdir(dirname(this.filePath), { recursive: true, mode: 0o700 });
-    await writeFile(tempFile, serialized, { mode: 0o600 });
-    await rename(tempFile, this.filePath);
+    let renamed = false;
+    let publicationAmbiguous = false;
+    let cleanupAttempted = false;
+    try {
+      try {
+        await this.persistence.writeFile(tempFile, serialized);
+        await this.persistence.fsyncFile(tempFile);
+      } catch (error) {
+        cleanupAttempted = true;
+        await this.removeTemporaryFile(tempFile);
+        throw error;
+      }
+      try {
+        await this.persistence.rename(tempFile, this.filePath);
+        renamed = true;
+      } catch (error) {
+        publicationAmbiguous = true;
+        throw new MetadataPublicationError(error);
+      }
+      try {
+        await this.persistence.fsyncDirectory(dirname(this.filePath));
+      } catch (error) {
+        throw new MetadataPublicationError(error);
+      }
+    } finally {
+      if (!renamed && !publicationAmbiguous && !cleanupAttempted) {
+        await this.removeTemporaryFile(tempFile);
+      } else if (renamed) {
+        await this.removeTemporaryFile(tempFile);
+      }
+    }
+  }
+
+  private async removeTemporaryFile(path: string): Promise<void> {
+    try {
+      await this.persistence.remove(path);
+    } catch (error) {
+      if (!isMissing(error)) {
+        this.cleanupFailed = true;
+        throw new MetadataCleanupError(error);
+      }
+    }
+  }
+
+  private async removeStalePersistenceTemps(): Promise<void> {
+    let entries: string[];
+    try {
+      entries = await this.persistence.readDirectory(dirname(this.filePath));
+    } catch (error) {
+      this.cleanupFailed = true;
+      throw new MetadataCleanupError(error);
+    }
+    const prefix = `${basename(this.filePath)}.`;
+    const tempPattern = /^[0-9]+\.[0-9]+\.[0-9a-f]+\.tmp$/u;
+    let removed = false;
+    try {
+      for (const entry of entries.filter((candidate) => candidate.startsWith(prefix) && candidate.endsWith('.tmp'))) {
+        if (!tempPattern.test(entry.slice(prefix.length))) throw new MetadataCleanupError();
+        await this.persistence.remove(join(dirname(this.filePath), entry));
+        removed = true;
+        this.cleanupDirectorySyncRequired = true;
+      }
+      if (removed || this.cleanupDirectorySyncRequired) await this.persistence.fsyncDirectory(dirname(this.filePath));
+      this.cleanupDirectorySyncRequired = false;
+      this.cleanupFailed = false;
+    } catch (error) {
+      this.cleanupFailed = true;
+      if (error instanceof MetadataCleanupError) throw error;
+      throw new MetadataCleanupError(error);
+    }
   }
 
   private normalizeLoadedDb(db: MetadataDb): boolean {
     const legacyDb = db as MetadataDb & {
-      schema_version: 1 | 2 | 3 | 4 | 5 | 6;
+      schema_version: 1 | 2 | 3 | 4 | 5 | 6 | 7;
+      deletion_jobs?: DeletionJob[];
+      deletion_receipts?: DeletionReceipt[];
       connections?: ConnectionRequestRow[];
       login_attempts?: LoginAttemptRow[];
       diagnostic_events?: DiagnosticEventRow[];
@@ -405,9 +597,17 @@ export class MetadataStore {
       legacyDb.derived_history_by_vault = {};
       changed = true;
     }
+    if (!Array.isArray(legacyDb.deletion_jobs)) {
+      legacyDb.deletion_jobs = [];
+      changed = true;
+    }
+    if (!Array.isArray(legacyDb.deletion_receipts)) {
+      legacyDb.deletion_receipts = [];
+      changed = true;
+    }
     const schema = legacyDb as unknown as { schema_version: number };
-    if (schema.schema_version < 6) {
-      schema.schema_version = 6;
+    if (schema.schema_version < 7) {
+      schema.schema_version = 7;
       changed = true;
     }
     for (const vault of db.vaults) {
@@ -607,7 +807,7 @@ function migrateDisplayName(value: unknown, fallback: string): string {
 
 function createEmptyDb(): MetadataDb {
   return {
-    schema_version: 6,
+    schema_version: 7,
     setup_complete: false,
     users: [],
     sessions: [],
@@ -625,10 +825,34 @@ function createEmptyDb(): MetadataDb {
     merge_sequence_by_vault: {},
     directory_state_by_vault: {},
     directory_proposal_results: [],
-    derived_history_by_vault: {}
+    derived_history_by_vault: {},
+    deletion_jobs: [],
+    deletion_receipts: []
   };
 }
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+export class MetadataPublicationError extends Error {
+  constructor(cause?: unknown) {
+    super('Metadata publication durability is uncertain.', { cause });
+  }
+}
+
+export class MetadataCleanupError extends Error {
+  constructor(cause?: unknown) {
+    super('Metadata temporary-file cleanup is unavailable.', { cause });
+  }
+}
+
+function isMissing(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT';
+}
+
+export function hasDurableDeletionRecord(db: MetadataDb, vaultId: string): boolean {
+  return db.vaults.some((vault) => vault.vault_id === vaultId && vault.status === 'deleting') ||
+    db.deletion_jobs.some((job) => job.vault_id === vaultId) ||
+    db.deletion_receipts.some((receipt) => receipt.vault_id === vaultId);
 }

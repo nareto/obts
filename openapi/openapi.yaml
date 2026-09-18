@@ -249,7 +249,73 @@ paths:
                 $ref: "#/components/schemas/VaultSummary"
         "400":
           $ref: "#/components/responses/Error"
+  /vault-deletions:
+    get:
+      summary: List pending deletions and unexpired completed deletion receipts for the authenticated owner.
+      responses:
+        "200":
+          description: Owner-scoped redacted deletion statuses.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VaultDeletionListResponse"
+        "401":
+          $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/Error"
+  /vault-deletions/{vault_id}:
+    get:
+      summary: Return one owner-scoped pending deletion or retained completed receipt.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+      responses:
+        "200":
+          description: Redacted deletion status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VaultDeletionStatus"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/Error"
   /vaults/{vault_id}:
+    delete:
+      summary: Accept deletion of one owned server vault after typed full-ID confirmation.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - $ref: "#/components/parameters/CsrfHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VaultDeletionRequest"
+      responses:
+        "200":
+          description: Completed deletion receipt retained for 30 days.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VaultDeletionStatus"
+        "202":
+          description: Deletion intent and access revocation are durably published; erasure is pending.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VaultDeletionStatus"
+        "401":
+          $ref: "#/components/responses/Error"
+        "400":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/Error"
     patch:
       summary: Rename an owned vault's server display metadata without renaming any device folder.
       parameters:
@@ -333,6 +399,8 @@ paths:
                 $ref: "#/components/schemas/ConnectionStatusResponse"
         "401":
           $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
         "429":
           $ref: "#/components/responses/Error"
   /connections/{connection_id}/review:
@@ -350,6 +418,8 @@ paths:
         "401":
           $ref: "#/components/responses/Error"
         "404":
+          $ref: "#/components/responses/Error"
+        "409":
           $ref: "#/components/responses/Error"
   /connections/{connection_id}/approve:
     post:
@@ -460,6 +530,8 @@ paths:
           $ref: "#/components/responses/Error"
         "404":
           $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
         "413":
           $ref: "#/components/responses/Error"
   /connections/{connection_id}/diagnostic-events:
@@ -489,6 +561,8 @@ paths:
         "401":
           $ref: "#/components/responses/Error"
         "404":
+          $ref: "#/components/responses/Error"
+        "409":
           $ref: "#/components/responses/Error"
         "413":
           $ref: "#/components/responses/Error"
@@ -703,11 +777,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ChunkPushDescriptor"
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
         "409":
           $ref: "#/components/responses/Error"
         "413":
           $ref: "#/components/responses/Error"
         "429":
+          $ref: "#/components/responses/Error"
+        "503":
           $ref: "#/components/responses/Error"
   /vaults/{vault_id}/sync/push-transfers/{transfer_id}:
     get:
@@ -726,7 +806,11 @@ paths:
                 $ref: "#/components/schemas/ChunkPushDescriptor"
         "404":
           $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
         "410":
+          $ref: "#/components/responses/Error"
+        "503":
           $ref: "#/components/responses/Error"
     delete:
       summary: Abort and delete a resumable transfer owned by this device.
@@ -738,6 +822,14 @@ paths:
       responses:
         "204":
           description: Transfer deleted.
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "410":
+          $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/Error"
   /vaults/{vault_id}/sync/push-transfers/{transfer_id}/chunks/{chunk_index}:
     put:
       summary: Upload one independently valid bounded Git pack chunk.
@@ -772,11 +864,21 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ChunkPushReceipt"
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
         "409":
           $ref: "#/components/responses/Error"
         "413":
           $ref: "#/components/responses/Error"
+        "410":
+          $ref: "#/components/responses/Error"
         "422":
+          $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/Error"
+        "507":
           $ref: "#/components/responses/Error"
   /vaults/{vault_id}/sync/push-transfers/{transfer_id}/finalize:
     post:
@@ -799,14 +901,26 @@ paths:
       responses:
         "200":
           description: Terminal transfer descriptor for async callers or the existing push result for legacy callers.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/PushOutcome"
+                  - $ref: "#/components/schemas/ChunkPushDescriptor"
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/Error"
         "202":
           description: Proposal durably queued for asynchronous validation and integration.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ChunkPushDescriptor"
-        "409":
-          $ref: "#/components/responses/Error"
   /vaults/{vault_id}/sync/push:
     post:
       summary: Upload an immutable device proposal for merge, conflict creation, or an idempotent no-op.
@@ -832,13 +946,19 @@ paths:
                 contentType: application/json
       responses:
         "200":
-          description: Push result.
+          description: Accepted no-op, merge, or conflict result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PushOutcome"
         "400":
           $ref: "#/components/responses/Error"
         "404":
           $ref: "#/components/responses/Error"
         "409":
           $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/TransferUnavailable"
   /vaults/{vault_id}/sync/pull:
     post:
       summary: Pull Git objects needed to reach current server main.
@@ -879,6 +999,8 @@ paths:
           $ref: "#/components/responses/Error"
         "404":
           $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/TransferUnavailable"
   /vaults/{vault_id}/sync/pull-chunk:
     post:
       summary: Pull one bounded independently importable Git object-pack chunk for a pinned target.
@@ -910,6 +1032,8 @@ paths:
           $ref: "#/components/responses/Error"
         "413":
           $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/TransferUnavailable"
   /vaults/{vault_id}/sync/device-status:
     post:
       summary: Report current local plugin status for dashboard diagnostics.
@@ -1329,6 +1453,12 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorEnvelope"
+    TransferUnavailable:
+      description: Redacted JSON error envelope with code `transfer_unavailable` when transfer storage durability is unavailable.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
   schemas:
     DisplayName:
       type: string
@@ -1453,7 +1583,7 @@ components:
           pattern: "^[0-9a-f]{40}$"
         status:
           type: string
-          enum: [active, blocked_integrity]
+          enum: [active, blocked_integrity, deleting]
         root_commit:
           oneOf:
             - type: "null"
@@ -1465,6 +1595,57 @@ components:
         updated_at:
           type: string
           format: date-time
+    VaultDeletionRequest:
+      type: object
+      additionalProperties: false
+      required: [confirmation]
+      properties:
+        confirmation:
+          type: string
+          description: Exact phrase DELETE followed by the full vault ID.
+          pattern: "^DELETE [A-Za-z0-9_]+$"
+    VaultDeletionStatus:
+      type: object
+      additionalProperties: false
+      required: [vault_id, status, requested_at, completed_at, receipt_expires_at, retry_at, error_code]
+      properties:
+        vault_id:
+          type: string
+        status:
+          type: string
+          enum: [deleting, deleted]
+        requested_at:
+          type: string
+          format: date-time
+        completed_at:
+          oneOf:
+            - type: "null"
+            - type: string
+              format: date-time
+        receipt_expires_at:
+          oneOf:
+            - type: "null"
+            - type: string
+              format: date-time
+        retry_at:
+          oneOf:
+            - type: "null"
+            - type: string
+              format: date-time
+        error_code:
+          oneOf:
+            - type: "null"
+            - type: string
+              enum: [storage_unavailable, unattributed_residue, metadata_unavailable]
+    VaultDeletionListResponse:
+      type: object
+      additionalProperties: false
+      required: [deletions]
+      properties:
+        deletions:
+          type: array
+          items:
+            $ref: "#/components/schemas/VaultDeletionStatus"
     VaultNameRequest:
       type: object
       required: [display_name]
@@ -1613,7 +1794,7 @@ components:
                 pattern: "^[0-9a-f]{40}$"
               status:
                 type: string
-                enum: [active, blocked_integrity]
+                enum: [active, blocked_integrity, deleting]
     ConnectionBootstrapManifest:
       type: object
       required: [api_version, connection_id, vault_id, vault_name, root_commit, target_main, changed_paths, explicit_directories]
@@ -1732,7 +1913,7 @@ components:
           pattern: "^[0-9a-f]{40}$"
         vault_status:
           type: string
-          enum: [active, blocked_integrity]
+          enum: [active, blocked_integrity, deleting]
         status:
           type: string
           enum: [paired, synced, ahead, review_needed, blocked_recovery, revoked]
@@ -2083,7 +2264,7 @@ components:
           $ref: "#/components/schemas/DisplayName"
         vault_status:
           type: string
-          enum: [active, blocked_integrity]
+          enum: [active, blocked_integrity, deleting]
         plugin:
           $ref: "#/components/schemas/PluginCompatibility"
     PluginCompatibility:
@@ -2284,6 +2465,109 @@ components:
         plan_sha256:
           type: string
           pattern: "^[0-9a-f]{64}$"
+    PushOutcome:
+      oneOf:
+        - $ref: "#/components/schemas/PushNoopResult"
+        - $ref: "#/components/schemas/PushMergedResult"
+        - $ref: "#/components/schemas/PushConflictedResult"
+    PushResult:
+      oneOf:
+        - $ref: "#/components/schemas/PushOutcome"
+        - $ref: "#/components/schemas/PushRejectedResult"
+    PushNoopResult:
+      type: object
+      additionalProperties: false
+      required: [status, device_ref, main, event_seq]
+      properties:
+        status:
+          const: noop
+        device_ref:
+          type: string
+          minLength: 1
+          maxLength: 512
+        main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        event_seq:
+          type: integer
+          minimum: 0
+        directory_ack:
+          $ref: "#/components/schemas/DirectoryProposalAcknowledgement"
+    PushMergedResult:
+      type: object
+      additionalProperties: false
+      required: [status, device_ref, main, merge_commit, event_seq]
+      properties:
+        status:
+          const: merged
+        device_ref:
+          type: string
+          minLength: 1
+          maxLength: 512
+        main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        merge_commit:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        event_seq:
+          type: integer
+          minimum: 0
+        directory_ack:
+          $ref: "#/components/schemas/DirectoryProposalAcknowledgement"
+    PushConflictedResult:
+      type: object
+      additionalProperties: false
+      required: [status, device_ref, main, conflict_id, event_seq]
+      properties:
+        status:
+          const: conflicted
+        device_ref:
+          type: string
+          minLength: 1
+          maxLength: 512
+        main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        conflict_id:
+          type: string
+          minLength: 1
+          maxLength: 256
+        event_seq:
+          type: integer
+          minimum: 0
+        directory_ack:
+          $ref: "#/components/schemas/DirectoryProposalAcknowledgement"
+    PushRejectedResult:
+      type: object
+      additionalProperties: false
+      required: [status, code, message]
+      properties:
+        status:
+          const: rejected
+        code:
+          type: string
+          minLength: 1
+          maxLength: 128
+        message:
+          type: string
+          minLength: 1
+          maxLength: 2048
+    DirectoryProposalAcknowledgement:
+      type: object
+      additionalProperties: false
+      required: [proposal_id, status, acknowledged_intents]
+      properties:
+        proposal_id:
+          type: string
+          pattern: "^dirprop_[0-9a-f]{64}$"
+        status:
+          type: string
+          enum: [accepted, conflicted, duplicate]
+        acknowledged_intents:
+          type: array
+          items:
+            $ref: "#/components/schemas/DirectoryIntentAcknowledgement"
     ChunkPushDescriptor:
       type: object
       required: [transfer_id, capability, status, target_commit, chunk_count, received_chunks, max_chunk_bytes, max_transfer_bytes, expires_at]
@@ -2321,7 +2605,7 @@ components:
           type: integer
           minimum: 0
         result:
-          type: object
+          $ref: "#/components/schemas/PushResult"
     ChunkPushReceipt:
       type: object
       required: [transfer_id, chunk_index, chunk_sha256, received_bytes, idempotent]

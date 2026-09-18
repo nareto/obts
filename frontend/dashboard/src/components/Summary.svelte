@@ -1,22 +1,17 @@
 <script lang="ts">
+  import Icon from './Icon.svelte';
+
   export let title: string;
   export let value: string;
   export let role: 'success' | 'info' | 'warning' | 'danger' | 'neutral';
   export let detail: string;
+  export let technical = false;
 
-  $: icon = roleIcon(role);
-
-  function roleIcon(value: typeof role) {
-    if (value === 'success') return '✓';
-    if (value === 'info') return 'i';
-    if (value === 'warning') return '!';
-    if (value === 'danger') return '×';
-    return '•';
-  }
+  $: icon = role === 'success' ? 'check' : role === 'danger' ? 'danger' : role === 'warning' ? 'warning' : role === 'info' ? 'info' : 'dot';
 </script>
 
 <section class="panel summary">
   <p>{title}</p>
-  <strong class={role}><i aria-hidden="true">{icon}</i>{value}</strong>
-  <code>{detail}</code>
+  <strong class={role}><Icon name={icon} size={17} />{value}</strong>
+  <span class="summary-detail" class:mono={technical} title={detail}>{detail}</span>
 </section>

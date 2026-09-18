@@ -1,12 +1,13 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { constants, copyFile, chmod, mkdir, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { constants, copyFile, chmod, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 
 import { assertSyncableTreePaths, PathPolicyViolation } from '../shared/pathPolicy.js';
 import type { ServerConfig } from './config.js';
+import { fsyncDurableDirectory, fsyncDurableTree, type DurableFilePersistence } from './durableFile.js';
 
 const ZERO_OID = '0000000000000000000000000000000000000000';
 
@@ -59,16 +60,38 @@ export class GitCommandError extends Error {
   }
 }
 
+export class GitDurabilityError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+  }
+}
+
 export class GitService {
-  constructor(private readonly config: ServerConfig) {}
+  private durabilityUncertain = false;
+
+  constructor(
+    private readonly config: ServerConfig,
+    private readonly persistence: Partial<DurableFilePersistence> = {}
+  ) {}
 
   repoPath(vaultId: string): string {
     return join(this.config.gitStoreDir, `${vaultId}.git`);
   }
 
+  isDurabilityUnavailable(): boolean {
+    return this.durabilityUncertain;
+  }
+
+  assertDurabilityAvailable(): void {
+    if (this.durabilityUncertain) {
+      throw new GitDurabilityError('Git repository durability could not be confirmed.');
+    }
+  }
+
   async checkReady(): Promise<{ ok: true; version: string } | { ok: false; error: string }> {
+    if (this.durabilityUncertain) return { ok: false, error: 'Git repository durability is uncertain' };
     try {
-      const { stdout } = await this.execRaw(['--version']);
+      const { stdout } = await this.execRaw(['--version'], undefined, undefined, {}, true);
       return { ok: true, version: asText(stdout).trim() };
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : 'git unavailable' };
@@ -76,6 +99,7 @@ export class GitService {
   }
 
   async checkIntegrity(vaultId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+    this.assertDurabilityAvailable();
     try {
       await this.exec(this.repoPath(vaultId), ['fsck', '--strict', '--no-dangling'], undefined, undefined, {
         maxBuffer: 16 * 1024 * 1024
@@ -87,17 +111,66 @@ export class GitService {
   }
 
   async listVaultRepositoryIds(): Promise<string[]> {
+    this.assertDurabilityAvailable();
     const entries = await readdir(this.config.gitStoreDir, { withFileTypes: true });
-    return entries
-      .filter((entry) => entry.isDirectory() && entry.name.endsWith('.git'))
-      .map((entry) => entry.name.slice(0, -'.git'.length))
-      .sort();
+    const repositories: string[] = [];
+    for (const entry of entries) {
+      if (!/^[A-Za-z0-9_]+\.git$/u.test(entry.name)) continue;
+      if (entry.isSymbolicLink() || !entry.isDirectory()) {
+        throw new GitCommandError('Server Git store contains a non-directory vault repository.', '');
+      }
+      const repository = join(this.config.gitStoreDir, entry.name);
+      if (!(await this.isBareRepositoryShape(repository))) {
+        throw new GitCommandError('Server Git store contains a malformed vault repository.', '');
+      }
+      repositories.push(entry.name.slice(0, -'.git'.length));
+    }
+    return repositories.sort();
+  }
+
+  async isBareRepositoryShape(repo: string): Promise<boolean> {
+    this.assertDurabilityAvailable();
+    return await this.isBareRepositoryShapeInRepo(repo, null);
+  }
+
+  async checkBareRepositoryIntegrity(repo: string): Promise<boolean> {
+    this.assertDurabilityAvailable();
+    if (!(await this.isBareRepositoryShape(repo))) return false;
+    try {
+      await this.exec(repo, ['fsck', '--strict', '--no-dangling'], undefined, undefined, {
+        maxBuffer: 16 * 1024 * 1024
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async checkTransferRepositoryIntegrity(repo: string, vaultId: string): Promise<boolean> {
+    this.assertDurabilityAvailable();
+    const alternateObjectStore = join(this.repoPath(vaultId), 'objects');
+    if (!(await this.isBareRepositoryShapeInRepo(repo, alternateObjectStore))) return false;
+    try {
+      await this.execRaw(['--git-dir', repo, 'fsck', '--strict', '--no-dangling'], undefined, undefined, {
+        maxBuffer: 16 * 1024 * 1024
+      });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async checkRepositoryPermissions(vaultId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+    this.assertDurabilityAvailable();
     try {
-      const repository = await stat(this.repoPath(vaultId));
-      if (!repository.isDirectory() || (repository.mode & 0o700) !== 0o700) {
+      const repository = await lstat(this.repoPath(vaultId));
+      if (repository.isSymbolicLink() || !repository.isDirectory()) {
+        return { ok: false, error: 'server Git repository is missing or inaccessible' };
+      }
+      if (!(await this.isBareRepositoryShape(this.repoPath(vaultId)))) {
+        return { ok: false, error: 'server Git repository is malformed' };
+      }
+      if ((repository.mode & 0o700) !== 0o700) {
         return { ok: false, error: 'server Git repository permissions are not owner-readable, writable, and searchable' };
       }
       if ((repository.mode & 0o077) !== 0) {
@@ -110,8 +183,15 @@ export class GitService {
   }
 
   async initializeVault(vaultId: string): Promise<string> {
+    this.assertDurabilityAvailable();
     const repo = this.repoPath(vaultId);
     await mkdir(this.config.gitStoreDir, { recursive: true, mode: 0o700 });
+    try {
+      await lstat(repo);
+      throw new GitCommandError('Git repository path already exists.', '');
+    } catch (error) {
+      if (!isMissing(error)) throw error;
+    }
     await this.execRaw(['init', '--bare', repo]);
     await chmod(repo, 0o700);
     await this.exec(repo, ['config', 'core.logAllRefUpdates', 'true']);
@@ -126,6 +206,7 @@ export class GitService {
     ).stdout;
     const root = asText(rootOutput).trim();
     await this.updateRef(vaultId, 'refs/heads/main', root, null);
+    await this.fsyncDirectory(this.config.gitStoreDir);
     return root;
   }
 
@@ -147,7 +228,8 @@ export class GitService {
     try {
       const { stdout } = await this.exec(repo, ['rev-parse', '--verify', `${ref}^{commit}`]);
       return asText(stdout).trim();
-    } catch {
+    } catch (error) {
+      if (error instanceof GitDurabilityError) throw error;
       return null;
     }
   }
@@ -156,6 +238,7 @@ export class GitService {
     const repo = this.repoPath(vaultId);
     const oldValue = expected ?? ZERO_OID;
     await this.exec(repo, ['update-ref', ref, target, oldValue]);
+    await this.fsyncTree(repo);
   }
 
   async ensureRef(vaultId: string, ref: string, target: string): Promise<void> {
@@ -173,11 +256,14 @@ export class GitService {
     return await this.commitExistsInRepo(this.repoPath(vaultId), commit);
   }
 
-  private async commitExistsInRepo(repo: string, commit: string): Promise<boolean> {
+  private async commitExistsInRepo(repo: string, commit: string, alternateObjectStore?: string): Promise<boolean> {
     try {
-      await this.exec(repo, ['cat-file', '-e', `${commit}^{commit}`]);
+      await this.exec(repo, ['cat-file', '-e', `${commit}^{commit}`], undefined, undefined, {
+        allowedAlternateObjectStore: alternateObjectStore
+      });
       return true;
-    } catch {
+    } catch (error) {
+      if (error instanceof GitDurabilityError) throw error;
       return false;
     }
   }
@@ -186,11 +272,14 @@ export class GitService {
     return await this.isAncestorInRepo(this.repoPath(vaultId), ancestor, descendant);
   }
 
-  private async isAncestorInRepo(repo: string, ancestor: string, descendant: string): Promise<boolean> {
+  private async isAncestorInRepo(repo: string, ancestor: string, descendant: string, alternateObjectStore?: string): Promise<boolean> {
     try {
-      await this.exec(repo, ['merge-base', '--is-ancestor', ancestor, descendant]);
+      await this.exec(repo, ['merge-base', '--is-ancestor', ancestor, descendant], undefined, undefined, {
+        allowedAlternateObjectStore: alternateObjectStore
+      });
       return true;
-    } catch {
+    } catch (error) {
+      if (error instanceof GitDurabilityError) throw error;
       return false;
     }
   }
@@ -200,17 +289,22 @@ export class GitService {
     try {
       const { stdout } = await this.exec(repo, ['merge-base', left, right]);
       return asText(stdout).trim();
-    } catch {
+    } catch (error) {
+      if (error instanceof GitDurabilityError) throw error;
       return null;
     }
   }
 
   async importPack(vaultId: string, packfile: Buffer): Promise<void> {
+    this.assertDurabilityAvailable();
     const repo = this.repoPath(vaultId);
     await this.exec(repo, ['unpack-objects', '-q'], packfile);
+    await this.fsyncTree(repo);
   }
 
   async initializeTransferRepo(vaultId: string, repo: string): Promise<void> {
+    this.assertDurabilityAvailable();
+    await this.assertSafeRepositoryPath(this.repoPath(vaultId));
     await mkdir(dirname(repo), { recursive: true, mode: 0o700 });
     try {
       await stat(repo);
@@ -219,34 +313,48 @@ export class GitService {
     }
     await mkdir(join(repo, 'objects', 'info'), { recursive: true, mode: 0o700 });
     await writeFile(join(repo, 'objects', 'info', 'alternates'), `${join(this.repoPath(vaultId), 'objects')}\n`, { mode: 0o600 });
+    if (!(await this.isBareRepositoryShapeInRepo(repo, join(this.repoPath(vaultId), 'objects')))) {
+      throw new GitCommandError('Transfer repository is not a safe bare repository.', '');
+    }
+    await this.fsyncTree(repo);
+    await this.fsyncDirectory(dirname(repo));
   }
 
-  async importPackIntoRepo(repo: string, packfile: Buffer): Promise<void> {
+  async importPackIntoRepo(repo: string, packfile: Buffer, alternateObjectStore?: string): Promise<void> {
+    this.assertDurabilityAvailable();
     const packDir = join(repo, 'objects', 'pack');
     await mkdir(packDir, { recursive: true, mode: 0o700 });
     const before = new Set(await readdir(packDir));
     try {
-      await this.exec(repo, ['index-pack', '--stdin', '--fix-thin'], packfile);
+      await this.exec(repo, ['index-pack', '--stdin', '--fix-thin'], packfile, undefined, {
+        allowedAlternateObjectStore: alternateObjectStore
+      });
     } catch (error) {
       for (const entry of await readdir(packDir)) {
         if (!before.has(entry)) await rm(join(packDir, entry), { force: true });
       }
+      await this.fsyncTree(repo);
       throw error;
     }
+    await this.fsyncTree(repo);
   }
 
-  readerForRepo(repo: string): GitObjectReader {
+  readerForRepo(repo: string, alternateObjectStore?: string): GitObjectReader {
+    this.assertDurabilityAvailable();
     return {
-      commitExists: async (_vaultId, commit) => await this.commitExistsInRepo(repo, commit),
+      commitExists: async (_vaultId, commit) => await this.commitExistsInRepo(repo, commit, alternateObjectStore),
       validateTreePathPolicy: async (_vaultId, commit, maxBlobBytes) =>
-        await this.validateTreePathPolicyInRepo(repo, commit, maxBlobBytes),
-      isAncestor: async (_vaultId, ancestor, descendant) => await this.isAncestorInRepo(repo, ancestor, descendant),
-      changedPaths: async (_vaultId, base, commit) => await this.changedPathsInRepo(repo, base, commit),
-      listTreePaths: async (_vaultId, commit) => await this.listTreePathsInRepo(repo, commit)
+        await this.validateTreePathPolicyInRepo(repo, commit, maxBlobBytes, alternateObjectStore),
+      isAncestor: async (_vaultId, ancestor, descendant) => await this.isAncestorInRepo(repo, ancestor, descendant, alternateObjectStore),
+      changedPaths: async (_vaultId, base, commit) => await this.changedPathsInRepo(repo, base, commit, alternateObjectStore),
+      listTreePaths: async (_vaultId, commit) => await this.listTreePathsInRepo(repo, commit, alternateObjectStore)
     };
   }
 
   async promoteTransferObjects(vaultId: string, transferRepo: string): Promise<void> {
+    this.assertDurabilityAvailable();
+    await this.assertSafeRepositoryPath(this.repoPath(vaultId));
+    await this.fsyncTree(transferRepo);
     const sourceObjects = join(transferRepo, 'objects');
     const targetObjects = join(this.repoPath(vaultId), 'objects');
     const sourcePacks = join(sourceObjects, 'pack');
@@ -290,6 +398,7 @@ export class GitService {
         }
       }
     }
+    await this.fsyncTree(this.repoPath(vaultId));
   }
 
   async reachableObjectSizes(vaultId: string, target: string, have: string | null): Promise<Array<{ oid: string; size: number }>> {
@@ -323,25 +432,31 @@ export class GitService {
     packfile: Buffer,
     fn: (reader: GitObjectReader) => Promise<T>
   ): Promise<T> {
+    this.assertDurabilityAvailable();
     const durableRepo = this.repoPath(vaultId);
+    await this.assertSafeRepositoryPath(durableRepo);
     const quarantineRoot = join(this.config.tempDir, `quarantine-${vaultId}-${randomBytes(8).toString('hex')}`);
     const quarantineRepo = join(quarantineRoot, 'repo.git');
     await mkdir(quarantineRoot, { recursive: true, mode: 0o700 });
+    await writeFile(join(quarantineRoot, '.obts-owner.json'), `${JSON.stringify({ vault_id: vaultId })}\n`, { mode: 0o600 });
     try {
       await this.execRaw(['init', '--bare', quarantineRepo]);
       await mkdir(join(quarantineRepo, 'objects', 'info'), { recursive: true, mode: 0o700 });
       await writeFile(join(quarantineRepo, 'objects', 'info', 'alternates'), `${join(durableRepo, 'objects')}\n`, {
         mode: 0o600
       });
-      await this.exec(quarantineRepo, ['unpack-objects', '-q'], packfile);
+      await this.exec(quarantineRepo, ['unpack-objects', '-q'], packfile, undefined, {
+        allowedAlternateObjectStore: join(durableRepo, 'objects')
+      });
+      await this.fsyncTree(quarantineRepo);
       return await fn({
-        commitExists: async (_vaultId, commit) => await this.commitExistsInRepo(quarantineRepo, commit),
+        commitExists: async (_vaultId, commit) => await this.commitExistsInRepo(quarantineRepo, commit, join(durableRepo, 'objects')),
         validateTreePathPolicy: async (_vaultId, commit, maxBlobBytes) =>
-          await this.validateTreePathPolicyInRepo(quarantineRepo, commit, maxBlobBytes),
+          await this.validateTreePathPolicyInRepo(quarantineRepo, commit, maxBlobBytes, join(durableRepo, 'objects')),
         isAncestor: async (_vaultId, ancestor, descendant) =>
-          await this.isAncestorInRepo(quarantineRepo, ancestor, descendant),
-        changedPaths: async (_vaultId, base, commit) => await this.changedPathsInRepo(quarantineRepo, base, commit),
-        listTreePaths: async (_vaultId, commit) => await this.listTreePathsInRepo(quarantineRepo, commit)
+          await this.isAncestorInRepo(quarantineRepo, ancestor, descendant, join(durableRepo, 'objects')),
+        changedPaths: async (_vaultId, base, commit) => await this.changedPathsInRepo(quarantineRepo, base, commit, join(durableRepo, 'objects')),
+        listTreePaths: async (_vaultId, commit) => await this.listTreePathsInRepo(quarantineRepo, commit, join(durableRepo, 'objects'))
       });
     } finally {
       await rm(quarantineRoot, { recursive: true, force: true });
@@ -362,17 +477,18 @@ export class GitService {
     return await this.listTreePathsInRepo(this.repoPath(vaultId), commit);
   }
 
-  private async listTreePathsInRepo(repo: string, commit: string): Promise<string[]> {
-    return (await this.listTreeEntriesInRepo(repo, commit)).map((entry) => entry.path);
+  private async listTreePathsInRepo(repo: string, commit: string, alternateObjectStore?: string): Promise<string[]> {
+    return (await this.listTreeEntriesInRepo(repo, commit, alternateObjectStore)).map((entry) => entry.path);
   }
 
   async listTreeEntries(vaultId: string, commit: string): Promise<GitTreeEntry[]> {
     return await this.listTreeEntriesInRepo(this.repoPath(vaultId), commit);
   }
 
-  private async listTreeEntriesInRepo(repo: string, commit: string): Promise<GitTreeEntry[]> {
+  private async listTreeEntriesInRepo(repo: string, commit: string, alternateObjectStore?: string): Promise<GitTreeEntry[]> {
     const { stdout } = await this.exec(repo, ['ls-tree', '-r', '-l', '-z', commit], undefined, undefined, {
-      encoding: 'buffer'
+      encoding: 'buffer',
+      allowedAlternateObjectStore: alternateObjectStore
     });
     const data = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
     return splitNul(data)
@@ -399,9 +515,10 @@ export class GitService {
   private async validateTreePathPolicyInRepo(
     repo: string,
     commit: string,
-    maxBlobBytes = Number.POSITIVE_INFINITY
+    maxBlobBytes = Number.POSITIVE_INFINITY,
+    alternateObjectStore?: string
   ): Promise<void> {
-    const entries = await this.listTreeEntriesInRepo(repo, commit);
+    const entries = await this.listTreeEntriesInRepo(repo, commit, alternateObjectStore);
     assertSyncableTreePaths(entries.map((entry) => entry.path));
     for (const entry of entries) {
       if (entry.type !== 'blob' || entry.mode === '120000' || entry.mode === '160000') {
@@ -425,9 +542,10 @@ export class GitService {
     return await this.changedPathsInRepo(this.repoPath(vaultId), base, commit);
   }
 
-  private async changedPathsInRepo(repo: string, base: string, commit: string): Promise<GitDiffEntry[]> {
+  private async changedPathsInRepo(repo: string, base: string, commit: string, alternateObjectStore?: string): Promise<GitDiffEntry[]> {
     const { stdout } = await this.exec(repo, ['diff', '--name-status', '-M', '-z', base, commit], undefined, undefined, {
-      encoding: 'buffer'
+      encoding: 'buffer',
+      allowedAlternateObjectStore: alternateObjectStore
     });
     const parts = splitNul(Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout)).filter((entry) => entry.length > 0);
     const entries: GitDiffEntry[] = [];
@@ -508,6 +626,7 @@ export class GitService {
     const workTree = join(tempRoot, 'worktree');
     const indexFile = join(tempRoot, 'index');
     await mkdir(workTree, { recursive: true, mode: 0o700 });
+    await writeFile(join(tempRoot, '.obts-owner.json'), `${JSON.stringify({ vault_id: vaultId })}\n`, { mode: 0o600 });
 
     try {
       const env = { ...process.env, GIT_INDEX_FILE: indexFile };
@@ -564,7 +683,8 @@ export class GitService {
         deviceCommit
       ]);
       tree = asText(stdout).trim();
-    } catch {
+    } catch (error) {
+      if (error instanceof GitDurabilityError) throw error;
       return await this.trySemanticOverlayMergeTree(vaultId, base, currentMain, deviceCommit, deviceChanges, mergedTextPaths);
     }
 
@@ -586,7 +706,8 @@ export class GitService {
         tree = await this.createTreeWithFileContents(vaultId, tree, validation.contentOverrides);
         await this.validateTreePathPolicy(vaultId, tree);
       }
-    } catch {
+    } catch (error) {
+      if (error instanceof GitDurabilityError) throw error;
       return await this.trySemanticOverlayMergeTree(vaultId, base, currentMain, deviceCommit, deviceChanges, mergedTextPaths);
     }
 
@@ -610,8 +731,11 @@ export class GitService {
     deviceCommit: string
   ): Promise<string> {
     const repo = this.repoPath(vaultId);
-    const indexFile = join(this.config.tempDir, `merge-index-${randomBytes(12).toString('hex')}`);
+    const tempRoot = join(this.config.tempDir, `merge-${vaultId}-${randomBytes(8).toString('hex')}`);
+    const indexFile = join(tempRoot, 'index');
     const env = { GIT_INDEX_FILE: indexFile };
+    await mkdir(tempRoot, { recursive: true, mode: 0o700 });
+    await writeFile(join(tempRoot, '.obts-owner.json'), `${JSON.stringify({ vault_id: vaultId })}\n`, { mode: 0o600 });
     try {
       await this.exec(repo, ['read-tree', currentMain], undefined, env);
       const { stdout } = await this.exec(
@@ -645,10 +769,7 @@ export class GitService {
       await this.validateTreePathPolicy(vaultId, tree);
       return tree;
     } finally {
-      await Promise.all([
-        rm(indexFile, { force: true }),
-        rm(`${indexFile}.lock`, { force: true })
-      ]);
+      await rm(tempRoot, { recursive: true, force: true });
     }
   }
 
@@ -766,7 +887,8 @@ export class GitService {
   async readBlobAtPathIfPresent(vaultId: string, commit: string, path: string): Promise<Buffer | null> {
     try {
       return await this.readBlobAtPath(vaultId, commit, path);
-    } catch {
+    } catch (error) {
+      if (error instanceof GitDurabilityError) throw error;
       return null;
     }
   }
@@ -782,7 +904,8 @@ export class GitService {
         maxBuffer: 16 * 1024 * 1024
       });
       return asText(stdout);
-    } catch {
+    } catch (error) {
+      if (error instanceof GitDurabilityError) throw error;
       return '';
     }
   }
@@ -875,11 +998,13 @@ export class GitService {
   }
 
   async runMaintenance(vaultId: string): Promise<string> {
+    this.assertDurabilityAvailable();
     const repo = this.repoPath(vaultId);
     await this.exec(repo, ['fsck', '--strict', '--no-dangling'], undefined, undefined, { maxBuffer: 16 * 1024 * 1024 });
     await this.exec(repo, ['repack', '-A', '-d'], undefined, undefined, { maxBuffer: 16 * 1024 * 1024 });
     await this.exec(repo, ['prune', '--expire=now'], undefined, undefined, { maxBuffer: 16 * 1024 * 1024 });
     await this.exec(repo, ['fsck', '--strict', '--no-dangling'], undefined, undefined, { maxBuffer: 16 * 1024 * 1024 });
+    await this.fsyncTree(repo);
     return 'Git integrity verification, repack, and unreachable-object pruning completed.';
   }
 
@@ -909,6 +1034,7 @@ export class GitService {
     const workTree = join(tempRoot, 'worktree');
     const indexFile = join(tempRoot, 'index');
     await mkdir(workTree, { recursive: true, mode: 0o700 });
+    await writeFile(join(tempRoot, '.obts-owner.json'), `${JSON.stringify({ vault_id: vaultId })}\n`, { mode: 0o600 });
 
     try {
       const env = { ...process.env, GIT_INDEX_FILE: indexFile };
@@ -929,22 +1055,112 @@ export class GitService {
     }
   }
 
+  private async fsyncTree(path: string): Promise<void> {
+    try {
+      await fsyncDurableTree(path, this.persistence);
+    } catch (error) {
+      this.durabilityUncertain = true;
+      throw new GitDurabilityError('Git repository durability could not be confirmed.', { cause: error });
+    }
+  }
+
+  private async fsyncDirectory(path: string): Promise<void> {
+    try {
+      await fsyncDurableDirectory(path, this.persistence);
+    } catch (error) {
+      this.durabilityUncertain = true;
+      throw new GitDurabilityError('Git repository parent durability could not be confirmed.', { cause: error });
+    }
+  }
+
   async exec(
     repo: string,
     args: string[],
     input?: Buffer,
     extraEnv?: NodeJS.ProcessEnv,
-    options: { encoding?: BufferEncoding | 'buffer'; maxBuffer?: number } = {}
+    options: { encoding?: BufferEncoding | 'buffer'; maxBuffer?: number; allowedAlternateObjectStore?: string | undefined } = {}
   ): Promise<{ stdout: string | Buffer; stderr: string | Buffer }> {
-    return this.execRaw(['--git-dir', repo, ...args], input, extraEnv, options);
+    this.assertDurabilityAvailable();
+    const { allowedAlternateObjectStore, encoding, maxBuffer } = options;
+    await this.assertSafeRepositoryPath(repo, allowedAlternateObjectStore);
+    return this.execRaw(
+      ['--git-dir', repo, ...args],
+      input,
+      extraEnv,
+      {
+        ...(encoding === undefined ? {} : { encoding }),
+        ...(maxBuffer === undefined ? {} : { maxBuffer })
+      }
+    );
+  }
+
+  private async assertSafeRepositoryPath(repo: string, alternateObjectStore?: string): Promise<void> {
+    this.assertDurabilityAvailable();
+    const info = await lstat(repo);
+    if (info.isSymbolicLink() || !info.isDirectory() || !(await this.isBareRepositoryShapeInRepo(repo, alternateObjectStore ?? null))) {
+      throw new GitCommandError('Git repository is not a safe bare repository.', '');
+    }
+  }
+
+  private async isBareRepositoryShapeInRepo(repo: string, alternateObjectStore: string | null): Promise<boolean> {
+    try {
+      if (await this.containsSymbolicLink(repo)) return false;
+      const required = [
+        { name: 'HEAD', directory: false },
+        { name: 'config', directory: false },
+        { name: 'objects', directory: true },
+        { name: 'refs', directory: true }
+      ];
+      for (const entry of required) {
+        const info = await lstat(join(repo, entry.name));
+        if (info.isSymbolicLink() || info.isDirectory() !== entry.directory || (!entry.directory && !info.isFile())) return false;
+      }
+      return await this.hasSafeAlternates(repo, alternateObjectStore);
+    } catch {
+      return false;
+    }
+  }
+
+  private async hasSafeAlternates(repo: string, alternateObjectStore: string | null): Promise<boolean> {
+    const alternatesPath = join(repo, 'objects', 'info', 'alternates');
+    let info;
+    try {
+      info = await lstat(alternatesPath);
+    } catch (error) {
+      return isMissing(error);
+    }
+    if (info.isSymbolicLink() || !info.isFile()) return false;
+    const content = await readFile(alternatesPath);
+    if (content.byteLength > 64 * 1024) return false;
+    const expectedPath = resolve(alternateObjectStore ?? join(repo, 'objects'));
+    const expectedRealPath = await realpath(expectedPath);
+    for (const line of content.toString('utf8').split(/\r?\n/u)) {
+      const alternate = line.trim();
+      if (alternate.length === 0 || alternate.includes('\u0000')) continue;
+      if (await realpath(resolve(dirname(alternatesPath), alternate)) !== expectedRealPath) return false;
+    }
+    return true;
+  }
+
+  private async containsSymbolicLink(path: string): Promise<boolean> {
+    const info = await lstat(path);
+    if (info.isSymbolicLink()) return true;
+    if (!info.isDirectory()) return false;
+    for (const entry of await readdir(path, { withFileTypes: true })) {
+      if (entry.isSymbolicLink()) return true;
+      if (entry.isDirectory() && await this.containsSymbolicLink(join(path, entry.name))) return true;
+    }
+    return false;
   }
 
   private async execRaw(
     args: string[],
     input?: Buffer,
     extraEnv?: NodeJS.ProcessEnv,
-    options: { encoding?: BufferEncoding | 'buffer'; maxBuffer?: number } = {}
+    options: { encoding?: BufferEncoding | 'buffer'; maxBuffer?: number } = {},
+    allowWhenDurabilityUncertain = false
   ): Promise<{ stdout: string | Buffer; stderr: string | Buffer }> {
+    if (!allowWhenDurabilityUncertain) this.assertDurabilityAvailable();
     const maxBuffer = options.maxBuffer ?? 64 * 1024 * 1024;
     return await new Promise((resolve, reject) => {
       const child = spawn(this.config.gitBinary, args, {
@@ -1047,7 +1263,8 @@ export class GitService {
   private async readTextAtPathIfPresent(vaultId: string, treeish: string, path: string): Promise<string | null> {
     try {
       return (await this.readBlobAtPath(vaultId, treeish, path)).toString('utf8');
-    } catch {
+    } catch (error) {
+      if (error instanceof GitDurabilityError) throw error;
       return null;
     }
   }
@@ -1092,7 +1309,8 @@ export class GitService {
           overlapping_path_count: overlappingPaths.length
         }
       };
-    } catch {
+    } catch (error) {
+      if (error instanceof GitDurabilityError) throw error;
       return null;
     }
   }
@@ -1108,6 +1326,10 @@ function splitNul(data: Buffer): string[] {
 
 function asText(value: string | Buffer): string {
   return Buffer.isBuffer(value) ? value.toString('utf8') : value;
+}
+
+function isMissing(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT';
 }
 
 function parseHistoryOutput(output: string, path: string | null): GitHistoryCommit[] {

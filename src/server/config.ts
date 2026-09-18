@@ -1,5 +1,7 @@
-import { mkdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { lstat, mkdir } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+
+import { assertNoSymlinkComponents } from './deletionRoot.js';
 
 export type ServerConfig = {
   dataDir: string;
@@ -70,8 +72,49 @@ export function createServerConfig(overrides: Partial<ServerConfig> & { dataDir:
 }
 
 export async function ensureServerDirectories(config: ServerConfig): Promise<void> {
-  await mkdir(config.dataDir, { recursive: true, mode: 0o700 });
-  await mkdir(config.gitStoreDir, { recursive: true, mode: 0o700 });
-  await mkdir(config.tempDir, { recursive: true, mode: 0o700 });
-  await mkdir(config.transferDir, { recursive: true, mode: 0o700 });
+  const metadataFile = join(config.dataDir, 'metadata', 'phase1.json');
+  await assertNoSymlinkComponents(resolve(config.dataDir));
+  const established = await isEstablishedMetadata(metadataFile);
+  for (const path of [config.dataDir, config.gitStoreDir, config.tempDir]) {
+    await ensureDirectory(path);
+  }
+  await assertNoSymlinkComponents(resolve(config.transferDir));
+  let transferInfo;
+  try {
+    transferInfo = await lstat(config.transferDir);
+  } catch (error) {
+    if (!isMissing(error) || !established) {
+      if (isMissing(error)) await ensureDirectory(config.transferDir);
+      else throw error;
+    }
+    return;
+  }
+  if (transferInfo.isSymbolicLink() || !transferInfo.isDirectory()) {
+    throw new Error('Configured server directory must be a real directory.');
+  }
+  await assertNoSymlinkComponents(resolve(config.transferDir));
+}
+
+async function ensureDirectory(path: string): Promise<void> {
+  await assertNoSymlinkComponents(resolve(path));
+  await mkdir(path, { recursive: true, mode: 0o700 });
+  const info = await lstat(path);
+  if (!info.isDirectory() || info.isSymbolicLink()) {
+    throw new Error('Configured server directory must be a real directory.');
+  }
+  await assertNoSymlinkComponents(resolve(path));
+}
+
+async function isEstablishedMetadata(path: string): Promise<boolean> {
+  try {
+    const info = await lstat(path);
+    return info.isFile() && !info.isSymbolicLink();
+  } catch (error) {
+    if (isMissing(error)) return false;
+    throw error;
+  }
+}
+
+function isMissing(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT';
 }

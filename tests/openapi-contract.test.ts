@@ -29,6 +29,8 @@ describe('OpenAPI Phase 3 contract', () => {
       '/admin/users/{user_id}/revoke-admin',
       '/admin/users/{user_id}/password-reset-tokens',
       '/vaults',
+      '/vault-deletions',
+      '/vault-deletions/{vault_id}',
       '/vaults/{vault_id}',
       '/vaults/{vault_id}/main',
       '/vaults/{vault_id}/dashboard',
@@ -76,7 +78,11 @@ describe('OpenAPI Phase 3 contract', () => {
     }
     expect(document.paths['/connections']?.post?.security).toEqual([]);
     expect(document.paths['/connections/{connection_id}']?.get?.security).toEqual([{ connectionBearer: [] }]);
+    expect(document.paths['/connections/{connection_id}']?.get?.responses).toHaveProperty('409');
+    expect(document.paths['/connections/{connection_id}/review']?.get?.responses).toHaveProperty('409');
     expect(document.paths['/connections/{connection_id}/bootstrap']?.post?.responses).toHaveProperty('409');
+    expect(document.paths['/connections/{connection_id}/bootstrap-chunk']?.post?.responses).toHaveProperty('409');
+    expect(document.paths['/connections/{connection_id}/diagnostic-events']?.post?.responses).toHaveProperty('409');
     expect(document.paths['/connections/{connection_id}/complete']?.post?.responses).toHaveProperty('409');
     expect(document.components.securitySchemes).toHaveProperty('connectionBearer');
     expect(document.components.schemas).toHaveProperty('ConnectionStatusResponse');
@@ -85,6 +91,53 @@ describe('OpenAPI Phase 3 contract', () => {
     expect(document.components.schemas).toHaveProperty('DeviceNameRequest');
     expect(document.components.schemas).toHaveProperty('DeviceNameResponse');
     expect(document.paths['/vaults/{vault_id}']?.patch).toBeDefined();
+    expect(document.paths['/vaults/{vault_id}']?.delete).toBeDefined();
+    expect(document.paths['/vaults/{vault_id}']?.delete?.responses).toHaveProperty('202');
+    expect(document.paths['/vault-deletions']?.get).toBeDefined();
+    expect(document.paths['/vault-deletions']?.get?.responses).toHaveProperty('503');
+    expect(document.paths['/vault-deletions/{vault_id}']?.get).toBeDefined();
+    expect(document.paths['/vault-deletions/{vault_id}']?.get?.responses).toHaveProperty('401');
+    expect(document.paths['/vault-deletions/{vault_id}']?.get?.responses).toHaveProperty('503');
+    expect(document.paths['/vaults/{vault_id}']?.delete?.responses).toHaveProperty('401');
+    expect(document.components.schemas).toHaveProperty('VaultDeletionStatus');
+    expect(document.components.schemas).toHaveProperty('VaultDeletionListResponse');
+    expect(document.components.schemas).toHaveProperty('VaultDeletionRequest');
+
+    const legacyPush = document.paths['/vaults/{vault_id}/sync/push']?.post;
+    const pull = document.paths['/vaults/{vault_id}/sync/pull']?.post;
+    const pullChunk = document.paths['/vaults/{vault_id}/sync/pull-chunk']?.post;
+    expect(legacyPush?.responses).toMatchObject({ '503': { $ref: '#/components/responses/TransferUnavailable' } });
+    expect(pull?.responses).toMatchObject({ '503': { $ref: '#/components/responses/TransferUnavailable' } });
+    expect(pullChunk?.responses).toMatchObject({ '503': { $ref: '#/components/responses/TransferUnavailable' } });
+    expect(document.components).toHaveProperty('responses.TransferUnavailable');
+    expect(contract).toContain('code `transfer_unavailable`');
+    const transferCreate = document.paths['/vaults/{vault_id}/sync/push-transfers']?.post;
+    const transferGet = document.paths['/vaults/{vault_id}/sync/push-transfers/{transfer_id}']?.get;
+    const transferDelete = document.paths['/vaults/{vault_id}/sync/push-transfers/{transfer_id}']?.delete;
+    const transferChunk = document.paths['/vaults/{vault_id}/sync/push-transfers/{transfer_id}/chunks/{chunk_index}']?.put;
+    const transferFinalize = document.paths['/vaults/{vault_id}/sync/push-transfers/{transfer_id}/finalize']?.post;
+    expect(Object.keys(transferCreate?.responses ?? {}).sort()).toEqual(['200', '201', '400', '404', '409', '413', '429', '503']);
+    expect(Object.keys(transferGet?.responses ?? {}).sort()).toEqual(['200', '404', '409', '410', '503']);
+    expect(Object.keys(transferChunk?.responses ?? {}).sort()).toEqual(['200', '400', '404', '409', '410', '413', '422', '503', '507']);
+    expect(Object.keys(transferFinalize?.responses ?? {}).sort()).toEqual(['200', '202', '400', '404', '409', '503']);
+    expect(Object.keys(transferDelete?.responses ?? {}).sort()).toEqual(['204', '404', '409', '410', '503']);
+    const finalize200 = transferFinalize?.responses?.['200'] as { content?: { 'application/json'?: { schema?: unknown } } };
+    expect(finalize200.content?.['application/json']?.schema).toMatchObject({
+      oneOf: [
+        { $ref: '#/components/schemas/PushOutcome' },
+        { $ref: '#/components/schemas/ChunkPushDescriptor' }
+      ]
+    });
+    expect(document.components.schemas).toEqual(expect.objectContaining({
+      PushOutcome: expect.anything(),
+      PushResult: expect.anything(),
+      PushMergedResult: expect.anything(),
+      PushConflictedResult: expect.anything(),
+      DirectoryProposalAcknowledgement: expect.anything()
+    }));
+    expect(document.components.schemas.ChunkPushDescriptor).toMatchObject({
+      properties: { result: { $ref: '#/components/schemas/PushResult' } }
+    });
     expect(document.paths['/vaults/{vault_id}/devices/{device_id}']?.patch).toBeDefined();
     expect(document.paths['/device/self']?.patch?.security).toEqual([{ deviceBearer: [] }]);
     expect(document.components.schemas).toHaveProperty('ConnectionReviewResponse');

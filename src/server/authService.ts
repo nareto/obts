@@ -116,13 +116,13 @@ export class AuthService {
     password: string;
     sourceIp?: string;
   }): Promise<{ user: UserRow; csrfToken: string; sessionId: string; recentAuthExpiresAt: string }> {
-    return await this.store.mutate(async (db) => {
-      const sourceIp = input.sourceIp ?? 'unknown';
+    const sourceIp = input.sourceIp ?? 'unknown';
+    const result = await this.store.mutate(async (db) => {
       enforceLoginBackoff(db, input.username, sourceIp);
       const user = db.users.find((candidate) => candidate.username === input.username);
       if (!user || user.disabled || !(await verifyPassword(input.password, user.password_hash))) {
         recordFailedLogin(db, input.username, sourceIp, user?.user_id ?? null);
-        throw new AuthError(401, 'invalid_credentials', 'Invalid username or password.');
+        return { kind: 'invalid_credentials' as const };
       }
       const timestamp = nowIso();
       user.last_login_at = timestamp;
@@ -140,12 +140,19 @@ export class AuthService {
         created_at: timestamp
       });
       return {
-        user,
-        csrfToken: session.csrf_token,
-        sessionId: session.session_id,
-        recentAuthExpiresAt: new Date(Date.parse(session.recent_auth_at) + RECENT_AUTH_MS).toISOString()
+        kind: 'authenticated' as const,
+        value: {
+          user,
+          csrfToken: session.csrf_token,
+          sessionId: session.session_id,
+          recentAuthExpiresAt: new Date(Date.parse(session.recent_auth_at) + RECENT_AUTH_MS).toISOString()
+        }
       };
     });
+    if (result.kind === 'invalid_credentials') {
+      throw new AuthError(401, 'invalid_credentials', 'Invalid username or password.');
+    }
+    return result.value;
   }
 
   async reauthenticateSession(input: {
@@ -587,6 +594,7 @@ export class AuthService {
         !user ||
         user.disabled ||
         !vault ||
+        vault.status === 'deleting' ||
         (expectedVaultId !== null && vault.vault_id !== expectedVaultId) ||
         vault.owner_user_id !== user.user_id ||
         !device ||
@@ -614,6 +622,9 @@ export function ownedVaultOrThrow(db: MetadataDb, userId: string, vaultId: strin
   const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId && candidate.owner_user_id === userId);
   if (!vault) {
     throw new AuthError(404, 'not_found', 'Resource not found.');
+  }
+  if (vault.status === 'deleting') {
+    throw new AuthError(409, 'vault_deleting', 'Vault deletion is in progress.');
   }
   return vault;
 }

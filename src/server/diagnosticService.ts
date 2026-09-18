@@ -78,6 +78,18 @@ export class DiagnosticService {
     this.enforceBurstLimits(sourceIp);
     return await this.store.mutate((db) => {
       const now = Date.now();
+      const vault = db.vaults.find((candidate) => candidate.vault_id === auth.vault.vault_id);
+      const device = db.devices.find((candidate) => candidate.device_id === auth.device.device_id);
+      const token = db.tokens.find((candidate) => candidate.token_id === auth.token.token_id);
+      const user = db.users.find((candidate) => candidate.user_id === auth.user.user_id);
+      if (!vault || !device || !user || !token || vault.owner_user_id !== auth.user.user_id || device.vault_id !== vault.vault_id ||
+        device.user_id !== auth.user.user_id || device.status === 'revoked' || device.revoked_at !== null || token.revoked_at !== null ||
+        token.vault_id !== vault.vault_id || token.device_id !== device.device_id) {
+        throw new AuthError(404, 'not_found', 'Resource not found.');
+      }
+      if (vault.status === 'deleting') {
+        throw new AuthError(409, 'vault_deleting', 'Vault deletion is in progress.');
+      }
       pruneRows(db, now);
       const duplicate = db.diagnostic_events.find(
         (candidate) =>
