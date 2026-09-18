@@ -53,6 +53,14 @@ Canonical directory deletion never authorizes recursive local deletion. Clients 
 
 Conflict resolution, note restore, and any future reversal operation advance canonical history through new commits or explicit durable outcomes. They do not rewrite published history or reset refs over later work.
 
+### OBTS-SAF-008: Whole-Vault Deletion Is Durable, Scoped, And Forward-Only
+
+A whole-vault deletion is a server-owned lifecycle, not a hidden-vault flag or a recursive directory tombstone. Admission closes first; the server then durably publishes deletion intent and access revocation before erasure or a successful acceptance response. Existing admitted work, including detached or late asynchronous processors and HTTP-buffer callbacks, is drained or safely rejected while the deletion barrier remains in force. Erasure is idempotent and may be partial across retries and restart. Completion is published only after every attributable server Git/history, metadata, transfer/temp, device/connection/credential, and diagnostic residue is removed and final metadata completion is durable.
+
+The lifecycle is active or integrity-blocked -> deleting -> deleted receipt -> receipt expired. An unfinished deletion retains retry state indefinitely; only a completed receipt expires 30 days after its completion. Expiry is not reopening, recreation, or barrier release. A completed or expired target cannot return to an active state.
+
+Deletion preserves local client files, independent Bridge filesystem/PostgreSQL state, and existing backups. It provides logical application-data deletion only; it makes no physical secure-erasure claim for storage snapshots or backup media. The server assumes one owner/process for a data directory and that prior instance subprocesses have stopped before restart recovery. Ordinary filesystem durability is assumed at its supported boundary.
+
 ## Fault Model
 
 Required safety analysis and testing cover:

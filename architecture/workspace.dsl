@@ -42,6 +42,7 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
         gitService = component "Git service" "Uses batched tree inspection and object-level merge operations for refs, validation, merge, history, and conflict retention." "Native Git"
         metadataStoreService = component "Metadata store" "Atomically persists users, vaults, devices, operations, transfer-independent proposal outcomes, events, and conflicts." "TypeScript"
         diagnosticService = component "Diagnostic service" "Accepts and retains opt-in redacted client diagnostics." "TypeScript"
+        deletionCoordinator = component "Vault deletion coordinator" "Closes per-vault admissions, durably publishes deletion intent and revocation, drains detached work, erases attributable server material, and retries completion/receipt publication." "TypeScript"
         dashboardHost = component "Dashboard host" "Serves the built SPA and dashboard APIs." "Fastify"
       }
 
@@ -324,6 +325,48 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
     obts.server.metadataStoreService -> obts.metadataStore "Atomically reads and replaces durable metadata" "Filesystem" {
       properties {
         "ops" "read,write"
+        "protocol" "filesystem"
+      }
+    }
+    obts.server.deletionCoordinator -> obts.server.syncService "Closes new per-vault sync admission and rejects target work after durable revocation" "In-process calls" {
+      properties {
+        "ops" "write"
+        "protocol" "in-process"
+      }
+    }
+    obts.server.deletionCoordinator -> obts.server.chunkTransferService "Stops or drains target transfer processors and detached callbacks without reusing released request leases" "In-process calls" {
+      properties {
+        "ops" "write"
+        "protocol" "in-process"
+      }
+    }
+    obts.server.deletionCoordinator -> obts.server.connectionService "Revokes target devices/connections and closes new approval/completion admission" "In-process calls" {
+      properties {
+        "ops" "write"
+        "protocol" "in-process"
+      }
+    }
+    obts.server.deletionCoordinator -> obts.server.diagnosticService "Stops target diagnostic ingestion and erases attributable diagnostics" "In-process calls" {
+      properties {
+        "ops" "write"
+        "protocol" "in-process"
+      }
+    }
+    obts.server.deletionCoordinator -> obts.server.metadataStoreService "Owns the transactional MetadataStore mutation seam for intent/revocation, final purge, and minimal receipt at durable boundaries" "In-process calls" {
+      properties {
+        "ops" "read,write"
+        "protocol" "in-process"
+      }
+    }
+    obts.server.deletionCoordinator -> obts.server.gitService "Erases the exact target Git store and protected refs after drain" "In-process calls" {
+      properties {
+        "ops" "write"
+        "protocol" "in-process"
+      }
+    }
+    obts.server.deletionCoordinator -> obts.transferStore "Erases attributable transfer/temp residue and fails closed on uncertain ownership" "Filesystem" {
+      properties {
+        "ops" "write"
         "protocol" "filesystem"
       }
     }

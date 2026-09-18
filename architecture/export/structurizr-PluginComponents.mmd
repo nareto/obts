@@ -18,24 +18,24 @@ graph LR
       end
 
       24["Server API and CLI [Container: TypeScript, Node.js, Fastify]"]
-      37["Visible vault [Container: Obsidian Vault API, filesystem]"]
-      38[".obts local store [Container: Filesystem]"]
+      38["Visible vault [Container: Obsidian Vault API, filesystem]"]
+      39[".obts local store [Container: Filesystem]"]
     end
 
     8-. "Queues durable invalidated paths [In-process calls]" .->9
     9-. "Checks durable inventory and complete-audit deadlines [In-process calls]" .->10
-    10-. "Persists scan-state.json and scan-cache.json [Filesystem]" .->38
+    10-. "Persists scan-state.json and scan-cache.json [Filesystem]" .->39
     9-. "Requests targeted reconciliation or a fallback audit only when no upload target is in flight [In-process calls]" .->11
-    11-. "Inventories paths and reads only invalidated, metadata-changed, or audit-selected files [Obsidian DataAdapter]" .->37
-    11-. "Writes Git objects and local refs [isomorphic-git filesystem adapter]" .->38
+    11-. "Inventories paths and reads only invalidated, metadata-changed, or audit-selected files [Obsidian DataAdapter]" .->38
+    11-. "Writes Git objects and local refs [isomorphic-git filesystem adapter]" .->39
     9-. "Creates or resumes exactly one immutable attempt [In-process calls]" .->12
-    12-. "Persists upload-transfer.json until terminal result consumption [Filesystem]" .->38
+    12-. "Persists upload-transfer.json until terminal result consumption [Filesystem]" .->39
     9-. "Uploads or retrieves the journaled attempt before scanning later edits [In-process calls]" .->13
     13-. "Creates/resumes transfers, uploads missing packs, requests async processing, and polls [HTTPS]" .->24
-    14-. "Persists observed directories, causal intent generations, and stale-baseline recovery journal [Filesystem]" .->38
+    14-. "Persists observed directories, causal intent generations, and stale-baseline recovery journal [Filesystem]" .->39
     9-. "Applies canonical main only after pending proposal outcomes settle [In-process calls]" .->15
-    15-. "Writes accepted files and safely creates/removes explicit directories [Obsidian Vault API]" .->37
-    15-. "Stages recovery bundles and crash journals before mutation [Filesystem]" .->38
+    15-. "Writes accepted files and safely creates/removes explicit directories [Obsidian Vault API]" .->38
+    15-. "Stages recovery bundles and crash journals before mutation [Filesystem]" .->39
     16-. "Observes monotonic operation progress [In-process calls]" .->9
 
   end

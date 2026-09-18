@@ -25,6 +25,12 @@ Cookie-authenticated mutations require a session-bound CSRF token. The active au
 
 Passwords are at least 12 characters and use Argon2id with minimum parameters `m=19456`, `t=2`, `p=1`. Five failed logins for one account/source within ten minutes trigger exponential backoff starting at one minute and capped at one hour. Connection creation/review/polling is rate-limited by source and connection identity. Local account recovery uses audited one-time reset credentials; v1 does not depend on email recovery.
 
+### OBTS-SEC-DEL-001: Owner-Scoped Destructive Deletion
+
+A vault deletion request requires the ordinary authenticated owner session, a valid session-bound CSRF token, and an explicit typed target phrase bound to the captured full vault ID. It does not require recent-auth or password re-entry. Authorization is checked against the target before confirmation errors; unknown and cross-owner resources remain indistinguishable `404` responses. A request cannot change target when selection or account context changes.
+
+The deletion coordinator rechecks owner scope and lifecycle state at its durable acceptance boundary. All pending, active, and completed deletion status is owner-scoped and redacted to opaque IDs, timestamps, status, and fixed safe error categories. No receipt or pending record retains names, paths, commits, content, manifests, tokens, connection secrets, device names, or diagnostics. Revocation and the deletion barrier prevent new device, transfer, connection, diagnostic, sync, history, or mutation admissions for the target while another vault remains independently accessible.
+
 ## Device And Connection Credentials
 
 Connection secrets and device tokens have at least 256 bits of entropy and are stored server-side only as hashes with non-secret lookup prefixes. Connections are one-time, expire after ten minutes, and bind browser approval to the matching plugin-held secret and verification code.

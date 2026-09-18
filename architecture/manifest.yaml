@@ -1,7 +1,7 @@
 schema_version: 1
-revision: 6
+revision: 7
 status: current
-updated: 2026-09-05
+updated: 2026-09-15
 authoritative_artifacts:
   - architecture/manifest.yaml
   - architecture/README.md
@@ -53,3 +53,14 @@ formal_models:
       - OBTS-BRG-BODY-001
       - OBTS-BRG-QUERY-001
       - OBTS-BRG-EMBED-001
+  - id: OBTS-FM-004
+    status: accepted
+    path: architecture/models/formal/OBTSVaultDeletion.tla
+    architecture_revision: 7
+    checks: architecture/models/formal/checks-fm004.json
+    refines:
+      - OBTS-SAF-008
+      - OBTS-SEC-DEL-001
+      - OBTS-PER-DEL-001
+      - OBTS-DASH-DEL-001
+      - OBTS-VER-DEL-001

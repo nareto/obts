@@ -45,7 +45,7 @@ The 64 MiB default per-file input boundary and normal derived-batch/singleton co
 
 ## OBTS-PER-OP-001: Server Write Protocol
 
-Every operation capable of changing Git refs and associated metadata uses one durable operation record:
+Every ordinary synchronization, merge, restore, conflict-resolution, and other ref-transition operation capable of changing Git refs and associated metadata uses one durable operation record. Whole-vault deletion is deliberately excluded from this ordinary protocol and is governed by `OBTS-PER-DEL-001`, because its lifecycle erases the Git store and its metadata rather than committing a prepared ref transition:
 
 1. acquire the per-vault mutation lock;
 2. persist an operation identity and expected refs;
@@ -85,6 +85,18 @@ Backup schedules, offsite destinations, retention, and secret-store paths are de
 Readiness verifies storage access, migrations, native Git, repository/object integrity, metadata/ref agreement, device refs, conflict protection, operation recovery, and derived-index references. Missing or inconsistent authoritative state fails closed.
 
 Operator repair validates and clears a block only after the underlying state has been restored or reconciled deliberately. It never invents missing objects, selects among mismatched refs, reconstructs uncertain device work, or discards metadata to make readiness pass.
+
+### OBTS-PER-DEL-001: Server Vault Deletion Lifecycle Persistence
+
+`OBTS-PER-DEL-001` is the deliberate whole-vault lifecycle-record exception to `OBTS-PER-OP-001`; it does not weaken or replace the ordinary prepared/CAS protocol for any other operation.
+
+The server-owned deletion coordinator persists one opaque per-vault lifecycle record. Admission closure and revocation are durably published before any erasure and before the operation is reported accepted. The coordinator never waits for drain while holding the global metadata mutation queue or an inner transfer/processing lease that admitted work needs. It wakes or cancels retryable target work, then drains all pre-existing admitted, detached, and late work while retaining the deletion barrier and ownership through callback completion.
+
+The erasable server scope includes the exact vault Git repository and refs/history, conflicts, sync/operation/directory/history-index/event metadata, attributable transfer and temporary material, vault devices/tokens/connections, and vault-scoped diagnostics. Newly created temporary/transfer material carries unambiguous vault ownership. Existing residue with uncertain ownership fails closed rather than deleting another vault's data or claiming completion. Exact-path and symlink-safe validation is required.
+
+Each resource class is erased idempotently. I/O or metadata failures leave durable unfinished retry state; restart restores deletion barriers before integrity repair, recovery/merge resume, transfer retry, or new admission. Final completion requires empty attributable server residue, drained work, and durable final metadata plus the minimal receipt containing only opaque vault/owner IDs, requested/completed timestamps, and completion state. The receipt expires 30 days after completion. Expiry never recreates a vault, releases a completed lifecycle into active state, or removes the unfinished retry state of another pending deletion.
+
+Local client files, independent Bridge filesystem/PostgreSQL state, and existing backups are outside this deletion boundary. This is logical deletion under ordinary filesystem durability, not physical secure erasure. The operational assumption is one owner/process per data directory with prior instance subprocesses stopped before restart recovery.
 
 ## Retention And Maintenance
 

@@ -19,38 +19,38 @@ graph LR
 
       17["Dashboard SPA [Container: Svelte, TypeScript, Vite]"]
       24["Server API and CLI [Container: TypeScript, Node.js, Fastify]"]
-      33["OBTS Bridge API and indexer [Container: Rust, Axum, SQLx]"]
-      34["Headless OBTS client [Container: Node.js, TypeScript]"]
-      35["Bridge visible vault and .obts state [Container: Filesystem]"]
-      36[("Bridge PostgreSQL state [Container: PostgreSQL, pgvector]")]
-      37["Visible vault [Container: Obsidian Vault API, filesystem]"]
-      38[".obts local store [Container: Filesystem]"]
-      39[("Metadata store [Container: JSON file adapter]")]
-      40["Vault Git stores [Container: Native Git bare repositories]"]
-      41["Transfer quarantine [Container: Filesystem, temporary bare Git repositories]"]
-      42["Semantic merge workspace [Container: Temporary filesystem]"]
+      34["OBTS Bridge API and indexer [Container: Rust, Axum, SQLx]"]
+      35["Headless OBTS client [Container: Node.js, TypeScript]"]
+      36["Bridge visible vault and .obts state [Container: Filesystem]"]
+      37[("Bridge PostgreSQL state [Container: PostgreSQL, pgvector]")]
+      38["Visible vault [Container: Obsidian Vault API, filesystem]"]
+      39[".obts local store [Container: Filesystem]"]
+      40[("Metadata store [Container: JSON file adapter]")]
+      41["Vault Git stores [Container: Native Git bare repositories]"]
+      42["Transfer quarantine [Container: Filesystem, temporary bare Git repositories]"]
+      43["Semantic merge workspace [Container: Temporary filesystem]"]
       7["Obsidian plugin [Container: JavaScript, TypeScript, Obsidian Plugin API]"]
     end
 
     1-. "Connects devices and reviews conflicts [HTTPS]" .->17
     2-. "Edits notes and observes synchronization [Obsidian UI]" .->7
     3-. "Runs setup, health, repair, and maintenance commands [CLI and HTTPS]" .->24
-    4-. "Uses context-scoped note, search, graph, Base, create, and edit tools [REST, MCP]" .->33
+    4-. "Uses context-scoped note, search, graph, Base, create, and edit tools [REST, MCP]" .->34
     7-. "Uses plugin lifecycle, vault, workspace, request, and status APIs [Obsidian Plugin API]" .->5
     24-. "Serves static dashboard assets [HTTP]" .->17
     17-. "Calls authenticated dashboard and conflict APIs [HTTPS]" .->24
     7-. "Uploads immutable Git/directory proposals, polls processing outcomes, pulls canonical state, and reports status [HTTPS]" .->24
-    33-. "Supervises lifecycle and sends administrative or synchronization commands [JSON Lines over stdin/stdout]" .->34
-    33-. "Reads selected ordinary files under the shared headless/filesystem lock, verifies revision/OID, and atomically writes authorized files; releases bounded body work after each operation [Filesystem]" .->35
-    33-. "Queries paginated ACL-visible metadata and candidates, writes verified derived batches/cursors, and retains access/audit records without a full snapshot or raw-body fallback [PostgreSQL]" .->36
-    34-. "Owns visible-state reconciliation, hidden Git, credentials, journals, queues, apply, and recovery [Filesystem]" .->35
-    34-. "Pairs and synchronizes as a normal protected OBTS device [HTTPS]" .->24
-    7-. "Scans and safely applies visible vault content [Obsidian Vault API]" .->37
-    7-. "Persists local journal, immutable upload identity, credentials, cursors, and recovery evidence [Filesystem]" .->38
-    24-. "Reads and atomically replaces application metadata [Filesystem]" .->39
-    24-. "Validates objects and maintains canonical, device, and conflict refs [Git object and ref operations]" .->40
-    24-. "Persists resumable chunks, staged objects, and asynchronous terminal results [Filesystem]" .->41
-    24-. "Materializes only overlapping candidates requiring semantic validation [Filesystem]" .->42
+    34-. "Supervises lifecycle and sends administrative or synchronization commands [JSON Lines over stdin/stdout]" .->35
+    34-. "Reads selected ordinary files under the shared headless/filesystem lock, verifies revision/OID, and atomically writes authorized files; releases bounded body work after each operation [Filesystem]" .->36
+    34-. "Queries paginated ACL-visible metadata and candidates, writes verified derived batches/cursors, and retains access/audit records without a full snapshot or raw-body fallback [PostgreSQL]" .->37
+    35-. "Owns visible-state reconciliation, hidden Git, credentials, journals, queues, apply, and recovery [Filesystem]" .->36
+    35-. "Pairs and synchronizes as a normal protected OBTS device [HTTPS]" .->24
+    7-. "Scans and safely applies visible vault content [Obsidian Vault API]" .->38
+    7-. "Persists local journal, immutable upload identity, credentials, cursors, and recovery evidence [Filesystem]" .->39
+    24-. "Reads and atomically replaces application metadata [Filesystem]" .->40
+    24-. "Validates objects and maintains canonical, device, and conflict refs [Git object and ref operations]" .->41
+    24-. "Persists resumable chunks, staged objects, and asynchronous terminal results [Filesystem]" .->42
+    24-. "Materializes only overlapping candidates requiring semantic validation [Filesystem]" .->43
 
   end
 
@@ -104,24 +104,24 @@ graph LR
       end
 
       24["Server API and CLI [Container: TypeScript, Node.js, Fastify]"]
-      37["Visible vault [Container: Obsidian Vault API, filesystem]"]
-      38[".obts local store [Container: Filesystem]"]
+      38["Visible vault [Container: Obsidian Vault API, filesystem]"]
+      39[".obts local store [Container: Filesystem]"]
     end
 
     8-. "Queues durable invalidated paths [In-process calls]" .->9
     9-. "Checks durable inventory and complete-audit deadlines [In-process calls]" .->10
-    10-. "Persists scan-state.json and scan-cache.json [Filesystem]" .->38
+    10-. "Persists scan-state.json and scan-cache.json [Filesystem]" .->39
     9-. "Requests targeted reconciliation or a fallback audit only when no upload target is in flight [In-process calls]" .->11
-    11-. "Inventories paths and reads only invalidated, metadata-changed, or audit-selected files [Obsidian DataAdapter]" .->37
-    11-. "Writes Git objects and local refs [isomorphic-git filesystem adapter]" .->38
+    11-. "Inventories paths and reads only invalidated, metadata-changed, or audit-selected files [Obsidian DataAdapter]" .->38
+    11-. "Writes Git objects and local refs [isomorphic-git filesystem adapter]" .->39
     9-. "Creates or resumes exactly one immutable attempt [In-process calls]" .->12
-    12-. "Persists upload-transfer.json until terminal result consumption [Filesystem]" .->38
+    12-. "Persists upload-transfer.json until terminal result consumption [Filesystem]" .->39
     9-. "Uploads or retrieves the journaled attempt before scanning later edits [In-process calls]" .->13
     13-. "Creates/resumes transfers, uploads missing packs, requests async processing, and polls [HTTPS]" .->24
-    14-. "Persists observed directories, causal intent generations, and stale-baseline recovery journal [Filesystem]" .->38
+    14-. "Persists observed directories, causal intent generations, and stale-baseline recovery journal [Filesystem]" .->39
     9-. "Applies canonical main only after pending proposal outcomes settle [In-process calls]" .->15
-    15-. "Writes accepted files and safely creates/removes explicit directories [Obsidian Vault API]" .->37
-    15-. "Stages recovery bundles and crash journals before mutation [Filesystem]" .->38
+    15-. "Writes accepted files and safely creates/removes explicit directories [Obsidian Vault API]" .->38
+    15-. "Stages recovery bundles and crash journals before mutation [Filesystem]" .->39
     16-. "Observes monotonic operation progress [In-process calls]" .->9
 
   end
@@ -146,28 +146,36 @@ graph LR
         29["Git service [Component: Native Git]"]
         30["Metadata store [Component: TypeScript]"]
         31["Diagnostic service [Component: TypeScript]"]
-        32["Dashboard host [Component: Fastify]"]
+        32["Vault deletion coordinator [Component: TypeScript]"]
+        33["Dashboard host [Component: Fastify]"]
       end
 
       17["Dashboard SPA [Container: Svelte, TypeScript, Vite]"]
-      39[("Metadata store [Container: JSON file adapter]")]
-      40["Vault Git stores [Container: Native Git bare repositories]"]
-      41["Transfer quarantine [Container: Filesystem, temporary bare Git repositories]"]
-      42["Semantic merge workspace [Container: Temporary filesystem]"]
+      40[("Metadata store [Container: JSON file adapter]")]
+      41["Vault Git stores [Container: Native Git bare repositories]"]
+      42["Transfer quarantine [Container: Filesystem, temporary bare Git repositories]"]
+      43["Semantic merge workspace [Container: Temporary filesystem]"]
       7["Obsidian plugin [Container: JavaScript, TypeScript, Obsidian Plugin API]"]
     end
 
+    33-. "Serves built assets [HTTP]" .->17
+    31-. "Stores consented redacted diagnostic events [Filesystem]" .->40
     7-. "Creates/resumes transfers, uploads missing packs, requests async processing, and polls [HTTPS]" .->27
-    27-. "Stores receipts, staged objects, processing state, and terminal results [Filesystem]" .->41
+    27-. "Stores receipts, staged objects, processing state, and terminal results [Filesystem]" .->42
     27-. "Queues a validated immutable proposal for canonical integration [In-process calls]" .->28
     28-. "Checks ancestry, validates trees, and creates merge or protected conflict history [In-process calls]" .->29
     28-. "Persists operation phases, merge order, events, acknowledgements, and conflicts [In-process calls]" .->30
-    29-. "Runs batched tree inspection, object promotion, temporary-index read-tree/write-tree merges, commit-tree, and ref CAS [Native Git]" .->40
-    29-. "Reads validated staged objects and promotes them after policy checks [Git alternates and filesystem]" .->41
-    29-. "Materializes semantic overlap candidates only [Filesystem]" .->42
-    30-. "Atomically reads and replaces durable metadata [Filesystem]" .->39
-    32-. "Serves built assets [HTTP]" .->17
-    31-. "Stores consented redacted diagnostic events [Filesystem]" .->39
+    29-. "Runs batched tree inspection, object promotion, temporary-index read-tree/write-tree merges, commit-tree, and ref CAS [Native Git]" .->41
+    29-. "Reads validated staged objects and promotes them after policy checks [Git alternates and filesystem]" .->42
+    29-. "Materializes semantic overlap candidates only [Filesystem]" .->43
+    30-. "Atomically reads and replaces durable metadata [Filesystem]" .->40
+    32-. "Closes new per-vault sync admission and rejects target work after durable revocation [In-process calls]" .->28
+    32-. "Stops or drains target transfer processors and detached callbacks without reusing released request leases [In-process calls]" .->27
+    32-. "Revokes target devices/connections and closes new approval/completion admission [In-process calls]" .->26
+    32-. "Stops target diagnostic ingestion and erases attributable diagnostics [In-process calls]" .->31
+    32-. "Owns the transactional MetadataStore mutation seam for intent/revocation, final purge, and minimal receipt at durable boundaries [In-process calls]" .->30
+    32-. "Erases the exact target Git store and protected refs after drain [In-process calls]" .->29
+    32-. "Erases attributable transfer/temp residue and fails closed on uncertain ownership [Filesystem]" .->42
 
   end
 

@@ -234,3 +234,55 @@ Negative controls reproduce empty-inner starvation (`EventuallyReady`), ID-only 
 Review 9e4558bf identified false action-to-check attribution despite correct model semantics. The corrected mapping uses inverse-acquisition, failure, hash/epoch and cancellation configurations that actually exercise those actions, plus failure/drift for attestation rejection. Every mapped action/check pair must have nonzero generated-successor coverage from TLC, not merely a known ID or syntactically present action. `--validate-only` verifies stored coverage and exact model/configuration SHA-256 digests; normal TLC runs independently enforce mappings against fresh `-coverage 1` output. This is finite model-action exercise, not implementation coverage or trace conformance. Default npm and formal CI entry points include 52 + 39 + 48 = 139 checks without modifying the baseline or projection models.
 
 **Omissions and handoff:** `CompleteSQL` and replacement are atomic abstract linearization points. A READ COMMITTED `UPDATE blocks ... FROM notes` revision predicate alone does not prove that atomicity: use a parent-row transactional guard/consistent lock order or a target-row epoch and coordinated replacement. Schema/model invalidation must likewise serialize with note/block mutation: update a target-row schema epoch with invalidation or use consistent transactional guarding. A source-only CAS or separate global-schema preflight/snapshot does not protect against an old SQL statement completing after a reset, including after process death. Multiworker scheduling, backend/process lifecycle, combined source-plus-schema changes, SQL/MVCC execution, source SHA/OID computation, filesystem faults/durability, block cleanup details, embedding arithmetic/quality, parser/HTTP encoding/driver allocations and RSS are not proved. The worker trace map gives exact existing seams and actual-PG/fake-provider/shared-headless regressions still required; neither core evidence nor green TLC establishes worker implementation conformance.
+
+## OBTS-FM-004: Whole-Vault Deletion Lifecycle (accepted formal architecture)
+
+| Field | Value |
+| --- | --- |
+| Status | Accepted formal architecture; repository gate evidence approved by independent review |
+| Architecture revision | 7 (preserved; no additional bump) |
+| Refined contracts | `OBTS-SAF-008`, `OBTS-SEC-DEL-001`, `OBTS-PER-DEL-001`, `OBTS-DASH-DEL-001`, `OBTS-VER-DEL-001` |
+| Specification | `OBTSVaultDeletion.tla` |
+| Check matrix | `checks-fm004.json` (29 required checks) |
+| Checker | `scripts/check-deletion-model.mjs`; SANY before each TLC matrix run |
+| Implementation map | `src/server/vaultLifecycleCoordinator.ts`, `src/server/metadataStore.ts`, `src/server/chunkTransferService.ts`, `src/server/app.ts`, `src/server/syncService.ts`, `src/server/connectionService.ts`, `src/shared/types.ts`, `frontend/dashboard/src/api/client.ts`, `frontend/dashboard/src/api/types.ts`, `frontend/dashboard/src/components/SettingsPage.svelte`, `openapi/openapi.yaml`, and `tests/vault-deletion.test.ts` provide the current implementation/evidence map |
+
+### Corrected lifecycle boundaries
+
+The accepted model separates volatile request/captured identity, runtime admission closure, durable intent/revocation/job publication, observable 202 acceptance, durable restart discovery, erasure, final completion, and relative receipt expiry. `CaptureRequest` captures route target, owner, and typed confirmation identity. `CloseAdmissions` closes target admission without waiting for drain. `PublishIntent` durably writes intent, revocation, target, and the deleting lifecycle record; only `PublishResponse202` may set observable acceptance. `RejectIntentPublication` leaves all durable deletion state unchanged and permits reopening only when publication is unambiguously rejected. An ambiguous outcome remains closed and cannot be reopened by the model. `Crash` clears volatile request/capture state; `Restart` discovers only a durable deleting job after `RestoreDeletionBarrier`. The mapped implementation now covers the core HTTP, metadata, coordinator, transfer marker/inventory, startup barrier, shared client types, and Settings seam. Runtime conformance is not claimed for every listed vault-touching path, physical secure erasure, distributed locking, or all model counterexample families; those remain residual verification obligations.
+
+The accepted model binds the typed confirmation identity to the captured target, models same-owner wrong confirmation and stale live-selection mutants, and retains wrong-owner/unknown-target controls. HTTP 404 equivalence, repeated-request idempotence, exact API schema, and status/list redaction remain explicitly runtime/API obligations rather than claims of this bounded state model.
+
+### Scope, preservation, and fail-closed behavior
+
+Five finite residue classes stand for exact target-owned server scope: Git/history; metadata/history (sync, operation, directory, conflict, history-index and event state); transfer/temp; device credentials/connections; and diagnostics. An unattributed-residue state blocks correct completion; a mutant that completes anyway is rejected. Startup repair/recreation after receipt/expiry, protected local/Bridge/backup mutation, and other-vault mutation each have focused negative controls. Exact-path validation, symlink safety, complete legacy residue inventory, and ownership attribution remain runtime obligations.
+
+The lifecycle is active or `blocked_integrity` -> deleting -> deleted receipt -> expired. A completed or expired target cannot be recreated/reopened. Local client files, independent Bridge filesystem/PostgreSQL state, and backups remain outside the erasable set. Receipt retention is the approved 30 days after completion; `ReceiptDays = 3` logical ticks are a relative bounded abstraction and cannot advance before completion. The relative receipt age persists through restart and `ReceiptEventuallyExpires` is checked under explicit fairness.
+
+### Bounds and assumptions
+
+Two vaults/two owners, one target, one admitted slot, one detached slot, one crash/restart, one finite erase fault, one finite final-publication fault, and five residue classes keep the state space reviewable. Positive liveness assumes finite faults, fair scheduling, one owner/process per data directory with prior subprocesses stopped at restart, and ordinary supported filesystem durability. No distributed-lock, wall-clock, physical secure-erasure, or implementation-conformance claim is made.
+
+### Matrix and required controls
+
+Positive checks cover safety, conditional deletion liveness, blocked-integrity deletion safety, and conditional receipt-expiry liveness. Reachability checks require deletion-state crash/restart barrier restoration, erase-fault retry, final-publication retry, post-final-fault crash/restart, receipt expiry, blocked target, pre-intent crash/restart, intent-publication rejection, and durable 202 acceptance. Negative controls require exact witnesses for failed-publication mistaken acceptance, response-before-durability, same-owner wrong phrase, stale live selection, wrong owner/unknown target, erase-before-intent, admission after closure, premature completion, unfinished expiry, early lease release/late reuse, unattributed residue completion, startup recreation, protected boundary mutation, other-vault mutation, and ambiguous-publication reopening.
+
+The checker rejects parse/semantic failure, unexpected deadlock, timeout, resource overflow, wrong invariant, missing/shallow witness, state-space collapse, and matrix drift. It has no production source map.
+
+### Accepted formal architecture/repository-gate evidence
+
+Actual run: Java 21.0.12.1, TLC 2.19, SANY first, one worker, fingerprint polynomial 0. Full logs and witnesses are under `/tmp/obts-dashboard-stage2/fm004-corrections/evidence/`.
+
+| Check family | Outcome | Generated | Distinct | Depth |
+| --- | --- | ---: | ---: |
+| deletion safety/liveness (each) | PASS | 20,846 | 3,153 | 21 |
+| blocked safety | PASS | 20,250 | 3,039 | 21 |
+| receipt expiry liveness | PASS | 20,846 | 3,153 | 21 |
+| deletion crash/restart witness | REACHED | 81 | 40 | 6 |
+| erase fault then retry | REACHED | 41 | 22 | 6 |
+| final publication fault then completion | REACHED | 2,031 | 290 | 11 |
+| final fault then crash/restart | REACHED | 2,056 | 296 | 12 |
+| receipt expiry | REACHED | 2,050 | 293 | 14 |
+| all remaining reachability/negative controls | REACHED | see result artifact | see result artifact | exact witnesses |
+
+Independent review approved this evidence for the repository gate. FM004 acceptance is an architecture/formal gate only: no backend/API/UI implementation or runtime conformance is claimed, and all runtime obligations remain.

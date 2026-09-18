@@ -13,27 +13,35 @@ graph LR
         29["Git service [Component: Native Git]"]
         30["Metadata store [Component: TypeScript]"]
         31["Diagnostic service [Component: TypeScript]"]
-        32["Dashboard host [Component: Fastify]"]
+        32["Vault deletion coordinator [Component: TypeScript]"]
+        33["Dashboard host [Component: Fastify]"]
       end
 
       17["Dashboard SPA [Container: Svelte, TypeScript, Vite]"]
-      39[("Metadata store [Container: JSON file adapter]")]
-      40["Vault Git stores [Container: Native Git bare repositories]"]
-      41["Transfer quarantine [Container: Filesystem, temporary bare Git repositories]"]
-      42["Semantic merge workspace [Container: Temporary filesystem]"]
+      40[("Metadata store [Container: JSON file adapter]")]
+      41["Vault Git stores [Container: Native Git bare repositories]"]
+      42["Transfer quarantine [Container: Filesystem, temporary bare Git repositories]"]
+      43["Semantic merge workspace [Container: Temporary filesystem]"]
       7["Obsidian plugin [Container: JavaScript, TypeScript, Obsidian Plugin API]"]
     end
 
+    33-. "Serves built assets [HTTP]" .->17
+    31-. "Stores consented redacted diagnostic events [Filesystem]" .->40
     7-. "Creates/resumes transfers, uploads missing packs, requests async processing, and polls [HTTPS]" .->27
-    27-. "Stores receipts, staged objects, processing state, and terminal results [Filesystem]" .->41
+    27-. "Stores receipts, staged objects, processing state, and terminal results [Filesystem]" .->42
     27-. "Queues a validated immutable proposal for canonical integration [In-process calls]" .->28
     28-. "Checks ancestry, validates trees, and creates merge or protected conflict history [In-process calls]" .->29
     28-. "Persists operation phases, merge order, events, acknowledgements, and conflicts [In-process calls]" .->30
-    29-. "Runs batched tree inspection, object promotion, temporary-index read-tree/write-tree merges, commit-tree, and ref CAS [Native Git]" .->40
-    29-. "Reads validated staged objects and promotes them after policy checks [Git alternates and filesystem]" .->41
-    29-. "Materializes semantic overlap candidates only [Filesystem]" .->42
-    30-. "Atomically reads and replaces durable metadata [Filesystem]" .->39
-    32-. "Serves built assets [HTTP]" .->17
-    31-. "Stores consented redacted diagnostic events [Filesystem]" .->39
+    29-. "Runs batched tree inspection, object promotion, temporary-index read-tree/write-tree merges, commit-tree, and ref CAS [Native Git]" .->41
+    29-. "Reads validated staged objects and promotes them after policy checks [Git alternates and filesystem]" .->42
+    29-. "Materializes semantic overlap candidates only [Filesystem]" .->43
+    30-. "Atomically reads and replaces durable metadata [Filesystem]" .->40
+    32-. "Closes new per-vault sync admission and rejects target work after durable revocation [In-process calls]" .->28
+    32-. "Stops or drains target transfer processors and detached callbacks without reusing released request leases [In-process calls]" .->27
+    32-. "Revokes target devices/connections and closes new approval/completion admission [In-process calls]" .->26
+    32-. "Stops target diagnostic ingestion and erases attributable diagnostics [In-process calls]" .->31
+    32-. "Owns the transactional MetadataStore mutation seam for intent/revocation, final purge, and minimal receipt at durable boundaries [In-process calls]" .->30
+    32-. "Erases the exact target Git store and protected refs after drain [In-process calls]" .->29
+    32-. "Erases attributable transfer/temp residue and fails closed on uncertain ownership [Filesystem]" .->42
 
   end
