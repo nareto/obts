@@ -417,7 +417,10 @@ describe('transfer durable state publication', () => {
     await writeFile(sessionPath, JSON.stringify(session));
     const restarted = new ChunkTransferService(config, git as never, {} as never);
     await restarted.initialize();
-    expect(restarted.isReady()).toBe(false);
+    // Readiness reports the unusable quarantine repository, but a legacy session must not disable
+    // transfers for every other device on the server.
+    expect(restarted.isReady()).toBe(true);
+    expect(await restarted.checkReady()).toMatchObject({ ok: false });
     await service.close();
     await restarted.close();
   });
@@ -446,7 +449,7 @@ describe('transfer durable state publication', () => {
     await writeFile(sessionPath, JSON.stringify(session));
     await writeFile(join(config.transferDir, created.descriptor.transfer_id, 'repo.git', 'oversized'), Buffer.alloc(1_048_577));
     expect(await service.checkReady()).toMatchObject({ ok: false });
-    expect(service.isReady()).toBe(false);
+    expect(service.isReady()).toBe(true);
     await service.close();
   });
 
@@ -475,7 +478,7 @@ describe('transfer durable state publication', () => {
     session.result = { status: 'noop', device_ref: auth.device.device_ref, main: 'a'.repeat(40), event_seq: 1 };
     await writeFile(sessionPath, JSON.stringify(session));
     expect(await service.checkReady()).toMatchObject({ ok: false });
-    expect(service.isReady()).toBe(false);
+    expect(service.isReady()).toBe(true);
     await service.close();
   });
 
@@ -555,7 +558,7 @@ describe('transfer durable state publication', () => {
     session.stored_bytes += 1;
     await writeFile(sessionPath, JSON.stringify(session));
     expect(await service.checkReady()).toMatchObject({ ok: false });
-    expect(service.isReady()).toBe(false);
+    expect(service.isReady()).toBe(true);
     await service.close();
   });
 
@@ -583,7 +586,7 @@ describe('transfer durable state publication', () => {
     session.result = { status: 'merged', device_ref: auth.device.device_ref, main: 'a'.repeat(40), event_seq: 1 };
     await writeFile(sessionPath, JSON.stringify(session));
     expect(await service.checkReady()).toMatchObject({ ok: false });
-    expect(service.isReady()).toBe(false);
+    expect(service.isReady()).toBe(true);
     await service.close();
   });
 

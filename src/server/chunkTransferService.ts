@@ -42,6 +42,12 @@ const MAX_RESULT_CODE_LENGTH = 128;
 const MAX_RESULT_MESSAGE_LENGTH = 2048;
 const MAX_DEVICE_REF_LENGTH = 512;
 
+// Persisted-transfer scan modes. Startup may adopt legacy ownership; request paths never write while
+// scanning; the readiness verdict is strictly read-only.
+const SCAN_STARTUP = 'startup';
+const SCAN_OPERATIONAL = 'operational';
+const SCAN_VERDICT = 'verdict';
+
 export type PersistedDeviceResolver = (session: PushSession) => Promise<AuthenticatedDevice | null>;
 
 type ChunkReceipt = { index: number; bytes: number; sha256: string };
@@ -76,6 +82,7 @@ export class ChunkTransferService {
   private storedBytes: number | null = null;
   private closed = false;
   private transferUnavailable = false;
+  private transferAnomaly: string | null = null;
 
   constructor(
     private readonly config: ServerConfig,
@@ -89,48 +96,60 @@ export class ChunkTransferService {
     return !this.closed && !this.transferUnavailable && !this.isGitDurabilityUnavailable();
   }
 
+  /**
+   * Reports whether transfer storage can serve requests.
+   *
+   * A readiness or dashboard probe never writes to transfer storage and never lets a session-scoped
+   * inconsistency disable serving: those are reported here as an anomaly verdict while transfers keep
+   * working. Only transfer storage itself being unusable (missing or unsafe root, or a failed durable
+   * write) makes the service not ready.
+   */
   async checkReady(): Promise<{ ok: true } | { ok: false; error: string }> {
     if (!this.isReady()) return { ok: false, error: 'transfer storage is unavailable' };
     try {
-      await this.withStorageLock(async () => {
-        const sessions = await this.listSessions();
-        for (const session of sessions) {
-          if (!(await this.validTransferRepository(session.transfer_id, session.vault_id))) {
-            this.transferUnavailable = true;
-            throw new TransferStorageError('Transfer repository is unavailable.');
-          }
-        }
-      });
-      return { ok: true };
+      const { problem } = await this.withStorageLock(async () => await this.scanSessions(SCAN_VERDICT));
+      return problem === null ? { ok: true } : { ok: false, error: `transfer storage anomaly: ${problem}` };
     } catch {
       return { ok: false, error: 'transfer storage is unavailable' };
     }
   }
 
+  transferAnomalyReason(): string | null {
+    return this.transferAnomaly;
+  }
+
+  private suspendTransferStorage(): void {
+    this.transferUnavailable = true;
+  }
+
+  /**
+   * Records a survivable inconsistency in pre-existing transfer state. Only genuine write-path
+   * durability failures suspend transfer storage globally; an unusable or legacy session affects
+   * that transfer, not every vault on the server.
+   */
+  private recordTransferAnomaly(reason: string, detail?: string): void {
+    const message = detail === undefined ? reason : `${reason}:${detail}`;
+    if (this.transferAnomaly === message) return;
+    this.transferAnomaly = message;
+    process.stderr.write(`obts: transfer storage anomaly: ${message}\n`);
+  }
+
   async initialize(resolvePersistedDevice?: PersistedDeviceResolver): Promise<void> {
     if (this.isGitDurabilityUnavailable()) {
-      this.transferUnavailable = true;
+      this.suspendTransferStorage();
       return;
     }
     let sessions: PushSession[];
     try {
-      sessions = await this.listSessions(true);
+      sessions = (await this.scanSessions(SCAN_STARTUP)).sessions;
     } catch {
-      this.transferUnavailable = true;
+      this.suspendTransferStorage();
       return;
     }
     for (const session of sessions) {
-      if (!(await this.validTransferRepository(session.transfer_id, session.vault_id))) {
-        this.transferUnavailable = true;
-        return;
-      }
-      if (session.status === 'processing' && session.receipts.length !== session.chunk_count) {
-        this.transferUnavailable = true;
-        return;
-      }
-    }
-    for (const session of sessions) {
       if (session.status === 'processing') {
+        // A processing session always has complete receipts here: the session parser rejects an
+        // incomplete processing record as malformed, so it never reaches resumption.
         const auth = resolvePersistedDevice ? await resolvePersistedDevice(session) : null;
         const deletionBlocked = this.lifecycle?.isBlocked(session.vault_id) ?? false;
         if (
@@ -140,8 +159,9 @@ export class ChunkTransferService {
         ) {
           this.startProcessing(auth, session.transfer_id);
         } else if (!deletionBlocked) {
-          this.transferUnavailable = true;
-          return;
+          // A processing session whose device no longer resolves cannot be resumed. That leaves one
+          // unfinished transfer behind; it must not disable transfers for every other device.
+          this.recordTransferAnomaly('transfer_processing_session_unresolved', session.transfer_id);
         }
         continue;
       }
@@ -400,7 +420,7 @@ export class ChunkTransferService {
       try {
         await fsyncDurableDirectory(this.config.transferDir, this.persistence);
       } catch (error) {
-        this.transferUnavailable = true;
+        this.suspendTransferStorage();
         throw error;
       }
       await this.writeOwnerMarker(transferId, auth.vault.vault_id);
@@ -408,7 +428,7 @@ export class ChunkTransferService {
         await this.git.initializeTransferRepo(auth.vault.vault_id, this.repoDir(transferId));
       } catch (error) {
         if (error instanceof GitDurabilityError) {
-          this.transferUnavailable = true;
+          this.suspendTransferStorage();
           throw new AuthError(503, 'transfer_unavailable', 'Transfer storage is unavailable.');
         }
         throw error;
@@ -476,7 +496,13 @@ export class ChunkTransferService {
         throw new AuthError(413, 'transfer_too_large', 'Transfer exceeds the configured aggregate limit.');
       }
       return await this.withStorageLock(async () => {
-        const actualSessionBytes = await this.verifySessionAccounting(session);
+        const verification = await this.verifySessionAccounting(
+          session,
+          true,
+          (reason, detail) => this.recordTransferAnomaly(reason, detail)
+        );
+        if (!verification.ok) throw new AuthError(503, 'transfer_unavailable', 'Transfer storage is unavailable.');
+        const actualSessionBytes = verification.actual;
         await this.listSessions();
         this.storedBytes = await this.directoryBytes(this.config.transferDir, true, true);
         const previousSessionBytes = actualSessionBytes;
@@ -492,7 +518,7 @@ export class ChunkTransferService {
           try {
             await fsyncDurableFile(temporary, this.persistence);
           } catch (error) {
-            this.transferUnavailable = true;
+            this.suspendTransferStorage();
             throw new AuthError(503, 'transfer_unavailable', 'Transfer storage is unavailable.');
           }
           const canonicalRepoPath = (this.git as unknown as { repoPath?: (vaultId: string) => string }).repoPath?.call(this.git, session.vault_id);
@@ -515,7 +541,7 @@ export class ChunkTransferService {
           await rm(temporary, { force: true });
           if (error instanceof AuthError) throw error;
           if (error instanceof GitDurabilityError) {
-            this.transferUnavailable = true;
+            this.suspendTransferStorage();
             throw new AuthError(503, 'transfer_unavailable', 'Transfer storage is unavailable.');
           }
           throw new AuthError(422, 'malformed_packfile', 'Chunk is not a valid Git pack.');
@@ -589,7 +615,9 @@ export class ChunkTransferService {
   async deletePush(auth: AuthenticatedDevice, transferId: string): Promise<void> {
     const operation = async () => await this.withLock(transferId, async () => {
       this.assertTransferAllowed(auth);
-      const session = await this.requireSession(auth, transferId);
+      // Removal stays available even when the quarantine repository is unusable, so a device can
+      // always clear a stuck transfer instead of being locked out of its open-transfer budget.
+      const session = await this.requireSession(auth, transferId, { requireRepository: false });
       if (session.status === 'processing') throw new AuthError(409, 'transfer_processing', 'A processing transfer cannot be deleted.');
       await this.withStorageLock(async () => {
         let root: DeletionRoot;
@@ -652,7 +680,7 @@ export class ChunkTransferService {
         return;
       } catch (error) {
         if (error instanceof GitDurabilityError || error instanceof AuthError && error.code === 'transfer_unavailable') {
-          this.transferUnavailable = true;
+          this.suspendTransferStorage();
           return;
         }
         if (error instanceof AuthError) {
@@ -744,7 +772,11 @@ export class ChunkTransferService {
     };
   }
 
-  private async requireSession(auth: AuthenticatedDevice, transferId: string): Promise<PushSession> {
+  private async requireSession(
+    auth: AuthenticatedDevice,
+    transferId: string,
+    options: { requireRepository?: boolean } = {}
+  ): Promise<PushSession> {
     if (!/^trn_[A-Za-z0-9]+$/u.test(transferId)) throw new AuthError(404, 'not_found', 'Resource not found.');
     const session = await this.readSession(transferId);
     if (!session || session.vault_id !== auth.vault.vault_id || session.device_id !== auth.device.device_id) {
@@ -758,8 +790,10 @@ export class ChunkTransferService {
       }
       throw new AuthError(410, 'transfer_expired', 'Transfer expired.');
     }
-    if (!(await this.validTransferRepository(transferId, session.vault_id))) {
-      this.transferUnavailable = true;
+    if (options.requireRepository !== false && !(await this.validTransferRepository(transferId, session.vault_id))) {
+      // Refuse this transfer, not every transfer: an unusable quarantine repository for one session
+      // is not a reason to stop serving other vaults.
+      this.recordTransferAnomaly('transfer_repository_unusable', transferId);
       throw new AuthError(503, 'transfer_unavailable', 'Transfer storage is unavailable.');
     }
     return session;
@@ -793,38 +827,89 @@ export class ChunkTransferService {
     });
   }
 
-  private async listSessions(rejectTemporary = false): Promise<PushSession[]> {
+  private async listSessions(): Promise<PushSession[]> {
+    return (await this.scanSessions(SCAN_OPERATIONAL)).sessions;
+  }
+
+  /**
+   * Walks persisted transfer sessions.
+   *
+   * `SCAN_STARTUP` is used once at initialization: it adopts a session record written before
+   * ownership markers existed by durably recording ownership, repairs harmless accounting drift in
+   * memory, and skips a session it cannot serve.
+   *
+   * `SCAN_OPERATIONAL` serves requests: identical, except that it never writes. It runs on request
+   * paths that may already hold the storage lock, and accounting repairs stay in memory.
+   *
+   * `SCAN_VERDICT` is read-only for readiness: it reports the first inconsistency it finds without
+   * writing anything, so a readiness or dashboard probe cannot change availability.
+   *
+   * Only a genuine storage failure suspends transfer service; a session-scoped anomaly is skipped
+   * for that transfer instead of disabling every vault on the server.
+   */
+  private async scanSessions(
+    mode: typeof SCAN_STARTUP | typeof SCAN_OPERATIONAL | typeof SCAN_VERDICT
+  ): Promise<{ sessions: PushSession[]; problem: string | null }> {
     if (this.transferUnavailable) throw new TransferStorageError('Transfer storage is unavailable.');
     let root: DeletionRoot;
     try {
       root = await openDeletionRoot(this.config.transferDir);
     } catch (error) {
-      this.transferUnavailable = true;
+      this.suspendTransferStorage();
       if (isMissing(error)) throw new TransferStorageError('Transfer storage is unavailable.');
       throw error;
     }
+    const sessions: PushSession[] = [];
+    let problem: string | null = null;
+    const flag = (reason: string, detail?: string): void => {
+      this.recordTransferAnomaly(reason, detail);
+      if (problem === null) problem = detail === undefined ? reason : `${reason}:${detail}`;
+    };
     try {
-      const entries = await readDeletionRootEntries(root);
-      const sessions: PushSession[] = [];
-      for (const entry of entries) {
+      for (const entry of await readDeletionRootEntries(root)) {
         if (!entry.isDirectory() || entry.isSymbolicLink() || !/^trn_[A-Za-z0-9]+$/u.test(entry.name)) {
-          throw new TransferStorageError('Transfer storage contains unattributed residue.');
+          // Residue this server cannot read as one of its own sessions. Deletion-scoped inventory
+          // keeps failing closed on unattributable residue; ordinary serving ignores it.
+          continue;
         }
         const inspection = await this.inspectSessionAt(root, entry.name);
+        if (inspection.kind !== 'valid') {
+          flag('transfer_session_unusable', entry.name);
+          continue;
+        }
         const marker = await this.inspectOwnerMarkerAt(root, entry.name);
-        if (inspection.kind !== 'valid' || marker.kind !== 'valid' || marker.vaultId !== inspection.value.vault_id) {
-          throw new TransferStorageError('Transfer session ownership is unavailable.');
+        if (marker.kind === 'valid') {
+          if (marker.vaultId !== inspection.value.vault_id) {
+            flag('transfer_session_owner_mismatch', entry.name);
+            continue;
+          }
+        } else if (marker.kind === 'missing') {
+          if (mode !== SCAN_STARTUP) {
+            flag('transfer_session_ownership_missing', entry.name);
+            continue;
+          }
+          flag('transfer_session_ownership_adopted', entry.name);
+          await this.withStorageLock(async () => await this.writeOwnerMarker(entry.name, inspection.value.vault_id));
+        } else {
+          flag('transfer_session_owner_unreadable', entry.name);
+          continue;
         }
-        if (rejectTemporary && await this.hasStatePublicationTemporary(root, entry.name)) {
-          throw new TransferStorageError('Transfer state publication is incomplete.');
+        if (await this.hasStatePublicationTemporary(root, entry.name)) {
+          flag('transfer_state_publication_incomplete', entry.name);
+          continue;
         }
+        if (!(await this.validTransferRepository(entry.name, inspection.value.vault_id))) {
+          flag('transfer_repository_unusable', entry.name);
+          continue;
+        }
+        if (!(await this.verifySessionAccounting(inspection.value, mode !== SCAN_VERDICT, flag)).ok) continue;
         sessions.push(inspection.value);
       }
-      for (const session of sessions) await this.verifySessionAccounting(session);
       await assertDeletionRootUnchanged(root);
-      return sessions;
+      return { sessions, problem };
     } catch (error) {
-      this.transferUnavailable = true;
+      if (error instanceof TransferStorageError) throw error;
+      this.suspendTransferStorage();
       throw error;
     } finally {
       await closeDeletionRoot(root);
@@ -834,11 +919,15 @@ export class ChunkTransferService {
   private async readSession(transferId: string): Promise<PushSession | null> {
     const inspection = await this.inspectSession(transferId);
     if (inspection.kind === 'valid') {
-      await this.verifySessionAccounting(inspection.value);
+      const flag = (reason: string, detail?: string): void => this.recordTransferAnomaly(reason, detail);
+      if (!(await this.verifySessionAccounting(inspection.value, false, flag)).ok) {
+        this.recordTransferAnomaly('transfer_session_unusable', transferId);
+        return null;
+      }
       return inspection.value;
     }
     if (inspection.kind === 'missing') return null;
-    this.transferUnavailable = true;
+    this.recordTransferAnomaly('transfer_session_unusable', transferId);
     return null;
   }
 
@@ -926,7 +1015,7 @@ export class ChunkTransferService {
         this.persistence
       );
     } catch (error) {
-      this.transferUnavailable = true;
+      this.suspendTransferStorage();
       throw error;
     }
   }
@@ -939,7 +1028,7 @@ export class ChunkTransferService {
         this.persistence
       );
     } catch (error) {
-      this.transferUnavailable = true;
+      this.suspendTransferStorage();
       throw error;
     }
   }
@@ -1031,30 +1120,41 @@ export class ChunkTransferService {
     return total;
   }
 
-  private async verifySessionAccounting(session: PushSession): Promise<number> {
+  // Returns whether the session is serveable. In operational mode harmless accounting drift is
+  // repaired from on-disk material instead of reporting the session unusable.
+  private async verifySessionAccounting(
+    session: PushSession,
+    repair: boolean,
+    flag: (reason: string, detail?: string) => void
+  ): Promise<{ ok: boolean; actual: number }> {
     if (
       session.chunk_count > this.config.maxTransferChunks ||
       session.total_bytes > this.config.maxTransferBytes ||
       (session.stored_bytes !== undefined && session.stored_bytes > this.config.maxTransferStorageBytes) ||
       session.receipts.some((receipt) => receipt.bytes > this.config.transferChunkBytes)
     ) {
-      this.transferUnavailable = true;
-      throw new TransferStorageError('Persisted transfer session exceeds configured limits.');
+      flag('transfer_session_exceeds_limits', session.transfer_id);
     }
-    const actual = await this.directoryBytes(this.sessionDir(session.transfer_id), false, true);
+    let actual: number;
+    try {
+      actual = await this.directoryBytes(this.sessionDir(session.transfer_id), false, true);
+    } catch {
+      flag('transfer_session_unreadable', session.transfer_id);
+      return { ok: false, actual: session.stored_bytes ?? 0 };
+    }
     if (actual > this.config.maxTransferBytes || actual > this.config.maxTransferStorageBytes) {
-      this.transferUnavailable = true;
-      throw new TransferStorageError('Persisted transfer storage exceeds configured limits.');
+      flag('transfer_session_storage_exceeds_limits', session.transfer_id);
     }
     if (session.stored_bytes !== undefined && session.stored_bytes !== actual) {
-      this.transferUnavailable = true;
-      throw new TransferStorageError('Persisted transfer storage accounting does not match transfer material.');
+      // Accounted bytes can drift across releases. On-disk material is the authority; the recomputed
+      // value keeps later quota decisions truthful without suspending the service.
+      flag('transfer_session_accounting_mismatch', session.transfer_id);
+      if (repair) session.stored_bytes = actual;
     }
     if ((session.status === 'completed' || session.status === 'rejected') && session.receipts.length !== session.chunk_count) {
-      this.transferUnavailable = true;
-      throw new TransferStorageError('Persisted terminal transfer is missing chunk receipts.');
+      flag('transfer_terminal_session_incomplete', session.transfer_id);
     }
-    return actual;
+    return { ok: true, actual };
   }
 
   private async withStorageLock<T>(fn: () => Promise<T>): Promise<T> {
