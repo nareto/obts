@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { lstat, mkdir, open, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 
@@ -15,6 +16,12 @@ import type {
 
 const EVENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const EVENT_RETENTION_LIMIT = 100_000;
+
+// Metadata temp residue is only removed when its name matches a naming scheme this
+// project has actually written: `<pid>.<epoch-ms>.<random-hex>.tmp` for the current
+// writer and `<pid>.<epoch-ms>.tmp` for the previous release. Anything else is
+// unexpected residue and still fails closed.
+const TEMP_RESIDUE_PATTERN = /^[0-9]+\.[0-9]+(?:\.[0-9a-f]+)?\.tmp$/u;
 
 export type PasswordHash = {
   algorithm: 'argon2id';
@@ -461,7 +468,7 @@ export class MetadataStore {
 
   private async persist(db = this.requireDb()): Promise<void> {
     const serialized = `${JSON.stringify(db, null, 2)}\n`;
-    const tempFile = `${this.filePath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+    const tempFile = `${this.filePath}.${process.pid}.${Date.now()}.${randomBytes(8).toString('hex')}.tmp`;
     try {
       await mkdir(dirname(this.filePath), { recursive: true, mode: 0o700 });
     } catch (error) {
@@ -521,11 +528,12 @@ export class MetadataStore {
       throw new MetadataCleanupError(error);
     }
     const prefix = `${basename(this.filePath)}.`;
-    const tempPattern = /^[0-9]+\.[0-9]+\.[0-9a-f]+\.tmp$/u;
     let removed = false;
     try {
       for (const entry of entries.filter((candidate) => candidate.startsWith(prefix) && candidate.endsWith('.tmp'))) {
-        if (!tempPattern.test(entry.slice(prefix.length))) throw new MetadataCleanupError();
+        if (!TEMP_RESIDUE_PATTERN.test(entry.slice(prefix.length))) {
+          throw new MetadataCleanupError(new Error(`unexpected metadata temp residue: ${entry}`));
+        }
         await this.persistence.remove(join(dirname(this.filePath), entry));
         removed = true;
         this.cleanupDirectorySyncRequired = true;

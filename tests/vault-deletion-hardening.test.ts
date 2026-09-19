@@ -601,6 +601,42 @@ describe('vault deletion hardening', () => {
     await root.handle.close();
   });
 
+  it('removes metadata temp residue written by the current and previous releases', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'obts-metadata-legacy-temp-'));
+    roots.push(root);
+    const dataDir = join(root, 'data');
+    const metadataDir = join(dataDir, 'metadata');
+    await new MetadataStore(dataDir).initialize();
+    await writeFile(join(metadataDir, 'phase1.json.123.1695024000000.tmp'), 'legacy stale');
+    await writeFile(join(metadataDir, 'phase1.json.456.1695024000001.9f8c1d2e3a4b5c6d.tmp'), 'current stale');
+
+    const store = new MetadataStore(dataDir);
+    await store.initialize();
+
+    expect(store.isReady()).toBe(true);
+    const entries = await readdir(metadataDir);
+    expect(entries).toEqual(['phase1.json']);
+    await expect(store.snapshot()).resolves.toBeDefined();
+  });
+
+  it('fails closed on unexpected metadata temp residue and names the residue', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'obts-metadata-unknown-temp-'));
+    roots.push(root);
+    const dataDir = join(root, 'data');
+    const metadataDir = join(dataDir, 'metadata');
+    await new MetadataStore(dataDir).initialize();
+    await writeFile(join(metadataDir, 'phase1.json.not-a-temp-name.tmp'), 'unknown residue');
+
+    const store = new MetadataStore(dataDir);
+    await expect(store.initialize()).rejects.toThrow('Metadata temporary-file cleanup is unavailable.');
+    expect(store.isReady()).toBe(false);
+    await expect(store.cleanupPersistenceTemps()).rejects.toMatchObject({
+      cause: { message: 'unexpected metadata temp residue: phase1.json.not-a-temp-name.tmp' }
+    });
+    await expect(store.snapshot()).rejects.toThrow('Metadata temporary-file cleanup is unavailable.');
+    expect(await readdir(metadataDir)).toContain('phase1.json.not-a-temp-name.tmp');
+  });
+
   it('fails closed after metadata temp cleanup failure', async () => {
     const root = await mkdtemp(join(tmpdir(), 'obts-metadata-cleanup-'));
     roots.push(root);

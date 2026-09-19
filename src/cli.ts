@@ -325,6 +325,10 @@ export async function runCli(
     }
     const message = error instanceof Error ? error.message : 'Unknown error';
     io.stderr(`obts: ${message}\n`);
+    const cause = error instanceof Error ? error.cause : undefined;
+    if (cause instanceof Error && cause.message) {
+      io.stderr(`obts: caused by ${cause.message}\n`);
+    }
     return 1;
   } finally {
     if (server && command !== 'serve') {
