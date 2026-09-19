@@ -448,8 +448,12 @@ describe('transfer durable state publication', () => {
     delete session.stored_bytes;
     await writeFile(sessionPath, JSON.stringify(session));
     await writeFile(join(config.transferDir, created.descriptor.transfer_id, 'repo.git', 'oversized'), Buffer.alloc(1_048_577));
-    expect(await service.checkReady()).toMatchObject({ ok: false });
-    expect(service.isReady()).toBe(true);
+    // The deep quarantine audit runs at startup and reports the anomaly without disabling serving.
+    const restarted = new ChunkTransferService(config, git as never, {} as never);
+    await restarted.initialize();
+    expect(await restarted.checkReady()).toMatchObject({ ok: false });
+    expect(restarted.isReady()).toBe(true);
+    await restarted.close();
     await service.close();
   });
 
@@ -557,8 +561,14 @@ describe('transfer durable state publication', () => {
     const session = JSON.parse(await readFile(sessionPath, 'utf8')) as { stored_bytes: number };
     session.stored_bytes += 1;
     await writeFile(sessionPath, JSON.stringify(session));
-    expect(await service.checkReady()).toMatchObject({ ok: false });
-    expect(service.isReady()).toBe(true);
+    const restarted = new ChunkTransferService(config, git as never, {} as never);
+    await restarted.initialize();
+    // Drift is repaired from on-disk material and persisted, so readiness is healthy afterwards.
+    expect(await restarted.checkReady()).toMatchObject({ ok: true });
+    expect(restarted.isReady()).toBe(true);
+    const repaired = JSON.parse(await readFile(sessionPath, 'utf8')) as { stored_bytes: number };
+    expect(repaired.stored_bytes).toBe(session.stored_bytes - 1);
+    await restarted.close();
     await service.close();
   });
 

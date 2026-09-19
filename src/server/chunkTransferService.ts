@@ -83,6 +83,7 @@ export class ChunkTransferService {
   private closed = false;
   private transferUnavailable = false;
   private transferAnomaly: string | null = null;
+  private startupAnomaly: string | null = null;
 
   constructor(
     private readonly config: ServerConfig,
@@ -99,16 +100,18 @@ export class ChunkTransferService {
   /**
    * Reports whether transfer storage can serve requests.
    *
-   * A readiness or dashboard probe never writes to transfer storage and never lets a session-scoped
-   * inconsistency disable serving: those are reported here as an anomaly verdict while transfers keep
-   * working. Only transfer storage itself being unusable (missing or unsafe root, or a failed durable
-   * write) makes the service not ready.
+   * This is a structural verdict, deliberately cheap: it inspects the transfer root and the durable
+   * session records only. It never writes, never takes the storage lock, and never performs a deep
+   * quarantine audit (repository integrity and on-disk byte accounting), because readiness and
+   * dashboard probes must neither stall device transfers nor change availability. The deep audit runs
+   * once at startup, repairs what it can, and records any remaining anomaly.
    */
   async checkReady(): Promise<{ ok: true } | { ok: false; error: string }> {
     if (!this.isReady()) return { ok: false, error: 'transfer storage is unavailable' };
     try {
-      const { problem } = await this.withStorageLock(async () => await this.scanSessions(SCAN_VERDICT));
-      return problem === null ? { ok: true } : { ok: false, error: `transfer storage anomaly: ${problem}` };
+      const { problem } = await this.scanSessions(SCAN_VERDICT);
+      const blocking = problem ?? this.startupAnomaly;
+      return blocking === null ? { ok: true } : { ok: false, error: `transfer storage anomaly: ${blocking}` };
     } catch {
       return { ok: false, error: 'transfer storage is unavailable' };
     }
@@ -141,7 +144,11 @@ export class ChunkTransferService {
     }
     let sessions: PushSession[];
     try {
-      sessions = (await this.scanSessions(SCAN_STARTUP)).sessions;
+      const scan = await this.scanSessions(SCAN_STARTUP);
+      sessions = scan.sessions;
+      // The deep audit runs only here. Record what it found so readiness can report it without
+      // repeating the expensive work on every probe.
+      this.startupAnomaly = scan.problem;
     } catch {
       this.suspendTransferStorage();
       return;
@@ -496,16 +503,16 @@ export class ChunkTransferService {
         throw new AuthError(413, 'transfer_too_large', 'Transfer exceeds the configured aggregate limit.');
       }
       return await this.withStorageLock(async () => {
-        const verification = await this.verifySessionAccounting(
+        const flag = (reason: string, detail?: string): void => this.recordTransferAnomaly(reason, detail);
+        const accounting = await this.verifySessionAccounting(
           session,
-          true,
+          flag,
           (reason, detail) => this.recordTransferAnomaly(reason, detail)
         );
-        if (!verification.ok) throw new AuthError(503, 'transfer_unavailable', 'Transfer storage is unavailable.');
-        const actualSessionBytes = verification.actual;
+        if (!accounting.ok) throw new AuthError(503, 'transfer_unavailable', 'Transfer storage is unavailable.');
         await this.listSessions();
         this.storedBytes = await this.directoryBytes(this.config.transferDir, true, true);
-        const previousSessionBytes = actualSessionBytes;
+        const previousSessionBytes = accounting.actual;
         if (this.storedBytes + data.byteLength > this.config.maxTransferStorageBytes) {
           throw new AuthError(507, 'transfer_storage_full', 'Transfer quarantine storage is full.');
         }
@@ -679,13 +686,15 @@ export class ChunkTransferService {
         });
         return;
       } catch (error) {
-        if (error instanceof GitDurabilityError || error instanceof AuthError && error.code === 'transfer_unavailable') {
+        if (error instanceof GitDurabilityError) {
           this.suspendTransferStorage();
           return;
         }
         if (error instanceof AuthError) {
           await this.withLock(transferId, async () => {
-            const latest = await this.requireSession(auth, transferId);
+            // Removal-tolerant read: this session's quarantine repository is what failed, so marking
+            // the transfer rejected must not depend on validating it again.
+            const latest = await this.requireSession(auth, transferId, { requireRepository: false });
             if (latest.status !== 'processing') return;
             latest.result = { status: 'rejected', code: error.code, message: error.message };
             latest.status = 'rejected';
@@ -834,15 +843,16 @@ export class ChunkTransferService {
   /**
    * Walks persisted transfer sessions.
    *
-   * `SCAN_STARTUP` is used once at initialization: it adopts a session record written before
-   * ownership markers existed by durably recording ownership, repairs harmless accounting drift in
-   * memory, and skips a session it cannot serve.
+   * `SCAN_STARTUP` runs once at initialization and performs the deep audit: it adopts a session
+   * record written before ownership markers existed by durably recording ownership, rewrites a
+   * session whose accounted bytes drifted, validates quarantine repository integrity, and skips a
+   * session it cannot serve.
    *
-   * `SCAN_OPERATIONAL` serves requests: identical, except that it never writes. It runs on request
-   * paths that may already hold the storage lock, and accounting repairs stay in memory.
+   * `SCAN_OPERATIONAL` serves requests: it performs only the cheap structural checks, writes nothing,
+   * and runs on request paths that may already hold the storage lock.
    *
-   * `SCAN_VERDICT` is read-only for readiness: it reports the first inconsistency it finds without
-   * writing anything, so a readiness or dashboard probe cannot change availability.
+   * `SCAN_VERDICT` is the readiness verdict: equally structural and strictly read-only, so a readiness
+   * or dashboard probe can neither write nor stall device transfers, and cannot change availability.
    *
    * Only a genuine storage failure suspends transfer service; a session-scoped anomaly is skipped
    * for that transfer instead of disabling every vault on the server.
@@ -859,12 +869,17 @@ export class ChunkTransferService {
       if (isMissing(error)) throw new TransferStorageError('Transfer storage is unavailable.');
       throw error;
     }
+    const deep = mode === SCAN_STARTUP;
     const sessions: PushSession[] = [];
     let problem: string | null = null;
+    // `flag` records an anomaly that leaves persisted state inconsistent; `note` records something the
+    // audit resolved or can safely ignore. Both are logged; only `flag` makes readiness report a
+    // persistent-state anomaly, because a healed state is not a reason to stay unhealthy.
     const flag = (reason: string, detail?: string): void => {
       this.recordTransferAnomaly(reason, detail);
       if (problem === null) problem = detail === undefined ? reason : `${reason}:${detail}`;
     };
+    const note = (reason: string, detail?: string): void => this.recordTransferAnomaly(reason, detail);
     try {
       for (const entry of await readDeletionRootEntries(root)) {
         if (!entry.isDirectory() || entry.isSymbolicLink() || !/^trn_[A-Za-z0-9]+$/u.test(entry.name)) {
@@ -884,12 +899,32 @@ export class ChunkTransferService {
             continue;
           }
         } else if (marker.kind === 'missing') {
-          if (mode !== SCAN_STARTUP) {
+          if (!deep) {
             flag('transfer_session_ownership_missing', entry.name);
             continue;
           }
-          flag('transfer_session_ownership_adopted', entry.name);
-          await this.withStorageLock(async () => await this.writeOwnerMarker(entry.name, inspection.value.vault_id));
+          if (this.lifecycle?.isBlocked(inspection.value.vault_id)) {
+            // A vault mid-deletion owns this residue. Leave it to the deletion coordinator, which
+            // requires attribution to make progress and must not be helped by adoption.
+            flag('transfer_session_ownership_deferred', entry.name);
+            continue;
+          }
+          note('transfer_session_ownership_adopted', entry.name);
+          try {
+            await this.withStorageLock(async () => await writeDurableFile(
+              this.ownerMarker(entry.name),
+              `${JSON.stringify({ vault_id: inspection.value.vault_id })}\n`,
+              this.persistence
+            ));
+          } catch (error) {
+            if (isMissing(error)) {
+              // The session directory disappeared underneath the audit (expiry or deletion).
+              note('transfer_session_vanished', entry.name);
+              continue;
+            }
+            this.suspendTransferStorage();
+            throw error;
+          }
         } else {
           flag('transfer_session_owner_unreadable', entry.name);
           continue;
@@ -898,11 +933,22 @@ export class ChunkTransferService {
           flag('transfer_state_publication_incomplete', entry.name);
           continue;
         }
-        if (!(await this.validTransferRepository(entry.name, inspection.value.vault_id))) {
-          flag('transfer_repository_unusable', entry.name);
+        if (!this.verifySessionStructure(inspection.value, flag)) {
+          flag('transfer_session_unusable', entry.name);
           continue;
         }
-        if (!(await this.verifySessionAccounting(inspection.value, mode !== SCAN_VERDICT, flag)).ok) continue;
+        if (deep) {
+          const accounting = await this.verifySessionAccounting(inspection.value, flag, note);
+          if (!accounting.ok) continue;
+          if (accounting.repaired) {
+            // Persist the repair so the durable record stops disagreeing with its own material.
+            await this.withStorageLock(async () => await this.writeSession(inspection.value, entry.name));
+          }
+          if (!(await this.validTransferRepository(entry.name, inspection.value.vault_id))) {
+            flag('transfer_repository_unusable', entry.name);
+            continue;
+          }
+        }
         sessions.push(inspection.value);
       }
       await assertDeletionRootUnchanged(root);
@@ -920,7 +966,7 @@ export class ChunkTransferService {
     const inspection = await this.inspectSession(transferId);
     if (inspection.kind === 'valid') {
       const flag = (reason: string, detail?: string): void => this.recordTransferAnomaly(reason, detail);
-      if (!(await this.verifySessionAccounting(inspection.value, false, flag)).ok) {
+      if (!this.verifySessionStructure(inspection.value, flag)) {
         this.recordTransferAnomaly('transfer_session_unusable', transferId);
         return null;
       }
@@ -1120,13 +1166,12 @@ export class ChunkTransferService {
     return total;
   }
 
-  // Returns whether the session is serveable. In operational mode harmless accounting drift is
-  // repaired from on-disk material instead of reporting the session unusable.
-  private async verifySessionAccounting(
+  // Cheap structural validation of a persisted session record: values the record itself declares.
+  // Returns whether the session is serveable at all.
+  private verifySessionStructure(
     session: PushSession,
-    repair: boolean,
     flag: (reason: string, detail?: string) => void
-  ): Promise<{ ok: boolean; actual: number }> {
+  ): boolean {
     if (
       session.chunk_count > this.config.maxTransferChunks ||
       session.total_bytes > this.config.maxTransferBytes ||
@@ -1134,27 +1179,42 @@ export class ChunkTransferService {
       session.receipts.some((receipt) => receipt.bytes > this.config.transferChunkBytes)
     ) {
       flag('transfer_session_exceeds_limits', session.transfer_id);
+      return false;
     }
+    if ((session.status === 'completed' || session.status === 'rejected') && session.receipts.length !== session.chunk_count) {
+      flag('transfer_terminal_session_incomplete', session.transfer_id);
+      return false;
+    }
+    return true;
+  }
+
+  // Deep audit of on-disk material: recompute the session's bytes and reconcile them with the durable
+  // record. This walks the quarantine directory, so it runs at startup and on the write path, never
+  // from a readiness probe.
+  private async verifySessionAccounting(
+    session: PushSession,
+    flag: (reason: string, detail?: string) => void,
+    note: (reason: string, detail?: string) => void
+  ): Promise<{ ok: boolean; actual: number; repaired: boolean }> {
     let actual: number;
     try {
       actual = await this.directoryBytes(this.sessionDir(session.transfer_id), false, true);
     } catch {
       flag('transfer_session_unreadable', session.transfer_id);
-      return { ok: false, actual: session.stored_bytes ?? 0 };
+      return { ok: false, actual: session.stored_bytes ?? 0, repaired: false };
     }
     if (actual > this.config.maxTransferBytes || actual > this.config.maxTransferStorageBytes) {
       flag('transfer_session_storage_exceeds_limits', session.transfer_id);
+      return { ok: false, actual, repaired: false };
     }
     if (session.stored_bytes !== undefined && session.stored_bytes !== actual) {
-      // Accounted bytes can drift across releases. On-disk material is the authority; the recomputed
-      // value keeps later quota decisions truthful without suspending the service.
-      flag('transfer_session_accounting_mismatch', session.transfer_id);
-      if (repair) session.stored_bytes = actual;
+      // Accounted bytes drift across releases. On-disk material is the authority, and the repaired
+      // value is persisted by the caller, so this heals rather than leaving readiness unhealthy.
+      note('transfer_session_accounting_mismatch', session.transfer_id);
+      session.stored_bytes = actual;
+      return { ok: true, actual, repaired: true };
     }
-    if ((session.status === 'completed' || session.status === 'rejected') && session.receipts.length !== session.chunk_count) {
-      flag('transfer_terminal_session_incomplete', session.transfer_id);
-    }
-    return { ok: true, actual };
+    return { ok: true, actual, repaired: false };
   }
 
   private async withStorageLock<T>(fn: () => Promise<T>): Promise<T> {

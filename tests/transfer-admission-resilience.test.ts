@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -30,6 +30,8 @@ describe('transfer admission resilience against legacy and anomalous state', () 
     expect(restarted.transferAnomalyReason()).toBe(`transfer_session_ownership_adopted:${transferId}`);
     const marker = JSON.parse(await readFile(join(fixture.config.transferDir, transferId, 'owner.json'), 'utf8')) as { vault_id: string };
     expect(marker.vault_id).toBe(fixture.auth.vault.vault_id);
+    // Adoption heals the state, so readiness must not stay unhealthy.
+    await expect(restarted.checkReady()).resolves.toEqual({ ok: true });
     await expect(restarted.getPush(fixture.auth, transferId)).resolves.toMatchObject({ transfer_id: transferId });
   });
 
@@ -38,12 +40,15 @@ describe('transfer admission resilience against legacy and anomalous state', () 
     const broken = await createTransfer(fixture, 'readiness-probe-broken', 1);
     await rm(join(fixture.config.transferDir, broken, 'repo.git'), { recursive: true, force: true });
 
-    // Readiness reports the inconsistency, but the probe must not change serving availability.
-    await expect(fixture.service.checkReady()).resolves.toMatchObject({
+    // The deep quarantine audit runs at startup and reports the anomaly, but it must not change
+    // serving availability.
+    const restarted = restart(fixture);
+    await restarted.initialize();
+    await expect(restarted.checkReady()).resolves.toMatchObject({
       ok: false,
       error: `transfer storage anomaly: transfer_repository_unusable:${broken}`
     });
-    expect(fixture.service.isReady()).toBe(true);
+    expect(restarted.isReady()).toBe(true);
 
     // Other transfers keep working; only the unusable transfer is refused.
     await expect(createTransfer(fixture, 'readiness-probe-healthy', 1)).resolves.toBeTypeOf('string');
@@ -51,7 +56,7 @@ describe('transfer admission resilience against legacy and anomalous state', () 
       statusCode: 503,
       code: 'transfer_unavailable'
     });
-    expect(fixture.service.isReady()).toBe(true);
+    expect(restarted.isReady()).toBe(true);
   });
 
   it('still allows a device to remove a transfer whose quarantine repository is unusable', async () => {
@@ -69,7 +74,8 @@ describe('transfer admission resilience against legacy and anomalous state', () 
     await fixture.service.putChunk(fixture.auth, transferId, 0, Buffer.from('chunk'), sha256('chunk'));
     const path = join(fixture.config.transferDir, transferId, 'session.json');
     const persisted = JSON.parse(await readFile(path, 'utf8')) as { stored_bytes: number };
-    persisted.stored_bytes = persisted.stored_bytes + 4096;
+    const drifted = persisted.stored_bytes + 4096;
+    persisted.stored_bytes = drifted;
     await writeFile(path, `${JSON.stringify(persisted)}\n`);
 
     const restarted = restart(fixture);
@@ -77,10 +83,10 @@ describe('transfer admission resilience against legacy and anomalous state', () 
 
     expect(restarted.isReady()).toBe(true);
     expect(restarted.transferAnomalyReason()).toBe(`transfer_session_accounting_mismatch:${transferId}`);
-    await expect(restarted.checkReady()).resolves.toMatchObject({
-      ok: false,
-      error: `transfer storage anomaly: transfer_session_accounting_mismatch:${transferId}`
-    });
+    // The repair is persisted, so readiness returns to healthy instead of reporting drift forever.
+    await expect(restarted.checkReady()).resolves.toEqual({ ok: true });
+    const repaired = JSON.parse(await readFile(path, 'utf8')) as { stored_bytes: number };
+    expect(repaired.stored_bytes).toBe(drifted - 4096);
     await expect(restarted.getPush(fixture.auth, transferId)).resolves.toMatchObject({ transfer_id: transferId });
   });
 
@@ -118,6 +124,45 @@ describe('transfer admission resilience against legacy and anomalous state', () 
     expect(restarted.transferAnomalyReason()).toBeNull();
     await expect(restarted.checkReady()).resolves.toEqual({ ok: true });
     await expect(createTransfer(fixture, 'residue-follow-up', 1)).resolves.toBeTypeOf('string');
+  });
+
+  it('defers adopting a legacy session whose vault is mid-deletion', async () => {
+    const fixture = await createFixture();
+    const transferId = await createTransfer(fixture, 'deletion-blocked-adoption', 1);
+    await rm(join(fixture.config.transferDir, transferId, 'owner.json'), { force: true });
+
+    const lifecycle = { isBlocked: () => true, withAdmission: async (_vaultId: string, operation: () => Promise<unknown>) => await operation() };
+    const restarted = restart(fixture, lifecycle);
+    await restarted.initialize();
+
+    // Adoption must not attribute residue to a vault that is being deleted, because that is what the
+    // deletion coordinator's fail-closed attribution check relies on. Serving continues meanwhile.
+    expect(restarted.isReady()).toBe(true);
+    expect(restarted.transferAnomalyReason()).toBe(`transfer_session_ownership_deferred:${transferId}`);
+    expect(await exists(join(fixture.config.transferDir, transferId, 'owner.json'))).toBe(false);
+  });
+
+  it('treats a session directory that vanished during adoption as benign, not fatal', async () => {
+    const fixture = await createFixture();
+    const transferId = await createTransfer(fixture, 'vanished-adoption', 1);
+    await rm(join(fixture.config.transferDir, transferId, 'owner.json'), { force: true });
+
+    const missing = Object.assign(new Error('synthetic vanish'), { code: 'ENOENT' });
+    const persistence = {
+      readDirectory: async (path: string) => await readdir(path),
+      writeFile: async (path: string, data: string) => await writeFile(path, data, { mode: 0o600, flag: 'wx' }),
+      fsyncFile: async () => { throw missing; },
+      rename: async () => undefined,
+      fsyncDirectory: async () => undefined,
+      remove: async () => undefined
+    };
+    const service = new ChunkTransferService(fixture.config, fixture.git as never, {} as never, undefined, persistence as never);
+    await service.initialize();
+
+    // Expiry or deletion can remove the directory underneath the audit. That is a race, not a reason
+    // to stop serving every device on the server.
+    expect(service.isReady()).toBe(true);
+    expect(service.transferAnomalyReason()).toBe(`transfer_session_vanished:${transferId}`);
   });
 
   it('still suspends transfer storage when a durable write itself fails', async () => {
@@ -172,8 +217,8 @@ async function createFixture(): Promise<Fixture> {
   return { config, service, git, auth: syntheticAuth() };
 }
 
-function restart(fixture: Fixture): ChunkTransferService {
-  return new ChunkTransferService(fixture.config, fixture.git as never, {} as never);
+function restart(fixture: Fixture, lifecycle?: unknown): ChunkTransferService {
+  return new ChunkTransferService(fixture.config, fixture.git as never, {} as never, lifecycle as never);
 }
 
 async function createTransfer(fixture: Fixture, attemptId: string, chunkCount: number): Promise<string> {
