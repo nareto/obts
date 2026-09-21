@@ -23,6 +23,7 @@ pub mod search;
 pub mod service;
 pub mod store;
 pub mod summary;
+mod vault_export;
 pub mod workers;
 
 pub use api::{AppState, app_router};

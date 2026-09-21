@@ -2,6 +2,7 @@ use super::*;
 use crate::authorization::{AccessMatcher, AccessPolicy};
 use crate::filesystem::{FilesystemSource, synchronize_snapshot};
 use crate::service::VaultBridgeService;
+use crate::vault_export::MarkdownExportResponse;
 use sqlx::postgres::PgPoolOptions;
 use tempfile::TempDir;
 
@@ -293,12 +294,12 @@ async fn postgres_projection_reads_queries_acl_edits_and_faults() {
                 &auth,
                 &id,
                 serde_json::from_value(
-                    serde_json::json!({"content":"# changed", "expected_sha256":"0".repeat(64)})
+                    serde_json::json!({"content":"# changed", "expected_revision":format!("v1:sha256:{}", "0".repeat(64))})
                 )
                 .unwrap()
             )
             .await,
-        Err(ServiceError::Write(WriteError::ContentChanged { .. }))
+        Err(ServiceError::Write(WriteError::RevisionMismatch))
     ));
     f.service
         .store
@@ -577,6 +578,43 @@ async fn postgres_failed_block_batch_retains_cursor_and_revert_replays() {
 
 #[tokio::test]
 #[ignore = "requires synthetic PostgreSQL; run explicitly with --ignored"]
+async fn postgres_markdown_export_pages_all_policy_visible_files_and_weak_etags() {
+    let f = Fixture::new().await;
+    for i in 0..520 {
+        std::fs::write(
+            f.root.path().join(format!("Export-{i:03}.md")),
+            format!("---\ntags: [exported]\n---\n# Export {i}\n"),
+        )
+        .unwrap();
+    }
+    f.project().await;
+    let auth = admin();
+    let export = f
+        .service
+        .export_markdown(&auth, &[])
+        .await
+        .expect("SQL-backed Markdown export");
+    let export_etag = match export {
+        MarkdownExportResponse::Archive(archive) => {
+            assert_eq!(archive.metadata.exported_markdown_files, 520);
+            assert_eq!(archive.metadata.unavailable_markdown_files, 0);
+            archive.metadata.etag.clone()
+        }
+        MarkdownExportResponse::NotModified(_) => panic!("unconditional export returned 304"),
+    };
+    assert!(matches!(
+        f.service
+            .export_markdown(&auth, &[format!("W/{export_etag}")])
+            .await
+            .expect("conditional SQL-backed Markdown export"),
+        MarkdownExportResponse::NotModified(_)
+    ));
+    f.assert_no_resident_text().await;
+    f.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires synthetic PostgreSQL; run explicitly with --ignored"]
 async fn postgres_paged_totals_semantic_blocks_and_successful_cas_writes() {
     let f = Fixture::new().await;
     for i in 0..520 {
@@ -664,20 +702,40 @@ async fn postgres_paged_totals_semantic_blocks_and_successful_cas_writes() {
     let original = f.service.get_vault_file(&auth, &created.id).await.unwrap();
     assert!(original.content.contains("created_by: synthetic-admin"));
     assert!(original.content.contains("ai-created"));
-    let update:UpdateNoteRequest=serde_json::from_value(serde_json::json!({"expected_sha256":original.content_sha256,"content_patch":[{"op":"append","text":"\nAppended exactly once.\n"}]})).unwrap();
+    assert!(original.revision.starts_with("v1:sha256:"));
+    let original_revision = original.revision.clone();
     drop(original);
-    f.service
+    let missing_precondition: UpdateNoteRequest =
+        serde_json::from_value(serde_json::json!({"content":"must not land"})).unwrap();
+    assert!(matches!(
+        f.service
+            .edit_vault_file(&auth, &created.id, missing_precondition)
+            .await,
+        Err(ServiceError::Write(WriteError::PreconditionRequired))
+    ));
+    let update: UpdateNoteRequest = serde_json::from_value(serde_json::json!({
+        "expected_revision": original_revision,
+        "content_patch": [{"op":"append","text":"\nAppended exactly once.\n"}]
+    }))
+    .unwrap();
+    let update_response = f
+        .service
         .edit_vault_file(&auth, &created.id, update.clone())
         .await
         .unwrap();
+    assert_ne!(update_response.revision, original_revision);
     f.project().await;
     let updated = f.service.get_vault_file(&auth, &created.id).await.unwrap();
     assert_eq!(updated.content.matches("Appended exactly once.").count(), 1);
     assert!(updated.content.contains("created_by: synthetic-admin"));
     drop(updated);
+    let mut stale_update = update;
+    stale_update.metadata = Some(serde_json::Value::String("invalid".to_string()));
     assert!(matches!(
-        f.service.edit_vault_file(&auth, &created.id, update).await,
-        Err(ServiceError::Write(WriteError::ContentChanged { .. }))
+        f.service
+            .edit_vault_file(&auth, &created.id, stale_update)
+            .await,
+        Err(ServiceError::Write(WriteError::RevisionMismatch))
     ));
     let denied = std::collections::BTreeMap::from([(
         "admin".to_string(),
@@ -1520,12 +1578,23 @@ async fn postgres_cancel_singleton_drains_owned_body_before_replay() {
     assert!(f.service.filesystem.as_ref().unwrap().is_index_current());
     *f.service.store.forced_projection_failure.write().await =
         Some(PersistenceFailureKind::DatabaseUnavailable);
+    let cancel_id = NoteId::new("Cancel.md");
+    let expected_revision = f
+        .service
+        .get_vault_file(&admin(), &cancel_id)
+        .await
+        .unwrap()
+        .revision;
     let edited = f
         .service
         .edit_vault_file(
             &admin(),
-            &NoteId::new("Cancel.md"),
-            serde_json::from_value(serde_json::json!({"content":"# durable local edit"})).unwrap(),
+            &cancel_id,
+            serde_json::from_value(serde_json::json!({
+                "content":"# durable local edit",
+                "expected_revision": expected_revision,
+            }))
+            .unwrap(),
         )
         .await
         .unwrap();

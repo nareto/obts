@@ -36,8 +36,8 @@ use crate::markdown::{
 };
 use crate::model::{Note, NoteId, UnscopedNote, VaultFile};
 use crate::new_note::{
-    ContentPatchOperation, NewNoteFileType, NewNotePathSettings, NewNoteRequest,
-    PersistenceFailureKind, UpdateNoteRequest, WriteError, apply_content_patch,
+    NewNoteFileType, NewNotePathSettings, NewNoteRequest, PersistenceFailureKind,
+    UpdateNoteRequest, WriteError, apply_content_patch,
 };
 use crate::persistence::{
     BlockSemanticMatch, PersistedAccessLogEntry, PersistedFileAlias, PersistedIngestDelta,
@@ -468,6 +468,7 @@ impl BacklinksResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct NewNoteResponse {
     pub id: NoteId,
+    pub revision: String,
     pub status: &'static str,
     pub file_type: NewNoteFileType,
     pub indexed_as_note: bool,
@@ -478,6 +479,7 @@ pub struct NewNoteResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct UpdateNoteResponse {
     pub id: NoteId,
+    pub revision: String,
     pub status: &'static str,
     pub local_projection: &'static str,
     pub operation_id: String,
@@ -640,6 +642,18 @@ pub enum VaultFileVisibility {
     MissingIndexWithRawMarkdown,
     Accessible,
     Filtered,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MarkdownExportCandidate {
+    pub path: String,
+    pub source_revision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MarkdownExportCandidates {
+    pub files: Vec<MarkdownExportCandidate>,
+    pub exceeds_limit: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3004,6 +3018,7 @@ impl VaultStore {
         let write = self.prepare_create_vault_write_at(request, now).await?;
         let response = NewNoteResponse {
             id: NoteId::new(write.path.clone()),
+            revision: whole_file_revision(&write.content),
             status: "created",
             file_type: write.file_type,
             indexed_as_note: write.note.is_some(),
@@ -3246,12 +3261,19 @@ impl VaultStore {
     ) -> Result<UpdateNoteRequest, WriteError> {
         self.prepare_cached_read("prepare note update").await;
         let path = note_id.as_str().to_string();
-        let note = {
+        let (note, existing_raw_content) = {
             let guard = self.inner.read().await;
             let Some(note) = guard.notes.get(note_id) else {
                 return Err(WriteError::NotFound { path });
             };
-            policy_note_from_stored(note)
+            let raw_file =
+                guard
+                    .vault_files
+                    .get(&note.path)
+                    .ok_or_else(|| WriteError::NotFound {
+                        path: note.path.clone(),
+                    })?;
+            (policy_note_from_stored(note), raw_file.content.clone())
         };
 
         let config = self.authorization_config().await;
@@ -3262,6 +3284,7 @@ impl VaultStore {
                 reason: "no matching edit rule in the effective authorization policy".to_string(),
             });
         };
+        require_matching_revision(&request, &existing_raw_content)?;
 
         if let Some(metadata) = request.metadata.as_mut() {
             let Some(metadata) = metadata.as_object_mut() else {
@@ -3307,6 +3330,7 @@ impl VaultStore {
         let (
             existing_frontmatter,
             existing_body,
+            existing_raw_content,
             existing_tags,
             existing_created_at,
             expected_couchdb_rev,
@@ -3316,14 +3340,20 @@ impl VaultStore {
                 .notes
                 .get(note_id)
                 .ok_or_else(|| WriteError::NotFound { path: path.clone() })?;
+            let raw_file = guard
+                .vault_files
+                .get(&path)
+                .ok_or_else(|| WriteError::NotFound { path: path.clone() })?;
             (
                 note.frontmatter.clone(),
                 note.content.clone(),
+                raw_file.content.clone(),
                 note.tags.clone(),
                 note.created_at,
                 note.couchdb_rev.clone(),
             )
         };
+        require_matching_revision(request, &existing_raw_content)?;
         let markdown =
             request.rebuild_markdown(&existing_frontmatter, &existing_body, &existing_tags, now)?;
         let max_link_context_chars = self.settings.read().await.max_link_context_chars;
@@ -3367,6 +3397,7 @@ impl VaultStore {
         Ok((
             UpdateNoteResponse {
                 id: note_id.clone(),
+                revision: whole_file_revision(&markdown),
                 status: "updated",
                 local_projection: "applied",
                 operation_id,
@@ -3418,6 +3449,39 @@ impl VaultStore {
         } else {
             VaultFileVisibility::Filtered
         }
+    }
+
+    pub(crate) async fn markdown_export_candidates(
+        &self,
+        auth: &AuthContext,
+        max_files: usize,
+    ) -> Result<MarkdownExportCandidates, crate::service::ServiceError> {
+        if self.uses_sql_backend() {
+            return self.sql_markdown_export_candidates(auth, max_files).await;
+        }
+        self.prepare_cached_read("Markdown export policy snapshot")
+            .await;
+        let guard = self.inner.read().await;
+        let config = self.authorization_config().await;
+        let now = Utc::now();
+        let mut files = guard
+            .notes
+            .values()
+            .filter(|note| {
+                policy_allows(&config, auth, "read", &policy_note_from_stored(note), now)
+            })
+            .map(|note| MarkdownExportCandidate {
+                path: note.path.clone(),
+                source_revision: note.couchdb_rev.clone(),
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+        let exceeds_limit = files.len() > max_files;
+        files.truncate(max_files.saturating_add(1));
+        Ok(MarkdownExportCandidates {
+            files,
+            exceeds_limit,
+        })
     }
 
     pub async fn vault_file_recovery_target(
@@ -3696,6 +3760,7 @@ impl VaultStore {
         let write = self.prepare_create_vault_write_at(request, now).await?;
         let response = NewNoteResponse {
             id: NoteId::new(write.path.clone()),
+            revision: whole_file_revision(&write.content),
             status: "created",
             file_type: write.file_type,
             indexed_as_note: write.note.is_some(),
@@ -3787,30 +3852,6 @@ impl VaultStore {
         policy_note: PolicyNote,
         expected_couchdb_rev: String,
     ) -> Result<PreparedVaultWrite, WriteError> {
-        let actual_sha256 = hex::encode(Sha256::digest(existing_content.as_bytes()));
-        if let Some(expected) = request.expected_sha256.as_deref() {
-            let expected = expected.strip_prefix("sha256:").unwrap_or(expected);
-            if expected != actual_sha256 {
-                return Err(WriteError::ContentChanged {
-                    expected: expected.to_string(),
-                    actual: actual_sha256,
-                });
-            }
-        }
-        if request.content_patch.as_ref().is_some_and(|operations| {
-            operations.iter().any(|operation| {
-                matches!(
-                    operation,
-                    ContentPatchOperation::Append { .. } | ContentPatchOperation::Prepend { .. }
-                )
-            })
-        }) && request.expected_sha256.is_none()
-        {
-            return Err(WriteError::InvalidUpdate {
-                reason: "append and prepend require expected_sha256".to_string(),
-            });
-        }
-
         let config = self.authorization_config().await;
         let Some(decision) = policy_decision_for(&config, auth, "edit", &policy_note, now) else {
             return Err(WriteError::PolicyDenied {
@@ -3819,6 +3860,7 @@ impl VaultStore {
                 reason: "no matching edit rule in the effective authorization policy".to_string(),
             });
         };
+        require_matching_revision(&request, &existing_content)?;
         if request.content.is_some() && request.content_patch.is_some() {
             return Err(WriteError::InvalidUpdate {
                 reason: "content and content_patch are mutually exclusive".to_string(),
@@ -3896,6 +3938,7 @@ impl VaultStore {
         Ok((
             UpdateNoteResponse {
                 id: file_id.clone(),
+                revision: whole_file_revision(&content),
                 status: "updated",
                 local_projection: "applied",
                 operation_id,
@@ -4879,6 +4922,7 @@ fn get_vault_file_from_inner(guard: &StoreInner, path: &str) -> Option<VaultFile
     Some(VaultFile {
         _body_lease: None,
         id: NoteId::new(path),
+        revision: whole_file_revision(&file.content),
         path: path.to_string(),
         file_type: file_type_from_path(path),
         content: file.content.clone(),
@@ -5154,6 +5198,8 @@ fn rebuild_graph_cache_locked(guard: &mut StoreInner) {
 
 fn build_unscoped_note(guard: &StoreInner, note_id: &NoteId) -> Option<UnscopedNote> {
     let note = guard.notes.get(note_id)?;
+    let raw_file = guard.vault_files.get(&note.path)?;
+    let revision = whole_file_revision(&raw_file.content);
     let links = outgoing_links(guard, note_id)
         .into_iter()
         .map(|l| l.target_id)
@@ -5165,6 +5211,7 @@ fn build_unscoped_note(guard: &StoreInner, note_id: &NoteId) -> Option<UnscopedN
 
     Some(UnscopedNote {
         id: note.id.clone(),
+        revision,
         path: note.path.clone(),
         title: title_from_note_id(note.path.as_str()),
         heading_title: note.heading_title.clone(),
@@ -5826,6 +5873,29 @@ fn policy_decision_for(
     }
 
     allowed.then_some(decision)
+}
+
+fn require_matching_revision(
+    request: &UpdateNoteRequest,
+    current_raw_content: &str,
+) -> Result<(), WriteError> {
+    let expected = request
+        .expected_revision
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(WriteError::PreconditionRequired)?;
+    if expected != whole_file_revision(current_raw_content) {
+        return Err(WriteError::RevisionMismatch);
+    }
+    Ok(())
+}
+
+pub(crate) fn whole_file_revision(raw_content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"vault-file-content-v1:\0");
+    hasher.update(raw_content.as_bytes());
+    format!("v1:sha256:{}", hex::encode(hasher.finalize()))
 }
 
 fn write_operation_id(path: &str, content: &str, timestamp: DateTime<Utc>) -> String {
@@ -7317,8 +7387,8 @@ mod tests {
     use super::{
         NeighborDirection, NoteInput, QueryBaseRequest, QueryNotesRequest, RuntimeSyncState,
         StoreSettings, StoredVaultFile, UnscopedBacklinkEntry, UnscopedNeighborNode,
-        UnscopedRecentNoteSummary, VaultStore, find_case_insensitive, get_note_from_inner,
-        neighbors_from_inner, note_readable_for_policy_from_inner,
+        UnscopedRecentNoteSummary, VaultStore, build_unscoped_note, find_case_insensitive,
+        get_note_from_inner, neighbors_from_inner, note_readable_for_policy_from_inner,
         stale_file_recovery_targets_locked, status_from_inner, store_inner_from_persisted_notes,
         upsert_note_locked,
     };
@@ -7390,6 +7460,10 @@ mod tests {
         assert_eq!(targets[0].note_path, path);
         assert!(targets[0].child_doc_ids.is_empty());
         assert!(targets[0].needs_file_document);
+        assert!(
+            build_unscoped_note(&inner, &NoteId::new(path)).is_none(),
+            "an exact note read must not invent an empty whole-file revision"
+        );
     }
 
     #[test]
@@ -7459,6 +7533,7 @@ mod tests {
         store
             .upsert_note(note_input("secret.md", "Duplicate", vec!["private"], now))
             .await;
+        seed_raw_vault_files(&store).await;
 
         let note = store
             .get_note_by_title_for_policy(&external_auth(), "duplicate")
@@ -7482,6 +7557,7 @@ mod tests {
                 now,
             ))
             .await;
+        seed_raw_vault_files(&store).await;
 
         let by_id = store
             .get_note_for_policy(&external_auth(), &note_id)
@@ -7686,7 +7762,33 @@ views:
         let now = Utc::now();
         let settings = StoreSettings::new(20);
         let sync_state = RuntimeSyncState::new(now);
-        store_inner_from_persisted_notes(persisted_notes_fixture(now), &settings, &sync_state)
+        let mut inner =
+            store_inner_from_persisted_notes(persisted_notes_fixture(now), &settings, &sync_state);
+        seed_raw_vault_files_locked(&mut inner);
+        inner
+    }
+
+    async fn seed_raw_vault_files(store: &VaultStore) {
+        let mut guard = store.inner.write().await;
+        seed_raw_vault_files_locked(&mut guard);
+    }
+
+    fn seed_raw_vault_files_locked(inner: &mut super::StoreInner) {
+        let files = inner
+            .notes
+            .values()
+            .map(|note| StoredVaultFile {
+                path: note.path.clone(),
+                content: note.content.clone(),
+                couchdb_rev: note.couchdb_rev.clone(),
+                created_at: note.created_at,
+                updated_at: note.updated_at,
+                indexed_at: note.indexed_at,
+            })
+            .collect::<Vec<_>>();
+        for file in files {
+            inner.vault_files.insert(file.path.clone(), file);
+        }
     }
 
     fn persisted_notes_fixture(now: chrono::DateTime<Utc>) -> Vec<PersistedNoteRecord> {

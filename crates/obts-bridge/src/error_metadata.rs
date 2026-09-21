@@ -156,14 +156,20 @@ pub(crate) fn service_error_metadata(
         )
         .with_http_status(503),
         ServiceError::FilesystemWrite(error) => match error {
-            crate::filesystem::FilesystemError::AlreadyExists
-            | crate::filesystem::FilesystemError::Changed { .. } => ErrorMetadata::new(
+            crate::filesystem::FilesystemError::AlreadyExists => ErrorMetadata::new(
                 ErrorCategory::Business,
                 false,
-                "vault file changed",
+                "vault file already exists",
                 error.to_string(),
             )
             .with_http_status(409),
+            crate::filesystem::FilesystemError::Changed { .. } => ErrorMetadata::new(
+                ErrorCategory::Business,
+                false,
+                "revision mismatch",
+                "The vault file changed after it was read; read it again before retrying",
+            )
+            .with_http_status(412),
             crate::filesystem::FilesystemError::NotFound => ErrorMetadata::new(
                 ErrorCategory::Business,
                 false,
@@ -202,13 +208,20 @@ fn write_error_metadata(error: &WriteError) -> ErrorMetadata {
             error.to_string(),
         )
         .with_http_status(409),
-        WriteError::ContentChanged { .. } => ErrorMetadata::new(
+        WriteError::PreconditionRequired => ErrorMetadata::new(
+            ErrorCategory::Validation,
+            false,
+            "revision required",
+            "Read the current vault file and submit its revision as expected_revision",
+        )
+        .with_http_status(428),
+        WriteError::RevisionMismatch => ErrorMetadata::new(
             ErrorCategory::Business,
             false,
-            "vault file changed",
-            error.to_string(),
+            "revision mismatch",
+            "The vault file changed after it was read; read it again before retrying",
         )
-        .with_http_status(409),
+        .with_http_status(412),
         WriteError::NotFound { .. } => ErrorMetadata::new(
             ErrorCategory::Business,
             false,

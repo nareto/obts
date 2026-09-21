@@ -1,7 +1,7 @@
 schema_version: 1
-revision: 11
+revision: 12
 status: current
-updated: 2026-09-20
+updated: 2026-09-21
 authoritative_artifacts:
   - architecture/manifest.yaml
   - architecture/README.md
@@ -11,6 +11,8 @@ authoritative_artifacts:
   - architecture/migrations
   - architecture/workspace.dsl
   - openapi/openapi.yaml
+  - crates/obts-bridge/src/api_docs.rs
+  - crates/obts-bridge/config/mcp_tools.yaml
 formal_models:
   - id: OBTS-FM-001
     status: accepted
@@ -64,3 +66,12 @@ formal_models:
       - OBTS-PER-DEL-001
       - OBTS-DASH-DEL-001
       - OBTS-VER-DEL-001
+  - id: OBTS-FM-005
+    status: accepted
+    path: architecture/models/formal/OBTSBridgeExternalProtocol.tla
+    architecture_revision: 12
+    checks: architecture/models/formal/checks-fm005.json
+    refines:
+      - OBTS-BRG-WRITE-001
+      - OBTS-BRG-EXPORT-001
+      - OBTS-BRG-BODY-001

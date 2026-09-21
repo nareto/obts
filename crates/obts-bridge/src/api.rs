@@ -4,8 +4,10 @@ use std::path::PathBuf;
 
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
-use axum::http::header::CONTENT_TYPE;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::header::{
+    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
+};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -13,7 +15,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::api_docs;
 use crate::authorization::{AuthContext, ContextName};
@@ -32,6 +34,7 @@ use crate::store::{
     MAX_GRAPH_TRAVERSAL_DEPTH, MAX_NOTE_LIST_LIMIT, NeighborDirection, NoteTimeFilter,
     QueryNotesRequest, StatusResponse,
 };
+use crate::vault_export::{MarkdownExportError, MarkdownExportResponse};
 
 #[derive(Clone, Debug)]
 pub struct AppState {
@@ -263,6 +266,10 @@ pub enum ApiError {
     Forbidden(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("too many requests: {0}")]
+    TooManyRequests(String),
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
     #[error("service unavailable: {0}")]
     Unavailable(String),
     #[error("internal error: {0}")]
@@ -286,6 +293,8 @@ impl ApiError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Service(error) => service_error_status(error),
@@ -299,6 +308,8 @@ impl ApiError {
             Self::BadRequest(message)
             | Self::Forbidden(message)
             | Self::Conflict(message)
+            | Self::TooManyRequests(message)
+            | Self::PayloadTooLarge(message)
             | Self::Unavailable(message)
             | Self::Internal(message) => message.clone(),
             Self::Service(error) => service_error_legacy_error(error),
@@ -339,6 +350,20 @@ impl ApiError {
                 message,
             )
             .with_http_status(409),
+            Self::TooManyRequests(message) => ErrorMetadata::new(
+                ErrorCategory::Transient,
+                true,
+                "export already running",
+                message,
+            )
+            .with_http_status(429),
+            Self::PayloadTooLarge(message) => ErrorMetadata::new(
+                ErrorCategory::Validation,
+                false,
+                "export limit exceeded",
+                message,
+            )
+            .with_http_status(413),
             Self::Unavailable(message) => ErrorMetadata::new(
                 ErrorCategory::Transient,
                 true,
@@ -381,6 +406,9 @@ fn service_error_legacy_error(error: &ServiceError) -> String {
             crate::new_note::WriteError::NotFound { .. } => "not found".to_string(),
             other => other.to_string(),
         },
+        ServiceError::FilesystemWrite(crate::filesystem::FilesystemError::Changed { .. }) => {
+            "the vault file changed after it was read".to_string()
+        }
         ServiceError::FilesystemWrite(error) => error.to_string(),
         ServiceError::Headless(error) => error.to_string(),
     }
@@ -460,6 +488,13 @@ struct GetNoteLookupRequest {
     title: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VaultExportParams {
+    #[serde(default)]
+    include: Option<String>,
+}
+
 pub async fn serve(state: AppState, addr: SocketAddr) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("obts_bridge listening on {}", addr);
@@ -477,6 +512,10 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/notes", post(create_note))
         .route("/api/v1/notes/{*id}", get(get_note).put(update_note))
         .route("/api/v1/vault-files", post(create_vault_file_endpoint))
+        .route(
+            "/api/v1/vault-files/export",
+            get(export_vault_files_endpoint),
+        )
         .route(
             "/api/v1/vault-files/{*id}",
             get(get_vault_file_endpoint).put(edit_vault_file_endpoint),
@@ -901,6 +940,105 @@ async fn create_vault_file_endpoint(
     )
     .await;
     Ok(write_response(response.local_projection, response))
+}
+
+async fn export_vault_files_endpoint(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    query: Result<Query<VaultExportParams>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let auth = auth_from_headers(&state, &headers).await?;
+    let params = decode_query(query)?;
+    if params.include.as_deref().unwrap_or("markdown") != "markdown" {
+        return Err(ApiError::BadRequest(
+            "include must be exactly 'markdown'; binary assets are not supported".to_string(),
+        ));
+    }
+    let if_none_match = headers
+        .get_all(IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok().map(ToOwned::to_owned))
+        .collect::<Vec<_>>();
+    let export = state
+        .service
+        .export_markdown(&auth, &if_none_match)
+        .await
+        .map_err(map_export_error)?;
+    let (metadata, not_modified) = match &export {
+        MarkdownExportResponse::NotModified(metadata) => (metadata, true),
+        MarkdownExportResponse::Archive(archive) => (&archive.metadata, false),
+    };
+    log_access(
+        &state,
+        &auth,
+        "/api/v1/vault-files/export",
+        &json!({
+            "include": "markdown",
+            "export_revision": metadata.export_revision,
+            "exported_markdown_files": metadata.exported_markdown_files,
+            "unavailable_markdown_files": metadata.unavailable_markdown_files,
+            "policy_filtered_markdown_files": "omitted_without_disclosing_paths_or_counts",
+            "not_modified": not_modified,
+        }),
+        &[],
+    )
+    .await;
+
+    let etag = metadata.etag.clone();
+    let mut response = match export {
+        MarkdownExportResponse::NotModified(_) => StatusCode::NOT_MODIFIED.into_response(),
+        MarkdownExportResponse::Archive(archive) => {
+            let (body, size) = archive.into_body().map_err(map_export_error)?;
+            let mut response = Response::new(body);
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("application/zip"));
+            response.headers_mut().insert(
+                CONTENT_DISPOSITION,
+                HeaderValue::from_static("attachment; filename=\"vault-markdown-export.zip\""),
+            );
+            response.headers_mut().insert(
+                CONTENT_LENGTH,
+                HeaderValue::from_str(&size.to_string())
+                    .map_err(|_| ApiError::Internal("could not encode export size".to_string()))?,
+            );
+            response
+        }
+    };
+    response.headers_mut().insert(
+        ETAG,
+        HeaderValue::from_str(&etag)
+            .map_err(|_| ApiError::Internal("could not encode export ETag".to_string()))?,
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
+    Ok(response)
+}
+
+fn map_export_error(error: MarkdownExportError) -> ApiError {
+    match error {
+        MarkdownExportError::Busy => ApiError::TooManyRequests(error.to_string()),
+        MarkdownExportError::LimitExceeded { .. } => ApiError::PayloadTooLarge(error.to_string()),
+        MarkdownExportError::IndexCatchingUp => {
+            ApiError::Unavailable("vault index is not current".to_string())
+        }
+        MarkdownExportError::Source(_)
+        | MarkdownExportError::Projection(_)
+        | MarkdownExportError::SnapshotChanged => {
+            warn!("policy-aware Markdown export source became unavailable");
+            ApiError::Unavailable("vault export source is unavailable".to_string())
+        }
+        MarkdownExportError::DuplicatePath(_)
+        | MarkdownExportError::InvalidPath(_)
+        | MarkdownExportError::Serialize(_)
+        | MarkdownExportError::Zip(_)
+        | MarkdownExportError::Io(_)
+        | MarkdownExportError::Task(_) => {
+            warn!("failed to build policy-aware Markdown export");
+            ApiError::Internal("could not build vault export".to_string())
+        }
+    }
 }
 
 async fn get_vault_file_endpoint(
@@ -1429,22 +1567,27 @@ fn prometheus_label_escape(value: &str) -> String {
 mod tests {
     use std::collections::BTreeMap;
 
-    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::body::Body;
+    use axum::http::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH};
+    use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
     use axum::response::IntoResponse;
     use chrono::Utc;
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
     use tempfile::tempdir;
+    use tower::ServiceExt;
 
     use super::{
         ApiError, ApiTokenState, AppState, auth_from_headers, build_info_metric_line,
         commit_from_image_tag, prometheus_label_escape, render_prometheus_metrics, write_response,
     };
+    use crate::authorization::AccessPolicy;
     use crate::config::{ApiTokenConfig, AppConfig};
     use crate::filesystem::FilesystemSource;
+    use crate::new_note::{NewNoteFileType, WriteError};
     use crate::runtime_config::{AuthConfigSnapshot, RuntimeConfigState};
     use crate::service::{ServiceError, VaultBridgeService};
-    use crate::store::{HeadlessProcessStatus, VaultStore};
+    use crate::store::{HeadlessProcessStatus, RecoveredVaultFileState, VaultStore};
 
     async fn api_error_body(error: ApiError) -> (StatusCode, Value) {
         let response = error.into_response();
@@ -1523,6 +1666,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn markdown_export_route_streams_and_honors_weak_etags() {
+        let config = AppConfig::default();
+        let runtime_config = RuntimeConfigState::for_tests(&config);
+        let root = tempdir().expect("source root");
+        let source =
+            std::sync::Arc::new(FilesystemSource::new(root.path()).expect("filesystem source"));
+        let path = "Visible.md";
+        source
+            .create(path, "# Visible\n")
+            .await
+            .expect("create source file");
+        let snapshot = source.scan().await.expect("scan source");
+        source.mark_indexed(&snapshot);
+        let file = snapshot.get(path).expect("scanned source file");
+        let store = VaultStore::new_with_auth_config(10, runtime_config.auth_config());
+        store
+            .set_authorization_config(BTreeMap::from([(
+                "admin".to_string(),
+                AccessPolicy::admin(),
+            )]))
+            .await;
+        store
+            .project_filesystem_file(RecoveredVaultFileState {
+                path: path.to_string(),
+                content: file.content.clone(),
+                file_type: NewNoteFileType::Md,
+                couchdb_rev: file.revision.clone(),
+                created_at: file.created_at,
+                updated_at: file.updated_at,
+            })
+            .await
+            .expect("project source file");
+        let state = AppState {
+            service: VaultBridgeService::new_with_filesystem(store, source, None),
+            api_tokens: ApiTokenState::for_tests([("agent", "secret-token", "admin")]),
+            mcp: None,
+            runtime_config,
+        };
+        let router = super::app_router(state);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/vault-files/export?include=markdown")
+                    .header("x-api-key", "secret-token")
+                    .body(Body::empty())
+                    .expect("export request"),
+            )
+            .await
+            .expect("export response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/zip");
+        let etag = response.headers()[ETAG]
+            .to_str()
+            .expect("export ETag")
+            .to_string();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect export")
+            .to_bytes();
+        assert_eq!(&bytes[..2], b"PK");
+
+        let cached = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/vault-files/export?include=markdown")
+                    .header("x-api-key", "secret-token")
+                    .header(IF_NONE_MATCH, format!("W/{etag}"))
+                    .body(Body::empty())
+                    .expect("conditional export request"),
+            )
+            .await
+            .expect("conditional export response");
+        assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(cached.headers()[ETAG], etag);
+    }
+
+    #[tokio::test]
     async fn internal_rest_errors_are_structured() {
         let (status, body) =
             api_error_body(ApiError::Internal("unexpected failure".to_string())).await;
@@ -1534,6 +1757,39 @@ mod tests {
         assert_eq!(body["message"], "internal server error");
         assert_eq!(body["description"], "unexpected failure");
         assert_eq!(body["httpStatus"], 500);
+    }
+
+    #[tokio::test]
+    async fn revision_precondition_errors_use_428_and_412() {
+        let (missing_status, missing_body) = api_error_body(ApiError::Service(
+            ServiceError::Write(WriteError::PreconditionRequired),
+        ))
+        .await;
+        assert_eq!(missing_status, StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(missing_body["httpStatus"], 428);
+
+        let (stale_status, stale_body) = api_error_body(ApiError::Service(ServiceError::Write(
+            WriteError::RevisionMismatch,
+        )))
+        .await;
+        assert_eq!(stale_status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(stale_body["httpStatus"], 412);
+
+        let (source_race_status, source_race_body) = api_error_body(ApiError::Service(
+            ServiceError::FilesystemWrite(crate::filesystem::FilesystemError::Changed {
+                expected: "sha256:internal-old".to_string(),
+                actual: "sha256:internal-new".to_string(),
+            }),
+        ))
+        .await;
+        assert_eq!(source_race_status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(source_race_body["httpStatus"], 412);
+        assert_eq!(
+            source_race_body["error"],
+            "the vault file changed after it was read"
+        );
+        assert!(!source_race_body.to_string().contains("internal-old"));
+        assert!(!source_race_body.to_string().contains("internal-new"));
     }
 
     #[test]

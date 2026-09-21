@@ -10,7 +10,9 @@ This directory is the source of truth for OBTS product boundaries, safety proper
 | `models/*.md` | Normative state ownership, lifecycle, and interaction models |
 | `workspace.dsl` | Authored C4 structure and relationships |
 | `adrs/*.md` | Accepted and superseded architectural decisions and their rationale |
-| `openapi/openapi.yaml` | Executable current HTTP shape, schema, and error contract; semantic deviations from normative contracts must be annotated and tracked |
+| `openapi/openapi.yaml` | Executable current OBTS server HTTP shape, schema, and error contract; semantic deviations from normative contracts must be annotated and tracked |
+| `crates/obts-bridge/src/api_docs.rs` | Executable OBTS Bridge REST shape served at `/openapi.json`; semantic deviations from normative contracts must be annotated and tracked |
+| `crates/obts-bridge/config/mcp_tools.yaml` | Executable OBTS Bridge MCP tool shape and descriptions |
 | `manifest.yaml` | Monotonic architecture revision and complete authoritative-artifact inventory |
 | `DIAGRAMS.md`, `export/*` | Generated views; never edit directly |
 | `migrations/*.md` | Immutable reconciliation records for authority migrations; entries may be superseded by a new revision but not silently rewritten |
@@ -25,8 +27,8 @@ The contracts are the semantic hub. Other artifacts are complementary projection
 
 - Authored C4 in `workspace.dsl` describes static structure: people, software systems, containers, components, responsibilities, and relationships. Update it when allocation, ownership, trust boundaries, or deployment relationships change.
 - TLA+ under `models/formal/` describes bounded dynamic behavior: transitions, ordering, concurrency, retries, crashes, and recovery. Each accepted model refines named contract IDs and records its implementation and test mapping.
-- OpenAPI describes the executable HTTP operations, schemas, and errors. It must remain semantically consistent with the contracts or carry a tracked deviation.
-- Production code realizes these artifacts, while executable tests and formal checks provide evidence. Neither code nor a green check silently changes product semantics or proves complete implementation conformance.
+- The server OpenAPI and Bridge runtime OpenAPI describe their respective executable HTTP operations, schemas, and errors. The Bridge MCP catalog describes the executable tool surface. They must remain semantically consistent with the contracts or carry a tracked deviation.
+- Production code realizes these artifacts, while executable tests and formal checks provide evidence. The Bridge API schema source and MCP catalog are listed separately above only as executable contracts; they do not override normative behavior. Neither other code nor a green check silently changes product semantics or proves complete implementation conformance.
 
 The mandatory coding workflow for keeping these artifacts synchronized is defined in root [`AGENTS.md`](../AGENTS.md). This file defines what the architecture artifacts mean; `AGENTS.md` defines what an agent must do when fixing bugs, implementing features, or refactoring production behavior.
 
@@ -40,8 +42,10 @@ The mandatory coding workflow for keeping these artifacts synchronized is define
 - [`contracts/dashboard.md`](contracts/dashboard.md): dashboard information architecture, status vocabulary, and consequential workflows.
 - [`contracts/verification.md`](contracts/verification.md): required evidence, fault tests, real-device proof, and release assurance.
 - [`models/system-overview.md`](models/system-overview.md): current runtime allocation and state ownership.
-- [`models/formal/README.md`](models/formal/README.md): bounded formal-model policy and the accepted `OBTS-FM-001` local apply/recovery, `OBTS-FM-002` composed distributed, and `OBTS-FM-003` focused Bridge bounded-body projection and independent embedding-worker companion models.
-- [`../openapi/openapi.yaml`](../openapi/openapi.yaml): executable HTTP shape, schema, and error contract.
+- [`models/formal/README.md`](models/formal/README.md): bounded formal-model policy and the accepted `OBTS-FM-001` local apply/recovery, `OBTS-FM-002` composed distributed, `OBTS-FM-003` focused Bridge bounded-body projection and embedding-worker companion, `OBTS-FM-004` deletion lifecycle, and `OBTS-FM-005` Bridge external-protocol models.
+- [`../openapi/openapi.yaml`](../openapi/openapi.yaml): executable OBTS server HTTP shape, schema, and error contract.
+- [`../crates/obts-bridge/src/api_docs.rs`](../crates/obts-bridge/src/api_docs.rs): executable OBTS Bridge REST shape served at `/openapi.json`.
+- [`../crates/obts-bridge/config/mcp_tools.yaml`](../crates/obts-bridge/config/mcp_tools.yaml): executable OBTS Bridge MCP tool shape.
 
 ## Architecture Revision
 

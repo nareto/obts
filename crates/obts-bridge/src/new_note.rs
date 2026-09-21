@@ -59,6 +59,7 @@ impl NewNoteFileType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NewNoteRequest {
     pub title: String,
     pub content: String,
@@ -69,9 +70,8 @@ pub struct NewNoteRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateNoteRequest {
-    #[serde(default)]
-    pub expected_sha256: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
     #[serde(default)]
@@ -80,10 +80,12 @@ pub struct UpdateNoteRequest {
     pub tags: Option<Vec<String>>,
     #[serde(default)]
     pub metadata: Option<Value>,
+    #[serde(default)]
+    pub expected_revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContentPatchOperation {
     Replace { old: String, new: String },
     Delete { old: String },
@@ -131,10 +133,12 @@ pub enum WriteError {
     InvalidCreate { reason: String },
     #[error("template not found or not visible: {path}")]
     TemplateNotFound { path: String },
+    #[error("update requires the revision returned by the corresponding read")]
+    PreconditionRequired,
+    #[error("the vault file changed after it was read")]
+    RevisionMismatch,
     #[error("invalid update: {reason}")]
     InvalidUpdate { reason: String },
-    #[error("vault file changed (expected {expected}, found {actual})")]
-    ContentChanged { expected: String, actual: String },
     #[error("{operation} denied for '{path}': {reason}")]
     PolicyDenied {
         operation: &'static str,
@@ -611,7 +615,10 @@ fn normalized_template(path_template: &str) -> String {
 mod tests {
     use chrono::{TimeZone, Utc};
 
-    use super::{NewNoteFileType, NewNotePathSettings, NewNoteRequest, WriteError};
+    use super::{
+        ContentPatchOperation, NewNoteFileType, NewNotePathSettings, NewNoteRequest,
+        UpdateNoteRequest, WriteError,
+    };
 
     fn request(title: &str) -> NewNoteRequest {
         NewNoteRequest {
@@ -695,6 +702,33 @@ mod tests {
             .expect("valid base path");
 
         assert_eq!(path, "00New/Project Dashboard.base");
+    }
+
+    #[test]
+    fn mutation_requests_reject_unknown_fields() {
+        assert!(
+            serde_json::from_value::<NewNoteRequest>(serde_json::json!({
+                "title": "Test",
+                "content": "Body",
+                "unexpected": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<UpdateNoteRequest>(serde_json::json!({
+                "expected_revision": "v1:sha256:test",
+                "expected_sha256": "legacy"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ContentPatchOperation>(serde_json::json!({
+                "op": "append",
+                "text": "Body",
+                "unexpected": true
+            }))
+            .is_err()
+        );
     }
 
     #[test]

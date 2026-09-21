@@ -373,7 +373,7 @@ impl FilesystemSource {
     }
 
     #[allow(dead_code)]
-    fn mark_indexed(&self, files: &BTreeMap<String, FilesystemFile>) {
+    pub(crate) fn mark_indexed(&self, files: &BTreeMap<String, FilesystemFile>) {
         let indexed = snapshot_revision(files);
         let mut watermark = self.watermark.write().expect("filesystem watermark lock");
         if watermark.observed == indexed && watermark.observed_generation == watermark.generation {

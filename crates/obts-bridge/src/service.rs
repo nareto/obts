@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use chrono::Utc;
+use once_cell::sync::Lazy;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tracing::{info, warn};
 
 use crate::authorization::AuthContext;
@@ -20,8 +21,13 @@ use crate::store::{
     BacklinksResponse, LocalProjectionOutcome, NeighborDirection, NeighborsResponse,
     NewNoteResponse, NoteTimeFilter, NoteVisibility, PathResponse, PreparedVaultWrite,
     QueryNotesRequest, RecentNotesResponse, StatusResponse, TagsResponse, UpdateNoteResponse,
-    VaultFileVisibility, VaultStore,
+    VaultFileVisibility, VaultStore, whole_file_revision,
 };
+use crate::vault_export::{
+    MarkdownExportError, MarkdownExportResponse, export_markdown as build_markdown_export,
+};
+
+static MARKDOWN_EXPORT_SEMAPHORE: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(1)));
 
 #[derive(Clone, Debug)]
 pub struct VaultBridgeService {
@@ -141,7 +147,11 @@ impl VaultBridgeService {
 
         let visibility = self.store.note_visibility_for_policy(auth, note_id).await;
         log_note_lookup_miss(auth, "id", note_id.as_str(), visibility);
-        Err(ServiceError::NotFound)
+        if visibility == NoteVisibility::Accessible {
+            Err(ServiceError::IndexCatchingUp)
+        } else {
+            Err(ServiceError::NotFound)
+        }
     }
 
     pub async fn get_note_by_title(
@@ -159,7 +169,11 @@ impl VaultBridgeService {
 
         let visibility = self.store.title_visibility_for_policy(auth, title).await;
         log_note_lookup_miss(auth, "title", title, visibility);
-        Err(ServiceError::NotFound)
+        if visibility == NoteVisibility::Accessible {
+            Err(ServiceError::IndexCatchingUp)
+        } else {
+            Err(ServiceError::NotFound)
+        }
     }
 
     pub async fn search(
@@ -396,6 +410,7 @@ impl VaultBridgeService {
         let file_type = write.file_type;
         let indexed_as_note = write.note.is_some();
         let operation_id = write.operation_id.clone();
+        let response_revision = whole_file_revision(&write.content);
         let filesystem = self
             .filesystem
             .as_ref()
@@ -423,6 +438,7 @@ impl VaultBridgeService {
         drop(headless_guard);
         Ok(NewNoteResponse {
             id: response_id,
+            revision: response_revision,
             status: projection.response_status("created"),
             file_type,
             indexed_as_note,
@@ -456,6 +472,7 @@ impl VaultBridgeService {
             .await
             .map_err(ServiceError::Write)?;
         let operation_id = write.operation_id.clone();
+        let response_revision = whole_file_revision(&write.content);
         let filesystem = self
             .filesystem
             .as_ref()
@@ -487,6 +504,7 @@ impl VaultBridgeService {
         drop(headless_guard);
         Ok(UpdateNoteResponse {
             id: note_id.clone(),
+            revision: response_revision,
             status: projection.response_status("updated"),
             local_projection: projection.state(),
             operation_id,
@@ -529,6 +547,43 @@ impl VaultBridgeService {
         self.ensure_vault_file_available(auth, file_id).await
     }
 
+    pub(crate) async fn export_markdown(
+        &self,
+        auth: &AuthContext,
+        if_none_match: &[String],
+    ) -> Result<MarkdownExportResponse, MarkdownExportError> {
+        let permit = MARKDOWN_EXPORT_SEMAPHORE
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| MarkdownExportError::Busy)?;
+        let source = self.filesystem.clone().ok_or_else(|| {
+            MarkdownExportError::Projection("filesystem source is disabled".to_string())
+        })?;
+        let store = self.store.clone();
+        let headless = self.headless.clone();
+        let auth = auth.clone();
+        let if_none_match = if_none_match.to_vec();
+        tokio::spawn(async move {
+            let _headless_guard = if let Some(headless) = headless.as_ref() {
+                Some(
+                    headless
+                        .lock_filesystem()
+                        .await
+                        .map_err(|error| MarkdownExportError::Projection(error.to_string()))?,
+                )
+            } else {
+                None
+            };
+            let _projection_guard = source.projection_lock.read().await;
+            if !source.is_index_current() {
+                return Err(MarkdownExportError::IndexCatchingUp);
+            }
+            build_markdown_export(&store, &source, &auth, &if_none_match, permit).await
+        })
+        .await
+        .map_err(|error| MarkdownExportError::Task(error.to_string()))?
+    }
+
     pub async fn create_vault_file(
         &self,
         auth: &AuthContext,
@@ -556,6 +611,7 @@ impl VaultBridgeService {
         let file_type = write.file_type;
         let indexed_as_note = write.note.is_some();
         let operation_id = write.operation_id.clone();
+        let response_revision = whole_file_revision(&write.content);
         let filesystem = self
             .filesystem
             .as_ref()
@@ -583,6 +639,7 @@ impl VaultBridgeService {
         drop(headless_guard);
         Ok(NewNoteResponse {
             id: response_id,
+            revision: response_revision,
             status: projection.response_status("created"),
             file_type,
             indexed_as_note,
@@ -611,6 +668,7 @@ impl VaultBridgeService {
             .await
             .map_err(ServiceError::Write)?;
         let operation_id = write.operation_id.clone();
+        let response_revision = whole_file_revision(&write.content);
         let filesystem = self
             .filesystem
             .as_ref()
@@ -642,6 +700,7 @@ impl VaultBridgeService {
         drop(headless_guard);
         Ok(UpdateNoteResponse {
             id: file_id.clone(),
+            revision: response_revision,
             status: projection.response_status("updated"),
             local_projection: projection.state(),
             operation_id,
@@ -676,6 +735,7 @@ impl VaultBridgeService {
         self.ensure_index_current()?;
         let write = self.store.sql_prepare_write(auth, id, request, raw).await?;
         let operation_id = write.operation_id.clone();
+        let response_revision = whole_file_revision(&write.content);
         let source = self.filesystem.as_ref().expect("SQL filesystem");
         self.ensure_projected_write_within_limit(source, &write.path, write.content.len())
             .await?;
@@ -692,6 +752,7 @@ impl VaultBridgeService {
         let projection = self.finalize_prepared_write(write, &revision).await?;
         Ok(UpdateNoteResponse {
             id: id.clone(),
+            revision: response_revision,
             status: projection.response_status("updated"),
             local_projection: projection.state(),
             operation_id,
@@ -789,6 +850,7 @@ impl VaultBridgeService {
                 return Ok(VaultFile {
                     _body_lease: current.lease.clone(),
                     id: file_id.clone(),
+                    revision: whole_file_revision(&current.content),
                     path: current.path.clone(),
                     file_type: if current.path.ends_with(".md") {
                         NewNoteFileType::Md
@@ -939,7 +1001,7 @@ mod obts_tests {
     use crate::config::AppConfig;
     use crate::filesystem::FilesystemSource;
     use crate::model::NoteId;
-    use crate::new_note::NewNoteFileType;
+    use crate::new_note::{NewNoteFileType, UpdateNoteRequest, WriteError};
     use crate::runtime_config::RuntimeConfigState;
     use crate::store::{RecoveredVaultFileState, VaultStore};
 
@@ -1026,6 +1088,100 @@ mod obts_tests {
             service.get_vault_file(&admin, &NoteId::new(path)).await,
             Err(ServiceError::IndexCatchingUp)
         ));
+    }
+
+    #[tokio::test]
+    async fn existing_file_edits_require_and_advance_whole_file_revisions() {
+        let store = VaultStore::new(10);
+        store
+            .set_authorization_config(BTreeMap::from([(
+                "admin".to_string(),
+                AccessPolicy::admin(),
+            )]))
+            .await;
+        let root = tempdir().expect("vault root");
+        let source = Arc::new(FilesystemSource::new(root.path()).expect("filesystem source"));
+        let path = "Revision.md";
+        let original_content = "# Original\n";
+        let source_revision = source
+            .create(path, original_content)
+            .await
+            .expect("create source file");
+        store
+            .project_filesystem_file(RecoveredVaultFileState {
+                path: path.to_string(),
+                content: original_content.to_string(),
+                file_type: NewNoteFileType::Md,
+                couchdb_rev: source_revision,
+                created_at: Some(Utc::now()),
+                updated_at: Utc::now(),
+            })
+            .await
+            .expect("project source file");
+        let service = VaultBridgeService::new_with_filesystem(store, source.clone(), None);
+        let admin = AuthContext::new(ContextName::new("admin"), "test:admin".to_string());
+        let id = NoteId::new(path);
+        let original = service
+            .get_vault_file(&admin, &id)
+            .await
+            .expect("read original file");
+        assert!(original.revision.starts_with("v1:sha256:"));
+
+        let missing = UpdateNoteRequest {
+            content: Some("# Missing precondition\n".to_string()),
+            content_patch: None,
+            tags: None,
+            metadata: None,
+            expected_revision: None,
+        };
+        assert!(matches!(
+            service.edit_vault_file(&admin, &id, missing).await,
+            Err(ServiceError::Write(WriteError::PreconditionRequired))
+        ));
+
+        let stale_revision = original.revision;
+        let response = service
+            .edit_vault_file(
+                &admin,
+                &id,
+                UpdateNoteRequest {
+                    content: Some("# Updated\n".to_string()),
+                    content_patch: None,
+                    tags: None,
+                    metadata: None,
+                    expected_revision: Some(stale_revision.clone()),
+                },
+            )
+            .await
+            .expect("update with current revision");
+        assert_ne!(response.revision, stale_revision);
+
+        assert!(matches!(
+            service
+                .update_note(
+                    &admin,
+                    &id,
+                    UpdateNoteRequest {
+                        content: Some("# Stale overwrite\n".to_string()),
+                        content_patch: None,
+                        tags: None,
+                        metadata: Some(serde_json::Value::String("invalid".to_string())),
+                        expected_revision: Some(stale_revision),
+                    },
+                )
+                .await,
+            Err(ServiceError::Write(WriteError::RevisionMismatch))
+        ));
+        let source_file = source.read(path).await.expect("read committed source");
+        assert!(source_file.content.contains("# Updated\n"));
+        assert!(!source_file.content.contains("Stale overwrite"));
+        let projected = service
+            .store
+            .get_vault_file_for_policy(&admin, &id)
+            .await
+            .expect("read projected source");
+        assert_eq!(projected.content, source_file.content);
+        assert_eq!(projected.revision, response.revision);
     }
 
     #[tokio::test]

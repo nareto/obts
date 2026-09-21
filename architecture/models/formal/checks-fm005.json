@@ -1,0 +1,238 @@
+{
+  "schemaVersion": 1,
+  "modelId": "OBTS-FM-005",
+  "architectureRevision": 12,
+  "architectureStatus": "accepted",
+  "tooling": {
+    "workers": 1,
+    "fingerprintPolynomial": 0,
+    "defaultTimeoutMs": 60000,
+    "defaultHeapMb": 1024,
+    "defaultMaximumDistinctStates": 10000
+  },
+  "model": "OBTSBridgeExternalProtocol.tla",
+  "checks": [
+    {
+      "id": "fm005-revision-safety",
+      "config": "fm005-revision-safety.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 10000,
+      "maximumDepth": 100,
+      "baseline": {"generated": 8, "distinct": 4, "depth": 4, "minGenerated": 4, "minDistinct": 2, "minDepth": 2}
+    },
+    {
+      "id": "fm005-revision-liveness",
+      "config": "fm005-revision-liveness.cfg",
+      "kind": "positive-liveness",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 10000,
+      "maximumDepth": 100,
+      "baseline": {"generated": 8, "distinct": 4, "depth": 4, "minGenerated": 4, "minDistinct": 2, "minDepth": 2}
+    },
+    {
+      "id": "fm005-missing-safety",
+      "config": "fm005-missing-safety.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 10000,
+      "maximumDepth": 100,
+      "baseline": {"generated": 7, "distinct": 3, "depth": 3, "minGenerated": 3, "minDistinct": 1, "minDepth": 1}
+    },
+    {
+      "id": "fm005-reach-missing-rejection",
+      "config": "fm005-reach-missing-rejection.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 10000,
+      "maximumDepth": 100,
+      "expectedInvariant": "NeverRejected",
+      "requiredWitness": "RejectRevision",
+      "minimumTraceDepth": 3
+    },
+    {
+      "id": "fm005-stale-safety",
+      "config": "fm005-stale-safety.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 10000,
+      "maximumDepth": 100,
+      "baseline": {"generated": 6, "distinct": 3, "depth": 3, "minGenerated": 3, "minDistinct": 1, "minDepth": 1}
+    },
+    {
+      "id": "fm005-reach-stale-rejection",
+      "config": "fm005-reach-stale-rejection.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 10000,
+      "maximumDepth": 100,
+      "expectedInvariant": "NeverRejected",
+      "requiredWitness": "RejectRevision",
+      "minimumTraceDepth": 3
+    },
+    {
+      "id": "fm005-drift-safety",
+      "config": "fm005-drift-safety.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 10000,
+      "maximumDepth": 100,
+      "baseline": {"generated": 12, "distinct": 6, "depth": 5, "minGenerated": 6, "minDistinct": 3, "minDepth": 2}
+    },
+    {
+      "id": "fm005-reach-drift-rejection",
+      "config": "fm005-reach-drift-rejection.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 10000,
+      "maximumDepth": 100,
+      "expectedInvariant": "NeverRejectDrift",
+      "requiredWitness": "RejectRevisionDrift",
+      "minimumTraceDepth": 5
+    },
+    {
+      "id": "fm005-negative-missing-bypass",
+      "config": "fm005-negative-missing-bypass.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 10000,
+      "maximumDepth": 100,
+      "expectedInvariant": "RevisionMutationAuthorized",
+      "requiredWitness": "WriteWithoutPrecondition",
+      "minimumTraceDepth": 3
+    },
+    {
+      "id": "fm005-negative-stale-bypass",
+      "config": "fm005-negative-stale-bypass.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 10000,
+      "maximumDepth": 100,
+      "expectedInvariant": "RevisionMutationAuthorized",
+      "requiredWitness": "WriteWithoutPrecondition",
+      "minimumTraceDepth": 3
+    },
+    {
+      "id": "fm005-negative-drift-bypass",
+      "config": "fm005-negative-drift-bypass.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 10000,
+      "maximumDepth": 100,
+      "expectedInvariant": "RevisionMutationAuthorized",
+      "requiredWitness": "WriteAfterDrift",
+      "minimumTraceDepth": 5
+    },
+    {
+      "id": "fm005-export-safety",
+      "config": "fm005-export-safety.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 10000,
+      "maximumDepth": 100,
+      "baseline": {"generated": 20, "distinct": 10, "depth": 10, "minGenerated": 10, "minDistinct": 5, "minDepth": 5}
+    },
+    {
+      "id": "fm005-export-liveness",
+      "config": "fm005-export-liveness.cfg",
+      "kind": "positive-liveness",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 10000,
+      "maximumDepth": 100,
+      "baseline": {"generated": 20, "distinct": 10, "depth": 10, "minGenerated": 10, "minDistinct": 5, "minDepth": 5}
+    },
+    {
+      "id": "fm005-export-cancel-safety",
+      "config": "fm005-export-cancel-safety.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 10000,
+      "maximumDepth": 100,
+      "baseline": {"generated": 50, "distinct": 24, "depth": 11, "minGenerated": 25, "minDistinct": 12, "minDepth": 5}
+    },
+    {
+      "id": "fm005-export-cancel-drain",
+      "config": "fm005-export-cancel-drain.cfg",
+      "kind": "positive-liveness",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 10000,
+      "maximumDepth": 100,
+      "baseline": {"generated": 50, "distinct": 24, "depth": 11, "minGenerated": 25, "minDistinct": 12, "minDepth": 5}
+    },
+    {
+      "id": "fm005-reach-export-ready",
+      "config": "fm005-reach-export-ready.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 10000,
+      "maximumDepth": 100,
+      "expectedInvariant": "NeverReady",
+      "requiredWitness": "CompleteExport",
+      "minimumTraceDepth": 10
+    },
+    {
+      "id": "fm005-reach-export-cancel",
+      "config": "fm005-reach-export-cancel.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 10000,
+      "maximumDepth": 100,
+      "expectedInvariant": "NeverCancelled",
+      "requiredWitness": "CancelExport",
+      "minimumTraceDepth": 3
+    },
+    {
+      "id": "fm005-negative-denied-hydration",
+      "config": "fm005-negative-denied-hydration.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 10000,
+      "maximumDepth": 100,
+      "expectedInvariant": "PolicyBeforeHydration",
+      "requiredWitness": "AcquireDeniedBody",
+      "minimumTraceDepth": 3
+    },
+    {
+      "id": "fm005-negative-entry-before-manifest",
+      "config": "fm005-negative-entry-before-manifest.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 10000,
+      "maximumDepth": 100,
+      "expectedInvariant": "ManifestFirst",
+      "requiredWitness": "WriteEntryBeforeManifest",
+      "minimumTraceDepth": 3
+    },
+    {
+      "id": "fm005-negative-export-lease",
+      "config": "fm005-negative-export-lease.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 10000,
+      "maximumDepth": 100,
+      "expectedInvariant": "ExportCompleteSafe",
+      "requiredWitness": "CompleteWithLease",
+      "minimumTraceDepth": 4
+    }
+  ]
+}

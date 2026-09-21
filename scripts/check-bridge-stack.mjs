@@ -66,13 +66,14 @@ async function launchServer(create, options, port) {
   run.checkpoint('server-started');
   return address;
 }
-async function request(base, path, { method = 'GET', body, token, cookie, csrf, bearer } = {}) {
+async function request(base, path, { method = 'GET', body, token, cookie, csrf, bearer, headers = {}, raw = false } = {}) {
   const response = await fetch(`${base}${path}`, {
     method,
-    headers: { ...(body === undefined ? {} : { 'content-type': 'application/json' }), ...(token ? { 'x-api-key': token } : {}), ...(cookie ? { cookie } : {}), ...(csrf ? { 'x-obts-csrf': csrf } : {}), ...(bearer ? { authorization: `Bearer ${bearer}` } : {}) },
+    headers: { ...(body === undefined ? {} : { 'content-type': 'application/json' }), ...(token ? { 'x-api-key': token } : {}), ...(cookie ? { cookie } : {}), ...(csrf ? { 'x-obts-csrf': csrf } : {}), ...(bearer ? { authorization: `Bearer ${bearer}` } : {}), ...headers },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     signal: AbortSignal.timeout(120_000)
   });
+  if (raw) return { status: response.status, body: Buffer.from(await response.arrayBuffer()), headers: response.headers };
   const text = await response.text();
   let parsed;
   try { parsed = text ? JSON.parse(text) : null; } catch { parsed = null; }
@@ -281,6 +282,11 @@ try {
   check(smallRead.status === 200 && hash(smallRead.body.content) === hash(await readFile(join(sourceDir, 'Fixture000.md'), 'utf8')), 'raw REST file matches peer source SHA-256');
   check(smallRead.body.content_sha256.replace(/^sha256:/, '') === hash(smallRead.body.content), 'reported raw SHA-256 matches response bytes');
   check((await request(bridgeUrl, '/api/v1/vault-files/Private.md', { token: readerToken })).status === 404, 'private exact body denied to scoped reader');
+  const exported = await request(bridgeUrl, '/api/v1/vault-files/export?include=markdown', { token: readerToken, raw: true });
+  const exportEtag = exported.headers.get('etag');
+  check(exported.status === 200 && exported.headers.get('content-type') === 'application/zip' && exported.body.subarray(0, 2).toString() === 'PK' && /^"v1:sha256:[0-9a-f]{64}"$/.test(exportEtag ?? ''), 'policy-aware Markdown ZIP export streams with a strong deterministic ETag');
+  const cachedExport = await request(bridgeUrl, '/api/v1/vault-files/export?include=markdown', { token: readerToken, headers: { 'if-none-match': `W/${exportEtag}` }, raw: true });
+  check(cachedExport.status === 304 && cachedExport.body.length === 0 && cachedExport.headers.get('etag') === exportEtag, 'weak If-None-Match returns 304 for the deterministic export');
   const deniedSearch = await request(bridgeUrl, '/api/v1/notes/query', { method: 'POST', token: readerToken, body: { text_query: 'private-marker', search_mode: 'fulltext' } });
   check(deniedSearch.status === 200 && deniedSearch.body.total === 0, 'private lexical result excluded');
   const lexical = await request(bridgeUrl, '/api/v1/notes/query', { method: 'POST', token: readerToken, body: { text_query: 'quartz0', search_mode: 'fulltext' } });
@@ -305,11 +311,16 @@ try {
   await ready();
   const readCreated = await request(bridgeUrl, `/api/v1/vault-files/${encodeURI(id)}`, { token: apiToken });
   assert.equal(readCreated.status, 200);
-  const edited = await request(bridgeUrl, `/api/v1/vault-files/${encodeURI(id)}`, { method: 'PUT', token: apiToken, body: { expected_sha256: readCreated.body.content_sha256, content: '# Stack disposable\n\nedited-marker\n' } });
-  check([200, 201, 202].includes(edited.status), 'revision-safe REST edit accepted');
+  check(/^v1:sha256:[0-9a-f]{64}$/.test(readCreated.body.revision), 'exact REST read returns an opaque whole-file revision');
+  const missingRevision = await request(bridgeUrl, `/api/v1/vault-files/${encodeURI(id)}`, { method: 'PUT', token: apiToken, body: { content: 'missing-precondition-must-not-land' } });
+  check(missingRevision.status === 428, 'REST edit without expected_revision is rejected with 428');
+  const unknownField = await request(bridgeUrl, `/api/v1/vault-files/${encodeURI(id)}`, { method: 'PUT', token: apiToken, body: { expected_revision: readCreated.body.revision, expected_sha256: readCreated.body.content_sha256, content: 'unknown-field-must-not-land' } });
+  check(unknownField.status === 400, 'REST edit rejects unknown legacy mutation fields');
+  const edited = await request(bridgeUrl, `/api/v1/vault-files/${encodeURI(id)}`, { method: 'PUT', token: apiToken, body: { expected_revision: readCreated.body.revision, content: '# Stack disposable\n\nedited-marker\n' } });
+  check([200, 201, 202].includes(edited.status) && edited.body.revision !== readCreated.body.revision, 'revision-safe REST edit advances the whole-file revision');
   await ready();
-  const stale = await request(bridgeUrl, `/api/v1/vault-files/${encodeURI(id)}`, { method: 'PUT', token: apiToken, body: { expected_sha256: readCreated.body.content_sha256, content: 'stale-overwrite-must-not-land' } });
-  check(stale.status === 409, 'stale REST revision rejected with 409');
+  const stale = await request(bridgeUrl, `/api/v1/vault-files/${encodeURI(id)}`, { method: 'PUT', token: apiToken, body: { expected_revision: readCreated.body.revision, content: 'stale-overwrite-must-not-land' } });
+  check(stale.status === 412, 'stale REST revision rejected with 412');
   await command('sync-once');
   check((await peer.syncOnce()).status === 'Synced', 'REST edit synchronized back to peer');
   const after = await request(bridgeUrl, `/api/v1/vault-files/${encodeURI(id)}`, { token: apiToken });
@@ -329,7 +340,7 @@ try {
   stage = 'pending-write-volume-restore';
   await server.app.close();
   server = undefined;
-  const offlineEdit = await request(bridgeUrl, `/api/v1/vault-files/${encodeURI(id)}`, { method: 'PUT', token: apiToken, body: { expected_sha256: recovered.body.content_sha256, content: '# Stack disposable\n\npending-restore-marker\n' } });
+  const offlineEdit = await request(bridgeUrl, `/api/v1/vault-files/${encodeURI(id)}`, { method: 'PUT', token: apiToken, body: { expected_revision: recovered.body.revision, content: '# Stack disposable\n\npending-restore-marker\n' } });
   check([200, 202].includes(offlineEdit.status), 'REST edit remains accepted while the sync server is unavailable');
   check((await readFile(join(bridgeDir, id), 'utf8')).includes('pending-restore-marker'), 'pending edit exists in authoritative client files before termination');
   await stopBridge(true);

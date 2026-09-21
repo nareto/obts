@@ -90,11 +90,16 @@ pub(crate) fn openapi_spec() -> Value {
                 },
                 "Note": {
                     "type": "object",
-                    "required": ["id", "path", "title", "content", "summary", "frontmatter", "links", "backlinks", "tags", "updated_at"],
+                    "required": ["id", "revision", "path", "title", "content", "summary", "frontmatter", "links", "backlinks", "tags", "updated_at"],
                     "properties": {
                         "id": {
                             "type": "string",
                             "description": "Canonical vault-relative note ID. Pass this unchanged to `get_vault_file(id=...)` when exact file content is needed."
+                        },
+                        "revision": {
+                            "type": "string",
+                            "pattern": "^v1:sha256:[0-9a-f]{64}$",
+                            "description": "Opaque whole-file revision required as expected_revision for an update."
                         },
                         "path": {"type": "string"},
                         "title": {
@@ -111,6 +116,25 @@ pub(crate) fn openapi_spec() -> Value {
                         "links": {"type": "array", "items": {"type": "string"}},
                         "backlinks": {"type": "array", "items": {"type": "string"}},
                         "tags": {"type": "array", "items": {"type": "string"}},
+                        "updated_at": {"type": "string", "format": "date-time"}
+                    }
+                },
+                "VaultFile": {
+                    "type": "object",
+                    "required": ["id", "revision", "path", "file_type", "content", "content_sha256", "size_bytes", "updated_at"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "revision": {
+                            "type": "string",
+                            "pattern": "^v1:sha256:[0-9a-f]{64}$",
+                            "description": "Opaque whole-file revision required as expected_revision for an edit."
+                        },
+                        "path": {"type": "string"},
+                        "file_type": {"type": "string", "enum": ["md", "base"]},
+                        "content": {"type": "string"},
+                        "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                        "size_bytes": {"type": "integer", "minimum": 0},
+                        "created_at": {"type": ["string", "null"], "format": "date-time"},
                         "updated_at": {"type": "string", "format": "date-time"}
                     }
                 },
@@ -428,6 +452,7 @@ pub(crate) fn openapi_spec() -> Value {
                 },
                 "NewNoteRequest": {
                     "type": "object",
+                    "additionalProperties": false,
                     "required": ["title", "content"],
                     "properties": {
                         "title": {
@@ -451,9 +476,10 @@ pub(crate) fn openapi_spec() -> Value {
                 },
                 "NewNoteResponse": {
                     "type": "object",
-                    "required": ["id", "status", "file_type", "indexed_as_note", "local_projection", "operation_id"],
+                    "required": ["id", "revision", "status", "file_type", "indexed_as_note", "local_projection", "operation_id"],
                     "properties": {
                         "id": {"type": "string"},
+                        "revision": {"type": "string", "pattern": "^v1:sha256:[0-9a-f]{64}$"},
                         "status": {"type": "string", "enum": ["created", "accepted"]},
                         "file_type": {"type": "string", "enum": ["md", "base"]},
                         "indexed_as_note": {"type": "boolean"},
@@ -465,6 +491,7 @@ pub(crate) fn openapi_spec() -> Value {
                     "oneOf": [
                         {
                             "type": "object",
+                            "additionalProperties": false,
                             "required": ["op", "old", "new"],
                             "properties": {
                                 "op": {"type": "string", "const": "replace"},
@@ -477,6 +504,7 @@ pub(crate) fn openapi_spec() -> Value {
                         },
                         {
                             "type": "object",
+                            "additionalProperties": false,
                             "required": ["op", "old"],
                             "properties": {
                                 "op": {"type": "string", "const": "delete"},
@@ -488,6 +516,7 @@ pub(crate) fn openapi_spec() -> Value {
                         },
                         {
                             "type": "object",
+                            "additionalProperties": false,
                             "required": ["op", "anchor", "text"],
                             "properties": {
                                 "op": {"type": "string", "enum": ["insert_before", "insert_after"]},
@@ -500,6 +529,7 @@ pub(crate) fn openapi_spec() -> Value {
                         },
                         {
                             "type": "object",
+                            "additionalProperties": false,
                             "required": ["op", "text"],
                             "properties": {
                                 "op": {"type": "string", "enum": ["append", "prepend"]},
@@ -510,10 +540,13 @@ pub(crate) fn openapi_spec() -> Value {
                 },
                 "UpdateNoteRequest": {
                     "type": "object",
+                    "additionalProperties": false,
+                    "required": ["expected_revision"],
                     "properties": {
-                        "expected_sha256": {
+                        "expected_revision": {
                             "type": "string",
-                            "description": "Optional current-content SHA-256 precondition; required for append and prepend patches."
+                            "minLength": 1,
+                            "description": "Opaque whole-file revision returned by the corresponding exact read."
                         },
                         "content": {
                             "type": "string",
@@ -530,9 +563,10 @@ pub(crate) fn openapi_spec() -> Value {
                 },
                 "UpdateNoteResponse": {
                     "type": "object",
-                    "required": ["id", "status", "local_projection", "operation_id"],
+                    "required": ["id", "revision", "status", "local_projection", "operation_id"],
                     "properties": {
                         "id": {"type": "string"},
+                        "revision": {"type": "string", "pattern": "^v1:sha256:[0-9a-f]{64}$"},
                         "status": {"type": "string", "enum": ["updated", "accepted"]},
                         "local_projection": {"type": "string", "enum": ["applied", "pending"]},
                         "operation_id": {"type": "string"}
@@ -774,7 +808,8 @@ pub(crate) fn openapi_spec() -> Value {
                     "responses": {
                         "200": json_response("#/components/schemas/Note", "Note found"),
                         "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key"),
-                        "404": json_response("#/components/schemas/ApiError", "Note not found or not visible to this context")
+                        "404": json_response("#/components/schemas/ApiError", "Note not found or not visible to this context"),
+                        "503": json_response("#/components/schemas/ApiError", "Authorized note raw content is not yet available")
                     }
                 },
                 "put": {
@@ -805,7 +840,8 @@ pub(crate) fn openapi_spec() -> Value {
                         "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key"),
                         "403": json_response("#/components/schemas/ApiError", "Edit denied by context policy"),
                         "404": json_response("#/components/schemas/ApiError", "Note not found or not editable in this context"),
-                        "409": json_response("#/components/schemas/ApiError", "Authoritative source revision changed"),
+                        "412": json_response("#/components/schemas/ApiError", "expected_revision does not match the current whole-file revision"),
+                        "428": json_response("#/components/schemas/ApiError", "expected_revision is required"),
                         "503": json_response("#/components/schemas/ApiError", "Dependency or source reconciliation unavailable")
                     }
                 }
@@ -844,7 +880,8 @@ pub(crate) fn openapi_spec() -> Value {
                         "200": json_response("#/components/schemas/Note", "Resolved note"),
                         "400": json_response("#/components/schemas/ApiError", "Neither id nor title was provided"),
                         "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key"),
-                        "404": json_response("#/components/schemas/ApiError", "Matching note not found or not visible to this context")
+                        "404": json_response("#/components/schemas/ApiError", "Matching note not found or not visible to this context"),
+                        "503": json_response("#/components/schemas/ApiError", "Authorized note raw content is not yet available")
                     }
                 }
             },
@@ -1082,6 +1119,39 @@ pub(crate) fn openapi_spec() -> Value {
                     }
                 }
             },
+            "/api/v1/vault-files/export": {
+                "get": {
+                    "tags": ["obts_bridge"],
+                    "summary": "Export policy-visible Markdown as a deterministic ZIP",
+                    "security": [{"api_key": []}],
+                    "parameters": [{
+                        "name": "include",
+                        "in": "query",
+                        "required": false,
+                        "schema": {"type": "string", "const": "markdown", "default": "markdown"}
+                    }],
+                    "responses": {
+                        "200": {
+                            "description": "Schema-2 Markdown ZIP with manifest.json as the first entry",
+                            "headers": {
+                                "ETag": {"schema": {"type": "string"}},
+                                "Cache-Control": {"schema": {"type": "string"}}
+                            },
+                            "content": {
+                                "application/zip": {
+                                    "schema": {"type": "string", "format": "binary"}
+                                }
+                            }
+                        },
+                        "304": {"description": "The current export matches If-None-Match"},
+                        "400": json_response("#/components/schemas/ApiError", "Invalid include query"),
+                        "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key"),
+                        "413": json_response("#/components/schemas/ApiError", "Export exceeds bounded file or byte limits"),
+                        "429": json_response("#/components/schemas/ApiError", "Another export is already running"),
+                        "503": json_response("#/components/schemas/ApiError", "Projection is not current or exact source bodies changed")
+                    }
+                }
+            },
             "/api/v1/vault-files/{id}": {
                 "get": {
                     "tags": ["obts_bridge"],
@@ -1094,7 +1164,7 @@ pub(crate) fn openapi_spec() -> Value {
                         "schema": {"type": "string"}
                     }],
                     "responses": {
-                        "200": {"description": "Raw vault file"},
+                        "200": json_response("#/components/schemas/VaultFile", "Raw vault file"),
                         "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key"),
                         "404": json_response("#/components/schemas/ApiError", "File not found or not visible"),
                         "503": json_response("#/components/schemas/ApiError", "Source reconciliation unavailable")
@@ -1125,7 +1195,8 @@ pub(crate) fn openapi_spec() -> Value {
                         "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key"),
                         "403": json_response("#/components/schemas/ApiError", "Edit denied by context policy"),
                         "404": json_response("#/components/schemas/ApiError", "File not found or not editable"),
-                        "409": json_response("#/components/schemas/ApiError", "Authoritative source revision changed"),
+                        "412": json_response("#/components/schemas/ApiError", "expected_revision does not match the current whole-file revision"),
+                        "428": json_response("#/components/schemas/ApiError", "expected_revision is required"),
                         "503": json_response("#/components/schemas/ApiError", "Dependency or source reconciliation unavailable")
                     }
                 }
@@ -1185,6 +1256,52 @@ fn query_param(name: &str, required: bool, schema: Value, description: impl Into
         "schema": schema,
         "description": description.into()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::openapi_spec;
+
+    #[test]
+    fn openapi_exposes_revision_and_export_contracts() {
+        let spec = openapi_spec();
+        let update = &spec["components"]["schemas"]["UpdateNoteRequest"];
+        assert_eq!(update["additionalProperties"], false);
+        assert_eq!(update["required"], json!(["expected_revision"]));
+        assert!(update["properties"].get("expected_sha256").is_none());
+        assert!(
+            spec["components"]["schemas"]["Note"]["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&json!("revision")))
+        );
+        assert!(
+            spec["components"]["schemas"]["VaultFile"]["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&json!("revision")))
+        );
+        assert!(
+            spec["paths"]["/api/v1/notes/{id}"]["put"]["responses"]
+                .get("412")
+                .is_some()
+        );
+        assert!(
+            spec["paths"]["/api/v1/notes/{id}"]["put"]["responses"]
+                .get("428")
+                .is_some()
+        );
+        assert!(
+            spec["paths"]["/api/v1/vault-files/export"]["get"]["responses"]
+                .get("200")
+                .is_some()
+        );
+        assert!(
+            spec["paths"]["/api/v1/vault-files/export"]["get"]["responses"]
+                .get("304")
+                .is_some()
+        );
+    }
 }
 
 const SWAGGER_UI_HTML: &str = r#"<!doctype html>

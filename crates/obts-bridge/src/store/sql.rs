@@ -120,6 +120,57 @@ impl VaultStore {
         Ok(note)
     }
 
+    pub(crate) async fn sql_markdown_export_candidates(
+        &self,
+        auth: &AuthContext,
+        max_files: usize,
+    ) -> Result<MarkdownExportCandidates, ServiceError> {
+        let config = self.authorization_config().await;
+        let now = Utc::now();
+        let mut after = String::new();
+        let mut files = Vec::new();
+        loop {
+            let rows = sqlx::query(&format!(
+                "{} WHERE n.id COLLATE \"C\">$1 ORDER BY n.id COLLATE \"C\" LIMIT $2",
+                policy_metadata()
+            ))
+            .bind(&after)
+            .bind(PAGE)
+            .fetch_all(&self.db().pool)
+            .await
+            .map_err(unavailable)?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
+                let note = metadata(row).map_err(unavailable)?;
+                after = note.id.to_string();
+                if policy_allows(&config, auth, "read", &policy_note_from_stored(&note), now) {
+                    files.push(MarkdownExportCandidate {
+                        path: note.path,
+                        source_revision: note.couchdb_rev,
+                    });
+                    if files.len() > max_files {
+                        files
+                            .sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+                        return Ok(MarkdownExportCandidates {
+                            files,
+                            exceeds_limit: true,
+                        });
+                    }
+                }
+            }
+            if rows.len() < PAGE as usize {
+                break;
+            }
+        }
+        files.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+        Ok(MarkdownExportCandidates {
+            files,
+            exceeds_limit: false,
+        })
+    }
+
     pub(crate) async fn sql_body(
         &self,
         path: &str,
@@ -151,6 +202,7 @@ impl VaultStore {
         Ok(Note {
             _body_lease: file.lease.clone(),
             id: note.id,
+            revision: whole_file_revision(&file.content),
             path: note.path,
             title: note.title,
             heading_title: note.heading_title,
@@ -225,6 +277,7 @@ impl VaultStore {
         Ok(VaultFile {
             _body_lease: file.lease.clone(),
             id: id.clone(),
+            revision: whole_file_revision(&file.content),
             path: file.path.clone(),
             file_type: if is_markdown_note_path(id.as_str()) {
                 NewNoteFileType::Md
@@ -1301,6 +1354,7 @@ impl VaultStore {
                 })
             })?;
         let file = self.sql_body(&path, &revision).await?;
+        require_matching_revision(&request, &file.content)?;
         let mut write = if raw {
             self.prepare_edit_from_parts(
                 auth,
@@ -1338,17 +1392,6 @@ impl VaultStore {
                 }
                 tags.sort();
                 tags.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
-            }
-            if let Some(expected) = request.expected_sha256.as_deref() {
-                let expected = expected.strip_prefix("sha256:").unwrap_or(expected);
-                let actual = hex::encode(Sha256::digest(file.content.as_bytes()));
-                if expected != actual {
-                    return Err(WriteError::ContentChanged {
-                        expected: expected.to_string(),
-                        actual,
-                    }
-                    .into());
-                }
             }
             let (_, body) = parse_frontmatter(&file.content);
             let content = request.rebuild_markdown(&note.frontmatter, &body, &note.tags, now)?;

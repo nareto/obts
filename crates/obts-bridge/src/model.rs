@@ -38,6 +38,7 @@ impl From<String> for NoteId {
 
 pub struct UnscopedNote {
     pub id: NoteId,
+    pub revision: String,
     pub path: String,
     pub title: String,
     pub heading_title: Option<String>,
@@ -55,6 +56,7 @@ pub struct Note {
     #[serde(skip)]
     pub(crate) _body_lease: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub id: NoteId,
+    pub revision: String,
     pub path: String,
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,6 +80,7 @@ pub struct VaultFile {
     #[serde(skip)]
     pub(crate) _body_lease: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub id: NoteId,
+    pub revision: String,
     pub path: String,
     pub file_type: NewNoteFileType,
     pub content: String,
@@ -93,6 +96,7 @@ impl UnscopedNote {
         Note {
             _body_lease: None,
             id: self.id.clone(),
+            revision: self.revision,
             path: self.path,
             title: self.title,
             heading_title: self.heading_title,

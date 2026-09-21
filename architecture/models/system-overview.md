@@ -16,7 +16,7 @@ Owns authenticated presentation and user intent collection. It does not decide s
 
 ### OBTS Bridge
 
-The Rust service owns scoped REST/MCP authentication, SQL-backed metadata/ACL/query planning, atomic ordinary-vault-file mutation, and bounded on-demand body hydration. The supervised Node headless client owns pairing, visible headless vault, `.obts/`, local Git, queue, transfer, pull/apply, and recovery. Rust never mutates `.obts/**`, retains a corpus-sized raw-body or derived `search_text` map, or substitutes a rebuilt index for uncertain client state.
+The Rust service owns scoped REST/MCP authentication, SQL-backed metadata/ACL/query planning, mandatory whole-file revision admission, atomic ordinary-vault-file mutation, policy-aware bounded Markdown export, and bounded on-demand body hydration. The supervised Node headless client owns pairing, visible headless vault, `.obts/`, local Git, queue, transfer, pull/apply, and recovery. Rust never mutates `.obts/**`, retains a corpus-sized raw-body or derived `search_text` map, or substitutes a rebuilt index for uncertain client state.
 
 Config.yaml/runtime auth is the sole ACL-policy authority; PostgreSQL stores note metadata and executes predicates derived from the current policy. It owns paginated metadata, policy-derived search/graph/Base candidates, revision/OID, and projection-cursor state plus retained audit history. Raw Markdown, Bases, blocks and exact response bodies remain authoritative in ordinary files/Git; PostgreSQL may retain a derived normalized lowercase plaintext lexical index (also plaintext in DB backups), never used for exact reads/snippets. Foreground caller denial remains 403/404 and does not dirty global projection. Principal-independent background projection indexes every supported synced note, including private notes. Each selected body is read under the existing shared filesystem/headless lock, checked against the projected revision/OID, parsed within the configured input-file limit, and owned until body-bearing use and copies are released. Normal derived batches obey row/encoded-byte budgets; an indivisible oversized row executes alone under the file lease and one shared singleton permit through cleanup. Parser trees/singletons/driver copies are separately measured, with no numerical hard singleton ceiling or RSS claim. Source-integrity/storage failures drain work, retain the cursor, and fail readiness closed. A corpus whose total text exceeds a legacy aggregate cap remains eligible; an individual file above the configured per-file read/parse limit remains unsupported.
 
@@ -52,11 +52,19 @@ Config.yaml/runtime auth is the sole ACL-policy authority; PostgreSQL stores not
 
 ### Bridge write and projection
 
-1. Rust authenticates the context and validates ACL plus revision preconditions.
-2. Rust atomically writes the ordinary visible vault file under the shared client/filesystem lock.
+1. Rust authenticates the context, validates ACL, requires the opaque whole-file revision, and compares it with the exact authorized raw bytes before transformations.
+2. Rust carries the prepared source revision to the atomic ordinary-file replacement under the shared client/filesystem lock; mutation-seam drift fails without changing bytes.
 3. Node observes and processes the edit through the normal device protocol.
 4. Projection obtains a bounded metadata page, acquires only selected bodies, verifies revision/OID against the ordinary source, writes every required row via normal batches or owned singletons, cleans up partial/superseded rows and body work, and advances PostgreSQL's cursor only after complete success.
 5. Drift, source/storage denial, parse/read, batch, or database failure retains the prior cursor and fails readiness closed; no stale DB body or all-text RAM fallback is permitted.
+
+### Bridge Markdown export
+
+1. Rust authenticates the automation context and requires a current headless/filesystem projection.
+2. PostgreSQL derives the complete policy-visible Markdown candidate set without a query-result cap; denied paths and counts remain undisclosed.
+3. Rust hydrates and revision-attests one candidate body at a time under the shared headless/filesystem lock, privately spools it, and releases the body lease before the next candidate.
+4. Rust emits a deterministic schema-2 manifest first, builds a bounded disk-backed ZIP, and streams it while retaining export-permit and temporary-file ownership through response completion or drop.
+5. PostgreSQL lexical/indexed text never supplies archive bodies. Missing or drifting exact bodies are omitted with only the aggregate unavailable count; failures and cancellation remove temporary plaintext.
 
 ## Fail-Closed Boundaries
 

@@ -1902,16 +1902,24 @@ impl IntoResponse for McpError {
             McpError::Service(ServiceError::Write(WriteError::PolicyDenied { .. })) => {
                 StatusCode::FORBIDDEN
             }
-            McpError::Service(ServiceError::Write(
-                WriteError::AlreadyExists { .. } | WriteError::ContentChanged { .. },
-            )) => StatusCode::CONFLICT,
+            McpError::Service(ServiceError::Write(WriteError::AlreadyExists { .. })) => {
+                StatusCode::CONFLICT
+            }
+            McpError::Service(ServiceError::Write(WriteError::PreconditionRequired)) => {
+                StatusCode::PRECONDITION_REQUIRED
+            }
+            McpError::Service(ServiceError::Write(WriteError::RevisionMismatch)) => {
+                StatusCode::PRECONDITION_FAILED
+            }
             McpError::Service(ServiceError::Write(WriteError::Persistence { .. })) => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             McpError::Service(ServiceError::FilesystemWrite(
-                crate::filesystem::FilesystemError::AlreadyExists
-                | crate::filesystem::FilesystemError::Changed { .. },
+                crate::filesystem::FilesystemError::AlreadyExists,
             )) => StatusCode::CONFLICT,
+            McpError::Service(ServiceError::FilesystemWrite(
+                crate::filesystem::FilesystemError::Changed { .. },
+            )) => StatusCode::PRECONDITION_FAILED,
             McpError::Service(ServiceError::FilesystemWrite(
                 crate::filesystem::FilesystemError::NotFound,
             )) => StatusCode::NOT_FOUND,
@@ -2125,9 +2133,11 @@ mod tests {
 
         let get_vault_file = tool_named("get_vault_file");
         assert!(get_vault_file.description.contains("raw"));
+        assert!(get_vault_file.description.contains("revision"));
         assert!(get_vault_file.description.contains("404"));
 
         let edit_vault_file = tool_named("edit_vault_file");
+        assert!(edit_vault_file.description.contains("expected_revision"));
         assert!(edit_vault_file.description.contains("mutually exclusive"));
         assert!(edit_vault_file.description.contains("403"));
         assert!(edit_vault_file.description.contains("YAML"));
@@ -2267,6 +2277,26 @@ mod tests {
     }
 
     #[test]
+    fn edit_vault_file_schema_requires_whole_file_revision() {
+        let tool = tool_named("edit_vault_file");
+
+        assert_eq!(tool.input_schema["additionalProperties"], false);
+        assert_eq!(
+            tool.input_schema["required"],
+            json!(["id", "expected_revision"])
+        );
+        assert_eq!(
+            tool.input_schema["properties"]["expected_revision"]["minLength"],
+            1
+        );
+        assert!(
+            tool.input_schema["properties"]
+                .get("expected_sha256")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn sanitizer_replaces_large_embedded_data_uris() {
         let payload = "A".repeat(600);
         let content = format!("before ![img](data:image/png;base64,{payload}) after");
@@ -2357,6 +2387,7 @@ mod body_ownership_tests {
         crate::model::VaultFile {
             _body_lease: Some(Arc::new(slots.clone().acquire_owned().await.unwrap())),
             id: NoteId::new("Lease.md"),
+            revision: "v1:sha256:test".into(),
             path: "Lease.md".into(),
             file_type: crate::new_note::NewNoteFileType::Md,
             content: "# leased body".into(),
