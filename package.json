@@ -25,6 +25,8 @@
     "test:formal:bridge": "node scripts/check-bridge-bounded-model.mjs && node scripts/check-bridge-bounded-model.mjs --worker-companion",
     "test:formal:workers": "node scripts/check-bridge-bounded-model.mjs --worker-companion",
     "test:bridge:stack": "npm run build && cargo build -p obts_bridge && node scripts/check-bridge-stack.mjs",
+    "test:upgrade-compat": "npm run build && node scripts/check-server-upgrade.mjs && npx vitest run tests/transfer-readiness-observational.test.ts",
+    "test:deployment-canary": "npm run build && node scripts/check-deployment-canary.mjs",
     "test:watch": "vitest",
     "benchmark:large-vault": "npm run build && node scripts/benchmark-large-vault.mjs"
   },

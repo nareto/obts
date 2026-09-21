@@ -34,6 +34,14 @@ Mutation testing may be used selectively for the safety kernel. Critical mutants
 
 In-process exception tests are not sufficient evidence for restart semantics. Safety-critical transitions require subprocess termination and restart on the same persistent state, followed by exact-byte, ref-reachability, journal, checksum, and integrity inspection.
 
+### N-1 Persisted-State Upgrade Gate
+
+Every server release or change that tightens durable filename, schema, accounting, ownership, recovery, or validation rules must carry a separately identifiable N-1 persisted-state compatibility result. The result must identify the exact previously deployed server producer revision from deployment history, not only a release tag, and use either that historical writer or a reproducible pinned generator.
+
+The generated state must include every relevant legacy artifact and a healthy second vault/device for failure-scope isolation. The current built server—not only an isolated service class—must start over that state and prove listening, canonical metadata preservation, durable cleanup of supported residue, ownership adoption where allowed, durable accounting repair, bounded/read-only readiness, an unrelated chunked upload, and an existing pull. Unknown or unattributed residue remains fail-closed where the contract requires it, and only genuine transfer-root, durable-write, or Git-durability failures may suspend transfer service globally.
+
+The fixture producer, generation command, included durable artifacts, and checksum/freshness mechanism belong in the release assurance record. The gate is exposed through a dedicated command such as `npm run test:upgrade-compat` and its CI/release result remains distinct from aggregate unit, formal, OpenAPI, and synthetic browser counts.
+
 Supported platforms require representative filesystem and application-lifecycle exercises. Mobile force-close coverage is mandatory; sudden-power-loss claims require separate storage evidence and cannot be inferred from process kill alone.
 
 ## Formal Methods
@@ -67,6 +75,7 @@ Before worker acceptance, execute actual-PostgreSQL regressions with a paused fa
 
 Before trusted primary-vault use:
 
+- run the candidate deployment canary over an isolated synthetic N-1 state; prove live, bounded readiness with useful failure detail, an existing pull, and an unrelated chunked upload before authoritative service state changes; clean up the canary state on success or failure;
 - run disposable-vault server/plugin smoke tests from empty state;
 - validate desktop and foreground iOS/Android onboarding, offline edits, reconnect, concurrent edits, deletes, renames, conflict review, restore, and interrupted apply;
 - run large-vault and long-running-operation checks within memory/resource budgets;
