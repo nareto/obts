@@ -146,7 +146,10 @@ function runCheck(manifest, check) {
 }
 
 function run(command, args, timeoutMs, heapMb) {
-  const result = spawnSync(command, args, {
+  const jar = process.env.TLA2TOOLS_JAR;
+  const executable = jar ? 'java' : command;
+  const commandArgs = jar ? ['-cp', resolve(jar), command === 'tla2sany' ? 'tla2sany.SANY' : 'tlc2.TLC', ...args] : args;
+  const result = spawnSync(executable, commandArgs, {
     cwd: modelDir,
     encoding: 'utf8',
     timeout: timeoutMs,
