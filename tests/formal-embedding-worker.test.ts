@@ -61,7 +61,7 @@ describe('FM003 embedding-worker companion gate', () => {
     ]);
     expect(scripts['test:formal:onboarding']).toBe('node scripts/check-onboarding-model.mjs');
     expect(scripts['test:bridge:stack']).toContain('node scripts/check-bridge-stack.mjs');
-    const workflow = readFileSync(join(root, '.forgejo/workflows/formal-model.yml'), 'utf8');
+    const workflow = readFileSync(join(root, '.github/workflows/formal-model.yml'), 'utf8');
     expect(workflow).toContain('run: npm run test:formal');
     expect(workflow).toContain('run: npx vitest run tests/formal-checker.test.ts tests/formal-bounded-body.test.ts tests/formal-embedding-worker.test.ts');
     expect(JSON.parse(readFileSync(join(root, formal, 'checks.json'), 'utf8')).checks).toHaveLength(52);

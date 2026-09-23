@@ -1,0 +1,33 @@
+name: Architecture synchronization audit
+
+on:
+  push:
+
+jobs:
+  architecture-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Use the supported Node runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Audit architecture impact acknowledgement
+        env:
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${PUSH_BEFORE:-}" ]]; then
+            echo "Push event did not provide github.event.before; refusing an incomplete audit." >&2
+            exit 1
+          elif [[ "${PUSH_BEFORE}" =~ ^0+$ ]]; then
+            mode=create
+          else
+            mode=update
+          fi
+          node scripts/check-architecture-impact.mjs "${PUSH_BEFORE}" "${GITHUB_SHA}" "${mode}" "${GITHUB_REF}"

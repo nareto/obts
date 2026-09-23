@@ -1,0 +1,25 @@
+name: Server N-1 upgrade compatibility
+
+on:
+  push:
+
+jobs:
+  server-upgrade-compatibility:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Use the supported Node runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install server dependencies
+        run: npm ci
+
+      - name: Run the separately visible built-server N-1 gate
+        run: npm run test:upgrade-compat
