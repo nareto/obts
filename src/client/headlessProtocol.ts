@@ -1,4 +1,4 @@
-import { PluginBlockedError, type ObtsPluginClient, type OnboardingAnalysis } from './core.js';
+import { PluginBlockedError, type IndexDelta, type ObtsPluginClient, type OnboardingAnalysis } from './core.js';
 import { TransportError } from '../../obsidian-plugin/src/core/transport.js';
 
 export type HeadlessRequest = {
@@ -13,13 +13,23 @@ export type HeadlessResponse =
 
 export type HeadlessEvent =
   | { type: 'event'; event: 'ready' | 'state'; state: Awaited<ReturnType<ObtsPluginClient['readState']>> }
+  | { type: 'event'; event: 'progress'; status: string; diagnosticPoint: string }
   | { type: 'event'; event: 'stopping'; reason: string };
 
 export type HeadlessMessage = HeadlessResponse | HeadlessEvent;
 
+const MAX_INDEX_DELTA_PAGE_BYTES = 480 * 1024;
+
+type IndexDeltaPage = IndexDelta & {
+  next_cursor: number | null;
+  total_files: number;
+  total_changes: number;
+};
+
 export type HeadlessClient = Pick<
   ObtsPluginClient,
   | 'initialize'
+  | 'setProgressListener'
   | 'readState'
   | 'readQueue'
   | 'readPendingOnboarding'
@@ -42,16 +52,27 @@ export type HeadlessClient = Pick<
 
 export class HeadlessSession {
   private tail: Promise<void> = Promise.resolve();
+  private emitTail: Promise<void> = Promise.resolve();
   private stopping = false;
+  private indexDeltaCache: { fromCommit: string | null; delta: IndexDelta } | null = null;
 
   constructor(
     private readonly client: HeadlessClient,
     private readonly emit: (message: HeadlessMessage) => Promise<void>
   ) {}
 
+  private emitMessage(message: HeadlessMessage): Promise<void> {
+    const operation = this.emitTail.then(async () => await this.emit(message));
+    this.emitTail = operation.catch(() => undefined);
+    return operation;
+  }
+
   async start(): Promise<void> {
+    this.client.setProgressListener((status, diagnosticPoint) => {
+      void this.emitMessage({ type: 'event', event: 'progress', status, diagnosticPoint });
+    });
     await this.client.initialize();
-    await this.emit({ type: 'event', event: 'ready', state: await this.client.readState() });
+    await this.emitMessage({ type: 'event', event: 'ready', state: await this.client.readState() });
   }
 
   submit(value: unknown): Promise<void> {
@@ -60,11 +81,11 @@ export class HeadlessSession {
       try {
         request = parseRequest(value);
       } catch (error) {
-        await this.emit({ type: 'response', id: requestId(value), ok: false, error: protocolError(error) });
+        await this.emitMessage({ type: 'response', id: requestId(value), ok: false, error: protocolError(error) });
         return;
       }
       if (this.stopping && request.command !== 'shutdown') {
-        await this.emit({
+        await this.emitMessage({
           type: 'response',
           id: request.id,
           ok: false,
@@ -74,13 +95,13 @@ export class HeadlessSession {
       }
       try {
         const { result, stateChanged, shouldStop } = await this.dispatch(request);
-        await this.emit({ type: 'response', id: request.id, ok: true, result });
         if (stateChanged) {
-          await this.emit({ type: 'event', event: 'state', state: await this.client.readState() });
+          await this.emitMessage({ type: 'event', event: 'state', state: await this.client.readState() });
         }
+        await this.emitMessage({ type: 'response', id: request.id, ok: true, result });
         if (shouldStop) this.stopping = true;
       } catch (error) {
-        await this.emit({ type: 'response', id: request.id, ok: false, error: protocolError(error) });
+        await this.emitMessage({ type: 'response', id: request.id, ok: false, error: protocolError(error) });
       }
     });
     this.tail = operation.catch(() => undefined);
@@ -90,7 +111,8 @@ export class HeadlessSession {
   async stop(reason: string): Promise<void> {
     this.stopping = true;
     await this.tail;
-    await this.emit({ type: 'event', event: 'stopping', reason });
+    this.client.setProgressListener(null);
+    await this.emitMessage({ type: 'event', event: 'stopping', reason });
   }
 
   private async dispatch(request: HeadlessRequest): Promise<{ result: unknown; stateChanged: boolean; shouldStop?: boolean }> {
@@ -102,7 +124,13 @@ export class HeadlessSession {
       case 'read-pending-onboarding':
         return { result: await this.client.readPendingOnboarding(), stateChanged: false };
       case 'read-index-delta':
-        return { result: await this.client.readIndexDelta(optionalString(request, 'fromCommit')), stateChanged: false };
+        return {
+          result: await this.readIndexDeltaPage(
+            optionalString(request, 'fromCommit') ?? null,
+            optionalNonNegativeInteger(request, 'cursor') ?? 0
+          ),
+          stateChanged: false
+        };
       case 'maintenance-tick':
         return { result: await this.client.maintenanceTick(), stateChanged: false };
       case 'start-onboarding':
@@ -163,6 +191,49 @@ export class HeadlessSession {
         throw new ProtocolInputError('unknown_command', `Unknown headless command: ${request.command}`);
     }
   }
+
+  private async readIndexDeltaPage(fromCommit: string | null, cursor: number): Promise<IndexDeltaPage> {
+    if (cursor === 0) {
+      this.indexDeltaCache = { fromCommit, delta: await this.client.readIndexDelta(fromCommit) };
+    }
+    const cached = this.indexDeltaCache;
+    if (!cached || cached.fromCommit !== fromCommit) {
+      throw new ProtocolInputError('invalid_cursor', 'read-index-delta cursor does not match an active inventory.');
+    }
+    const { delta } = cached;
+    const totalEntries = delta.files.length + delta.changes.length;
+    if (cursor > totalEntries) {
+      throw new ProtocolInputError('invalid_cursor', 'read-index-delta cursor exceeds the active inventory.');
+    }
+    const page: IndexDeltaPage = {
+      head: delta.head,
+      base: delta.base,
+      mode: delta.mode,
+      files: [],
+      changes: [],
+      next_cursor: null,
+      total_files: delta.files.length,
+      total_changes: delta.changes.length
+    };
+    let usedBytes = Buffer.byteLength(JSON.stringify(page), 'utf8');
+    let nextCursor = cursor;
+    while (nextCursor < totalEntries) {
+      const entry = nextCursor < delta.files.length
+        ? delta.files[nextCursor]
+        : delta.changes[nextCursor - delta.files.length];
+      const entryBytes = Buffer.byteLength(JSON.stringify(entry), 'utf8') + 1;
+      if (usedBytes + entryBytes > MAX_INDEX_DELTA_PAGE_BYTES && nextCursor > cursor) break;
+      if (usedBytes + entryBytes > MAX_INDEX_DELTA_PAGE_BYTES) {
+        throw new ProtocolInputError('index_entry_too_large', 'One index entry exceeds the protocol page limit.');
+      }
+      if (nextCursor < delta.files.length) page.files.push(entry as IndexDelta['files'][number]);
+      else page.changes.push(entry as IndexDelta['changes'][number]);
+      usedBytes += entryBytes;
+      nextCursor += 1;
+    }
+    page.next_cursor = nextCursor < totalEntries ? nextCursor : null;
+    return page;
+  }
 }
 
 export class ProtocolInputError extends Error {
@@ -210,6 +281,15 @@ function requiredObject(request: HeadlessRequest, field: string): Record<string,
     throw new ProtocolInputError('invalid_request', `${field} must be an object.`);
   }
   return value as Record<string, unknown>;
+}
+
+function optionalNonNegativeInteger(request: HeadlessRequest, field: string): number | undefined {
+  const value = request[field];
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new ProtocolInputError('invalid_request', `${field} must be a non-negative safe integer.`);
+  }
+  return value as number;
 }
 
 function optionalBoolean(request: HeadlessRequest, field: string): boolean | undefined {

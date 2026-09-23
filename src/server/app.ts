@@ -1005,7 +1005,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const currentLocalMainIsAncestor = have ? await git.isAncestor(vaultId, have, targetMain) : null;
     const allChangedPaths = have === null
       ? await git.listTreePaths(vaultId, targetMain)
-      : (await git.changedPaths(vaultId, have, targetMain)).map((entry) => entry.path);
+      : (await git.changedPaths(vaultId, have, targetMain)).flatMap((entry) => entry.oldPath ? [entry.oldPath, entry.path] : [entry.path]);
     const db = await store.snapshot();
     const currentEventSeq = Number.isSafeInteger(pullRequest.current_event_seq) ? pullRequest.current_event_seq ?? 0 : 0;
     const usesAcknowledgedDirectorySnapshot = currentEventSeq === deviceAuth.device.last_applied_event_seq;
@@ -1102,7 +1102,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const allChangedPaths =
       have === null
         ? await git.listTreePaths(vaultId, targetMain)
-        : (await git.changedPaths(vaultId, have, targetMain)).map((entry) => entry.path);
+        : (await git.changedPaths(vaultId, have, targetMain)).flatMap((entry) => entry.oldPath ? [entry.oldPath, entry.path] : [entry.path]);
     const changedPaths = allChangedPaths.filter((path) => isSyncableVaultPath(path));
     const db = await store.snapshot();
     const currentEventSeq = Number.isSafeInteger(pullRequest.current_event_seq) ? pullRequest.current_event_seq ?? 0 : 0;
@@ -1268,43 +1268,31 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
 
   app.post('/api/v1/vaults/:vaultId/onboarding/complete', async (request) => {
     const { vaultId } = pathParams(request);
-    const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
-    const body = requestBody(request);
-    const appliedMain = readCommitId(body, 'applied_main');
-    if (!(await git.commitExists(vaultId, appliedMain)) || !(await git.isAncestor(vaultId, appliedMain, deviceAuth.vault.current_main))) {
-      throw new AuthError(409, 'invalid_applied_main', 'Applied main is not trusted vault history.');
-    }
-    await store.mutate((db) => {
-      const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
-      const device = db.devices.find((candidate) => candidate.device_id === deviceAuth.device.device_id);
-      if (device && vault) {
-        const snapshot = device.last_applied_main === appliedMain && Array.isArray(device.last_applied_explicit_dirs)
-          ? {
-              eventSeq: device.last_applied_event_seq,
-              directoryIntents: [],
-              explicitDirectories: device.last_applied_explicit_dirs
-            }
-          : appliedMain === vault.current_main
-            ? eventSnapshotForTarget(db, vaultId, device.device_id, appliedMain, device.last_applied_event_seq)
-            : device.pending_applied_main === appliedMain && Array.isArray(device.pending_applied_explicit_dirs)
-              ? {
-                  eventSeq: device.pending_applied_event_seq,
-                  directoryIntents: [],
-                  explicitDirectories: device.pending_applied_explicit_dirs
-                }
-              : null;
-        if (!snapshot) {
-          throw new AuthError(409, 'applied_snapshot_unavailable', 'The delivered directory snapshot for this applied main is unavailable.');
+    return await sync.runWithVaultLock(vaultId, async () => {
+      const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+      const body = requestBody(request);
+      const appliedMain = readCommitId(body, 'applied_main');
+      await store.mutate((db) => {
+        const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
+        const device = db.devices.find((candidate) => candidate.device_id === deviceAuth.device.device_id);
+        if (!device || !vault || device.revoked_at !== null || device.status === 'revoked') {
+          throw new AuthError(404, 'not_found', 'Resource not found.');
         }
-        device.last_applied_main = appliedMain;
-        device.last_applied_event_seq = snapshot.eventSeq;
-        device.last_applied_explicit_dirs = snapshot.explicitDirectories;
-        device.status = appliedMain === vault.current_main ? 'synced' : 'paired';
+        if (appliedMain !== vault.current_main || device.last_applied_main !== appliedMain) {
+          throw new AuthError(409, 'onboarding_target_stale', 'Apply and acknowledge the current server main before completing onboarding.');
+        }
+        if (device.onboarding_status !== 'pending' && device.onboarding_status !== 'complete') {
+          throw new AuthError(409, 'onboarding_inconsistent', 'Device onboarding state is invalid.');
+        }
+        device.status = 'synced';
+        device.onboarding_status = 'complete';
+        device.onboarding_completed_at ??= nowIso();
+        device.initial_proposal_kind = null;
+        device.initial_proposal_base = null;
         store.pruneDirectoryProposalResults(db, vaultId);
-      }
+      });
+      return { status: 'ok' };
     });
-    await connections.markComplete(deviceAuth.device.device_id);
-    return { status: 'ok' };
   });
 
   app.post('/api/v1/vaults/:vaultId/sync/unpair', async (request) => {

@@ -11,9 +11,15 @@
 
 ## Browser-Assisted Onboarding
 
-The plugin initiates a short-lived, one-time connection request containing only redacted counts and device/vault display metadata. The authenticated owner reviews the matching verification code and selects a new or existing owned vault. No manual pairing-token dialog, plugin-stored account password, or copied reusable credential is part of normal onboarding.
+### OBTS-SYNC-ONB-001: Durable Enrollment Before Bulk Transfer
 
-Before device registration the client classifies local state as empty, identical, clean stale, divergent with trusted ancestry, or divergent without trusted ancestry. Destructive use-server paths require recovery first. Independent merge uses the server-authored empty root so remote-only and local-only paths survive and differing same-path additions conflict. A changed local snapshot invalidates stale consent and must be reviewed again.
+The plugin initiates a short-lived, one-time connection request containing only redacted counts and device/vault display metadata. The authenticated owner reviews the matching verification code and selects a new or existing owned vault. Approval pins an immutable enrollment baseline for the selected vault and starts the finite approved-enrollment lease defined by the security contract. No manual pairing-token dialog, plugin-stored account password, or copied reusable credential is part of normal onboarding.
+
+Before device registration the client classifies local state as empty, identical, clean stale, divergent with trusted ancestry, or divergent without trusted ancestry. An empty local vault joining an existing server vault is classified from the coherent local snapshot and approved server metadata without downloading remote objects. Non-empty classification that needs ancestry or byte identity uses the approval-pinned baseline; it must not silently retarget when canonical `main` advances.
+
+Destructive use-server paths require recovery first. Use-server consent authorizes replacement from the selected server vault, not replacement with only the exact head visible at approval. Completion validates the submitted baseline against the approved baseline, registers an initializing device, and consumes the browser connection before bulk transfer. The device then pulls and applies a resumable immutable server snapshot and catches up to newer canonical state. It becomes active only through an atomic check that the current canonical head is durably applied and acknowledged; a concurrent advance keeps it initializing and requires another pull/apply/acknowledgement pass. Canonical `main` movement after approval does not require reapproval and does not invalidate use-server consent.
+
+Independent merge uses the server-authored empty root so remote-only and local-only paths survive and differing same-path additions conflict. A changed local snapshot invalidates stale consent and must be reviewed again. An expired or denied pre-registration attempt remains a durable terminal local onboarding state until the user explicitly restarts or cancels it; it is never presented as registered-device recovery.
 
 ## Local Reconciliation
 
@@ -49,7 +55,7 @@ Disjoint changes merge automatically when path and directory policy agree. Same-
 - JSON Canvas first requires a valid object root with `nodes` and `edges` arrays, unique node/edge IDs, valid required fields, and no dangling edge references. Nodes and edges merge as maps keyed by stable ID. One-sided add/delete/edit and disjoint-field edits merge; differing same-field edits, incompatible type changes, and delete-versus-edit/reference conflict. A one-sided reorder of surviving base IDs is accepted, equivalent concurrent reorder is accepted, and divergent concurrent reorder conflicts. One-sided additions retain their side-relative position. Accepted output is deterministic pretty JSON.
 - Obsidian Bases first requires valid supported YAML. `formulas`, `properties`, and `summaries` merge as maps keyed by name; one-sided entry changes and disjoint nested-key edits merge, while differing same-key expression/value edits conflict. Top-level `filters` is one semantic field and concurrent differing edits conflict. Views are keyed by `(type,name)` and duplicate keys conflict. Any reorder of surviving base views conflicts. Same-view type, filter, or order edits and concurrent edits to plugin-specific or unknown view keys conflict when both sides changed the same view; otherwise disjoint known-key edits may merge. Accepted output is deterministic YAML.
 - Binary content auto-merges only when identity is equal or paths are disjoint.
-- Delete/edit, incompatible rename, file/directory hierarchy collision, unsupported, ambiguous, or unsafe cases create durable conflicts.
+- Delete/edit, incompatible rename, file/directory hierarchy collision, unsupported, ambiguous, or unsafe cases create durable conflicts. Pull manifests list every changed syncable path, including both source and destination of a rename, so replacement and recovery cover deletions as well as new content.
 
 Every decision records base, current main, device commit, merge order, policy version, and validator results.
 

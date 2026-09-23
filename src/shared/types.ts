@@ -105,6 +105,7 @@ export type ConnectionStatusResponse =
       vault_id: string | null;
       vault_name: string;
       expected_main: string | null;
+      expires_at: string;
     }
   | {
       status: 'consumed';
@@ -121,7 +122,7 @@ export type ConnectionBootstrapManifest = {
   root_commit: string;
   target_main: string;
   changed_paths: string[];
-  target_file_sizes?: Record<string, number>;
+  target_file_sizes: Record<string, number>;
   explicit_directories: string[];
 };
 
@@ -289,12 +290,12 @@ export type DevicePullManifest = {
   device_id: string;
   target_main: string;
   changed_paths: string[];
-  target_file_sizes?: Record<string, number>;
+  target_file_sizes: Record<string, number>;
   current_local_main_is_ancestor: boolean | null;
   event_seq: number;
-  directory_intents?: DirectoryIntent[];
-  explicit_directories?: string[];
-  directory_acknowledgements?: DirectoryIntentAcknowledgement[];
+  directory_intents: DirectoryIntent[];
+  explicit_directories: string[];
+  directory_acknowledgements: DirectoryIntentAcknowledgement[];
 };
 
 export const CHUNK_TRANSFER_CAPABILITY = 'git-object-pack-chunks-v1' as const;
@@ -357,7 +358,8 @@ export type ChunkPullRequest = DevicePullRequest & {
   cursor: number;
 };
 
-export type ChunkPullManifest = DevicePullManifest & {
+export type ChunkPullManifest = Omit<DevicePullManifest, 'target_file_sizes'> & {
+  target_file_sizes?: Record<string, number>;
   capability: typeof CHUNK_TRANSFER_CAPABILITY;
   cursor: number;
   next_cursor: number;
@@ -373,7 +375,8 @@ export type ChunkBootstrapRequest = {
   requested_target: 'latest' | string;
 };
 
-export type ChunkBootstrapManifest = ConnectionBootstrapManifest & {
+export type ChunkBootstrapManifest = Omit<ConnectionBootstrapManifest, 'target_file_sizes'> & {
+  target_file_sizes?: Record<string, number>;
   capability: typeof CHUNK_TRANSFER_CAPABILITY;
   cursor: number;
   next_cursor: number;

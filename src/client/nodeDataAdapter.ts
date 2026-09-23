@@ -2,6 +2,7 @@ import { mkdirSync } from 'node:fs';
 import {
   lstat,
   mkdir,
+  open,
   readFile,
   readdir,
   rename,
@@ -97,6 +98,24 @@ export class NodeDataAdapter {
     const destination = this.resolvePath(destinationPath);
     await mkdir(resolve(destination, '..'), { recursive: true, mode: 0o700 });
     await rename(this.resolvePath(sourcePath), destination);
+  }
+
+  async syncFile(adapterPath: string): Promise<void> {
+    const handle = await open(this.resolvePath(adapterPath), 'r');
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  }
+
+  async syncDirectory(adapterPath: string): Promise<void> {
+    const handle = await open(this.resolvePath(adapterPath), 'r');
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
   }
 
   async exists(adapterPath: string): Promise<boolean> {

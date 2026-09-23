@@ -223,6 +223,9 @@ export class SyncService {
           if (auth.device.onboarding_mode === 'use_server') {
             return await this.rejectDevicePush(auth, operation.operation_id, 'onboarding_apply_required', 'Apply server state before uploading local changes.');
           }
+          if (currentDeviceRef !== null) {
+            return await this.rejectDevicePush(auth, operation.operation_id, 'onboarding_completion_required', 'Complete onboarding before publishing another proposal.');
+          }
           if (
             !auth.device.initial_proposal_base ||
             !auth.device.initial_proposal_kind ||

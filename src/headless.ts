@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import { once } from 'node:events';
-import { createInterface } from 'node:readline';
 
 import { ObtsPluginClient } from './client/core.js';
 import { HeadlessSession, type HeadlessMessage } from './client/headlessProtocol.js';
@@ -39,10 +38,9 @@ async function main(): Promise<void> {
     process.once('SIGTERM', () => void stop('SIGTERM'));
 
     await session.start();
-    const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
-    for await (const line of lines) {
+    for await (const frame of readBoundedLines(process.stdin, MAX_LINE_BYTES)) {
       if (stopping) break;
-      if (Buffer.byteLength(line, 'utf8') > MAX_LINE_BYTES) {
+      if (frame.tooLarge) {
         await emit({
           type: 'response',
           id: null,
@@ -53,7 +51,7 @@ async function main(): Promise<void> {
       }
       let value: unknown;
       try {
-        value = JSON.parse(line);
+        value = JSON.parse(frame.line);
       } catch {
         await emit({ type: 'response', id: null, ok: false, error: { code: 'invalid_json', message: 'Request is not valid JSON.' } });
         continue;
@@ -75,6 +73,48 @@ async function main(): Promise<void> {
     });
     process.exitCode = 1;
   }
+}
+
+async function* readBoundedLines(
+  input: NodeJS.ReadableStream,
+  maxBytes: number
+): AsyncGenerator<{ line: string; tooLarge: false } | { line: ''; tooLarge: true }> {
+  let parts: Buffer[] = [];
+  let bufferedBytes = 0;
+  let discarding = false;
+  for await (const value of input) {
+    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value as string);
+    let start = 0;
+    while (start < chunk.length) {
+      const newline = chunk.indexOf(0x0a, start);
+      const end = newline === -1 ? chunk.length : newline;
+      const segment = chunk.subarray(start, end);
+      if (!discarding) {
+        if (bufferedBytes + segment.length > maxBytes) {
+          parts = [];
+          bufferedBytes = 0;
+          discarding = true;
+        } else if (segment.length > 0) {
+          parts.push(segment);
+          bufferedBytes += segment.length;
+        }
+      }
+      if (newline === -1) break;
+      if (discarding) {
+        yield { line: '', tooLarge: true };
+      } else {
+        const line = Buffer.concat(parts, bufferedBytes);
+        const content = line.length > 0 && line[line.length - 1] === 0x0d ? line.subarray(0, -1) : line;
+        yield { line: content.toString('utf8'), tooLarge: false };
+      }
+      parts = [];
+      bufferedBytes = 0;
+      discarding = false;
+      start = newline + 1;
+    }
+  }
+  if (discarding) yield { line: '', tooLarge: true };
+  else if (bufferedBytes > 0) yield { line: Buffer.concat(parts, bufferedBytes).toString('utf8'), tooLarge: false };
 }
 
 function readStartupConfig(args: string[], env: NodeJS.ProcessEnv): StartupConfig {

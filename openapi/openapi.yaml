@@ -1731,7 +1731,7 @@ components:
               type: string
               enum: [denied, expired]
         - type: object
-          required: [status, selection, vault_id, vault_name, expected_main]
+          required: [status, selection, vault_id, vault_name, expected_main, expires_at]
           properties:
             status:
               const: approved
@@ -1749,6 +1749,10 @@ components:
                 - type: "null"
                 - type: string
                   pattern: "^[0-9a-f]{40}$"
+            expires_at:
+              type: string
+              format: date-time
+              description: Finite approved-enrollment lease deadline; status polling does not renew it.
         - type: object
           required: [status, vault_id, vault_name, device_id]
           properties:
@@ -1814,9 +1818,16 @@ components:
           type: string
           pattern: "^[0-9a-f]{40}$"
         changed_paths:
+          description: Complete changed path effects, including both the old and new paths of a rename.
           type: array
           items:
             type: string
+        target_file_sizes:
+          description: Exact target byte sizes; required on a complete bootstrap manifest and omitted only from incomplete chunk manifests.
+          type: object
+          additionalProperties:
+            type: integer
+            minimum: 0
         explicit_directories:
           type: array
           items:
@@ -2376,9 +2387,16 @@ components:
           type: string
           pattern: "^[0-9a-f]{40}$"
         changed_paths:
+          description: Complete changed path effects, including both the old and new paths of a rename.
           type: array
           items:
             type: string
+        target_file_sizes:
+          description: Exact target byte sizes; required on a complete pull manifest and omitted only from incomplete chunk manifests.
+          type: object
+          additionalProperties:
+            type: integer
+            minimum: 0
         current_local_main_is_ancestor:
           oneOf:
             - type: "null"
@@ -2649,6 +2667,12 @@ components:
               pattern: "^[0-9a-f]{64}$"
             chunk_bytes:
               type: integer
+        - if:
+            properties:
+              complete:
+                const: true
+          then:
+            required: [target_file_sizes, directory_intents, explicit_directories, directory_acknowledgements]
     ChunkBootstrapRequest:
       type: object
       required: [api_version, cursor, requested_target]
@@ -2684,6 +2708,12 @@ components:
               pattern: "^[0-9a-f]{64}$"
             chunk_bytes:
               type: integer
+        - if:
+            properties:
+              complete:
+                const: true
+          then:
+            required: [target_file_sizes, explicit_directories]
     DirectoryIntent:
       type: object
       required: [op, path]

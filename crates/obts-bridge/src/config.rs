@@ -151,6 +151,7 @@ pub struct ClientConfig {
     pub projection_batch_bytes: u64,
     #[serde(rename = "projection_max_text_bytes", default)]
     pub legacy_projection_max_text_bytes: Option<u64>,
+    pub request_inactivity_timeout_seconds: u64,
     pub restart_failure_window_seconds: u64,
     pub restart_max_failures: u32,
     pub restart_base_backoff_seconds: u64,
@@ -172,6 +173,7 @@ impl Default for ClientConfig {
             projection_batch_rows: 128,
             projection_batch_bytes: 8 * 1024 * 1024,
             legacy_projection_max_text_bytes: None,
+            request_inactivity_timeout_seconds: 5 * 60,
             restart_failure_window_seconds: 15 * 60,
             restart_max_failures: 3,
             restart_base_backoff_seconds: 5,
@@ -216,6 +218,11 @@ impl ClientConfig {
         if self.projection_max_inflight_bodies == 0 {
             return Err(ConfigError::InvalidClient(
                 "client.projection_max_inflight_bodies must be at least 1".to_string(),
+            ));
+        }
+        if self.request_inactivity_timeout_seconds == 0 {
+            return Err(ConfigError::InvalidClient(
+                "client.request_inactivity_timeout_seconds must be at least 1".to_string(),
             ));
         }
         if self.projection_batch_rows == 0 {
@@ -975,6 +982,22 @@ mod tests {
         assert_eq!(config.client.projection_max_inflight_bodies, 2);
         assert_eq!(config.client.projection_batch_rows, 128);
         assert_eq!(config.client.projection_batch_bytes, 8 * 1024 * 1024);
+        assert_eq!(config.client.request_inactivity_timeout_seconds, 5 * 60);
+    }
+
+    #[test]
+    fn rejects_zero_headless_request_inactivity_timeout() {
+        let mut file = NamedTempFile::new().expect("temp file");
+        writeln!(
+            file,
+            "client:\n  request_inactivity_timeout_seconds: 0\ncontexts:\n  smoke:\n    read: []\n    create: []\n    edit: []\n"
+        )
+        .expect("write config");
+
+        let error = AppConfig::load_from_path(file.path()).expect_err("zero timeout must fail");
+        assert!(
+            matches!(error, ConfigError::InvalidClient(message) if message.contains("request_inactivity_timeout_seconds"))
+        );
     }
 
     #[test]

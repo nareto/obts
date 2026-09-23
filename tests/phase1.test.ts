@@ -3156,6 +3156,148 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect((await server.store.snapshot()).tokens.every((token) => token.kind !== ('pairing' as never))).toBe(true);
   });
 
+  it('onboards an empty client from the approval-pinned baseline and catches up after main advances', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'moving-main-desktop');
+    const phoneDir = join(root, 'moving-main-phone');
+    await mkdirp(desktopDir);
+    await mkdirp(phoneDir);
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await writeFile(join(desktopDir, 'server.md'), 'approval baseline\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const phone = new ObtsPluginClient(phoneDir, { serverUrl: baseUrl, deviceName: 'phone' });
+    const connection = await phone.startOnboarding('Moving main phone');
+    expect((await admin.post(`/api/v1/connections/${connection.connection_id}/approve`, {
+      selection: 'existing_vault',
+      vault_id: admin.vaultId
+    })).status).toBe(200);
+    const transport = (phone as unknown as {
+      transport: { fetchBootstrap: (...args: unknown[]) => Promise<unknown> };
+    }).transport;
+    transport.fetchBootstrap = async () => {
+      throw new Error('empty-local analysis must not fetch server objects');
+    };
+    const analysis = await phone.analyzeOnboarding(connection.connection_id, connection.connection_secret);
+    expect(analysis).toMatchObject({ classification: 'server_to_empty', expectedMain: expect.stringMatching(/^[0-9a-f]{40}$/u) });
+    const pinnedMain = analysis.expectedMain;
+
+    await writeFile(join(desktopDir, 'server.md'), 'latest server state\n');
+    await writeFile(join(desktopDir, 'advanced.md'), 'created after approval\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const advancedMain = (await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)!.current_main;
+    expect(advancedMain).not.toBe(pinnedMain);
+    let finalMain = advancedMain;
+    const phoneInternal = (phone as unknown as {
+      client: { acknowledgeAppliedMain(targetMain: string): Promise<void> };
+    }).client;
+    const acknowledgeAppliedMain = phoneInternal.acknowledgeAppliedMain.bind(phoneInternal);
+    let advancedDuringCompletion = false;
+    phoneInternal.acknowledgeAppliedMain = async (targetMain) => {
+      await acknowledgeAppliedMain(targetMain);
+      if (advancedDuringCompletion) return;
+      advancedDuringCompletion = true;
+      await writeFile(join(desktopDir, 'during-completion.md'), 'advanced during completion\n');
+      expect((await desktop.syncOnce()).status).toBe('Synced');
+      finalMain = (await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)!.current_main;
+    };
+
+    await expect(phone.finishOnboarding({
+      connectionId: connection.connection_id,
+      secret: connection.connection_secret,
+      analysis,
+      mode: 'use_server'
+    })).resolves.toMatchObject({ status: 'Synced' });
+    expect(await readFile(join(phoneDir, 'server.md'), 'utf8')).toBe('latest server state\n');
+    expect(await readFile(join(phoneDir, 'advanced.md'), 'utf8')).toBe('created after approval\n');
+    expect(await readFile(join(phoneDir, 'during-completion.md'), 'utf8')).toBe('advanced during completion\n');
+    const phoneState = await phone.readState();
+    expect(phoneState.local_main).toBe(finalMain);
+    const registeredDevice = (await server.store.snapshot()).devices.find((device) => device.device_id === phoneState.device_id);
+    expect(registeredDevice).toMatchObject({ onboarding_status: 'complete', last_applied_main: finalMain });
+    const consumedConnection = (await server.store.snapshot()).connections.find(
+      (candidate) => candidate.connection_id === connection.connection_id
+    );
+    expect(consumedConnection).toMatchObject({ status: 'consumed', expected_main: pinnedMain });
+  });
+
+  it('merges a divergent client from the approval-pinned baseline after main advances', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'moving-merge-desktop');
+    const phoneDir = join(root, 'moving-merge-phone');
+    await mkdirp(desktopDir);
+    await mkdirp(phoneDir);
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await writeFile(join(desktopDir, 'server.md'), 'approval baseline\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    await writeFile(join(phoneDir, 'phone.md'), 'independent phone state\n');
+
+    const phone = new ObtsPluginClient(phoneDir, { serverUrl: baseUrl, deviceName: 'phone' });
+    const connection = await phone.startOnboarding('Moving merge phone');
+    expect((await admin.post(`/api/v1/connections/${connection.connection_id}/approve`, {
+      selection: 'existing_vault',
+      vault_id: admin.vaultId
+    })).status).toBe(200);
+    const analysis = await phone.analyzeOnboarding(connection.connection_id, connection.connection_secret);
+    expect(analysis).toMatchObject({
+      classification: 'independent_divergent',
+      expectedMain: expect.stringMatching(/^[0-9a-f]{40}$/u),
+      proposalBase: expect.stringMatching(/^[0-9a-f]{40}$/u)
+    });
+    const pinnedMain = analysis.expectedMain;
+
+    await writeFile(join(desktopDir, 'advanced.md'), 'created after approval\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    expect((await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).not.toBe(pinnedMain);
+
+    await expect(phone.finishOnboarding({
+      connectionId: connection.connection_id,
+      secret: connection.connection_secret,
+      analysis,
+      mode: 'merge'
+    })).resolves.toMatchObject({ status: 'Synced' });
+    expect(await readFile(join(phoneDir, 'server.md'), 'utf8')).toBe('approval baseline\n');
+    expect(await readFile(join(phoneDir, 'advanced.md'), 'utf8')).toBe('created after approval\n');
+    expect(await readFile(join(phoneDir, 'phone.md'), 'utf8')).toBe('independent phone state\n');
+    const connectionRow = (await server.store.snapshot()).connections.find(
+      (candidate) => candidate.connection_id === connection.connection_id
+    );
+    expect(connectionRow).toMatchObject({ status: 'consumed', expected_main: pinnedMain });
+  });
+
+  it('serializes onboarding activation with canonical vault mutation', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'activation-lock-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'activation-lock-device');
+    const state = await plugin.readState();
+    const token = await (plugin as unknown as { client: { readDeviceToken(): Promise<string> } }).client.readDeviceToken();
+    let releaseLock!: () => void;
+    let markLockHeld!: () => void;
+    const lockHeld = new Promise<void>((resolve) => { markLockHeld = resolve; });
+    const release = new Promise<void>((resolve) => { releaseLock = resolve; });
+    const holder = server.sync.runWithVaultLock(admin.vaultId, async () => {
+      markLockHeld();
+      await release;
+    });
+    await lockHeld;
+
+    let settled = false;
+    const activation = fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/onboarding/complete`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ applied_main: state.local_main })
+    }).then((response) => {
+      settled = true;
+      return response;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(settled).toBe(false);
+    releaseLock();
+    await holder;
+    expect((await activation).status).toBe(200);
+  });
+
   it('expires bootstrap access and revokes approved connections when their owner is disabled', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const user = await admin.post<{ user_id: string }>('/api/v1/admin/users', {
@@ -3173,20 +3315,22 @@ describe('Phase 1 sync without conflict resolution', () => {
     await mkdirp(firstDir);
     const first = new ObtsPluginClient(firstDir, { serverUrl: baseUrl, deviceName: 'expiring' });
     const expiring = await first.startOnboarding('Expiring');
+    const pendingExpiresAt = Date.parse(expiring.expires_at);
     expect((await owner.post(`/api/v1/connections/${expiring.connection_id}/approve`, {
       selection: 'existing_vault',
       vault_id: vault.body.vault_id
     })).status).toBe(200);
+    const approvedConnection = (await server.store.snapshot()).connections.find(
+      (row) => row.connection_id === expiring.connection_id
+    )!;
+    expect(Date.parse(approvedConnection.expires_at)).toBeGreaterThan(pendingExpiresAt);
+    expect(Date.parse(approvedConnection.expires_at) - Date.now()).toBeGreaterThan(55 * 60 * 1000);
+    const expiringAnalysis = await first.analyzeOnboarding(expiring.connection_id, expiring.connection_secret);
     await server.store.mutate((db) => {
       const row = db.connections.find((candidate) => candidate.connection_id === expiring.connection_id)!;
       row.expires_at = new Date(Date.now() - 1_000).toISOString();
     });
-    const bootstrap = await fetch(`${baseUrl}/api/v1/connections/${expiring.connection_id}/bootstrap`, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${expiring.connection_secret}` }
-    });
-    expect(bootstrap.status).toBe(409);
-    expect((await server.store.snapshot()).connections.find((row) => row.connection_id === expiring.connection_id)?.status).toBe('expired');
+    const deviceCountBeforeExpiredCompletion = (await server.store.snapshot()).devices.length;
     const expiredCompletion = await fetch(`${baseUrl}/api/v1/connections/${expiring.connection_id}/complete`, {
       method: 'POST',
       headers: {
@@ -3196,6 +3340,27 @@ describe('Phase 1 sync without conflict resolution', () => {
       body: JSON.stringify({ mode: 'use_server', expected_main: null })
     });
     expect(expiredCompletion.status).toBe(409);
+    expect(await expiredCompletion.json()).toMatchObject({ error: { code: 'connection_expired' } });
+    expect((await server.store.snapshot()).devices).toHaveLength(deviceCountBeforeExpiredCompletion);
+    const bootstrap = await fetch(`${baseUrl}/api/v1/connections/${expiring.connection_id}/bootstrap`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${expiring.connection_secret}` }
+    });
+    expect(bootstrap.status).toBe(409);
+    expect((await server.store.snapshot()).connections.find((row) => row.connection_id === expiring.connection_id)?.status).toBe('expired');
+    await expect(first.finishOnboarding({
+      connectionId: expiring.connection_id,
+      secret: expiring.connection_secret,
+      analysis: expiringAnalysis,
+      mode: 'use_server'
+    })).rejects.toMatchObject({ code: 'connection_expired' });
+    expect(await first.readPendingOnboarding()).toMatchObject({
+      journal: {
+        stage: 'blocked',
+        connection: { connection_id: expiring.connection_id },
+        last_error_code: 'connection_expired'
+      }
+    });
 
     const secondDir = join(root, 'disabled-approved-connection');
     await mkdirp(secondDir);
@@ -3207,6 +3372,13 @@ describe('Phase 1 sync without conflict resolution', () => {
     })).status).toBe(200);
     expect((await admin.post(`/api/v1/admin/users/${user.body.user_id}/disable`, {})).status).toBe(200);
     expect((await second.pollOnboarding(approved.connection_id, approved.connection_secret)).status).toBe('denied');
+    expect(await second.readPendingOnboarding()).toMatchObject({
+      journal: {
+        stage: 'blocked',
+        connection: { connection_id: approved.connection_id },
+        last_error_code: 'connection_denied'
+      }
+    });
     expect((await server.store.snapshot()).audit_log.some((row) => row.action === 'connection_revoked_user_disabled')).toBe(true);
   });
 
@@ -3340,10 +3512,11 @@ describe('Phase 1 sync without conflict resolution', () => {
       vault_id: admin.vaultId
     })).status).toBe(200);
     const analysis = await phone.analyzeOnboarding(connection.connection_id, connection.connection_secret);
-    const transport = (phone as unknown as { transport: { pullChunk: (...args: unknown[]) => Promise<unknown> } }).transport;
-    const originalPull = transport.pullChunk.bind(transport);
-    transport.pullChunk = async () => {
-      throw new Error('simulated interruption after registration');
+    const internal = (phone as unknown as {
+      client: { writeTargetFilesFromJournal: (...args: unknown[]) => Promise<void> };
+    }).client;
+    internal.writeTargetFilesFromJournal = async () => {
+      throw new Error('simulated interruption after final bootstrap chunk');
     };
     const submit = {
       connectionId: connection.connection_id,
@@ -3351,18 +3524,74 @@ describe('Phase 1 sync without conflict resolution', () => {
       analysis,
       mode: 'use_server' as const
     };
-    await expect(phone.finishOnboarding(submit)).rejects.toThrow('simulated interruption');
+    await expect(phone.finishOnboarding(submit)).rejects.toThrow('simulated interruption after final bootstrap chunk');
     const interruptedState = await phone.readState();
-    expect(interruptedState).toMatchObject({ vault_id: admin.vaultId, status_label: 'Checking' });
+    expect(interruptedState).toMatchObject({ vault_id: admin.vaultId, status_label: 'Applying' });
     expect((await phone.readPendingOnboarding())?.journal.stage).toBe('blocked');
-    transport.pullChunk = originalPull;
+    expect(JSON.parse(await readFile(join(phoneDir, '.obts', 'pull-transfer.json'), 'utf8'))).toMatchObject({
+      complete: true,
+      target_main: analysis.expectedMain
+    });
 
     const devicesBeforeResume = (await server.store.snapshot()).devices.length;
     const restarted = new ObtsPluginClient(phoneDir, { serverUrl: baseUrl, deviceName: 'phone' });
+    const restartedTransport = (restarted as unknown as {
+      transport: { pullChunk: (...args: unknown[]) => Promise<unknown> };
+    }).transport;
+    const restartedPull = restartedTransport.pullChunk.bind(restartedTransport);
+    let resumedPullCalls = 0;
+    restartedTransport.pullChunk = async (...args) => {
+      resumedPullCalls += 1;
+      return await restartedPull(...args);
+    };
     await expect(restarted.finishOnboarding(submit)).resolves.toMatchObject({ status: 'Synced' });
+    expect(resumedPullCalls).toBe(0);
     expect(await readFile(join(phoneDir, 'server.md'), 'utf8')).toBe('server state\n');
+    await expect(stat(join(phoneDir, '.obts', 'pull-transfer.json'))).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await restarted.readPendingOnboarding()).toBeNull();
     expect((await server.store.snapshot()).devices).toHaveLength(devicesBeforeResume);
+  });
+
+  it('prevents an initializing device from publishing a second proposal', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const phoneDir = join(root, 'single-onboarding-proposal-phone');
+    await mkdirp(phoneDir);
+    await writeFile(join(phoneDir, 'initial.md'), 'initial proposal\n');
+    const phone = new ObtsPluginClient(phoneDir, { serverUrl: baseUrl, deviceName: 'phone' });
+    const connection = await phone.startOnboarding('Single proposal phone');
+    expect((await admin.post(`/api/v1/connections/${connection.connection_id}/approve`, {
+      selection: 'new_vault',
+      display_name: 'Single proposal vault'
+    })).status).toBe(200);
+    const analysis = await phone.analyzeOnboarding(connection.connection_id, connection.connection_secret);
+    const internal = (phone as unknown as {
+      client: {
+        onboardingOperation: boolean;
+        completeRegisteredOnboarding: (...args: unknown[]) => Promise<unknown>;
+      };
+    }).client;
+    internal.completeRegisteredOnboarding = async () => {
+      throw new Error('simulated interruption before onboarding activation');
+    };
+    await expect(phone.finishOnboarding({
+      connectionId: connection.connection_id,
+      secret: connection.connection_secret,
+      analysis,
+      mode: 'initialize'
+    })).rejects.toThrow('simulated interruption before onboarding activation');
+    const state = await phone.readState();
+    expect((await server.store.snapshot()).devices.find((device) => device.device_id === state.device_id)).toMatchObject({
+      onboarding_status: 'pending',
+      device_ref_head: expect.stringMatching(/^[0-9a-f]{40}$/u)
+    });
+
+    await writeFile(join(phoneDir, 'second.md'), 'second proposal\n');
+    internal.onboardingOperation = true;
+    try {
+      await expect(phone.syncOnce()).rejects.toMatchObject({ code: 'onboarding_completion_required' });
+    } finally {
+      internal.onboardingOperation = false;
+    }
   });
 
   it('does not complete new-vault onboarding before the local proposal is accepted', async () => {
@@ -5418,6 +5647,46 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
   });
 
+  it('blocks destructive apply when recovery payload durability fails', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const { plugin2, device2Dir } = await preparePullApplyScenario(root, admin, 'bundle-sync-device-1', 'bundle-sync-device-2');
+    const internal = (plugin2 as unknown as { client: { fsp: Record<string, any> } }).client;
+    const syncFile = internal.fsp.syncFile.bind(internal.fsp);
+    internal.fsp.syncFile = async (filePath: string) => {
+      if (filePath.endsWith('checksums.sha256')) throw new Error('simulated recovery fsync failure');
+      return await syncFile(filePath);
+    };
+
+    await expect(plugin2.syncOnce()).rejects.toMatchObject({ code: 'recovery_bundle_failed' });
+    expect(await readFile(join(device2Dir, 'shared.md'), 'utf8')).toBe('base\n');
+    expect(await exists(join(device2Dir, '.obts', 'apply.lock'))).toBe(false);
+    expect(JSON.parse(await readFile(join(device2Dir, '.obts', 'apply-journal.json'), 'utf8'))).toMatchObject({
+      phase: 'blocked_recovery',
+      redacted_error_category: 'recovery_bundle_failed',
+      recovery_bundle_id: null
+    });
+  });
+
+  it('blocks destructive apply when the recovery checksum manifest cannot be reread exactly', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const { plugin2, device2Dir } = await preparePullApplyScenario(root, admin, 'bundle-checksum-device-1', 'bundle-checksum-device-2');
+    const internal = (plugin2 as unknown as { client: { fsp: Record<string, any> } }).client;
+    const read = internal.fsp.readFile.bind(internal.fsp);
+    internal.fsp.readFile = async (filePath: string, ...args: unknown[]) => {
+      if (filePath.endsWith('checksums.sha256') && args[0] === 'utf8') return 'truncated\n';
+      return await read(filePath, ...args);
+    };
+
+    await expect(plugin2.syncOnce()).rejects.toMatchObject({ code: 'recovery_bundle_failed' });
+    expect(await readFile(join(device2Dir, 'shared.md'), 'utf8')).toBe('base\n');
+    expect(await exists(join(device2Dir, '.obts', 'apply.lock'))).toBe(false);
+    expect(JSON.parse(await readFile(join(device2Dir, '.obts', 'apply-journal.json'), 'utf8'))).toMatchObject({
+      phase: 'blocked_recovery',
+      redacted_error_category: 'recovery_bundle_failed',
+      recovery_bundle_id: null
+    });
+  });
+
   it('does not resume an apply that was explicitly blocked from destructive writes', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const { plugin2, device2Dir } = await preparePullApplyScenario(root, admin, 'non-destructive-device-1', 'non-destructive-device-2');
@@ -5485,6 +5754,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect((await stat(join(bundleDir, 'git', 'local-refs.pack'))).size).toBe(0);
     const checksums = await readFile(join(bundleDir, 'checksums.sha256'), 'utf8');
     expect(checksums).toContain('  manifest.json');
+    expect(checksums).toContain(`${sha256(Buffer.from(await readFile(join(bundleDir, 'complete.json'))))}  complete.json`);
     expect(checksums).toContain('  files/shared.md');
     expect(checksums).toContain('  patches/shared.md.patch');
     expect(checksums).toContain('  git/local-refs.pack');
@@ -6165,6 +6435,41 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(repairedDevice?.last_applied_main).not.toBe(initialPhoneState.local_main);
   });
 
+  it('emits headless liveness heartbeats during real startup recovery', async () => {
+    const deviceDir = join(root, 'startup-progress-device');
+    await mkdirp(deviceDir);
+    const plugin = new ObtsPluginClient(deviceDir, { serverUrl: baseUrl, deviceName: 'startup-progress-device' });
+    const progress: Array<{ status: string; diagnosticPoint: string }> = [];
+    plugin.setProgressListener((status, diagnosticPoint) => progress.push({ status, diagnosticPoint }));
+
+    await plugin.initialize();
+
+    expect(progress).toContainEqual({ status: 'Recovering metadata replacements', diagnosticPoint: 'startup_metadata' });
+    expect(progress).toContainEqual({ status: 'Opening local Git state', diagnosticPoint: 'startup_git' });
+    expect(progress).toContainEqual({ status: 'Reading local sync state', diagnosticPoint: 'startup_state' });
+  });
+
+  it('emits a headless liveness heartbeat for every active server merge poll', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'merge-progress-heartbeat-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'merge-progress-heartbeat-device');
+    const progress: Array<{ status: string; diagnosticPoint: string }> = [];
+    plugin.setProgressListener((status, diagnosticPoint) => progress.push({ status, diagnosticPoint }));
+    const core = (plugin as unknown as {
+      client: { updatePushProcessingStatus(descriptor: Record<string, unknown>): Promise<void> };
+    }).client;
+    const descriptor = { status: 'processing', processing_error_code: null };
+
+    await core.updatePushProcessingStatus(descriptor);
+    await core.updatePushProcessingStatus(descriptor);
+
+    expect(progress).toEqual([
+      { status: 'Merging on server', diagnosticPoint: 'upload_finalize' },
+      { status: 'Merging on server', diagnosticPoint: 'upload_finalize' }
+    ]);
+  });
+
   it('keeps permanent async policy failures terminal instead of retrying them forever', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'terminal-policy-failure-device');
@@ -6326,6 +6631,77 @@ describe('Phase 1 sync without conflict resolution', () => {
     await expect(restartedReceiver.syncOnce()).resolves.toMatchObject({ status: 'Synced' });
     expect(resumedCursors[0]).toBe(1);
     expect(await readFile(join(receiverDir, 'first.bin'))).toEqual(await readFile(join(deviceDir, 'first.bin')));
+    await expect(stat(join(receiverDir, '.obts', 'pull-transfer.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+
+    await rename(join(deviceDir, 'first.bin'), join(deviceDir, 'renamed-first.bin'));
+    await writeFile(join(deviceDir, 'after-final-checkpoint.md'), 'durable final checkpoint\n');
+    expect((await restarted.syncOnce()).status).toBe('Synced');
+    const interruptedReceiver = new ObtsPluginClient(receiverDir, { serverUrl: baseUrl, deviceName: 'chunked-phone' });
+    const interruptedInternal = (interruptedReceiver as unknown as {
+      client: { writeTargetFilesFromJournal: (...args: unknown[]) => Promise<void> };
+    }).client;
+    interruptedInternal.writeTargetFilesFromJournal = async () => {
+      throw new Error('simulated interruption after final pull chunk');
+    };
+    await expect(interruptedReceiver.syncOnce()).rejects.toThrow('simulated interruption after final pull chunk');
+    const checkpointPath = join(receiverDir, '.obts', 'pull-transfer.json');
+    const completeCheckpoint = JSON.parse(await readFile(checkpointPath, 'utf8')) as Record<string, any>;
+    expect(completeCheckpoint).toMatchObject({ complete: true });
+    const interruptedState = await interruptedReceiver.readState();
+    const malformedReceiver = new ObtsPluginClient(receiverDir, { serverUrl: baseUrl, deviceName: 'chunked-phone' });
+    await malformedReceiver.initialize();
+    const malformedInternal = (malformedReceiver as unknown as {
+      client: {
+        readDeviceToken(): Promise<string>;
+        pull(...args: unknown[]): Promise<unknown>;
+      };
+    }).client;
+    const malformedToken = await malformedInternal.readDeviceToken();
+    for (const field of ['target_file_sizes', 'explicit_directories', 'directory_intents', 'directory_acknowledgements']) {
+      const malformedCheckpoint = structuredClone(completeCheckpoint);
+      delete malformedCheckpoint.manifest[field];
+      await writeFile(checkpointPath, `${JSON.stringify(malformedCheckpoint)}\n`);
+      await expect(malformedInternal.pull(
+        interruptedState.vault_id,
+        interruptedState.device_id,
+        malformedToken,
+        interruptedState.local_main,
+        'latest',
+        interruptedState.last_applied_event_seq
+      )).rejects.toMatchObject({ code: 'invalid_transfer_checkpoint' });
+    }
+    const incompleteEffectsCheckpoint = structuredClone(completeCheckpoint);
+    incompleteEffectsCheckpoint.manifest.changed_paths = incompleteEffectsCheckpoint.manifest.changed_paths.slice(1);
+    incompleteEffectsCheckpoint.manifest_sha256 = createHash('sha256')
+      .update(JSON.stringify(incompleteEffectsCheckpoint.manifest))
+      .digest('hex');
+    await writeFile(checkpointPath, `${JSON.stringify(incompleteEffectsCheckpoint)}\n`);
+    await expect(malformedInternal.pull(
+      interruptedState.vault_id,
+      interruptedState.device_id,
+      malformedToken,
+      interruptedState.local_main,
+      'latest',
+      interruptedState.last_applied_event_seq
+    )).rejects.toMatchObject({ code: 'invalid_transfer_checkpoint' });
+    await writeFile(checkpointPath, `${JSON.stringify(completeCheckpoint)}\n`);
+
+    const finalReceiver = new ObtsPluginClient(receiverDir, { serverUrl: baseUrl, deviceName: 'chunked-phone' });
+    const finalTransport = (finalReceiver as unknown as {
+      transport: { pullChunk: (...args: unknown[]) => Promise<unknown> };
+    }).transport;
+    const finalPull = finalTransport.pullChunk.bind(finalTransport);
+    let finalPullCalls = 0;
+    finalTransport.pullChunk = async (...args) => {
+      finalPullCalls += 1;
+      return await finalPull(...args);
+    };
+    await finalReceiver.initialize();
+    await expect(finalReceiver.syncOnce()).resolves.toMatchObject({ status: 'Synced' });
+    expect(finalPullCalls).toBe(0);
+    expect(await readFile(join(receiverDir, 'after-final-checkpoint.md'), 'utf8')).toBe('durable final checkpoint\n');
+    expect(await readFile(join(receiverDir, 'renamed-first.bin'))).toEqual(await readFile(join(deviceDir, 'renamed-first.bin')));
+    await expect(stat(join(receiverDir, 'first.bin'))).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(stat(join(receiverDir, '.obts', 'pull-transfer.json'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
@@ -6657,7 +7033,11 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('class ObtsOnboardingModal');
     expect(pluginMain).toContain('setButtonText("Set up sync")');
     expect(pluginMain).toContain('Continue in browser');
+    expect(pluginMain).toContain('"Continue approval"');
     expect(pluginMain).toContain('setButtonText("Resume setup")');
+    expect(pluginMain).toContain('"Restart setup"');
+    expect(pluginMain).toContain('pendingOnboarding.journal.last_error_code === "connection_expired"');
+    expect(pluginMain).toContain('pendingOnboarding.journal.last_error_code === "connection_denied"');
     expect(pluginMain).toContain('Resolve the conflict, then return here');
     expect(pluginMain).toContain('Do not submit the merge again.');
     expect(pluginMain).toContain('resumeAcceptedOnboarding');

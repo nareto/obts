@@ -7,7 +7,7 @@ use std::time::Instant;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, MutexGuard};
 use tokio::task::JoinHandle;
@@ -18,8 +18,7 @@ use crate::config::ClientConfig;
 use crate::filesystem::FilesystemSource;
 use crate::store::HeadlessProcessStatus;
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_HEADLESS_MESSAGE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
 pub struct HeadlessClient {
@@ -54,7 +53,40 @@ struct HeadlessProcess {
     child: Child,
     pid: Option<u32>,
     stdin: ChildStdin,
-    stdout: Lines<BufReader<ChildStdout>>,
+    stdout: BufReader<ChildStdout>,
+}
+
+struct ActiveRequest<'a> {
+    process: &'a mut HeadlessProcess,
+    healthy: &'a AtomicBool,
+    armed: bool,
+}
+
+impl<'a> ActiveRequest<'a> {
+    fn new(process: &'a mut HeadlessProcess, healthy: &'a AtomicBool) -> Self {
+        Self {
+            process,
+            healthy,
+            armed: true,
+        }
+    }
+
+    fn process(&mut self) -> &mut HeadlessProcess {
+        self.process
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ActiveRequest<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.process.child.start_kill();
+            self.healthy.store(false, Ordering::Release);
+        }
+    }
 }
 
 pub struct HeadlessFilesystemGuard<'a> {
@@ -62,6 +94,7 @@ pub struct HeadlessFilesystemGuard<'a> {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct HeadlessIndexDelta {
     pub head: Option<String>,
     pub base: Option<String>,
@@ -71,16 +104,31 @@ pub struct HeadlessIndexDelta {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct HeadlessIndexFile {
     pub path: String,
     pub oid: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct HeadlessIndexChange {
     pub path: String,
     pub kind: String,
     pub oid: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeadlessIndexDeltaPage {
+    head: Option<String>,
+    base: Option<String>,
+    mode: String,
+    files: Vec<HeadlessIndexFile>,
+    changes: Vec<HeadlessIndexChange>,
+    next_cursor: Option<usize>,
+    total_files: usize,
+    total_changes: usize,
 }
 
 impl HeadlessFilesystemGuard<'_> {
@@ -89,35 +137,80 @@ impl HeadlessFilesystemGuard<'_> {
         client: &HeadlessClient,
         from_commit: Option<&str>,
     ) -> Result<HeadlessIndexDelta, HeadlessError> {
-        let arguments = from_commit
-            .map(|commit| json!({ "fromCommit": commit }))
-            .unwrap_or(Value::Null);
-        let result = timeout(
-            REQUEST_TIMEOUT,
-            request_on_process(
-                &mut self.process,
-                &client.next_id,
-                &client.state,
-                "read-index-delta",
-                arguments,
-            ),
-        )
+        let result = async {
+            let mut cursor = 0usize;
+            let mut combined: Option<HeadlessIndexDelta> = None;
+            let mut expected_totals: Option<(usize, usize)> = None;
+            loop {
+                let mut arguments = json!({ "cursor": cursor });
+                if let Some(commit) = from_commit {
+                    arguments["fromCommit"] = json!(commit);
+                }
+                let value = supervised_request_on_process(
+                    &mut self.process,
+                    &client.next_id,
+                    &client.state,
+                    "read-index-delta",
+                    arguments,
+                    client.inactivity_timeout(),
+                    &client.healthy,
+                )
+                .await?;
+                let page: HeadlessIndexDeltaPage = serde_json::from_value(value)?;
+                let page_entries = page.files.len() + page.changes.len();
+                let totals = (page.total_files, page.total_changes);
+                if expected_totals.get_or_insert(totals) != &totals {
+                    return Err(HeadlessError::Protocol(
+                        "read-index-delta page totals changed".to_owned(),
+                    ));
+                }
+                let delta = combined.get_or_insert_with(|| HeadlessIndexDelta {
+                    head: page.head.clone(),
+                    base: page.base.clone(),
+                    mode: page.mode.clone(),
+                    files: Vec::new(),
+                    changes: Vec::new(),
+                });
+                if delta.head != page.head || delta.base != page.base || delta.mode != page.mode {
+                    return Err(HeadlessError::Protocol(
+                        "read-index-delta page identity changed".to_owned(),
+                    ));
+                }
+                delta.files.extend(page.files);
+                delta.changes.extend(page.changes);
+                match page.next_cursor {
+                    Some(next) if next == cursor + page_entries => cursor = next,
+                    Some(_) => {
+                        return Err(HeadlessError::Protocol(
+                            "read-index-delta cursor did not advance".to_owned(),
+                        ));
+                    }
+                    None if delta.files.len() == page.total_files
+                        && delta.changes.len() == page.total_changes =>
+                    {
+                        break;
+                    }
+                    None => {
+                        return Err(HeadlessError::Protocol(
+                            "read-index-delta ended before the declared inventory".to_owned(),
+                        ));
+                    }
+                }
+            }
+            combined.ok_or_else(|| HeadlessError::Protocol("empty index inventory".to_owned()))
+        }
         .await;
         match result {
-            Ok(Ok(value)) => {
+            Ok(delta) => {
                 client.healthy.store(true, Ordering::Release);
-                serde_json::from_value(value).map_err(HeadlessError::Json)
+                Ok(delta)
             }
-            Ok(Err(error)) => {
+            Err(error) => {
                 if error.is_process_failure() {
+                    quarantine_process(&mut self.process).await;
                     client.healthy.store(false, Ordering::Release);
                 }
                 Err(error)
-            }
-            Err(_) => {
-                quarantine_process(&mut self.process).await;
-                client.healthy.store(false, Ordering::Release);
-                Err(HeadlessError::Timeout)
             }
         }
     }
@@ -127,40 +220,41 @@ impl HeadlessFilesystemGuard<'_> {
         client: &HeadlessClient,
         path: &str,
     ) -> Result<Value, HeadlessError> {
-        let result = timeout(REQUEST_TIMEOUT, async {
-            request_on_process(
+        let inactivity_timeout = client.inactivity_timeout();
+        let result = async {
+            supervised_request_on_process(
                 &mut self.process,
                 &client.next_id,
                 &client.state,
                 "record-local-change",
                 json!({ "paths": [path] }),
+                inactivity_timeout,
+                &client.healthy,
             )
             .await?;
-            request_on_process(
+            supervised_request_on_process(
                 &mut self.process,
                 &client.next_id,
                 &client.state,
                 "sync-once",
                 Value::Null,
+                inactivity_timeout,
+                &client.healthy,
             )
             .await
-        })
+        }
         .await;
         match result {
-            Ok(Ok(value)) => {
+            Ok(value) => {
                 client.healthy.store(true, Ordering::Release);
                 Ok(value)
             }
-            Ok(Err(error)) => {
+            Err(error) => {
                 if error.is_process_failure() {
+                    quarantine_process(&mut self.process).await;
                     client.healthy.store(false, Ordering::Release);
                 }
                 Err(error)
-            }
-            Err(_) => {
-                quarantine_process(&mut self.process).await;
-                client.healthy.store(false, Ordering::Release);
-                Err(HeadlessError::Timeout)
             }
         }
     }
@@ -210,6 +304,10 @@ impl HeadlessClient {
         }
     }
 
+    fn inactivity_timeout(&self) -> Duration {
+        Duration::from_secs(self.config.request_inactivity_timeout_seconds.max(1))
+    }
+
     fn register_process_failure(&self, error: &HeadlessError) -> Option<Duration> {
         let mut runtime = self.runtime.write().expect("headless runtime lock");
         let backoff = register_failure(&mut runtime, &self.config, error, Instant::now());
@@ -228,9 +326,12 @@ impl HeadlessClient {
         if !self.healthy.load(Ordering::Acquire) {
             return Err(HeadlessError::Unavailable);
         }
-        let mut process = timeout(REQUEST_TIMEOUT, self.inner.lock())
+        let mut process = timeout(self.inactivity_timeout(), self.inner.lock())
             .await
             .map_err(|_| HeadlessError::Busy)?;
+        if !self.healthy.load(Ordering::Acquire) {
+            return Err(HeadlessError::Unavailable);
+        }
         match process.child.try_wait() {
             Ok(None) => Ok(HeadlessFilesystemGuard { process }),
             Ok(Some(status)) => {
@@ -246,7 +347,7 @@ impl HeadlessClient {
 
     pub async fn restart(&self) -> Result<(), HeadlessError> {
         self.healthy.store(false, Ordering::Release);
-        let mut process = timeout(REQUEST_TIMEOUT, self.inner.lock())
+        let mut process = timeout(self.inactivity_timeout(), self.inner.lock())
             .await
             .map_err(|_| HeadlessError::Timeout)?;
         if process.child.try_wait()?.is_none() {
@@ -270,6 +371,7 @@ impl HeadlessClient {
             .read()
             .expect("headless runtime lock")
             .circuit_open
+            || !self.healthy.load(Ordering::Acquire)
         {
             return Err(HeadlessError::Unavailable);
         }
@@ -289,21 +391,30 @@ impl HeadlessClient {
     }
 
     async fn request_inner(&self, command: &str, arguments: Value) -> Result<Value, HeadlessError> {
-        let mut process = timeout(REQUEST_TIMEOUT, self.inner.lock())
+        let inactivity_timeout = self.inactivity_timeout();
+        let mut process = timeout(inactivity_timeout, self.inner.lock())
             .await
             .map_err(|_| HeadlessError::Busy)?;
-        let result = timeout(
-            REQUEST_TIMEOUT,
-            request_on_process(&mut process, &self.next_id, &self.state, command, arguments),
+        if !self.healthy.load(Ordering::Acquire) {
+            return Err(HeadlessError::Unavailable);
+        }
+        let result = supervised_request_on_process(
+            &mut process,
+            &self.next_id,
+            &self.state,
+            command,
+            arguments,
+            inactivity_timeout,
+            &self.healthy,
         )
         .await;
-        match result {
-            Ok(result) => result,
-            Err(_) => {
-                quarantine_process(&mut process).await;
-                Err(HeadlessError::Timeout)
-            }
+        if result
+            .as_ref()
+            .is_err_and(|error| error.is_process_failure())
+        {
+            quarantine_process(&mut process).await;
         }
+        result
     }
 
     pub async fn refresh_state(&self) -> Result<Value, HeadlessError> {
@@ -362,12 +473,36 @@ async fn quarantine_process(process: &mut HeadlessProcess) {
     }
 }
 
+async fn supervised_request_on_process(
+    process: &mut HeadlessProcess,
+    next_id: &AtomicU64,
+    state: &RwLock<Value>,
+    command: &str,
+    arguments: Value,
+    inactivity_timeout: Duration,
+    healthy: &AtomicBool,
+) -> Result<Value, HeadlessError> {
+    let mut active = ActiveRequest::new(process, healthy);
+    let result = request_on_process(
+        active.process(),
+        next_id,
+        state,
+        command,
+        arguments,
+        inactivity_timeout,
+    )
+    .await;
+    active.disarm();
+    result
+}
+
 async fn request_on_process(
     process: &mut HeadlessProcess,
     next_id: &AtomicU64,
     state: &RwLock<Value>,
     command: &str,
     arguments: Value,
+    inactivity_timeout: Duration,
 ) -> Result<Value, HeadlessError> {
     if let Some(status) = process.child.try_wait()? {
         return Err(exited_error(status, process.pid));
@@ -384,55 +519,229 @@ async fn request_on_process(
     };
     request.insert("id".to_string(), json!(id));
     request.insert("command".to_string(), json!(command));
-    process
-        .stdin
-        .write_all(serde_json::to_string(&request)?.as_bytes())
-        .await?;
-    process.stdin.write_all(b"\n").await?;
-    process.stdin.flush().await?;
+    let request_line = serde_json::to_string(&request)?;
+    timeout(inactivity_timeout, async {
+        process.stdin.write_all(request_line.as_bytes()).await?;
+        process.stdin.write_all(b"\n").await?;
+        process.stdin.flush().await
+    })
+    .await
+    .map_err(|_| HeadlessError::Timeout)??;
 
+    let mut state_event_seen = false;
     loop {
-        let line = next_process_line(process).await?;
+        let line = timeout(inactivity_timeout, next_process_line(process))
+            .await
+            .map_err(|_| HeadlessError::Timeout)??;
         let message: Value = serde_json::from_str(&line)?;
-        if message.get("type").and_then(Value::as_str) == Some("event") {
-            if let Some(next_state) = message.get("state") {
-                *state.write().expect("headless state lock") = next_state.clone();
-            }
-            continue;
-        }
-        if message.get("type").and_then(Value::as_str) != Some("response")
-            || message.get("id").and_then(Value::as_u64) != Some(id)
-        {
-            continue;
-        }
-        if message.get("ok").and_then(Value::as_bool) == Some(true) {
-            let result = message.get("result").cloned().unwrap_or(Value::Null);
-            if command == "read-state" {
-                *state.write().expect("headless state lock") = result.clone();
-            } else if command == "maintenance-tick" {
-                let mut cached = state.write().expect("headless state lock");
-                if let Some(local_head) = result.get("local_head") {
-                    cached["local_head"] = local_head.clone();
+        match message.get("type").and_then(Value::as_str) {
+            Some("event") => match message.get("event").and_then(Value::as_str) {
+                Some("progress") if is_valid_progress_event(&message) => continue,
+                Some("state")
+                    if !state_event_seen
+                        && has_exact_keys(&message, &["type", "event", "state"])
+                        && message.get("state").is_some_and(is_valid_state) =>
+                {
+                    state_event_seen = true;
+                    *state.write().expect("headless state lock") = message["state"].clone();
+                    continue;
                 }
-                if let Some(status) = result.get("status") {
-                    cached["status_label"] = status.clone();
+                _ => {
+                    return Err(HeadlessError::Protocol(
+                        "headless client emitted an invalid event".to_string(),
+                    ));
                 }
+            },
+            Some("fatal") if is_valid_fatal_message(&message) => {
+                return Err(protocol_fatal_error(&message));
             }
-            return Ok(result);
+            Some("response") => {}
+            _ => {
+                return Err(HeadlessError::Protocol(
+                    "headless client emitted an unknown message".to_string(),
+                ));
+            }
         }
-        let code = message
-            .pointer("/error/code")
-            .and_then(Value::as_str)
-            .unwrap_or("headless_error");
-        let detail = message
-            .pointer("/error/message")
-            .and_then(Value::as_str)
-            .unwrap_or("Headless client command failed.");
-        return Err(HeadlessError::Remote {
-            code: code.to_string(),
-            message: detail.to_string(),
-        });
+        if message.get("id").and_then(Value::as_u64) != Some(id) {
+            return Err(HeadlessError::Protocol(
+                "headless client response id did not match the request".to_string(),
+            ));
+        }
+        match message.get("ok").and_then(Value::as_bool) {
+            Some(true) if has_exact_keys(&message, &["type", "id", "ok", "result"]) => {
+                let result = message.get("result").cloned().expect("validated result");
+                if command == "read-state" {
+                    if !is_valid_state(&result) {
+                        return Err(HeadlessError::Protocol(
+                            "headless client returned an invalid state".to_string(),
+                        ));
+                    }
+                    *state.write().expect("headless state lock") = result.clone();
+                } else if command == "maintenance-tick" {
+                    let mut cached = state.write().expect("headless state lock");
+                    if let Some(local_head) = result.get("local_head") {
+                        cached["local_head"] = local_head.clone();
+                    }
+                    if let Some(status) = result.get("status") {
+                        cached["status_label"] = status.clone();
+                    }
+                }
+                return Ok(result);
+            }
+            Some(false) if is_valid_error_response(&message) => {
+                return Err(HeadlessError::Remote {
+                    code: message["error"]["code"]
+                        .as_str()
+                        .expect("validated code")
+                        .to_string(),
+                    message: message["error"]["message"]
+                        .as_str()
+                        .expect("validated message")
+                        .to_string(),
+                });
+            }
+            Some(true) | Some(false) => {
+                return Err(HeadlessError::Protocol(
+                    "headless client response is malformed".to_string(),
+                ));
+            }
+            None => {
+                return Err(HeadlessError::Protocol(
+                    "headless client response is missing its result status".to_string(),
+                ));
+            }
+        }
     }
+}
+
+fn has_exact_keys(message: &Value, expected: &[&str]) -> bool {
+    let Some(object) = message.as_object() else {
+        return false;
+    };
+    object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
+}
+
+fn is_valid_progress_event(message: &Value) -> bool {
+    has_exact_keys(message, &["type", "event", "status", "diagnosticPoint"])
+        && message
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| !status.is_empty() && status.len() <= 512)
+        && message
+            .get("diagnosticPoint")
+            .and_then(Value::as_str)
+            .is_some_and(|point| !point.is_empty() && point.len() <= 128)
+}
+
+fn is_valid_state(value: &Value) -> bool {
+    let Some(state) = value.as_object() else {
+        return false;
+    };
+    const ALLOWED_KEYS: &[&str] = &[
+        "user_id",
+        "vault_id",
+        "device_id",
+        "device_name",
+        "device_ref",
+        "server_device_ref",
+        "local_main",
+        "local_head",
+        "initial_import_confirmed",
+        "status_label",
+        "last_error_code",
+        "last_error_details",
+        "last_event_seq",
+        "last_applied_event_seq",
+        "unpaired_baseline_vault_id",
+        "unpaired_baseline_main",
+        "updated_at",
+    ];
+    if state
+        .keys()
+        .any(|key| !ALLOWED_KEYS.contains(&key.as_str()))
+    {
+        return false;
+    }
+    [
+        "user_id",
+        "vault_id",
+        "device_id",
+        "device_ref",
+        "server_device_ref",
+        "local_main",
+        "local_head",
+        "last_error_code",
+    ]
+    .iter()
+    .all(|key| {
+        state
+            .get(*key)
+            .is_some_and(|field| field.is_null() || field.is_string())
+    }) && [
+        "device_name",
+        "unpaired_baseline_vault_id",
+        "unpaired_baseline_main",
+    ]
+    .iter()
+    .all(|key| {
+        state
+            .get(*key)
+            .is_none_or(|field| field.is_null() || field.is_string())
+    }) && state
+        .get("last_error_details")
+        .is_none_or(|field| field.is_null() || field.is_object())
+        && state
+            .get("initial_import_confirmed")
+            .and_then(Value::as_bool)
+            .is_some()
+        && state
+            .get("status_label")
+            .and_then(Value::as_str)
+            .is_some_and(|label| !label.is_empty() && label.len() <= 512)
+        && state
+            .get("last_event_seq")
+            .and_then(Value::as_u64)
+            .is_some()
+        && state
+            .get("last_applied_event_seq")
+            .and_then(Value::as_u64)
+            .is_some()
+        && state
+            .get("updated_at")
+            .and_then(Value::as_str)
+            .is_some_and(|timestamp| !timestamp.is_empty() && timestamp.len() <= 128)
+}
+
+fn is_valid_protocol_error(message: &Value) -> bool {
+    let Some(error) = message.get("error").and_then(Value::as_object) else {
+        return false;
+    };
+    error.len() == 2
+        && error
+            .get("code")
+            .and_then(Value::as_str)
+            .is_some_and(|code| !code.is_empty() && code.len() <= 128)
+        && error
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|detail| !detail.is_empty() && detail.len() <= 4096)
+}
+
+fn is_valid_error_response(message: &Value) -> bool {
+    has_exact_keys(message, &["type", "id", "ok", "error"]) && is_valid_protocol_error(message)
+}
+
+fn is_valid_fatal_message(message: &Value) -> bool {
+    has_exact_keys(message, &["type", "error"]) && is_valid_protocol_error(message)
+}
+
+fn protocol_fatal_error(message: &Value) -> HeadlessError {
+    HeadlessError::Protocol(
+        message["error"]["message"]
+            .as_str()
+            .expect("validated fatal message")
+            .to_string(),
+    )
 }
 
 async fn spawn_process(config: &ClientConfig) -> Result<(HeadlessProcess, Value), HeadlessError> {
@@ -478,11 +787,14 @@ async fn spawn_process(config: &ClientConfig) -> Result<(HeadlessProcess, Value)
         pid: child.id(),
         child,
         stdin,
-        stdout: BufReader::new(stdout).lines(),
+        stdout: BufReader::new(stdout),
     };
-    let ready = timeout(STARTUP_TIMEOUT, read_until_event(&mut process, "ready"))
-        .await
-        .map_err(|_| HeadlessError::Timeout)??;
+    let ready = read_until_event(
+        &mut process,
+        "ready",
+        Duration::from_secs(config.request_inactivity_timeout_seconds.max(1)),
+    )
+    .await?;
     Ok((process, ready))
 }
 
@@ -528,17 +840,50 @@ pub fn spawn_maintenance(
 }
 
 async fn next_process_line(process: &mut HeadlessProcess) -> Result<String, HeadlessError> {
-    match process.stdout.next_line().await? {
-        Some(line) => Ok(line),
-        None => Err(process
-            .child
-            .try_wait()?
-            .map(|status| exited_error(status, process.pid))
-            .unwrap_or(HeadlessError::Exited {
-                pid: process.pid,
-                code: None,
-                signal: None,
-            })),
+    let mut bytes = Vec::new();
+    loop {
+        let available = process.stdout.fill_buf().await?;
+        if available.is_empty() {
+            if !bytes.is_empty() {
+                return Err(HeadlessError::Protocol(
+                    "headless client closed an unterminated JSON-line message".to_string(),
+                ));
+            }
+            return Err(process
+                .child
+                .try_wait()?
+                .map(|status| exited_error(status, process.pid))
+                .unwrap_or(HeadlessError::Exited {
+                    pid: process.pid,
+                    code: None,
+                    signal: None,
+                }));
+        }
+        if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+            if bytes.len().saturating_add(newline) > MAX_HEADLESS_MESSAGE_BYTES {
+                return Err(HeadlessError::Protocol(
+                    "headless client message exceeded the byte limit".to_string(),
+                ));
+            }
+            bytes.extend_from_slice(&available[..newline]);
+            process.stdout.consume(newline + 1);
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+            return std::str::from_utf8(&bytes)
+                .map(ToOwned::to_owned)
+                .map_err(|_| {
+                    HeadlessError::Protocol("headless client emitted non-UTF-8 output".to_string())
+                });
+        }
+        if bytes.len().saturating_add(available.len()) > MAX_HEADLESS_MESSAGE_BYTES {
+            return Err(HeadlessError::Protocol(
+                "headless client message exceeded the byte limit".to_string(),
+            ));
+        }
+        let consumed = available.len();
+        bytes.extend_from_slice(available);
+        process.stdout.consume(consumed);
     }
 }
 
@@ -565,21 +910,32 @@ fn exited_error(status: ExitStatus, pid: Option<u32>) -> HeadlessError {
 async fn read_until_event(
     process: &mut HeadlessProcess,
     event: &str,
+    inactivity_timeout: Duration,
 ) -> Result<Value, HeadlessError> {
     loop {
-        let line = next_process_line(process).await?;
+        let line = timeout(inactivity_timeout, next_process_line(process))
+            .await
+            .map_err(|_| HeadlessError::Timeout)??;
         let message: Value = serde_json::from_str(&line)?;
-        if message.get("type").and_then(Value::as_str) == Some("fatal") {
-            let detail = message
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .unwrap_or("Headless client failed.");
-            return Err(HeadlessError::Protocol(detail.to_string()));
-        }
-        if message.get("type").and_then(Value::as_str) == Some("event")
-            && message.get("event").and_then(Value::as_str) == Some(event)
-        {
-            return Ok(message.get("state").cloned().unwrap_or(Value::Null));
+        match message.get("type").and_then(Value::as_str) {
+            Some("fatal") if is_valid_fatal_message(&message) => {
+                return Err(protocol_fatal_error(&message));
+            }
+            Some("event")
+                if message.get("event").and_then(Value::as_str) == Some(event)
+                    && has_exact_keys(&message, &["type", "event", "state"])
+                    && message.get("state").is_some_and(is_valid_state) =>
+            {
+                return Ok(message["state"].clone());
+            }
+            Some("event")
+                if message.get("event").and_then(Value::as_str) == Some("progress")
+                    && is_valid_progress_event(&message) => {}
+            _ => {
+                return Err(HeadlessError::Protocol(
+                    "headless client emitted an invalid startup message".to_string(),
+                ));
+            }
         }
     }
 }
@@ -647,11 +1003,67 @@ impl HeadlessError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::write;
+    use std::process::Stdio;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, RwLock};
     use std::time::{Duration, Instant};
 
-    use crate::config::ClientConfig;
+    use serde_json::{Value, json};
+    use tempfile::tempdir;
+    use tokio::io::BufReader;
+    use tokio::process::Command;
 
-    use super::{HeadlessError, HeadlessRuntimeState, register_failure};
+    use crate::config::ClientConfig;
+    use crate::filesystem::FilesystemSource;
+
+    use super::{
+        HeadlessClient, HeadlessError, HeadlessProcess, HeadlessRuntimeState, register_failure,
+        request_on_process, spawn_maintenance,
+    };
+
+    fn valid_state() -> Value {
+        json!({
+            "user_id": null,
+            "vault_id": null,
+            "device_id": null,
+            "device_ref": null,
+            "server_device_ref": null,
+            "local_main": null,
+            "local_head": null,
+            "initial_import_confirmed": false,
+            "status_label": "Checking",
+            "last_error_code": null,
+            "last_event_seq": 0,
+            "last_applied_event_seq": 0,
+            "updated_at": "2026-09-22T00:00:00.000Z"
+        })
+    }
+
+    fn ready_line() -> String {
+        json!({ "type": "event", "event": "ready", "state": valid_state() }).to_string()
+    }
+
+    async fn scripted_process(script: &str) -> HeadlessProcess {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().expect("spawn scripted headless process");
+        let pid = child.id();
+        let stdin = child.stdin.take().expect("script stdin");
+        let stdout = child.stdout.take().expect("script stdout");
+        HeadlessProcess {
+            child,
+            pid,
+            stdin,
+            stdout: BufReader::new(stdout),
+        }
+    }
 
     #[test]
     fn repeated_process_failures_back_off_and_open_the_circuit() {
@@ -705,5 +1117,367 @@ mod tests {
         assert!(error.is_unpaired());
         assert!(!error.is_process_failure());
         assert!(!HeadlessError::Busy.is_process_failure());
+    }
+
+    #[tokio::test]
+    async fn progress_events_reset_request_inactivity_timeout() {
+        let mut process = scripted_process(
+            r#"read -r _
+            sleep 0.03
+            printf '%s\n' '{"type":"event","event":"progress","status":"one","diagnosticPoint":"sync_download"}'
+            sleep 0.03
+            printf '%s\n' '{"type":"event","event":"progress","status":"two","diagnosticPoint":"sync_download"}'
+            sleep 0.03
+            printf '%s\n' '{"type":"response","id":1,"ok":true,"result":{"status":"done"}}'"#,
+        )
+        .await;
+        let started = Instant::now();
+        let result = request_on_process(
+            &mut process,
+            &AtomicU64::new(1),
+            &RwLock::new(Value::Null),
+            "long-command",
+            Value::Null,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("progress should keep the request alive");
+
+        assert!(started.elapsed() >= Duration::from_millis(75));
+        assert_eq!(result, json!({ "status": "done" }));
+    }
+
+    #[tokio::test]
+    async fn silent_request_exceeds_inactivity_timeout() {
+        let mut process = scripted_process(
+            r#"read -r _
+            sleep 0.10
+            printf '%s\n' '{"type":"response","id":1,"ok":true,"result":null}'"#,
+        )
+        .await;
+        let error = request_on_process(
+            &mut process,
+            &AtomicU64::new(1),
+            &RwLock::new(Value::Null),
+            "silent-command",
+            Value::Null,
+            Duration::from_millis(25),
+        )
+        .await
+        .expect_err("silence should time out");
+
+        assert!(matches!(error, HeadlessError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn invalid_protocol_traffic_fails_instead_of_renewing_activity() {
+        let mut process = scripted_process(
+            r#"read -r _
+            printf '%s\n' '{}'
+            sleep 0.10"#,
+        )
+        .await;
+        let error = request_on_process(
+            &mut process,
+            &AtomicU64::new(1),
+            &RwLock::new(Value::Null),
+            "invalid-command",
+            Value::Null,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("unknown messages must fail the protocol");
+
+        assert!(matches!(error, HeadlessError::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn malformed_recognized_messages_fail_the_protocol() {
+        for message in [
+            r#"{"type":"event","event":"state","state":{}}"#,
+            r#"{"type":"event","event":"state","state":{"user_id":null,"vault_id":null,"device_id":null,"device_ref":null,"server_device_ref":null,"local_main":null,"local_head":null,"initial_import_confirmed":false,"status_label":"Checking","last_error_code":null,"last_event_seq":0,"last_applied_event_seq":0,"updated_at":"2026-01-01T00:00:00.000Z","extra":"payload"}}"#,
+            r#"{"type":"event","event":"progress","status":"active","diagnosticPoint":"sync","extra":"payload"}"#,
+            r#"{"type":"response","id":1,"ok":true}"#,
+        ] {
+            let mut process =
+                scripted_process(&format!("read -r _\nprintf '%s\\n' '{message}'")).await;
+            let error = request_on_process(
+                &mut process,
+                &AtomicU64::new(1),
+                &RwLock::new(Value::Null),
+                "invalid-command",
+                Value::Null,
+                Duration::from_millis(250),
+            )
+            .await
+            .expect_err("malformed recognized traffic must fail");
+            assert!(matches!(error, HeadlessError::Protocol(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn unterminated_response_at_eof_fails_closed() {
+        let mut process = scripted_process(
+            r#"read -r _
+printf '%s' '{"type":"response","id":1,"ok":true,"result":null}'"#,
+        )
+        .await;
+        let error = request_on_process(
+            &mut process,
+            &AtomicU64::new(1),
+            &RwLock::new(Value::Null),
+            "unterminated-command",
+            Value::Null,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("unterminated output must not complete a request");
+        assert!(matches!(error, HeadlessError::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn oversized_stdout_frame_fails_before_unbounded_accumulation() {
+        let mut process = scripted_process(
+            r#"read -r _
+dd if=/dev/zero bs=1048577 count=1 2>/dev/null | tr '\000' x
+sleep 1"#,
+        )
+        .await;
+        let error = request_on_process(
+            &mut process,
+            &AtomicU64::new(1),
+            &RwLock::new(Value::Null),
+            "oversized-command",
+            Value::Null,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect_err("oversized child frames must fail");
+        assert!(matches!(error, HeadlessError::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn startup_progress_resets_the_inactivity_timeout() {
+        let directory = tempdir().expect("temporary script directory");
+        let script_path = directory.path().join("startup-progress.sh");
+        write(
+            &script_path,
+            format!(
+                r#"sleep 0.60
+printf '%s\n' '{{"type":"event","event":"progress","status":"recovering one","diagnosticPoint":"startup_recovery"}}'
+sleep 0.60
+printf '%s\n' '{{"type":"event","event":"progress","status":"recovering two","diagnosticPoint":"startup_recovery"}}'
+sleep 0.60
+printf '%s\n' '{ready}'
+"#,
+                ready = ready_line()
+            ),
+        )
+        .expect("write startup script");
+        let config = ClientConfig {
+            headless_command: format!("sh {}", script_path.display()),
+            vault_dir: directory.path().join("vault").display().to_string(),
+            request_inactivity_timeout_seconds: 1,
+            ..ClientConfig::default()
+        };
+        let started = Instant::now();
+        let client = HeadlessClient::spawn(&config)
+            .await
+            .expect("startup progress should keep the child alive");
+
+        assert!(started.elapsed() >= Duration::from_millis(1_500));
+        assert!(client.runtime_status().up);
+    }
+
+    #[tokio::test]
+    async fn supervised_timeout_quarantines_and_restart_recovers() {
+        let directory = tempdir().expect("temporary script directory");
+        let script_path = directory.path().join("restart.sh");
+        let counter_path = directory.path().join("started");
+        write(
+            &script_path,
+            format!(
+                r#"if [ ! -f '{counter}' ]; then
+  : > '{counter}'
+  printf '%s\n' '{ready}'
+  read -r _
+  sleep 5
+else
+  printf '%s\n' '{ready}'
+  read -r _
+  printf '%s\n' '{{"type":"response","id":2,"ok":true,"result":{{"status":"recovered"}}}}'
+fi
+"#,
+                counter = counter_path.display(),
+                ready = ready_line()
+            ),
+        )
+        .expect("write restart script");
+        let config = ClientConfig {
+            headless_command: format!("sh {}", script_path.display()),
+            vault_dir: directory.path().join("vault").display().to_string(),
+            request_inactivity_timeout_seconds: 1,
+            ..ClientConfig::default()
+        };
+        let client = HeadlessClient::spawn(&config).await.expect("spawn client");
+
+        let error = client
+            .request("long-command", Value::Null)
+            .await
+            .expect_err("silent child should time out");
+        assert!(matches!(error, HeadlessError::Timeout));
+        assert!(!client.runtime_status().up);
+
+        client.restart().await.expect("restart quarantined child");
+        let result = client
+            .request("long-command", Value::Null)
+            .await
+            .expect("replacement child should answer");
+        assert_eq!(result, json!({ "status": "recovered" }));
+        assert_eq!(client.runtime_status().restart_count, 1);
+    }
+
+    #[tokio::test]
+    async fn read_index_delta_reassembles_bounded_pages() {
+        let directory = tempdir().expect("temporary script directory");
+        let script_path = directory.path().join("paged-index.sh");
+        write(
+            &script_path,
+            format!(
+                r#"printf '%s\n' '{ready}'
+read -r _
+printf '%s\n' '{{"type":"response","id":1,"ok":true,"result":{{"head":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","base":null,"mode":"rebuild","files":[{{"path":"one.md","oid":"1111111111111111111111111111111111111111"}}],"changes":[],"next_cursor":1,"total_files":2,"total_changes":0}}}}'
+read -r _
+printf '%s\n' '{{"type":"response","id":2,"ok":true,"result":{{"head":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","base":null,"mode":"rebuild","files":[{{"path":"two.md","oid":"2222222222222222222222222222222222222222"}}],"changes":[],"next_cursor":null,"total_files":2,"total_changes":0}}}}'
+sleep 5
+"#,
+                ready = ready_line()
+            ),
+        )
+        .expect("write paged index script");
+        let config = ClientConfig {
+            headless_command: format!("sh {}", script_path.display()),
+            vault_dir: directory.path().join("vault").display().to_string(),
+            ..ClientConfig::default()
+        };
+        let client = HeadlessClient::spawn(&config).await.expect("spawn client");
+        let mut guard = client.lock_filesystem().await.expect("filesystem lock");
+
+        let delta = guard
+            .read_index_delta(&client, None)
+            .await
+            .expect("reassemble pages");
+
+        assert_eq!(delta.files.len(), 2);
+        assert_eq!(delta.files[0].path, "one.md");
+        assert_eq!(delta.files[1].path, "two.md");
+    }
+
+    #[tokio::test]
+    async fn maintenance_supervisor_restarts_a_quarantined_child() {
+        let directory = tempdir().expect("temporary script directory");
+        let script_path = directory.path().join("automatic-restart.sh");
+        let counter_path = directory.path().join("started");
+        write(
+            &script_path,
+            format!(
+                r#"if [ ! -f '{counter}' ]; then
+  : > '{counter}'
+  printf '%s\n' '{ready}'
+  read -r _
+  sleep 5
+else
+  printf '%s\n' '{ready}'
+  read -r _
+  printf '%s\n' '{{"type":"response","id":2,"ok":true,"result":{{"applied":false,"local_head":null}}}}'
+  sleep 5
+fi
+"#,
+                counter = counter_path.display(),
+                ready = ready_line()
+            ),
+        )
+        .expect("write automatic restart script");
+        let vault_dir = directory.path().join("vault");
+        std::fs::create_dir_all(&vault_dir).expect("create vault directory");
+        let config = ClientConfig {
+            headless_command: format!("sh {}", script_path.display()),
+            vault_dir: vault_dir.display().to_string(),
+            request_inactivity_timeout_seconds: 1,
+            restart_base_backoff_seconds: 1,
+            restart_max_backoff_seconds: 1,
+            ..ClientConfig::default()
+        };
+        let client = HeadlessClient::spawn(&config).await.expect("spawn client");
+        let filesystem = Arc::new(FilesystemSource::new(&vault_dir).expect("filesystem source"));
+        let maintenance = spawn_maintenance(client.clone(), filesystem, Duration::from_millis(10));
+        let observed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if client.runtime_status().restart_count >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        maintenance.abort();
+
+        assert!(
+            observed.is_ok(),
+            "maintenance supervisor did not restart the child"
+        );
+        assert!(client.runtime_status().up);
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_quarantines_and_restart_recovers() {
+        let directory = tempdir().expect("temporary script directory");
+        let script_path = directory.path().join("cancel-restart.sh");
+        let counter_path = directory.path().join("started");
+        write(
+            &script_path,
+            format!(
+                r#"if [ ! -f '{counter}' ]; then
+  : > '{counter}'
+  printf '%s\n' '{ready}'
+  read -r _
+  sleep 5
+else
+  printf '%s\n' '{ready}'
+  read -r _
+  printf '%s\n' '{{"type":"response","id":2,"ok":true,"result":{{"status":"recovered"}}}}'
+fi
+"#,
+                counter = counter_path.display(),
+                ready = ready_line()
+            ),
+        )
+        .expect("write cancellation script");
+        let config = ClientConfig {
+            headless_command: format!("sh {}", script_path.display()),
+            vault_dir: directory.path().join("vault").display().to_string(),
+            request_inactivity_timeout_seconds: 5,
+            ..ClientConfig::default()
+        };
+        let client = HeadlessClient::spawn(&config).await.expect("spawn client");
+        let request_client = client.clone();
+        let request =
+            tokio::spawn(async move { request_client.request("long-command", Value::Null).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        request.abort();
+        let _ = request.await;
+
+        assert!(!client.runtime_status().up);
+        let quarantined = client
+            .request("long-command", Value::Null)
+            .await
+            .expect_err("quarantined child must reject requests before restart");
+        assert!(matches!(quarantined, HeadlessError::Unavailable));
+        client.restart().await.expect("restart cancelled child");
+        let result = client
+            .request("long-command", Value::Null)
+            .await
+            .expect("replacement child should answer");
+        assert_eq!(result, json!({ "status": "recovered" }));
     }
 }

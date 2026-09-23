@@ -24,6 +24,7 @@ const state = {
 function fakeClient(overrides: Partial<HeadlessClient> = {}): HeadlessClient {
   return {
     initialize: vi.fn(async () => undefined),
+    setProgressListener: vi.fn(() => undefined),
     readState: vi.fn(async () => state),
     readQueue: vi.fn(async () => ({ pending_commit: null, expected_device_ref: null, status: 'idle', attempts: 0, updated_at: state.updated_at })),
     readPendingOnboarding: vi.fn(async () => null),
@@ -59,6 +60,42 @@ describe('headless client protocol', () => {
       { type: 'event', event: 'ready', state },
       { type: 'response', id: 1, ok: true, result: state }
     ]);
+  });
+
+  it('emits ordered progress while a long command is active', async () => {
+    const messages: HeadlessMessage[] = [];
+    let progress: ((status: string, diagnosticPoint: string) => void) | null = null;
+    const client = fakeClient({
+      setProgressListener: vi.fn((listener) => {
+        progress = listener;
+      }),
+      syncOnce: vi.fn(async () => {
+        progress?.('Downloaded 1 sync chunk', 'sync_download');
+        progress?.('Downloaded 2 sync chunks', 'sync_download');
+        return { status: 'Synced' };
+      })
+    });
+    const session = new HeadlessSession(client, async (message) => void messages.push(message));
+
+    await session.start();
+    await session.submit({ id: 1, command: 'sync-once' });
+    await session.stop('test');
+
+    expect(messages.map((message) => 'event' in message ? message.event : message.type)).toEqual([
+      'ready',
+      'progress',
+      'progress',
+      'state',
+      'response',
+      'stopping'
+    ]);
+    expect(messages[1]).toEqual({
+      type: 'event',
+      event: 'progress',
+      status: 'Downloaded 1 sync chunk',
+      diagnosticPoint: 'sync_download'
+    });
+    expect(client.setProgressListener).toHaveBeenLastCalledWith(null);
   });
 
   it('serializes overlapping commands', async () => {
@@ -122,7 +159,61 @@ describe('headless client protocol', () => {
     await session.submit({ id: 1, command: 'read-index-delta', fromCommit: 'a'.repeat(40) });
 
     expect(readIndexDelta).toHaveBeenCalledWith('a'.repeat(40));
-    expect(messages).toEqual([{ type: 'response', id: 1, ok: true, result: await readIndexDelta.mock.results[0]!.value }]);
+    expect(messages).toEqual([{
+      type: 'response',
+      id: 1,
+      ok: true,
+      result: {
+        ...await readIndexDelta.mock.results[0]!.value,
+        next_cursor: null,
+        total_files: 1,
+        total_changes: 1
+      }
+    }]);
+  });
+
+  it('pages large commit inventories below the protocol frame limit', async () => {
+    const messages: HeadlessMessage[] = [];
+    const files = Array.from({ length: 1_200 }, (_, index) => ({
+      path: `Notes/${index.toString().padStart(4, '0')}-${'x'.repeat(480)}.md`,
+      oid: index.toString(16).padStart(40, '0')
+    }));
+    const readIndexDelta = vi.fn(async () => ({
+      head: 'b'.repeat(40),
+      base: null,
+      mode: 'rebuild' as const,
+      files,
+      changes: []
+    }));
+    const session = new HeadlessSession(fakeClient({ readIndexDelta }), async (message) => void messages.push(message));
+
+    let cursor: number | null = 0;
+    let id = 1;
+    while (cursor !== null) {
+      await session.submit({ id, command: 'read-index-delta', cursor });
+      const response = messages.at(-1) as Extract<HeadlessMessage, { type: 'response'; ok: true }>;
+      expect(Buffer.byteLength(JSON.stringify(response), 'utf8')).toBeLessThan(1024 * 1024);
+      cursor = (response.result as { next_cursor: number | null }).next_cursor;
+      id += 1;
+    }
+
+    expect(readIndexDelta).toHaveBeenCalledOnce();
+    const returnedFiles = messages.flatMap((message) =>
+      message.type === 'response' && message.ok
+        ? ((message.result as { files?: typeof files }).files ?? [])
+        : []
+    );
+    expect(returnedFiles).toEqual(files);
+    expect(messages.length).toBeGreaterThan(1);
+  });
+
+  it('emits changed state before the correlated response', async () => {
+    const messages: HeadlessMessage[] = [];
+    const session = new HeadlessSession(fakeClient(), async (message) => void messages.push(message));
+
+    await session.submit({ id: 1, command: 'sync-once' });
+
+    expect(messages.map((message) => 'event' in message ? message.event : message.type)).toEqual(['state', 'response']);
   });
 
   it('runs one scheduler-controlled maintenance tick without an implicit sync command', async () => {

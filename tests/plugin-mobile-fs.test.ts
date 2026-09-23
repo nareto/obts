@@ -41,6 +41,48 @@ describe('mobile DataAdapter filesystem', () => {
     expect(await fs.promises.readFile('/.obts/state/renamed.bin')).toEqual(bytes);
   });
 
+  it('rejects over-budget recovery reads before loading mobile binary content', async () => {
+    const adapter = new MemoryDataAdapter();
+    const fs = createDataAdapterFs(adapter);
+    await fs.promises.writeFile('/.obts/large.bin', Buffer.alloc(64));
+    const readBinary = adapter.readBinary.bind(adapter);
+    let binaryReads = 0;
+    adapter.readBinary = async (filePath: string) => {
+      binaryReads += 1;
+      return await readBinary(filePath);
+    };
+
+    await expect(fs.promises.readFileBounded('/.obts/large.bin', 16)).rejects.toMatchObject({ code: 'EFBIG' });
+    expect(binaryReads).toBe(0);
+    expect(await fs.promises.readFileBounded('/.obts/large.bin', 64)).toHaveLength(64);
+    expect(binaryReads).toBe(1);
+  });
+
+  it('uses native visibility barriers when explicit fsync hooks are unavailable', async () => {
+    const adapter = new MemoryDataAdapter();
+    const fs = createDataAdapterFs(adapter);
+    await fs.promises.mkdir('/.obts/state', { recursive: true });
+    await fs.promises.writeFile('/.obts/state/data.bin', Buffer.from('durable'));
+    const stat = adapter.stat.bind(adapter);
+    const list = adapter.list.bind(adapter);
+    let statCalls = 0;
+    let listCalls = 0;
+    adapter.stat = async (filePath: string) => {
+      statCalls += 1;
+      return await stat(filePath);
+    };
+    adapter.list = async (dirPath: string) => {
+      listCalls += 1;
+      return await list(dirPath);
+    };
+
+    await fs.promises.syncFile('/.obts/state/data.bin');
+    await fs.promises.syncDirectory('/.obts/state');
+
+    expect(statCalls).toBeGreaterThanOrEqual(2);
+    expect(listCalls).toBe(1);
+  });
+
   it('preserves or recovers the prior file when replacement is interrupted', async () => {
     const adapter = new MemoryDataAdapter();
     const fs = createDataAdapterFs(adapter);

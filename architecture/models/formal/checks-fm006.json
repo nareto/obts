@@ -1,0 +1,142 @@
+{
+  "schemaVersion": 1,
+  "modelId": "OBTS-FM-006",
+  "architectureRevision": 13,
+  "architectureStatus": "accepted",
+  "tooling": {
+    "workers": 1,
+    "fingerprintPolynomial": 0,
+    "defaultTimeoutMs": 60000,
+    "defaultHeapMb": 1024,
+    "defaultMaximumDistinctStates": 10000,
+    "moduleLibrary": "modules"
+  },
+  "model": "OBTSOnboarding.tla",
+  "sanyModules": ["OBTSOnboarding"],
+  "checks": [
+    {
+      "id": "fm006-empty-safety",
+      "config": "configs/fm006-empty-safety.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 2000,
+      "maximumDepth": 30,
+      "baseline": {"generated": 1033, "distinct": 703, "depth": 20, "minGenerated": 516, "minDistinct": 351, "minDepth": 10}
+    },
+    {
+      "id": "fm006-empty-liveness",
+      "config": "configs/fm006-empty-liveness.cfg",
+      "kind": "positive-liveness",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 1000,
+      "maximumDepth": 30,
+      "baseline": {"generated": 165, "distinct": 114, "depth": 17, "minGenerated": 82, "minDistinct": 57, "minDepth": 8}
+    },
+    {
+      "id": "fm006-nonempty-safety",
+      "config": "configs/fm006-nonempty-safety.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 2000,
+      "maximumDepth": 30,
+      "baseline": {"generated": 1151, "distinct": 761, "depth": 21, "minGenerated": 575, "minDistinct": 380, "minDepth": 10}
+    },
+    {
+      "id": "fm006-nonempty-liveness",
+      "config": "configs/fm006-nonempty-liveness.cfg",
+      "kind": "positive-liveness",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 1000,
+      "maximumDepth": 30,
+      "baseline": {"generated": 170, "distinct": 118, "depth": 18, "minGenerated": 85, "minDistinct": 59, "minDepth": 9}
+    },
+    {
+      "id": "fm006-reach-restart",
+      "config": "configs/fm006-reach-restart.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 1000,
+      "maximumDepth": 20,
+      "expectedInvariant": "NeverRestartedTransfer",
+      "requiredWitness": "Restart",
+      "minimumTraceDepth": 6
+    },
+    {
+      "id": "fm006-negative-pending-deadline",
+      "config": "configs/fm006-negative-pending-deadline.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 1000,
+      "maximumDepth": 20,
+      "expectedInvariant": "ApprovedLeaseSeparated",
+      "requiredWitness": "ExpireApprovedAtPendingDeadline",
+      "minimumTraceDepth": 4
+    },
+    {
+      "id": "fm006-negative-retarget",
+      "config": "configs/fm006-negative-retarget.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 1000,
+      "maximumDepth": 20,
+      "expectedInvariant": "PinnedBaselineStable",
+      "requiredWitness": "RetargetPinned",
+      "minimumTraceDepth": 3
+    },
+    {
+      "id": "fm006-negative-transfer-before-registration",
+      "config": "configs/fm006-negative-transfer-before-registration.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 1000,
+      "maximumDepth": 20,
+      "expectedInvariant": "TransferRequiresCredential",
+      "requiredWitness": "TransferBeforeRegistration",
+      "minimumTraceDepth": 2
+    },
+    {
+      "id": "fm006-negative-apply-before-recovery",
+      "config": "configs/fm006-negative-apply-before-recovery.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 1000,
+      "maximumDepth": 20,
+      "expectedInvariant": "RecoveryBeforeApply",
+      "requiredWitness": "ApplyWithoutRecovery",
+      "minimumTraceDepth": 6
+    },
+    {
+      "id": "fm006-negative-final-checkpoint",
+      "config": "configs/fm006-negative-final-checkpoint.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 1000,
+      "maximumDepth": 20,
+      "expectedInvariant": "FinalCheckpointBeforeApply",
+      "requiredWitness": "ReceiveFinalWithoutCheckpoint",
+      "minimumTraceDepth": 5
+    },
+    {
+      "id": "fm006-negative-complete-before-ack",
+      "config": "configs/fm006-negative-complete-before-ack.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 1000,
+      "maximumDepth": 20,
+      "expectedInvariant": "CompleteRequiresAcknowledgement",
+      "requiredWitness": "CompleteWithoutAcknowledgement",
+      "minimumTraceDepth": 7
+    }
+  ]
+}

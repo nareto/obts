@@ -305,3 +305,22 @@ The export lane selects the policy-visible candidate set before hydration, owns 
 Actual TLC 2.19 used one worker and fingerprint polynomial 0. Nine positive safety/liveness checks passed; five reachability checks and six negative controls produced their declared invariant witnesses. The largest positive search was 50 generated / 24 distinct states at depth 11. Revision safety/liveness used 8/4/4; missing 7/3/3; stale 6/3/3; drift 12/6/5; export safety/liveness 20/10/10; export cancellation safety/drain 50/24/11. SANY passed before the matrix.
 
 The model assumes a finite two-file visible export plus one denied file, one export body slot, deterministic eventual progress, and one symbolic external source change. It does not model token hashing, file bytes, SQL policy compilation, ZIP/path implementation, disk permissions/capacity, HTTP response-drop mechanics, timestamps, ETag parsing, database isolation, filesystem durability, or runtime conformance. Those remain executable and operational evidence obligations.
+
+## OBTS-FM-006: Durable Browser-Assisted Onboarding
+
+| Field | Value |
+| --- | --- |
+| Status | Accepted focused bounded model |
+| Architecture revision | 13 |
+| Refined contracts | `OBTS-SYNC-ONB-001`, `OBTS-SAF-002`, `OBTS-SAF-005`, `OBTS-SAF-009` |
+| Specification | `OBTSOnboarding.tla` |
+| Check matrix | `checks-fm006.json` (11 required checks) |
+| Executable check | `npm run test:formal:onboarding`; included in the repository formal entry point |
+
+The model separates the pending browser deadline from the approved enrollment lease, pins one immutable server baseline while canonical state may advance, consumes authorization at device registration, transfers with a durable chunk cursor and target-bound complete final checkpoint, publishes recovery before replacing non-empty local state, and records local apply, durable acknowledgement (which permits checkpoint cleanup), catch-up transfer/checkpoint/apply/acknowledgement, and activation as separate boundaries. It preserves those durable boundaries across one crash/restart. Protocol fields denote already published durable records; `running`, `crashCount`, and `lastAction` are the execution layer. Crash therefore discards execution while retaining published state, and the negative controls model incorrect publication ordering. Host flush behavior remains an implementation obligation.
+
+Four positive checks cover empty and non-empty safety/liveness. One reachability check proves transfer restart after durable chunk progress. Six negative controls deliberately reuse the pending deadline after approval, retarget the approved snapshot, transfer before credential publication, apply before recovery, enter the post-transfer phase without a complete checkpoint, or activate before durable acknowledgement. Each must violate its named invariant with the declared action witness.
+
+Actual TLC 2.19 used one worker and fingerprint polynomial 0. Empty safety explored 943 generated / 631 distinct states at depth 17; empty liveness 150/102/14; non-empty safety 1061/689/18; and non-empty liveness 155/106/15. The restart witness reached 45/39/7. All six controls reached their intended violations between depth 3 and 8. SANY passed before the matrix.
+
+The model does not prove cryptography, Git object or manifest correctness, filesystem durability, wall-clock scheduling, iOS background execution, Rust/Node process supervision, HTTP proxy behavior, or implementation conformance. Executable fault tests and real-device/deployed-Bridge evidence remain mandatory.

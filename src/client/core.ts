@@ -218,6 +218,10 @@ export class ObtsPluginClient {
     this.host.unloaded = value;
   }
 
+  setProgressListener(listener: ((status: string, diagnosticPoint: string) => void) | null): void {
+    this.host.operationProgressListener = listener;
+  }
+
   flushEditorBuffersToDisk(): Promise<void> {
     return Promise.resolve();
   }
@@ -512,9 +516,14 @@ function createNodePluginHost(vaultDir: string, settings: ObtsPluginSettings) {
     clientInitialization: null,
     lastCheckingProgressAt: 0,
     deviceNameRevision: 0,
-    setInitializationStage: (_label: string, _diagnosticPoint?: string) => undefined,
-    updateInitializationProgress: (_message: string) => undefined,
-    setOperationProgress: (_status: string, _diagnosticPoint: string) => undefined,
+    operationProgressListener: null as ((status: string, diagnosticPoint: string) => void) | null,
+    initializationDiagnosticPoint: 'startup',
+    setInitializationStage: (label: string, diagnosticPoint?: string) => {
+      host.initializationDiagnosticPoint = diagnosticPoint || 'startup';
+      host.operationProgressListener?.(label, host.initializationDiagnosticPoint);
+    },
+    updateInitializationProgress: (message: string) => host.operationProgressListener?.(message, host.initializationDiagnosticPoint),
+    setOperationProgress: (status: string, diagnosticPoint: string) => host.operationProgressListener?.(status, diagnosticPoint),
     setStatus: (_status: string) => undefined,
     markFullScanCompleted: () => undefined,
     handlePluginCompatibility: (_compatibility: unknown) => undefined,

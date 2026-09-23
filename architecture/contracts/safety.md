@@ -61,6 +61,12 @@ The lifecycle is active or integrity-blocked -> deleting -> deleted receipt -> r
 
 Deletion preserves local client files, independent Bridge filesystem/PostgreSQL state, and existing backups. It provides logical application-data deletion only; it makes no physical secure-erasure claim for storage snapshots or backup media. The server assumes one owner/process for a data directory and that prior instance subprocesses have stopped before restart recovery. Ordinary filesystem durability is assumed at its supported boundary.
 
+### OBTS-SAF-009: Onboarding Recovery State Is Monotonic
+
+Approved enrollment, initializing-device identity, immutable transfer target, imported chunk cursor, final transfer manifest, recovery publication, apply, and acknowledgement are separate durable boundaries. Restart resumes from the latest verified boundary and never returns a registered device to browser authorization.
+
+A final imported transfer chunk remains represented by a complete checkpoint until the next onboarding or apply boundary is durable. Process termination, mobile suspension, request loss, canonical-main movement, or supervisor restart must not move a verified transfer cursor backward, discard the only complete manifest, require a second device registration, or repeat already completed bulk transfer merely because the response was lost.
+
 ## Fault Model
 
 Required safety analysis and testing cover:

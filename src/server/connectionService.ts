@@ -13,7 +13,8 @@ import type { GitService } from './gitService.js';
 import { hasDurableDeletionRecord, type ConnectionRequestRow, type MetadataStore, type UserRow } from './metadataStore.js';
 import type { VaultLifecycleCoordinator } from './vaultLifecycleCoordinator.js';
 
-const CONNECTION_TTL_MS = 10 * 60 * 1000;
+const PENDING_CONNECTION_TTL_MS = 10 * 60 * 1000;
+const APPROVED_CONNECTION_TTL_MS = 60 * 60 * 1000;
 const POLL_INTERVAL_MS = 2_000;
 const CREATION_WINDOW_MS = 60_000;
 const MAX_CREATIONS_PER_WINDOW = 100;
@@ -39,7 +40,7 @@ export class ConnectionService {
     const connectionId = newId('con');
     const credentialSalt = randomBytes(32).toString('base64url');
     const verificationCode = verificationCodeFromId(connectionId);
-    const expiresAt = new Date(Date.now() + CONNECTION_TTL_MS).toISOString();
+    const expiresAt = new Date(Date.now() + PENDING_CONNECTION_TTL_MS).toISOString();
     await this.store.mutate((db) => {
       expireConnections(db.connections);
       db.connections.push({
@@ -140,7 +141,8 @@ export class ConnectionService {
         selection: requireValue(connection.selection),
         vault_id: connection.selected_vault_id,
         vault_name: connection.new_vault_display_name ?? selectedVaultName(db.vaults, connection),
-        expected_main: connection.expected_main
+        expected_main: connection.expected_main,
+        expires_at: connection.expires_at
       };
     });
   }
@@ -186,10 +188,12 @@ export class ConnectionService {
         connection.expected_main = null;
         connection.new_vault_display_name = displayName;
       }
+      const approvedAt = nowIso();
       connection.status = 'approved';
       connection.approved_user_id = input.user.user_id;
       connection.selection = input.selection;
-      connection.approved_at = nowIso();
+      connection.approved_at = approvedAt;
+      connection.expires_at = new Date(Date.parse(approvedAt) + APPROVED_CONNECTION_TTL_MS).toISOString();
       db.audit_log.push({
         audit_id: newId('aud'),
         actor_user_id: input.user.user_id,
@@ -256,15 +260,24 @@ export class ConnectionService {
     if (vault.status !== 'active' || !vault.root_commit) {
       throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
     }
-    const buildMetadata = async () => ({
-      connection,
-      vaultId: vault.vault_id,
-      vaultName: vault.display_name,
-      rootCommit: vault.root_commit!,
-      targetMain: vault.current_main,
-      changedPaths: await this.git.listTreePaths(vault.vault_id, vault.current_main),
-      explicitDirectories: db.directory_state_by_vault[vault.vault_id]?.explicit_dirs ?? []
-    });
+    const targetMain = requireValue(connection.expected_main);
+    const buildMetadata = async () => {
+      if (
+        !(await this.git.commitExists(vault.vault_id, targetMain)) ||
+        !(await this.git.isAncestor(vault.vault_id, targetMain, vault.current_main))
+      ) {
+        throw new AuthError(409, 'blocked_integrity', 'Approved onboarding baseline is unavailable.');
+      }
+      return {
+        connection,
+        vaultId: vault.vault_id,
+        vaultName: vault.display_name,
+        rootCommit: vault.root_commit!,
+        targetMain,
+        changedPaths: await this.git.listTreePaths(vault.vault_id, targetMain),
+        explicitDirectories: db.directory_state_by_vault[vault.vault_id]?.explicit_dirs ?? []
+      };
+    };
     return this.lifecycle
       ? await this.lifecycle.withOwnerVault(requireValue(connection.approved_user_id), vault.vault_id, buildMetadata)
       : await buildMetadata();
@@ -339,8 +352,13 @@ export class ConnectionService {
 
     const snapshot = await this.store.snapshot();
     const connection = authenticatedConnection(snapshot.connections, connectionId, secret);
+    if (connection.status === 'expired') {
+      await this.store.mutate((db) => {
+        authenticatedConnection(db.connections, connectionId, secret);
+      });
+    }
     if (connection.status !== 'approved' || !connection.approved_user_id || !connection.selection) {
-      throw new AuthError(409, 'connection_not_approved', 'Connection has not been approved.');
+      throw connectionStatusError(connection);
     }
 
     let vaultId = connection.selected_vault_id;
@@ -363,8 +381,8 @@ export class ConnectionService {
         if (!vault.root_commit) {
           throw new AuthError(409, 'blocked_integrity', 'Vault root commit is unavailable.');
         }
-        if (request.expected_main !== connection.expected_main || request.expected_main !== vault.current_main) {
-          throw new AuthError(409, 'onboarding_target_stale', 'Server vault changed; analyze it again before continuing.');
+        if (request.expected_main !== connection.expected_main) {
+          throw new AuthError(409, 'onboarding_target_stale', 'Approved onboarding baseline no longer matches this setup attempt.');
         }
         rootCommit = vault.root_commit;
       }
@@ -380,7 +398,7 @@ export class ConnectionService {
     const result = await this.store.mutate((db) => {
       const mutableConnection = authenticatedConnection(db.connections, connectionId, secret);
       if (mutableConnection.status !== 'approved') {
-        throw new AuthError(409, 'connection_not_approved', 'Connection has already been consumed.');
+        throw connectionStatusError(mutableConnection);
       }
       if (hasDurableDeletionRecord(db, targetVaultId)) {
         throw new AuthError(409, 'vault_deleting', 'Vault deletion is in progress.');
@@ -461,7 +479,6 @@ export class ConnectionService {
       });
       mutableConnection.status = 'consumed';
       mutableConnection.selected_vault_id = vault.vault_id;
-      mutableConnection.expected_main = vault.current_main;
       mutableConnection.created_device_id = device.device_id;
       mutableConnection.consumed_at = timestamp;
       for (const diagnostic of db.diagnostic_events) {
@@ -518,19 +535,6 @@ export class ConnectionService {
         throw new AuthError(404, 'not_found', 'Resource not found.');
       }
       return { connection: structuredClone(connection), user: structuredClone(user) };
-    });
-  }
-
-  async markComplete(deviceId: string): Promise<void> {
-    await this.store.mutate((db) => {
-      const device = db.devices.find((candidate) => candidate.device_id === deviceId);
-      if (!device || device.revoked_at) {
-        throw new AuthError(404, 'not_found', 'Resource not found.');
-      }
-      device.onboarding_status = 'complete';
-      device.onboarding_completed_at = nowIso();
-      device.initial_proposal_kind = null;
-      device.initial_proposal_base = null;
     });
   }
 
@@ -650,6 +654,16 @@ function authenticatedConnection(connections: ConnectionRequestRow[], connection
     connection.status = 'expired';
   }
   return connection;
+}
+
+function connectionStatusError(connection: ConnectionRequestRow): AuthError {
+  if (connection.status === 'expired') {
+    return new AuthError(409, 'connection_expired', 'Connection approval has expired.');
+  }
+  if (connection.status === 'denied') {
+    return new AuthError(409, 'connection_denied', 'Connection was denied.');
+  }
+  return new AuthError(409, 'connection_not_approved', 'Connection has not been approved.');
 }
 
 function pruneOldestMapEntries<T>(entries: Map<string, T>, maximum: number): void {

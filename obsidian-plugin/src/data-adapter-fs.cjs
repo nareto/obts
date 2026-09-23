@@ -86,6 +86,27 @@ function createDataAdapterFs(adapter) {
       });
     },
 
+    async syncFile(filePath) {
+      const normalized = adapterPath(filePath);
+      if (typeof adapter.syncFile === "function") {
+        await adapter.syncFile(normalized);
+        return;
+      }
+      const metadata = await requiredStat(adapter, normalized);
+      if (!metadata.isFile()) throw fsError("EISDIR", normalized);
+    },
+
+    async syncDirectory(dirPath) {
+      const normalized = adapterPath(dirPath);
+      if (typeof adapter.syncDirectory === "function") {
+        await adapter.syncDirectory(normalized);
+        return;
+      }
+      const metadata = await requiredStat(adapter, normalized);
+      if (!metadata.isDirectory()) throw fsError("ENOTDIR", normalized);
+      await adapter.list(normalized);
+    },
+
     async mkdir(dirPath, options = {}) {
       const normalized = adapterPath(dirPath);
       if (!normalized) return;

@@ -14,6 +14,7 @@ client:
   projection_max_inflight_bodies: 2
   projection_batch_rows: 128
   projection_batch_bytes: 8388608
+  request_inactivity_timeout_seconds: 300
   restart_failure_window_seconds: 900
   restart_max_failures: 3
   restart_base_backoff_seconds: 5

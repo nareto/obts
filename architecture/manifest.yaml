@@ -1,7 +1,7 @@
 schema_version: 1
-revision: 12
+revision: 13
 status: current
-updated: 2026-09-21
+updated: 2026-09-22
 authoritative_artifacts:
   - architecture/manifest.yaml
   - architecture/README.md
@@ -75,3 +75,13 @@ formal_models:
       - OBTS-BRG-WRITE-001
       - OBTS-BRG-EXPORT-001
       - OBTS-BRG-BODY-001
+  - id: OBTS-FM-006
+    status: accepted
+    path: architecture/models/formal/OBTSOnboarding.tla
+    architecture_revision: 13
+    checks: architecture/models/formal/checks-fm006.json
+    refines:
+      - OBTS-SYNC-ONB-001
+      - OBTS-SAF-002
+      - OBTS-SAF-005
+      - OBTS-SAF-009

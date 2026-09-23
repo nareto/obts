@@ -1588,8 +1588,7 @@ class ObtsObsidianClient {
     const status = await response.json();
     if (status.status === "approved") await this.updateOnboardingStage(connectionId, "approved");
     if (status.status === "denied" || status.status === "expired") {
-      await this.fsp.rm(this.pendingConnectionPath, { force: true });
-      await this.fsp.rm(this.onboardingJournalPath, { force: true });
+      await this.updateOnboardingStage(connectionId, "blocked", null, `connection_${status.status}`);
     }
     return status;
   }
@@ -1618,9 +1617,16 @@ class ObtsObsidianClient {
       return parseMultipartPull(response.headers.get("content-type") || "", Buffer.from(await response.arrayBuffer()));
     }
     const checkpoint = await readJson(this.fsp, this.bootstrapTransferPath, null);
+    if (checkpoint && checkpoint.connection_id !== connectionId) await this.fsp.rm(this.bootstrapTransferPath, { force: true });
+    if (checkpoint?.connection_id === connectionId && checkpoint.complete === true) {
+      if (!isCompleteBootstrapCheckpoint(checkpoint) || !(await this.commitExists(checkpoint.target_main))) {
+        throw new ObtsBlockedError("invalid_transfer_checkpoint", "Completed onboarding transfer checkpoint is invalid.");
+      }
+      await this.validateCompleteTransferCheckpoint(checkpoint, null);
+      return { manifest: checkpoint.manifest, packfile: Buffer.alloc(0) };
+    }
     let cursor = checkpoint && checkpoint.connection_id === connectionId ? checkpoint.next_cursor : 0;
     let target = checkpoint && checkpoint.connection_id === connectionId ? checkpoint.target_main : "latest";
-    if (checkpoint && checkpoint.connection_id !== connectionId) await this.fsp.rm(this.bootstrapTransferPath, { force: true });
     let finalManifest = null;
     let chunkCount = checkpoint && checkpoint.connection_id === connectionId ? checkpoint.received_chunks || 0 : 0;
     let transferredBytes = checkpoint && checkpoint.connection_id === connectionId ? checkpoint.transferred_bytes || 0 : 0;
@@ -1644,7 +1650,21 @@ class ObtsObsidianClient {
       finalManifest = chunk.manifest;
       target = finalManifest.target_main;
       if (finalManifest.complete) {
-        await this.fsp.rm(this.bootstrapTransferPath, { force: true });
+        if (!(await this.commitExists(finalManifest.target_main))) {
+          throw new ObtsBlockedError("transfer_incomplete", "Downloaded onboarding chunks do not contain the target commit.");
+        }
+        await writeJson(this.fsp, this.bootstrapTransferPath, {
+          connection_id: connectionId,
+          target_main: target,
+          next_cursor: finalManifest.next_cursor,
+          received_chunks: chunkCount,
+          transferred_bytes: transferredBytes,
+          complete: true,
+          manifest: finalManifest,
+          manifest_sha256: transferManifestSha256(finalManifest),
+          updated_at: nowIso()
+        });
+        this.reportOperationProgress(`Downloaded ${chunkCount} onboarding chunks · ${formatBytes(transferredBytes)}`, "onboarding_download");
         break;
       }
       if (finalManifest.next_cursor <= cursor) throw new ObtsBlockedError("invalid_transfer_cursor", "Bootstrap transfer did not advance.");
@@ -1655,8 +1675,10 @@ class ObtsObsidianClient {
         next_cursor: cursor,
         received_chunks: chunkCount,
         transferred_bytes: transferredBytes,
+        complete: false,
         updated_at: nowIso()
       });
+      this.reportOperationProgress(`Downloaded ${chunkCount} onboarding chunks · ${formatBytes(transferredBytes)}`, "onboarding_download");
     }
     return { manifest: finalManifest, packfile: Buffer.alloc(0) };
   }
@@ -1684,6 +1706,24 @@ class ObtsObsidianClient {
       };
       const pending = await this.readPendingOnboarding();
       if (pending) await this.writeOnboardingJournal(Object.assign({}, pending.journal, { stage: "awaiting_confirmation", analysis }));
+      return analysis;
+    }
+    if (local.fileCount === 0) {
+      const analysis = {
+        selection: status.selection,
+        vaultId: status.vault_id,
+        vaultName: status.vault_name,
+        expectedMain: status.expected_main,
+        rootCommit: null,
+        classification: "server_to_empty",
+        proposalBase: null,
+        localFingerprint: local.fingerprint,
+        localFileCount: local.fileCount,
+        localBytes: local.bytes
+      };
+      const pending = await this.readPendingOnboarding();
+      if (pending) await this.writeOnboardingJournal(Object.assign({}, pending.journal, { stage: "awaiting_confirmation", analysis }));
+      await this.fsp.rm(this.bootstrapTransferPath, { force: true });
       return analysis;
     }
     const bootstrap = await this.bootstrapWithChunks(connectionId, secret);
@@ -1717,6 +1757,7 @@ class ObtsObsidianClient {
     };
     const pending = await this.readPendingOnboarding();
     if (pending) await this.writeOnboardingJournal(Object.assign({}, pending.journal, { stage: "awaiting_confirmation", analysis }));
+    await this.fsp.rm(this.bootstrapTransferPath, { force: true });
     return analysis;
   }
 
@@ -1750,6 +1791,36 @@ class ObtsObsidianClient {
 
   async completeConnection(connectionId, secret, request) {
     return await postJsonWithBearer(this.url(`/api/v1/connections/${connectionId}/complete`), secret, request);
+  }
+
+  async completeRegisteredOnboarding(connectionId, token) {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const state = await this.readState();
+      if (!state.vault_id || !state.local_main) {
+        throw new ObtsBlockedError("onboarding_incomplete", "Onboarding did not produce an applied server main.");
+      }
+      try {
+        await postJsonWithBearer(this.url(`/api/v1/vaults/${state.vault_id}/onboarding/complete`), token, {
+          applied_main: state.local_main
+        });
+        await this.writeState(Object.assign({}, await this.readState(), {
+          status_label: "Synced",
+          last_error_code: null,
+          updated_at: nowIso()
+        }));
+        await this.completePendingOnboarding(connectionId);
+        return { status: "Synced", main: state.local_main };
+      } catch (error) {
+        if (!(error instanceof ObtsTransportError && error.code === "onboarding_target_stale")) throw error;
+      }
+      const caughtUp = await this.syncOnce({ confirmInitialImport: false });
+      if (caughtUp.status === "Review needed") {
+        const pending = await this.readPendingOnboarding();
+        await this.updateOnboardingStage(connectionId, "awaiting_conflict", pending?.journal.selected_mode || null);
+        return caughtUp;
+      }
+    }
+    throw new ObtsBlockedError("onboarding_catchup_busy", "The server vault kept changing during setup. Resume setup to continue catching up.");
   }
 
   async finishOnboardingInternal(connectionId, secret, analysis, mode) {
@@ -1815,12 +1886,7 @@ class ObtsObsidianClient {
       );
       await this.acknowledgeAppliedMain(pulled.manifest.target_main);
       await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
-      await postJsonWithBearer(this.url(`/api/v1/vaults/${completion.vault_id}/onboarding/complete`), completion.device_token, {
-        applied_main: pulled.manifest.target_main
-      });
-      await this.writeState(Object.assign({}, await this.readState(), { status_label: "Synced", updated_at: nowIso() }));
-      await this.completePendingOnboarding(connectionId);
-      return { status: "Synced", main: pulled.manifest.target_main };
+      return await this.completeRegisteredOnboarding(connectionId, completion.device_token);
     }
     const proposalBase = mode === "initialize" ? completion.root_commit : analysis.proposalBase;
     if (!proposalBase) throw new ObtsBlockedError("invalid_onboarding_base", "Onboarding proposal base is unavailable.");
@@ -1841,12 +1907,7 @@ class ObtsObsidianClient {
       await this.updateOnboardingStage(connectionId, "awaiting_conflict", mode);
       return synced;
     }
-    const finalState = await this.readState();
-    await postJsonWithBearer(this.url(`/api/v1/vaults/${completion.vault_id}/onboarding/complete`), completion.device_token, {
-      applied_main: finalState.local_main
-    });
-    await this.completePendingOnboarding(connectionId);
-    return synced;
+    return await this.completeRegisteredOnboarding(connectionId, completion.device_token);
   }
 
   async resumeAcceptedOnboarding(connectionId, analysis, mode, localFiles) {
@@ -1889,17 +1950,11 @@ class ObtsObsidianClient {
     if (!pending.journal.registered_device_id) {
       await this.writeOnboardingJournal(Object.assign({}, pending.journal, { registered_device_id: state.device_id }));
     }
-    const localAlreadyApplied = state.local_main === self.current_main && (
-      mode !== "use_server" || (
-        await this.commitExists(self.current_main) && await this.localContentMatchesTree(localFiles, self.current_main)
-      )
-    );
+    const localAlreadyApplied = state.local_main === self.current_main &&
+      await this.commitExists(self.current_main) &&
+      await this.localContentMatchesTree(localFiles, self.current_main);
     if (localAlreadyApplied && (mode === "use_server" || self.server_device_ref)) {
-      await postJsonWithBearer(this.url(`/api/v1/vaults/${state.vault_id}/onboarding/complete`), token, {
-        applied_main: state.local_main
-      });
-      await this.completePendingOnboarding(connectionId);
-      return { status: state.status_label, main: state.local_main };
+      return await this.completeRegisteredOnboarding(connectionId, token);
     }
     if (mode === "use_server") {
       await this.createRecoveryBundle("replace_local_with_server", self.current_main, localFiles);
@@ -1921,16 +1976,7 @@ class ObtsObsidianClient {
       );
       await this.acknowledgeAppliedMain(pulled.manifest.target_main);
       await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
-      await postJsonWithBearer(this.url(`/api/v1/vaults/${state.vault_id}/onboarding/complete`), token, {
-        applied_main: pulled.manifest.target_main
-      });
-      await this.writeState(Object.assign({}, await this.readState(), {
-        status_label: "Synced",
-        last_error_code: null,
-        updated_at: nowIso()
-      }));
-      await this.completePendingOnboarding(connectionId);
-      return { status: "Synced", main: pulled.manifest.target_main };
+      return await this.completeRegisteredOnboarding(connectionId, token);
     }
     if (!self.server_device_ref) return null;
 
@@ -1964,15 +2010,7 @@ class ObtsObsidianClient {
         "Local files changed after the onboarding proposal. Recovery is required before applying the resolved vault."
       );
     }
-    const finalState = await this.readState();
-    if (!finalState.local_main) {
-      throw new ObtsBlockedError("onboarding_incomplete", "Onboarding did not produce an applied server main.");
-    }
-    await postJsonWithBearer(this.url(`/api/v1/vaults/${state.vault_id}/onboarding/complete`), token, {
-      applied_main: finalState.local_main
-    });
-    await this.completePendingOnboarding(connectionId);
-    return { status: finalState.status_label, main: finalState.local_main };
+    return await this.completeRegisteredOnboarding(connectionId, token);
   }
 
   async normalizeAcceptedOnboardingProposal(serverDeviceRef, localFiles) {
@@ -1991,6 +2029,7 @@ class ObtsObsidianClient {
     await this.updateRef("refs/heads/local", serverDeviceRef, null, true);
     await this.writeState(Object.assign({}, state, {
       server_device_ref: serverDeviceRef,
+      local_main: serverDeviceRef,
       local_head: serverDeviceRef,
       status_label: "Review needed",
       last_error_code: "conflict_review_required",
@@ -2696,11 +2735,11 @@ class ObtsObsidianClient {
   async updatePushProcessingStatus(descriptor) {
     if (descriptor.status !== "processing") return;
     const statusLabel = descriptor.processing_error_code ? "Server retrying" : "Merging";
+    this.reportOperationProgress(statusLabel === "Merging" ? "Merging on server" : statusLabel, "upload_finalize");
     const current = await this.readState();
     if (current.status_label === statusLabel && current.last_error_code === null) return;
     await this.writeState(Object.assign({}, current, { status_label: statusLabel, last_error_code: null, updated_at: nowIso() }));
     this.plugin.setStatus(statusLabel);
-    this.reportOperationProgress(statusLabel === "Merging" ? "Merging on server" : statusLabel, "upload_finalize");
     await this.reportDeviceStatus().catch(() => undefined);
   }
 
@@ -4566,13 +4605,22 @@ class ObtsObsidianClient {
     if (journal) await writeJson(this.fsp, path.join(staged.partialDir, "journal", "apply-journal.json"), journal);
     const pack = await this.createRecoveryRefsPack();
     await this.fsp.writeFile(path.join(staged.partialDir, "git", "local-refs.pack"), pack, { mode: 0o600 });
-    await this.fsp.writeFile(
-      path.join(staged.partialDir, "checksums.sha256"),
-      `${(await bundleChecksums(this.fsp, staged.partialDir)).join("\n")}\n`,
-      { mode: 0o600 }
-    );
     await writeJson(this.fsp, path.join(staged.partialDir, "complete.json"), { bundle_id: staged.bundleId, completed_at: nowIso() });
+    const expectedChecksums = await bundleChecksums(this.fsp, staged.partialDir, this.fileBufferBudgetBytes);
+    const expectedChecksumManifest = `${expectedChecksums.join("\n")}\n`;
+    const checksumPath = path.join(staged.partialDir, "checksums.sha256");
+    await this.fsp.writeFile(checksumPath, expectedChecksumManifest, { mode: 0o600 });
+    await syncRecoveryBundleTree(this.fsp, staged.partialDir);
+    const observedChecksumManifest = await this.fsp.readFile(checksumPath, "utf8");
+    const verifiedChecksums = await bundleChecksums(this.fsp, staged.partialDir, this.fileBufferBudgetBytes);
+    if (
+      observedChecksumManifest !== expectedChecksumManifest ||
+      JSON.stringify(verifiedChecksums) !== JSON.stringify(expectedChecksums)
+    ) {
+      throw new ObtsBlockedError("recovery_bundle_verification_failed", "Recovery bundle verification failed before publication.");
+    }
     await this.fsp.rename(staged.partialDir, bundleDir);
+    if (typeof this.fsp.syncDirectory === "function") await this.fsp.syncDirectory(path.dirname(bundleDir));
     return staged.bundleId;
   }
 
@@ -5054,6 +5102,39 @@ class ObtsObsidianClient {
     return parseMultipartPull(response.headers.get("content-type") || "", Buffer.from(await response.arrayBuffer()));
   }
 
+  async validateCompleteTransferCheckpoint(checkpoint, currentLocalMain) {
+    if (transferManifestSha256(checkpoint.manifest) !== checkpoint.manifest_sha256) {
+      throw new ObtsBlockedError("invalid_transfer_checkpoint", "Completed transfer checkpoint manifest digest does not match.");
+    }
+    if (currentLocalMain !== null && !(await this.commitExists(currentLocalMain))) {
+      throw new ObtsBlockedError("invalid_transfer_checkpoint", "Completed transfer checkpoint base commit is unavailable.");
+    }
+    const targetEntries = await this.listTreeBlobOids(checkpoint.target_main);
+    const priorEntries = currentLocalMain === null ? new Map() : await this.listTreeBlobOids(currentLocalMain);
+    const expectedChangedPaths = [...new Set([...priorEntries.keys(), ...targetEntries.keys()])]
+      .filter((filePath) => priorEntries.get(filePath) !== targetEntries.get(filePath))
+      .sort();
+    const recordedChangedPaths = [...checkpoint.manifest.changed_paths].sort();
+    if (JSON.stringify(recordedChangedPaths) !== JSON.stringify(expectedChangedPaths)) {
+      throw new ObtsBlockedError("invalid_transfer_checkpoint", "Completed transfer checkpoint path effects do not match the target tree.");
+    }
+    const targetPaths = [...targetEntries.keys()].sort();
+    const recordedSizePaths = Object.keys(checkpoint.manifest.target_file_sizes).sort();
+    if (JSON.stringify(recordedSizePaths) !== JSON.stringify(targetPaths)) {
+      throw new ObtsBlockedError("invalid_transfer_checkpoint", "Completed transfer checkpoint file-size inventory does not match the target tree.");
+    }
+    for (let index = 0; index < targetPaths.length; index += 1) {
+      const filePath = targetPaths[index];
+      const content = await this.readBlobOid(targetEntries.get(filePath));
+      if (checkpoint.manifest.target_file_sizes[filePath] !== content.byteLength) {
+        throw new ObtsBlockedError("invalid_transfer_checkpoint", "Completed transfer checkpoint file-size evidence does not match the target tree.");
+      }
+      if ((index + 1) % 100 === 0) {
+        this.reportOperationProgress(`Verified ${index + 1} transferred file records`, "transfer_checkpoint_verification");
+      }
+    }
+  }
+
   async pull(vaultId, deviceId, token, currentLocalMain, requestedTarget = "latest", currentEventSeq = undefined) {
     const capabilities = await this.syncCapabilities();
     if (capabilities) {
@@ -5064,6 +5145,13 @@ class ObtsObsidianClient {
         checkpoint.current_local_main === currentLocalMain &&
         checkpoint.current_event_seq === (currentEventSeq || 0) &&
         (requestedTarget === "latest" || requestedTarget === checkpoint.target_main);
+      if (checkpointMatches && checkpoint.complete === true) {
+        if (!isCompletePullCheckpoint(checkpoint) || !(await this.commitExists(checkpoint.target_main))) {
+          throw new ObtsBlockedError("invalid_transfer_checkpoint", "Completed pull transfer checkpoint is invalid.");
+        }
+        await this.validateCompleteTransferCheckpoint(checkpoint, currentLocalMain);
+        return { manifest: checkpoint.manifest, packfile: Buffer.alloc(0) };
+      }
       let cursor = checkpointMatches ? checkpoint.next_cursor : 0;
       let target = checkpointMatches ? checkpoint.target_main : requestedTarget;
       if (checkpoint && !checkpointMatches) await this.fsp.rm(this.pullTransferPath, { force: true });
@@ -5092,7 +5180,24 @@ class ObtsObsidianClient {
         finalManifest = chunk.manifest;
         target = finalManifest.target_main;
         if (finalManifest.complete) {
-          await this.fsp.rm(this.pullTransferPath, { force: true });
+          if (!(await this.commitExists(finalManifest.target_main))) {
+            throw new ObtsBlockedError("transfer_incomplete", "Downloaded Git chunks do not contain the target commit.");
+          }
+          await writeJson(this.fsp, this.pullTransferPath, {
+            vault_id: vaultId,
+            device_id: deviceId,
+            current_local_main: currentLocalMain,
+            current_event_seq: currentEventSeq || 0,
+            target_main: target,
+            next_cursor: finalManifest.next_cursor,
+            received_chunks: chunkCount,
+            transferred_bytes: transferredBytes,
+            complete: true,
+            manifest: finalManifest,
+            manifest_sha256: transferManifestSha256(finalManifest),
+            updated_at: nowIso()
+          });
+          this.reportOperationProgress(`Downloaded ${chunkCount} sync chunks · ${formatBytes(transferredBytes)}`, "sync_download");
           break;
         }
         if (finalManifest.next_cursor <= cursor) throw new ObtsBlockedError("invalid_transfer_cursor", "Pull transfer did not advance.");
@@ -5106,11 +5211,10 @@ class ObtsObsidianClient {
           next_cursor: cursor,
           received_chunks: chunkCount,
           transferred_bytes: transferredBytes,
+          complete: false,
           updated_at: nowIso()
         });
-      }
-      if (!await this.commitExists(finalManifest.target_main)) {
-        throw new ObtsBlockedError("transfer_incomplete", "Downloaded Git chunks do not contain the target commit.");
+        this.reportOperationProgress(`Downloaded ${chunkCount} sync chunks · ${formatBytes(transferredBytes)}`, "sync_download");
       }
       return { manifest: finalManifest, packfile: Buffer.alloc(0) };
     }
@@ -5307,12 +5411,26 @@ class ObtsObsidianClient {
         throw new ObtsBlockedError("applied_main_acknowledgement_failed", "The legacy server did not acknowledge the applied main commit.");
       }
       await this.fsp.rm(this.pendingAppliedAckPath, { force: true });
+      await this.clearAppliedPullCheckpoint(pending.target_main, currentState);
       return;
     }
     if (response.applied_main !== pending.target_main || response.applied_event_seq < pending.event_seq) {
       throw new ObtsBlockedError("applied_main_acknowledgement_failed", "The server did not durably acknowledge the applied main commit.");
     }
     await this.fsp.rm(this.pendingAppliedAckPath, { force: true });
+    await this.clearAppliedPullCheckpoint(pending.target_main, currentState);
+  }
+
+  async clearAppliedPullCheckpoint(targetMain, state) {
+    const checkpoint = await readJson(this.fsp, this.pullTransferPath, null);
+    if (
+      isCompletePullCheckpoint(checkpoint) &&
+      checkpoint.vault_id === state.vault_id &&
+      checkpoint.device_id === state.device_id &&
+      checkpoint.target_main === targetMain
+    ) {
+      await this.fsp.rm(this.pullTransferPath, { force: true });
+    }
   }
 
   async acknowledgeAppliedMain(targetMain) {
@@ -7462,6 +7580,10 @@ class ObtsOnboardingModal extends Modal {
     this.analysis = pending.journal.analysis || null;
     this.mode = pending.journal.selected_mode || null;
     const state = await this.plugin.client.readState();
+    if (pending.journal.last_error_code === "connection_expired" || pending.journal.last_error_code === "connection_denied") {
+      this.renderTerminalConnection(pending.journal.last_error_code === "connection_expired" ? "expired" : "denied");
+      return;
+    }
     const postRegistrationStage = ["registering", "applying_uploading", "uploading_proposal", "awaiting_conflict"].includes(pending.journal.stage);
     const resumableSubmission = Boolean(this.analysis && this.mode && ((state.vault_id && state.device_id) || postRegistrationStage));
     if (resumableSubmission) {
@@ -7584,6 +7706,35 @@ class ObtsOnboardingModal extends Modal {
     else new Notice(`obts: ${message}`, 15000);
   }
 
+  renderTerminalConnection(status) {
+    const { contentEl } = this;
+    const expired = status === "expired";
+    contentEl.empty();
+    contentEl.createEl("h2", { text: expired ? "Setup approval expired" : "Setup was denied" });
+    contentEl.createEl("p", {
+      text: expired
+        ? "This approval window ended before device registration. Restart setup to create one fresh request; no device or transfer was created."
+        : "This connection was denied before device registration. Restart setup when you are ready to approve this device."
+    });
+    const feedback = contentEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
+    new Setting(contentEl)
+      .addButton((button) => button.setButtonText("Close").onClick(() => this.close()))
+      .addButton((button) => button.setButtonText("Restart setup").setCta().onClick(async () => {
+        button.setDisabled(true);
+        setFeedback(feedback, "Clearing the expired setup request...", "muted");
+        try {
+          await this.plugin.runExclusiveAction(() => this.plugin.client.cancelOnboarding());
+          this.connection = null;
+          this.analysis = null;
+          this.mode = null;
+          this.renderStart();
+        } catch (error) {
+          button.setDisabled(false);
+          setFeedback(feedback, error instanceof Error ? error.message : "Unable to restart setup.", "error");
+        }
+      }));
+  }
+
   async pollUntilApproved() {
     while (!this.cancelled && this.connection) {
       const status = await this.plugin.runExclusiveAction(() => this.plugin.client.pollOnboarding(
@@ -7592,7 +7743,7 @@ class ObtsOnboardingModal extends Modal {
       ), "Checking sync setup approval");
       if (this.cancelled || this.plugin.unloaded) return;
       if (status.status === "approved") {
-        if (this.waitingFeedback) setFeedback(this.waitingFeedback, "Approved. Comparing local and server vaults...", "success");
+        if (this.waitingFeedback) setFeedback(this.waitingFeedback, "Approved. Checking the local vault...", "success");
         this.analysis = await this.plugin.runExclusiveAction(() => this.plugin.client.analyzeOnboarding(
           this.connection.connection_id,
           this.connection.connection_secret
@@ -7602,7 +7753,8 @@ class ObtsOnboardingModal extends Modal {
         return;
       }
       if (status.status === "denied" || status.status === "expired") {
-        throw new ObtsBlockedError(`connection_${status.status}`, `Connection was ${status.status}.`);
+        this.renderTerminalConnection(status.status);
+        return;
       }
       await new Promise((resolve) => window.setTimeout(resolve, this.connection.poll_interval_ms || 2000));
     }
@@ -7827,6 +7979,11 @@ class ObtsSettingTab extends PluginSettingTab {
       ]);
     }
     const paired = Boolean(state && state.vault_id && state.device_id);
+    const terminalOnboarding = pendingOnboarding && (
+      pendingOnboarding.journal.last_error_code === "connection_expired" ||
+      pendingOnboarding.journal.last_error_code === "connection_denied"
+    );
+    const awaitingOnboardingApproval = pendingOnboarding && pendingOnboarding.journal.stage === "awaiting_browser";
     const recoveryBlocked = Boolean(state && state.last_error_code === "local_state_incomplete");
     const restartRequired = availability === "restart_required";
     const initializationInProgress = clientUnavailable && Boolean(this.plugin.clientInitialization);
@@ -7902,7 +8059,11 @@ class ObtsSettingTab extends PluginSettingTab {
             : initializationInProgress
               ? "Loading"
               : "Please wait"
-        : pendingOnboarding
+        : terminalOnboarding
+          ? "Restart setup"
+          : awaitingOnboardingApproval
+            ? "Continue approval"
+          : pendingOnboarding
           ? "Resume setup"
           : recoveryBlocked
             ? "Needs recovery"
@@ -7945,21 +8106,39 @@ class ObtsSettingTab extends PluginSettingTab {
       refreshLoadingStatus();
     } else if (pendingOnboarding) {
       const conflictPending = pendingOnboarding.journal.stage === "awaiting_conflict";
-      const canCancelPending = !paired && ["awaiting_browser", "approved", "analyzing", "awaiting_confirmation"].includes(pendingOnboarding.journal.stage);
+      const canCancelPending = !paired && (
+        terminalOnboarding || ["awaiting_browser", "approved", "analyzing", "awaiting_confirmation"].includes(pendingOnboarding.journal.stage)
+      );
       new Setting(containerEl)
-        .setName(conflictPending ? "Conflict review submitted" : "Finish connecting this vault")
+        .setName(
+          terminalOnboarding
+            ? pendingOnboarding.journal.last_error_code === "connection_expired" ? "Setup approval expired" : "Setup was denied"
+            : awaitingOnboardingApproval
+              ? "Approve this connection"
+              : conflictPending ? "Conflict review submitted" : "Finish connecting this vault"
+        )
         .setDesc(
           restartRequired
             ? "A plugin update interrupted an operation. Fully restart Obsidian, then return here to resume setup safely."
-            : conflictPending
-              ? "Resolve the conflict in the dashboard, then resume here to apply the resolution. Do not submit the merge again."
-              : "Setup stopped after it started. Resume from the durable onboarding journal; obts will not create a second device."
+            : terminalOnboarding
+              ? "No device was registered. Restart setup to create one fresh approval request."
+              : awaitingOnboardingApproval
+                ? "Continue in the browser to approve this pending connection, then return here."
+                : conflictPending
+                  ? "Resolve the conflict in the dashboard, then resume here to apply the resolution. Do not submit the merge again."
+                  : "Setup stopped after it started. Resume from the durable onboarding journal; obts will not create a second device."
         );
       new Setting(containerEl)
         .setName("Onboarding")
         .addButton((button) => {
           button
-            .setButtonText(conflictPending ? "Resume conflict setup" : "Resume setup")
+            .setButtonText(
+              terminalOnboarding
+                ? "Restart setup"
+                : awaitingOnboardingApproval
+                  ? "Continue approval"
+                  : conflictPending ? "Resume conflict setup" : "Resume setup"
+            )
             .setCta()
             .setDisabled(restartRequired)
             .onClick(() => new ObtsOnboardingModal(this.app, this.plugin).open());
@@ -8373,14 +8552,13 @@ async function writeTextSnapshotPatch(fsp, bundleDir, filePath, content) {
   await fsp.writeFile(patchPath, `${body}\n`, { mode: 0o600 });
 }
 
-async function bundleChecksums(fsp, bundleDir) {
+async function bundleChecksums(fsp, bundleDir, maxBytes) {
   const entries = [];
   await walkBundleFiles(fsp, bundleDir, async (absolutePath) => {
     const relativePath = normalizePath(path.relative(bundleDir, absolutePath));
-    if (relativePath === "checksums.sha256") {
-      return;
-    }
-    entries.push(`${sha256(await fsp.readFile(absolutePath))}  ${relativePath}`);
+    if (relativePath === "checksums.sha256") return;
+    const content = await fsp.readFileBounded(absolutePath, maxBytes);
+    entries.push(`${sha256(content)}  ${relativePath}`);
   });
   return entries.sort();
 }
@@ -8394,6 +8572,26 @@ async function walkBundleFiles(fsp, root, visitFile) {
     } else if (entry.isFile()) {
       await visitFile(absolutePath);
     }
+  }
+}
+
+async function syncRecoveryBundleTree(fsp, root) {
+  if (typeof fsp.syncFile !== "function" || typeof fsp.syncDirectory !== "function") {
+    throw new ObtsBlockedError("recovery_bundle_durability_unavailable", "Recovery bundle durability is unavailable on this device.");
+  }
+  const directories = [];
+  const visit = async (directory) => {
+    directories.push(directory);
+    const entries = await fsp.readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      const absolutePath = path.join(directory, entry.name);
+      if (entry.isDirectory()) await visit(absolutePath);
+      else if (entry.isFile()) await fsp.syncFile(absolutePath);
+    }
+  };
+  await visit(root);
+  for (const directory of directories.sort((left, right) => right.length - left.length || right.localeCompare(left))) {
+    await fsp.syncDirectory(directory);
   }
 }
 
@@ -8557,8 +8755,79 @@ function stableJson(value) {
   return JSON.stringify(value);
 }
 
+function transferManifestSha256(manifest) {
+  return sha256(Buffer.from(stableJson(manifest), "utf8"));
+}
+
 function isGitObjectId(value) {
   return typeof value === "string" && /^[0-9a-f]{40}$/u.test(value);
+}
+
+function isTransferPathArray(value) {
+  return Array.isArray(value) &&
+    value.every((filePath) => typeof filePath === "string" && isSafeJournalPath(filePath) && isSyncableVaultPath(filePath)) &&
+    new Set(value).size === value.length;
+}
+
+function isCompleteTransferManifest(value) {
+  return Boolean(
+    value && typeof value === "object" && !Array.isArray(value) &&
+    value.api_version === API_VERSION && value.capability === "git-object-pack-chunks-v1" &&
+    value.complete === true && isGitObjectId(value.target_main) &&
+    Number.isSafeInteger(value.cursor) && value.cursor >= 0 &&
+    Number.isSafeInteger(value.next_cursor) && (value.next_cursor === value.cursor || value.next_cursor === value.cursor + 1) &&
+    typeof value.chunk_sha256 === "string" && /^[0-9a-f]{64}$/u.test(value.chunk_sha256) &&
+    Number.isSafeInteger(value.chunk_bytes) && value.chunk_bytes >= 0 &&
+    isTransferPathArray(value.changed_paths) && isTargetFileSizeMap(value.target_file_sizes) &&
+    isTransferPathArray(value.explicit_directories)
+  );
+}
+
+function isCompleteBootstrapCheckpoint(value) {
+  return Boolean(
+    value && typeof value === "object" && !Array.isArray(value) &&
+    typeof value.connection_id === "string" && value.complete === true &&
+    isGitObjectId(value.target_main) &&
+    Number.isSafeInteger(value.next_cursor) && value.next_cursor >= 0 &&
+    Number.isSafeInteger(value.received_chunks) && value.received_chunks > 0 &&
+    Number.isSafeInteger(value.transferred_bytes) && value.transferred_bytes >= 0 &&
+    isCompleteTransferManifest(value.manifest) &&
+    typeof value.manifest_sha256 === "string" && /^[0-9a-f]{64}$/u.test(value.manifest_sha256) &&
+    value.manifest.connection_id === value.connection_id &&
+    typeof value.manifest.vault_id === "string" && typeof value.manifest.vault_name === "string" &&
+    isGitObjectId(value.manifest.root_commit) &&
+    value.manifest.target_main === value.target_main &&
+    value.manifest.next_cursor === value.next_cursor
+  );
+}
+
+function isCompletePullCheckpoint(value) {
+  return Boolean(
+    value && typeof value === "object" && !Array.isArray(value) &&
+    typeof value.vault_id === "string" && typeof value.device_id === "string" &&
+    (value.current_local_main === null || isGitObjectId(value.current_local_main)) &&
+    Number.isSafeInteger(value.current_event_seq) && value.current_event_seq >= 0 &&
+    value.complete === true && isGitObjectId(value.target_main) &&
+    Number.isSafeInteger(value.next_cursor) && value.next_cursor >= 0 &&
+    Number.isSafeInteger(value.received_chunks) && value.received_chunks > 0 &&
+    Number.isSafeInteger(value.transferred_bytes) && value.transferred_bytes >= 0 &&
+    isCompleteTransferManifest(value.manifest) &&
+    typeof value.manifest_sha256 === "string" && /^[0-9a-f]{64}$/u.test(value.manifest_sha256) &&
+    value.manifest.vault_id === value.vault_id && value.manifest.device_id === value.device_id &&
+    value.manifest.target_main === value.target_main &&
+    value.manifest.next_cursor === value.next_cursor &&
+    (value.manifest.current_local_main_is_ancestor === null || typeof value.manifest.current_local_main_is_ancestor === "boolean") &&
+    Number.isSafeInteger(value.manifest.event_seq) && value.manifest.event_seq >= 0 &&
+    Array.isArray(value.manifest.directory_intents) && value.manifest.directory_intents.every((intent) =>
+      intent && typeof intent === "object" && !Array.isArray(intent) &&
+      (intent.op === "create" || intent.op === "delete") && typeof intent.path === "string" && isSafeJournalPath(intent.path)
+    ) &&
+    Array.isArray(value.manifest.directory_acknowledgements) && value.manifest.directory_acknowledgements.every((acknowledgement) =>
+      acknowledgement && typeof acknowledgement === "object" && !Array.isArray(acknowledgement) &&
+      typeof acknowledgement.intent_id === "string" && acknowledgement.intent_id.length > 0 &&
+      Number.isSafeInteger(acknowledgement.generation) && acknowledgement.generation >= 0
+    )
+  );
 }
 
 function isUploadTransferCheckpoint(value) {
@@ -9054,8 +9323,10 @@ async function writeJson(fsp, filePath, value) {
   await fsp.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
   const temporaryPath = `${filePath}.tmp-${randomHex(4)}-${Date.now()}`;
   await fsp.writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  if (typeof fsp.syncFile === "function") await fsp.syncFile(temporaryPath);
   try {
     await fsp.rename(temporaryPath, filePath);
+    if (typeof fsp.syncDirectory === "function") await fsp.syncDirectory(path.dirname(filePath));
   } catch (error) {
     await fsp.rm(temporaryPath, { force: true }).catch(() => undefined);
     throw error;

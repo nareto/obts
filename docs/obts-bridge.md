@@ -47,6 +47,8 @@ Content-Type: application/json
 
 Supported commands include pairing, onboarding analysis/completion, synchronization, event polling, rename, unpair, local pairing reset, server replacement/rebuild recovery, queue inspection, state inspection, and `reset-index-projection`. The last command clears only the derived commit cursor so the next worker pass performs an explicit full projection rebuild; it never changes the vault or `.obts` state. Destructive commands remain explicit one-shot operations; they are not persistent startup configuration.
 
+Long headless operations emit redacted startup and operation progress events. `client.request_inactivity_timeout_seconds` (default 300) bounds silence between closed-schema protocol messages rather than total command duration during startup recovery, request writes, and response reads; each valid progress event resets the inactivity window. Child stdout frames are capped at 1 MiB; `read-index-delta` inventories are returned in cursor-bound pages below that cap and reassembled under the Bridge filesystem lock. State events precede their correlated response, are schema-checked, and are limited to one per request; missing or extra protocol fields fail closed. Invalid, unrelated, oversized, cancelled, or silent child traffic is quarantined and restarted through the bounded circuit, while onboarding and transfer authority remains in the Node client's durable `.obts` journals rather than Rust memory.
+
 ## Write semantics
 
 Rust validates the effective ACL, prepares the complete candidate content, and writes ordinary vault files atomically. It then wakes the headless client, which detects the change and processes it through the normal OBTS commit, queue, push, merge, conflict, and recovery path.
