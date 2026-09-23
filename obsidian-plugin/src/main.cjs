@@ -7438,14 +7438,60 @@ class ObtsObsidianClient {
       if (displacedDirectory) await assertRecoveredDescendants(candidate);
       const displacedPath = this.applyDisplacedPath(journal, candidate);
       await ensureAdapterDir(this.adapter, path.posix.dirname(displacedPath));
-      if (await this.adapterExists(displacedPath)) throw new LocalSnapshotChangedError(candidate);
+      if (await this.adapterExists(displacedPath)) {
+        // An earlier interrupted attempt already captured the evidence copy.
+        // Complete the displacement by clearing the live path only after the
+        // copy validates against the preflight identity.
+        if (!(await this.applyDisplacedEntryMatchesPreflight(journal, candidate))) {
+          throw new LocalSnapshotChangedError(candidate);
+        }
+        await this.adapterRemove(candidate);
+        continue;
+      }
+      // Capture the evidence with a verified copy instead of a rename so that
+      // vault-visible paths are never moved: renaming a live path makes Obsidian
+      // re-bind already-open editor tabs to the hidden displaced path, which
+      // redirects later editor saves into the hidden evidence file (or fails
+      // with ENOENT once the evidence is archived).
       try {
-        await this.adapter.rename(candidate, displacedPath);
+        await this.captureDisplacedCandidate(candidate, displacedPath, displacedDirectory);
       } catch (error) {
         throw new LocalSnapshotChangedError(candidate, error);
       }
       if (!(await this.applyDisplacedEntryMatchesPreflight(journal, candidate))) {
         throw new LocalSnapshotChangedError(candidate);
+      }
+      await this.adapterRemove(candidate);
+    }
+  }
+
+  async captureDisplacedCandidate(candidate, displacedPath, displacedDirectory) {
+    if (displacedDirectory) {
+      await this.copyDirectoryIntoDisplacedPath(candidate, displacedPath);
+      return;
+    }
+    const snapshot = await this.readRecoveryFileSnapshot(candidate);
+    if (snapshot.fingerprint.kind !== "file" || snapshot.content === null) {
+      throw new LocalSnapshotChangedError(candidate);
+    }
+    await this.adapter.writeBinary(displacedPath, toArrayBuffer(snapshot.content));
+  }
+
+  async copyDirectoryIntoDisplacedPath(sourcePath, displacedPath) {
+    await ensureAdapterDir(this.adapter, displacedPath);
+    const frontier = [[sourcePath, displacedPath]];
+    while (frontier.length > 0) {
+      const [source, destination] = frontier.shift();
+      const listing = await this.adapter.list(source);
+      for (const folder of listing.folders || []) {
+        const childDestination = `${destination}/${path.posix.basename(folder)}`;
+        await ensureAdapterDir(this.adapter, childDestination);
+        frontier.push([folder, childDestination]);
+      }
+      for (const file of listing.files || []) {
+        const content = await this.adapterReadBinary(file);
+        if (content === null) throw new LocalSnapshotChangedError(file);
+        await this.adapter.writeBinary(`${destination}/${path.posix.basename(file)}`, toArrayBuffer(content));
       }
     }
   }

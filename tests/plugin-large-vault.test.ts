@@ -325,6 +325,175 @@ describe('large-vault client checkpoints', () => {
     ), 'utf8')).toBe('captured local bytes\n');
   });
 
+  it('captures displaced file evidence by copy without renaming the live path', async () => {
+    const { root, core } = await clientFixture();
+    await writeFile(join(root, 'shared.md'), 'server target bytes\n');
+    const target = await core.createLocalCommit('copy displacement target');
+    const targetEntries = await core.listTreeBlobOids(target);
+    const targetOid = targetEntries.get('shared.md');
+    const targetSize = (await core.readBlobOid(targetOid)).byteLength;
+    await writeFile(join(root, 'shared.md'), 'captured local bytes\n');
+    const preflight = await core.readRecoveryFileSnapshot('shared.md');
+    const renames: string[] = [];
+    const originalRename = core.adapter.rename.bind(core.adapter);
+    core.adapter.rename = async (from: string, to: string) => {
+      renames.push(`${from}->${to}`);
+      return await originalRename(from, to);
+    };
+
+    await core.writeTargetFilesFromJournal({
+      journal_version: 4,
+      apply_id: 'apply_copy_displacement',
+      operation_type: 'pull_apply',
+      target_main: target,
+      target_file_sizes: { 'shared.md': targetSize },
+      expected_prior_local_main: null,
+      expected_prior_local_device_ref: null,
+      phase: 'writing_files',
+      affected_paths: ['shared.md'],
+      preflight_sha256: { 'shared.md': preflight.fingerprint.sha256 },
+      preflight_fingerprints: { 'shared.md': preflight.fingerprint },
+      directory_intents: [],
+      explicit_directories: [],
+      pre_apply_directories: [],
+      pre_apply_directory_ctimes: {},
+      confirmed_directory_roots: [],
+      confirmed_directory_inventory: null,
+      preserve_local_changes: false,
+      event_seq: null,
+      recovery_bundle_id: 'rec_copy_displacement',
+      last_completed_step: 'recovery_bundle',
+      redacted_error_category: null
+    }, new Map([['shared.md', targetOid]]), new Set());
+
+    expect(renames).toEqual([]);
+    expect(await readFile(join(root, 'shared.md'), 'utf8')).toBe('server target bytes\n');
+    expect(await readFile(join(
+      root,
+      '.obts',
+      'apply-displaced',
+      'apply_copy_displacement',
+      `${encodeURIComponent('shared.md')}.entry`
+    ), 'utf8')).toBe('captured local bytes\n');
+  });
+
+  it('completes an interrupted displacement whose evidence copy already exists while the live file remains', async () => {
+    const { root, core } = await clientFixture();
+    await writeFile(join(root, 'shared.md'), 'server target bytes\n');
+    const target = await core.createLocalCommit('interrupted copy displacement target');
+    const targetEntries = await core.listTreeBlobOids(target);
+    const targetOid = targetEntries.get('shared.md');
+    const targetSize = Buffer.byteLength('server target bytes\n');
+    await writeFile(join(root, 'shared.md'), 'captured local bytes\n');
+    const preflight = await core.readRecoveryFileSnapshot('shared.md');
+    const journal = {
+      journal_version: 4,
+      apply_id: 'apply_interrupted_copy_displacement',
+      operation_type: 'pull_apply',
+      target_main: target,
+      target_file_sizes: { 'shared.md': targetSize },
+      expected_prior_local_main: null,
+      expected_prior_local_device_ref: null,
+      phase: 'writing_files',
+      affected_paths: ['shared.md'],
+      preflight_sha256: { 'shared.md': preflight.fingerprint.sha256 },
+      preflight_fingerprints: { 'shared.md': preflight.fingerprint },
+      directory_intents: [],
+      explicit_directories: [],
+      pre_apply_directories: [],
+      pre_apply_directory_ctimes: {},
+      confirmed_directory_roots: [],
+      confirmed_directory_inventory: null,
+      preserve_local_changes: false,
+      event_seq: null,
+      recovery_bundle_id: 'rec_interrupted_copy_displacement',
+      last_completed_step: 'recovery_bundle',
+      redacted_error_category: null
+    };
+    await writeFile(join(root, '.obts', 'apply-journal.json'), `${JSON.stringify(journal)}\n`);
+    await mkdir(join(root, '.obts', 'apply-displaced', journal.apply_id), { recursive: true });
+    await writeFile(join(
+      root,
+      '.obts',
+      'apply-displaced',
+      journal.apply_id,
+      `${encodeURIComponent('shared.md')}.entry`
+    ), 'captured local bytes\n');
+
+    const restarted = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'interrupted-copy-displacement' });
+    await restarted.initialize();
+
+    expect(await readFile(join(root, 'shared.md'), 'utf8')).toBe('server target bytes\n');
+    expect(await readFile(join(root, '.obts', 'apply-journal.json'), 'utf8').catch(() => null)).toBeNull();
+    expect(await readFile(join(
+      root,
+      '.obts',
+      'recovery-displaced',
+      journal.apply_id,
+      `${encodeURIComponent('shared.md')}.entry`
+    ), 'utf8')).toBe('captured local bytes\n');
+  });
+
+  it('captures deleted directory evidence by copy without renaming the live directory', async () => {
+    const { root, core } = await clientFixture();
+    await mkdir(join(root, 'folder'));
+    await writeFile(join(root, 'folder', 'note.md'), 'captured local bytes\n');
+    await writeFile(join(root, 'target-source.md'), 'server target bytes\n');
+    await rm(join(root, 'folder'), { recursive: true, force: true });
+    const target = await core.createLocalCommit('directory copy displacement target');
+    const targetEntries = await core.listTreeBlobOids(target);
+    await mkdir(join(root, 'folder'));
+    await writeFile(join(root, 'folder', 'note.md'), 'captured local bytes\n');
+    const preflightDir = await core.readRecoveryFileSnapshot('folder');
+    const preflightFile = await core.readRecoveryFileSnapshot('folder/note.md');
+    const preflightCtime = await core.adapterDirectoryCreationTime('folder');
+    const renames: string[] = [];
+    const originalRename = core.adapter.rename.bind(core.adapter);
+    core.adapter.rename = async (from: string, to: string) => {
+      renames.push(`${from}->${to}`);
+      return await originalRename(from, to);
+    };
+
+    await core.writeTargetFilesFromJournal({
+      journal_version: 4,
+      apply_id: 'apply_directory_copy_displacement',
+      operation_type: 'pull_apply',
+      target_main: target,
+      target_file_sizes: {},
+      expected_prior_local_main: null,
+      expected_prior_local_device_ref: null,
+      phase: 'writing_files',
+      affected_paths: ['folder', 'folder/note.md'],
+      preflight_sha256: { folder: null, 'folder/note.md': preflightFile.fingerprint.sha256 },
+      preflight_fingerprints: {
+        folder: preflightDir.fingerprint,
+        'folder/note.md': preflightFile.fingerprint
+      },
+      directory_intents: [],
+      explicit_directories: [],
+      pre_apply_directories: ['folder'],
+      pre_apply_directory_ctimes: { folder: preflightCtime },
+      confirmed_directory_roots: [],
+      confirmed_directory_inventory: null,
+      preserve_local_changes: false,
+      event_seq: null,
+      recovery_bundle_id: 'rec_directory_copy_displacement',
+      last_completed_step: 'recovery_bundle',
+      redacted_error_category: null
+    }, targetEntries, new Set());
+
+    expect(renames).toEqual([]);
+    expect(await core.adapterExists('folder')).toBe(false);
+    expect(await readFile(join(
+      root,
+      '.obts',
+      'apply-displaced',
+      'apply_directory_copy_displacement',
+      `${encodeURIComponent('folder')}.entry`,
+      'note.md'
+    ), 'utf8')).toBe('captured local bytes\n');
+  });
+
   it('replays a crash after displacement without losing the captured path', async () => {
     const { root, core } = await clientFixture();
     await writeFile(join(root, 'shared.md'), 'captured local bytes\n');
