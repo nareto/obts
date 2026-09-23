@@ -11,3 +11,7 @@ TLA+/PlusCal models live under `architecture/models/formal/`, refine named contr
 When changing the Obsidian plugin, run `just plugin-version <patch|minor|major|VERSION>` before committing. Do not edit generated plugin artifacts manually.
 
 For the user to be able to use the updated plugin, you need to create a new github release for it so it appears as updateable in BRAT (main installation vehicle).
+
+## Public source boundary
+
+This branch is mirrored publicly. Review every commit for private deployment details before committing, including commits pushed only to Forgejo; deleting a file later does not erase it from history. Keep application instructions and CI public-safe under `AGENTS.md` and `.github/workflows/`, and keep environment-specific operations in a separate private infrastructure repository. Do not track `.forgejo/` workflows on this shared branch.
