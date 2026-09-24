@@ -91,7 +91,7 @@ describe('formal manifest and traceability validation', () => {
   it('accepts the exact required matrix and complete source map', () => {
     const result = run();
     expect(result.status, result.stderr).toBe(0);
-    expect(result.stdout).toContain('52 required checks');
+    expect(result.stdout).toContain('74 required checks');
   });
 
   it('rejects required check removal', () => {
@@ -99,6 +99,15 @@ describe('formal manifest and traceability validation', () => {
     const result = run(['--validate-only'], fixture.env);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain('Required formal check removed');
+  });
+
+  it('rejects root-ignore negative-control removal', () => {
+    const fixture = mutateManifest((manifest) => {
+      manifest.checks = manifest.checks.filter((check: { id: string }) => check.id !== 'fm002-root-ignore-bridge-race-negative');
+    });
+    const result = run(['--validate-only'], fixture.env);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('Required formal check removed: fm002-root-ignore-bridge-race-negative');
   });
 
   it('rejects candidate/accepted mismatch', () => {

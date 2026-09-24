@@ -24,6 +24,13 @@ const requiredChecks = new Map([
     'equal', 'covered', 'divergent', 'reply-loss', 'conflict-partial', 'directory-delete', 'projection', 'proposal-trigger',
     'bridge-trigger', 'recovery-trigger', 'apply-trigger', 'apply-refinement'].map((id) => [`fm002-reach-${id}`, 'reachability']),
   ['fm002-server-recovery-implementation', 'positive-safety'],
+  ...['root-ignore-safety', 'root-ignore-legacy-safety', 'root-ignore-bridge-race-safety', 'root-ignore-invalid-safety'].map((id) => [`fm002-${id}`, 'positive-safety']),
+  ...['root-ignore-transition', 'root-ignore-stale', 'root-ignore-local-only', 'root-ignore-projection', 'root-ignore-legacy-activation', 'root-ignore-bridge-race-reach',
+    'root-ignore-offline-capture', 'root-ignore-invalid-reach', 'root-ignore-bridge-race-write-reach']
+    .map((id) => [`fm002-${id}`, 'reachability']),
+  ...['root-ignore-negative-discard', 'root-ignore-negative-old-client', 'root-ignore-negative-stale',
+    'root-ignore-negative-policy-identity', 'root-ignore-negative-bridge-write', 'root-ignore-negative-projection-rows',
+    'root-ignore-negative-legacy-activation', 'root-ignore-negative-candidate', 'root-ignore-bridge-race-negative'].map((id) => [`fm002-${id}`, 'negative-control']),
   ...['replace-inflight', 'drop-accepted', 'ref-rewind', 'discard-divergence', 'main-before-effects', 'early-ack',
     'overwrite-bridge', 'recursive-delete', 'restart-abort', 'duplicate-processing', 'retry-identity',
     'conflict-without-protection', 'cas-uncertain-abort', 'cursor-ack-conflation', 'projection-cursor-early']

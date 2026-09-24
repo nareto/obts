@@ -2,6 +2,7 @@ import { posix } from 'node:path';
 
 import { newId, nowIso } from '../shared/ids.js';
 import { assertSyncableTreePaths, PathPolicyViolation } from '../shared/pathPolicy.js';
+import { RootIgnorePolicyError } from '../shared/rootIgnore.cjs';
 import type {
   ConflictRecord,
   ConflictResolutionKind,
@@ -20,7 +21,7 @@ import type {
   ResolveConflictResponse
 } from '../shared/types.js';
 import { AuthError, type AuthenticatedDevice } from './authService.js';
-import { GitCommandError, GitDurabilityError, GitService, sha256Hex, type GitDiffEntry, type GitObjectReader } from './gitService.js';
+import { GitCommandError, GitDurabilityError, GitMalformedPackError, GitService, sha256Hex, type GitDiffEntry, type GitObjectReader } from './gitService.js';
 import { hasDurableDeletionRecord } from './metadataStore.js';
 import type { VaultLifecycleCoordinator } from './vaultLifecycleCoordinator.js';
 import type {
@@ -32,6 +33,11 @@ import type {
 } from './metadataStore.js';
 
 const MERGE_POLICY_VERSION = 'phase2.semantic-merge.v1';
+
+function policyConflictPaths(error: PathPolicyViolation | InstanceType<typeof RootIgnorePolicyError>): string[] {
+  return error instanceof PathPolicyViolation && typeof error.details?.path === 'string'
+    ? [error.details.path] : ['.gitignore'];
+}
 const SIMILAR_RENAME_THRESHOLD = 0.72;
 const SIMILAR_RENAME_MAX_BYTES = 256 * 1024;
 const MAX_INTERACTIVE_REVIEW_BYTES = 512 * 1024;
@@ -143,7 +149,10 @@ export class SyncService {
           this.latestEventSeq(vault.vault_id, currentDb),
           null,
           false,
-          storedDirectoryProposal(operation.prepared_manifest?.directory_proposal)
+          storedDirectoryProposal(operation.prepared_manifest?.directory_proposal),
+          operation.prepared_manifest?.root_ignore_capability === 'root-ignore-v1'
+            ? { root_ignore_capability: 'root-ignore-v1', root_ignore_oid: operation.prepared_manifest.root_ignore_oid as string | null }
+            : null
         );
       });
     }
@@ -168,21 +177,24 @@ export class SyncService {
     if (manifest.vault_id !== auth.vault.vault_id || manifest.device_id !== auth.device.device_id) {
       return { status: 'rejected', code: 'not_found', message: 'Resource not found.' };
     }
-    if (!staged) {
-      if (manifest.packfile_bytes !== packfile.byteLength || packfile.byteLength > this.maxUploadBytes) {
-        return { status: 'rejected', code: 'invalid_packfile', message: 'Packfile size does not match the manifest.' };
-      }
-      if (sha256Hex(packfile) !== manifest.packfile_sha256) {
-        return { status: 'rejected', code: 'invalid_packfile', message: 'Packfile digest does not match the manifest.' };
-      }
-    }
-
     return await this.withVaultLock(auth.vault.vault_id, async () => {
       let operationId: string | null = null;
       try {
+        const attemptHash = manifest.attempt_id
+          ? sha256Hex(Buffer.from(stableJson({ manifest, transport: staged ? 'chunk' : 'direct' })))
+          : null;
         const operation = await this.store.mutate((db) => {
           const device = requireDevice(db, auth.device.device_id);
-          return this.store.startOperation(db, {
+          if (attemptHash) {
+            const prior = db.sync_operations.find((candidate) =>
+              candidate.vault_id === auth.vault.vault_id && candidate.device_id === device.device_id &&
+              candidate.operation_type === 'device_push' && candidate.prepared_manifest?.attempt_id === manifest.attempt_id
+            );
+            if (prior && prior.prepared_manifest?.attempt_hash !== attemptHash) {
+              throw new AuthError(409, 'attempt_mismatch', 'Upload attempt does not match its original request.');
+            }
+          }
+          const started = this.store.startOperation(db, {
             vault_id: auth.vault.vault_id,
             device_id: device.device_id,
             operation_type: 'device_push',
@@ -194,8 +206,16 @@ export class SyncService {
             },
             target_commit: manifest.target_commit
           });
+          if (attemptHash) started.prepared_manifest = { attempt_id: manifest.attempt_id, attempt_hash: attemptHash };
+          return started;
         });
         operationId = operation.operation_id;
+        if (!staged) {
+          if (manifest.packfile_bytes !== packfile.byteLength || packfile.byteLength > this.maxUploadBytes ||
+              sha256Hex(packfile) !== manifest.packfile_sha256) {
+            return await this.rejectDevicePush(auth, operation.operation_id, 'invalid_packfile', 'Packfile does not match the manifest.');
+          }
+        }
 
         const directoryProposal = await this.normalizeDirectoryProposal(
           auth.device.device_id,
@@ -213,7 +233,7 @@ export class SyncService {
           return await this.rejectDevicePush(auth, operation.operation_id, deviceBlock.code, deviceBlock.message);
         }
         if (currentDeviceRef === manifest.target_commit) {
-          return await this.finishExistingDeviceCommit(auth, operation, manifest.target_commit, directoryProposal);
+          return await this.finishExistingDeviceCommit(auth, operation, manifest.target_commit, directoryProposal, manifest);
         }
         if (deviceBlock) {
           return await this.rejectDevicePush(auth, operation.operation_id, deviceBlock.code, deviceBlock.message);
@@ -240,7 +260,7 @@ export class SyncService {
           : await this.validateQuarantinedUpload(auth, operation, manifest, packfile, currentDeviceRef, currentMain);
         if (validation.rejection !== null) return validation.rejection;
         if (validation.deviceRelation === 'superseded' && currentDeviceRef) {
-          const result = await this.finishExistingDeviceCommit(auth, operation, manifest.target_commit, directoryProposal);
+          const result = await this.finishExistingDeviceCommit(auth, operation, manifest.target_commit, directoryProposal, manifest);
           return result.status === 'rejected' ? result : { ...result, device_ref: currentDeviceRef };
         }
 
@@ -251,6 +271,7 @@ export class SyncService {
             [auth.device.device_ref]: currentDeviceRef
           };
           op.prepared_manifest = {
+            ...(op.prepared_manifest ?? {}),
             actor: { user_id: auth.user.user_id, device_id: auth.device.device_id },
             operation_type: 'device_push',
             expected_device_ref: currentDeviceRef,
@@ -262,7 +283,9 @@ export class SyncService {
               fast_forward: validation.deviceRelation,
               base_commit: manifest.base_commit ?? null
             },
-            directory_proposal: directoryProposal
+            directory_proposal: directoryProposal,
+            root_ignore_capability: manifest.root_ignore_capability ?? null,
+            root_ignore_oid: manifest.root_ignore_oid ?? null
           };
           op.updated_at = nowIso();
         });
@@ -328,7 +351,8 @@ export class SyncService {
           refEventSeq,
           manifest.base_commit ?? null,
           detachedProposal,
-          directoryProposal
+          directoryProposal,
+          manifest
         );
       } catch (error) {
         const mappedError = error instanceof GitDurabilityError
@@ -773,7 +797,7 @@ export class SyncService {
       const resolvedDirectoryIntents = resolvedConflictDirectoryIntents(conflict, input.resolutionKind);
 
       const tree = await this.buildResolutionTree(conflict, input.resolutionKind, input.manualFiles, input.manualFilePlan);
-      await this.git.validateTreePathPolicy(input.vaultId, tree, this.maxUploadBytes);
+      await this.git.validateTreeRootIgnorePolicy(input.vaultId, tree, this.maxUploadBytes);
 
       const preparation = await this.store.mutate((db) => {
         const mutableVault = requireVault(db, input.vaultId);
@@ -936,7 +960,8 @@ export class SyncService {
     auth: AuthenticatedDevice,
     operation: SyncOperationRow,
     targetCommit: string,
-    directoryProposal: DirectoryProposal | null
+    directoryProposal: DirectoryProposal | null,
+    manifest: DevicePushManifest
   ): Promise<PushResult> {
     const main = await this.git.getRef(auth.vault.vault_id, 'refs/heads/main');
     if (!main) {
@@ -949,10 +974,20 @@ export class SyncService {
       : null;
     const existingConflict = await this.findOpenConflict(auth.vault.vault_id, auth.device.device_id, targetCommit);
     const fallbackEventSeq = this.latestEventSeq(auth.vault.vault_id, snapshot);
+    if (!existingConflict && !existingResult &&
+      (!(await this.git.isAncestor(auth.vault.vault_id, targetCommit, main)) || directoryProposal)) {
+      const rejection = await this.checkRootIgnoreAdmission(auth, operation.operation_id, manifest, main);
+      if (rejection) return rejection;
+    }
     await this.store.mutate((db) => {
       const op = requireOperation(db, operation.operation_id);
       op.status = 'committed';
       op.result = { idempotent: true, target_commit: targetCommit };
+      op.prepared_manifest = {
+        root_ignore_capability: manifest.root_ignore_capability ?? null,
+        root_ignore_oid: manifest.root_ignore_oid ?? null,
+        directory_proposal: directoryProposal
+      };
       op.updated_at = nowIso();
     });
     if (existingConflict || existingResult?.status === 'conflicted') {
@@ -975,7 +1010,8 @@ export class SyncService {
         fallbackEventSeq,
         null,
         false,
-        directoryProposal
+        directoryProposal,
+        manifest
       );
     }
     if (directoryProposal && !existingResult) {
@@ -986,7 +1022,8 @@ export class SyncService {
         fallbackEventSeq,
         null,
         false,
-        directoryProposal
+        directoryProposal,
+        manifest
       );
     }
     return {
@@ -996,6 +1033,40 @@ export class SyncService {
       event_seq: existingResult?.event_seq ?? fallbackEventSeq,
       ...(directoryProposal ? { directory_ack: proposalAcknowledgement(directoryProposal, 'duplicate') } : {})
     };
+  }
+
+  private async hasRootIgnoreAdmission(
+    vaultId: string,
+    commit: string,
+    main: string,
+    attestation: Pick<DevicePushManifest, 'root_ignore_capability' | 'root_ignore_oid'> | null
+  ): Promise<boolean> {
+    const proposed = await this.git.readRootIgnoreBlob(vaultId, commit);
+    const canonical = await this.git.readRootIgnoreBlob(vaultId, main);
+    if (attestation?.root_ignore_capability !== 'root-ignore-v1' || attestation.root_ignore_oid === undefined) {
+      return proposed.oid === null && canonical.oid === null;
+    }
+    if (attestation.root_ignore_oid !== proposed.oid) return false;
+    await this.git.validateTreeRootIgnorePolicy(vaultId, commit, this.maxUploadBytes);
+    return true;
+  }
+
+  private async checkRootIgnoreAdmission(
+    auth: AuthenticatedDevice,
+    operationId: string,
+    manifest: DevicePushManifest,
+    main: string
+  ): Promise<PushResult | null> {
+    try {
+      if (await this.hasRootIgnoreAdmission(auth.vault.vault_id, manifest.target_commit, main, manifest)) return null;
+      const code = manifest.root_ignore_capability === 'root-ignore-v1' && manifest.root_ignore_oid !== undefined
+        ? 'root_ignore_oid_mismatch' : 'root_ignore_capability_required';
+      return await this.rejectDevicePush(auth, operationId, code,
+        code === 'root_ignore_oid_mismatch' ? 'Root ignore identity does not match the proposed tree.' : 'Root ignore capability is required.');
+    } catch (error) {
+      if (!(error instanceof PathPolicyViolation || error instanceof RootIgnorePolicyError)) throw error;
+      return await this.rejectDevicePush(auth, operationId, error.code, 'Uploaded commit violates the root ignore policy.');
+    }
   }
 
   private async validateQuarantinedUpload(
@@ -1010,7 +1081,8 @@ export class SyncService {
       return await this.git.withQuarantinedPack(auth.vault.vault_id, packfile, async (reader) =>
         await this.validateUploadReader(auth, operation, manifest, reader, currentDeviceRef, currentMain)
       );
-    } catch {
+    } catch (error) {
+      if (!(error instanceof GitMalformedPackError)) throw error;
       return {
         rejection: await this.rejectDevicePush(auth, operation.operation_id, 'malformed_packfile', 'Malformed Git packfile.'),
         deviceRelation: 'divergent'
@@ -1041,7 +1113,8 @@ export class SyncService {
       try {
         await reader.validateTreePathPolicy(auth.vault.vault_id, manifest.target_commit, this.maxUploadBytes);
       } catch (error) {
-        const code = error instanceof PathPolicyViolation ? error.code : 'path_policy_rejected';
+        if (!(error instanceof PathPolicyViolation)) throw error;
+        const code = error.code;
         return {
           rejection: await this.rejectDevicePush(
             auth,
@@ -1051,6 +1124,41 @@ export class SyncService {
           ),
           deviceRelation: 'divergent'
         };
+      }
+      const alreadyPinnedLegacy = manifest.root_ignore_capability === undefined && currentDeviceRef !== null &&
+        await this.git.commitExists(auth.vault.vault_id, manifest.target_commit) &&
+        await this.git.isAncestor(auth.vault.vault_id, manifest.target_commit, currentMain) &&
+        (!manifest.directory_proposal || !!this.findDirectoryProposalResult(
+          await this.store.snapshot(), auth.vault.vault_id, auth.device.device_id, manifest.directory_proposal
+        ));
+      if (!alreadyPinnedLegacy) {
+        try {
+          const proposedPolicy = await reader.readRootIgnoreBlob(auth.vault.vault_id, manifest.target_commit);
+          const canonicalPolicy = await this.git.readRootIgnoreBlob(auth.vault.vault_id, currentMain);
+          if (manifest.root_ignore_capability !== 'root-ignore-v1' || manifest.root_ignore_oid === undefined) {
+            if (proposedPolicy.oid !== null || canonicalPolicy.oid !== null) {
+              return {
+                rejection: await this.rejectDevicePush(auth, operation.operation_id, 'root_ignore_capability_required', 'Root ignore capability is required.'),
+                deviceRelation: 'divergent'
+              };
+            }
+          } else {
+            if (manifest.root_ignore_oid !== proposedPolicy.oid) {
+              return {
+                rejection: await this.rejectDevicePush(auth, operation.operation_id, 'root_ignore_oid_mismatch', 'Root ignore identity does not match the proposed tree.'),
+                deviceRelation: 'divergent'
+              };
+            }
+            await reader.validateTreeRootIgnorePolicy(auth.vault.vault_id, manifest.target_commit, this.maxUploadBytes);
+          }
+        } catch (error) {
+          if (!(error instanceof PathPolicyViolation || error instanceof RootIgnorePolicyError)) throw error;
+          const code = error.code;
+          return {
+            rejection: await this.rejectDevicePush(auth, operation.operation_id, code, 'Uploaded commit violates the root ignore policy.'),
+            deviceRelation: 'divergent'
+          };
+        }
       }
       if (manifest.base_commit) {
         if (!(await reader.commitExists(auth.vault.vault_id, manifest.base_commit))) {
@@ -1080,9 +1188,10 @@ export class SyncService {
             ? 'superseded'
             : 'divergent';
       return { rejection: null, deviceRelation };
-    } catch {
+    } catch (error) {
+      if (!(error instanceof PathPolicyViolation || error instanceof RootIgnorePolicyError)) throw error;
       return {
-        rejection: await this.rejectDevicePush(auth, operation.operation_id, 'malformed_packfile', 'Malformed Git object set.'),
+        rejection: await this.rejectDevicePush(auth, operation.operation_id, error.code, 'Uploaded commit violates the vault policy.'),
         deviceRelation: 'divergent'
       };
     }
@@ -1095,7 +1204,8 @@ export class SyncService {
     fallbackEventSeq: number,
     proposalBase: string | null = null,
     detachedProposal = false,
-    directoryProposal: DirectoryProposal | null = null
+    directoryProposal: DirectoryProposal | null = null,
+    attestation: Pick<DevicePushManifest, 'root_ignore_capability' | 'root_ignore_oid'> | null = null
   ): Promise<PushResult> {
     const main = await this.git.getRef(vaultId, 'refs/heads/main');
     if (!main) {
@@ -1107,6 +1217,10 @@ export class SyncService {
         ? this.findDirectoryProposalResult(snapshot, vaultId, deviceId, directoryProposal)
         : null;
       if (directoryProposal && !proposalResult) {
+        if (!(await this.hasRootIgnoreAdmission(vaultId, deviceCommit, main, attestation))) {
+          return await this.createConflict(vaultId, deviceId, main, main, deviceCommit,
+            ['.gitignore'], 'root_ignore_capability_required');
+        }
         const directoryPlan = await this.classifyDirectoryProposal(vaultId, deviceId, directoryProposal);
         if (directoryPlan.affectedRoots.length > 0) {
           return await this.createConflict(
@@ -1167,6 +1281,11 @@ export class SyncService {
         main,
         event_seq: this.latestEventSeq(vaultId, await this.store.snapshot()) || fallbackEventSeq
       };
+    }
+
+    if (!(await this.hasRootIgnoreAdmission(vaultId, deviceCommit, main, attestation))) {
+      return await this.createConflict(vaultId, deviceId, main, main, deviceCommit,
+        ['.gitignore'], 'root_ignore_capability_required');
     }
 
     let base = proposalBase;
@@ -1315,10 +1434,15 @@ export class SyncService {
         deviceId,
         strategy: 'disjoint_overlay'
       });
+      await this.git.validateTreeRootIgnorePolicy(vaultId, mergeCommit, this.maxUploadBytes);
       await this.prepareMergeRefUpdate(mergePreparation.operationId, mergeCommit);
       await this.git.updateRef(vaultId, 'refs/heads/main', mergeCommit, main);
     } catch (error) {
       await this.abortOperation(mergePreparation.operationId, 'merge_git_error');
+      if (error instanceof PathPolicyViolation || error instanceof RootIgnorePolicyError) {
+        return await this.createConflict(vaultId, deviceId, base, main, deviceCommit,
+          policyConflictPaths(error), 'root_ignore_merge_policy', directoryPlan);
+      }
       throw error;
     }
     const eventSeq = await this.store.mutate((db) => {
@@ -1538,10 +1662,15 @@ export class SyncService {
         mergePreparation.mergeSequence,
         deviceId
       );
+      await this.git.validateTreeRootIgnorePolicy(vaultId, mergeCommit, this.maxUploadBytes);
       await this.prepareMergeRefUpdate(mergePreparation.operationId, mergeCommit);
       await this.git.updateRef(vaultId, 'refs/heads/main', mergeCommit, currentMain);
     } catch (error) {
       await this.abortOperation(mergePreparation.operationId, 'merge_git_error');
+      if (error instanceof PathPolicyViolation || error instanceof RootIgnorePolicyError) {
+        return await this.createConflict(vaultId, deviceId, base, currentMain, deviceCommit,
+          policyConflictPaths(error), 'root_ignore_merge_policy', directoryPlan);
+      }
       throw error;
     }
 
@@ -1899,10 +2028,15 @@ export class SyncService {
         deviceId,
         strategy: mergeTree.validatorResults.semantic_merge === 'clean' ? 'semantic_clean' : 'native_clean'
       });
+      await this.git.validateTreeRootIgnorePolicy(vaultId, mergeCommit, this.maxUploadBytes);
       await this.prepareMergeRefUpdate(mergePreparation.operationId, mergeCommit);
       await this.git.updateRef(vaultId, 'refs/heads/main', mergeCommit, currentMain);
     } catch (error) {
       await this.abortOperation(mergePreparation.operationId, 'merge_git_error');
+      if (error instanceof PathPolicyViolation || error instanceof RootIgnorePolicyError) {
+        return await this.createConflict(vaultId, deviceId, base, currentMain, deviceCommit,
+          policyConflictPaths(error), 'root_ignore_merge_policy', directoryPlan);
+      }
       throw error;
     }
 

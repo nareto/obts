@@ -347,6 +347,13 @@ export class ConnectionService {
     const deviceToken = deriveDeviceToken(secret, await this.connectionSalt(connectionId, secret));
     const existing = await this.existingCompletion(connectionId, secret, deviceToken);
     if (existing) {
+      const current = await this.store.snapshot();
+      const vault = current.vaults.find((candidate) => candidate.vault_id === existing.vault_id);
+      if (!vault) throw new AuthError(404, 'not_found', 'Resource not found.');
+      const policy = await this.git.readRootIgnoreBlob(existing.vault_id, vault.current_main);
+      if (policy.oid !== null && request.root_ignore_capability !== 'root-ignore-v1') {
+        throw new AuthError(409, 'root_ignore_capability_required', 'Update to a capable device before joining this vault.');
+      }
       return existing;
     }
 
@@ -385,6 +392,10 @@ export class ConnectionService {
           throw new AuthError(409, 'onboarding_target_stale', 'Approved onboarding baseline no longer matches this setup attempt.');
         }
         rootCommit = vault.root_commit;
+        const rootIgnore = await this.git.readRootIgnoreBlob(vault.vault_id, vault.current_main);
+        if (rootIgnore.oid !== null && request.root_ignore_capability !== 'root-ignore-v1') {
+          throw new AuthError(409, 'root_ignore_capability_required', 'Update to a capable device before joining this vault.');
+        }
       }
 
       if (!vaultId) {

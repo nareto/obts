@@ -1,5 +1,5 @@
 import * as fs from 'node:fs';
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, stat, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, join, relative } from 'node:path';
 
@@ -13,6 +13,8 @@ import {
 } from '../../../src/shared/pathPolicy.js';
 
 const require = createRequire(import.meta.url);
+const { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require('../../../src/shared/rootIgnore.cjs') as typeof import('../../../src/shared/rootIgnore.cjs');
+type RootIgnorePolicy = ReturnType<typeof createRootIgnorePolicy>;
 const { createByteBudget, runBoundedWork } = require('../work-pool.cjs') as {
   createByteBudget: (maxBytes: number) => { acquire: (bytes: number) => Promise<() => void> };
   runBoundedWork: <T, R>(
@@ -135,7 +137,46 @@ export class LocalGitEngine {
     }
   }
 
-  async scanSyncableFiles(): Promise<string[]> {
+  async readRootIgnorePolicy(): Promise<{ bytes: Buffer | null; oid: string | null; policy: RootIgnorePolicy }> {
+    let metadata;
+    try {
+      metadata = await lstat(join(this.vaultDir, '.gitignore'));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return { bytes: null, oid: null, policy: createRootIgnorePolicy(null) };
+      }
+      throw error;
+    }
+    if (!metadata.isFile()) throw new Error('Root .gitignore must be a regular readable file.');
+    if (metadata.size > MAX_ROOT_IGNORE_BYTES) throw new Error('Root .gitignore exceeds the byte limit.');
+    if (!fs.constants.O_NOFOLLOW) throw new Error('Cannot safely open root .gitignore on this device.');
+    const file = await open(join(this.vaultDir, '.gitignore'), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    let bytes: Buffer;
+    try {
+      const before = await file.stat();
+      if (!before.isFile() || before.dev !== metadata.dev || before.ino !== metadata.ino) {
+        throw new Error('Root .gitignore changed while opening.');
+      }
+      const buffer = Buffer.alloc(MAX_ROOT_IGNORE_BYTES + 1);
+      let length = 0;
+      while (length < buffer.length) {
+        const result = await file.read(buffer, length, buffer.length - length, length);
+        if (result.bytesRead === 0) break;
+        length += result.bytesRead;
+      }
+      const after = await file.stat();
+      if (length > MAX_ROOT_IGNORE_BYTES || length !== before.size ||
+          after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) {
+        throw new Error('Root .gitignore changed while reading or exceeds the byte limit.');
+      }
+      bytes = buffer.subarray(0, length);
+    } finally {
+      await file.close();
+    }
+    return { bytes, oid: (await git.hashBlob({ object: bytes })).oid, policy: createRootIgnorePolicy(bytes) };
+  }
+
+  async scanSyncableFiles(policy?: RootIgnorePolicy): Promise<string[]> {
     const files: string[] = [];
     await walk(this.vaultDir, this.vaultDir, async (absolutePath) => {
       const rel = relative(this.vaultDir, absolutePath).replaceAll('\\', '/');
@@ -143,7 +184,7 @@ export class LocalGitEngine {
       if (!normalized.ok) {
         throw new PathPolicyViolation(normalized.code, normalized.message, { ...(normalized.details ?? {}), path: rel });
       }
-      if (isSyncableVaultPath(normalized.path)) {
+      if (isSyncableVaultPath(normalized.path) && (!policy || !policy.ignores(normalized.path))) {
         files.push(normalized.path);
       }
     });
@@ -155,7 +196,8 @@ export class LocalGitEngine {
   async createLocalCommit(message: string, knownFiles?: string[]): Promise<string | null> {
     const baseCommit = await this.resolveRef('refs/heads/local');
     const baseEntries = baseCommit ? await this.flattenTree(baseCommit) : new Map<string, TreeEntry>();
-    const files = knownFiles ?? await this.scanSyncableFiles();
+    const pinnedPolicy = await this.readRootIgnorePolicy();
+    const files = await this.scanSyncableFiles(pinnedPolicy.policy);
     const fileSet = new Set(files);
     const nextEntries = new Map(baseEntries);
 
@@ -187,6 +229,17 @@ export class LocalGitEngine {
     });
     for (let index = 0; index < files.length; index += 1) nextEntries.set(files[index]!, entries[index]!);
 
+    const verifySnapshot = async (): Promise<void> => {
+      const verifiedPolicy = await this.readRootIgnorePolicy();
+      if (verifiedPolicy.oid !== pinnedPolicy.oid ||
+          (verifiedPolicy.bytes === null) !== (pinnedPolicy.bytes === null) ||
+          (verifiedPolicy.bytes !== null && pinnedPolicy.bytes !== null && !verifiedPolicy.bytes.equals(pinnedPolicy.bytes)) ||
+          JSON.stringify(await this.scanSyncableFiles(pinnedPolicy.policy)) !== JSON.stringify(files) ||
+          nextEntries.get('.gitignore')?.oid !== (pinnedPolicy.oid ?? undefined)) {
+        throw new Error('Local vault contents changed during a consistency checkpoint.');
+      }
+    };
+    await verifySnapshot();
     const tree = await this.writeTreeFromEntries(nextEntries);
     if (baseCommit) {
       const { commit } = await git.readCommit({ fs, dir: this.vaultDir, gitdir: this.gitdir, oid: baseCommit });
@@ -197,6 +250,7 @@ export class LocalGitEngine {
       return null;
     }
 
+    await verifySnapshot();
     return await this.commitTree(message, tree, baseCommit);
   }
 

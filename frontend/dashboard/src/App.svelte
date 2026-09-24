@@ -246,7 +246,7 @@
     if (value.vault.status === 'blocked_integrity') return { label: 'Integrity blocked', role: 'danger' };
     if (value.devices.length === 0) return { label: 'Status unknown', role: 'warning' };
     if (value.devices.every((device) => device.status_label === 'Synced')) return { label: 'Synced', role: 'success' };
-    if (value.devices.some((device) => ['Blocked', 'Needs recovery', 'Unsafe local state', 'Integrity failure'].includes(device.status_label))) {
+    if (value.devices.some((device) => ['Blocked', 'Needs recovery', 'Integrity failure', 'Conflict resolution needed', 'Out of sync — file exceeds upload limit', 'Out of sync — upload limit exceeded', 'Out of sync — local recovery required', 'Server repair required'].includes(device.status_label))) {
       return { label: 'Attention required', role: 'danger' };
     }
     if (value.devices.some((device) => isActiveStatusLabel(device.status_label))) {

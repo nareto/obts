@@ -21,7 +21,8 @@ import {
   PathPolicyViolation
 } from '../src/shared/pathPolicy.js';
 import { MINIMUM_PLUGIN_VERSION, RECOMMENDED_PLUGIN_VERSION } from '../src/shared/pluginCompatibility.js';
-import { API_VERSION } from '../src/shared/types.js';
+import { API_VERSION, type DevicePushManifest } from '../src/shared/types.js';
+import { parseChunkPushCreateRequest, parseDevicePushManifest } from '../src/shared/validators.js';
 
 type Json = Record<string, unknown>;
 
@@ -727,10 +728,89 @@ describe('Phase 1 sync without conflict resolution', () => {
     }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
     expect(dashboard.status).toBe(200);
     expect(dashboard.body.devices.find((device) => device.device_name === 'laptop')).toMatchObject({
-      status_label: 'Unsafe local state',
+      status_label: 'Out of sync',
       local_error_code: 'invalid_path',
       blocked: true
     });
+    await writeFile(statePath, `${JSON.stringify({
+      ...state,
+      status_label: 'Unsafe local state',
+      last_error_code: 'object_too_large_for_chunk',
+      last_error_details: { object_type: 'blob', object_oid: 'a'.repeat(40), object_bytes: 32505857, object_limit_bytes: 32505856, operation_phase: 'upload_prepare', current_paths: ['private-index.bin'] },
+      updated_at: new Date().toISOString()
+    }, null, 2)}\n`);
+    await plugin.reportDeviceStatus();
+    const sizeDashboard = await admin.get<{ devices: Array<{ status_label: string; local_error_code: string | null }> }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+    expect(sizeDashboard.body.devices.find((device) => device.local_error_code === 'object_too_large_for_chunk')).toMatchObject({
+      status_label: 'Out of sync — file exceeds upload limit'
+    });
+    expect(JSON.stringify(sizeDashboard.body)).not.toContain('private-index.bin');
+    expect(JSON.stringify(sizeDashboard.body)).not.toContain('32505857');
+
+    const countedReport = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/device-status`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${await readDeviceToken(deviceDir)}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        plugin_version: '0.4.40', local_status_label: 'Uploading 32505857/32505856', local_error_code: null,
+        local_queue_status: 'uploading', local_main: null, local_head: null, path_capabilities: null
+      })
+    });
+    expect(countedReport.status).toBe(200);
+    const countedDashboard = await admin.get<{ devices: Array<{ local_status_label: string }> }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+    expect(countedDashboard.body.devices.find((device) => device.local_status_label === 'Uploading')).toBeTruthy();
+    expect(JSON.stringify(countedDashboard.body)).not.toContain('32505857');
+
+    const poisonedReport = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/device-status`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${await readDeviceToken(deviceDir)}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        plugin_version: 'private/path.md', local_status_label: 'private/path.md', local_error_code: 'private/path.md',
+        local_queue_status: 'private/path.md', local_main: null, local_head: null,
+        path_capabilities: { adapter: 'private/path.md', platform: 'private/path.md', private: 'private/path.md' }
+      })
+    });
+    expect(poisonedReport.status).toBe(200);
+    const poisonedDashboard = await admin.get<{ devices: Array<{ status_label: string; local_error_code: string; plugin_version: string }> }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+    expect(poisonedDashboard.body.devices.find((device) => device.local_error_code === 'sync_error')).toMatchObject({ status_label: 'Out of sync', plugin_version: 'unknown' });
+    expect(JSON.stringify(poisonedDashboard.body)).not.toContain('private/path.md');
+
+    const deviceId = (await plugin.readState()).device_id;
+    await server.store.mutate((db) => {
+      const device = db.devices.find((candidate) => candidate.device_id === deviceId)!;
+      device.local_status_label = 'private/path.md';
+      device.local_error_code = 'private/path.md';
+      device.plugin_version = 'private/path.md';
+      device.local_queue_status = 'private/path.md';
+      device.path_capabilities = { adapter: 'private/path.md', platform: 'private/path.md', private: 'private/path.md' };
+      device.last_status_report_at = new Date().toISOString();
+    });
+    const legacyDashboard = await admin.get<{ devices: Array<{ status_label: string; local_status_label: string; local_error_code: string; local_queue_status: string; plugin_version: string; path_capabilities: Record<string, string> }> }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+    expect(legacyDashboard.body.devices.find((device) => device.local_error_code === 'sync_error')).toMatchObject({
+      status_label: 'Out of sync',
+      local_status_label: 'Out of sync',
+      local_queue_status: 'unknown',
+      plugin_version: 'unknown',
+      path_capabilities: { adapter: 'unknown', platform: 'unknown' }
+    });
+    expect(JSON.stringify(legacyDashboard.body)).not.toContain('private/path.md');
+
+    for (const code of ['directory_baseline_recovery_unsafe', 'local_ref_recovery_required', 'recovery_bundle_verification_failed']) {
+      const recoveryReport = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/device-status`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await readDeviceToken(deviceDir)}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          plugin_version: '0.4.40', local_status_label: 'Unsafe local state',
+          local_error_code: code, local_queue_status: 'blocked_recovery',
+          local_main: null, local_head: null, path_capabilities: null
+        })
+      });
+      expect(recoveryReport.status).toBe(200);
+      const recoveryDashboard = await admin.get<{ devices: Array<{ status_label: string; local_status_label: string; local_error_code: string }> }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+      expect(recoveryDashboard.body.devices.find((device) => device.local_error_code === code)).toMatchObject({
+        status_label: 'Out of sync — local recovery required',
+        local_status_label: 'Out of sync — local recovery required'
+      });
+    }
   });
 
   it('requeues stranded local commits when queue metadata is lost', async () => {
@@ -993,7 +1073,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     const restarted = new ObtsPluginClient(receiverDir, { serverUrl: baseUrl, deviceName: 'reload-delete-receiver' });
     await restarted.initialize();
     const recoveryResult = await restarted.syncOnce();
-    expect(recoveryResult.status).toBe('Review needed');
+    expect(recoveryResult.status).toBe('Conflict resolution needed');
     expect(recoveryResult.conflictId).toMatch(/^conf_/u);
     expect(await exists(refLockPath)).toBe(false);
     expect(await exists(join(receiverDir, '.obts', 'directory-recovery.json'))).toBe(false);
@@ -1397,7 +1477,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await exists(join(receiverDir, 'Crash Tree'))).toBe(true);
     expect(await exists(join(receiverDir, 'Crash Tree', 'Nested', 'note.md'))).toBe(false);
     expect(JSON.parse(await readFile(join(receiverDir, '.obts', 'apply-journal.json'), 'utf8'))).toMatchObject({
-      journal_version: 4,
+      journal_version: 5,
       phase: 'writing_files',
       directory_intents: [{ op: 'delete', path: 'Crash Tree' }],
       preserve_local_changes: true
@@ -1467,7 +1547,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(recoveredDevice?.last_applied_main).toBe(newestMain);
   });
 
-  it('finishes committed v4 directory recovery with the target event cursor', async () => {
+  it('finishes committed v5 directory recovery with the target event cursor', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const sourceDir = join(root, 'committed-tombstone-source');
     const receiverDir = join(root, 'committed-tombstone-receiver');
@@ -1502,7 +1582,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       phase: string;
       event_seq: number;
     };
-    expect(committedJournal).toMatchObject({ journal_version: 4, phase: 'committed', event_seq: expect.any(Number) });
+    expect(committedJournal).toMatchObject({ journal_version: 5, phase: 'committed', event_seq: expect.any(Number) });
     expect(await exists(join(receiverDir, 'Committed Tree'))).toBe(false);
 
     const restarted = new ObtsPluginClient(receiverDir, { serverUrl: baseUrl, deviceName: 'committed-tombstone-receiver' });
@@ -1711,7 +1791,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
 
     const secondFixtureBSync = await fixtureB.syncOnce();
-    expect(secondFixtureBSync.status).toBe('Review needed');
+    expect(secondFixtureBSync.status).toBe('Conflict resolution needed');
     expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('fixtureB must survive\n');
     const conflicts = await admin.get<{ conflicts: Array<{ status: string; affected_paths: string[] }> }>(
       `/api/v1/vaults/${admin.vaultId}/conflicts?status=open`
@@ -1749,7 +1829,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect((await fixtureA.syncOnce()).status).toBe('Synced');
 
     const conflicted = await fixtureB.syncOnce();
-    expect(conflicted.status).toBe('Review needed');
+    expect(conflicted.status).toBe('Conflict resolution needed');
     expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('fixtureB open edit\n');
     expect(await fixtureB.readQueue()).toMatchObject({
       status: 'conflicted'
@@ -1794,7 +1874,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
 
     const secondFixtureBSync = await fixtureB.syncOnce();
-    expect(secondFixtureBSync.status).toBe('Review needed');
+    expect(secondFixtureBSync.status).toBe('Conflict resolution needed');
     expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('fixtureB during apply prep\n');
   });
 
@@ -1947,7 +2027,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       attempts: 1
     });
     expect(await plugin.readState()).toMatchObject({
-      status_label: 'Ahead',
+      status_label: 'Out of sync',
       last_error_code: 'upload_interrupted'
     });
   });
@@ -1991,7 +2071,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(applyWriter).not.toContain('path.join(this.vaultDir');
 
     const scanner = sourceSection(artifact, 'async scanSyncableFiles', 'async localContentMatchesTree');
-    expect(scanner).toContain('this.listLocalVaultFiles()');
+    expect(scanner).toContain('this.listLocalVaultInventory("", policy)');
     expect(scanner).not.toContain('walk(');
     expect(scanner).not.toContain('path.relative');
 
@@ -2192,7 +2272,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       `/api/v1/vaults/${admin.vaultId}/dashboard`
     );
     expect(dashboard.body.devices.find((device) => device.device_name === 'active-progress-laptop')).toMatchObject({
-      status_label: 'Applying 120/6028 (taking longer than expected)'
+      status_label: 'Applying (~0%) (taking longer than expected)'
     });
   });
 
@@ -2913,7 +2993,7 @@ describe('Phase 1 sync without conflict resolution', () => {
 
     const result = await onboardExistingVault(admin, desktop, admin.vaultId, 'merge');
     expect(await readFile(join(desktopDir, 'shared.md'), 'utf8')).toBe('local unpaired edit\n');
-    expect(result.status).toBe('Review needed');
+    expect(result.status).toBe('Conflict resolution needed');
     expect(result.conflictId).toMatch(/^conf_/u);
     expect((await desktop.readState()).last_error_code).toBe('conflict_review_required');
   });
@@ -3706,7 +3786,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       analysis,
       mode: 'merge'
     });
-    expect(result.status).toBe('Review needed');
+    expect(result.status).toBe('Conflict resolution needed');
     expect(await readFile(join(localDir, 'local-only.md'), 'utf8')).toBe('local only\n');
     const main = (await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)!.current_main;
     expect(await server.git.listTreePaths(admin.vaultId, main)).toContain('server-only.md');
@@ -3733,10 +3813,10 @@ describe('Phase 1 sync without conflict resolution', () => {
     await writeFile(join(device2Dir, 'shared.md'), 'device two\n');
     await plugin1.syncOnce();
     const result = await plugin2.syncOnce();
-    expect(result.status).toBe('Review needed');
+    expect(result.status).toBe('Conflict resolution needed');
     expect(result.conflictId).toMatch(/^conf_/u);
     await expect(awaitState(plugin2)).resolves.toMatchObject({
-      status_label: 'Review needed',
+      status_label: 'Conflict resolution needed',
       last_error_code: 'conflict_review_required'
     });
 
@@ -3875,7 +3955,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       ?.current_main;
 
     const result = await tablet.syncOnce();
-    expect(result.status).toBe('Review needed');
+    expect(result.status).toBe('Conflict resolution needed');
 
     const db = await server.store.snapshot();
     expect(db.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(mainBeforeConflict);
@@ -3940,7 +4020,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     await rm(join(tabletDir, 'Old.md'));
     expect((await desktop.syncOnce()).status).toBe('Synced');
     const result = await tablet.syncOnce();
-    expect(result.status).toBe('Review needed');
+    expect(result.status).toBe('Conflict resolution needed');
 
     const db = await server.store.snapshot();
     const conflict = db.conflicts.find((candidate) => candidate.conflict_id === result.conflictId);
@@ -3964,7 +4044,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     await writeFile(join(tabletDir, 'Renamed.md'), 'tablet-created collision\n');
     expect((await desktop.syncOnce()).status).toBe('Synced');
     const result = await tablet.syncOnce();
-    expect(result.status).toBe('Review needed');
+    expect(result.status).toBe('Conflict resolution needed');
 
     const db = await server.store.snapshot();
     const conflict = db.conflicts.find((candidate) => candidate.conflict_id === result.conflictId);
@@ -3994,7 +4074,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     await writeFile(join(device1Dir, 'shared.md'), 'server version\n');
     await writeFile(join(device2Dir, 'shared.md'), 'device review version\n');
     await plugin1.syncOnce();
-    expect((await plugin2.syncOnce()).status).toBe('Review needed');
+    expect((await plugin2.syncOnce()).status).toBe('Conflict resolution needed');
 
     const conflictedState = await plugin2.readState();
     const conflictedToken = await readDeviceToken(device2Dir);
@@ -4120,7 +4200,7 @@ describe('Phase 1 sync without conflict resolution', () => {
 
     expect((await plugin1.syncOnce()).status).toBe('Synced');
     const result = await plugin2.syncOnce();
-    expect(result.status).toBe('Review needed');
+    expect(result.status).toBe('Conflict resolution needed');
 
     const db = await server.store.snapshot();
     const conflict = db.conflicts.find((candidate) => candidate.conflict_id === result.conflictId);
@@ -4218,7 +4298,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       ?.current_main;
 
     const result = await plugin2.syncOnce();
-    expect(result.status).toBe('Review needed');
+    expect(result.status).toBe('Conflict resolution needed');
 
     const db = await server.store.snapshot();
     expect(db.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(mainBeforeConflict);
@@ -4298,7 +4378,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       ?.current_main;
 
     const result = await plugin2.syncOnce();
-    expect(result.status).toBe('Review needed');
+    expect(result.status).toBe('Conflict resolution needed');
     const db = await server.store.snapshot();
     expect(db.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(mainBeforeConflict);
     expect(db.conflicts.find((candidate) => candidate.conflict_id === result.conflictId)).toMatchObject({
@@ -4360,7 +4440,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       ?.current_main;
 
     const result = await plugin2.syncOnce();
-    expect(result.status).toBe('Review needed');
+    expect(result.status).toBe('Conflict resolution needed');
 
     const db = await server.store.snapshot();
     expect(db.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(mainBeforeConflict);
@@ -4551,7 +4631,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
     await plugin.initialize();
     expect(await plugin.readState()).toMatchObject({
-      status_label: 'Needs recovery',
+      status_label: 'Out of sync — local recovery required',
       last_error_code: 'local_state_incomplete'
     });
 
@@ -4730,7 +4810,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       deviceName: 'laptop',
     });
     const result = await repairedLaptop.syncOnce();
-    expect(result.status).toBe('Review needed');
+    expect(result.status).toBe('Conflict resolution needed');
     expect(result.conflictId).toMatch(/^conf_/u);
     expect((await repairedLaptop.readState()).last_error_code).toBe('conflict_review_required');
     expect(await readFile(join(laptopDir, 'shared.md'), 'utf8')).toBe('laptop edit while metadata was lost\n');
@@ -5326,7 +5406,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     );
 
     await expect(plugin.syncOnce()).rejects.toMatchObject({ code: 'apply_journal_recovery_required' });
-    expect((await plugin.readState()).status_label).toBe('Unsafe local state');
+    expect((await plugin.readState()).status_label).toBe('Out of sync — local recovery required');
   });
 
   it('fails closed and preserves a malformed apply journal during restart', async () => {
@@ -5456,7 +5536,7 @@ describe('Phase 1 sync without conflict resolution', () => {
 
     await expect(plugin2.syncOnce()).rejects.toMatchObject({ code: 'apply_lock_active' });
     expect(await readFile(join(device2Dir, 'shared.md'), 'utf8')).toBe('base\n');
-    expect((await plugin2.readState()).status_label).toBe('Unsafe local state');
+    expect((await plugin2.readState()).status_label).toBe('Out of sync');
     expect(await exists(join(device2Dir, '.obts', 'apply-journal.json'))).toBe(false);
   });
 
@@ -5702,7 +5782,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     await restarted.initialize();
     expect(await readFile(join(device2Dir, 'shared.md'), 'utf8')).toBe('base\n');
     expect(await restarted.readState()).toMatchObject({
-      status_label: 'Unsafe local state',
+      status_label: 'Out of sync — local recovery required',
       last_error_code: 'apply_journal_recovery_required'
     });
     expect(JSON.parse(await readFile(join(device2Dir, '.obts', 'apply-journal.json'), 'utf8'))).toMatchObject({
@@ -5787,7 +5867,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await isDirectory(join(device1Dir, 'local-empty'))).toBe(true);
   });
 
-  it('uses one pre-sync snapshot and one labelled post-apply preservation snapshot', async () => {
+  it('checks the local head before apply and labels the post-apply preservation snapshot', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const { plugin2 } = await preparePullApplyScenario(root, admin, 'scan-count-device-1', 'scan-count-device-2');
     const internal = (plugin2 as unknown as { client: Record<string, any> }).client;
@@ -5803,7 +5883,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     };
 
     expect((await plugin2.syncOnce()).status).toBe('Synced');
-    expect(snapshotCount).toBe(2);
+    expect(snapshotCount).toBe(3);
     expect(diagnosticPoints).toContain('local_snapshot');
     expect(diagnosticPoints).toContain('apply_verify');
   });
@@ -5920,7 +6000,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       status: 'blocked_recovery'
     });
     expect(await plugin.readState()).toMatchObject({
-      status_label: 'Needs recovery',
+      status_label: 'Out of sync — local recovery required',
       last_error_code: 'same_device_non_fast_forward'
     });
   });
@@ -6754,6 +6834,8 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(() => assertSyncableTreePaths(['.obsidian/workspace-mobile.json'])).toThrow(PathPolicyViolation);
     expect(() => assertSyncableTreePaths(['.obsidian/plugins/obts'])).toThrow(PathPolicyViolation);
     expect(() => assertSyncableTreePaths(['.obsidian/plugins/obts/main.js'])).toThrow(PathPolicyViolation);
+    expect(() => assertSyncableTreePaths(['Notes/.Note.md.obts-bridge-tmp-x7.tmp'])).toThrow(PathPolicyViolation);
+    expect(isSyncableVaultPath('Notes/.Note.md.obts-bridge-tmp-x7.tmp')).toBe(false);
     expect(isSyncableVaultPath('.trash/deleted.md')).toBe(true);
     expect(isSyncableVaultPath('.obsidian/hotkeys.json')).toBe(true);
     expect(isSyncableVaultPath('.obsidian/app.json')).toBe(true);
@@ -7214,6 +7296,271 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(isSyncableVaultPath('.obsidian/cache/cache.json')).toBe(false);
     expect(isSyncableVaultPath('.obsidian/workspace.json')).toBe(false);
     expect(isSyncableVaultPath('.obsidian/workspace-mobile.json')).toBe(false);
+  });
+
+  it('rejects unattested, mismatched and invalid root policies inside quarantine without publishing refs', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'root-ignore-admission');
+    const plugin = await pairPlugin(admin, deviceDir, 'root-ignore-admission');
+    const state = await plugin.readState();
+    const auth = await server.auth.authenticateDevice(`Bearer ${await readDeviceToken(deviceDir)}`, admin.vaultId);
+    const repo = join(root, 'root-ignore-proposals.git');
+    await server.git.initializeTransferRepo(admin.vaultId, repo);
+    const objects = join(server.git.repoPath(admin.vaultId), 'objects');
+    const exec = async (args: string[], input?: Buffer) =>
+      (await server.git.exec(repo, args, input, undefined, { allowedAlternateObjectStore: objects })).stdout.toString().trim();
+    const propose = async (policy: Buffer, paths: Record<string, string>) => {
+      const policyOid = await exec(['hash-object', '-w', '--stdin'], policy);
+      const entries = [`100644 blob ${policyOid}\t.gitignore\n`];
+      for (const [path, contents] of Object.entries(paths)) {
+        const oid = await exec(['hash-object', '-w', '--stdin'], Buffer.from(contents));
+        const [rootPath, childPath] = path.split('/');
+        if (childPath) {
+          const subtree = await exec(['mktree'], Buffer.from(`100644 blob ${oid}\t${childPath}\n`));
+          entries.push(`040000 tree ${subtree}\t${rootPath}\n`);
+        } else {
+          entries.push(`100644 blob ${oid}\t${path}\n`);
+        }
+      }
+      const tree = await exec(['mktree'], Buffer.from(entries.join('')));
+      const commit = await exec(['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', 'commit-tree', tree, '-p', state.local_main!, '-m', 'root ignore proposal']);
+      const pack = (await server.git.exec(repo, ['pack-objects', '--stdout', '--revs'], Buffer.from(`${commit}\n^${state.local_main}\n`), undefined, {
+        encoding: 'buffer', allowedAlternateObjectStore: objects
+      })).stdout as Buffer;
+      return { commit, pack, policyOid };
+    };
+    const push = async (proposal: Awaited<ReturnType<typeof propose>>, attestation?: string | null) => {
+      const manifest: DevicePushManifest = {
+        api_version: API_VERSION, vault_id: admin.vaultId, device_id: auth.device.device_id,
+        expected_device_ref: null, target_commit: proposal.commit,
+        packfile_sha256: sha256(proposal.pack), packfile_bytes: proposal.pack.length,
+        client_known_main: state.local_main,
+        ...(attestation === undefined ? {} : { root_ignore_capability: 'root-ignore-v1', root_ignore_oid: attestation })
+      };
+      return await server.sync.pushDeviceCommit(auth, manifest, proposal.pack);
+    };
+    const ignored = await propose(Buffer.from('*.md\n'), { 'secret.md': 'private' });
+    const invalid = await propose(Buffer.from([0xff]), { 'safe.txt': 'safe' });
+    const hard = await propose(Buffer.from([0xff]), { '.obts/state': 'secret' });
+    for (const [proposal, oid, code] of [
+      [ignored, undefined, 'root_ignore_capability_required'],
+      [ignored, null, 'root_ignore_oid_mismatch'],
+      [ignored, ignored.policyOid, 'excluded_root_ignore_path'],
+      [invalid, invalid.policyOid, 'invalid_policy_encoding'],
+      [hard, hard.policyOid, 'excluded_internal_path']
+    ] as const) {
+      const result = await push(proposal, oid);
+      expect(result).toMatchObject({ status: 'rejected', code });
+      if (result.status !== 'rejected') throw new Error('Expected rejection.');
+      expect(result.message).not.toContain('secret.md');
+      expect(result.message).not.toContain(proposal.policyOid);
+      expect(await server.git.commitExists(admin.vaultId, proposal.commit)).toBe(false);
+      expect(await server.git.getRef(admin.vaultId, auth.device.device_ref)).toBeNull();
+    }
+    const transfer = await server.chunkTransfers.createPush(auth, parseChunkPushCreateRequest({
+      api_version: API_VERSION, vault_id: admin.vaultId, device_id: auth.device.device_id,
+      expected_device_ref: null, target_commit: ignored.commit, client_known_main: state.local_main,
+      root_ignore_capability: 'root-ignore-v1', root_ignore_oid: ignored.policyOid,
+      attempt_id: 'root-ignore-quarantine-1', chunk_count: 1, plan_sha256: sha256(ignored.pack)
+    }));
+    await server.chunkTransfers.putChunk(auth, transfer.descriptor.transfer_id, 0, ignored.pack, sha256(ignored.pack));
+    expect(await server.chunkTransfers.finalizePush(auth, transfer.descriptor.transfer_id))
+      .toMatchObject({ status: 'rejected', code: 'excluded_root_ignore_path' });
+    expect(await server.chunkTransfers.finalizePush(auth, transfer.descriptor.transfer_id))
+      .toMatchObject({ status: 'rejected', code: 'excluded_root_ignore_path' });
+    expect(await server.git.commitExists(admin.vaultId, ignored.commit)).toBe(false);
+    expect(await server.git.getRef(admin.vaultId, auth.device.device_ref)).toBeNull();
+    expect(await server.git.getRef(admin.vaultId, 'refs/heads/main')).toBe(state.local_main);
+  });
+
+  it('protects concurrent cross-policy integration and rejects old pinned directory effects without an operation attestation', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const firstDir = join(root, 'policy-first');
+    const secondDir = join(root, 'policy-second');
+    const first = await pairPlugin(admin, firstDir, 'policy-first');
+    const second = await pairPlugin(admin, secondDir, 'policy-second');
+    const firstState = await first.readState();
+    const secondState = await second.readState();
+    const firstAuth = await server.auth.authenticateDevice(`Bearer ${await readDeviceToken(firstDir)}`, admin.vaultId);
+    const secondAuth = await server.auth.authenticateDevice(`Bearer ${await readDeviceToken(secondDir)}`, admin.vaultId);
+    const firstGit = new LocalGitEngine(firstDir);
+    const secondGit = new LocalGitEngine(secondDir);
+    await writeFile(join(secondDir, 'concurrent.md'), 'retained device bytes\n');
+    const secondCommit = (await secondGit.createLocalCommit('concurrent note'))!;
+    const secondPack = await secondGit.createPackForCommit(secondCommit);
+    await writeFile(join(firstDir, '.gitignore'), '*.md\n');
+    const firstCommit = (await firstGit.createLocalCommit('policy change'))!;
+    const firstPack = await firstGit.createPackForCommit(firstCommit);
+    const firstPolicy = await server.git.readRootIgnoreBlob(admin.vaultId, firstState.local_main!);
+    expect(firstPolicy.oid).toBeNull();
+    const policyOid = (await server.git.exec(server.git.repoPath(admin.vaultId), ['hash-object', '--stdin'], Buffer.from('*.md\n'))).stdout.toString().trim();
+    const firstManifest: DevicePushManifest = {
+      api_version: API_VERSION, vault_id: admin.vaultId, device_id: firstAuth.device.device_id,
+      expected_device_ref: firstState.server_device_ref, target_commit: firstCommit,
+      packfile_sha256: sha256(firstPack), packfile_bytes: firstPack.length,
+      client_known_main: firstState.local_main,
+      root_ignore_capability: 'root-ignore-v1', root_ignore_oid: policyOid
+    };
+    expect((await server.sync.pushDeviceCommit(firstAuth, firstManifest, firstPack)).status).toBe('merged');
+    const policyMain = await server.git.getRef(admin.vaultId, 'refs/heads/main');
+    const token = await readDeviceToken(secondDir);
+    const pullBody = {
+      api_version: API_VERSION, vault_id: admin.vaultId, device_id: secondAuth.device.device_id,
+      current_local_main: secondState.local_main, requested_target: 'latest', cursor: 0
+    };
+    const postDevice = async (path: string, body: Record<string, unknown>) => {
+      const response = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}${path}`, {
+        method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      return { status: response.status, body: response.status === 409 ? await response.json() as Json : null };
+    };
+    expect(await postDevice('/sync/pull-chunk', pullBody)).toMatchObject({
+      status: 409, body: { error: { code: 'root_ignore_capability_required' } }
+    });
+    expect(await postDevice('/sync/applied', { applied_main: secondState.local_main })).toMatchObject({
+      status: 409, body: { error: { code: 'root_ignore_capability_required' } }
+    });
+    const capablePull = await postDevice('/sync/pull-chunk', { ...pullBody, root_ignore_capability: 'root-ignore-v1' });
+    expect(capablePull.status).toBe(200);
+    const secondManifest: DevicePushManifest = {
+      api_version: API_VERSION, vault_id: admin.vaultId, device_id: secondAuth.device.device_id,
+      expected_device_ref: secondState.server_device_ref, target_commit: secondCommit,
+      packfile_sha256: sha256(secondPack), packfile_bytes: secondPack.length,
+      client_known_main: secondState.local_main,
+      root_ignore_capability: 'root-ignore-v1', root_ignore_oid: null
+    };
+    const result = await server.sync.pushDeviceCommit(secondAuth, secondManifest, secondPack);
+    expect(result).toMatchObject({ status: 'conflicted' });
+    expect(await server.git.getRef(admin.vaultId, 'refs/heads/main')).toBe(policyMain);
+    expect(await server.git.getRef(admin.vaultId, secondAuth.device.device_ref)).toBe(secondCommit);
+    expect(await server.git.readBlobAtPath(admin.vaultId, secondCommit, 'concurrent.md')).toEqual(Buffer.from('retained device bytes\n'));
+    if (result.status !== 'conflicted') throw new Error('Expected protected conflict.');
+    expect(await server.git.getRef(admin.vaultId, `refs/obts/conflicts/${result.conflict_id}/device`)).toBe(secondCommit);
+    const { root_ignore_capability: _capability, root_ignore_oid: _oid, ...legacyManifest } = firstManifest;
+    expect(await server.sync.pushDeviceCommit(firstAuth, {
+      ...legacyManifest, directory_intents: [{ op: 'create', path: 'New folder' }]
+    }, firstPack)).toMatchObject({ status: 'rejected', code: 'root_ignore_capability_required' });
+    expect(await server.git.getRef(admin.vaultId, 'refs/heads/main')).toBe(policyMain);
+  });
+
+  it('propagates transient canonical policy read failures instead of rejecting an accepted proposal', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'policy-read-failure');
+    const plugin = await pairPlugin(admin, deviceDir, 'policy-read-failure');
+    const state = await plugin.readState();
+    const auth = await server.auth.authenticateDevice(`Bearer ${await readDeviceToken(deviceDir)}`, admin.vaultId);
+    await writeFile(join(deviceDir, 'safe.txt'), 'safe\n');
+    const git = new LocalGitEngine(deviceDir);
+    const commit = (await git.createLocalCommit('safe proposal'))!;
+    const pack = await git.createPackForCommit(commit);
+    const manifest: DevicePushManifest = {
+      api_version: API_VERSION, vault_id: admin.vaultId, device_id: auth.device.device_id,
+      expected_device_ref: state.server_device_ref, target_commit: commit,
+      packfile_sha256: sha256(pack), packfile_bytes: pack.length,
+      client_known_main: state.local_main, attempt_id: 'policy-read-failure-1'
+    };
+    const original = server.git.readRootIgnoreBlob.bind(server.git);
+    server.git.readRootIgnoreBlob = async () => { throw new GitCommandError('transient read failure', ''); };
+    try {
+      await expect(server.sync.pushDeviceCommit(auth, manifest, pack)).rejects.toBeInstanceOf(GitCommandError);
+    } finally {
+      server.git.readRootIgnoreBlob = original;
+    }
+    expect(await server.git.getRef(admin.vaultId, auth.device.device_ref)).toBeNull();
+    await expect(server.sync.pushDeviceCommit(auth, {
+      ...manifest, root_ignore_capability: 'root-ignore-v1', root_ignore_oid: null
+    }, pack)).rejects.toMatchObject({ code: 'attempt_mismatch' });
+    expect((await server.sync.pushDeviceCommit(auth, manifest, pack)).status).toBe('merged');
+    await expect(server.sync.pushDeviceCommit(auth, { ...manifest, target_commit: state.local_main! }, pack))
+      .rejects.toMatchObject({ code: 'attempt_mismatch' });
+  });
+
+  it('classifies malformed direct packs without moving protected refs', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'malformed-direct-pack');
+    const plugin = await pairPlugin(admin, deviceDir, 'malformed-direct-pack');
+    const state = await plugin.readState();
+    const auth = await server.auth.authenticateDevice(`Bearer ${await readDeviceToken(deviceDir)}`, admin.vaultId);
+    const pack = Buffer.from('badbytes');
+    const result = await server.sync.pushDeviceCommit(auth, {
+      api_version: API_VERSION, vault_id: admin.vaultId, device_id: auth.device.device_id,
+      expected_device_ref: null, target_commit: state.local_main!,
+      packfile_sha256: sha256(pack), packfile_bytes: pack.length,
+      client_known_main: state.local_main, attempt_id: 'malformed-direct-pack-1'
+    }, pack);
+    expect(result).toMatchObject({ status: 'rejected', code: 'malformed_packfile' });
+    expect(await server.git.getRef(admin.vaultId, auth.device.device_ref)).toBeNull();
+    expect(await server.git.getRef(admin.vaultId, 'refs/heads/main')).toBe(state.local_main);
+  });
+
+  it('retains accepted legacy retries and binds capable transfer checkpoints across restart', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'root-ignore-retry');
+    const plugin = await pairPlugin(admin, deviceDir, 'root-ignore-retry');
+    const state = await plugin.readState();
+    const auth = await server.auth.authenticateDevice(`Bearer ${await readDeviceToken(deviceDir)}`, admin.vaultId);
+    const localGit = new LocalGitEngine(deviceDir);
+    await writeFile(join(deviceDir, 'legacy.txt'), 'legacy\n');
+    const legacyCommit = (await localGit.createLocalCommit('legacy proposal'))!;
+    const legacyPack = await localGit.createPackForCommit(legacyCommit);
+    const legacy: DevicePushManifest = {
+      api_version: API_VERSION, vault_id: admin.vaultId, device_id: auth.device.device_id,
+      expected_device_ref: null, target_commit: legacyCommit,
+      packfile_sha256: sha256(legacyPack), packfile_bytes: legacyPack.length,
+      client_known_main: state.local_main
+    };
+    expect((await server.sync.pushDeviceCommit(auth, legacy, legacyPack)).status).toBe('merged');
+    expect(parseDevicePushManifest(legacy)).not.toHaveProperty('root_ignore_capability');
+    await writeFile(join(deviceDir, '.gitignore'), '*.md\n');
+    const policyCommit = (await localGit.createLocalCommit('policy proposal'))!;
+    const policyPack = await localGit.createPackForCommit(policyCommit);
+    const policyOid = (await server.git.exec(server.git.repoPath(admin.vaultId), ['hash-object', '--stdin'], Buffer.from('*.md\n'))).stdout.toString().trim();
+    const capable: DevicePushManifest = {
+      ...legacy, expected_device_ref: legacyCommit, target_commit: policyCommit,
+      packfile_sha256: sha256(policyPack), packfile_bytes: policyPack.length,
+      root_ignore_capability: 'root-ignore-v1', root_ignore_oid: policyOid
+    };
+    expect((await server.sync.pushDeviceCommit(auth, capable, policyPack)).status).toBe('merged');
+    expect((await server.sync.pushDeviceCommit(auth, legacy, legacyPack)).status).toBe('noop');
+    await writeFile(join(deviceDir, 'later.txt'), 'legacy client after policy\n');
+    const laterCommit = (await localGit.createLocalCommit('old client after policy'))!;
+    const laterPack = await localGit.createPackForCommit(laterCommit);
+    expect(await server.sync.pushDeviceCommit(auth, {
+      ...legacy, expected_device_ref: policyCommit, target_commit: laterCommit,
+      packfile_sha256: sha256(laterPack), packfile_bytes: laterPack.length
+    }, laterPack)).toMatchObject({ status: 'rejected', code: 'root_ignore_capability_required' });
+    expect(await server.git.getRef(admin.vaultId, auth.device.device_ref)).toBe(policyCommit);
+    await rm(join(deviceDir, '.gitignore'));
+    const withoutPolicyCommit = (await localGit.createLocalCommit('old client removes policy'))!;
+    const withoutPolicyPack = await localGit.createPackForCommit(withoutPolicyCommit);
+    expect(await server.sync.pushDeviceCommit(auth, {
+      ...legacy, expected_device_ref: policyCommit, target_commit: withoutPolicyCommit,
+      packfile_sha256: sha256(withoutPolicyPack), packfile_bytes: withoutPolicyPack.length
+    }, withoutPolicyPack)).toMatchObject({ status: 'rejected', code: 'root_ignore_capability_required' });
+    expect(await server.git.getRef(admin.vaultId, auth.device.device_ref)).toBe(policyCommit);
+
+    const request = parseChunkPushCreateRequest({
+      api_version: API_VERSION, vault_id: admin.vaultId, device_id: auth.device.device_id,
+      expected_device_ref: policyCommit, target_commit: policyCommit, client_known_main: state.local_main,
+      root_ignore_capability: 'root-ignore-v1', root_ignore_oid: policyOid,
+      attempt_id: 'root-ignore-retry-1', chunk_count: 0, plan_sha256: 'a'.repeat(64)
+    });
+    const created = await server.chunkTransfers.createPush(auth, request);
+    const checkpoint = join(server.config.transferDir, created.descriptor.transfer_id, 'session.json');
+    expect(JSON.parse(await readFile(checkpoint, 'utf8')).manifest).toMatchObject({ root_ignore_capability: 'root-ignore-v1', root_ignore_oid: policyOid });
+    const port = Number(new URL(baseUrl).port);
+    await server.app.close();
+    server = await createObtsServer({
+      dataDir: join(root, 'server-data'), publicBaseUrl: `http://127.0.0.1:${port}`,
+      sessionSecret: 'test-session-secret-with-enough-entropy'
+    });
+    baseUrl = await server.app.listen({ port, host: '127.0.0.1' });
+    const resumedAuth = await server.auth.authenticateDevice(`Bearer ${await readDeviceToken(deviceDir)}`, admin.vaultId);
+    expect((await server.chunkTransfers.createPush(resumedAuth, request)).created).toBe(false);
+    expect((await server.chunkTransfers.getPush(resumedAuth, created.descriptor.transfer_id)).status).toBe('open');
+    await expect(server.chunkTransfers.createPush(resumedAuth, { ...request, root_ignore_oid: null }))
+      .rejects.toMatchObject({ code: 'attempt_mismatch' });
   });
 
   it('serializes metadata snapshots behind in-flight mutations', async () => {

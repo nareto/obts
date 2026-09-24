@@ -6,6 +6,7 @@ import { spawn } from 'node:child_process';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 
 import { assertSyncableTreePaths, PathPolicyViolation } from '../shared/pathPolicy.js';
+import { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } from '../shared/rootIgnore.cjs';
 import type { ServerConfig } from './config.js';
 import { fsyncDurableDirectory, fsyncDurableTree, type DurableFilePersistence } from './durableFile.js';
 
@@ -35,9 +36,13 @@ export type MergeTreeResult = {
   validatorResults: Record<string, unknown>;
 };
 
+export type RootIgnoreBlob = { oid: string; bytes: Buffer } | { oid: null; bytes: null };
+
 export type GitObjectReader = {
   commitExists(vaultId: string, commit: string): Promise<boolean>;
+  readRootIgnoreBlob(vaultId: string, commit: string): Promise<RootIgnoreBlob>;
   validateTreePathPolicy(vaultId: string, commit: string, maxBlobBytes?: number): Promise<void>;
+  validateTreeRootIgnorePolicy(vaultId: string, commit: string, maxBlobBytes?: number): Promise<string | null>;
   isAncestor(vaultId: string, ancestor: string, descendant: string): Promise<boolean>;
   changedPaths(vaultId: string, base: string, commit: string): Promise<GitDiffEntry[]>;
   listTreePaths(vaultId: string, commit: string): Promise<string[]>;
@@ -57,6 +62,12 @@ export class GitCommandError extends Error {
   constructor(message: string, stderr: string) {
     super(message);
     this.stderr = stderr;
+  }
+}
+
+export class GitMalformedPackError extends Error {
+  constructor() {
+    super('Malformed Git packfile.');
   }
 }
 
@@ -343,8 +354,11 @@ export class GitService {
     this.assertDurabilityAvailable();
     return {
       commitExists: async (_vaultId, commit) => await this.commitExistsInRepo(repo, commit, alternateObjectStore),
+      readRootIgnoreBlob: async (_vaultId, commit) => await this.readRootIgnoreBlobInRepo(repo, commit, alternateObjectStore),
       validateTreePathPolicy: async (_vaultId, commit, maxBlobBytes) =>
         await this.validateTreePathPolicyInRepo(repo, commit, maxBlobBytes, alternateObjectStore),
+      validateTreeRootIgnorePolicy: async (_vaultId, commit, maxBlobBytes) =>
+        await this.validateTreeRootIgnorePolicyInRepo(repo, commit, maxBlobBytes, alternateObjectStore),
       isAncestor: async (_vaultId, ancestor, descendant) => await this.isAncestorInRepo(repo, ancestor, descendant, alternateObjectStore),
       changedPaths: async (_vaultId, base, commit) => await this.changedPathsInRepo(repo, base, commit, alternateObjectStore),
       listTreePaths: async (_vaultId, commit) => await this.listTreePathsInRepo(repo, commit, alternateObjectStore)
@@ -445,14 +459,26 @@ export class GitService {
       await writeFile(join(quarantineRepo, 'objects', 'info', 'alternates'), `${join(durableRepo, 'objects')}\n`, {
         mode: 0o600
       });
-      await this.exec(quarantineRepo, ['unpack-objects', '-q'], packfile, undefined, {
-        allowedAlternateObjectStore: join(durableRepo, 'objects')
-      });
+      try {
+        await this.exec(quarantineRepo, ['unpack-objects', '-q'], packfile, undefined, {
+          allowedAlternateObjectStore: join(durableRepo, 'objects')
+        });
+      } catch (error) {
+        if (error instanceof GitCommandError &&
+            /early EOF|packfile|pack header|pack has|inflate|bad object|bad packed|bad pack|corrupt|checksum mismatch|invalid pack/iu.test(error.stderr)) {
+          throw new GitMalformedPackError();
+        }
+        throw error;
+      }
       await this.fsyncTree(quarantineRepo);
       return await fn({
         commitExists: async (_vaultId, commit) => await this.commitExistsInRepo(quarantineRepo, commit, join(durableRepo, 'objects')),
+        readRootIgnoreBlob: async (_vaultId, commit) =>
+          await this.readRootIgnoreBlobInRepo(quarantineRepo, commit, join(durableRepo, 'objects')),
         validateTreePathPolicy: async (_vaultId, commit, maxBlobBytes) =>
           await this.validateTreePathPolicyInRepo(quarantineRepo, commit, maxBlobBytes, join(durableRepo, 'objects')),
+        validateTreeRootIgnorePolicy: async (_vaultId, commit, maxBlobBytes) =>
+          await this.validateTreeRootIgnorePolicyInRepo(quarantineRepo, commit, maxBlobBytes, join(durableRepo, 'objects')),
         isAncestor: async (_vaultId, ancestor, descendant) =>
           await this.isAncestorInRepo(quarantineRepo, ancestor, descendant, join(durableRepo, 'objects')),
         changedPaths: async (_vaultId, base, commit) => await this.changedPathsInRepo(quarantineRepo, base, commit, join(durableRepo, 'objects')),
@@ -510,6 +536,60 @@ export class GitService {
 
   async validateTreePathPolicy(vaultId: string, commit: string, maxBlobBytes = Number.POSITIVE_INFINITY): Promise<void> {
     await this.validateTreePathPolicyInRepo(this.repoPath(vaultId), commit, maxBlobBytes);
+  }
+
+  async readRootIgnoreBlob(vaultId: string, commit: string): Promise<RootIgnoreBlob> {
+    return await this.readRootIgnoreBlobInRepo(this.repoPath(vaultId), commit);
+  }
+
+  private async readRootIgnoreBlobInRepo(repo: string, commit: string, alternateObjectStore?: string): Promise<RootIgnoreBlob> {
+    const { stdout } = await this.exec(repo, ['ls-tree', '-l', '-z', commit, '--', '.gitignore'], undefined, undefined, {
+      encoding: 'buffer',
+      allowedAlternateObjectStore: alternateObjectStore
+    });
+    const entries = (Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout)).toString('utf8').split('\0').filter(Boolean);
+    if (entries.length === 0) return { oid: null, bytes: null };
+    const match = /^(100644|100755) blob ([0-9a-f]{40,64})\s+(\d+)\t\.gitignore$/u.exec(entries[0] ?? '');
+    if (entries.length !== 1 || !match?.[2] || !match[3]) {
+      throw new PathPolicyViolation('invalid_root_ignore', 'Root .gitignore must be a regular blob.');
+    }
+    const size = Number(match[3]);
+    if (!Number.isSafeInteger(size) || size > MAX_ROOT_IGNORE_BYTES) {
+      throw new PathPolicyViolation('policy_too_large', 'Root .gitignore exceeds the byte limit.');
+    }
+    const oid = match[2];
+    const result = await this.exec(repo, ['cat-file', 'blob', oid], undefined, undefined, {
+      encoding: 'buffer',
+      maxBuffer: MAX_ROOT_IGNORE_BYTES,
+      allowedAlternateObjectStore: alternateObjectStore
+    });
+    const bytes = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout);
+    if (bytes.length !== size) throw new GitCommandError('Root .gitignore blob size does not match its tree entry.', '');
+    return { oid, bytes };
+  }
+
+  async validateTreeRootIgnorePolicy(vaultId: string, commit: string, maxBlobBytes = Number.POSITIVE_INFINITY): Promise<string | null> {
+    return await this.validateTreeRootIgnorePolicyInRepo(this.repoPath(vaultId), commit, maxBlobBytes);
+  }
+
+  private async validateTreeRootIgnorePolicyInRepo(
+    repo: string,
+    commit: string,
+    maxBlobBytes = Number.POSITIVE_INFINITY,
+    alternateObjectStore?: string
+  ): Promise<string | null> {
+    await this.validateTreePathPolicyInRepo(repo, commit, maxBlobBytes, alternateObjectStore);
+    const { oid, bytes } = await this.readRootIgnoreBlobInRepo(repo, commit, alternateObjectStore);
+    const policy = createRootIgnorePolicy(bytes);
+    for (const path of await this.listTreePathsInRepo(repo, commit, alternateObjectStore)) {
+      if (policy.ignores(path)) {
+        throw new PathPolicyViolation('excluded_root_ignore_path', 'Vault path is excluded by root .gitignore.', {
+          path,
+          root_ignore_oid: oid
+        });
+      }
+    }
+    return oid;
   }
 
   private async validateTreePathPolicyInRepo(
@@ -1048,7 +1128,8 @@ export class GitService {
         await mkdir(dirname(absolutePath), { recursive: true, mode: 0o700 });
         await writeFile(absolutePath, content);
       }
-      await this.exec(repo, ['--work-tree', workTree, 'add', '-A', '--', '.'], undefined, env);
+      // Stage the requested tree even if its own .gitignore excludes a write; the caller validates the complete result.
+      await this.exec(repo, ['--work-tree', workTree, 'add', '-f', '-A', '--', '.'], undefined, env);
       return asText((await this.exec(repo, ['write-tree'], undefined, env)).stdout).trim();
     } finally {
       await rm(tempRoot, { recursive: true, force: true });

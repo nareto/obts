@@ -129,6 +129,96 @@ describe('large-vault client checkpoints', () => {
     await expect(restored.core.listTreeBlobOids(deleted)).resolves.toEqual(await core.listTreeBlobOids(deleted));
   });
 
+  it('accepts the 31 MiB uncompressed object boundary and identifies a compressible historical oversize', async () => {
+    const { root, core } = await clientFixture();
+    const maxChunkBytes = 32 * 1024 * 1024;
+    const objectLimit = maxChunkBytes - 1024 * 1024;
+    await writeFile(join(root, 'index.bin'), Buffer.alloc(objectLimit, 0));
+    const atLimit = await core.createLocalCommit('boundary object');
+    await expect(core.planPackChunks(atLimit, [], 8 * 1024 * 1024, maxChunkBytes)).resolves.toEqual(expect.any(Array));
+
+    await writeFile(join(root, 'index.bin'), Buffer.alloc(objectLimit + 1, 0));
+    const oversized = await core.createLocalCommit('uncompressed oversize');
+    const oid = (await core.flattenTree(oversized)).get('index.bin').oid;
+    await expect(core.planPackChunks(oversized, [atLimit], 8 * 1024 * 1024, maxChunkBytes)).rejects.toMatchObject({
+      code: 'object_too_large_for_chunk',
+      details: {
+        object_type: 'blob', object_oid: oid, object_bytes: objectLimit + 1,
+        object_limit_bytes: objectLimit, operation_phase: 'upload_prepare', current_paths: ['index.bin']
+      }
+    });
+
+    await rm(join(root, 'index.bin'));
+    const deleted = await core.createLocalCommit('delete oversize without losing ancestry');
+    await expect(core.planPackChunks(deleted, [atLimit], 8 * 1024 * 1024, maxChunkBytes)).rejects.toMatchObject({
+      code: 'object_too_large_for_chunk',
+      details: { object_oid: oid, current_paths: [] }
+    });
+  });
+
+  it('does not reselect an already-known oversized blob and keeps failed upload planning queued', async () => {
+    const { root, core } = await clientFixture();
+    const maxChunkBytes = 1024 * 1024;
+    await writeFile(join(root, 'known.bin'), Buffer.alloc(maxChunkBytes, 7));
+    const base = await core.createLocalCommit('server-known object');
+    await writeFile(join(root, 'small.md'), 'a normal edit\n');
+    const small = await core.createLocalCommit('small edit');
+    await expect(core.planPackChunks(small, [base], 256 * 1024, maxChunkBytes)).resolves.toEqual(expect.any(Array));
+
+    await writeFile(join(root, 'pending.bin'), Buffer.alloc(maxChunkBytes, 0));
+    const pending = await core.createLocalCommit('queued large edit');
+    await core.writeState({ ...await core.readState(), vault_id: 'vlt_test', device_id: 'dev_test', local_main: small, local_head: pending, server_device_ref: small });
+    await core.writeQueue({ ...await core.readQueue(), pending_commit: pending, expected_device_ref: small, status: 'queued_local' });
+    core.readDeviceToken = vi.fn(async () => 'synthetic-token');
+    core.reportDeviceStatus = vi.fn(async () => undefined);
+    core.getDeviceSelf = vi.fn(async () => ({ server_device_ref: small, vault_status: 'active' }));
+    core.reconcileServerVaultStatus = vi.fn(async () => undefined);
+    core.syncCapabilities = vi.fn(async () => ({ capabilities: ['git-object-pack-chunks-v1'], target_chunk_bytes: 256 * 1024, max_chunk_bytes: maxChunkBytes, max_transfer_chunks: 4096 }));
+    core.push = vi.fn();
+
+    await expect(core.uploadQueuedCommit(await core.readQueue())).rejects.toMatchObject({ code: 'object_too_large_for_chunk' });
+    expect(await core.readQueue()).toMatchObject({ pending_commit: pending, status: 'queued_local' });
+    expect(await core.readState()).toMatchObject({
+      status_label: 'Out of sync — file exceeds upload limit',
+      last_error_code: 'object_too_large_for_chunk',
+      last_error_details: { object_bytes: maxChunkBytes, current_paths: ['pending.bin'] }
+    });
+    await expect(readFile(join(root, '.obts', 'upload-transfer.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(core.push).not.toHaveBeenCalled();
+    const diagnostic = await core.collectTroubleshootingContext({ trigger: 'manual' });
+    expect(diagnostic.safe_error_code).toBe('object_too_large_for_chunk');
+    expect(JSON.stringify(diagnostic)).not.toContain('pending.bin');
+  });
+
+  it('preserves recovery-required status for local safety stops and legacy labels', async () => {
+    const { core } = await clientFixture();
+    core.reportDeviceStatus = vi.fn(async () => undefined);
+    for (const code of [
+      'local_ref_recovery_required', 'directory_baseline_recovery_unsafe',
+      'directory_baseline_recovery_journal_invalid', 'directory_recovery_journal_mismatch',
+      'recovery_bundle_verification_failed', 'recovery_bundle_durability_unavailable'
+    ]) {
+      await core.markBlocked(code);
+      expect(await core.readState()).toMatchObject({ status_label: 'Out of sync — local recovery required', last_error_code: code });
+      await core.writeState({ ...await core.readState(), status_label: 'Unsafe local state' });
+      expect(await core.readState()).toMatchObject({ status_label: 'Out of sync — local recovery required', last_error_code: code });
+    }
+  });
+
+  it('classifies a non-file upload limit as out of sync without sharing object details', async () => {
+    const { core } = await clientFixture();
+    await core.writeState({
+      ...await core.readState(),
+      status_label: 'Out of sync — upload limit exceeded',
+      last_error_code: 'object_too_large_for_chunk',
+      last_error_details: { object_type: 'tree', object_oid: 'a'.repeat(40), object_bytes: 32505857, object_limit_bytes: 32505856 }
+    });
+    const diagnostic = await core.collectTroubleshootingContext({ trigger: 'manual' });
+    expect(diagnostic.status_class).toBe('out_of_sync');
+    expect(JSON.stringify(diagnostic)).not.toContain('32505857');
+    expect(JSON.stringify(diagnostic)).not.toContain('a'.repeat(40));
+  });
+
   it('reconstructs merge and file-tree replacement packs from the excluded base', async () => {
     const { root, core } = await clientFixture();
     await mkdir(join(root, 'nested'));

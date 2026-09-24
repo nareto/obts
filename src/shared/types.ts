@@ -11,11 +11,14 @@ export type StatusLabel =
   | 'Ahead'
   | 'Behind'
   | 'Offline'
-  | 'Review needed'
+  | 'Conflict resolution needed'
+  | 'Out of sync'
+  | 'Out of sync — file exceeds upload limit'
+  | 'Out of sync — upload limit exceeded'
+  | 'Out of sync — local recovery required'
   | 'Stale review'
   | 'Blocked'
   | 'Needs recovery'
-  | 'Unsafe local state'
   | 'Integrity failure';
 
 export type ErrorEnvelope = {
@@ -121,6 +124,7 @@ export type ConnectionBootstrapManifest = {
   vault_name: string;
   root_commit: string;
   target_main: string;
+  root_ignore_oid: string | null;
   changed_paths: string[];
   target_file_sizes: Record<string, number>;
   explicit_directories: string[];
@@ -129,6 +133,7 @@ export type ConnectionBootstrapManifest = {
 export type CompleteConnectionRequest = {
   mode: 'initialize' | 'use_server' | 'merge';
   expected_main: string | null;
+  root_ignore_capability?: 'root-ignore-v1';
   proposal_kind?: 'new_vault_import' | 'independent_vault_merge' | 'shared_baseline_merge';
   proposal_base?: string | null;
 };
@@ -238,6 +243,8 @@ export type DevicePushManifest = {
   packfile_sha256: string;
   packfile_bytes: number;
   client_known_main: string | null;
+  root_ignore_capability?: 'root-ignore-v1';
+  root_ignore_oid?: string | null;
   base_commit?: string | null;
   attempt_id?: string;
   directory_intents?: DirectoryIntent[];
@@ -281,6 +288,7 @@ export type DevicePullRequest = {
   device_id: string;
   current_local_main: string | null;
   requested_target: 'latest' | string;
+  root_ignore_capability?: 'root-ignore-v1';
   current_event_seq?: number;
 };
 
@@ -289,6 +297,7 @@ export type DevicePullManifest = {
   vault_id: string;
   device_id: string;
   target_main: string;
+  root_ignore_oid: string | null;
   changed_paths: string[];
   target_file_sizes: Record<string, number>;
   current_local_main_is_ancestor: boolean | null;
@@ -322,6 +331,8 @@ export type ChunkPushCreateRequest = {
   expected_device_ref: string | null;
   target_commit: string;
   client_known_main: string | null;
+  root_ignore_capability?: 'root-ignore-v1';
+  root_ignore_oid?: string | null;
   base_commit?: string | null;
   directory_intents?: DirectoryIntent[];
   directory_proposal?: DirectoryProposal;
@@ -373,6 +384,7 @@ export type ChunkBootstrapRequest = {
   plugin_version?: string;
   cursor: number;
   requested_target: 'latest' | string;
+  root_ignore_capability?: 'root-ignore-v1';
 };
 
 export type ChunkBootstrapManifest = Omit<ConnectionBootstrapManifest, 'target_file_sizes'> & {

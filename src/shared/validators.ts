@@ -164,6 +164,7 @@ export function parseDevicePushManifest(value: unknown): DevicePushManifest {
     ? readNullableCommitId(value, 'base_commit')
     : undefined;
   const attemptId = readOptionalString(value, 'attempt_id');
+  const rootIgnoreAttestation = readRootIgnoreAttestation(value);
   const directoryIntents = readOptionalDirectoryIntents(value, 'directory_intents');
   const directoryProposal = readOptionalDirectoryProposal(value, 'directory_proposal');
   if (directoryIntents !== undefined && directoryProposal !== undefined) {
@@ -174,9 +175,32 @@ export function parseDevicePushManifest(value: unknown): DevicePushManifest {
     ...(pluginVersion === undefined ? {} : { plugin_version: pluginVersion }),
     ...(baseCommit === undefined ? {} : { base_commit: baseCommit }),
     ...(attemptId === undefined ? {} : { attempt_id: attemptId }),
+    ...rootIgnoreAttestation,
     ...(directoryIntents === undefined ? {} : { directory_intents: directoryIntents }),
     ...(directoryProposal === undefined ? {} : { directory_proposal: directoryProposal })
   };
+}
+
+function readOptionalRootIgnoreCapability(record: Record<string, unknown>): 'root-ignore-v1' | undefined {
+  if (record.root_ignore_capability === undefined) return undefined;
+  if (record.root_ignore_capability !== 'root-ignore-v1') {
+    throw new ValidationError('invalid_request', 'Unsupported root ignore capability.');
+  }
+  return 'root-ignore-v1';
+}
+
+function readRootIgnoreAttestation(record: Record<string, unknown>): Pick<DevicePushManifest, 'root_ignore_capability' | 'root_ignore_oid'> {
+  const capability = record.root_ignore_capability;
+  if (capability !== undefined && capability !== 'root-ignore-v1') {
+    throw new ValidationError('invalid_request', 'Unsupported root ignore capability.');
+  }
+  const oid = Object.prototype.hasOwnProperty.call(record, 'root_ignore_oid')
+    ? readNullableCommitId(record, 'root_ignore_oid')
+    : undefined;
+  if ((capability === undefined) !== (oid === undefined)) {
+    throw new ValidationError('invalid_request', 'Root ignore capability and identity must be supplied together.');
+  }
+  return capability === undefined ? {} : { root_ignore_capability: 'root-ignore-v1', root_ignore_oid: oid! };
 }
 
 function readOptionalDirectoryProposal(record: Record<string, unknown>, field: string): DirectoryProposal | undefined {
@@ -310,6 +334,7 @@ export function parseDevicePullRequest(value: unknown): DevicePullRequest {
     device_id: readString(value, 'device_id'),
     current_local_main: readNullableCommitId(value, 'current_local_main'),
     requested_target: requested,
+    ...(readOptionalRootIgnoreCapability(value) === undefined ? {} : { root_ignore_capability: 'root-ignore-v1' }),
     ...(currentEventSeq === undefined ? {} : { current_event_seq: currentEventSeq })
   };
 }
@@ -333,6 +358,7 @@ export function parseChunkPushCreateRequest(value: unknown): ChunkPushCreateRequ
     : undefined;
   const directoryIntents = readOptionalDirectoryIntents(value, 'directory_intents');
   const directoryProposal = readOptionalDirectoryProposal(value, 'directory_proposal');
+  const rootIgnoreAttestation = readRootIgnoreAttestation(value);
   if (directoryIntents !== undefined && directoryProposal !== undefined) {
     throw new ValidationError('invalid_request', 'Use either legacy directory intents or a directory proposal, not both.');
   }
@@ -345,6 +371,7 @@ export function parseChunkPushCreateRequest(value: unknown): ChunkPushCreateRequ
     target_commit: readCommitId(value, 'target_commit'),
     client_known_main: readNullableCommitId(value, 'client_known_main'),
     ...(baseCommit === undefined ? {} : { base_commit: baseCommit }),
+    ...rootIgnoreAttestation,
     ...(directoryIntents === undefined ? {} : { directory_intents: directoryIntents }),
     ...(directoryProposal === undefined ? {} : { directory_proposal: directoryProposal }),
     attempt_id: attemptId,
@@ -372,7 +399,8 @@ export function parseChunkBootstrapRequest(value: unknown): ChunkBootstrapReques
     api_version: API_VERSION,
     ...(pluginVersion === undefined ? {} : { plugin_version: pluginVersion }),
     cursor: readNonNegativeInteger(value, 'cursor'),
-    requested_target: requested
+    requested_target: requested,
+    ...(readOptionalRootIgnoreCapability(value) === undefined ? {} : { root_ignore_capability: 'root-ignore-v1' })
   };
 }
 

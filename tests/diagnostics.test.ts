@@ -210,6 +210,29 @@ describe('opt-in error diagnostics backend', () => {
     expect(snapshot.diagnostic_events.map((event) => event.schema_version).sort()).toEqual([1, 2, 2]);
   });
 
+  it('accepts only bounded upload-size categories without paths, OIDs, or exact bytes', async () => {
+    const fixture = await setupFixture(true);
+    const connection = await createConnection(fixture.baseUrl);
+    await approveNewVault(fixture, connection.connection_id);
+    const sizeReport = {
+      ...report,
+      event_id: 'dgr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      flow: 'sync', stage: 'sync_request', failure_code: 'object_too_large_for_chunk', error_class: 'blocked_error',
+      breadcrumbs: [{ point: 'upload_prepare', outcome: 'failed', value_kind: 'other', size_bucket: 'under_64m', error_code: 'none' }]
+    };
+    expect((await postDiagnostic(`${fixture.baseUrl}/api/v1/connections/${connection.connection_id}/diagnostic-events`, connection.connection_secret, sizeReport)).status).toBe(202);
+    const sizeSnapshot = {
+      ...troubleshootingReport,
+      event_id: 'dgr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      context: { ...troubleshootingReport.context, safe_error_code: 'object_too_large_for_chunk', status_class: 'out_of_sync' }
+    };
+    expect((await postDiagnostic(`${fixture.baseUrl}/api/v1/connections/${connection.connection_id}/diagnostic-events`, connection.connection_secret, sizeSnapshot)).status).toBe(202);
+    expect((await postDiagnostic(`${fixture.baseUrl}/api/v1/connections/${connection.connection_id}/diagnostic-events`, connection.connection_secret, {
+      ...sizeReport, event_id: 'dgr_cccccccccccccccccccccccccccccccc', current_paths: ['private-index.bin']
+    })).status).toBe(400);
+    expect(JSON.stringify(await fixture.server.store.snapshot())).not.toContain('private-index.bin');
+  });
+
   it('rejects disabled ingestion, wrong credentials, extra fields, and privacy canaries', async () => {
     const disabled = await setupFixture(false);
     const disabledConnection = await createConnection(disabled.baseUrl);

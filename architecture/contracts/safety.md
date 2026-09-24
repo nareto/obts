@@ -67,6 +67,10 @@ Approved enrollment, initializing-device identity, immutable transfer target, im
 
 A final imported transfer chunk remains represented by a complete checkpoint until the next onboarding or apply boundary is durable. Process termination, mobile suspension, request loss, canonical-main movement, or supervisor restart must not move a verified transfer cursor backward, discard the only complete manifest, require a second device registration, or repeat already completed bulk transfer merely because the response was lost.
 
+### OBTS-SAF-010: Ignored Content Remains Local And Recoverable
+
+A policy change cannot treat formerly synced but newly ignored visible files or directories as user-authorized deletion. All clients may continue to write ignored paths in their local vault; exclusion applies to capture and derived projection, not the local write. Such content remains visible and local-only; older captured versions remain reachable through their existing preservation roots. Pull/apply skips policy-removal writes and physical directory deletion, records that disposition in durable restart evidence, and revalidates collisions before attempting any replacement. Policy edits during scanning, upload, apply or recovery never change an in-flight attempt's or journal's meaning. An incapable old client stops before an unsafe pull, write, or acknowledgement. Canonical history, accepted proposal bytes and Bridge retained audit do not disappear when current-state projection excludes ignored content. Re-enabling a path may expose distinct local copies and must preserve them for ordinary conflict reconciliation rather than silently adopting a historical winner.
+
 ## Fault Model
 
 Required safety analysis and testing cover:
@@ -78,7 +82,8 @@ Required safety analysis and testing cover:
 - disk-full, permission, missing-file, truncated/corrupt-state, and failed-publication errors;
 - plugin reload and foreground mobile suspension;
 - concurrent local edits during scan, transfer, and apply;
-- partial metadata/Git backup restore and inconsistent projections.
+- partial metadata/Git backup restore and inconsistent projections;
+- changed root ignore rules during scan, immutable transfer, apply and restart, with an offline old client, conflicting local-only copies, and a Bridge write/projection race.
 
 Explicit exclusions unless separately mitigated are malicious trusted operators, compromised live server code, simultaneous destruction of all preservation roots, undetectable hardware corruption, and unsaved editor-buffer loss before capture.
 

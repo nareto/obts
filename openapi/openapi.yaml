@@ -481,6 +481,14 @@ paths:
         - connectionBearer: []
       parameters:
         - $ref: "#/components/parameters/ConnectionId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                root_ignore_capability:
+                  const: root-ignore-v1
       responses:
         "200":
           description: Bootstrap manifest and Git packfile.
@@ -1801,7 +1809,7 @@ components:
                 enum: [active, blocked_integrity, deleting]
     ConnectionBootstrapManifest:
       type: object
-      required: [api_version, connection_id, vault_id, vault_name, root_commit, target_main, changed_paths, explicit_directories]
+      required: [api_version, connection_id, vault_id, vault_name, root_commit, target_main, root_ignore_oid, changed_paths, explicit_directories]
       properties:
         api_version:
           const: 2026-07-12.browser-onboarding
@@ -1817,6 +1825,11 @@ components:
         target_main:
           type: string
           pattern: "^[0-9a-f]{40}$"
+        root_ignore_oid:
+          oneOf:
+            - type: "null"
+            - type: string
+              pattern: "^[0-9a-f]{40}$"
         changed_paths:
           description: Complete changed path effects, including both the old and new paths of a rename.
           type: array
@@ -1847,6 +1860,8 @@ components:
       type: object
       required: [mode, expected_main]
       properties:
+        root_ignore_capability:
+          const: root-ignore-v1
         mode:
           type: string
           enum: [initialize, use_server, merge]
@@ -2238,15 +2253,19 @@ components:
         plugin_version:
           type: string
           maxLength: 80
+          description: A bounded numeric major.minor.patch version is retained; other values are normalized to unknown before storage and dashboard output.
         local_status_label:
           type: string
           maxLength: 80
+          description: Accepted display states and coarse operation-progress buckets are retained; exact counts, unknown values, and legacy labels are normalized before storage and dashboard output.
         local_error_code:
+          description: Only allowlisted safe codes are retained; unknown values become sync_error. No paths, object IDs, sizes, or exception messages.
           oneOf:
             - type: "null"
             - type: string
               maxLength: 120
         local_queue_status:
+          description: Only known queue states are retained; unknown values become unknown.
           oneOf:
             - type: "null"
             - type: string
@@ -2262,6 +2281,7 @@ components:
             - type: string
               pattern: "^[0-9a-f]{40}$"
         path_capabilities:
+          description: Only adapter and platform from the supported fixed vocabulary are retained; other fields are discarded.
           oneOf:
             - type: "null"
             - type: object
@@ -2296,6 +2316,9 @@ components:
           type: string
     DevicePushManifest:
       type: object
+      dependentRequired:
+        root_ignore_capability: [root_ignore_oid]
+        root_ignore_oid: [root_ignore_capability]
       required:
         - api_version
         - vault_id
@@ -2329,6 +2352,15 @@ components:
           type: integer
           minimum: 0
         client_known_main:
+          oneOf:
+            - type: "null"
+            - type: string
+              pattern: "^[0-9a-f]{40}$"
+        root_ignore_capability:
+          description: Operation-bound root exclusion capability; required with root_ignore_oid when either the proposed or canonical tree has a root policy.
+          const: root-ignore-v1
+        root_ignore_oid:
+          description: Attested root .gitignore Git blob identity, or null when the proposed tree has no root policy.
           oneOf:
             - type: "null"
             - type: string
@@ -2373,9 +2405,11 @@ components:
         current_event_seq:
           type: integer
           minimum: 0
+        root_ignore_capability:
+          const: root-ignore-v1
     DevicePullManifest:
       type: object
-      required: [api_version, vault_id, device_id, target_main, changed_paths, current_local_main_is_ancestor, event_seq]
+      required: [api_version, vault_id, device_id, target_main, root_ignore_oid, changed_paths, current_local_main_is_ancestor, event_seq]
       properties:
         api_version:
           const: 2026-07-12.browser-onboarding
@@ -2386,6 +2420,11 @@ components:
         target_main:
           type: string
           pattern: "^[0-9a-f]{40}$"
+        root_ignore_oid:
+          oneOf:
+            - type: "null"
+            - type: string
+              pattern: "^[0-9a-f]{40}$"
         changed_paths:
           description: Complete changed path effects, including both the old and new paths of a rename.
           type: array
@@ -2437,6 +2476,9 @@ components:
           type: integer
     ChunkPushCreateRequest:
       type: object
+      dependentRequired:
+        root_ignore_capability: [root_ignore_oid]
+        root_ignore_oid: [root_ignore_capability]
       required: [api_version, vault_id, device_id, expected_device_ref, target_commit, client_known_main, attempt_id, chunk_count, plan_sha256]
       properties:
         api_version:
@@ -2456,6 +2498,13 @@ components:
           type: string
           pattern: "^[0-9a-f]{40}$"
         client_known_main:
+          oneOf:
+            - type: "null"
+            - type: string
+              pattern: "^[0-9a-f]{40}$"
+        root_ignore_capability:
+          const: root-ignore-v1
+        root_ignore_oid:
           oneOf:
             - type: "null"
             - type: string
@@ -2681,6 +2730,8 @@ components:
           const: 2026-07-12.browser-onboarding
         plugin_version:
           type: string
+        root_ignore_capability:
+          const: root-ignore-v1
         cursor:
           type: integer
           minimum: 0

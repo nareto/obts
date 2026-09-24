@@ -18,6 +18,7 @@ use crate::headless::{HeadlessClient, HeadlessFilesystemGuard};
 use crate::model::NoteId;
 use crate::new_note::NewNoteFileType;
 use crate::persistence::{ObtsProjectionState, PostgresPersistence};
+use crate::root_ignore::{RootIgnoreError, RootIgnorePolicy};
 use crate::store::{
     FilesystemProjectionStatus, LocalProjectionOutcome, RecoveredVaultFileState, VaultStore,
 };
@@ -33,7 +34,11 @@ pub struct FilesystemSource {
     active_inputs: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     pub(crate) input_highwater: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    write_stage_gate: Arc<std::sync::Mutex<Option<Arc<WriteStageGate>>>>,
     pub(crate) projection_lock: Arc<tokio::sync::RwLock<()>>,
+    // Serializes Rust stages; the service holds the headless guard against Node writes.
+    mutation_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -44,6 +49,7 @@ struct FilesystemWatermark {
     observed_generation: u64,
     indexed_generation: u64,
     indexed_files: BTreeMap<String, AttestedFile>,
+    indexed_policy: Option<Option<String>>,
     projection_status: FilesystemProjectionStatus,
 }
 
@@ -72,6 +78,47 @@ pub struct FilesystemFile {
 struct FileIdentity {
     len: u64,
     modified: Option<SystemTime>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct WriteStageGate {
+    entered: tokio::sync::Notify,
+    finished: tokio::sync::Notify,
+    release: (std::sync::Mutex<bool>, std::sync::Condvar),
+}
+
+#[cfg(test)]
+impl WriteStageGate {
+    fn pause(&self) {
+        self.entered.notify_one();
+        let mut released = self.release.0.lock().expect("write gate lock");
+        while !*released {
+            released = self.release.1.wait(released).expect("write gate wait");
+        }
+    }
+
+    fn release(&self) {
+        *self.release.0.lock().expect("write gate lock") = true;
+        self.release.1.notify_one();
+    }
+}
+
+#[cfg(test)]
+struct FinishWriteGate(Arc<WriteStageGate>);
+#[cfg(test)]
+struct ReleaseWriteGateOnDrop(Arc<WriteStageGate>);
+#[cfg(test)]
+impl Drop for ReleaseWriteGateOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+#[cfg(test)]
+impl Drop for FinishWriteGate {
+    fn drop(&mut self) {
+        self.0.finished.notify_one();
+    }
 }
 
 #[cfg(test)]
@@ -147,7 +194,10 @@ impl FilesystemSource {
             active_inputs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             input_highwater: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            write_stage_gate: Arc::new(std::sync::Mutex::new(None)),
             projection_lock: Arc::new(tokio::sync::RwLock::new(())),
+            mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -190,8 +240,16 @@ impl FilesystemSource {
     }
 
     async fn supported_metadata(&self) -> Result<BTreeMap<String, FileIdentity>, FilesystemError> {
+        let policy = RootIgnorePolicy::read(self.root())?;
+        self.supported_metadata_for(Arc::new(policy)).await
+    }
+
+    async fn supported_metadata_for(
+        &self,
+        policy: Arc<RootIgnorePolicy>,
+    ) -> Result<BTreeMap<String, FileIdentity>, FilesystemError> {
         let root = self.root.clone();
-        tokio::task::spawn_blocking(move || list_root_metadata(root.as_path()))
+        tokio::task::spawn_blocking(move || list_root_metadata(root.as_path(), &policy))
             .await
             .map_err(|error| FilesystemError::Task(error.to_string()))?
     }
@@ -225,6 +283,10 @@ impl FilesystemSource {
             && watermark.observed == watermark.indexed
             && watermark.observed_generation == watermark.generation
             && watermark.indexed_generation == watermark.generation
+            && RootIgnorePolicy::read(self.root())
+                .ok()
+                .map(|policy| policy.blob_oid)
+                == watermark.indexed_policy
     }
 
     pub fn revisions(&self) -> (String, String) {
@@ -261,6 +323,7 @@ impl FilesystemSource {
             watermark.observed_generation = watermark.generation;
             watermark.indexed_generation = 0;
             watermark.indexed_files.clear();
+            watermark.indexed_policy = None;
         }
         self.persist_projection_state(ObtsProjectionState {
             indexed_commit: None,
@@ -299,6 +362,7 @@ impl FilesystemSource {
         target: &str,
         generation: u64,
         indexed_files: BTreeMap<String, AttestedFile>,
+        policy_oid: Option<String>,
     ) -> Result<(), FilesystemError> {
         let previous = {
             let watermark = self.watermark.read().expect("filesystem watermark lock");
@@ -329,6 +393,7 @@ impl FilesystemSource {
                 watermark.indexed = target.to_string();
                 watermark.indexed_generation = generation;
                 watermark.indexed_files = indexed_files;
+                watermark.indexed_policy = Some(policy_oid);
                 false
             }
         };
@@ -375,10 +440,14 @@ impl FilesystemSource {
     #[allow(dead_code)]
     pub(crate) fn mark_indexed(&self, files: &BTreeMap<String, FilesystemFile>) {
         let indexed = snapshot_revision(files);
+        let policy = RootIgnorePolicy::read(self.root())
+            .ok()
+            .map(|policy| policy.blob_oid);
         let mut watermark = self.watermark.write().expect("filesystem watermark lock");
         if watermark.observed == indexed && watermark.observed_generation == watermark.generation {
             watermark.indexed = indexed;
             watermark.indexed_generation = watermark.generation;
+            watermark.indexed_policy = policy;
             watermark.indexed_files = files
                 .iter()
                 .map(|(path, file)| {
@@ -403,7 +472,11 @@ impl FilesystemSource {
             .clone()
     }
 
-    fn mark_indexed_revisions(&self, revisions: BTreeMap<String, AttestedFile>) {
+    fn mark_indexed_revisions(
+        &self,
+        revisions: BTreeMap<String, AttestedFile>,
+        policy_oid: Option<String>,
+    ) {
         let mut hasher = Sha256::new();
         for (path, file) in &revisions {
             hasher.update(path.as_bytes());
@@ -417,6 +490,7 @@ impl FilesystemSource {
             watermark.indexed = indexed;
             watermark.indexed_generation = watermark.generation;
             watermark.indexed_files = revisions;
+            watermark.indexed_policy = Some(policy_oid);
         }
     }
 
@@ -615,15 +689,37 @@ impl FilesystemSource {
         .map_err(|error| FilesystemError::Task(error.to_string()))?
     }
 
+    pub(crate) fn is_path_ignored(&self, path: &str) -> Result<bool, FilesystemError> {
+        let path = normalize_relative_path(path)?;
+        Ok(RootIgnorePolicy::read(self.root())?.ignores(&path, false)?)
+    }
+
     pub async fn create(&self, path: &str, content: &str) -> Result<String, FilesystemError> {
+        let _mutation_guard = self.mutation_lock.lock().await;
         self.ensure_runtime_size([content.len() as u64])?;
         let target = self.safe_target(path)?;
         let content = content.to_owned();
         let revision = content_revision(content.as_bytes());
-        tokio::task::spawn_blocking(move || atomic_write(&target, &content, true))
-            .await
-            .map_err(|error| FilesystemError::Task(error.to_string()))??;
-        self.mark_dirty();
+        #[cfg(test)]
+        let gate = self
+            .write_stage_gate
+            .lock()
+            .expect("write gate lock")
+            .take();
+        let temporary = tokio::task::spawn_blocking({
+            let target = target.clone();
+            move || {
+                stage_atomic_write(
+                    &target,
+                    &content,
+                    #[cfg(test)]
+                    gate,
+                )
+            }
+        })
+        .await
+        .map_err(|error| FilesystemError::Task(error.to_string()))??;
+        self.commit_visible_write(&target, temporary, true)?;
         Ok(revision)
     }
 
@@ -633,46 +729,63 @@ impl FilesystemSource {
         content: &str,
         expected_revision: Option<&str>,
     ) -> Result<String, FilesystemError> {
+        let _mutation_guard = self.mutation_lock.lock().await;
         self.ensure_runtime_size([content.len() as u64])?;
         let target = self.safe_target(path)?;
         let content = content.to_owned();
         let revision = content_revision(content.as_bytes());
         let expected_revision = expected_revision.map(ToOwned::to_owned);
         let max_text_bytes = self.max_text_bytes;
-        tokio::task::spawn_blocking(move || {
-            let metadata = fs::metadata(&target).map_err(|error| {
-                if error.kind() == io::ErrorKind::NotFound {
-                    FilesystemError::NotFound
-                } else {
-                    FilesystemError::Io(error)
+        #[cfg(test)]
+        let gate = self
+            .write_stage_gate
+            .lock()
+            .expect("write gate lock")
+            .take();
+        let temporary = tokio::task::spawn_blocking({
+            let target = target.clone();
+            move || {
+                let actual = source_revision(&target, max_text_bytes)?;
+                if let Some(expected) = expected_revision
+                    && expected != actual
+                {
+                    return Err(FilesystemError::Changed { expected, actual });
                 }
-            })?;
-            if metadata.len() > max_text_bytes {
-                return Err(FilesystemError::ProjectionLimitExceeded {
-                    limit: max_text_bytes,
-                });
+                let temporary = stage_atomic_write(
+                    &target,
+                    &content,
+                    #[cfg(test)]
+                    gate,
+                )?;
+                Ok::<_, FilesystemError>(temporary)
             }
-            let file = fs::File::open(&target)?;
-            let mut current = Vec::new();
-            file.take(max_text_bytes.saturating_add(1))
-                .read_to_end(&mut current)?;
-            if current.len() as u64 > max_text_bytes {
-                return Err(FilesystemError::ProjectionLimitExceeded {
-                    limit: max_text_bytes,
-                });
-            }
-            let actual = content_revision(&current);
-            if let Some(expected) = expected_revision
-                && expected != actual
-            {
-                return Err(FilesystemError::Changed { expected, actual });
-            }
-            atomic_write(&target, &content, false)
         })
         .await
         .map_err(|error| FilesystemError::Task(error.to_string()))??;
-        self.mark_dirty();
+        self.commit_visible_write(&target, temporary, false)?;
         Ok(revision)
+    }
+
+    fn commit_visible_write(
+        &self,
+        target: &Path,
+        temporary: tempfile::NamedTempFile,
+        create_new: bool,
+    ) -> Result<(), FilesystemError> {
+        // The visible replacement and dirty marker must complete before this task can be canceled.
+        let commit = || {
+            commit_atomic_write(target, self.root(), temporary, create_new, || {
+                self.mark_dirty()
+            })
+        };
+        if matches!(
+            tokio::runtime::Handle::current().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            tokio::task::block_in_place(commit)
+        } else {
+            commit()
+        }
     }
 
     pub fn mark_dirty(&self) {
@@ -700,8 +813,16 @@ impl FilesystemSource {
         }
         let target = self.root.join(&normalized);
         let parent = target.parent().ok_or(FilesystemError::PathEscape)?;
-        fs::create_dir_all(parent)?;
-        let canonical_parent = parent.canonicalize()?;
+        let mut existing_parent = parent;
+        while !existing_parent.is_dir() {
+            if existing_parent.exists() {
+                return Err(FilesystemError::PathEscape);
+            }
+            existing_parent = existing_parent
+                .parent()
+                .ok_or(FilesystemError::PathEscape)?;
+        }
+        let canonical_parent = existing_parent.canonicalize()?;
         if !canonical_parent.starts_with(self.root.as_path()) {
             return Err(FilesystemError::PathEscape);
         }
@@ -759,13 +880,14 @@ pub async fn synchronize_commit_projection(
             .read_index_delta(client, indexed_commit.as_deref())
             .await
             .map_err(|error| FilesystemError::Headless(error.to_string()))?;
-        let changed = apply_commit_delta(
+        let changed = apply_commit_delta_inner(
             store,
             source,
             indexed_commit,
             delta,
             full_audit,
             hydrate_runtime,
+            Some((guard, client)),
         )
         .await?;
         Ok(changed)
@@ -783,7 +905,30 @@ pub(crate) async fn apply_commit_delta(
     full_audit: bool,
     hydrate_runtime: bool,
 ) -> Result<usize, FilesystemError> {
+    apply_commit_delta_inner(
+        store,
+        source,
+        indexed_commit,
+        delta,
+        full_audit,
+        hydrate_runtime,
+        None,
+    )
+    .await
+}
+
+async fn apply_commit_delta_inner(
+    store: &VaultStore,
+    source: &FilesystemSource,
+    indexed_commit: Option<String>,
+    delta: crate::headless::HeadlessIndexDelta,
+    full_audit: bool,
+    hydrate_runtime: bool,
+    mut headless: Option<(&mut HeadlessFilesystemGuard<'_>, &HeadlessClient)>,
+) -> Result<usize, FilesystemError> {
     let _projection_guard = source.projection_lock.write().await;
+    let policy = Arc::new(RootIgnorePolicy::read(source.root())?);
+    attest_target_policy(&delta, &policy)?;
     store.drain_projection_writes().await;
     let Some(target_commit) = delta.head.clone() else {
         source.mark_dirty();
@@ -806,7 +951,7 @@ pub(crate) async fn apply_commit_delta(
     let mut target_manifest = BTreeMap::new();
     for file in &delta.files {
         let path = normalize_relative_path(&file.path)?;
-        if !is_supported_path(&path) || is_excluded_path(&path) {
+        if !is_supported_path(&path) || is_excluded_path(&path) || policy.ignores(&path, false)? {
             continue;
         }
         validate_commit_id(&file.oid)?;
@@ -825,9 +970,11 @@ pub(crate) async fn apply_commit_delta(
         let runtime_hydration = hydrate_runtime || source.indexed_manifest().is_empty();
         let force_full = full_audit || runtime_hydration || delta.mode == "rebuild";
         let (changed, indexed_files) = if force_full {
-            reconcile_full_snapshot(store, source, &target_manifest, runtime_hydration).await?
+            reconcile_full_snapshot(store, source, &target_manifest, runtime_hydration, &policy)
+                .await?
         } else {
-            reconcile_incremental_snapshot(store, source, &target_manifest, &delta.changes).await?
+            reconcile_incremental_snapshot(store, source, &target_manifest, &delta.changes, &policy)
+                .await?
         };
         store.drain_projection_writes().await;
         if store.uses_sql_backend() {
@@ -844,9 +991,26 @@ pub(crate) async fn apply_commit_delta(
             }
         }
         source.purge_persisted_raw_content().await?;
+        attest_policy_unchanged(source, &policy)?;
+        if let Some((guard, client)) = headless.as_mut() {
+            let latest = guard
+                .read_index_delta(client, indexed_commit.as_deref())
+                .await
+                .map_err(|error| FilesystemError::Headless(error.to_string()))?;
+            if latest != delta {
+                return Err(FilesystemError::ProjectionChanged);
+            }
+        }
+        attest_policy_unchanged(source, &policy)?;
         source
-            .complete_commit_projection(&target_commit, generation, indexed_files)
+            .complete_commit_projection(
+                &target_commit,
+                generation,
+                indexed_files,
+                policy.blob_oid.clone(),
+            )
             .await?;
+        store.clear_verified_projection_pending().await;
         Ok(changed)
     }
     .await;
@@ -863,8 +1027,9 @@ async fn reconcile_full_snapshot(
     source: &FilesystemSource,
     target_manifest: &BTreeMap<String, String>,
     hydrate_runtime: bool,
+    policy: &Arc<RootIgnorePolicy>,
 ) -> Result<(usize, BTreeMap<String, AttestedFile>), FilesystemError> {
-    let expected_metadata = source.supported_metadata().await?;
+    let expected_metadata = source.supported_metadata_for(policy.clone()).await?;
     if expected_metadata.keys().ne(target_manifest.keys()) {
         return Err(FilesystemError::CommitSnapshotMismatch);
     }
@@ -911,7 +1076,7 @@ async fn reconcile_full_snapshot(
             );
         }
     }
-    if source.supported_metadata().await? != expected_metadata {
+    if source.supported_metadata_for(policy.clone()).await? != expected_metadata {
         return Err(FilesystemError::ProjectionChanged);
     }
     let extras = projected
@@ -946,8 +1111,14 @@ async fn reconcile_incremental_snapshot(
     source: &FilesystemSource,
     target_manifest: &BTreeMap<String, String>,
     changes: &[crate::headless::HeadlessIndexChange],
+    policy: &RootIgnorePolicy,
 ) -> Result<(usize, BTreeMap<String, AttestedFile>), FilesystemError> {
     let mut indexed_files = source.indexed_manifest();
+    for path in indexed_files.keys().cloned().collect::<Vec<_>>() {
+        if policy.ignores(&path, false)? {
+            indexed_files.remove(&path);
+        }
+    }
     let mut prospective_oids = indexed_files
         .iter()
         .map(|(path, file)| (path.clone(), file.oid.clone()))
@@ -958,7 +1129,7 @@ async fn reconcile_incremental_snapshot(
     // Validate the complete target size before reading or mutating runtime content.
     for change in changes {
         let path = normalize_relative_path(&change.path)?;
-        if !is_supported_path(&path) || is_excluded_path(&path) {
+        if !is_supported_path(&path) || is_excluded_path(&path) || policy.ignores(&path, false)? {
             continue;
         }
         if !seen.insert(path.clone()) {
@@ -1139,7 +1310,8 @@ pub async fn synchronize_snapshot(
     source.mark_dirty();
     // Keep only the body currently being projected. Metadata/OID inventory is
     // retained, but raw file contents are released before the next read.
-    let metadata = source.supported_metadata().await?;
+    let policy = Arc::new(RootIgnorePolicy::read(source.root())?);
+    let metadata = source.supported_metadata_for(policy.clone()).await?;
     let indexed = store
         .projection_revisions()
         .await
@@ -1167,7 +1339,9 @@ pub async fn synchronize_snapshot(
         changed += 1;
     }
 
-    if source.supported_metadata().await? != metadata {
+    if source.supported_metadata_for(policy.clone()).await? != metadata
+        || RootIgnorePolicy::read(source.root())?.blob_oid != policy.blob_oid
+    {
         return Err(FilesystemError::ProjectionChanged);
     }
     let paths = metadata.keys().collect::<HashSet<_>>();
@@ -1193,6 +1367,9 @@ pub async fn synchronize_snapshot(
             return Err(FilesystemError::ProjectionChanged);
         }
     }
+    if RootIgnorePolicy::read(source.root())?.blob_oid != policy.blob_oid {
+        return Err(FilesystemError::ProjectionChanged);
+    }
     let mut hasher = Sha256::new();
     for (path, file) in &revisions {
         hasher.update(path.as_bytes());
@@ -1206,7 +1383,8 @@ pub async fn synchronize_snapshot(
         watermark.observed = observed;
         watermark.observed_generation = watermark.generation;
     }
-    source.mark_indexed_revisions(revisions);
+    source.mark_indexed_revisions(revisions, policy.blob_oid.clone());
+    store.clear_verified_projection_pending().await;
     Ok(changed)
 }
 
@@ -1284,15 +1462,19 @@ fn log_projection_result(result: Result<usize, FilesystemError>) {
     }
 }
 
-fn list_root_metadata(root: &Path) -> Result<BTreeMap<String, FileIdentity>, FilesystemError> {
+fn list_root_metadata(
+    root: &Path,
+    policy: &RootIgnorePolicy,
+) -> Result<BTreeMap<String, FileIdentity>, FilesystemError> {
     let mut files = BTreeMap::new();
-    walk_metadata(root, root, &mut files)?;
+    walk_metadata(root, root, policy, &mut files)?;
     Ok(files)
 }
 
 fn walk_metadata(
     root: &Path,
     directory: &Path,
+    policy: &RootIgnorePolicy,
     files: &mut BTreeMap<String, FileIdentity>,
 ) -> Result<(), FilesystemError> {
     let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
@@ -1307,11 +1489,11 @@ fn walk_metadata(
             path.strip_prefix(root)
                 .map_err(|_| FilesystemError::PathEscape)?,
         )?;
-        if is_excluded_path(&relative) {
+        if is_excluded_path(&relative) || policy.ignores(&relative, file_type.is_dir())? {
             continue;
         }
         if file_type.is_dir() {
-            walk_metadata(root, &path, files)?;
+            walk_metadata(root, &path, policy, files)?;
         } else if file_type.is_file() && is_supported_path(&relative) {
             let metadata = entry.metadata()?;
             files.insert(
@@ -1326,20 +1508,84 @@ fn walk_metadata(
     Ok(())
 }
 
-fn atomic_write(path: &Path, content: &str, create_new: bool) -> Result<(), FilesystemError> {
-    if create_new && path.exists() {
-        return Err(FilesystemError::AlreadyExists);
+fn source_revision(path: &Path, max_bytes: u64) -> Result<String, FilesystemError> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            FilesystemError::NotFound
+        } else {
+            FilesystemError::Io(error)
+        }
+    })?;
+    if metadata.len() > max_bytes {
+        return Err(FilesystemError::ProjectionLimitExceeded { limit: max_bytes });
     }
-    let parent = path.parent().ok_or(FilesystemError::PathEscape)?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or(FilesystemError::PathEscape)?;
+    let mut current = Vec::new();
+    fs::File::open(path)?
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut current)?;
+    if current.len() as u64 > max_bytes {
+        return Err(FilesystemError::ProjectionLimitExceeded { limit: max_bytes });
+    }
+    Ok(content_revision(&current))
+}
+
+fn stage_atomic_write(
+    path: &Path,
+    content: &str,
+    #[cfg(test)] gate: Option<Arc<WriteStageGate>>,
+) -> Result<tempfile::NamedTempFile, FilesystemError> {
+    #[cfg(test)]
+    let _finish = gate.as_ref().map(|gate| FinishWriteGate(gate.clone()));
+    let mut parent = path.parent().ok_or(FilesystemError::PathEscape)?;
+    while !parent.is_dir() {
+        if parent.exists() {
+            return Err(FilesystemError::PathEscape);
+        }
+        parent = parent.parent().ok_or(FilesystemError::PathEscape)?;
+    }
     let mut temporary = tempfile::Builder::new()
-        .prefix(&format!(".{file_name}.obts-bridge-tmp-"))
+        .prefix(".obts-bridge-tmp-")
+        .suffix(".tmp")
         .tempfile_in(parent)?;
     temporary.write_all(content.as_bytes())?;
     temporary.as_file().sync_all()?;
+    #[cfg(test)]
+    if let Some(gate) = gate.as_ref() {
+        gate.pause();
+    }
+    Ok(temporary)
+}
+
+fn commit_atomic_write(
+    path: &Path,
+    root: &Path,
+    temporary: tempfile::NamedTempFile,
+    create_new: bool,
+    on_visible_change: impl FnOnce(),
+) -> Result<(), FilesystemError> {
+    let parent = path.parent().ok_or(FilesystemError::PathEscape)?;
+    let mut created = NewDirectories::default();
+    if create_new {
+        let mut missing = Vec::new();
+        let mut ancestor = parent;
+        while !ancestor.is_dir() {
+            if ancestor.exists() {
+                return Err(FilesystemError::PathEscape);
+            }
+            missing.push(ancestor.to_owned());
+            ancestor = ancestor.parent().ok_or(FilesystemError::PathEscape)?;
+        }
+        if !ancestor.canonicalize()?.starts_with(root) {
+            return Err(FilesystemError::PathEscape);
+        }
+        for directory in missing.into_iter().rev() {
+            fs::create_dir(&directory)?;
+            created.paths.push(directory);
+        }
+        if path.exists() {
+            return Err(FilesystemError::AlreadyExists);
+        }
+    }
     if create_new {
         if let Err(error) = fs::hard_link(temporary.path(), path) {
             return if error.kind() == io::ErrorKind::AlreadyExists {
@@ -1348,13 +1594,40 @@ fn atomic_write(path: &Path, content: &str, create_new: bool) -> Result<(), File
                 Err(FilesystemError::Io(error))
             };
         }
+        on_visible_change();
+        created.committed = true;
+        temporary.close()?;
     } else {
         temporary
             .persist(path)
             .map_err(|error| FilesystemError::Io(error.error))?;
+        on_visible_change();
     }
-    OpenOptions::new().read(true).open(parent)?.sync_all()?;
+    let mut directory = parent;
+    loop {
+        OpenOptions::new().read(true).open(directory)?.sync_all()?;
+        if !create_new || directory == root {
+            break;
+        }
+        directory = directory.parent().ok_or(FilesystemError::PathEscape)?;
+    }
     Ok(())
+}
+
+#[derive(Default)]
+struct NewDirectories {
+    paths: Vec<PathBuf>,
+    committed: bool,
+}
+
+impl Drop for NewDirectories {
+    fn drop(&mut self) {
+        if !self.committed {
+            for path in self.paths.iter().rev() {
+                let _ = fs::remove_dir(path);
+            }
+        }
+    }
 }
 
 fn content_revision(content: &[u8]) -> String {
@@ -1377,6 +1650,33 @@ fn snapshot_revision(files: &BTreeMap<String, FilesystemFile>) -> String {
         hasher.update(b"\n");
     }
     format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn attest_policy_unchanged(
+    source: &FilesystemSource,
+    policy: &RootIgnorePolicy,
+) -> Result<(), FilesystemError> {
+    if RootIgnorePolicy::read(source.root())?.blob_oid != policy.blob_oid {
+        return Err(FilesystemError::ProjectionChanged);
+    }
+    Ok(())
+}
+
+fn attest_target_policy(
+    delta: &crate::headless::HeadlessIndexDelta,
+    policy: &RootIgnorePolicy,
+) -> Result<(), FilesystemError> {
+    let root_files = delta
+        .files
+        .iter()
+        .filter(|file| file.path == ".gitignore")
+        .collect::<Vec<_>>();
+    if root_files.len() > 1
+        || root_files.first().map(|file| file.oid.as_str()) != policy.blob_oid.as_deref()
+    {
+        return Err(FilesystemError::CommitSnapshotMismatch);
+    }
+    Ok(())
 }
 
 fn validate_commit_id(commit: &str) -> Result<(), FilesystemError> {
@@ -1426,8 +1726,7 @@ fn is_supported_path(path: &str) -> bool {
 fn is_excluded_path(path: &str) -> bool {
     path == ".obts"
         || path.starts_with(".obts/")
-        || path == ".git"
-        || path.starts_with(".git/")
+        || path.split('/').any(|segment| segment == ".git")
         || path == ".obsidian/cache"
         || path.starts_with(".obsidian/cache/")
         || path == ".obsidian/workspace.json"
@@ -1454,6 +1753,8 @@ pub enum FilesystemError {
     Symlink,
     #[error("unsupported vault path: {0}")]
     UnsupportedPath(String),
+    #[error(transparent)]
+    RootIgnore(#[from] RootIgnoreError),
     #[error("vault file already exists")]
     AlreadyExists,
     #[error("vault file does not exist")]
@@ -1497,6 +1798,7 @@ impl FilesystemError {
             Self::CommitSnapshotMismatch => "commit_snapshot_mismatch",
             Self::CommitContentMismatch { .. } => "commit_content_mismatch",
             Self::Projection(_) => "projection_error",
+            Self::RootIgnore(_) => "policy_error",
             Self::Io(_) | Self::Task(_) => "filesystem_error",
             Self::PathEscape
             | Self::NonUtf8Path
@@ -1517,13 +1819,426 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::headless::{HeadlessIndexChange, HeadlessIndexDelta, HeadlessIndexFile};
+    use crate::root_ignore::RootIgnorePolicy;
     use crate::store::VaultStore;
 
     use super::{
-        FilesystemError, FilesystemSource, apply_commit_delta, git_blob_oid,
-        hydrate_runtime_snapshot, project_file, projection_required, projection_retry_delay,
-        synchronize_snapshot,
+        FilesystemError, FilesystemSource, apply_commit_delta, attest_policy_unchanged,
+        git_blob_oid, hydrate_runtime_snapshot, project_file, projection_required,
+        projection_retry_delay, synchronize_snapshot,
     };
+
+    #[tokio::test]
+    async fn ignored_and_invalid_policies_never_block_local_writes() {
+        let root = tempdir().unwrap();
+        let source = FilesystemSource::new(root.path()).unwrap();
+        let revision = source.create("existing.md", "original").await.unwrap();
+        fs::write(root.path().join(".gitignore"), "*.md\n").unwrap();
+        source.create("fresh.md", "new").await.unwrap();
+        source
+            .update("existing.md", "changed", Some(&revision))
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.path().join("fresh.md")).unwrap(),
+            "new"
+        );
+        fs::write(root.path().join(".gitignore"), [0xff]).unwrap();
+        assert!(matches!(
+            source.update("existing.md", "stale", Some(&revision)).await,
+            Err(FilesystemError::Changed { .. })
+        ));
+        source.create("another.md", "local").await.unwrap();
+        assert_eq!(
+            fs::read_to_string(root.path().join("existing.md")).unwrap(),
+            "changed"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("another.md")).unwrap(),
+            "local"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_write_cannot_replace_a_later_local_write() {
+        let root = tempdir().unwrap();
+        let source = FilesystemSource::new(root.path()).unwrap();
+        let original = source.create("Note.md", "original").await.unwrap();
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        let gate = std::sync::Arc::new(super::WriteStageGate {
+            entered: tokio::sync::Notify::new(),
+            finished: tokio::sync::Notify::new(),
+            release: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+        });
+        *source.write_stage_gate.lock().unwrap() = Some(gate.clone());
+        let first_source = source.clone();
+        let first_revision = original.clone();
+        let first = tokio::spawn(async move {
+            first_source
+                .update("Note.md", "first", Some(&first_revision))
+                .await
+        });
+        gate.entered.notified().await;
+        let staged = fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .find(|name| name.contains(".obts-bridge-tmp-"))
+            .expect("staged write must be present while blocked");
+        assert!(staged.ends_with(".tmp"));
+        assert!(
+            !source
+                .supported_metadata()
+                .await
+                .unwrap()
+                .contains_key(&staged)
+        );
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        source
+            .update("Note.md", "second", Some(&original))
+            .await
+            .unwrap();
+        gate.release();
+        gate.finished.notified().await;
+        assert_eq!(
+            fs::read_to_string(root.path().join("Note.md")).unwrap(),
+            "second"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_bridge_updates_serialize_source_revision() {
+        let root = tempdir().unwrap();
+        let source = FilesystemSource::new(root.path()).unwrap();
+        let original = source.create("Note.md", "original").await.unwrap();
+        let gate = std::sync::Arc::new(super::WriteStageGate {
+            entered: tokio::sync::Notify::new(),
+            finished: tokio::sync::Notify::new(),
+            release: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+        });
+        *source.write_stage_gate.lock().unwrap() = Some(gate.clone());
+        let _release_on_failure = super::ReleaseWriteGateOnDrop(gate.clone());
+        let first_source = source.clone();
+        let first_revision = original.clone();
+        let first = tokio::spawn(async move {
+            first_source
+                .update("Note.md", "first", Some(&first_revision))
+                .await
+        });
+        gate.entered.notified().await;
+        let second_source = source.clone();
+        let mut second = tokio::spawn(async move {
+            second_source
+                .update("Note.md", "second", Some(&original))
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut second)
+                .await
+                .is_err()
+        );
+        gate.release();
+        first.await.unwrap().unwrap();
+        assert!(matches!(
+            second.await.unwrap(),
+            Err(FilesystemError::Changed { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(root.path().join("Note.md")).unwrap(),
+            "first"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_staged_create_does_not_publish_a_file() {
+        let root = tempdir().unwrap();
+        let source = FilesystemSource::new(root.path()).unwrap();
+        let gate = std::sync::Arc::new(super::WriteStageGate {
+            entered: tokio::sync::Notify::new(),
+            finished: tokio::sync::Notify::new(),
+            release: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+        });
+        *source.write_stage_gate.lock().unwrap() = Some(gate.clone());
+        let _release_on_failure = super::ReleaseWriteGateOnDrop(gate.clone());
+        let first_source = source.clone();
+        let first =
+            tokio::spawn(async move { first_source.create("Private/Note.md", "aborted").await });
+        gate.entered.notified().await;
+        assert!(!root.path().join("Private").exists());
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        gate.release();
+        gate.finished.notified().await;
+        assert!(!root.path().join("Private").exists());
+        source.create("Private/Note.md", "accepted").await.unwrap();
+        assert_eq!(
+            fs::read_to_string(root.path().join("Private/Note.md")).unwrap(),
+            "accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_git_directory_is_never_created_by_bridge() {
+        let root = tempdir().unwrap();
+        let source = FilesystemSource::new(root.path()).unwrap();
+        assert!(matches!(
+            source.create("Notes/.git/note.md", "content").await,
+            Err(FilesystemError::UnsupportedPath(_))
+        ));
+        assert!(!root.path().join("Notes").exists());
+    }
+
+    #[tokio::test]
+    async fn long_valid_basename_does_not_overflow_staging_name() {
+        let root = tempdir().unwrap();
+        let source = FilesystemSource::new(root.path()).unwrap();
+        let name = format!("{}.md", "n".repeat(240));
+        let revision = source.create(&name, "first").await.unwrap();
+        source
+            .update(&name, "second", Some(&revision))
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.path().join(name)).unwrap(),
+            "second"
+        );
+    }
+
+    #[tokio::test]
+    async fn crash_orphaned_stage_is_local_only_even_with_negated_ignore_rule() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join(".gitignore"), "!*.tmp\n").unwrap();
+        let target = root.path().join("Note.md");
+        let staged = super::stage_atomic_write(&target, "unpublished", None).unwrap();
+        let staged_path = staged.path().to_owned();
+        let (file, _) = staged.keep().unwrap();
+        drop(file);
+        let source = FilesystemSource::new(root.path()).unwrap();
+        let scan = source.supported_metadata().await.unwrap();
+        assert!(!scan.contains_key(staged_path.file_name().unwrap().to_str().unwrap()));
+        assert!(staged_path.exists());
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn incremental_policy_removal_cleans_rows_without_deleting_visible_file() {
+        let root = tempdir().unwrap();
+        let source = FilesystemSource::new(root.path()).unwrap();
+        let store = VaultStore::new(10);
+        fs::write(root.path().join("Keep.md"), "keep").unwrap();
+        fs::write(root.path().join("Local.md"), "local").unwrap();
+        let first_head = "1".repeat(40);
+        apply_commit_delta(
+            &store,
+            &source,
+            None,
+            HeadlessIndexDelta {
+                head: Some(first_head.clone()),
+                base: None,
+                mode: "rebuild".to_string(),
+                files: vec![
+                    HeadlessIndexFile {
+                        path: "Keep.md".into(),
+                        oid: git_blob_oid(b"keep"),
+                    },
+                    HeadlessIndexFile {
+                        path: "Local.md".into(),
+                        oid: git_blob_oid(b"local"),
+                    },
+                ],
+                changes: vec![],
+            },
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let rules = b"Local.md\n";
+        fs::write(root.path().join(".gitignore"), rules).unwrap();
+        let second_head = "2".repeat(40);
+        let delta = HeadlessIndexDelta {
+            head: Some(second_head.clone()),
+            base: Some(first_head.clone()),
+            mode: "incremental".into(),
+            files: vec![
+                HeadlessIndexFile {
+                    path: ".gitignore".into(),
+                    oid: git_blob_oid(rules),
+                },
+                HeadlessIndexFile {
+                    path: "Keep.md".into(),
+                    oid: git_blob_oid(b"keep"),
+                },
+            ],
+            changes: vec![
+                HeadlessIndexChange {
+                    path: ".gitignore".into(),
+                    kind: "add".into(),
+                    oid: Some(git_blob_oid(rules)),
+                },
+                HeadlessIndexChange {
+                    path: "Local.md".into(),
+                    kind: "delete".into(),
+                    oid: None,
+                },
+            ],
+        };
+        let changed = apply_commit_delta(
+            &store,
+            &source,
+            Some(first_head),
+            delta.clone(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(changed, 1);
+        assert_eq!(source.indexed_commit(), Some(second_head.clone()));
+        assert_eq!(
+            store
+                .indexed_vault_file_revisions()
+                .await
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["Keep.md"]
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("Local.md")).unwrap(),
+            "local"
+        );
+        // A stale row from an interrupted projection is removed even without another delta change.
+        project_file(&store, source.read("Local.md").await.unwrap())
+            .await
+            .unwrap();
+        let third_head = "3".repeat(40);
+        let retry = HeadlessIndexDelta {
+            head: Some(third_head.clone()),
+            base: Some(second_head.clone()),
+            mode: "incremental".into(),
+            changes: vec![],
+            ..delta
+        };
+        assert_eq!(
+            apply_commit_delta(&store, &source, Some(second_head), retry, false, false)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.indexed_vault_file_revisions().await.len(), 1);
+        assert!(root.path().join("Local.md").exists());
+    }
+
+    #[tokio::test]
+    async fn rebuild_filters_ignored_directory_and_purges_old_rows() {
+        let root = tempdir().unwrap();
+        let source = FilesystemSource::new(root.path()).unwrap();
+        let store = VaultStore::new(10);
+        fs::create_dir(root.path().join("Private")).unwrap();
+        fs::write(root.path().join("Private/local.md"), "local").unwrap();
+        fs::write(root.path().join("public.md"), "public").unwrap();
+        fs::write(root.path().join(".gitignore"), "Private/\n").unwrap();
+        project_file(&store, source.read("Private/local.md").await.unwrap())
+            .await
+            .unwrap();
+        let rules = b"Private/\n";
+        apply_commit_delta(
+            &store,
+            &source,
+            None,
+            HeadlessIndexDelta {
+                head: Some("2".repeat(40)),
+                base: None,
+                mode: "rebuild".into(),
+                files: vec![
+                    HeadlessIndexFile {
+                        path: ".gitignore".into(),
+                        oid: git_blob_oid(rules),
+                    },
+                    HeadlessIndexFile {
+                        path: "public.md".into(),
+                        oid: git_blob_oid(b"public"),
+                    },
+                ],
+                changes: vec![],
+            },
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.indexed_vault_file_revisions().await.len(), 1);
+        assert_eq!(
+            fs::read_to_string(root.path().join("Private/local.md")).unwrap(),
+            "local"
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_policy_swap_fails_attestation_and_invalidates_readiness() {
+        let root = tempdir().unwrap();
+        let source = FilesystemSource::new(root.path()).unwrap();
+        let store = VaultStore::new(10);
+        fs::write(root.path().join("note.md"), "note").unwrap();
+        let policy = RootIgnorePolicy::read(root.path()).unwrap();
+        apply_commit_delta(
+            &store,
+            &source,
+            None,
+            HeadlessIndexDelta {
+                head: Some("1".repeat(40)),
+                base: None,
+                mode: "rebuild".into(),
+                files: vec![HeadlessIndexFile {
+                    path: "note.md".into(),
+                    oid: git_blob_oid(b"note"),
+                }],
+                changes: vec![],
+            },
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(source.is_index_current());
+        fs::write(root.path().join(".gitignore"), "note.md\n").unwrap();
+        assert!(matches!(
+            attest_policy_unchanged(&source, &policy),
+            Err(FilesystemError::ProjectionChanged)
+        ));
+        assert!(!source.is_index_current());
+        assert_eq!(source.indexed_commit(), Some("1".repeat(40)));
+    }
+
+    #[tokio::test]
+    async fn policy_mismatch_keeps_old_cursor() {
+        let root = tempdir().unwrap();
+        let source = FilesystemSource::new(root.path()).unwrap();
+        let store = VaultStore::new(10);
+        fs::write(root.path().join(".gitignore"), "*.md\n").unwrap();
+        let result = apply_commit_delta(
+            &store,
+            &source,
+            None,
+            HeadlessIndexDelta {
+                head: Some("1".repeat(40)),
+                base: None,
+                mode: "rebuild".into(),
+                files: vec![],
+                changes: vec![],
+            },
+            false,
+            false,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(FilesystemError::CommitSnapshotMismatch)
+        ));
+        assert!(source.indexed_commit().is_none());
+    }
 
     #[test]
     fn projection_failures_back_off_to_a_bounded_delay() {

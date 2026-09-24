@@ -21931,6 +21931,53 @@ var require_work_pool = __commonJS({
   }
 });
 
+// src/shared/rootIgnore.cjs
+var require_rootIgnore = __commonJS({
+  "src/shared/rootIgnore.cjs"(exports2, module2) {
+    "use strict";
+    var createIgnore = require_ignore();
+    var MAX_ROOT_IGNORE_BYTES2 = 1024 * 1024;
+    var RootIgnorePolicyError = class extends Error {
+      constructor(code, message) {
+        super(message);
+        this.name = "RootIgnorePolicyError";
+        this.code = code;
+      }
+    };
+    function createRootIgnorePolicy2(bytes) {
+      if (bytes !== null && bytes !== void 0 && !(bytes instanceof Uint8Array)) {
+        throw new RootIgnorePolicyError("invalid_policy", "Root .gitignore must be bytes or absent.");
+      }
+      if (bytes && bytes.byteLength > MAX_ROOT_IGNORE_BYTES2) {
+        throw new RootIgnorePolicyError("policy_too_large", "Root .gitignore exceeds the byte limit.");
+      }
+      let contents = "";
+      if (bytes) {
+        try {
+          contents = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+        } catch {
+          throw new RootIgnorePolicyError("invalid_policy_encoding", "Root .gitignore must be valid UTF-8.");
+        }
+        if (contents.includes("\0")) {
+          throw new RootIgnorePolicyError("invalid_policy_nul", "Root .gitignore cannot contain NUL bytes.");
+        }
+      }
+      const matcher = createIgnore({ ignorecase: false }).add(contents);
+      return Object.freeze({
+        ignores(path2, isDirectory = false) {
+          if (typeof path2 !== "string" || !path2 || path2.startsWith("/") || path2.includes("\\") || path2.includes("\0") || path2.endsWith("/") || path2.split("/").some((part) => !part || part === "." || part === "..")) {
+            throw new RootIgnorePolicyError("invalid_path", "Expected a relative canonical vault path.");
+          }
+          const normalized = path2.normalize("NFC");
+          if (normalized === ".gitignore") return false;
+          return matcher.ignores(normalized + (isDirectory ? "/" : ""));
+        }
+      });
+    }
+    module2.exports = { createRootIgnorePolicy: createRootIgnorePolicy2, RootIgnorePolicyError, MAX_ROOT_IGNORE_BYTES: MAX_ROOT_IGNORE_BYTES2 };
+  }
+});
+
 // obsidian-plugin/src/main.js
 var obtsRuntime = globalThis.__OBTS_CLIENT_RUNTIME__ || require("obsidian");
 var { Plugin, PluginSettingTab, Setting, Notice, Modal, Platform, requestUrl, apiVersion } = obtsRuntime;
@@ -21941,8 +21988,9 @@ var path = require_path_browserify();
 var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
 var { createByteBudget, runBoundedWork } = require_work_pool();
+var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.39";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.40";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_INVENTORY_INTERVAL_MS = 6 * 60 * 60 * 1e3;
@@ -22618,7 +22666,7 @@ module.exports = class ObtsPlugin extends Plugin {
     this.degradedStatusBase = null;
   }
   handleStatusClick() {
-    if (statusBaseLabel(this.currentStatusLabel) === "Review needed") {
+    if (statusBaseLabel(this.currentStatusLabel) === "Conflict resolution needed") {
       const destination = normalizedServerDestination(this.settings.serverUrl);
       if (destination) {
         window.open(`${destination}/dashboard`);
@@ -22640,7 +22688,7 @@ module.exports = class ObtsPlugin extends Plugin {
     }
     void this.flushWatcherHints().catch((error) => this.reportDeviceError(error));
     if (!this.clientReady) return;
-    if (!this.syncRunning) this.setStatus("Checking");
+    if (!this.syncRunning && !isPersistentAttentionStatus(statusBaseLabel(this.currentStatusLabel))) this.setStatus("Checking");
     this.scheduleQueuedSync(SYNC_DEBOUNCE_MS);
   }
   async flushWatcherHints() {
@@ -23183,6 +23231,14 @@ var ObtsObsidianClient = class {
     this.plugin.setInitializationStage("Checking interrupted apply journal", "recovery_journal");
     const journal = await readApplyJournalStrict(this.fsp, this.applyJournalPath);
     if (journal) this.plugin.setInitializationStage("Recovering an interrupted apply", "recovery_journal");
+    if (journal && !await this.validateApplyJournalPolicy(journal)) {
+      await this.writeState(Object.assign({}, state, {
+        status_label: "Out of sync \u2014 local recovery required",
+        last_error_code: "apply_journal_recovery_required",
+        updated_at: nowIso()
+      }));
+      return;
+    }
     if (journal && journal.phase === "committed") {
       let preservedLocalChangePaths = [];
       let preservedLocalSnapshot = null;
@@ -23190,7 +23246,7 @@ var ObtsObsidianClient = class {
       if (journal.preserve_local_changes) {
         this.plugin.setInitializationStage("Validating recovered local changes", "recovery_file_validation");
         const targetEntries = await this.listTreeBlobOids(journal.target_main);
-        const preserved = await this.localChangedPathsFromTree(targetEntries, true);
+        const preserved = await this.localChangedPathsFromTree(targetEntries, true, { targetRootIgnoreOid: journal.target_root_ignore_oid });
         preservedLocalChangePaths = preserved.paths;
         preservedLocalSnapshot = preserved.snapshot;
         pendingDirectoryIntents = (await this.readDirectoryState()).pending_intents;
@@ -23233,7 +23289,7 @@ var ObtsObsidianClient = class {
     if (journal) {
       this.plugin.setInitializationStage("Persisting blocked recovery state", "recovery_state");
       await this.writeState(Object.assign({}, state, {
-        status_label: "Unsafe local state",
+        status_label: "Out of sync \u2014 local recovery required",
         last_error_code: "apply_journal_recovery_required",
         updated_at: nowIso()
       }));
@@ -23244,7 +23300,7 @@ var ObtsObsidianClient = class {
       directoryRecovery = await this.readDirectoryRecoveryDecision();
     } catch (error) {
       await this.writeState(Object.assign({}, state, {
-        status_label: "Unsafe local state",
+        status_label: "Out of sync \u2014 local recovery required",
         last_error_code: "directory_recovery_journal_invalid",
         updated_at: nowIso()
       }));
@@ -23387,7 +23443,8 @@ var ObtsObsidianClient = class {
     if (!capabilities) {
       const response = await fetchWithTimeout(this.url(`/api/v1/connections/${connectionId}/bootstrap`), {
         method: "POST",
-        headers: { authorization: `Bearer ${secret}` }
+        headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" },
+        body: JSON.stringify({ root_ignore_capability: await this.rootIgnoreProtocolCapability() })
       });
       if (!response.ok) await throwResponseError(response);
       return parseMultipartPull(response.headers.get("content-type") || "", Buffer2.from(await response.arrayBuffer()));
@@ -23410,7 +23467,13 @@ var ObtsObsidianClient = class {
       const response = await fetchWithTimeout(this.url(`/api/v1/connections/${connectionId}/bootstrap-chunk`), {
         method: "POST",
         headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" },
-        body: JSON.stringify({ api_version: API_VERSION, plugin_version: PLUGIN_VERSION, cursor, requested_target: target })
+        body: JSON.stringify({
+          api_version: API_VERSION,
+          plugin_version: PLUGIN_VERSION,
+          cursor,
+          requested_target: target,
+          root_ignore_capability: await this.rootIgnoreProtocolCapability()
+        })
       });
       if (!response.ok) await throwResponseError(response);
       const chunk = parseMultipartPull(response.headers.get("content-type") || "", Buffer2.from(await response.arrayBuffer()));
@@ -23503,7 +23566,8 @@ var ObtsObsidianClient = class {
     }
     const bootstrap = await this.bootstrapWithChunks(connectionId, secret);
     await this.importPack(bootstrap.packfile, "onboarding", [makeDiagnosticBreadcrumb("onboarding_approved", "succeeded")]);
-    const localFiles = await this.scanSyncableFiles();
+    await this.verifyTransferredRootIgnore(bootstrap.manifest);
+    const localFiles = await this.scanSyncableFiles((await this.readRootIgnorePolicy()).policy);
     const matchesServer = localFiles.length === bootstrap.manifest.changed_paths.length && await this.localContentMatchesTree(localFiles, bootstrap.manifest.target_main);
     const repair = await this.discoverPairingRepairContext(await readJson(this.fsp, this.statePath, null));
     const baseline = this.baselineForPairing(repair.baseline, bootstrap.manifest.vault_id);
@@ -23551,7 +23615,10 @@ var ObtsObsidianClient = class {
     }
   }
   async completeConnection(connectionId, secret, request) {
-    return await postJsonWithBearer(this.url(`/api/v1/connections/${connectionId}/complete`), secret, request);
+    return await postJsonWithBearer(this.url(`/api/v1/connections/${connectionId}/complete`), secret, {
+      ...request,
+      root_ignore_capability: await this.rootIgnoreProtocolCapability()
+    });
   }
   async completeRegisteredOnboarding(connectionId, token) {
     for (let attempt = 0; attempt < 8; attempt += 1) {
@@ -23561,7 +23628,8 @@ var ObtsObsidianClient = class {
       }
       try {
         await postJsonWithBearer(this.url(`/api/v1/vaults/${state.vault_id}/onboarding/complete`), token, {
-          applied_main: state.local_main
+          applied_main: state.local_main,
+          root_ignore_capability: await this.rootIgnoreProtocolCapability()
         });
         await this.writeState(Object.assign({}, await this.readState(), {
           status_label: "Synced",
@@ -23574,7 +23642,7 @@ var ObtsObsidianClient = class {
         if (!(error instanceof ObtsTransportError && error.code === "onboarding_target_stale")) throw error;
       }
       const caughtUp = await this.syncOnce({ confirmInitialImport: false });
-      if (caughtUp.status === "Review needed") {
+      if (caughtUp.status === "Conflict resolution needed") {
         const pending = await this.readPendingOnboarding();
         await this.updateOnboardingStage(connectionId, "awaiting_conflict", pending?.journal.selected_mode || null);
         return caughtUp;
@@ -23584,7 +23652,7 @@ var ObtsObsidianClient = class {
   }
   async finishOnboardingInternal(connectionId, secret, analysis, mode) {
     const current = await this.localSnapshotSummary();
-    const localFiles = await this.scanSyncableFiles();
+    const localFiles = await this.scanSyncableFiles((await this.readRootIgnorePolicy()).policy);
     const resumed = await this.resumeAcceptedOnboarding(connectionId, analysis, mode, localFiles);
     if (resumed) return resumed;
     if (current.fingerprint !== analysis.localFingerprint) {
@@ -23662,7 +23730,7 @@ var ObtsObsidianClient = class {
     }
     await this.writeQueue({ pending_commit: proposalCommit, expected_device_ref: null, status: proposalCommit ? "queued_local" : "idle", attempts: 0, updated_at: nowIso() });
     const synced = await this.syncOnce({ confirmInitialImport: false });
-    if (synced.status === "Review needed") {
+    if (synced.status === "Conflict resolution needed") {
       await this.updateOnboardingStage(connectionId, "awaiting_conflict", mode);
       return synced;
     }
@@ -23730,7 +23798,7 @@ var ObtsObsidianClient = class {
         updated_at: nowIso()
       }));
       await this.updateOnboardingStage(connectionId, "awaiting_conflict", mode);
-      return { status: "Review needed" };
+      return { status: "Conflict resolution needed" };
     }
     await this.normalizeAcceptedOnboardingProposal(self.server_device_ref, localFiles);
     await this.writeState(Object.assign({}, await this.readState(), {
@@ -23810,7 +23878,7 @@ var ObtsObsidianClient = class {
         }));
         await this.reportDeviceStatus().catch(() => void 0);
       }
-      const localInventory = await this.listLocalVaultInventory("");
+      const localInventory = await this.listLocalVaultInventory("", (await this.readRootIgnorePolicy()).policy);
       const localFiles = assertNoCaseCollisions(localInventory.files.filter((filePath) => isSyncableVaultPath(filePath)).sort());
       const pendingDirectoryIntents = await this.reconcileDirectoryState(localFiles, localInventory.directories);
       if (localFiles.length > 0 && !state.initial_import_confirmed && state.server_device_ref === null) {
@@ -24076,6 +24144,9 @@ var ObtsObsidianClient = class {
     let directoryProposal = isUploadTransferCheckpoint(uploadCheckpoint) && uploadCheckpoint.target_commit === queue.pending_commit ? uploadCheckpoint.directory_proposal || null : null;
     let result;
     try {
+      if (uploadCheckpoint && (!isUploadTransferCheckpoint(uploadCheckpoint) || uploadCheckpoint.target_commit !== queue.pending_commit || uploadCheckpoint.transfer_request.root_ignore_capability !== "root-ignore-v1" || !Object.hasOwn(uploadCheckpoint.transfer_request, "root_ignore_oid"))) {
+        throw new ObtsBlockedError("legacy_upload_checkpoint", "Existing upload checkpoint needs explicit recovery; it will not be replaced or reinterpreted.");
+      }
       if (isUploadTransferCheckpoint(uploadCheckpoint) && uploadCheckpoint.transfer_id && uploadCheckpoint.target_commit === queue.pending_commit) {
         const existingResponse = await fetchWithTimeout(
           this.url(`/api/v1/vaults/${state.vault_id}/sync/push-transfers/${uploadCheckpoint.transfer_id}`),
@@ -24110,8 +24181,9 @@ var ObtsObsidianClient = class {
       if (!result && directoryProposal && !(capabilities && capabilities.capabilities.includes("directory-proposals-v2"))) {
         throw new ObtsBlockedError("server_update_required", "The server must be updated before directory changes can sync safely.");
       }
+      const rootIgnoreOid = !result ? await this.validateUploadTargetRootIgnore(queue.pending_commit) : null;
       if (!result && capabilities && capabilities.capabilities.includes("git-object-pack-chunks-v1")) {
-        result = await this.pushInChunks(state, queue, token, directoryProposal, capabilities);
+        result = await this.pushInChunks(state, queue, token, directoryProposal, capabilities, rootIgnoreOid);
       } else if (!result) {
         const packfile = await this.createPackForCommit(queue.pending_commit, [queue.expected_device_ref, state.local_main].filter(Boolean));
         const manifest = {
@@ -24121,6 +24193,8 @@ var ObtsObsidianClient = class {
           device_id: state.device_id,
           expected_device_ref: queue.expected_device_ref,
           target_commit: queue.pending_commit,
+          root_ignore_capability: "root-ignore-v1",
+          root_ignore_oid: rootIgnoreOid,
           packfile_sha256: sha256(packfile),
           packfile_bytes: packfile.byteLength,
           client_known_main: state.local_main,
@@ -24150,14 +24224,15 @@ var ObtsObsidianClient = class {
       await this.updateQueue(async (latestQueue) => {
         if (latestQueue.pending_commit !== queue.pending_commit || latestQueue.status === "blocked_recovery") return latestQueue;
         const permanentTransport = error instanceof ObtsTransportError && !isOfflineTransportError(error) && !isRetryableServerError(error);
-        errorCode = permanentTransport ? error.code : latestQueue.attempts > queue.attempts ? "upload_interrupted" : "pack_preparation_failed";
-        statusLabel = permanentTransport ? blockStatusLabel(errorCode) : "Ahead";
+        errorCode = error instanceof ObtsBlockedError || permanentTransport ? error.code : latestQueue.attempts > queue.attempts ? "upload_interrupted" : "pack_preparation_failed";
+        statusLabel = error instanceof ObtsBlockedError || permanentTransport ? blockStatusLabel(errorCode, error.details) : "Out of sync";
         return Object.assign({}, latestQueue, { status: "queued_local", updated_at: nowIso() });
       });
       if (errorCode && statusLabel) {
         await this.writeState(Object.assign({}, await this.readState(), {
           status_label: statusLabel,
           last_error_code: errorCode,
+          last_error_details: error instanceof ObtsBlockedError && error.code === "object_too_large_for_chunk" ? error.details : null,
           updated_at: nowIso()
         }));
         this.plugin.setStatus(statusLabel);
@@ -24249,9 +24324,88 @@ var ObtsObsidianClient = class {
     );
     if (!response.ok) await throwResponseError(response);
   }
-  async pushInChunks(state, queue, token, directoryProposal, capabilities, allowStaleRetry = true) {
+  async validateUploadTargetRootIgnore(commit2) {
+    const entries = /* @__PURE__ */ new Map();
+    await this.walkTree(commit2, "", async (filePath, entry) => {
+      assertValidLocalVaultPath(filePath);
+      if (entry.type === "tree") {
+        if (filePath === ".gitignore") throw new ObtsBlockedError("invalid_root_ignore", "Root .gitignore must be a regular blob.");
+        return;
+      }
+      if (entry.type !== "blob" || !["100644", "100755"].includes(entry.mode) || !isSyncableVaultPath(filePath)) {
+        throw new ObtsBlockedError("excluded_path", "Target commit contains an unsupported or excluded vault path.");
+      }
+      entries.set(filePath, entry);
+    });
+    const root = entries.get(".gitignore");
+    if (root && (root.type !== "blob" || !["100644", "100755"].includes(root.mode))) {
+      throw new ObtsBlockedError("invalid_root_ignore", "Target root .gitignore must be a regular blob.");
+    }
+    const bytes = root ? await this.readBlobOid(root.oid) : null;
+    if (bytes && (await git.hashBlob({ object: bytes })).oid !== root.oid) {
+      throw new ObtsBlockedError("root_ignore_oid_mismatch", "Target root ignore blob identity changed.");
+    }
+    const policy = createRootIgnorePolicy(bytes);
+    for (const filePath of entries.keys()) {
+      if (policy.ignores(filePath)) {
+        throw new ObtsBlockedError("excluded_root_ignore_path", "Target commit contains an excluded vault path.");
+      }
+    }
+    return root ? root.oid : null;
+  }
+  async verifyTransferredRootIgnore(manifest) {
+    if (!manifest || !Object.hasOwn(manifest, "root_ignore_oid")) {
+      throw new ObtsBlockedError("root_ignore_manifest_missing", "The server did not attest the target root ignore policy.");
+    }
+    const target = await this.targetApplyPolicy(manifest.target_main);
+    if (target.oid !== manifest.root_ignore_oid) {
+      throw new ObtsBlockedError("root_ignore_oid_mismatch", "The transferred root ignore policy differs from the target tree.");
+    }
+  }
+  async targetApplyPolicy(commit2, entries = null) {
+    const targetEntries = entries || await this.listTreeBlobOids(commit2);
+    const oid = await this.validateUploadTargetRootIgnore(commit2);
+    const bytes = oid ? await this.readBlobOid(oid) : null;
+    if (oid && (await git.hashBlob({ object: bytes })).oid !== oid) {
+      throw new ObtsBlockedError("root_ignore_oid_mismatch", "Target root ignore blob identity changed.");
+    }
+    return { oid, policy: createRootIgnorePolicy(bytes), entries: targetEntries };
+  }
+  async validateApplyJournalPolicy(journal) {
+    let target;
+    try {
+      target = await this.targetApplyPolicy(journal.target_main);
+      if (journal.journal_version < 5) return target.oid === null;
+      if (journal.target_root_ignore_oid !== target.oid) return false;
+      const previous = journal.expected_prior_local_main ? await this.listTreeFiles(journal.expected_prior_local_main) : [];
+      const physical = await this.listLocalVaultInventory("");
+      const expected = this.localOnlyApplyPaths(target, previous, physical);
+      if (!sameStringArray(journal.local_only_paths, expected) || journal.local_only_paths.some((filePath) => Boolean(journal.local_only_presence[filePath]) !== (physical.files.includes(filePath) || physical.directories.includes(filePath)))) return false;
+      this.assertLocalOnlyApplyCollisions(journal.local_only_paths, target.entries);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  localOnlyApplyPaths(target, previousFiles, physical) {
+    const targetFiles = new Set(target.entries.keys());
+    const targetDirs = new Set([...targetFiles].flatMap(directoryPrefixes));
+    return [.../* @__PURE__ */ new Set([...previousFiles, ...physical.files, ...physical.directories])].filter((filePath) => isRecoverableApplyPath(filePath) && target.policy.ignores(filePath, physical.directories.includes(filePath)) && !targetFiles.has(filePath) && !(targetDirs.has(filePath) && !physical.files.includes(filePath))).sort();
+  }
+  assertLocalOnlyApplyCollisions(paths, targetEntries) {
+    for (const retained of paths) {
+      for (const targetPath of targetEntries.keys()) {
+        if (retained === targetPath || retained.startsWith(`${targetPath}/`)) {
+          throw new ObtsBlockedError("local_only_collision", "Target file collides with retained local-only content.");
+        }
+      }
+    }
+  }
+  async pushInChunks(state, queue, token, directoryProposal, capabilities, rootIgnoreOid, allowStaleRetry = true) {
     const transferIdentity = sha256(Buffer2.from(stableJson({
       target_commit: queue.pending_commit,
+      root_ignore_capability: "root-ignore-v1",
+      root_ignore_oid: rootIgnoreOid,
       expected_device_ref: queue.expected_device_ref,
       client_known_main: state.local_main,
       directory_proposal: directoryProposal,
@@ -24262,11 +24416,12 @@ var ObtsObsidianClient = class {
     let groups;
     let transferRequest;
     let attemptId;
-    if (isUploadTransferCheckpoint(checkpoint) && checkpoint.identity === transferIdentity) {
+    if (isUploadTransferCheckpoint(checkpoint) && checkpoint.identity === transferIdentity && checkpoint.transfer_request.root_ignore_capability === "root-ignore-v1" && checkpoint.transfer_request.root_ignore_oid === rootIgnoreOid) {
       groups = checkpoint.groups;
       transferRequest = checkpoint.transfer_request;
       attemptId = checkpoint.attempt_id;
     } else {
+      if (checkpoint) throw new ObtsBlockedError("upload_checkpoint_mismatch", "Existing immutable upload attempt differs; explicit recovery is required.");
       this.reportOperationProgress("Preparing upload (planning objects)", "upload_prepare");
       groups = await this.planPackChunks(
         queue.pending_commit,
@@ -24284,6 +24439,8 @@ var ObtsObsidianClient = class {
         device_id: state.device_id,
         expected_device_ref: queue.expected_device_ref,
         target_commit: queue.pending_commit,
+        root_ignore_capability: "root-ignore-v1",
+        root_ignore_oid: rootIgnoreOid,
         client_known_main: state.local_main,
         ...queue.expected_device_ref === null && state.local_main ? { base_commit: state.local_main } : {},
         ...directoryProposal ? { directory_proposal: directoryProposal } : {},
@@ -24375,7 +24532,7 @@ var ObtsObsidianClient = class {
           await this.writeQueue(recoveredQueue);
           await this.writeState(Object.assign({}, state, { server_device_ref: recoveredRef, status_label: "Preparing upload", updated_at: nowIso() }));
           await this.fsp.rm(this.uploadTransferPath, { force: true });
-          return await this.pushInChunks(Object.assign({}, state, { server_device_ref: recoveredRef }), recoveredQueue, token, directoryProposal, capabilities, false);
+          return await this.pushInChunks(Object.assign({}, state, { server_device_ref: recoveredRef }), recoveredQueue, token, directoryProposal, capabilities, rootIgnoreOid, false);
         }
       }
       throw error;
@@ -24532,7 +24689,7 @@ var ObtsObsidianClient = class {
           requestOutcome: "succeeded",
           httpStatus: 200
         }));
-        return { applied: false, status: "Review needed" };
+        return { applied: false, status: "Conflict resolution needed" };
       }
       if (self.status === "blocked_recovery") {
         const nextState2 = Object.assign({}, state, {
@@ -24669,9 +24826,6 @@ var ObtsObsidianClient = class {
       return false;
     }
     this.throwIfSyncBlocked(state);
-    if (!await this.ensureNoQueuedLocalChangesBeforeApply(state)) {
-      return false;
-    }
     state = await this.readState();
     const token = await this.readDeviceToken();
     const pulled = await this.pull(
@@ -24685,7 +24839,8 @@ var ObtsObsidianClient = class {
     await this.importPack(pulled.packfile);
     await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
     state = await this.readState();
-    if (!await this.ensureNoQueuedLocalChangesBeforeApply(state)) {
+    const targetPolicy = await this.targetApplyPolicy(pulled.manifest.target_main);
+    if (!await this.ensureNoQueuedLocalChangesBeforeApply(state, targetPolicy)) {
       return false;
     }
     const applied = await this.applyTargetMain(
@@ -24697,7 +24852,7 @@ var ObtsObsidianClient = class {
       pulled.manifest.directory_intents || [],
       pulled.manifest.explicit_directories || [],
       pulled.manifest.event_seq,
-      true,
+      false,
       null,
       pulled.manifest.target_file_sizes || {}
     );
@@ -24748,7 +24903,7 @@ var ObtsObsidianClient = class {
               last_event_seq: currentEventSeq,
               updated_at: nowIso()
             }));
-            return { applied: false, status: "Review needed" };
+            return { applied: false, status: "Conflict resolution needed" };
           }
           throw pullError;
         }
@@ -24783,7 +24938,7 @@ var ObtsObsidianClient = class {
           last_error_code: "conflict_review_required",
           updated_at: nowIso()
         }));
-        return { applied: false, status: "Review needed" };
+        return { applied: false, status: "Conflict resolution needed" };
       }
       if (self.status === "blocked_recovery") {
         await this.writeState(Object.assign({}, authoritativeState, {
@@ -24914,7 +25069,8 @@ var ObtsObsidianClient = class {
       }));
       return true;
     }
-    if (requireCleanVisibleState && !cleanVisibleStateVerified && !await this.ensureNoLocalChangesBeforeApply(state)) {
+    const targetPolicy = await this.targetApplyPolicy(targetMain);
+    if (requireCleanVisibleState && !cleanVisibleStateVerified && !await this.ensureNoLocalChangesBeforeApply(state, targetPolicy)) {
       return false;
     }
     const applyId = `apply_${Date.now()}_${randomHex(8)}`;
@@ -24927,7 +25083,10 @@ var ObtsObsidianClient = class {
     }));
     this.reportOperationProgress("Applying", "apply_recovery_prepare");
     const journal = {
-      journal_version: 4,
+      journal_version: 5,
+      target_root_ignore_oid: targetPolicy.oid,
+      local_only_paths: [],
+      local_only_presence: {},
       apply_id: applyId,
       operation_type: "pull_apply",
       target_main: targetMain,
@@ -24951,32 +25110,51 @@ var ObtsObsidianClient = class {
       redacted_error_category: null
     };
     try {
-      const targetEntries = await this.listTreeBlobOids(targetMain);
+      const targetEntries = targetPolicy.entries;
       const targetFiles = new Set(targetEntries.keys());
-      const affected = new Set(changedPaths || []);
       const previousFiles = state.local_main ? await this.listTreeFiles(state.local_main) : [];
+      const localVaultInventory = await this.listLocalVaultInventory("");
+      journal.local_only_paths = this.localOnlyApplyPaths(targetPolicy, previousFiles, localVaultInventory);
+      journal.local_only_presence = Object.fromEntries(journal.local_only_paths.map((filePath) => [
+        filePath,
+        localVaultInventory.files.includes(filePath) || localVaultInventory.directories.includes(filePath)
+      ]));
+      this.assertLocalOnlyApplyCollisions(journal.local_only_paths, targetEntries);
+      const localOnly = new Set(journal.local_only_paths);
+      const protectsPath = (filePath) => journal.local_only_paths.some((retained) => retained === filePath || retained.startsWith(`${filePath}/`));
+      const affected = new Set((changedPaths || []).filter((filePath) => !protectsPath(filePath)));
       const previousMaterializedDirectories = new Set(previousFiles.flatMap((filePath) => directoryPrefixes(filePath)));
       const targetMaterializedDirectories = new Set(explicitDirectorySet);
       for (const filePath of targetFiles) {
         for (const dirPath of directoryPrefixes(filePath)) targetMaterializedDirectories.add(dirPath);
       }
+      const protectsDirectory = (dirPath) => journal.local_only_paths.some((retained) => retained === dirPath || retained.startsWith(`${dirPath}/`));
       const impliedDirectoryDeletes = topmostDirectories(
-        [...previousMaterializedDirectories].filter((dirPath) => !targetMaterializedDirectories.has(dirPath))
+        [...previousMaterializedDirectories].filter((dirPath) => !targetMaterializedDirectories.has(dirPath) && !protectsDirectory(dirPath))
       ).map((dirPath) => ({ op: "delete", path: dirPath }));
-      compactedDirectoryIntents = compactDirectoryIntents([...compactedDirectoryIntents, ...impliedDirectoryDeletes]);
+      compactedDirectoryIntents = compactDirectoryIntents([
+        ...compactedDirectoryIntents.filter((intent) => intent.op !== "delete" || !protectsDirectory(intent.path)),
+        ...impliedDirectoryDeletes
+      ]);
       journal.directory_intents = compactedDirectoryIntents;
       for (const previousPath of previousFiles) {
-        if (!targetFiles.has(previousPath)) affected.add(previousPath);
+        if (!targetFiles.has(previousPath) && !localOnly.has(previousPath)) affected.add(previousPath);
       }
       for (const localPath of extraAffectedPaths) {
-        affected.add(localPath);
+        if (!protectsPath(localPath)) affected.add(localPath);
       }
-      const localVaultInventory = await this.listLocalVaultInventory("");
+      const priorEntries = state.local_main ? await this.listTreeBlobOids(state.local_main) : /* @__PURE__ */ new Map();
+      for (const [filePath, oid] of targetEntries) {
+        if (priorEntries.get(filePath) !== oid) affected.add(filePath);
+      }
       const localVaultFiles = localVaultInventory.files;
       const preApplyDirectories = new Set(localVaultInventory.directories);
       journal.pre_apply_directories = [...preApplyDirectories].sort();
       journal.pre_apply_directory_ctimes = await this.captureDirectoryCreationTimes(journal.pre_apply_directories);
       for (const conflictPath of materializationConflictFiles(/* @__PURE__ */ new Set([...targetFiles, ...affected]), localVaultFiles)) {
+        if (localOnly.has(conflictPath)) {
+          throw new ObtsBlockedError("local_only_collision", "Target file collides with retained local-only content.");
+        }
         affected.add(conflictPath);
       }
       const affectedPaths = Array.from(affected).filter((filePath) => isRecoverableApplyPath(filePath)).sort();
@@ -25018,6 +25196,9 @@ var ObtsObsidianClient = class {
         }
       }
       await writeJson(this.fsp, this.applyJournalPath, journal);
+      if (!await this.validateApplyJournalPolicy(journal)) {
+        await this.block("target_policy_changed", "The pinned target policy or retained local-only paths changed before apply.");
+      }
       if (affectedPaths.length > 0) {
         if (!allowDestructive) {
           await this.fsp.rm(stagedRecovery.partialDir, { recursive: true, force: true }).catch(() => void 0);
@@ -25097,6 +25278,9 @@ var ObtsObsidianClient = class {
           return false;
         }
       }
+      if (!await this.validateApplyJournalPolicy(journal)) {
+        await this.block("target_policy_changed", "The pinned target policy or retained local-only paths changed before writing.");
+      }
       journal.phase = "writing_files";
       await writeJson(this.fsp, this.applyJournalPath, journal);
       await this.writeTargetFilesFromJournal(journal, targetEntries, /* @__PURE__ */ new Set());
@@ -25107,7 +25291,8 @@ var ObtsObsidianClient = class {
         explicitDirectorySet,
         preApplyDirectories,
         confirmedDirectoryCtimes,
-        removableDirectories
+        removableDirectories,
+        journal.local_only_paths
       );
       journal.phase = "verifying";
       journal.last_completed_step = "files_written";
@@ -25131,7 +25316,10 @@ var ObtsObsidianClient = class {
       if (requireCleanVisibleState) {
         await this.flushEditorBuffersToDisk();
         try {
-          const preserved = await this.localChangedPathsFromTree(targetEntries, true, { reportOperationProgress: true });
+          const preserved = await this.localChangedPathsFromTree(targetEntries, true, {
+            reportOperationProgress: true,
+            targetRootIgnoreOid: journal.target_root_ignore_oid
+          });
           preservedLocalChangePaths = preserved.paths;
           preservedLocalSnapshot = preserved.snapshot;
         } catch (error) {
@@ -25151,6 +25339,9 @@ var ObtsObsidianClient = class {
           explicitDirectorySet,
           residualTombstoneDirectories
         );
+      }
+      if (!await this.validateApplyJournalPolicy(journal)) {
+        await this.block("target_policy_changed", "Retained local-only content changed during apply.");
       }
       await this.updateRef("refs/heads/main", targetMain, null, true);
       await this.updateRef("refs/heads/local", targetMain, null, true);
@@ -25193,7 +25384,7 @@ var ObtsObsidianClient = class {
     let preservedLocalChangePaths = [];
     let preservedLocalSnapshot = null;
     if (canRecoverFinalVisibleTree) {
-      const preserved = await this.localChangedPathsFromTree(targetEntries, true);
+      const preserved = await this.localChangedPathsFromTree(targetEntries, true, { targetRootIgnoreOid: journal.target_root_ignore_oid });
       preservedLocalChangePaths = preserved.paths;
       preservedLocalSnapshot = preserved.snapshot;
     } else {
@@ -25219,7 +25410,8 @@ var ObtsObsidianClient = class {
         journal.explicit_directories || [],
         new Set(journal.pre_apply_directories || []),
         journal.confirmed_directory_inventory ? Object.fromEntries(journal.confirmed_directory_inventory.directories.map((entry) => [entry.path, entry.creation_time])) : journal.pre_apply_directory_ctimes || {},
-        journal.confirmed_directory_inventory ? new Set(journal.confirmed_directory_inventory.directories.map((entry) => entry.path)) : new Set(journal.pre_apply_directories || [])
+        journal.confirmed_directory_inventory ? new Set(journal.confirmed_directory_inventory.directories.map((entry) => entry.path)) : new Set(journal.pre_apply_directories || []),
+        journal.local_only_paths || []
       );
       const preservedDirectoryIntents = journal.preserve_local_changes ? await this.preserveDirectoryChangesFromTarget(
         targetEntries,
@@ -25227,6 +25419,7 @@ var ObtsObsidianClient = class {
         residualTombstoneDirectories
       ) : [];
       this.plugin.setInitializationStage("Restoring interrupted apply refs", "recovery_refs");
+      if (!await this.validateApplyJournalPolicy(journal)) return false;
       await this.updateRef("refs/heads/main", journal.target_main, null, true);
       await this.updateRef("refs/heads/local", journal.target_main, null, true);
       journal.phase = "committed";
@@ -25300,7 +25493,8 @@ var ObtsObsidianClient = class {
         journal.explicit_directories || [],
         new Set(journal.pre_apply_directories || []),
         journal.confirmed_directory_inventory ? Object.fromEntries(journal.confirmed_directory_inventory.directories.map((entry) => [entry.path, entry.creation_time])) : journal.pre_apply_directory_ctimes || {},
-        journal.confirmed_directory_inventory ? new Set(journal.confirmed_directory_inventory.directories.map((entry) => entry.path)) : new Set(journal.pre_apply_directories || [])
+        journal.confirmed_directory_inventory ? new Set(journal.confirmed_directory_inventory.directories.map((entry) => entry.path)) : new Set(journal.pre_apply_directories || []),
+        journal.local_only_paths || []
       );
       journal.phase = "verifying";
       journal.last_completed_step = "files_written";
@@ -25316,7 +25510,7 @@ var ObtsObsidianClient = class {
       let preservedLocalSnapshot = null;
       let preservedDirectoryIntents = [];
       if (journal.preserve_local_changes) {
-        const preserved = await this.localChangedPathsFromTree(targetEntries, true);
+        const preserved = await this.localChangedPathsFromTree(targetEntries, true, { targetRootIgnoreOid: journal.target_root_ignore_oid });
         preservedLocalChangePaths = preserved.paths;
         preservedLocalSnapshot = preserved.snapshot;
         if (preservedLocalChangePaths.length > 0) {
@@ -25330,6 +25524,7 @@ var ObtsObsidianClient = class {
         );
       }
       this.plugin.setInitializationStage("Restoring interrupted apply refs", "recovery_refs");
+      if (!await this.validateApplyJournalPolicy(journal)) return false;
       await this.updateRef("refs/heads/main", journal.target_main, null, true);
       await this.updateRef("refs/heads/local", journal.target_main, null, true);
       journal.phase = "committed";
@@ -25389,13 +25584,18 @@ var ObtsObsidianClient = class {
     return matches.every(Boolean);
   }
   async localChangedPathsFromTree(targetEntries, includeSnapshot = false, options = {}) {
-    const localFiles = await this.scanSyncableFiles();
+    const rootPolicy = await this.readRootIgnorePolicy();
+    if (options.targetRootIgnoreOid !== void 0 && rootPolicy.oid !== options.targetRootIgnoreOid) {
+      throw new ObtsBlockedError("target_policy_changed", "The visible root ignore policy changed during apply.");
+    }
+    const localFiles = await this.scanSyncableFiles(rootPolicy.policy);
     const localSet = new Set(localFiles);
     const snapshot = await this.captureLocalFileSnapshot(localFiles, new Map(
       [...targetEntries].map(([filePath, oid]) => [filePath, { oid }])
     ), {
       persistChangedBlobs: includeSnapshot,
       verifyInventory: includeSnapshot,
+      rootPolicy,
       reportProgress: false,
       onProgress: options.reportOperationProgress ? (completed, total) => this.reportOperationProgress(
         total > 0 ? `Applying (verifying vault) ${completed}/${total}` : "Applying (verifying vault)",
@@ -25532,6 +25732,9 @@ var ObtsObsidianClient = class {
     return { matches: true, targetMatchedPaths };
   }
   async writeTargetFilesFromJournal(journal, targetEntries, targetMatchedPaths) {
+    if (journal.journal_version >= 5 && !await this.validateApplyJournalPolicy(journal)) {
+      throw new ObtsBlockedError("target_policy_changed", "The pinned target policy or retained local-only paths changed.");
+    }
     const assertRecoveredDescendants = async (filePath) => {
       const descendants = await this.listLocalDescendantFiles(filePath);
       if (descendants.some((descendant) => {
@@ -25786,7 +25989,8 @@ var ObtsObsidianClient = class {
   async createLocalCommit(message, knownLocalFiles = void 0, options = {}) {
     const base = await this.resolveRef("refs/heads/local");
     const baseEntries = base ? await this.flattenTree(base) : /* @__PURE__ */ new Map();
-    const localFiles = (knownLocalFiles || await this.scanSyncableFiles()).slice().sort();
+    const pinnedPolicy = await this.readRootIgnorePolicy();
+    const localFiles = knownLocalFiles ? knownLocalFiles.filter((filePath) => !pinnedPolicy.policy.ignores(filePath)).slice().sort() : await this.scanSyncableFiles(pinnedPolicy.policy);
     const localSet = new Set(localFiles);
     const nextEntries = new Map(baseEntries);
     for (const filePath of baseEntries.keys()) {
@@ -25800,7 +26004,8 @@ var ObtsObsidianClient = class {
         reportProgress: true,
         verifyInventory: true,
         forcePaths: options.forcePaths,
-        fullAudit: Boolean(options.fullAudit)
+        fullAudit: Boolean(options.fullAudit),
+        rootPolicy: pinnedPolicy
       });
     } catch (error) {
       if (!(error instanceof LocalSnapshotChangedError)) throw error;
@@ -25818,12 +26023,19 @@ var ObtsObsidianClient = class {
     } else if (nextEntries.size === 0) {
       return null;
     }
+    try {
+      await this.verifyLocalPolicySnapshot(snapshot);
+    } catch (error) {
+      if (!(error instanceof LocalSnapshotChangedError)) throw error;
+      this.plugin.syncQueued = true;
+      throw new ObtsBlockedError("local_snapshot_changed", "Root .gitignore changed during capture. Sync will retry.");
+    }
     return await this.commitTree(tree, base, message);
   }
   async captureLocalFileSnapshot(localFiles, baseEntries = /* @__PURE__ */ new Map(), options = {}) {
     const files = localFiles.slice().sort();
     const byteBudget = createByteBudget(this.fileBufferBudgetBytes);
-    const forcedPaths = Array.from(new Set((Array.isArray(options.forcePaths) ? options.forcePaths : []).filter((filePath) => typeof filePath === "string" && isSyncableVaultPath(filePath)).map((filePath) => normalizePath2(filePath))));
+    const forcedPaths = Array.from(new Set([".gitignore", ...Array.isArray(options.forcePaths) ? options.forcePaths : []].filter((filePath) => typeof filePath === "string" && isSyncableVaultPath(filePath)).map((filePath) => normalizePath2(filePath))));
     const scanCache = options.fullAudit ? /* @__PURE__ */ new Map() : await this.readScanCache();
     if (options.persistScanCache) this.lastSnapshotWasFullAudit = Boolean(options.fullAudit || scanCache.size === 0);
     if (options.reportProgress) this.reportCheckingProgress(0, files.length, Boolean(options.fullAudit));
@@ -25854,7 +26066,16 @@ var ObtsObsidianClient = class {
       try {
         let content;
         try {
-          content = Buffer2.from(await this.adapter.readBinary(filePath));
+          if (filePath === ".gitignore") {
+            const raw = typeof this.adapter.readRootIgnorePolicyNoFollow === "function" ? await this.adapter.readRootIgnorePolicyNoFollow(MAX_ROOT_IGNORE_BYTES) : await this.adapter.readBinary(filePath);
+            if (raw === null || raw.byteLength > MAX_ROOT_IGNORE_BYTES) throw new LocalSnapshotChangedError(filePath);
+            content = Buffer2.from(raw);
+            if (options.rootPolicy && (options.rootPolicy.bytes === null || !content.equals(options.rootPolicy.bytes))) {
+              throw new LocalSnapshotChangedError(filePath);
+            }
+          } else {
+            content = Buffer2.from(await this.adapter.readBinary(filePath));
+          }
         } catch (error) {
           throw new LocalSnapshotChangedError(filePath, error);
         }
@@ -25883,15 +26104,21 @@ var ObtsObsidianClient = class {
         releaseBytes();
       }
     });
-    if (options.verifyInventory) {
-      const verifiedFiles = await this.scanSyncableFiles();
-      if (!sameStringArray(files, verifiedFiles)) throw new LocalSnapshotChangedError("<inventory>");
+    const rootPolicy = options.rootPolicy || await this.readRootIgnorePolicy();
+    const snapshot = { files, entries: new Map(files.map((filePath, index2) => [filePath, values[index2]])), rootPolicy };
+    if (options.verifyInventory) await this.verifyLocalPolicySnapshot(snapshot);
+    if (options.persistScanCache) await this.writeScanCache(snapshot.entries);
+    return snapshot;
+  }
+  async verifyLocalPolicySnapshot(snapshot) {
+    if (!snapshot.rootPolicy || !Array.isArray(snapshot.files)) throw new LocalSnapshotChangedError(".gitignore");
+    const current = await this.readRootIgnorePolicy();
+    if (current.oid !== snapshot.rootPolicy.oid || snapshot.entries.get(".gitignore")?.entry.oid !== (snapshot.rootPolicy.oid ?? void 0) || current.bytes === null !== (snapshot.rootPolicy.bytes === null) || current.bytes !== null && !current.bytes.equals(snapshot.rootPolicy.bytes) || !sameStringArray(snapshot.files, await this.scanSyncableFiles(snapshot.rootPolicy.policy))) {
+      throw new LocalSnapshotChangedError(".gitignore");
     }
-    const entries = new Map(files.map((filePath, index2) => [filePath, values[index2]]));
-    if (options.persistScanCache) await this.writeScanCache(entries);
-    return { files, entries };
   }
   async createLocalCommitFromSnapshot(message, snapshot) {
+    await this.verifyLocalPolicySnapshot(snapshot);
     const base = await this.resolveRef("refs/heads/local");
     const baseEntries = base ? await this.flattenTree(base) : /* @__PURE__ */ new Map();
     const nextEntries = new Map(baseEntries);
@@ -25907,6 +26134,7 @@ var ObtsObsidianClient = class {
     } else if (nextEntries.size === 0) {
       return null;
     }
+    await this.verifyLocalPolicySnapshot(snapshot);
     return await this.commitTree(tree, base, message);
   }
   async createMetadataCommit(message) {
@@ -25928,8 +26156,70 @@ var ObtsObsidianClient = class {
     await this.updateRef("refs/heads/local", commit2, base);
     return commit2;
   }
-  async scanSyncableFiles() {
-    const result = (await this.listLocalVaultFiles()).filter((filePath) => isSyncableVaultPath(filePath));
+  async readRootIgnoreBytes() {
+    const trusted = typeof this.adapter.readRootIgnorePolicyNoFollow === "function" ? await this.adapter.readRootIgnorePolicyNoFollow(MAX_ROOT_IGNORE_BYTES) : void 0;
+    const listing = await this.adapter.list("");
+    const metadata = await this.adapter.stat(".gitignore");
+    const present = (listing.files || []).includes(".gitignore");
+    if (!present && !metadata && !(listing.folders || []).includes(".gitignore") && (trusted === null || trusted === void 0)) return null;
+    if (!present || !metadata || metadata.type !== "file") {
+      throw new ObtsBlockedError("root_ignore_changed", "Root .gitignore is not a regular readable file.");
+    }
+    if (metadata.size > MAX_ROOT_IGNORE_BYTES) {
+      throw new ObtsBlockedError("root_ignore_too_large", "Root .gitignore exceeds the byte limit.");
+    }
+    const raw = trusted === void 0 ? await this.adapter.readBinary(".gitignore") : trusted;
+    if (raw === null) throw new ObtsBlockedError("root_ignore_changed", "Root .gitignore changed while reading.");
+    if (raw.byteLength > MAX_ROOT_IGNORE_BYTES) {
+      throw new ObtsBlockedError("root_ignore_too_large", "Root .gitignore exceeds the byte limit.");
+    }
+    return Buffer2.from(raw);
+  }
+  async readRootIgnorePolicy() {
+    const bytes = await this.readRootIgnoreBytes();
+    const verified = await this.readRootIgnoreBytes();
+    if (verified === null !== (bytes === null) || verified !== null && !verified.equals(bytes)) {
+      throw new ObtsBlockedError("root_ignore_changed", "Root .gitignore changed while reading.");
+    }
+    return {
+      bytes,
+      oid: bytes === null ? null : (await git.hashBlob({ object: bytes })).oid,
+      policy: createRootIgnorePolicy(bytes)
+    };
+  }
+  rootIgnoreDraftPolicy(draft) {
+    if (typeof draft !== "string" || Buffer2.from(draft, "utf8").toString("utf8") !== draft) {
+      throw new ObtsBlockedError("invalid_root_ignore_draft", "Root .gitignore must be valid UTF-8 text.");
+    }
+    const bytes = Buffer2.from(draft, "utf8");
+    return { bytes, policy: createRootIgnorePolicy(bytes) };
+  }
+  async previewRootIgnoreDraft(draft) {
+    const { policy } = this.rootIgnoreDraftPolicy(draft);
+    const local = await this.listLocalVaultInventory("", policy);
+    const head = await this.resolveRef("refs/heads/local");
+    const tracked = head ? [...(await this.listTreeBlobOids(head)).keys()] : [];
+    const newlyLocal = tracked.filter((filePath) => filePath !== ".gitignore" && policy.ignores(filePath));
+    return {
+      includedFiles: local.files.filter((filePath) => isSyncableVaultPath(filePath)).length,
+      newlyLocal: newlyLocal.sort()
+    };
+  }
+  async saveRootIgnoreDraft(draft) {
+    const { bytes } = this.rootIgnoreDraftPolicy(draft);
+    await this.adapter.writeBinary(".gitignore", bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    const saved = await this.readRootIgnorePolicy();
+    if (saved.bytes === null || !saved.bytes.equals(bytes)) {
+      throw new ObtsBlockedError("root_ignore_save_uncertain", "Root .gitignore changed during save. Keep your draft and inspect the local file.");
+    }
+    return saved;
+  }
+  async rootIgnoreProtocolCapability() {
+    await this.readRootIgnorePolicy();
+    return "root-ignore-v1";
+  }
+  async scanSyncableFiles(policy = null) {
+    const result = (await this.listLocalVaultInventory("", policy)).files.filter((filePath) => isSyncableVaultPath(filePath));
     return assertNoCaseCollisions(result.sort());
   }
   reportCheckingProgress(completed, total, fullAudit = false) {
@@ -25947,16 +26237,20 @@ var ObtsObsidianClient = class {
     }
   }
   async localSnapshotSummary() {
-    const inventory = await this.listLocalVaultInventory("");
+    const rootPolicy = await this.readRootIgnorePolicy();
+    const inventory = await this.listLocalVaultInventory("", rootPolicy.policy);
     const files = assertNoCaseCollisions(inventory.files.filter((filePath) => isSyncableVaultPath(filePath)).sort());
     const directories = inventory.directories;
-    const snapshot = await this.captureLocalFileSnapshot(files, /* @__PURE__ */ new Map(), { reportProgress: true });
+    const snapshot = await this.captureLocalFileSnapshot(files, /* @__PURE__ */ new Map(), { reportProgress: true, rootPolicy, verifyInventory: true });
     const hash = createSha("sha256");
     for (const directoryPath of directories) {
       hash.update("dir\0");
       hash.update(directoryPath);
       hash.update("\0");
     }
+    hash.update("root-policy\0");
+    hash.update(rootPolicy.oid || "absent");
+    hash.update("\0");
     let bytes = 0;
     for (const filePath of files) {
       const value = snapshot.entries.get(filePath);
@@ -26204,9 +26498,11 @@ var ObtsObsidianClient = class {
     if (cached) return cached.map((group2) => group2.slice());
     const oids = await this.collectIncrementalPackObjects(commit2, excludeCommits);
     const sizes = [];
+    const objectTypes = [];
     for (let index2 = 0; index2 < oids.length; index2 += 1) {
       const result = await git.readObject({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: oids[index2], format: "content" });
       sizes.push(result.object.byteLength);
+      objectTypes.push(result.type);
       this.reportOperationProgress(
         `Preparing upload (planning objects) ${index2 + 1}/${oids.length}`,
         "upload_prepare"
@@ -26223,7 +26519,15 @@ var ObtsObsidianClient = class {
       const size = sizes[index2];
       const packHeadroom = Math.min(1024 * 1024, Math.max(64 * 1024, Math.floor(maxChunkBytes * 0.1)));
       if (size > maxChunkBytes - packHeadroom) {
-        throw new ObtsBlockedError("object_too_large_for_chunk", "A file is too large for bounded mobile transfer.");
+        const currentPaths = objectTypes[index2] === "blob" ? [...(await this.flattenTree(commit2)).values()].filter((entry) => entry.oid === oid).map((entry) => entry.path).slice(0, 3) : [];
+        throw new ObtsBlockedError("object_too_large_for_chunk", "A Git object exceeds the upload chunk limit; queued work remains local.", {
+          object_type: objectTypes[index2],
+          object_oid: oid,
+          object_bytes: size,
+          object_limit_bytes: maxChunkBytes - packHeadroom,
+          operation_phase: "upload_prepare",
+          current_paths: currentPaths
+        });
       }
       if (group.length > 0 && groupBytes + size > targetChunkBytes) {
         groups.push(group);
@@ -26550,7 +26854,8 @@ var ObtsObsidianClient = class {
         current_local_main: currentLocalMain,
         requested_target: requestedTarget,
         current_event_seq: currentEventSeq || 0,
-        cursor
+        cursor,
+        root_ignore_capability: await this.rootIgnoreProtocolCapability()
       })
     });
     if (!response.ok) await throwResponseError(response);
@@ -26563,6 +26868,7 @@ var ObtsObsidianClient = class {
     if (currentLocalMain !== null && !await this.commitExists(currentLocalMain)) {
       throw new ObtsBlockedError("invalid_transfer_checkpoint", "Completed transfer checkpoint base commit is unavailable.");
     }
+    await this.verifyTransferredRootIgnore(checkpoint.manifest);
     const targetEntries = await this.listTreeBlobOids(checkpoint.target_main);
     const priorEntries = currentLocalMain === null ? /* @__PURE__ */ new Map() : await this.listTreeBlobOids(currentLocalMain);
     const expectedChangedPaths = [.../* @__PURE__ */ new Set([...priorEntries.keys(), ...targetEntries.keys()])].filter((filePath) => priorEntries.get(filePath) !== targetEntries.get(filePath)).sort();
@@ -26590,7 +26896,11 @@ var ObtsObsidianClient = class {
     const capabilities = await this.syncCapabilities();
     if (capabilities) {
       const checkpoint = await readJson(this.fsp, this.pullTransferPath, null);
-      const checkpointMatches = checkpoint && checkpoint.vault_id === vaultId && checkpoint.device_id === deviceId && checkpoint.current_local_main === currentLocalMain && checkpoint.current_event_seq === (currentEventSeq || 0) && (requestedTarget === "latest" || requestedTarget === checkpoint.target_main);
+      let checkpointMatches = checkpoint && checkpoint.vault_id === vaultId && checkpoint.device_id === deviceId && checkpoint.current_local_main === currentLocalMain && checkpoint.current_event_seq === (currentEventSeq || 0) && (requestedTarget === "latest" || requestedTarget === checkpoint.target_main);
+      if (checkpointMatches && checkpoint.complete === true && requestedTarget === "latest") {
+        const current = await this.getDeviceSelf(token);
+        if (current.current_main !== checkpoint.target_main) checkpointMatches = false;
+      }
       if (checkpointMatches && checkpoint.complete === true) {
         if (!isCompletePullCheckpoint(checkpoint) || !await this.commitExists(checkpoint.target_main)) {
           throw new ObtsBlockedError("invalid_transfer_checkpoint", "Completed pull transfer checkpoint is invalid.");
@@ -26662,6 +26972,7 @@ var ObtsObsidianClient = class {
         });
         this.reportOperationProgress(`Downloaded ${chunkCount} sync chunks \xB7 ${formatBytes(transferredBytes)}`, "sync_download");
       }
+      await this.verifyTransferredRootIgnore(finalManifest);
       return { manifest: finalManifest, packfile: Buffer2.alloc(0) };
     }
     const multipart = createMultipartBody([
@@ -26675,6 +26986,7 @@ var ObtsObsidianClient = class {
           device_id: deviceId,
           current_local_main: currentLocalMain,
           requested_target: requestedTarget,
+          root_ignore_capability: await this.rootIgnoreProtocolCapability(),
           ...currentEventSeq === void 0 ? {} : { current_event_seq: currentEventSeq }
         }))
       },
@@ -26688,7 +27000,10 @@ var ObtsObsidianClient = class {
     if (!response.ok) {
       await throwResponseError(response);
     }
-    return parseMultipartPull(response.headers.get("content-type") || "", Buffer2.from(await response.arrayBuffer()));
+    const pulled = parseMultipartPull(response.headers.get("content-type") || "", Buffer2.from(await response.arrayBuffer()));
+    await this.importPack(pulled.packfile);
+    await this.verifyTransferredRootIgnore(pulled.manifest);
+    return { manifest: pulled.manifest, packfile: Buffer2.alloc(0) };
   }
   async push(vaultId, token, manifest, packfile) {
     const multipart = createMultipartBody([
@@ -26720,7 +27035,7 @@ var ObtsObsidianClient = class {
     const operation = typeof this.plugin.operationDetails === "function" ? this.plugin.operationDetails() : null;
     const stateUpdatedAt = Date.parse(state.updated_at || "");
     const operationIsNewer = operation && (!Number.isFinite(stateUpdatedAt) || operation.progressUpdatedAt > stateUpdatedAt);
-    const activeStatusLabel = operation && operation.availability === "busy" && operation.label && operationIsNewer && isReportableOperationStatus(operation.label) ? `${operation.label}${operation.slow ? " (taking longer than expected)" : ""}`.slice(0, 80) : state.status_label || "Checking";
+    const activeStatusLabel = operation && operation.availability === "busy" && operation.label && operationIsNewer && isReportableOperationStatus(operation.label) ? `${operation.label}${operation.slow ? " (taking longer than expected)" : ""}`.slice(0, 80) : normalizePersistedStatusLabel(state.status_label, state.last_error_code, state.last_error_details);
     const nameRevision = this.plugin.deviceNameRevision;
     const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${state.vault_id}/sync/device-status`), {
       method: "POST",
@@ -26824,7 +27139,7 @@ var ObtsObsidianClient = class {
       response = await postJsonWithBearer(
         this.url(`/api/v1/vaults/${currentState.vault_id}/sync/applied`),
         token,
-        { applied_main: pending.target_main }
+        { applied_main: pending.target_main, root_ignore_capability: await this.rootIgnoreProtocolCapability() }
       );
     } catch (error) {
       if (!(error instanceof ObtsTransportError && error.status === 404)) throw error;
@@ -26833,7 +27148,7 @@ var ObtsObsidianClient = class {
         await postJsonWithBearer(
           this.url(`/api/v1/vaults/${currentState.vault_id}/onboarding/complete`),
           token,
-          { applied_main: pending.target_main }
+          { applied_main: pending.target_main, root_ignore_capability: await this.rootIgnoreProtocolCapability() }
         );
         self = await this.getDeviceSelf(token);
       }
@@ -26862,42 +27177,45 @@ var ObtsObsidianClient = class {
     await this.writePendingAppliedAcknowledgement(targetMain, state.last_applied_event_seq || 0);
     await this.retryPendingAppliedAcknowledgement();
   }
-  async ensureNoQueuedLocalChangesBeforeApply(state) {
+  async ensureNoQueuedLocalChangesBeforeApply(state, target = null) {
     const flushedPaths = await this.flushEditorBuffersToDisk();
-    if (Array.isArray(flushedPaths) && flushedPaths.length > 0) this.plugin.syncQueued = true;
+    if (Array.isArray(flushedPaths) && flushedPaths.some((filePath) => !target || !target.policy.ignores(filePath))) this.plugin.syncQueued = true;
     const queue = await this.readQueue();
-    if (queue.pending_commit && queue.status !== "conflicted" || queue.status === "queued_local" || (queue.changed_paths || []).length > 0 || this.plugin.syncQueued) {
+    if (queue.pending_commit && queue.status !== "conflicted" || queue.status === "queued_local" || (queue.changed_paths || []).some((filePath) => !target || !target.policy.ignores(filePath)) || !target && this.plugin.syncQueued) {
       await this.deferApplyForLocalChanges(state);
       return false;
     }
     return true;
   }
-  async ensureNoLocalChangesBeforeApply(state) {
+  async ensureNoLocalChangesBeforeApply(state, target = null) {
     await this.flushEditorBuffersToDisk();
     const queue = await this.readQueue();
-    if (queue.pending_commit && queue.status !== "conflicted" || queue.status === "queued_local" || (queue.changed_paths || []).length > 0) {
+    if (queue.pending_commit && queue.status !== "conflicted" || queue.status === "queued_local" || (queue.changed_paths || []).some((filePath) => !target || !target.policy.ignores(filePath))) {
       await this.deferApplyForLocalChanges(state);
       return false;
     }
-    if (await this.visibleVaultMatchesLocalHead(state)) {
+    if (await this.visibleVaultMatchesLocalHead(state, target)) {
       return true;
     }
     await this.deferApplyForLocalChanges(state);
     return false;
   }
-  async visibleVaultMatchesLocalHead(state) {
+  async visibleVaultMatchesLocalHead(state, target = null) {
     const expectedLocalHead = state.local_head || state.local_main;
-    const localFiles = await this.scanSyncableFiles();
-    if (!expectedLocalHead) {
-      return localFiles.length === 0;
-    }
-    if (!await this.commitExists(expectedLocalHead)) {
-      return false;
-    }
-    if (await this.localContentMatchesTree(localFiles, expectedLocalHead)) {
-      return true;
-    }
-    return state.local_main && state.local_main !== expectedLocalHead ? await this.localContentMatchesTree(localFiles, state.local_main) : false;
+    const localFiles = await this.scanSyncableFiles(target?.policy || null);
+    if (!expectedLocalHead) return localFiles.length === 0;
+    if (!await this.commitExists(expectedLocalHead)) return false;
+    const matches = async (commit2) => {
+      if (!target) return this.localContentMatchesTree(localFiles, commit2);
+      const entries = new Map([...await this.listTreeBlobOids(commit2)].filter(([filePath]) => !target.policy.ignores(filePath) || target.entries.has(filePath)));
+      if (localFiles.length !== entries.size) return false;
+      const snapshot = await this.captureLocalFileSnapshot(localFiles, new Map(
+        [...entries].map(([filePath, oid]) => [filePath, { oid }])
+      ), { reportProgress: true });
+      return [...entries].every(([filePath, oid]) => snapshot.entries.get(filePath)?.entry.oid === oid);
+    };
+    if (await matches(expectedLocalHead)) return true;
+    return Boolean(state.local_main && state.local_main !== expectedLocalHead && await matches(state.local_main));
   }
   async clearResolvedConflictQueue() {
     const queue = await this.readQueue();
@@ -27301,6 +27619,7 @@ var ObtsObsidianClient = class {
   }
   normalizeStateEventCursors(state) {
     return Object.assign({}, state, {
+      status_label: normalizePersistedStatusLabel(state && state.status_label, state && state.last_error_code, state && state.last_error_details),
       last_event_seq: Number.isSafeInteger(state && state.last_event_seq) && state.last_event_seq >= 0 ? state.last_event_seq : 0,
       last_applied_event_seq: Number.isSafeInteger(state && state.last_applied_event_seq) && state.last_applied_event_seq >= 0 ? state.last_applied_event_seq : 0
     });
@@ -28214,9 +28533,11 @@ var ObtsObsidianClient = class {
   }
   async preserveDirectoryChangesFromTarget(targetEntries, explicitDirectories, residualTombstoneDirectories = /* @__PURE__ */ new Set()) {
     const previous = await this.readDirectoryState();
+    const rootOid = targetEntries.get(".gitignore");
+    const policy = createRootIgnorePolicy(rootOid ? await this.readBlobOid(rootOid) : null);
     const inventory = await this.listLocalVaultInventory("");
     const currentFiles = assertNoCaseCollisions(inventory.files.filter((filePath) => isSyncableVaultPath(filePath)).sort());
-    const currentDirs = inventory.directories;
+    const currentDirs = inventory.directories.filter((dirPath) => !policy.ignores(dirPath, true));
     const expectedDirs = new Set(explicitDirectories);
     for (const filePath of targetEntries.keys()) {
       for (const dirPath of directoryPrefixes(filePath)) expectedDirs.add(dirPath);
@@ -28228,7 +28549,10 @@ var ObtsObsidianClient = class {
       ...topmostDirectories([...expectedDirs].filter((dirPath) => !currentDirSet.has(dirPath))).map((dirPath) => ({ op: "delete", path: dirPath }))
     ];
     const created = await this.createDirectoryIntents(previous, changes);
-    const pendingIntents = compactDirectoryIntents([...previous.pending_intents, ...created.intents]);
+    const pendingIntents = compactDirectoryIntents([
+      ...previous.pending_intents.filter((intent) => !policy.ignores(intent.path, true)),
+      ...created.intents
+    ]);
     await this.writeDirectoryState({
       observed_dirs: currentDirs,
       observed_directory_ctimes: currentDirectoryCtimes,
@@ -28264,9 +28588,10 @@ var ObtsObsidianClient = class {
     }
     return false;
   }
-  async applyDirectoryChanges(directoryIntents, explicitDirectories, preApplyDirectories = /* @__PURE__ */ new Set(), preApplyDirectoryCtimes = {}, removableDirectories = preApplyDirectories) {
+  async applyDirectoryChanges(directoryIntents, explicitDirectories, preApplyDirectories = /* @__PURE__ */ new Set(), preApplyDirectoryCtimes = {}, removableDirectories = preApplyDirectories, localOnlyPaths = []) {
     const residualTombstoneDirectories = /* @__PURE__ */ new Set();
     for (const intent of directoryIntents.filter((entry) => entry.op === "delete").sort((left, right) => right.path.length - left.path.length)) {
+      if (localOnlyPaths.some((retained) => retained === intent.path || retained.startsWith(`${intent.path}/`))) continue;
       const replacedDirectories = await this.pruneEmptyDirectoryTree(
         intent.path,
         preApplyDirectories,
@@ -28517,7 +28842,7 @@ var ObtsObsidianClient = class {
     if (!await this.adapterIsDirectory(filePath)) return [];
     return (await this.listLocalVaultInventory(filePath)).files;
   }
-  async listLocalVaultInventory(root) {
+  async listLocalVaultInventory(root, policy = null) {
     const files = [];
     const directories = [];
     let frontier = [root];
@@ -28533,14 +28858,14 @@ var ObtsObsidianClient = class {
           if (normalizedFolder === ".obts" || normalizedFolder.startsWith(".obts/")) continue;
           assertValidLocalVaultPath(normalizedFolder);
           if (!isSyncableVaultPath(normalizedFolder)) continue;
-          directories.push(normalizedFolder);
+          if (!policy || !policy.ignores(normalizedFolder, true)) directories.push(normalizedFolder);
           next.push(normalizedFolder);
         }
         for (const filePath of (listing.files || []).slice().sort()) {
           const normalizedFile = normalizePath2(filePath);
           if (normalizedFile === ".obts" || normalizedFile.startsWith(".obts/")) continue;
           assertValidLocalVaultPath(normalizedFile);
-          files.push(normalizedFile);
+          if (!policy || !policy.ignores(normalizedFile)) files.push(normalizedFile);
         }
       }
       frontier = Array.from(new Set(next)).sort();
@@ -28548,6 +28873,9 @@ var ObtsObsidianClient = class {
     return { files: Array.from(new Set(files)).sort(), directories: Array.from(new Set(directories)).sort() };
   }
   async displaceApplyPath(journal, filePath, assertCurrentPreflight, assertRecoveredDescendants) {
+    if ((journal.local_only_paths || []).some((retained) => retained === filePath || retained.startsWith(`${filePath}/`) || filePath.startsWith(`${retained}/`))) {
+      throw new ObtsBlockedError("local_only_collision", "A write collides with retained local-only content.");
+    }
     for (const candidate of [...directoryPrefixes(filePath), filePath]) {
       if (!await this.adapterExists(candidate)) {
         if (await this.applyDisplacedEntryExists(journal, candidate)) continue;
@@ -28696,7 +29024,7 @@ var ObtsObsidianClient = class {
   }
   async markBlocked(code, details = void 0) {
     await this.writeState(Object.assign({}, await this.readState(), {
-      status_label: blockStatusLabel(code),
+      status_label: blockStatusLabel(code, details),
       last_error_code: code,
       last_error_details: details || null,
       updated_at: nowIso()
@@ -28995,7 +29323,7 @@ var ObtsOnboardingModal = class extends Modal {
     setFeedback(feedback, "Checking the dashboard resolution...", "muted");
     try {
       const result = await this.resumeRegisteredSetup();
-      if (result.status === "Review needed") {
+      if (isConflictResultStatus(result.status)) {
         setFeedback(feedback, "The conflict is still awaiting resolution in the dashboard.", "muted");
         button.setDisabled(false);
         return;
@@ -29022,7 +29350,7 @@ var ObtsOnboardingModal = class extends Modal {
     return result;
   }
   renderResult(result) {
-    if (result.status === "Review needed") {
+    if (isConflictResultStatus(result.status)) {
       this.renderConflictReview();
       return;
     }
@@ -29038,6 +29366,7 @@ var ObtsSettingTab = class extends PluginSettingTab {
     super(app, plugin);
     this.plugin = plugin;
     this.operationRefreshTimer = null;
+    this.rootIgnoreEditor = null;
   }
   clearOperationRefreshTimer() {
     if (this.operationRefreshTimer !== null) {
@@ -29182,7 +29511,10 @@ var ObtsSettingTab = class extends PluginSettingTab {
         }
       }));
       const renameFeedback = containerEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
-      new Setting(containerEl).setName("Status").setDesc(state.last_error_code ? blockStatusLabel(state.last_error_code) : state.status_label || "Checking");
+      new Setting(containerEl).setName("Status").setDesc(normalizePersistedStatusLabel(state.status_label, state.last_error_code, state.last_error_details));
+      if (state.last_error_code) {
+        new Setting(containerEl).setName("Sync details").setDesc(localSyncFailureExplanation(state.last_error_code, state.last_error_details));
+      }
       const operationSetting = new Setting(containerEl).setName("Current operation");
       let syncButton = null;
       const refreshOperation = () => {
@@ -29211,15 +29543,16 @@ var ObtsSettingTab = class extends PluginSettingTab {
                 const blockedState = await this.plugin.client.readState();
                 setFeedback(
                   actionFeedback,
-                  blockedState.last_error_code ? `Sync stopped: ${blockStatusLabel(blockedState.last_error_code)}.` : "Sync did not complete; check the current status for details.",
+                  blockedState.last_error_code ? localSyncFailureExplanation(blockedState.last_error_code, blockedState.last_error_details) : "Sync did not complete; check the current status for details.",
                   blockedState.last_error_code ? "error" : "muted"
                 );
               }
               return;
             }
             this.plugin.setStatus((await this.plugin.client.readState()).status_label);
-            setFeedback(actionFeedback, `Synced: ${result.status}`, "success");
-            if (shouldShowRoutineStatusNotice(result.status)) new Notice(`obts: ${result.status}`);
+            const resultLabel = result.status === "Review needed" ? "Conflict resolution needed" : result.status;
+            setFeedback(actionFeedback, resultLabel === "Conflict resolution needed" ? "Server conflict recorded; review it in the dashboard." : `Sync result: ${resultLabel}`, resultLabel === "Conflict resolution needed" ? "error" : "success");
+            if (shouldShowRoutineStatusNotice(resultLabel)) new Notice(`obts: ${resultLabel}`);
             await this.display();
           } catch (error) {
             setFeedback(actionFeedback, error instanceof Error ? error.message : "Sync failed.", "error");
@@ -29303,6 +29636,101 @@ var ObtsSettingTab = class extends PluginSettingTab {
         (button) => button.setButtonText("Set up sync").setCta().onClick(() => new ObtsOnboardingModal(this.app, this.plugin).open())
       );
     }
+    await this.renderRootIgnoreEditor(containerEl);
+  }
+  async renderRootIgnoreEditor(containerEl) {
+    containerEl.createEl("h3", { text: "Advanced: sync exclusions", cls: "obts-settings-section-header" });
+    new Setting(containerEl).setName("Vault-root .gitignore").setDesc("Shared with your other devices. Preview before saving. Excluded files stay in this local vault; changing a rule does not remove oversized objects from queued history.");
+    const feedback = containerEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
+    let editor = this.rootIgnoreEditor;
+    try {
+      const pin = await this.plugin.client.readRootIgnorePolicy();
+      if (!editor) {
+        editor = { baseline: pin.bytes, draft: pin.bytes === null ? "" : Buffer2.from(pin.bytes).toString("utf8") };
+        this.rootIgnoreEditor = editor;
+      } else if (editor.baseline === null !== (pin.bytes === null) || editor.baseline !== null && !Buffer2.from(editor.baseline).equals(pin.bytes)) {
+        setFeedback(feedback, "The local .gitignore changed since you opened this draft. Reload to see the new version, or preview and overwrite it with your draft.", "muted");
+      }
+    } catch (error) {
+      setFeedback(feedback, error instanceof Error ? error.message : "Cannot safely read root .gitignore on this device.", "error");
+      return;
+    }
+    const input = containerEl.createEl("textarea", {
+      cls: "obts-ignore-editor",
+      attr: { "aria-label": "Vault-root .gitignore rules", spellcheck: "false", rows: "8" }
+    });
+    input.value = editor.draft;
+    const previewEl = containerEl.createDiv({ cls: "obts-ignore-preview", attr: { "aria-live": "polite" } });
+    let previewedDraft = null;
+    let saveButton;
+    input.addEventListener("input", () => {
+      editor.draft = input.value;
+      previewedDraft = null;
+      previewEl.empty();
+      if (saveButton) saveButton.setDisabled(true);
+    });
+    new Setting(containerEl).setName("Reload file").setDesc("Discard this draft and read the current local .gitignore again.").addButton((button) => button.setButtonText("Reload from vault").onClick(async () => {
+      if (editor.draft !== (editor.baseline === null ? "" : Buffer2.from(editor.baseline).toString("utf8")) && !window.confirm("Discard your unsaved .gitignore draft and reload the local file?")) return;
+      button.setDisabled(true);
+      try {
+        const current = await this.plugin.client.readRootIgnorePolicy();
+        editor.baseline = current.bytes;
+        editor.draft = current.bytes === null ? "" : Buffer2.from(current.bytes).toString("utf8");
+        input.value = editor.draft;
+        previewedDraft = null;
+        previewEl.empty();
+        if (saveButton) saveButton.setDisabled(true);
+        setFeedback(feedback, "Loaded the current local .gitignore. Preview before saving.", "muted");
+      } catch (error) {
+        setFeedback(feedback, error instanceof Error ? error.message : "Cannot reload root .gitignore.", "error");
+      } finally {
+        button.setDisabled(false);
+      }
+    }));
+    new Setting(containerEl).setName("Review and save").addButton((button) => button.setButtonText("Preview effect").onClick(async () => {
+      button.setDisabled(true);
+      previewedDraft = null;
+      if (saveButton) saveButton.setDisabled(true);
+      try {
+        const draft = input.value;
+        const result = await this.plugin.client.previewRootIgnoreDraft(draft);
+        if (draft !== input.value) return;
+        previewedDraft = draft;
+        previewEl.empty();
+        previewEl.createEl("p", { text: `${result.includedFiles} syncable files remain in this vault. ${result.newlyLocal.length} tracked files would become local only.` });
+        if (result.newlyLocal.length) {
+          previewEl.createEl("p", { text: `Newly local-only: ${result.newlyLocal.slice(0, 10).join(", ")}${result.newlyLocal.length > 10 ? " (and more)" : ""}` });
+        }
+        if (saveButton) saveButton.setDisabled(false);
+        setFeedback(feedback, "Preview ready. Save only after reviewing the local-only paths.", "success");
+      } catch (error) {
+        setFeedback(feedback, error instanceof Error ? error.message : "Unable to preview .gitignore.", "error");
+      } finally {
+        button.setDisabled(false);
+      }
+    })).addButton((button) => {
+      saveButton = button.setButtonText("Save .gitignore").setDisabled(true).onClick(async () => {
+        if (previewedDraft !== input.value) return;
+        const submitted = input.value;
+        button.setDisabled(true);
+        input.disabled = true;
+        try {
+          const saved = await this.plugin.runExclusiveAction(
+            () => this.plugin.client.saveRootIgnoreDraft(submitted),
+            "Saving root .gitignore"
+          );
+          editor.baseline = saved.bytes;
+          editor.draft = submitted;
+          previewedDraft = null;
+          previewEl.empty();
+          setFeedback(feedback, "Saved locally. Sync will propose this file and the previewed exclusions.", "success");
+        } catch (error) {
+          setFeedback(feedback, error instanceof Error ? error.message : "Unable to save .gitignore. Your draft is preserved.", "error");
+        } finally {
+          input.disabled = false;
+        }
+      });
+    });
   }
 };
 function normalizeDisplayName(value) {
@@ -29877,14 +30305,14 @@ function statusBaseLabel(label) {
   return normalized;
 }
 function statusPresentation(label) {
-  const normalized = typeof label === "string" && label.trim().length > 0 ? label.trim() : "Checking";
+  const normalized = normalizePersistedStatusLabel(label, null);
   const base = statusBaseLabel(normalized);
-  const action = base === "Review needed" ? "Click to open the conflict dashboard." : "Click to open obts settings.";
+  const action = base === "Conflict resolution needed" ? "Click to open the conflict dashboard." : "Click to open obts settings for details.";
   let tone = "neutral";
   if (base === "Synced") tone = "success";
   else if (["Checking", "Verifying contents", "Preparing upload", "Uploading", "Applying", "Merging", "Server retrying", "Repairing baseline", "Finishing update", "Waiting for operation"].includes(base)) tone = "active";
-  else if (["Ahead", "Behind", "Offline", "Review needed"].includes(base)) tone = "warning";
-  else if (["Blocked", "Needs recovery", "Unsafe local state", "Server repair required", "Integrity failure", "Recovery required", "Restart required"].includes(base)) tone = "danger";
+  else if (["Ahead", "Behind", "Offline", "Out of sync"].includes(base)) tone = "warning";
+  else if (["Conflict resolution needed", "Out of sync \u2014 file exceeds upload limit", "Out of sync \u2014 upload limit exceeded", "Out of sync \u2014 local recovery required", "Blocked", "Server repair required", "Integrity failure", "Recovery required", "Restart required"].includes(base)) tone = "danger";
   return {
     label: normalized,
     base,
@@ -29894,15 +30322,15 @@ function statusPresentation(label) {
   };
 }
 function statusAttentionMessage(base) {
-  if (base === "Review needed") return "obts needs attention: Resolve the conflict in the dashboard. Click the sync indicator to continue.";
+  if (base === "Conflict resolution needed") return "obts needs attention: Resolve the server conflict in the dashboard. Click the sync indicator to continue.";
+  if (base === "Out of sync \u2014 file exceeds upload limit" || base === "Out of sync \u2014 upload limit exceeded") return "obts cannot upload an oversized Git object. Open obts settings for the size, version, and next step.";
+  if (base === "Out of sync \u2014 local recovery required") return "obts cannot continue automatically. Open obts settings for the specific recovery reason.";
   if (base === "Blocked") return "obts sync is blocked. Click the sync indicator to inspect the required action.";
-  if (base === "Needs recovery") return "obts needs recovery before sync can continue. Click the sync indicator for recovery options.";
-  if (base === "Unsafe local state") return "obts stopped to protect local changes. Click the sync indicator to inspect recovery options.";
   if (base === "Server repair required") return "obts stopped because the server vault needs an integrity repair. Click the sync indicator for details.";
   return null;
 }
 function isPersistentAttentionStatus(base) {
-  return ["Review needed", "Blocked", "Needs recovery", "Unsafe local state", "Server repair required", "Integrity failure", "Recovery required", "Restart required"].includes(base);
+  return ["Conflict resolution needed", "Out of sync", "Out of sync \u2014 file exceeds upload limit", "Out of sync \u2014 upload limit exceeded", "Out of sync \u2014 local recovery required", "Blocked", "Server repair required", "Integrity failure", "Recovery required", "Restart required"].includes(base);
 }
 function isActiveTransferStatus(base) {
   return ["Verifying contents", "Preparing upload", "Uploading", "Applying", "Merging", "Server retrying", "Repairing baseline", "Finishing update", "Waiting for operation"].includes(base);
@@ -29922,35 +30350,56 @@ function samePairedDeviceState(left, right) {
 function sameStateCursors(left, right) {
   return left.local_main === right.local_main && left.local_head === right.local_head && left.server_device_ref === right.server_device_ref;
 }
-function blockStatusLabel(code) {
-  if (code === "conflict_review_required") {
-    return "Review needed";
+function isConflictResultStatus(status2) {
+  return status2 === "Review needed" || status2 === "Conflict resolution needed";
+}
+function blockStatusLabel(code, details = null) {
+  if (code === "conflict_review_required") return "Conflict resolution needed";
+  if (code === "object_too_large_for_chunk") return details?.object_type === "blob" ? "Out of sync \u2014 file exceeds upload limit" : "Out of sync \u2014 upload limit exceeded";
+  if (["unsafe_local_state", "apply_journal_recovery_required", "apply_recovery_required", "recovery_bundle_failed", "recovery_bundle_verification_failed", "recovery_bundle_durability_unavailable", "directory_baseline_recovery_journal_invalid", "directory_baseline_recovery_unsafe", "directory_recovery_journal_invalid", "directory_recovery_journal_mismatch", "directory_recovery_decision_required", "directory_recovery_changed", "local_ref_recovery_required", "replace_local_with_server_required", "server_recovery_required", "stale_device_ref", "same_device_non_fast_forward", "local_state_incomplete"].includes(code)) {
+    return "Out of sync \u2014 local recovery required";
   }
-  if (code === "directory_recovery_decision_required" || code === "directory_recovery_changed") {
-    return "Directory decision required";
+  if (code === "local_snapshot_changed") return "Checking";
+  if (code === "git_error" || code === "server_git_error" || code === "server_processing_error") return "Server retrying";
+  if (code === "stale_directory_proposal_base") return "Repairing baseline";
+  if (code === "initial_import_confirmation_required") return "Blocked";
+  if (code === "blocked_integrity") return "Server repair required";
+  return "Out of sync";
+}
+function normalizePersistedStatusLabel(label, code, details = null) {
+  if (typeof code === "string" && code) {
+    const mapped = blockStatusLabel(code, details);
+    if (mapped !== "Out of sync" || ["Unsafe local state", "Needs recovery", "Review needed", "Conflict resolution needed", "Synced"].includes(label) || ["upload_interrupted", "pack_preparation_failed"].includes(code)) return mapped;
   }
-  if (code === "device_blocked") {
-    return "Review needed";
+  if (label === "Unsafe local state" || label === "Needs recovery" || label === "Review needed") return "Out of sync";
+  return typeof label === "string" && label.trim() ? label.trim() : "Checking";
+}
+function safeLocalErrorCode(code) {
+  return typeof code === "string" && /^[a-z][a-z0-9_]{0,79}$/u.test(code) ? code : "sync_error";
+}
+function localSyncFailureExplanation(code, details) {
+  const safeCode = safeLocalErrorCode(code);
+  if (safeCode === "object_too_large_for_chunk") {
+    const valid = details && details.operation_phase === "upload_prepare" && ["blob", "tree", "commit", "tag"].includes(details.object_type) && /^[0-9a-f]{40}$/u.test(details.object_oid || "") && Number.isSafeInteger(details.object_bytes) && details.object_bytes >= 0 && Number.isSafeInteger(details.object_limit_bytes) && details.object_limit_bytes > 0;
+    const summary = valid ? `Git ${details.object_type} ${details.object_oid}: ${formatBytes(details.object_bytes)} (${details.object_bytes} bytes), upload limit ${formatBytes(details.object_limit_bytes)} (${details.object_limit_bytes} bytes).` : "A Git object exceeds the upload chunk limit; this device has no reliable object details.";
+    const paths = valid && details.object_type === "blob" && Array.isArray(details.current_paths) ? details.current_paths.filter((value) => typeof value === "string" && isValidVaultPath(value)).slice(0, 3) : [];
+    const location = paths.length ? ` Current path${paths.length === 1 ? "" : "s"}: ${paths.join(", ")}.` : " No current path is known; the object may exist only in pending history.";
+    return `${summary}${location} The queued commit remains local; changing the current file or an ignore rule alone may not clear its ancestry. Preserve the journal and use a reviewed fresh baseline or supported large-file transport before retrying.`;
   }
-  if (code === "replace_local_with_server_required" || code === "server_recovery_required" || code === "stale_device_ref" || code === "same_device_non_fast_forward" || code === "local_state_incomplete") {
-    return "Needs recovery";
-  }
-  if (code === "local_snapshot_changed") {
-    return "Checking";
-  }
-  if (code === "git_error" || code === "server_git_error" || code === "server_processing_error") {
-    return "Server retrying";
-  }
-  if (code === "stale_directory_proposal_base") {
-    return "Repairing baseline";
-  }
-  if (code === "initial_import_confirmation_required") {
-    return "Blocked";
-  }
-  if (code === "blocked_integrity") {
-    return "Server repair required";
-  }
-  return "Unsafe local state";
+  if (safeCode === "conflict_review_required") return "The server recorded a conflict. Review it in the dashboard; the client cannot choose a winner locally.";
+  if (safeCode === "apply_journal_recovery_required" || safeCode === "apply_recovery_required") return `Local apply recovery needs review (${safeCode}). Preserve the vault and .obts state; restart Obsidian once, then inspect the recovery journal if this persists.`;
+  if (safeCode === "directory_recovery_journal_invalid") return "The local directory recovery journal is invalid. Preserve .obts/directory-recovery.json and the vault; send sanitized diagnostics before assisted recovery.";
+  if (safeCode === "apply_lock_active") return "A local apply lock is active. Another operation may still own it; do not remove the lock. If it persists after restarting Obsidian, preserve the vault and .obts state for recovery support.";
+  if (safeCode === "recovery_bundle_failed") return "Recovery evidence could not be completed, so destructive apply stopped. Check local storage and permissions; preserve the vault and .obts state before retrying.";
+  if (safeCode === "recovery_bundle_verification_failed" || safeCode === "recovery_bundle_durability_unavailable") return `Recovery evidence is not verified or durable (${safeCode}), so destructive apply stopped. Preserve the vault and .obts state; check storage and permissions, then seek assisted recovery if it persists.`;
+  if (safeCode === "local_ref_recovery_required") return "A local Git ref lock or lease could not be recovered safely. Do not remove it manually; preserve the vault and .obts state for assisted recovery.";
+  if (safeCode === "directory_baseline_recovery_unsafe" || safeCode === "directory_baseline_recovery_journal_invalid") return `Directory baseline recovery stopped (${safeCode}). Preserve the vault and .obts state, including the directory recovery journal; seek assisted recovery rather than resetting sync.`;
+  if (safeCode === "unsafe_local_state") return "A previous apply safety check stopped. Preserve the vault and .obts state; inspect the local recovery journal before attempting further changes.";
+  if (blockStatusLabel(safeCode) === "Out of sync \u2014 local recovery required") return `Sync needs local recovery (${safeCode}). Preserve the vault and .obts state; use the existing recovery flow or seek assisted recovery rather than resetting sync.`;
+  if (safeCode === "initial_import_confirmation_required") return "Review the initial import recovery bundle and explicitly confirm the import before continuing.";
+  if (safeCode === "upload_interrupted" || safeCode === "pack_preparation_failed") return `Uploading local changes did not finish (${safeCode}). The pending commit remains queued on this device; check connectivity or local storage before retrying.`;
+  if (safeCode === "blocked_integrity") return "The server vault requires an integrity repair. Keep local state intact and contact the server operator.";
+  return `Sync has not completed (${safeCode}). Check connectivity and sync diagnostics; keep local state intact and retry only after the cause is understood.`;
 }
 async function readJson(fsp, filePath, fallback) {
   try {
@@ -29995,9 +30444,9 @@ function parseApplyJournal(value) {
   const confirmedDirectoryRoots = value.confirmed_directory_roots === void 0 ? [] : value.confirmed_directory_roots;
   const confirmedDirectoryInventory = value.confirmed_directory_inventory === void 0 ? null : value.confirmed_directory_inventory;
   const targetFileSizes = value.target_file_sizes === void 0 ? {} : value.target_file_sizes;
-  if (journalVersion !== 1 && journalVersion !== 2 && journalVersion !== 3 && journalVersion !== 4 || !isApplyId(value.apply_id) || typeof value.operation_type !== "string" || !operations.has(value.operation_type) || typeof value.target_main !== "string" || !/^[0-9a-f]{40}$/u.test(value.target_main) || !isNullableString(value.expected_prior_local_main) || !isNullableString(value.expected_prior_local_device_ref) || typeof value.phase !== "string" || !phases.has(value.phase) || !Array.isArray(affectedPaths) || affectedPaths.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath)) || new Set(affectedPaths).size !== affectedPaths.length || !preflight || typeof preflight !== "object" || Array.isArray(preflight) || affectedPaths.some((filePath) => !Object.hasOwn(preflight, filePath) || !isNullableSha256(preflight[filePath])) || journalVersion >= 2 && (!typedPreflight || typeof typedPreflight !== "object" || Array.isArray(typedPreflight) || affectedPaths.some((filePath) => !Object.hasOwn(typedPreflight, filePath) || !isPreflightFingerprint(typedPreflight[filePath]))) || journalVersion >= 3 && (!Array.isArray(directoryIntents) || directoryIntents.some(
+  if (journalVersion !== 1 && journalVersion !== 2 && journalVersion !== 3 && journalVersion !== 4 && journalVersion !== 5 || !isApplyId(value.apply_id) || typeof value.operation_type !== "string" || !operations.has(value.operation_type) || typeof value.target_main !== "string" || !/^[0-9a-f]{40}$/u.test(value.target_main) || !isNullableString(value.expected_prior_local_main) || !isNullableString(value.expected_prior_local_device_ref) || typeof value.phase !== "string" || !phases.has(value.phase) || !Array.isArray(affectedPaths) || affectedPaths.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath)) || new Set(affectedPaths).size !== affectedPaths.length || !preflight || typeof preflight !== "object" || Array.isArray(preflight) || affectedPaths.some((filePath) => !Object.hasOwn(preflight, filePath) || !isNullableSha256(preflight[filePath])) || journalVersion >= 2 && (!typedPreflight || typeof typedPreflight !== "object" || Array.isArray(typedPreflight) || affectedPaths.some((filePath) => !Object.hasOwn(typedPreflight, filePath) || !isPreflightFingerprint(typedPreflight[filePath]))) || journalVersion >= 3 && (!Array.isArray(directoryIntents) || directoryIntents.some(
     (intent) => !intent || typeof intent !== "object" || Array.isArray(intent) || intent.op !== "create" && intent.op !== "delete" || typeof intent.path !== "string" || !isSafeJournalPath(intent.path)
-  ) || !Array.isArray(explicitDirectories) || explicitDirectories.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath)) || new Set(explicitDirectories).size !== explicitDirectories.length || !Array.isArray(preApplyDirectories) || preApplyDirectories.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath)) || new Set(preApplyDirectories).size !== preApplyDirectories.length || !preApplyDirectoryCtimes || typeof preApplyDirectoryCtimes !== "object" || Array.isArray(preApplyDirectoryCtimes) || Object.keys(preApplyDirectoryCtimes).length !== preApplyDirectories.length || preApplyDirectories.some((filePath) => !Object.hasOwn(preApplyDirectoryCtimes, filePath) || !isNullableNonNegativeNumber(preApplyDirectoryCtimes[filePath])) || !Array.isArray(confirmedDirectoryRoots) || confirmedDirectoryRoots.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath)) || new Set(confirmedDirectoryRoots).size !== confirmedDirectoryRoots.length || !(confirmedDirectoryInventory === null || isValidDirectoryRecoveryInventory(confirmedDirectoryInventory, confirmedDirectoryRoots)) || confirmedDirectoryInventory === null && confirmedDirectoryRoots.length > 0 || typeof value.preserve_local_changes !== "boolean" || !(value.event_seq === null || Number.isSafeInteger(value.event_seq) && value.event_seq >= 0)) || journalVersion >= 4 && !isTargetFileSizeMap(targetFileSizes) || !isNullableString(value.recovery_bundle_id) || !isNullableString(value.last_completed_step) || !isNullableString(value.redacted_error_category)) {
+  ) || !Array.isArray(explicitDirectories) || explicitDirectories.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath)) || new Set(explicitDirectories).size !== explicitDirectories.length || !Array.isArray(preApplyDirectories) || preApplyDirectories.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath)) || new Set(preApplyDirectories).size !== preApplyDirectories.length || !preApplyDirectoryCtimes || typeof preApplyDirectoryCtimes !== "object" || Array.isArray(preApplyDirectoryCtimes) || Object.keys(preApplyDirectoryCtimes).length !== preApplyDirectories.length || preApplyDirectories.some((filePath) => !Object.hasOwn(preApplyDirectoryCtimes, filePath) || !isNullableNonNegativeNumber(preApplyDirectoryCtimes[filePath])) || !Array.isArray(confirmedDirectoryRoots) || confirmedDirectoryRoots.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath)) || new Set(confirmedDirectoryRoots).size !== confirmedDirectoryRoots.length || !(confirmedDirectoryInventory === null || isValidDirectoryRecoveryInventory(confirmedDirectoryInventory, confirmedDirectoryRoots)) || confirmedDirectoryInventory === null && confirmedDirectoryRoots.length > 0 || typeof value.preserve_local_changes !== "boolean" || !(value.event_seq === null || Number.isSafeInteger(value.event_seq) && value.event_seq >= 0)) || journalVersion >= 4 && !isTargetFileSizeMap(targetFileSizes) || journalVersion >= 5 && (!(value.target_root_ignore_oid === null || /^[0-9a-f]{40}$/u.test(value.target_root_ignore_oid)) || !Array.isArray(value.local_only_paths) || value.local_only_paths.some((filePath) => typeof filePath !== "string" || !isSafeJournalPath(filePath) || !isRecoverableApplyPath(filePath)) || !sameStringArray(value.local_only_paths, [...new Set(value.local_only_paths)].sort()) || !value.local_only_presence || typeof value.local_only_presence !== "object" || Array.isArray(value.local_only_presence) || !sameStringArray(Object.keys(value.local_only_presence).sort(), value.local_only_paths) || Object.values(value.local_only_presence).some((present) => typeof present !== "boolean") || value.local_only_paths.some((filePath) => affectedPaths.some((affected) => affected === filePath || affected.startsWith(`${filePath}/`) || filePath.startsWith(`${affected}/`)))) || !isNullableString(value.recovery_bundle_id) || !isNullableString(value.last_completed_step) || !isNullableString(value.redacted_error_category)) {
     throw new Error("Apply journal is invalid.");
   }
   return Object.assign({
@@ -30009,7 +30458,10 @@ function parseApplyJournal(value) {
     confirmed_directory_inventory: null,
     target_file_sizes: {},
     preserve_local_changes: false,
-    event_seq: null
+    event_seq: null,
+    target_root_ignore_oid: null,
+    local_only_paths: [],
+    local_only_presence: {}
   }, value);
 }
 function isTargetFileSizeMap(value) {
@@ -30254,6 +30706,8 @@ function troubleshootingSafeErrorCode(value) {
     "directory_recovery_decision_required",
     "directory_recovery_changed",
     "directory_recovery_journal_invalid",
+    "object_too_large_for_chunk",
+    "pack_preparation_failed",
     "network_error",
     "http_error",
     "sync_error",
@@ -30281,9 +30735,10 @@ function troubleshootingStatusClass(label) {
   if (label === "Synced") return "synced";
   if (label === "Ahead") return "ahead";
   if (label === "Behind") return "behind";
-  if (label === "Review needed" || label === "Stale review") return "review";
-  if (label === "Needs recovery") return "recovery";
-  if (label === "Unsafe local state" || label === "Blocked" || label === "Integrity failure") return "unsafe";
+  if (label === "Conflict resolution needed" || label === "Review needed" || label === "Stale review") return "review";
+  if (label === "Out of sync \u2014 local recovery required" || label === "Needs recovery") return "recovery";
+  if (label === "Out of sync" || label === "Out of sync \u2014 file exceeds upload limit" || label === "Out of sync \u2014 upload limit exceeded" || label === "Unsafe local state") return "out_of_sync";
+  if (label === "Blocked" || label === "Integrity failure") return "unsafe";
   if (label === "Offline" || label === "Retrying" || label === "Server retrying") return "retrying";
   return "other";
 }
@@ -30432,7 +30887,7 @@ function buildDiagnosticReport(error) {
   const blocked = error instanceof ObtsBlockedError;
   const lifecycleFailure = safeErrorCode === "operation_interrupted_by_reload" || safeErrorCode === "sync_lease_blocked";
   const directoryRecoveryFailure = safeErrorCode === "directory_recovery_decision_required" || safeErrorCode === "directory_recovery_changed" || safeErrorCode === "directory_recovery_journal_invalid";
-  const failureCode = context && context.failureCode ? context.failureCode : safeErrorCode === "invalid_json" ? "invalid_json" : safeErrorCode === "operation_interrupted_by_reload" || safeErrorCode === "sync_lease_blocked" ? safeErrorCode : message.includes("Missing Buffer dependency") ? "missing_buffer_dependency" : message.includes("pack.slice") ? "null_pack_slice" : directoryRecoveryFailure ? safeErrorCode : transport ? "request_failed" : blocked ? "sync_failed" : "unknown";
+  const failureCode = context && context.failureCode ? context.failureCode : safeErrorCode === "invalid_json" ? "invalid_json" : safeErrorCode === "operation_interrupted_by_reload" || safeErrorCode === "sync_lease_blocked" ? safeErrorCode : message.includes("Missing Buffer dependency") ? "missing_buffer_dependency" : message.includes("pack.slice") ? "null_pack_slice" : safeErrorCode === "object_too_large_for_chunk" ? "object_too_large_for_chunk" : directoryRecoveryFailure ? safeErrorCode : transport ? "request_failed" : blocked ? "sync_failed" : "unknown";
   return {
     schema_version: 1,
     event_id: `dgr_${randomHex(16)}`,
@@ -30444,7 +30899,7 @@ function buildDiagnosticReport(error) {
     failure_code: failureCode,
     error_class: transport ? "transport_error" : blocked ? "blocked_error" : error instanceof TypeError ? "type_error" : error instanceof Error ? "error" : "unknown",
     retryable: transport ? isOfflineTransportError(error) || isRetryableServerError(error) : false,
-    breadcrumbs: context && Array.isArray(context.breadcrumbs) ? context.breadcrumbs.slice(0, 16).map(normalizeDiagnosticBreadcrumb) : []
+    breadcrumbs: safeErrorCode === "object_too_large_for_chunk" && Number.isSafeInteger(error.details?.object_bytes) ? [makeDiagnosticBreadcrumb("upload_prepare", "failed", { byteLength: error.details.object_bytes })] : context && Array.isArray(context.breadcrumbs) ? context.breadcrumbs.slice(0, 16).map(normalizeDiagnosticBreadcrumb) : []
   };
 }
 function makeDiagnosticBreadcrumb(point, outcome, value = void 0, errorCode = "none") {
@@ -30549,6 +31004,7 @@ function toArrayBuffer(data) {
 function nowIso() {
   return (/* @__PURE__ */ new Date()).toISOString();
 }
+module.exports.createRootIgnorePolicy = createRootIgnorePolicy;
 module.exports.ObtsClientCore = ObtsObsidianClient;
 module.exports.PluginBlockedError = ObtsBlockedError;
 module.exports.TransportError = ObtsTransportError;

@@ -18,6 +18,7 @@ pub mod mcp;
 pub mod model;
 pub mod new_note;
 pub mod persistence;
+pub mod root_ignore;
 pub mod runtime_config;
 pub mod search;
 pub mod service;

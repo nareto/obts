@@ -74,10 +74,10 @@ The model does not cover directories, multiple paths, write concurrency, editor-
 | Field | Value |
 | --- | --- |
 | Status | Accepted bounded composed model |
-| Architecture revision | 4 |
-| Refined contracts | `OBTS-SAF-001` through `OBTS-SAF-006`, `OBTS-SYNC-IMM-001`, `OBTS-SYNC-ACK-001`, `OBTS-PER-OP-001`, `OBTS-BRG-PROJ-001` |
+| Architecture revision | 15 |
+| Refined contracts | `OBTS-SAF-001` through `OBTS-SAF-006`, `OBTS-SAF-010`, `OBTS-SYNC-IMM-001`, `OBTS-SYNC-IGN-001`, `OBTS-SYNC-ACK-001`, `OBTS-PER-OP-001`, `OBTS-BRG-PROJ-001` |
 | Root specification | `OBTSDistributedSync.tla` |
-| Check matrix | `checks.json` (exactly 52 required checks) |
+| Check matrix | `checks.json` (74 required checks: original 52 plus 22 root-ignore checks) |
 | Static transition map / future trace schema | `trace/transition-map.json`, `trace/trace-schema.json` |
 | Executable check | `npm run test:formal` |
 
@@ -96,11 +96,21 @@ Local apply state projects non-vacuously through `modules/OBTSApplyRefinement.tl
 
 ### Check matrix and assumptions
 
-The required matrix contains six FM-001 checks; seven FM-002 positive safety checks; four separately fair liveness checks; twenty trigger/action reachability checks; and fifteen distributed negative controls. Removing or retyping any required check fails validation. Accepted architecture status requires zero candidate counterexamples and all required positives.
+The required matrix contains the original six FM-001 checks; seven FM-002 positive safety checks; four separately fair liveness checks; twenty trigger/action reachability checks; and fifteen distributed negative controls. Revision 15 adds four positive root-policy safety checks, nine non-vacuity witnesses, and nine independent negative controls. Removing or retyping any required check fails validation. Accepted architecture status requires zero candidate counterexamples and all required positives.
 
 Liveness is conditional on bounded edits/crashes, eventual restart, retry/delivery, and no permanent storage failure. Fairness is attached to the concrete action/actor sequence for proposal/result consumption, Rust write to Node capture, server restart/recovery, and main event to durable apply/server acknowledgement. Each obligation has a separate reachable-trigger check; there is no broad fairness disjunction.
 
 The safety bounds include two same-path plugin edits; two disjoint Plugin1/Bridge paths; meaningful client/server/Rust crash seams; and at most two symbolic message copies. The all-actors bound retains every claimed interaction but causally orders the three proposals and bounds each crash/network fault to one relevant seam. Equal, covered, and divergent classifications are independently reachable; divergence never moves the device ref.
+
+### Root `.gitignore` policy bound (revision 15)
+
+The composed `SafetySpec` retains all prior actors and actions. In `root-ignore`, `PathB` is the root `.gitignore` and `PathA` is one tracked note newly matched by it. `empty` and `exclude-a` stand for exact policy-byte/blob identities, **not** an implementation of Git matching. Plugin1 changes and captures the root policy, then persists an immutable attempt containing that policy; the server checks the symbolic policy identity against its proposed commit and rejects a candidate retaining excluded `PathA` with a durable attempt outcome. Canonical integration removes only the current `PathA` tree entry and retains the old `BaseVersion` in `mainHistory` and local Git. Plugin2 starts incapable and can observe/capture/queue an offline local edit but cannot pull/ack or submit a request until it explicitly upgrades; apply pins the event policy in its journal and skips mutation/displacement of the local-only path. A stale Plugin2 proposal under `empty` enters protected review rather than moving the ref. The Bridge projection pins the policy, removes `PathA` from current derived rows before cursor publication, and retains audit. Bridge local writes remain permitted regardless of the policy and retain their visible bytes; capture omits an ignored path from a candidate tree. In `root-ignore-bridge-race`, a Bridge write starts before policy integration and finishes afterward; the local write survives, while the excluded version cannot enter the current candidate tree or derived rows. A negative control discards the ignored local write and violates preservation. The separate `root-ignore-invalid` bound proposes a policy-bearing tree that still contains `PathA`; rejection remains queryable and cannot move canonical content. Negative controls break each of these independent boundaries.
+
+`root-ignore-legacy` begins with a **pre-existing** root policy byte identity `exclude-a` and a canonical tree that still contains the matched tracked `PathA`; `policyActive = FALSE` marks this historical state, not a valid newly admitted tree. All pull/ack and proposal activity remains closed until `ActivateLegacyPolicy` reconciles the current tree forward and emits a policy-bound event; the old content remains rooted. The mutant that enables policy without reconciliation violates the current-tree invariant. This bound is an explicit activation choice, not an assertion that every historical tree was always policy-valid.
+
+The 22 added checks passed TLC 2.19 / Java 21: safety generated/distinct/depth 10,116/1,718/61 (`root-ignore`), 602/136/21 (legacy), 18,295/2,662/39 (Bridge race with a reachable pre-activation write), and 31/13/13 (invalid candidate). Nine reachability counterexamples witness policy integration (depth 19), protected stale review with three separately protected conflict roots (42), local-only apply (47), derived cursor (28), legacy activation (2), a permitted Bridge write before activation, a stale Bridge validation after policy integration (20), offline old-client local capture/queue before upgrade (31), and a server-side rejected malformed candidate (8). Nine single-fault controls violated their designated invariants with exact witness actions: local-only displacement, incapable-client pull, stale main admission, in-flight policy mutation, excluded Bridge write, excluded projection row publication, activation without reconciliation, excluded candidate admission, and stale Bridge write-seam bypass. The executable checker enforces their witness and trace-depth floors.
+
+This is a **bounded design model**, not feature implementation evidence. The actual Git matcher, blob-byte calculation, full candidate trees, subtree/rename/collision behavior, capability authentication, concurrent root-file edits during capture or in-flight transfer, other unscheduled Bridge write interleavings, arbitrary embedded policy-bearing paths, and policy updates during partial projection/restart need implementation tests or stronger models. Static transition mappings for these new actions point to existing ownership families, not a claim that the root-ignore feature already exists in production.
 
 ### Implementation recovery check
 
@@ -110,7 +120,7 @@ The production regression in `tests/phase2.test.ts` performs a genuine conflict 
 
 ### Negative controls and harness
 
-The fifteen distributed controls mutate one behavior after realistic setup: in-flight target replacement, accepted-root loss, covered-ref rewind, divergent-proposal discard, main move without preparation, early apply acknowledgement, uncaptured Bridge overwrite, recursive tombstone deletion, moved-ref abort, duplicate non-idempotent processing, retry identity mutation, conflict metadata without complete protection, uncertain-CAS abort, seen/applied cursor conflation, and projection cursor publication before complete verification.
+The original fifteen distributed controls mutate one behavior after realistic setup: in-flight target replacement, accepted-root loss, covered-ref rewind, divergent-proposal discard, main move without preparation, early apply acknowledgement, uncaptured Bridge overwrite, recursive tombstone deletion, moved-ref abort, duplicate non-idempotent processing, retry identity mutation, conflict metadata without complete protection, uncertain-CAS abort, seen/applied cursor conflation, and projection cursor publication before complete verification.
 
 The checker requires the exact invariant, witness action, and minimum meaningful trace depth. It rejects timeout, parse/semantic failure, deadlock, wrong invariant, absent/shallow witness, state/depth overflow, required-matrix removal, status mismatch, stale evidence, path traversal, invalid source ranges, state-space collapse, and unexplained greater-than-twofold growth. `tests/formal-checker.test.ts` covers these gates; formal CI runs it before TLC.
 
@@ -133,13 +143,13 @@ Final checked run: TLC 2.19, Java 21, one worker, fingerprint polynomial 0. Base
 | apply/ack liveness | 484 | 151 | 34 |
 | implementation recovery | 11,389 | 3,772 | 56 |
 
-All twenty reachability checks produced their required witness. All four FM-001 and fifteen FM-002 negative controls violated exactly their intended invariant with the required meaningful prefix. See the executable summary from `npm run test:formal` for every generated/distinct/depth tuple.
+All original twenty reachability checks produced their required witness. All four FM-001 and original fifteen FM-002 negative controls violated exactly their intended invariant with the required meaningful prefix. See the executable summary from `npm run test:formal` for every generated/distinct/depth tuple.
 
 ### Traceability and omissions
 
 `trace/transition-map.json` maps every root action and the required production families to existing, range-validated code/test evidence. It cites `obsidian-plugin/src/main.cjs` only within its current 9,652 lines. The schema/map are static design artifacts only: runtime transition instrumentation and replay do not exist, so no runtime trace conformance or implementation proof is claimed.
 
-FM-002 remains bounded and does not prove byte/checksum correctness, Git ancestry implementation, semantic merge formats, filesystem/power-loss durability, editor-buffer flushing, authorization, onboarding, restore, event-pruning recovery, transfer expiry, rename graphs, garbage collection, backup/restore, or real process supervision. Transfer expiry and event-cursor expiry appear in the static production-family map but are not modeled transitions. Audit retention is omitted. The contract-required integrated server/Rust/Node/PostgreSQL deployment fault test remains outstanding.
+FM-002 remains bounded and does not prove byte/checksum correctness, Git ancestry implementation, Git-ignore matching semantics, semantic merge formats, filesystem/power-loss durability, editor-buffer flushing, authorization, onboarding, restore, event-pruning recovery, transfer expiry, rename graphs, garbage collection, backup/restore, or real process supervision. Transfer expiry and event-cursor expiry appear in the static production-family map but are not modeled transitions. Audit retention is omitted. The contract-required integrated server/Rust/Node/PostgreSQL deployment fault test remains outstanding.
 
 ## OBTS-FM-003: Focused Bridge Bounded-Body Projection
 

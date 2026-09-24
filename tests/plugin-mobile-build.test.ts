@@ -133,6 +133,9 @@ describe('mobile plugin artifact', () => {
       const container: any = {
         className: '',
         textContent: '',
+        value: '',
+        disabled: false,
+        addEventListener(_event: string, _callback: () => void) {},
         empty() {
           renderedSettingNames.length = 0;
           renderedSettingDescriptions.length = 0;
@@ -342,8 +345,11 @@ describe('mobile plugin artifact', () => {
     (plugin as any).setStatus('Synced');
     const silentNoticeCount = notices.length;
     (plugin as any).setStatus('Unsafe local state', { notify: false });
-    expect(statusItem.classes).toContain('obts-status--danger');
+    expect(statusItem.text).toBe('obts: Out of sync');
+    expect(statusItem.classes).toContain('obts-status--warning');
     expect(notices).toHaveLength(silentNoticeCount);
+    (plugin as any).setStatus('Out of sync — file exceeds upload limit', { notify: false });
+    expect(statusItem.classes).toContain('obts-status--danger');
     (plugin as any).setStatus('Not paired');
 
     const initialNoticeCount = notices.length;
@@ -358,11 +364,11 @@ describe('mobile plugin artifact', () => {
     expect(ribbonItem.classes).toContain('obts-ribbon-status');
     expect(ribbonItem.classes).toContain('obts-status--active');
     expect(ribbonItem.attributes['data-obts-status']).toBe('uploading');
-    (plugin as any).setStatus('Review needed');
-    expect(statusItem.classes).toContain('obts-status--warning');
+    (plugin as any).setStatus('Conflict resolution needed');
+    expect(statusItem.classes).toContain('obts-status--danger');
     expect(statusItem.attributes.title).toContain('conflict dashboard');
     expect(notices).toHaveLength(initialNoticeCount + 1);
-    (plugin as any).setStatus('Review needed');
+    (plugin as any).setStatus('Conflict resolution needed');
     expect(notices).toHaveLength(initialNoticeCount + 1);
     ribbonActions[0]!();
     expect(openedUrls).toEqual(['http://127.0.0.1:3000/dashboard']);
@@ -1092,6 +1098,9 @@ describe('mobile plugin artifact', () => {
     await settingTabs[0]!.display();
     expect(renderedSettingNames).toContain('Status');
     expect(renderedSettingNames).toContain('Current operation');
+    expect(renderedSettingNames).toContain('Vault-root .gitignore');
+    expect(renderedButtons.find((button) => button.text === 'Preview effect')).toBeDefined();
+    expect(renderedButtons.find((button) => button.text === 'Save .gitignore')).toMatchObject({ disabled: true });
     expect(renderedSettingDescriptions.some((description) => description.includes('400/6028'))).toBe(true);
     expect(renderedButtons.find((button) => button.text === 'Sync now')).toMatchObject({ disabled: true });
     expect(renderedButtons.find((button) => button.text === 'Unpair...')).toMatchObject({ disabled: true });
@@ -1144,7 +1153,7 @@ describe('mobile plugin artifact', () => {
         lease_state: 'owned_active',
         state_source: 'primary',
         paired: true,
-        status_class: 'review',
+        status_class: 'out_of_sync',
         queue_state: 'conflicted',
         onboarding_journal: 'complete',
         server_device_status: 'not_observed',
@@ -1266,7 +1275,7 @@ describe('mobile plugin artifact', () => {
     expect(blockedSyncButton?.disabled).toBe(false);
     await blockedSyncButton?.click?.();
     expect(blockedActionCalls).toBe(1);
-    expect(JSON.stringify(renderedContainers.map((container) => container.textContent).filter(Boolean))).toContain('Sync stopped: Server repair required.');
+    expect(JSON.stringify(renderedContainers.map((container) => container.textContent).filter(Boolean))).toContain('The server vault requires an integrity repair.');
     expect(renderedContainers.every((container) => !container.textContent?.includes('Another obts operation'))).toBe(true);
     expect((plugin as any).operationDescription()).toBe('No obts operation is running.');
     reportedVaultStatus = 'active';
@@ -1383,6 +1392,25 @@ describe('mobile plugin artifact', () => {
     await expect((successor as any).ensureClientReady()).resolves.toBe(true);
     expect((successor as any).clientReady).toBe(true);
     expect(overlappingWrites).toBe(0);
+
+    const rootEditorClient = (successor as any).client;
+    const writeRoot = async (contents: string) => {
+      const bytes = Buffer.from(contents, 'utf8');
+      await reloadAdapter.writeBinary('.gitignore', bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer);
+    };
+    const absentRoot = await rootEditorClient.readRootIgnorePolicy();
+    expect(absentRoot.bytes).toBeNull();
+    expect((await rootEditorClient.previewRootIgnoreDraft('private/\n')).includedFiles).toBeGreaterThanOrEqual(0);
+    await rootEditorClient.saveRootIgnoreDraft('private/\n');
+    expect(Buffer.from(await reloadAdapter.readBinary('.gitignore')).toString('utf8')).toBe('private/\n');
+    await rootEditorClient.saveRootIgnoreDraft('*.tmp\n');
+    await writeRoot('other/\n');
+    await rootEditorClient.saveRootIgnoreDraft('draft/\n');
+    expect(Buffer.from(await reloadAdapter.readBinary('.gitignore')).toString('utf8')).toBe('draft/\n');
+    await rootEditorClient.saveRootIgnoreDraft('');
+    expect(await reloadAdapter.exists('.gitignore')).toBe(true);
+    await expect(rootEditorClient.previewRootIgnoreDraft('\u0000')).rejects.toThrow(/NUL/u);
+    await expect(rootEditorClient.previewRootIgnoreDraft('\ud800')).rejects.toThrow(/UTF-8/u);
     (successor as any).onunload();
   });
 });

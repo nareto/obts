@@ -15,7 +15,9 @@ use crate::context::{AssembleContextRequest, AssembleContextResponse};
 use crate::filesystem::{FilesystemError, FilesystemSource};
 use crate::headless::{HeadlessClient, HeadlessError, HeadlessFilesystemGuard};
 use crate::model::{Note, NoteId, VaultFile};
-use crate::new_note::{NewNoteFileType, NewNoteRequest, UpdateNoteRequest, WriteError};
+use crate::new_note::{
+    NewNoteFileType, NewNoteRequest, PersistenceFailureKind, UpdateNoteRequest, WriteError,
+};
 use crate::search::{SearchMode, SearchResponse};
 use crate::store::{
     BacklinksResponse, LocalProjectionOutcome, NeighborDirection, NeighborsResponse,
@@ -459,18 +461,33 @@ impl VaultBridgeService {
         let write_lock = self.vault_file_repair_lock(note_id.as_str()).await;
         let _write_guard = write_lock.lock().await;
         let _vault_write_guard = self.vault_write_lock.lock().await;
-        self.refresh_vault_file_for_write(auth, note_id).await?;
-        let now = Utc::now();
-        let request = self
-            .store
-            .prepare_update_note_request(auth, note_id, request, now)
-            .await
-            .map_err(ServiceError::Write)?;
-        let write = self
-            .store
-            .prepare_update_note_write_at(note_id, &request, now)
-            .await
-            .map_err(ServiceError::Write)?;
+        let filesystem = self.filesystem.as_ref().expect("filesystem source");
+        let indexed = matches!(filesystem.is_path_ignored(note_id.as_str()), Ok(false))
+            && match self.refresh_vault_file_for_write(auth, note_id).await {
+                Ok(_) => true,
+                Err(ServiceError::NotFound) => false,
+                Err(error) => return Err(error),
+            };
+        let write = if indexed {
+            let now = Utc::now();
+            let request = self
+                .store
+                .prepare_update_note_request(auth, note_id, request, now)
+                .await
+                .map_err(ServiceError::Write)?;
+            self.store
+                .prepare_update_note_write_at(note_id, &request, now)
+                .await
+                .map_err(ServiceError::Write)?
+        } else {
+            let file = filesystem
+                .read(note_id.as_str())
+                .await
+                .map_err(ServiceError::FilesystemWrite)?;
+            self.store
+                .prepare_source_update(auth, note_id, request, false, &file)
+                .await?
+        };
         let operation_id = write.operation_id.clone();
         let response_revision = whole_file_revision(&write.content);
         let filesystem = self
@@ -660,13 +677,27 @@ impl VaultBridgeService {
         let write_lock = self.vault_file_repair_lock(file_id.as_str()).await;
         let _write_guard = write_lock.lock().await;
         let _vault_write_guard = self.vault_write_lock.lock().await;
-        self.refresh_vault_file_for_write(auth, file_id).await?;
-        let now = Utc::now();
-        let write = self
-            .store
-            .prepare_edit_vault_file_write(auth, file_id, request, now)
-            .await
-            .map_err(ServiceError::Write)?;
+        let filesystem = self.filesystem.as_ref().expect("filesystem source");
+        let indexed = matches!(filesystem.is_path_ignored(file_id.as_str()), Ok(false))
+            && match self.refresh_vault_file_for_write(auth, file_id).await {
+                Ok(_) => true,
+                Err(ServiceError::NotFound) => false,
+                Err(error) => return Err(error),
+            };
+        let write = if indexed {
+            self.store
+                .prepare_edit_vault_file_write(auth, file_id, request, Utc::now())
+                .await
+                .map_err(ServiceError::Write)?
+        } else {
+            let file = filesystem
+                .read(file_id.as_str())
+                .await
+                .map_err(ServiceError::FilesystemWrite)?;
+            self.store
+                .prepare_source_update(auth, file_id, request, true, &file)
+                .await?
+        };
         let operation_id = write.operation_id.clone();
         let response_revision = whole_file_revision(&write.content);
         let filesystem = self
@@ -732,11 +763,38 @@ impl VaultBridgeService {
             .projection_lock
             .write()
             .await;
-        self.ensure_index_current()?;
-        let write = self.store.sql_prepare_write(auth, id, request, raw).await?;
+        let source = self.filesystem.as_ref().expect("SQL filesystem");
+        let indexed = matches!(source.is_path_ignored(id.as_str()), Ok(false));
+        let write = if indexed {
+            self.ensure_index_current()?;
+            match self
+                .store
+                .sql_prepare_write(auth, id, request.clone(), raw)
+                .await
+            {
+                Ok(write) => write,
+                Err(ServiceError::NotFound) => {
+                    let file = source
+                        .read(id.as_str())
+                        .await
+                        .map_err(ServiceError::FilesystemWrite)?;
+                    self.store
+                        .prepare_source_update(auth, id, request, raw, &file)
+                        .await?
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            let file = source
+                .read(id.as_str())
+                .await
+                .map_err(ServiceError::FilesystemWrite)?;
+            self.store
+                .prepare_source_update(auth, id, request, raw, &file)
+                .await?
+        };
         let operation_id = write.operation_id.clone();
         let response_revision = whole_file_revision(&write.content);
-        let source = self.filesystem.as_ref().expect("SQL filesystem");
         self.ensure_projected_write_within_limit(source, &write.path, write.content.len())
             .await?;
         let revision = source
@@ -794,6 +852,44 @@ impl VaultBridgeService {
         mut write: PreparedVaultWrite,
         revision: &str,
     ) -> Result<LocalProjectionOutcome, ServiceError> {
+        let source = self.filesystem.as_ref().expect("source");
+        match source.is_path_ignored(&write.path) {
+            Ok(true) => {
+                let path = write.path;
+                let result = self
+                    .store
+                    .delete_filesystem_file(&NoteId::new(path.clone()))
+                    .await;
+                return match result {
+                    Ok(()) => {
+                        self.store.clear_local_projection_pending(&path).await;
+                        Ok(LocalProjectionOutcome::Applied)
+                    }
+                    Err(error) => {
+                        let kind = match error {
+                            WriteError::Persistence { kind } => kind,
+                            _ => PersistenceFailureKind::Unknown,
+                        };
+                        Ok(self
+                            .store
+                            .mark_local_projection_pending(path, revision, kind)
+                            .await)
+                    }
+                };
+            }
+            Err(error) => {
+                warn!(error = %error, path_hash = %lookup_fingerprint("vault_file", &write.path), "local write committed, projection policy unavailable");
+                return Ok(self
+                    .store
+                    .mark_local_projection_pending(
+                        write.path,
+                        revision,
+                        PersistenceFailureKind::Unknown,
+                    )
+                    .await);
+            }
+            Ok(false) => {}
+        }
         if self.store.uses_sql_backend() && write.body_lease.is_none() {
             let file = self
                 .filesystem
@@ -818,6 +914,48 @@ impl VaultBridgeService {
         auth: &AuthContext,
         file_id: &NoteId,
     ) -> Result<VaultFile, ServiceError> {
+        if let Some(source) = self.filesystem.as_ref()
+            && !matches!(source.is_path_ignored(file_id.as_str()), Ok(false))
+        {
+            let _headless_guard = if let Some(headless) = self.headless.as_ref() {
+                Some(
+                    headless
+                        .lock_filesystem()
+                        .await
+                        .map_err(ServiceError::Headless)?,
+                )
+            } else {
+                None
+            };
+            let _projection_guard = source.projection_lock.read().await;
+            let file = source.read(file_id.as_str()).await.map_err(|error| {
+                if matches!(error, FilesystemError::NotFound) {
+                    ServiceError::NotFound
+                } else {
+                    ServiceError::FilesystemWrite(error)
+                }
+            })?;
+            if !self.store.source_file_readable(auth, &file).await {
+                return Err(ServiceError::NotFound);
+            }
+            let content_sha256 = hex::encode(Sha256::digest(file.content.as_bytes()));
+            return Ok(VaultFile {
+                _body_lease: file.lease.clone(),
+                id: file_id.clone(),
+                revision: whole_file_revision(&file.content),
+                path: file.path.clone(),
+                file_type: if file.path.ends_with(".md") {
+                    NewNoteFileType::Md
+                } else {
+                    NewNoteFileType::Base
+                },
+                size_bytes: file.content.len(),
+                content_sha256,
+                content: file.content,
+                created_at: file.created_at,
+                updated_at: file.updated_at,
+            });
+        }
         if self.store.uses_sql_backend() {
             let _guard = self.sql_read_guard().await?;
             return self.store.sql_get_file(auth, file_id).await;
@@ -997,13 +1135,207 @@ mod obts_tests {
     use tempfile::tempdir;
 
     use super::{ServiceError, VaultBridgeService};
-    use crate::authorization::{AccessPolicy, AuthContext, ContextName};
+    use crate::authorization::{AccessMatcher, AccessPolicy, AccessRule, AuthContext, ContextName};
     use crate::config::AppConfig;
     use crate::filesystem::FilesystemSource;
     use crate::model::NoteId;
-    use crate::new_note::{NewNoteFileType, UpdateNoteRequest, WriteError};
+    use crate::new_note::{NewNoteFileType, NewNoteRequest, UpdateNoteRequest, WriteError};
     use crate::runtime_config::RuntimeConfigState;
     use crate::store::{RecoveredVaultFileState, VaultStore};
+
+    #[tokio::test]
+    async fn ignored_note_and_vault_file_writes_remain_local() {
+        let store = VaultStore::new(10);
+        store
+            .set_authorization_config(BTreeMap::from([
+                ("admin".into(), AccessPolicy::admin()),
+                (
+                    "reader".into(),
+                    AccessPolicy {
+                        read: vec![
+                            AccessRule::deny(AccessMatcher {
+                                tags_any: vec!["private".into()],
+                                ..Default::default()
+                            }),
+                            AccessRule::allow(AccessMatcher::allow_all()),
+                        ],
+                        ..Default::default()
+                    },
+                ),
+            ]))
+            .await;
+        let root = tempdir().unwrap();
+        let source = Arc::new(FilesystemSource::new(root.path()).unwrap());
+        for (path, content, file_type) in [
+            ("Note.md", "# Note\n", NewNoteFileType::Md),
+            ("Data.base", "views: []\n", NewNoteFileType::Base),
+        ] {
+            let revision = source.create(path, content).await.unwrap();
+            store
+                .project_filesystem_file(RecoveredVaultFileState {
+                    path: path.into(),
+                    content: content.into(),
+                    file_type,
+                    couchdb_rev: revision,
+                    created_at: Some(Utc::now()),
+                    updated_at: Utc::now(),
+                })
+                .await
+                .unwrap();
+        }
+        let service = VaultBridgeService::new_with_filesystem(store.clone(), source.clone(), None);
+        let auth = AuthContext::new(ContextName::new("admin"), "test:admin".into());
+        std::fs::write(root.path().join(".gitignore"), "*.md\n*.base\n").unwrap();
+        let new_request = |file_type| NewNoteRequest {
+            title: "new".into(),
+            content: if file_type == NewNoteFileType::Base {
+                "views: []\n"
+            } else {
+                "new"
+            }
+            .into(),
+            template_id: None,
+            file_type,
+        };
+        let note = service
+            .create_note(&auth, new_request(NewNoteFileType::Md))
+            .await
+            .unwrap();
+        let file = service
+            .create_vault_file(&auth, new_request(NewNoteFileType::Base))
+            .await
+            .unwrap();
+        assert!(
+            std::fs::read_to_string(root.path().join(note.id.as_str()))
+                .unwrap()
+                .ends_with("\nnew\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(file.id.as_str())).unwrap(),
+            "views: []\n"
+        );
+        assert!(store.get_note_for_policy(&auth, &note.id).await.is_none());
+        let note_before = std::fs::read_to_string(root.path().join(note.id.as_str())).unwrap();
+        let note_read = service.get_vault_file(&auth, &note.id).await.unwrap();
+        assert_eq!(
+            note_read.revision,
+            crate::store::whole_file_revision(&note_before)
+        );
+        let reader = AuthContext::new(ContextName::new("reader"), "test:reader".into());
+        source
+            .create("Private.md", "---\ntags:\n- private\n---\n\nprivate body\n")
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .get_vault_file(&reader, &NoteId::new("Private.md"))
+                .await,
+            Err(ServiceError::NotFound)
+        ));
+        assert!(
+            service
+                .get_vault_file(&auth, &NoteId::new("Private.md"))
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            service
+                .update_note(
+                    &reader,
+                    &note.id,
+                    UpdateNoteRequest {
+                        content: Some("forbidden".into()),
+                        content_patch: None,
+                        tags: None,
+                        metadata: None,
+                        expected_revision: Some(crate::store::whole_file_revision(&note_before)),
+                    }
+                )
+                .await,
+            Err(ServiceError::Write(WriteError::PolicyDenied { .. }))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(note.id.as_str())).unwrap(),
+            note_before
+        );
+        service
+            .update_note(
+                &auth,
+                &note.id,
+                UpdateNoteRequest {
+                    content: Some("local edit".into()),
+                    content_patch: None,
+                    tags: None,
+                    metadata: None,
+                    expected_revision: Some(crate::store::whole_file_revision(&note_before)),
+                },
+            )
+            .await
+            .unwrap();
+        let base_before = std::fs::read_to_string(root.path().join(file.id.as_str())).unwrap();
+        service
+            .edit_vault_file(
+                &auth,
+                &file.id,
+                UpdateNoteRequest {
+                    content: Some("views: []\nfilters: []\n".into()),
+                    content_patch: None,
+                    tags: None,
+                    metadata: None,
+                    expected_revision: Some(crate::store::whole_file_revision(&base_before)),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            std::fs::read_to_string(root.path().join(note.id.as_str()))
+                .unwrap()
+                .ends_with("\nlocal edit\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(file.id.as_str())).unwrap(),
+            "views: []\nfilters: []\n"
+        );
+        assert!(store.get_note_for_policy(&auth, &note.id).await.is_none());
+        assert!(
+            store
+                .get_vault_file_for_policy(&auth, &file.id)
+                .await
+                .is_none()
+        );
+        std::fs::write(root.path().join(".gitignore"), [0xff]).unwrap();
+        let note_revision =
+            crate::store::whole_file_revision(&source.read("Note.md").await.unwrap().content);
+        let edit = UpdateNoteRequest {
+            content: Some("changed".into()),
+            content_patch: None,
+            tags: None,
+            metadata: None,
+            expected_revision: Some(note_revision),
+        };
+        let accepted = service
+            .update_note(&auth, &NoteId::new("Note.md"), edit)
+            .await
+            .unwrap();
+        assert_eq!(accepted.local_projection, "pending");
+        assert_eq!(store.status().await.write_projection.pending, 1);
+        assert!(
+            std::fs::read_to_string(root.path().join("Note.md"))
+                .unwrap()
+                .ends_with("\nchanged\n")
+        );
+        std::fs::write(root.path().join(".gitignore"), "*.md\n*.base\n").unwrap();
+        crate::filesystem::synchronize_snapshot(&store, &source)
+            .await
+            .unwrap();
+        assert_eq!(store.status().await.write_projection.pending, 0);
+        assert!(
+            store
+                .get_note_for_policy(&auth, &NoteId::new("Note.md"))
+                .await
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn filesystem_backed_reads_fail_closed_when_visible_content_drifts() {

@@ -4,7 +4,7 @@ INSTANCE OBTSApplyRefinement
 INSTANCE OBTSSafety
 
 (***************************************************************************
-OBTS-FM-002, architecture revision 4. This is a bounded refinement of the
+OBTS-FM-002, architecture revision 15. This is a bounded refinement of the
 architecture contracts, not a definition of product behavior. Persist/commit
 steps assume their named durable facts survive restart. Git ancestry, bytes,
 flush semantics, process kill, and runtime trace conformance remain external.
@@ -28,6 +28,12 @@ NoIntent == "NoIntent"
 NoPlan == "NoPlan"
 NoResult == "NoResult"
 NoReading == "NoReading"
+Policies == {"empty", "exclude-a"}
+PolicyScenario == Scenario \in {"root-ignore", "root-ignore-legacy", "root-ignore-bridge-race", "root-ignore-invalid"}
+ChangingPolicyScenario == Scenario \in {"root-ignore", "root-ignore-bridge-race", "root-ignore-invalid"}
+PolicyOfTarget(v) == IF ChangingPolicyScenario /\ v = Plugin1Version THEN "exclude-a" ELSE "empty"
+NoPolicy == "NoPolicy"
+PolicyIds == Policies \cup {NoPolicy}
 Copies == 1..MaxMessages
 AttemptIds == {"attempt-plugin-1", "attempt-plugin-2", "attempt-bridge", "attempt-plugin-1-retry", "attempt-equal", "attempt-covered"}
 TransferIds == {"transfer-plugin-1", "transfer-plugin-2", "transfer-bridge", "transfer-plugin-1-retry", "transfer-equal", "transfer-covered"}
@@ -46,7 +52,7 @@ EffectNames == {"attribution", "audit", "main_event", "conflict_event", "last_su
 IdentityType == {<<v, e, b, d, p, a, t>> :
   v \in Versions \cup {NoVersion}, e \in Versions \cup {NoVersion},
   b \in Versions \cup {NoVersion}, d \in ProposalIds, p \in Plans,
-  a \in AttemptIds \cup {NoId}, t \in TransferIds \cup {NoId}}
+  a \in AttemptIds \cup {NoId}, t \in TransferIds \cup {NoId}} \X PolicyIds
 AllResolutionEffects == EffectNames
 
 ASSUME Plugin1 # Plugin2 /\ Plugin1 # BridgeNode /\ Plugin2 # BridgeNode
@@ -65,7 +71,8 @@ ClientVersion(c, n) ==
     [] OTHER -> BridgeVersion
 
 ClientPath(c) ==
-  CASE Scenario = "disjoint-directory" /\ c = Plugin1 -> PathB
+  CASE ChangingPolicyScenario /\ c = Plugin1 -> PathB
+    [] Scenario = "disjoint-directory" /\ c = Plugin1 -> PathB
     [] OTHER -> PathA
 
 AttemptId(c, n) ==
@@ -85,7 +92,11 @@ IntentId(c) == CASE c = Plugin1 -> "intent-plugin-1" [] c = Plugin2 -> "intent-p
 PlanId(c) == CASE c = Plugin1 -> "plan-plugin-1" [] c = Plugin2 -> "plan-plugin-2" [] OTHER -> "plan-bridge"
 
 ScenarioAllowsClient(c) ==
-  CASE Scenario = "same-path" -> c \in PluginClients
+  CASE Scenario = "root-ignore" -> c \in PluginClients
+    [] Scenario = "root-ignore-bridge-race" -> c = Plugin1
+    [] Scenario = "root-ignore-invalid" -> c = Plugin1
+    [] Scenario = "root-ignore-legacy" -> FALSE
+    [] Scenario = "same-path" -> c \in PluginClients
     [] Scenario = "disjoint-directory" -> c \in {Plugin1, BridgeNode}
     [] Scenario \in {"server-recovery", "server-recovery-implementation", "live-proposal", "live-recovery", "live-apply", "apply-refinement"} -> c = Plugin1
     [] Scenario \in {"bridge-handoff", "live-bridge"} -> c = BridgeNode
@@ -94,7 +105,7 @@ ScenarioAllowsClient(c) ==
     [] OTHER -> FALSE
 
 MaxEdits(c) == IF c = Plugin1 /\ Scenario \in {"same-path", "server-recovery", "server-recovery-implementation", "live-recovery", "all-actors"} THEN 2 ELSE 1
-BridgeWriteAllowed == Scenario \in {"disjoint-directory", "bridge-handoff", "all-actors", "live-bridge"} /\ (Scenario # "disjoint-directory" \/ client.proposalPhase[Plugin1] = "Terminal")
+BridgeWriteAllowed == Scenario \in {"disjoint-directory", "bridge-handoff", "all-actors", "live-bridge", "root-ignore-bridge-race"} /\ (Scenario # "disjoint-directory" \/ client.proposalPhase[Plugin1] = "Terminal")
 EditOrderAllows(c) ==
   CASE Scenario = "disjoint-directory" /\ c = BridgeNode -> client.proposalPhase[Plugin1] = "Terminal"
     [] Scenario = "all-actors" /\ c = Plugin2 -> client.proposalPhase[Plugin1] = "Terminal"
@@ -107,7 +118,7 @@ AllScenarioProposalsTerminal ==
   CASE Scenario = "disjoint-directory" -> client.proposalPhase[Plugin1] = "Terminal" /\ client.proposalPhase[BridgeNode] = "Terminal"
     [] Scenario = "all-actors" -> \A c \in Clients: client.proposalPhase[c] = "Terminal"
     [] OTHER -> FALSE
-ApplyAllowed(c) == c = Plugin2 /\ Scenario \in {"disjoint-directory", "all-actors", "live-apply", "apply-refinement"} /\ (Scenario # "all-actors" \/ AllScenarioProposalsTerminal)
+ApplyAllowed(c) == c = Plugin2 /\ Scenario \in {"root-ignore", "root-ignore-legacy", "disjoint-directory", "all-actors", "live-apply", "apply-refinement"} /\ (Scenario # "all-actors" \/ AllScenarioProposalsTerminal)
 ServerCrashAllowed == Scenario \in {"server-recovery", "server-recovery-implementation", "all-actors", "live-recovery"}
 
 EmptyTree == [p \in Paths |-> {BaseVersion}]
@@ -122,12 +133,16 @@ Rooted(v) ==
   \/ \E p \in Paths: v \in server.mainTree[p]
   \/ v \in server.conflictRoots
 
-Request(c, copy) == [actor |-> c, copy |-> copy, attempt |-> client.attemptId[c], transfer |-> client.transferId[c], target |-> client.queueTarget[c], expected |-> client.expectedDevice[c], base |-> client.proposalBase[c], directoryProposal |-> client.directoryProposal[c], objectPlan |-> client.objectPlan[c]]
+Request(c, copy) == [actor |-> c, copy |-> copy, attempt |-> client.attemptId[c], transfer |-> client.transferId[c], target |-> client.queueTarget[c], expected |-> client.expectedDevice[c], base |-> client.proposalBase[c], directoryProposal |-> client.directoryProposal[c], objectPlan |-> client.objectPlan[c], policy |-> client.attemptPolicy[c], hasA |-> client.candidateHasA[c]]
 Reply(c, copy) == [actor |-> c, copy |-> copy, attempt |-> client.attemptId[c], result |-> IF client.attemptId[c] \in AttemptIds THEN server.resultByAttempt[client.attemptId[c]] ELSE NoResult]
 MessageKey(m) == <<m.actor, m.copy, m.attempt>>
 
 Init ==
   /\ client = [
+       capable |-> [c \in Clients |-> ~PolicyScenario \/ c # Plugin2],
+       policy |-> SetMap(Clients, "empty"), attemptPolicy |-> SetMap(Clients, NoPolicy),
+       candidateHasA |-> SetMap(Clients, TRUE),
+       journalPolicy |-> SetMap(Clients, NoPolicy), localOnly |-> SetMap(Clients, FALSE),
        up |-> SetMap(Clients, TRUE), recovering |-> SetMap(Clients, FALSE),
        restartDisposition |-> SetMap(Clients, "None"), crashCount |-> SetMap(Clients, 0),
        visible |-> [c \in Clients |-> [p \in Paths |-> BaseVersion]],
@@ -138,7 +153,7 @@ Init ==
        proposalBase |-> SetMap(Clients, NoVersion), directoryProposal |-> SetMap(Clients, NoProposal),
        directoryIntent |-> SetMap(Clients, NoIntent), directoryGeneration |-> SetMap(Clients, 0),
        objectPlan |-> SetMap(Clients, NoPlan), attemptId |-> SetMap(Clients, NoId),
-       transferId |-> SetMap(Clients, NoId), immutableIdentity |-> SetMap(Clients, <<NoVersion, NoVersion, NoVersion, NoProposal, NoPlan, NoId, NoId>>),
+       transferId |-> SetMap(Clients, NoId), immutableIdentity |-> SetMap(Clients, <<<<NoVersion, NoVersion, NoVersion, NoProposal, NoPlan, NoId, NoId>>, NoPolicy>>),
        proposalPhase |-> SetMap(Clients, "Idle"), seenCursor |-> SetMap(Clients, 0),
        appliedCursor |-> SetMap(Clients, 0), localMainEpoch |-> SetMap(Clients, 0),
        durableApplied |-> SetMap(Clients, FALSE), ackIntent |-> SetMap(Clients, FALSE),
@@ -147,6 +162,9 @@ Init ==
        displaced |-> SetMap(Clients, {}), blocked |-> SetMap(Clients, FALSE)]
   /\ network = [requestBag |-> {}, delayedRequests |-> {}, droppedRequests |-> {}, deliveredRequests |-> {}, replyBag |-> {}, delayedReplies |-> {}, droppedReplies |-> {}, deliveredReplies |-> {}]
   /\ server = [
+       policy |-> IF Scenario = "root-ignore-legacy" THEN "exclude-a" ELSE "empty",
+       policyActive |-> Scenario # "root-ignore-legacy", opCandidateHasA |-> TRUE,
+       eventPolicy |-> "empty", opPolicy |-> NoPolicy,
        up |-> TRUE, recovering |-> FALSE, crashCount |-> 0, mainEpoch |-> 0,
        mainTree |-> EmptyTree, mainHistory |-> {BaseVersion}, deviceRef |-> SetMap(Clients, BaseVersion),
        deviceHistory |-> SetMap(Clients, {BaseVersion}), processingRoots |-> {}, accepted |-> {},
@@ -165,10 +183,12 @@ Init ==
        eventSeq |-> 0, eventTree |-> EmptyTree, lastAppliedEpoch |-> SetMap(Clients, 0), blocked |-> FALSE]
   /\ bridge = [
        rustUp |-> TRUE, rustCrashCount |-> 0, rustPhase |-> "Idle", acknowledged |-> FALSE,
-       nodeHintDurable |-> FALSE, manifestVerified |-> FALSE, baseVerified |-> FALSE,
+       nodeHintDurable |-> FALSE, projectionPolicy |-> NoPolicy, projectedPaths |-> Paths,
+       preservedAtPolicy |-> BaseVersion,
+       manifestVerified |-> FALSE, baseVerified |-> FALSE,
        pathOidsVerified |-> FALSE, rowsComplete |-> FALSE, projectionCursor |-> 0,
        projectionTarget |-> 0, projectionHealthy |-> FALSE, derivedReady |-> FALSE,
-       projectionFailure |-> FALSE, cursorPublishedVerified |-> FALSE, auditRetained |-> FALSE]
+       projectionFailure |-> FALSE, cursorPublishedVerified |-> FALSE, auditRetained |-> PolicyScenario]
   /\ directory = [
        canonicalTombstone |-> FALSE, proposalId |-> NoProposal, intentId |-> NoIntent,
        generation |-> 0, baseMainEpoch |-> 0, baseEventSeq |-> 0, prepared |-> FALSE,
@@ -189,9 +209,12 @@ Mark(action) == IF Scenario \in {"all-actors", "disjoint-directory"} /\ action \
 ObservePluginEdit(c, p) ==
   /\ c \in PluginClients /\ ScenarioAllowsClient(c) /\ EditOrderAllows(c) /\ NormalClient(c)
   /\ p = ClientPath(c) /\ client.editCount[c] < MaxEdits(c)
+  /\ (Scenario # "root-ignore" \/ c = Plugin1 \/ (server.policy = "exclude-a" /\ bridge.projectionCursor > 0))
+  /\ (Scenario # "root-ignore-bridge-race" \/ bridge.rustPhase = "Validated")
   /\ client.proposalPhase[c] \in {"Idle", "Terminal"}
   /\ LET n == client.editCount[c] + 1 v == ClientVersion(c, n) IN
-       client' = [client EXCEPT !.visible[c][p] = v, !.observed[c] = @ \cup {v}, !.hints[c] = @ \cup {p}, !.editCount[c] = n, !.editPath[c] = p, !.proposalPhase[c] = "Observed"]
+       client' = [client EXCEPT !.visible[c][p] = v, !.observed[c] = @ \cup {v}, !.hints[c] = @ \cup {p}, !.editCount[c] = n, !.editPath[c] = p, !.proposalPhase[c] = "Observed",
+         !.policy[c] = IF ChangingPolicyScenario /\ c = Plugin1 THEN "exclude-a" ELSE @]
   /\ coverage' = Mark("ObservePluginEdit") /\ lastAction' = "ObservePluginEdit"
   /\ UNCHANGED <<network, server, bridge, directory, ghost>>
 
@@ -219,8 +242,11 @@ CaptureLocalCommit(c) ==
   /\ NormalClient(c) /\ client.proposalPhase[c] = "Observed" /\ client.hints[c] # {}
   /\ LET v == ClientVersion(c, client.editCount[c]) IN
        /\ v = client.visible[c][client.editPath[c]]
-       /\ client' = [client EXCEPT !.localGit[c] = @ \cup {v}, !.capturePublished[c] = @ \cup {v}, !.hints[c] = {}, !.proposalPhase[c] = "Captured"]
-       /\ ghost' = [ghost EXCEPT !.captured = @ \cup {v}]
+       /\ IF c = BridgeNode /\ PolicyScenario /\ server.policy = "exclude-a"
+          THEN /\ client' = [client EXCEPT !.hints[c] = {}, !.proposalPhase[c] = "Terminal"]
+               /\ UNCHANGED ghost
+          ELSE /\ client' = [client EXCEPT !.localGit[c] = @ \cup {v}, !.capturePublished[c] = @ \cup {v}, !.hints[c] = {}, !.proposalPhase[c] = "Captured"]
+               /\ ghost' = [ghost EXCEPT !.captured = @ \cup {v}]
   /\ bridge' = IF c = BridgeNode THEN [bridge EXCEPT !.nodeHintDurable = TRUE] ELSE bridge
   /\ coverage' = [Mark("CaptureLocalCommit") EXCEPT !.actions = @ \cup {IF c = BridgeNode THEN "BridgeNodeCaptured" ELSE "PluginCaptured"}]
   /\ lastAction' = "CaptureLocalCommit" /\ UNCHANGED <<network, server, directory>>
@@ -230,7 +256,7 @@ PersistImmutableProposal(c) ==
   /\ LET n == client.editCount[c] v == ClientVersion(c, n) a == AttemptId(c, n) t == TransferId(c, n)
          dp == ProposalId(c) di == IntentId(c) plan == PlanId(c) IN
        /\ v \in client.localGit[c] /\ a \in AttemptIds /\ t \in TransferIds
-       /\ client' = [client EXCEPT !.queueTarget[c] = v, !.expectedDevice[c] = server.deviceRef[c], !.proposalBase[c] = BaseVersion, !.directoryProposal[c] = dp, !.directoryIntent[c] = di, !.directoryGeneration[c] = n, !.objectPlan[c] = plan, !.attemptId[c] = a, !.transferId[c] = t, !.immutableIdentity[c] = <<v, server.deviceRef[c], BaseVersion, dp, plan, a, t>>, !.proposalPhase[c] = "Queued"]
+       /\ client' = [client EXCEPT !.queueTarget[c] = v, !.expectedDevice[c] = server.deviceRef[c], !.proposalBase[c] = BaseVersion, !.directoryProposal[c] = dp, !.directoryIntent[c] = di, !.directoryGeneration[c] = n, !.objectPlan[c] = plan, !.attemptId[c] = a, !.transferId[c] = t, !.attemptPolicy[c] = client.policy[c], !.candidateHasA[c] = Scenario = "root-ignore-invalid" \/ client.policy[c] # "exclude-a", !.immutableIdentity[c] = <<<<v, server.deviceRef[c], BaseVersion, dp, plan, a, t>>, client.policy[c]>>, !.proposalPhase[c] = "Queued"]
   /\ coverage' = [Mark("PersistImmutableProposal") EXCEPT !.actorsProposed = @ \cup {c}]
   /\ lastAction' = "PersistImmutableProposal" /\ UNCHANGED <<network, server, bridge, directory, ghost>>
 
@@ -238,19 +264,20 @@ PersistEqualRetry(c) ==
   /\ Scenario = "server-recovery" /\ c = Plugin1 /\ NormalClient(c)
   /\ client.proposalPhase[c] = "Terminal" /\ client.editCount[c] = 1 /\ "attempt-equal" \notin server.processedAttempts
   /\ LET v == server.deviceRef[c] IN
-       client' = [client EXCEPT !.queueTarget[c] = v, !.expectedDevice[c] = v, !.proposalBase[c] = BaseVersion, !.directoryProposal[c] = ProposalId(c), !.directoryIntent[c] = IntentId(c), !.directoryGeneration[c] = 1, !.objectPlan[c] = PlanId(c), !.attemptId[c] = "attempt-equal", !.transferId[c] = "transfer-equal", !.immutableIdentity[c] = <<v, v, BaseVersion, ProposalId(c), PlanId(c), "attempt-equal", "transfer-equal">>, !.proposalPhase[c] = "Queued"]
+       client' = [client EXCEPT !.queueTarget[c] = v, !.expectedDevice[c] = v, !.proposalBase[c] = BaseVersion, !.directoryProposal[c] = ProposalId(c), !.directoryIntent[c] = IntentId(c), !.directoryGeneration[c] = 1, !.objectPlan[c] = PlanId(c), !.attemptId[c] = "attempt-equal", !.transferId[c] = "transfer-equal", !.attemptPolicy[c] = client.policy[c], !.immutableIdentity[c] = <<<<v, v, BaseVersion, ProposalId(c), PlanId(c), "attempt-equal", "transfer-equal">>, client.policy[c]>>, !.proposalPhase[c] = "Queued"]
   /\ coverage' = Mark("PersistEqualRetry") /\ lastAction' = "PersistEqualRetry"
   /\ UNCHANGED <<network, server, bridge, directory, ghost>>
 
 PersistCoveredQuery(c) ==
   /\ Scenario = "server-recovery" /\ c = Plugin1 /\ NormalClient(c)
   /\ client.proposalPhase[c] = "Terminal" /\ client.editCount[c] = 1 /\ server.deviceRef[c] # BaseVersion /\ "attempt-covered" \notin server.processedAttempts
-  /\ client' = [client EXCEPT !.queueTarget[c] = BaseVersion, !.expectedDevice[c] = server.deviceRef[c], !.proposalBase[c] = BaseVersion, !.directoryProposal[c] = ProposalId(c), !.directoryIntent[c] = IntentId(c), !.directoryGeneration[c] = 1, !.objectPlan[c] = PlanId(c), !.attemptId[c] = "attempt-covered", !.transferId[c] = "transfer-covered", !.immutableIdentity[c] = <<BaseVersion, server.deviceRef[c], BaseVersion, ProposalId(c), PlanId(c), "attempt-covered", "transfer-covered">>, !.proposalPhase[c] = "Queued"]
+  /\ client' = [client EXCEPT !.queueTarget[c] = BaseVersion, !.expectedDevice[c] = server.deviceRef[c], !.proposalBase[c] = BaseVersion, !.directoryProposal[c] = ProposalId(c), !.directoryIntent[c] = IntentId(c), !.directoryGeneration[c] = 1, !.objectPlan[c] = PlanId(c), !.attemptId[c] = "attempt-covered", !.transferId[c] = "transfer-covered", !.attemptPolicy[c] = client.policy[c], !.immutableIdentity[c] = <<<<BaseVersion, server.deviceRef[c], BaseVersion, ProposalId(c), PlanId(c), "attempt-covered", "transfer-covered">>, client.policy[c]>>, !.proposalPhase[c] = "Queued"]
   /\ coverage' = Mark("PersistCoveredQuery") /\ lastAction' = "PersistCoveredQuery"
   /\ UNCHANGED <<network, server, bridge, directory, ghost>>
 
 SendProposalRequest(c) ==
   /\ NormalClient(c) /\ client.proposalPhase[c] \in {"Queued", "Transferring"}
+  /\ client.capable[c] /\ server.policyActive
   /\ (Scenario \notin {"all-actors", "disjoint-directory"} \/
        ((c = Plugin1 /\ client.editCount[Plugin1] = 1) \/
         (c = Plugin2 /\ client.proposalPhase[Plugin1] = "Terminal") \/
@@ -298,19 +325,33 @@ ServerStartProposal(c, copy) ==
   /\ NormalServer /\ server.opPhase \in {"Idle", "Committed", "Aborted"}
   /\ MessageKey(Request(c, copy)) \in network.deliveredRequests
   /\ client.attemptId[c] \notin server.processedAttempts
-  /\ server' = [server EXCEPT !.opType = "device_push", !.opActor = c, !.opTarget = client.queueTarget[c], !.opPath = client.editPath[c], !.opExpected = client.expectedDevice[c], !.opAttempt = client.attemptId[c], !.opTransfer = client.transferId[c], !.opDirectoryProposal = client.directoryProposal[c], !.opDirectoryIntent = client.directoryIntent[c], !.opDirectoryGeneration = client.directoryGeneration[c], !.opBaseEpoch = server.mainEpoch, !.opBaseEvent = server.eventSeq, !.opObjectPlan = client.objectPlan[c], !.classification = "None", !.opPhase = "Started", !.casKind = "none", !.casSideEffect = FALSE, !.casObserved = "None", !.casMetadataCommitted = FALSE, !.expectedEffects = {}, !.committedEffects = {}]
+  /\ server' = [server EXCEPT !.opType = "device_push", !.opActor = c, !.opTarget = client.queueTarget[c], !.opPath = client.editPath[c], !.opExpected = client.expectedDevice[c], !.opAttempt = client.attemptId[c], !.opTransfer = client.transferId[c], !.opDirectoryProposal = client.directoryProposal[c], !.opDirectoryIntent = client.directoryIntent[c], !.opDirectoryGeneration = client.directoryGeneration[c], !.opBaseEpoch = server.mainEpoch, !.opBaseEvent = server.eventSeq, !.opObjectPlan = client.objectPlan[c], !.opPolicy = client.attemptPolicy[c], !.opCandidateHasA = client.candidateHasA[c], !.classification = "None", !.opPhase = "Started", !.casKind = "none", !.casSideEffect = FALSE, !.casObserved = "None", !.casMetadataCommitted = FALSE, !.expectedEffects = {}, !.committedEffects = {}]
   /\ coverage' = Mark("ServerStartProposal") /\ lastAction' = "ServerStartProposal"
+  /\ UNCHANGED <<client, network, bridge, directory, ghost>>
+
+RejectExcludedCandidate ==
+  /\ NormalServer /\ server.opPhase = "Started" /\ server.opPolicy = "exclude-a"
+  /\ server.opCandidateHasA
+  /\ server' = [server EXCEPT !.opPhase = "Aborted",
+       !.processedAttempts = @ \cup {server.opAttempt},
+       !.processCount[server.opAttempt] = @ + 1,
+       !.resultByAttempt[server.opAttempt] = "rejected"]
+  /\ coverage' = Mark("RejectExcludedCandidate") /\ lastAction' = "RejectExcludedCandidate"
   /\ UNCHANGED <<client, network, bridge, directory, ghost>>
 
 ServerValidateProposal ==
   /\ NormalServer /\ server.opPhase = "Started"
   /\ server.opTarget \in client.localGit[server.opActor]
+  /\ (~ChangingPolicyScenario \/ (server.opPolicy = PolicyOfTarget(server.opTarget) /\
+       (server.opPolicy # "exclude-a" \/ (server.opPath = PathB /\ ~server.opCandidateHasA))))
   /\ server' = [server EXCEPT !.opPhase = "Validated", !.accepted = @ \cup {server.opTarget}, !.processingRoots = @ \cup {server.opTarget}]
   /\ coverage' = Mark("ServerValidateProposal") /\ lastAction' = "ServerValidateProposal"
   /\ UNCHANGED <<client, network, bridge, directory, ghost>>
 
 ClassifyProposal ==
   /\ NormalServer /\ server.opPhase = "Validated"
+  /\ (~ChangingPolicyScenario \/ server.opPolicy = server.policy \/
+       (server.opActor = Plugin1 /\ server.opPolicy = "exclude-a" /\ server.policy = "empty"))
   /\ LET relation == IF server.opTarget = server.deviceRef[server.opActor] THEN "Equal"
                      ELSE IF server.opTarget \in server.deviceHistory[server.opActor] THEN "Covered"
                      ELSE IF server.opActor = Plugin1 /\ client.editCount[Plugin1] = 2 THEN "Divergent"
@@ -319,8 +360,34 @@ ClassifyProposal ==
        /\ coverage' = [Mark("ClassifyProposal") EXCEPT !.classifications = @ \cup {relation}]
   /\ lastAction' = "ClassifyProposal" /\ UNCHANGED <<client, network, bridge, directory, ghost>>
 
+ClassifyStalePolicyProposal ==
+  /\ Scenario = "root-ignore" /\ NormalServer /\ server.opPhase = "Validated"
+  /\ server.opPolicy # server.policy /\ server.policy = "exclude-a"
+  /\ server' = [server EXCEPT !.classification = "Divergent", !.opPhase = "Classified"]
+  /\ coverage' = [Mark("ClassifyStalePolicyProposal") EXCEPT !.classifications = @ \cup {"Divergent"}]
+  /\ lastAction' = "ClassifyStalePolicyProposal"
+  /\ UNCHANGED <<client, network, bridge, directory, ghost>>
+
+ActivateLegacyPolicy ==
+  /\ Scenario = "root-ignore-legacy" /\ NormalServer /\ ~server.policyActive
+  /\ server.policy = "exclude-a" /\ client.capable[Plugin1]
+  /\ server' = [server EXCEPT !.policyActive = TRUE, !.mainTree[PathA] = {},
+       !.mainEpoch = @ + 1, !.eventTree[PathA] = {}, !.eventSeq = @ + 1,
+       !.eventPolicy = "exclude-a"]
+  /\ bridge' = [bridge EXCEPT !.preservedAtPolicy = client.visible[BridgeNode][PathA]]
+  /\ coverage' = Mark("ActivateLegacyPolicy") /\ lastAction' = "ActivateLegacyPolicy"
+  /\ UNCHANGED <<client, network, directory, ghost>>
+
+UpgradeOldClient ==
+  /\ Scenario \in {"root-ignore", "root-ignore-legacy"} /\ server.policyActive
+  /\ server.policy = "exclude-a" /\ bridge.projectionCursor > 0 /\ ~client.capable[Plugin2]
+  /\ client' = [client EXCEPT !.capable[Plugin2] = TRUE]
+  /\ coverage' = Mark("UpgradeOldClient") /\ lastAction' = "UpgradeOldClient"
+  /\ UNCHANGED <<network, server, bridge, directory, ghost>>
+
 PrepareDeviceCAS ==
   /\ NormalServer /\ server.opPhase = "Classified" /\ server.classification = "Descendant"
+  /\ (~ChangingPolicyScenario \/ server.opPolicy = "empty" \/ server.opPath = PathB)
   /\ server' = [server EXCEPT !.casKind = "device", !.casOld = server.opExpected, !.casTarget = server.opTarget, !.casActual = server.deviceRef[server.opActor], !.casSideEffect = FALSE, !.casObserved = "None", !.casMetadataCommitted = FALSE, !.opPhase = "CASPrepared"]
   /\ coverage' = Mark("PrepareDeviceCAS") /\ lastAction' = "PrepareDeviceCAS"
   /\ UNCHANGED <<client, network, bridge, directory, ghost>>
@@ -378,7 +445,7 @@ BeginConflictMetadata ==
   /\ \/ server.opPhase = "Classified" /\ server.classification = "Divergent"
      \/ server.opPhase = "IntegrationPrepared" /\ IntegrationDiverges
   /\ server.opTarget # NoVersion /\ BaseVersion # NoVersion
-  /\ server' = [server EXCEPT !.opPhase = "ConflictMetadata", !.conflictMetadata = TRUE, !.conflictEvent = TRUE, !.reviewNeeded = TRUE, !.protectBase = FALSE, !.protectCurrent = FALSE, !.protectDevice = FALSE, !.conflictBase = BaseVersion, !.conflictCurrent = CHOOSE v \in server.mainTree[server.opPath]: TRUE, !.conflictDevice = server.opTarget]
+  /\ server' = [server EXCEPT !.opPhase = "ConflictMetadata", !.conflictMetadata = TRUE, !.conflictEvent = TRUE, !.reviewNeeded = TRUE, !.protectBase = FALSE, !.protectCurrent = FALSE, !.protectDevice = FALSE, !.conflictBase = BaseVersion, !.conflictCurrent = IF server.mainTree[server.opPath] = {} THEN BaseVersion ELSE CHOOSE v \in server.mainTree[server.opPath]: TRUE, !.conflictDevice = server.opTarget]
   /\ coverage' = Mark("BeginConflictMetadata") /\ lastAction' = "BeginConflictMetadata"
   /\ UNCHANGED <<client, network, bridge, directory, ghost>>
 
@@ -408,10 +475,16 @@ CommitConflictResult ==
 
 CommitIntegrationEffects ==
   /\ NormalServer /\ server.opPhase = "MainMoved" /\ server.opType = "device_push"
-  /\ server' = [server EXCEPT !.opPhase = "Committed", !.eventSeq = @ + 1, !.eventTree = server.mainTree, !.processedAttempts = @ \cup {server.opAttempt}, !.processCount[server.opAttempt] = @ + 1, !.resultByAttempt[server.opAttempt] = "accepted", !.processingRoots = @ \ {server.opTarget}]
+  /\ server' = [server EXCEPT !.opPhase = "Committed", !.eventSeq = @ + 1,
+      !.policy = IF ChangingPolicyScenario THEN server.opPolicy ELSE @,
+      !.mainTree = IF ChangingPolicyScenario /\ server.opPolicy = "exclude-a" THEN [@ EXCEPT ![PathA] = {}] ELSE @,
+      !.eventTree = IF ChangingPolicyScenario /\ server.opPolicy = "exclude-a" THEN [server.mainTree EXCEPT ![PathA] = {}] ELSE server.mainTree,
+      !.eventPolicy = IF ChangingPolicyScenario THEN server.opPolicy ELSE @, !.processedAttempts = @ \cup {server.opAttempt}, !.processCount[server.opAttempt] = @ + 1, !.resultByAttempt[server.opAttempt] = "accepted", !.processingRoots = @ \ {server.opTarget}]
   /\ directory' = [directory EXCEPT !.proposalId = server.opDirectoryProposal, !.intentId = server.opDirectoryIntent, !.generation = server.opDirectoryGeneration, !.baseMainEpoch = server.opBaseEpoch, !.baseEventSeq = server.opBaseEvent, !.prepared = TRUE, !.committed = TRUE, !.resultProposal = server.opDirectoryProposal, !.resultEvent = server.eventSeq + 1, !.eventProposal = server.opDirectoryProposal]
+  /\ bridge' = IF ChangingPolicyScenario /\ server.opPolicy = "exclude-a"
+       THEN [bridge EXCEPT !.preservedAtPolicy = client.visible[BridgeNode][PathA]] ELSE bridge
   /\ coverage' = Mark("CommitIntegrationEffects") /\ lastAction' = "CommitIntegrationEffects"
-  /\ UNCHANGED <<client, network, bridge, ghost>>
+  /\ UNCHANGED <<client, network, ghost>>
 
 CommitConflictResolutionEffects ==
   /\ NormalServer /\ server.opPhase = "MainMoved" /\ server.opType = "conflict_resolve"
@@ -484,15 +557,17 @@ ConsumeProposalResult(c) ==
   /\ UNCHANGED <<server, bridge, directory, ghost>>
 
 PollCommittedEvent(c) ==
-  /\ ApplyAllowed(c) /\ NormalClient(c)
+  /\ ApplyAllowed(c) /\ NormalClient(c) /\ client.capable[c] /\ server.policyActive
+  /\ (Scenario # "root-ignore" \/ client.proposalPhase[Plugin2] = "Terminal")
   /\ (Scenario # "all-actors" \/ "DropProposalRequest" \in coverage.actions) /\ server.eventSeq > client.seenCursor[c]
   /\ client' = [client EXCEPT !.seenCursor[c] = server.eventSeq]
   /\ coverage' = Mark("PollCommittedEvent") /\ lastAction' = "PollCommittedEvent"
   /\ UNCHANGED <<network, server, bridge, directory, ghost>>
 
 PlanLocalApply(c) ==
-  /\ ApplyAllowed(c) /\ NormalClient(c) /\ client.applyPhase[c] = "Idle" /\ client.seenCursor[c] > client.appliedCursor[c]
-  /\ client' = [client EXCEPT !.applyPhase[c] = "Planned", !.journalPresent[c] = TRUE, !.preflight[c] = client.visible[c][PathA], !.durableApplied[c] = FALSE]
+  /\ ApplyAllowed(c) /\ NormalClient(c) /\ client.capable[c] /\ server.policyActive /\ client.applyPhase[c] = "Idle" /\ client.seenCursor[c] > client.appliedCursor[c]
+  /\ client' = [client EXCEPT !.applyPhase[c] = "Planned", !.journalPresent[c] = TRUE, !.preflight[c] = client.visible[c][PathA], !.durableApplied[c] = FALSE,
+       !.journalPolicy[c] = server.eventPolicy, !.localOnly[c] = PolicyScenario /\ server.eventPolicy = "exclude-a"]
   /\ coverage' = Mark("PlanLocalApply") /\ lastAction' = "PlanLocalApply"
   /\ UNCHANGED <<network, server, bridge, directory, ghost>>
 
@@ -510,8 +585,9 @@ BeginLocalMutation(c) ==
 
 MutateWithFreshIdentity(c) ==
   /\ NormalClient(c) /\ client.applyPhase[c] = "Writing" /\ client.visible[c][PathA] = client.preflight[c]
-  /\ client' = [client EXCEPT !.visible[c][PathA] = CHOOSE v \in server.mainTree[PathA]: TRUE, !.displaced[c] = @ \cup {client.preflight[c]}, !.applyPhase[c] = "Verifying"]
-  /\ ghost' = [ghost EXCEPT !.overwritten = @ \cup {client.preflight[c]}]
+  /\ client' = IF client.localOnly[c] THEN [client EXCEPT !.applyPhase[c] = "Verifying"]
+       ELSE [client EXCEPT !.visible[c][PathA] = CHOOSE v \in server.mainTree[PathA]: TRUE, !.displaced[c] = @ \cup {client.preflight[c]}, !.applyPhase[c] = "Verifying"]
+  /\ ghost' = IF client.localOnly[c] THEN ghost ELSE [ghost EXCEPT !.overwritten = @ \cup {client.preflight[c]}]
   /\ coverage' = Mark("MutateWithFreshIdentity") /\ lastAction' = "MutateWithFreshIdentity"
   /\ UNCHANGED <<network, server, bridge, directory>>
 
@@ -540,7 +616,7 @@ CleanupApplyJournal(c) ==
   /\ UNCHANGED <<network, server, bridge, directory, ghost>>
 
 AcknowledgeDurableApply(c) ==
-  /\ NormalServer /\ NormalClient(c) /\ client.ackIntent[c] /\ client.durableApplied[c] /\ client.localMainEpoch[c] = server.mainEpoch
+  /\ NormalServer /\ NormalClient(c) /\ client.capable[c] /\ server.policyActive /\ client.ackIntent[c] /\ client.durableApplied[c] /\ client.localMainEpoch[c] = server.mainEpoch
   /\ server' = [server EXCEPT !.lastAppliedEpoch[c] = client.localMainEpoch[c]]
   /\ coverage' = Mark("AcknowledgeDurableApply") /\ lastAction' = "AcknowledgeDurableApply"
   /\ UNCHANGED <<client, network, bridge, directory, ghost>>
@@ -587,10 +663,12 @@ DeleteEmptyDirectory(c) ==
   /\ UNCHANGED <<client, network, server, bridge, ghost>>
 
 BeginProjection ==
-  /\ bridge.rustUp /\ NormalClient(BridgeNode)
+  /\ bridge.rustUp /\ NormalClient(BridgeNode) /\ server.policyActive
   /\ (Scenario # "all-actors" \/ (AllScenarioProposalsTerminal /\ "RecoverServerOperation" \in coverage.actions))
-  /\ (Scenario # "disjoint-directory" \/ client.proposalPhase[BridgeNode] = "Terminal") /\ BridgeVersion \in client.localGit[BridgeNode] /\ bridge.projectionCursor < server.mainEpoch + 1
-  /\ bridge' = [bridge EXCEPT !.projectionTarget = server.mainEpoch + 1, !.manifestVerified = FALSE, !.baseVerified = FALSE, !.pathOidsVerified = FALSE, !.rowsComplete = FALSE, !.projectionHealthy = FALSE, !.derivedReady = FALSE]
+  /\ (Scenario # "disjoint-directory" \/ client.proposalPhase[BridgeNode] = "Terminal")
+  /\ (PolicyScenario => server.policy = "exclude-a" /\ server.eventSeq > 0 /\ (Scenario # "root-ignore" \/ client.proposalPhase[Plugin1] = "Terminal"))
+  /\ (PolicyScenario \/ BridgeVersion \in client.localGit[BridgeNode]) /\ bridge.projectionCursor < server.mainEpoch + 1
+  /\ bridge' = [bridge EXCEPT !.projectionTarget = server.mainEpoch + 1, !.projectionPolicy = server.policy, !.manifestVerified = FALSE, !.baseVerified = FALSE, !.pathOidsVerified = FALSE, !.rowsComplete = FALSE, !.projectionHealthy = FALSE, !.derivedReady = FALSE]
   /\ coverage' = Mark("BeginProjection") /\ lastAction' = "BeginProjection"
   /\ UNCHANGED <<client, network, server, directory, ghost>>
 
@@ -614,12 +692,14 @@ VerifyProjectionPathOids ==
 
 WriteDerivedProjection ==
   /\ bridge.rustUp /\ bridge.manifestVerified /\ bridge.baseVerified /\ bridge.pathOidsVerified
-  /\ bridge' = [bridge EXCEPT !.rowsComplete = TRUE]
+  /\ bridge.projectionPolicy = server.policy
+  /\ bridge' = [bridge EXCEPT !.rowsComplete = TRUE, !.projectedPaths = IF bridge.projectionPolicy = "exclude-a" THEN Paths \ {PathA} ELSE Paths]
   /\ coverage' = Mark("WriteDerivedProjection") /\ lastAction' = "WriteDerivedProjection"
   /\ UNCHANGED <<client, network, server, directory, ghost>>
 
 AdvanceProjectionCursor ==
   /\ bridge.rustUp /\ bridge.manifestVerified /\ bridge.baseVerified /\ bridge.pathOidsVerified /\ bridge.rowsComplete
+  /\ bridge.projectionPolicy = server.policy
   /\ bridge' = [bridge EXCEPT !.projectionCursor = bridge.projectionTarget, !.projectionHealthy = TRUE, !.derivedReady = TRUE, !.projectionFailure = FALSE, !.cursorPublishedVerified = TRUE]
   /\ coverage' = Mark("AdvanceProjectionCursor") /\ lastAction' = "AdvanceProjectionCursor"
   /\ UNCHANGED <<client, network, server, directory, ghost>>
@@ -671,6 +751,7 @@ RestartServer ==
 
 PrepareConflictResolutionOperation ==
   /\ NormalServer /\ server.opPhase = "Committed" /\ server.conflictMetadata /\ server.protectBase /\ server.protectCurrent /\ server.protectDevice /\ server.reviewNeeded
+  /\ (Scenario # "root-ignore" \/ server.policy = "empty")
   /\ server' = [server EXCEPT !.opType = "conflict_resolve", !.opPhase = "IntegrationPrepared", !.opTarget = Plugin2Version, !.opPath = PathA, !.opExpected = server.conflictCurrent, !.classification = "None", !.expectedEffects = AllResolutionEffects, !.committedEffects = {}, !.casKind = "none", !.casSideEffect = FALSE, !.casObserved = "None", !.casMetadataCommitted = FALSE]
   /\ coverage' = Mark("PrepareConflictResolutionOperation") /\ lastAction' = "PrepareConflictResolutionOperation"
   /\ UNCHANGED <<client, network, bridge, directory, ghost>>
@@ -794,9 +875,65 @@ AdvanceProjectionCursorEarly ==
   /\ coverage' = Mark("AdvanceProjectionCursorEarly") /\ lastAction' = "AdvanceProjectionCursorEarly"
   /\ UNCHANGED <<client, network, server, directory, ghost>>
 
+DiscardLocalOnly ==
+  /\ FaultMode = "DiscardLocalOnly" /\ client.localOnly[Plugin2] /\ client.applyPhase[Plugin2] = "Writing"
+  /\ client' = [client EXCEPT !.visible[Plugin2][PathA] = Plugin1Version, !.applyPhase[Plugin2] = "Verifying", !.displaced[Plugin2] = @ \cup {client.preflight[Plugin2]}]
+  /\ coverage' = Mark("DiscardLocalOnly") /\ lastAction' = "DiscardLocalOnly"
+  /\ UNCHANGED <<network, server, bridge, directory, ghost>>
+
+DiscardIgnoredBridgeWrite ==
+  /\ FaultMode = "DiscardIgnoredBridgeWrite" /\ server.policy = "exclude-a" /\ bridge.rustPhase \in {"Idle", "Validated"}
+  /\ bridge' = [bridge EXCEPT !.rustPhase = "Written", !.acknowledged = TRUE]
+  /\ client' = [client EXCEPT !.visible[BridgeNode][PathA] = BaseVersion]
+  /\ coverage' = Mark("DiscardIgnoredBridgeWrite") /\ lastAction' = "DiscardIgnoredBridgeWrite"
+  /\ UNCHANGED <<network, server, directory, ghost>>
+
+PublishExcludedRows ==
+  /\ FaultMode = "PublishExcludedRows" /\ bridge.projectionPolicy = "exclude-a" /\ bridge.rowsComplete /\ bridge.projectionCursor = 0
+  /\ bridge' = [bridge EXCEPT !.projectedPaths = Paths]
+  /\ coverage' = Mark("PublishExcludedRows") /\ lastAction' = "PublishExcludedRows"
+  /\ UNCHANGED <<client, network, server, directory, ghost>>
+
+AdmitExcludedCandidate ==
+  /\ FaultMode = "AdmitExcludedCandidate" /\ Scenario = "root-ignore"
+  /\ server.opPhase = "Started" /\ server.opPolicy = "exclude-a"
+  /\ server' = [server EXCEPT !.opCandidateHasA = TRUE, !.opPhase = "Validated",
+       !.accepted = @ \cup {server.opTarget}, !.processingRoots = @ \cup {server.opTarget}]
+  /\ coverage' = Mark("AdmitExcludedCandidate") /\ lastAction' = "AdmitExcludedCandidate"
+  /\ UNCHANGED <<client, network, bridge, directory, ghost>>
+
+ActivateLegacyWithoutReconciliation ==
+  /\ FaultMode = "ActivateLegacyWithoutReconciliation" /\ Scenario = "root-ignore-legacy"
+  /\ ~server.policyActive
+  /\ server' = [server EXCEPT !.policyActive = TRUE]
+  /\ coverage' = Mark("ActivateLegacyWithoutReconciliation")
+  /\ lastAction' = "ActivateLegacyWithoutReconciliation"
+  /\ UNCHANGED <<client, network, bridge, directory, ghost>>
+
+UnsafeOldClientPoll ==
+  /\ FaultMode = "UnsafeOldClientPoll" /\ PolicyScenario /\ server.policyActive
+  /\ server.policy = "exclude-a" /\ ~client.capable[Plugin2] /\ server.eventSeq > 0
+  /\ client' = [client EXCEPT !.applyPhase[Plugin2] = "Planned"]
+  /\ coverage' = Mark("UnsafeOldClientPoll") /\ lastAction' = "UnsafeOldClientPoll"
+  /\ UNCHANGED <<network, server, bridge, directory, ghost>>
+
+AcceptStalePolicyProposal ==
+  /\ FaultMode = "AcceptStalePolicyProposal" /\ Scenario = "root-ignore"
+  /\ server.opPhase = "Validated" /\ server.policy = "exclude-a" /\ server.opPolicy = "empty"
+  /\ server' = [server EXCEPT !.mainTree[PathA] = @ \cup {server.opTarget},
+       !.eventTree[PathA] = @ \cup {server.opTarget}, !.opPhase = "Committed"]
+  /\ coverage' = Mark("AcceptStalePolicyProposal") /\ lastAction' = "AcceptStalePolicyProposal"
+  /\ UNCHANGED <<client, network, bridge, directory, ghost>>
+
+MutateAttemptPolicy ==
+  /\ FaultMode = "MutateAttemptPolicy" /\ client.proposalPhase[Plugin1] = "Transferring"
+  /\ client' = [client EXCEPT !.attemptPolicy[Plugin1] = "empty"]
+  /\ coverage' = Mark("MutateAttemptPolicy") /\ lastAction' = "MutateAttemptPolicy"
+  /\ UNCHANGED <<network, server, bridge, directory, ghost>>
+
 RootActions == {
  "ObservePluginEdit", "RustValidateWrite", "RustAtomicVisibleWrite", "NodePersistBridgeHint", "CaptureLocalCommit", "PersistImmutableProposal", "PersistEqualRetry", "PersistCoveredQuery",
- "SendProposalRequest", "DelayProposalRequest", "DuplicateProposalRequest", "DropProposalRequest", "DeliverProposalRequest", "ServerStartProposal",
+ "SendProposalRequest", "DelayProposalRequest", "DuplicateProposalRequest", "DropProposalRequest", "DeliverProposalRequest", "ServerStartProposal", "RejectExcludedCandidate",
  "ServerValidateProposal", "ClassifyProposal", "PrepareDeviceCAS", "ApplyCASSideEffect", "ObserveCASResult", "CommitCASMetadata",
  "HandleEqualOrCovered", "ServerPrepareIntegration", "PrepareMainCAS", "BeginConflictMetadata", "ProtectConflictBase", "ProtectConflictCurrent",
  "ProtectConflictDevice", "CommitConflictResult", "CommitIntegrationEffects", "CommitConflictResolutionEffects", "SendStoredReply", "DuplicateProposalReply", "DelayProposalReply",
@@ -809,19 +946,20 @@ RootActions == {
  "CrashRust", "RestartRust", "ReplaceInflightTarget", "DropAcceptedProposal", "MoveCoveredRefBackward", "DiscardDivergence",
  "MoveMainBeforePreparedEffects", "AckBeforeDurableApply", "OverwriteUncapturedBridgeWrite", "RecursiveDirectoryDelete",
  "RestartAbortsMovedRef", "DuplicateNonIdempotentProcessing", "MutateRetryIdentity", "LoseConflictProtection", "AbortUncertainCAS",
- "ConflateSeenAndApplied", "AdvanceProjectionCursorEarly"
+ "ConflateSeenAndApplied", "AdvanceProjectionCursorEarly", "ClassifyStalePolicyProposal", "UpgradeOldClient", "ActivateLegacyPolicy",
+ "DiscardLocalOnly", "DiscardIgnoredBridgeWrite", "PublishExcludedRows", "MutateAttemptPolicy", "UnsafeOldClientPoll", "AcceptStalePolicyProposal", "ActivateLegacyWithoutReconciliation", "AdmitExcludedCandidate"
 }
 
 ClientActions(c) ==
-  (\E p \in Paths: ObservePluginEdit(c, p)) \/ CaptureLocalCommit(c) \/ PersistImmutableProposal(c) \/ PersistEqualRetry(c) \/ PersistCoveredQuery(c) \/ SendProposalRequest(c) \/
+  (\E p \in Paths: ObservePluginEdit(c, p)) \/ UpgradeOldClient \/ CaptureLocalCommit(c) \/ PersistImmutableProposal(c) \/ PersistEqualRetry(c) \/ PersistCoveredQuery(c) \/ SendProposalRequest(c) \/
   DelayProposalRequest(c) \/ DuplicateProposalRequest(c) \/ (\E copy \in Copies: DropProposalRequest(c, copy) \/ DeliverProposalRequest(c, copy) \/ DelayProposalReply(c, copy) \/ DropProposalReply(c, copy) \/ DeliverProposalReply(c, copy)) \/
   DuplicateProposalReply(c) \/ RetryOrQueryStable(c) \/ ConsumeProposalResult(c) \/ PollCommittedEvent(c) \/ PlanLocalApply(c) \/
   PublishApplyRecovery(c) \/ BeginLocalMutation(c) \/ MutateWithFreshIdentity(c) \/ VerifyLocalApply(c) \/ CommitLocalCoordination(c) \/
   PersistApplyAckIntent(c) \/ CleanupApplyJournal(c) \/ AcknowledgeDurableApply(c) \/ CrashClient(c) \/ RestartClient(c) \/ ClassifyClientRestart(c)
 
 ServerActions ==
-  (\E c \in Clients, copy \in Copies: ServerStartProposal(c, copy)) \/ ServerValidateProposal \/ ClassifyProposal \/ PrepareDeviceCAS \/
-  ApplyCASSideEffect \/ (\E observation \in CASObservations: ObserveCASResult(observation)) \/ CommitCASMetadata \/ HandleEqualOrCovered \/
+  (\E c \in Clients, copy \in Copies: ServerStartProposal(c, copy)) \/ RejectExcludedCandidate \/ ServerValidateProposal \/ ClassifyProposal \/ PrepareDeviceCAS \/
+  ClassifyStalePolicyProposal \/ ActivateLegacyPolicy \/ ApplyCASSideEffect \/ (\E observation \in CASObservations: ObserveCASResult(observation)) \/ CommitCASMetadata \/ HandleEqualOrCovered \/
   ServerPrepareIntegration \/ PrepareMainCAS \/ BeginConflictMetadata \/ ProtectConflictBase \/ ProtectConflictCurrent \/ ProtectConflictDevice \/
   CommitConflictResult \/ CommitIntegrationEffects \/ CommitConflictResolutionEffects \/ (\E c \in Clients: SendStoredReply(c)) \/ PrepareDirectoryTombstone \/ CommitDirectoryTombstone \/
   CrashServer \/ RestartServer \/ PrepareConflictResolutionOperation \/ RecoverServerOperation
@@ -833,13 +971,17 @@ DirectoryActions == ObserveDirectoryDescendant(Plugin1) \/ RemoveDirectoryDescen
 
 FaultActions == ReplaceInflightTarget \/ DropAcceptedProposal \/ MoveCoveredRefBackward \/ DiscardDivergence \/ MoveMainBeforePreparedEffects \/
   AckBeforeDurableApply \/ OverwriteUncapturedBridgeWrite \/ RecursiveDirectoryDelete \/ RestartAbortsMovedRef \/ DuplicateNonIdempotentProcessing \/
-  MutateRetryIdentity \/ LoseConflictProtection \/ AbortUncertainCAS \/ ConflateSeenAndApplied \/ AdvanceProjectionCursorEarly
+  MutateRetryIdentity \/ LoseConflictProtection \/ AbortUncertainCAS \/ ConflateSeenAndApplied \/ AdvanceProjectionCursorEarly \/
+  DiscardLocalOnly \/ DiscardIgnoredBridgeWrite \/ PublishExcludedRows \/ MutateAttemptPolicy \/ UnsafeOldClientPoll \/ AcceptStalePolicyProposal \/ ActivateLegacyWithoutReconciliation \/ AdmitExcludedCandidate
 
 CoreNext == (\E c \in Clients: ClientActions(c)) \/ ServerActions \/ BridgeActions \/ DirectoryActions \/ FaultActions
 Next == CoreNext \/ UNCHANGED vars
 SafetySpec == Init /\ [][Next]_vars
 
 TypeOK ==
+  /\ client.capable \in [Clients -> BOOLEAN] /\ client.policy \in [Clients -> Policies]
+  /\ client.candidateHasA \in [Clients -> BOOLEAN]
+  /\ client.attemptPolicy \in [Clients -> PolicyIds] /\ client.journalPolicy \in [Clients -> PolicyIds] /\ client.localOnly \in [Clients -> BOOLEAN]
   /\ client.up \in [Clients -> BOOLEAN] /\ client.recovering \in [Clients -> BOOLEAN] /\ client.restartDisposition \in [Clients -> RestartDispositions]
   /\ client.crashCount \in [Clients -> 0..MaxClientCrashes] /\ client.visible \in [Clients -> [Paths -> Versions]]
   /\ client.observed \in [Clients -> SUBSET Versions] /\ client.localGit \in [Clients -> SUBSET Versions] /\ client.capturePublished \in [Clients -> SUBSET Versions]
@@ -853,14 +995,16 @@ TypeOK ==
   /\ client.localMainEpoch \in [Clients -> Nat] /\ client.durableApplied \in [Clients -> BOOLEAN] /\ client.ackIntent \in [Clients -> BOOLEAN]
   /\ client.applyPhase \in [Clients -> ApplyPhases] /\ client.journalPresent \in [Clients -> BOOLEAN] /\ client.recoveryRoots \in [Clients -> SUBSET Versions]
   /\ client.preflight \in [Clients -> Versions \cup {NoVersion}] /\ client.displaced \in [Clients -> SUBSET Versions] /\ client.blocked \in [Clients -> BOOLEAN]
-  /\ network.requestBag \subseteq [actor: Clients, copy: Copies, attempt: AttemptIds, transfer: TransferIds, target: Versions, expected: Versions, base: Versions, directoryProposal: ProposalIds, objectPlan: Plans]
+  /\ network.requestBag \subseteq [actor: Clients, copy: Copies, attempt: AttemptIds, transfer: TransferIds, target: Versions, expected: Versions, base: Versions, directoryProposal: ProposalIds, objectPlan: Plans, policy: Policies, hasA: BOOLEAN]
   /\ network.delayedRequests \subseteq Clients \X Copies \X AttemptIds /\ network.droppedRequests \subseteq Clients \X Copies \X AttemptIds /\ network.deliveredRequests \subseteq Clients \X Copies \X AttemptIds
-  /\ network.replyBag \subseteq [actor: Clients, copy: Copies, attempt: AttemptIds, result: {"accepted", "conflicted"}]
+  /\ network.replyBag \subseteq [actor: Clients, copy: Copies, attempt: AttemptIds, result: {"accepted", "conflicted", "rejected"}]
   /\ network.delayedReplies \subseteq Clients \X Copies \X AttemptIds /\ network.droppedReplies \subseteq Clients \X Copies \X AttemptIds /\ network.deliveredReplies \subseteq Clients \X Copies \X AttemptIds
+  /\ server.opCandidateHasA \in BOOLEAN
+  /\ server.policy \in Policies /\ server.policyActive \in BOOLEAN /\ server.eventPolicy \in Policies /\ server.opPolicy \in PolicyIds
   /\ server.up \in BOOLEAN /\ server.recovering \in BOOLEAN /\ server.crashCount \in 0..MaxServerCrashes /\ server.mainEpoch \in Nat
   /\ server.mainTree \in [Paths -> SUBSET Versions] /\ server.mainHistory \subseteq Versions /\ server.deviceRef \in [Clients -> Versions]
   /\ server.deviceHistory \in [Clients -> SUBSET Versions] /\ server.processingRoots \subseteq Versions /\ server.accepted \subseteq Versions
-  /\ server.processedAttempts \subseteq AttemptIds /\ server.resultByAttempt \in [AttemptIds -> {NoResult, "accepted", "conflicted"}]
+  /\ server.processedAttempts \subseteq AttemptIds /\ server.resultByAttempt \in [AttemptIds -> {NoResult, "accepted", "conflicted", "rejected"}]
   /\ server.processCount \in [AttemptIds -> Nat] /\ server.opType \in OperationTypes /\ server.opActor \in Clients \cup {NoClient}
   /\ server.opTarget \in Versions \cup {NoVersion} /\ server.opPath \in Paths \cup {NoPath} /\ server.opExpected \in Versions \cup {NoVersion}
   /\ server.opAttempt \in AttemptIds \cup {NoId} /\ server.opTransfer \in TransferIds \cup {NoId} /\ server.opDirectoryProposal \in ProposalIds
@@ -873,6 +1017,7 @@ TypeOK ==
   /\ server.conflictBase \in Versions \cup {NoVersion} /\ server.conflictCurrent \in Versions \cup {NoVersion} /\ server.conflictDevice \in Versions \cup {NoVersion}
   /\ server.conflictRoots \subseteq Versions /\ server.expectedEffects \subseteq EffectNames /\ server.committedEffects \subseteq EffectNames
   /\ server.eventSeq \in Nat /\ server.eventTree \in [Paths -> SUBSET Versions] /\ server.lastAppliedEpoch \in [Clients -> Nat] /\ server.blocked \in BOOLEAN
+  /\ bridge.projectionPolicy \in PolicyIds /\ bridge.projectedPaths \subseteq Paths /\ bridge.preservedAtPolicy \in Versions
   /\ bridge.rustUp \in BOOLEAN /\ bridge.rustCrashCount \in 0..MaxRustCrashes /\ bridge.rustPhase \in RustPhases /\ bridge.acknowledged \in BOOLEAN
   /\ bridge.nodeHintDurable \in BOOLEAN /\ bridge.manifestVerified \in BOOLEAN /\ bridge.baseVerified \in BOOLEAN /\ bridge.pathOidsVerified \in BOOLEAN
   /\ bridge.rowsComplete \in BOOLEAN /\ bridge.projectionCursor \in Nat /\ bridge.projectionTarget \in Nat /\ bridge.projectionHealthy \in BOOLEAN
@@ -897,7 +1042,7 @@ OBTS_SAF_005_RestartRollsForwardOrBlocks ==
   /\ \A c \in Clients: client.restartDisposition[c] \in {"None", "Resume", "RollForward", "Block"}
 OBTS_SAF_006_DirectoryDeletionNonRecursive == \A c \in Clients: ~directory.descendantLost[c]
 NoDeviceRefRewind == \A c \in Clients: Cardinality(server.deviceHistory[c]) > 1 => server.deviceRef[c] # BaseVersion
-AttemptIdentityImmutable == \A c \in Clients: client.attemptId[c] # NoId => client.immutableIdentity[c] = <<client.queueTarget[c], client.expectedDevice[c], client.proposalBase[c], client.directoryProposal[c], client.objectPlan[c], client.attemptId[c], client.transferId[c]>>
+AttemptIdentityImmutable == \A c \in Clients: client.attemptId[c] # NoId => client.immutableIdentity[c] = <<<<client.queueTarget[c], client.expectedDevice[c], client.proposalBase[c], client.directoryProposal[c], client.objectPlan[c], client.attemptId[c], client.transferId[c]>>, client.attemptPolicy[c]>>
 ServerProcessesAttemptOnce == \A a \in AttemptIds: server.processCount[a] <= 1
 DivergenceDoesNotMoveDeviceRef == server.classification = "Divergent" => server.deviceRef[server.opActor] = server.opExpected
 DivergentProposalProtected == server.classification = "Divergent" => server.opTarget \in server.processingRoots \/ server.opTarget \in server.conflictRoots
@@ -914,8 +1059,15 @@ DisjointEditsSurvive == Scenario = "disjoint-directory" /\ Plugin1 \in coverage.
 BridgeAcknowledgedWritePreserved == bridge.acknowledged => Rooted(BridgeVersion)
 ProjectionVerifiedBeforeCursor == bridge.projectionCursor > 0 => bridge.cursorPublishedVerified
 ProjectionFailureRetainsCursor == bridge.projectionFailure => ~bridge.derivedReady /\ ~bridge.projectionHealthy
-ProjectionIsDerivedOnly == bridge.derivedReady => bridge.projectionHealthy /\ BridgeVersion \in client.localGit[BridgeNode]
+ProjectionIsDerivedOnly == bridge.derivedReady => bridge.projectionHealthy /\ (PolicyScenario \/ BridgeVersion \in client.localGit[BridgeNode])
 ApplyRefinementBoundary == \A c \in Clients: ApplyBoundaryOK(client.applyPhase[c], client.journalPresent[c], client.recoveryRoots[c] # {}, client.durableApplied[c], client.ackIntent[c])
+CandidateAdmittedOnlyWhenPolicyValid == server.opPhase \notin {"Validated", "Classified", "CASPrepared", "CASSideEffect", "CASObserved", "DeviceCommitted", "IntegrationPrepared", "MainMoved"} \/ server.opPolicy # "exclude-a" \/ ~server.opCandidateHasA
+PolicyTransitionRemovesOnlyCanonicalCopy == ~PolicyScenario \/ ~server.policyActive \/ server.policy # "exclude-a" \/ server.mainTree[PathA] = {}
+LocalOnlyApplyRetainsVisible == \A c \in Clients: client.localOnly[c] => client.journalPolicy[c] = "exclude-a" /\ client.preflight[c] \notin client.displaced[c] /\ client.visible[c][PathA] = client.preflight[c]
+OldClientCannotApply == ~PolicyScenario \/ client.capable[Plugin2] \/ (client.applyPhase[Plugin2] = "Idle" /\ server.lastAppliedEpoch[Plugin2] = 0)
+PolicyProjectionExcludesCurrentRows == bridge.projectionPolicy # "exclude-a" \/ ~bridge.rowsComplete \/ (PathA \notin bridge.projectedPaths /\ bridge.auditRetained)
+BridgeExcludedLocalWriteRetained == ~PolicyScenario \/ server.policy # "exclude-a" \/ ~bridge.acknowledged \/ client.visible[BridgeNode][PathA] = BridgeVersion
+StalePolicyRefProtected == ~PolicyScenario \/ server.opPolicy = server.policy \/ server.classification # "Divergent" \/ server.opTarget \in server.processingRoots \cup server.conflictRoots
 ApplyProjectionConsistent == \A c \in Clients: FM001Phase(client.applyPhase[c]) \in {"Idle", "Planned", "RecoveryRecorded", "Writing", "Verifying", "RefsCommitted", "CoordinationCommitted", "AckIntentPersisted", "Done", "Blocked"}
 
 AllSafety == /\ TypeOK /\ CapturedOnlyAfterDurablePublication /\ OBTS_SAF_001_CapturedVersionsRemainRecoverable /\ OBTS_SAF_002_DestructiveApplyRequiresRecovery
@@ -924,7 +1076,9 @@ AllSafety == /\ TypeOK /\ CapturedOnlyAfterDurablePublication /\ OBTS_SAF_001_Ca
   /\ DivergentProposalProtected /\ ConflictProtectionCompleteOrRetained /\ NoEmptyConflictRoot /\ MainMoveWasPrepared /\ CASSideEffectRecoveryByReading /\ ExactPreparedOperationRecovery
   /\ SoundApplyAcknowledgement /\ SeenAppliedSeparation /\ DirectoryDeletionCausal /\ GitDirectoryEventAgreement /\ DisjointEditsSurvive
   /\ BridgeAcknowledgedWritePreserved /\ ProjectionVerifiedBeforeCursor /\ ProjectionFailureRetainsCursor /\ ProjectionIsDerivedOnly
-  /\ ApplyRefinementBoundary /\ ApplyProjectionConsistent
+  /\ ApplyRefinementBoundary /\ ApplyProjectionConsistent /\ CandidateAdmittedOnlyWhenPolicyValid /\ PolicyTransitionRemovesOnlyCanonicalCopy
+  /\ LocalOnlyApplyRetainsVisible /\ OldClientCannotApply /\ PolicyProjectionExcludesCurrentRows
+  /\ BridgeExcludedLocalWriteRetained /\ StalePolicyRefProtected
 
 ProposalTrigger == "PersistImmutableProposal" \in coverage.actions
 ProposalConsumed == \E c \in Clients: client.proposalPhase[c] = "Terminal"
@@ -964,6 +1118,15 @@ NeverProposalTrigger == ~ProposalTrigger
 NeverBridgeTrigger == ~BridgeWriteTrigger
 NeverRecoveryTrigger == ~RecoveryTrigger
 NeverApplyTrigger == ~ApplyTrigger
+NeverPolicyTransition == ~server.policyActive \/ server.policy # "exclude-a"
+NeverLocalOnlyApply == ~client.localOnly[Plugin2] \/ client.applyPhase[Plugin2] = "Idle"
+NeverStalePolicyReview == Scenario # "root-ignore" \/ ~(server.reviewNeeded /\ server.opPhase = "Committed" /\ server.conflictDevice \in server.conflictRoots)
+NeverPolicyProjection == bridge.projectionCursor = 0
+NeverUpgrade == ~client.capable[Plugin2]
+NeverInvalidCandidateRejected == "RejectExcludedCandidate" \notin coverage.actions
+NeverOldOfflineCapture == client.capable[Plugin2] \/ client.proposalPhase[Plugin2] # "Queued"
+NeverLegacyActivation == ~server.policyActive
+NeverBridgeRace == Scenario # "root-ignore-bridge-race" \/ server.policy # "exclude-a" \/ bridge.rustPhase # "Validated"
 NeverApplyProjection == "CommitLocalCoordination" \notin coverage.actions
 
 =============================================================================

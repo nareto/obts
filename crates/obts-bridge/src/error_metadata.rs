@@ -156,6 +156,13 @@ pub(crate) fn service_error_metadata(
         )
         .with_http_status(503),
         ServiceError::FilesystemWrite(error) => match error {
+            crate::filesystem::FilesystemError::RootIgnore(_) => ErrorMetadata::new(
+                ErrorCategory::Business,
+                false,
+                "root ignore policy unavailable",
+                "Review the vault-root .gitignore before trusting the current projection; local vault files remain intact",
+            )
+            .with_http_status(409),
             crate::filesystem::FilesystemError::AlreadyExists => ErrorMetadata::new(
                 ErrorCategory::Business,
                 false,
@@ -287,8 +294,22 @@ mod tests {
     use serde_json::json;
 
     use super::service_error_metadata;
+    use crate::filesystem::FilesystemError;
     use crate::new_note::{PersistenceFailureKind, WriteError};
+    use crate::root_ignore::RootIgnoreError;
     use crate::service::ServiceError;
+
+    #[test]
+    fn invalid_root_policy_is_actionable_and_not_blindly_retryable() {
+        let metadata = service_error_metadata(
+            &ServiceError::FilesystemWrite(FilesystemError::RootIgnore(RootIgnoreError::TooLarge)),
+            None,
+        );
+        let value = serde_json::to_value(metadata).expect("serialize metadata");
+        assert_eq!(value["isRetryable"], false);
+        assert_eq!(value["httpStatus"], 409);
+        assert_eq!(value["message"], "root ignore policy unavailable");
+    }
 
     #[test]
     fn insufficient_storage_is_actionable_and_not_blindly_retryable() {

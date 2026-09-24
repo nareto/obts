@@ -10,11 +10,14 @@ export type StatusLabel =
   | 'Behind'
   | 'Offline'
   | 'Status unknown'
-  | 'Review needed'
+  | 'Conflict resolution needed'
+  | 'Out of sync'
+  | 'Out of sync — file exceeds upload limit'
+  | 'Out of sync — upload limit exceeded'
+  | 'Out of sync — local recovery required'
   | 'Stale review'
   | 'Blocked'
   | 'Needs recovery'
-  | 'Unsafe local state'
   | 'Integrity failure';
 
 export type Session = {

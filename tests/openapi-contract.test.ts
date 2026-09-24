@@ -5,8 +5,38 @@ import { describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
 
 import { API_VERSION } from '../src/shared/types.js';
+import { parseChunkPushCreateRequest, parseDevicePushManifest } from '../src/shared/validators.js';
 
 describe('OpenAPI Phase 3 contract', () => {
+  it('matches optional operation-bound root-ignore attestation on direct and chunked pushes', async () => {
+    const contract = parse(await readFile(join(process.cwd(), 'openapi', 'openapi.yaml'), 'utf8')) as {
+      components: { schemas: Record<string, { properties: Record<string, unknown>; dependentRequired: Record<string, string[]> }> };
+    };
+    const direct = contract.components.schemas.DevicePushManifest!;
+    const chunked = contract.components.schemas.ChunkPushCreateRequest!;
+    for (const schema of [direct, chunked]) {
+      expect(schema.properties.root_ignore_capability).toMatchObject({ const: 'root-ignore-v1' });
+      expect(schema.properties.root_ignore_oid).toMatchObject({ oneOf: [
+        { type: 'null' }, { type: 'string', pattern: '^[0-9a-f]{40}$' }
+      ] });
+      expect(schema.dependentRequired).toEqual({
+        root_ignore_capability: ['root_ignore_oid'], root_ignore_oid: ['root_ignore_capability']
+      });
+    }
+    const base = {
+      api_version: API_VERSION, vault_id: 'vault', device_id: 'device',
+      expected_device_ref: null, target_commit: 'a'.repeat(40), client_known_main: null
+    };
+    const manifest = { ...base, packfile_sha256: 'b'.repeat(64), packfile_bytes: 0 };
+    const create = { ...base, attempt_id: 'attempt-policy-1', chunk_count: 0, plan_sha256: 'b'.repeat(64) };
+    for (const [parser, value] of [[parseDevicePushManifest, manifest], [parseChunkPushCreateRequest, create]] as const) {
+      expect(parser(value)).not.toHaveProperty('root_ignore_oid');
+      expect(parser({ ...value, root_ignore_capability: 'root-ignore-v1', root_ignore_oid: null })).toMatchObject({ root_ignore_oid: null });
+      expect(() => parser({ ...value, root_ignore_capability: 'root-ignore-v1' })).toThrow();
+      expect(() => parser({ ...value, root_ignore_capability: 'root-ignore-v2', root_ignore_oid: null })).toThrow();
+      expect(() => parser({ ...value, root_ignore_capability: 'root-ignore-v1', root_ignore_oid: 'not-an-oid' })).toThrow();
+    }
+  });
   it('commits the endpoints and version used by the server and plugin', async () => {
     const contract = await readFile(join(process.cwd(), 'openapi', 'openapi.yaml'), 'utf8');
     const document = parse(contract) as {

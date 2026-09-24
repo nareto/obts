@@ -7,6 +7,7 @@
 - Devices create local commits but never advance server `main` directly.
 - Git object identity and parent links, never timestamps, define content identity and ancestry.
 - Device identity and proposal merge base remain separate; using a trusted vault commit as a base never adopts another device's ref.
+- The vault-root `.gitignore` is plugin-managed shared content edited in Obsidian settings; it is never a server setting or a per-device exclusion override.
 - Server merge and resolution decisions are deterministic, auditable, and serialized per vault.
 
 ## Browser-Assisted Onboarding
@@ -23,7 +24,7 @@ Independent merge uses the server-authored empty root so remote-only and local-o
 
 ## Local Reconciliation
 
-The visible local vault is the device source of truth; coordination metadata is recoverable state, not authoritative content.
+The visible local vault is the device source of truth; coordination metadata is recoverable state, not authoritative content. Each client owns a separate local vault, potentially on a separate operating system; other clients cannot write it directly. Cross-client changes pass through the server and are applied by the receiving client. In the Bridge client, its Rust API and embedded headless client coordinate their writes to their shared local vault; independently editing the Bridge volume is outside the supported topology.
 
 - Watcher-invalidated paths are durable and drive normal reconciliation.
 - Immutable in-flight upload identity cannot be replaced by later watcher hints or edits.
@@ -34,7 +35,7 @@ The visible local vault is the device source of truth; coordination metadata is 
 
 ## OBTS-SYNC-IMM-001: Immutable Transfer And Integration
 
-One upload attempt has immutable target commit, expected device ref, proposal base, directory proposal, object plan, attempt ID, and transfer ID until an authoritative outcome is consumed.
+One upload attempt has immutable target commit, expected device ref, proposal base, directory proposal, object plan, root-ignore policy identity, attempt ID, and transfer ID until an authoritative outcome is consumed.
 
 Transfer receipt is distinct from integration. Durable chunks and processing state survive request loss and restart. Internal server processing failure remains retryable processing, not proposal rejection. Valid proposals are rejected only for authorization, integrity, unsafe path/provenance, limits/abuse, revocation, or pre-existing blocked-state failures.
 
@@ -114,6 +115,16 @@ Restore creates new canonical history through the same safe merge/resolution mac
 Canonical paths use `/`, Unicode NFC, no absolute/traversal/empty/control segments, no symlinks, and regular supported Git modes. `.obts/**`, `.obsidian/cache/**`, `.obsidian/workspace.json`, `.obsidian/workspace-mobile.json`, and `.obsidian/plugins/obts/**` are deterministic hard exclusions. Any visible `.git` path segment is a sync-blocking validation error rather than a silently excluded subtree. `.trash/**`, attachments, allowed `.obsidian/**`, and other community-plugin files are normal vault content.
 
 OS-specific filename limitations are device capability failures, not global server rejection. An incapable device blocks locally without changing canonical state.
+
+### OBTS-SYNC-IGN-001: Version-Bound Root Exclusions
+
+Only the vault-root `.gitignore` defines user exclusions. It is itself syncable even if a rule would match it. Apply standard Git ignore matching for root-file patterns, including negation, slash anchoring, `**`, escaping and directory rules, to canonical NFC `/` paths with case-sensitive matching on every platform. An absent file means no user exclusions. An unreadable, invalid or over-budget policy fails closed; neither the client nor server guesses a narrower interpretation. Hard exclusions always prevail, and visible `.git` remains a validation error. Nested `.gitignore` files are ordinary synced files, not policy sources. The implementation and supported rule-size budget are versioned and parity-tested across plugin, server and Bridge.
+
+A coherent local snapshot pins the exact root policy bytes and their Git blob identity before constructing a candidate tree. The policy never prevents a user's local write on any client, including Bridge. A newly ignored tracked path is omitted from that tree without deleting its visible local copy. The policy file and its blob identity are part of the immutable upload attempt and durable transfer checkpoint; later edits create a new attempt. The server verifies the attested policy against the proposed Git tree in quarantine and rejects a candidate that still contains excluded paths, including entries in ignored subtrees. It never silently strips proposal content. A completed received transfer remains queryable and protected even if a later policy change prevents integration.
+
+The canonical `main` tree is valid under its own root policy. A policy-changing proposal reconciles newly excluded tracked paths by a forward-only canonical transition; prior bytes remain reachable in history and protected refs. A moving canonical policy cannot silently reinterpret an accepted in-flight proposal: a differing concurrent policy edit, or a candidate whose retained paths would become excluded by current canonical policy, enters protected conflict/review or a recoverable blocked outcome before any canonical ref move. Resolution and restore validate their complete final tree under its resulting policy. Unignoring does not resurrect an old canonical version automatically: each independently retained local copy is proposed from its actual content and normal add/add or edit conflict review preserves divergent copies.
+
+Before any canonical policy transition that removes synced content, server admission requires a capable plugin/headless protocol on pull, acknowledgement, onboarding, push/finalize and recovery. An enrolled offline old client may remain paired but is barred from unsafe sync until it upgrades; no forced reset or silent revocation is authorized. Capability evidence is bound to authenticated device operations, not an untrusted status label alone. Pull manifests, apply journals and Bridge projections bind the target policy identity. A removal caused by the target ignore policy is local-only disposition, never a physical deletion; an unrelated ordinary deletion remains a deletion. Apply and restart honor the recorded disposition rather than interpreting a newer mutable `.gitignore`. A file/directory collision involving preserved local-only content blocks pending explicit reconciliation and cannot use a recursive directory delete as a shortcut.
 
 ## Event Contract
 

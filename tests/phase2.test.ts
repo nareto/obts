@@ -100,7 +100,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
     expect((await desktop.syncOnce()).status).toBe('Synced');
     const conflictResult = await tablet.syncOnce();
-    expect(conflictResult.status).toBe('Review needed');
+    expect(conflictResult.status).toBe('Conflict resolution needed');
     expect(conflictResult.conflictId).toMatch(/^conf_/u);
     const review = await admin.get<{ current_main: string }>(
       `/api/v1/vaults/${admin.vaultId}/conflicts/${conflictResult.conflictId}`
@@ -145,7 +145,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     await writeFile(join(tabletDir, 'shared.md'), 'selected device version\n');
     expect((await desktop.syncOnce()).status).toBe('Synced');
     const conflicted = await tablet.syncOnce();
-    expect(conflicted.status).toBe('Review needed');
+    expect(conflicted.status).toBe('Conflict resolution needed');
     const conflictState = await tablet.readState();
     const conflictQueue = await tablet.readQueue();
     expect(conflictQueue).toMatchObject({
@@ -280,7 +280,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
     expect((await desktop.syncOnce()).status).toBe('Synced');
     const result = await tablet.syncOnce();
-    expect(result.status).toBe('Review needed');
+    expect(result.status).toBe('Conflict resolution needed');
 
     const review = await admin.get<{
       conflict: { conflict_id: string; expected_main: string; device_commit: string };
@@ -424,7 +424,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect((await source.syncOnce()).status).toBe('Synced');
 
     const conflicted = await receiver.syncOnce();
-    expect(conflicted.status).toBe('Review needed');
+    expect(conflicted.status).toBe('Conflict resolution needed');
     expect(conflicted.conflictId).toMatch(/^conf_/u);
     const review = await admin.get<{
       conflict: { expected_main: string; conflict_kind: string };
@@ -471,7 +471,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect((await source.syncOnce()).status).toBe('Synced');
 
     const conflicted = await receiver.syncOnce();
-    expect(conflicted.status).toBe('Review needed');
+    expect(conflicted.status).toBe('Conflict resolution needed');
 
     // Both server-only and device-only descendants must survive directory-only resolution.
     await forceConflictDeviceFile(server, admin.vaultId, conflicted.conflictId!, 'Scratch/local.md', 'device-only\n');
@@ -538,7 +538,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
       mode: 'merge' as const
     };
     const conflicted = await phone.finishOnboarding(submit);
-    expect(conflicted.status).toBe('Review needed');
+    expect(conflicted.status).toBe('Conflict resolution needed');
     const firstState = await phone.readState();
     expect(firstState.server_device_ref).toMatch(/^[0-9a-f]{40}$/u);
     const proposalEventsBeforeRetry = (await server.store.snapshot()).events.filter(
@@ -559,7 +559,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     await expect(phone.finishOnboarding(submit)).rejects.toMatchObject({ code: 'onboarding_identity_mismatch' });
     await writeFile(join(phoneDir, '.obts', 'onboarding.json'), `${JSON.stringify(identityJournal.journal, null, 2)}\n`);
 
-    await expect(phone.finishOnboarding(submit)).resolves.toMatchObject({ status: 'Review needed' });
+    await expect(phone.finishOnboarding(submit)).resolves.toMatchObject({ status: 'Conflict resolution needed' });
     expect((await phone.readPendingOnboarding())?.journal.stage).toBe('awaiting_conflict');
     expect((await server.store.snapshot()).events.filter(
       (event) => event.event_type === 'device_ref_updated' && event.resource_ids.device_id === firstState.device_id
@@ -746,7 +746,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     await writeFile(join(tabletDir, 'device-only.md'), 'created while resolving another note\n');
     expect((await desktop.syncOnce()).status).toBe('Synced');
     const result = await tablet.syncOnce();
-    expect(result.status).toBe('Review needed');
+    expect(result.status).toBe('Conflict resolution needed');
 
     const review = await admin.get<{
       conflict: { conflict_id: string; expected_main: string };
@@ -793,7 +793,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     await writeFile(join(tabletDir, 'device-only.md'), 'created while the conflict was open\n');
     expect((await desktop.syncOnce()).status).toBe('Synced');
     const result = await tablet.syncOnce();
-    expect(result.status).toBe('Review needed');
+    expect(result.status).toBe('Conflict resolution needed');
     const conflictedState = await tablet.readState();
 
     const resolutionCommit = await forceLegacyKeepServerResolution(server, admin.vaultId, result.conflictId!);
@@ -865,7 +865,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
     expect((await desktop.syncOnce()).status).toBe('Synced');
     const result = await tablet.syncOnce();
-    expect(result.status).toBe('Review needed');
+    expect(result.status).toBe('Conflict resolution needed');
 
     const review = await admin.get<{
       conflict: { conflict_id: string; expected_main: string };
@@ -905,7 +905,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     await writeFile(join(tabletDir, 'shared.md'), '<script>alert(2)</script>\n');
     expect((await desktop.syncOnce()).status).toBe('Synced');
     const result = await tablet.syncOnce();
-    expect(result.status).toBe('Review needed');
+    expect(result.status).toBe('Conflict resolution needed');
 
     const review = await admin.get<{
       files: Array<{ rendered_markdown_diff: string | null; server_content: string; device_content: string }>;
@@ -935,7 +935,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     await writeFile(join(tabletDir, 'asset.bin'), Buffer.from([0, 7, 8, 9]));
     expect((await desktop.syncOnce()).status).toBe('Synced');
     const result = await tablet.syncOnce();
-    expect(result.status).toBe('Review needed');
+    expect(result.status).toBe('Conflict resolution needed');
 
     const review = await admin.get<{
       conflict: { expected_main: string };
@@ -999,7 +999,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
     expect((await desktop.syncOnce()).status).toBe('Synced');
     const result = await tablet.syncOnce();
-    expect(result.status).toBe('Review needed');
+    expect(result.status).toBe('Conflict resolution needed');
 
     const review = await admin.get<{
       conflict: { conflict_id: string };
@@ -1193,7 +1193,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
     expect((await desktop.syncOnce()).status).toBe('Synced');
     const conflicted = await tablet.syncOnce();
-    expect(conflicted.status).toBe('Review needed');
+    expect(conflicted.status).toBe('Conflict resolution needed');
 
     const review = await admin.get<{ conflict: { expected_main: string } }>(
       `/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}`
@@ -1542,7 +1542,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     await writeFile(join(tabletDir, 'two.md'), 'two device\n');
     expect((await desktop.syncOnce()).status).toBe('Synced');
     const result = await tablet.syncOnce();
-    expect(result.status).toBe('Review needed');
+    expect(result.status).toBe('Conflict resolution needed');
 
     const review = await admin.get<{
       conflict: { conflict_id: string; expected_main: string };
@@ -1594,7 +1594,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
       await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
       expect((await desktop.syncOnce()).status).toBe('Synced');
       const result = await tablet.syncOnce();
-      expect(result.status).toBe('Review needed');
+      expect(result.status).toBe('Conflict resolution needed');
 
       const review = await admin.get<{
         conflict: { conflict_id: string; expected_main: string; device_commit: string; device_id: string };
@@ -1663,7 +1663,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
     expect((await desktop.syncOnce()).status).toBe('Synced');
     const result = await tablet.syncOnce();
-    expect(result.status).toBe('Review needed');
+    expect(result.status).toBe('Conflict resolution needed');
 
     const review = await admin.get<{
       conflict: { conflict_id: string; expected_main: string };
@@ -1724,7 +1724,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     await writeFile(join(tabletDir, 'two.md'), 'two device\n');
     expect((await desktop.syncOnce()).status).toBe('Synced');
     const result = await tablet.syncOnce();
-    expect(result.status).toBe('Review needed');
+    expect(result.status).toBe('Conflict resolution needed');
 
     const review = await admin.get<{
       conflict: { conflict_id: string; expected_main: string };
@@ -1764,14 +1764,14 @@ describe('Phase 2 dashboard conflict resolution', () => {
     await writeFile(join(desktopDir, 'shared.md'), 'server version\n');
     await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
     expect((await desktop.syncOnce()).status).toBe('Synced');
-    expect((await tablet.syncOnce()).status).toBe('Review needed');
+    expect((await tablet.syncOnce()).status).toBe('Conflict resolution needed');
     expect((await tablet.readState()).last_error_code).toBe('conflict_review_required');
 
     await writeFile(join(phoneDir, 'other.md'), 'unrelated accepted edit\n');
     expect((await phone.syncOnce()).status).toBe('Synced');
 
     const polled = await tablet.pollRemoteEventsAndApply();
-    expect(polled).toMatchObject({ applied: false, status: 'Review needed' });
+    expect(polled).toMatchObject({ applied: false, status: 'Conflict resolution needed' });
     expect((await tablet.readState()).last_error_code).toBe('conflict_review_required');
     expect(await readFile(join(tabletDir, 'shared.md'), 'utf8')).toBe('device version\n');
   });
@@ -1791,7 +1791,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
     expect((await desktop.syncOnce()).status).toBe('Synced');
     const result = await tablet.syncOnce();
-    expect(result.status).toBe('Review needed');
+    expect(result.status).toBe('Conflict resolution needed');
     expect((await tablet.readState()).last_error_code).toBe('conflict_review_required');
 
     const review = await admin.get<{
@@ -1928,7 +1928,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
     expect((await desktop.syncOnce()).status).toBe('Synced');
     const conflicted = await tablet.syncOnce();
-    expect(conflicted.status).toBe('Review needed');
+    expect(conflicted.status).toBe('Conflict resolution needed');
     const conflictState = await tablet.readState();
 
     const review = await admin.get<{ conflict: { conflict_id: string; expected_main: string } }>(
@@ -1975,7 +1975,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
       devices: Array<{ device_name: string; status_label: string; local_error_code: string | null; blocked: boolean }>;
     }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
     expect(openDashboard.body.devices.find((device) => device.device_name === 'tablet')).toMatchObject({
-      status_label: 'Review needed',
+      status_label: 'Conflict resolution needed',
       local_error_code: null,
       blocked: true
     });
@@ -2046,7 +2046,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     const interrupted = new ObtsPluginClient(tabletDir, { serverUrl: baseUrl, deviceName: 'tablet' });
     await interrupted.initialize();
     expect(await interrupted.readState()).toMatchObject({
-      status_label: 'Review needed',
+      status_label: 'Out of sync',
       last_error_code: 'device_blocked',
       server_device_ref: staleQueue.expected_device_ref
     });
@@ -2096,14 +2096,14 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(await device.readState()).toMatchObject({
       local_main: pairedState.local_main,
       local_head: pairedState.local_head,
-      status_label: 'Needs recovery',
+      status_label: 'Out of sync — local recovery required',
       last_error_code: 'server_recovery_required'
     });
 
     const restarted = new ObtsPluginClient(deviceDir, { serverUrl: baseUrl, deviceName: 'blocked-device' });
     await restarted.initialize();
     expect(await restarted.readState()).toMatchObject({
-      status_label: 'Needs recovery',
+      status_label: 'Out of sync — local recovery required',
       last_error_code: 'server_recovery_required'
     });
     await expect(restarted.syncOnce()).rejects.toMatchObject({ code: 'server_recovery_required' });
@@ -2252,7 +2252,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
       requestOutcome: 'succeeded',
       httpStatus: 200,
       capturedState: {
-        status_label: 'Review needed',
+        status_label: 'Out of sync',
         last_error_code: 'device_blocked'
       }
     });
@@ -2425,6 +2425,60 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(maintenanceState.audit_log.map((entry) => entry.action)).toEqual(
       expect.arrayContaining(['git_maintenance_started', 'git_maintenance_finished'])
     );
+  });
+
+  it('blocks conflict resolution that would restore a path excluded by the current policy', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'policy-resolution-desktop');
+    const tabletDir = join(root, 'policy-resolution-tablet');
+    const desktop = await pairPlugin(admin, desktopDir, 'policy-resolution-desktop');
+    await writeFile(join(desktopDir, 'shared.md'), 'base\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const tablet = await pairPlugin(admin, tabletDir, 'policy-resolution-tablet');
+    await writeFile(join(desktopDir, 'shared.md'), 'server edit\n');
+    await writeFile(join(tabletDir, 'shared.md'), 'device edit\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const conflicted = await tablet.syncOnce();
+    expect(conflicted.status).toBe('Conflict resolution needed');
+    await writeFile(join(desktopDir, '.gitignore'), 'shared.md\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const policyMain = (await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)!.current_main!;
+    const refreshed = await admin.post<{ expected_main: string }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}/refresh`, {}
+    );
+    expect(refreshed.status).toBe(200);
+    expect(refreshed.body.expected_main).toBe(policyMain);
+    const resolved = await admin.post<{ error: { code: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}/resolve`,
+      { expected_main: policyMain, resolution_kind: 'use_device' }
+    );
+    expect(resolved.status).toBe(409);
+    expect(resolved.body.error.code).toBe('excluded_root_ignore_path');
+    expect(await server.git.getRef(admin.vaultId, 'refs/heads/main')).toBe(policyMain);
+    expect((await server.store.snapshot()).conflicts.find((conflict) => conflict.conflict_id === conflicted.conflictId)?.status).toBe('open');
+  });
+
+  it('keeps a historical note excluded by the current root policy out of main', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'policy-history-restore');
+    const device = await pairPlugin(admin, deviceDir, 'policy-history-restore');
+    await writeFile(join(deviceDir, 'retained.md'), 'old local content\n');
+    expect((await device.syncOnce()).status).toBe('Synced');
+    const sourceCommit = (await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)!.current_main!;
+    expect((await server.git.readBlobAtPath(admin.vaultId, sourceCommit, 'retained.md')).toString('utf8')).toBe('old local content\n');
+    await writeFile(join(deviceDir, '.gitignore'), 'retained.md\n');
+    expect((await device.syncOnce()).status).toBe('Synced');
+    const policyMain = (await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)!.current_main!;
+    expect(await server.git.readBlobAtPathIfPresent(admin.vaultId, policyMain, 'retained.md')).toBeNull();
+    expect((await server.git.readRootIgnoreBlob(admin.vaultId, policyMain)).bytes?.toString('utf8')).toBe('retained.md\n');
+    const restored = await admin.post<{ error: { code: string; message: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/history/restore`,
+      { path: 'retained.md', source_commit: sourceCommit, expected_main: policyMain }
+    );
+    expect(restored.status).toBe(409);
+    expect(restored.body.error.code).toBe('excluded_root_ignore_path');
+    expect(JSON.stringify(restored.body)).not.toContain('retained.md');
+    expect(await server.git.getRef(admin.vaultId, 'refs/heads/main')).toBe(policyMain);
   });
 
   it('shows rename provenance in note history and previews historical paths', async () => {
@@ -2734,7 +2788,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
 
       const recoveredState = await client.readState();
       expect(recoveredState.last_error_code).toBe('apply_journal_recovery_required');
-      expect(recoveredState.status_label).toBe('Unsafe local state');
+      expect(recoveredState.status_label).toBe('Out of sync — local recovery required');
 
       const savedJournal = JSON.parse(
         await readFile(join(vaultDir, '.obts', 'apply-journal.json'), 'utf8')
@@ -2964,7 +3018,7 @@ async function prepareRenameConflict(
   await rename(join(tabletDir, 'Old.md'), join(tabletDir, 'Title B.md'));
   expect((await desktop.syncOnce()).status).toBe('Synced');
   const result = await tablet.syncOnce();
-  expect(result.status).toBe('Review needed');
+  expect(result.status).toBe('Conflict resolution needed');
   return { result };
 }
 

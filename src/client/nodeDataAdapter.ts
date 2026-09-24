@@ -1,4 +1,4 @@
-import { mkdirSync } from 'node:fs';
+import { constants, mkdirSync } from 'node:fs';
 import {
   lstat,
   mkdir,
@@ -31,6 +31,47 @@ export class NodeDataAdapter {
   async readBinary(adapterPath: string): Promise<ArrayBuffer> {
     const data = await readFile(this.resolvePath(adapterPath));
     return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+  }
+
+  async readRootIgnorePolicyNoFollow(maxBytes: number): Promise<ArrayBuffer | null> {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || !constants.O_NOFOLLOW) {
+      throw new Error('Root .gitignore cannot be read safely on this platform.');
+    }
+    const path = this.resolvePath('.gitignore');
+    let before;
+    try {
+      before = await lstat(path);
+    } catch (error) {
+      if (isErrno(error, 'ENOENT')) return null;
+      throw error;
+    }
+    if (!before.isFile()) throw new Error('Root .gitignore must be a regular readable file.');
+    if (before.size > maxBytes) throw new Error('Root .gitignore exceeds the byte limit.');
+    const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const opened = await handle.stat();
+      if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size) {
+        throw new Error('Root .gitignore changed while opening.');
+      }
+      const buffer = Buffer.alloc(maxBytes + 1);
+      let size = 0;
+      while (size < buffer.length) {
+        const result = await handle.read(buffer, size, buffer.length - size, size);
+        if (result.bytesRead === 0) break;
+        size += result.bytesRead;
+      }
+      const after = await lstat(path);
+      const readState = await handle.stat();
+      if (!after.isFile() || after.dev !== opened.dev || after.ino !== opened.ino ||
+          readState.size !== opened.size || size !== opened.size || size > maxBytes ||
+          after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs ||
+          readState.mtimeMs !== before.mtimeMs || readState.ctimeMs !== before.ctimeMs) {
+        throw new Error('Root .gitignore changed while reading.');
+      }
+      return buffer.subarray(0, size).buffer.slice(buffer.byteOffset, buffer.byteOffset + size) as ArrayBuffer;
+    } finally {
+      await handle.close();
+    }
   }
 
   async writeBinary(adapterPath: string, data: ArrayBuffer): Promise<void> {

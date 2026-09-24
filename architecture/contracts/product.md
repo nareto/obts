@@ -15,7 +15,7 @@ OBTS is intended for individuals and small trusted multi-user deployments. The s
 
 ## Supported Product Boundary
 
-- Full-vault synchronization after deterministic hard exclusions.
+- Full-vault synchronization after deterministic hard exclusions and the shared plugin-managed root `.gitignore` policy. Ignored tracked paths become local-only without deleting local copies; historical versions remain recoverable. Obsidian plugin settings offer an explicit preview and save for the plugin-managed vault-root file; saving creates or overwrites it and never deletes it.
 - Browser-assisted device onboarding without copied long-lived account credentials.
 - Offline local edits captured as hidden Git history.
 - Server-authoritative canonical `main`, deterministic safe merge, and durable conflict review.

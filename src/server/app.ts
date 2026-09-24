@@ -8,7 +8,8 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 
 import { DIAGNOSTIC_MAX_BODY_BYTES } from '../shared/diagnostics.js';
 import { newId, nowIso } from '../shared/ids.js';
-import { isSyncableVaultPath } from '../shared/pathPolicy.js';
+import { isSyncableVaultPath, PathPolicyViolation } from '../shared/pathPolicy.js';
+import { RootIgnorePolicyError } from '../shared/rootIgnore.cjs';
 import {
   describePluginCompatibility,
   isPluginVersionAtLeast,
@@ -542,9 +543,11 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
           const offline = device.last_seen_at !== null && Date.now() - Date.parse(device.last_seen_at) > 24 * 60 * 60 * 1000;
           const localStatusFresh = isFreshDeviceStatus(device.last_status_report_at);
           const staleDeviceBlockReport = localStatusFresh && device.local_error_code === 'device_blocked';
-          const localStatusLabel = localStatusFresh && !staleDeviceBlockReport ? device.local_status_label : null;
-          const localErrorCode = localStatusFresh && !staleDeviceBlockReport ? device.local_error_code : null;
-          const localQueueStatus = localStatusFresh ? device.local_queue_status : null;
+          const localErrorCode = localStatusFresh && !staleDeviceBlockReport ? safeReportedErrorCode(device.local_error_code) : null;
+          const localStatusLabel = localStatusFresh && !staleDeviceBlockReport
+            ? safeReportedStatusLabel(device.local_status_label, localErrorCode)
+            : null;
+          const localQueueStatus = localStatusFresh ? safeReportedQueueStatus(device.local_queue_status) : null;
           const pendingLocal = localStatusFresh &&
             device.local_head !== null &&
             device.local_head !== device.local_main;
@@ -576,8 +579,8 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
             local_queue_status: localQueueStatus,
             local_main: localStatusFresh ? device.local_main : null,
             local_head: localStatusFresh ? device.local_head : null,
-            plugin_version: device.plugin_version,
-            path_capabilities: localStatusFresh ? device.path_capabilities : null,
+            plugin_version: device.plugin_version === null ? null : safeReportedPluginVersion(device.plugin_version),
+            path_capabilities: localStatusFresh ? safePathCapabilities(device.path_capabilities) : null,
             last_status_report_at: device.last_status_report_at,
             status_report_fresh: localStatusFresh,
             status_report_age_seconds: device.last_status_report_at === null
@@ -724,6 +727,13 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   app.post('/api/v1/connections/:connectionId/bootstrap', async (request, reply) => {
     const { connectionId } = connectionPathParams(request);
     const result = await connections.bootstrap(connectionId, readBearerToken(request.headers.authorization));
+    const capability = request.body && typeof request.body === 'object'
+      ? readRootIgnoreCapability(requestBody(request)) : undefined;
+    const rootIgnoreOid = await requireRootIgnoreCapability(git, result.vaultId, result.targetMain, capability);
+    if (result.connection.selection === 'existing_vault') {
+      const currentMain = await git.getRef(result.vaultId, 'refs/heads/main');
+      if (currentMain) await requireRootIgnoreCapability(git, result.vaultId, currentMain, capability);
+    }
     const sendBootstrap = async () => await sendMultipart(reply, {
       manifest: {
         api_version: API_VERSION,
@@ -732,6 +742,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         vault_name: result.vaultName,
         root_commit: result.rootCommit,
         target_main: result.targetMain,
+        root_ignore_oid: rootIgnoreOid,
         changed_paths: result.changedPaths.filter((path) => isSyncableVaultPath(path)),
         target_file_sizes: await syncableTargetFileSizes(git, result.vaultId, result.targetMain),
         explicit_directories: result.explicitDirectories
@@ -754,6 +765,9 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       if (!(await git.commitExists(metadata.vaultId, requestedTarget)) || !(await git.isAncestor(metadata.vaultId, requestedTarget, metadata.targetMain))) {
         throw new AuthError(404, 'not_found', 'Resource not found.');
       }
+      const rootIgnoreOid = await requireRootIgnoreCapability(git, metadata.vaultId, requestedTarget, chunkRequest.root_ignore_capability);
+      const currentMain = await git.getRef(metadata.vaultId, 'refs/heads/main');
+      if (currentMain) await requireRootIgnoreCapability(git, metadata.vaultId, currentMain, chunkRequest.root_ignore_capability);
       const chunk = await createPullObjectChunk(git, metadata.vaultId, requestedTarget, null, chunkRequest.cursor, config);
       const eventSnapshot = eventSnapshotForTarget(await store.snapshot(), metadata.vaultId, '', requestedTarget, 0);
       const manifest: ChunkBootstrapManifest = {
@@ -763,6 +777,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         vault_name: metadata.vaultName,
         root_commit: metadata.rootCommit,
         target_main: requestedTarget,
+        root_ignore_oid: rootIgnoreOid,
         changed_paths: (requestedTarget === metadata.targetMain
           ? metadata.changedPaths
           : await git.listTreePaths(metadata.vaultId, requestedTarget)).filter((path) => isSyncableVaultPath(path)),
@@ -817,7 +832,8 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       mode,
       expected_main: readOptionalNullableString(body, 'expected_main'),
       ...(proposalKind ? { proposal_kind: proposalKind } : {}),
-      proposal_base: readOptionalNullableString(body, 'proposal_base')
+      proposal_base: readOptionalNullableString(body, 'proposal_base'),
+      ...(readRootIgnoreCapability(body) === undefined ? {} : { root_ignore_capability: 'root-ignore-v1' })
     });
     return reply.status(201).send(result);
   });
@@ -1000,6 +1016,8 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     if (!(await git.commitExists(vaultId, targetMain)) || !(await git.isAncestor(vaultId, targetMain, deviceAuth.vault.current_main))) {
       throw new AuthError(404, 'not_found', 'Resource not found.');
     }
+    await requireRootIgnoreCapability(git, vaultId, deviceAuth.vault.current_main, pullRequest.root_ignore_capability);
+    const rootIgnoreOid = await requireRootIgnoreCapability(git, vaultId, targetMain, pullRequest.root_ignore_capability);
     const currentLocalMainExists = pullRequest.current_local_main !== null && await git.commitExists(vaultId, pullRequest.current_local_main);
     const have = currentLocalMainExists ? pullRequest.current_local_main : null;
     const currentLocalMainIsAncestor = have ? await git.isAncestor(vaultId, have, targetMain) : null;
@@ -1031,6 +1049,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       vault_id: vaultId,
       device_id: deviceAuth.device.device_id,
       target_main: targetMain,
+      root_ignore_oid: rootIgnoreOid,
       changed_paths: [...new Set(allChangedPaths.filter((path) => isSyncableVaultPath(path)))].sort(),
       ...(chunk.complete ? { target_file_sizes: await syncableTargetFileSizes(git, vaultId, targetMain) } : {}),
       current_local_main_is_ancestor: currentLocalMainIsAncestor,
@@ -1060,8 +1079,9 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       pullRequest.current_local_main === targetMain && targetMain === deviceAuth.vault.current_main && chunk.complete
     ) {
       await store.mutate((mutableDb) => {
+        const vault = mutableDb.vaults.find((candidate) => candidate.vault_id === vaultId);
         const device = mutableDb.devices.find((candidate) => candidate.device_id === deviceAuth.device.device_id);
-        if (device && device.status !== 'revoked' && device.status !== 'review_needed' && device.status !== 'blocked_recovery') {
+        if (vault?.current_main === targetMain && device && device.status !== 'revoked' && device.status !== 'review_needed' && device.status !== 'blocked_recovery') {
           device.status = 'synced';
           device.last_applied_main = targetMain;
           device.last_applied_event_seq = eventSnapshot.eventSeq;
@@ -1092,6 +1112,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     if (targetMain !== deviceAuth.vault.current_main) {
       throw new AuthError(404, 'not_found', 'Resource not found.');
     }
+    const rootIgnoreOid = await requireRootIgnoreCapability(git, vaultId, targetMain, pullRequest.root_ignore_capability);
     const currentLocalMainExists =
       pullRequest.current_local_main !== null && (await git.commitExists(vaultId, pullRequest.current_local_main));
     const currentLocalMainIsAncestor =
@@ -1128,6 +1149,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       vault_id: vaultId,
       device_id: deviceAuth.device.device_id,
       target_main: targetMain,
+      root_ignore_oid: rootIgnoreOid,
       changed_paths: [...new Set(changedPaths)].sort(),
       target_file_sizes: await syncableTargetFileSizes(git, vaultId, targetMain),
       current_local_main_is_ancestor: currentLocalMainIsAncestor,
@@ -1152,8 +1174,9 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       pullRequest.current_local_main === targetMain && targetMain === deviceAuth.vault.current_main
     ) {
       await store.mutate((mutableDb) => {
+        const vault = mutableDb.vaults.find((candidate) => candidate.vault_id === vaultId);
         const device = mutableDb.devices.find((candidate) => candidate.device_id === deviceAuth.device.device_id);
-        if (device && device.status !== 'revoked' && device.status !== 'review_needed' && device.status !== 'blocked_recovery') {
+        if (vault?.current_main === targetMain && device && device.status !== 'revoked' && device.status !== 'review_needed' && device.status !== 'blocked_recovery') {
           device.status = 'synced';
           device.last_applied_main = targetMain;
           device.last_applied_event_seq = eventSnapshot.eventSeq;
@@ -1183,7 +1206,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       if (!device || device.status === 'revoked') {
         throw new AuthError(404, 'not_found', 'Resource not found.');
       }
-      device.local_status_label = report.localStatusLabel;
+      device.local_status_label = safeReportedStatusLabel(report.localStatusLabel, report.localErrorCode);
       device.local_error_code = report.localErrorCode;
       device.local_queue_status = report.localQueueStatus;
       device.local_main = report.localMain;
@@ -1204,7 +1227,9 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const { vaultId } = pathParams(request);
     return await sync.runWithVaultLock(vaultId, async () => {
       const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
-      const appliedMain = readCommitId(requestBody(request), 'applied_main');
+      const appliedBody = requestBody(request);
+      const appliedMain = readCommitId(appliedBody, 'applied_main');
+      await requireRootIgnoreCapability(git, vaultId, deviceAuth.vault.current_main, readRootIgnoreCapability(appliedBody));
       if (deviceAuth.vault.status === 'blocked_integrity') {
         throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
       }
@@ -1272,6 +1297,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
       const body = requestBody(request);
       const appliedMain = readCommitId(body, 'applied_main');
+      await requireRootIgnoreCapability(git, vaultId, deviceAuth.vault.current_main, readRootIgnoreCapability(body));
       await store.mutate((db) => {
         const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
         const device = db.devices.find((candidate) => candidate.device_id === deviceAuth.device.device_id);
@@ -1505,7 +1531,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         writes: sourceContent === null ? new Map() : new Map([[path, sourceContent]]),
         deletes: sourceContent === null ? [path] : []
       });
-      await git.validateTreePathPolicy(vault.vault_id, tree, config.maxUploadBytes);
+      await git.validateTreeRootIgnorePolicy(vault.vault_id, tree, config.maxUploadBytes);
       const operation = await store.mutate((mutableDb) => {
         const currentVault = ownedVaultOrThrow(mutableDb, session.user.user_id, vaultId);
         if (currentVault.current_main !== expectedMain) {
@@ -2455,6 +2481,27 @@ function requestBody(request: FastifyRequest): Record<string, unknown> {
   return body;
 }
 
+function readRootIgnoreCapability(body: Record<string, unknown>): 'root-ignore-v1' | undefined {
+  if (body.root_ignore_capability === undefined) return undefined;
+  if (body.root_ignore_capability !== 'root-ignore-v1') {
+    throw new ValidationError('invalid_request', 'Unsupported root ignore capability.');
+  }
+  return 'root-ignore-v1';
+}
+
+async function requireRootIgnoreCapability(
+  git: GitService,
+  vaultId: string,
+  targetMain: string,
+  capability: 'root-ignore-v1' | undefined
+): Promise<string | null> {
+  const { oid } = await git.readRootIgnoreBlob(vaultId, targetMain);
+  if (oid !== null && capability !== 'root-ignore-v1') {
+    throw new AuthError(409, 'root_ignore_capability_required', 'Update to a capable device before syncing this vault.');
+  }
+  return oid;
+}
+
 function readDeviceStatusReport(record: Record<string, unknown>): {
   pluginVersion: string;
   localStatusLabel: string;
@@ -2465,14 +2512,78 @@ function readDeviceStatusReport(record: Record<string, unknown>): {
   pathCapabilities: Record<string, unknown> | null;
 } {
   return {
-    pluginVersion: readBoundedString(record, 'plugin_version', 80),
+    pluginVersion: safeReportedPluginVersion(readBoundedString(record, 'plugin_version', 80)),
     localStatusLabel: readBoundedString(record, 'local_status_label', 80),
-    localErrorCode: readNullableBoundedString(record, 'local_error_code', 120),
-    localQueueStatus: readNullableBoundedString(record, 'local_queue_status', 80),
+    localErrorCode: safeReportedErrorCode(readNullableBoundedString(record, 'local_error_code', 120)),
+    localQueueStatus: safeReportedQueueStatus(readNullableBoundedString(record, 'local_queue_status', 80)),
     localMain: readNullableCommitId(record, 'local_main'),
     localHead: readNullableCommitId(record, 'local_head'),
-    pathCapabilities: readNullableSmallRecord(record, 'path_capabilities')
+    pathCapabilities: safePathCapabilities(readNullableSmallRecord(record, 'path_capabilities'))
   };
+}
+
+const reportedErrorCodes = new Set([
+  'applied_main_acknowledgement_failed', 'apply_journal_recovery_required', 'apply_lock_active', 'apply_recovery_required',
+  'blocked_integrity', 'chunk_digest_mismatch', 'chunk_too_large', 'conflict_review_required',
+  'connection_not_approved', 'device_blocked', 'device_identity_mismatch', 'device_revoked', 'directory_acknowledgement_missing',
+  'directory_baseline_recovery_journal_invalid', 'directory_baseline_recovery_unsafe',
+  'directory_delete_failed', 'directory_identity_unavailable',
+  'directory_inspection_failed', 'directory_materialization_failed', 'directory_recovery_changed',
+  'directory_recovery_choice_invalid', 'directory_recovery_decision_required',
+  'directory_recovery_journal_invalid', 'directory_recovery_journal_mismatch', 'directory_recovery_not_pending',
+  'displaced_recovery_archive_exists', 'exclusive_write_unavailable', 'file_too_large', 'git_error',
+  'initial_import_confirmation_required', 'invalid_onboarding_base', 'invalid_path', 'invalid_transfer_checkpoint',
+  'invalid_transfer_cursor', 'invalid_transfer_plan', 'local_queue_changed', 'local_ref_changed',
+  'local_ref_lease_lost', 'local_ref_lock_active', 'local_ref_recovery_required', 'local_snapshot_changed',
+  'local_state_already_paired', 'local_state_incomplete', 'network_error', 'not_paired',
+  'object_too_large_for_chunk', 'onboarding_catchup_busy', 'onboarding_identity_mismatch',
+  'onboarding_incomplete', 'onboarding_local_changes_after_submit', 'onboarding_snapshot_changed',
+  'operation_interrupted_by_reload', 'pack_preparation_failed', 'partial_local_state',
+  'recovery_bundle_durability_unavailable', 'recovery_bundle_failed', 'recovery_bundle_verification_failed',
+  'replace_local_with_server_not_required', 'replace_local_with_server_required',
+  'same_device_non_fast_forward', 'server_git_error',
+  'server_processing_error', 'server_recovery_required', 'server_update_required', 'stale_device_ref',
+  'stale_directory_proposal_base', 'sync_error', 'sync_lease_blocked', 'target_blob_size_mismatch',
+  'target_blob_size_unavailable', 'transfer_closed',
+  'transfer_incomplete', 'transfer_too_large', 'unsafe_local_state', 'upload_interrupted'
+]);
+
+function safeReportedPluginVersion(version: string): string {
+  return /^(?:0|[1-9]\d{0,2})\.(?:0|[1-9]\d{0,2})\.(?:0|[1-9]\d{0,2})$/u.test(version) ? version : 'unknown';
+}
+
+function safeReportedErrorCode(code: string | null): string | null {
+  if (code === null) return null;
+  return reportedErrorCodes.has(code) ? code : 'sync_error';
+}
+
+function safeReportedQueueStatus(status: string | null): string | null {
+  if (status === null) return null;
+  return ['idle', 'queued_local', 'uploading', 'merged', 'conflicted', 'blocked_recovery'].includes(status) ? status : 'unknown';
+}
+
+function safePathCapabilities(value: Record<string, unknown> | null): Record<string, unknown> | null {
+  if (value === null) return null;
+  return {
+    adapter: value.adapter === 'obsidian-data-adapter' ? value.adapter : 'unknown',
+    platform: typeof value.platform === 'string' && ['ios', 'android', 'linux', 'darwin', 'win32'].includes(value.platform) ? value.platform : 'unknown'
+  };
+}
+
+function safeReportedStatusLabel(label: string | null, errorCode: string | null): string {
+  if (errorCode) return normalizedLocalDashboardLabel(label, errorCode);
+  if (label === 'Unsafe local state' || label === 'Review needed' || label === 'Needs recovery') return 'Out of sync';
+  if (label && ['Synced', 'Ahead', 'Behind', 'Offline', 'Out of sync', 'Blocked', 'Server repair required', 'Out of sync — file exceeds upload limit', 'Out of sync — upload limit exceeded', 'Out of sync — local recovery required'].includes(label)) return label;
+  const active = label?.match(/^((?:Checking|Checking changes|Verifying contents|Preparing upload|Uploading|Applying|Merging|Server retrying|Repairing baseline|Finishing update|Waiting for operation)(?: \((?:planning objects|revalidating|verifying)\))?)(?: ([0-9]+)\/([0-9]+)| \(~(0|10|20|30|40|50|60|70|80|90|100)%\))?( \(taking longer than expected\))?$/u);
+  if (active) {
+    const completed = Number(active[2]);
+    const total = Number(active[3]);
+    const bucket = active[4] ?? (active[2] !== undefined && Number.isSafeInteger(completed) && Number.isSafeInteger(total) && total > 0 && completed <= total
+      ? String(Math.floor(completed / total * 10) * 10)
+      : null);
+    return `${active[1]}${bucket === null ? '' : ` (~${bucket}%)`}${active[5] ?? ''}`;
+  }
+  return label === null ? 'Checking' : 'Out of sync';
 }
 
 function readBoundedString(record: Record<string, unknown>, key: string, maxLength: number): string {
@@ -2952,6 +3063,17 @@ async function sendError(error: Error, request: FastifyRequest, reply: FastifyRe
         message: error.message,
         request_id: request.id,
         details: error.details
+      }
+    });
+    return;
+  }
+  if (error instanceof PathPolicyViolation || error instanceof RootIgnorePolicyError) {
+    await reply.status(409).send({
+      error: {
+        code: error.code,
+        message: 'The resulting vault tree violates the root ignore or path policy.',
+        request_id: request.id,
+        details: {}
       }
     });
     return;
@@ -3936,7 +4058,7 @@ function deviceStatusLabel(status: string): string {
     return 'Synced';
   }
   if (status === 'review_needed') {
-    return 'Review needed';
+    return 'Conflict resolution needed';
   }
   if (status === 'blocked_recovery') {
     return 'Needs recovery';
@@ -3962,8 +4084,9 @@ function dashboardDeviceStatusLabel(
     localErrorCode?: string | null;
   }
 ): string {
+  if (status === 'review_needed') return 'Conflict resolution needed';
   if (isLocalStatusOverride(state.localStatusLabel ?? null, state.localErrorCode ?? null)) {
-    return state.localStatusLabel || 'Unsafe local state';
+    return normalizedLocalDashboardLabel(state.localStatusLabel ?? null, state.localErrorCode ?? null);
   }
   if (status === 'synced' && state.offline) {
     return 'Offline';
@@ -3978,6 +4101,26 @@ function dashboardDeviceStatusLabel(
     return 'Status unknown';
   }
   return deviceStatusLabel(status);
+}
+
+function normalizedLocalDashboardLabel(label: string | null, code: string | null): string {
+  if (code === 'conflict_review_required' || label === 'Conflict resolution needed') return 'Out of sync';
+  if (code === 'object_too_large_for_chunk') return label === 'Out of sync — file exceeds upload limit' ? label : 'Out of sync — upload limit exceeded';
+  if (code === 'blocked_integrity') return 'Server repair required';
+  if (code === 'initial_import_confirmation_required') return 'Blocked';
+  if (code && ['unsafe_local_state', 'apply_journal_recovery_required', 'apply_recovery_required', 'recovery_bundle_failed', 'recovery_bundle_verification_failed', 'recovery_bundle_durability_unavailable', 'directory_baseline_recovery_journal_invalid', 'directory_baseline_recovery_unsafe', 'directory_recovery_journal_invalid', 'directory_recovery_journal_mismatch', 'directory_recovery_decision_required', 'directory_recovery_changed', 'local_ref_recovery_required', 'replace_local_with_server_required', 'server_recovery_required', 'stale_device_ref', 'same_device_non_fast_forward', 'local_state_incomplete'].includes(code)) {
+    return 'Out of sync — local recovery required';
+  }
+  if (code === 'local_snapshot_changed') return 'Checking';
+  if (code === 'stale_directory_proposal_base') return 'Repairing baseline';
+  if (code && ['git_error', 'server_git_error', 'server_processing_error'].includes(code)) return 'Server retrying';
+  if (code) return 'Out of sync';
+  if (label === 'Review needed' || label === 'Unsafe local state' || label === 'Needs recovery') return 'Out of sync';
+  if (label && ['Out of sync', 'Out of sync — file exceeds upload limit', 'Out of sync — upload limit exceeded', 'Out of sync — local recovery required', 'Blocked', 'Offline', 'Ahead', 'Behind', 'Server repair required'].includes(label)) return label;
+  if (label && /^(?:Checking|Checking changes|Verifying contents|Preparing upload|Uploading|Applying|Merging|Server retrying|Repairing baseline|Finishing update|Waiting for operation)(?: \((?:planning objects|revalidating|verifying)\))?(?: \(~(?:0|10|20|30|40|50|60|70|80|90|100)%\))?(?: \(taking longer than expected\))?$/u.test(label)) return label;
+  const progressBase = localStatusBaseLabel(label);
+  if (progressBase && ['Verifying contents', 'Preparing upload', 'Uploading', 'Applying', 'Checking', 'Merging', 'Server retrying', 'Repairing baseline', 'Finishing update', 'Waiting for operation'].includes(progressBase)) return progressBase;
+  return 'Out of sync';
 }
 
 function isFreshDeviceStatus(reportedAt: string | null): boolean {
@@ -3997,6 +4140,11 @@ function isLocalStatusOverride(label: string | null, errorCode: string | null): 
   return Boolean(
     errorCode ||
       base === 'Unsafe local state' ||
+      base === 'Out of sync' ||
+      base === 'Out of sync — file exceeds upload limit' ||
+      base === 'Out of sync — upload limit exceeded' ||
+      base === 'Out of sync — local recovery required' ||
+      base === 'Conflict resolution needed' ||
       base === 'Needs recovery' ||
       base === 'Blocked' ||
       base === 'Verifying contents' ||
@@ -4017,7 +4165,7 @@ function isLocalStatusOverride(label: string | null, errorCode: string | null): 
 }
 
 function isBlockingLocalReport(label: string | null, errorCode: string | null): boolean {
-  return Boolean(errorCode || label === 'Unsafe local state' || label === 'Needs recovery' || label === 'Blocked' || label === 'Review needed');
+  return Boolean(errorCode || ['Unsafe local state', 'Needs recovery', 'Blocked', 'Review needed', 'Conflict resolution needed', 'Out of sync — file exceeds upload limit', 'Out of sync — upload limit exceeded', 'Out of sync — local recovery required'].includes(label ?? ''));
 }
 
 function isMultipartInvalidJsonError(error: Error): boolean {

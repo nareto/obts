@@ -403,6 +403,7 @@ export class ChunkTransferService {
         packfile_sha256: sha256Hex(Buffer.alloc(0)),
         packfile_bytes: 0,
         client_known_main: request.client_known_main,
+        ...(request.root_ignore_capability === undefined ? {} : { root_ignore_capability: request.root_ignore_capability, root_ignore_oid: request.root_ignore_oid }),
         ...(request.base_commit === undefined ? {} : { base_commit: request.base_commit }),
         ...(request.directory_intents === undefined ? {} : { directory_intents: request.directory_intents }),
         ...(request.directory_proposal === undefined ? {} : { directory_proposal: request.directory_proposal }),

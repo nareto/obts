@@ -20,10 +20,18 @@ Statuses combine text and icon; color is never the sole signal.
 
 - **Success:** Synced, healthy, complete.
 - **Active/information:** Uploading, Applying, Checking, Verifying contents, Preparing upload, Merging, Server retrying, Repairing baseline, Finishing update.
-- **Warning:** Ahead, Behind, Offline, Status unknown, Review needed, Stale review.
-- **Danger:** Blocked, Needs recovery, Unsafe local state, Integrity failure.
+- **Warning:** Out of sync, Ahead, Behind, Offline, Status unknown, Stale review.
+- **Danger:** Conflict resolution needed, Out of sync — file exceeds upload limit (blob), Out of sync — upload limit exceeded (other Git object), Out of sync — local recovery required, Blocked, Needs recovery, Integrity failure.
 
-Long-running local work remains an active truthful operation with elapsed/detail information. It does not become Offline solely because local processing took time. Device convergence comes from fresh server/client reports, not browser-side aging guesses.
+### OBTS-DASH-STATUS-001: Truthful Local Sync Failure Presentation
+
+“Unsafe local state” is not an active user-facing status, including for persisted older reports. A pending upload, retry or deferred local edit is out of sync, not a conflict or evidence of corruption. “Conflict resolution needed” is reserved for an actual unresolved server conflict. Recovery required means automatic safe continuation could not be established and must identify the reason and supported next action; unknown failures remain neutral and show a bounded safe code without promising that all work was uploaded or independently preserved. Transfer size failures show the actual limit and locally available object size, type, version, and path when known; historical objects without a current path are identified honestly. Oversized-object paths, object OIDs, exact object sizes, content and arbitrary exception messages stay local, never in shared status or diagnostic telemetry. Commit-reference OIDs already carried as device sync cursors (`local_main`, `local_head`) remain available in authenticated dashboard details; they must not be confused with the oversized-object OID. Legacy error codes remain interpretable and old status labels are normalized at presentation boundaries.
+
+Long-running local work remains an active truthful operation with elapsed/detail information. The shared dashboard displays coarse progress (10% buckets) rather than exact client-reported counts; exact progress stays local. It does not become Offline solely because local processing took time. Device convergence comes from fresh server/client reports, not browser-side aging guesses.
+
+### OBTS-DASH-IGN-001: Advanced Root-Ignore Editing
+
+The plugin's Advanced view edits the shared vault-root `.gitignore` as a normal user file, not a hidden server policy. It shows the current bytes, local-only effect on already tracked paths, and a preview under the same full Git matcher used for scanning. Save rechecks the file's original identity and refuses to overwrite concurrent edits; failure preserves the draft. Creating, editing or deleting the file uses normal local capture and immutable proposal flow. The editor does not silently rewrite rules, delete matched local files, truncate queued history, or promise that changing a rule fixes an oversized object already in queued ancestry. If this client or server cannot safely interpret or activate the policy, editing/sync blocks with an explicit update action rather than producing a scanner-only partial result.
 
 ## Overview And Devices
 

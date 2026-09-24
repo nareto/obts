@@ -3084,6 +3084,31 @@ impl VaultStore {
         }
     }
 
+    pub(crate) async fn mark_local_projection_pending(
+        &self,
+        path: String,
+        revision: &str,
+        failure_kind: PersistenceFailureKind,
+    ) -> LocalProjectionOutcome {
+        let mut health = self.projection_health.write().await;
+        health.pending.insert(path, revision.to_string());
+        health.last_failure_at = Some(Utc::now());
+        health.last_failure_kind = Some(failure_kind);
+        LocalProjectionOutcome::Pending { failure_kind }
+    }
+
+    pub(crate) async fn clear_local_projection_pending(&self, path: &str) {
+        self.projection_health.write().await.pending.remove(path);
+    }
+
+    pub(crate) async fn clear_verified_projection_pending(&self) {
+        let mut health = self.projection_health.write().await;
+        if !health.pending.is_empty() {
+            health.pending.clear();
+            health.last_success_at = Some(Utc::now());
+        }
+    }
+
     pub async fn project_source_committed_vault_write(
         &self,
         write: PreparedVaultWrite,
@@ -3837,6 +3862,115 @@ impl VaultStore {
             expected_couchdb_rev,
         )
         .await
+    }
+
+    pub(crate) async fn source_file_readable(
+        &self,
+        auth: &AuthContext,
+        file: &crate::filesystem::FilesystemFile,
+    ) -> bool {
+        let (_, policy) = source_policy_note(file);
+        policy_allows(
+            &self.authorization_config().await,
+            auth,
+            "read",
+            &policy,
+            Utc::now(),
+        )
+    }
+
+    pub(crate) async fn prepare_source_update(
+        &self,
+        auth: &AuthContext,
+        id: &NoteId,
+        mut request: UpdateNoteRequest,
+        raw: bool,
+        file: &crate::filesystem::FilesystemFile,
+    ) -> Result<PreparedVaultWrite, crate::service::ServiceError> {
+        use crate::service::ServiceError;
+
+        let now = Utc::now();
+        let path = id.as_str().to_string();
+        let file_type = file_type_from_path(&path);
+        let (note, policy) = source_policy_note(file);
+        let config = self.authorization_config().await;
+        if !policy_allows(&config, auth, "read", &policy, now) {
+            return Err(ServiceError::NotFound);
+        }
+        let decision =
+            policy_decision_for(&config, auth, "edit", &policy, now).ok_or_else(|| {
+                WriteError::PolicyDenied {
+                    operation: "edit",
+                    path: path.clone(),
+                    reason: "no matching edit rule in the effective authorization policy"
+                        .to_string(),
+                }
+            })?;
+        require_matching_revision(&request, &file.content)?;
+        let mut write = if raw {
+            self.prepare_edit_from_parts(
+                auth,
+                request,
+                now,
+                path,
+                file_type,
+                file.content.clone(),
+                file.created_at,
+                note.map(|note| note.frontmatter),
+                policy,
+                file.revision.clone(),
+            )
+            .await?
+        } else {
+            let note = note.ok_or(ServiceError::NotFound)?;
+            if let Some(metadata) = request.metadata.as_mut() {
+                let object = metadata
+                    .as_object_mut()
+                    .ok_or_else(|| WriteError::InvalidUpdate {
+                        reason: "metadata must be an object".to_string(),
+                    })?;
+                for key in ["created", "created_by", "tags", "updated"] {
+                    object.remove(key);
+                }
+            }
+            if let Some(tags) = request.tags.as_mut() {
+                for tag in decision.preserve_tags {
+                    if note.tags.iter().any(|candidate| {
+                        crate::authorization::normalize_tag(candidate)
+                            .eq_ignore_ascii_case(&crate::authorization::normalize_tag(&tag))
+                    }) {
+                        add_unique_tag(tags, &tag);
+                    }
+                }
+                tags.sort();
+                tags.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+            }
+            let content =
+                request.rebuild_markdown(&note.frontmatter, &note.content, &note.tags, now)?;
+            let max_context = self.settings.read().await.max_link_context_chars;
+            let parsed = note_input_from_raw_markdown(
+                &path,
+                &content,
+                "",
+                file.created_at,
+                now,
+                max_context,
+            );
+            PreparedVaultWrite {
+                body_lease: None,
+                operation_id: write_operation_id(&path, &content, now),
+                path,
+                content,
+                file_type,
+                created_at: file.created_at,
+                updated_at: now,
+                note: Some(parsed),
+                mark_created: false,
+                expected_couchdb_rev: Some(file.revision.clone()),
+            }
+        };
+        write.body_lease = file.lease.clone();
+        Ok(write)
     }
 
     async fn prepare_edit_from_parts(
@@ -4967,6 +5101,39 @@ fn file_type_from_path(path: &str) -> NewNoteFileType {
     } else {
         NewNoteFileType::Base
     }
+}
+
+fn source_policy_note(file: &crate::filesystem::FilesystemFile) -> (Option<NoteInput>, PolicyNote) {
+    let path = &file.path;
+    let note = file_type_from_path(path).is_markdown().then(|| {
+        note_input_from_raw_markdown(
+            path,
+            &file.content,
+            &file.revision,
+            file.created_at,
+            file.updated_at,
+            0,
+        )
+    });
+    let policy = note
+        .as_ref()
+        .map(|note| PolicyNote {
+            path: path.clone(),
+            title: note.title.clone(),
+            tags: note.tags.clone(),
+            created_at: note.created_at,
+            updated_at: note.updated_at,
+            owner: owner_from_frontmatter(&note.frontmatter).map(str::to_string),
+        })
+        .unwrap_or_else(|| PolicyNote {
+            path: path.clone(),
+            title: title_from_note_id(path),
+            tags: Vec::new(),
+            created_at: file.created_at,
+            updated_at: file.updated_at,
+            owner: None,
+        });
+    (note, policy)
 }
 
 fn note_input_from_raw_markdown(

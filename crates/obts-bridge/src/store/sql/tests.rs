@@ -132,6 +132,60 @@ fn reader() -> AuthContext {
 
 #[tokio::test]
 #[ignore = "requires synthetic PostgreSQL; run explicitly with --ignored"]
+async fn root_ignore_removes_stale_sql_projection_without_touching_file() {
+    let f = Fixture::new().await;
+    std::fs::write(f.root.path().join("Visible.md"), "# Visible\n").unwrap();
+    std::fs::write(f.root.path().join("Local.md"), "# Local\n").unwrap();
+    f.project().await;
+    assert_eq!(f.service.store.sql_revisions().await.unwrap().len(), 2);
+    std::fs::write(f.root.path().join(".gitignore"), "Local.md\n").unwrap();
+    f.project().await;
+    let projected = f.service.store.sql_revisions().await.unwrap();
+    assert_eq!(
+        projected.keys().cloned().collect::<Vec<_>>(),
+        vec!["Visible.md"]
+    );
+    let stale: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM notes WHERE id='Local.md')+(SELECT count(*) FROM vault_files WHERE path='Local.md')+(SELECT count(*) FROM tags WHERE note_id='Local.md')+(SELECT count(*) FROM links WHERE source_id='Local.md')+(SELECT count(*) FROM blocks WHERE note_id='Local.md')")
+        .fetch_one(&f.service.store.db().pool).await.unwrap();
+    assert_eq!(stale, 0);
+    assert_eq!(
+        std::fs::read_to_string(f.root.path().join("Local.md")).unwrap(),
+        "# Local\n"
+    );
+    let read = f
+        .service
+        .get_vault_file(&admin(), &NoteId::new("Local.md"))
+        .await
+        .unwrap();
+    assert_eq!(read.content, "# Local\n");
+    let updated = f
+        .service
+        .update_note(
+            &admin(),
+            &NoteId::new("Local.md"),
+            UpdateNoteRequest {
+                content: Some("changed".into()),
+                content_patch: None,
+                tags: None,
+                metadata: None,
+                expected_revision: Some(read.revision),
+            },
+        )
+        .await
+        .unwrap();
+    let local_content = std::fs::read_to_string(f.root.path().join("Local.md")).unwrap();
+    assert!(local_content.ends_with("\nchanged\n"));
+    assert_eq!(
+        updated.revision,
+        crate::store::whole_file_revision(&local_content)
+    );
+    f.project().await;
+    assert_eq!(f.service.store.sql_revisions().await.unwrap().len(), 1);
+    f.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires synthetic PostgreSQL; run explicitly with --ignored"]
 async fn postgres_projection_reads_queries_acl_edits_and_faults() {
     let f = Fixture::new().await;
     let raw = "---\ntags: [project]\nstatus: active\n---\n# Heading alpha\n\nUniquequartz alpha body links [[Beta.md]] and [[Private.md]].\n";
