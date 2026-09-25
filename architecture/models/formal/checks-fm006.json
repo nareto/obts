@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "modelId": "OBTS-FM-006",
-  "architectureRevision": 13,
+  "architectureRevision": 21,
   "architectureStatus": "accepted",
   "tooling": {
     "workers": 1,
@@ -12,7 +12,9 @@
     "moduleLibrary": "modules"
   },
   "model": "OBTSOnboarding.tla",
-  "sanyModules": ["OBTSOnboarding"],
+  "sanyModules": [
+    "OBTSOnboarding"
+  ],
   "checks": [
     {
       "id": "fm006-empty-safety",
@@ -22,7 +24,14 @@
       "heapMb": 1024,
       "maximumDistinctStates": 2000,
       "maximumDepth": 30,
-      "baseline": {"generated": 1033, "distinct": 703, "depth": 20, "minGenerated": 516, "minDistinct": 351, "minDepth": 10}
+      "baseline": {
+        "generated": 1199,
+        "distinct": 781,
+        "depth": 21,
+        "minGenerated": 599,
+        "minDistinct": 390,
+        "minDepth": 10
+      }
     },
     {
       "id": "fm006-empty-liveness",
@@ -32,7 +41,14 @@
       "heapMb": 1024,
       "maximumDistinctStates": 1000,
       "maximumDepth": 30,
-      "baseline": {"generated": 165, "distinct": 114, "depth": 17, "minGenerated": 82, "minDistinct": 57, "minDepth": 8}
+      "baseline": {
+        "generated": 179,
+        "distinct": 123,
+        "depth": 18,
+        "minGenerated": 89,
+        "minDistinct": 61,
+        "minDepth": 9
+      }
     },
     {
       "id": "fm006-nonempty-safety",
@@ -42,7 +58,14 @@
       "heapMb": 1024,
       "maximumDistinctStates": 2000,
       "maximumDepth": 30,
-      "baseline": {"generated": 1151, "distinct": 761, "depth": 21, "minGenerated": 575, "minDistinct": 380, "minDepth": 10}
+      "baseline": {
+        "generated": 1527,
+        "distinct": 921,
+        "depth": 22,
+        "minGenerated": 763,
+        "minDistinct": 460,
+        "minDepth": 11
+      }
     },
     {
       "id": "fm006-nonempty-liveness",
@@ -52,7 +75,14 @@
       "heapMb": 1024,
       "maximumDistinctStates": 1000,
       "maximumDepth": 30,
-      "baseline": {"generated": 170, "distinct": 118, "depth": 18, "minGenerated": 85, "minDistinct": 59, "minDepth": 9}
+      "baseline": {
+        "generated": 196,
+        "distinct": 134,
+        "depth": 19,
+        "minGenerated": 98,
+        "minDistinct": 67,
+        "minDepth": 9
+      }
     },
     {
       "id": "fm006-reach-restart",
@@ -137,6 +167,18 @@
       "expectedInvariant": "CompleteRequiresAcknowledgement",
       "requiredWitness": "CompleteWithoutAcknowledgement",
       "minimumTraceDepth": 7
+    },
+    {
+      "id": "fm006-negative-consent",
+      "config": "configs/fm006-negative-consent.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 1000,
+      "maximumDepth": 20,
+      "expectedInvariant": "ConsentBeforeRegistration",
+      "requiredWitness": "RegisterWithoutConsent",
+      "minimumTraceDepth": 2
     }
   ]
 }

@@ -22,7 +22,8 @@ const requiredChecks = [
   ['fm006-negative-transfer-before-registration', 'negative-control'],
   ['fm006-negative-apply-before-recovery', 'negative-control'],
   ['fm006-negative-final-checkpoint', 'negative-control'],
-  ['fm006-negative-complete-before-ack', 'negative-control']
+  ['fm006-negative-complete-before-ack', 'negative-control'],
+  ['fm006-negative-consent', 'negative-control']
 ];
 
 try {
@@ -55,9 +56,9 @@ function containedModelPath(value, label) {
 }
 function requireFile(path, label) { if (!existsSync(path) || !statSync(path).isFile()) throw new Error(`${label} does not exist: ${path}`); }
 function validateManifest(manifest) {
-  if (manifest.schemaVersion !== 1 || manifest.modelId !== 'OBTS-FM-006' || manifest.architectureRevision !== 13 || !['candidate', 'accepted'].includes(manifest.architectureStatus)) throw new Error('checks manifest metadata is invalid.');
+  if (manifest.schemaVersion !== 1 || manifest.modelId !== 'OBTS-FM-006' || manifest.architectureRevision !== 21 || !['candidate', 'accepted'].includes(manifest.architectureStatus)) throw new Error('checks manifest metadata is invalid.');
   const arch = readFileSync(architectureManifestPath, 'utf8');
-  if (!/- id: OBTS-FM-006[\s\S]*?\n\s+status:\s*(candidate|accepted)\b[\s\S]*?\n\s+architecture_revision:\s*13\b/u.test(arch)) throw new Error('architecture inventory lacks FM006 revision 13.');
+  if (!/- id: OBTS-FM-006[\s\S]*?\n\s+status:\s*(candidate|accepted)\b[\s\S]*?\n\s+architecture_revision:\s*21\b/u.test(arch)) throw new Error('architecture inventory lacks FM006 revision 21.');
   if (manifest.model !== 'OBTSOnboarding.tla' || !Array.isArray(manifest.sanyModules) || (!testMode && (manifest.sanyModules.length !== 1 || manifest.sanyModules[0] !== 'OBTSOnboarding'))) throw new Error('model/SANY declaration is invalid.');
   const t = manifest.tooling;
   for (const field of ['workers', 'defaultTimeoutMs', 'defaultHeapMb', 'defaultMaximumDistinctStates']) if (!Number.isInteger(t?.[field]) || t[field] <= 0) throw new Error(`tooling.${field} must be positive.`);

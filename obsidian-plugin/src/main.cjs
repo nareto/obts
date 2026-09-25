@@ -1556,7 +1556,7 @@ class ObtsObsidianClient {
     await this.fsp.rm(this.pendingConnectionPath, { force: true });
   }
 
-  async startOnboarding() {
+  async startOnboarding(_vaultNameHint, earlyDisposition = null) {
     await this.assertPairingCanStart();
     await this.flushEditorBuffersToDisk();
     const summary = await this.localSnapshotSummary();
@@ -1582,6 +1582,12 @@ class ObtsObsidianClient {
       version: 1,
       stage: "awaiting_browser",
       connection: redactedConnection,
+      early_disposition: earlyDisposition === "use_server" ? "use_server" : null,
+      pending_summary: {
+        fingerprint: summary.fingerprint,
+        file_count: summary.fileCount,
+        bytes: summary.bytes
+      },
       analysis: null,
       selected_mode: null,
       last_error_code: null
@@ -1843,7 +1849,7 @@ class ObtsObsidianClient {
     const localFiles = await this.scanSyncableFiles((await this.readRootIgnorePolicy()).policy);
     const resumed = await this.resumeAcceptedOnboarding(connectionId, analysis, mode, localFiles);
     if (resumed) return resumed;
-    if (current.fingerprint !== analysis.localFingerprint) {
+    if (analysis && current.fingerprint !== analysis.localFingerprint) {
       throw new ObtsBlockedError("onboarding_snapshot_changed", "The local vault changed. Review the updated onboarding summary before continuing.");
     }
     await this.createRecoveryBundle(mode === "use_server" ? "replace_local_with_server" : "initial_import", analysis.expectedMain, localFiles);
@@ -8008,6 +8014,7 @@ class ObtsOnboardingModal extends Modal {
     this.connection = null;
     this.analysis = null;
     this.mode = null;
+    this.earlyDisposition = null;
     this.browserReturnAbortController = null;
   }
 
@@ -8021,19 +8028,27 @@ class ObtsOnboardingModal extends Modal {
     this.connection = Object.assign({}, pending.journal.connection, { connection_secret: pending.secret });
     this.analysis = pending.journal.analysis || null;
     this.mode = pending.journal.selected_mode || null;
+    this.earlyDisposition = pending.journal.early_disposition || null;
     const state = await this.plugin.client.readState();
     if (pending.journal.last_error_code === "connection_expired" || pending.journal.last_error_code === "connection_denied") {
       this.renderTerminalConnection(pending.journal.last_error_code === "connection_expired" ? "expired" : "denied");
       return;
     }
     const postRegistrationStage = ["registering", "applying_uploading", "uploading_proposal", "awaiting_conflict"].includes(pending.journal.stage);
-    const resumableSubmission = Boolean(this.analysis && this.mode && ((state.vault_id && state.device_id) || postRegistrationStage));
+    const resumableSubmission = Boolean(
+      (this.analysis || postRegistrationStage) && this.mode &&
+        ((state.vault_id && state.device_id) || postRegistrationStage)
+    );
     if (resumableSubmission) {
       if (pending.journal.stage === "awaiting_conflict") this.renderConflictReview();
       else this.renderResume();
       return;
     }
-    if (this.analysis && !["awaiting_browser", "approved", "analyzing"].includes(pending.journal.stage)) {
+    if (this.analysis && !["awaiting_browser", "approved", "analyzing", "registering", "applying_uploading", "uploading_proposal", "awaiting_conflict"].includes(pending.journal.stage)) {
+      if (this.earlyDisposition === "use_server" && this.analysis.classification === "use_server_direct" && !this.mode) {
+        this.renderReplaceConfirmation(this.analysis);
+        return;
+      }
       this.renderConfirmation();
       return;
     }
@@ -8086,6 +8101,16 @@ class ObtsOnboardingModal extends Modal {
         if (text.inputEl) text.inputEl.maxLength = 80;
       });
     new Setting(contentEl)
+      .setName("Vault contents")
+      .setDesc("What should happen to this vault's local files when setup connects to an existing server vault? You can still confirm or change this after browser approval.")
+      .addDropdown((dropdown) => dropdown
+        .addOption("keep", "Keep local contents (classify and choose after approval)")
+        .addOption("use_server", "Replace local contents from the selected server vault")
+        .setValue(this.earlyDisposition === "use_server" ? "use_server" : "keep")
+        .onChange((value) => {
+          this.earlyDisposition = value === "use_server" ? "use_server" : null;
+        }));
+    new Setting(contentEl)
       .setName("Share sanitized troubleshooting diagnostics")
       .setDesc(diagnosticSharingDescription(this.plugin.settings.serverUrl))
       .addToggle((toggle) => toggle.setValue(this.plugin.diagnosticSharingEnabled()).onChange(async (value) => {
@@ -8107,7 +8132,10 @@ class ObtsOnboardingModal extends Modal {
         button.setDisabled(true);
         setFeedback(feedback, "Scanning the local vault...", "muted");
         try {
-          this.connection = await this.plugin.runExclusiveAction(() => this.plugin.client.startOnboarding(), "Starting sync setup");
+          this.connection = await this.plugin.runExclusiveAction(
+          () => this.plugin.client.startOnboarding(this.plugin.app.vault.getName(), this.earlyDisposition),
+          "Starting sync setup"
+        );
           if (this.cancelled || this.plugin.unloaded) return;
           window.open(this.connection.authorization_url);
           this.renderWaiting();
@@ -8185,6 +8213,11 @@ class ObtsOnboardingModal extends Modal {
       ), "Checking sync setup approval");
       if (this.cancelled || this.plugin.unloaded) return;
       if (status.status === "approved") {
+        if (this.earlyDisposition === "use_server") {
+          if (this.waitingFeedback) setFeedback(this.waitingFeedback, "Approved. Determining the replacement scope...", "success");
+          await this.renderAfterApprovedReplacement(status);
+          return;
+        }
         if (this.waitingFeedback) setFeedback(this.waitingFeedback, "Approved. Checking the local vault...", "success");
         this.analysis = await this.plugin.runExclusiveAction(() => this.plugin.client.analyzeOnboarding(
           this.connection.connection_id,
@@ -8200,6 +8233,104 @@ class ObtsOnboardingModal extends Modal {
       }
       await new Promise((resolve) => window.setTimeout(resolve, this.connection.poll_interval_ms || 2000));
     }
+  }
+
+  async renderAfterApprovedReplacement(status) {
+    if (status.selection === "new_vault" || !(status.vault_id && status.vault_name && status.expected_main)) {
+      this.renderIntentMismatch(!status.selection || status.selection === "new_vault");
+      return;
+    }
+    const pending = await this.plugin.client.readPendingOnboarding();
+    const summary = pending && pending.journal.pending_summary &&
+      typeof pending.journal.pending_summary.fingerprint === "string"
+      ? pending.journal.pending_summary
+      : null;
+    if (!summary) {
+      this.renderIntentMismatch(false);
+      return;
+    }
+    this.analysis = {
+      selection: "existing_vault",
+      vaultId: status.vault_id,
+      vaultName: status.vault_name,
+      expectedMain: status.expected_main,
+      rootCommit: null,
+      classification: "use_server_direct",
+      proposalBase: null,
+      localFingerprint: summary.fingerprint,
+      localFileCount: summary.file_count,
+      localBytes: summary.bytes
+    };
+    this.renderReplaceConfirmation(this.analysis);
+  }
+
+  renderIntentMismatch(browserSelectedNewVault) {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Replacement needs an existing server vault" });
+    contentEl.createEl("p", {
+      text: browserSelectedNewVault
+        ? "The browser created or selected a new vault, but this device was set up to replace its contents from an existing one. Nothing was uploaded, downloaded, or deleted. Restart setup to choose a different disposition."
+        : "Setup was interrupted before the approved vault could be recorded. Nothing was uploaded, downloaded, or deleted. Restart setup to continue."
+    });
+    const feedback = contentEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
+    new Setting(contentEl)
+      .addButton((button) => button.setButtonText("Close").onClick(() => this.close()))
+      .addButton((button) => button.setButtonText("Restart setup").setCta().onClick(async () => {
+        button.setDisabled(true);
+        setFeedback(feedback, "Clearing the unused setup request...", "muted");
+        try {
+          await this.plugin.runExclusiveAction(() => this.plugin.client.cancelOnboarding());
+          this.connection = null;
+          this.analysis = null;
+          this.mode = null;
+          this.earlyDisposition = null;
+          this.renderStart();
+        } catch (error) {
+          button.setDisabled(false);
+          setFeedback(feedback, error instanceof Error ? error.message : "Unable to restart setup.", "error");
+        }
+      }));
+  }
+
+  renderReplaceConfirmation(analysis) {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: `Replace this vault's contents from ${analysis.vaultName}?` });
+    contentEl.createEl("p", {
+      text: "Syncable local files will be replaced by the server vault. Existing syncable files remain recoverable: obts creates a recovery bundle before replacing anything. Sync starts after the server contents are installed."
+    });
+    const summary = contentEl.createDiv({ cls: "obts-onboarding-summary" });
+    summary.createEl("strong", { text: analysis.vaultName });
+    summary.createEl("span", {
+      text: `${analysis.localFileCount.toLocaleString()} syncable local files · ${formatBytes(analysis.localBytes)}`
+    });
+    const feedback = contentEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
+    new Setting(contentEl)
+      .addButton((button) => button.setButtonText("Cancel").onClick(async () => {
+        button.setDisabled(true);
+        await this.plugin.runExclusiveAction(() => this.plugin.client.cancelOnboarding());
+        this.close();
+      }))
+      .addButton((button) => button.setButtonText("Replace local contents").setCta().onClick(async () => {
+        button.setDisabled(true);
+        setFeedback(feedback, "Connecting and replacing from the server vault...", "muted");
+        try {
+          const result = await this.plugin.runOnboardingAction(() => this.plugin.client.finishOnboarding(
+            this.connection.connection_id,
+            this.connection.connection_secret,
+            this.analysis,
+            "use_server"
+          ));
+          this.plugin.setStatus((await this.plugin.client.readState()).status_label);
+          this.renderResult(result);
+        } catch (error) {
+          if (this.cancelled || this.plugin.unloaded) return;
+          void this.plugin.reportOnboardingError(error, this.connection);
+          button.setDisabled(false);
+          setFeedback(feedback, error instanceof Error ? error.message : "Setup failed.", "error");
+        }
+      }));
   }
 
   renderConfirmation() {

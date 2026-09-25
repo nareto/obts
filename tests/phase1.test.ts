@@ -3301,6 +3301,85 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(consumedConnection).toMatchObject({ status: 'consumed', expected_main: pinnedMain });
   });
 
+  it('replaces local contents from the early disposition without pre-registration classification', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'early-replace-desktop');
+    const phoneDir = join(root, 'early-replace-phone');
+    await mkdirp(desktopDir);
+    await mkdirp(phoneDir);
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await writeFile(join(desktopDir, 'server.md'), 'server truth\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    // A fresh phone vault still contains syncable Obsidian configuration files.
+    await writeFile(join(phoneDir, 'stale-local-only.md'), 'local only\n');
+    const phone = new ObtsPluginClient(phoneDir, { serverUrl: baseUrl, deviceName: 'phone' });
+    const connection = await phone.startOnboarding('Early replace phone', 'use_server');
+    const journalOnDisk = JSON.parse(await readFile(join(phoneDir, '.obts', 'onboarding.json'), 'utf8'));
+    expect(journalOnDisk).toMatchObject({
+      stage: 'awaiting_browser',
+      early_disposition: 'use_server'
+    });
+    expect(journalOnDisk.pending_summary).toMatchObject({
+      fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      file_count: 1,
+      bytes: expect.any(Number)
+    });
+    const startSummary = journalOnDisk.pending_summary as { fingerprint: string };
+
+    expect((await admin.post(`/api/v1/connections/${connection.connection_id}/approve`, {
+      selection: 'existing_vault',
+      vault_id: admin.vaultId
+    })).status).toBe(200);
+    const approvedStatus = await phone.pollOnboarding(connection.connection_id, connection.connection_secret);
+    if (approvedStatus.status !== 'approved' || approvedStatus.selection !== 'existing_vault') {
+      throw new Error('expected an approved existing-vault connection');
+    }
+    expect(approvedStatus.expected_main).toMatch(/^[0-9a-f]{40}$/u);
+
+    // The replacement screen synthesizes consent from the persisted start summary.
+    const analysis = {
+      selection: 'existing_vault' as const,
+      vaultId: approvedStatus.vault_id as string,
+      vaultName: approvedStatus.vault_name as string,
+      expectedMain: approvedStatus.expected_main as string,
+      rootCommit: null,
+      classification: 'use_server_direct' as const,
+      proposalBase: null,
+      localFingerprint: startSummary.fingerprint,
+      localFileCount: startSummary.fingerprint ? journalOnDisk.pending_summary.file_count : 0,
+      localBytes: journalOnDisk.pending_summary.bytes
+    };
+    const transport = (phone as unknown as {
+      transport: { fetchBootstrap: (...args: unknown[]) => Promise<unknown> };
+    }).transport;
+    let bootstrapCalls = 0;
+    transport.fetchBootstrap = async () => {
+      bootstrapCalls += 1;
+      throw new Error('early replacement must not fetch server objects before registration');
+    };
+
+    const result = await phone.finishOnboarding({
+      connectionId: connection.connection_id,
+      secret: connection.connection_secret,
+      analysis,
+      mode: 'use_server'
+    });
+    expect(result).toMatchObject({ status: 'Synced' });
+    expect(bootstrapCalls).toBe(0);
+    expect(await readFile(join(phoneDir, 'server.md'), 'utf8')).toBe('server truth\n');
+    // Destructive replacement still publishes recovery evidence for the removed local file.
+    await expect(stat(join(phoneDir, 'stale-local-only.md'))).rejects.toBeTruthy();
+    expect((await readdir(join(phoneDir, '.obts', 'recovery'))).length).toBeGreaterThan(0);
+    const phoneState = await phone.readState();
+    const finishedJournal = JSON.parse(await readFile(join(phoneDir, '.obts', 'onboarding.json'), 'utf8'));
+    expect(finishedJournal.stage).toBe('complete');
+    const db = await server.store.snapshot();
+    const device = db.devices.find((candidate) => candidate.device_id === phoneState.device_id);
+    expect(device).toMatchObject({ onboarding_status: 'complete', last_applied_main: phoneState.local_main });
+    expect(bootstrapCalls).toBe(0);
+  });
+
   it('merges a divergent client from the approval-pinned baseline after main advances', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const desktopDir = join(root, 'moving-merge-desktop');
@@ -7114,6 +7193,11 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('obts-feedback');
     expect(pluginMain).toContain('class ObtsOnboardingModal');
     expect(pluginMain).toContain('setButtonText("Set up sync")');
+    expect(pluginMain).toContain("Replace local contents from the selected server vault");
+    expect(pluginMain).toContain('Replace this vault\'s contents from');
+    expect(pluginMain).toContain('renderAfterApprovedReplacement');
+    expect(pluginMain).toContain('renderIntentMismatch');
+    expect(pluginMain).toContain("early_disposition: earlyDisposition === \"use_server\" ? \"use_server\" : null");
     expect(pluginMain).toContain('Continue in browser');
     expect(pluginMain).toContain('"Continue approval"');
     expect(pluginMain).toContain('setButtonText("Resume setup")');

@@ -1,5 +1,5 @@
 schema_version: 1
-revision: 20
+revision: 21
 status: current
 updated: 2026-09-25
 authoritative_artifacts:
@@ -80,7 +80,7 @@ formal_models:
   - id: OBTS-FM-006
     status: accepted
     path: architecture/models/formal/OBTSOnboarding.tla
-    architecture_revision: 13
+    architecture_revision: 21
     checks: architecture/models/formal/checks-fm006.json
     refines:
       - OBTS-SYNC-ONB-001

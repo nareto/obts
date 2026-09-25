@@ -58,6 +58,7 @@ export type OnboardingAnalysis = {
     | 'new_empty'
     | 'new_with_content'
     | 'server_to_empty'
+    | 'use_server_direct'
     | 'identical'
     | 'stale_baseline'
     | 'shared_baseline_divergent'
@@ -68,10 +69,18 @@ export type OnboardingAnalysis = {
   localBytes: number;
 };
 
+export type OnboardingAnalysisLocalSummary = {
+  fingerprint: string | null;
+  file_count: number;
+  bytes: number;
+};
+
 export type OnboardingJournal = {
   version: 1;
   stage: OnboardingStage;
   connection: Record<string, unknown>;
+  early_disposition?: 'use_server' | null;
+  pending_summary?: OnboardingAnalysisLocalSummary | null;
   analysis: OnboardingAnalysis | null;
   selected_mode: 'initialize' | 'use_server' | 'merge' | null;
   registered_device_id?: string | null;
@@ -127,7 +136,7 @@ type SharedClientCore = {
   readQueue(): Promise<QueueState>;
   readPendingOnboarding(): Promise<{ journal: OnboardingJournal; secret: string } | null>;
   readDeviceToken(): Promise<string>;
-  startOnboarding(): Promise<CreateConnectionResponse>;
+  startOnboarding(localVaultName?: string, earlyDisposition?: 'use_server' | null): Promise<CreateConnectionResponse>;
   pollOnboarding(connectionId: string, secret: string): Promise<ConnectionStatusResponse>;
   analyzeOnboarding(connectionId: string, secret: string): Promise<OnboardingAnalysis>;
   finishOnboarding(
@@ -254,9 +263,9 @@ export class ObtsPluginClient {
     return this.client.readDeviceToken();
   }
 
-  startOnboarding(localVaultName?: string): Promise<CreateConnectionResponse> {
+  startOnboarding(localVaultName?: string, earlyDisposition?: 'use_server' | null): Promise<CreateConnectionResponse> {
     if (localVaultName?.trim()) this.host.vaultName = localVaultName.trim();
-    return this.client.startOnboarding();
+    return this.client.startOnboarding(localVaultName, earlyDisposition);
   }
 
   pollOnboarding(connectionId: string, secret: string): Promise<ConnectionStatusResponse> {

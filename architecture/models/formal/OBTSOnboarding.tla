@@ -2,8 +2,9 @@
 EXTENDS Naturals, TLC
 
 (***************************************************************************
-OBTS-FM-006: browser authorization, durable device enrollment, resumable
-use-server transfer, recovery publication, apply, and catch-up.
+OBTS-FM-006: browser authorization, durable early consent, durable device
+enrollment, resumable use-server transfer, recovery publication, apply, and
+catch-up.
 
 Every field except running, crashCount, and lastAction denotes an already
 published durable record. Actions model successful publication boundaries;
@@ -44,6 +45,7 @@ InitialState == [
   appliedMain |-> 2,
   acknowledged |-> FALSE,
   acknowledgedMain |-> 2,
+  consentPublished |-> FALSE,
   running |-> TRUE,
   crashCount |-> 0,
   lastAction |-> "Init"
@@ -61,6 +63,13 @@ TickApproved ==
   /\ s.approvedAge < ApprovedLimit
   /\ s' = [s EXCEPT !.pendingAge = @ + 1,
       !.approvedAge = @ + 1, !.lastAction = "TickApproved"]
+
+PublishConsent ==
+  \* Durable early-disposition consent: chosen before browser approval or
+  \* confirmed after it. Consent survives crashes; registration consumes it.
+  /\ s.running /\ s.phase \in {"pending", "approved"}
+  /\ ~s.consentPublished
+  /\ s' = [s EXCEPT !.consentPublished = TRUE, !.lastAction = "PublishConsent"]
 
 ExpirePending ==
   /\ s.running /\ s.phase = "pending" /\ s.pendingAge >= PendingLimit
@@ -104,6 +113,7 @@ PublishRecovery ==
 
 Register ==
   /\ s.running /\ s.phase = "approved" /\ s.approvedAge < ApprovedLimit
+  /\ s.consentPublished
   /\ (~LocalHasContent \/ s.recoveryPublished)
   /\ s' = [s EXCEPT !.phase = "registered",
       !.deviceCredential = TRUE, !.everRegistered = TRUE,
@@ -116,6 +126,14 @@ RegisterWithoutRecovery ==
   /\ s' = [s EXCEPT !.phase = "registered",
       !.deviceCredential = TRUE, !.everRegistered = TRUE,
       !.lastAction = "RegisterWithoutRecovery"]
+
+RegisterWithoutConsent ==
+  /\ Mutation = "register-without-consent"
+  /\ s.running /\ s.phase = "approved" /\ s.approvedAge < ApprovedLimit
+  /\ (~LocalHasContent \/ s.recoveryPublished)
+  /\ s' = [s EXCEPT !.phase = "registered",
+      !.deviceCredential = TRUE, !.everRegistered = TRUE,
+      !.lastAction = "RegisterWithoutConsent"]
 
 TransferBeforeRegistration ==
   /\ Mutation = "transfer-before-registration"
@@ -207,7 +225,8 @@ Terminal ==
 
 Next == TickPending \/ TickApproved \/ ExpirePending \/ Approve \/
   ExpireApproved \/ ExpireApprovedAtPendingDeadline \/ AdvanceMain \/
-  RetargetPinned \/ PublishRecovery \/ Register \/ RegisterWithoutRecovery \/
+  RetargetPinned \/ PublishConsent \/ PublishRecovery \/ Register \/
+  RegisterWithoutRecovery \/ RegisterWithoutConsent \/
   TransferBeforeRegistration \/ StartTransfer \/ ReceiveChunk \/
   ReceiveFinalChunk \/ ReceiveFinalWithoutCheckpoint \/ Apply \/
   ApplyWithoutRecovery \/ Acknowledge \/ CatchUp \/
@@ -217,6 +236,7 @@ Spec == Init /\ [][Next]_vars
 
 FairSpec == Init /\ [][Next]_vars
   /\ WF_vars(Approve)
+  /\ WF_vars(PublishConsent)
   /\ WF_vars(PublishRecovery)
   /\ WF_vars(Register)
   /\ WF_vars(StartTransfer)
@@ -239,6 +259,7 @@ TypeOK ==
   /\ s.appliedMain \in {0, 1, 2}
   /\ s.acknowledgedMain \in {0, 1, 2}
   /\ s.acknowledged \in BOOLEAN
+  /\ s.consentPublished \in BOOLEAN
   /\ s.cursor \in 0..ChunkCount
   /\ s.crashCount \in 0..MaxCrashes
 
@@ -251,6 +272,8 @@ TransferRequiresCredential == s.phase \in TransferPhases => s.deviceCredential
 
 RegisteredDoesNotReauthorize ==
   ~s.everRegistered \/ s.phase \in PostRegistrationPhases
+
+ConsentBeforeRegistration == s.everRegistered => s.consentPublished
 
 RecoveryBeforeApply ==
   ~s.localApplied \/ ~LocalHasContent \/ s.recoveryPublished
