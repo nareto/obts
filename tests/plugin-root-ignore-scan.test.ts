@@ -25,6 +25,46 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
+function stubUploadTransport(core: any, serverDeviceRef: string | null) {
+  core.readDeviceToken = vi.fn(async () => 'synthetic-token');
+  core.reportDeviceStatus = vi.fn(async () => undefined);
+  core.getDeviceSelf = vi.fn(async () => ({ server_device_ref: serverDeviceRef, vault_status: 'active' }));
+  core.reconcileServerVaultStatus = vi.fn(async () => undefined);
+  core.syncCapabilities = vi.fn(async () => ({ capabilities: [] }));
+  const push = vi.fn(async (_vaultId: string, _token: string, _manifest: Record<string, unknown>, _packfile: Buffer) => {
+    throw new Error('network interrupted');
+  });
+  core.push = push;
+  return push;
+}
+
+async function stageStaleQueuedCommit(root: string, core: any, options: { acceptedRef: boolean }) {
+  await writeFile(join(root, 'slug.md'), 'note');
+  await mkdir(join(root, 'cache'), { recursive: true });
+  await writeFile(join(root, 'cache', 'vectors.bin'), 'derived bytes v1');
+  const base = await core.createLocalCommit('obts: base');
+  await writeFile(join(root, 'cache', 'vectors.bin'), 'derived bytes v2');
+  const queued = await core.createLocalCommit('obts: local vault changes');
+  await writeFile(join(root, '.gitignore'), 'cache/\n');
+  await core.writeState({
+    ...await core.readState(),
+    vault_id: 'vlt_policy_rebuild',
+    device_id: 'dev_policy_rebuild',
+    local_main: options.acceptedRef ? base : null,
+    server_device_ref: options.acceptedRef ? base : null,
+    local_head: queued,
+    last_error_code: null
+  });
+  await core.writeQueue({
+    pending_commit: queued,
+    expected_device_ref: options.acceptedRef ? base : null,
+    status: 'queued_local',
+    attempts: 0,
+    updated_at: new Date().toISOString()
+  });
+  return { base, queued };
+}
+
 describe('opt-in root .gitignore local scan', () => {
   it('pins the same bytes, blob OID and policy in plugin and headless; leaves default scans physical', async () => {
     const { root, core, headless } = await fixture();
@@ -167,6 +207,62 @@ describe('opt-in root .gitignore local scan', () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it('rebuilds an unaccepted queued commit under the current policy without dropping local content', async () => {
+    const { root, core } = await fixture();
+    const { base, queued } = await stageStaleQueuedCommit(root, core, { acceptedRef: true });
+    const push = stubUploadTransport(core, base);
+
+    await expect(core.uploadQueuedCommit(await core.readQueue())).rejects.toThrow('network interrupted');
+
+    const manifest = push.mock.calls[0]?.[2] as Record<string, unknown>;
+    const rebuilt = manifest.target_commit as string;
+    expect(rebuilt).not.toBe(queued);
+    expect(manifest.expected_device_ref).toBe(base);
+    expect(manifest.root_ignore_capability).toBe('root-ignore-v1');
+    expect(await core.validateUploadTargetRootIgnore(rebuilt)).toBe((await core.readRootIgnorePolicy()).oid);
+    expect([...(await core.listTreeBlobOids(rebuilt)).keys()]).toEqual(['.gitignore', 'slug.md']);
+    expect(await core.readQueue()).toMatchObject({ pending_commit: rebuilt, expected_device_ref: base, status: 'queued_local' });
+    expect((await core.readState()).local_head).toBe(rebuilt);
+    expect(await readFile(join(root, 'cache', 'vectors.bin'), 'utf8')).toBe('derived bytes v2');
+    expect(await core.resolveRef('refs/heads/local')).toBe(rebuilt);
+  });
+
+  it('keeps a queued commit whose pinned policy still matches the working file', async () => {
+    const { root, core } = await fixture();
+    await writeFile(join(root, 'rules.md'), 'note');
+    await writeFile(join(root, '.gitignore'), 'other/\n');
+    const base = await core.createLocalCommit('obts: base');
+    await writeFile(join(root, 'rules.md'), 'note changed');
+    const queued = await core.createLocalCommit('obts: local vault changes');
+    await core.writeState({
+      ...await core.readState(),
+      vault_id: 'vlt_policy_current',
+      device_id: 'dev_policy_current',
+      local_main: base,
+      server_device_ref: base,
+      local_head: queued
+    });
+    await core.writeQueue({ pending_commit: queued, expected_device_ref: base, status: 'queued_local', attempts: 0, updated_at: new Date().toISOString() });
+    const push = stubUploadTransport(core, base);
+
+    await expect(core.uploadQueuedCommit(await core.readQueue())).rejects.toThrow('network interrupted');
+
+    expect(push.mock.calls[0]?.[2].target_commit).toBe(queued);
+    expect((await core.readQueue()).pending_commit).toBe(queued);
+  });
+
+  it('never rewrites queued ancestry the server has not accepted', async () => {
+    const { root, core } = await fixture();
+    const { queued } = await stageStaleQueuedCommit(root, core, { acceptedRef: false });
+    const push = stubUploadTransport(core, null);
+
+    await expect(core.uploadQueuedCommit(await core.readQueue())).rejects.toThrow('network interrupted');
+
+    expect(push.mock.calls[0]?.[2].target_commit).toBe(queued);
+    expect((await core.readQueue()).pending_commit).toBe(queued);
+    expect(await core.resolveRef('refs/heads/local')).toBe(queued);
   });
 
   it('rejects excluded paths in an immutable target even when the mutable root has changed', async () => {

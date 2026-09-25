@@ -1066,6 +1066,19 @@
       "expectedInvariant": "NeverInvalidCandidateRejected",
       "requiredWitness": "RejectExcludedCandidate",
       "minimumTraceDepth": 8
+    },
+    {
+      "id": "fm002-root-ignore-rebuild-stale",
+      "model": "OBTSDistributedSync",
+      "config": "configs/root-ignore-rebuild-stale.cfg",
+      "kind": "reachability",
+      "timeoutMs": 120000,
+      "heapMb": 1536,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 120,
+      "expectedInvariant": "NeverStaleQueuedRebuild",
+      "requiredWitness": "RebuildStaleQueuedProposal",
+      "minimumTraceDepth": 6
     }
   ]
 }

@@ -74,10 +74,10 @@ The model does not cover directories, multiple paths, write concurrency, editor-
 | Field | Value |
 | --- | --- |
 | Status | Accepted bounded composed model |
-| Architecture revision | 15 |
+| Architecture revision | 16 |
 | Refined contracts | `OBTS-SAF-001` through `OBTS-SAF-006`, `OBTS-SAF-010`, `OBTS-SYNC-IMM-001`, `OBTS-SYNC-IGN-001`, `OBTS-SYNC-ACK-001`, `OBTS-PER-OP-001`, `OBTS-BRG-PROJ-001` |
 | Root specification | `OBTSDistributedSync.tla` |
-| Check matrix | `checks.json` (74 required checks: original 52 plus 22 root-ignore checks) |
+| Check matrix | `checks.json` (75 required checks: original 52 plus 23 root-ignore checks) |
 | Static transition map / future trace schema | `trace/transition-map.json`, `trace/trace-schema.json` |
 | Executable check | `npm run test:formal` |
 

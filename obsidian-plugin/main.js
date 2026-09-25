@@ -21990,7 +21990,7 @@ var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_da
 var { createByteBudget, runBoundedWork } = require_work_pool();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.40";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.41";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_INVENTORY_INTERVAL_MS = 6 * 60 * 60 * 1e3;
@@ -24147,6 +24147,13 @@ var ObtsObsidianClient = class {
       if (uploadCheckpoint && (!isUploadTransferCheckpoint(uploadCheckpoint) || uploadCheckpoint.target_commit !== queue.pending_commit || uploadCheckpoint.transfer_request.root_ignore_capability !== "root-ignore-v1" || !Object.hasOwn(uploadCheckpoint.transfer_request, "root_ignore_oid"))) {
         throw new ObtsBlockedError("legacy_upload_checkpoint", "Existing upload checkpoint needs explicit recovery; it will not be replaced or reinterpreted.");
       }
+      if (!uploadCheckpoint && queue.pending_commit && await this.queuedCommitRootPolicyIsStale(queue.pending_commit)) {
+        const rebuilt = await this.rebuildQueuedCommitForRootPolicy(queue.pending_commit, state, queue);
+        if (rebuilt) {
+          queue = rebuilt.queue;
+          state = rebuilt.state;
+        }
+      }
       if (isUploadTransferCheckpoint(uploadCheckpoint) && uploadCheckpoint.transfer_id && uploadCheckpoint.target_commit === queue.pending_commit) {
         const existingResponse = await fetchWithTimeout(
           this.url(`/api/v1/vaults/${state.vault_id}/sync/push-transfers/${uploadCheckpoint.transfer_id}`),
@@ -24323,6 +24330,63 @@ var ObtsObsidianClient = class {
       }
     );
     if (!response.ok) await throwResponseError(response);
+  }
+  async queuedCommitRootPolicyIsStale(commit2) {
+    const policy = await this.readRootIgnorePolicy();
+    const entries = await this.flattenTree(commit2);
+    const pinnedOid = entries.get(".gitignore")?.oid ?? null;
+    if (pinnedOid !== policy.oid) return true;
+    for (const filePath of entries.keys()) {
+      if (isSyncableVaultPath(filePath) && policy.policy.ignores(filePath)) return true;
+    }
+    return false;
+  }
+  async rebuildQueuedCommitForRootPolicy(commit2, state, queue) {
+    if (queue.status === "blocked_recovery" || !await this.commitExists(commit2)) return null;
+    const { commit: parsed } = await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: commit2 });
+    const parents = Array.isArray(parsed.parent) ? parsed.parent : [];
+    if (parents.length > 1) return null;
+    const parent = parents[0] ?? null;
+    const parentIsAccepted = Boolean(parent) && (state.server_device_ref && await this.isAncestor(parent, state.server_device_ref) || state.local_main && await this.isAncestor(parent, state.local_main));
+    if (!parentIsAccepted) return null;
+    const policy = await this.readRootIgnorePolicy();
+    const entries = await this.flattenTree(commit2);
+    const nextEntries = /* @__PURE__ */ new Map();
+    for (const [filePath, entry] of entries) {
+      if (!isSyncableVaultPath(filePath) || filePath === ".gitignore") continue;
+      if (policy.policy.ignores(filePath)) continue;
+      nextEntries.set(filePath, entry);
+    }
+    if (policy.bytes !== null) {
+      const oid = await git.writeBlob({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, blob: policy.bytes });
+      nextEntries.set(".gitignore", { mode: "100644", path: ".gitignore", oid, type: "blob" });
+    }
+    const tree = await this.writeTreeFromEntries(nextEntries);
+    if (tree === parsed.tree) return null;
+    const timestamp = Math.floor(Date.now() / 1e3);
+    const identity = { name: "obts device", email: "device@obts.local", timestamp, timezoneOffset: (/* @__PURE__ */ new Date()).getTimezoneOffset() };
+    const rebuilt = await git.writeCommit({
+      fs: this.fs,
+      dir: this.vaultDir,
+      gitdir: this.gitdir,
+      commit: { tree, parent: parent ? [parent] : [], message: parsed.message, author: identity, committer: identity }
+    });
+    await this.updateRef("refs/heads/local", rebuilt, commit2);
+    const nextQueue = Object.assign({}, queue, {
+      pending_commit: rebuilt,
+      status: "queued_local",
+      attempts: 0,
+      updated_at: nowIso()
+    });
+    await this.writeQueue(nextQueue);
+    const nextState = Object.assign({}, await this.readState(), {
+      local_head: rebuilt,
+      status_label: "Ahead",
+      last_error_code: null,
+      updated_at: nowIso()
+    });
+    await this.writeState(nextState);
+    return { queue: nextQueue, state: nextState };
   }
   async validateUploadTargetRootIgnore(commit2) {
     const entries = /* @__PURE__ */ new Map();

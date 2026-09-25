@@ -4,7 +4,7 @@ INSTANCE OBTSApplyRefinement
 INSTANCE OBTSSafety
 
 (***************************************************************************
-OBTS-FM-002, architecture revision 15. This is a bounded refinement of the
+OBTS-FM-002, architecture revision 16. This is a bounded refinement of the
 architecture contracts, not a definition of product behavior. Persist/commit
 steps assume their named durable facts survive restart. Git ancestry, bytes,
 flush semantics, process kill, and runtime trace conformance remain external.
@@ -29,14 +29,14 @@ NoPlan == "NoPlan"
 NoResult == "NoResult"
 NoReading == "NoReading"
 Policies == {"empty", "exclude-a"}
-PolicyScenario == Scenario \in {"root-ignore", "root-ignore-legacy", "root-ignore-bridge-race", "root-ignore-invalid"}
+PolicyScenario == Scenario \in {"root-ignore", "root-ignore-legacy", "root-ignore-bridge-race", "root-ignore-invalid", "root-ignore-stale-queued"}
 ChangingPolicyScenario == Scenario \in {"root-ignore", "root-ignore-bridge-race", "root-ignore-invalid"}
 PolicyOfTarget(v) == IF ChangingPolicyScenario /\ v = Plugin1Version THEN "exclude-a" ELSE "empty"
 NoPolicy == "NoPolicy"
 PolicyIds == Policies \cup {NoPolicy}
 Copies == 1..MaxMessages
-AttemptIds == {"attempt-plugin-1", "attempt-plugin-2", "attempt-bridge", "attempt-plugin-1-retry", "attempt-equal", "attempt-covered"}
-TransferIds == {"transfer-plugin-1", "transfer-plugin-2", "transfer-bridge", "transfer-plugin-1-retry", "transfer-equal", "transfer-covered"}
+AttemptIds == {"attempt-plugin-1", "attempt-plugin-2", "attempt-bridge", "attempt-plugin-1-retry", "attempt-equal", "attempt-covered", "attempt-rebuild"}
+TransferIds == {"transfer-plugin-1", "transfer-plugin-2", "transfer-bridge", "transfer-plugin-1-retry", "transfer-equal", "transfer-covered", "transfer-rebuild"}
 ProposalIds == {"dir-plugin-1", "dir-plugin-2", "dir-bridge", NoProposal}
 IntentIds == {"intent-plugin-1", "intent-plugin-2", "intent-bridge", NoIntent}
 Plans == {"plan-plugin-1", "plan-plugin-2", "plan-bridge", NoPlan}
@@ -93,6 +93,7 @@ PlanId(c) == CASE c = Plugin1 -> "plan-plugin-1" [] c = Plugin2 -> "plan-plugin-
 
 ScenarioAllowsClient(c) ==
   CASE Scenario = "root-ignore" -> c \in PluginClients
+    [] Scenario = "root-ignore-stale-queued" -> c = Plugin1
     [] Scenario = "root-ignore-bridge-race" -> c = Plugin1
     [] Scenario = "root-ignore-invalid" -> c = Plugin1
     [] Scenario = "root-ignore-legacy" -> FALSE
@@ -259,6 +260,27 @@ PersistImmutableProposal(c) ==
        /\ client' = [client EXCEPT !.queueTarget[c] = v, !.expectedDevice[c] = server.deviceRef[c], !.proposalBase[c] = BaseVersion, !.directoryProposal[c] = dp, !.directoryIntent[c] = di, !.directoryGeneration[c] = n, !.objectPlan[c] = plan, !.attemptId[c] = a, !.transferId[c] = t, !.attemptPolicy[c] = client.policy[c], !.candidateHasA[c] = Scenario = "root-ignore-invalid" \/ client.policy[c] # "exclude-a", !.immutableIdentity[c] = <<<<v, server.deviceRef[c], BaseVersion, dp, plan, a, t>>, client.policy[c]>>, !.proposalPhase[c] = "Queued"]
   /\ coverage' = [Mark("PersistImmutableProposal") EXCEPT !.actorsProposed = @ \cup {c}]
   /\ lastAction' = "PersistImmutableProposal" /\ UNCHANGED <<network, server, bridge, directory, ghost>>
+
+RebuildStaleQueuedProposal(c) ==
+  /\ NormalClient(c) /\ ScenarioAllowsClient(c) /\ PolicyScenario /\ c = Plugin1
+  /\ client.proposalPhase[c] = "Queued"
+  /\ client.attemptPolicy[c] # client.policy[c]
+  /\ client.candidateHasA[c]
+  /\ client.expectedDevice[c] = server.deviceRef[c]
+  /\ LET a == "attempt-rebuild" t == "transfer-rebuild" IN
+       /\ client' = [client EXCEPT !.candidateHasA[c] = FALSE, !.attemptId[c] = a, !.transferId[c] = t,
+            !.attemptPolicy[c] = client.policy[c],
+            !.immutableIdentity[c] = <<<<client.queueTarget[c], client.expectedDevice[c], client.proposalBase[c], client.directoryProposal[c], client.objectPlan[c], a, t>>, client.policy[c]>>]
+  /\ coverage' = Mark("RebuildStaleQueuedProposal") /\ lastAction' = "RebuildStaleQueuedProposal"
+  /\ UNCHANGED <<network, server, bridge, directory, ghost>>
+
+ObserveRootPolicyEdit(c) ==
+  /\ NormalClient(c) /\ ScenarioAllowsClient(c) /\ Scenario = "root-ignore-stale-queued" /\ c = Plugin1
+  /\ client.policy[c] # "exclude-a"
+  /\ client.proposalPhase[c] = "Queued"
+  /\ client' = [client EXCEPT !.policy[c] = "exclude-a"]
+  /\ coverage' = Mark("ObserveRootPolicyEdit") /\ lastAction' = "ObserveRootPolicyEdit"
+  /\ UNCHANGED <<network, server, bridge, directory, ghost>>
 
 PersistEqualRetry(c) ==
   /\ Scenario = "server-recovery" /\ c = Plugin1 /\ NormalClient(c)
@@ -932,7 +954,7 @@ MutateAttemptPolicy ==
   /\ UNCHANGED <<network, server, bridge, directory, ghost>>
 
 RootActions == {
- "ObservePluginEdit", "RustValidateWrite", "RustAtomicVisibleWrite", "NodePersistBridgeHint", "CaptureLocalCommit", "PersistImmutableProposal", "PersistEqualRetry", "PersistCoveredQuery",
+ "ObservePluginEdit", "RustValidateWrite", "RustAtomicVisibleWrite", "NodePersistBridgeHint", "CaptureLocalCommit", "PersistImmutableProposal", "ObserveRootPolicyEdit", "RebuildStaleQueuedProposal", "PersistEqualRetry", "PersistCoveredQuery",
  "SendProposalRequest", "DelayProposalRequest", "DuplicateProposalRequest", "DropProposalRequest", "DeliverProposalRequest", "ServerStartProposal", "RejectExcludedCandidate",
  "ServerValidateProposal", "ClassifyProposal", "PrepareDeviceCAS", "ApplyCASSideEffect", "ObserveCASResult", "CommitCASMetadata",
  "HandleEqualOrCovered", "ServerPrepareIntegration", "PrepareMainCAS", "BeginConflictMetadata", "ProtectConflictBase", "ProtectConflictCurrent",
@@ -951,7 +973,7 @@ RootActions == {
 }
 
 ClientActions(c) ==
-  (\E p \in Paths: ObservePluginEdit(c, p)) \/ UpgradeOldClient \/ CaptureLocalCommit(c) \/ PersistImmutableProposal(c) \/ PersistEqualRetry(c) \/ PersistCoveredQuery(c) \/ SendProposalRequest(c) \/
+  (\E p \in Paths: ObservePluginEdit(c, p)) \/ UpgradeOldClient \/ CaptureLocalCommit(c) \/ PersistImmutableProposal(c) \/ ObserveRootPolicyEdit(c) \/ RebuildStaleQueuedProposal(c) \/ PersistEqualRetry(c) \/ PersistCoveredQuery(c) \/ SendProposalRequest(c) \/
   DelayProposalRequest(c) \/ DuplicateProposalRequest(c) \/ (\E copy \in Copies: DropProposalRequest(c, copy) \/ DeliverProposalRequest(c, copy) \/ DelayProposalReply(c, copy) \/ DropProposalReply(c, copy) \/ DeliverProposalReply(c, copy)) \/
   DuplicateProposalReply(c) \/ RetryOrQueryStable(c) \/ ConsumeProposalResult(c) \/ PollCommittedEvent(c) \/ PlanLocalApply(c) \/
   PublishApplyRecovery(c) \/ BeginLocalMutation(c) \/ MutateWithFreshIdentity(c) \/ VerifyLocalApply(c) \/ CommitLocalCoordination(c) \/
@@ -1120,6 +1142,7 @@ NeverRecoveryTrigger == ~RecoveryTrigger
 NeverApplyTrigger == ~ApplyTrigger
 NeverPolicyTransition == ~server.policyActive \/ server.policy # "exclude-a"
 NeverLocalOnlyApply == ~client.localOnly[Plugin2] \/ client.applyPhase[Plugin2] = "Idle"
+NeverStaleQueuedRebuild == Scenario # "root-ignore-stale-queued" \/ "RebuildStaleQueuedProposal" \notin coverage.actions
 NeverStalePolicyReview == Scenario # "root-ignore" \/ ~(server.reviewNeeded /\ server.opPhase = "Committed" /\ server.conflictDevice \in server.conflictRoots)
 NeverPolicyProjection == bridge.projectionCursor = 0
 NeverUpgrade == ~client.capable[Plugin2]

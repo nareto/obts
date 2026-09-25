@@ -25,7 +25,7 @@ const requiredChecks = new Map([
     'bridge-trigger', 'recovery-trigger', 'apply-trigger', 'apply-refinement'].map((id) => [`fm002-reach-${id}`, 'reachability']),
   ['fm002-server-recovery-implementation', 'positive-safety'],
   ...['root-ignore-safety', 'root-ignore-legacy-safety', 'root-ignore-bridge-race-safety', 'root-ignore-invalid-safety'].map((id) => [`fm002-${id}`, 'positive-safety']),
-  ...['root-ignore-transition', 'root-ignore-stale', 'root-ignore-local-only', 'root-ignore-projection', 'root-ignore-legacy-activation', 'root-ignore-bridge-race-reach',
+  ...['root-ignore-transition', 'root-ignore-stale', 'root-ignore-local-only', 'root-ignore-projection', 'root-ignore-legacy-activation', 'root-ignore-rebuild-stale', 'root-ignore-bridge-race-reach',
     'root-ignore-offline-capture', 'root-ignore-invalid-reach', 'root-ignore-bridge-race-write-reach']
     .map((id) => [`fm002-${id}`, 'reachability']),
   ...['root-ignore-negative-discard', 'root-ignore-negative-old-client', 'root-ignore-negative-stale',
