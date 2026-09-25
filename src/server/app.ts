@@ -1373,6 +1373,26 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     });
   });
 
+  app.post('/api/v1/vaults/:vaultId/conflicts/:conflictId/preview', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
+    const { vaultId, conflictId } = vaultConflictPathParams(request);
+    const db = await store.snapshot();
+    ownedVaultOrThrow(db, session.user.user_id, vaultId);
+    const body = requestBody(request);
+    const resolutionKind = readConflictResolutionKind(body);
+    const manualFiles = readManualResolutionFiles(body);
+    const manualFilePlan = readManualFilePlan(body);
+    return await sync.previewConflictResolution({
+      vaultId,
+      conflictId,
+      expectedMain: readCommitId(body, 'expected_main'),
+      resolutionKind,
+      ...(manualFiles === undefined ? {} : { manualFiles }),
+      ...(manualFilePlan === undefined ? {} : { manualFilePlan })
+    });
+  });
+
   app.post('/api/v1/vaults/:vaultId/conflicts/:conflictId/resolve', async (request) => {
     const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
@@ -1383,12 +1403,14 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const resolutionKind = readConflictResolutionKind(body);
     const manualFiles = readManualResolutionFiles(body);
     const manualFilePlan = readManualFilePlan(body);
+    const expectedTree = readOptionalCommitId(body, 'expected_tree');
     return await sync.resolveConflict({
       actorUserId: session.user.user_id,
       vaultId,
       conflictId,
       expectedMain: readCommitId(body, 'expected_main'),
       resolutionKind,
+      ...(expectedTree === undefined ? {} : { expectedTree }),
       ...(manualFiles === undefined ? {} : { manualFiles }),
       ...(manualFilePlan === undefined ? {} : { manualFilePlan })
     });
@@ -2681,7 +2703,7 @@ function isSyncLifecycleLockingRoute(method: string, path: string): boolean {
     /^\/api\/v1\/vaults\/[^/]+\/sync\/applied$/u.test(path) ||
     /^\/api\/v1\/vaults\/[^/]+\/history\/restore$/u.test(path) ||
     /^\/api\/v1\/vaults\/[^/]+\/maintenance\/git-gc\/start$/u.test(path) ||
-    /^\/api\/v1\/vaults\/[^/]+\/conflicts\/[^/]+\/(?:refresh|resolve)$/u.test(path) ||
+    /^\/api\/v1\/vaults\/[^/]+\/conflicts\/[^/]+\/(?:refresh|preview|resolve)$/u.test(path) ||
     /^\/api\/v1\/vaults\/[^/]+\/sync\/push-transfers\/[^/]+\/finalize$/u.test(path)
   )) return true;
   return method === 'GET' && /^\/api\/v1\/vaults\/[^/]+\/sync\/push-transfers\/[^/]+$/u.test(path);
@@ -2717,6 +2739,11 @@ function vaultConflictPathParams(request: FastifyRequest): { vaultId: string; co
     throw new ValidationError('invalid_request', 'Missing vault or conflict ID.');
   }
   return { vaultId: params.vaultId, conflictId: params.conflictId };
+}
+
+function readOptionalCommitId(record: Record<string, unknown>, field: string): string | undefined {
+  if (record[field] === undefined) return undefined;
+  return readCommitId(record, field);
 }
 
 function readConflictResolutionKind(

@@ -405,6 +405,185 @@ describe('Phase 2 dashboard conflict resolution', () => {
     );
   });
 
+  it('previews resolution candidates from the same computation and applies only the reviewed tree', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'preview-desktop');
+    const tabletDir = join(root, 'preview-tablet');
+    await mkdir(desktopDir, { recursive: true });
+    await mkdir(tabletDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, 'preview-desktop');
+    await writeFile(join(desktopDir, 'shared.md'), 'base\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const tablet = await pairPlugin(admin, tabletDir, 'preview-tablet');
+    await writeFile(join(desktopDir, 'shared.md'), 'server version\n');
+    await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const result = await tablet.syncOnce();
+    expect(result.status).toBe('Conflict resolution needed');
+
+    const review = await admin.get<{ conflict: { expected_main: string; device_commit: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`
+    );
+    expect(review.status).toBe(200);
+    const expectedMainTree = await server.git.treeHash(admin.vaultId, review.body.conflict.expected_main);
+
+    const beforePreview = await server.store.snapshot();
+    const serverPreview = await admin.post<{
+      resolution_kind: string;
+      expected_main: string;
+      tree: string;
+      files: Array<{ path: string; operation: string; provenance: string; content: string | null; content_kind: string }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/preview`, {
+      expected_main: review.body.conflict.expected_main,
+      resolution_kind: 'keep_server'
+    });
+    expect(serverPreview.status).toBe(200);
+    expect(serverPreview.body).toMatchObject({
+      resolution_kind: 'keep_server',
+      expected_main: review.body.conflict.expected_main,
+      tree: expectedMainTree
+    });
+    expect(serverPreview.body.files).toEqual([
+      expect.objectContaining({
+        path: 'shared.md',
+        operation: 'retained',
+        provenance: 'server',
+        content_kind: 'text',
+        content: 'server version\n'
+      })
+    ]);
+
+    const afterPreview = await server.store.snapshot();
+    expect(afterPreview.conflicts.find((conflict) => conflict.conflict_id === result.conflictId)).toMatchObject({ status: 'open' });
+    expect(afterPreview.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(
+      review.body.conflict.expected_main
+    );
+    expect(afterPreview.events.length).toBe(beforePreview.events.length);
+    expect(afterPreview.sync_operations.length).toBe(beforePreview.sync_operations.length);
+    expect(afterPreview.audit_log.length).toBe(beforePreview.audit_log.length);
+    expect(await server.git.getRef(admin.vaultId, 'refs/heads/main')).toBe(review.body.conflict.expected_main);
+
+    const devicePreview = await admin.post<{
+      tree: string;
+      files: Array<{ content: string | null; provenance: string; operation: string }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/preview`, {
+      expected_main: review.body.conflict.expected_main,
+      resolution_kind: 'use_device'
+    });
+    expect(devicePreview.status).toBe(200);
+    expect(devicePreview.body.tree).not.toBe(expectedMainTree);
+    expect(devicePreview.body.files[0]).toMatchObject({ content: 'device version\n', provenance: 'device', operation: 'updated' });
+
+    const manualPreview = await admin.post<{
+      files: Array<{ content: string | null; operation: string; provenance: string }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/preview`, {
+      expected_main: review.body.conflict.expected_main,
+      resolution_kind: 'manual',
+      manual_files: { 'shared.md': 'merged final\n' }
+    });
+    expect(manualPreview.status).toBe(200);
+    expect(manualPreview.body.files[0]).toMatchObject({ content: 'merged final\n', operation: 'updated', provenance: 'manual' });
+
+    const emptyPreview = await admin.post<{
+      files: Array<{ content: string | null; operation: string; bytes: number | null }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/preview`, {
+      expected_main: review.body.conflict.expected_main,
+      resolution_kind: 'manual',
+      manual_files: { 'shared.md': '' }
+    });
+    expect(emptyPreview.status).toBe(200);
+    expect(emptyPreview.body.files[0]).toMatchObject({ content: '', operation: 'updated', bytes: 0 });
+
+    const deletionPreview = await admin.post<{
+      files: Array<{ content: string | null; operation: string; bytes: number | null }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/preview`, {
+      expected_main: review.body.conflict.expected_main,
+      resolution_kind: 'manual',
+      manual_files: { 'shared.md': null }
+    });
+    expect(deletionPreview.status).toBe(200);
+    expect(deletionPreview.body.files[0]).toMatchObject({ content: null, operation: 'deleted', bytes: null });
+
+    const mismatched = await admin.post<{ error: { code: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
+      {
+        expected_main: review.body.conflict.expected_main,
+        expected_tree: 'f'.repeat(40),
+        resolution_kind: 'use_device'
+      }
+    );
+    expect(mismatched.status).toBe(409);
+    expect(mismatched.body.error.code).toBe('stale_conflict_preview');
+    expect((await server.store.snapshot()).conflicts.find((conflict) => conflict.conflict_id === result.conflictId)).toMatchObject({
+      status: 'open'
+    });
+
+    const resolved = await admin.post<{ resolution_commit: string }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
+      {
+        expected_main: review.body.conflict.expected_main,
+        expected_tree: devicePreview.body.tree,
+        resolution_kind: 'use_device'
+      }
+    );
+    expect(resolved.status).toBe(200);
+    expect(await server.git.treeHash(admin.vaultId, resolved.body.resolution_commit)).toBe(devicePreview.body.tree);
+    expect((await server.git.readBlobAtPath(admin.vaultId, resolved.body.resolution_commit, 'shared.md')).toString('utf8')).toBe(
+      'device version\n'
+    );
+  });
+
+  it('previews keep-both and insert-both outcomes with their exact final paths and content', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'preview-combined-desktop');
+    const tabletDir = join(root, 'preview-combined-tablet');
+    await mkdir(desktopDir, { recursive: true });
+    await mkdir(tabletDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, 'preview-combined-desktop');
+    await writeFile(join(desktopDir, 'shared.md'), 'base\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const tablet = await pairPlugin(admin, tabletDir, 'preview-combined-tablet');
+    await writeFile(join(desktopDir, 'shared.md'), 'server version\n');
+    await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const result = await tablet.syncOnce();
+    expect(result.status).toBe('Conflict resolution needed');
+    expect(result.conflictId).toMatch(/^conf_/u);
+
+    const review = await admin.get<{ conflict: { expected_main: string; device_commit: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`
+    );
+    expect(review.status).toBe(200);
+
+    const keepBoth = await admin.post<{
+      files: Array<{ path: string; operation: string; provenance: string; source_path: string | null; content: string | null }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/preview`, {
+      expected_main: review.body.conflict.expected_main,
+      resolution_kind: 'keep_both_files'
+    });
+    expect(keepBoth.status).toBe(200);
+    expect(keepBoth.body.files.find((file) => file.path === 'shared.md')).toMatchObject({
+      operation: 'retained',
+      provenance: 'server',
+      content: 'server version\n'
+    });
+    const copy = keepBoth.body.files.find((file) => file.path !== 'shared.md');
+    expect(copy).toBeDefined();
+    expect(copy).toMatchObject({ operation: 'copied', provenance: 'device', source_path: 'shared.md', content: 'device version\n' });
+    expect(copy?.path).toMatch(new RegExp(`^shared\\.device-[0-9A-Z]{8}-${result.conflictId!.slice(-8)}\\.md$`, 'u'));
+
+    const insertBoth = await admin.post<{ files: Array<{ content: string | null }> }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/preview`,
+      { expected_main: review.body.conflict.expected_main, resolution_kind: 'insert_both_blocks' }
+    );
+    expect(insertBoth.status).toBe(200);
+    expect(insertBoth.body.files[0]?.content).toBe(
+      `## Server version (${review.body.conflict.expected_main.slice(0, 12)})\n\nserver version\n\n\n## Device version (${review.body.conflict.device_commit.slice(0, 12)})\n\ndevice version\n`
+    );
+  });
+
   it('routes concurrent directory recreation to the dashboard and applies the server decision', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const sourceDir = join(root, 'directory-conflict-source');
@@ -962,6 +1141,15 @@ describe('Phase 2 dashboard conflict resolution', () => {
       source_diff: 'Binary preview unavailable.'
     });
 
+    const binaryPreview = await admin.post<{
+      files: Array<{ content_kind: string; content: string | null; bytes: number | null }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/preview`, {
+      expected_main: review.body.conflict.expected_main,
+      resolution_kind: 'use_device'
+    });
+    expect(binaryPreview.status).toBe(200);
+    expect(binaryPreview.body.files[0]).toMatchObject({ content_kind: 'binary', content: null, bytes: 4 });
+
     for (const body of [
       { expected_main: review.body.conflict.expected_main, resolution_kind: 'insert_both_blocks' },
       { expected_main: review.body.conflict.expected_main, resolution_kind: 'manual', manual_files: { 'asset.bin': 'unsafe text' } }
@@ -1031,6 +1219,14 @@ describe('Phase 2 dashboard conflict resolution', () => {
       {}
     );
     expect(hiddenRefresh.status).toBe(404);
+    const hiddenPreview = await intruder.post<{ error: { code: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/preview`,
+      {
+        expected_main: review.body.expected_main,
+        resolution_kind: 'keep_server'
+      }
+    );
+    expect(hiddenPreview.status).toBe(404);
     const hiddenResolve = await intruder.post<{ error: { code: string } }>(
       `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
       {
@@ -1058,6 +1254,15 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(stale.status).toBe(409);
     expect(stale.body.error.code).toBe('stale_conflict_review');
     expect((await server.store.snapshot()).conflicts.find((conflict) => conflict.conflict_id === result.conflictId)?.status).toBe('open');
+    const stalePreview = await admin.post<{ error: { code: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/preview`,
+      {
+        expected_main: review.body.expected_main,
+        resolution_kind: 'keep_server'
+      }
+    );
+    expect(stalePreview.status).toBe(409);
+    expect(stalePreview.body.error.code).toBe('stale_conflict_review');
 
     const refreshed = await admin.post<{
       stale: boolean;

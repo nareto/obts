@@ -1,6 +1,6 @@
 import { diffLines, diffWordsWithSpace } from 'diff';
 
-import type { ConflictReviewFile, ConflictReviewPath } from './api/types.js';
+import type { ConflictPreviewFile, ConflictResolutionSubmission, ConflictReviewFile, ConflictReviewPath } from './api/types.js';
 
 export type LineResolution = 'server' | 'device' | 'both';
 
@@ -152,6 +152,35 @@ export function unresolvedLineCount(
     (count, [path, rows]) => count + changedRows(rows).filter((row) => !choices[path]?.[row.id]).length,
     0
   );
+}
+
+export function submissionCandidateKey(submission: ConflictResolutionSubmission): string {
+  return JSON.stringify({
+    resolution_kind: submission.resolutionKind,
+    manual_files: submission.manualFiles
+      ? Object.fromEntries(Object.entries(submission.manualFiles).sort(([left], [right]) => left.localeCompare(right)))
+      : null,
+    manual_file_plan: submission.manualFilePlan ?? null
+  });
+}
+
+export function previewOutcomeLabel(file: ConflictPreviewFile): string {
+  switch (file.operation) {
+    case 'retained': return 'Retained';
+    case 'updated': return 'Updated';
+    case 'added': return 'Added';
+    case 'copied': return 'Device copy';
+    case 'deleted': return 'Deleted';
+  }
+}
+
+export function previewProvenanceLabel(file: ConflictPreviewFile, deviceName: string): string {
+  switch (file.provenance) {
+    case 'server': return 'Server main';
+    case 'device': return `Device: ${deviceName}`;
+    case 'both': return `Server main + Device: ${deviceName}`;
+    case 'manual': return 'Manual final content';
+  }
 }
 
 export function choicesForAllRows(

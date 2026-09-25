@@ -4,13 +4,16 @@ import { newId, nowIso } from '../shared/ids.js';
 import { assertSyncableTreePaths, PathPolicyViolation } from '../shared/pathPolicy.js';
 import { RootIgnorePolicyError } from '../shared/rootIgnore.cjs';
 import type {
+  ConflictPreviewFile,
   ConflictRecord,
   ConflictResolutionKind,
+  ConflictResolutionPreview,
   ConflictReviewFile,
   ConflictReviewPackage,
   ConflictReviewPath,
   DevicePushManifest,
   DirectoryConflictContext,
+  DirectoryConflictReview,
   DirectoryIntent,
   DirectoryIntentAcknowledgement,
   DirectoryProposal,
@@ -88,6 +91,14 @@ type DirectoryMergePlan = {
   conflictingIntents: DirectoryProposalIntent[];
   affectedRoots: string[];
   expectedEventSeq: number;
+};
+
+type ResolutionArtifacts = {
+  tree: string;
+  sourceTree: string;
+  fileAffectedPaths: string[];
+  writes: Map<string, Buffer>;
+  deletes: string[];
 };
 
 export class SyncService {
@@ -528,18 +539,7 @@ export class SyncService {
       });
     }
     const directoryContext = conflict.directory_context;
-    const deviceExplicitDirs = directoryContext
-      ? applyDirectoryIntentsToSnapshot(directoryContext.base_explicit_dirs, directoryContext.proposal.intents)
-      : [];
-    const directoryConflicts = (directoryContext?.affected_roots ?? []).map((root) => ({
-      root,
-      server_state: snapshotContainsDirectory(directoryContext?.server_explicit_dirs ?? [], root) ? 'present' as const : 'deleted' as const,
-      device_state: snapshotContainsDirectory(deviceExplicitDirs, root) ? 'present' as const : 'deleted' as const,
-      affected_paths: [...new Set([
-        root,
-        ...(directoryContext?.proposal.intents ?? []).filter((intent) => pathsOverlap(intent.path, root)).map((intent) => intent.path)
-      ])].sort()
-    }));
+    const directoryConflicts = buildDirectoryConflictViews(directoryContext);
     const directoryStale = directoryContext !== undefined &&
       (db.directory_state_by_vault[vaultId]?.last_event_seq ?? 0) !== directoryContext.expected_event_seq;
     return {
@@ -732,6 +732,70 @@ export class SyncService {
     return await this.getConflictReviewPackage(input.vaultId, input.conflictId);
   }
 
+  private loadResolutionConflict(
+    snapshot: MetadataDb,
+    input: { vaultId: string; conflictId: string; expectedMain: string; resolutionKind: ConflictResolutionKind },
+    options: { allowResolved?: boolean } = {}
+  ): ConflictRecord {
+    const vault = requireVault(snapshot, input.vaultId);
+    if (vault.status === 'blocked_integrity') {
+      throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+    }
+    const conflict = snapshot.conflicts.find(
+      (candidate) => candidate.vault_id === input.vaultId && candidate.conflict_id === input.conflictId
+    );
+    if (!conflict) {
+      throw new AuthError(404, 'not_found', 'Resource not found.');
+    }
+    if (conflict.status === 'resolved') {
+      if (options.allowResolved) return conflict;
+      throw new AuthError(409, 'conflict_already_resolved', 'Conflict has already been resolved.');
+    }
+    const currentDirectoryEventSeq = snapshot.directory_state_by_vault[input.vaultId]?.last_event_seq ?? 0;
+    if (
+      conflict.expected_main !== input.expectedMain ||
+      vault.current_main !== input.expectedMain ||
+      (conflict.directory_context !== undefined && conflict.directory_context.expected_event_seq !== currentDirectoryEventSeq)
+    ) {
+      throw new AuthError(409, 'stale_conflict_review', 'Conflict review is stale; refresh before resolving.');
+    }
+    if (
+      (conflict.conflict_kind === 'directory' || conflict.conflict_kind === 'mixed') &&
+      input.resolutionKind !== 'keep_server' && input.resolutionKind !== 'use_device'
+    ) {
+      throw new AuthError(400, 'invalid_resolution', 'Directory conflicts require a server or device resolution.');
+    }
+    return conflict;
+  }
+
+  async previewConflictResolution(input: {
+    vaultId: string;
+    conflictId: string;
+    expectedMain: string;
+    resolutionKind: ConflictResolutionKind;
+    manualFiles?: Record<string, string | null>;
+    manualFilePlan?: ManualFilePlanEntry[];
+  }): Promise<ConflictResolutionPreview> {
+    return await this.withVaultLock(input.vaultId, async () => {
+      const snapshot = await this.store.snapshot();
+      const conflict = this.loadResolutionConflict(snapshot, input);
+      const artifacts = await this.buildResolutionArtifacts(conflict, input.resolutionKind, input.manualFiles, input.manualFilePlan);
+      await this.git.validateTreeRootIgnorePolicy(input.vaultId, artifacts.tree, this.maxUploadBytes);
+      return {
+        conflict_id: conflict.conflict_id,
+        resolution_kind: input.resolutionKind,
+        expected_main: conflict.expected_main,
+        current_main: conflict.expected_main,
+        tree: artifacts.tree,
+        files: await this.describeResolutionPreview(conflict, input.resolutionKind, artifacts),
+        directory_conflicts: buildDirectoryConflictViews(conflict.directory_context).map((view) => ({
+          ...view,
+          outcome: input.resolutionKind === 'use_device' ? 'device' as const : 'server' as const
+        }))
+      };
+    });
+  }
+
   private async refreshedAffectedPaths(conflict: ConflictRecord, currentMain: string): Promise<string[]> {
     if (
       !(await this.git.commitExists(conflict.vault_id, conflict.base_commit)) ||
@@ -750,6 +814,7 @@ export class SyncService {
     vaultId: string;
     conflictId: string;
     expectedMain: string;
+    expectedTree?: string;
     resolutionKind: ConflictResolutionKind;
     manualFiles?: Record<string, string | null>;
     manualFilePlan?: ManualFilePlanEntry[];
@@ -757,16 +822,7 @@ export class SyncService {
     const requestHash = resolutionRequestHash(input);
     return await this.withVaultLock(input.vaultId, async () => {
       const snapshot = await this.store.snapshot();
-      const vault = requireVault(snapshot, input.vaultId);
-      if (vault.status === 'blocked_integrity') {
-        throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
-      }
-      const conflict = snapshot.conflicts.find(
-        (candidate) => candidate.vault_id === input.vaultId && candidate.conflict_id === input.conflictId
-      );
-      if (!conflict) {
-        throw new AuthError(404, 'not_found', 'Resource not found.');
-      }
+      const conflict = this.loadResolutionConflict(snapshot, input, { allowResolved: true });
       if (conflict.status === 'resolved') {
         if (conflict.resolution_request_hash === requestHash && conflict.resolution_commit) {
           return {
@@ -780,23 +836,12 @@ export class SyncService {
         }
         throw new AuthError(409, 'conflict_already_resolved', 'Conflict has already been resolved.');
       }
-      const currentDirectoryEventSeq = snapshot.directory_state_by_vault[input.vaultId]?.last_event_seq ?? 0;
-      if (
-        conflict.expected_main !== input.expectedMain ||
-        vault.current_main !== input.expectedMain ||
-        (conflict.directory_context !== undefined && conflict.directory_context.expected_event_seq !== currentDirectoryEventSeq)
-      ) {
-        throw new AuthError(409, 'stale_conflict_review', 'Conflict review is stale; refresh before resolving.');
-      }
-      if (
-        (conflict.conflict_kind === 'directory' || conflict.conflict_kind === 'mixed') &&
-        input.resolutionKind !== 'keep_server' && input.resolutionKind !== 'use_device'
-      ) {
-        throw new AuthError(400, 'invalid_resolution', 'Directory conflicts require a server or device resolution.');
-      }
       const resolvedDirectoryIntents = resolvedConflictDirectoryIntents(conflict, input.resolutionKind);
 
       const tree = await this.buildResolutionTree(conflict, input.resolutionKind, input.manualFiles, input.manualFilePlan);
+      if (input.expectedTree !== undefined && tree !== input.expectedTree) {
+        throw new AuthError(409, 'stale_conflict_preview', 'The reviewed resolution result changed; review the result again.');
+      }
       await this.git.validateTreeRootIgnorePolicy(input.vaultId, tree, this.maxUploadBytes);
 
       const preparation = await this.store.mutate((db) => {
@@ -1760,20 +1805,40 @@ export class SyncService {
     manualFiles: Record<string, string | null> | undefined,
     manualFilePlan: ManualFilePlanEntry[] | undefined
   ): Promise<string> {
+    return (await this.buildResolutionArtifacts(conflict, resolutionKind, manualFiles, manualFilePlan)).tree;
+  }
+
+  private async buildResolutionArtifacts(
+    conflict: ConflictRecord,
+    resolutionKind: ConflictResolutionKind,
+    manualFiles: Record<string, string | null> | undefined,
+    manualFilePlan: ManualFilePlanEntry[] | undefined
+  ): Promise<ResolutionArtifacts> {
     const sourceTree = await this.resolutionSourceTree(conflict);
     const fileAffectedPaths = await this.conflictFileAffectedPaths(conflict);
     if (resolutionKind === 'keep_server') {
-      return sourceTree;
+      return { tree: sourceTree, sourceTree, fileAffectedPaths, writes: new Map(), deletes: [] };
     }
 
     const writes = new Map<string, Buffer>();
     const deletes: string[] = [];
+    const artifacts = async (): Promise<ResolutionArtifacts> => ({
+      tree: await this.git.createTreeFromTreeWithChanges({ vaultId: conflict.vault_id, sourceTree, writes, deletes }),
+      sourceTree,
+      fileAffectedPaths,
+      writes,
+      deletes
+    });
 
     if (resolutionKind === 'use_device') {
       if (fileAffectedPaths.length === 0) {
-        return conflict.directory_context
-          ? sourceTree
-          : await this.git.treeHash(conflict.vault_id, conflict.device_commit);
+        return {
+          tree: conflict.directory_context ? sourceTree : await this.git.treeHash(conflict.vault_id, conflict.device_commit),
+          sourceTree,
+          fileAffectedPaths,
+          writes,
+          deletes
+        };
       }
       for (const path of fileAffectedPaths) {
         const deviceBlob = await this.readOptionalBlob(conflict.vault_id, conflict.device_commit, path);
@@ -1783,12 +1848,7 @@ export class SyncService {
           writes.set(path, deviceBlob);
         }
       }
-      return await this.git.createTreeFromTreeWithChanges({
-        vaultId: conflict.vault_id,
-        sourceTree,
-        writes,
-        deletes
-      });
+      return await artifacts();
     }
 
     if (resolutionKind === 'keep_both_files') {
@@ -1800,11 +1860,7 @@ export class SyncService {
         }
       }
       assertSyncableTreePaths([...writes.keys()]);
-      return await this.git.createTreeFromTreeWithChanges({
-        vaultId: conflict.vault_id,
-        sourceTree,
-        writes
-      });
+      return await artifacts();
     }
 
     if ((resolutionKind === 'insert_both_blocks' || resolutionKind === 'manual') && await this.conflictContainsBinary(conflict)) {
@@ -1835,12 +1891,7 @@ export class SyncService {
           )
         );
       }
-      return await this.git.createTreeFromTreeWithChanges({
-        vaultId: conflict.vault_id,
-        sourceTree,
-        writes,
-        deletes
-      });
+      return await artifacts();
     }
 
     if (resolutionKind === 'manual') {
@@ -1848,7 +1899,10 @@ export class SyncService {
         throw new AuthError(400, 'invalid_resolution', 'Manual resolution must use either manual_files or manual_file_plan.');
       }
       if (manualFilePlan !== undefined) {
-        return await this.buildManualFilePlanTree(conflict, sourceTree, manualFilePlan);
+        const plan = await this.buildManualFilePlanChanges(conflict, sourceTree, manualFilePlan);
+        for (const [path, content] of plan.writes) writes.set(path, content);
+        deletes.push(...plan.deletes);
+        return await artifacts();
       }
       if (manualFiles === undefined || Object.keys(manualFiles).length === 0) {
         throw new AuthError(400, 'invalid_resolution', 'Manual resolution requires final file content.');
@@ -1870,15 +1924,45 @@ export class SyncService {
           writes.set(path, Buffer.from(content, 'utf8'));
         }
       }
-      return await this.git.createTreeFromTreeWithChanges({
-        vaultId: conflict.vault_id,
-        sourceTree,
-        writes,
-        deletes
-      });
+      return await artifacts();
     }
 
     throw new AuthError(400, 'invalid_resolution', 'Unsupported conflict resolution kind.');
+  }
+
+  private async describeResolutionPreview(
+    conflict: ConflictRecord,
+    resolutionKind: ConflictResolutionKind,
+    artifacts: ResolutionArtifacts
+  ): Promise<ConflictPreviewFile[]> {
+    const deleted = new Set(artifacts.deletes);
+    const copySources = new Map<string, string>();
+    if (resolutionKind === 'keep_both_files') {
+      for (const path of conflict.affected_paths) {
+        const copyPath = conflictCopyPath(path, conflict.conflict_id, conflict.device_id);
+        if (artifacts.writes.has(copyPath)) copySources.set(copyPath, path);
+      }
+    }
+    const paths = [...new Set([...artifacts.fileAffectedPaths, ...artifacts.writes.keys(), ...artifacts.deletes])].sort();
+    const files: ConflictPreviewFile[] = [];
+    for (const path of paths) {
+      const blob = deleted.has(path) ? null : await this.readOptionalBlob(conflict.vault_id, artifacts.tree, path);
+      const sourceBlob = await this.readOptionalBlob(conflict.vault_id, artifacts.sourceTree, path);
+      const text = blob === null ? null : decodeReviewText(blob);
+      const contentKind: ConflictPreviewFile['content_kind'] =
+        blob !== null && text === null ? 'binary' : blob !== null && blob.byteLength > MAX_INTERACTIVE_REVIEW_BYTES ? 'large_text' : 'text';
+      files.push({
+        path,
+        operation: previewOperation(path, blob, sourceBlob, deleted, copySources),
+        provenance: previewProvenance(resolutionKind, artifacts.writes.has(path), copySources.has(path)),
+        source_path: copySources.get(path) ?? null,
+        content_kind: contentKind,
+        content: contentKind === 'text' ? text : null,
+        bytes: blob?.byteLength ?? null,
+        sha256: blob === null ? null : sha256Hex(blob)
+      });
+    }
+    return files;
   }
 
   private async conflictContainsBinary(conflict: ConflictRecord): Promise<boolean> {
@@ -1893,11 +1977,11 @@ export class SyncService {
     return false;
   }
 
-  private async buildManualFilePlanTree(
+  private async buildManualFilePlanChanges(
     conflict: ConflictRecord,
     sourceTree: string,
     manualFilePlan: ManualFilePlanEntry[]
-  ): Promise<string> {
+  ): Promise<{ writes: Map<string, Buffer>; deletes: string[] }> {
     if (manualFilePlan.length === 0) {
       throw new AuthError(400, 'invalid_resolution', 'Manual file plan requires at least one path.');
     }
@@ -1928,12 +2012,7 @@ export class SyncService {
       throw new AuthError(400, 'invalid_resolution', 'Manual file plan must include every affected conflict path.');
     }
     assertSyncableTreePaths([...seen]);
-    return await this.git.createTreeFromTreeWithChanges({
-      vaultId: conflict.vault_id,
-      sourceTree,
-      writes,
-      deletes
-    });
+    return { writes, deletes };
   }
 
   private async conflictFileAffectedPaths(conflict: ConflictRecord): Promise<string[]> {
@@ -3478,6 +3557,53 @@ function decodeReviewText(blob: Buffer | null): string | null {
     return REVIEW_TEXT_DECODER.decode(blob);
   } catch {
     return null;
+  }
+}
+
+function buildDirectoryConflictViews(directoryContext: DirectoryConflictContext | undefined): DirectoryConflictReview[] {
+  const deviceExplicitDirs = directoryContext
+    ? applyDirectoryIntentsToSnapshot(directoryContext.base_explicit_dirs, directoryContext.proposal.intents)
+    : [];
+  return (directoryContext?.affected_roots ?? []).map((root) => ({
+    root,
+    server_state: snapshotContainsDirectory(directoryContext?.server_explicit_dirs ?? [], root) ? 'present' as const : 'deleted' as const,
+    device_state: snapshotContainsDirectory(deviceExplicitDirs, root) ? 'present' as const : 'deleted' as const,
+    affected_paths: [...new Set([
+      root,
+      ...(directoryContext?.proposal.intents ?? []).filter((intent) => pathsOverlap(intent.path, root)).map((intent) => intent.path)
+    ])].sort()
+  }));
+}
+
+function previewOperation(
+  path: string,
+  blob: Buffer | null,
+  sourceBlob: Buffer | null,
+  deleted: Set<string>,
+  copySources: Map<string, string>
+): ConflictPreviewFile['operation'] {
+  if (deleted.has(path) || blob === null) return 'deleted';
+  if (copySources.has(path)) return 'copied';
+  if (sourceBlob === null) return 'added';
+  return blob.equals(sourceBlob) ? 'retained' : 'updated';
+}
+
+function previewProvenance(
+  resolutionKind: ConflictResolutionKind,
+  written: boolean,
+  copied: boolean
+): ConflictPreviewFile['provenance'] {
+  switch (resolutionKind) {
+    case 'keep_server':
+      return 'server';
+    case 'use_device':
+      return 'device';
+    case 'keep_both_files':
+      return written || copied ? 'device' : 'server';
+    case 'insert_both_blocks':
+      return 'both';
+    case 'manual':
+      return 'manual';
   }
 }
 

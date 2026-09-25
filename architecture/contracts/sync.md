@@ -100,6 +100,8 @@ A client pulls required objects and a manifest for canonical `main`, then applie
 
 The owner reviews server and named-device provenance, affected paths, rendered/source differences, structural path variants, and directory outcomes. Content conflicts may support server, device, keep-both, insert-both, line, or manual final results according to content kind. Structural manual resolution includes final path and content.
 
+A resolution preview returns the candidate tree and complete final outcomes produced by the same resolution computation that application uses; it never advances main, records a resolution, mutates conflict metadata, or emits resolution events. Creating internal unreachable Git objects during candidate construction is not canonical mutation. A submission may carry the reviewed candidate tree and is rejected when the recomputed candidate differs, so the applied result is the reviewed result.
+
 Submission carries conflict ID and expected current main. If main advanced, the package is stale and cannot resolve until refreshed. Accepted resolution creates a two-parent merge commit whose tree exactly represents the accepted final package while preserving non-conflicting device changes. Duplicate submission is idempotent.
 
 Conflict resolution uses the valid dashboard session, CSRF protection, stale-review checks, and audit logging. It does not require password re-entry.

@@ -6,11 +6,14 @@ import {
   choicesForAllRows,
   hasDivergentFinalPaths,
   isAgreedFileDeletion,
+  previewOutcomeLabel,
+  previewProvenanceLabel,
   resolveConflictFile,
+  submissionCandidateKey,
   unresolvedLineCount,
   validateManualPathTargets
 } from '../frontend/dashboard/src/conflictDiff.js';
-import type { ConflictReviewFile } from '../frontend/dashboard/src/api/types.js';
+import type { ConflictPreviewFile, ConflictResolutionSubmission, ConflictReviewFile } from '../frontend/dashboard/src/api/types.js';
 
 describe('conflict diff workbench', () => {
   it('builds line-addressable changes with word-level emphasis and reconstructs mixed choices', () => {
@@ -125,6 +128,39 @@ describe('conflict diff workbench', () => {
     };
     expect(buildConflictDiff(file)).toEqual([]);
     expect(() => resolveConflictFile(file, [], {})).toThrow('Binary files cannot be resolved as text.');
+  });
+
+  it('keys a resolution candidate by policy and content so any edit invalidates it', () => {
+    const base: ConflictResolutionSubmission = { resolutionKind: 'manual', manualFiles: { 'b.md': 'two\n', 'a.md': 'one\n' } };
+    expect(submissionCandidateKey(base)).toBe(
+      submissionCandidateKey({ resolutionKind: 'manual', manualFiles: { 'a.md': 'one\n', 'b.md': 'two\n' } })
+    );
+    expect(submissionCandidateKey(base)).not.toBe(
+      submissionCandidateKey({ resolutionKind: 'manual', manualFiles: { 'a.md': 'one\n', 'b.md': 'edited\n' } })
+    );
+    expect(submissionCandidateKey(base)).not.toBe(submissionCandidateKey({ resolutionKind: 'keep_server' }));
+    expect(submissionCandidateKey({ resolutionKind: 'manual', manualFilePlan: [{ path: 'new.md', content: 'x' }] })).not.toBe(
+      submissionCandidateKey({ resolutionKind: 'manual', manualFilePlan: [{ path: 'new.md', content: 'y' }] })
+    );
+  });
+
+  it('labels final outcomes and provenance in text rather than color', () => {
+    const file = (overrides: Partial<ConflictPreviewFile>): ConflictPreviewFile => ({
+      path: 'notes/a.md',
+      operation: 'updated',
+      provenance: 'device',
+      source_path: null,
+      content_kind: 'text',
+      content: 'x\n',
+      bytes: 2,
+      sha256: null,
+      ...overrides
+    });
+    expect(previewOutcomeLabel(file({ operation: 'deleted' }))).toBe('Deleted');
+    expect(previewOutcomeLabel(file({ operation: 'copied' }))).toBe('Device copy');
+    expect(previewProvenanceLabel(file({ provenance: 'server' }), 'Tablet')).toBe('Server main');
+    expect(previewProvenanceLabel(file({ provenance: 'device' }), 'Tablet')).toBe('Device: Tablet');
+    expect(previewProvenanceLabel(file({ provenance: 'both' }), 'Tablet')).toContain('Tablet');
   });
 });
 

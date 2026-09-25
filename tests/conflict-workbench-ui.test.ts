@@ -31,4 +31,36 @@ describe('conflict workbench UI contract', () => {
     expect(styles).toContain('.conflict-review-body');
     expect(styles).toContain('grid-template-columns: 280px minmax(0, 1fr)');
   });
+
+  it('requires a reviewed server-derived result before applying a resolution', async () => {
+    const [app, component, client, styles] = await Promise.all([
+      readFile('frontend/dashboard/src/App.svelte', 'utf8'),
+      readFile('frontend/dashboard/src/components/ConflictWorkbench.svelte', 'utf8'),
+      readFile('frontend/dashboard/src/api/client.ts', 'utf8'),
+      readFile('frontend/dashboard/src/style.css', 'utf8')
+    ]);
+
+    expect(component).toContain('class="diff-source-legend"');
+    expect(component).toContain('Server main');
+    expect(component).toContain('Device: {review.device_name}');
+    expect(component).toContain("Colors identify versions, not which changes you've chosen to keep.");
+    expect(component).toContain('class="conflict-view-tabs"');
+    expect(component).toContain('>Compare</button>');
+    expect(component).toContain('>Result</button>');
+    expect(component).toContain('Review result');
+    expect(component).toContain('Apply resolution');
+    expect(component).toContain('Reviewed result');
+    expect(component).toContain('Nothing is applied until you choose Apply resolution');
+    expect(component).toContain('class="conflict-result"');
+    expect(component).toContain('A deletion is not an empty file.');
+    expect(component).toContain('onSubmit(submission, preview.tree)');
+    expect(component).not.toContain('>Resolve conflict<');
+
+    expect(app).toContain('onPreview={previewResolution}');
+    expect(app).toContain('expectedTree');
+    expect(client).toContain('/preview');
+    expect(client).toContain('expected_tree');
+    expect(styles).toContain('.diff-source-legend');
+    expect(styles).toContain('.conflict-result');
+  });
 });

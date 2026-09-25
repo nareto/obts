@@ -364,7 +364,71 @@ try {
     await refreshed;
     await expect(page.getByRole('button',{name:'Refresh review',exact:true})).toBeVisible();
     await expect(draft).toHaveValue('Unsubmitted sample draft');
-    await expect(page.getByRole('button',{name:'Resolve conflict',exact:true})).toHaveCount(0);
+    await expect(page.getByRole('button',{name:'Apply resolution',exact:true})).toHaveCount(0);
+    await expect(page.getByRole('button',{name:'Review result',exact:true})).toHaveCount(0);
+  });
+
+  await scenario('result review gates apply and candidate edits invalidate the reviewed result',async({page,navigate,fixture})=>{
+    await navigate('Conflicts');
+    await expect(page.locator('.diff-source-legend')).toContainText('Server main');
+    await expect(page.locator('.diff-source-legend')).toContainText('Device: Travel laptop');
+    await expect(page.locator('.diff-source-legend')).toContainText('Colors identify versions');
+    await expect(page.getByRole('button',{name:'Apply resolution',exact:true})).toHaveCount(0);
+    await page.locator('.resolution-policy select').selectOption('use_device');
+    const previewRequest=page.waitForRequest(request=>request.url().endsWith('/preview'));
+    await page.getByRole('button',{name:'Review result',exact:true}).click();
+    const previewBody=(await previewRequest).postDataJSON();
+    assert.equal(previewBody.resolution_kind,'use_device');
+    assert.equal(previewBody.expected_main,fixture.vault.current_main);
+    await expect(page.getByRole('button',{name:'Apply resolution',exact:true})).toBeVisible();
+    await expect(page.locator('.conflict-result')).toContainText('Nothing is applied until you choose Apply resolution');
+    await expect(page.locator('.conflict-result')).toContainText('Solaris');
+    await expect(page.locator('.conflict-result')).not.toContainText('Piranesi');
+    await page.getByRole('button',{name:'Compare',exact:true}).click();
+    await page.locator('.resolution-policy select').selectOption('keep_server');
+    await expect(page.getByRole('button',{name:'Review result',exact:true})).toBeVisible();
+    await expect(page.getByRole('button',{name:'Apply resolution',exact:true})).toHaveCount(0);
+    await page.getByRole('button',{name:'Result',exact:true}).click();
+    await expect(page.locator('.conflict-result')).toContainText('Piranesi');
+    const resolveRequest=page.waitForRequest(request=>request.url().endsWith('/resolve'));
+    await page.getByRole('button',{name:'Apply resolution',exact:true}).click();
+    const resolveBody=(await resolveRequest).postDataJSON();
+    assert.equal(resolveBody.resolution_kind,'keep_server');
+    assert.equal(resolveBody.expected_tree,'e'.repeat(40));
+    await expect(page.locator('.notice')).toContainText('Conflict resolved');
+  });
+
+  await scenario('failed result review keeps the draft and never enables apply',async({page,navigate,fixture})=>{
+    await navigate('Conflicts');
+    await page.locator('.resolution-policy select').selectOption('manual');
+    const draft=page.locator('.manual-file-editor textarea').first();
+    await draft.fill('Draft final content');
+    fixture.setFailure({path:'/vaults/sample-vault/conflicts/sample-conflict/preview',status:503});
+    await page.getByRole('button',{name:'Review result',exact:true}).click();
+    await expect(page.locator('.resolution-banner.warning')).toContainText('temporarily unavailable');
+    await expect(page.getByRole('button',{name:'Apply resolution',exact:true})).toHaveCount(0);
+    await expect(draft).toHaveValue('Draft final content');
+    fixture.setFailure(null);
+    await page.getByRole('button',{name:'Review result',exact:true}).click();
+    await expect(page.locator('.conflict-result')).toContainText('Draft final content');
+    await expect(page.getByRole('button',{name:'Apply resolution',exact:true})).toBeVisible();
+  });
+
+  await scenario('line selections preview the assembled final text with newlines preserved',async({page,navigate})=>{
+    await navigate('Conflicts');
+    await page.getByRole('button',{name:'Line by line',exact:true}).click();
+    await page.getByRole('button',{name:'All device',exact:true}).first().click();
+    await page.getByRole('button',{name:/^Use server for /u}).first().click();
+    const previewRequest=page.waitForRequest(request=>request.url().endsWith('/preview'));
+    await page.getByRole('button',{name:'Review result',exact:true}).click();
+    const previewBody=(await previewRequest).postDataJSON();
+    assert.equal(previewBody.resolution_kind,'manual');
+    const first=previewBody.manual_files['Projects/Weekend plans.md'];
+    assert.ok(first.includes('Visit the market on Saturday'),'server line choice is preserved');
+    assert.ok(!first.includes('Visit the market on Sunday'),'overridden device line is replaced');
+    assert.ok(first.endsWith('\n'),'final newline is preserved');
+    assert.ok(previewBody.manual_files['Notes/Reading list.md'].includes('Solaris'));
+    await expect(page.getByRole('button',{name:'Apply resolution',exact:true})).toBeVisible();
   });
 
   await scenario('manual refresh owns its request while focus polling is suppressed',async({page,fixture})=>{
@@ -459,7 +523,7 @@ try {
     await page.getByRole('combobox', {name: 'Current review', exact: true}).selectOption('other-conflict');
     await expect(page.locator('.action-error')).toContainText('temporarily unavailable');
     await expect(page.locator('.conflict-workbench')).toHaveCount(0);
-    await expect(page.getByRole('button', {name: 'Resolve conflict', exact: true})).toHaveCount(0);
+    await expect(page.getByRole('button', {name: 'Review result', exact: true})).toHaveCount(0);
   });
 
   await scenario('late same-target conflict response cannot overwrite a newer selection', async ({page, fixture, navigate}) => {
@@ -516,7 +580,7 @@ try {
       await response;
       await page.evaluate(() => new Promise(requestAnimationFrame));
       await expect(page.getByRole('button', {name: 'Refresh review', exact: true})).toBeVisible();
-      await expect(page.getByRole('button', {name: 'Resolve conflict', exact: true})).toHaveCount(0);
+      await expect(page.getByRole('button', {name: 'Review result', exact: true})).toHaveCount(0);
     } finally { release(); }
   });
 
@@ -600,6 +664,17 @@ try {
         const layout = await page.evaluate(() => ({width: innerWidth, scroll: document.documentElement.scrollWidth}));
         assert.ok(layout.scroll <= layout.width + 1, `${view} at ${width}: no document overflow`);
       }
+    }
+  });
+
+  await scenario('conflict workbench stays readable without document overflow at narrow widths', async ({page, navigate}) => {
+    await navigate('Conflicts');
+    for (const width of [1440, 768, 390, 320]) {
+      await page.setViewportSize({width, height: 900});
+      const layout = await page.evaluate(() => ({width: innerWidth, scroll: document.documentElement.scrollWidth}));
+      assert.ok(layout.scroll <= layout.width + 1, `Conflicts at ${width}: no document overflow`);
+      await expect(page.locator('.diff-source-legend')).toBeVisible();
+      await expect(page.getByRole('button', {name: 'Review result', exact: true})).toBeVisible();
     }
   });
 

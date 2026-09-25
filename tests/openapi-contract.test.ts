@@ -85,6 +85,7 @@ describe('OpenAPI Phase 3 contract', () => {
       '/vaults/{vault_id}/sync/unpair',
       '/vaults/{vault_id}/conflicts',
       '/vaults/{vault_id}/conflicts/{conflict_id}',
+      '/vaults/{vault_id}/conflicts/{conflict_id}/preview',
       '/vaults/{vault_id}/conflicts/{conflict_id}/resolve',
       '/vaults/{vault_id}/history/query',
       '/vaults/{vault_id}/history/version',
@@ -213,7 +214,10 @@ describe('OpenAPI Phase 3 contract', () => {
     expect(contract).toContain('server_device_ref');
     expect(contract).toContain('ConflictRecord');
     expect(contract).toContain('ConflictReviewPackage');
+    expect(contract).toContain('ConflictResolutionPreview');
+    expect(contract).toContain('ConflictPreviewFile');
     expect(contract).toContain('ResolveConflictRequest');
+    expect(contract).toContain('expected_tree');
     expect(contract).toContain('ResolveConflictResponse');
     expect(contract).toContain('keep_server');
     expect(contract).toContain('insert_both_blocks');

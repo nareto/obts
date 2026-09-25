@@ -18,6 +18,7 @@
   import type {
     DashboardConflict,
     ConnectionReview,
+    ConflictResolutionPreview,
     ConflictResolutionSubmission,
     ConflictReviewPackage,
     DashboardDevice,
@@ -92,6 +93,7 @@
   let logoutFailed = false;
   let accountEpoch = 0;
   let reviewRequestGeneration = 0;
+  let previewRequestGeneration = 0;
   let historyRequestGeneration = 0;
   let diagnosticsRequestGeneration = 0;
   let diagnosticsDeleteGeneration = 0;
@@ -116,6 +118,7 @@
     stateEpoch += 1;
     dashboardRefreshGeneration += 1;
     reviewRequestGeneration += 1;
+    previewRequestGeneration += 1;
     historyRequestGeneration += 1;
     diagnosticsRequestGeneration += 1;
     diagnosticsDeleteGeneration += 1;
@@ -189,6 +192,7 @@
     stateEpoch += 1;
     dashboardRefreshGeneration += 1;
     reviewRequestGeneration += 1;
+    previewRequestGeneration += 1;
     historyRequestGeneration += 1;
     diagnosticsRequestGeneration += 1;
     deletionRequestGeneration += 1;
@@ -868,6 +872,46 @@
     review = nextReview;
   }
 
+  async function previewResolution(submission: ConflictResolutionSubmission): Promise<ConflictResolutionPreview> {
+    if (!vaultId || selectedVaultDeleting || !review || review.stale) {
+      throw new Error('This conflict review is not available.');
+    }
+    const requestedVaultId = vaultId;
+    const epoch = stateEpoch;
+    const reviewRef = review;
+    const conflictId = review.conflict.conflict_id;
+    const expectedMain = review.expected_main;
+    const generation = ++previewRequestGeneration;
+    try {
+      const preview = await api.previewConflict({
+        vaultId: requestedVaultId,
+        conflictId,
+        expectedMain,
+        ...submission
+      });
+      if (
+        !currentRequest(requestedVaultId, epoch) ||
+        generation !== previewRequestGeneration ||
+        selectedConflictId !== conflictId ||
+        review !== reviewRef ||
+        review?.conflict.conflict_id !== conflictId ||
+        review.expected_main !== expectedMain
+      ) {
+        throw new Error('This preview is no longer current.');
+      }
+      return preview;
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 'stale_conflict_review' && review?.conflict.conflict_id === conflictId) {
+        review = { ...review, stale: true };
+        conflicts = conflicts.map((conflict) =>
+          conflict.conflict_id === conflictId ? { ...conflict, stale: true, status_label: 'Stale review' } : conflict
+        );
+        throw new Error('This conflict review is stale. Refresh it before reviewing the result.');
+      }
+      throw error;
+    }
+  }
+
   async function refreshReview() {
     if (!vaultId || !review) return;
     await refreshConflictReview(review.conflict.conflict_id);
@@ -1069,7 +1113,7 @@
     });
   }
 
-  async function submitResolution(submission: ConflictResolutionSubmission) {
+  async function submitResolution(submission: ConflictResolutionSubmission, expectedTree?: string) {
     if (!vaultId || selectedVaultDeleting || !review || review.stale) return;
     actionError = '';
     notice = '';
@@ -1081,6 +1125,7 @@
         vaultId: requestedVaultId,
         conflictId,
         expectedMain: review.expected_main,
+        ...(expectedTree ? { expectedTree } : {}),
         ...submission
       });
       if (!currentRequest(requestedVaultId, epoch) || selectedConflictId !== conflictId) return;
@@ -1430,6 +1475,7 @@
               {review}
               conflictType={selectedConflict?.conflict_type ?? 'Path overlap'}
               onSubmit={submitResolution}
+              onPreview={previewResolution}
               onRefresh={refreshReview}
             />
           {:else if conflicts.length === 0}

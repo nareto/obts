@@ -487,6 +487,31 @@ export type ConflictReviewPackage = {
   choices: ConflictResolutionKind[];
 };
 
+export type ConflictResolutionPreview = {
+  conflict_id: string;
+  resolution_kind: ConflictResolutionKind;
+  expected_main: string;
+  current_main: string;
+  tree: string;
+  files: ConflictPreviewFile[];
+  directory_conflicts: ConflictPreviewDirectory[];
+};
+
+export type ConflictPreviewFile = {
+  path: string;
+  operation: 'retained' | 'updated' | 'added' | 'copied' | 'deleted';
+  provenance: 'server' | 'device' | 'both' | 'manual';
+  source_path: string | null;
+  content_kind: 'text' | 'large_text' | 'binary';
+  content: string | null;
+  bytes: number | null;
+  sha256: string | null;
+};
+
+export type ConflictPreviewDirectory = DirectoryConflictReview & {
+  outcome: 'server' | 'device';
+};
+
 export type ManualFilePlanEntry = {
   path: string;
   content: string | null;
@@ -494,6 +519,7 @@ export type ManualFilePlanEntry = {
 
 export type ResolveConflictRequest = {
   expected_main: string;
+  expected_tree?: string;
   resolution_kind: ConflictResolutionKind;
   manual_files?: Record<string, string | null>;
   manual_file_plan?: ManualFilePlanEntry[];

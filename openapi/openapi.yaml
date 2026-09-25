@@ -1231,6 +1231,38 @@ paths:
           $ref: "#/components/responses/Error"
         "404":
           $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/conflicts/{conflict_id}/preview:
+    post:
+      summary: Preview the complete candidate result of a conflict resolution without applying it.
+      description: |
+        Returns the candidate tree and per-path final outcomes produced by the same
+        resolution computation used by `/resolve`. A preview never advances main, marks
+        the conflict resolved, mutates conflict metadata, or emits resolution events;
+        candidate construction may create unreachable internal Git objects. Stale
+        reviews and invalid manual input are rejected exactly as for resolution.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - $ref: "#/components/parameters/ConflictId"
+        - $ref: "#/components/parameters/CsrfHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResolveConflictRequest"
+      responses:
+        "200":
+          description: Non-applying resolution candidate.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConflictResolutionPreview"
+        "403":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
   /vaults/{vault_id}/conflicts/{conflict_id}/resolve:
     post:
       summary: Resolve a conflict with the current authenticated dashboard session.
@@ -3243,6 +3275,85 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ConflictResolutionKind"
+    ConflictResolutionPreview:
+      type: object
+      required: [conflict_id, resolution_kind, expected_main, current_main, tree, files, directory_conflicts]
+      properties:
+        conflict_id:
+          type: string
+          pattern: "^conf_"
+        resolution_kind:
+          $ref: "#/components/schemas/ConflictResolutionKind"
+        expected_main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        current_main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        tree:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        files:
+          type: array
+          items:
+            $ref: "#/components/schemas/ConflictPreviewFile"
+        directory_conflicts:
+          type: array
+          items:
+            $ref: "#/components/schemas/ConflictPreviewDirectory"
+    ConflictPreviewFile:
+      type: object
+      required: [path, operation, provenance, source_path, content_kind, content, bytes, sha256]
+      properties:
+        path:
+          type: string
+          description: Final path in the candidate tree.
+        operation:
+          type: string
+          enum: [retained, updated, added, copied, deleted]
+        provenance:
+          type: string
+          enum: [server, device, both, manual]
+        source_path:
+          oneOf:
+            - type: "null"
+            - type: string
+          description: Affected path this outcome was copied from, when applicable.
+        content_kind:
+          type: string
+          enum: [text, large_text, binary]
+        content:
+          oneOf:
+            - type: "null"
+            - type: string
+          description: Complete final text when displayable; null for deletions and non-displayable content.
+        bytes:
+          oneOf:
+            - type: "null"
+            - type: integer
+              minimum: 0
+        sha256:
+          oneOf:
+            - type: "null"
+            - type: string
+              pattern: "^[0-9a-f]{64}$"
+    ConflictPreviewDirectory:
+      type: object
+      required: [root, outcome, server_state, device_state, affected_paths]
+      properties:
+        root:
+          type: string
+        outcome:
+          type: string
+          enum: [server, device]
+        server_state:
+          enum: [present, deleted]
+        device_state:
+          enum: [present, deleted]
+        affected_paths:
+          type: array
+          items:
+            type: string
     ResolveConflictRequest:
       type: object
       required: [expected_main, resolution_kind]
@@ -3250,6 +3361,10 @@ components:
         expected_main:
           type: string
           pattern: "^[0-9a-f]{40}$"
+        expected_tree:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+          description: Reviewed candidate tree from a resolution preview; when present the recomputed candidate must match or the submission is rejected.
         resolution_kind:
           $ref: "#/components/schemas/ConflictResolutionKind"
         manual_files:

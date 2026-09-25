@@ -1,4 +1,5 @@
 import type {
+  ConflictResolutionPreview,
   ConflictReviewPackage,
   ConnectionReview,
   ConflictResolutionKind,
@@ -137,6 +138,26 @@ export class DashboardApi {
     });
   }
 
+  async previewConflict(input: {
+    vaultId: string;
+    conflictId: string;
+    expectedMain: string;
+    resolutionKind: ConflictResolutionKind;
+    manualFiles?: Record<string, string | null>;
+    manualFilePlan?: ManualFilePlanEntry[];
+  }): Promise<ConflictResolutionPreview> {
+    return await this.request(`/vaults/${input.vaultId}/conflicts/${input.conflictId}/preview`, {
+      method: 'POST',
+      csrf: true,
+      body: {
+        expected_main: input.expectedMain,
+        resolution_kind: input.resolutionKind,
+        ...(input.manualFiles ? { manual_files: input.manualFiles } : {}),
+        ...(input.manualFilePlan ? { manual_file_plan: input.manualFilePlan } : {})
+      }
+    });
+  }
+
   async connectionReview(connectionId: string): Promise<ConnectionReview> {
     return await this.request(`/connections/${connectionId}/review`);
   }
@@ -180,6 +201,7 @@ export class DashboardApi {
     vaultId: string;
     conflictId: string;
     expectedMain: string;
+    expectedTree?: string;
     resolutionKind: ConflictResolutionKind;
     manualFiles?: Record<string, string | null>;
     manualFilePlan?: ManualFilePlanEntry[];
@@ -190,6 +212,7 @@ export class DashboardApi {
       body: {
         expected_main: input.expectedMain,
         resolution_kind: input.resolutionKind,
+        ...(input.expectedTree ? { expected_tree: input.expectedTree } : {}),
         ...(input.manualFiles ? { manual_files: input.manualFiles } : {}),
         ...(input.manualFilePlan ? { manual_file_plan: input.manualFilePlan } : {})
       }

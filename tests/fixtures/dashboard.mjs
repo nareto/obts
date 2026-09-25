@@ -63,6 +63,31 @@ export function createFixtures() {
         return;
       }
       if(method==='DELETE'&&path==='/diagnostic-events'){await route.fulfill({status:200,json:{deleted_count:routes['/diagnostic-events'].events.length}});return;}
+      if(method==='POST'&&path==='/vaults/sample-vault/conflicts/sample-conflict/preview'){
+        const body = request.postDataJSON();
+        const kind = body.resolution_kind;
+        const tree = 'e'.repeat(40);
+        const files = review.files.map(file=>{
+          const base = {path:file.path,source_path:null,content_kind:'text',bytes:null,sha256:null,content:null,provenance:'server',operation:'retained'};
+          if(kind==='use_device') return {...base,provenance:'device',operation:'updated',content:file.device_content,bytes:file.device_bytes,sha256:file.device_sha256};
+          if(kind==='keep_both_files') return {...base,provenance:'device',operation:'copied',source_path:file.path,path:file.path.replace(/(\.[^.]+)$/u,'.device-abcdef12-conflict$1'),content:file.device_content,bytes:file.device_bytes};
+          if(kind==='insert_both_blocks') return {...base,provenance:'both',operation:'updated',content:`## Server version\n\n${file.server_content}\n## Device version\n\n${file.device_content}`,bytes:(file.server_bytes??0)+(file.device_bytes??0)};
+          if(kind==='manual'){
+            const value = Object.prototype.hasOwnProperty.call(body.manual_files ?? {},file.path) ? body.manual_files[file.path] : '';
+            if(value===null) return {...base,operation:'deleted',provenance:'manual',content:null};
+            return {...base,operation:'updated',provenance:'manual',content:value,bytes:value.length};
+          }
+          return {...base,content:file.server_content,bytes:file.server_bytes,sha256:file.server_sha256};
+        });
+        await route.fulfill({status:200,json:{conflict_id:'sample-conflict',resolution_kind:kind,expected_main:main,current_main:main,tree,files,directory_conflicts:[]}});return;
+      }
+      if(method==='POST'&&path==='/vaults/sample-vault/conflicts/sample-conflict/resolve'){
+        const body = request.postDataJSON();
+        if(body.expected_tree && body.expected_tree !== 'e'.repeat(40)){
+          await route.fulfill({status:409,json:{error:{code:'stale_conflict_preview',message:'The reviewed resolution result changed; review the result again.'}}});return;
+        }
+        await route.fulfill({status:200,json:{status:'resolved',conflict_id:'sample-conflict',main:'f'.repeat(40),resolution_commit:'f'.repeat(40),event_seq:101,idempotent:false}});return;
+      }
       unexpected.push({method,path});
       await route.fulfill({status:400,json:{error:{code:'fixture_missing',message:'This sample request is not configured.'}}});
     });
