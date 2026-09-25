@@ -64,7 +64,7 @@ describe('FM003 embedding-worker companion gate', () => {
     const workflow = readFileSync(join(root, '.github/workflows/formal-model.yml'), 'utf8');
     expect(workflow).toContain('run: npm run test:formal');
     expect(workflow).toContain('run: npx vitest run tests/formal-checker.test.ts tests/formal-bounded-body.test.ts tests/formal-embedding-worker.test.ts');
-    expect(JSON.parse(readFileSync(join(root, formal, 'checks.json'), 'utf8')).checks).toHaveLength(75);
+    expect(JSON.parse(readFileSync(join(root, formal, 'checks.json'), 'utf8')).checks).toHaveLength(77);
     expect(JSON.parse(readFileSync(join(root, formal, 'checks-fm003.json'), 'utf8')).checks).toHaveLength(39);
     expect(JSON.parse(readFileSync(join(root, formal, 'checks-fm003-workers.json'), 'utf8')).checks).toHaveLength(48);
   });

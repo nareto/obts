@@ -91,7 +91,7 @@ describe('formal manifest and traceability validation', () => {
   it('accepts the exact required matrix and complete source map', () => {
     const result = run();
     expect(result.status, result.stderr).toBe(0);
-    expect(result.stdout).toContain('75 required checks');
+    expect(result.stdout).toContain('77 required checks');
   });
 
   it('rejects required check removal', () => {
