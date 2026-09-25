@@ -181,7 +181,8 @@ Init ==
        protectBase |-> FALSE, protectCurrent |-> FALSE, protectDevice |-> FALSE,
        conflictBase |-> NoVersion, conflictCurrent |-> NoVersion, conflictDevice |-> NoVersion,
        conflictRoots |-> {}, expectedEffects |-> {}, committedEffects |-> {},
-       eventSeq |-> 0, eventTree |-> EmptyTree, lastAppliedEpoch |-> SetMap(Clients, 0), blocked |-> FALSE]
+       eventSeq |-> 0, eventTree |-> EmptyTree, lastAppliedEpoch |-> SetMap(Clients, 0),
+       deliveredAckEpoch |-> SetMap(Clients, 0), historyRetained |-> TRUE, blocked |-> FALSE]
   /\ bridge = [
        rustUp |-> TRUE, rustCrashCount |-> 0, rustPhase |-> "Idle", acknowledged |-> FALSE,
        nodeHintDurable |-> FALSE, projectionPolicy |-> NoPolicy, projectedPaths |-> Paths,
@@ -204,7 +205,7 @@ Init ==
 
 NormalClient(c) == client.up[c] /\ ~client.recovering[c] /\ ~client.blocked[c]
 NormalServer == server.up /\ ~server.recovering /\ ~server.blocked
-AllActorCoverageActions == {"RustAtomicVisibleWrite", "AdvanceProjectionCursor", "DropProposalRequest", "CrashClient", "CrashServer", "CrashRust", "RecoverServerOperation", "BeginConflictMetadata", "AcknowledgeDurableApply", "DeleteEmptyDirectory"}
+AllActorCoverageActions == {"RustAtomicVisibleWrite", "AdvanceProjectionCursor", "DropProposalRequest", "CrashClient", "CrashServer", "CrashRust", "RecoverServerOperation", "BeginConflictMetadata", "AcknowledgeDurableApply", "AcknowledgeHistorical", "EvictDeliveredAckSnapshot", "LoseAllAckEvidence", "DeleteEmptyDirectory"}
 Mark(action) == IF Scenario \in {"all-actors", "disjoint-directory"} /\ action \notin AllActorCoverageActions THEN coverage ELSE [coverage EXCEPT !.actions = @ \cup {action}]
 
 ObservePluginEdit(c, p) ==
@@ -590,8 +591,11 @@ PlanLocalApply(c) ==
   /\ ApplyAllowed(c) /\ NormalClient(c) /\ client.capable[c] /\ server.policyActive /\ client.applyPhase[c] = "Idle" /\ client.seenCursor[c] > client.appliedCursor[c]
   /\ client' = [client EXCEPT !.applyPhase[c] = "Planned", !.journalPresent[c] = TRUE, !.preflight[c] = client.visible[c][PathA], !.durableApplied[c] = FALSE,
        !.journalPolicy[c] = server.eventPolicy, !.localOnly[c] = PolicyScenario /\ server.eventPolicy = "exclude-a"]
+  \* The pull delivering this apply carried a directory snapshot through the
+  \* then-current main; the server retains that evidence until acknowledgement.
+  /\ server' = [server EXCEPT !.deliveredAckEpoch[c] = server.mainEpoch]
   /\ coverage' = Mark("PlanLocalApply") /\ lastAction' = "PlanLocalApply"
-  /\ UNCHANGED <<network, server, bridge, directory, ghost>>
+  /\ UNCHANGED <<network, bridge, directory, ghost>>
 
 PublishApplyRecovery(c) ==
   /\ NormalClient(c) /\ client.applyPhase[c] = "Planned"
@@ -637,10 +641,35 @@ CleanupApplyJournal(c) ==
   /\ coverage' = Mark("CleanupApplyJournal") /\ lastAction' = "CleanupApplyJournal"
   /\ UNCHANGED <<network, server, bridge, directory, ghost>>
 
+\* Acknowledgement evidence mirrors the server ack contract: the applied epoch is
+\* resolvable through the current main, the retained delivered snapshot, or
+\* reconstruction from contiguous retained event history.
+AcknowledgeEvidence(c) ==
+  \/ client.localMainEpoch[c] = server.mainEpoch
+  \/ client.localMainEpoch[c] = server.deliveredAckEpoch[c]
+  \/ server.historyRetained
+
+AcknowledgeLabel(c) ==
+  IF client.localMainEpoch[c] = server.mainEpoch THEN "AcknowledgeDurableApply" ELSE "AcknowledgeHistorical"
+
 AcknowledgeDurableApply(c) ==
-  /\ NormalServer /\ NormalClient(c) /\ client.capable[c] /\ server.policyActive /\ client.ackIntent[c] /\ client.durableApplied[c] /\ client.localMainEpoch[c] = server.mainEpoch
+  /\ NormalServer /\ NormalClient(c) /\ client.capable[c] /\ server.policyActive /\ client.ackIntent[c] /\ client.durableApplied[c] /\ AcknowledgeEvidence(c)
   /\ server' = [server EXCEPT !.lastAppliedEpoch[c] = client.localMainEpoch[c]]
-  /\ coverage' = Mark("AcknowledgeDurableApply") /\ lastAction' = "AcknowledgeDurableApply"
+  /\ coverage' = Mark(AcknowledgeLabel(c)) /\ lastAction' = AcknowledgeLabel(c)
+  /\ UNCHANGED <<client, network, bridge, directory, ghost>>
+
+EvictDeliveredAckSnapshot ==
+  /\ FaultMode = "EvictDeliveredAckSnapshot" /\ NormalServer /\ client.ackIntent[Plugin2] /\ client.durableApplied[Plugin2]
+  /\ client.localMainEpoch[Plugin2] < server.mainEpoch
+  /\ server' = [server EXCEPT !.deliveredAckEpoch[Plugin2] = server.mainEpoch]
+  /\ coverage' = Mark("EvictDeliveredAckSnapshot") /\ lastAction' = "EvictDeliveredAckSnapshot"
+  /\ UNCHANGED <<client, network, bridge, directory, ghost>>
+
+LoseAllAckEvidence ==
+  /\ FaultMode = "LoseAllAckEvidence" /\ NormalServer /\ client.ackIntent[Plugin2] /\ client.durableApplied[Plugin2]
+  /\ client.localMainEpoch[Plugin2] < server.mainEpoch
+  /\ server' = [server EXCEPT !.deliveredAckEpoch[Plugin2] = server.mainEpoch, !.historyRetained = FALSE]
+  /\ coverage' = Mark("LoseAllAckEvidence") /\ lastAction' = "LoseAllAckEvidence"
   /\ UNCHANGED <<client, network, bridge, directory, ghost>>
 
 PrepareDirectoryTombstone ==
@@ -969,7 +998,8 @@ RootActions == {
  "MoveMainBeforePreparedEffects", "AckBeforeDurableApply", "OverwriteUncapturedBridgeWrite", "RecursiveDirectoryDelete",
  "RestartAbortsMovedRef", "DuplicateNonIdempotentProcessing", "MutateRetryIdentity", "LoseConflictProtection", "AbortUncertainCAS",
  "ConflateSeenAndApplied", "AdvanceProjectionCursorEarly", "ClassifyStalePolicyProposal", "UpgradeOldClient", "ActivateLegacyPolicy",
- "DiscardLocalOnly", "DiscardIgnoredBridgeWrite", "PublishExcludedRows", "MutateAttemptPolicy", "UnsafeOldClientPoll", "AcceptStalePolicyProposal", "ActivateLegacyWithoutReconciliation", "AdmitExcludedCandidate"
+ "DiscardLocalOnly", "DiscardIgnoredBridgeWrite", "PublishExcludedRows", "MutateAttemptPolicy", "UnsafeOldClientPoll", "AcceptStalePolicyProposal", "ActivateLegacyWithoutReconciliation", "AdmitExcludedCandidate",
+ "EvictDeliveredAckSnapshot", "LoseAllAckEvidence", "AcknowledgeHistorical"
 }
 
 ClientActions(c) ==
@@ -992,7 +1022,7 @@ BridgeActions == RustValidateWrite \/ RustAtomicVisibleWrite \/ NodePersistBridg
 DirectoryActions == ObserveDirectoryDescendant(Plugin1) \/ RemoveDirectoryDescendant(Plugin1) \/ PreflightEmptyDirectory(Plugin1) \/ DeleteEmptyDirectory(Plugin1)
 
 FaultActions == ReplaceInflightTarget \/ DropAcceptedProposal \/ MoveCoveredRefBackward \/ DiscardDivergence \/ MoveMainBeforePreparedEffects \/
-  AckBeforeDurableApply \/ OverwriteUncapturedBridgeWrite \/ RecursiveDirectoryDelete \/ RestartAbortsMovedRef \/ DuplicateNonIdempotentProcessing \/
+  AckBeforeDurableApply \/ EvictDeliveredAckSnapshot \/ LoseAllAckEvidence \/ OverwriteUncapturedBridgeWrite \/ RecursiveDirectoryDelete \/ RestartAbortsMovedRef \/ DuplicateNonIdempotentProcessing \/
   MutateRetryIdentity \/ LoseConflictProtection \/ AbortUncertainCAS \/ ConflateSeenAndApplied \/ AdvanceProjectionCursorEarly \/
   DiscardLocalOnly \/ DiscardIgnoredBridgeWrite \/ PublishExcludedRows \/ MutateAttemptPolicy \/ UnsafeOldClientPoll \/ AcceptStalePolicyProposal \/ ActivateLegacyWithoutReconciliation \/ AdmitExcludedCandidate
 
@@ -1039,6 +1069,7 @@ TypeOK ==
   /\ server.conflictBase \in Versions \cup {NoVersion} /\ server.conflictCurrent \in Versions \cup {NoVersion} /\ server.conflictDevice \in Versions \cup {NoVersion}
   /\ server.conflictRoots \subseteq Versions /\ server.expectedEffects \subseteq EffectNames /\ server.committedEffects \subseteq EffectNames
   /\ server.eventSeq \in Nat /\ server.eventTree \in [Paths -> SUBSET Versions] /\ server.lastAppliedEpoch \in [Clients -> Nat] /\ server.blocked \in BOOLEAN
+  /\ server.deliveredAckEpoch \in [Clients -> Nat] /\ server.historyRetained \in BOOLEAN
   /\ bridge.projectionPolicy \in PolicyIds /\ bridge.projectedPaths \subseteq Paths /\ bridge.preservedAtPolicy \in Versions
   /\ bridge.rustUp \in BOOLEAN /\ bridge.rustCrashCount \in 0..MaxRustCrashes /\ bridge.rustPhase \in RustPhases /\ bridge.acknowledged \in BOOLEAN
   /\ bridge.nodeHintDurable \in BOOLEAN /\ bridge.manifestVerified \in BOOLEAN /\ bridge.baseVerified \in BOOLEAN /\ bridge.pathOidsVerified \in BOOLEAN
@@ -1050,7 +1081,7 @@ TypeOK ==
   /\ directory.localDeletionTarget \in [Clients -> ProposalIds] /\ directory.deletedUnderProposal \in [Clients -> ProposalIds] /\ directory.deletedIdentity \in [Clients -> Nat] /\ directory.localPresent \in [Clients -> BOOLEAN]
   /\ directory.localIdentity \in [Clients -> Nat] /\ directory.preflightIdentity \in [Clients -> Nat] /\ directory.localEmpty \in [Clients -> BOOLEAN]
   /\ directory.descendantPresent \in [Clients -> BOOLEAN] /\ directory.descendantObserved \in [Clients -> BOOLEAN] /\ directory.descendantLost \in [Clients -> BOOLEAN]
-  /\ coverage.actions \subseteq RootActions \cup {"BridgeNodeCaptured", "PluginCaptured", "CASOld", "CASTarget", "CASForeign", "CASUncertain"}
+  /\ coverage.actions \subseteq RootActions \cup {"BridgeNodeCaptured", "PluginCaptured", "CASOld", "CASTarget", "CASForeign", "CASUncertain", "AcknowledgeHistorical"}
   /\ coverage.classifications \subseteq Classifications /\ coverage.actorsProposed \subseteq Clients /\ coverage.conflictPartial \in BOOLEAN /\ coverage.replyLostAfterOutcome \in BOOLEAN
   /\ ghost.captured \subseteq Versions /\ ghost.overwritten \subseteq Versions /\ lastAction \in RootActions \cup {"Init"}
 
@@ -1074,6 +1105,7 @@ MainMoveWasPrepared == server.opPhase = "MainMoved" => server.casKind = "main" /
 CASSideEffectRecoveryByReading == server.opPhase = "Aborted" /\ server.casKind # "none" => server.casActual # server.casTarget
 ExactPreparedOperationRecovery == server.opType = "conflict_resolve" /\ server.opPhase = "Committed" => server.committedEffects = server.expectedEffects
 SoundApplyAcknowledgement == \A c \in Clients: server.lastAppliedEpoch[c] > 0 => client.durableApplied[c] /\ client.localMainEpoch[c] = server.lastAppliedEpoch[c]
+AckIntentResolvable == \A c \in Clients: client.ackIntent[c] => AcknowledgeEvidence(c)
 SeenAppliedSeparation == \A c \in Clients: client.appliedCursor[c] <= client.seenCursor[c] /\ (client.appliedCursor[c] > 0 => client.durableApplied[c])
 DirectoryDeletionCausal == \A c \in Clients: ~directory.localPresent[c] => directory.canonicalTombstone /\ directory.deletedUnderProposal[c] # NoProposal /\ directory.deletedIdentity[c] = directory.preflightIdentity[c] /\ directory.localEmpty[c]
 GitDirectoryEventAgreement == directory.committed => directory.resultProposal = directory.eventProposal /\ directory.resultEvent <= server.eventSeq
@@ -1096,7 +1128,7 @@ AllSafety == /\ TypeOK /\ CapturedOnlyAfterDurablePublication /\ OBTS_SAF_001_Ca
   /\ OBTS_SAF_003_UploadedProposalsRemainReachable /\ OBTS_SAF_004_GitAndDirectoryOutcomesAtomic /\ OBTS_SAF_005_RestartRollsForwardOrBlocks
   /\ OBTS_SAF_006_DirectoryDeletionNonRecursive /\ NoDeviceRefRewind /\ AttemptIdentityImmutable /\ ServerProcessesAttemptOnce /\ DivergenceDoesNotMoveDeviceRef
   /\ DivergentProposalProtected /\ ConflictProtectionCompleteOrRetained /\ NoEmptyConflictRoot /\ MainMoveWasPrepared /\ CASSideEffectRecoveryByReading /\ ExactPreparedOperationRecovery
-  /\ SoundApplyAcknowledgement /\ SeenAppliedSeparation /\ DirectoryDeletionCausal /\ GitDirectoryEventAgreement /\ DisjointEditsSurvive
+  /\ SoundApplyAcknowledgement /\ AckIntentResolvable /\ SeenAppliedSeparation /\ DirectoryDeletionCausal /\ GitDirectoryEventAgreement /\ DisjointEditsSurvive
   /\ BridgeAcknowledgedWritePreserved /\ ProjectionVerifiedBeforeCursor /\ ProjectionFailureRetainsCursor /\ ProjectionIsDerivedOnly
   /\ ApplyRefinementBoundary /\ ApplyProjectionConsistent /\ CandidateAdmittedOnlyWhenPolicyValid /\ PolicyTransitionRemovesOnlyCanonicalCopy
   /\ LocalOnlyApplyRetainsVisible /\ OldClientCannotApply /\ PolicyProjectionExcludesCurrentRows
@@ -1129,6 +1161,7 @@ NeverNetworkFault == "DropProposalRequest" \notin coverage.actions
 NeverServerRecovery == "RecoverServerOperation" \notin coverage.actions
 NeverConflict == "BeginConflictMetadata" \notin coverage.actions
 NeverApplyAck == "AcknowledgeDurableApply" \notin coverage.actions
+NeverAcknowledgeHistorical == "AcknowledgeHistorical" \notin coverage.actions
 NeverEqualClassification == "Equal" \notin coverage.classifications
 NeverCoveredClassification == "Covered" \notin coverage.classifications
 NeverDivergentClassification == "Divergent" \notin coverage.classifications

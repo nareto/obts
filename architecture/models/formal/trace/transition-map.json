@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "modelId": "OBTS-FM-002",
-  "architectureRevision": 16,
+  "architectureRevision": 18,
   "rootModule": "OBTSDistributedSync.tla",
   "traceSchema": "trace/trace-schema.json",
   "instrumentationStatus": "static-map-only; runtime emission and replay are omitted and no implementation conformance is claimed",
@@ -1739,6 +1739,47 @@
       ],
       "tests": [
         "tests/headless-protocol.test.ts:1-157"
+      ]
+    },
+    "AcknowledgeHistorical": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SYNC-ACK-001",
+        "OBTS-SAF-005"
+      ],
+      "code": [
+        "src/server/app.ts:1226-1310",
+        "src/server/app.ts:2338-2357"
+      ],
+      "tests": [
+        "tests/applied-snapshot-reconstruction.test.ts:1-235"
+      ]
+    },
+    "EvictDeliveredAckSnapshot": {
+      "category": "control",
+      "controlOnly": true,
+      "contracts": [
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "architecture/models/formal/OBTSDistributedSync.tla:640-675"
+      ],
+      "tests": [
+        "tests/formal-checker.test.ts:1-54"
+      ]
+    },
+    "LoseAllAckEvidence": {
+      "category": "control",
+      "controlOnly": true,
+      "contracts": [
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "architecture/models/formal/OBTSDistributedSync.tla:640-675"
+      ],
+      "tests": [
+        "tests/formal-checker.test.ts:1-54"
       ]
     }
   }

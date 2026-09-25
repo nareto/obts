@@ -22,7 +22,7 @@ const requiredChecks = new Map([
   ...['proposal', 'bridge', 'server-recovery', 'apply-ack'].map((id) => [`fm002-liveness-${id}`, 'positive-liveness']),
   ...['observe', 'bridge-proposal', 'plugin2-proposal', 'rust-write', 'network-fault', 'recovery', 'conflict', 'apply-ack',
     'equal', 'covered', 'divergent', 'reply-loss', 'conflict-partial', 'directory-delete', 'projection', 'proposal-trigger',
-    'bridge-trigger', 'recovery-trigger', 'apply-trigger', 'apply-refinement'].map((id) => [`fm002-reach-${id}`, 'reachability']),
+    'bridge-trigger', 'recovery-trigger', 'apply-trigger', 'apply-refinement', 'ack-reconstruction'].map((id) => [`fm002-reach-${id}`, 'reachability']),
   ['fm002-server-recovery-implementation', 'positive-safety'],
   ...['root-ignore-safety', 'root-ignore-legacy-safety', 'root-ignore-bridge-race-safety', 'root-ignore-invalid-safety'].map((id) => [`fm002-${id}`, 'positive-safety']),
   ...['root-ignore-transition', 'root-ignore-stale', 'root-ignore-local-only', 'root-ignore-projection', 'root-ignore-legacy-activation', 'root-ignore-rebuild-stale', 'root-ignore-bridge-race-reach',
@@ -33,7 +33,7 @@ const requiredChecks = new Map([
     'root-ignore-negative-legacy-activation', 'root-ignore-negative-candidate', 'root-ignore-bridge-race-negative'].map((id) => [`fm002-${id}`, 'negative-control']),
   ...['replace-inflight', 'drop-accepted', 'ref-rewind', 'discard-divergence', 'main-before-effects', 'early-ack',
     'overwrite-bridge', 'recursive-delete', 'restart-abort', 'duplicate-processing', 'retry-identity',
-    'conflict-without-protection', 'cas-uncertain-abort', 'cursor-ack-conflation', 'projection-cursor-early']
+    'conflict-without-protection', 'cas-uncertain-abort', 'cursor-ack-conflation', 'projection-cursor-early', 'ack-evidence-loss']
     .map((id) => [`fm002-negative-${id}`, 'negative-control'])
 ]);
 

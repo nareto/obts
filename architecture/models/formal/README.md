@@ -74,10 +74,10 @@ The model does not cover directories, multiple paths, write concurrency, editor-
 | Field | Value |
 | --- | --- |
 | Status | Accepted bounded composed model |
-| Architecture revision | 16 |
+| Architecture revision | 17 |
 | Refined contracts | `OBTS-SAF-001` through `OBTS-SAF-006`, `OBTS-SAF-010`, `OBTS-SYNC-IMM-001`, `OBTS-SYNC-IGN-001`, `OBTS-SYNC-ACK-001`, `OBTS-PER-OP-001`, `OBTS-BRG-PROJ-001` |
 | Root specification | `OBTSDistributedSync.tla` |
-| Check matrix | `checks.json` (75 required checks: original 52 plus 23 root-ignore checks) |
+| Check matrix | `checks.json` (77 required checks: original 52 plus 23 root-ignore checks plus 2 acknowledgement-evidence checks) |
 | Static transition map / future trace schema | `trace/transition-map.json`, `trace/trace-schema.json` |
 | Executable check | `npm run test:formal` |
 
@@ -96,7 +96,7 @@ Local apply state projects non-vacuously through `modules/OBTSApplyRefinement.tl
 
 ### Check matrix and assumptions
 
-The required matrix contains the original six FM-001 checks; seven FM-002 positive safety checks; four separately fair liveness checks; twenty trigger/action reachability checks; and fifteen distributed negative controls. Revision 15 adds four positive root-policy safety checks, nine non-vacuity witnesses, and nine independent negative controls. Removing or retyping any required check fails validation. Accepted architecture status requires zero candidate counterexamples and all required positives.
+The required matrix contains the original six FM-001 checks; seven FM-002 positive safety checks; four separately fair liveness checks; twenty-one trigger/action reachability checks; and sixteen distributed negative controls. Revision 15 adds four positive root-policy safety checks, nine non-vacuity witnesses, and nine independent negative controls. Revision 17 adds the acknowledgement-evidence reach and negative checks above. Removing or retyping any required check fails validation. Accepted architecture status requires zero candidate counterexamples and all required positives.
 
 Liveness is conditional on bounded edits/crashes, eventual restart, retry/delivery, and no permanent storage failure. Fairness is attached to the concrete action/actor sequence for proposal/result consumption, Rust write to Node capture, server restart/recovery, and main event to durable apply/server acknowledgement. Each obligation has a separate reachable-trigger check; there is no broad fairness disjunction.
 
@@ -111,6 +111,10 @@ The composed `SafetySpec` retains all prior actors and actions. In `root-ignore`
 The 22 added checks passed TLC 2.19 / Java 21: safety generated/distinct/depth 10,116/1,718/61 (`root-ignore`), 602/136/21 (legacy), 18,295/2,662/39 (Bridge race with a reachable pre-activation write), and 31/13/13 (invalid candidate). Nine reachability counterexamples witness policy integration (depth 19), protected stale review with three separately protected conflict roots (42), local-only apply (47), derived cursor (28), legacy activation (2), a permitted Bridge write before activation, a stale Bridge validation after policy integration (20), offline old-client local capture/queue before upgrade (31), and a server-side rejected malformed candidate (8). Nine single-fault controls violated their designated invariants with exact witness actions: local-only displacement, incapable-client pull, stale main admission, in-flight policy mutation, excluded Bridge write, excluded projection row publication, activation without reconciliation, excluded candidate admission, and stale Bridge write-seam bypass. The executable checker enforces their witness and trace-depth floors.
 
 This is a **bounded design model**, not feature implementation evidence. The actual Git matcher, blob-byte calculation, full candidate trees, subtree/rename/collision behavior, capability authentication, concurrent root-file edits during capture or in-flight transfer, other unscheduled Bridge write interleavings, arbitrary embedded policy-bearing paths, and policy updates during partial projection/restart need implementation tests or stronger models. Static transition mappings for these new actions point to existing ownership families, not a claim that the root-ignore feature already exists in production.
+
+### Acknowledgement evidence bound (revision 17)
+
+`server.deliveredAckEpoch[c]` captures, at each planned local apply, the canonical epoch whose directory snapshot the pull delivered. `AcknowledgeEvidence(c)` admits an acknowledgement through the current main (server recomputation), the retained delivered snapshot, or reconstruction from contiguous retained event history (`server.historyRetained`). In `disjoint-directory`, Plugin1/Bridge proposals can integrate a newer canonical main while Plugin2's apply pipeline is between its plan and its acknowledgement: before this revision the acknowledgement was permanently blocked there, which is exactly the production `applied_snapshot_unavailable` failure. `AcknowledgeHistorical` marks the reconstructed-evidence acknowledgement. `fm002-reach-ack-reconstruction` proves the historical acknowledgement still completes after a newer pull replaces the delivered snapshot, and `fm002-negative-ack-evidence-loss` proves the model reproduces the stuck state and fails closed when the delivered snapshot is replaced and no event history remains. `AckIntentResolvable` joins the safety invariant set.
 
 ### Implementation recovery check
 

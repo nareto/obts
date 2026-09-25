@@ -136,12 +136,12 @@
       "maximumDistinctStates": 1100000,
       "maximumDepth": 300,
       "baseline": {
-        "generated": 383858,
-        "distinct": 47581,
-        "depth": 73,
-        "minGenerated": 191929,
-        "minDistinct": 23790,
-        "minDepth": 36
+        "generated": 789674,
+        "distinct": 86453,
+        "depth": 74,
+        "minGenerated": 394837,
+        "minDistinct": 43226,
+        "minDepth": 37
       }
     },
     {
@@ -1079,6 +1079,32 @@
       "expectedInvariant": "NeverStaleQueuedRebuild",
       "requiredWitness": "RebuildStaleQueuedProposal",
       "minimumTraceDepth": 6
+    },
+    {
+      "id": "fm002-reach-ack-reconstruction",
+      "model": "OBTSDistributedSync",
+      "config": "configs/coverage-ack-reconstruction.cfg",
+      "kind": "reachability",
+      "timeoutMs": 180000,
+      "heapMb": 2048,
+      "maximumDistinctStates": 800000,
+      "maximumDepth": 200,
+      "expectedInvariant": "NeverAcknowledgeHistorical",
+      "requiredWitness": "AcknowledgeDurableApply",
+      "minimumTraceDepth": 20
+    },
+    {
+      "id": "fm002-negative-ack-evidence-loss",
+      "model": "OBTSDistributedSync",
+      "config": "negative/distributed/LoseAllAckEvidence.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 180000,
+      "heapMb": 2048,
+      "maximumDistinctStates": 800000,
+      "maximumDepth": 200,
+      "expectedInvariant": "AckIntentResolvable",
+      "requiredWitness": "LoseAllAckEvidence",
+      "minimumTraceDepth": 20
     }
   ]
 }

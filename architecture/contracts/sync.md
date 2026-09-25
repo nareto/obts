@@ -93,6 +93,7 @@ A client pulls required objects and a manifest for canonical `main`, then applie
 - OBTS-authored watcher events are suppressed or tagged.
 - Seen-event and durably-applied-event cursors remain separate.
 - The server advances `last_applied_main` only after explicit durable apply acknowledgement.
+- Delivered snapshot evidence stays ack-resolvable: the server accepts the acknowledgement through the retained delivered snapshot, recomputation against current main, or reconstruction of the exact delivered snapshot from contiguous retained events on top of the acknowledged baseline, and fails closed when no source can reproduce the delivered snapshot.
 - Restart finishes idempotently or blocks with recovery options.
 - Semantic ambiguity is never presented as a client-side winner choice.
 

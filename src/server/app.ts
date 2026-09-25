@@ -1266,7 +1266,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
                   directoryIntents: [],
                   explicitDirectories: device.pending_applied_explicit_dirs
                 }
-              : null;
+              : historicalAcknowledgementSnapshot(db, vaultId, device, appliedMain);
         if (!snapshot) {
           throw new AuthError(409, 'applied_snapshot_unavailable', 'The delivered directory snapshot for this applied main is unavailable.');
         }
@@ -2333,6 +2333,27 @@ function eventSnapshotForTarget(
       eventSeq
     )
   };
+}
+
+function historicalAcknowledgementSnapshot(
+  db: MetadataDb,
+  vaultId: string,
+  device: MetadataDb['devices'][number],
+  appliedMain: string
+): { eventSeq: number; directoryIntents: never[]; explicitDirectories: string[] } | null {
+  try {
+    const snapshot = eventSnapshotForTarget(
+      db,
+      vaultId,
+      device.device_id,
+      appliedMain,
+      device.last_applied_event_seq,
+      Array.isArray(device.last_applied_explicit_dirs) ? device.last_applied_explicit_dirs : undefined
+    );
+    return { eventSeq: snapshot.eventSeq, directoryIntents: [], explicitDirectories: snapshot.explicitDirectories };
+  } catch {
+    return null;
+  }
 }
 
 function directoryAcknowledgementsForDevice(
