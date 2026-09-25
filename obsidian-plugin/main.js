@@ -21990,7 +21990,7 @@ var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_da
 var { createByteBudget, runBoundedWork } = require_work_pool();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.42";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.4.43";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_INVENTORY_INTERVAL_MS = 6 * 60 * 60 * 1e3;
@@ -24891,6 +24891,15 @@ var ObtsObsidianClient = class {
     }
     this.throwIfSyncBlocked(state);
     state = await this.readState();
+    const pendingAck = await this.readPendingAppliedAcknowledgement();
+    if (pendingAck) {
+      state = await this.readState();
+      if (state.local_main !== pendingAck.target_main) {
+        throw new ObtsBlockedError("applied_main_acknowledgement_failed", "Local state does not match the pending applied main acknowledgement.");
+      }
+      await this.retryPendingAppliedAcknowledgement();
+      state = await this.readState();
+    }
     const token = await this.readDeviceToken();
     const pulled = await this.pull(
       state.vault_id,
@@ -25090,6 +25099,7 @@ var ObtsObsidianClient = class {
     const localFiles = await this.scanSyncableFiles();
     const recoveryBundleId = localFiles.length > 0 ? await this.createRecoveryBundle("rebuild_from_server", state.local_main, localFiles) : null;
     await this.fsp.rm(this.authPath, { force: true });
+    await this.fsp.rm(this.pendingAppliedAckPath, { force: true });
     await this.writeQueue({
       pending_commit: null,
       expected_device_ref: null,

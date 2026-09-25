@@ -3215,6 +3215,19 @@ class ObtsObsidianClient {
     }
     this.throwIfSyncBlocked(state);
     state = await this.readState();
+    // A pending applied-main acknowledgement must settle before this device
+    // pulls newer state. Both pull routes keep a single delivered-snapshot
+    // slot per device, so pulling newer state here would replace the evidence
+    // the retry needs and permanently block the acknowledgement.
+    const pendingAck = await this.readPendingAppliedAcknowledgement();
+    if (pendingAck) {
+      state = await this.readState();
+      if (state.local_main !== pendingAck.target_main) {
+        throw new ObtsBlockedError("applied_main_acknowledgement_failed", "Local state does not match the pending applied main acknowledgement.");
+      }
+      await this.retryPendingAppliedAcknowledgement();
+      state = await this.readState();
+    }
     const token = await this.readDeviceToken();
     const pulled = await this.pull(
       state.vault_id,
@@ -3420,6 +3433,7 @@ class ObtsObsidianClient {
     const localFiles = await this.scanSyncableFiles();
     const recoveryBundleId = localFiles.length > 0 ? await this.createRecoveryBundle("rebuild_from_server", state.local_main, localFiles) : null;
     await this.fsp.rm(this.authPath, { force: true });
+    await this.fsp.rm(this.pendingAppliedAckPath, { force: true });
     await this.writeQueue({
       pending_commit: null,
       expected_device_ref: null,
