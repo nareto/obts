@@ -36,6 +36,7 @@ struct HeadlessRuntimeState {
     restart_count: u64,
     unexpected_exits: u64,
     circuit_open: bool,
+    recovery_attempts: u64,
     last_counted_exit_pid: Option<u32>,
     last_exit_code: Option<i32>,
     last_exit_signal: Option<i32>,
@@ -59,14 +60,16 @@ struct HeadlessProcess {
 struct ActiveRequest<'a> {
     process: &'a mut HeadlessProcess,
     healthy: &'a AtomicBool,
+    command: String,
     armed: bool,
 }
 
 impl<'a> ActiveRequest<'a> {
-    fn new(process: &'a mut HeadlessProcess, healthy: &'a AtomicBool) -> Self {
+    fn new(process: &'a mut HeadlessProcess, healthy: &'a AtomicBool, command: &str) -> Self {
         Self {
             process,
             healthy,
+            command: command.to_owned(),
             armed: true,
         }
     }
@@ -83,6 +86,11 @@ impl<'a> ActiveRequest<'a> {
 impl Drop for ActiveRequest<'_> {
     fn drop(&mut self) {
         if self.armed {
+            warn!(
+                command = %self.command,
+                pid = ?self.process.pid,
+                "headless request cancelled while in flight; quarantining supervised child"
+            );
             let _ = self.process.child.start_kill();
             self.healthy.store(false, Ordering::Release);
         }
@@ -299,9 +307,42 @@ impl HeadlessClient {
             restart_count: runtime.restart_count,
             unexpected_exits: runtime.unexpected_exits,
             circuit_open: runtime.circuit_open,
+            recovery_attempts: runtime.recovery_attempts,
             last_exit_code: runtime.last_exit_code,
             last_exit_signal: runtime.last_exit_signal,
         }
+    }
+
+    fn recovery_cooldown_seconds(&self) -> u64 {
+        self.config.restart_recovery_cooldown_seconds.max(1)
+    }
+
+    /// Attempt a bounded recovery while the restart circuit is open: replace
+    /// the child and clear the circuit plus the failure window. Returns `Ok(false)`
+    /// when the circuit is already closed.
+    pub async fn recover_circuit(&self) -> Result<bool, HeadlessError> {
+        if !self
+            .runtime
+            .read()
+            .expect("headless runtime lock")
+            .circuit_open
+        {
+            return Ok(false);
+        }
+        {
+            let mut runtime = self.runtime.write().expect("headless runtime lock");
+            runtime.recovery_attempts = runtime.recovery_attempts.saturating_add(1);
+        }
+        self.restart().await?;
+        {
+            let mut runtime = self.runtime.write().expect("headless runtime lock");
+            if runtime.circuit_open {
+                runtime.circuit_open = false;
+                runtime.failures.clear();
+            }
+        }
+        info!("headless restart circuit recovered");
+        Ok(true)
     }
 
     fn inactivity_timeout(&self) -> Duration {
@@ -412,6 +453,11 @@ impl HeadlessClient {
             .as_ref()
             .is_err_and(|error| error.is_process_failure())
         {
+            warn!(
+                command = %command,
+                error = %result.as_ref().err().map(ToString::to_string).unwrap_or_default(),
+                "headless request failed; quarantining supervised child"
+            );
             quarantine_process(&mut process).await;
         }
         result
@@ -482,7 +528,7 @@ async fn supervised_request_on_process(
     inactivity_timeout: Duration,
     healthy: &AtomicBool,
 ) -> Result<Value, HeadlessError> {
-    let mut active = ActiveRequest::new(process, healthy);
+    let mut active = ActiveRequest::new(process, healthy, command);
     let result = request_on_process(
         active.process(),
         next_id,
@@ -804,11 +850,34 @@ pub fn spawn_maintenance(
     interval: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let cooldown = Duration::from_secs(client.recovery_cooldown_seconds());
+        let mut next_recovery_at: Option<Instant> = None;
         loop {
             if client.runtime_status().circuit_open {
+                let now = Instant::now();
+                let due = match next_recovery_at {
+                    Some(due) => due,
+                    None => {
+                        let due = now + cooldown;
+                        next_recovery_at = Some(due);
+                        due
+                    }
+                };
+                if now >= due {
+                    match client.recover_circuit().await {
+                        Ok(_) => {
+                            next_recovery_at = None;
+                        }
+                        Err(error) => {
+                            warn!(error = %error, "headless circuit recovery failed");
+                            next_recovery_at = Some(now + cooldown);
+                        }
+                    }
+                }
                 sleep(interval).await;
                 continue;
             }
+            next_recovery_at = None;
             match client.request("maintenance-tick", Value::Null).await {
                 Ok(result) => {
                     let applied = result.get("applied").and_then(Value::as_bool) == Some(true);
@@ -1371,6 +1440,68 @@ sleep 5
         assert_eq!(delta.files.len(), 2);
         assert_eq!(delta.files[0].path, "one.md");
         assert_eq!(delta.files[1].path, "two.md");
+    }
+
+    #[tokio::test]
+    async fn circuit_recovers_automatically_after_cooldown() {
+        let directory = tempdir().expect("temporary script directory");
+        let script_path = directory.path().join("circuit-recovery.sh");
+        let counter_path = directory.path().join("starts");
+        write(
+            &script_path,
+            format!(
+                r#"if [ ! -f '{counter}' ]; then
+  : > '{counter}'
+  echo 0 > '{counter}'
+fi
+N=$(( $(cat '{counter}') + 1 ))
+echo "$N" > '{counter}'
+printf '%s\n' '{ready}'
+read -r request
+ID=$(printf '%s' "$request" | sed 's/.*"id":\([0-9]*\).*/\1/')
+printf '%s\n' "{{\"type\":\"response\",\"id\":$ID,\"ok\":true,\"result\":{{\"applied\":false,\"local_head\":null}}}}"
+if [ "$N" -lt 4 ]; then
+  exit 0
+fi
+sleep 5
+"#,
+                counter = counter_path.display(),
+                ready = ready_line()
+            ),
+        )
+        .expect("write circuit recovery script");
+        let vault_dir = directory.path().join("vault");
+        std::fs::create_dir_all(&vault_dir).expect("create vault directory");
+        let config = ClientConfig {
+            headless_command: format!("sh {}", script_path.display()),
+            vault_dir: vault_dir.display().to_string(),
+            request_inactivity_timeout_seconds: 1,
+            restart_failure_window_seconds: 900,
+            restart_max_failures: 3,
+            restart_base_backoff_seconds: 1,
+            restart_max_backoff_seconds: 1,
+            restart_recovery_cooldown_seconds: 1,
+            ..ClientConfig::default()
+        };
+        let client = HeadlessClient::spawn(&config).await.expect("spawn client");
+        let filesystem = Arc::new(FilesystemSource::new(&vault_dir).expect("filesystem source"));
+        let maintenance = spawn_maintenance(client.clone(), filesystem, Duration::from_millis(25));
+        let recovered = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if client.runtime_status().up && client.runtime_status().recovery_attempts >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        maintenance.abort();
+
+        assert!(recovered.is_ok(), "circuit did not recover automatically");
+        let status = client.runtime_status();
+        assert!(status.up);
+        assert!(!status.circuit_open);
+        assert!(status.recovery_attempts >= 1);
     }
 
     #[tokio::test]

@@ -1270,11 +1270,17 @@ fn render_prometheus_metrics(status: &StatusResponse) -> String {
             "obts_bridge_headless_unexpected_exits_total {}",
             status.headless_process.unexpected_exits
         ),
-        "# HELP obts_bridge_headless_restart_circuit_open Whether repeated failures suppressed automatic restarts.".to_string(),
+        "# HELP obts_bridge_headless_restart_circuit_open Whether repeated failures are pausing automatic restarts during the recovery cooldown.".to_string(),
         "# TYPE obts_bridge_headless_restart_circuit_open gauge".to_string(),
         format!(
             "obts_bridge_headless_restart_circuit_open {}",
             usize::from(status.headless_process.circuit_open)
+        ),
+        "# HELP obts_bridge_headless_recovery_attempts_total Bounded automatic recovery attempts after the restart circuit opened.".to_string(),
+        "# TYPE obts_bridge_headless_recovery_attempts_total counter".to_string(),
+        format!(
+            "obts_bridge_headless_recovery_attempts_total {}",
+            status.headless_process.recovery_attempts
         ),
         "# HELP obts_bridge_filesystem_projection_attempts_total Commit-attested filesystem projection attempts.".to_string(),
         "# TYPE obts_bridge_filesystem_projection_attempts_total counter".to_string(),
@@ -1812,6 +1818,7 @@ mod tests {
             restart_count: 2,
             unexpected_exits: 3,
             circuit_open: true,
+            recovery_attempts: 4,
             last_exit_code: None,
             last_exit_signal: Some(9),
         };
@@ -1826,6 +1833,7 @@ mod tests {
         assert!(metrics.contains("obts_bridge_headless_restarts_total 2"));
         assert!(metrics.contains("obts_bridge_headless_unexpected_exits_total 3"));
         assert!(metrics.contains("obts_bridge_headless_restart_circuit_open 1"));
+        assert!(metrics.contains("obts_bridge_headless_recovery_attempts_total 4"));
         assert!(metrics.contains("obts_bridge_filesystem_projection_attempts_total 7"));
         assert!(metrics.contains("obts_bridge_filesystem_projection_failures_total 2"));
         assert!(metrics.contains("obts_bridge_filesystem_projection_consecutive_failures 1"));

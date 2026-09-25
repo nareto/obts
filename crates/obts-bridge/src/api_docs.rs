@@ -724,6 +724,7 @@ pub(crate) fn openapi_spec() -> Value {
                         "restart_count": {"type": "integer", "minimum": 0},
                         "unexpected_exits": {"type": "integer", "minimum": 0},
                         "circuit_open": {"type": "boolean"},
+                        "recovery_attempts": {"type": "integer", "minimum": 0},
                         "last_exit_code": {"type": ["integer", "null"]},
                         "last_exit_signal": {"type": ["integer", "null"]}
                     }

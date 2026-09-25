@@ -19,6 +19,7 @@ client:
   restart_max_failures: 3
   restart_base_backoff_seconds: 5
   restart_max_backoff_seconds: 60
+  restart_recovery_cooldown_seconds: 300
   auto_start: true
 
 database:
