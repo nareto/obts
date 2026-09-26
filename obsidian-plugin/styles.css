@@ -158,6 +158,23 @@
   color: var(--text-error);
 }
 
+.obts-feedback--warning {
+  color: var(--text-warning);
+}
+
+.obts-onboarding-progress {
+  display: block;
+  width: 100%;
+  height: 6px;
+  margin-top: 8px;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.obts-onboarding-progress[hidden] {
+  display: none;
+}
+
 .obts-onboarding {
   max-width: 640px;
 }

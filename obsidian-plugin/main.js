@@ -21990,7 +21990,7 @@ var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_da
 var { createByteBudget, runBoundedWork } = require_work_pool();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.0";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.1";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_INVENTORY_INTERVAL_MS = 6 * 60 * 60 * 1e3;
@@ -29122,6 +29122,13 @@ var ObtsOnboardingModal = class extends Modal {
     this.mode = null;
     this.earlyDisposition = null;
     this.browserReturnAbortController = null;
+    this.replaceProgressTimer = null;
+    this.replaceProgressEl = null;
+    this.replaceLastLabel = null;
+    this.onboardingRunning = false;
+    this.onboardingPaused = false;
+    this.resumeVisibilityHandler = null;
+    this.resumeRetryTimer = null;
   }
   async onOpen() {
     this.contentEl.addClass("obts-onboarding");
@@ -29139,9 +29146,10 @@ var ObtsOnboardingModal = class extends Modal {
       this.renderTerminalConnection(pending.journal.last_error_code === "connection_expired" ? "expired" : "denied");
       return;
     }
-    const postRegistrationStage = ["registering", "applying_uploading", "uploading_proposal", "awaiting_conflict"].includes(pending.journal.stage);
+    const registeredState = Boolean(state.vault_id && state.device_id);
+    const postRegistrationStage = ["registering", "applying_uploading", "uploading_proposal", "awaiting_conflict"].includes(pending.journal.stage) || pending.journal.stage === "blocked" && registeredState;
     const resumableSubmission = Boolean(
-      (this.analysis || postRegistrationStage) && this.mode && (state.vault_id && state.device_id || postRegistrationStage)
+      (this.analysis || postRegistrationStage) && this.mode && (registeredState || postRegistrationStage)
     );
     if (resumableSubmission) {
       if (pending.journal.stage === "awaiting_conflict") this.renderConflictReview();
@@ -29163,6 +29171,8 @@ var ObtsOnboardingModal = class extends Modal {
     this.cancelled = true;
     if (this.browserReturnAbortController) this.browserReturnAbortController.abort();
     this.browserReturnAbortController = null;
+    this.clearOnboardingResume();
+    this.stopReplaceProgress();
     this.contentEl.empty();
   }
   async waitForBrowserReturn() {
@@ -29371,30 +29381,119 @@ var ObtsOnboardingModal = class extends Modal {
     summary.createEl("span", {
       text: `${analysis.localFileCount.toLocaleString()} syncable local files \xB7 ${formatBytes(analysis.localBytes)}`
     });
+    const progress = contentEl.createEl("progress", { cls: "obts-onboarding-progress" });
+    progress.setAttribute("hidden", "");
     const feedback = contentEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
     new Setting(contentEl).addButton((button) => button.setButtonText("Cancel").onClick(async () => {
       button.setDisabled(true);
       await this.plugin.runExclusiveAction(() => this.plugin.client.cancelOnboarding());
       this.close();
-    })).addButton((button) => button.setButtonText("Replace local contents").setCta().onClick(async () => {
-      button.setDisabled(true);
-      setFeedback(feedback, "Connecting and replacing from the server vault...", "muted");
-      try {
-        const result = await this.plugin.runOnboardingAction(() => this.plugin.client.finishOnboarding(
-          this.connection.connection_id,
-          this.connection.connection_secret,
-          this.analysis,
-          "use_server"
-        ));
-        this.plugin.setStatus((await this.plugin.client.readState()).status_label);
-        this.renderResult(result);
-      } catch (error) {
-        if (this.cancelled || this.plugin.unloaded) return;
-        void this.plugin.reportOnboardingError(error, this.connection);
-        button.setDisabled(false);
-        setFeedback(feedback, error instanceof Error ? error.message : "Setup failed.", "error");
-      }
+    })).addButton((button) => button.setButtonText("Replace local contents").setCta().onClick(() => {
+      void this.runOnboardingCompletion(button, feedback, progress, {
+        mode: "use_server",
+        resumeLabel: "Resume replacing"
+      });
     }));
+  }
+  async runOnboardingCompletion(button, feedback, progressEl, options = {}) {
+    if (this.cancelled || this.plugin.unloaded || this.onboardingRunning) return;
+    this.onboardingRunning = true;
+    this.onboardingPaused = false;
+    this.clearOnboardingResume();
+    button.setDisabled(true);
+    this.startReplaceProgress(progressEl, feedback);
+    let result = null;
+    try {
+      result = await this.plugin.runOnboardingAction(() => this.plugin.client.finishOnboarding(
+        this.connection.connection_id,
+        this.connection.connection_secret,
+        this.analysis,
+        options.mode || this.mode
+      ));
+    } catch (error) {
+      this.stopReplaceProgress();
+      this.onboardingRunning = false;
+      if (this.cancelled || this.plugin.unloaded) return;
+      void this.plugin.reportOnboardingError(error, this.connection);
+      if (isOfflineTransportError(error) || isRetryableServerError(error)) {
+        button.setDisabled(false);
+        button.setButtonText(options.resumeLabel || "Resume setup");
+        this.onboardingPaused = true;
+        setFeedback(
+          feedback,
+          "Transfer paused \u2014 iOS suspends network transfers when Obsidian leaves the foreground or the screen locks. Downloaded progress is saved: it resumes automatically when you return, or tap the button below.",
+          "warning"
+        );
+        this.armOnboardingResume(button, feedback, progressEl, options);
+        return;
+      }
+      button.setDisabled(false);
+      setFeedback(feedback, error instanceof Error ? error.message : "Setup failed.", "error");
+      return;
+    }
+    this.stopReplaceProgress();
+    this.onboardingRunning = false;
+    this.plugin.setStatus((await this.plugin.client.readState()).status_label);
+    this.renderResult(result);
+  }
+  startReplaceProgress(progressEl, feedback) {
+    this.stopReplaceProgress();
+    this.replaceProgressEl = progressEl;
+    if (progressEl) progressEl.removeAttribute("hidden");
+    const update = () => {
+      if (this.cancelled || this.plugin.unloaded) return;
+      const label = this.plugin.activeOperationProgressLabel || this.plugin.currentStatusLabel || "Connecting";
+      if (progressEl) {
+        const match = /(\d+)\s*\/\s*(\d+)/u.exec(label);
+        if (match && Number(match[2]) > 0) {
+          progressEl.value = Number(match[1]);
+          progressEl.max = Number(match[2]);
+        } else {
+          progressEl.removeAttribute("value");
+          progressEl.removeAttribute("max");
+        }
+      }
+      if (this.replaceLastLabel !== label) {
+        this.replaceLastLabel = label;
+        if (feedback) setFeedback(feedback, `obts: ${label}`, "muted");
+      }
+    };
+    update();
+    this.replaceProgressTimer = window.setInterval(update, 500);
+  }
+  stopReplaceProgress() {
+    if (this.replaceProgressTimer !== null) {
+      window.clearInterval(this.replaceProgressTimer);
+      this.replaceProgressTimer = null;
+    }
+    if (this.replaceProgressEl && typeof this.replaceProgressEl.setAttribute === "function") {
+      this.replaceProgressEl.setAttribute("hidden", "");
+    }
+    this.replaceLastLabel = null;
+  }
+  armOnboardingResume(button, feedback, progressEl, options = {}) {
+    this.clearOnboardingResume();
+    this.resumeVisibilityHandler = () => {
+      if (document.hidden || this.cancelled || this.plugin.unloaded || !this.onboardingPaused) return;
+      if (this.resumeRetryTimer !== null) return;
+      this.resumeRetryTimer = window.setTimeout(() => {
+        this.resumeRetryTimer = null;
+        if (document.hidden || this.cancelled || this.plugin.unloaded || !this.onboardingPaused) return;
+        if (button) button.setButtonText(options.resumeLabel || "Resume setup");
+        void this.runOnboardingCompletion(button, feedback, progressEl, options);
+      }, 1200);
+    };
+    document.addEventListener("visibilitychange", this.resumeVisibilityHandler);
+  }
+  clearOnboardingResume() {
+    if (this.resumeVisibilityHandler) {
+      document.removeEventListener("visibilitychange", this.resumeVisibilityHandler);
+      this.resumeVisibilityHandler = null;
+    }
+    if (this.resumeRetryTimer !== null) {
+      window.clearTimeout(this.resumeRetryTimer);
+      this.resumeRetryTimer = null;
+    }
   }
   renderConfirmation() {
     const { contentEl } = this;
@@ -29457,24 +29556,17 @@ var ObtsOnboardingModal = class extends Modal {
   }
   renderResume() {
     const { contentEl } = this;
+    this.onboardingPaused = false;
     contentEl.empty();
     contentEl.createEl("h2", { text: "Finish sync setup" });
     contentEl.createEl("p", {
       text: "This setup submission started but did not finish. Resume from the durable journal and server state; obts will not submit the local vault a second time."
     });
+    const progress = contentEl.createEl("progress", { cls: "obts-onboarding-progress" });
+    progress.setAttribute("hidden", "");
     const feedback = contentEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
-    new Setting(contentEl).addButton((button) => button.setButtonText("Close").onClick(() => this.close())).addButton((button) => button.setButtonText("Resume setup").setCta().onClick(async () => {
-      button.setDisabled(true);
-      setFeedback(feedback, "Checking the accepted onboarding proposal...", "muted");
-      try {
-        const result = await this.resumeRegisteredSetup();
-        this.renderResult(result);
-      } catch (error) {
-        if (this.cancelled || this.plugin.unloaded) return;
-        void this.plugin.reportOnboardingError(error, this.connection);
-        button.setDisabled(false);
-        setFeedback(feedback, error instanceof Error ? error.message : "Unable to resume setup.", "error");
-      }
+    new Setting(contentEl).addButton((button) => button.setButtonText("Close").onClick(() => this.close())).addButton((button) => button.setButtonText("Resume setup").setCta().onClick(() => {
+      void this.runOnboardingCompletion(button, feedback, progress, { resumeLabel: "Resume setup" });
     }));
   }
   renderConflictReview() {

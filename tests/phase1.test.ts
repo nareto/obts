@@ -7195,6 +7195,11 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('setButtonText("Set up sync")');
     expect(pluginMain).toContain("Replace local contents from the selected server vault");
     expect(pluginMain).toContain('Replace this vault\'s contents from');
+    expect(pluginMain).toContain('pending.journal.stage === "blocked" && registeredState');
+    expect(pluginMain).toContain('runOnboardingCompletion');
+    expect(pluginMain).toContain('armOnboardingResume');
+    expect(pluginMain).toContain('obts-onboarding-progress');
+    expect(pluginMain).toContain('Transfer paused — iOS suspends network transfers');
     expect(pluginMain).toContain('renderAfterApprovedReplacement');
     expect(pluginMain).toContain('renderIntentMismatch');
     expect(pluginMain).toContain("early_disposition: earlyDisposition === \"use_server\" ? \"use_server\" : null");
