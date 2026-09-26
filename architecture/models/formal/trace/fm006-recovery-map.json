@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "model": "architecture/models/formal/OBTSOnboardingRecovery.tla",
+  "architectureRevision": 22,
+  "status": "static seam mapping; no runtime trace conformance claim",
+  "contracts": ["OBTS-SYNC-ONB-001", "OBTS-SYNC-ACK-001", "OBTS-SAF-002", "OBTS-SAF-005", "OBTS-SAF-009"],
+  "checker": "scripts/check-onboarding-recovery-model.mjs",
+  "mappings": [
+    {
+      "actions": ["PublishContext", "Accept", "PublishReceipt", "Crash", "Restart"],
+      "implementation": ["obsidian-plugin/src/main.cjs: prepareReplacementOnboarding, finishOnboarding, finishOnboardingInternal, repairLocalStateIfNeeded", "src/server/connectionService.ts: statusInternal, existingCompletion"],
+      "tests": ["tests/onboarding-mobile-restart.test.ts: real modal response loss, historical journal migration, enrollment/accepted/credential/identity/registered SIGKILL boundaries"],
+      "checks": ["safety", "liveness", "response-loss-restart", "legacy-context"]
+    },
+    {
+      "actions": ["PlanApply", "Recover", "Apply", "OverwriteJournal"],
+      "implementation": ["obsidian-plugin/src/main.cjs: admitApplyRecovery, applyRecoveryValidationReason, validateApplyJournalPolicy, initialize, applyTargetMain"],
+      "tests": ["tests/onboarding-recovery.test.ts: absent lock and same-target apply, corrupt or missing recovery, corrupt displacement, concurrent edits", "tests/onboarding-mobile-restart.test.ts: recovery/files/committed SIGKILL boundaries"],
+      "checks": ["safety", "overwrite-journal"]
+    },
+    {
+      "actions": ["Chunk", "AdvanceMain", "DropCheckpoint", "Ack", "NewApplyBeforeAck", "CatchUp", "LoseCatchUp", "CaptureInterim"],
+      "implementation": ["obsidian-plugin/src/main.cjs: pull, pullAndApply, queuePreservedLocalChanges, retained catch-up marker and intermediate-ancestry admission, retryPendingAppliedAcknowledgement, settlePreviouslyAppliedPullCheckpoint, completeRegisteredOnboarding"],
+      "tests": ["tests/retained-catchup.test.ts: retired-checkpoint catch-up with empty events and blocked intermediate-ancestry upload after restart", "tests/onboarding-mobile-restart.test.ts: checkpoint and pending acknowledgement with advanced main; checkpoint/pending-ack/acknowledged/activated SIGKILL boundaries", "tests/phase1.test.ts: watcher paths during chunk upload including existing-file edits; multipack applied-checkpoint cleanup"],
+      "checks": ["safety", "liveness", "drop-checkpoint", "skip-ack", "lost-catchup", "interim-ancestry"]
+    }
+  ],
+  "omissions": ["Physical iPhone suspension and power loss", "Git object, path, checksum and consent validator implementation proof", "Unbounded network faults", "Runtime TLA trace replay"]
+}

@@ -1215,7 +1215,7 @@ describe('mobile plugin artifact', () => {
       paired: true
     });
     await adapter.writeBinary('.obts/state.json', savedPrimaryState);
-    await adapter.writeBinary('.obts/apply-journal.json', Uint8Array.from({ length: 256 * 1024 + 1 }, () => 97).buffer);
+    await adapter.writeBinary('.obts/apply-journal.json', Uint8Array.from({ length: 512 * 1024 + 1 }, () => 97).buffer);
     expect(await diagnosticClient.collectTroubleshootingContext({ trigger: 'manual' })).toMatchObject({
       state_source: 'primary',
       apply_journal: 'present_unclassified'

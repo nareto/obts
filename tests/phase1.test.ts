@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { publishRecoveryFixture } from './helpers/publishRecoveryFixture.js';
 
 import { ObtsPluginClient, PluginBlockedError } from '../obsidian-plugin/src/core/client.js';
 import { LocalGitEngine } from '../obsidian-plugin/src/core/localGit.js';
@@ -643,7 +644,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await plugin.readQueue()).toMatchObject({ pending_commit: null, status: 'idle' });
   });
 
-  it('preserves watcher paths that arrive during chunk upload state transitions', async () => {
+  it.each([false, true])('preserves watcher paths that arrive during chunk upload state transitions (edit existing=%s)', async (editExisting) => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'watcher-during-upload-device');
     await mkdirp(deviceDir);
@@ -657,7 +658,8 @@ describe('Phase 1 sync without conflict resolution', () => {
       if (!injected) {
         injected = true;
         await writeFile(join(deviceDir, 'during-upload.md'), 'must remain queued\n');
-        await plugin.recordLocalChangeHint(['during-upload.md']);
+        if (editExisting) await writeFile(join(deviceDir, 'first.md'), 'newer accepted edit\n');
+        await plugin.recordLocalChangeHint(['during-upload.md', ...(editExisting ? ['first.md'] : [])]);
       }
       return await putPushChunk(...args);
     };
@@ -667,7 +669,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await plugin.readQueue()).toMatchObject({
       pending_commit: null,
       status: 'queued_local',
-      changed_paths: ['during-upload.md']
+      changed_paths: ['during-upload.md', ...(editExisting ? ['first.md'] : [])]
     });
     core.putPushChunk = putPushChunk;
     await expect(plugin.syncOnce()).resolves.toMatchObject({ status: 'Synced' });
@@ -675,6 +677,8 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await server.git.listTreePaths(admin.vaultId, finalMain!)).toEqual(
       expect.arrayContaining(['during-upload.md', 'first.md'])
     );
+    expect(await readFile(join(deviceDir, 'first.md'), 'utf8')).toBe(editExisting ? 'newer accepted edit\n' : 'first upload\n');
+    await expect(stat(join(deviceDir, '.obts', 'pull-transfer.json'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('syncs Obsidian-valid punctuation paths and large markdown directories', async () => {
@@ -1985,6 +1989,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       updated_at: new Date().toISOString()
     }, null, 2)}\n`);
 
+    await publishRecoveryFixture(fixtureBDir);
     const restartedFixtureB = new ObtsPluginClient(fixtureBDir, { serverUrl: baseUrl, deviceName: 'fixtureB-blocked-delete' });
     await restartedFixtureB.initialize();
     expect(await restartedFixtureB.readQueue()).toMatchObject({ status: 'queued_local' });
@@ -5527,7 +5532,9 @@ describe('Phase 1 sync without conflict resolution', () => {
         serverUrl: baseUrl,
         deviceName: 'malformed-journal-device'
       });
-      await expect(restartedPlugin.initialize()).rejects.toThrow();
+      await restartedPlugin.initialize();
+      expect(await restartedPlugin.readState()).toMatchObject({ last_error_code: 'apply_journal_recovery_required' });
+      await expect(restartedPlugin.syncOnce()).rejects.toMatchObject({ code: 'apply_journal_recovery_required' });
       expect(await readFile(journalPath, 'utf8')).toBe(malformedJournal);
     }
   });
@@ -5656,6 +5663,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       )}\n`
     );
 
+    await publishRecoveryFixture(device2Dir);
     const restartedPlugin = new ObtsPluginClient(device2Dir, {
       serverUrl: baseUrl,
       deviceName: 'journal-device-2',
@@ -5710,6 +5718,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       )}\n`
     );
 
+    await publishRecoveryFixture(device2Dir);
     const restartedPlugin = new ObtsPluginClient(device2Dir, {
       serverUrl: baseUrl,
       deviceName: 'journal-packed-device-2'
@@ -5772,6 +5781,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       }, null, 2)}\n`
     );
 
+    await publishRecoveryFixture(device2Dir);
     const restartedPlugin = new ObtsPluginClient(device2Dir, {
       serverUrl: baseUrl,
       deviceName: 'journal-directory-device-2'
@@ -7195,7 +7205,6 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('setButtonText("Set up sync")');
     expect(pluginMain).toContain("Replace local contents from the selected server vault");
     expect(pluginMain).toContain('Replace this vault\'s contents from');
-    expect(pluginMain).toContain('pending.journal.stage === "blocked" && registeredState');
     expect(pluginMain).toContain('runOnboardingCompletion');
     expect(pluginMain).toContain('armOnboardingResume');
     expect(pluginMain).toContain('obts-onboarding-progress');

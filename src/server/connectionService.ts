@@ -126,11 +126,23 @@ export class ConnectionService {
       if (connection.status === 'consumed') {
         const device = db.devices.find((candidate) => candidate.device_id === connection.created_device_id);
         const vault = device ? db.vaults.find((candidate) => candidate.vault_id === device.vault_id) : null;
-        if (!device || !vault) {
+        const expectedToken = hashToken(deriveDeviceToken(secret, connection.credential_salt));
+        const token = db.tokens.find(candidate => candidate.kind === 'device' && candidate.device_id === device?.device_id &&
+          candidate.vault_id === vault?.vault_id && candidate.user_id === device?.user_id && candidate.revoked_at === null &&
+          candidate.consumed_at === null && candidate.token_hash === expectedToken.hash);
+        const owner = db.users.find(candidate => candidate.user_id === device?.user_id);
+        if (!device || !vault || !token || !owner || owner.disabled || !device.onboarding_mode || !connection.selection ||
+          device.status === 'revoked' || device.revoked_at !== null ||
+          device.user_id !== vault.owner_user_id || connection.approved_user_id !== device.user_id ||
+          device.onboarding_connection_id !== connection.connection_id ||
+          (connection.selection === 'existing_vault' && connection.selected_vault_id !== vault.vault_id)) {
           throw new AuthError(409, 'connection_inconsistent', 'Connection state is incomplete.');
         }
         return {
           status: 'consumed',
+          selection: connection.selection,
+          expected_main: connection.expected_main,
+          mode: device.onboarding_mode,
           vault_id: vault.vault_id,
           vault_name: vault.display_name,
           device_id: device.device_id
@@ -350,6 +362,12 @@ export class ConnectionService {
       const current = await this.store.snapshot();
       const vault = current.vaults.find((candidate) => candidate.vault_id === existing.vault_id);
       if (!vault) throw new AuthError(404, 'not_found', 'Resource not found.');
+      const connection = authenticatedConnection(current.connections, connectionId, secret);
+      // Consumed completion returns the durable receipt; proposal authorization
+      // expires at activation and is never recreated by this replay.
+      if (request.mode !== existing.mode || request.expected_main !== connection.expected_main) {
+        throw new AuthError(409, 'onboarding_identity_mismatch', 'Completion does not match the accepted enrollment.');
+      }
       const policy = await this.git.readRootIgnoreBlob(existing.vault_id, vault.current_main);
       if (policy.oid !== null && request.root_ignore_capability !== 'root-ignore-v1') {
         throw new AuthError(409, 'root_ignore_capability_required', 'Update to a capable device before joining this vault.');
@@ -574,9 +592,13 @@ export class ConnectionService {
     }
     const token = db.tokens.find((candidate) =>
       candidate.kind === 'device' && candidate.device_id === device.device_id && candidate.vault_id === vault.vault_id &&
-      candidate.user_id === device.user_id && candidate.revoked_at === null && candidate.consumed_at === null
+      candidate.user_id === device.user_id && candidate.revoked_at === null && candidate.consumed_at === null &&
+      candidate.token_hash === hashToken(deviceToken).hash
     );
-    if (!token || device.status === 'revoked' || device.revoked_at !== null || device.user_id !== vault.owner_user_id) {
+    const owner = db.users.find(candidate => candidate.user_id === device.user_id);
+    if (!token || !owner || owner.disabled || device.status === 'revoked' || device.revoked_at !== null || device.user_id !== vault.owner_user_id ||
+      connection.approved_user_id !== device.user_id || device.onboarding_connection_id !== connectionId ||
+      (connection.selection === 'existing_vault' && connection.selected_vault_id !== vault.vault_id)) {
       throw new AuthError(409, 'connection_inconsistent', 'Connection state is incomplete.');
     }
     return responseFor(vault, device, deviceToken, device.onboarding_mode);

@@ -146,16 +146,16 @@ export class HeadlessSession {
           stateChanged: true
         };
       case 'finish-onboarding': {
-        const mode = requiredString(request, 'mode');
-        if (mode !== 'initialize' && mode !== 'use_server' && mode !== 'merge') {
+        const mode = request.mode === undefined ? undefined : requiredString(request, 'mode');
+        if (mode !== undefined && mode !== 'initialize' && mode !== 'use_server' && mode !== 'merge') {
           throw new ProtocolInputError('invalid_mode', 'mode must be initialize, use_server, or merge.');
         }
         return {
           result: await this.client.finishOnboarding({
             connectionId: requiredString(request, 'connectionId'),
             secret: requiredString(request, 'secret'),
-            analysis: requiredObject(request, 'analysis') as OnboardingAnalysis,
-            mode
+            ...(request.analysis == null ? {} : { analysis: requiredObject(request, 'analysis') as OnboardingAnalysis }),
+            ...(mode === undefined ? {} : { mode })
           }),
           stateChanged: true
         };

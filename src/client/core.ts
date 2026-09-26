@@ -142,8 +142,8 @@ type SharedClientCore = {
   finishOnboarding(
     connectionId: string,
     secret: string,
-    analysis: OnboardingAnalysis,
-    mode: 'initialize' | 'use_server' | 'merge'
+    analysis: OnboardingAnalysis | null | undefined,
+    mode: 'initialize' | 'use_server' | 'merge' | undefined
   ): Promise<SyncResult>;
   cancelOnboarding(): Promise<void>;
   recordLocalChangeHint(paths: string[]): Promise<void>;
@@ -279,8 +279,8 @@ export class ObtsPluginClient {
   finishOnboarding(input: {
     connectionId: string;
     secret: string;
-    analysis: OnboardingAnalysis;
-    mode: 'initialize' | 'use_server' | 'merge';
+    analysis?: OnboardingAnalysis | null;
+    mode?: 'initialize' | 'use_server' | 'merge';
   }): Promise<SyncResult> {
     return this.client.finishOnboarding(input.connectionId, input.secret, input.analysis, input.mode);
   }

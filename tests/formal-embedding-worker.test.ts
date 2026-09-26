@@ -52,14 +52,15 @@ describe('FM003 embedding-worker companion gate', () => {
       'node scripts/check-bridge-bounded-model.mjs --worker-companion',
       'node scripts/check-deletion-model.mjs',
       'node scripts/check-bridge-external-protocol.mjs',
-      'node scripts/check-onboarding-model.mjs'
+      'node scripts/check-onboarding-model.mjs',
+      'node scripts/check-onboarding-recovery-model.mjs'
     ]);
     expect(scripts['test:formal:bridge'].split(' && ')).toEqual([
       'node scripts/check-bridge-bounded-model.mjs',
       'node scripts/check-bridge-bounded-model.mjs --worker-companion',
       'node scripts/check-bridge-external-protocol.mjs'
     ]);
-    expect(scripts['test:formal:onboarding']).toBe('node scripts/check-onboarding-model.mjs');
+    expect(scripts['test:formal:onboarding']).toBe('node scripts/check-onboarding-model.mjs && node scripts/check-onboarding-recovery-model.mjs');
     expect(scripts['test:bridge:stack']).toContain('node scripts/check-bridge-stack.mjs');
     const workflow = readFileSync(join(root, '.github/workflows/formal-model.yml'), 'utf8');
     expect(workflow).toContain('run: npm run test:formal');

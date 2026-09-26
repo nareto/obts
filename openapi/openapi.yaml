@@ -581,6 +581,11 @@ paths:
   /connections/{connection_id}/complete:
     post:
       summary: Register the approved device with an explicit onboarding content mode.
+      description: >-
+        Authenticated consumed-connection replay returns the same durable receipt,
+        including after activation. Mode and original expected_main must match.
+        Proposal kind and base are unused on consumed replay and never authorize
+        another proposal. Existing consumed receipts require no proposal metadata migration.
       security:
         - connectionBearer: []
       parameters:
@@ -1794,8 +1799,18 @@ components:
               format: date-time
               description: Finite approved-enrollment lease deadline; status polling does not renew it.
         - type: object
-          required: [status, vault_id, vault_name, device_id]
+          required: [status, vault_id, vault_name, device_id, selection, expected_main, mode]
           properties:
+            selection:
+              enum: [new_vault, existing_vault]
+            expected_main:
+              description: Original approval baseline, never the current canonical head.
+              oneOf:
+                - type: "null"
+                - type: string
+                  pattern: "^[0-9a-f]{40}$"
+            mode:
+              enum: [initialize, use_server, merge]
             status:
               const: consumed
             vault_id:
@@ -2084,9 +2099,25 @@ components:
         outcome:
           type: string
           enum: [observed, succeeded, skipped, blocked, failed]
+        recovery_summary:
+          type: object
+          additionalProperties: false
+          required: [apply_read, transfer_read, consent, checkpoint, apply_error]
+          description: Optional bounded observation; never recovery authority. Older clients may omit it.
+          properties:
+            apply_read:
+              enum: [valid, absent, invalid, unreadable, oversized]
+            transfer_read:
+              enum: [valid, absent, invalid, unreadable, oversized]
+            consent:
+              enum: [saved, missing, unknown]
+            checkpoint:
+              enum: [complete, partial, unknown]
+            apply_error:
+              $ref: '#/components/schemas/TroubleshootingDiagnosticContext/properties/safe_error_code'
         safe_error_code:
           type: string
-          enum: [none, device_blocked, conflict_review_required, server_recovery_required, blocked_integrity, device_revoked, device_identity_mismatch, not_paired, sync_lease_blocked, operation_interrupted_by_reload, local_state_incomplete, same_device_non_fast_forward, apply_recovery_required, directory_recovery_decision_required, directory_recovery_changed, directory_recovery_journal_invalid, network_error, http_error, sync_error, unknown]
+          enum: [none, device_blocked, conflict_review_required, server_recovery_required, blocked_integrity, device_revoked, device_identity_mismatch, not_paired, sync_lease_blocked, operation_interrupted_by_reload, local_state_incomplete, same_device_non_fast_forward, apply_recovery_required, apply_journal_recovery_required, onboarding_context_required, onboarding_identity_mismatch, onboarding_snapshot_changed, invalid_transfer_checkpoint, applied_main_acknowledgement_failed, recovery_evidence_missing, recovery_checksum_mismatch, recovery_identity_mismatch, recovery_target_policy_mismatch, recovery_state_corrupt, catchup_recovery_required, catchup_local_changes, local_files_diverge_from_journal, local_changed_during_apply, preflight_hash_changed, recovery_bundle_failed, directory_recovery_decision_required, directory_recovery_changed, directory_recovery_journal_invalid, object_too_large_for_chunk, pack_preparation_failed, network_error, http_error, sync_error, unknown]
         client_state:
           type: string
           enum: [uninitialized, initializing, ready, unloaded]

@@ -112,6 +112,9 @@ export type ConnectionStatusResponse =
     }
   | {
       status: 'consumed';
+      selection: 'new_vault' | 'existing_vault';
+      expected_main: string | null;
+      mode: CompleteConnectionRequest['mode'];
       vault_id: string;
       vault_name: string;
       device_id: string;

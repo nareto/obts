@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { publishRecoveryFixture } from './helpers/publishRecoveryFixture.js';
 
 import { ObtsPluginClient, TransportError } from '../obsidian-plugin/src/core/client.js';
 import type { ApplyJournal } from '../obsidian-plugin/src/core/recovery.js';
@@ -1012,6 +1013,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
       )}\n`
     );
 
+    await publishRecoveryFixture(tabletDir);
     const restartedTablet = new ObtsPluginClient(tabletDir, {
       serverUrl: admin.baseUrl,
       deviceName: 'tablet'
@@ -2924,6 +2926,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
         `${JSON.stringify(journal, null, 2)}\n`
       );
 
+      await publishRecoveryFixture(vaultDir);
       const client = new ObtsPluginClient(vaultDir, {
         serverUrl: admin.baseUrl,
         deviceName: 'device-recovery'
@@ -2983,6 +2986,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
         `${JSON.stringify(journal, null, 2)}\n`
       );
 
+      await publishRecoveryFixture(vaultDir);
       await writeFile(join(vaultDir, 'other.md'), 'externally modified content\n');
 
       const client = new ObtsPluginClient(vaultDir, {

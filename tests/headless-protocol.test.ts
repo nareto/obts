@@ -48,6 +48,19 @@ function fakeClient(overrides: Partial<HeadlessClient> = {}): HeadlessClient {
 }
 
 describe('headless client protocol', () => {
+  it('resumes onboarding from durable context without retaining analysis in the supervisor', async () => {
+    const messages: HeadlessMessage[] = [];
+    const client = fakeClient();
+    const session = new HeadlessSession(client, async message => void messages.push(message));
+    await session.submit({ id: 'resume', command: 'finish-onboarding', connectionId: 'connection', secret: 'synthetic' });
+    expect(client.finishOnboarding).toHaveBeenCalledWith({ connectionId: 'connection', secret: 'synthetic' });
+    expect(messages.at(-1)).toMatchObject({ type: 'response', id: 'resume', ok: true });
+    await session.submit({ id: 'bad-mode', command: 'finish-onboarding', connectionId: 'connection', secret: 'synthetic', mode: 'guess' });
+    await session.submit({ id: 'bad-analysis', command: 'finish-onboarding', connectionId: 'connection', secret: 'synthetic', analysis: [] });
+    expect(client.finishOnboarding).toHaveBeenCalledTimes(1);
+    expect(messages.at(-1)).toMatchObject({ type: 'response', id: 'bad-analysis', ok: false });
+  });
+
   it('emits ready and correlated responses without exposing implementation logs', async () => {
     const messages: HeadlessMessage[] = [];
     const client = fakeClient();

@@ -125,6 +125,23 @@ export const troubleshootingSafeErrorCodes = [
   'local_state_incomplete',
   'same_device_non_fast_forward',
   'apply_recovery_required',
+  'apply_journal_recovery_required',
+  'onboarding_context_required',
+  'onboarding_identity_mismatch',
+  'onboarding_snapshot_changed',
+  'invalid_transfer_checkpoint',
+  'applied_main_acknowledgement_failed',
+  'recovery_evidence_missing',
+  'recovery_checksum_mismatch',
+  'recovery_identity_mismatch',
+  'recovery_target_policy_mismatch',
+  'recovery_state_corrupt',
+  'catchup_recovery_required',
+  'catchup_local_changes',
+  'local_files_diverge_from_journal',
+  'local_changed_during_apply',
+  'preflight_hash_changed',
+  'recovery_bundle_failed',
   'directory_recovery_decision_required',
   'directory_recovery_changed',
   'directory_recovery_journal_invalid',
@@ -290,7 +307,16 @@ export type DiagnosticEventV1 = DiagnosticEventFields<DiagnosticFailureCodeV1> &
   schema_version: typeof DIAGNOSTIC_SCHEMA_VERSION;
 };
 
+export type RecoveryDiagnosticSummary = {
+  apply_read: 'valid' | 'absent' | 'invalid' | 'unreadable' | 'oversized';
+  transfer_read: 'valid' | 'absent' | 'invalid' | 'unreadable' | 'oversized';
+  consent: 'saved' | 'missing' | 'unknown';
+  checkpoint: 'complete' | 'partial' | 'unknown';
+  apply_error: TroubleshootingSafeErrorCode;
+};
+
 export type TroubleshootingDiagnosticContext = {
+  recovery_summary?: RecoveryDiagnosticSummary;
   attempt_id: string;
   trigger: TroubleshootingTrigger;
   phase: TroubleshootingPhase;
@@ -466,7 +492,7 @@ function parseEventFields<const T extends readonly DiagnosticFailureCode[]>(
 
 function parseTroubleshootingContext(value: unknown): TroubleshootingDiagnosticContext {
   assertRecord(value);
-  assertExactKeys(value, TROUBLESHOOTING_CONTEXT_KEYS);
+  assertExactKeys(value, value.recovery_summary === undefined ? TROUBLESHOOTING_CONTEXT_KEYS : [...TROUBLESHOOTING_CONTEXT_KEYS, 'recovery_summary']);
   const attemptId = readBoundedString(value, 'attempt_id', 36);
   if (!ATTEMPT_ID_PATTERN.test(attemptId)) {
     throw new ValidationError('invalid_request', 'Invalid troubleshooting attempt ID.');
@@ -477,6 +503,7 @@ function parseTroubleshootingContext(value: unknown): TroubleshootingDiagnosticC
   assertRecord(value.cursor_relations);
   assertExactKeys(value.cursor_relations, CURSOR_RELATION_KEYS);
   return {
+    ...(value.recovery_summary === undefined ? {} : { recovery_summary: parseRecoverySummary(value.recovery_summary) }),
     attempt_id: attemptId,
     trigger: readEnum(value, 'trigger', troubleshootingTriggers),
     phase: readEnum(value, 'phase', troubleshootingPhases),
@@ -508,6 +535,19 @@ function parseTroubleshootingContext(value: unknown): TroubleshootingDiagnosticC
       event_to_applied: readEnum(value.cursor_relations, 'event_to_applied', troubleshootingSequenceRelations),
       event_to_server: readEnum(value.cursor_relations, 'event_to_server', troubleshootingSequenceRelations)
     }
+  };
+}
+
+function parseRecoverySummary(value: unknown): RecoveryDiagnosticSummary {
+  assertRecord(value);
+  assertExactKeys(value, ['apply_read', 'transfer_read', 'consent', 'checkpoint', 'apply_error']);
+  const reads = ['valid', 'absent', 'invalid', 'unreadable', 'oversized'] as const;
+  return {
+    apply_read: readEnum(value, 'apply_read', reads),
+    transfer_read: readEnum(value, 'transfer_read', reads),
+    consent: readEnum(value, 'consent', ['saved', 'missing', 'unknown'] as const),
+    checkpoint: readEnum(value, 'checkpoint', ['complete', 'partial', 'unknown'] as const),
+    apply_error: readEnum(value, 'apply_error', troubleshootingSafeErrorCodes)
   };
 }
 

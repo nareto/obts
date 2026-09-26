@@ -949,7 +949,8 @@ module.exports = class ObtsPlugin extends Plugin {
     if (this.unloaded || (typeof document !== "undefined" && document.hidden) || !(await this.ensureClientReady()) || this.isSyncInProgress()) {
       return;
     }
-    if (await this.client.readPendingOnboarding()) return;
+    try { if (await this.client.readPendingOnboarding()) return; }
+    catch (error) { if (error?.code === "onboarding_context_required") return; throw error; }
     if (!this.beginSync("Background sync")) return;
     try {
       const state = await this.client.readState();
@@ -1307,6 +1308,7 @@ class ObtsObsidianClient {
     this.pendingConnectionPath = path.join(this.obtsDir, "auth", "pending-connection.json");
     this.bootstrapTransferPath = path.join(this.obtsDir, "bootstrap-transfer.json");
     this.pullTransferPath = path.join(this.obtsDir, "pull-transfer.json");
+    this.catchupPath = path.join(this.obtsDir, "catchup.json");
     this.uploadTransferPath = path.join(this.obtsDir, "upload-transfer.json");
     this.pendingAppliedAckPath = path.join(this.obtsDir, "pending-applied-ack.json");
     this.directoryRecoveryPath = path.join(this.obtsDir, "directory-recovery.json");
@@ -1363,6 +1365,13 @@ class ObtsObsidianClient {
       onboarding_journal: troubleshootingOnboardingState(onboardingJournal),
       transfer_journal: troubleshootingCombinedPresence(transferJournals),
       pending_applied_ack: troubleshootingPresence(pendingAck),
+      recovery_summary: {
+        apply_read: applyJournal.kind,
+        transfer_read: transferJournals.some(read => read.kind === "oversized") ? "oversized" : transferJournals.some(read => read.kind === "invalid") ? "invalid" : transferJournals.some(read => read.kind === "unreadable") ? "unreadable" : transferJournals.some(read => read.kind === "valid") ? "valid" : "absent",
+        consent: onboardingJournal.value ? (isOnboardingConsentSummary(onboardingJournal.value.pending_summary) || onboardingJournal.value.consent === "saved" ? "saved" : "missing") : "unknown",
+        checkpoint: transferJournals.some(read => read.value?.complete === true) ? "complete" : transferJournals.some(read => read.value?.complete === false) ? "partial" : "unknown",
+        apply_error: troubleshootingSafeErrorCode(capturedState?.apply_validation_reason || applyJournal.value?.redacted_error_category)
+      },
       cursor_guard: troubleshootingEnum(details.cursorGuard || this.lastCursorGuardDiagnostic, ["not_observed", "no_preservation", "local_main", "local_head", "server_ref", "event_cursor", "multiple"], "not_observed"),
       reconcile_guard: troubleshootingEnum(details.reconcileGuard, ["not_observed", "unchanged", "timestamp_changed", "error_changed", "cursor_changed", "multiple"], "not_observed"),
       reconcile_timestamp: troubleshootingEnum(details.reconcileTimestamp, ["unchanged", "changed", "unknown"], "unknown"),
@@ -1393,17 +1402,31 @@ class ObtsObsidianClient {
     await this.fsp.mkdir(path.join(this.gitdir, "info"), { recursive: true, mode: 0o700 });
     await this.fsp.writeFile(path.join(this.gitdir, "info", "exclude"), ".obts/\n.git/\n", { mode: 0o600 });
     this.plugin.setInitializationStage("Reading local sync state", "startup_state");
-    const state = await this.repairLocalStateIfNeeded(await this.readState());
+    let state = await this.readState();
     this.plugin.setInitializationStage("Checking interrupted apply journal", "recovery_journal");
-    const journal = await readApplyJournalStrict(this.fsp, this.applyJournalPath);
+    let journal;
+    try {
+      journal = await readApplyJournalStrict(this.fsp, this.applyJournalPath);
+    } catch {
+      await this.writeState(Object.assign({}, state, { status_label: "Out of sync — local recovery required", last_error_code: "apply_journal_recovery_required", apply_validation_reason: "recovery_state_corrupt", updated_at: nowIso() }));
+      return;
+    }
+    if (!journal) state = await this.repairLocalStateIfNeeded(state);
     if (journal) this.plugin.setInitializationStage("Recovering an interrupted apply", "recovery_journal");
-    if (journal && !(await this.validateApplyJournalPolicy(journal))) {
+    const validationReason = journal && (await this.applyRecoveryValidationReason(journal, state) ||
+      (!(await this.validateApplyJournalPolicy(journal)) ? "recovery_target_policy_mismatch" : null));
+    if (validationReason) {
       await this.writeState(Object.assign({}, state, {
         status_label: "Out of sync — local recovery required",
         last_error_code: "apply_journal_recovery_required",
+        apply_validation_reason: validationReason,
         updated_at: nowIso()
       }));
       return;
+    }
+    if (state.apply_validation_reason) {
+      state = Object.assign({}, state, { apply_validation_reason: null });
+      await this.writeState(state);
     }
     if (journal && journal.phase === "committed") {
       let preservedLocalChangePaths = [];
@@ -1523,9 +1546,13 @@ class ObtsObsidianClient {
   }
 
   async readPendingOnboarding() {
-    const journal = await readJson(this.fsp, this.onboardingJournalPath, null);
-    const pending = await readJson(this.fsp, this.pendingConnectionPath, null);
-    if (!journal || journal.stage === "complete" || !pending || !pending.connection_secret) return null;
+    const journal = await readRecoveryJsonStrict(this.fsp, this.onboardingJournalPath, "onboarding_context_required", "The saved setup journal is unreadable. Preserve it for recovery.");
+    if (journal && !isTroubleshootingOnboardingJournal(journal)) throw new ObtsBlockedError("onboarding_context_required", "The saved setup journal is invalid. Preserve it for recovery.");
+    if (!journal || journal.stage === "complete") return null;
+    const pending = await readRecoveryJsonStrict(this.fsp, this.pendingConnectionPath, "onboarding_context_required", "The saved connection credential is unreadable. Preserve the setup state for recovery.");
+    if (!pending || typeof pending.connection_secret !== "string" || !pending.connection_secret.trim()) {
+      throw new ObtsBlockedError("onboarding_context_required", "The unfinished setup is missing its connection credential. Preserve the original setup journal and restore its matching credential from a trusted backup before resuming; do not start another enrollment.");
+    }
     return { journal, secret: pending.connection_secret };
   }
 
@@ -1557,6 +1584,7 @@ class ObtsObsidianClient {
   }
 
   async startOnboarding(_vaultNameHint, earlyDisposition = null) {
+    if (await this.readPendingOnboarding()) throw new ObtsBlockedError("onboarding_incomplete", "Resume the saved setup or explicitly cancel it before starting another enrollment.");
     await this.assertPairingCanStart();
     await this.flushEditorBuffersToDisk();
     const summary = await this.localSnapshotSummary();
@@ -1632,7 +1660,7 @@ class ObtsObsidianClient {
       if (!response.ok) await throwResponseError(response);
       return parseMultipartPull(response.headers.get("content-type") || "", Buffer.from(await response.arrayBuffer()));
     }
-    const checkpoint = await readJson(this.fsp, this.bootstrapTransferPath, null);
+    const checkpoint = await readRecoveryJsonStrict(this.fsp, this.bootstrapTransferPath, "invalid_transfer_checkpoint", "The saved bootstrap checkpoint is unreadable. Preserve it for recovery.");
     if (checkpoint && checkpoint.connection_id !== connectionId) await this.fsp.rm(this.bootstrapTransferPath, { force: true });
     if (checkpoint?.connection_id === connectionId && checkpoint.complete === true) {
       if (!isCompleteBootstrapCheckpoint(checkpoint) || !(await this.commitExists(checkpoint.target_main))) {
@@ -1779,15 +1807,110 @@ class ObtsObsidianClient {
     return analysis;
   }
 
-  async finishOnboarding(connectionId, secret, analysis, mode) {
+  async prepareReplacementOnboarding(connectionId, secret) {
     const pending = await this.readPendingOnboarding();
+    if (!pending || pending.journal.connection.connection_id !== connectionId || pending.secret !== secret ||
+      pending.journal.early_disposition !== "use_server") {
+      throw new ObtsBlockedError("onboarding_identity_mismatch", "Replacement consent does not match this setup.");
+    }
+    const status = await this.pollOnboarding(connectionId, secret);
+    const summary = pending.journal.pending_summary;
+    if ((status.status !== "approved" && status.status !== "consumed") ||
+      status.selection !== "existing_vault" || !isGitObjectId(status.expected_main) ||
+      typeof status.vault_id !== "string" || !isOnboardingConsentSummary(summary) ||
+      (status.status === "consumed" && (status.mode !== "use_server" || pending.journal.selected_mode !== "use_server"))) {
+      throw new ObtsBlockedError("onboarding_context_required", "This setup needs its original replacement consent and approved enrollment receipt. Preserve the setup journals and recovery bundles for recovery; do not reset this vault.");
+    }
+    const state = await this.readState();
+    if (state.vault_id && (state.vault_id !== status.vault_id ||
+      (status.status === "consumed" && state.device_id !== status.device_id)) ||
+      pending.journal.registered_device_id && pending.journal.registered_device_id !== status.device_id) {
+      throw new ObtsBlockedError("onboarding_identity_mismatch", "The enrollment receipt targets a different device or vault.");
+    }
+    const analysis = {
+      selection: "existing_vault", vaultId: status.vault_id, vaultName: status.vault_name,
+      expectedMain: status.expected_main, rootCommit: null, classification: "use_server_direct",
+      proposalBase: null, localFingerprint: summary.fingerprint,
+      localFileCount: summary.file_count, localBytes: summary.bytes
+    };
+    validateOnboardingAnalysis(analysis, "use_server");
+    await this.writeOnboardingJournal(Object.assign({}, pending.journal, {
+      analysis, stage: pending.journal.selected_mode ? pending.journal.stage : "awaiting_confirmation"
+    }));
+    return analysis;
+  }
+
+  async reviewOnboardingConsent(confirmation = null) {
+    const pending = await this.readPendingOnboarding();
+    if (!pending) throw new ObtsBlockedError("onboarding_context_required", "The original setup context is required.");
+    if (!pending.journal.analysis && pending.journal.early_disposition === "use_server") {
+      await this.prepareReplacementOnboarding(pending.journal.connection.connection_id, pending.secret);
+      return await this.reviewOnboardingConsent(confirmation);
+    }
+    const journal = pending.journal;
+    const analysis = journal.analysis;
+    const mode = journal.selected_mode;
+    validateOnboardingAnalysis(analysis, mode);
+    const state = await this.readState();
+    if (state.device_id || journal.registered_device_id || journal.proposal_commit ||
+      await exists(this.fsp, this.authPath) || await exists(this.fsp, this.applyJournalPath) ||
+      await exists(this.fsp, this.pendingAppliedAckPath) || await exists(this.fsp, this.pullTransferPath)) {
+      throw new ObtsBlockedError("onboarding_context_required", "Local enrollment or apply has already started. Preserve the setup journal and recovery evidence; finish that recovery before reviewing consent.");
+    }
+    const status = await this.pollOnboarding(journal.connection.connection_id, pending.secret);
+    if (!["approved", "consumed"].includes(status.status) || status.selection !== analysis.selection ||
+      status.expected_main !== analysis.expectedMain || (analysis.vaultId && status.vault_id !== analysis.vaultId) ||
+      (status.status === "consumed" && (status.mode !== mode || !status.device_id)) ||
+      (journal.consent_device_id && journal.consent_device_id !== status.device_id)) {
+      throw new ObtsBlockedError("onboarding_identity_mismatch", "The original enrollment identity, mode or baseline differs. Preserve its setup evidence for recovery.");
+    }
+    await this.flushEditorBuffersToDisk();
+    const summary = await this.localSnapshotSummary();
+    const review = { connection_id: journal.connection.connection_id, accepted_device_id: status.device_id || null,
+      analysis, mode, fingerprint: summary.fingerprint, file_count: summary.fileCount, bytes: summary.bytes };
+    if (confirmation) {
+      if (stableJson(confirmation) !== stableJson(review)) throw new ObtsBlockedError("onboarding_snapshot_changed", "The local vault changed again. Review the updated local contents before confirming.");
+      const updated = Object.assign({}, analysis, { localFingerprint: summary.fingerprint, localFileCount: summary.fileCount, localBytes: summary.bytes });
+      await this.writeOnboardingJournal(Object.assign({}, journal, { analysis: updated,
+        pending_summary: { fingerprint: summary.fingerprint, file_count: summary.fileCount, bytes: summary.bytes },
+        consent_device_id: review.accepted_device_id, last_error_code: null }));
+      return updated;
+    }
+    return review;
+  }
+
+  async finishOnboarding(connectionId, secret, analysis, mode) {
+    let pending = await this.readPendingOnboarding();
     if (
       !pending ||
-      pending.journal.connection.connection_id !== connectionId ||
-      pending.journal.selected_mode && pending.journal.selected_mode !== mode
+      pending.journal.connection.connection_id !== connectionId || pending.secret !== secret ||
+      pending.journal.selected_mode && mode && pending.journal.selected_mode !== mode
     ) {
       throw new ObtsBlockedError("onboarding_identity_mismatch", "Pending onboarding mode does not match this setup attempt.");
     }
+    mode = pending.journal.selected_mode || mode;
+    if (!pending.journal.analysis && pending.journal.early_disposition === "use_server") {
+      await this.prepareReplacementOnboarding(connectionId, secret);
+      pending = await this.readPendingOnboarding();
+    }
+    const durableAnalysis = pending.journal.analysis;
+    if (analysis && durableAnalysis && !sameOnboardingAnalysis(analysis, durableAnalysis)) {
+      throw new ObtsBlockedError("onboarding_identity_mismatch", "The submitted consent differs from the durable setup context.");
+    }
+    analysis = durableAnalysis || analysis;
+    validateOnboardingAnalysis(analysis, mode);
+    const approval = await this.pollOnboarding(connectionId, secret);
+    if (approval.status === "expired" || approval.status === "denied") {
+      throw new ObtsBlockedError(`connection_${approval.status}`, "The setup approval ended before enrollment. Restart this unused setup request explicitly.");
+    }
+    if ((pending.journal.consent_device_id && pending.journal.consent_device_id !== approval.device_id) ||
+      !["approved", "consumed"].includes(approval.status) ||
+      (approval.status === "approved" && (approval.selection !== analysis.selection || approval.expected_main !== analysis.expectedMain || approval.vault_id !== analysis.vaultId)) ||
+      (approval.status === "consumed" && ((analysis.vaultId && approval.vault_id !== analysis.vaultId) ||
+        (approval.mode !== undefined && (approval.mode !== mode || approval.expected_main !== analysis.expectedMain || approval.selection !== analysis.selection))))) {
+      throw new ObtsBlockedError("onboarding_identity_mismatch", "The original enrollment receipt does not match this setup.");
+    }
+    await this.writeOnboardingJournal(Object.assign({}, pending.journal, { analysis, selected_mode: mode, stage: "registering" }));
     this.onboardingOperation = true;
     await this.updateOnboardingStage(connectionId, "registering", mode);
     try {
@@ -1845,6 +1968,10 @@ class ObtsObsidianClient {
   }
 
   async finishOnboardingInternal(connectionId, secret, analysis, mode) {
+    validateOnboardingAnalysis(analysis, mode);
+    await this.admitApplyRecovery();
+    await this.retryPendingAppliedAcknowledgement();
+    await this.flushEditorBuffersToDisk();
     const current = await this.localSnapshotSummary();
     const localFiles = await this.scanSyncableFiles((await this.readRootIgnorePolicy()).policy);
     const resumed = await this.resumeAcceptedOnboarding(connectionId, analysis, mode, localFiles);
@@ -1862,8 +1989,17 @@ class ObtsObsidianClient {
         proposal_base: analysis.proposalBase
       } : {})
     });
+    if (completion.mode !== mode || (analysis.vaultId && completion.vault_id !== analysis.vaultId)) {
+      throw new ObtsBlockedError("onboarding_identity_mismatch", "Completion differs from the approved enrollment.");
+    }
+    const priorState = await this.readState();
+    const pendingIdentity = await this.readPendingOnboarding();
+    if ((priorState.vault_id && (priorState.vault_id !== completion.vault_id || priorState.device_id !== completion.device_id)) ||
+      (pendingIdentity?.journal.registered_device_id && pendingIdentity.journal.registered_device_id !== completion.device_id)) {
+      throw new ObtsBlockedError("onboarding_identity_mismatch", "Completion differs from the local device identity.");
+    }
     await writeJson(this.fsp, this.authPath, { device_token: completion.device_token, created_at: nowIso() });
-    await this.writeState({
+    if (!priorState.vault_id) await this.writeState({
       user_id: completion.user_id,
       vault_id: completion.vault_id,
       device_id: completion.device_id,
@@ -1911,10 +2047,32 @@ class ObtsObsidianClient {
     }
     const proposalBase = mode === "initialize" ? completion.root_commit : analysis.proposalBase;
     if (!proposalBase) throw new ObtsBlockedError("invalid_onboarding_base", "Onboarding proposal base is unavailable.");
-    await this.updateRef("refs/heads/main", proposalBase, null, true);
-    await this.updateRef("refs/heads/local", proposalBase, null, true);
-    await this.writeState(Object.assign({}, await this.readState(), { local_main: proposalBase, local_head: proposalBase, status_label: "Ahead", updated_at: nowIso() }));
-    const proposalCommit = await this.createLocalCommit("obts: onboarding local vault");
+    const proposalState = await this.readState();
+    const existingMainRef = await this.resolveRef("refs/heads/main");
+    const existingLocalRef = await this.resolveRef("refs/heads/local");
+    if (!proposalState.local_main && (!existingMainRef || existingMainRef === proposalBase)) {
+      if (existingLocalRef && !(await this.isAncestor(proposalBase, existingLocalRef))) {
+        throw new ObtsBlockedError("onboarding_context_required", "Existing local history does not descend from the approved proposal baseline.");
+      }
+      if (!existingMainRef) await this.updateRef("refs/heads/main", proposalBase, null, true);
+      if (!existingLocalRef) await this.updateRef("refs/heads/local", proposalBase, null, true);
+      await this.writeState(Object.assign({}, proposalState, { local_main: proposalBase, local_head: existingLocalRef || proposalBase, status_label: "Ahead", updated_at: nowIso() }));
+    } else if (proposalState.local_main !== proposalBase) {
+      throw new ObtsBlockedError("onboarding_context_required", "Existing local history requires recovery before the initial proposal can resume.");
+    }
+    const durableProposal = (await this.readPendingOnboarding())?.journal.proposal_commit;
+    const localProposalRef = durableProposal || await this.resolveRef("refs/heads/local");
+    let proposalCommit;
+    if (localProposalRef && localProposalRef !== proposalBase) {
+      if (!(await this.commitExists(localProposalRef)) || !(await this.isAncestor(proposalBase, localProposalRef))) {
+        throw new ObtsBlockedError("onboarding_context_required", "The saved initial proposal needs preservation-safe recovery before setup can continue.");
+      }
+      const matchesProposal = await this.localContentMatchesTree(localFiles, localProposalRef);
+      if (durableProposal && !matchesProposal) throw new ObtsBlockedError("onboarding_snapshot_changed", "The local vault no longer matches the saved initial proposal.");
+      proposalCommit = matchesProposal ? localProposalRef : await this.createLocalCommit("obts: onboarding local vault");
+    } else {
+      proposalCommit = await this.createLocalCommit("obts: onboarding local vault");
+    }
     const proposalPending = await this.readPendingOnboarding();
     if (proposalPending && proposalPending.journal.connection.connection_id === connectionId) {
       await this.writeOnboardingJournal(Object.assign({}, proposalPending.journal, {
@@ -1923,6 +2081,15 @@ class ObtsObsidianClient {
       }));
     }
     await this.writeQueue({ pending_commit: proposalCommit, expected_device_ref: null, status: proposalCommit ? "queued_local" : "idle", attempts: 0, updated_at: nowIso() });
+    // The proposal and its base refs now durably consume the initial object download.
+    const initialCheckpoint = await readJson(this.fsp, this.pullTransferPath, null);
+    if (initialCheckpoint) {
+      if (!isCompletePullCheckpoint(initialCheckpoint) || initialCheckpoint.vault_id !== completion.vault_id || initialCheckpoint.device_id !== completion.device_id) {
+        throw new ObtsBlockedError("invalid_transfer_checkpoint", "The onboarding proposal has an inconsistent transfer checkpoint.");
+      }
+      await this.validateCompleteTransferCheckpoint(initialCheckpoint, initialCheckpoint.current_local_main);
+      await this.fsp.rm(this.pullTransferPath, { force: true });
+    }
     const synced = await this.syncOnce({ confirmInitialImport: false });
     if (synced.status === "Conflict resolution needed") {
       await this.updateOnboardingStage(connectionId, "awaiting_conflict", mode);
@@ -2080,7 +2247,11 @@ class ObtsObsidianClient {
     }
     this.throwIfSyncBlocked(state);
     await this.retryPendingAppliedAcknowledgement();
+    await this.settlePreviouslyAppliedPullCheckpoint();
+    await this.resumeDurableCatchup();
+    if (await this.readDurableCatchup()) throw new ObtsBlockedError("catchup_local_changes", "Catch-up is still pending. Make a copy of local edits outside this vault and preserve recovery evidence before resuming.");
     await this.recoverUnacknowledgedServerApply();
+    state = await this.readState();
     await this.flushEditorBuffersToDisk();
     await this.reconcileQueueWithLocalHead(await this.readState());
     const queueBeforeScan = await this.readQueue();
@@ -3214,7 +3385,36 @@ class ObtsObsidianClient {
     return true;
   }
 
-  async pullAndApply(allowDestructive) {
+  async readDurableCatchup() {
+    const saved = await readRecoveryJsonStrict(this.fsp, this.catchupPath, "catchup_recovery_required", "The saved catch-up state is unreadable. Preserve local files and recovery evidence.");
+    if (!saved) return null;
+    const state = await this.readState();
+    if (saved.version !== 1 || saved.vault_id !== state.vault_id || saved.device_id !== state.device_id ||
+      !isGitObjectId(saved.target_main) || !isGitObjectId(saved.local_head) ||
+      (saved.accepted_ref !== null && !isGitObjectId(saved.accepted_ref))) {
+      throw new ObtsBlockedError("catchup_recovery_required", "The saved catch-up identity is invalid. Preserve local files and recovery evidence.");
+    }
+    return saved;
+  }
+
+  async resumeDurableCatchup() {
+    const saved = await this.readDurableCatchup();
+    if (!saved) return false;
+    await this.flushEditorBuffersToDisk();
+    const files = await this.scanSyncableFiles((await this.readRootIgnorePolicy()).policy);
+    if (await this.resolveRef("refs/heads/local") !== saved.local_head || !(await this.commitExists(saved.local_head)) ||
+      !(await this.localContentMatchesTree(files, saved.local_head)) ||
+      (await this.readDirectoryState()).pending_intents.length > 0) {
+      throw new ObtsBlockedError("catchup_local_changes", "Catch-up paused to preserve local edits. Make a copy of the edited files outside this vault, restore those files to their contents immediately after the interrupted apply using local history or recovery copies, then resume sync and reapply your edits. Keep the catch-up journal and recovery evidence.");
+    }
+    const queue = await this.readQueue();
+    if (queue.pending_commit) throw new ObtsBlockedError("catchup_recovery_required", "A proposal overlaps interrupted catch-up. Preserve the queue and recovery evidence before continuing.");
+    // Byte verification above proves these watcher hints describe the saved tree.
+    await this.clearQueuedHintIfUnchanged(queue.change_seq || 0);
+    return await this.pullAndApply(true);
+  }
+
+  async pullAndApply(allowDestructive, catchupPass = 0) {
     let state = await this.readState();
     if (!state.vault_id || !state.device_id) {
       return false;
@@ -3235,6 +3435,7 @@ class ObtsObsidianClient {
       state = await this.readState();
     }
     const token = await this.readDeviceToken();
+    const retainedCheckpoint = await readRecoveryJsonStrict(this.fsp, this.pullTransferPath, "invalid_transfer_checkpoint", "The saved pull checkpoint is unreadable. Preserve it for recovery.");
     const pulled = await this.pull(
       state.vault_id,
       state.device_id,
@@ -3249,6 +3450,19 @@ class ObtsObsidianClient {
     const targetPolicy = await this.targetApplyPolicy(pulled.manifest.target_main);
     if (!(await this.ensureNoQueuedLocalChangesBeforeApply(state, targetPolicy))) {
       return false;
+    }
+    let catchup = await this.readDurableCatchup();
+    if (!catchup && retainedCheckpoint) {
+      const acceptedRef = state.server_device_ref && state.local_head === state.server_device_ref &&
+        await this.commitExists(state.server_device_ref) && await this.isAncestor(pulled.manifest.target_main, state.server_device_ref)
+        ? state.server_device_ref : null;
+      catchup = { version: 1, vault_id: state.vault_id, device_id: state.device_id,
+        target_main: pulled.manifest.target_main, local_head: state.local_head || pulled.manifest.target_main, accepted_ref: acceptedRef };
+      await writeJson(this.fsp, this.catchupPath, catchup);
+    }
+    if (catchup?.accepted_ref && pulled.manifest.target_main !== catchup.target_main &&
+      !(await this.isAncestor(catchup.accepted_ref, pulled.manifest.target_main))) {
+      throw new ObtsBlockedError("catchup_recovery_required", "The catch-up target does not include accepted device history. Preserve local files and recovery evidence.");
     }
     const applied = await this.applyTargetMain(
       pulled.manifest.target_main,
@@ -3268,6 +3482,33 @@ class ObtsObsidianClient {
     await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
     await this.clearResolvedConflictQueue();
     await this.settleAppliedQueue();
+    const appliedState = await this.readState();
+    const appliedQueue = await this.readQueue();
+    if (catchup && !appliedQueue.pending_commit && appliedQueue.status !== "queued_local" && !(appliedQueue.changed_paths || []).length) {
+      const self = await this.getDeviceSelf(token);
+      if (self.vault_id !== appliedState.vault_id || self.device_id !== appliedState.device_id) {
+        throw new ObtsBlockedError("device_identity_mismatch", "Server device identity does not match local sync state.");
+      }
+      // The retained snapshot is acknowledged before observing and pulling a
+      // newer canonical target, including our own already-accepted proposal.
+      // Bound the recursion: a vault that advances on every pass keeps its
+      // journal and status Behind for the next scheduled sync instead of
+      // spinning network and battery here.
+      if (self.current_main !== appliedState.local_main) {
+        if (catchupPass >= 4) return false;
+        return await this.pullAndApply(allowDestructive, catchupPass + 1);
+      }
+      if (catchup.accepted_ref && !(await this.isAncestor(catchup.accepted_ref, appliedState.local_head))) {
+        throw new ObtsBlockedError("catchup_recovery_required", "Accepted device history is not restored. Preserve the catch-up journal and local recovery evidence.");
+      }
+      await this.fsp.rm(this.catchupPath, { force: true });
+      const retiredState = await this.readState();
+      if (retiredState.status_label === "Behind" && !retiredState.last_error_code) {
+        // The retained snapshot is applied, acknowledged and canonical: this
+        // device is fully caught up, not merely behind the snapshot it loaded.
+        await this.writeState(Object.assign({}, retiredState, { status_label: "Synced", updated_at: nowIso() }));
+      }
+    }
     return true;
   }
 
@@ -3440,6 +3681,8 @@ class ObtsObsidianClient {
     const recoveryBundleId = localFiles.length > 0 ? await this.createRecoveryBundle("rebuild_from_server", state.local_main, localFiles) : null;
     await this.fsp.rm(this.authPath, { force: true });
     await this.fsp.rm(this.pendingAppliedAckPath, { force: true });
+    await this.fsp.rm(this.catchupPath, { force: true });
+    await this.fsp.rm(this.pullTransferPath, { force: true });
     await this.writeQueue({
       pending_commit: null,
       expected_device_ref: null,
@@ -3468,6 +3711,52 @@ class ObtsObsidianClient {
     return { status: "Not paired", recoveryBundleId };
   }
 
+  async admitApplyRecovery() {
+    let journal;
+    try { journal = await readApplyJournalStrict(this.fsp, this.applyJournalPath); }
+    catch { throw new ObtsBlockedError("apply_journal_recovery_required", "The apply journal is unreadable or invalid. Preserve it and restore verified recovery evidence before resuming."); }
+    if (!journal) return;
+    await this.initialize();
+    if (await readApplyJournalStrict(this.fsp, this.applyJournalPath)) {
+      const reason = troubleshootingSafeErrorCode((await this.readState()).apply_validation_reason);
+      throw new ObtsBlockedError("apply_journal_recovery_required", `An interrupted apply needs verified recovery evidence (${reason}). Keep the setup journal and recovery bundles; restore missing or damaged recovery evidence before resuming. No new apply can replace this operation.`);
+    }
+  }
+
+  async applyRecoveryValidationReason(journal, state) {
+    try {
+      if (!(await this.commitExists(journal.target_main))) return "recovery_evidence_missing";
+      if (state.local_main && state.local_main !== journal.target_main && state.local_main !== journal.expected_prior_local_main) return "recovery_target_policy_mismatch";
+      const ack = await this.readPendingAppliedAcknowledgement();
+      if (ack && ack.target_main !== journal.target_main) return "recovery_target_policy_mismatch";
+      const ref = await this.resolveRef("refs/heads/main");
+      if (ref && ref !== journal.target_main && ref !== journal.expected_prior_local_main) return "recovery_target_policy_mismatch";
+      if (journal.recovery_bundle_id !== null) {
+        if (!/^rec_[A-Za-z0-9_-]+$/u.test(journal.recovery_bundle_id)) return "recovery_identity_mismatch";
+        const bundle = path.join(this.obtsDir, "recovery", journal.recovery_bundle_id);
+        const complete = await readRecoveryJsonStrict(this.fsp, path.join(bundle, "complete.json"), "recovery_state_corrupt", "Recovery completion evidence is unreadable.");
+        const manifest = await readRecoveryJsonStrict(this.fsp, path.join(bundle, "manifest.json"), "recovery_state_corrupt", "Recovery manifest is unreadable.");
+        if (!complete || !manifest) return "recovery_evidence_missing";
+        if (complete.bundle_id !== journal.recovery_bundle_id || manifest.bundle_id !== journal.recovery_bundle_id) return "recovery_identity_mismatch";
+        if (manifest.target_main !== journal.target_main || stableJson(manifest.affected_paths) !== stableJson(journal.affected_paths)) return "recovery_target_policy_mismatch";
+        const savedJournal = parseApplyJournal(await readJson(this.fsp, path.join(bundle, "journal", "apply-journal.json"), null));
+        for (const key of ["apply_id", "target_main", "expected_prior_local_main", "expected_prior_local_device_ref", "affected_paths", "preflight_sha256", "preflight_fingerprints", "directory_intents", "explicit_directories", "pre_apply_directories", "pre_apply_directory_ctimes", "confirmed_directory_roots", "confirmed_directory_inventory", "preserve_local_changes", "event_seq", "target_file_sizes", "target_root_ignore_oid", "local_only_paths", "local_only_presence"]) {
+          if (stableJson(savedJournal[key]) !== stableJson(journal[key])) return key === "apply_id" ? "recovery_identity_mismatch" : "recovery_target_policy_mismatch";
+        }
+        const checksums = await this.fsp.readFileBounded(path.join(bundle, "checksums.sha256"), this.fileBufferBudgetBytes, "utf8");
+        if (checksums !== `${(await bundleChecksums(this.fsp, bundle, this.fileBufferBudgetBytes)).join("\n")}\n`) return "recovery_checksum_mismatch";
+      } else if (journal.affected_paths.length > 0 && !["planned", "blocked_recovery"].includes(journal.phase)) {
+        return "recovery_evidence_missing";
+      }
+      for (const filePath of journal.affected_paths) {
+        if (await this.applyDisplacedEntryExists(journal, filePath) && !(await this.applyDisplacedEntryMatchesPreflight(journal, filePath))) return "recovery_checksum_mismatch";
+      }
+      return null;
+    } catch (error) {
+      return error?.code === "ENOENT" ? "recovery_evidence_missing" : "recovery_state_corrupt";
+    }
+  }
+
   async applyTargetMain(
     targetMain,
     changedPaths,
@@ -3481,6 +3770,12 @@ class ObtsObsidianClient {
     confirmedDirectoryRecovery = null,
     targetFileSizes = {}
   ) {
+    await this.admitApplyRecovery();
+    const pendingAck = await this.readPendingAppliedAcknowledgement();
+    if (pendingAck) {
+      await this.retryPendingAppliedAcknowledgement();
+      if (pendingAck.target_main !== targetMain && await this.readPendingAppliedAcknowledgement()) throw new ObtsBlockedError("applied_main_acknowledgement_failed", "Settle the previous applied snapshot before another apply.");
+    }
     const state = await this.readState();
     let compactedDirectoryIntents = compactDirectoryIntents(directoryIntents);
     const explicitDirectorySet = Array.from(new Set(explicitDirectories)).sort();
@@ -4097,6 +4392,38 @@ class ObtsObsidianClient {
   }
 
   async queuePreservedLocalChanges(targetMain, expectedDeviceRef, snapshot = null) {
+    if (snapshot && expectedDeviceRef && expectedDeviceRef !== targetMain &&
+      await this.commitExists(expectedDeviceRef) && (await this.readQueue()).status === "merged" &&
+      !(await this.readQueue()).pending_commit && (await this.readDirectoryState()).pending_intents.length === 0) {
+      const acceptedEntries = await this.listTreeBlobOids(expectedDeviceRef);
+      const exactAcceptedTree = acceptedEntries.size === snapshot.entries.size && [...acceptedEntries].every(([filePath, oid]) => snapshot.entries.get(filePath)?.entry.oid === oid);
+      const journal = await readApplyJournalStrict(this.fsp, this.applyJournalPath);
+      const targetEntries = await this.listTreeBlobOids(targetMain);
+      const paths = [...new Set([...acceptedEntries.keys(), ...snapshot.entries.keys()])];
+      const onlyAppliedDifferences = journal && journal.target_main === targetMain && journal.expected_prior_local_device_ref === expectedDeviceRef && paths.every(filePath => {
+        const actual = snapshot.entries.get(filePath)?.entry.oid;
+        const accepted = acceptedEntries.get(filePath);
+        return actual === accepted || (journal.affected_paths.includes(filePath) && actual === targetEntries.get(filePath) &&
+          journal.preflight_fingerprints[filePath] && this.fingerprintMatchesTarget(journal.preflight_fingerprints[filePath], accepted));
+      });
+      if (exactAcceptedTree || onlyAppliedDifferences) {
+        // These bytes were already accepted; differences are solely this older
+        // snapshot's verified writes. Retain a local tree for the next clean
+        // apply without uploading a second, stale proposal.
+        const localHead = exactAcceptedTree ? expectedDeviceRef : await this.createLocalCommitFromSnapshot("obts: retain intermediate applied snapshot", snapshot) || targetMain;
+        await this.updateRef("refs/heads/local", localHead, null, true);
+        await this.writeQueue({ pending_commit: null, expected_device_ref: expectedDeviceRef, status: "merged", attempts: 0, updated_at: nowIso() });
+        await this.writeState(Object.assign({}, await this.readState(), { local_main: targetMain, local_head: localHead, status_label: "Behind", last_error_code: null, updated_at: nowIso() }));
+        return;
+      }
+    }
+    if (await this.readDurableCatchup()) {
+      // A retained catch-up obligation owns recovery ordering. Queueing a
+      // proposal from this snapshot's ancestry would block the catch-up it
+      // depends on; keep the preserved bytes visible and in the recovery
+      // bundle so the catch-up path can require explicit local-change review.
+      return;
+    }
     const preservedCommit = snapshot
       ? await this.createLocalCommitFromSnapshot("obts: preserve local changes after conflict resolution", snapshot)
       : await this.createLocalCommit("obts: preserve local changes after conflict resolution");
@@ -4120,6 +4447,11 @@ class ObtsObsidianClient {
   }
 
   async queuePreservedDirectoryChanges(targetMain, expectedDeviceRef) {
+    if (await this.readDurableCatchup()) {
+      // See queuePreservedLocalChanges: the pending catch-up must settle before
+      // this device queues any new proposal or metadata commit.
+      return;
+    }
     const preservedCommit = await this.createMetadataCommit("obts: preserve local directory changes after apply");
     if (!preservedCommit) return;
     await this.writeQueue({
@@ -4901,17 +5233,7 @@ class ObtsObsidianClient {
       await this.fsp.mkdir(path.join(partialDir, dir), { recursive: true, mode: 0o700 });
     }
     const paths = affectedPaths.filter((filePath) => !filePath.startsWith(".obts/")).slice().sort();
-    const parentDirs = new Set();
-    for (const filePath of paths) {
-      let parent = path.posix.dirname(filePath);
-      while (parent && parent !== ".") {
-        parentDirs.add(parent);
-        parent = path.posix.dirname(parent);
-      }
-    }
-    for (const parent of [...parentDirs].sort((left, right) => left.length - right.length || left.localeCompare(right))) {
-      await this.fsp.mkdir(path.join(partialDir, "files", parent), { recursive: true, mode: 0o700 });
-    }
+    let createParents = Promise.resolve();
     const byteBudget = createByteBudget(this.fileBufferBudgetBytes);
     let completed = 0;
     const reportProgress = () => this.reportOperationProgress(
@@ -4929,6 +5251,11 @@ class ObtsObsidianClient {
     }, async (filePath) => {
       const snapshot = await this.readRecoveryFileSnapshot(filePath, byteBudget);
       if (snapshot.fingerprint.kind === "file") {
+        // Missing future descendants must not create a directory over the
+        // captured ancestor file in a file-to-directory replacement.
+        // Adapter mkdir is not atomic for concurrent shared parents.
+        createParents = createParents.then(() => this.fsp.mkdir(path.dirname(path.join(partialDir, "files", filePath)), { recursive: true, mode: 0o700 }));
+        await createParents;
         await this.fsp.writeFile(path.join(partialDir, "files", filePath), snapshot.content, { mode: 0o600 });
         if (isTextPatchPath(filePath)) await writeTextSnapshotPatch(this.fsp, partialDir, filePath, snapshot.content);
       }
@@ -5513,29 +5840,42 @@ class ObtsObsidianClient {
   }
 
   async pull(vaultId, deviceId, token, currentLocalMain, requestedTarget = "latest", currentEventSeq = undefined) {
+    await this.admitApplyRecovery();
+    await this.retryPendingAppliedAcknowledgement();
+    if (await this.readPendingAppliedAcknowledgement()) throw new ObtsBlockedError("applied_main_acknowledgement_failed", "Settle the previous applied snapshot before pulling another.");
     const capabilities = await this.syncCapabilities();
     if (capabilities) {
-      const checkpoint = await readJson(this.fsp, this.pullTransferPath, null);
+      const checkpoint = await readRecoveryJsonStrict(this.fsp, this.pullTransferPath, "invalid_transfer_checkpoint", "The saved pull checkpoint is unreadable. Preserve it for recovery.");
       let checkpointMatches = checkpoint &&
         checkpoint.vault_id === vaultId &&
         checkpoint.device_id === deviceId &&
         checkpoint.current_local_main === currentLocalMain &&
         checkpoint.current_event_seq === (currentEventSeq || 0) &&
         (requestedTarget === "latest" || requestedTarget === checkpoint.target_main);
-      if (checkpointMatches && checkpoint.complete === true && requestedTarget === "latest") {
-        const current = await this.getDeviceSelf(token);
-        if (current.current_main !== checkpoint.target_main) checkpointMatches = false;
-      }
-      if (checkpointMatches && checkpoint.complete === true) {
-        if (!isCompletePullCheckpoint(checkpoint) || !(await this.commitExists(checkpoint.target_main))) {
+      if (checkpoint?.complete === true) {
+        if (!isCompletePullCheckpoint(checkpoint) || checkpoint.vault_id !== vaultId || checkpoint.device_id !== deviceId ||
+          (requestedTarget !== "latest" && requestedTarget !== checkpoint.target_main) || !(await this.commitExists(checkpoint.target_main))) {
           throw new ObtsBlockedError("invalid_transfer_checkpoint", "Completed pull transfer checkpoint is invalid.");
         }
-        await this.validateCompleteTransferCheckpoint(checkpoint, currentLocalMain);
-        return { manifest: checkpoint.manifest, packfile: Buffer.alloc(0) };
+        await this.validateCompleteTransferCheckpoint(checkpoint, checkpoint.current_local_main);
+        await publishJournalDiagnosticSummary(this.fsp, this.pullTransferPath, checkpoint);
+        if (checkpointMatches) return { manifest: checkpoint.manifest, packfile: Buffer.alloc(0) };
+        // Accepted proposal normalization can advance the local base after this
+        // download. Keep the immutable checkpoint and derive only its local diff.
+        if (!currentLocalMain || !(await this.isAncestor(currentLocalMain, checkpoint.target_main)) ||
+          (currentEventSeq || 0) > checkpoint.manifest.event_seq) {
+          throw new ObtsBlockedError("invalid_transfer_checkpoint", "The saved snapshot cannot safely advance the current local baseline.");
+        }
+        const prior = await this.listTreeBlobOids(currentLocalMain);
+        const target = await this.listTreeBlobOids(checkpoint.target_main);
+        const changedPaths = [...new Set([...prior.keys(), ...target.keys()])].filter(filePath => prior.get(filePath) !== target.get(filePath)).sort();
+        return { manifest: Object.assign({}, checkpoint.manifest, { changed_paths: changedPaths }), packfile: Buffer.alloc(0) };
       }
       let cursor = checkpointMatches ? checkpoint.next_cursor : 0;
       let target = checkpointMatches ? checkpoint.target_main : requestedTarget;
-      if (checkpoint && !checkpointMatches) await this.fsp.rm(this.pullTransferPath, { force: true });
+      if (checkpoint && !checkpointMatches) {
+        throw new ObtsBlockedError("invalid_transfer_checkpoint", "The saved immutable transfer does not match local state. Preserve it for recovery before starting another transfer.");
+      }
       let finalManifest = null;
       let chunkCount = checkpointMatches ? checkpoint.received_chunks || 0 : 0;
       let transferredBytes = checkpointMatches ? checkpoint.transferred_bytes || 0 : 0;
@@ -5730,7 +6070,7 @@ class ObtsObsidianClient {
   }
 
   async writePendingAppliedAcknowledgement(targetMain, eventSeq) {
-    const existing = await readJson(this.fsp, this.pendingAppliedAckPath, null);
+    const existing = await this.readPendingAppliedAcknowledgement();
     if (existing && existing.target_main !== targetMain) {
       throw new ObtsBlockedError("applied_main_acknowledgement_failed", "A different applied main acknowledgement is still pending.");
     }
@@ -5742,7 +6082,7 @@ class ObtsObsidianClient {
   }
 
   async readPendingAppliedAcknowledgement() {
-    const pending = await readJson(this.fsp, this.pendingAppliedAckPath, null);
+    const pending = await readRecoveryJsonStrict(this.fsp, this.pendingAppliedAckPath, "applied_main_acknowledgement_failed", "The pending acknowledgement is unreadable. Preserve it for recovery.");
     if (pending === null) return null;
     if (
       !pending || typeof pending !== "object" || !/^[0-9a-f]{40}$/u.test(pending.target_main || "") ||
@@ -5805,6 +6145,20 @@ class ObtsObsidianClient {
     }
     await this.fsp.rm(this.pendingAppliedAckPath, { force: true });
     await this.clearAppliedPullCheckpoint(pending.target_main, currentState);
+  }
+
+  async settlePreviouslyAppliedPullCheckpoint() {
+    const checkpoint = await readRecoveryJsonStrict(this.fsp, this.pullTransferPath, "invalid_transfer_checkpoint", "The saved pull checkpoint is unreadable. Preserve it for recovery.");
+    if (!checkpoint || checkpoint.complete !== true) return;
+    const state = await this.readState();
+    if (!isCompletePullCheckpoint(checkpoint) || checkpoint.vault_id !== state.vault_id || checkpoint.device_id !== state.device_id) {
+      throw new ObtsBlockedError("invalid_transfer_checkpoint", "Completed pull transfer checkpoint is invalid.");
+    }
+    if (checkpoint.target_main !== state.local_main || (state.last_applied_event_seq || 0) < checkpoint.manifest.event_seq) return;
+    await this.validateCompleteTransferCheckpoint(checkpoint, checkpoint.current_local_main);
+    // An already-applied snapshot can survive a lost cleanup write. Replay the
+    // authenticated acknowledgement before retiring its validated checkpoint.
+    await this.acknowledgeAppliedMain(checkpoint.target_main);
   }
 
   async clearAppliedPullCheckpoint(targetMain, state) {
@@ -6108,6 +6462,9 @@ class ObtsObsidianClient {
 
   async clearApplyState() {
     const journal = await readApplyJournalStrict(this.fsp, this.applyJournalPath);
+    let catchup = null;
+    try { catchup = await this.readDurableCatchup(); } catch { catchup = null; }
+    if (catchup) await writeJson(this.fsp, this.catchupPath, Object.assign({}, catchup, { local_head: await this.resolveRef("refs/heads/local") }));
     if (journal && isApplyId(journal.apply_id)) {
       const displacedRoot = path.join(this.obtsDir, "apply-displaced", journal.apply_id);
       if (await this.adapterExists(displacedRoot)) {
@@ -6121,6 +6478,16 @@ class ObtsObsidianClient {
     }
     await this.fsp.rm(this.applyJournalPath, { force: true });
     await this.fsp.rm(this.applyLockPath, { force: true });
+    if (catchup) {
+      // A surviving catch-up obligation means the applied snapshot is not yet
+      // canonical; never leave a transient success/progress label in place while
+      // it is pending. Cursor-regression guarding can preserve the pre-apply
+      // label, so rewrite any of those transient labels to Behind.
+      const state = await this.readState();
+      if (["Synced", "Applying", "Checking", "Uploading", "Merging"].includes(state.status_label)) {
+        await this.writeState(Object.assign({}, state, { status_label: "Behind", updated_at: nowIso() }));
+      }
+    }
   }
 
   async recoverInterruptedRefLocks() {
@@ -6544,6 +6911,13 @@ class ObtsObsidianClient {
   }
 
   async repairLocalStateIfNeeded(state) {
+    // Enrollment owns partial credential publication; generic repair must not
+    // download or manufacture refs before its completion receipt is recovered.
+    try { if (await this.readPendingOnboarding()) return state; }
+    catch (error) {
+      if (error?.code !== "onboarding_context_required") throw error;
+      return Object.assign({}, state, { status_label: "Needs recovery", last_error_code: "onboarding_context_required" });
+    }
     if (state.last_error_code !== "local_state_incomplete") {
       return state;
     }
@@ -8027,7 +8401,15 @@ class ObtsOnboardingModal extends Modal {
 
   async onOpen() {
     this.contentEl.addClass("obts-onboarding");
-    const pending = await this.plugin.client.readPendingOnboarding();
+    let pending;
+    try { pending = await this.plugin.client.readPendingOnboarding(); }
+    catch (error) {
+      this.contentEl.empty();
+      this.contentEl.createEl("h2", { text: "Setup recovery required" });
+      this.contentEl.createEl("p", { text: error instanceof Error ? error.message : "Preserve the setup journal and restore its original credential before resuming." });
+      new Setting(this.contentEl).addButton(button => button.setButtonText("Close").onClick(() => this.close()));
+      return;
+    }
     if (!pending) {
       this.renderStart();
       return;
@@ -8042,8 +8424,12 @@ class ObtsOnboardingModal extends Modal {
       return;
     }
     const registeredState = Boolean(state.vault_id && state.device_id);
+    if (pending.journal.last_error_code === "onboarding_disposition_mismatch") {
+      this.renderIntentMismatch(true);
+      return;
+    }
     const postRegistrationStage = ["registering", "applying_uploading", "uploading_proposal", "awaiting_conflict"].includes(pending.journal.stage) ||
-      (pending.journal.stage === "blocked" && registeredState);
+      (pending.journal.stage === "blocked" && Boolean(this.mode));
     const resumableSubmission = Boolean(
       (this.analysis || postRegistrationStage) && this.mode &&
         (registeredState || postRegistrationStage)
@@ -8238,6 +8624,12 @@ class ObtsOnboardingModal extends Modal {
         this.renderConfirmation();
         return;
       }
+      if (status.status === "consumed") {
+        const pending = await this.plugin.client.readPendingOnboarding();
+        this.mode = pending?.journal.selected_mode || null;
+        this.renderResume();
+        return;
+      }
       if (status.status === "denied" || status.status === "expired") {
         this.renderTerminalConnection(status.status);
         return;
@@ -8248,30 +8640,13 @@ class ObtsOnboardingModal extends Modal {
 
   async renderAfterApprovedReplacement(status) {
     if (status.selection === "new_vault" || !(status.vault_id && status.vault_name && status.expected_main)) {
+      await this.plugin.runExclusiveAction(() => this.plugin.client.updateOnboardingStage(this.connection.connection_id, "blocked", null, "onboarding_disposition_mismatch"));
       this.renderIntentMismatch(!status.selection || status.selection === "new_vault");
       return;
     }
-    const pending = await this.plugin.client.readPendingOnboarding();
-    const summary = pending && pending.journal.pending_summary &&
-      typeof pending.journal.pending_summary.fingerprint === "string"
-      ? pending.journal.pending_summary
-      : null;
-    if (!summary) {
-      this.renderIntentMismatch(false);
-      return;
-    }
-    this.analysis = {
-      selection: "existing_vault",
-      vaultId: status.vault_id,
-      vaultName: status.vault_name,
-      expectedMain: status.expected_main,
-      rootCommit: null,
-      classification: "use_server_direct",
-      proposalBase: null,
-      localFingerprint: summary.fingerprint,
-      localFileCount: summary.file_count,
-      localBytes: summary.bytes
-    };
+    this.analysis = await this.plugin.runExclusiveAction(() => this.plugin.client.prepareReplacementOnboarding(
+      this.connection.connection_id, this.connection.connection_secret
+    ), "Saving approved replacement context");
     this.renderReplaceConfirmation(this.analysis);
   }
 
@@ -8337,7 +8712,8 @@ class ObtsOnboardingModal extends Modal {
     if (this.cancelled || this.plugin.unloaded || this.onboardingRunning) return;
     this.onboardingRunning = true;
     this.onboardingPaused = false;
-    this.clearOnboardingResume();
+    this.foregroundWhileRunning = false;
+    this.armOnboardingResume(button, feedback, progressEl, options);
     button.setDisabled(true);
     this.startReplaceProgress(progressEl, feedback);
     let result = null;
@@ -8362,17 +8738,24 @@ class ObtsOnboardingModal extends Modal {
           "Transfer paused — iOS suspends network transfers when Obsidian leaves the foreground or the screen locks. Downloaded progress is saved: it resumes automatically when you return, or tap the button below.",
           "warning"
         );
-        this.armOnboardingResume(button, feedback, progressEl, options);
+        if (this.foregroundWhileRunning) this.resumeVisibilityHandler();
         return;
       }
+      this.clearOnboardingResume();
       button.setDisabled(false);
       setFeedback(feedback, error instanceof Error ? error.message : "Setup failed.", "error");
+      if (error?.code === "onboarding_snapshot_changed") this.addConsentReview(feedback);
       return;
     }
     this.stopReplaceProgress();
-    this.onboardingRunning = false;
-    this.plugin.setStatus((await this.plugin.client.readState()).status_label);
-    this.renderResult(result);
+    this.clearOnboardingResume();
+    try {
+      if (this.cancelled || this.plugin.unloaded) return;
+      this.plugin.setStatus((await this.plugin.client.readState()).status_label);
+      if (!this.cancelled && !this.plugin.unloaded) this.renderResult(result);
+    } finally {
+      this.onboardingRunning = false;
+    }
   }
 
   startReplaceProgress(progressEl, feedback) {
@@ -8415,21 +8798,24 @@ class ObtsOnboardingModal extends Modal {
   armOnboardingResume(button, feedback, progressEl, options = {}) {
     this.clearOnboardingResume();
     this.resumeVisibilityHandler = () => {
-      if (document.hidden || this.cancelled || this.plugin.unloaded || !this.onboardingPaused) return;
-      if (this.resumeRetryTimer !== null) return;
+      if (document.hidden || this.cancelled || this.plugin.unloaded || globalThis.navigator?.onLine === false) return;
+      if (this.onboardingRunning) { this.foregroundWhileRunning = true; return; }
+      if (!this.onboardingPaused || this.resumeRetryTimer !== null) return;
       this.resumeRetryTimer = window.setTimeout(() => {
         this.resumeRetryTimer = null;
-        if (document.hidden || this.cancelled || this.plugin.unloaded || !this.onboardingPaused) return;
+        if (document.hidden || this.cancelled || this.plugin.unloaded || globalThis.navigator?.onLine === false || !this.onboardingPaused) return;
         if (button) button.setButtonText(options.resumeLabel || "Resume setup");
         void this.runOnboardingCompletion(button, feedback, progressEl, options);
       }, 1200);
     };
     document.addEventListener("visibilitychange", this.resumeVisibilityHandler);
+    window.addEventListener("online", this.resumeVisibilityHandler);
   }
 
   clearOnboardingResume() {
     if (this.resumeVisibilityHandler) {
       document.removeEventListener("visibilitychange", this.resumeVisibilityHandler);
+      window.removeEventListener("online", this.resumeVisibilityHandler);
       this.resumeVisibilityHandler = null;
     }
     if (this.resumeRetryTimer !== null) {
@@ -8489,25 +8875,39 @@ class ObtsOnboardingModal extends Modal {
         await this.plugin.runExclusiveAction(() => this.plugin.client.cancelOnboarding());
         this.close();
       }))
-      .addButton((button) => button.setButtonText(actionLabel).setCta().onClick(async () => {
-        button.setDisabled(true);
-        setFeedback(feedback, "Creating recovery bundle and completing setup...", "muted");
-        try {
-          const result = await this.plugin.runOnboardingAction(() => this.plugin.client.finishOnboarding(
-            this.connection.connection_id,
-            this.connection.connection_secret,
-            this.analysis,
-            this.mode
-          ));
-          this.plugin.setStatus((await this.plugin.client.readState()).status_label);
-          this.renderResult(result);
-        } catch (error) {
-          if (this.cancelled || this.plugin.unloaded) return;
-          void this.plugin.reportOnboardingError(error, this.connection);
-          button.setDisabled(false);
-          setFeedback(feedback, error instanceof Error ? error.message : "Setup failed.", "error");
-        }
-      }));
+      .addButton((button) => button.setButtonText(actionLabel).setCta().onClick(() =>
+        this.runOnboardingCompletion(button, feedback, null, { resumeLabel: "Resume setup" })
+      ));
+  }
+
+  addConsentReview(feedback) {
+    new Setting(this.contentEl).addButton(button => button.setButtonText("Review changed local contents").onClick(async () => {
+      button.setDisabled(true);
+      try {
+        const review = await this.plugin.runExclusiveAction(() => this.plugin.client.reviewOnboardingConsent());
+        this.contentEl.empty();
+        this.contentEl.createEl("h2", { text: "Review changed local contents" });
+        this.contentEl.createEl("p", { text: `${review.file_count.toLocaleString()} syncable files · ${formatBytes(review.bytes)}` });
+        this.contentEl.createEl("p", { text: `Keep the original ${review.mode} choice and approved vault. Local contents will be saved in a recovery bundle before continuing.` });
+        const status = this.contentEl.createDiv({ cls: "obts-feedback" });
+        new Setting(this.contentEl)
+          .addButton(close => close.setButtonText("Close").onClick(() => this.close()))
+          .addButton(confirm => confirm.setButtonText("Confirm updated consent").setCta().onClick(async () => {
+            confirm.setDisabled(true);
+            try {
+              this.analysis = await this.plugin.runExclusiveAction(() => this.plugin.client.reviewOnboardingConsent(review));
+              this.mode = review.mode;
+              await this.runOnboardingCompletion(confirm, status, null);
+            } catch (error) {
+              confirm.setDisabled(false);
+              setFeedback(status, error instanceof Error ? error.message : "Unable to confirm consent.", "error");
+            }
+          }));
+      } catch (error) {
+        button.setDisabled(false);
+        setFeedback(feedback, error instanceof Error ? error.message : "Unable to review consent.", "error");
+      }
+    }));
   }
 
   renderResume() {
@@ -10022,7 +10422,9 @@ async function readRecoveryJsonStrict(fsp, filePath, errorCode, message) {
 
 async function readApplyJournalStrict(fsp, filePath) {
   try {
-    return parseApplyJournal(JSON.parse(await fsp.readFile(filePath, "utf8")));
+    const journal = parseApplyJournal(JSON.parse(await fsp.readFile(filePath, "utf8")));
+    await publishJournalDiagnosticSummary(fsp, filePath, journal);
+    return journal;
   } catch (error) {
     if (error && error.code === "ENOENT") return null;
     throw error;
@@ -10150,6 +10552,46 @@ function isPreflightFingerprint(value) {
   return value.sha256 === null && value.oid === null;
 }
 
+function journalDiagnosticSummary(filePath, value) {
+  if (path.basename(filePath) === "apply-journal.json" && isTroubleshootingApplyJournal(value)) {
+    return { phase: value.phase, redacted_error_category: troubleshootingSafeErrorCode(value.redacted_error_category) };
+  }
+  if (path.basename(filePath) === "onboarding.json" && isTroubleshootingOnboardingJournal(value)) {
+    return { stage: value.stage, consent: isOnboardingConsentSummary(value.pending_summary) ? "saved" : "missing" };
+  }
+  if ((path.basename(filePath) === "pull-transfer.json" && isTroubleshootingPullTransfer(value)) ||
+    (path.basename(filePath) === "bootstrap-transfer.json" && isTroubleshootingBootstrapTransfer(value))) {
+    return { complete: value.complete === true };
+  }
+  return null;
+}
+
+async function publishJournalDiagnosticSummary(fsp, filePath, value) {
+  const summary = journalDiagnosticSummary(filePath, value);
+  if (!summary) return;
+  // This optional, sanitized observation is never recovery authority.
+  try {
+    const stat = await fsp.stat(filePath);
+    await writeJson(fsp, `${filePath}.diagnostic-summary`, { version: 1, size: stat.size, mtime: stat.mtimeMs, summary });
+  } catch { /* Diagnostics must not change the durable operation's outcome. */ }
+}
+
+async function readJournalDiagnosticSummary(fsp, filePath) {
+  try {
+    const stat = await fsp.stat(filePath);
+    const saved = JSON.parse(await fsp.readFileBounded(`${filePath}.diagnostic-summary`, 4096, "utf8"));
+    if (saved.version !== 1 || saved.size !== stat.size || saved.mtime !== stat.mtimeMs || !saved.summary) return null;
+    const summary = saved.summary;
+    return {
+      phase: troubleshootingEnum(summary.phase, ["planned", "recovery_bundle_written", "writing_files", "verifying", "committed", "blocked_recovery"], "invalid"),
+      stage: troubleshootingEnum(summary.stage, ["awaiting_browser", "approved", "analyzing", "awaiting_confirmation", "registering", "applying_uploading", "uploading_proposal", "awaiting_conflict", "complete", "blocked"], "other"),
+      consent: summary.consent === "saved" ? "saved" : "missing",
+      complete: typeof summary.complete === "boolean" ? summary.complete : undefined,
+      redacted_error_category: troubleshootingSafeErrorCode(summary.redacted_error_category)
+    };
+  } catch { return null; }
+}
+
 async function writeJson(fsp, filePath, value) {
   await fsp.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
   const temporaryPath = `${filePath}.tmp-${randomHex(4)}-${Date.now()}`;
@@ -10162,6 +10604,7 @@ async function writeJson(fsp, filePath, value) {
     await fsp.rm(temporaryPath, { force: true }).catch(() => undefined);
     throw error;
   }
+  await publishJournalDiagnosticSummary(fsp, filePath, value);
 }
 
 async function exists(fsp, filePath) {
@@ -10289,9 +10732,37 @@ function annotateDiagnosticError(error, context) {
   }
 }
 
+function isOnboardingConsentSummary(summary) {
+  return summary && typeof summary.fingerprint === "string" && /^[0-9a-f]{64}$/u.test(summary.fingerprint) &&
+    Number.isSafeInteger(summary.file_count) && summary.file_count >= 0 &&
+    Number.isSafeInteger(summary.bytes) && summary.bytes >= 0;
+}
+
+function sameOnboardingAnalysis(a, b) {
+  return ["selection", "vaultId", "expectedMain", "rootCommit", "classification", "proposalBase", "localFingerprint", "localFileCount", "localBytes"]
+    .every(key => a[key] === b[key]);
+}
+
+function validateOnboardingAnalysis(analysis, mode) {
+  const existing = analysis?.selection === "existing_vault";
+  const classification = analysis?.classification;
+  const valid = analysis && ["initialize", "merge", "use_server"].includes(mode) &&
+    typeof analysis.vaultName === "string" &&
+    isOnboardingConsentSummary({ fingerprint: analysis.localFingerprint, file_count: analysis.localFileCount, bytes: analysis.localBytes }) &&
+    (existing
+      ? typeof analysis.vaultId === "string" && analysis.vaultId.length > 0 && isGitObjectId(analysis.expectedMain) &&
+        ["server_to_empty", "use_server_direct", "identical", "stale_baseline", "shared_baseline_divergent", "independent_divergent"].includes(classification) && mode !== "initialize"
+      : analysis.selection === "new_vault" && analysis.vaultId === null && analysis.expectedMain === null &&
+        ["new_empty", "new_with_content"].includes(classification) && mode !== "merge" &&
+        (mode === "initialize" || classification === "new_empty")) &&
+    (mode !== "merge" || ["shared_baseline_divergent", "independent_divergent"].includes(classification) && isGitObjectId(analysis.proposalBase)) &&
+    (classification !== "server_to_empty" && classification !== "new_empty" || analysis.localFileCount === 0);
+  if (!valid) throw new ObtsBlockedError("onboarding_context_required", "Setup needs a valid saved enrollment context and consent before it can scan or continue. Preserve the existing setup state for recovery.");
+}
+
 async function readRawTroubleshootingJson(fsp, filePath, validate = () => true) {
   try {
-    const raw = await fsp.readFileBounded(filePath, 256 * 1024, "utf8");
+    const raw = await fsp.readFileBounded(filePath, 512 * 1024, "utf8");
     if (typeof raw !== "string") return { kind: "invalid", value: null };
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !validate(parsed)) {
@@ -10303,7 +10774,7 @@ async function readRawTroubleshootingJson(fsp, filePath, validate = () => true) 
       return { kind: "absent", value: null };
     }
     if (error && typeof error === "object" && error.code === "EFBIG") {
-      return { kind: "oversized", value: null };
+      return { kind: "oversized", value: await readJournalDiagnosticSummary(fsp, filePath) };
     }
     if (error instanceof SyntaxError) {
       return { kind: "invalid", value: null };
@@ -10411,6 +10882,23 @@ function troubleshootingSafeErrorCode(value) {
     "local_state_incomplete",
     "same_device_non_fast_forward",
     "apply_recovery_required",
+    "apply_journal_recovery_required",
+    "onboarding_context_required",
+    "onboarding_identity_mismatch",
+    "onboarding_snapshot_changed",
+    "invalid_transfer_checkpoint",
+    "applied_main_acknowledgement_failed",
+    "recovery_evidence_missing",
+    "recovery_checksum_mismatch",
+    "recovery_identity_mismatch",
+    "recovery_target_policy_mismatch",
+    "recovery_state_corrupt",
+    "catchup_recovery_required",
+    "catchup_local_changes",
+    "local_files_diverge_from_journal",
+    "local_changed_during_apply",
+    "preflight_hash_changed",
+    "recovery_bundle_failed",
     "directory_recovery_decision_required",
     "directory_recovery_changed",
     "directory_recovery_journal_invalid",
@@ -10466,8 +10954,8 @@ function troubleshootingQueueState(read) {
 }
 
 function troubleshootingApplyJournalState(read) {
-  if (read.kind === "oversized") return "present_unclassified";
-  if (read.kind !== "valid") return read.kind;
+  if (read.kind === "oversized" && !read.value) return "present_unclassified";
+  if (read.kind !== "valid" && read.kind !== "oversized") return read.kind;
   return troubleshootingEnum(read.value.phase, [
     "planned",
     "recovery_bundle_written",
@@ -10479,8 +10967,8 @@ function troubleshootingApplyJournalState(read) {
 }
 
 function troubleshootingOnboardingState(read) {
-  if (read.kind === "oversized") return "unreadable";
-  if (read.kind !== "valid") return read.kind;
+  if (read.kind === "oversized" && !read.value) return "unreadable";
+  if (read.kind !== "valid" && read.kind !== "oversized") return read.kind;
   return troubleshootingEnum(read.value.stage, [
     "awaiting_browser",
     "approved",
@@ -10499,9 +10987,9 @@ function troubleshootingPresence(read) {
 }
 
 function troubleshootingCombinedPresence(reads) {
-  if (reads.some((read) => read.kind === "unreadable" || read.kind === "oversized")) return "unreadable";
+  if (reads.some((read) => read.kind === "unreadable" || read.kind === "oversized" && !read.value)) return "unreadable";
   if (reads.some((read) => read.kind === "invalid")) return "invalid";
-  if (reads.some((read) => read.kind === "valid")) return "present";
+  if (reads.some((read) => read.kind === "valid" || read.kind === "oversized" && read.value)) return "present";
   return "absent";
 }
 

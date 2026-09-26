@@ -6,6 +6,7 @@ import git from 'isomorphic-git';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ObtsPluginClient } from '../src/client/core.js';
+import { publishRecoveryFixture } from './helpers/publishRecoveryFixture.js';
 
 const roots: string[] = [];
 const delay = async (milliseconds: number): Promise<void> => {
@@ -501,6 +502,7 @@ describe('large-vault client checkpoints', () => {
       redacted_error_category: null
     };
     await writeFile(join(root, '.obts', 'apply-journal.json'), `${JSON.stringify(journal)}\n`);
+    await publishRecoveryFixture(root);
     await mkdir(join(root, '.obts', 'apply-displaced', journal.apply_id), { recursive: true });
     await writeFile(join(
       root,
@@ -619,6 +621,7 @@ describe('large-vault client checkpoints', () => {
       redacted_error_category: null
     };
     await writeFile(join(root, '.obts', 'apply-journal.json'), `${JSON.stringify(journal)}\n`);
+    await publishRecoveryFixture(root);
     await core.adapter.rename(
       'shared.md',
       `.obts/apply-displaced/${journal.apply_id}/${encodeURIComponent('shared.md')}.entry`
@@ -672,6 +675,7 @@ describe('large-vault client checkpoints', () => {
       redacted_error_category: null
     };
     await writeFile(join(root, '.obts', 'apply-journal.json'), `${JSON.stringify(journal)}\n`);
+    await publishRecoveryFixture(root);
     await core.adapter.rename(
       'shared.md',
       `.obts/apply-displaced/${journal.apply_id}/${encodeURIComponent('shared.md')}.entry`
@@ -814,6 +818,7 @@ describe('large-vault client checkpoints', () => {
       redacted_error_category: null
     };
     await writeFile(join(root, '.obts', 'apply-journal.json'), `${JSON.stringify(journal)}\n`);
+    await publishRecoveryFixture(root);
     await core.adapter.rename(
       'folder',
       `.obts/apply-displaced/${journal.apply_id}/${encodeURIComponent('folder')}.entry`
