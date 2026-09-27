@@ -1509,7 +1509,10 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const db = await store.snapshot();
     const vault = ownedVaultOrThrow(db, session.user.user_id, vaultId);
     const health = await buildReadinessSummary(config, store, git, lifecycle, chunkTransfers);
-    return buildRedactedDiagnostics(db, vault.vault_id, health);
+    return buildRedactedDiagnostics(db, vault.vault_id, health, {
+      git_integrity: git.integrityMetricsSnapshot(),
+      transfer_phases: chunkTransfers.transferMetricsSnapshot().phases
+    });
   });
 
   app.post('/api/v1/vaults/:vaultId/history/restore', async (request) => {
@@ -1976,7 +1979,11 @@ function redactedPathId(path: string): string {
 function buildRedactedDiagnostics(
   db: MetadataDb,
   vaultId: string,
-  health: Awaited<ReturnType<typeof buildReadinessSummary>>
+  health: Awaited<ReturnType<typeof buildReadinessSummary>>,
+  observability: {
+    git_integrity: ReturnType<GitService['integrityMetricsSnapshot']>;
+    transfer_phases: ReturnType<ChunkTransferService['transferMetricsSnapshot']>['phases'];
+  }
 ): {
   generated_at: string;
   vault: { vault_id: string; status: 'active' | 'blocked_integrity' | 'deleting'; current_main: string };
@@ -1986,6 +1993,10 @@ function buildRedactedDiagnostics(
   event_cursor: number;
   operation_counts: Record<string, number>;
   health: { status: 'ready' | 'not_ready'; checks: Record<string, boolean>; detail: string | null };
+  observability: {
+    git_integrity: ReturnType<GitService['integrityMetricsSnapshot']>;
+    transfer_phases: ReturnType<ChunkTransferService['transferMetricsSnapshot']>['phases'];
+  };
   redactions: string[];
 } {
   const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
@@ -2030,6 +2041,7 @@ function buildRedactedDiagnostics(
     event_cursor: db.event_seq_by_vault[vaultId] ?? 0,
     operation_counts: operationCounts,
     health: { status: health.status, checks: health.checks, detail: health.detail },
+    observability,
     redactions: [
       'note bodies',
       'raw vault paths',

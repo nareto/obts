@@ -84,6 +84,14 @@ export class ChunkTransferService {
   private transferUnavailable = false;
   private transferAnomaly: string | null = null;
   private startupAnomaly: string | null = null;
+  // Process-wide lifecycle counters since server start, exposed through redacted diagnostics so a
+  // transfer-phase regression is visible without per-request log archaeology.
+  private transferMetrics = {
+    create: { count: 0, totalMs: 0 },
+    chunk: { count: 0, totalMs: 0 },
+    finalize: { count: 0, totalMs: 0 },
+    process: { count: 0, totalMs: 0 }
+  };
 
   constructor(
     private readonly config: ServerConfig,
@@ -447,9 +455,14 @@ export class ChunkTransferService {
     });
     return { descriptor: this.descriptor(session), created: true };
     });
-    return this.lifecycle
-      ? await this.lifecycle.withAdmission(auth.vault.vault_id, operation)
-      : await operation();
+    const startedAt = Date.now();
+    try {
+      return this.lifecycle
+        ? await this.lifecycle.withAdmission(auth.vault.vault_id, operation)
+        : await operation();
+    } finally {
+      this.recordTransferPhase('create', startedAt);
+    }
   }
 
   async getPush(auth: AuthenticatedDevice, transferId: string): Promise<ChunkPushDescriptor> {
@@ -563,9 +576,14 @@ export class ChunkTransferService {
         return { transfer_id: transferId, chunk_index: index, chunk_sha256: digest, received_bytes: data.byteLength, idempotent: false };
       });
     });
-    return this.lifecycle
-      ? await this.lifecycle.withAdmission(auth.vault.vault_id, operation)
-      : await operation();
+    const startedAt = Date.now();
+    try {
+      return this.lifecycle
+        ? await this.lifecycle.withAdmission(auth.vault.vault_id, operation)
+        : await operation();
+    } finally {
+      this.recordTransferPhase('chunk', startedAt);
+    }
   }
 
   async finalizePush(auth: AuthenticatedDevice, transferId: string): Promise<PushResult> {
@@ -589,9 +607,14 @@ export class ChunkTransferService {
       await this.withStorageLock(async () => await this.writeSessionWithAdmission(auth, session, transferId));
       return result;
     });
-    return this.lifecycle
-      ? await this.lifecycle.withAdmission(auth.vault.vault_id, operation)
-      : await operation();
+    const startedAt = Date.now();
+    try {
+      return this.lifecycle
+        ? await this.lifecycle.withAdmission(auth.vault.vault_id, operation)
+        : await operation();
+    } finally {
+      this.recordTransferPhase('finalize', startedAt);
+    }
   }
 
   async beginFinalizePush(auth: AuthenticatedDevice, transferId: string): Promise<ChunkPushDescriptor> {
@@ -613,9 +636,15 @@ export class ChunkTransferService {
       }
       return current;
     });
-    const session = this.lifecycle
-      ? await this.lifecycle.withAdmission(auth.vault.vault_id, operation)
-      : await operation();
+    const startedAt = Date.now();
+    let session: PushSession;
+    try {
+      session = this.lifecycle
+        ? await this.lifecycle.withAdmission(auth.vault.vault_id, operation)
+        : await operation();
+    } finally {
+      this.recordTransferPhase('finalize', startedAt);
+    }
     if (session.status === 'processing') this.startProcessing(auth, transferId);
     return this.descriptor(session);
   }
@@ -738,14 +767,19 @@ export class ChunkTransferService {
   }
 
   private async processPush(auth: AuthenticatedDevice, session: PushSession, transferId: string): Promise<PushResult> {
-    if (this.isGitDurabilityUnavailable()) {
-      throw new GitDurabilityError('Git repository durability could not be confirmed.');
+    const startedAt = Date.now();
+    try {
+      if (this.isGitDurabilityUnavailable()) {
+        throw new GitDurabilityError('Git repository durability could not be confirmed.');
+      }
+      const canonicalRepoPath = (this.git as unknown as { repoPath?: (vaultId: string) => string }).repoPath?.call(this.git, session.vault_id);
+      return await this.sync.pushDeviceCommit(auth, session.manifest, Buffer.alloc(0), {
+        reader: this.git.readerForRepo(this.repoDir(transferId), canonicalRepoPath === undefined ? undefined : join(canonicalRepoPath, 'objects')),
+        promote: async () => await this.git.promoteTransferObjects(auth.vault.vault_id, this.repoDir(transferId))
+      });
+    } finally {
+      this.recordTransferPhase('process', startedAt);
     }
-    const canonicalRepoPath = (this.git as unknown as { repoPath?: (vaultId: string) => string }).repoPath?.call(this.git, session.vault_id);
-    return await this.sync.pushDeviceCommit(auth, session.manifest, Buffer.alloc(0), {
-      reader: this.git.readerForRepo(this.repoDir(transferId), canonicalRepoPath === undefined ? undefined : join(canonicalRepoPath, 'objects')),
-      promote: async () => await this.git.promoteTransferObjects(auth.vault.vault_id, this.repoDir(transferId))
-    });
   }
 
   private assertTransferAllowed(auth: AuthenticatedDevice): void {
@@ -846,8 +880,8 @@ export class ChunkTransferService {
    *
    * `SCAN_STARTUP` runs once at initialization and performs the deep audit: it adopts a session
    * record written before ownership markers existed by durably recording ownership, rewrites a
-   * session whose accounted bytes drifted, validates quarantine repository integrity, and skips a
-   * session it cannot serve.
+   * session whose accounted bytes drifted, validates quarantine repository integrity, verifies each
+   * owning vault's canonical object store once, and skips a session it cannot serve.
    *
    * `SCAN_OPERATIONAL` serves requests: it performs only the cheap structural checks, writes nothing,
    * and runs on request paths that may already hold the storage lock.
@@ -951,6 +985,28 @@ export class ChunkTransferService {
           }
         }
         sessions.push(inspection.value);
+      }
+      if (deep && sessions.length > 0) {
+        // The deep audit is the startup's one-time canonical object-store verification. The per-
+        // session checks above validate only the session's own material, so verify each owning
+        // vault's canonical store exactly once instead of once per session (previously a full
+        // fsck walked the shared alternate store N times here). A canonical-store failure is a
+        // recorded anomaly, not a per-session refusal: processing validates against the real
+        // store and vault readiness independently blocks the vault.
+        const canonicalValidator = (this.git as unknown as {
+          checkIntegrity?: (vaultId: string) => Promise<{ ok: boolean; error?: string }>;
+        }).checkIntegrity;
+        if (canonicalValidator) {
+          for (const vaultId of new Set(sessions.map((session) => session.vault_id))) {
+            try {
+              const verdict = await canonicalValidator.call(this.git, vaultId);
+              if (!verdict.ok) flag('canonical_repository_unusable', vaultId);
+            } catch (error) {
+              if (error instanceof GitDurabilityError) throw error;
+              flag('canonical_repository_unusable', vaultId);
+            }
+          }
+        }
       }
       await assertDeletionRootUnchanged(root);
       return { sessions, problem };
@@ -1083,6 +1139,32 @@ export class ChunkTransferService {
   private isGitDurabilityUnavailable(): boolean {
     const checker = (this.git as unknown as { isDurabilityUnavailable?: () => boolean }).isDurabilityUnavailable;
     return checker?.call(this.git) ?? false;
+  }
+
+  transferMetricsSnapshot(): {
+    phases: {
+      create: { count: number; total_ms: number };
+      chunk: { count: number; total_ms: number };
+      finalize: { count: number; total_ms: number };
+      process: { count: number; total_ms: number };
+    };
+  } {
+    const phase = (entry: { count: number; totalMs: number }): { count: number; total_ms: number } =>
+      ({ count: entry.count, total_ms: entry.totalMs });
+    return {
+      phases: {
+        create: phase(this.transferMetrics.create),
+        chunk: phase(this.transferMetrics.chunk),
+        finalize: phase(this.transferMetrics.finalize),
+        process: phase(this.transferMetrics.process)
+      }
+    };
+  }
+
+  private recordTransferPhase(phase: keyof ChunkTransferService['transferMetrics'], startedAt: number): void {
+    const entry = this.transferMetrics[phase];
+    entry.count += 1;
+    entry.totalMs += Date.now() - startedAt;
   }
 
   private async validTransferRepository(transferId: string, vaultId?: string): Promise<boolean> {

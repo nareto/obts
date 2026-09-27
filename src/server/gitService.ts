@@ -79,11 +79,34 @@ export class GitDurabilityError extends Error {
 
 export class GitService {
   private durabilityUncertain = false;
+  // Process-wide counters since server start. They make validation regressions (for example a
+  // scoped quarantine check silently becoming a full-store walk) visible in redacted diagnostics
+  // instead of requiring per-request log archaeology.
+  private integrityMetrics = {
+    fullFsckCount: 0,
+    fullFsckTotalMs: 0,
+    quarantineCheckCount: 0,
+    quarantineCheckTotalMs: 0
+  };
 
   constructor(
     private readonly config: ServerConfig,
     private readonly persistence: Partial<DurableFilePersistence> = {}
   ) {}
+
+  integrityMetricsSnapshot(): {
+    full_fsck_checks: number;
+    full_fsck_total_ms: number;
+    quarantine_checks: number;
+    quarantine_total_ms: number;
+  } {
+    return {
+      full_fsck_checks: this.integrityMetrics.fullFsckCount,
+      full_fsck_total_ms: this.integrityMetrics.fullFsckTotalMs,
+      quarantine_checks: this.integrityMetrics.quarantineCheckCount,
+      quarantine_total_ms: this.integrityMetrics.quarantineCheckTotalMs
+    };
+  }
 
   repoPath(vaultId: string): string {
     return join(this.config.gitStoreDir, `${vaultId}.git`);
@@ -111,6 +134,7 @@ export class GitService {
 
   async checkIntegrity(vaultId: string): Promise<{ ok: true } | { ok: false; error: string }> {
     this.assertDurabilityAvailable();
+    const startedAt = Date.now();
     try {
       await this.exec(this.repoPath(vaultId), ['fsck', '--strict', '--no-dangling'], undefined, undefined, {
         maxBuffer: 16 * 1024 * 1024
@@ -118,6 +142,9 @@ export class GitService {
       return { ok: true };
     } catch {
       return { ok: false, error: 'server Git object integrity check failed' };
+    } finally {
+      this.integrityMetrics.fullFsckCount += 1;
+      this.integrityMetrics.fullFsckTotalMs += Date.now() - startedAt;
     }
   }
 
@@ -147,6 +174,7 @@ export class GitService {
   async checkBareRepositoryIntegrity(repo: string): Promise<boolean> {
     this.assertDurabilityAvailable();
     if (!(await this.isBareRepositoryShape(repo))) return false;
+    const startedAt = Date.now();
     try {
       await this.exec(repo, ['fsck', '--strict', '--no-dangling'], undefined, undefined, {
         maxBuffer: 16 * 1024 * 1024
@@ -154,20 +182,65 @@ export class GitService {
       return true;
     } catch {
       return false;
+    } finally {
+      this.integrityMetrics.fullFsckCount += 1;
+      this.integrityMetrics.fullFsckTotalMs += Date.now() - startedAt;
     }
   }
 
+  // Transfer-quarantine validation covers only the session repository's own material: bare shape,
+  // safe canonical-only alternates, pack/index pairing, pack checksums, and refusal of loose-object
+  // material the ingestion path never writes. It deliberately never walks the alternate canonical
+  // object store: that store is the vault's durable state, verified once by the startup deep audit
+  // and by vault readiness, and chunk ingestion already validates every incoming pack at write
+  // time. A full fsck from a transfer repository would inflate and checksum the entire canonical
+  // store, per request read.
   async checkTransferRepositoryIntegrity(repo: string, vaultId: string): Promise<boolean> {
     this.assertDurabilityAvailable();
     const alternateObjectStore = join(this.repoPath(vaultId), 'objects');
     if (!(await this.isBareRepositoryShapeInRepo(repo, alternateObjectStore))) return false;
+    const startedAt = Date.now();
     try {
-      await this.execRaw(['--git-dir', repo, 'fsck', '--strict', '--no-dangling'], undefined, undefined, {
-        maxBuffer: 16 * 1024 * 1024
-      });
+      const objectsDir = join(repo, 'objects');
+      const packDir = join(objectsDir, 'pack');
+      const entries = await readdir(packDir);
+      const stems = new Map<string, { pack: boolean; index: boolean }>();
+      for (const name of entries) {
+        const packMatch = /^pack-([0-9a-f]{40})\.pack$/u.exec(name);
+        const indexMatch = /^pack-([0-9a-f]{40})\.idx$/u.exec(name);
+        const stem = packMatch?.[1] ?? indexMatch?.[1];
+        if (stem === undefined) continue;
+        const state = stems.get(stem) ?? { pack: false, index: false };
+        if (packMatch !== null) state.pack = true;
+        else state.index = true;
+        stems.set(stem, state);
+      }
+      const orderedStems = [...stems.keys()].sort();
+      for (const stem of orderedStems) {
+        const state = stems.get(stem)!;
+        if (!state.pack || !state.index) return false;
+        await this.execRaw(
+          ['--git-dir', repo, 'verify-pack', '--', join(packDir, `pack-${stem}.idx`)],
+          undefined,
+          undefined,
+          { maxBuffer: 1024 * 1024 }
+        );
+      }
+      // Every surviving stem has a matching packfile and index, and verify-pack validated the
+      // pack's checksums by opening it directly, without consulting the alternate object store.
+      // Loose-object material is never produced by the ingestion path (which writes packs through
+      // index-pack), so its presence is unexpected residue and is refused rather than validated;
+      // every alternative loose-object check would read the canonical store's loose objects too.
+      for (const name of await readdir(objectsDir)) {
+        if (!/^[0-9a-f]{2}$/u.test(name)) continue;
+        if ((await readdir(join(objectsDir, name))).length > 0) return false;
+      }
       return true;
     } catch {
       return false;
+    } finally {
+      this.integrityMetrics.quarantineCheckCount += 1;
+      this.integrityMetrics.quarantineCheckTotalMs += Date.now() - startedAt;
     }
   }
 

@@ -2844,6 +2844,18 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(serialized).not.toContain('diagnostic-secret-body');
     expect(serialized).not.toContain('prepared_manifest');
     expect(serialized).toContain('raw vault paths');
+    const observability = (diagnostics.body as {
+      observability?: {
+        git_integrity?: { full_fsck_checks?: number; quarantine_checks?: number };
+        transfer_phases?: Record<string, { count?: number; total_ms?: number }>;
+      };
+    }).observability;
+    expect(observability?.git_integrity?.full_fsck_checks).toBeGreaterThanOrEqual(0);
+    expect(observability?.git_integrity?.quarantine_checks).toBeGreaterThanOrEqual(0);
+    for (const phase of ['create', 'chunk', 'finalize', 'process']) {
+      expect(observability?.transfer_phases?.[phase]?.count).toBeGreaterThanOrEqual(0);
+      expect(observability?.transfer_phases?.[phase]?.total_ms).toBeGreaterThanOrEqual(0);
+    }
   });
 
   describe('apply journal recovery', () => {

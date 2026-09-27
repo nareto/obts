@@ -3589,7 +3589,7 @@ components:
           type: string
     DiagnosticsExport:
       type: object
-      required: [generated_at, vault, devices, conflicts, event_cursor, operation_counts, health, redactions]
+      required: [generated_at, vault, devices, conflicts, event_cursor, operation_counts, health, observability, redactions]
       properties:
         generated_at:
           type: string
@@ -3623,10 +3623,57 @@ components:
             type: integer
         health:
           type: object
+        observability:
+          description: Process-wide validation counters since server start; no vault content.
+          type: object
+          required: [git_integrity, transfer_phases]
+          additionalProperties: false
+          properties:
+            git_integrity:
+              type: object
+              required: [full_fsck_checks, full_fsck_total_ms, quarantine_checks, quarantine_total_ms]
+              additionalProperties: false
+              properties:
+                full_fsck_checks:
+                  type: integer
+                  minimum: 0
+                full_fsck_total_ms:
+                  type: integer
+                  minimum: 0
+                quarantine_checks:
+                  type: integer
+                  minimum: 0
+                quarantine_total_ms:
+                  type: integer
+                  minimum: 0
+            transfer_phases:
+              type: object
+              required: [create, chunk, finalize, process]
+              additionalProperties: false
+              properties:
+                create:
+                  $ref: '#/components/schemas/TransferPhaseObservation'
+                chunk:
+                  $ref: '#/components/schemas/TransferPhaseObservation'
+                finalize:
+                  $ref: '#/components/schemas/TransferPhaseObservation'
+                process:
+                  $ref: '#/components/schemas/TransferPhaseObservation'
         redactions:
           type: array
           items:
             type: string
+    TransferPhaseObservation:
+      type: object
+      required: [count, total_ms]
+      additionalProperties: false
+      properties:
+        count:
+          type: integer
+          minimum: 0
+        total_ms:
+          type: integer
+          minimum: 0
     ConflictRecord:
       type: object
       required:
