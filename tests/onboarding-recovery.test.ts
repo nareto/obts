@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ObtsPluginClient } from '../src/client/core.js';
@@ -46,7 +46,7 @@ describe('durable onboarding recovery admission', () => {
     expect(await readFile(file, 'utf8')).toBe('{');
   });
 
-  it.each(['recovery-missing', 'recovery-corrupt', 'checksum', 'policy', 'oversized-missing', 'displacement-corrupt', 'concurrent-edit'])('blocks unsafe recovery without replacing evidence: %s', async fault => {
+  it.each(['recovery-missing', 'recovery-corrupt', 'checksum', 'policy', 'oversized-missing', 'displacement-corrupt'])('blocks unsafe recovery without replacing evidence: %s', async fault => {
     const { core, root } = await client();
     await writeFile(join(root, 'note.md'), 'original bytes\n');
     const base = await core.createLocalCommit('base');
@@ -68,12 +68,11 @@ describe('durable onboarding recovery admission', () => {
     if (fault === 'policy') await writeFile(journalPath, JSON.stringify({ ...saved, target_root_ignore_oid: 'b'.repeat(40) }));
     if (fault === 'recovery-corrupt') await writeFile(bundleFile, '{}');
     if (fault === 'displacement-corrupt') await writeFile(join(root, '.obts/apply-displaced', saved.apply_id, 'note.md.entry'), 'unexpected displaced bytes\n');
-    if (fault === 'concurrent-edit') await writeFile(join(root, 'note.md'), 'edited during recovery\n');
     const restarted = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'recovery' });
     await restarted.initialize();
     const resumed = (restarted as any).client;
     expect((await resumed.readState()).last_error_code).toBe('apply_journal_recovery_required');
-    const reason = ({ 'recovery-missing': 'recovery_evidence_missing', 'oversized-missing': 'recovery_evidence_missing', 'recovery-corrupt': 'recovery_identity_mismatch', checksum: 'recovery_checksum_mismatch', policy: 'recovery_target_policy_mismatch', 'displacement-corrupt': 'recovery_checksum_mismatch', 'concurrent-edit': 'local_files_diverge_from_journal' } as Record<string, string>)[fault];
+    const reason = ({ 'recovery-missing': 'recovery_evidence_missing', 'oversized-missing': 'recovery_evidence_missing', 'recovery-corrupt': 'recovery_identity_mismatch', checksum: 'recovery_checksum_mismatch', policy: 'recovery_target_policy_mismatch', 'displacement-corrupt': 'recovery_checksum_mismatch' } as Record<string, string>)[fault];
     const context = await resumed.collectTroubleshootingContext();
     expect(context.recovery_summary.apply_error).toBe(reason);
     if (fault === 'oversized-missing') expect(context.recovery_summary.apply_read).toBe('oversized');
@@ -84,7 +83,120 @@ describe('durable onboarding recovery admission', () => {
     expect((await resumed.collectTroubleshootingContext()).recovery_summary.apply_error).toBe(reason);
     await expect(resumed.applyTargetMain(target, [], true)).rejects.toMatchObject({ code: 'apply_journal_recovery_required' });
     expect(JSON.parse(await readFile(journalPath, 'utf8')).apply_id).toBe(saved.apply_id);
-    expect(await readFile(join(root, 'note.md'), 'utf8')).toBe(fault === 'concurrent-edit' ? 'edited during recovery\n' : 'target bytes\n');
+    expect(await readFile(join(root, 'note.md'), 'utf8')).toBe('target bytes\n');
+  });
+
+  it('completes a diverged interrupted apply while preserving the edited path', async () => {
+    const { core, root } = await client();
+    await writeFile(join(root, 'note.md'), 'original bytes\n');
+    const base = await core.createLocalCommit('base');
+    await core.updateRef('refs/heads/main', base, null, true);
+    await writeFile(join(root, 'note.md'), 'target bytes\n');
+    const target = await core.createLocalCommit('target');
+    await writeFile(join(root, 'note.md'), 'original bytes\n');
+    await core.updateRef('refs/heads/local', base, null, true);
+    await core.writeState({ ...await core.readState(), local_main: base, local_head: base });
+    const write = core.writeTargetFilesFromJournal.bind(core);
+    core.writeTargetFilesFromJournal = async (...args: any[]) => { await write(...args); throw new Error('Synthetic process interruption'); };
+    await expect(core.applyTargetMain(target, ['note.md'], true, [], false, [], [], 1, false, null, { 'note.md': 13 })).rejects.toThrow('Synthetic process interruption');
+    await writeFile(join(root, 'note.md'), 'edited during recovery\n');
+
+    const classified = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'recovery' });
+    await classified.initialize();
+    expect((await classified.readState()).last_error_code).toBe('apply_journal_recovery_required');
+    expect((await (classified as any).client.collectTroubleshootingContext()).recovery_summary.apply_error).toBe('local_files_diverge_from_journal');
+
+    const restarted = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'recovery' });
+    await restarted.initialize();
+    const recovered = (restarted as any).client;
+    const recoveredState = await recovered.readState();
+    expect(recoveredState.local_main).toBe(target);
+    expect(recoveredState.last_error_code).toBeNull();
+    expect(await readFile(join(root, 'note.md'), 'utf8')).toBe('edited during recovery\n');
+    expect(await recovered.readQueue()).toMatchObject({ status: 'queued_local', pending_commit: recoveredState.local_head });
+    await expect(readFile(join(root, '.obts/apply-journal.json'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('restores a displaced path while a blocked resume preserves the other edited path', async () => {
+    const { core, root } = await client();
+    await writeFile(join(root, 'a.md'), 'a original\n');
+    await writeFile(join(root, 'b.md'), 'b original\n');
+    const base = await core.createLocalCommit('base');
+    await core.updateRef('refs/heads/main', base, null, true);
+    await writeFile(join(root, 'a.md'), 'a target\n');
+    await writeFile(join(root, 'b.md'), 'b target\n');
+    const target = await core.createLocalCommit('target');
+    await writeFile(join(root, 'a.md'), 'a original\n');
+    await writeFile(join(root, 'b.md'), 'b original\n');
+    await core.updateRef('refs/heads/local', base, null, true);
+    await core.writeState({ ...await core.readState(), local_main: base, local_head: base });
+    const displace = core.displaceApplyPath.bind(core);
+    let interrupted = false;
+    core.displaceApplyPath = async (...args: any[]) => {
+      await displace(...args);
+      if (!interrupted) {
+        interrupted = true;
+        throw new Error('Synthetic interruption after displacement');
+      }
+    };
+    await expect(core.applyTargetMain(target, ['a.md', 'b.md'], true, [], false, [], [], 1, false, null, { 'a.md': 9, 'b.md': 9 }))
+      .rejects.toThrow('Synthetic interruption after displacement');
+    core.displaceApplyPath = displace;
+    await writeFile(join(root, 'b.md'), 'b edited during recovery\n');
+
+    const classified = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'recovery' });
+    await classified.initialize();
+    expect((await classified.readState()).last_error_code).toBe('apply_journal_recovery_required');
+    expect((await (classified as any).client.collectTroubleshootingContext()).recovery_summary.apply_error).toBe('local_files_diverge_from_journal');
+
+    const resumed = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'recovery' });
+    await resumed.initialize();
+    const recovered = (resumed as any).client;
+    expect(await readFile(join(root, 'a.md'), 'utf8')).toBe('a target\n');
+    expect(await readFile(join(root, 'b.md'), 'utf8')).toBe('b edited during recovery\n');
+    const recoveredState = await recovered.readState();
+    expect(recoveredState).toMatchObject({ local_main: target, last_error_code: null });
+    expect(await recovered.readQueue()).toMatchObject({ status: 'queued_local', pending_commit: recoveredState.local_head });
+    await expect(readFile(join(root, '.obts/apply-journal.json'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('preserves a diverged subtree when the target needs the conflicting parent path', async () => {
+    const { core, root } = await client();
+    await mkdir(join(root, 'notes.md'));
+    await writeFile(join(root, 'notes.md', 'c.md'), 'child original\n');
+    await writeFile(join(root, 'other.md'), 'other\n');
+    const base = await core.createLocalCommit('base');
+    await core.updateRef('refs/heads/main', base, null, true);
+    await rm(join(root, 'notes.md'), { recursive: true, force: true });
+    await writeFile(join(root, 'notes.md'), 'target file\n');
+    const target = await core.createLocalCommit('target');
+    await rm(join(root, 'notes.md'), { force: true });
+    await mkdir(join(root, 'notes.md'));
+    await writeFile(join(root, 'notes.md', 'c.md'), 'child original\n');
+    await core.updateRef('refs/heads/local', base, null, true);
+    await core.writeState({ ...await core.readState(), local_main: base, local_head: base });
+    const write = core.writeTargetFilesFromJournal.bind(core);
+    core.writeTargetFilesFromJournal = async () => { throw new Error('Synthetic process interruption'); };
+    await expect(core.applyTargetMain(target, ['notes.md', 'notes.md/c.md'], true, [], false, [], [], 1, false, null, { 'notes.md': 12, 'notes.md/c.md': 15 }))
+      .rejects.toThrow('Synthetic process interruption');
+    core.writeTargetFilesFromJournal = write;
+    await writeFile(join(root, 'notes.md', 'c.md'), 'child edited during recovery\n');
+
+    const classified = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'recovery' });
+    await classified.initialize();
+    expect((await classified.readState()).last_error_code).toBe('apply_journal_recovery_required');
+    expect((await (classified as any).client.collectTroubleshootingContext()).recovery_summary.apply_error).toBe('local_files_diverge_from_journal');
+
+    const resumed = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'recovery' });
+    await resumed.initialize();
+    const recovered = (resumed as any).client;
+    expect((await lstat(join(root, 'notes.md'))).isDirectory()).toBe(true);
+    expect(await readFile(join(root, 'notes.md', 'c.md'), 'utf8')).toBe('child edited during recovery\n');
+    expect(await readFile(join(root, 'other.md'), 'utf8')).toBe('other\n');
+    const recoveredState = await recovered.readState();
+    expect(recoveredState).toMatchObject({ local_main: target, last_error_code: null });
+    expect(await recovered.readQueue()).toMatchObject({ status: 'queued_local', pending_commit: recoveredState.local_head });
+    await expect(readFile(join(root, '.obts/apply-journal.json'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('reports the retained pre-write failure instead of claiming missing evidence with reason none', async () => {

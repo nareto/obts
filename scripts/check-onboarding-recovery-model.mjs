@@ -29,7 +29,10 @@ const checks = [
   ['drop-checkpoint', 'drop-checkpoint', 'CheckpointPreserved', 'DropCheckpoint'],
   ['skip-ack', 'skip-ack', 'AckBeforeNewApply', 'NewApplyBeforeAck'],
   ['lost-catchup', 'lost-catchup', 'CatchUpDurable', 'LoseCatchUp'],
-  ['interim-ancestry', 'interim-ancestry', 'AcceptedAncestry', 'CaptureInterim']
+  ['interim-ancestry', 'interim-ancestry', 'AcceptedAncestry', 'CaptureInterim'],
+  ['divergence-preserved', 'none', 'DivergencePreserved', null],
+  ['divergence-reachable', 'none', 'DivergenceRecovered', 'Recover'],
+  ['discard-divergence', 'discard-divergence', 'DivergencePreserved', 'Apply']
 ];
 for (const [id, mutation, invariant, witness] of checks) {
   const cfg = join(run, `${id}.cfg`);

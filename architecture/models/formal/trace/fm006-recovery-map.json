@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "model": "architecture/models/formal/OBTSOnboardingRecovery.tla",
-  "architectureRevision": 22,
+  "architectureRevision": 24,
   "status": "static seam mapping; no runtime trace conformance claim",
   "contracts": ["OBTS-SYNC-ONB-001", "OBTS-SYNC-ACK-001", "OBTS-SAF-002", "OBTS-SAF-005", "OBTS-SAF-009"],
   "checker": "scripts/check-onboarding-recovery-model.mjs",
@@ -13,10 +13,10 @@
       "checks": ["safety", "liveness", "response-loss-restart", "legacy-context"]
     },
     {
-      "actions": ["PlanApply", "Recover", "Apply", "OverwriteJournal"],
-      "implementation": ["obsidian-plugin/src/main.cjs: admitApplyRecovery, applyRecoveryValidationReason, validateApplyJournalPolicy, initialize, applyTargetMain"],
-      "tests": ["tests/onboarding-recovery.test.ts: absent lock and same-target apply, corrupt or missing recovery, corrupt displacement, concurrent edits", "tests/onboarding-mobile-restart.test.ts: recovery/files/committed SIGKILL boundaries"],
-      "checks": ["safety", "overwrite-journal"]
+      "actions": ["PlanApply", "DivergeEdit", "Recover", "Apply", "OverwriteJournal"],
+      "implementation": ["obsidian-plugin/src/main.cjs: admitApplyRecovery, applyRecoveryValidationReason, validateApplyJournalPolicy, initialize, applyTargetMain, recoverDivergedApplyWithPreservedLocalChanges, completeInterruptedApply"],
+      "tests": ["tests/onboarding-recovery.test.ts: absent lock and same-target apply, corrupt or missing recovery, corrupt displacement, diverged-edit preservation with displaced-path resume", "tests/onboarding-mobile-restart.test.ts: recovery/files/committed SIGKILL boundaries"],
+      "checks": ["safety", "overwrite-journal", "divergence-preserved", "discard-divergence"]
     },
     {
       "actions": ["Chunk", "AdvanceMain", "DropCheckpoint", "Ack", "NewApplyBeforeAck", "CatchUp", "LoseCatchUp", "CaptureInterim"],

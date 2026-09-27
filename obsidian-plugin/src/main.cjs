@@ -4108,7 +4108,11 @@ class ObtsObsidianClient {
   }
 
   async recoverBlockedApplyWithPreservedLocalChanges(journal, state) {
-    if (journal.phase !== "blocked_recovery" || journal.redacted_error_category !== "local_changed_during_apply") {
+    if (journal.phase !== "blocked_recovery") return false;
+    if (journal.redacted_error_category === "local_files_diverge_from_journal") {
+      return await this.recoverDivergedApplyWithPreservedLocalChanges(journal, state);
+    }
+    if (journal.redacted_error_category !== "local_changed_during_apply") {
       return false;
     }
     this.plugin.setInitializationStage("Reading interrupted apply target commit", "recovery_target_commit");
@@ -4215,6 +4219,59 @@ class ObtsObsidianClient {
       await writeJson(this.fsp, this.applyJournalPath, journal);
       return false;
     }
+    return await this.completeInterruptedApply(journal, state, targetEntries, validation, new Set());
+  }
+
+  async recoverDivergedApplyWithPreservedLocalChanges(journal, state) {
+    this.plugin.setInitializationStage("Reading interrupted apply target commit", "recovery_target_commit");
+    if (!(await this.commitExists(journal.target_main))) {
+      return false;
+    }
+    this.plugin.setInitializationStage("Reading interrupted apply target tree", "recovery_target_tree");
+    const targetEntries = await this.listTreeBlobOids(journal.target_main);
+    this.plugin.setInitializationStage("Validating interrupted apply files", "recovery_file_validation");
+    const validation = await this.applyJournalMatchesCurrentFiles(journal, targetEntries);
+    // A path that matches neither the recorded pre-apply state nor the target
+    // holds content the user changed while the apply was interrupted. Preserve
+    // those bytes and complete the operation around them; empty divergence is
+    // an ordinary resume.
+    return await this.completeInterruptedApply(
+      journal,
+      state,
+      targetEntries,
+      validation,
+      this.expandDeferredDivergedPaths(journal, validation.targetMatchedPaths, validation.divergedPaths)
+    );
+  }
+
+  expandDeferredDivergedPaths(journal, targetMatchedPaths, divergedPaths) {
+    const deferred = new Set(divergedPaths);
+    if (deferred.size === 0) return deferred;
+    // An affected write/removal that is an ancestor or descendant of preserved
+    // content cannot run either: replacing around a preserved path would trip
+    // its own descendant guard. Defer the whole conflicting chain so the local
+    // shape is preserved as local work instead of retrying forever.
+    const candidates = journal.affected_paths.filter((filePath) => !targetMatchedPaths.has(filePath));
+    const queue = [...deferred];
+    while (queue.length > 0) {
+      const deferredPath = queue.pop();
+      for (const candidate of candidates) {
+        if (deferred.has(candidate)) continue;
+        if (
+          candidate === deferredPath ||
+          candidate.startsWith(`${deferredPath}/`) ||
+          deferredPath.startsWith(`${candidate}/`)
+        ) {
+          deferred.add(candidate);
+          queue.push(candidate);
+        }
+      }
+    }
+    return deferred;
+  }
+
+  async completeInterruptedApply(journal, state, targetEntries, validation, deferredDivergedPaths) {
+    const preservedDeferredPaths = new Set(deferredDivergedPaths || []);
     try {
       await this.fsp.rm(this.applyLockPath, { force: true });
       await this.acquireApplyLock(journal.apply_id);
@@ -4230,7 +4287,11 @@ class ObtsObsidianClient {
       journal.redacted_error_category = null;
       await writeJson(this.fsp, this.applyJournalPath, journal);
       this.plugin.setInitializationStage("Restoring interrupted apply files", "recovery_file_apply");
-      await this.writeTargetFilesFromJournal(journal, targetEntries, validation.targetMatchedPaths);
+      await this.writeTargetFilesFromJournal(
+        journal,
+        targetEntries,
+        new Set([...validation.targetMatchedPaths, ...preservedDeferredPaths])
+      );
       const residualTombstoneDirectories = await this.applyDirectoryChanges(
         journal.directory_intents || [],
         journal.explicit_directories || [],
@@ -4247,16 +4308,29 @@ class ObtsObsidianClient {
       journal.last_completed_step = "files_written";
       await writeJson(this.fsp, this.applyJournalPath, journal);
       this.plugin.setInitializationStage("Revalidating interrupted apply files", "recovery_file_validation");
-      if (!journal.preserve_local_changes && !(await this.affectedApplyPathsMatchTarget(journal, targetEntries))) {
+      if (!journal.preserve_local_changes &&
+        !(await this.affectedApplyPathsMatchTarget(journal, targetEntries, true, preservedDeferredPaths))) {
         journal.phase = "blocked_recovery";
         journal.redacted_error_category = "local_changed_during_apply";
         await writeJson(this.fsp, this.applyJournalPath, journal);
         return false;
       }
+      if (preservedDeferredPaths.size > 0) {
+        // Only the paths that were already divergent may stay behind; a new
+        // edit during the writes keeps the operation blocked.
+        const revalidated = await this.applyJournalMatchesCurrentFiles(journal, targetEntries);
+        if (revalidated.divergedPaths.some((filePath) => !preservedDeferredPaths.has(filePath))) {
+          journal.phase = "blocked_recovery";
+          journal.redacted_error_category = "local_files_diverge_from_journal";
+          await writeJson(this.fsp, this.applyJournalPath, journal);
+          return false;
+        }
+      }
+      const keepResidualLocalChanges = journal.preserve_local_changes || preservedDeferredPaths.size > 0;
       let preservedLocalChangePaths = [];
       let preservedLocalSnapshot = null;
       let preservedDirectoryIntents = [];
-      if (journal.preserve_local_changes) {
+      if (keepResidualLocalChanges) {
         const preserved = await this.localChangedPathsFromTree(targetEntries, true, { targetRootIgnoreOid: journal.target_root_ignore_oid });
         preservedLocalChangePaths = preserved.paths;
         preservedLocalSnapshot = preserved.snapshot;
@@ -4264,6 +4338,8 @@ class ObtsObsidianClient {
           this.plugin.setInitializationStage("Writing recovered local change bundle", "recovery_bundle");
           await this.createRecoveryBundle("rebuild_from_server", journal.target_main, preservedLocalChangePaths);
         }
+      }
+      if (journal.preserve_local_changes) {
         preservedDirectoryIntents = await this.preserveDirectoryChangesFromTarget(
           targetEntries,
           journal.explicit_directories || [],
@@ -4307,10 +4383,12 @@ class ObtsObsidianClient {
     }
   }
 
-  async affectedApplyPathsMatchTarget(journal, targetEntries, initialization = true) {
+  async affectedApplyPathsMatchTarget(journal, targetEntries, initialization = true, excludedPaths = null) {
     const paths = journal.affected_paths.filter((filePath) =>
-      targetEntries.has(filePath) ||
-      ![...targetEntries.keys()].some((targetPath) => targetPath.startsWith(`${filePath}/`))
+      !excludedPaths?.has(filePath) && (
+        targetEntries.has(filePath) ||
+        ![...targetEntries.keys()].some((targetPath) => targetPath.startsWith(`${filePath}/`))
+      )
     );
     const budget = createByteBudget(this.fileBufferBudgetBytes);
     const matches = await runBoundedWork(paths, {
@@ -4522,6 +4600,12 @@ class ObtsObsidianClient {
       )
     }, async (filePath) => (await this.readRecoveryFileSnapshot(filePath, budget)).fingerprint);
     const targetMatchedPaths = new Set();
+    const divergedPaths = [];
+    // A verified displaced entry is durable evidence that this path was removed
+    // as part of the apply; it stays valid while the recovery admission is
+    // already blocked, not only during active writes.
+    const displacedEvidencePhase = journal.phase === "writing_files" || journal.phase === "verifying" || journal.phase === "blocked_recovery";
+    const activeWritePhase = journal.phase === "writing_files" || journal.phase === "verifying";
     for (let index = 0; index < paths.length; index += 1) {
       const filePath = paths[index];
       const fingerprint = fingerprints[index];
@@ -4539,15 +4623,15 @@ class ObtsObsidianClient {
         journal.preflight_fingerprints?.[filePath]
       );
       const displacedPreflight =
-        (journal.phase === "writing_files" || journal.phase === "verifying") &&
+        displacedEvidencePhase &&
         fingerprint.kind === "missing" &&
         await this.applyDisplacedEntryMatchesPreflight(journal, filePath);
       if (displacedPreflight) continue;
-      if (!matchesPreflight && ((journal.phase !== "writing_files" && journal.phase !== "verifying") || !matchesTarget)) {
-        return { matches: false, targetMatchedPaths };
+      if (!matchesPreflight && (!activeWritePhase || !matchesTarget)) {
+        divergedPaths.push(filePath);
       }
     }
-    return { matches: true, targetMatchedPaths };
+    return { matches: divergedPaths.length === 0, targetMatchedPaths, divergedPaths };
   }
 
   async writeTargetFilesFromJournal(journal, targetEntries, targetMatchedPaths) {

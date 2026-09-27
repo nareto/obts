@@ -2,11 +2,13 @@
 EXTENDS Naturals, TLC
 
 (***************************************************************************
-FM006 companion, revision 22: one enrollment, two immutable heads, one crash.
+FM006 companion, revision 24: one enrollment, two immutable heads, one crash.
 Context denotes validated identity, original approval baseline, mode and consent.
 Server acceptance and local receipt publication are separate durable boundaries.
 LegacyContext reproduces the missing-analysis implementation; the other mutants
-isolate admission and ordering defects. Durability and byte validation are assumed.
+isolate admission and ordering defects. A local edit on an affected path that
+matches neither the recorded pre-apply nor the target state must survive the
+completed apply. Durability and byte validation are assumed.
 ***************************************************************************)
 CONSTANT Mutation
 VARIABLE s
@@ -18,7 +20,9 @@ Init == s = [phase |-> "approved", durableContext |-> FALSE,
   journal |-> FALSE, journalId |-> 0, recovered |-> FALSE,
   pendingAck |-> FALSE, applied |-> 2, acknowledged |-> 2,
   catchup |-> FALSE, interim |-> FALSE, unsafeUpload |-> FALSE,
-  overwritten |-> FALSE, dropped |-> FALSE, lastAction |-> "Init"]
+  overwritten |-> FALSE, dropped |-> FALSE,
+  diverged |-> FALSE, preserved |-> FALSE,
+  lastAction |-> "Init"]
 PublishContext ==
   /\ s.running /\ s.phase = "approved"
   /\ s' = [s EXCEPT !.phase = "registering",
@@ -56,9 +60,15 @@ PlanApply ==
 OverwriteJournal ==
   /\ Mutation = "overwrite-journal" /\ s.running /\ s.journal /\ s.resumed
   /\ s' = [s EXCEPT !.journalId = 2, !.overwritten = TRUE, !.lastAction = "OverwriteJournal"]
+DivergeEdit ==
+  /\ s.running /\ s.journal /\ ~s.recovered
+  /\ s' = [s EXCEPT !.diverged = TRUE, !.lastAction = "DivergeEdit"]
 Recover ==
   /\ s.running /\ s.journal /\ ~s.recovered
-  /\ s' = [s EXCEPT !.recovered = TRUE, !.lastAction = "Recover"]
+  /\ LET discard == Mutation = "discard-divergence" /\ s.diverged
+     IN s' = [s EXCEPT !.recovered = TRUE,
+       !.preserved = IF s.diverged /\ ~discard THEN TRUE ELSE s.preserved,
+       !.lastAction = "Recover"]
 Apply ==
   /\ s.running /\ s.phase = "applying" /\ s.recovered /\ ~s.pendingAck
   /\ s' = [s EXCEPT !.applied = s.target, !.pendingAck = TRUE,
@@ -88,8 +98,9 @@ CatchUp ==
       !.cursor = 0, !.recovered = FALSE, !.lastAction = "CatchUp"]
 Terminal == s.phase = "complete" /\ UNCHANGED s
 Next == PublishContext \/ Accept \/ PublishReceipt \/ Crash \/ Restart \/ Chunk \/
-  AdvanceMain \/ DropCheckpoint \/ PlanApply \/ OverwriteJournal \/ Recover \/ Apply \/
-  NewApplyBeforeAck \/ Ack \/ LoseCatchUp \/ CaptureInterim \/ CatchUp \/ Terminal
+  AdvanceMain \/ DropCheckpoint \/ PlanApply \/ OverwriteJournal \/ DivergeEdit \/
+  Recover \/ Apply \/ NewApplyBeforeAck \/ Ack \/ LoseCatchUp \/ CaptureInterim \/
+  CatchUp \/ Terminal
 Spec == Init /\ [][Next]_vars
 FairSpec == Spec /\ WF_vars(PublishContext) /\ WF_vars(Accept) /\ WF_vars(PublishReceipt)
   /\ WF_vars(Restart) /\ WF_vars(Chunk) /\ WF_vars(PlanApply) /\ WF_vars(Recover)
@@ -101,7 +112,9 @@ AckBeforeNewApply == s.pendingAck => s.applied = s.target
 CompleteAfterAck == s.phase = "complete" => s.applied = s.acknowledged
 CatchUpDurable == (s.phase = "acknowledged" /\ s.applied # s.main) => s.catchup
 AcceptedAncestry == ~s.unsafeUpload
-Safety == ResumeHasContext /\ JournalPreserved /\ CheckpointPreserved /\ AckBeforeNewApply /\ CompleteAfterAck /\ CatchUpDurable /\ AcceptedAncestry
+DivergencePreserved == (s.diverged /\ s.applied = s.target) => s.preserved
+DivergenceRecovered == ~(s.diverged /\ s.recovered)
+Safety == ResumeHasContext /\ JournalPreserved /\ CheckpointPreserved /\ AckBeforeNewApply /\ CompleteAfterAck /\ CatchUpDurable /\ AcceptedAncestry /\ DivergencePreserved
 EventuallyComplete == <> (s.phase = "complete")
 NeverLostResponseRestart == ~(s.resumed /\ s.accepted /\ ~s.credential)
 =============================================================================
