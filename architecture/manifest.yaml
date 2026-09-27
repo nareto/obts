@@ -1,7 +1,7 @@
 schema_version: 1
-revision: 22
+revision: 23
 status: current
-updated: 2026-09-25
+updated: 2026-09-27
 authoritative_artifacts:
   - architecture/manifest.yaml
   - architecture/README.md
@@ -89,3 +89,18 @@ formal_models:
       - OBTS-SAF-002
       - OBTS-SAF-005
       - OBTS-SAF-009
+  - id: OBTS-FM-007
+    status: accepted
+    path: architecture/models/formal/OBTSDiagnosticAdmission.tla
+    architecture_revision: 23
+    trace_map: architecture/models/formal/trace/fm007-fm008-map.json
+    refines:
+      - OBTS-SEC-DIAG-001
+  - id: OBTS-FM-008
+    status: accepted
+    path: architecture/models/formal/OBTSClientStateRecovery.tla
+    architecture_revision: 23
+    trace_map: architecture/models/formal/trace/fm007-fm008-map.json
+    refines:
+      - OBTS-PER-CLIENT-001
+      - OBTS-SYNC-IMM-001

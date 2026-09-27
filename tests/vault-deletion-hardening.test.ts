@@ -571,9 +571,13 @@ describe('vault deletion hardening', () => {
       method: 'DELETE', url: `/api/v1/vaults/${vaultId}`, headers: { cookie, 'x-obts-csrf': csrf }, payload: { confirmation: `DELETE ${vaultId}` }
     });
     expect(accepted.statusCode).toBe(202);
-    await sleep(80);
-    expect((await server.store.snapshot()).deletion_receipts.some((receipt) => receipt.vault_id === vaultId)).toBe(false);
-    expect((await server.store.snapshot()).deletion_jobs.find((job) => job.vault_id === vaultId)?.error_code).toBe('unattributed_residue');
+    let blockedSnapshot = await server.store.snapshot();
+    for (let attempt = 0; attempt < 200 && blockedSnapshot.deletion_jobs.find((job) => job.vault_id === vaultId)?.error_code !== 'unattributed_residue'; attempt += 1) {
+      await sleep(10);
+      blockedSnapshot = await server.store.snapshot();
+    }
+    expect(blockedSnapshot.deletion_receipts.some((receipt) => receipt.vault_id === vaultId)).toBe(false);
+    expect(blockedSnapshot.deletion_jobs.find((job) => job.vault_id === vaultId)?.error_code).toBe('unattributed_residue');
     await expect(lstat(unknownRepository)).resolves.toBeTruthy();
     await expect(lstat(join(dataDir, 'git', `${vaultId}.git`))).resolves.toBeTruthy();
     await rm(unknownRepository, { recursive: true, force: true });

@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "architectureRevision": 23,
+  "status": "static seam mapping; no runtime trace conformance claim",
+  "models": [
+    {
+      "model": "architecture/models/formal/OBTSDiagnosticAdmission.tla",
+      "checker": "scripts/check-diagnostic-admission-model.mjs",
+      "contracts": ["OBTS-SEC-DIAG-001"],
+      "mappings": [
+        {"actions": ["Request", "Accept", "Duplicate", "Reject"], "implementation": ["src/server/diagnosticService.ts: ingestDevice, ingestConnection, withAdmission, enforceAcceptanceLimits"], "tests": ["tests/diagnostics.test.ts: shared source, concurrent reservation, duplicates, quota/persistence rejection"], "checks": ["safety", "manual-after-saturation", "legacy-shared-starvation", "duplicate-capacity", "rejected-capacity"]},
+        {"actions": ["ExpireHour", "ExpireRows", "Enroll"], "implementation": ["src/server/diagnosticService.ts: seedAcceptanceWindow, deleteOwnerEvents, isStoredManualSnapshot", "src/server/connectionService.ts: enrollment association backfill"], "tests": ["tests/diagnostics.test.ts: startup deletion, expiry, connection provenance"], "checks": ["expiry", "connection-lane"]}
+      ]
+    },
+    {
+      "model": "architecture/models/formal/OBTSClientStateRecovery.tla",
+      "checker": "scripts/check-client-state-model.mjs",
+      "contracts": ["OBTS-PER-CLIENT-001", "OBTS-SYNC-IMM-001"],
+      "mappings": [
+        {"actions": ["Observe", "StaleLocalWrite", "EqualServerRef", "SplitLocalRefs", "Read", "Crash", "Restart"], "implementation": ["obsidian-plugin/src/main.cjs: reconcileDeviceBlocked, readState, preferRecoverableBackupState, restoreRecoveredBackupState, backupStateCursorsDescend, cursorDescends"], "tests": ["tests/client-state-authority.test.ts", "tests/phase1.test.ts: genuine newer backup and stale-writer recovery", "tests/phase2.test.ts: resolved blocked-device restart", "tests/plugin-mobile-build.test.ts: packaged state selection"], "checks": ["safety", "liveness", "restart-recovery", "queue-rollback", "stale-primary", "attempt-rewrite", "equal-ref-error", "incomparable-head"]}
+      ]
+    }
+  ],
+  "executableOnly": ["tests/diagnostic-client-admission.test.ts: packaged signature cooldown and redacted notices", "tests/onboarding-recovery.test.ts: retained pre-write reason without evidence replacement"],
+  "omissions": ["Physical device suspension and filesystem power loss", "Arbitrary Git graphs and byte preservation proof", "Nested real-time acceptance windows", "Admission queue latency", "Legacy saturated partitions", "Report deletion before server restart", "Runtime trace replay"]
+}

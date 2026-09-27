@@ -88,10 +88,11 @@ export async function mobileHarness(root: string, serverUrl: string, options: { 
     const value = target[key]; return typeof value === 'function' ? value.bind(target) : value;
   } });
   const requests: string[] = [];
+  const notices: string[] = [];
   const obsidian = {
     Plugin, Modal, Setting,
     PluginSettingTab: class { constructor(public app: any, public plugin: any) {} },
-    Notice: class { constructor(_message: string) {} },
+    Notice: class { constructor(message: string) { notices.push(message); } },
     Platform: { isMobile: true, isIosApp: true }, apiVersion: '1.9.12',
     requestUrl: async (request: any) => {
       requests.push(new URL(request.url).pathname);
@@ -119,7 +120,7 @@ export async function mobileHarness(root: string, serverUrl: string, options: { 
   await plugin.onload();
   await plugin.initializeClient();
   return {
-    plugin, core: plugin.client, adapter, requests, modals, context,
+    plugin, core: plugin.client, adapter, requests, notices, modals, context,
     async open() {
       await commands.get('obts-setup-sync')!();
       const modal = modals.at(-1);

@@ -94,6 +94,10 @@ Recovery admission validates the original operation's target, prior/current refs
 
 Phases distinguish at least planning, recovery publication, file writes, verification, committed local refs/state, and blocked recovery. Journal cleanup occurs only after visible state, local refs, preservation queueing, and local applied-event cursor are durable. Missing server acknowledgement is recoverable independently.
 
+### OBTS-PER-CLIENT-001: Client Coordination Authority
+
+A queued proposal's expected device ref is its immutable compare-and-swap baseline, not the latest authenticated server observation. Queue agreement alone must never select an older state backup or resurrect a cleared block. A valid primary with the current local Git refs retains its server observation across ordinary reads and process restart. Backup recovery may repair local cursors from actual Git-pointer agreement or independently verified ancestry; missing objects and divergent histories do not establish ordering. When repairing local cursors, retain the primary's server observation unless the backup server ref is independently proven newer. Recovery does not rewrite a queued attempt, discard local changes, or bypass an apply journal or pending acknowledgement. Each changed local cursor requires its own evidence; ancestry of one cursor does not authorize replacing another incomparable cursor. Local repair retains primary error/status/details even when the server refs are equal, except for a proven stale local-only error with newer backup evidence and no apply journal. Recovery publication failures propagate instead of falling back to unrelated backup observations.
+
 ## Backup Boundary
 
 A server backup captures metadata and every per-vault Git store at one consistent point in time, plus any separately configured durable store. Deployment encryption keys and storage credentials are protected separately from the captured data.

@@ -21990,7 +21990,7 @@ var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_da
 var { createByteBudget, runBoundedWork } = require_work_pool();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.2";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.3";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_INVENTORY_INTERVAL_MS = 6 * 60 * 60 * 1e3;
@@ -22015,6 +22015,7 @@ var REF_LOCK_STALE_MS = 30 * 1e3;
 var PLUGIN_UPDATE_URL = "obsidian://brat?plugin=nareto%2Fobts";
 var DIAGNOSTIC_CONSENT_VERSION = 2;
 var TROUBLESHOOTING_DEDUP_MS = 15 * 60 * 1e3;
+var DIAGNOSTIC_FAILURE_COOLDOWN_MS = 60 * 1e3;
 var DIAGNOSTIC_CONTEXT = /* @__PURE__ */ Symbol("obtsDiagnosticContext");
 var DEFAULT_SETTINGS = {
   serverUrl: "http://127.0.0.1:3000",
@@ -22095,6 +22096,8 @@ module.exports = class ObtsPlugin extends Plugin {
     this.reportedOperationStalls = /* @__PURE__ */ new Set();
     this.layoutStarted = false;
     this.reportedDiagnosticErrors = /* @__PURE__ */ new WeakSet();
+    this.diagnosticRetryAfter = /* @__PURE__ */ new Map();
+    this.failedTroubleshootingTransitions = /* @__PURE__ */ new Map();
     this.reportedTroubleshootingTransitions = /* @__PURE__ */ new Map();
     this.pendingTroubleshootingTransitions = /* @__PURE__ */ new Map();
     this.manualTroubleshootingInFlight = null;
@@ -22463,11 +22466,16 @@ module.exports = class ObtsPlugin extends Plugin {
         return;
       }
       if (this.unloaded || !this.diagnosticSharingEnabled() || this.settings.diagnosticConsentServer !== consentDestination) return;
+      const { event_id: _eventId, ...safeSignature } = report;
+      const signature = `${consentDestination}:${state.device_id || route}:${JSON.stringify(safeSignature)}`;
+      if (Date.now() < (this.diagnosticRetryAfter.get(signature) || 0)) return;
+      rememberDiagnosticDeadline(this.diagnosticRetryAfter, signature, DIAGNOSTIC_FAILURE_COOLDOWN_MS);
       const response = await fetchWithTimeout(`${consentDestination}${route}`, {
         method: "POST",
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
         body: JSON.stringify(report)
       });
+      if (response.ok) rememberDiagnosticDeadline(this.diagnosticRetryAfter, signature, TROUBLESHOOTING_DEDUP_MS);
       if (response.ok && !this.unloaded && this.diagnosticSharingEnabled() && this.settings.diagnosticConsentServer === consentDestination && !this.diagnosticNoticeShown) {
         this.diagnosticNoticeShown = true;
         new Notice(`obts sent a sanitized error diagnostic to ${consentDestination}.`);
@@ -22487,7 +22495,9 @@ module.exports = class ObtsPlugin extends Plugin {
         if (manual) new Notice("obts: Pair this device before sending a troubleshooting snapshot.", 15e3);
         return false;
       }
-      const signature = `${consentDestination}:${troubleshootingTransitionSignature(context)}`;
+      const diagnosticState = await this.client.readPrimaryState();
+      const signature = `${consentDestination}:${diagnosticState?.device_id || "unpaired"}:${troubleshootingTransitionSignature(context)}`;
+      if (!manual && Date.now() < (this.failedTroubleshootingTransitions.get(signature) || 0)) return false;
       const lastSentAt = this.reportedTroubleshootingTransitions.get(signature) || 0;
       if (!manual && Date.now() - lastSentAt < TROUBLESHOOTING_DEDUP_MS) return false;
       if (!manual && this.pendingTroubleshootingTransitions.has(signature)) {
@@ -22497,15 +22507,17 @@ module.exports = class ObtsPlugin extends Plugin {
         const token = await this.client.readDeviceToken();
         if (this.unloaded || !this.diagnosticSharingEnabled() || this.settings.diagnosticConsentServer !== consentDestination) return false;
         const report = buildTroubleshootingDiagnostic(context);
+        if (!manual) rememberDiagnosticDeadline(this.failedTroubleshootingTransitions, signature, DIAGNOSTIC_FAILURE_COOLDOWN_MS);
         const response = await fetchWithTimeout(`${consentDestination}/api/v1/device/diagnostic-events`, {
           method: "POST",
           headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
           body: JSON.stringify(report)
         });
         if (!response.ok) {
-          if (manual) new Notice("obts: The troubleshooting snapshot could not be accepted by the server.", 15e3);
+          if (manual) new Notice(await diagnosticRejectionNotice(response), 15e3);
           return false;
         }
+        this.failedTroubleshootingTransitions.delete(signature);
         this.reportedTroubleshootingTransitions.set(signature, Date.now());
         while (this.reportedTroubleshootingTransitions.size > 64) {
           this.reportedTroubleshootingTransitions.delete(this.reportedTroubleshootingTransitions.keys().next().value);
@@ -23317,6 +23329,7 @@ var ObtsObsidianClient = class {
       await this.writeState(Object.assign({}, state, {
         status_label: "Out of sync \u2014 local recovery required",
         last_error_code: "apply_journal_recovery_required",
+        apply_validation_reason: applyRecoveryReason(state, journal),
         updated_at: nowIso()
       }));
       return;
@@ -24960,17 +24973,6 @@ var ObtsObsidianClient = class {
         last_error_code: null,
         updated_at: nowIso()
       });
-      attempt.authoritativePrimary = {
-        vaultId: state.vault_id,
-        deviceId: state.device_id,
-        primaryUpdatedAt: nextState.updated_at,
-        primaryServerDeviceRef: nextState.server_device_ref,
-        primaryStatusLabel: nextState.status_label,
-        priorUpdatedAt: state.updated_at,
-        priorServerDeviceRef: state.server_device_ref,
-        priorErrorCode: state.last_error_code,
-        triggeringErrorCode: triggeringErrorCode || state.last_error_code
-      };
       await this.writeState(nextState);
       capturedState = await this.readState();
       attempt.phase = "applying";
@@ -25375,9 +25377,10 @@ var ObtsObsidianClient = class {
     }
     if (!journal) return;
     await this.initialize();
-    if (await readApplyJournalStrict(this.fsp, this.applyJournalPath)) {
-      const reason = troubleshootingSafeErrorCode((await this.readState()).apply_validation_reason);
-      throw new ObtsBlockedError("apply_journal_recovery_required", `An interrupted apply needs verified recovery evidence (${reason}). Keep the setup journal and recovery bundles; restore missing or damaged recovery evidence before resuming. No new apply can replace this operation.`);
+    const remaining = await readApplyJournalStrict(this.fsp, this.applyJournalPath);
+    if (remaining) {
+      const reason = applyRecoveryReason(await this.readState(), remaining);
+      throw new ObtsBlockedError("apply_journal_recovery_required", `The interrupted apply is still blocked (${reason}). Keep the setup journal, local files and recovery bundles. Resolve this recorded recovery issue before resuming; a new apply cannot replace the unfinished operation.`);
     }
   }
   async applyRecoveryValidationReason(journal, state) {
@@ -28003,12 +28006,10 @@ var ObtsObsidianClient = class {
     }
   }
   async readState() {
+    let state;
     try {
-      const state = JSON.parse(await this.fsp.readFile(this.statePath, "utf8"));
-      if (await this.hasActiveTokenWithoutIdentity(state)) {
-        return this.normalizeStateEventCursors(await this.readBackupState() || this.localStateIncomplete(state));
-      }
-      return this.normalizeStateEventCursors(await this.preferRecoverableBackupState(state));
+      state = JSON.parse(await this.fsp.readFile(this.statePath, "utf8"));
+      if (!state || typeof state !== "object" || Array.isArray(state)) throw new Error("Invalid client state");
     } catch {
       if (await exists(this.fsp, this.authPath)) {
         const backupState = await this.readBackupState();
@@ -28033,6 +28034,10 @@ var ObtsObsidianClient = class {
         updated_at: nowIso()
       };
     }
+    if (await this.hasActiveTokenWithoutIdentity(state)) {
+      return this.normalizeStateEventCursors(await this.readBackupState() || this.localStateIncomplete(state));
+    }
+    return this.normalizeStateEventCursors(await this.preferRecoverableBackupState(state));
   }
   normalizeStateEventCursors(state) {
     return Object.assign({}, state, {
@@ -28101,9 +28106,6 @@ var ObtsObsidianClient = class {
       return primaryState;
     }
     if (sameStateCursors(primaryState, backupState)) return primaryState;
-    if (await this.shouldUseAuthoritativeReconciliationPrimary(primaryState, backupState)) {
-      return primaryState;
-    }
     const [localMain, localHead] = await Promise.all([
       this.resolveRefPointer("refs/heads/main"),
       this.resolveRefPointer("refs/heads/local")
@@ -28114,53 +28116,46 @@ var ObtsObsidianClient = class {
       primaryState.local_main && primaryState.local_head && backupState.local_main && backupState.local_head
     );
     if (comparableLocalCursors && primaryMatchesRefs !== backupMatchesRefs) {
-      return backupMatchesRefs ? await this.restoreRecoveredBackupState(primaryState, backupState) : primaryState;
-    }
-    if (comparableLocalCursors && primaryMatchesRefs && backupMatchesRefs) {
-      const expectedDeviceRef = (await this.readQueue()).expected_device_ref;
-      const primaryMatchesQueue = primaryState.server_device_ref === expectedDeviceRef;
-      const backupMatchesQueue = backupState.server_device_ref === expectedDeviceRef;
-      if (primaryMatchesQueue !== backupMatchesQueue) {
-        return backupMatchesQueue ? await this.restoreRecoveredBackupState(primaryState, backupState, expectedDeviceRef) : primaryState;
+      if (backupMatchesRefs && await this.commitExists(localMain) && await this.commitExists(localHead)) {
+        return await this.restoreRecoveredBackupState(primaryState, backupState);
       }
+      return primaryState;
     }
     this.plugin.setInitializationStage("Validating local state history", "startup_state");
     if (await this.backupStateCursorsDescend(primaryState, backupState)) {
-      return backupState;
+      return await this.restoreRecoveredBackupState(primaryState, backupState);
     }
     return primaryState;
   }
-  async shouldUseAuthoritativeReconciliationPrimary(primaryState, backupState) {
-    const expected = this.activeReconciliation && this.activeReconciliation.authoritativePrimary;
-    if (!expected || primaryState.vault_id !== expected.vaultId || primaryState.device_id !== expected.deviceId || primaryState.updated_at !== expected.primaryUpdatedAt || primaryState.server_device_ref !== expected.primaryServerDeviceRef || primaryState.status_label !== expected.primaryStatusLabel || primaryState.last_error_code !== null || backupState.vault_id !== expected.vaultId || backupState.device_id !== expected.deviceId || backupState.updated_at !== expected.priorUpdatedAt || backupState.server_device_ref !== expected.priorServerDeviceRef || expected.triggeringErrorCode !== "device_blocked" || expected.priorErrorCode !== null && expected.priorErrorCode !== "device_blocked" || backupState.last_error_code !== expected.priorErrorCode || primaryState.local_main !== backupState.local_main || primaryState.local_head !== backupState.local_head) {
-      return false;
-    }
-    const queue = await this.readQueue();
-    return Boolean(
-      queue.status === "conflicted" && queue.pending_commit && queue.pending_commit === backupState.local_head && queue.expected_device_ref === backupState.server_device_ref
-    );
-  }
-  async restoreRecoveredBackupState(primaryState, backupState, knownExpectedDeviceRef = void 0) {
-    const expectedDeviceRef = knownExpectedDeviceRef === void 0 ? (await this.readQueue()).expected_device_ref : knownExpectedDeviceRef;
-    const backupMatchesQueue = expectedDeviceRef && backupState.server_device_ref === expectedDeviceRef;
-    const recovered = Object.assign({}, backupState, {
+  async restoreRecoveredBackupState(primaryState, backupState) {
+    const backupServerIsNewer = await this.cursorDescends(primaryState.server_device_ref, backupState.server_device_ref);
+    const recoverMissingServerRef = !primaryState.server_device_ref && backupState.server_device_ref && await this.commitExists(backupState.server_device_ref);
+    const recovered = Object.assign({}, primaryState, {
+      local_main: backupState.local_main,
+      local_head: backupState.local_head,
       device_name: primaryState.device_name || backupState.device_name || null,
-      server_device_ref: backupMatchesQueue ? backupState.server_device_ref : primaryState.server_device_ref,
+      server_device_ref: backupServerIsNewer || recoverMissingServerRef ? backupState.server_device_ref : primaryState.server_device_ref,
       initial_import_confirmed: Boolean(primaryState.initial_import_confirmed || backupState.initial_import_confirmed),
       last_event_seq: Math.max(primaryState.last_event_seq || 0, backupState.last_event_seq || 0),
-      last_applied_event_seq: backupState.last_applied_event_seq || 0,
+      last_applied_event_seq: primaryState.local_main === backupState.local_main ? Math.max(primaryState.last_applied_event_seq || 0, backupState.last_applied_event_seq || 0) : backupState.last_applied_event_seq || 0,
       updated_at: nowIso()
     });
-    if (recovered.server_device_ref === primaryState.server_device_ref && primaryState.server_device_ref !== backupState.server_device_ref) {
-      recovered.status_label = primaryState.status_label;
-      recovered.last_error_code = primaryState.last_error_code;
-      recovered.last_error_details = primaryState.last_error_details || null;
+    if (backupServerIsNewer && ["unsafe_local_state", "local_state_incomplete"].includes(primaryState.last_error_code) && !backupState.last_error_code && !await exists(this.fsp, this.applyJournalPath)) {
+      recovered.status_label = backupState.status_label;
+      recovered.last_error_code = null;
+      recovered.last_error_details = null;
     }
     await writeJson(this.fsp, this.statePath, recovered);
     return recovered;
   }
   async backupStateCursorsDescend(primaryState, backupState) {
-    return await this.cursorDescends(primaryState.local_main, backupState.local_main) || await this.cursorDescends(primaryState.local_head, backupState.local_head) || await this.cursorDescends(primaryState.server_device_ref, backupState.server_device_ref);
+    let advanced = false;
+    for (const field of ["local_main", "local_head"]) {
+      if (primaryState[field] === backupState[field]) continue;
+      if (!await this.cursorDescends(primaryState[field], backupState[field])) return false;
+      advanced = true;
+    }
+    return advanced || await this.cursorDescends(primaryState.server_device_ref, backupState.server_device_ref);
   }
   async shouldPreserveCurrentCursor(nextCursor, currentCursor) {
     if (!currentCursor) {
@@ -31206,6 +31201,13 @@ async function exists(fsp, filePath) {
     return false;
   }
 }
+function applyRecoveryReason(state, journal) {
+  for (const value of [state.apply_validation_reason, journal.redacted_error_category]) {
+    const reason = troubleshootingSafeErrorCode(value);
+    if (reason !== "none" && reason !== "unknown") return reason;
+  }
+  return "apply_recovery_required";
+}
 function categorizeRecoveryError(error) {
   if (error instanceof ObtsBlockedError) {
     if (error.code === "unsafe_local_state") {
@@ -31550,6 +31552,28 @@ function troubleshootingHttpStatus(status2) {
 }
 function troubleshootingTransitionSignature(context) {
   return JSON.stringify(Object.assign({}, context, { attempt_id: "none" }));
+}
+function rememberDiagnosticDeadline(cache, signature, delay) {
+  cache.set(signature, Date.now() + delay);
+  while (cache.size > 128) cache.delete(cache.keys().next().value);
+}
+async function diagnosticRejectionNotice(response) {
+  const guidance = {
+    diagnostic_rate_limited: "The diagnostic rate limit was reached. Retry later.",
+    diagnostic_quota_exceeded: "The diagnostic storage quota was reached. Ask the server operator to review retention.",
+    diagnostic_reporting_disabled: "Diagnostic ingestion is disabled on this server.",
+    invalid_request: "The server rejected the report format. Check plugin and server versions.",
+    unsupported_diagnostic_schema: "The server does not support this report format. Check plugin and server versions."
+  };
+  let code;
+  try {
+    code = (await response.json())?.error?.code;
+  } catch {
+    code = null;
+  }
+  const known = typeof code === "string" && Object.hasOwn(guidance, code);
+  const status2 = Number.isInteger(response.status) && response.status >= 400 && response.status <= 599 ? `HTTP ${response.status}` : "request rejected";
+  return `obts: Snapshot rejected (${status2}${known ? `, ${code}` : ""}). ${known ? guidance[code] : "Check the server connection and retry; local sync evidence is unchanged."}`;
 }
 function buildTroubleshootingDiagnostic(context) {
   const blocked = context.safe_error_code !== "none" && context.safe_error_code !== "unknown";

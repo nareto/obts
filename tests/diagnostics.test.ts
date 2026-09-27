@@ -2,7 +2,8 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { DiagnosticService } from '../src/server/diagnosticService.js';
 
 import { createObtsServer, type ObtsServer } from '../src/server/app.js';
 
@@ -77,6 +78,8 @@ describe('opt-in error diagnostics backend', () => {
   const servers: ObtsServer[] = [];
 
   afterEach(async () => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
     await Promise.all(servers.splice(0).map(async (server) => await server.app.close()));
     await Promise.all(roots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true })));
   });
@@ -208,6 +211,104 @@ describe('opt-in error diagnostics backend', () => {
     expect((listed.body.events as Array<Record<string, unknown>>)[0]).toMatchObject(largeJournalReport);
     const snapshot = await fixture.server.store.snapshot();
     expect(snapshot.diagnostic_events.map((event) => event.schema_version).sort()).toEqual([1, 2, 2]);
+  });
+
+  it('reserves manual capacity across devices sharing a source and returns duplicates after saturation', async () => {
+    const fixture = await setupFixture(true);
+    const devices: Awaited<ReturnType<typeof completeConnection>>[] = [];
+    for (let index = 0; index < 2; index++) {
+      const connection = await createConnection(fixture.baseUrl);
+      await approveNewVault(fixture, connection.connection_id);
+      devices.push(await completeConnection(fixture.baseUrl, connection.connection_id, connection.connection_secret));
+    }
+    const endpoint = `${fixture.baseUrl}/api/v1/device/diagnostic-events`;
+    for (let index = 0; index < 60; index++) {
+      expect((await postDiagnostic(endpoint, devices[0]!.device_token, { ...report, event_id: `dgr_${index.toString(16).padStart(32, '0')}` })).status).toBe(202);
+    }
+    expect((await postDiagnostic(endpoint, devices[0]!.device_token, { ...report, event_id: `dgr_${'0'.repeat(32)}` })).status).toBe(200);
+    expect((await postDiagnostic(endpoint, devices[0]!.device_token, { ...report, event_id: `dgr_${'a'.repeat(32)}` })).status).toBe(429);
+    expect((await postDiagnostic(endpoint, devices[1]!.device_token, { ...report, event_id: `dgr_${'b'.repeat(32)}` })).status).toBe(202);
+    const manual = { ...troubleshootingReport, context: { ...troubleshootingReport.context, trigger: 'manual' } };
+    expect((await postDiagnostic(endpoint, devices[1]!.device_token, manual)).status).toBe(202);
+    expect((await postDiagnostic(endpoint, devices[0]!.device_token, manual)).status).toBe(202);
+    const attempts = await Promise.all(Array.from({ length: 12 }, (_, index) => postDiagnostic(endpoint, devices[0]!.device_token,
+      { ...manual, event_id: `dgr_${(index + 100).toString(16).padStart(32, '0')}` })));
+    expect(attempts.filter(response => response.status === 202)).toHaveLength(9);
+    expect(attempts.filter(response => response.status === 429)).toHaveLength(3);
+    expect((await postDiagnostic(endpoint, devices[0]!.device_token, manual)).status).toBe(200);
+  });
+
+  it('keeps connection-origin manual claims automatic after enrollment and restart', async () => {
+    const fixture = await setupFixture(true);
+    const connection = await createConnection(fixture.baseUrl);
+    await approveNewVault(fixture, connection.connection_id);
+    const manual = { ...troubleshootingReport, context: { ...troubleshootingReport.context, trigger: 'manual' } };
+    for (let index = 0; index < 20; index++) {
+      expect((await postDiagnostic(`${fixture.baseUrl}/api/v1/connections/${connection.connection_id}/diagnostic-events`, connection.connection_secret,
+        { ...manual, event_id: `dgr_${index.toString(16).padStart(32, '0')}` })).status).toBe(202);
+    }
+    const device = await completeConnection(fixture.baseUrl, connection.connection_id, connection.connection_secret);
+    const auth = await fixture.server.auth.authenticateDeviceAnyVault(`Bearer ${device.device_token}`);
+    const restarted = new DiagnosticService(fixture.server.store, fixture.server.config);
+    await restarted.initialize();
+    await expect(restarted.ingestDevice(auth, manual, 'shared-proxy')).resolves.toMatchObject({ status: 'accepted' });
+  });
+
+  it('retains daily admission accounting through startup deletion and hourly expiry', async () => {
+    const fixture = await setupFixture(true);
+    const connection = await createConnection(fixture.baseUrl);
+    await approveNewVault(fixture, connection.connection_id);
+    const device = await completeConnection(fixture.baseUrl, connection.connection_id, connection.connection_secret);
+    const auth = await fixture.server.auth.authenticateDeviceAnyVault(`Bearer ${device.device_token}`);
+    const manual = { ...troubleshootingReport, context: { ...troubleshootingReport.context, trigger: 'manual' } };
+    for (let index = 0; index < 10; index++) {
+      await fixture.server.diagnostics.ingestDevice(auth, { ...manual, event_id: `dgr_${index.toString(16).padStart(32, '0')}` }, 'proxy');
+    }
+    const restarted = new DiagnosticService(fixture.server.store, fixture.server.config);
+    await restarted.initialize();
+    await restarted.deleteOwnerEvents(fixture.userId);
+    await expect(restarted.ingestDevice(auth, manual, 'proxy')).rejects.toMatchObject({ code: 'diagnostic_rate_limited' });
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const now = Date.now();
+    vi.setSystemTime(now + 60 * 60 * 1000 + 1);
+    await expect(restarted.ingestDevice(auth, manual, 'proxy')).rejects.toMatchObject({ code: 'diagnostic_quota_exceeded' });
+    vi.setSystemTime(now + 24 * 60 * 60 * 1000 + 1);
+    await expect(restarted.ingestDevice(auth, manual, 'proxy')).resolves.toMatchObject({ status: 'accepted' });
+  });
+
+  it('does not charge rejected quotas or failed persistence against manual acceptance', async () => {
+    const fixture = await setupFixture(true);
+    const connection = await createConnection(fixture.baseUrl);
+    await approveNewVault(fixture, connection.connection_id);
+    const device = await completeConnection(fixture.baseUrl, connection.connection_id, connection.connection_secret);
+    const auth = await fixture.server.auth.authenticateDeviceAnyVault(`Bearer ${device.device_token}`);
+    const manual = { ...troubleshootingReport, context: { ...troubleshootingReport.context, trigger: 'manual' } };
+    const mutate = vi.spyOn(fixture.server.store, 'mutate');
+    mutate.mockRejectedValueOnce(new Error('synthetic persistence failure'));
+    await expect(fixture.server.diagnostics.ingestDevice(auth, manual, 'proxy')).rejects.toThrow('synthetic persistence failure');
+    mutate.mockRestore();
+    await fixture.server.store.mutate(db => {
+      db.diagnostic_events = Array.from({ length: 2000 }, (_, index) => ({ ...report, breadcrumbs: [...report.breadcrumbs],
+        event_id: `dgr_${index.toString(16).padStart(32, '0')}`, owner_user_id: fixture.userId,
+        device_id: null, connection_id: null, vault_id: auth.vault.vault_id,
+        received_at: new Date().toISOString(), expires_at: new Date(Date.now() + 86400000).toISOString() }));
+    });
+    for (let index = 0; index < 12; index++) {
+      await expect(fixture.server.diagnostics.ingestDevice(auth, manual, 'proxy')).rejects.toMatchObject({ code: 'diagnostic_quota_exceeded' });
+    }
+    await fixture.server.diagnostics.deleteOwnerEvents(fixture.userId);
+    const results = await Promise.allSettled(Array.from({ length: 10 }, (_, index) =>
+      fixture.server.diagnostics.ingestDevice(auth, { ...manual, event_id: `dgr_${index.toString(16).padStart(32, '0')}` }, 'proxy')));
+    expect(results.every(result => result.status === 'fulfilled')).toBe(true);
+  });
+
+  it('rechecks connection authorization after it waits for admission', async () => {
+    const fixture = await setupFixture(true);
+    const connection = await createConnection(fixture.baseUrl);
+    await approveNewVault(fixture, connection.connection_id);
+    const auth = await fixture.server.connections.authenticateDiagnostics(connection.connection_id, connection.connection_secret);
+    await fixture.server.store.mutate(db => { db.connections.find(row => row.connection_id === connection.connection_id)!.status = 'denied'; });
+    await expect(fixture.server.diagnostics.ingestConnection(auth, report, 'proxy')).rejects.toMatchObject({ code: 'not_found' });
   });
 
   it('accepts only bounded upload-size categories without paths, OIDs, or exact bytes', async () => {

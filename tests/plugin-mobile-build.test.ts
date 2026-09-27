@@ -423,6 +423,8 @@ describe('mobile plugin artifact', () => {
     const resolveRefPointer = stateClient.resolveRefPointer.bind(stateClient);
     const restoreRecoveredBackupState = stateClient.restoreRecoveredBackupState.bind(stateClient);
     const backupStateCursorsDescend = stateClient.backupStateCursorsDescend.bind(stateClient);
+    const commitExists = stateClient.commitExists.bind(stateClient);
+    stateClient.commitExists = async () => true;
     let ancestryChecks = 0;
     let restoredBackups = 0;
     stateClient.readBackupState = async () => backupState;
@@ -439,14 +441,15 @@ describe('mobile plugin artifact', () => {
     stateClient.readQueue = async () => ({ expected_device_ref: primaryState.server_device_ref });
     expect(await stateClient.preferRecoverableBackupState(primaryState)).toBe(primaryState);
     stateClient.readQueue = async () => ({ expected_device_ref: serverOnlyBackup.server_device_ref });
-    expect(await stateClient.preferRecoverableBackupState(primaryState)).toBe(serverOnlyBackup);
-    expect(ancestryChecks).toBe(0);
-    expect(restoredBackups).toBe(2);
+    expect(await stateClient.preferRecoverableBackupState(primaryState)).toBe(primaryState);
+    expect(ancestryChecks).toBe(2);
+    expect(restoredBackups).toBe(1);
     stateClient.readBackupState = readBackupState;
     stateClient.readQueue = readQueue;
     stateClient.resolveRefPointer = resolveRefPointer;
     stateClient.restoreRecoveredBackupState = restoreRecoveredBackupState;
     stateClient.backupStateCursorsDescend = backupStateCursorsDescend;
+    stateClient.commitExists = commitExists;
 
     const originalPrimaryState = await stateClient.readPrimaryState();
     const mixedPrimary = {
@@ -468,8 +471,7 @@ describe('mobile plugin artifact', () => {
     };
     const mergedRecovery = await stateClient.restoreRecoveredBackupState(
       mixedPrimary,
-      mixedBackup,
-      mixedPrimary.server_device_ref
+      mixedBackup
     );
     expect(mergedRecovery).toMatchObject({
       local_main: mixedBackup.local_main,
@@ -489,8 +491,7 @@ describe('mobile plugin artifact', () => {
     };
     const nullServerRecovery = await stateClient.restoreRecoveredBackupState(
       nullServerPrimary,
-      mixedBackup,
-      null
+      mixedBackup
     );
     expect(nullServerRecovery).toMatchObject({
       server_device_ref: null,

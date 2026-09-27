@@ -87,6 +87,27 @@ describe('durable onboarding recovery admission', () => {
     expect(await readFile(join(root, 'note.md'), 'utf8')).toBe(fault === 'concurrent-edit' ? 'edited during recovery\n' : 'target bytes\n');
   });
 
+  it('reports the retained pre-write failure instead of claiming missing evidence with reason none', async () => {
+    const { core, root } = await client();
+    await writeFile(join(root, 'note.md'), 'original\n');
+    const base = await core.createLocalCommit('base');
+    await core.updateRef('refs/heads/main', base, null, true);
+    await writeFile(join(root, 'note.md'), 'target\n');
+    const target = await core.createLocalCommit('target');
+    await writeFile(join(root, 'note.md'), 'original\n');
+    await core.updateRef('refs/heads/local', base, null, true);
+    await core.writeState({ ...await core.readState(), local_main: base, local_head: base });
+    core.finalizeRecoveryBundle = async () => { throw new Error('synthetic storage failure'); };
+    await expect(core.applyTargetMain(target, ['note.md'], true, [], false, [], [], 1, false, null, { 'note.md': 7 }))
+      .rejects.toMatchObject({ code: 'recovery_bundle_failed' });
+    const before = JSON.parse(await readFile(join(root, '.obts/apply-journal.json'), 'utf8'));
+    const restarted = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'recovery' });
+    await restarted.initialize();
+    await expect((restarted as any).client.admitApplyRecovery()).rejects.toThrow('(recovery_bundle_failed)');
+    expect(JSON.parse(await readFile(join(root, '.obts/apply-journal.json'), 'utf8')).apply_id).toBe(before.apply_id);
+    expect(await readFile(join(root, 'note.md'), 'utf8')).toBe('original\n');
+  });
+
   it('does not replace an unresolved journal without a lock, including same-target apply', async () => {
     const { core, root } = await client();
     const journalPath = join(root, '.obts/apply-journal.json');

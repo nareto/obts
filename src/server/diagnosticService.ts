@@ -15,15 +15,22 @@ const MAX_EVENTS = 10_000;
 const MAX_OWNER_EVENTS = 2_000;
 const MAX_CONNECTION_EVENTS = 20;
 const MAX_DEVICE_EVENTS_PER_DAY = 100;
-const MAX_EVENTS_PER_SOURCE_HOUR = 60;
+const MAX_EVENTS_PER_IDENTITY_HOUR = 60;
 const MAX_EVENTS_PER_INSTANCE_HOUR = 1_000;
+const MANUAL_DEVICE_RESERVE = 10;
+const MANUAL_OWNER_RESERVE = 200;
+const MANUAL_STORAGE_RESERVE = 1_000;
+const MANUAL_INSTANCE_HOUR_RESERVE = 100;
 const TERMINAL_CONNECTION_RETENTION_MS = 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 
+type AcceptedDiagnostic = { at: number; deviceId: string | null; connectionId: string | null; manual: boolean };
+
 export class DiagnosticService {
-  private readonly sourceWindows = new Map<string, number[]>();
-  private instanceWindow: number[] = [];
+  private acceptedWindow: AcceptedDiagnostic[] = [];
+  private acceptanceInitialized = false;
+  private pendingAdmission: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly store: MetadataStore,
@@ -32,18 +39,25 @@ export class DiagnosticService {
 
   async initialize(): Promise<void> {
     await this.prune();
+    this.seedAcceptanceWindow(await this.store.snapshot(), Date.now());
   }
 
   async ingestConnection(
     auth: { connection: ConnectionRequestRow; user: UserRow },
     value: unknown,
-    sourceIp: string
+    _sourceIp: string
   ): Promise<{ status: 'accepted' | 'duplicate'; event_id: string }> {
     this.requireEnabled();
     const event = this.parse(value);
-    this.enforceBurstLimits(sourceIp);
-    return await this.store.mutate((db) => {
-      pruneRows(db, Date.now());
+    return await this.withAdmission(event, null, auth.connection.connection_id, async () => this.store.mutate((db) => {
+      const now = Date.now();
+      const connection = db.connections.find(row => row.connection_id === auth.connection.connection_id);
+      const user = db.users.find(row => row.user_id === auth.user.user_id);
+      if (!connection || connection.status !== 'approved' || connection.approved_user_id !== auth.user.user_id ||
+        connection.selected_vault_id !== auth.connection.selected_vault_id || Date.parse(connection.expires_at) <= now || !user || user.disabled) {
+        throw new AuthError(404, 'not_found', 'Resource not found.');
+      }
+      pruneRows(db, now);
       const duplicate = db.diagnostic_events.find(
         (candidate) =>
           candidate.event_id === event.event_id &&
@@ -54,10 +68,10 @@ export class DiagnosticService {
       const connectionCount = db.diagnostic_events.filter(
         (candidate) => candidate.connection_id === auth.connection.connection_id
       ).length;
-      const ownerCount = db.diagnostic_events.filter((candidate) => candidate.owner_user_id === auth.user.user_id).length;
-      if (connectionCount >= MAX_CONNECTION_EVENTS || ownerCount >= MAX_OWNER_EVENTS || db.diagnostic_events.length >= MAX_EVENTS) {
+      if (connectionCount >= MAX_CONNECTION_EVENTS) {
         throw new AuthError(429, 'diagnostic_quota_exceeded', 'Diagnostic reporting quota exceeded.');
       }
+      this.enforceAcceptanceLimits(db, event, auth.user.user_id, null, auth.connection.connection_id, Date.now());
       appendRow(db, event, this.config.diagnosticRetentionDays, {
         ownerUserId: auth.user.user_id,
         connectionId: auth.connection.connection_id,
@@ -65,24 +79,25 @@ export class DiagnosticService {
         deviceId: null
       });
       return { status: 'accepted' as const, event_id: event.event_id };
-    });
+    }));
   }
 
   async ingestDevice(
     auth: AuthenticatedDevice,
     value: unknown,
-    sourceIp: string
+    _sourceIp: string
   ): Promise<{ status: 'accepted' | 'duplicate'; event_id: string }> {
     this.requireEnabled();
     const event = this.parse(value);
-    this.enforceBurstLimits(sourceIp);
-    return await this.store.mutate((db) => {
+    return await this.withAdmission(event, auth.device.device_id, null, async () => this.store.mutate((db) => {
       const now = Date.now();
       const vault = db.vaults.find((candidate) => candidate.vault_id === auth.vault.vault_id);
       const device = db.devices.find((candidate) => candidate.device_id === auth.device.device_id);
       const token = db.tokens.find((candidate) => candidate.token_id === auth.token.token_id);
       const user = db.users.find((candidate) => candidate.user_id === auth.user.user_id);
-      if (!vault || !device || !user || !token || vault.owner_user_id !== auth.user.user_id || device.vault_id !== vault.vault_id ||
+      if (!vault || !device || !user || user.disabled || !token || token.kind !== 'device' || token.user_id !== auth.user.user_id ||
+        token.consumed_at !== null || (token.expires_at !== null && Date.parse(token.expires_at) <= now) ||
+        vault.owner_user_id !== auth.user.user_id || device.vault_id !== vault.vault_id ||
         device.user_id !== auth.user.user_id || device.status === 'revoked' || device.revoked_at !== null || token.revoked_at !== null ||
         token.vault_id !== vault.vault_id || token.device_id !== device.device_id) {
         throw new AuthError(404, 'not_found', 'Resource not found.');
@@ -98,13 +113,7 @@ export class DiagnosticService {
           candidate.device_id === auth.device.device_id
       );
       if (duplicate) return { status: 'duplicate' as const, event_id: duplicate.event_id };
-      const deviceCount = db.diagnostic_events.filter(
-        (candidate) => candidate.device_id === auth.device.device_id && Date.parse(candidate.received_at) >= now - DAY_MS
-      ).length;
-      const ownerCount = db.diagnostic_events.filter((candidate) => candidate.owner_user_id === auth.user.user_id).length;
-      if (deviceCount >= MAX_DEVICE_EVENTS_PER_DAY || ownerCount >= MAX_OWNER_EVENTS || db.diagnostic_events.length >= MAX_EVENTS) {
-        throw new AuthError(429, 'diagnostic_quota_exceeded', 'Diagnostic reporting quota exceeded.');
-      }
+      this.enforceAcceptanceLimits(db, event, auth.user.user_id, auth.device.device_id, null, now);
       appendRow(db, event, this.config.diagnosticRetentionDays, {
         ownerUserId: auth.user.user_id,
         connectionId: null,
@@ -112,7 +121,7 @@ export class DiagnosticService {
         deviceId: auth.device.device_id
       });
       return { status: 'accepted' as const, event_id: event.event_id };
-    });
+    }));
   }
 
   async list(ownerUserId: string, cursor: string | null, limit: number): Promise<DiagnosticEventsResponse> {
@@ -169,23 +178,67 @@ export class DiagnosticService {
     }
   }
 
-  private enforceBurstLimits(sourceIp: string): void {
-    const now = Date.now();
-    this.instanceWindow = this.instanceWindow.filter((timestamp) => timestamp >= now - HOUR_MS);
-    const sourceWindow = (this.sourceWindows.get(sourceIp) ?? []).filter((timestamp) => timestamp >= now - HOUR_MS);
-    if (sourceWindow.length >= MAX_EVENTS_PER_SOURCE_HOUR || this.instanceWindow.length >= MAX_EVENTS_PER_INSTANCE_HOUR) {
+  private async withAdmission(
+    event: DiagnosticEvent, deviceId: string | null, connectionId: string | null,
+    accept: () => Promise<{ status: 'accepted' | 'duplicate'; event_id: string }>
+  ): Promise<{ status: 'accepted' | 'duplicate'; event_id: string }> {
+    const previous = this.pendingAdmission;
+    let release!: () => void;
+    this.pendingAdmission = new Promise<void>(resolve => { release = resolve; });
+    await previous;
+    try {
+      const result = await accept();
+      if (result.status === 'accepted') {
+        this.acceptedWindow.push({ at: Date.now(), deviceId, connectionId, manual: deviceId !== null && isManualSnapshot(event) });
+      }
+      return result;
+    } finally { release(); }
+  }
+
+  private seedAcceptanceWindow(db: MetadataDb, now: number): void {
+    if (this.acceptanceInitialized) return;
+    this.acceptedWindow = db.diagnostic_events.filter(row => Date.parse(row.received_at) > now - DAY_MS)
+      .map(row => ({ at: Date.parse(row.received_at), deviceId: row.connection_id === null ? row.device_id : null,
+        connectionId: row.connection_id, manual: isStoredManualSnapshot(row) }));
+    this.acceptanceInitialized = true;
+  }
+
+  private enforceAcceptanceLimits(
+    db: MetadataDb, event: DiagnosticEvent, ownerId: string, deviceId: string | null, connectionId: string | null, now: number
+  ): void {
+    this.seedAcceptanceWindow(db, now);
+    this.acceptedWindow = this.acceptedWindow.filter(entry => entry.at > now - DAY_MS);
+    const manual = deviceId !== null && isManualSnapshot(event);
+    const lane = db.diagnostic_events.filter(row => isStoredManualSnapshot(row) === manual);
+    const dailyIdentity = this.acceptedWindow.filter(entry => deviceId !== null ? entry.deviceId === deviceId : entry.connectionId === connectionId);
+    const hourly = this.acceptedWindow.filter(entry => entry.at > now - HOUR_MS);
+    const hourlyLane = hourly.filter(entry => entry.manual === manual);
+    const hourlyIdentity = hourlyLane.filter(entry => deviceId !== null ? entry.deviceId === deviceId : entry.connectionId === connectionId);
+    const perHour = manual ? MANUAL_DEVICE_RESERVE : MAX_EVENTS_PER_IDENTITY_HOUR;
+    const instanceHour = manual ? MANUAL_INSTANCE_HOUR_RESERVE : MAX_EVENTS_PER_INSTANCE_HOUR - MANUAL_INSTANCE_HOUR_RESERVE;
+    if (hourlyIdentity.length >= perHour || hourlyLane.length >= instanceHour || hourly.length >= MAX_EVENTS_PER_INSTANCE_HOUR) {
       throw new AuthError(429, 'diagnostic_rate_limited', 'Diagnostic reporting rate limit exceeded.');
     }
-    sourceWindow.push(now);
-    this.instanceWindow.push(now);
-    this.sourceWindows.set(sourceIp, sourceWindow);
-    if (this.sourceWindows.size > 10_000) {
-      for (const [key, timestamps] of this.sourceWindows) {
-        if (timestamps.every((timestamp) => timestamp < now - HOUR_MS)) this.sourceWindows.delete(key);
-        if (this.sourceWindows.size <= 10_000) break;
-      }
+    const deviceDay = manual ? MANUAL_DEVICE_RESERVE : MAX_DEVICE_EVENTS_PER_DAY - MANUAL_DEVICE_RESERVE;
+    const ownerLimit = manual ? MANUAL_OWNER_RESERVE : MAX_OWNER_EVENTS - MANUAL_OWNER_RESERVE;
+    const storageLimit = manual ? MANUAL_STORAGE_RESERVE : MAX_EVENTS - MANUAL_STORAGE_RESERVE;
+    if (db.diagnostic_events.length >= MAX_EVENTS || lane.length >= storageLimit ||
+      db.diagnostic_events.filter(row => row.owner_user_id === ownerId).length >= MAX_OWNER_EVENTS ||
+      lane.filter(row => row.owner_user_id === ownerId).length >= ownerLimit ||
+      deviceId !== null && (dailyIdentity.filter(entry => entry.manual === manual).length >= deviceDay ||
+        dailyIdentity.length >= MAX_DEVICE_EVENTS_PER_DAY)) {
+      throw new AuthError(429, 'diagnostic_quota_exceeded', 'Diagnostic reporting quota exceeded.');
     }
   }
+}
+
+function isStoredManualSnapshot(row: MetadataDb['diagnostic_events'][number]): boolean {
+  // Enrollment may backfill device_id, but must not change admission provenance.
+  return row.connection_id === null && row.device_id !== null && isManualSnapshot(row);
+}
+
+function isManualSnapshot(event: DiagnosticEvent): boolean {
+  return event.schema_version === 2 && event.context.trigger === 'manual';
 }
 
 function appendRow(

@@ -354,3 +354,17 @@ The pinned TLC 2.19 JAR passed SANY and nine companion checks before production 
 | `Chunk`, `AdvanceMain`, `Ack`, `CatchUp`, `LoseCatchUp`, `CaptureInterim` | `pull`, `retryPendingAppliedAcknowledgement`, `settlePreviouslyAppliedPullCheckpoint`, retained catch-up marker, intermediate-ancestry admission | `tests/retained-catchup.test.ts`: retired-checkpoint catch-up with empty events and blocked intermediate-ancestry upload after restart; mobile immutable-checkpoint and pending-ack tests with advanced main, cold checkpoint/ack/activation restart |
 
 These mappings identify executable seams, not runtime TLA trace replay. Persistent mobile-shaped adapters exercise DataAdapter metadata barriers and actual subprocess termination; they do not establish physical iPhone suspension or power-loss durability.
+
+## OBTS-FM-007: Diagnostic Admission (revision 23)
+
+`OBTSDiagnosticAdmission.tla` refines `OBTS-SEC-DIAG-001`. Six report IDs share finite automatic/manual partitions within one owner/instance. Acceptance is serialized; duplicate/quota rejection, one acceptance-window expiry, independent stored-row expiry and connection enrollment are separate actions. Reusing an expired row ID produces a distinct admission token. Connection-origin claims cannot change lane at enrollment. This abstraction represents one acceptance window; executable tests cover real hourly/daily clocks and startup reconstruction.
+
+`scripts/check-diagnostic-admission-model.mjs` runs SANY and seven checks: safety, manual-after-automatic-saturation and expiry witnesses, plus broken shared-budget, duplicate-charge, rejected-charge and connection-promotion controls. Final positive exploration: 834,689 generated / 123,712 distinct states, depth 20. Exact invariant/action witnesses and bounded exploration are required. The model starts with empty partitions and does not establish availability with saturated legacy storage, queue latency, deletion before process restart, or physical persistence.
+
+## OBTS-FM-008: Client State Recovery (revision 23)
+
+`OBTSClientStateRecovery.tla` refines `OBTS-PER-CLIENT-001` and `OBTS-SYNC-IMM-001`. Durable server observation, stale local state, equal server refs with different block observations, split incomparable local heads, immutable proposal identity and one crash/restart are independent facts. Local repair cannot regress the observation or rewrite the attempt; ambiguous split heads retain their existing primary evidence.
+
+`scripts/check-client-state-model.mjs` runs SANY and eight checks: safety, fair liveness, restarted recovery, queue-driven rollback, blanket-primary selection, attempt rewriting, equal-ref error restoration and incomparable-head replacement. Positive safety/liveness each explore 77 generated / 43 distinct states, depth 8. Git pointer/ancestry facts are already verified symbolic inputs; actual object existence and ancestry are exercised with real Git fixtures in `tests/client-state-authority.test.ts`. Failed publication, immutable checkpoint bytes and later visible edits are executable obligations rather than formal filesystem claims.
+
+Both checkers run through `npm run test:formal`; `trace/fm007-fm008-map.json` maps implementation and executable tests. That map is static documentation, not runtime trace conformance or a checker-validated proof of code equivalence.
