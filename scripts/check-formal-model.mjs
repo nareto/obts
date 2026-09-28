@@ -17,12 +17,15 @@ const requiredChecks = new Map([
   ['fm001-safety', 'positive-safety'], ['fm001-liveness', 'positive-liveness'],
   ['fm001-negative-skip-recovery', 'negative-control'], ['fm001-negative-stale-preflight', 'negative-control'],
   ['fm001-negative-early-cleanup', 'negative-control'], ['fm001-negative-infer-completion', 'negative-control'],
-  ...['same-path', 'disjoint-directory', 'server-recovery-contract', 'bridge-handoff', 'all-actors', 'apply-refinement']
+  ...['same-path', 'disjoint-directory', 'server-recovery-contract', 'bridge-handoff', 'all-actors', 'apply-refinement',
+    'directory-baseline-delivered', 'directory-baseline-rebase', 'directory-baseline-intervening', 'directory-baseline-history-lost', 'directory-baseline-historical']
     .map((id) => [`fm002-${id}`, 'positive-safety']),
   ...['proposal', 'bridge', 'server-recovery', 'apply-ack'].map((id) => [`fm002-liveness-${id}`, 'positive-liveness']),
   ...['observe', 'bridge-proposal', 'plugin2-proposal', 'rust-write', 'network-fault', 'recovery', 'conflict', 'apply-ack',
     'equal', 'covered', 'divergent', 'reply-loss', 'conflict-partial', 'directory-delete', 'projection', 'proposal-trigger',
     'bridge-trigger', 'recovery-trigger', 'apply-trigger', 'apply-refinement', 'ack-reconstruction'].map((id) => [`fm002-reach-${id}`, 'reachability']),
+  ...['directory-baseline-delivered', 'directory-baseline-rebase', 'directory-baseline-intervening', 'directory-baseline-history-lost', 'directory-baseline-historical']
+    .map((id) => [`fm002-reach-${id}`, 'reachability']),
   ['fm002-server-recovery-implementation', 'positive-safety'],
   ...['root-ignore-safety', 'root-ignore-legacy-safety', 'root-ignore-bridge-race-safety', 'root-ignore-invalid-safety'].map((id) => [`fm002-${id}`, 'positive-safety']),
   ...['root-ignore-transition', 'root-ignore-stale', 'root-ignore-local-only', 'root-ignore-projection', 'root-ignore-legacy-activation', 'root-ignore-rebuild-stale', 'root-ignore-bridge-race-reach',
@@ -34,6 +37,8 @@ const requiredChecks = new Map([
   ...['replace-inflight', 'drop-accepted', 'ref-rewind', 'discard-divergence', 'main-before-effects', 'early-ack',
     'overwrite-bridge', 'recursive-delete', 'restart-abort', 'duplicate-processing', 'retry-identity',
     'conflict-without-protection', 'cas-uncertain-abort', 'cursor-ack-conflation', 'projection-cursor-early', 'ack-evidence-loss']
+    .map((id) => [`fm002-negative-${id}`, 'negative-control']),
+  ...['directory-baseline-strict', 'directory-baseline-mutant-intent', 'directory-baseline-mutant-history', 'directory-baseline-mutant-historical']
     .map((id) => [`fm002-negative-${id}`, 'negative-control'])
 ]);
 

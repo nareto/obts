@@ -74,10 +74,10 @@ The model does not cover directories, multiple paths, write concurrency, editor-
 | Field | Value |
 | --- | --- |
 | Status | Accepted bounded composed model |
-| Architecture revision | 17 |
+| Architecture revision | 27 |
 | Refined contracts | `OBTS-SAF-001` through `OBTS-SAF-006`, `OBTS-SAF-010`, `OBTS-SYNC-IMM-001`, `OBTS-SYNC-IGN-001`, `OBTS-SYNC-ACK-001`, `OBTS-PER-OP-001`, `OBTS-BRG-PROJ-001` |
 | Root specification | `OBTSDistributedSync.tla` |
-| Check matrix | `checks.json` (77 required checks: original 52 plus 23 root-ignore checks plus 2 acknowledgement-evidence checks) |
+| Check matrix | `checks.json` (91 required checks: original 52, 23 root-ignore, 2 acknowledgement-evidence, and 14 directory-baseline checks) |
 | Static transition map / future trace schema | `trace/transition-map.json`, `trace/trace-schema.json` |
 | Executable check | `npm run test:formal` |
 
@@ -96,7 +96,7 @@ Local apply state projects non-vacuously through `modules/OBTSApplyRefinement.tl
 
 ### Check matrix and assumptions
 
-The required matrix contains the original six FM-001 checks; seven FM-002 positive safety checks; four separately fair liveness checks; twenty-one trigger/action reachability checks; and sixteen distributed negative controls. Revision 15 adds four positive root-policy safety checks, nine non-vacuity witnesses, and nine independent negative controls. Revision 17 adds the acknowledgement-evidence reach and negative checks above. Removing or retyping any required check fails validation. Accepted architecture status requires zero candidate counterexamples and all required positives.
+The required matrix contains the original six FM-001 checks; seven FM-002 positive safety checks; four separately fair liveness checks; twenty-one trigger/action reachability checks; and sixteen distributed negative controls. Revision 15 adds four positive root-policy safety checks, nine non-vacuity witnesses, and nine independent negative controls. Revision 17 adds the acknowledgement-evidence reach and negative checks above. Revision 27 adds five directory-baseline safety checks, five progress/reconstruction witnesses, and four negative controls for the exact-cursor block, unsafe rebase, missing history, and mislabeled historical snapshot. Removing or retyping any required check fails validation. Accepted architecture status requires zero candidate counterexamples and all required positives.
 
 Liveness is conditional on bounded edits/crashes, eventual restart, retry/delivery, and no permanent storage failure. Fairness is attached to the concrete action/actor sequence for proposal/result consumption, Rust write to Node capture, server restart/recovery, and main event to durable apply/server acknowledgement. Each obligation has a separate reachable-trigger check; there is no broad fairness disjunction.
 
@@ -115,6 +115,12 @@ This is a **bounded design model**, not feature implementation evidence. The act
 ### Acknowledgement evidence bound (revision 17)
 
 `server.deliveredAckEpoch[c]` captures, at each planned local apply, the canonical epoch whose directory snapshot the pull delivered. `AcknowledgeEvidence(c)` admits an acknowledgement through the current main (server recomputation), the retained delivered snapshot, or reconstruction from contiguous retained event history (`server.historyRetained`). In `disjoint-directory`, Plugin1/Bridge proposals can integrate a newer canonical main while Plugin2's apply pipeline is between its plan and its acknowledgement: before this revision the acknowledgement was permanently blocked there, which is exactly the production `applied_snapshot_unavailable` failure. `AcknowledgeHistorical` marks the reconstructed-evidence acknowledgement. `fm002-reach-ack-reconstruction` proves the historical acknowledgement still completes after a newer pull replaces the delivered snapshot, and `fm002-negative-ack-evidence-loss` proves the model reproduces the stuck state and fails closed when the delivered snapshot is replaced and no event history remains. `AckIntentResolvable` joins the safety invariant set.
+
+### Directory-baseline cursor bound (revision 27)
+
+The bounded `directory-baseline` scenario starts with a locally applied main and queued local work at cursor 1, then advances the server cursor through either a neutral event or a directory intent before acknowledgement. The delivered-snapshot case keeps the cursor aligned. The compatibility case accepts a trailing proposal cursor only when the retained interval is neutral and the snapshot matches; an intervening directory intent or unavailable history rejects it. A second main advance exercises historical reconstruction: a newer acknowledged snapshot may be returned for an older main only with its true cursor and neutral intervening history. Negative controls require exact-cursor rejection, unsupported rebasing over a directory intent or missing history, and the former older-cursor/newer-snapshot label to violate their target properties.
+
+The model abstracts the event interval as a contiguous-retained flag plus its latest directory-affecting sequence. It does not implement event storage or payload parsing; executable regressions cover those production details.
 
 ### Implementation recovery check
 

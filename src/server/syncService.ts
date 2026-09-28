@@ -388,11 +388,7 @@ export class SyncService {
     const device = requireDevice(db, deviceId);
     if (proposal) {
       this.findDirectoryProposalResult(db, device.vault_id, deviceId, proposal);
-      if (
-        proposal.base_main !== device.last_applied_main ||
-        proposal.base_event_seq !== device.last_applied_event_seq ||
-        !Array.isArray(device.last_applied_explicit_dirs)
-      ) {
+      if (!(await this.hasUsableDirectoryProposalBaseline(db, device, proposal))) {
         throw new AuthError(409, 'stale_directory_proposal_base', 'Directory proposal does not match the device acknowledged baseline.');
       }
       return proposal;
@@ -424,6 +420,27 @@ export class SyncService {
     };
   }
 
+  private async hasUsableDirectoryProposalBaseline(
+    db: MetadataDb,
+    device: DeviceRow,
+    proposal: DirectoryProposal
+  ): Promise<boolean> {
+    if (!Array.isArray(device.last_applied_explicit_dirs)) return false;
+    if (
+      proposal.base_main === device.last_applied_main &&
+      proposal.base_event_seq === device.last_applied_event_seq
+    ) return true;
+    if (
+      !Number.isSafeInteger(proposal.base_event_seq) || proposal.base_event_seq < 0 ||
+      proposal.base_event_seq >= device.last_applied_event_seq ||
+      !hasContiguousDirectoryNeutralEventGap(db, device.vault_id, proposal.base_event_seq, device.last_applied_event_seq)
+    ) return false;
+    if (proposal.base_main === device.last_applied_main) return true;
+    if (!proposal.base_main || !device.last_applied_main) return false;
+    return await this.git.commitExists(device.vault_id, proposal.base_main) &&
+      await this.git.isAncestor(device.vault_id, proposal.base_main, device.last_applied_main);
+  }
+
   private async classifyDirectoryProposal(
     vaultId: string,
     deviceId: string,
@@ -431,11 +448,7 @@ export class SyncService {
   ): Promise<DirectoryMergePlan> {
     const db = await this.store.snapshot();
     const device = requireDevice(db, deviceId);
-    if (
-      proposal.base_main !== device.last_applied_main ||
-      proposal.base_event_seq !== device.last_applied_event_seq ||
-      !Array.isArray(device.last_applied_explicit_dirs)
-    ) {
+    if (!Array.isArray(device.last_applied_explicit_dirs) || !(await this.hasUsableDirectoryProposalBaseline(db, device, proposal))) {
       throw new AuthError(409, 'stale_directory_proposal_base', 'Directory proposal does not match the device acknowledged baseline.');
     }
     const requestSha256 = directoryProposalRequestSha256(proposal);
@@ -3372,6 +3385,42 @@ function reclassifyDirectoryContext(
     ])),
     expected_event_seq: expectedEventSeq
   };
+}
+
+const DIRECTORY_NEUTRAL_EVENT_TYPES = new Set([
+  'device_ref_updated',
+  'device_sync_rejected',
+  'device_recovery_required',
+  'conflict_created',
+  'conflict_review_refreshed',
+  'conflict_resolved',
+  'note_restored',
+  'device_state_changed',
+  'vault_maintenance_started',
+  'vault_maintenance_finished'
+]);
+
+function hasContiguousDirectoryNeutralEventGap(
+  db: MetadataDb,
+  vaultId: string,
+  afterEventSeq: number,
+  throughEventSeq: number
+): boolean {
+  if (
+    !Number.isSafeInteger(afterEventSeq) || !Number.isSafeInteger(throughEventSeq) ||
+    afterEventSeq < 0 || throughEventSeq <= afterEventSeq
+  ) return false;
+  const expectedCount = throughEventSeq - afterEventSeq;
+  const events = db.events
+    .filter((event) => event.vault_id === vaultId && event.event_seq > afterEventSeq && event.event_seq <= throughEventSeq)
+    .sort((left, right) => left.event_seq - right.event_seq);
+  if (events.length !== expectedCount) return false;
+  return events.every((event, index) => {
+    if (event.event_seq !== afterEventSeq + index + 1) return false;
+    const directoryIntents = event.payload.directory_intents;
+    if (directoryIntents !== undefined && (!Array.isArray(directoryIntents) || directoryIntents.length > 0)) return false;
+    return event.event_type === 'main_advanced' || DIRECTORY_NEUTRAL_EVENT_TYPES.has(event.event_type);
+  });
 }
 
 function directoryIntentsBetweenSnapshots(previous: string[], current: string[]): DirectoryIntent[] {

@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "modelId": "OBTS-FM-002",
-  "architectureRevision": 18,
+  "architectureRevision": 27,
   "rootModule": "OBTSDistributedSync.tla",
   "traceSchema": "trace/trace-schema.json",
   "instrumentationStatus": "static-map-only; runtime emission and replay are omitted and no implementation conformance is claimed",
@@ -1780,6 +1780,103 @@
       ],
       "tests": [
         "tests/formal-checker.test.ts:1-54"
+      ]
+    },
+    "DirectoryBaselineFixture": {
+      "category": "control",
+      "controlOnly": true,
+      "contracts": [
+        "OBTS-SYNC-DIR-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "architecture/models/formal/OBTSDistributedSync.tla"
+      ],
+      "tests": [
+        "architecture/models/formal/configs/directory-baseline-strict.cfg"
+      ]
+    },
+    "AppendDirectoryBaselineEvent": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SYNC-DIR-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "src/server/metadataStore.ts",
+        "src/server/app.ts"
+      ],
+      "tests": [
+        "tests/directory-baseline-cursor.test.ts"
+      ]
+    },
+    "AcknowledgeDirectoryBaseline": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SYNC-DIR-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "src/server/app.ts"
+      ],
+      "tests": [
+        "tests/directory-baseline-cursor.test.ts"
+      ]
+    },
+    "QueueDirectoryBaselineProposal": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SYNC-DIR-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs"
+      ],
+      "tests": [
+        "tests/directory-baseline-cursor.test.ts"
+      ]
+    },
+    "ClassifyDirectoryBaselineProposal": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SYNC-DIR-001"
+      ],
+      "code": [
+        "src/server/syncService.ts"
+      ],
+      "tests": [
+        "tests/directory-baseline-cursor.test.ts"
+      ]
+    },
+    "AdvanceDirectoryBaselineMain": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SYNC-DIR-001"
+      ],
+      "code": [
+        "src/server/syncService.ts"
+      ],
+      "tests": [
+        "tests/directory-baseline-cursor.test.ts"
+      ]
+    },
+    "ReconstructDirectoryBaseline": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SYNC-DIR-001",
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "src/server/app.ts",
+        "obsidian-plugin/src/main.cjs"
+      ],
+      "tests": [
+        "tests/directory-baseline-cursor.test.ts"
       ]
     }
   }

@@ -4,7 +4,7 @@ INSTANCE OBTSApplyRefinement
 INSTANCE OBTSSafety
 
 (***************************************************************************
-OBTS-FM-002, architecture revision 16. This is a bounded refinement of the
+OBTS-FM-002, architecture revision 27. This is a bounded refinement of the
 architecture contracts, not a definition of product behavior. Persist/commit
 steps assume their named durable facts survive restart. Git ancestry, bytes,
 flush semantics, process kill, and runtime trace conformance remain external.
@@ -34,6 +34,9 @@ ChangingPolicyScenario == Scenario \in {"root-ignore", "root-ignore-bridge-race"
 PolicyOfTarget(v) == IF ChangingPolicyScenario /\ v = Plugin1Version THEN "exclude-a" ELSE "empty"
 NoPolicy == "NoPolicy"
 PolicyIds == Policies \cup {NoPolicy}
+DirectorySnapshotStates == {"baseline", "changed"}
+DirectoryProposalOutcomes == {"Pending", "Accepted", "Rejected"}
+DirectoryRecoveryOutcomes == {"Pending", "Available", "Unavailable"}
 Copies == 1..MaxMessages
 AttemptIds == {"attempt-plugin-1", "attempt-plugin-2", "attempt-bridge", "attempt-plugin-1-retry", "attempt-equal", "attempt-covered", "attempt-rebuild"}
 TransferIds == {"transfer-plugin-1", "transfer-plugin-2", "transfer-bridge", "transfer-plugin-1-retry", "transfer-equal", "transfer-covered", "transfer-rebuild"}
@@ -182,7 +185,10 @@ Init ==
        conflictBase |-> NoVersion, conflictCurrent |-> NoVersion, conflictDevice |-> NoVersion,
        conflictRoots |-> {}, expectedEffects |-> {}, committedEffects |-> {},
        eventSeq |-> 0, eventTree |-> EmptyTree, lastAppliedEpoch |-> SetMap(Clients, 0),
-       deliveredAckEpoch |-> SetMap(Clients, 0), historyRetained |-> TRUE, blocked |-> FALSE]
+       deliveredAckEpoch |-> SetMap(Clients, 0), historyRetained |-> TRUE,
+       directoryAckCursor |-> SetMap(Clients, 0), directoryAckSnapshot |-> SetMap(Clients, "baseline"),
+       directoryDeliveredCursor |-> SetMap(Clients, 0), directoryDeliveredSnapshot |-> SetMap(Clients, "baseline"),
+       directorySnapshot |-> "baseline", lastDirectoryEventSeq |-> 0, blocked |-> FALSE]
   /\ bridge = [
        rustUp |-> TRUE, rustCrashCount |-> 0, rustPhase |-> "Idle", acknowledged |-> FALSE,
        nodeHintDurable |-> FALSE, projectionPolicy |-> NoPolicy, projectedPaths |-> Paths,
@@ -198,7 +204,11 @@ Init ==
        eventProposal |-> NoProposal, localDeletionTarget |-> SetMap(Clients, NoProposal), deletedUnderProposal |-> SetMap(Clients, NoProposal),
        deletedIdentity |-> SetMap(Clients, 0), localPresent |-> SetMap(Clients, TRUE), localIdentity |-> SetMap(Clients, 0),
        preflightIdentity |-> SetMap(Clients, 0), localEmpty |-> SetMap(Clients, TRUE),
-       descendantPresent |-> SetMap(Clients, FALSE), descendantObserved |-> SetMap(Clients, FALSE), descendantLost |-> SetMap(Clients, FALSE)]
+       descendantPresent |-> SetMap(Clients, FALSE), descendantObserved |-> SetMap(Clients, FALSE), descendantLost |-> SetMap(Clients, FALSE),
+       cursorFixtureReady |-> FALSE, cursorEventAppended |-> FALSE, cursorAcknowledged |-> FALSE, cursorProposalQueued |-> FALSE,
+       proposalBaseCursor |-> 0, proposalBaseSnapshot |-> "baseline", proposalOutcome |-> "Pending", proposalRebased |-> FALSE,
+       acknowledgedMainEpoch |-> 0, targetMainEventSeq |-> 0, mainAdvancedAfterAck |-> FALSE,
+       recoveryOutcome |-> "Pending", recoveryCursor |-> 0, recoverySnapshot |-> "baseline"]
   /\ coverage = [actions |-> {}, classifications |-> {}, actorsProposed |-> {}, conflictPartial |-> FALSE, replyLostAfterOutcome |-> FALSE]
   /\ ghost = [captured |-> {}, overwritten |-> {}]
   /\ lastAction = "Init"
@@ -299,6 +309,7 @@ PersistCoveredQuery(c) ==
   /\ UNCHANGED <<network, server, bridge, directory, ghost>>
 
 SendProposalRequest(c) ==
+  /\ Scenario # "directory-baseline"
   /\ NormalClient(c) /\ client.proposalPhase[c] \in {"Queued", "Transferring"}
   /\ client.capable[c] /\ server.policyActive
   /\ (Scenario \notin {"all-actors", "disjoint-directory"} \/
@@ -658,6 +669,85 @@ AcknowledgeDurableApply(c) ==
   /\ coverage' = Mark(AcknowledgeLabel(c)) /\ lastAction' = AcknowledgeLabel(c)
   /\ UNCHANGED <<client, network, bridge, directory, ghost>>
 
+DirectoryBaselineFixture ==
+  /\ Scenario = "directory-baseline" /\ ~directory.cursorFixtureReady
+  /\ server' = [server EXCEPT !.mainEpoch = 1, !.eventSeq = 1,
+       !.deliveredAckEpoch[Plugin2] = 1, !.directoryDeliveredCursor[Plugin2] = 1,
+       !.directoryDeliveredSnapshot[Plugin2] = "baseline", !.directorySnapshot = "baseline",
+       !.lastDirectoryEventSeq = 1, !.historyRetained = TRUE]
+  /\ client' = [client EXCEPT !.localMainEpoch[Plugin2] = 1, !.seenCursor[Plugin2] = 1,
+       !.appliedCursor[Plugin2] = 1, !.durableApplied[Plugin2] = TRUE, !.ackIntent[Plugin2] = TRUE,
+       !.localGit[Plugin2] = @ \cup {Plugin2Version}, !.capturePublished[Plugin2] = @ \cup {Plugin2Version},
+       !.visible[Plugin2][PathA] = Plugin2Version, !.editCount[Plugin2] = 1, !.editPath[Plugin2] = PathA]
+  /\ ghost' = [ghost EXCEPT !.captured = @ \cup {Plugin2Version}]
+  /\ directory' = [directory EXCEPT !.cursorFixtureReady = TRUE, !.targetMainEventSeq = 1]
+  /\ coverage' = Mark("DirectoryBaselineFixture") /\ lastAction' = "DirectoryBaselineFixture"
+  /\ UNCHANGED <<network, bridge>>
+
+AppendDirectoryBaselineEvent ==
+  /\ Scenario = "directory-baseline" /\ directory.cursorFixtureReady /\ ~directory.cursorEventAppended
+  /\ server' = [server EXCEPT !.eventSeq = @ + 1,
+       !.directorySnapshot = IF FaultMode \in {"DirectoryBaselineInterveningIntent", "DirectoryBaselineMutantIntent"} THEN "changed" ELSE @,
+       !.lastDirectoryEventSeq = IF FaultMode \in {"DirectoryBaselineInterveningIntent", "DirectoryBaselineMutantIntent"} THEN @ + 1 ELSE @,
+       !.historyRetained = IF FaultMode \in {"DirectoryBaselineHistoryLost", "DirectoryBaselineMutantHistory"} THEN FALSE ELSE @]
+  /\ directory' = [directory EXCEPT !.cursorEventAppended = TRUE]
+  /\ coverage' = Mark("AppendDirectoryBaselineEvent") /\ lastAction' = "AppendDirectoryBaselineEvent"
+  /\ UNCHANGED <<client, network, bridge, ghost>>
+
+AcknowledgeDirectoryBaseline ==
+  /\ Scenario = "directory-baseline" /\ directory.cursorEventAppended /\ ~directory.cursorAcknowledged
+  /\ server' = [server EXCEPT !.lastAppliedEpoch[Plugin2] = client.localMainEpoch[Plugin2],
+       !.directoryAckCursor[Plugin2] = IF FaultMode = "DirectoryBaselineDelivered" THEN server.directoryDeliveredCursor[Plugin2] ELSE server.eventSeq,
+       !.directoryAckSnapshot[Plugin2] = IF FaultMode = "DirectoryBaselineDelivered" THEN server.directoryDeliveredSnapshot[Plugin2] ELSE server.directorySnapshot]
+  /\ directory' = [directory EXCEPT !.cursorAcknowledged = TRUE, !.acknowledgedMainEpoch = client.localMainEpoch[Plugin2]]
+  /\ coverage' = Mark("AcknowledgeDirectoryBaseline") /\ lastAction' = "AcknowledgeDirectoryBaseline"
+  /\ UNCHANGED <<client, network, bridge, ghost>>
+
+QueueDirectoryBaselineProposal ==
+  /\ Scenario = "directory-baseline" /\ directory.cursorAcknowledged /\ ~directory.cursorProposalQueued
+  /\ client' = [client EXCEPT !.proposalPhase[Plugin2] = "Queued"]
+  /\ directory' = [directory EXCEPT !.cursorProposalQueued = TRUE,
+       !.proposalBaseCursor = client.appliedCursor[Plugin2], !.proposalBaseSnapshot = "baseline"]
+  /\ coverage' = Mark("QueueDirectoryBaselineProposal") /\ lastAction' = "QueueDirectoryBaselineProposal"
+  /\ UNCHANGED <<network, server, bridge, ghost>>
+
+ClassifyDirectoryBaselineProposal ==
+  /\ Scenario = "directory-baseline" /\ directory.cursorProposalQueued /\ directory.proposalOutcome = "Pending"
+  /\ LET baseCursor == directory.proposalBaseCursor
+         ackCursor == server.directoryAckCursor[Plugin2]
+         exact == baseCursor = ackCursor /\ directory.proposalBaseSnapshot = server.directoryAckSnapshot[Plugin2]
+         neutralRebase == baseCursor < ackCursor /\ server.historyRetained /\ server.lastDirectoryEventSeq <= baseCursor
+           /\ directory.proposalBaseSnapshot = server.directoryAckSnapshot[Plugin2]
+         accepted == exact \/ (FaultMode = "DirectoryBaselineSafeRebase" /\ neutralRebase)
+           \/ (FaultMode \in {"DirectoryBaselineMutantIntent", "DirectoryBaselineMutantHistory"} /\ baseCursor <= ackCursor)
+     IN
+       /\ directory' = [directory EXCEPT !.proposalOutcome = IF accepted THEN "Accepted" ELSE "Rejected",
+            !.proposalRebased = accepted /\ ~exact]
+  /\ coverage' = Mark("ClassifyDirectoryBaselineProposal") /\ lastAction' = "ClassifyDirectoryBaselineProposal"
+  /\ UNCHANGED <<client, network, server, bridge, ghost>>
+
+AdvanceDirectoryBaselineMain ==
+  /\ Scenario = "directory-baseline" /\ directory.cursorAcknowledged /\ ~directory.mainAdvancedAfterAck
+  /\ server' = [server EXCEPT !.mainEpoch = @ + 1, !.eventSeq = @ + 1]
+  /\ directory' = [directory EXCEPT !.mainAdvancedAfterAck = TRUE]
+  /\ coverage' = Mark("AdvanceDirectoryBaselineMain") /\ lastAction' = "AdvanceDirectoryBaselineMain"
+  /\ UNCHANGED <<client, network, bridge, ghost>>
+
+ReconstructDirectoryBaseline ==
+  /\ Scenario = "directory-baseline" /\ directory.mainAdvancedAfterAck /\ directory.recoveryOutcome = "Pending"
+  /\ LET targetCursor == directory.targetMainEventSeq
+         ackCursor == server.directoryAckCursor[Plugin2]
+         reconstructable == server.historyRetained /\ targetCursor <= ackCursor /\ ackCursor <= server.eventSeq
+           /\ server.lastDirectoryEventSeq <= targetCursor
+         buggySnapshot == FaultMode = "DirectoryBaselineMutantHistorical"
+     IN
+       /\ directory' = [directory EXCEPT
+            !.recoveryOutcome = IF reconstructable \/ buggySnapshot THEN "Available" ELSE "Unavailable",
+            !.recoveryCursor = IF buggySnapshot THEN targetCursor ELSE IF reconstructable THEN ackCursor ELSE 0,
+            !.recoverySnapshot = server.directoryAckSnapshot[Plugin2]]
+  /\ coverage' = Mark("ReconstructDirectoryBaseline") /\ lastAction' = "ReconstructDirectoryBaseline"
+  /\ UNCHANGED <<client, network, server, bridge, ghost>>
+
 EvictDeliveredAckSnapshot ==
   /\ FaultMode = "EvictDeliveredAckSnapshot" /\ NormalServer /\ client.ackIntent[Plugin2] /\ client.durableApplied[Plugin2]
   /\ client.localMainEpoch[Plugin2] < server.mainEpoch
@@ -999,7 +1089,9 @@ RootActions == {
  "RestartAbortsMovedRef", "DuplicateNonIdempotentProcessing", "MutateRetryIdentity", "LoseConflictProtection", "AbortUncertainCAS",
  "ConflateSeenAndApplied", "AdvanceProjectionCursorEarly", "ClassifyStalePolicyProposal", "UpgradeOldClient", "ActivateLegacyPolicy",
  "DiscardLocalOnly", "DiscardIgnoredBridgeWrite", "PublishExcludedRows", "MutateAttemptPolicy", "UnsafeOldClientPoll", "AcceptStalePolicyProposal", "ActivateLegacyWithoutReconciliation", "AdmitExcludedCandidate",
- "EvictDeliveredAckSnapshot", "LoseAllAckEvidence", "AcknowledgeHistorical"
+ "EvictDeliveredAckSnapshot", "LoseAllAckEvidence", "AcknowledgeHistorical",
+ "DirectoryBaselineFixture", "AppendDirectoryBaselineEvent", "AcknowledgeDirectoryBaseline", "QueueDirectoryBaselineProposal",
+ "ClassifyDirectoryBaselineProposal", "AdvanceDirectoryBaselineMain", "ReconstructDirectoryBaseline"
 }
 
 ClientActions(c) ==
@@ -1019,7 +1111,9 @@ ServerActions ==
 BridgeActions == RustValidateWrite \/ RustAtomicVisibleWrite \/ NodePersistBridgeHint \/ BeginProjection \/ VerifyProjectionManifest \/
   VerifyProjectionBase \/ VerifyProjectionPathOids \/ WriteDerivedProjection \/ AdvanceProjectionCursor \/ FailProjection \/ CrashRust \/ RestartRust
 
-DirectoryActions == ObserveDirectoryDescendant(Plugin1) \/ RemoveDirectoryDescendant(Plugin1) \/ PreflightEmptyDirectory(Plugin1) \/ DeleteEmptyDirectory(Plugin1)
+DirectoryActions == ObserveDirectoryDescendant(Plugin1) \/ RemoveDirectoryDescendant(Plugin1) \/ PreflightEmptyDirectory(Plugin1) \/ DeleteEmptyDirectory(Plugin1) \/
+  DirectoryBaselineFixture \/ AppendDirectoryBaselineEvent \/ AcknowledgeDirectoryBaseline \/ QueueDirectoryBaselineProposal \/ ClassifyDirectoryBaselineProposal \/
+  AdvanceDirectoryBaselineMain \/ ReconstructDirectoryBaseline
 
 FaultActions == ReplaceInflightTarget \/ DropAcceptedProposal \/ MoveCoveredRefBackward \/ DiscardDivergence \/ MoveMainBeforePreparedEffects \/
   AckBeforeDurableApply \/ EvictDeliveredAckSnapshot \/ LoseAllAckEvidence \/ OverwriteUncapturedBridgeWrite \/ RecursiveDirectoryDelete \/ RestartAbortsMovedRef \/ DuplicateNonIdempotentProcessing \/
@@ -1070,6 +1164,9 @@ TypeOK ==
   /\ server.conflictRoots \subseteq Versions /\ server.expectedEffects \subseteq EffectNames /\ server.committedEffects \subseteq EffectNames
   /\ server.eventSeq \in Nat /\ server.eventTree \in [Paths -> SUBSET Versions] /\ server.lastAppliedEpoch \in [Clients -> Nat] /\ server.blocked \in BOOLEAN
   /\ server.deliveredAckEpoch \in [Clients -> Nat] /\ server.historyRetained \in BOOLEAN
+  /\ server.directoryAckCursor \in [Clients -> Nat] /\ server.directoryAckSnapshot \in [Clients -> DirectorySnapshotStates]
+  /\ server.directoryDeliveredCursor \in [Clients -> Nat] /\ server.directoryDeliveredSnapshot \in [Clients -> DirectorySnapshotStates]
+  /\ server.directorySnapshot \in DirectorySnapshotStates /\ server.lastDirectoryEventSeq \in Nat
   /\ bridge.projectionPolicy \in PolicyIds /\ bridge.projectedPaths \subseteq Paths /\ bridge.preservedAtPolicy \in Versions
   /\ bridge.rustUp \in BOOLEAN /\ bridge.rustCrashCount \in 0..MaxRustCrashes /\ bridge.rustPhase \in RustPhases /\ bridge.acknowledged \in BOOLEAN
   /\ bridge.nodeHintDurable \in BOOLEAN /\ bridge.manifestVerified \in BOOLEAN /\ bridge.baseVerified \in BOOLEAN /\ bridge.pathOidsVerified \in BOOLEAN
@@ -1081,6 +1178,11 @@ TypeOK ==
   /\ directory.localDeletionTarget \in [Clients -> ProposalIds] /\ directory.deletedUnderProposal \in [Clients -> ProposalIds] /\ directory.deletedIdentity \in [Clients -> Nat] /\ directory.localPresent \in [Clients -> BOOLEAN]
   /\ directory.localIdentity \in [Clients -> Nat] /\ directory.preflightIdentity \in [Clients -> Nat] /\ directory.localEmpty \in [Clients -> BOOLEAN]
   /\ directory.descendantPresent \in [Clients -> BOOLEAN] /\ directory.descendantObserved \in [Clients -> BOOLEAN] /\ directory.descendantLost \in [Clients -> BOOLEAN]
+  /\ directory.cursorFixtureReady \in BOOLEAN /\ directory.cursorEventAppended \in BOOLEAN /\ directory.cursorAcknowledged \in BOOLEAN /\ directory.cursorProposalQueued \in BOOLEAN
+  /\ directory.proposalBaseCursor \in Nat /\ directory.proposalBaseSnapshot \in DirectorySnapshotStates
+  /\ directory.proposalOutcome \in DirectoryProposalOutcomes /\ directory.proposalRebased \in BOOLEAN
+  /\ directory.acknowledgedMainEpoch \in Nat /\ directory.targetMainEventSeq \in Nat /\ directory.mainAdvancedAfterAck \in BOOLEAN
+  /\ directory.recoveryOutcome \in DirectoryRecoveryOutcomes /\ directory.recoveryCursor \in Nat /\ directory.recoverySnapshot \in DirectorySnapshotStates
   /\ coverage.actions \subseteq RootActions \cup {"BridgeNodeCaptured", "PluginCaptured", "CASOld", "CASTarget", "CASForeign", "CASUncertain", "AcknowledgeHistorical"}
   /\ coverage.classifications \subseteq Classifications /\ coverage.actorsProposed \subseteq Clients /\ coverage.conflictPartial \in BOOLEAN /\ coverage.replyLostAfterOutcome \in BOOLEAN
   /\ ghost.captured \subseteq Versions /\ ghost.overwritten \subseteq Versions /\ lastAction \in RootActions \cup {"Init"}
@@ -1119,6 +1221,23 @@ CandidateAdmittedOnlyWhenPolicyValid == server.opPhase \notin {"Validated", "Cla
 PolicyTransitionRemovesOnlyCanonicalCopy == ~PolicyScenario \/ ~server.policyActive \/ server.policy # "exclude-a" \/ server.mainTree[PathA] = {}
 LocalOnlyApplyRetainsVisible == \A c \in Clients: client.localOnly[c] => client.journalPolicy[c] = "exclude-a" /\ client.preflight[c] \notin client.displaced[c] /\ client.visible[c][PathA] = client.preflight[c]
 OldClientCannotApply == ~PolicyScenario \/ client.capable[Plugin2] \/ (client.applyPhase[Plugin2] = "Idle" /\ server.lastAppliedEpoch[Plugin2] = 0)
+DirectoryCursorProposalAcceptanceSound == directory.proposalOutcome # "Accepted" \/
+  (directory.proposalBaseCursor = server.directoryAckCursor[Plugin2] /\ directory.proposalBaseSnapshot = server.directoryAckSnapshot[Plugin2]) \/
+  (directory.proposalBaseCursor < server.directoryAckCursor[Plugin2] /\ server.historyRetained /\
+    server.lastDirectoryEventSeq <= directory.proposalBaseCursor /\ directory.proposalBaseSnapshot = server.directoryAckSnapshot[Plugin2])
+DirectoryCursorNeutralProposalProgress == Scenario # "directory-baseline" \/
+  FaultMode \notin {"DirectoryBaselineStrict", "DirectoryBaselineDelivered", "DirectoryBaselineSafeRebase"} \/
+  directory.proposalOutcome # "Rejected"
+DirectoryCursorUnprovenProposalRejected == Scenario # "directory-baseline" \/
+  FaultMode \notin {"DirectoryBaselineInterveningIntent", "DirectoryBaselineHistoryLost"} \/
+  directory.proposalOutcome # "Accepted"
+DirectoryHistoricalSnapshotCoherent == directory.recoveryOutcome # "Available" \/
+  (directory.recoveryCursor = server.directoryAckCursor[Plugin2] /\
+   directory.recoverySnapshot = server.directoryAckSnapshot[Plugin2] /\
+   server.historyRetained /\ server.lastDirectoryEventSeq <= directory.targetMainEventSeq)
+DirectoryRecoveryUnprovenUnavailable == Scenario # "directory-baseline" \/
+  FaultMode \notin {"DirectoryBaselineInterveningIntent", "DirectoryBaselineHistoryLost"} \/
+  directory.recoveryOutcome # "Available"
 PolicyProjectionExcludesCurrentRows == bridge.projectionPolicy # "exclude-a" \/ ~bridge.rowsComplete \/ (PathA \notin bridge.projectedPaths /\ bridge.auditRetained)
 BridgeExcludedLocalWriteRetained == ~PolicyScenario \/ server.policy # "exclude-a" \/ ~bridge.acknowledged \/ client.visible[BridgeNode][PathA] = BridgeVersion
 StalePolicyRefProtected == ~PolicyScenario \/ server.opPolicy = server.policy \/ server.classification # "Divergent" \/ server.opTarget \in server.processingRoots \cup server.conflictRoots
@@ -1131,8 +1250,9 @@ AllSafety == /\ TypeOK /\ CapturedOnlyAfterDurablePublication /\ OBTS_SAF_001_Ca
   /\ SoundApplyAcknowledgement /\ AckIntentResolvable /\ SeenAppliedSeparation /\ DirectoryDeletionCausal /\ GitDirectoryEventAgreement /\ DisjointEditsSurvive
   /\ BridgeAcknowledgedWritePreserved /\ ProjectionVerifiedBeforeCursor /\ ProjectionFailureRetainsCursor /\ ProjectionIsDerivedOnly
   /\ ApplyRefinementBoundary /\ ApplyProjectionConsistent /\ CandidateAdmittedOnlyWhenPolicyValid /\ PolicyTransitionRemovesOnlyCanonicalCopy
-  /\ LocalOnlyApplyRetainsVisible /\ OldClientCannotApply /\ PolicyProjectionExcludesCurrentRows
-  /\ BridgeExcludedLocalWriteRetained /\ StalePolicyRefProtected
+  /\ LocalOnlyApplyRetainsVisible /\ OldClientCannotApply /\ DirectoryCursorProposalAcceptanceSound
+  /\ DirectoryHistoricalSnapshotCoherent /\ DirectoryCursorUnprovenProposalRejected /\ DirectoryRecoveryUnprovenUnavailable
+  /\ PolicyProjectionExcludesCurrentRows /\ BridgeExcludedLocalWriteRetained /\ StalePolicyRefProtected
 
 ProposalTrigger == "PersistImmutableProposal" \in coverage.actions
 ProposalConsumed == \E c \in Clients: client.proposalPhase[c] = "Terminal"
@@ -1177,6 +1297,10 @@ NeverPolicyTransition == ~server.policyActive \/ server.policy # "exclude-a"
 NeverLocalOnlyApply == ~client.localOnly[Plugin2] \/ client.applyPhase[Plugin2] = "Idle"
 NeverStaleQueuedRebuild == Scenario # "root-ignore-stale-queued" \/ "RebuildStaleQueuedProposal" \notin coverage.actions
 NeverStalePolicyReview == Scenario # "root-ignore" \/ ~(server.reviewNeeded /\ server.opPhase = "Committed" /\ server.conflictDevice \in server.conflictRoots)
+NeverDirectoryBaselineProposalAccepted == directory.proposalOutcome # "Accepted"
+NeverDirectoryBaselineProposalRejected == directory.proposalOutcome # "Rejected"
+NeverDirectoryBaselineRecoveryAvailable == directory.recoveryOutcome # "Available"
+NeverDirectoryBaselineRecoveryUnavailable == directory.recoveryOutcome # "Unavailable"
 NeverPolicyProjection == bridge.projectionCursor = 0
 NeverUpgrade == ~client.capable[Plugin2]
 NeverInvalidCandidateRejected == "RejectExcludedCandidate" \notin coverage.actions

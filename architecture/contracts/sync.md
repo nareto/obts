@@ -70,6 +70,14 @@ Git does not represent empty directories. OBTS therefore carries a causal direct
 
 The server compares the proposal with the device's acknowledged explicit-directory snapshot and canonical directory state. Equivalent and disjoint operations merge; opposing same- or ancestor/descendant create/delete intent creates a directory or mixed conflict. Git and directory state settle atomically.
 
+### OBTS-SYNC-DIR-001: Causally Safe Directory Proposal Baselines
+
+A directory baseline is the acknowledged main, explicit-directory snapshot, and event cursor that identifies that snapshot. When available, apply acknowledgement records the exact delivered snapshot rather than a newer server snapshot. If acknowledgement must be reconstructed, the server may advance its cursor across later events only when retained, contiguous event history proves those events carried no directory intents. The cursor does not claim that the client observed unrelated events.
+
+For already-deployed clients, a proposal may trail the server's acknowledged event cursor only when its base main still matches and retained, contiguous history proves that every intervening event was directory-neutral. The server then evaluates the unchanged proposal against the acknowledged snapshot. A future cursor, a directory-affecting event, a missing event, or malformed directory evidence is not rebased and fails closed; genuine directory divergence continues through normal conflict classification.
+
+When reconstructing an older main from a newer acknowledged baseline, the server may reuse that baseline only if the complete event interval between the target main and the acknowledged cursor is retained and directory-neutral. It returns the cursor paired with the reused snapshot, never the older main-event cursor beside newer directory state. If directory intents intervene or the interval cannot be proved, reconstruction fails closed.
+
 Clients materialize explicit directories and remove tombstones only according to `OBTS-SAF-006`. Historical state without directory intent cannot invent right-click folder deletion from a Git tree.
 
 ## Recovery And Rebuild
@@ -99,7 +107,7 @@ A client pulls required objects and a manifest for canonical `main`, then applie
 - OBTS-authored watcher events are suppressed or tagged.
 - Seen-event and durably-applied-event cursors remain separate.
 - The server advances `last_applied_main` only after explicit durable apply acknowledgement.
-- Delivered snapshot evidence stays ack-resolvable: the server accepts the acknowledgement through the retained delivered snapshot, recomputation against current main, or reconstruction of the exact delivered snapshot from contiguous retained events on top of the acknowledged baseline, and fails closed when no source can reproduce the delivered snapshot.
+- Delivered snapshot evidence stays ack-resolvable: the server prefers the retained delivered snapshot, or reconstructs its directory state from contiguous retained events on top of the acknowledged baseline. Recomputing at acknowledgement time may advance the event cursor only across a contiguous, directory-neutral interval; it must not claim directory intents that the client did not apply. Missing or ambiguous evidence fails closed.
 - Clients settle a pending acknowledgement before every automatic pull/apply path; an unsettled pending acknowledgement blocks newer pulls and surfaces recovery guidance instead of being replaced.
 - Every apply entry, including same-target shortcuts, first admits recovery under exclusive client ownership. An unresolved journal retains its operation ID and target until validated roll-forward or an explicit preservation-safe block; an absent apply lock does not authorize replacing it.
 - Resume orders recovery, pending acknowledgement, complete immutable checkpoint reuse, apply/acknowledgement, and catch-up before activation. A newer canonical head cannot invalidate an imported complete checkpoint.

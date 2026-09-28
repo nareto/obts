@@ -1252,21 +1252,28 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         if (device.status === 'revoked' || device.status === 'review_needed' || device.status === 'blocked_recovery') {
           throw new AuthError(409, 'device_blocked', 'Device requires review or recovery before acknowledging server state.');
         }
-        const snapshot = device.last_applied_main === appliedMain && Array.isArray(device.last_applied_explicit_dirs)
-          ? {
-              eventSeq: device.last_applied_event_seq,
-              directoryIntents: [],
-              explicitDirectories: device.last_applied_explicit_dirs
-            }
-          : appliedMain === vault.current_main
-            ? eventSnapshotForTarget(db, vaultId, device.device_id, appliedMain, device.last_applied_event_seq)
-            : device.pending_applied_main === appliedMain && Array.isArray(device.pending_applied_explicit_dirs)
-              ? {
-                  eventSeq: device.pending_applied_event_seq,
-                  directoryIntents: [],
-                  explicitDirectories: device.pending_applied_explicit_dirs
-                }
-              : historicalAcknowledgementSnapshot(db, vaultId, device, appliedMain);
+        const matchingPendingSnapshot = device.pending_applied_main === appliedMain;
+        const hasFreshPendingSnapshot = matchingPendingSnapshot &&
+          device.pending_applied_event_seq >= device.last_applied_event_seq;
+        const snapshot = hasFreshPendingSnapshot
+          ? Array.isArray(device.pending_applied_explicit_dirs)
+            ? {
+                eventSeq: device.pending_applied_event_seq,
+                directoryIntents: [],
+                explicitDirectories: device.pending_applied_explicit_dirs
+              }
+            : null
+          : device.last_applied_main === appliedMain && Array.isArray(device.last_applied_explicit_dirs)
+            ? {
+                eventSeq: device.last_applied_event_seq,
+                directoryIntents: [],
+                explicitDirectories: device.last_applied_explicit_dirs
+              }
+            : matchingPendingSnapshot
+              ? null
+              : appliedMain === vault.current_main
+                ? eventSnapshotForTarget(db, vaultId, device.device_id, appliedMain, device.last_applied_event_seq)
+                : historicalAcknowledgementSnapshot(db, vaultId, device, appliedMain);
         if (!snapshot) {
           throw new AuthError(409, 'applied_snapshot_unavailable', 'The delivered directory snapshot for this applied main is unavailable.');
         }
