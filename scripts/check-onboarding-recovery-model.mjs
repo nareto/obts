@@ -32,7 +32,11 @@ const checks = [
   ['interim-ancestry', 'interim-ancestry', 'AcceptedAncestry', 'CaptureInterim'],
   ['divergence-preserved', 'none', 'DivergencePreserved', null],
   ['divergence-reachable', 'none', 'DivergenceRecovered', 'Recover'],
-  ['discard-divergence', 'discard-divergence', 'DivergencePreserved', 'Apply']
+  ['snapshot-capture-race-preserved', 'none', 'LatestLocalEditRecoverable', null],
+  ['multi-edit-capture', 'none', 'NoSecondEdit', 'SecondEditDuringCapture'],
+  ['block-live-edit', 'current-live-edit-block', 'LocalEditNeverBlocks', 'BlockApplyForEdit'],
+  ['discard-divergence', 'discard-divergence', 'DivergencePreserved', 'Apply'],
+  ['discard-live-edit', 'discard-live-edit', 'DivergencePreserved', 'CompleteLiveApply']
 ];
 for (const [id, mutation, invariant, witness] of checks) {
   const cfg = join(run, `${id}.cfg`);

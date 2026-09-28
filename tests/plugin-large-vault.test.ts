@@ -354,7 +354,7 @@ describe('large-vault client checkpoints', () => {
       return content;
     };
 
-    await expect(core.writeTargetFilesFromJournal({
+    await core.writeTargetFilesFromJournal({
       journal_version: 4,
       apply_id: 'apply_mutation_revalidation',
       operation_type: 'pull_apply',
@@ -369,9 +369,11 @@ describe('large-vault client checkpoints', () => {
       recovery_bundle_id: 'rec_mutation_revalidation',
       last_completed_step: 'recovery_bundle',
       redacted_error_category: null
-    }, sharedTargetEntries, new Set())).rejects.toMatchObject({ filePath: 'shared.md' });
+    }, sharedTargetEntries, new Set());
 
     expect(await readFile(join(root, 'shared.md'), 'utf8')).toBe('concurrent local edit\n');
+    expect(JSON.parse(await readFile(join(root, '.obts/apply-journal.json'), 'utf8')).deferred_local_paths)
+      .toContain('shared.md');
   });
 
   it('preserves a path created at the exclusive-write boundary', async () => {
@@ -389,7 +391,7 @@ describe('large-vault client checkpoints', () => {
       return await originalExclusiveWrite(path, content);
     };
 
-    await expect(core.writeTargetFilesFromJournal({
+    await core.writeTargetFilesFromJournal({
       journal_version: 4,
       apply_id: 'apply_exclusive_write_race',
       operation_type: 'pull_apply',
@@ -404,9 +406,11 @@ describe('large-vault client checkpoints', () => {
       recovery_bundle_id: 'rec_exclusive_write_race',
       last_completed_step: 'recovery_bundle',
       redacted_error_category: null
-    }, new Map([['shared.md', targetOid]]), new Set())).rejects.toMatchObject({ filePath: 'shared.md' });
+    }, new Map([['shared.md', targetOid]]), new Set());
 
     expect(await readFile(join(root, 'shared.md'), 'utf8')).toBe('last-moment local edit\n');
+    expect(JSON.parse(await readFile(join(root, '.obts/apply-journal.json'), 'utf8')).deferred_local_paths)
+      .toContain('shared.md');
     expect(await readFile(join(
       root,
       '.obts',
@@ -714,7 +718,7 @@ describe('large-vault client checkpoints', () => {
       return content;
     };
 
-    await expect(core.writeTargetFilesFromJournal({
+    await core.writeTargetFilesFromJournal({
       journal_version: 4,
       apply_id: 'apply_blocking_ancestor',
       operation_type: 'pull_apply',
@@ -729,9 +733,11 @@ describe('large-vault client checkpoints', () => {
       recovery_bundle_id: 'rec_blocking_ancestor',
       last_completed_step: 'recovery_bundle',
       redacted_error_category: null
-    }, new Map([['folder/note.md', targetOid]]), new Set())).rejects.toMatchObject({ filePath: 'folder' });
+    }, new Map([['folder/note.md', targetOid]]), new Set());
 
     expect(await readFile(join(root, 'folder'), 'utf8')).toBe('concurrent ancestor edit\n');
+    expect(JSON.parse(await readFile(join(root, '.obts/apply-journal.json'), 'utf8')).deferred_local_paths)
+      .toEqual(['folder', 'folder/note.md']);
   });
 
   it('materializes a target descendant after displacing a blocking file ancestor', async () => {
@@ -849,7 +855,7 @@ describe('large-vault client checkpoints', () => {
       return content;
     };
 
-    await expect(core.writeTargetFilesFromJournal({
+    await core.writeTargetFilesFromJournal({
       journal_version: 4,
       apply_id: 'apply_recreated_descendant',
       operation_type: 'pull_apply',
@@ -865,9 +871,11 @@ describe('large-vault client checkpoints', () => {
       recovery_bundle_id: 'rec_recreated_descendant',
       last_completed_step: 'recovery_bundle',
       redacted_error_category: null
-    }, new Map([['replacement', targetOid]]), new Set())).rejects.toMatchObject({ filePath: 'replacement' });
+    }, new Map([['replacement', targetOid]]), new Set());
 
     expect(await readFile(join(root, 'replacement', 'new-local.md'), 'utf8')).toBe('concurrent descendant edit\n');
+    expect(JSON.parse(await readFile(join(root, '.obts/apply-journal.json'), 'utf8')).deferred_local_paths)
+      .toContain('replacement');
   });
 
   it('does not replace a recreated empty directory', async () => {
@@ -889,7 +897,7 @@ describe('large-vault client checkpoints', () => {
       return content;
     };
 
-    await expect(core.writeTargetFilesFromJournal({
+    await core.writeTargetFilesFromJournal({
       journal_version: 4,
       apply_id: 'apply_recreated_empty_directory',
       operation_type: 'pull_apply',
@@ -905,9 +913,11 @@ describe('large-vault client checkpoints', () => {
       recovery_bundle_id: 'rec_recreated_empty_directory',
       last_completed_step: 'recovery_bundle',
       redacted_error_category: null
-    }, new Map([['replacement', targetOid]]), new Set())).rejects.toMatchObject({ filePath: 'replacement' });
+    }, new Map([['replacement', targetOid]]), new Set());
 
     expect((await core.adapter.stat('replacement')).type).toBe('folder');
+    expect(JSON.parse(await readFile(join(root, '.obts/apply-journal.json'), 'utf8')).deferred_local_paths)
+      .toContain('replacement');
   });
 
   it('drains active apply writes and stops scheduling after a failure', async () => {

@@ -664,14 +664,15 @@ describe('Phase 1 sync without conflict resolution', () => {
       return await putPushChunk(...args);
     };
 
-    await expect(plugin.syncOnce()).resolves.toMatchObject({ status: 'Checking' });
+    await expect(plugin.syncOnce()).resolves.toMatchObject({ status: 'Ahead' });
     expect(injected).toBe(true);
     expect(await plugin.readQueue()).toMatchObject({
-      pending_commit: null,
+      pending_commit: expect.any(String),
       status: 'queued_local',
       changed_paths: ['during-upload.md', ...(editExisting ? ['first.md'] : [])]
     });
     core.putPushChunk = putPushChunk;
+    await expect(plugin.syncOnce()).resolves.toMatchObject({ status: 'Checking' });
     await expect(plugin.syncOnce()).resolves.toMatchObject({ status: 'Synced' });
     const finalMain = (await plugin.readState()).local_main;
     expect(await server.git.listTreePaths(admin.vaultId, finalMain!)).toEqual(
@@ -1481,7 +1482,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await exists(join(receiverDir, 'Crash Tree'))).toBe(true);
     expect(await exists(join(receiverDir, 'Crash Tree', 'Nested', 'note.md'))).toBe(false);
     expect(JSON.parse(await readFile(join(receiverDir, '.obts', 'apply-journal.json'), 'utf8'))).toMatchObject({
-      journal_version: 5,
+      journal_version: 6,
       phase: 'writing_files',
       directory_intents: [{ op: 'delete', path: 'Crash Tree' }],
       preserve_local_changes: true
@@ -1551,7 +1552,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(recoveredDevice?.last_applied_main).toBe(newestMain);
   });
 
-  it('finishes committed v5 directory recovery with the target event cursor', async () => {
+  it('finishes committed v6 directory recovery with the target event cursor', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const sourceDir = join(root, 'committed-tombstone-source');
     const receiverDir = join(root, 'committed-tombstone-receiver');
@@ -1586,7 +1587,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       phase: string;
       event_seq: number;
     };
-    expect(committedJournal).toMatchObject({ journal_version: 5, phase: 'committed', event_seq: expect.any(Number) });
+    expect(committedJournal).toMatchObject({ journal_version: 6, phase: 'committed', event_seq: expect.any(Number) });
     expect(await exists(join(receiverDir, 'Committed Tree'))).toBe(false);
 
     const restarted = new ObtsPluginClient(receiverDir, { serverUrl: baseUrl, deviceName: 'committed-tombstone-receiver' });
@@ -1755,7 +1756,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
   });
 
-  it('does not apply remote main over local edits that appear during pull', async () => {
+  it('preserves local edits that appear during pull and lets the server resolve the conflict', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const fixtureADir = join(root, 'race-fixtureA');
     const fixtureBDir = join(root, 'race-fixtureB');
@@ -1782,6 +1783,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       if (!injectedLocalEdit && input.cursor === 0) {
         injectedLocalEdit = true;
         await writeFile(join(fixtureBDir, 'shared.md'), 'fixtureB must survive\n');
+        await fixtureB.recordLocalChangeHint(['shared.md']);
       }
       return result;
     };
@@ -1795,17 +1797,11 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
 
     const secondFixtureBSync = await fixtureB.syncOnce();
-    expect(secondFixtureBSync.status).toBe('Conflict resolution needed');
+    expect(secondFixtureBSync.status).toBe('Synced');
     expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('fixtureB must survive\n');
-    const conflicts = await admin.get<{ conflicts: Array<{ status: string; affected_paths: string[] }> }>(
-      `/api/v1/vaults/${admin.vaultId}/conflicts?status=open`
-    );
-    expect(conflicts.body.conflicts).toEqual([
-      expect.objectContaining({
-        status: 'open',
-        affected_paths: ['shared.md']
-      })
-    ]);
+    const finalMain = (await fixtureB.readState()).local_main!;
+    expect((await server.git.readBlobAtPath(admin.vaultId, finalMain, 'shared.md')).toString('utf8'))
+      .toBe('fixtureB must survive\n');
   });
 
   it('flushes dirty open editor content before applying remote main', async () => {
@@ -1842,7 +1838,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('fixtureB open edit\n');
   });
 
-  it('does not apply remote main over local edits that appear during apply preparation', async () => {
+  it('preserves local edits that appear during apply preparation for server conflict resolution', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const fixtureADir = join(root, 'prep-race-fixtureA');
     const fixtureBDir = join(root, 'prep-race-fixtureB');
@@ -1864,6 +1860,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       if (!injectedLocalEdit) {
         injectedLocalEdit = true;
         await writeFile(join(fixtureBDir, 'shared.md'), 'fixtureB during apply prep\n');
+        await fixtureB.recordLocalChangeHint(['shared.md']);
       }
       return await originalStageRecoveryBundle(...args);
     };
@@ -1873,13 +1870,16 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('fixtureB during apply prep\n');
     expect(await exists(join(fixtureBDir, '.obts', 'apply-journal.json'))).toBe(false);
     expect(await fixtureB.readQueue()).toMatchObject({
-      pending_commit: null,
       status: 'queued_local'
     });
+    expect((await fixtureB.readState()).local_main).not.toBeNull();
 
     const secondFixtureBSync = await fixtureB.syncOnce();
-    expect(secondFixtureBSync.status).toBe('Conflict resolution needed');
+    expect(secondFixtureBSync.status).toBe('Synced');
     expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('fixtureB during apply prep\n');
+    const finalMain = (await fixtureB.readState()).local_main!;
+    expect((await server.git.readBlobAtPath(admin.vaultId, finalMain, 'shared.md')).toString('utf8'))
+      .toBe('fixtureB during apply prep\n');
   });
 
   it('preserves user folder deletions made while a remote apply is writing files', async () => {
@@ -3607,19 +3607,20 @@ describe('Phase 1 sync without conflict resolution', () => {
     const analysis = await restarted.analyzeOnboarding(connection.connection_id, connection.connection_secret);
     expect((await restarted.readPendingOnboarding())?.journal.stage).toBe('awaiting_confirmation');
     await mkdirp(join(deviceDir, 'explicit-empty-directory'));
-    await expect(restarted.finishOnboarding({
+    const completion = await restarted.finishOnboarding({
       connectionId: connection.connection_id,
       secret: connection.connection_secret,
       analysis,
       mode: 'initialize'
-    })).rejects.toMatchObject({ code: 'onboarding_snapshot_changed' });
-    expect((await restarted.readPendingOnboarding())?.journal).toMatchObject({
-      stage: 'blocked',
-      last_error_code: 'onboarding_snapshot_changed'
     });
-    await restarted.cancelOnboarding();
+    expect(completion.status).toBe('Synced');
     expect(await restarted.readPendingOnboarding()).toBeNull();
-    await expect(stat(journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await exists(join(deviceDir, 'explicit-empty-directory'))).toBe(true);
+    expect(JSON.parse(await readFile(journalPath, 'utf8')).stage).toBe('complete');
+    const directoryState = await (restarted as unknown as {
+      client: { readDirectoryState(): Promise<{ explicit_empty_dirs: string[] }> };
+    }).client.readDirectoryState();
+    expect(directoryState.explicit_empty_dirs).toContain('explicit-empty-directory');
     await expect(stat(secretPath)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
@@ -5888,6 +5889,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     internal.finalizeRecoveryBundle = async (...args: unknown[]) => {
       const bundleId = await originalFinalizeRecoveryBundle(...args);
       await writeFile(join(device2Dir, 'shared.md'), 'changed after preflight\n');
+      await plugin2.recordLocalChangeHint(['shared.md']);
       return bundleId;
     };
 

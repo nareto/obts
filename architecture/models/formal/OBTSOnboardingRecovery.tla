@@ -2,13 +2,13 @@
 EXTENDS Naturals, TLC
 
 (***************************************************************************
-FM006 companion, revision 24: one enrollment, two immutable heads, one crash.
+FM006 companion, revision 26: one enrollment, two immutable heads, one crash.
 Context denotes validated identity, original approval baseline, mode and consent.
 Server acceptance and local receipt publication are separate durable boundaries.
 LegacyContext reproduces the missing-analysis implementation; the other mutants
-isolate admission and ordering defects. A local edit on an affected path that
-matches neither the recorded pre-apply nor the target state must survive the
-completed apply. Durability and byte validation are assumed.
+isolate admission and ordering defects. Repeated edits during apply and snapshot
+capture remain visible or queued, and never block setup/sync. Durability and byte
+validation are assumed.
 ***************************************************************************)
 CONSTANT Mutation
 VARIABLE s
@@ -21,7 +21,9 @@ Init == s = [phase |-> "approved", durableContext |-> FALSE,
   pendingAck |-> FALSE, applied |-> 2, acknowledged |-> 2,
   catchup |-> FALSE, interim |-> FALSE, unsafeUpload |-> FALSE,
   overwritten |-> FALSE, dropped |-> FALSE,
-  diverged |-> FALSE, preserved |-> FALSE,
+  diverged |-> FALSE, preserved |-> FALSE, blockedByEdit |-> FALSE,
+  editCount |-> 0, localVisible |-> FALSE, captureActive |-> FALSE,
+  captureVersion |-> 0, queuedVersion |-> 0,
   lastAction |-> "Init"]
 PublishContext ==
   /\ s.running /\ s.phase = "approved"
@@ -61,19 +63,54 @@ OverwriteJournal ==
   /\ Mutation = "overwrite-journal" /\ s.running /\ s.journal /\ s.resumed
   /\ s' = [s EXCEPT !.journalId = 2, !.overwritten = TRUE, !.lastAction = "OverwriteJournal"]
 DivergeEdit ==
-  /\ s.running /\ s.journal /\ ~s.recovered
-  /\ s' = [s EXCEPT !.diverged = TRUE, !.lastAction = "DivergeEdit"]
+  /\ s.running /\ s.journal /\ s.phase = "applying" /\ s.editCount = 0
+  /\ s' = [s EXCEPT !.diverged = TRUE, !.editCount = 1,
+    !.localVisible = TRUE, !.lastAction = "DivergeEdit"]
+BeginLocalCapture ==
+  /\ s.running /\ s.journal /\ s.phase = "applying" /\ s.diverged
+  /\ ~s.captureActive /\ s.editCount > s.queuedVersion
+  /\ s' = [s EXCEPT !.captureActive = TRUE,
+    !.captureVersion = s.editCount, !.lastAction = "BeginLocalCapture"]
+SecondEditDuringCapture ==
+  /\ s.running /\ s.journal /\ s.phase = "applying" /\ s.captureActive
+  /\ s.editCount = 1
+  /\ s' = [s EXCEPT !.editCount = 2, !.localVisible = TRUE,
+    !.lastAction = "SecondEditDuringCapture"]
+FinishLocalCapture ==
+  /\ s.running /\ s.journal /\ s.phase = "applying" /\ s.captureActive
+  /\ s' = [s EXCEPT !.captureActive = FALSE,
+    !.queuedVersion = s.captureVersion, !.preserved = TRUE,
+    !.lastAction = "FinishLocalCapture"]
+BlockApplyForEdit ==
+  /\ Mutation = "current-live-edit-block" /\ s.running /\ s.journal
+  /\ s.phase = "applying" /\ s.editCount > 0
+  /\ s' = [s EXCEPT !.blockedByEdit = TRUE, !.phase = "blocked",
+    !.lastAction = "BlockApplyForEdit"]
 Recover ==
   /\ s.running /\ s.journal /\ ~s.recovered
   /\ LET discard == Mutation = "discard-divergence" /\ s.diverged
      IN s' = [s EXCEPT !.recovered = TRUE,
+       !.phase = IF s.phase = "blocked" THEN "applying" ELSE @,
        !.preserved = IF s.diverged /\ ~discard THEN TRUE ELSE s.preserved,
        !.lastAction = "Recover"]
 Apply ==
   /\ s.running /\ s.phase = "applying" /\ s.recovered /\ ~s.pendingAck
   /\ s' = [s EXCEPT !.applied = s.target, !.pendingAck = TRUE,
     !.catchup = TRUE, !.interim = (s.main # s.target),
-    !.journal = FALSE, !.phase = "applied", !.lastAction = "Apply"]
+    !.journal = FALSE, !.phase = "applied",
+    !.preserved = IF Mutation = "discard-divergence" /\ s.diverged THEN FALSE ELSE @ \/ s.diverged,
+    !.localVisible = IF Mutation = "discard-divergence" /\ s.diverged THEN FALSE ELSE @,
+    !.lastAction = "Apply"]
+CompleteLiveApply ==
+  /\ s.running /\ s.phase = "applying" /\ ~s.pendingAck
+  /\ (s.editCount = 0 \/ s.localVisible)
+  /\ LET discard == Mutation = "discard-live-edit" /\ s.diverged
+     IN s' = [s EXCEPT !.applied = s.target, !.pendingAck = TRUE,
+       !.catchup = TRUE, !.interim = (s.main # s.target),
+       !.journal = FALSE, !.phase = "applied",
+       !.preserved = IF discard THEN FALSE ELSE @ \/ s.diverged,
+       !.localVisible = IF discard THEN FALSE ELSE @,
+       !.lastAction = "CompleteLiveApply"]
 NewApplyBeforeAck ==
   /\ Mutation = "skip-ack" /\ s.running /\ s.pendingAck /\ s.main # s.target
   /\ s' = [s EXCEPT !.applied = s.main, !.lastAction = "NewApplyBeforeAck"]
@@ -99,12 +136,13 @@ CatchUp ==
 Terminal == s.phase = "complete" /\ UNCHANGED s
 Next == PublishContext \/ Accept \/ PublishReceipt \/ Crash \/ Restart \/ Chunk \/
   AdvanceMain \/ DropCheckpoint \/ PlanApply \/ OverwriteJournal \/ DivergeEdit \/
-  Recover \/ Apply \/ NewApplyBeforeAck \/ Ack \/ LoseCatchUp \/ CaptureInterim \/
+  BeginLocalCapture \/ SecondEditDuringCapture \/ FinishLocalCapture \/ BlockApplyForEdit \/
+  Recover \/ Apply \/ CompleteLiveApply \/ NewApplyBeforeAck \/ Ack \/ LoseCatchUp \/ CaptureInterim \/
   CatchUp \/ Terminal
 Spec == Init /\ [][Next]_vars
 FairSpec == Spec /\ WF_vars(PublishContext) /\ WF_vars(Accept) /\ WF_vars(PublishReceipt)
   /\ WF_vars(Restart) /\ WF_vars(Chunk) /\ WF_vars(PlanApply) /\ WF_vars(Recover)
-  /\ WF_vars(Apply) /\ WF_vars(Ack) /\ WF_vars(CatchUp)
+  /\ WF_vars(Apply) /\ WF_vars(CompleteLiveApply) /\ WF_vars(Ack) /\ WF_vars(CatchUp)
 ResumeHasContext == s.resumed => s.durableContext
 JournalPreserved == ~s.overwritten
 CheckpointPreserved == ~s.dropped
@@ -113,8 +151,11 @@ CompleteAfterAck == s.phase = "complete" => s.applied = s.acknowledged
 CatchUpDurable == (s.phase = "acknowledged" /\ s.applied # s.main) => s.catchup
 AcceptedAncestry == ~s.unsafeUpload
 DivergencePreserved == (s.diverged /\ s.applied = s.target) => s.preserved
+LocalEditNeverBlocks == ~s.blockedByEdit
+LatestLocalEditRecoverable == s.editCount = 0 \/ s.localVisible \/ s.queuedVersion = s.editCount
+NoSecondEdit == s.editCount < 2
 DivergenceRecovered == ~(s.diverged /\ s.recovered)
-Safety == ResumeHasContext /\ JournalPreserved /\ CheckpointPreserved /\ AckBeforeNewApply /\ CompleteAfterAck /\ CatchUpDurable /\ AcceptedAncestry /\ DivergencePreserved
+Safety == ResumeHasContext /\ JournalPreserved /\ CheckpointPreserved /\ AckBeforeNewApply /\ CompleteAfterAck /\ CatchUpDurable /\ AcceptedAncestry /\ DivergencePreserved /\ LocalEditNeverBlocks /\ LatestLocalEditRecoverable
 EventuallyComplete == <> (s.phase = "complete")
 NeverLostResponseRestart == ~(s.resumed /\ s.accepted /\ ~s.credential)
 =============================================================================

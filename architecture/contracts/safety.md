@@ -31,7 +31,7 @@ Edits that exist only in an application buffer before the capture boundary are o
 
 Before overwriting, deleting, renaming, rebuilding, or replacing syncable local content, OBTS must publish complete recovery evidence for every affected captured local version. Failure to create or verify that evidence blocks the operation.
 
-Immediately before each mutation, OBTS revalidates the affected path identity. Unexpected local changes stop the apply or become separately preserved local work; they are never overwritten because an earlier preflight succeeded.
+Immediately before each mutation, OBTS revalidates the affected path identity. An unexpected local edit is never a reason to block setup or sync: the client preserves the latest visible bytes, defers only target mutations whose paths or hierarchy overlap that edit, and completes the apply of independent server state. This remains true for repeated edits during file application, snapshot capture, recovery-bundle publication, and local proposal creation; completion never waits for a user-idle window. An edit after a captured snapshot remains visible and creates a durable follow-up scan/capture obligation. Local/server divergence is submitted through the ordinary proposal protocol for server-side integration or conflict handling; the client does not choose a semantic winner or surface a local-edit safety block. This guarantee concerns persisted vault changes; unsaved editor-buffer loss before the capture boundary remains outside OBTS-SAF-001.
 
 ### OBTS-SAF-003: Uploaded Proposals Remain Reachable
 

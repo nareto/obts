@@ -83,7 +83,7 @@ describe('root ignore pull apply journal', () => {
     };
     await expect(apply(f, ['ignored.md', '.gitignore'])).rejects.toThrow('injected crash');
     const journal = JSON.parse(await readFile(join(f.root, '.obts/apply-journal.json'), 'utf8'));
-    expect(journal).toMatchObject({ journal_version: 5, target_root_ignore_oid: f.targetEntries.get('.gitignore'), local_only_paths: ['ignored.md'] });
+    expect(journal).toMatchObject({ journal_version: 6, target_root_ignore_oid: f.targetEntries.get('.gitignore'), local_only_paths: ['ignored.md'] });
     const restarted = new ObtsPluginClient(f.root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'ignore-replay' });
     await restarted.initialize();
     expect(await readFile(join(f.root, 'ignored.md'), 'utf8')).toBe('local\n');
@@ -159,7 +159,7 @@ describe('root ignore pull apply journal', () => {
     expect(await readFile(join(f.root, 'ignored.md'), 'utf8')).toBe('local\n');
   });
 
-  it('blocks replay if the retained local-only file disappears', async () => {
+  it('completes replay while preserving deletion of a retained local-only file', async () => {
     const f = await fixture({ 'ignored.md': 'local\n' }, 'ignored.md\n');
     const original = f.core.writeTargetFilesFromJournal.bind(f.core);
     f.core.writeTargetFilesFromJournal = async (...args: unknown[]) => {
@@ -170,17 +170,19 @@ describe('root ignore pull apply journal', () => {
     await rm(join(f.root, 'ignored.md'));
     const restarted = new ObtsPluginClient(f.root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'absence-replay' });
     await restarted.initialize();
-    expect(await restarted.readState()).toMatchObject({ last_error_code: 'apply_journal_recovery_required' });
-    expect(await readFile(join(f.root, '.obts/apply-journal.json'), 'utf8')).toContain('ignored.md');
+    expect(await restarted.readState()).toMatchObject({ status_label: 'Synced', last_error_code: null });
+    await expect(readFile(join(f.root, 'ignored.md'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(readFile(join(f.root, '.obts/apply-journal.json'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('defers an unrelated local edit rather than treating it as policy-only', async () => {
+  it('applies root policy and queues an unrelated local edit', async () => {
     const f = await fixture({ 'keep.md': 'old\n', 'ignored.md': 'local\n' }, 'ignored.md\n');
     await writeFile(join(f.root, 'keep.md'), 'changed\n');
-    expect(await apply(f, ['ignored.md', '.gitignore'])).toBe(false);
+    expect(await apply(f, ['ignored.md', '.gitignore'])).toBe(true);
     expect(await readFile(join(f.root, 'keep.md'), 'utf8')).toBe('changed\n');
     expect(await readFile(join(f.root, 'ignored.md'), 'utf8')).toBe('local\n');
-    expect(await f.core.resolveRef('refs/heads/main')).toBe(f.base);
+    expect(await f.core.resolveRef('refs/heads/main')).toBe(f.target);
+    expect(await f.core.readQueue()).toMatchObject({ status: 'queued_local', pending_commit: expect.any(String) });
   });
 
   it('still deletes ordinary non-policy paths with a recovery bundle', async () => {

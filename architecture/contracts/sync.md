@@ -76,6 +76,8 @@ Clients materialize explicit directories and remove tombstones only according to
 
 Lost coordination metadata is repaired before rebuild when a valid device token and intact local Git journal can recover identity and ancestry. Visible filesystem differences are captured before any destructive server apply.
 
+A persisted local edit never blocks onboarding, setup, or sync. During apply, the client protects changed paths and overlapping path hierarchies from later target writes, continues independent server writes, and finishes the target transition. It captures the latest stable local snapshot as a proposal when possible; edits that race snapshot or proposal creation remain visible and durably scheduled for a later capture without requiring the vault to become idle. Same-path and structural divergence proceeds through the ordinary server proposal and conflict protocol; only the server selects or requests a semantic resolution.
+
 When explicit replacement/rebuild is required, OBTS publishes a recovery bundle, applies canonical server state, then classifies preserved local work:
 
 - repeated or already-covered commits settle idempotently;
