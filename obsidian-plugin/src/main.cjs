@@ -7821,6 +7821,9 @@ class ObtsObsidianClient {
           target_main: advanced.manifest.target_main,
           advanced_explicit_directories: Array.from(new Set(advanced.manifest.explicit_directories)).sort(),
           advanced_directory_intents: compactDirectoryIntents(advanced.manifest.directory_intents),
+          advanced_target_file_sizes: isTargetFileSizeMap(advanced.manifest.target_file_sizes)
+            ? Object.assign({}, advanced.manifest.target_file_sizes)
+            : {},
           recovered_event_seq: advanced.manifest.event_seq,
           recovered_server_device_ref: serverDevice.server_device_ref,
           updated_at: nowIso()
@@ -7862,7 +7865,7 @@ class ObtsObsidianClient {
         journal.recovered_event_seq,
         false,
         null,
-        {}
+        journal.advanced_target_file_sizes || {}
       );
       if ((await this.resolveRef("refs/heads/local")) !== journal.target_main) {
         await this.updateRef("refs/heads/local", journal.target_main, null, true);

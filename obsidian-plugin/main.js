@@ -21990,7 +21990,7 @@ var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_da
 var { createByteBudget, runBoundedWork } = require_work_pool();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.6";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.7";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_INVENTORY_INTERVAL_MS = 6 * 60 * 60 * 1e3;
@@ -28963,6 +28963,7 @@ var ObtsObsidianClient = class {
           target_main: advanced.manifest.target_main,
           advanced_explicit_directories: Array.from(new Set(advanced.manifest.explicit_directories)).sort(),
           advanced_directory_intents: compactDirectoryIntents(advanced.manifest.directory_intents),
+          advanced_target_file_sizes: isTargetFileSizeMap(advanced.manifest.target_file_sizes) ? Object.assign({}, advanced.manifest.target_file_sizes) : {},
           recovered_event_seq: advanced.manifest.event_seq,
           recovered_server_device_ref: serverDevice.server_device_ref,
           updated_at: nowIso()
@@ -28998,7 +28999,7 @@ var ObtsObsidianClient = class {
         journal.recovered_event_seq,
         false,
         null,
-        {}
+        journal.advanced_target_file_sizes || {}
       );
       if (await this.resolveRef("refs/heads/local") !== journal.target_main) {
         await this.updateRef("refs/heads/local", journal.target_main, null, true);
