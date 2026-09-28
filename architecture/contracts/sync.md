@@ -80,6 +80,16 @@ When reconstructing an older main from a newer acknowledged baseline, the server
 
 Clients materialize explicit directories and remove tombstones only according to `OBTS-SAF-006`. Historical state without directory intent cannot invent right-click folder deletion from a Git tree.
 
+### OBTS-SYNC-DIR-002: Client-Side Stale Baseline Resolution
+
+When a device's directory-baseline recovery cannot prove the authoritative baseline for its queued proposal because the server main advanced past the proposal base with a real directory change, the client resolves deterministically against the current server directory state instead of retrying forever:
+
+- a queued directory intent whose goal is already satisfied by the server's current directory state (for example, the directory is already deleted server-side) is dropped together with its content-empty proposal commit;
+- a queued directory intent that still applies on top of the new server main is rebased onto it with a fresh proposal base and uploaded normally;
+- anything else, including a queued commit that carries content or a server main that is not a linear descendant of the proposal base, fails closed.
+
+This flow never asks the device user to resolve anything. Dropping an intent is permitted only when the server state provably already satisfies it; content changes are never discarded by this flow. Genuine directory divergence continues through the server-side conflict machinery and dashboard review.
+
 ## Recovery And Rebuild
 
 Lost coordination metadata is repaired before rebuild when a valid device token and intact local Git journal can recover identity and ancestry. Visible filesystem differences are captured before any destructive server apply.

@@ -18,13 +18,13 @@ const requiredChecks = new Map([
   ['fm001-negative-skip-recovery', 'negative-control'], ['fm001-negative-stale-preflight', 'negative-control'],
   ['fm001-negative-early-cleanup', 'negative-control'], ['fm001-negative-infer-completion', 'negative-control'],
   ...['same-path', 'disjoint-directory', 'server-recovery-contract', 'bridge-handoff', 'all-actors', 'apply-refinement',
-    'directory-baseline-delivered', 'directory-baseline-rebase', 'directory-baseline-intervening', 'directory-baseline-history-lost', 'directory-baseline-historical']
+    'directory-baseline-delivered', 'directory-baseline-rebase', 'directory-baseline-intervening', 'directory-baseline-history-lost', 'directory-baseline-historical', 'stale-baseline-selfheal', 'stale-baseline-content']
     .map((id) => [`fm002-${id}`, 'positive-safety']),
   ...['proposal', 'bridge', 'server-recovery', 'apply-ack'].map((id) => [`fm002-liveness-${id}`, 'positive-liveness']),
   ...['observe', 'bridge-proposal', 'plugin2-proposal', 'rust-write', 'network-fault', 'recovery', 'conflict', 'apply-ack',
     'equal', 'covered', 'divergent', 'reply-loss', 'conflict-partial', 'directory-delete', 'projection', 'proposal-trigger',
     'bridge-trigger', 'recovery-trigger', 'apply-trigger', 'apply-refinement', 'ack-reconstruction'].map((id) => [`fm002-reach-${id}`, 'reachability']),
-  ...['directory-baseline-delivered', 'directory-baseline-rebase', 'directory-baseline-intervening', 'directory-baseline-history-lost', 'directory-baseline-historical']
+  ...['directory-baseline-delivered', 'directory-baseline-rebase', 'directory-baseline-intervening', 'directory-baseline-history-lost', 'directory-baseline-historical', 'stale-baseline-selfheal', 'stale-baseline-content']
     .map((id) => [`fm002-reach-${id}`, 'reachability']),
   ['fm002-server-recovery-implementation', 'positive-safety'],
   ...['root-ignore-safety', 'root-ignore-legacy-safety', 'root-ignore-bridge-race-safety', 'root-ignore-invalid-safety'].map((id) => [`fm002-${id}`, 'positive-safety']),

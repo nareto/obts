@@ -1144,6 +1144,52 @@
       "maximumDepth": 100
     },
     {
+      "id": "fm002-stale-baseline-selfheal",
+      "model": "OBTSDistributedSync",
+      "config": "configs/stale-baseline-selfheal.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100
+    },
+    {
+      "id": "fm002-stale-baseline-content",
+      "model": "OBTSDistributedSync",
+      "config": "configs/stale-baseline-content.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100
+    },
+    {
+      "id": "fm002-reach-stale-baseline-selfheal",
+      "model": "OBTSDistributedSync",
+      "config": "configs/stale-baseline-selfheal-reach.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "expectedInvariant": "NeverStaleBaselineRecoverSettled",
+      "requiredWitness": "StaleBaselineRecover",
+      "minimumTraceDepth": 5
+    },
+    {
+      "id": "fm002-reach-stale-baseline-content",
+      "model": "OBTSDistributedSync",
+      "config": "configs/stale-baseline-content-reach.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "expectedInvariant": "NeverStaleBaselineRecoverSettled",
+      "requiredWitness": "StaleBaselineRecover",
+      "minimumTraceDepth": 5
+    },
+    {
       "id": "fm002-reach-directory-baseline-delivered",
       "model": "OBTSDistributedSync",
       "config": "configs/directory-baseline-delivered-reach.cfg",
