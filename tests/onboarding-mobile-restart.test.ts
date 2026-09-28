@@ -100,7 +100,7 @@ describe('packaged mobile onboarding recovery', () => {
     expect(await readFile(join(phoneRoot, '.obts/onboarding.json'), 'utf8')).toBe(journal);
   });
 
-  it.each(['approved', 'consumed'])('reviews changed local consent on the same enrollment: %s', async status => {
+  it.each(['approved', 'consumed'])('completes same enrollment while preserving later local edits: %s', async status => {
     await seed();
     const { h, phoneRoot, connection } = await prepared();
     const saved = await h.core.readPendingOnboarding();
@@ -112,23 +112,57 @@ describe('packaged mobile onboarding recovery', () => {
     const modal = await restarted.open();
     await click(modal, 'Resume setup');
     await waitUntil(() => !modal.onboardingRunning);
-    expect(modal.contentEl.allText).toContain('local vault changed');
-    await click(modal, 'Review changed local contents');
-    expect(modal.contentEl.allText).toContain('1 syncable files');
-    const before = await restarted.core.readPendingOnboarding();
-    expect(before.journal.analysis.localFingerprint).toBe(saved.journal.analysis.localFingerprint);
-    await click(modal, 'Confirm updated consent');
-    await waitUntil(() => !modal.onboardingRunning);
     expect(modal.contentEl.allText).toContain('Sync is ready');
-    const journal = JSON.parse(await readFile(join(phoneRoot, '.obts/onboarding.json'), 'utf8'));
-    expect(journal.connection.connection_id).toBe(connection.connection_id);
-    expect(journal.analysis.expectedMain).toBe(saved.journal.analysis.expectedMain);
-    expect(journal.analysis.localFingerprint).not.toBe(saved.journal.analysis.localFingerprint);
     expect((await server.store.snapshot()).devices).toHaveLength(2);
     expect(restarted.requests.filter(path => path === '/api/v1/connections')).toHaveLength(0);
-    expect(await readFile(join(phoneRoot, 'note.md'), 'utf8')).toBe('server bytes\n');
-    const bundles = await readdir(join(phoneRoot, '.obts/recovery'));
-    expect((await Promise.all(bundles.map(bundle => readFile(join(phoneRoot, '.obts/recovery', bundle, 'files/note.md'), 'utf8').catch(() => '')))).some(bytes => bytes === 'later local edit\n')).toBe(true);
+    expect(await readFile(join(phoneRoot, 'note.md'), 'utf8')).toBe('later local edit\n');
+    expect(await restarted.core.readQueue()).toMatchObject({ status: 'queued_local', pending_commit: expect.any(String) });
+    expect((await restarted.core.syncOnce()).status).toBe('Synced');
+    expect(await readFile(join(phoneRoot, 'note.md'), 'utf8')).toBe('later local edit\n');
+  });
+
+  it('completes setup and queues edits when the local snapshot keeps changing during baseline capture', async () => {
+    await seed();
+    const { h, phoneRoot } = await prepared();
+    const originalReadFile = h.core.fsp.readFile.bind(h.core.fsp);
+    const originalCreateStableRecoveryBundle = h.core.createStableRecoveryBundle.bind(h.core);
+    let capturingBaseline = false;
+    let edits = 0;
+    h.core.fsp.readFile = async (filePath: string, ...args: any[]) => {
+      const bytes = await originalReadFile(filePath, ...args);
+      if (capturingBaseline && filePath === 'note.md' && edits < 3) {
+        edits += 1;
+        await writeFile(join(phoneRoot, 'note.md'), `edit ${edits} during baseline ${'x'.repeat(edits)}\n`);
+      }
+      return bytes;
+    };
+    h.core.createStableRecoveryBundle = async (...args: any[]) => {
+      if (args[0] !== 'replace_local_with_server') return await originalCreateStableRecoveryBundle(...args);
+      capturingBaseline = true;
+      try {
+        return await originalCreateStableRecoveryBundle(...args);
+      } finally {
+        capturingBaseline = false;
+      }
+    };
+
+    try {
+      const modal = await h.open();
+      await click(modal, 'Replace local contents');
+      await waitUntil(() => !modal.onboardingRunning);
+      expect(modal.contentEl.allText).toContain('Sync is ready');
+    } finally {
+      h.core.fsp.readFile = originalReadFile;
+      h.core.createStableRecoveryBundle = originalCreateStableRecoveryBundle;
+    }
+
+    expect(edits).toBe(3);
+    expect(await readFile(join(phoneRoot, 'note.md'), 'utf8')).toBe('edit 3 during baseline xxx\n');
+    expect((await h.core.readState()).status_label).toBe('Ahead');
+    expect((await h.core.readQueue()).status).toBe('queued_local');
+    await h.plugin.runExclusiveAction(() => h.core.syncOnce());
+    expect(await readFile(join(phoneRoot, 'note.md'), 'utf8')).toBe('edit 3 during baseline xxx\n');
+    expect((await h.core.readState()).status_label).toBe('Synced');
   });
 
   it.each(['apply', 'credential', 'proposal', 'identity'])('does not refresh initial consent after local publication: %s', async boundary => {
@@ -242,7 +276,7 @@ describe('packaged mobile onboarding recovery', () => {
     await verifyRecovery(phoneRoot);
   });
 
-  it.each(['missing-consent', 'stale-consent', 'mode', 'vault', 'revoked'])('preserves historical state when migration is unsafe: %s', async fault => {
+  it.each(['missing-consent', 'mode', 'vault', 'revoked'])('preserves historical state when migration is unsafe: %s', async fault => {
     await seed();
     const { h, phoneRoot, connection } = await prepared();
     const saved = await h.core.readPendingOnboarding();
@@ -254,7 +288,6 @@ describe('packaged mobile onboarding recovery', () => {
         else device.onboarding_mode = 'merge';
       });
     }
-    if (fault === 'stale-consent') await writeFile(join(phoneRoot, 'note.md'), 'later local edit\n');
     if (fault === 'vault') await h.core.writeState({ ...await h.core.readState(), vault_id: 'other-vault', device_id: 'other-device' });
     await h.core.writeOnboardingJournal({ ...saved.journal, analysis: null, selected_mode: 'use_server', stage: 'blocked', ...(fault === 'missing-consent' ? { pending_summary: null } : {}) });
     h.dispose();
@@ -263,9 +296,27 @@ describe('packaged mobile onboarding recovery', () => {
     await click(modal, 'Resume setup');
     await waitUntil(() => !modal.onboardingRunning);
     expect(modal.contentEl.allText).not.toContain('Sync is ready');
-    expect(await readFile(join(phoneRoot, 'note.md'), 'utf8')).toBe(fault === 'stale-consent' ? 'later local edit\n' : 'local recovery bytes\n');
+    expect(await readFile(join(phoneRoot, 'note.md'), 'utf8')).toBe('local recovery bytes\n');
     expect(await restarted.core.readPendingOnboarding()).not.toBeNull();
     expect(restarted.requests.filter(path => path.endsWith('/sync/pull-chunk'))).toHaveLength(0);
+  });
+
+  it('completes a historical replacement resume and queues edits made after saved consent', async () => {
+    await seed();
+    const { h, phoneRoot } = await prepared();
+    const saved = await h.core.readPendingOnboarding();
+    await writeFile(join(phoneRoot, 'note.md'), 'later local edit\n');
+    await h.core.writeOnboardingJournal({ ...saved.journal, analysis: null, selected_mode: 'use_server', stage: 'blocked', last_error_code: 'onboarding_failed' });
+    h.dispose();
+    const restarted = await mobileHarness(phoneRoot, url); harnesses.push(restarted);
+    const modal = await restarted.open();
+    await click(modal, 'Resume setup');
+    await waitUntil(() => !modal.onboardingRunning);
+    expect(modal.contentEl.allText).toContain('Sync is ready');
+    expect(await readFile(join(phoneRoot, 'note.md'), 'utf8')).toBe('later local edit\n');
+    expect(await restarted.core.readQueue()).toMatchObject({ status: 'queued_local', pending_commit: expect.any(String) });
+    expect(await restarted.core.readPendingOnboarding()).toBeNull();
+    expect((await server.store.snapshot()).devices).toHaveLength(2);
   });
 
   it.each(['checkpoint', 'pending-ack'])('settles %s before catching up to an advanced main', async boundary => {

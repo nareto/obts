@@ -2096,22 +2096,19 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(await readFile(join(fixture.tabletDir, 'shared.md'), 'utf8')).toBe('selected device version\n');
   });
 
-  it('preserves an unreported visible edit while deferring authoritative-main reconciliation', async () => {
+  it('preserves an unreported visible edit while applying authoritative main', async () => {
     const fixture = await createConsumedResolutionFixture('consumed-resolution-missed-watcher');
     await writeFile(join(fixture.tabletDir, 'shared.md'), 'unreported newer local edit\n');
 
-    expect(await fixture.tablet.pollRemoteEventsAndApply()).toMatchObject({ applied: false, status: 'Checking' });
-    expect(await fixture.tablet.readState()).toMatchObject({
-      local_main: fixture.preResolutionMain,
-      local_head: fixture.deviceCommit,
-      status_label: 'Checking',
-      last_error_code: null
-    });
-    expect(await fixture.tablet.readQueue()).toMatchObject({
-      pending_commit: null,
-      status: 'queued_local'
-    });
+    expect(await fixture.tablet.pollRemoteEventsAndApply()).toMatchObject({ applied: true, status: 'Synced' });
+    const state = await fixture.tablet.readState();
+    expect(state.local_main).not.toBe(fixture.preResolutionMain);
+    expect(state.status_label).toBe('Synced');
+    expect(state.last_error_code).toBeNull();
+    expect(await fixture.tablet.readQueue()).toMatchObject({ pending_commit: null, status: 'idle' });
     expect(await readFile(join(fixture.tabletDir, 'shared.md'), 'utf8')).toBe('unreported newer local edit\n');
+    expect((await server.git.readBlobAtPath(fixture.admin.vaultId, state.local_main!, 'shared.md')).toString('utf8'))
+      .toBe('unreported newer local edit\n');
     expect((await server.git.readBlobAtPath(fixture.admin.vaultId, fixture.resolutionCommit, 'shared.md')).toString('utf8')).toBe(
       'selected device version\n'
     );
@@ -2918,7 +2915,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
       ).rejects.toThrow();
     });
 
-    it('fails recovery and writes error category when an affected file was externally modified', async () => {
+    it('completes recovery while preserving an affected file modified externally', async () => {
       const admin = await setupAdminAndVault(baseUrl);
       const vaultDir = join(root, 'recovery-modified');
       await mkdir(vaultDir, { recursive: true });
@@ -2972,14 +2969,11 @@ describe('Phase 2 dashboard conflict resolution', () => {
       await client.initialize();
 
       const recoveredState = await client.readState();
-      expect(recoveredState.last_error_code).toBe('apply_journal_recovery_required');
-      expect(recoveredState.status_label).toBe('Out of sync — local recovery required');
-
-      const savedJournal = JSON.parse(
-        await readFile(join(vaultDir, '.obts', 'apply-journal.json'), 'utf8')
-      ) as ApplyJournal;
-      expect(savedJournal.phase).toBe('blocked_recovery');
-      expect(savedJournal.redacted_error_category).toBe('local_files_diverge_from_journal');
+      expect(recoveredState.last_error_code).toBeNull();
+      expect(recoveredState.status_label).toBe('Ahead');
+      expect(await readFile(join(vaultDir, 'other.md'), 'utf8')).toBe('externally modified content\n');
+      expect(await client.readQueue()).toMatchObject({ status: 'queued_local', pending_commit: expect.any(String) });
+      await expect(readFile(join(vaultDir, '.obts', 'apply-journal.json'))).rejects.toMatchObject({ code: 'ENOENT' });
     });
   });
 });

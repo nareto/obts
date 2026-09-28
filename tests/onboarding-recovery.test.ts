@@ -101,14 +101,9 @@ describe('durable onboarding recovery admission', () => {
     await expect(core.applyTargetMain(target, ['note.md'], true, [], false, [], [], 1, false, null, { 'note.md': 13 })).rejects.toThrow('Synthetic process interruption');
     await writeFile(join(root, 'note.md'), 'edited during recovery\n');
 
-    const classified = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'recovery' });
-    await classified.initialize();
-    expect((await classified.readState()).last_error_code).toBe('apply_journal_recovery_required');
-    expect((await (classified as any).client.collectTroubleshootingContext()).recovery_summary.apply_error).toBe('local_files_diverge_from_journal');
-
-    const restarted = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'recovery' });
-    await restarted.initialize();
-    const recovered = (restarted as any).client;
+    const resumed = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'recovery' });
+    await resumed.initialize();
+    const recovered = (resumed as any).client;
     const recoveredState = await recovered.readState();
     expect(recoveredState.local_main).toBe(target);
     expect(recoveredState.last_error_code).toBeNull();
@@ -117,7 +112,7 @@ describe('durable onboarding recovery admission', () => {
     await expect(readFile(join(root, '.obts/apply-journal.json'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('restores a displaced path while a blocked resume preserves the other edited path', async () => {
+  it('restores a displaced path while preserving the other edited path during automatic recovery', async () => {
     const { core, root } = await client();
     await writeFile(join(root, 'a.md'), 'a original\n');
     await writeFile(join(root, 'b.md'), 'b original\n');
@@ -143,11 +138,6 @@ describe('durable onboarding recovery admission', () => {
       .rejects.toThrow('Synthetic interruption after displacement');
     core.displaceApplyPath = displace;
     await writeFile(join(root, 'b.md'), 'b edited during recovery\n');
-
-    const classified = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'recovery' });
-    await classified.initialize();
-    expect((await classified.readState()).last_error_code).toBe('apply_journal_recovery_required');
-    expect((await (classified as any).client.collectTroubleshootingContext()).recovery_summary.apply_error).toBe('local_files_diverge_from_journal');
 
     const resumed = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'recovery' });
     await resumed.initialize();
@@ -182,11 +172,6 @@ describe('durable onboarding recovery admission', () => {
     core.writeTargetFilesFromJournal = write;
     await writeFile(join(root, 'notes.md', 'c.md'), 'child edited during recovery\n');
 
-    const classified = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'recovery' });
-    await classified.initialize();
-    expect((await classified.readState()).last_error_code).toBe('apply_journal_recovery_required');
-    expect((await (classified as any).client.collectTroubleshootingContext()).recovery_summary.apply_error).toBe('local_files_diverge_from_journal');
-
     const resumed = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'recovery' });
     await resumed.initialize();
     const recovered = (resumed as any).client;
@@ -197,6 +182,134 @@ describe('durable onboarding recovery admission', () => {
     expect(recoveredState).toMatchObject({ local_main: target, last_error_code: null });
     expect(await recovered.readQueue()).toMatchObject({ status: 'queued_local', pending_commit: recoveredState.local_head });
     await expect(readFile(join(root, '.obts/apply-journal.json'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('completes server apply while preserving repeated local edits made during writes and capture', async () => {
+    const { core, root } = await client();
+    await writeFile(join(root, 'note.md'), 'base bytes\n');
+    const base = await core.createLocalCommit('base');
+    await core.updateRef('refs/heads/main', base, null, true);
+    await writeFile(join(root, 'note.md'), 'server bytes\n');
+    const target = await core.createLocalCommit('server');
+    await writeFile(join(root, 'note.md'), 'base bytes\n');
+    await core.updateRef('refs/heads/local', base, null, true);
+    await core.writeState({
+      ...await core.readState(),
+      vault_id: 'vault',
+      device_id: 'device',
+      local_main: base,
+      local_head: base,
+      server_device_ref: base
+    });
+
+    const write = core.writeTargetFilesFromJournal.bind(core);
+    core.writeTargetFilesFromJournal = async (...args: any[]) => {
+      await write(...args);
+      await writeFile(join(root, 'note.md'), 'edit during apply\n');
+    };
+    const scan = core.localChangedPathsFromTree.bind(core);
+    let editedDuringCapture = false;
+    core.localChangedPathsFromTree = async (...args: any[]) => {
+      const result = await scan(...args);
+      if (args[1] === true && !editedDuringCapture) {
+        editedDuringCapture = true;
+        await writeFile(join(root, 'note.md'), 'edit during snapshot\n');
+      }
+      return result;
+    };
+
+    await expect(core.applyTargetMain(
+      target, ['note.md'], true, ['note.md'], false, [], [], 1, false, null, { 'note.md': 13 }
+    )).resolves.toBe(true);
+    expect(editedDuringCapture).toBe(true);
+    expect(await readFile(join(root, 'note.md'), 'utf8')).toBe('edit during snapshot\n');
+    const state = await core.readState();
+    const queue = await core.readQueue();
+    expect(state).toMatchObject({ local_main: target, last_error_code: null, status_label: 'Ahead' });
+    expect(queue).toMatchObject({ status: 'queued_local', pending_commit: state.local_head });
+    const queuedTree = await core.listTreeBlobOids(queue.pending_commit);
+    expect(await core.readBlobOid(queuedTree.get('note.md'))).toEqual(Buffer.from('edit during snapshot\n'));
+    await expect(readFile(join(root, '.obts/apply-journal.json'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('preserves a file edited after displaced evidence is copied while applying independent target paths', async () => {
+    const { core, root } = await client();
+    await writeFile(join(root, 'note.md'), 'base bytes\n');
+    await writeFile(join(root, 'other.md'), 'base other\n');
+    const base = await core.createLocalCommit('base');
+    await core.updateRef('refs/heads/main', base, null, true);
+    await writeFile(join(root, 'note.md'), 'server bytes\n');
+    await writeFile(join(root, 'other.md'), 'server other\n');
+    const target = await core.createLocalCommit('server');
+    await writeFile(join(root, 'note.md'), 'base bytes\n');
+    await writeFile(join(root, 'other.md'), 'base other\n');
+    await core.updateRef('refs/heads/local', base, null, true);
+    await core.writeState({
+      ...await core.readState(),
+      vault_id: 'vault',
+      device_id: 'device',
+      local_main: base,
+      local_head: base,
+      server_device_ref: base
+    });
+
+    const matches = core.applyDisplacedEntryMatchesPreflight.bind(core);
+    let edited = false;
+    core.applyDisplacedEntryMatchesPreflight = async (...args: any[]) => {
+      const result = await matches(...args);
+      if (args[1] === 'note.md' && !edited) {
+        edited = true;
+        await writeFile(join(root, 'note.md'), 'edit during displacement\n');
+      }
+      return result;
+    };
+
+    await expect(core.applyTargetMain(
+      target, ['note.md', 'other.md'], true, [], false, [], [], 1, false, null,
+      { 'note.md': 13, 'other.md': 13 }
+    )).resolves.toBe(true);
+    expect(edited).toBe(true);
+    expect(await readFile(join(root, 'note.md'), 'utf8')).toBe('edit during displacement\n');
+    expect(await readFile(join(root, 'other.md'), 'utf8')).toBe('server other\n');
+    const state = await core.readState();
+    const queue = await core.readQueue();
+    expect(state).toMatchObject({ local_main: target, last_error_code: null, status_label: 'Ahead' });
+    expect(queue).toMatchObject({ status: 'queued_local', pending_commit: state.local_head });
+  });
+
+  it('binds a replacement baseline to its onboarding context', async () => {
+    const { core, root } = await client();
+    await writeFile(join(root, 'note.md'), 'consented bytes\n');
+    await core.writeState({ ...await core.readState(), vault_id: 'source-vault', device_id: 'source-device' });
+    const context = {
+      connection_id: 'connection-one',
+      vault_id: 'vault-one',
+      source_vault_id: 'source-vault',
+      source_device_id: 'source-device',
+      target_main: 'a'.repeat(40),
+      affected_paths: ['note.md']
+    };
+    const bundleId = await core.createStableRecoveryBundle(
+      'replace_local_with_server', context.target_main, context.affected_paths, 3, context
+    );
+    expect(bundleId).toMatch(/^rec_/u);
+    await expect(core.readRecoveryBundleFingerprints(bundleId, context)).resolves.toHaveProperty('size', 1);
+    const wrongOperationBundleId = await core.createStableRecoveryBundle(
+      'initial_import', context.target_main, context.affected_paths, 3, context
+    );
+    await expect(core.readRecoveryBundleFingerprints(wrongOperationBundleId, context))
+      .rejects.toMatchObject({ code: 'onboarding_context_required' });
+    for (const mismatchedContext of [
+      { ...context, connection_id: 'connection-two' },
+      { ...context, vault_id: 'vault-two' },
+      { ...context, source_vault_id: 'other-source-vault' },
+      { ...context, source_device_id: 'other-source-device' },
+      { ...context, target_main: 'b'.repeat(40) },
+      { ...context, affected_paths: ['other.md'] }
+    ]) {
+      await expect(core.readRecoveryBundleFingerprints(bundleId, mismatchedContext))
+        .rejects.toMatchObject({ code: 'onboarding_context_required' });
+    }
   });
 
   it('reports the retained pre-write failure instead of claiming missing evidence with reason none', async () => {

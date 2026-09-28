@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "model": "architecture/models/formal/OBTSOnboardingRecovery.tla",
-  "architectureRevision": 24,
+  "architectureRevision": 26,
   "status": "static seam mapping; no runtime trace conformance claim",
   "contracts": ["OBTS-SYNC-ONB-001", "OBTS-SYNC-ACK-001", "OBTS-SAF-002", "OBTS-SAF-005", "OBTS-SAF-009"],
   "checker": "scripts/check-onboarding-recovery-model.mjs",
@@ -13,10 +13,10 @@
       "checks": ["safety", "liveness", "response-loss-restart", "legacy-context"]
     },
     {
-      "actions": ["PlanApply", "DivergeEdit", "Recover", "Apply", "OverwriteJournal"],
-      "implementation": ["obsidian-plugin/src/main.cjs: admitApplyRecovery, applyRecoveryValidationReason, validateApplyJournalPolicy, initialize, applyTargetMain, recoverDivergedApplyWithPreservedLocalChanges, completeInterruptedApply"],
-      "tests": ["tests/onboarding-recovery.test.ts: absent lock and same-target apply, corrupt or missing recovery, corrupt displacement, diverged-edit preservation with displaced-path resume", "tests/onboarding-mobile-restart.test.ts: recovery/files/committed SIGKILL boundaries"],
-      "checks": ["safety", "overwrite-journal", "divergence-preserved", "discard-divergence"]
+      "actions": ["PlanApply", "DivergeEdit", "BeginLocalCapture", "SecondEditDuringCapture", "FinishLocalCapture", "CompleteLiveApply", "BlockApplyForEdit", "Recover", "Apply", "OverwriteJournal"],
+      "implementation": ["obsidian-plugin/src/main.cjs: admitApplyRecovery, applyRecoveryValidationReason, validateApplyJournalPolicy, initialize, applyTargetMain, writeTargetFilesFromJournal, localChangedPathsFromTree, queuePreservedLocalChanges, recoverDivergedApplyWithPreservedLocalChanges, completeInterruptedApply"],
+      "tests": ["tests/onboarding-recovery.test.ts and tests/phase1.test.ts: live edits through setup/apply, repeated edits during preservation, queued local work and server-side resolution", "tests/onboarding-mobile-restart.test.ts: recovery/files/committed SIGKILL boundaries"],
+      "checks": ["safety", "overwrite-journal", "divergence-preserved", "discard-divergence", "snapshot-capture-race-preserved", "multi-edit-capture", "block-live-edit", "discard-live-edit"]
     },
     {
       "actions": ["Chunk", "AdvanceMain", "DropCheckpoint", "Ack", "NewApplyBeforeAck", "CatchUp", "LoseCatchUp", "CaptureInterim"],

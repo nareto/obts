@@ -12,7 +12,7 @@ export type ApplyFingerprint = {
 };
 
 export type ApplyJournal = {
-  journal_version?: 1 | 2 | 3;
+  journal_version?: 1 | 2 | 3 | 4 | 5 | 6;
   apply_id: string;
   operation_type: 'pull_apply' | 'initial_import' | 'replace_local_with_server' | 'rebuild_from_server';
   target_main: string;
@@ -27,6 +27,7 @@ export type ApplyJournal = {
   pre_apply_directories?: string[];
   pre_apply_directory_ctimes?: Record<string, number | null>;
   preserve_local_changes?: boolean;
+  deferred_local_paths?: string[];
   event_seq?: number | null;
   recovery_bundle_id: string | null;
   last_completed_step: string | null;
@@ -199,7 +200,7 @@ function parseApplyJournal(value: unknown): ApplyJournal {
   const preApplyDirectories = journal.pre_apply_directories;
   const preApplyDirectoryCtimes = journal.pre_apply_directory_ctimes;
   if (
-    journalVersion !== 1 && journalVersion !== 2 && journalVersion !== 3 ||
+    journalVersion !== 1 && journalVersion !== 2 && journalVersion !== 3 && journalVersion !== 4 && journalVersion !== 5 && journalVersion !== 6 ||
     typeof journal.apply_id !== 'string' || journal.apply_id.length === 0 ||
     typeof journal.operation_type !== 'string' || !operations.has(journal.operation_type) ||
     typeof journal.target_main !== 'string' || !/^[0-9a-f]{40}$/u.test(journal.target_main) ||
@@ -215,7 +216,7 @@ function parseApplyJournal(value: unknown): ApplyJournal {
       affectedPaths.some((path) => !Object.hasOwn(typedPreflight, path) ||
         !isApplyFingerprint((typedPreflight as Record<string, unknown>)[path]))
     ) ||
-    journalVersion === 3 && (
+    journalVersion >= 3 && (
       !Array.isArray(directoryIntents) || directoryIntents.some((intent) => {
         if (!intent || typeof intent !== 'object' || Array.isArray(intent)) return true;
         const candidate = intent as Record<string, unknown>;
@@ -232,6 +233,12 @@ function parseApplyJournal(value: unknown): ApplyJournal {
         !isNullableNonNegativeNumber((preApplyDirectoryCtimes as Record<string, unknown>)[path])) ||
       typeof journal.preserve_local_changes !== 'boolean' ||
       !(journal.event_seq === null || Number.isSafeInteger(journal.event_seq) && Number(journal.event_seq) >= 0)
+    ) ||
+    journalVersion >= 6 && (
+      !Array.isArray(journal.deferred_local_paths) ||
+      journal.deferred_local_paths.some((path) => typeof path !== 'string' || !isSafeJournalPath(path)) ||
+      new Set(journal.deferred_local_paths).size !== journal.deferred_local_paths.length ||
+      journal.deferred_local_paths.some((path, index, paths) => index > 0 && paths[index - 1] >= path)
     ) ||
     !isNullableString(journal.recovery_bundle_id) ||
     !isNullableString(journal.last_completed_step) ||
