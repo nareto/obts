@@ -28,6 +28,7 @@ export type LocalPluginState = {
   initial_import_confirmed: boolean;
   status_label: string;
   last_error_code: string | null;
+  apply_validation_reason?: string | null;
   last_error_details?: Record<string, unknown> | null;
   last_event_seq: number;
   last_applied_event_seq: number;

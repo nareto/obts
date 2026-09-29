@@ -695,6 +695,7 @@ fn is_valid_state(value: &Value) -> bool {
         "initial_import_confirmed",
         "status_label",
         "last_error_code",
+        "apply_validation_reason",
         "last_error_details",
         "last_event_seq",
         "last_applied_event_seq",
@@ -734,6 +735,13 @@ fn is_valid_state(value: &Value) -> bool {
             .get(*key)
             .is_none_or(|field| field.is_null() || field.is_string())
     }) && state
+        .get("apply_validation_reason")
+        .is_none_or(|field| {
+            field.is_null()
+                || field
+                    .as_str()
+                    .is_some_and(|code| !code.is_empty() && code.len() <= 128)
+        }) && state
         .get("last_error_details")
         .is_none_or(|field| field.is_null() || field.is_object())
         && state
@@ -1014,7 +1022,8 @@ fn redact_state(state: &Value) -> Value {
         "vault_id": state.get("vault_id"),
         "device_id": state.get("device_id"),
         "status_label": state.get("status_label"),
-        "last_error_code": state.get("last_error_code")
+        "last_error_code": state.get("last_error_code"),
+        "apply_validation_reason": state.get("apply_validation_reason")
     })
 }
 
@@ -1132,6 +1141,27 @@ mod tests {
             stdin,
             stdout: BufReader::new(stdout),
         }
+    }
+
+    #[test]
+    fn apply_validation_reason_is_optional_and_bounded() {
+        let mut state = valid_state();
+        assert!(super::is_valid_state(&state));
+
+        state["apply_validation_reason"] = json!("validation_rejected");
+        assert!(super::is_valid_state(&state));
+        assert_eq!(super::redact_state(&state)["apply_validation_reason"], "validation_rejected");
+
+        state["apply_validation_reason"] = Value::Null;
+        assert!(super::is_valid_state(&state));
+        for invalid in [json!(""), json!("x".repeat(129)), json!(7), json!({})] {
+            state["apply_validation_reason"] = invalid;
+            assert!(!super::is_valid_state(&state));
+        }
+
+        state.as_object_mut().unwrap().remove("apply_validation_reason");
+        state["unknown_internal_field"] = json!(true);
+        assert!(!super::is_valid_state(&state));
     }
 
     #[test]

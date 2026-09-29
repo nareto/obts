@@ -75,6 +75,30 @@ describe('headless client protocol', () => {
     ]);
   });
 
+  it('projects ready, state, and read-state payloads onto protocol fields', async () => {
+    const messages: HeadlessMessage[] = [];
+    const internalState = {
+      ...state,
+      apply_validation_reason: 'validation_rejected',
+      internal_cache: { secret: 'not-for-the-protocol' }
+    } as typeof state;
+    const client = fakeClient({ readState: vi.fn(async () => internalState) });
+    const session = new HeadlessSession(client, async (message) => void messages.push(message));
+
+    await session.start();
+    await session.submit({ id: 1, command: 'sync-once' });
+    await session.submit({ id: 2, command: 'read-state' });
+
+    const projected = { ...state, apply_validation_reason: 'validation_rejected' };
+    expect(messages[0]).toEqual({ type: 'event', event: 'ready', state: projected });
+    expect(messages[1]).toEqual({ type: 'event', event: 'state', state: projected });
+    expect(messages[3]).toEqual({ type: 'response', id: 2, ok: true, result: projected });
+    for (const message of [messages[0], messages[1]]) {
+      expect(message).toMatchObject({ state: projected });
+      expect(Object.keys((message as Extract<HeadlessMessage, { type: 'event'; event: 'ready' | 'state' }>).state)).not.toContain('internal_cache');
+    }
+  });
+
   it('emits ordered progress while a long command is active', async () => {
     const messages: HeadlessMessage[] = [];
     let progress: ((status: string, diagnosticPoint: string) => void) | null = null;

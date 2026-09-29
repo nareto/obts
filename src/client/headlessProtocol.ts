@@ -1,4 +1,4 @@
-import { PluginBlockedError, type IndexDelta, type ObtsPluginClient, type OnboardingAnalysis } from './core.js';
+import { PluginBlockedError, type IndexDelta, type LocalPluginState, type ObtsPluginClient, type OnboardingAnalysis } from './core.js';
 import { TransportError } from '../../obsidian-plugin/src/core/transport.js';
 
 export type HeadlessRequest = {
@@ -19,6 +19,29 @@ export type HeadlessEvent =
 export type HeadlessMessage = HeadlessResponse | HeadlessEvent;
 
 const MAX_INDEX_DELTA_PAGE_BYTES = 480 * 1024;
+
+function projectState(state: LocalPluginState): LocalPluginState {
+  return {
+    user_id: state.user_id,
+    vault_id: state.vault_id,
+    device_id: state.device_id,
+    ...(state.device_name === undefined ? {} : { device_name: state.device_name }),
+    device_ref: state.device_ref,
+    server_device_ref: state.server_device_ref,
+    local_main: state.local_main,
+    local_head: state.local_head,
+    initial_import_confirmed: state.initial_import_confirmed,
+    status_label: state.status_label,
+    last_error_code: state.last_error_code,
+    ...(state.apply_validation_reason === undefined ? {} : { apply_validation_reason: state.apply_validation_reason }),
+    ...(state.last_error_details === undefined ? {} : { last_error_details: state.last_error_details }),
+    last_event_seq: state.last_event_seq,
+    last_applied_event_seq: state.last_applied_event_seq,
+    ...(state.unpaired_baseline_vault_id === undefined ? {} : { unpaired_baseline_vault_id: state.unpaired_baseline_vault_id }),
+    ...(state.unpaired_baseline_main === undefined ? {} : { unpaired_baseline_main: state.unpaired_baseline_main }),
+    updated_at: state.updated_at
+  };
+}
 
 type IndexDeltaPage = IndexDelta & {
   next_cursor: number | null;
@@ -72,7 +95,7 @@ export class HeadlessSession {
       void this.emitMessage({ type: 'event', event: 'progress', status, diagnosticPoint });
     });
     await this.client.initialize();
-    await this.emitMessage({ type: 'event', event: 'ready', state: await this.client.readState() });
+    await this.emitMessage({ type: 'event', event: 'ready', state: projectState(await this.client.readState()) });
   }
 
   submit(value: unknown): Promise<void> {
@@ -96,7 +119,7 @@ export class HeadlessSession {
       try {
         const { result, stateChanged, shouldStop } = await this.dispatch(request);
         if (stateChanged) {
-          await this.emitMessage({ type: 'event', event: 'state', state: await this.client.readState() });
+          await this.emitMessage({ type: 'event', event: 'state', state: projectState(await this.client.readState()) });
         }
         await this.emitMessage({ type: 'response', id: request.id, ok: true, result });
         if (shouldStop) this.stopping = true;
@@ -118,7 +141,7 @@ export class HeadlessSession {
   private async dispatch(request: HeadlessRequest): Promise<{ result: unknown; stateChanged: boolean; shouldStop?: boolean }> {
     switch (request.command) {
       case 'read-state':
-        return { result: await this.client.readState(), stateChanged: false };
+        return { result: projectState(await this.client.readState()), stateChanged: false };
       case 'read-queue':
         return { result: await this.client.readQueue(), stateChanged: false };
       case 'read-pending-onboarding':
