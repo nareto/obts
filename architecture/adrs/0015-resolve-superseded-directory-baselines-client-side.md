@@ -27,6 +27,8 @@ Extend the client's `recoverStaleDirectoryProposalBase` flow with a deterministi
 4. **Apply.** `applyTargetMain` materializes the new server main (which preserves local content and directory work under the existing contracts), moves both refs, and writes the applied-snapshot acknowledgement.
 5. **Rebuild.** The directory intents are rebuilt from the current disk state against the new snapshot: satisfied intents disappear (their goal already holds server-side), satisfiable intents are rebased onto the new main with a fresh base, and the flow then re-enters the normal sync tail (checkpoint removal, queue reset, error clear).
 
+The journal's pivot intent (target main and recovered cursors) is authoritative; the advanced payload — explicit directories, intents, and bounded target sizes — is re-derived from the server whenever the advanced apply is not yet committed, so an interrupted, superseded, or older-format pivot resumes deterministically instead of stalling or discarding files.
+
 Any precondition failure — content in the queued commit, divergent server history, a bad manifest — fails closed exactly as before.
 
 ## Constraints

@@ -6672,6 +6672,91 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(healedDevice?.last_applied_main).not.toBe(initialPhoneState.local_main);
   });
 
+  it('resumes an interrupted stale baseline pivot recorded in an older journal format', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const phoneDir = join(root, 'stale-advanced-resume-phone');
+    const writerDir = join(root, 'stale-advanced-resume-writer');
+    await mkdirp(phoneDir);
+    await mkdirp(writerDir);
+    const phone = await pairPlugin(admin, phoneDir, 'stale-advanced-resume-phone');
+    const initialPhoneState = await phone.readState();
+    const writer = await pairPlugin(admin, writerDir, 'stale-advanced-resume-writer');
+    await writeFile(join(writerDir, 'remote.md'), 'remote canonical change\n');
+    await mkdirp(join(writerDir, 'Shared Empty Dir'));
+    expect((await writer.syncOnce()).status).toBe('Synced');
+    await writeFile(join(writerDir, 'remote.md'), 'remote canonical change two\n');
+    expect((await writer.syncOnce()).status).toBe('Synced');
+    expect((await phone.pollRemoteEventsAndApply()).applied).toBe(true);
+
+    const phoneCore = (phone as unknown as { client: Record<string, any> }).client;
+    const appliedState = await phone.readState();
+    expect(appliedState.local_main).not.toBe(initialPhoneState.local_main);
+    await server.store.mutate((db) => {
+      const device = db.devices.find((candidate) => candidate.device_id === appliedState.device_id);
+      if (!device) throw new Error('phone device disappeared');
+      device.last_applied_main = initialPhoneState.local_main;
+      device.last_applied_event_seq = initialPhoneState.last_applied_event_seq;
+      device.last_applied_explicit_dirs = [];
+      device.pending_applied_main = null;
+      device.pending_applied_event_seq = 0;
+      device.pending_applied_explicit_dirs = null;
+    });
+
+    await rm(join(phoneDir, 'Shared Empty Dir'), { recursive: true });
+    const bumpedCursor = appliedState.last_applied_event_seq + 1;
+    await writeFile(join(phoneDir, '.obts', 'state.json'), `${JSON.stringify({
+      ...appliedState,
+      last_event_seq: bumpedCursor,
+      last_applied_event_seq: bumpedCursor
+    }, null, 2)}\n`);
+    await expect(phone.syncOnce()).rejects.toMatchObject({ code: 'stale_directory_proposal_base' });
+
+    // The writer deletes the same directory: the server main advances with a real
+    // directory change, which is what supersedes the queued proposal.
+    await rm(join(writerDir, 'Shared Empty Dir'), { recursive: true });
+    expect((await writer.syncOnce()).status).toBe('Synced');
+
+    // Interrupt the pivot after it has recorded the advance but before it applies it, as
+    // the earlier client did when it could not bound the target file sizes.
+    const originalApplyTargetMain = phoneCore.applyTargetMain.bind(phoneCore);
+    let interrupted = false;
+    phoneCore.applyTargetMain = async (...args: unknown[]) => {
+      if (!interrupted) {
+        interrupted = true;
+        throw new Error('simulated interrupted baseline apply');
+      }
+      return await originalApplyTargetMain(...args);
+    };
+    await expect(phone.syncOnce()).rejects.toThrow('simulated interrupted baseline apply');
+    phoneCore.applyTargetMain = originalApplyTargetMain;
+
+    const recoveryPath = join(phoneDir, '.obts', 'directory-baseline-recovery.json');
+    const recorded = JSON.parse(await readFile(recoveryPath, 'utf8')) as Record<string, unknown>;
+    expect(recorded.phase).toBe('main_advanced');
+    expect(recorded.local_main).toBe(appliedState.local_main);
+
+    // Rewrite it in the older journal shape: advanced payload absent, the pre-rename
+    // directory field still in place, refs still at the pre-apply state.
+    const legacyJournal: Record<string, unknown> = { ...recorded };
+    legacyJournal.advanced_explicit_directories = recorded.target_explicit_directories;
+    delete legacyJournal.target_explicit_directories;
+    delete legacyJournal.advanced_directory_intents;
+    delete legacyJournal.advanced_target_file_sizes;
+    await writeFile(recoveryPath, `${JSON.stringify(legacyJournal, null, 2)}\n`);
+
+    await expect(phone.syncOnce()).resolves.toMatchObject({ status: 'Synced' });
+    expect(await phone.readQueue()).toMatchObject({ pending_commit: null, status: 'idle' });
+    expect(await phone.readState()).toMatchObject({ last_error_code: null, local_head: expect.stringMatching(/^[0-9a-f]{40}$/u) });
+    expect(JSON.parse(await readFile(join(phoneDir, '.obts', 'directory-state.json'), 'utf8'))).toMatchObject({
+      pending_intents: []
+    });
+    await expect(stat(recoveryPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(stat(join(phoneDir, '.obts', 'upload-transfer.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    const resumedDevice = (await server.store.snapshot()).devices.find((device) => device.device_id === appliedState.device_id);
+    expect(resumedDevice?.last_applied_event_seq).toBeGreaterThan(initialPhoneState.last_applied_event_seq);
+    expect(resumedDevice?.last_applied_main).not.toBe(initialPhoneState.local_main);
+  });
+
   it('fails closed when the superseded baseline carries content in the queued commit', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const phoneDir = join(root, 'stale-advanced-content-phone');

@@ -21990,7 +21990,7 @@ var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_da
 var { createByteBudget, runBoundedWork } = require_work_pool();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.7";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.8";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_INVENTORY_INTERVAL_MS = 6 * 60 * 60 * 1e3;
@@ -28802,6 +28802,75 @@ var ObtsObsidianClient = class {
     this.queueMutation = run.then(() => void 0, () => void 0);
     return await run;
   }
+  // Issue #23. A retained completed pull checkpoint that points at a commit other than
+  // local main is residue from a superseded pivot attempt; the recovery never applies such
+  // a target, so it must not constrain the next attempt. The proof pull's own residue is
+  // retired once the device cursor already covers it.
+  async discardRecoveryPullCheckpoint(state) {
+    const checkpoint = await readJson(this.fsp, this.pullTransferPath, null);
+    if (!isCompletePullCheckpoint(checkpoint)) return;
+    if (checkpoint.vault_id !== state.vault_id || checkpoint.device_id !== state.device_id) return;
+    const coversLocalMain = checkpoint.target_main === state.local_main && (state.last_applied_event_seq || 0) >= checkpoint.manifest.event_seq;
+    if (checkpoint.target_main !== state.local_main || coversLocalMain) {
+      await this.fsp.rm(this.pullTransferPath, { force: true });
+    }
+  }
+  // Claim the current server main as the replacement baseline for a superseded directory
+  // proposal. The pivot intent recorded in the journal (target main, recovered cursors) is
+  // authoritative; the advanced payload -- explicit directories, intents, and bounded
+  // target sizes -- is re-derived here from the server so an interrupted, superseded, or
+  // older-format pivot resumes deterministically instead of stalling or discarding files.
+  async claimAdvancedBaseline(state, queue, token, serverDevice, journal) {
+    await this.discardRecoveryPullCheckpoint(state);
+    let advanced;
+    try {
+      advanced = await this.pull(
+        state.vault_id,
+        state.device_id,
+        token,
+        state.local_main,
+        "latest",
+        serverDevice.last_applied_event_seq
+      );
+    } catch (error) {
+      throw new ObtsBlockedError(
+        "directory_baseline_recovery_unsafe",
+        "The server could not deliver a current authoritative baseline while repairing the stale proposal base."
+      );
+    }
+    const pivotChecks = [
+      ["target_oid", isGitObjectId(advanced.manifest.target_main)],
+      ["target_commit_missing", await this.commitExists(advanced.manifest.target_main)],
+      ["target_is_local_head", advanced.manifest.target_main !== state.local_head],
+      ["not_linear", await this.isAncestor(state.local_main, advanced.manifest.target_main)],
+      ["event_seq_type", Number.isSafeInteger(advanced.manifest.event_seq)],
+      ["event_seq_behind_device", advanced.manifest.event_seq >= serverDevice.last_applied_event_seq],
+      ["event_seq_behind_journal", advanced.manifest.event_seq >= journal.last_applied_event_seq],
+      ["explicit_dirs_type", Array.isArray(advanced.manifest.explicit_directories)],
+      ["directory_intents_type", Array.isArray(advanced.manifest.directory_intents)],
+      ["bounded_target_sizes", isTargetFileSizeMap(advanced.manifest.target_file_sizes)],
+      ["pending_has_content", await this.sameCommitTree(queue.pending_commit, state.local_main)]
+    ];
+    const failedPivotCheck = (await Promise.all(pivotChecks.map(async (entry) => [entry[0], Boolean(await entry[1])]))).find(([, ok]) => !ok);
+    if (failedPivotCheck) {
+      throw new ObtsBlockedError(
+        "directory_baseline_recovery_unsafe",
+        "The server main diverged from the proposal base or the queued commit carries content; baseline repair cannot resolve it locally."
+      );
+    }
+    const claimed = Object.assign({}, journal, {
+      phase: "main_advanced",
+      target_main: advanced.manifest.target_main,
+      target_explicit_directories: Array.from(new Set(advanced.manifest.explicit_directories)).sort(),
+      advanced_directory_intents: compactDirectoryIntents(advanced.manifest.directory_intents),
+      advanced_target_file_sizes: Object.assign({}, advanced.manifest.target_file_sizes),
+      recovered_event_seq: advanced.manifest.event_seq,
+      recovered_server_device_ref: serverDevice.server_device_ref,
+      updated_at: nowIso()
+    });
+    await writeJson(this.fsp, this.directoryBaselineRecoveryPath, claimed);
+    return claimed;
+  }
   async recoverStaleDirectoryProposalBase() {
     const state = await this.readState();
     const queue = await this.readQueue();
@@ -28874,7 +28943,7 @@ var ObtsObsidianClient = class {
       journal.rejected_plan_sha256
     ];
     const checkpointJournalFieldsComplete = checkpointJournalFields.every((value) => value === null) || checkpointJournalFields.every((value) => typeof value === "string");
-    if (journal.version !== 1 || !["planned", "snapshot_proven", "baseline_acknowledged", "main_advanced"].includes(journal.phase) || journal.vault_id !== state.vault_id || journal.device_id !== state.device_id || !Number.isSafeInteger(journal.last_event_seq) || journal.last_event_seq < 0 || !Number.isSafeInteger(journal.last_applied_event_seq) || journal.last_applied_event_seq < 0 || !(journal.server_device_ref === null || isGitObjectId(journal.server_device_ref)) || !(journal.recovered_server_device_ref === null || isGitObjectId(journal.recovered_server_device_ref)) || !(journal.recovered_event_seq === null || Number.isSafeInteger(journal.recovered_event_seq) && journal.recovered_event_seq >= 0) || (journal.phase === "main_advanced" ? state.local_main !== journal.local_main && state.local_main !== journal.target_main || state.local_head !== journal.local_head && state.local_head !== journal.target_main : journal.local_main !== state.local_main || journal.local_head !== state.local_head) || journal.pending_commit !== queue.pending_commit || !allowedServerDeviceRefs.has(state.server_device_ref) || journal.last_event_seq > (state.last_event_seq || 0) || !allowedAppliedCursors.has(state.last_applied_event_seq || 0) || !Array.isArray(journal.original_pending_intents) || journal.original_pending_intents.some((intent) => !isStoredDirectoryIntent(intent)) || typeof journal.checkpoint_removal_authorized !== "boolean" || !checkpointJournalFieldsComplete || !(journal.rejected_transfer_id === null || typeof journal.rejected_transfer_id === "string" && /^trn_[A-Za-z0-9]+$/u.test(journal.rejected_transfer_id)) || !(journal.rejected_checkpoint_identity === null || typeof journal.rejected_checkpoint_identity === "string" && /^[0-9a-f]{64}$/u.test(journal.rejected_checkpoint_identity)) || !(journal.rejected_attempt_id === null || typeof journal.rejected_attempt_id === "string" && /^[A-Za-z0-9_-]{8,128}$/u.test(journal.rejected_attempt_id)) || !(journal.rejected_plan_sha256 === null || typeof journal.rejected_plan_sha256 === "string" && /^[0-9a-f]{64}$/u.test(journal.rejected_plan_sha256)) || journal.phase === "planned" && (journal.recovered_event_seq !== null || journal.recovered_server_device_ref !== null || journal.checkpoint_removal_authorized) || journal.phase === "snapshot_proven" && (journal.recovered_event_seq === null || journal.checkpoint_removal_authorized) || journal.phase === "baseline_acknowledged" && journal.recovered_event_seq === null || journal.phase === "main_advanced" && (journal.recovered_event_seq === null || journal.recovered_server_device_ref === null || !isGitObjectId(journal.target_main) || !Array.isArray(journal.target_explicit_directories) || journal.target_explicit_directories.some((dirPath) => typeof dirPath !== "string") || !Array.isArray(journal.advanced_directory_intents) || journal.advanced_directory_intents.some((intent) => !isStoredDirectoryIntent(intent)) || journal.checkpoint_removal_authorized)) {
+    if (journal.version !== 1 || !["planned", "snapshot_proven", "baseline_acknowledged", "main_advanced"].includes(journal.phase) || journal.vault_id !== state.vault_id || journal.device_id !== state.device_id || !Number.isSafeInteger(journal.last_event_seq) || journal.last_event_seq < 0 || !Number.isSafeInteger(journal.last_applied_event_seq) || journal.last_applied_event_seq < 0 || !(journal.server_device_ref === null || isGitObjectId(journal.server_device_ref)) || !(journal.recovered_server_device_ref === null || isGitObjectId(journal.recovered_server_device_ref)) || !(journal.recovered_event_seq === null || Number.isSafeInteger(journal.recovered_event_seq) && journal.recovered_event_seq >= 0) || (journal.phase === "main_advanced" ? state.local_main !== journal.local_main && state.local_main !== journal.target_main || state.local_head !== journal.local_head && state.local_head !== journal.target_main : journal.local_main !== state.local_main || journal.local_head !== state.local_head) || journal.pending_commit !== queue.pending_commit || !allowedServerDeviceRefs.has(state.server_device_ref) || journal.last_event_seq > (state.last_event_seq || 0) || !allowedAppliedCursors.has(state.last_applied_event_seq || 0) || !Array.isArray(journal.original_pending_intents) || journal.original_pending_intents.some((intent) => !isStoredDirectoryIntent(intent)) || typeof journal.checkpoint_removal_authorized !== "boolean" || !checkpointJournalFieldsComplete || !(journal.rejected_transfer_id === null || typeof journal.rejected_transfer_id === "string" && /^trn_[A-Za-z0-9]+$/u.test(journal.rejected_transfer_id)) || !(journal.rejected_checkpoint_identity === null || typeof journal.rejected_checkpoint_identity === "string" && /^[0-9a-f]{64}$/u.test(journal.rejected_checkpoint_identity)) || !(journal.rejected_attempt_id === null || typeof journal.rejected_attempt_id === "string" && /^[A-Za-z0-9_-]{8,128}$/u.test(journal.rejected_attempt_id)) || !(journal.rejected_plan_sha256 === null || typeof journal.rejected_plan_sha256 === "string" && /^[0-9a-f]{64}$/u.test(journal.rejected_plan_sha256)) || journal.phase === "planned" && (journal.recovered_event_seq !== null || journal.recovered_server_device_ref !== null || journal.checkpoint_removal_authorized) || journal.phase === "snapshot_proven" && (journal.recovered_event_seq === null || journal.checkpoint_removal_authorized) || journal.phase === "baseline_acknowledged" && journal.recovered_event_seq === null || journal.phase === "main_advanced" && (journal.recovered_event_seq === null || !isGitObjectId(journal.target_main) || journal.checkpoint_removal_authorized)) {
       throw new ObtsBlockedError(
         "directory_baseline_recovery_journal_invalid",
         "The directory baseline recovery journal does not match the protected refs, cursors, queue, and intent evidence."
@@ -28906,6 +28975,7 @@ var ObtsObsidianClient = class {
         "The server-acknowledged device baseline is not a trusted ancestor of local main."
       );
     }
+    await this.discardRecoveryPullCheckpoint(state);
     const pulled = await this.pull(
       state.vault_id,
       state.device_id,
@@ -28919,56 +28989,7 @@ var ObtsObsidianClient = class {
     let baselineEventSeq;
     if (proofEventSeqStale) {
       if (journal.phase === "planned") {
-        let advanced;
-        try {
-          const stalePullCheckpoint = await readJson(this.fsp, this.pullTransferPath, null);
-          if (isCompletePullCheckpoint(stalePullCheckpoint) && stalePullCheckpoint.target_main === state.local_main && (state.last_applied_event_seq || 0) >= stalePullCheckpoint.manifest.event_seq) {
-            await this.fsp.rm(this.pullTransferPath, { force: true });
-          }
-          advanced = await this.pull(
-            state.vault_id,
-            state.device_id,
-            token,
-            state.local_main,
-            "latest",
-            serverDevice.last_applied_event_seq
-          );
-        } catch (error) {
-          throw new ObtsBlockedError(
-            "directory_baseline_recovery_unsafe",
-            "The server could not deliver a current authoritative baseline while repairing the stale proposal base."
-          );
-        }
-        const pivotChecks = [
-          ["target_oid", isGitObjectId(advanced.manifest.target_main)],
-          ["target_commit_missing", await this.commitExists(advanced.manifest.target_main)],
-          ["target_is_local_head", advanced.manifest.target_main !== state.local_head],
-          ["not_linear", await this.isAncestor(state.local_main, advanced.manifest.target_main)],
-          ["event_seq_type", Number.isSafeInteger(advanced.manifest.event_seq)],
-          ["event_seq_behind_device", advanced.manifest.event_seq >= serverDevice.last_applied_event_seq],
-          ["event_seq_behind_journal", advanced.manifest.event_seq >= journal.last_applied_event_seq],
-          ["explicit_dirs_type", Array.isArray(advanced.manifest.explicit_directories)],
-          ["directory_intents_type", Array.isArray(advanced.manifest.directory_intents)],
-          ["pending_has_content", await this.sameCommitTree(queue.pending_commit, state.local_main)]
-        ];
-        const failedPivotCheck = (await Promise.all(pivotChecks.map(async (entry) => [entry[0], Boolean(await entry[1])]))).find(([, ok]) => !ok);
-        if (failedPivotCheck) {
-          throw new ObtsBlockedError(
-            "directory_baseline_recovery_unsafe",
-            "The server main diverged from the proposal base or the queued commit carries content; baseline repair cannot resolve it locally."
-          );
-        }
-        journal = Object.assign({}, journal, {
-          phase: "main_advanced",
-          target_main: advanced.manifest.target_main,
-          advanced_explicit_directories: Array.from(new Set(advanced.manifest.explicit_directories)).sort(),
-          advanced_directory_intents: compactDirectoryIntents(advanced.manifest.directory_intents),
-          advanced_target_file_sizes: isTargetFileSizeMap(advanced.manifest.target_file_sizes) ? Object.assign({}, advanced.manifest.target_file_sizes) : {},
-          recovered_event_seq: advanced.manifest.event_seq,
-          recovered_server_device_ref: serverDevice.server_device_ref,
-          updated_at: nowIso()
-        });
-        await writeJson(this.fsp, this.directoryBaselineRecoveryPath, journal);
+        journal = await this.claimAdvancedBaseline(state, queue, token, serverDevice, journal);
       } else if (journal.phase !== "main_advanced") {
         throw new ObtsBlockedError(
           "directory_baseline_recovery_unsafe",
@@ -28988,19 +29009,24 @@ var ObtsObsidianClient = class {
         updated_at: nowIso()
       }));
       await this.retryPendingAppliedAcknowledgement();
-      await this.applyTargetMain(
-        journal.target_main,
-        [],
-        true,
-        [],
-        false,
-        journal.advanced_directory_intents,
-        journal.advanced_explicit_directories,
-        journal.recovered_event_seq,
-        false,
-        null,
-        journal.advanced_target_file_sizes || {}
-      );
+      const advancedMainCommitted = await this.resolveRef("refs/heads/main") === journal.target_main;
+      const advancedPayloadComplete = Array.isArray(journal.target_explicit_directories) && Array.isArray(journal.advanced_directory_intents) && isTargetFileSizeMap(journal.advanced_target_file_sizes);
+      if (!advancedMainCommitted || !advancedPayloadComplete) {
+        journal = await this.claimAdvancedBaseline(state, queue, token, serverDevice, journal);
+        await this.applyTargetMain(
+          journal.target_main,
+          [],
+          true,
+          [],
+          false,
+          journal.advanced_directory_intents,
+          journal.target_explicit_directories,
+          journal.recovered_event_seq,
+          false,
+          null,
+          journal.advanced_target_file_sizes || {}
+        );
+      }
       if (await this.resolveRef("refs/heads/local") !== journal.target_main) {
         await this.updateRef("refs/heads/local", journal.target_main, null, true);
       }
@@ -29015,7 +29041,7 @@ var ObtsObsidianClient = class {
         }));
       }
       await this.acknowledgeAppliedMain(journal.target_main);
-      baselineExplicitDirs = journal.advanced_explicit_directories;
+      baselineExplicitDirs = journal.target_explicit_directories;
       baselineEventSeq = journal.recovered_event_seq;
     } else {
       if (!Number.isSafeInteger(pulled.manifest.event_seq) || pulled.manifest.event_seq < serverDevice.last_applied_event_seq || pulled.manifest.event_seq < journal.last_applied_event_seq || !Array.isArray(pulled.manifest.explicit_directories)) {
