@@ -52,6 +52,12 @@ The fixture producer, generation command, included durable artifacts, and checks
 
 Supported platforms require representative filesystem and application-lifecycle exercises. Mobile force-close coverage is mandatory; sudden-power-loss claims require separate storage evidence and cannot be inferred from process kill alone.
 
+## Validation Cadence And Evidence Classes
+
+Development validation is scoped: use `npm run test:fast` and focused suites while iterating. CI selects executable tests, formal families, and Rust unit tests from the exact trusted commit range; core, tooling, unknown, and cross-cutting changes fall back to broad validation. A main-branch publication candidate is selected against the immutable commit of the latest successful plugin release, so an earlier failed/cancelled core change remains in scope. Missing or non-ancestor release baselines force full selection and prevent publication until release policy can be checked against a trusted baseline. Weekly and manual validation run the full suite.
+
+These evidence classes are distinct: metadata validation checks checker manifests and recorded formal evidence without running TLC; a selected formal family runs the full TLC matrix for that family; executable tests validate implementation behavior; operator-assisted/device/deployment evidence remains separate. Skipped checks are acceptable only when the selector explicitly marked that category unselected. The aggregate publication gate requires success for every selected build, executable, checker, formal, and Rust job. The separate N-1 compatibility workflow remains visible and is not represented as awaited by this gate.
+
 ## Formal Methods
 
 TLA+/PlusCal is an optional bounded technique inside the architecture model set. Adopt a model only when it:

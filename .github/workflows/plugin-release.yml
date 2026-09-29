@@ -1,82 +1,261 @@
-name: Plugin release
+name: Validation and plugin release
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      base: ${{ steps.select.outputs.base }}
+      executable: ${{ steps.select.outputs.executable }}
+      families: ${{ steps.select.outputs.families }}
+      rust: ${{ steps.select.outputs.rust }}
+      full: ${{ steps.select.outputs.full }}
+      publication: ${{ steps.select.outputs.publication }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Select validation against trusted history
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_BEFORE: ${{ github.event.before }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_HEAD: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          publication=false
+          full=false
+          if [[ "$EVENT_NAME" == schedule || "$EVENT_NAME" == workflow_dispatch ]]; then full=true; fi
+          if [[ ( "$EVENT_NAME" == push && "$EVENT_REF" == refs/heads/main ) || ( "$EVENT_NAME" == workflow_dispatch && "$EVENT_REF" == refs/heads/main ) ]]; then
+            publication=true
+          fi
+          release_base=""
+          if [[ "$publication" == true ]]; then
+            if tag="$(gh release view --json tagName --jq .tagName 2>/dev/null)"; then
+              release_base="$(git rev-parse --verify "refs/tags/${tag}^{commit}" 2>/dev/null || true)"
+            fi
+          fi
+          EVENT_NAME="$EVENT_NAME" EVENT_BEFORE="${EVENT_BEFORE:-}" EVENT_BASE_SHA="${EVENT_BASE_SHA:-}" EVENT_HEAD="$EVENT_HEAD" RELEASE_BASE="$release_base" PUBLICATION="$publication" FULL="$full" node scripts/validation-baseline.mjs > tmp-baseline.json
+          base="$(node -p 'JSON.parse(require("node:fs").readFileSync("tmp-baseline.json","utf8")).base')"
+          full="$(node -p 'JSON.parse(require("node:fs").readFileSync("tmp-baseline.json","utf8")).full')"
+          if [[ "$full" == true ]]; then
+            node scripts/select-validation.mjs --full > tmp-plan.json
+          elif [[ -n "$base" && "$EVENT_NAME" == push ]]; then
+            node scripts/select-validation.mjs --exact-base --base "$base" --head "$EVENT_HEAD" > tmp-plan.json
+          elif [[ -n "$base" ]]; then
+            node scripts/select-validation.mjs --base "$base" --head "$EVENT_HEAD" > tmp-plan.json
+          else
+            node scripts/select-validation.mjs --base '' --head "$EVENT_HEAD" > tmp-plan.json
+          fi
+          BASE_SHA="$base" FULL="$full" PUBLICATION="$publication" node -e 'const fs=require("node:fs");const p=JSON.parse(fs.readFileSync("tmp-plan.json","utf8"));const out=process.env.GITHUB_OUTPUT;fs.appendFileSync(out,`base=${process.env.BASE_SHA || ""}\nexecutable=${p.executableGroup}\nfamilies=${JSON.stringify(p.formalFamilies)}\nrust=${p.rustUnitTestsRequired}\nfull=${process.env.FULL}\npublication=${process.env.PUBLICATION}\n`);'
+
+  build:
+    needs: plan
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: Check plugin freshness before generation
+        run: npm run build:plugin:check
+      - name: Build once
+        run: npm run build
+      - name: Record immutable artifact identity
+        run: node scripts/validation-artifact.mjs write "$GITHUB_SHA"
+      - uses: actions/upload-artifact@v4
+        id: upload
+        with:
+          name: validated-build-${{ github.sha }}
+          path: |
+            dist/
+            obsidian-plugin/main.js
+            obsidian-plugin/manifest.json
+            obsidian-plugin/styles.css
+            tmp/validation-artifact.json
+          if-no-files-found: error
+          retention-days: 7
+
+  executable:
+    needs: [plan, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
           cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          path: .
+          merge-multiple: true
+      - name: Verify exact tested build artifact
+        run: node scripts/validation-artifact.mjs verify "$GITHUB_SHA"
+      - name: Run selected executable tests
+        env:
+          GROUP: ${{ needs.plan.outputs.executable }}
+        run: |
+          set -euo pipefail
+          mkdir -p tmp
+          if [[ "$GROUP" == all ]]; then GROUP=ci-all; fi
+          VITEST_GROUP="$GROUP" npx vitest run --reporter=default --reporter=json --outputFile=tmp/vitest-report.json
+      - name: Upload test timing report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitest-report-${{ github.sha }}
+          path: tmp/vitest-report.json
+          if-no-files-found: warn
+          retention-days: 14
 
+  checker:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
-
-      - name: Install pinned TLA+ tools
-        run: |
-          set -euo pipefail
-          curl -fsSL -o "${RUNNER_TEMP}/tla2tools.jar" \
-            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
-          echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  ${RUNNER_TEMP}/tla2tools.jar" | sha256sum -c -
-          echo "TLA2TOOLS_JAR=${RUNNER_TEMP}/tla2tools.jar" >> "$GITHUB_ENV"
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Enforce plugin release policy
+      - run: npm ci
+      - name: Validate checker regression and metadata gates once
+        run: VITEST_GROUP=checker npx vitest run && npm run test:formal:metadata
+      - name: Enforce plugin version policy from trusted comparison base
+        if: needs.plan.outputs.publication == 'true' || needs.plan.outputs.base != ''
         env:
-          PUSH_BEFORE: ${{ github.event.before }}
+          CHANGE_BASE: ${{ needs.plan.outputs.base }}
+          PUBLICATION: ${{ needs.plan.outputs.publication }}
         run: |
           set -euo pipefail
-          base="${PUSH_BEFORE:-}"
-          if [[ -z "$base" || "$base" =~ ^0+$ ]] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
-            base="$(git rev-parse HEAD^)"
+          if [[ -z "$CHANGE_BASE" ]]; then
+            if [[ "$PUBLICATION" == true ]]; then echo 'No trusted plugin-policy baseline; publication is blocked.' >&2; exit 1; fi
+            echo 'No trusted plugin-policy baseline; full validation proceeds without version-policy comparison.'
+            exit 0
           fi
-          node scripts/check-plugin-release.mjs "$base" HEAD
+          git merge-base --is-ancestor "$CHANGE_BASE" "$GITHUB_SHA"
+          node scripts/check-plugin-release.mjs "$CHANGE_BASE" "$GITHUB_SHA"
 
-      - name: Read plugin version
+  formal:
+    needs: [plan, build]
+    if: ${{ needs.plan.outputs.families != '[]' }}
+    uses: ./.github/workflows/formal-model.yml
+    with:
+      families: ${{ needs.plan.outputs.families }}
+
+  rust:
+    needs: plan
+    if: ${{ needs.plan.outputs.rust == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: cargo test --workspace --locked
+
+  gate:
+    if: always()
+    needs: [plan, build, executable, checker, formal, rust]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Require every selected job to succeed
+        env:
+          EXECUTABLE_GROUP: ${{ needs.plan.outputs.executable }}
+          FORMAL_FAMILIES: ${{ needs.plan.outputs.families }}
+          RUST_REQUIRED: ${{ needs.plan.outputs.rust }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          EXECUTABLE_RESULT: ${{ needs.executable.result }}
+          CHECKER_RESULT: ${{ needs.checker.result }}
+          FORMAL_RESULT: ${{ needs.formal.result }}
+          RUST_RESULT: ${{ needs.rust.result }}
+        run: node scripts/validation-gate.mjs
+
+  release:
+    needs: [plan, build, gate]
+    if: ${{ needs.gate.result == 'success' && needs.plan.outputs.publication == 'true' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: plugin-publication
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          path: .
+          merge-multiple: true
+      - name: Verify exact tested artifact and release baseline
+        env:
+          RELEASE_BASE: ${{ needs.plan.outputs.base }}
+        run: |
+          set -euo pipefail
+          node scripts/validation-artifact.mjs verify "$GITHUB_SHA"
+          test -n "$RELEASE_BASE"
+          git merge-base --is-ancestor "$RELEASE_BASE" "$GITHUB_SHA"
+      - name: Recheck serialized publication against the latest release
         id: version
         run: |
           set -euo pipefail
           version="$(node -p 'require("./obsidian-plugin/manifest.json").version')"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          if gh release view "$version" >/dev/null 2>&1; then
-            echo "needed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "needed=true" >> "$GITHUB_OUTPUT"
+          latest_tag="$(gh release view --json tagName --jq .tagName)"
+          git fetch --no-tags origin "refs/tags/${latest_tag}"
+          git merge-base --is-ancestor FETCH_HEAD "$GITHUB_SHA" || { echo 'A newer or divergent release already exists; refusing stale publication.' >&2; exit 1; }
+          needed="$(node scripts/validation-baseline.mjs --publication-needed "$version" "$latest_tag")"
+          if [[ "$needed" == false ]]; then
+            released="$(mktemp -d "$RUNNER_TEMP/published-plugin.XXXXXX")"
+            gh release download "$version" --dir "$released" --pattern main.js --pattern manifest.json --pattern styles.css
+            node scripts/validation-artifact.mjs compare-release "$released"
           fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "needed=$needed" >> "$GITHUB_OUTPUT"
         env:
           GH_TOKEN: ${{ github.token }}
-
-      - name: Test release candidate
-        if: steps.version.outputs.needed == 'true'
-        run: npm test
-
-      - name: Create release
+      - name: Publish tested plugin artifact
         if: steps.version.outputs.needed == 'true'
         run: |
-          set -euo pipefail
           version="${{ steps.version.outputs.version }}"
-          gh release create "$version" \
-            obsidian-plugin/main.js \
-            obsidian-plugin/manifest.json \
-            obsidian-plugin/styles.css \
-            --target "$GITHUB_SHA" \
-            --title "$version" \
-            --generate-notes
+          gh release create "$version" obsidian-plugin/main.js obsidian-plugin/manifest.json obsidian-plugin/styles.css --target "$GITHUB_SHA" --title "$version" --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}

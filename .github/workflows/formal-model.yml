@@ -1,23 +1,36 @@
-name: Formal model verification
+name: Formal model families
 
 on:
-  push:
+  workflow_call:
+    inputs:
+      families:
+        required: true
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
-  formal-model:
+  formal:
+    if: ${{ inputs.families != '[]' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        family: ${{ fromJSON(inputs.families) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-
+          cache: npm
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
-
       - name: Install pinned TLA+ tools
         run: |
           set -euo pipefail
@@ -25,12 +38,19 @@ jobs:
             https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
           echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  ${RUNNER_TEMP}/tla2tools.jar" | sha256sum -c -
           echo "TLA2TOOLS_JAR=${RUNNER_TEMP}/tla2tools.jar" >> "$GITHUB_ENV"
-
-      - name: Install checker test dependencies
-        run: npm ci
-
-      - name: Validate formal checker failure gates
-        run: npx vitest run tests/formal-checker.test.ts tests/formal-bounded-body.test.ts tests/formal-embedding-worker.test.ts
-
-      - name: Check bounded safety, liveness, reachability, candidates, and negative controls
-        run: npm run test:formal
+      - run: npm ci
+      - name: Run complete formal family
+        env:
+          FAMILY: ${{ matrix.family }}
+        run: |
+          case "$FAMILY" in
+            sync) npm run test:formal:sync ;;
+            bridge-body) npm run test:formal:bridge-body ;;
+            workers) npm run test:formal:workers ;;
+            deletion) npm run test:formal:deletion ;;
+            bridge-protocol) npm run test:formal:bridge-protocol ;;
+            onboarding) npm run test:formal:onboarding ;;
+            diagnostics) npm run test:formal:diagnostics ;;
+            client-state) npm run test:formal:client-state ;;
+            *) echo "Unknown formal family: $FAMILY" >&2; exit 1 ;;
+          esac

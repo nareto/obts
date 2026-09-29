@@ -125,7 +125,7 @@ Requirements:
 
 ```sh
 npm ci
-npm test
+npm run test:fast
 npm run build
 
 export OBTS_DATA_DIR="$PWD/.obts-server"
@@ -137,16 +137,25 @@ node dist/src/cli.js serve
 Useful commands:
 
 ```sh
-npm run check       # TypeScript and dashboard build checks
-npm test            # Full Vitest suite
-npm run build       # Dashboard, plugin, and server build
-just plugin-version patch  # Select and build the next plugin release
-just arch           # Render and serve the Structurizr architecture model
+npm run check                 # TypeScript and dashboard build checks
+npm run test:fast              # Build-free, bounded-parallel low-risk regression group
+npm run test:integration       # Build prerequisites, then the complementary serial tests
+npm test                       # Build once, then every executable Vitest test; no implicit TLC
+npm run test:all               # Build, all executable tests, and the full formal matrix
+npm run test:formal:metadata   # Cheap formal manifest/trace validation; does not run TLC
+npm run test:formal:sync       # Focused complete formal family (also bridge-body, workers, deletion, bridge-protocol, onboarding, diagnostics, client-state)
+npm run test:plugin-focused    # Build plus fast and plugin/mobile safety regressions
+npm run test:dashboard-focused # Build plus fast and dashboard/deletion/conflict regressions
+npm run build                  # Dashboard, plugin, and server build
+just plugin-version patch      # Select and build the next plugin release
+just arch                      # Render and serve the Structurizr architecture model
 ```
 
 Run `node dist/src/cli.js help` for setup, vault, device, conflict, health, integrity, and local admin-recovery commands. Password-bearing automation should use `--password-env` rather than command-line values.
 
-Plugin releases use `obsidian-plugin/manifest.json` as their canonical version. Run `just setup-hooks` once per checkout; the pre-push hook prevents plugin changes without a version increase. After `just plugin-version patch` (or an explicit version) reaches GitHub `main`, the release workflow tests the build and publishes the BRAT assets automatically.
+The CI selector compares committed base/head revisions only; uncommitted, staged, and untracked local changes are not included. Commit changes before using a selected plan as evidence for them.
+
+Plugin releases use `obsidian-plugin/manifest.json` as their canonical version. Run `just setup-hooks` once per checkout; the pre-push hook prevents plugin changes without a version increase. After `just plugin-version patch` (or an explicit version) reaches GitHub `main`, the coordinating validation workflow selects tests from the commit after the latest successfully published plugin release, builds once, and publishes only the exact same-run artifact for the tested SHA after every selected executable, checker, formal-family, and Rust gate succeeds. A missing/unavailable/non-ancestor release baseline forces full validation and blocks release until the plugin-version policy can be verified against a trusted release. Pull requests and non-main pushes never publish; scheduled and manual full runs validate comprehensively. Publication is serialized and rechecks the latest release's ancestry and version; an existing version succeeds only when its downloaded plugin assets match the tested bytes. Vitest timing JSON is retained as a workflow artifact. The separate N-1 persisted-state compatibility and architecture-sync workflows remain visible checks and are not claimed as prerequisites awaited by plugin publication. Selection is conservative: policy/tooling/core/shared code, test changes, model shared dependencies, and unknown paths fall back to broad validation; isolated formal inputs select their complete family. PostgreSQL/container and real-device/manual evidence remains operator-assisted and is not implied by ordinary Rust tests.
 
 ## What Gets Synchronized?
 
