@@ -21990,7 +21990,7 @@ var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_da
 var { createByteBudget, runBoundedWork } = require_work_pool();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.9";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.10";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_INVENTORY_INTERVAL_MS = 6 * 60 * 60 * 1e3;
@@ -25522,9 +25522,10 @@ var ObtsObsidianClient = class {
       if (pendingAck.target_main !== targetMain && await this.readPendingAppliedAcknowledgement()) throw new ObtsBlockedError("applied_main_acknowledgement_failed", "Settle the previous applied snapshot before another apply.");
     }
     const state = await this.readState();
-    let compactedDirectoryIntents = compactDirectoryIntents(directoryIntents);
-    const explicitDirectorySet = Array.from(new Set(explicitDirectories)).sort();
-    const hasDirectoryWork = await this.hasActionableDirectoryWork(compactedDirectoryIntents, explicitDirectorySet);
+    const targetPolicy = await this.targetApplyPolicy(targetMain);
+    let compactedDirectoryIntents = compactDirectoryIntents(directoryIntents).filter((intent) => isSyncableVaultPath(intent.path) && !targetPolicy.policy.ignores(intent.path, true));
+    const explicitDirectorySet = Array.from(new Set(explicitDirectories)).filter((dirPath) => isSyncableVaultPath(dirPath) && !targetPolicy.policy.ignores(dirPath, true)).sort();
+    const hasDirectoryWork = await this.hasActionableDirectoryWork(compactedDirectoryIntents, explicitDirectorySet, targetPolicy.policy);
     if (state.local_main === targetMain && extraAffectedPaths.length === 0 && !hasDirectoryWork) {
       await this.writePendingAppliedAcknowledgement(targetMain, eventSeq || 0);
       await this.writeState(Object.assign({}, state, {
@@ -25536,7 +25537,6 @@ var ObtsObsidianClient = class {
       }));
       return true;
     }
-    const targetPolicy = await this.targetApplyPolicy(targetMain);
     if (requireCleanVisibleState && !cleanVisibleStateVerified && !await this.ensureNoLocalChangesBeforeApply(state, targetPolicy)) {
       return false;
     }
@@ -25792,7 +25792,8 @@ var ObtsObsidianClient = class {
         preApplyDirectories,
         confirmedDirectoryCtimes,
         removableDirectories,
-        [...journal.local_only_paths, ...journal.deferred_local_paths || []]
+        [...journal.local_only_paths, ...journal.deferred_local_paths || []],
+        targetMain
       );
       journal.phase = "verifying";
       journal.last_completed_step = "files_written";
@@ -25925,7 +25926,8 @@ var ObtsObsidianClient = class {
         new Set(journal.pre_apply_directories || []),
         journal.confirmed_directory_inventory ? Object.fromEntries(journal.confirmed_directory_inventory.directories.map((entry) => [entry.path, entry.creation_time])) : journal.pre_apply_directory_ctimes || {},
         journal.confirmed_directory_inventory ? new Set(journal.confirmed_directory_inventory.directories.map((entry) => entry.path)) : new Set(journal.pre_apply_directories || []),
-        [...journal.local_only_paths || [], ...journal.deferred_local_paths || []]
+        [...journal.local_only_paths || [], ...journal.deferred_local_paths || []],
+        journal.target_main
       );
       const preservedDirectoryIntents = journal.preserve_local_changes ? await this.preserveDirectoryChangesFromTarget(
         targetEntries,
@@ -26070,7 +26072,8 @@ var ObtsObsidianClient = class {
         new Set(journal.pre_apply_directories || []),
         journal.confirmed_directory_inventory ? Object.fromEntries(journal.confirmed_directory_inventory.directories.map((entry) => [entry.path, entry.creation_time])) : journal.pre_apply_directory_ctimes || {},
         journal.confirmed_directory_inventory ? new Set(journal.confirmed_directory_inventory.directories.map((entry) => entry.path)) : new Set(journal.pre_apply_directories || []),
-        [...journal.local_only_paths || [], ...journal.deferred_local_paths || []]
+        [...journal.local_only_paths || [], ...journal.deferred_local_paths || []],
+        journal.target_main
       );
       journal.phase = "verifying";
       journal.last_completed_step = "files_written";
@@ -26339,6 +26342,21 @@ var ObtsObsidianClient = class {
     }
     if (await this.readDurableCatchup()) {
       return;
+    }
+    if (snapshot) {
+      const [targetPolicy, targetEntries, directoryState] = await Promise.all([
+        this.targetApplyPolicy(targetMain),
+        this.listTreeBlobOids(targetMain),
+        this.readDirectoryState()
+      ]);
+      const snapshotEntries = new Map([...snapshot.entries].filter(([filePath]) => isSyncableVaultPath(filePath) && !targetPolicy.policy.ignores(filePath)).map(([filePath, value]) => [filePath, value.entry.oid]));
+      const treeChanged = snapshotEntries.size !== targetEntries.size || [...targetEntries].some(([filePath, oid]) => snapshotEntries.get(filePath) !== oid);
+      const directoryWork = await this.hasActionableDirectoryWork(
+        directoryState.pending_intents,
+        [],
+        targetPolicy.policy
+      );
+      if (!treeChanged && !directoryWork) return;
     }
     const preservedCommit = snapshot ? await this.createLocalCommitFromSnapshot("obts: preserve local changes after conflict resolution", snapshot) : await this.createLocalCommit("obts: preserve local changes after conflict resolution");
     if (!preservedCommit) {
@@ -29082,9 +29100,18 @@ var ObtsObsidianClient = class {
       await this.refreshDirectoryStateFromDisk([], knownLocalFiles, knownLocalDirectories);
       return [];
     }
-    const previous = await this.readDirectoryState();
-    const currentDirs = knownLocalDirectories || await this.listLocalVaultDirectories();
-    const currentFiles = knownLocalFiles || await this.scanSyncableFiles();
+    const stored = await this.readDirectoryState();
+    const policy = (await this.readRootIgnorePolicy()).policy;
+    const allowedDirectory = (dirPath) => isSyncableVaultPath(dirPath) && !policy.ignores(dirPath, true);
+    const previous = {
+      ...stored,
+      observed_dirs: stored.observed_dirs.filter(allowedDirectory),
+      observed_directory_ctimes: Object.fromEntries(Object.entries(stored.observed_directory_ctimes).filter(([dirPath]) => allowedDirectory(dirPath))),
+      explicit_empty_dirs: stored.explicit_empty_dirs.filter(allowedDirectory),
+      pending_intents: stored.pending_intents.filter((intent) => allowedDirectory(intent.path))
+    };
+    const currentDirs = (knownLocalDirectories || await this.listLocalVaultDirectories()).filter(allowedDirectory);
+    const currentFiles = (knownLocalFiles || await this.scanSyncableFiles(policy)).filter(isSyncableVaultPath);
     const explicitDirs = explicitEmptyDirectories(currentDirs, currentFiles);
     const previousDirs = new Set(previous.observed_dirs);
     const previousExplicitDirs = new Set(previous.explicit_empty_dirs);
@@ -29424,30 +29451,37 @@ var ObtsObsidianClient = class {
   }
   async refreshDirectoryStateFromDisk(pendingIntents = void 0, knownLocalFiles = void 0, knownLocalDirectories = void 0) {
     const previous = await this.readDirectoryState();
-    const currentDirs = knownLocalDirectories || await this.listLocalVaultDirectories();
-    const currentFiles = knownLocalFiles || await this.scanSyncableFiles();
+    const policy = (await this.readRootIgnorePolicy()).policy;
+    const allowedDirectory = (dirPath) => isSyncableVaultPath(dirPath) && !policy.ignores(dirPath, true);
+    const currentDirs = (knownLocalDirectories || await this.listLocalVaultDirectories()).filter(allowedDirectory);
+    const currentFiles = (knownLocalFiles || await this.scanSyncableFiles(policy)).filter(isSyncableVaultPath);
     const currentDirectoryCtimes = await this.captureDirectoryCreationTimes(currentDirs);
     await this.writeDirectoryState({
       observed_dirs: currentDirs,
       observed_directory_ctimes: currentDirectoryCtimes,
       explicit_empty_dirs: explicitEmptyDirectories(currentDirs, currentFiles),
-      pending_intents: pendingIntents === void 0 ? previous.pending_intents : pendingIntents,
+      pending_intents: (pendingIntents === void 0 ? previous.pending_intents : pendingIntents).filter((intent) => allowedDirectory(intent.path)),
       next_generation: previous.next_generation,
       updated_at: nowIso()
     });
   }
-  async hasActionableDirectoryWork(directoryIntents, explicitDirectories) {
+  async hasActionableDirectoryWork(directoryIntents, explicitDirectories, policy = null) {
     for (const intent of directoryIntents) {
+      if (!isSyncableVaultPath(intent.path) || policy && policy.ignores(intent.path, true)) continue;
       const isDirectory = await this.adapterIsDirectory(intent.path);
       if (intent.op === "create" && !isDirectory) return true;
       if (intent.op === "delete" && isDirectory) return true;
     }
     for (const dirPath of explicitDirectories) {
+      if (!isSyncableVaultPath(dirPath) || policy && policy.ignores(dirPath, true)) continue;
       if (!await this.adapterIsDirectory(dirPath)) return true;
     }
     return false;
   }
-  async applyDirectoryChanges(directoryIntents, explicitDirectories, preApplyDirectories = /* @__PURE__ */ new Set(), preApplyDirectoryCtimes = {}, removableDirectories = preApplyDirectories, localOnlyPaths = []) {
+  async applyDirectoryChanges(directoryIntents, explicitDirectories, preApplyDirectories = /* @__PURE__ */ new Set(), preApplyDirectoryCtimes = {}, removableDirectories = preApplyDirectories, localOnlyPaths = [], targetMain = null) {
+    const policy = targetMain ? (await this.targetApplyPolicy(targetMain)).policy : (await this.readRootIgnorePolicy()).policy;
+    directoryIntents = compactDirectoryIntents(directoryIntents).filter((intent) => isSyncableVaultPath(intent.path) && !policy.ignores(intent.path, true));
+    explicitDirectories = explicitDirectories.filter((dirPath) => isSyncableVaultPath(dirPath) && !policy.ignores(dirPath, true));
     const residualTombstoneDirectories = /* @__PURE__ */ new Set();
     for (const intent of directoryIntents.filter((entry) => entry.op === "delete").sort((left, right) => right.path.length - left.path.length)) {
       if (localOnlyPaths.some((retained) => retained === intent.path || retained.startsWith(`${intent.path}/`))) continue;
@@ -29695,13 +29729,14 @@ var ObtsObsidianClient = class {
     return (await this.listLocalVaultInventory("")).files;
   }
   async listLocalVaultDirectories() {
-    return (await this.listLocalVaultInventory("")).directories;
+    const policy = (await this.readRootIgnorePolicy()).policy;
+    return (await this.listLocalVaultInventory("", policy, true)).directories;
   }
   async listLocalDescendantFiles(filePath) {
     if (!await this.adapterIsDirectory(filePath)) return [];
     return (await this.listLocalVaultInventory(filePath)).files;
   }
-  async listLocalVaultInventory(root, policy = null) {
+  async listLocalVaultInventory(root, policy = null, skipIgnoredDirectories = false) {
     const files = [];
     const directories = [];
     let frontier = [root];
@@ -29717,7 +29752,9 @@ var ObtsObsidianClient = class {
           if (normalizedFolder === ".obts" || normalizedFolder.startsWith(".obts/")) continue;
           assertValidLocalVaultPath(normalizedFolder);
           if (!isSyncableVaultPath(normalizedFolder)) continue;
-          if (!policy || !policy.ignores(normalizedFolder, true)) directories.push(normalizedFolder);
+          const ignoredDirectory = Boolean(policy && policy.ignores(normalizedFolder, true));
+          if (!ignoredDirectory) directories.push(normalizedFolder);
+          if (ignoredDirectory && skipIgnoredDirectories) continue;
           next.push(normalizedFolder);
         }
         for (const filePath of (listing.files || []).slice().sort()) {
