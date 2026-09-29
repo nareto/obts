@@ -65,8 +65,14 @@ describe('FM003 embedding-worker companion gate', () => {
     expect(scripts['test:formal:onboarding']).toBe('node scripts/check-onboarding-model.mjs && node scripts/check-onboarding-recovery-model.mjs');
     expect(scripts['test:bridge:stack']).toContain('node scripts/check-bridge-stack.mjs');
     const workflow = readFileSync(join(root, '.github/workflows/formal-model.yml'), 'utf8');
-    expect(workflow).toContain('run: npm run test:formal');
-    expect(workflow).toContain('run: npx vitest run tests/formal-checker.test.ts tests/formal-bounded-body.test.ts tests/formal-embedding-worker.test.ts');
+    const coordinator = readFileSync(join(root, '.github/workflows/plugin-release.yml'), 'utf8');
+    expect(workflow).toContain('workflow_call:');
+    expect(workflow).toContain('max-parallel: 2');
+    expect(workflow).toContain('bridge-body) npm run test:formal:bridge-body');
+    expect(workflow).toContain('workers) npm run test:formal:workers');
+    expect(workflow).not.toContain('  push:');
+    expect(coordinator).toContain('VITEST_GROUP=checker npx vitest run');
+    expect(coordinator).toContain('npm run test:formal:metadata');
     expect(JSON.parse(readFileSync(join(root, formal, 'checks.json'), 'utf8')).checks).toHaveLength(91);
     expect(JSON.parse(readFileSync(join(root, formal, 'checks-fm003.json'), 'utf8')).checks).toHaveLength(39);
     expect(JSON.parse(readFileSync(join(root, formal, 'checks-fm003-workers.json'), 'utf8')).checks).toHaveLength(48);

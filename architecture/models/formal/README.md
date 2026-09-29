@@ -2,6 +2,10 @@
 
 Formal models are bounded refinements of stable contracts in `architecture/contracts/`. They do not define product behavior independently. Protocol-changing code or architecture changes must update an affected model and its declared revision or explicitly retire it. Mechanical revision agreement does not prove semantic conformance.
 
+## Validation Families
+
+`npm run test:formal` remains the unchanged complete TLC chain. CI can select complete family entrypoints: `sync` (FM001/FM002), `bridge-body`, `workers`, `deletion`, `bridge-protocol`, `onboarding` (including recovery), `diagnostics`, and `client-state`. Isolated model/config/check-manifest edits can run their entire affected family; shared model modules, checker infrastructure, unknown paths, and shared dependencies require broad formal validation. The fast metadata command invokes `--validate-only` only for sync, bridge-body, workers, deletion, bridge-protocol, and onboarding entrypoints; diagnostic admission, onboarding recovery, and client-state do not implement metadata-only mode and must never receive that flag. A selected family is a complete checker matrix, not a partial check list. Unchanged models do not prove implementation conformance; executable and operator evidence remain independently required.
+
 ## OBTS-FM-001: Local Apply And Recovery
 
 | Field | Value |

@@ -30,7 +30,17 @@ The contracts are the semantic hub. Other artifacts are complementary projection
 - The server OpenAPI and Bridge runtime OpenAPI describe their respective executable HTTP operations, schemas, and errors. The Bridge MCP catalog describes the executable tool surface. They must remain semantically consistent with the contracts or carry a tracked deviation.
 - Production code realizes these artifacts, while executable tests and formal checks provide evidence. The Bridge API schema source and MCP catalog are listed separately above only as executable contracts; they do not override normative behavior. Neither other code nor a green check silently changes product semantics or proves complete implementation conformance.
 
-The mandatory coding workflow for keeping these artifacts synchronized is defined in root [`AGENTS.md`](../AGENTS.md). This file defines what the architecture artifacts mean; `AGENTS.md` defines what an agent must do when fixing bugs, implementing features, or refactoring production behavior.
+The coding workflow for keeping these artifacts synchronized is defined in root [`AGENTS.md`](../AGENTS.md). Classify each change by the surface it actually affects:
+
+| Change | Required architecture treatment | Example |
+| --- | --- | --- |
+| Implementation fix under an already-complete contract/model | Regression and focused implementation validation; no architecture edit | Correct a code path that violates a current safety invariant |
+| Contract, ordering, concurrency, preservation, or recovery semantics | Update affected contract and bounded model/checks before implementation; run TLC | Change acknowledgement ordering or recovery behavior |
+| Allocation, ownership, relationship, or trust-boundary change | Update authored C4 and affected contracts/models | Move a writer across a trust boundary |
+| HTTP contract change | Update OpenAPI and its normative contract | Add or change a request/response/error |
+| Behavior-preserving refactor | Review architecture and acknowledge `Architecture-Impact: none` | Internal extraction without semantic change |
+
+Do not mechanically update every artifact for each code change. Model only relevant behavior; a model gap does not require encoding unrelated implementation details. For ordinary development, use `npm run test:fast` plus focused tests; CI selects the broader authoritative evidence.
 
 ## Contract Set
 
