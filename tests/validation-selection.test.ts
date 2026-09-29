@@ -236,6 +236,18 @@ describe('validation selection', () => {
     }
   });
 
+  it('installs shared JavaScript dependencies before Rust conformance tests', () => {
+    const workflow = parse(readFileSync(join(root, '.github/workflows/plugin-release.yml'), 'utf8'));
+    const steps = workflow.jobs.rust.steps;
+    const nodeIndex = steps.findIndex((step: { uses?: string }) => step.uses?.startsWith('actions/setup-node@'));
+    const installIndex = steps.findIndex((step: { run?: string }) => step.run === 'npm ci');
+    const cargoIndex = steps.findIndex((step: { run?: string }) => step.run === 'cargo test --workspace --locked');
+    expect(nodeIndex).toBeGreaterThanOrEqual(0);
+    expect(steps[nodeIndex].with['node-version']).toBe('24');
+    expect(installIndex).toBeGreaterThan(nodeIndex);
+    expect(cargoIndex).toBeGreaterThan(installIndex);
+  });
+
   it('keeps single-coordinator publication behind selected gates and correct artifact paths', () => {
     const scripts = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).scripts;
     expect(scripts.test).toContain('test:executable:built');
