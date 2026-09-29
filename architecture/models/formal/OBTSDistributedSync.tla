@@ -208,9 +208,7 @@ Init ==
        cursorFixtureReady |-> FALSE, cursorEventAppended |-> FALSE, cursorAcknowledged |-> FALSE, cursorProposalQueued |-> FALSE,
        proposalBaseCursor |-> 0, proposalBaseSnapshot |-> "baseline", proposalOutcome |-> "Pending", proposalRebased |-> FALSE,
        acknowledgedMainEpoch |-> 0, targetMainEventSeq |-> 0, mainAdvancedAfterAck |-> FALSE,
-       recoveryOutcome |-> "Pending", recoveryCursor |-> 0, recoverySnapshot |-> "baseline",
-       staleFixtureReady |-> FALSE, staleServerAdvanced |-> FALSE, staleProposalRejected |-> FALSE,
-       staleRecoverySettled |-> FALSE, staleRecoveryDroppedIntents |-> FALSE, staleRecoveryRebasedIntents |-> FALSE]
+       recoveryOutcome |-> "Pending", recoveryCursor |-> 0, recoverySnapshot |-> "baseline"]
   /\ coverage = [actions |-> {}, classifications |-> {}, actorsProposed |-> {}, conflictPartial |-> FALSE, replyLostAfterOutcome |-> FALSE]
   /\ ghost = [captured |-> {}, overwritten |-> {}]
   /\ lastAction = "Init"
@@ -750,58 +748,6 @@ ReconstructDirectoryBaseline ==
   /\ coverage' = Mark("ReconstructDirectoryBaseline") /\ lastAction' = "ReconstructDirectoryBaseline"
   /\ UNCHANGED <<client, network, server, bridge, ghost>>
 
-\* Issue #23 client-side stale-baseline resolution: a queued content-empty directory
-\* proposal whose base can no longer be proven (the server main advanced past it with a
-\* real directory change) is resolved deterministically against the current server
-\* directory state. Satisfied intents are dropped, satisfiable intents are rebased onto
-\* the new server main, and everything else fails closed. The client's content edits are
-\* never discarded by this flow.
-StaleBaselineFixture ==
-  /\ Scenario = "stale-baseline" /\ ~directory.staleFixtureReady
-  /\ server' = [server EXCEPT !.mainEpoch = 1, !.eventSeq = 1,
-       !.deliveredAckEpoch[Plugin2] = 1, !.directoryDeliveredCursor[Plugin2] = 1,
-       !.directoryDeliveredSnapshot[Plugin2] = "baseline", !.directorySnapshot = "baseline",
-       !.lastDirectoryEventSeq = 1, !.historyRetained = TRUE]
-  /\ client' = [client EXCEPT !.localMainEpoch[Plugin2] = 1, !.seenCursor[Plugin2] = 1,
-       !.appliedCursor[Plugin2] = 1, !.durableApplied[Plugin2] = TRUE, !.ackIntent[Plugin2] = TRUE,
-       !.localGit[Plugin2] = @ \cup {Plugin2Version}, !.capturePublished[Plugin2] = @ \cup {Plugin2Version},
-       !.visible[Plugin2][PathA] = Plugin2Version, !.editCount[Plugin2] = 1, !.editPath[Plugin2] = PathA]
-  /\ ghost' = [ghost EXCEPT !.captured = @ \cup {Plugin2Version}]
-  /\ directory' = [directory EXCEPT !.staleFixtureReady = TRUE,
-       !.proposalBaseCursor = client.appliedCursor[Plugin2], !.proposalBaseSnapshot = "baseline"]
-  /\ coverage' = Mark("StaleBaselineFixture") /\ lastAction' = "StaleBaselineFixture"
-  /\ UNCHANGED <<network, bridge>>
-
-StaleBaselineAdvanceServer ==
-  /\ Scenario = "stale-baseline" /\ directory.staleFixtureReady /\ ~directory.staleServerAdvanced
-  /\ server' = [server EXCEPT !.mainEpoch = @ + 1, !.eventSeq = @ + 1,
-       !.directorySnapshot = "changed", !.lastDirectoryEventSeq = @ + 1]
-  /\ directory' = [directory EXCEPT !.staleServerAdvanced = TRUE]
-  /\ coverage' = Mark("StaleBaselineAdvanceServer") /\ lastAction' = "StaleBaselineAdvanceServer"
-  /\ UNCHANGED <<client, network, bridge, ghost>>
-
-StaleBaselineRejectProposal ==
-  /\ Scenario = "stale-baseline" /\ directory.staleServerAdvanced /\ ~directory.staleProposalRejected
-  /\ directory' = [directory EXCEPT !.staleProposalRejected = TRUE]
-  /\ coverage' = Mark("StaleBaselineRejectProposal") /\ lastAction' = "StaleBaselineRejectProposal"
-  /\ UNCHANGED <<client, network, server, bridge, ghost>>
-
-StaleBaselineRecover ==
-  /\ Scenario = "stale-baseline" /\ directory.staleProposalRejected /\ ~directory.staleRecoverySettled
-  /\ LET contentEmpty == FaultMode # "StaleBaselineContentPending"
-         intentSatisfied == FaultMode # "StaleBaselineContentPending"
-         recoverable == contentEmpty /\ intentSatisfied
-     IN
-       /\ client' = [client EXCEPT
-            !.visible[Plugin2][PathA] = @,
-            !.proposalPhase[Plugin2] = IF recoverable THEN "Idle" ELSE "Blocked"]
-       /\ directory' = [directory EXCEPT
-            !.staleRecoverySettled = TRUE,
-            !.staleRecoveryDroppedIntents = recoverable,
-            !.staleRecoveryRebasedIntents = FALSE]
-  /\ coverage' = Mark("StaleBaselineRecover") /\ lastAction' = "StaleBaselineRecover"
-  /\ UNCHANGED <<network, server, bridge, ghost>>
-
 EvictDeliveredAckSnapshot ==
   /\ FaultMode = "EvictDeliveredAckSnapshot" /\ NormalServer /\ client.ackIntent[Plugin2] /\ client.durableApplied[Plugin2]
   /\ client.localMainEpoch[Plugin2] < server.mainEpoch
@@ -1145,8 +1091,7 @@ RootActions == {
  "DiscardLocalOnly", "DiscardIgnoredBridgeWrite", "PublishExcludedRows", "MutateAttemptPolicy", "UnsafeOldClientPoll", "AcceptStalePolicyProposal", "ActivateLegacyWithoutReconciliation", "AdmitExcludedCandidate",
  "EvictDeliveredAckSnapshot", "LoseAllAckEvidence", "AcknowledgeHistorical",
  "DirectoryBaselineFixture", "AppendDirectoryBaselineEvent", "AcknowledgeDirectoryBaseline", "QueueDirectoryBaselineProposal",
- "ClassifyDirectoryBaselineProposal", "AdvanceDirectoryBaselineMain", "ReconstructDirectoryBaseline",
- "StaleBaselineFixture", "StaleBaselineAdvanceServer", "StaleBaselineRejectProposal", "StaleBaselineRecover"
+ "ClassifyDirectoryBaselineProposal", "AdvanceDirectoryBaselineMain", "ReconstructDirectoryBaseline"
 }
 
 ClientActions(c) ==
@@ -1168,8 +1113,7 @@ BridgeActions == RustValidateWrite \/ RustAtomicVisibleWrite \/ NodePersistBridg
 
 DirectoryActions == ObserveDirectoryDescendant(Plugin1) \/ RemoveDirectoryDescendant(Plugin1) \/ PreflightEmptyDirectory(Plugin1) \/ DeleteEmptyDirectory(Plugin1) \/
   DirectoryBaselineFixture \/ AppendDirectoryBaselineEvent \/ AcknowledgeDirectoryBaseline \/ QueueDirectoryBaselineProposal \/ ClassifyDirectoryBaselineProposal \/
-  AdvanceDirectoryBaselineMain \/ ReconstructDirectoryBaseline \/
-  StaleBaselineFixture \/ StaleBaselineAdvanceServer \/ StaleBaselineRejectProposal \/ StaleBaselineRecover
+  AdvanceDirectoryBaselineMain \/ ReconstructDirectoryBaseline
 
 FaultActions == ReplaceInflightTarget \/ DropAcceptedProposal \/ MoveCoveredRefBackward \/ DiscardDivergence \/ MoveMainBeforePreparedEffects \/
   AckBeforeDurableApply \/ EvictDeliveredAckSnapshot \/ LoseAllAckEvidence \/ OverwriteUncapturedBridgeWrite \/ RecursiveDirectoryDelete \/ RestartAbortsMovedRef \/ DuplicateNonIdempotentProcessing \/
@@ -1294,13 +1238,6 @@ DirectoryHistoricalSnapshotCoherent == directory.recoveryOutcome # "Available" \
 DirectoryRecoveryUnprovenUnavailable == Scenario # "directory-baseline" \/
   FaultMode \notin {"DirectoryBaselineInterveningIntent", "DirectoryBaselineHistoryLost"} \/
   directory.recoveryOutcome # "Available"
-StaleBaselineContentNeverDestroyed == Scenario # "stale-baseline" \/
-  ~directory.staleRecoverySettled \/
-  client.visible[Plugin2][PathA] = Plugin2Version
-StaleBaselineSettleIsDeterministic == Scenario # "stale-baseline" \/
-  ~directory.staleRecoverySettled \/
-  (directory.staleRecoveryDroppedIntents = (FaultMode # "StaleBaselineContentPending")) \/
-  (client.proposalPhase[Plugin2] \in {"Idle", "Blocked"})
 PolicyProjectionExcludesCurrentRows == bridge.projectionPolicy # "exclude-a" \/ ~bridge.rowsComplete \/ (PathA \notin bridge.projectedPaths /\ bridge.auditRetained)
 BridgeExcludedLocalWriteRetained == ~PolicyScenario \/ server.policy # "exclude-a" \/ ~bridge.acknowledged \/ client.visible[BridgeNode][PathA] = BridgeVersion
 StalePolicyRefProtected == ~PolicyScenario \/ server.opPolicy = server.policy \/ server.classification # "Divergent" \/ server.opTarget \in server.processingRoots \cup server.conflictRoots
@@ -1315,7 +1252,6 @@ AllSafety == /\ TypeOK /\ CapturedOnlyAfterDurablePublication /\ OBTS_SAF_001_Ca
   /\ ApplyRefinementBoundary /\ ApplyProjectionConsistent /\ CandidateAdmittedOnlyWhenPolicyValid /\ PolicyTransitionRemovesOnlyCanonicalCopy
   /\ LocalOnlyApplyRetainsVisible /\ OldClientCannotApply /\ DirectoryCursorProposalAcceptanceSound
   /\ DirectoryHistoricalSnapshotCoherent /\ DirectoryCursorUnprovenProposalRejected /\ DirectoryRecoveryUnprovenUnavailable
-  /\ StaleBaselineContentNeverDestroyed /\ StaleBaselineSettleIsDeterministic
   /\ PolicyProjectionExcludesCurrentRows /\ BridgeExcludedLocalWriteRetained /\ StalePolicyRefProtected
 
 ProposalTrigger == "PersistImmutableProposal" \in coverage.actions
@@ -1362,9 +1298,6 @@ NeverLocalOnlyApply == ~client.localOnly[Plugin2] \/ client.applyPhase[Plugin2] 
 NeverStaleQueuedRebuild == Scenario # "root-ignore-stale-queued" \/ "RebuildStaleQueuedProposal" \notin coverage.actions
 NeverStalePolicyReview == Scenario # "root-ignore" \/ ~(server.reviewNeeded /\ server.opPhase = "Committed" /\ server.conflictDevice \in server.conflictRoots)
 NeverDirectoryBaselineProposalAccepted == directory.proposalOutcome # "Accepted"
-NeverStaleBaselineRecoverSettled == "StaleBaselineRecover" \notin coverage.actions
-StaleBaselineContentFailsClosed == ~directory.staleRecoverySettled \/
-  client.proposalPhase[Plugin2] = "Blocked"
 NeverDirectoryBaselineProposalRejected == directory.proposalOutcome # "Rejected"
 NeverDirectoryBaselineRecoveryAvailable == directory.recoveryOutcome # "Available"
 NeverDirectoryBaselineRecoveryUnavailable == directory.recoveryOutcome # "Unavailable"

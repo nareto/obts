@@ -74,10 +74,10 @@ The model does not cover directories, multiple paths, write concurrency, editor-
 | Field | Value |
 | --- | --- |
 | Status | Accepted bounded composed model |
-| Architecture revision | 28 |
-| Refined contracts | `OBTS-SAF-001` through `OBTS-SAF-006`, `OBTS-SAF-010`, `OBTS-SYNC-IMM-001`, `OBTS-SYNC-IGN-001`, `OBTS-SYNC-ACK-001`, `OBTS-SYNC-DIR-002`, `OBTS-PER-OP-001`, `OBTS-BRG-PROJ-001` |
+| Architecture revision | 27 |
+| Refined contracts | `OBTS-SAF-001` through `OBTS-SAF-006`, `OBTS-SAF-010`, `OBTS-SYNC-IMM-001`, `OBTS-SYNC-IGN-001`, `OBTS-SYNC-ACK-001`, `OBTS-PER-OP-001`, `OBTS-BRG-PROJ-001` |
 | Root specification | `OBTSDistributedSync.tla` |
-| Check matrix | `checks.json` (95 required checks: original 52, 23 root-ignore, 2 acknowledgement-evidence, 14 directory-baseline, and 4 stale-baseline-resolution checks) |
+| Check matrix | `checks.json` (91 required checks: original 52, 23 root-ignore, 2 acknowledgement-evidence, and 14 directory-baseline checks) |
 | Static transition map / future trace schema | `trace/transition-map.json`, `trace/trace-schema.json` |
 | Executable check | `npm run test:formal` |
 
@@ -96,7 +96,7 @@ Local apply state projects non-vacuously through `modules/OBTSApplyRefinement.tl
 
 ### Check matrix and assumptions
 
-The required matrix contains the original six FM-001 checks; seven FM-002 positive safety checks; four separately fair liveness checks; twenty-one trigger/action reachability checks; and sixteen distributed negative controls. Revision 15 adds four positive root-policy safety checks, nine non-vacuity witnesses, and nine independent negative controls. Revision 17 adds the acknowledgement-evidence reach and negative checks above. Revision 27 adds five directory-baseline safety checks, five progress/reconstruction witnesses, and four negative controls for the exact-cursor block, unsafe rebase, missing history, and mislabeled historical snapshot. Revision 28 adds two stale-baseline-resolution safety checks (content is never destroyed; the settle is deterministic) plus two reach witnesses, with the content-pending fault variant proving the fail-closed branch. Removing or retyping any required check fails validation. Accepted architecture status requires zero candidate counterexamples and all required positives.
+The required matrix contains the original six FM-001 checks; seven FM-002 positive safety checks; four separately fair liveness checks; twenty-one trigger/action reachability checks; and sixteen distributed negative controls. Revision 15 adds four positive root-policy safety checks, nine non-vacuity witnesses, and nine independent negative controls. Revision 17 adds the acknowledgement-evidence reach and negative checks above. Revision 27 adds five directory-baseline safety checks, five progress/reconstruction witnesses, and four negative controls for the exact-cursor block, unsafe rebase, missing history, and mislabeled historical snapshot. Removing or retyping any required check fails validation. Accepted architecture status requires zero candidate counterexamples and all required positives.
 
 Liveness is conditional on bounded edits/crashes, eventual restart, retry/delivery, and no permanent storage failure. Fairness is attached to the concrete action/actor sequence for proposal/result consumption, Rust write to Node capture, server restart/recovery, and main event to durable apply/server acknowledgement. Each obligation has a separate reachable-trigger check; there is no broad fairness disjunction.
 

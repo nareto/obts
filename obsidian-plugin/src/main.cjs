@@ -7574,81 +7574,6 @@ class ObtsObsidianClient {
     return await run;
   }
 
-  // Issue #23. A retained completed pull checkpoint that points at a commit other than
-  // local main is residue from a superseded pivot attempt; the recovery never applies such
-  // a target, so it must not constrain the next attempt. The proof pull's own residue is
-  // retired once the device cursor already covers it.
-  async discardRecoveryPullCheckpoint(state) {
-    const checkpoint = await readJson(this.fsp, this.pullTransferPath, null);
-    if (!isCompletePullCheckpoint(checkpoint)) return;
-    if (checkpoint.vault_id !== state.vault_id || checkpoint.device_id !== state.device_id) return;
-    const coversLocalMain = checkpoint.target_main === state.local_main &&
-      (state.last_applied_event_seq || 0) >= checkpoint.manifest.event_seq;
-    if (checkpoint.target_main !== state.local_main || coversLocalMain) {
-      await this.fsp.rm(this.pullTransferPath, { force: true });
-    }
-  }
-
-  // Claim the current server main as the replacement baseline for a superseded directory
-  // proposal. The pivot intent recorded in the journal (target main, recovered cursors) is
-  // authoritative; the advanced payload -- explicit directories, intents, and bounded
-  // target sizes -- is re-derived here from the server so an interrupted, superseded, or
-  // older-format pivot resumes deterministically instead of stalling or discarding files.
-  async claimAdvancedBaseline(state, queue, token, serverDevice, journal) {
-    // The proof pull wrote a completed checkpoint for the historical target; retire it so
-    // this pull reaches the current server main instead of replaying that snapshot.
-    await this.discardRecoveryPullCheckpoint(state);
-    let advanced;
-    try {
-      advanced = await this.pull(
-        state.vault_id,
-        state.device_id,
-        token,
-        state.local_main,
-        "latest",
-        serverDevice.last_applied_event_seq
-      );
-    } catch (error) {
-      throw new ObtsBlockedError(
-        "directory_baseline_recovery_unsafe",
-        "The server could not deliver a current authoritative baseline while repairing the stale proposal base."
-      );
-    }
-    const pivotChecks = [
-      ["target_oid", isGitObjectId(advanced.manifest.target_main)],
-      ["target_commit_missing", await this.commitExists(advanced.manifest.target_main)],
-      ["target_is_local_head", advanced.manifest.target_main !== state.local_head],
-      ["not_linear", await this.isAncestor(state.local_main, advanced.manifest.target_main)],
-      ["event_seq_type", Number.isSafeInteger(advanced.manifest.event_seq)],
-      ["event_seq_behind_device", advanced.manifest.event_seq >= serverDevice.last_applied_event_seq],
-      ["event_seq_behind_journal", advanced.manifest.event_seq >= journal.last_applied_event_seq],
-      ["explicit_dirs_type", Array.isArray(advanced.manifest.explicit_directories)],
-      ["directory_intents_type", Array.isArray(advanced.manifest.directory_intents)],
-      ["bounded_target_sizes", isTargetFileSizeMap(advanced.manifest.target_file_sizes)],
-      ["pending_has_content", await this.sameCommitTree(queue.pending_commit, state.local_main)]
-    ];
-    const failedPivotCheck = (await Promise.all(pivotChecks.map(async (entry) => [entry[0], Boolean(await entry[1])])))
-      .find(([, ok]) => !ok);
-    if (failedPivotCheck) {
-      throw new ObtsBlockedError(
-        "directory_baseline_recovery_unsafe",
-        "The server main diverged from the proposal base or the queued commit carries content; baseline repair cannot resolve it locally."
-      );
-    }
-    const claimed = Object.assign({}, journal, {
-      phase: "main_advanced",
-      target_main: advanced.manifest.target_main,
-      target_explicit_directories: Array.from(new Set(advanced.manifest.explicit_directories)).sort(),
-      advanced_directory_intents: compactDirectoryIntents(advanced.manifest.directory_intents),
-      advanced_target_file_sizes: Object.assign({}, advanced.manifest.target_file_sizes),
-      recovered_event_seq: advanced.manifest.event_seq,
-      recovered_server_device_ref: serverDevice.server_device_ref,
-      updated_at: nowIso()
-    });
-    await writeJson(this.fsp, this.directoryBaselineRecoveryPath, claimed);
-    return claimed;
-  }
-
   async recoverStaleDirectoryProposalBase() {
     const state = await this.readState();
     const queue = await this.readQueue();
@@ -7663,22 +7588,12 @@ class ObtsObsidianClient {
       this.resolveRef("refs/heads/main"),
       this.resolveRef("refs/heads/local")
     ]);
-    const advancedJournal = Boolean(journal && journal.phase === "main_advanced");
-    const queuedLinePreserved = advancedJournal
-      ? (state.local_main === journal.local_main || state.local_main === journal.target_main) &&
-        (state.local_head === journal.local_head || state.local_head === journal.target_main) &&
-        actualMain === state.local_main &&
-        actualHead === state.local_head &&
-        await this.isAncestor(journal.local_main, queue.pending_commit) &&
-        await this.isAncestor(queue.pending_commit, journal.local_head)
-      : actualMain === state.local_main &&
-        actualHead === state.local_head &&
-        await this.isAncestor(state.local_main, queue.pending_commit) &&
-        await this.isAncestor(queue.pending_commit, state.local_head);
     if (
       !state.vault_id || !state.device_id || !state.local_main || !state.local_head ||
-      !queuedLinePreserved ||
-      !queue.pending_commit || !await this.commitExists(queue.pending_commit)
+      actualMain !== state.local_main || actualHead !== state.local_head ||
+      !queue.pending_commit || !await this.commitExists(queue.pending_commit) ||
+      !await this.isAncestor(state.local_main, queue.pending_commit) ||
+      !await this.isAncestor(queue.pending_commit, state.local_head)
     ) {
       throw new ObtsBlockedError(
         "directory_baseline_recovery_unsafe",
@@ -7738,17 +7653,14 @@ class ObtsObsidianClient {
     const checkpointJournalFieldsComplete = checkpointJournalFields.every((value) => value === null) ||
       checkpointJournalFields.every((value) => typeof value === "string");
     if (
-      journal.version !== 1 || !["planned", "snapshot_proven", "baseline_acknowledged", "main_advanced"].includes(journal.phase) ||
+      journal.version !== 1 || !["planned", "snapshot_proven", "baseline_acknowledged"].includes(journal.phase) ||
       journal.vault_id !== state.vault_id || journal.device_id !== state.device_id ||
       !Number.isSafeInteger(journal.last_event_seq) || journal.last_event_seq < 0 ||
       !Number.isSafeInteger(journal.last_applied_event_seq) || journal.last_applied_event_seq < 0 ||
       !(journal.server_device_ref === null || isGitObjectId(journal.server_device_ref)) ||
       !(journal.recovered_server_device_ref === null || isGitObjectId(journal.recovered_server_device_ref)) ||
       !(journal.recovered_event_seq === null || Number.isSafeInteger(journal.recovered_event_seq) && journal.recovered_event_seq >= 0) ||
-      (journal.phase === "main_advanced"
-        ? (state.local_main !== journal.local_main && state.local_main !== journal.target_main) ||
-          (state.local_head !== journal.local_head && state.local_head !== journal.target_main)
-        : journal.local_main !== state.local_main || journal.local_head !== state.local_head) ||
+      journal.local_main !== state.local_main || journal.local_head !== state.local_head ||
       journal.pending_commit !== queue.pending_commit || !allowedServerDeviceRefs.has(state.server_device_ref) ||
       journal.last_event_seq > (state.last_event_seq || 0) ||
       !allowedAppliedCursors.has(state.last_applied_event_seq || 0) ||
@@ -7761,12 +7673,7 @@ class ObtsObsidianClient {
       !(journal.rejected_plan_sha256 === null || typeof journal.rejected_plan_sha256 === "string" && /^[0-9a-f]{64}$/u.test(journal.rejected_plan_sha256)) ||
       journal.phase === "planned" && (journal.recovered_event_seq !== null || journal.recovered_server_device_ref !== null || journal.checkpoint_removal_authorized) ||
       journal.phase === "snapshot_proven" && (journal.recovered_event_seq === null || journal.checkpoint_removal_authorized) ||
-      journal.phase === "baseline_acknowledged" && journal.recovered_event_seq === null ||
-      journal.phase === "main_advanced" && (
-        journal.recovered_event_seq === null ||
-        !isGitObjectId(journal.target_main) ||
-        journal.checkpoint_removal_authorized
-      )
+      journal.phase === "baseline_acknowledged" && journal.recovered_event_seq === null
     ) {
       throw new ObtsBlockedError(
         "directory_baseline_recovery_journal_invalid",
@@ -7813,10 +7720,6 @@ class ObtsObsidianClient {
       );
     }
 
-    // Any completed transfer checkpoint retained by the recovery is residue from this or a
-    // previous repair attempt; the proof and pivot pulls below must reach the server fresh.
-    await this.discardRecoveryPullCheckpoint(state);
-
     const pulled = await this.pull(
       state.vault_id,
       state.device_id,
@@ -7825,31 +7728,7 @@ class ObtsObsidianClient {
       state.local_main,
       serverDevice.last_applied_event_seq
     );
-    const proofEventSeqStale =
-      pulled.manifest.target_main === state.local_main &&
-      Number.isSafeInteger(pulled.manifest.event_seq) &&
-      Array.isArray(pulled.manifest.explicit_directories) &&
-      (pulled.manifest.event_seq < serverDevice.last_applied_event_seq ||
-        pulled.manifest.event_seq < journal.last_applied_event_seq);
-    let baselineExplicitDirs;
-    let baselineEventSeq;
-    if (proofEventSeqStale) {
-      // Issue #23: the historical snapshot for local main is provably behind the device
-      // cursor (the server main advanced past the proposal base), so the directory
-      // baseline cannot be proven from it. When the queued commit carries no content and
-      // the server advance is linear from the rejected base, the client resolves
-      // deterministically: record the advance, apply the new server main (which preserves
-      // local content and directory work), acknowledge it, and rebuild the directory
-      // intents against the new baseline. Everything else fails closed.
-      if (journal.phase === "planned") {
-        journal = await this.claimAdvancedBaseline(state, queue, token, serverDevice, journal);
-      } else if (journal.phase !== "main_advanced") {
-        throw new ObtsBlockedError(
-          "directory_baseline_recovery_unsafe",
-          "The recovery journal already advanced past the superseded baseline and cannot pivot to the new server main."
-        );
-      }
-    } else if (
+    if (
       pulled.manifest.target_main !== state.local_main ||
       !Number.isSafeInteger(pulled.manifest.event_seq) ||
       pulled.manifest.event_seq < serverDevice.last_applied_event_seq ||
@@ -7861,77 +7740,19 @@ class ObtsObsidianClient {
         "The server could not prove the authoritative directory baseline for local main."
       );
     }
-    if (journal.phase === "main_advanced") {
-      this.plugin.setStatus("Repairing baseline");
-      await this.writeState(Object.assign({}, await this.readState(), {
-        status_label: "Repairing baseline",
-        updated_at: nowIso()
-      }));
-      await this.retryPendingAppliedAcknowledgement();
-      const advancedMainCommitted = (await this.resolveRef("refs/heads/main")) === journal.target_main;
-      const advancedPayloadComplete = Array.isArray(journal.target_explicit_directories) &&
-        Array.isArray(journal.advanced_directory_intents) &&
-        isTargetFileSizeMap(journal.advanced_target_file_sizes);
-      if (!advancedMainCommitted || !advancedPayloadComplete) {
-        journal = await this.claimAdvancedBaseline(state, queue, token, serverDevice, journal);
-        await this.applyTargetMain(
-          journal.target_main,
-          [],
-          true,
-          [],
-          false,
-          journal.advanced_directory_intents,
-          journal.target_explicit_directories,
-          journal.recovered_event_seq,
-          false,
-          null,
-          journal.advanced_target_file_sizes || {}
-        );
-      }
-      if ((await this.resolveRef("refs/heads/local")) !== journal.target_main) {
-        await this.updateRef("refs/heads/local", journal.target_main, null, true);
-      }
-      const advancedState = await this.readState();
-      if (advancedState.local_main !== journal.target_main || advancedState.local_head !== journal.target_main) {
-        await this.writeState(Object.assign({}, advancedState, {
-          local_main: journal.target_main,
-          local_head: journal.target_main,
-          last_event_seq: Math.max(advancedState.last_event_seq || 0, journal.recovered_event_seq),
-          last_applied_event_seq: Math.max(advancedState.last_applied_event_seq || 0, journal.recovered_event_seq),
-          updated_at: nowIso()
-        }));
-      }
-      await this.acknowledgeAppliedMain(journal.target_main);
-      baselineExplicitDirs = journal.target_explicit_directories;
-      baselineEventSeq = journal.recovered_event_seq;
-    } else {
-      if (
-        !Number.isSafeInteger(pulled.manifest.event_seq) ||
-        pulled.manifest.event_seq < serverDevice.last_applied_event_seq ||
-        pulled.manifest.event_seq < journal.last_applied_event_seq ||
-        !Array.isArray(pulled.manifest.explicit_directories)
-      ) {
-        throw new ObtsBlockedError(
-          "directory_baseline_recovery_unsafe",
-          "The server could not prove the authoritative directory baseline for local main."
-        );
-      }
-      journal = Object.assign({}, journal, {
-        phase: journal.phase === "baseline_acknowledged" ? "baseline_acknowledged" : "snapshot_proven",
-        recovered_event_seq: pulled.manifest.event_seq,
-        recovered_server_device_ref: serverDevice.server_device_ref,
-        updated_at: nowIso()
-      });
-      await writeJson(this.fsp, this.directoryBaselineRecoveryPath, journal);
-      baselineExplicitDirs = Array.from(new Set(pulled.manifest.explicit_directories)).sort();
-      baselineEventSeq = pulled.manifest.event_seq;
-    }
+    journal = Object.assign({}, journal, {
+      phase: journal.phase === "baseline_acknowledged" ? "baseline_acknowledged" : "snapshot_proven",
+      recovered_event_seq: pulled.manifest.event_seq,
+      recovered_server_device_ref: serverDevice.server_device_ref,
+      updated_at: nowIso()
+    });
+    await writeJson(this.fsp, this.directoryBaselineRecoveryPath, journal);
 
     const inventory = await this.listLocalVaultInventory("");
     const localFiles = assertNoCaseCollisions(inventory.files.filter((filePath) => isSyncableVaultPath(filePath)).sort());
     const currentDirs = inventory.directories.filter((dirPath) => isSyncableVaultPath(dirPath)).sort();
     const currentExplicitDirs = explicitEmptyDirectories(currentDirs, localFiles);
-    const baseExplicitDirs = Array.from(new Set(baselineExplicitDirs)).sort();
+    const baseExplicitDirs = Array.from(new Set(pulled.manifest.explicit_directories)).sort();
     const baseSet = new Set(baseExplicitDirs);
     const currentSet = new Set(currentExplicitDirs);
     const changes = [
@@ -7949,7 +7770,7 @@ class ObtsObsidianClient {
       if (existing) {
         return Object.assign({}, existing, {
           base_main: state.local_main,
-          base_event_seq: baselineEventSeq
+          base_event_seq: pulled.manifest.event_seq
         });
       }
       const intent = {
@@ -7959,7 +7780,7 @@ class ObtsObsidianClient {
         generation: nextGeneration,
         provenance: "local_v2",
         base_main: state.local_main,
-        base_event_seq: baselineEventSeq,
+        base_event_seq: pulled.manifest.event_seq,
         replaces_intent_id: null,
         recreated_after_delete: false,
         created_at: nowIso()
@@ -7976,8 +7797,7 @@ class ObtsObsidianClient {
       updated_at: nowIso()
     });
 
-    const acknowledgedState = await this.readState();
-    await this.writePendingAppliedAcknowledgement(acknowledgedState.local_main, baselineEventSeq);
+    await this.writePendingAppliedAcknowledgement(state.local_main, pulled.manifest.event_seq);
     await this.retryPendingAppliedAcknowledgement();
     journal = Object.assign({}, journal, { phase: "baseline_acknowledged", updated_at: nowIso() });
     await writeJson(this.fsp, this.directoryBaselineRecoveryPath, journal);
@@ -8009,18 +7829,6 @@ class ObtsObsidianClient {
           "directory_baseline_recovery_journal_invalid",
           "The queued commit changed while repairing its directory baseline."
         );
-      }
-      if (journal.target_main) {
-        // The advanced apply moved refs and state to the new server main; the old
-        // content-empty proposal commit is superseded and unreachable, so retire it.
-        return Object.assign({}, currentQueue, {
-          pending_commit: null,
-          changed_paths: [],
-          expected_device_ref: serverDevice.server_device_ref,
-          status: "idle",
-          attempts: 0,
-          updated_at: nowIso()
-        });
       }
       return Object.assign({}, currentQueue, {
         expected_device_ref: serverDevice.server_device_ref,
