@@ -17,6 +17,9 @@ const requiredChecks = new Map([
   ['fm001-safety', 'positive-safety'], ['fm001-liveness', 'positive-liveness'],
   ['fm001-negative-skip-recovery', 'negative-control'], ['fm001-negative-stale-preflight', 'negative-control'],
   ['fm001-negative-early-cleanup', 'negative-control'], ['fm001-negative-infer-completion', 'negative-control'],
+  ['fm001-in-place-safety', 'positive-safety'], ['fm001-in-place-liveness', 'positive-liveness'],
+  ...['old', 'target', 'unknown'].map((image) => [`fm001-in-place-reach-${image}`, 'reachability']),
+  ['fm001-in-place-negative-non-atomic', 'negative-control'],
   ...['same-path', 'disjoint-directory', 'server-recovery-contract', 'bridge-handoff', 'all-actors', 'apply-refinement',
     'directory-baseline-delivered', 'directory-baseline-rebase', 'directory-baseline-intervening', 'directory-baseline-history-lost', 'directory-baseline-historical']
     .map((id) => [`fm002-${id}`, 'positive-safety']),

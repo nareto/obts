@@ -16,6 +16,7 @@ Formal models are bounded refinements of stable contracts in `architecture/contr
 | Specification | `OBTSApplyRecovery.tla` |
 | TLC configuration | `OBTSApplyRecovery.cfg`, `OBTSApplyRecoveryLiveness.cfg` |
 | Executable check | `npm run test:formal` |
+| In-place companion / revision | `OBTSApplyInPlace.tla`, revision 34; six required `configs/in-place-*.cfg` checks |
 
 The model covers one client, one path, the captured local version, one concurrent local edit, a target server version, recovery staging/publication, mutation, verification, ref and coordination publication, acknowledgement intent, cleanup, one crash, and restart. Values stand for exact bytes plus path identity and provenance.
 
@@ -64,14 +65,20 @@ On `tla-tools` 1.7.4 / TLC 2.19 with one worker and fingerprint polynomial 0:
 | --- | --- |
 | `StartApply` / planned journal | `ObtsObsidianClient.applyTargetMain` publishes `.obts/apply-journal.json` before destructive work; phase/restart tests live in `tests/phase1.test.ts`. |
 | `StageInitialBundle`, `PublishInitialBundle`, `RecordRecoveryPublication` | `stageRecoveryBundleFiles` and `finalizeRecoveryBundle` stage snapshots, manifest, Git closure, checksums, completion marker, rename, then journal the bundle ID. |
-| `BeginWriting`, `WriteTarget`, `BlockChangedPath` | `writeTargetFilesFromJournal` captures each affected path into journal-addressed `.obts/apply-displaced` preservation as a verified copy (never by renaming a vault-visible path), removes the live path only after the copy validates against the preflight identity, and creates the target through Obsidian `Vault.createBinary` (documented to fail if the path exists) or Node `writeFile(..., {flag:"wx"})`; cleanup archives displaced evidence under `.obts/recovery-displaced` rather than deleting it. Stale-file, ancestor, directory, primitive-boundary, and restart races live in `tests/plugin-large-vault.test.ts`. |
+| `BeginWriting`, `WriteTarget`, `BlockChangedPath`; companion copy/compare/modify/recovery actions | `writeTargetFilesFromJournal` captures each affected path into journal-addressed `.obts/apply-displaced` preservation as a verified copy (never by renaming a vault-visible path). Regular-file updates retain the live path and use `Vault.modifyBinary` or an unindexed binary adapter overwrite after final revalidation. Removals/type changes still remove only after evidence validation; new files use Obsidian `Vault.createBinary` or Node `writeFile(..., {flag:"wx"})`. Cleanup archives evidence under `.obts/recovery-displaced`. The intended atomic mutation guard is **not** a proven implementation primitive: OBTS issue #33 tracks the existing compare-to-delete/overwrite gap. Stale-file, no-delete-event, ancestor, directory, primitive-boundary, and restart regressions live in `tests/plugin-large-vault.test.ts`. |
 | Post-write bundle actions | `localChangedPathsFromTree` plus `createRecoveryBundle` preserve edits detected after materialization before refs advance. |
 | Ref, coordination, acknowledgement, cleanup actions | `updateRef`, `writeState`, `writePendingAppliedAcknowledgement`, and `clearApplyState` are separate durable calls. |
 | `Crash`, `Restart`, recovery classifiers | `initialize`, `recoverIncompleteApplyJournal`, and `recoverBlockedApplyWithPreservedLocalChanges` classify persisted journal, visible tree, target commit, refs, and preservation evidence. |
 
+### In-place companion and known implementation deviation
+
+`OBTSApplyInPlace.tla` reuses the pilot's preservation predicates and publication assumptions without weakening them. It separates verified pre-image copy, final comparison, and mutation; copy evidence never implies that the live path disappeared. Restart witnesses exercise copy + old image, copy + target image, and an interrupted write leaving a symbolic partial target. Unknown bytes are durably preserved and retained as local work. The original pilot/configurations remain unchanged for historical checks and deletion/type-change abstraction.
+
+Positive safety and conditional liveness each pass 631 generated / 476 distinct states at depth 23. Old-image, target-image, and interrupted-write recovery witnesses reach depths 10, 12, and 11 respectively. The required `NonAtomicWrite=TRUE` control retains a local-write environment action between compare and mutation and violates `NoLocalVersionLost` at depth 10 (89 generated / 66 distinct states). This is an **existing unresolved implementation defect**, not merely a hypothetical mutant: both delete/create and in-place binary writes lack an all-writer conditional mutation primitive. It is separately tracked as OBTS issue #33; positive checks describe the intended seam and must never be reported as proof of actual atomicity or complete lossless implementation conformance.
+
 ### Known omissions
 
-The model does not cover directories, multiple paths, write concurrency, editor-buffer capture, Git object structure, network/server acknowledgement, byte/checksum implementation, mobile lifecycle, process kill, power loss, filesystem semantics, corrupted finalized bundles, or competing client instances. Those require executable fault tests and platform evidence; a green TLC result makes no claim about them.
+The pilot does not cover directories, multiple paths, write concurrency, editor-buffer capture, Git object structure, network/server acknowledgement, byte/checksum implementation, mobile lifecycle, process kill, power loss, filesystem semantics, corrupted finalized bundles, or competing client instances. The companion adds the bounded compare/write interleaving and one symbolic interrupted write, not a proof of byte-level storage atomicity. Those require executable fault tests and platform evidence; a green TLC result makes no claim about them.
 
 ## OBTS-FM-002: Composed Distributed Synchronization
 
@@ -81,7 +88,7 @@ The model does not cover directories, multiple paths, write concurrency, editor-
 | Architecture revision | 32 |
 | Refined contracts | `OBTS-SAF-001` through `OBTS-SAF-006`, `OBTS-SAF-010`, `OBTS-SYNC-IMM-001`, `OBTS-SYNC-IGN-001`, `OBTS-SYNC-ACK-001`, `OBTS-PER-OP-001`, `OBTS-PER-CLIENT-001`, `OBTS-BRG-PROJ-001` |
 | Root specification | `OBTSDistributedSync.tla` |
-| Check matrix | `checks.json` (109 required checks: original 52, 23 root-ignore, 2 acknowledgement-evidence, 14 directory-baseline, and 18 legacy-retirement checks) |
+| Check matrix | `checks.json` (115 required checks: original 52, 23 root-ignore, 2 acknowledgement-evidence, 14 directory-baseline, 18 legacy-retirement, and 6 FM001 in-place companion checks) |
 | Static transition map / future trace schema | `trace/transition-map.json`, `trace/trace-schema.json` |
 | Executable check | `npm run test:formal` |
 
@@ -100,7 +107,7 @@ Local apply state projects non-vacuously through `modules/OBTSApplyRefinement.tl
 
 ### Check matrix and assumptions
 
-The required matrix contains the original six FM-001 checks; seven FM-002 positive safety checks; four separately fair liveness checks; twenty-one trigger/action reachability checks; and sixteen distributed negative controls. Revision 15 adds four positive root-policy safety checks, nine non-vacuity witnesses, and nine independent negative controls. Revision 17 adds the acknowledgement-evidence reach and negative checks above. Revision 27 adds five directory-baseline safety checks, five progress/reconstruction witnesses, and four negative controls for the exact-cursor block, unsafe rebase, missing history, and mislabeled historical snapshot. Revision 32 adds four legacy-retirement witnesses, a full positive safety exploration, ten additional witnesses for queue changes, transfer outcomes, uploads, and restart, and three single-fault negative controls. Removing or retyping any required check fails validation. Accepted architecture status requires zero candidate counterexamples and all required positives.
+The required matrix contains the original six FM-001 checks plus six in-place companion checks; seven FM-002 positive safety checks; four separately fair liveness checks; twenty-one trigger/action reachability checks; and sixteen distributed negative controls. Revision 15 adds four positive root-policy safety checks, nine non-vacuity witnesses, and nine independent negative controls. Revision 17 adds the acknowledgement-evidence reach and negative checks above. Revision 27 adds five directory-baseline safety checks, five progress/reconstruction witnesses, and four negative controls for the exact-cursor block, unsafe rebase, missing history, and mislabeled historical snapshot. Revision 32 adds four legacy-retirement witnesses, a full positive safety exploration, ten additional witnesses for queue changes, transfer outcomes, uploads, and restart, and three single-fault negative controls. Removing or retyping any required check fails validation. Accepted architecture status requires zero candidate counterexamples and all required positives.
 
 Liveness is conditional on bounded edits/crashes, eventual restart, retry/delivery, and no permanent storage failure. Fairness is attached to the concrete action/actor sequence for proposal/result consumption, Rust write to Node capture, server restart/recovery, and main event to durable apply/server acknowledgement. Each obligation has a separate reachable-trigger check; there is no broad fairness disjunction.
 

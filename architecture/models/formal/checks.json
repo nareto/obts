@@ -14,6 +14,7 @@
   },
   "sanyModules": [
     "OBTSApplyRecovery",
+    "OBTSApplyInPlace",
     "OBTSDistributedSync",
     "modules/OBTSDomain",
     "modules/OBTSApplyRefinement",
@@ -107,6 +108,62 @@
       "expectedInvariant": "NoFalseCompletion",
       "requiredWitness": "Restart",
       "minimumTraceDepth": 8
+    },
+    {
+      "id": "fm001-in-place-safety",
+      "model": "OBTSApplyInPlace",
+      "config": "configs/in-place-safety.cfg",
+      "kind": "positive-safety",
+      "maximumDepth": 250,
+      "baseline": { "generated": 631, "distinct": 476, "depth": 23, "minGenerated": 315, "minDistinct": 238, "minDepth": 11 }
+    },
+    {
+      "id": "fm001-in-place-liveness",
+      "model": "OBTSApplyInPlace",
+      "config": "configs/in-place-liveness.cfg",
+      "kind": "positive-liveness",
+      "maximumDepth": 250,
+      "baseline": { "generated": 631, "distinct": 476, "depth": 23, "minGenerated": 315, "minDistinct": 238, "minDepth": 11 }
+    },
+    {
+      "id": "fm001-in-place-reach-old",
+      "model": "OBTSApplyInPlace",
+      "config": "configs/in-place-reach-old.cfg",
+      "kind": "reachability",
+      "maximumDepth": 250,
+      "expectedInvariant": "NoOldImageRecovery",
+      "requiredWitness": "RecoverOldImage",
+      "minimumTraceDepth": 10
+    },
+    {
+      "id": "fm001-in-place-reach-target",
+      "model": "OBTSApplyInPlace",
+      "config": "configs/in-place-reach-target.cfg",
+      "kind": "reachability",
+      "maximumDepth": 250,
+      "expectedInvariant": "NoTargetImageRecovery",
+      "requiredWitness": "RecoverTargetImage",
+      "minimumTraceDepth": 12
+    },
+    {
+      "id": "fm001-in-place-reach-unknown",
+      "model": "OBTSApplyInPlace",
+      "config": "configs/in-place-reach-unknown.cfg",
+      "kind": "reachability",
+      "maximumDepth": 250,
+      "expectedInvariant": "NoUnknownImageRecovery",
+      "requiredWitness": "RecoverUnknownImage",
+      "minimumTraceDepth": 11
+    },
+    {
+      "id": "fm001-in-place-negative-non-atomic",
+      "model": "OBTSApplyInPlace",
+      "config": "configs/in-place-negative-non-atomic.cfg",
+      "kind": "negative-control",
+      "maximumDepth": 250,
+      "expectedInvariant": "NoLocalVersionLost",
+      "requiredWitness": "LocalWriteBetweenCompareAndModify",
+      "minimumTraceDepth": 10
     },
     {
       "id": "fm002-same-path",

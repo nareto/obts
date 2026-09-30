@@ -22180,7 +22180,7 @@ var { createByteBudget, runBoundedWork } = require_work_pool();
 var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.12";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.13";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_INVENTORY_INTERVAL_MS = 6 * 60 * 60 * 1e3;
@@ -26669,16 +26669,19 @@ var ObtsObsidianClient = class {
       const filePath = paths[index2];
       const fingerprint = fingerprints[index2];
       if (fingerprint.kind === "directory" && journal.preflight_fingerprints?.[filePath]?.kind === "file" && await this.applyDisplacedEntryMatchesPreflight(journal, filePath) && [...targetEntries.keys()].some((targetPath) => targetPath.startsWith(`${filePath}/`))) continue;
+      const hasDisplacedEntry = await this.applyDisplacedEntryExists(journal, filePath);
+      const displacedPreflight = displacedEvidencePhase && hasDisplacedEntry && await this.applyDisplacedEntryMatchesPreflight(journal, filePath);
       const matchesTarget = this.fingerprintMatchesTarget(fingerprint, targetEntries.get(filePath));
-      if (matchesTarget && !await this.applyDisplacedEntryExists(journal, filePath)) targetMatchedPaths.add(filePath);
+      if (matchesTarget && (!hasDisplacedEntry || displacedPreflight && fingerprint.kind === "file")) {
+        targetMatchedPaths.add(filePath);
+      }
       const matchesPreflight = this.fingerprintMatchesPreflight(
         fingerprint,
         journal.preflight_sha256[filePath] || null,
         journal.preflight_fingerprints?.[filePath]
       );
-      const displacedPreflight = displacedEvidencePhase && fingerprint.kind === "missing" && await this.applyDisplacedEntryMatchesPreflight(journal, filePath);
-      if (displacedPreflight) continue;
-      if (!matchesPreflight && (!activeWritePhase || !matchesTarget)) {
+      if (fingerprint.kind === "missing" && displacedPreflight) continue;
+      if (!matchesPreflight && (!(activeWritePhase || displacedPreflight) || !matchesTarget)) {
         divergedPaths.push(filePath);
       }
     }
@@ -26732,6 +26735,7 @@ var ObtsObsidianClient = class {
           throw new LocalSnapshotChangedError(filePath);
         }
       }
+      return current;
     };
     const assertRecoveredDescendants = async (filePath) => {
       const descendants = await this.listLocalDescendantFiles(filePath);
@@ -26842,15 +26846,25 @@ var ObtsObsidianClient = class {
                   return;
                 }
               }
-              await this.displaceApplyPath(journal, filePath, assertCurrentPreflight, assertRecoveredDescendants);
-              await ensureAdapterDir(this.adapter, parentPath);
-              try {
-                await this.adapterWriteBinaryExclusive(filePath, content);
-              } catch (error) {
-                if (error?.code === "EEXIST" && await this.adapterExists(filePath)) {
-                  throw new LocalSnapshotChangedError(filePath, error);
+              const retainedFile = await this.displaceApplyPath(
+                journal,
+                filePath,
+                assertCurrentPreflight,
+                assertRecoveredDescendants,
+                true
+              );
+              if (retainedFile) {
+                await this.adapterModifyBinaryRevalidated(filePath, content, journal);
+              } else {
+                await ensureAdapterDir(this.adapter, parentPath);
+                try {
+                  await this.adapterWriteBinaryExclusive(filePath, content);
+                } catch (error) {
+                  if (error?.code === "EEXIST" && await this.adapterExists(filePath)) {
+                    throw new LocalSnapshotChangedError(filePath, error);
+                  }
+                  throw error;
                 }
-                throw error;
               }
               onProgress();
             } catch (error) {
@@ -29976,6 +29990,26 @@ var ObtsObsidianClient = class {
     }
     await this.adapter.writeBinary(filePath, arrayBuffer);
   }
+  async adapterModifyBinaryRevalidated(filePath, content, journal) {
+    const vault = this.plugin.app && this.plugin.app.vault;
+    const existing = vault && typeof vault.getAbstractFileByPath === "function" ? vault.getAbstractFileByPath(filePath) : null;
+    const arrayBuffer = toArrayBuffer(content);
+    const writers = existing && !existing.children && typeof vault.modifyBinary === "function" ? [() => vault.modifyBinary(existing, arrayBuffer), () => this.adapter.writeBinary(filePath, arrayBuffer)] : [() => this.adapter.writeBinary(filePath, arrayBuffer)];
+    for (let index2 = 0; index2 < writers.length; index2 += 1) {
+      const current = (await this.readRecoveryFileSnapshot(filePath)).fingerprint;
+      if (current.kind !== "file" || !this.fingerprintMatchesPreflight(
+        current,
+        journal.preflight_sha256[filePath] || null,
+        journal.preflight_fingerprints?.[filePath]
+      )) throw new LocalSnapshotChangedError(filePath);
+      try {
+        await writers[index2]();
+        return;
+      } catch (error) {
+        if (index2 === writers.length - 1) throw error;
+      }
+    }
+  }
   async adapterWriteBinaryExclusive(filePath, content) {
     await ensureAdapterDir(this.adapter, path.posix.dirname(filePath));
     const vault = this.plugin.app && this.plugin.app.vault;
@@ -30180,7 +30214,7 @@ var ObtsObsidianClient = class {
     }
     return { files: Array.from(new Set(files)).sort(), directories: Array.from(new Set(directories)).sort() };
   }
-  async displaceApplyPath(journal, filePath, assertCurrentPreflight, assertRecoveredDescendants) {
+  async displaceApplyPath(journal, filePath, assertCurrentPreflight, assertRecoveredDescendants, retainTargetFile = false) {
     if ((journal.local_only_paths || []).some((retained) => retained === filePath || retained.startsWith(`${filePath}/`) || filePath.startsWith(`${retained}/`))) {
       throw new ObtsBlockedError("local_only_collision", "A write collides with retained local-only content.");
     }
@@ -30194,8 +30228,9 @@ var ObtsObsidianClient = class {
         if (await this.adapterIsDirectory(candidate)) continue;
         throw new LocalSnapshotChangedError(candidate);
       }
-      await assertCurrentPreflight(candidate);
-      const displacedDirectory = await this.adapterIsDirectory(candidate);
+      const current = await assertCurrentPreflight(candidate);
+      const displacedDirectory = current.kind === "directory";
+      const retainLiveFile = retainTargetFile && candidate === filePath && current.kind === "file";
       if (displacedDirectory) await assertRecoveredDescendants(candidate);
       const displacedPath = this.applyDisplacedPath(journal, candidate);
       await ensureAdapterDir(this.adapter, path.posix.dirname(displacedPath));
@@ -30205,6 +30240,7 @@ var ObtsObsidianClient = class {
         }
         await assertCurrentPreflight(candidate);
         if (displacedDirectory) await assertRecoveredDescendants(candidate);
+        if (retainLiveFile) return true;
         await this.adapterRemove(candidate);
         continue;
       }
@@ -30218,8 +30254,10 @@ var ObtsObsidianClient = class {
       }
       await assertCurrentPreflight(candidate);
       if (displacedDirectory) await assertRecoveredDescendants(candidate);
+      if (retainLiveFile) return true;
       await this.adapterRemove(candidate);
     }
+    return false;
   }
   async captureDisplacedCandidate(candidate, displacedPath, displacedDirectory) {
     if (displacedDirectory) {

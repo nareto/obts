@@ -1,7 +1,7 @@
 schema_version: 1
-revision: 33
+revision: 34
 status: current
-updated: 2026-09-29
+updated: 2026-09-30
 authoritative_artifacts:
   - architecture/manifest.yaml
   - architecture/README.md
@@ -18,6 +18,8 @@ formal_models:
     status: accepted
     path: architecture/models/formal/OBTSApplyRecovery.tla
     architecture_revision: 2
+    companion_path: architecture/models/formal/OBTSApplyInPlace.tla
+    companion_architecture_revision: 34
     refines:
       - OBTS-SAF-001
       - OBTS-SAF-002
