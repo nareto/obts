@@ -24,8 +24,14 @@ const requiredChecks = new Map([
   ...['observe', 'bridge-proposal', 'plugin2-proposal', 'rust-write', 'network-fault', 'recovery', 'conflict', 'apply-ack',
     'equal', 'covered', 'divergent', 'reply-loss', 'conflict-partial', 'directory-delete', 'projection', 'proposal-trigger',
     'bridge-trigger', 'recovery-trigger', 'apply-trigger', 'apply-refinement', 'ack-reconstruction'].map((id) => [`fm002-reach-${id}`, 'reachability']),
-  ...['directory-baseline-delivered', 'directory-baseline-rebase', 'directory-baseline-intervening', 'directory-baseline-history-lost', 'directory-baseline-historical']
+  ...['directory-baseline-delivered', 'directory-baseline-rebase', 'directory-baseline-intervening', 'directory-baseline-history-lost', 'directory-baseline-historical',
+    'legacy-retirement-completed', 'legacy-retirement-changed-queue', 'legacy-retirement-pending-apply', 'legacy-retirement-unsafe-evidence']
     .map((id) => [`fm002-reach-${id}`, 'reachability']),
+  ['fm002-legacy-retirement-safety', 'positive-safety'],
+  ...['descendant', 'unsafe-queue', 'hint-blocked', 'processing', 'accepted', 'late-acceptance', 'new-upload',
+    'restarted-archive', 'restarted-settled', 'cancelled-race'].map((id) => [`fm002-reach-legacy-retirement-${id}`, 'reachability']),
+  ...['mutant-queue-binding', 'mutant-volatile-equality', 'mutant-early-journal-clear']
+    .map((id) => [`fm002-negative-legacy-retirement-${id}`, 'negative-control']),
   ['fm002-server-recovery-implementation', 'positive-safety'],
   ...['root-ignore-safety', 'root-ignore-legacy-safety', 'root-ignore-bridge-race-safety', 'root-ignore-invalid-safety'].map((id) => [`fm002-${id}`, 'positive-safety']),
   ...['root-ignore-transition', 'root-ignore-stale', 'root-ignore-local-only', 'root-ignore-projection', 'root-ignore-legacy-activation', 'root-ignore-rebuild-stale', 'root-ignore-bridge-race-reach',

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import git from 'isomorphic-git';
 import { publishRecoveryFixture } from './helpers/publishRecoveryFixture.js';
 
 import { ObtsPluginClient, PluginBlockedError } from '../obsidian-plugin/src/core/client.js';
@@ -6453,6 +6454,250 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(uploadedChunks).toBe(chunksBeforeRestart);
     await expect(stat(join(deviceDir, '.obts', 'upload-transfer.json'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
+
+  it.each(['open', 'injected-processing', 'completed'])(
+    'handles a withdrawn completed directory advance with a %s transfer', async (transferOutcome) => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const phoneDir = join(root, 'legacy-advance-phone');
+    const writerDir = join(root, 'legacy-advance-writer');
+    await mkdirp(phoneDir);
+    await mkdirp(writerDir);
+    const phone = await pairPlugin(admin, phoneDir, 'legacy-advance-phone');
+    const writer = await pairPlugin(admin, writerDir, 'legacy-advance-writer');
+    const core = (phone as unknown as { client: Record<string, any> }).client;
+    await writeFile(join(phoneDir, 'starter.md'), 'starter bytes\n');
+    expect((await phone.syncOnce()).status).toBe('Synced');
+    expect((await writer.pollRemoteEventsAndApply()).applied).toBe(true);
+    const serverRef = (await phone.readState()).server_device_ref;
+    await writeFile(join(writerDir, '.gitignore'), '/.local-cache/\n');
+    for (let index = 0; index < 10; index++) await writeFile(join(writerDir, `remote-${index}.md`), 'base bytes\n');
+    for (let index = 0; index < 3; index++) await writeFile(join(writerDir, `edit-${index}.md`), 'original bytes\n');
+    for (let index = 0; index < 54; index++) await mkdirp(join(writerDir, `empty-${index}`));
+    for (let index = 0; index < 69; index++) await mkdirp(join(writerDir, `content-${index}`));
+    for (let start = 0; start < 3255; start += 64) {
+      await Promise.all(Array.from({ length: Math.min(64, 3255 - start) }, (_, offset) =>
+        writeFile(join(writerDir, `content-${(start + offset) % 69}`, `filler-${start + offset}.md`), 'unchanged manifest entry\n')));
+    }
+    expect((await writer.syncOnce()).status).toBe('Synced');
+    expect((await phone.pollRemoteEventsAndApply()).applied).toBe(true);
+    const baseState = await phone.readState();
+    const base = baseState.local_main;
+    if (!base || !serverRef || !baseState.vault_id) throw new Error('Expected a paired baseline and server device ref.');
+    expect(base).not.toBe(serverRef);
+    expect(typeof serverRef).toBe('string');
+    expect(baseState.last_event_seq).toBe(baseState.last_applied_event_seq);
+    expect(await core.isAncestor(serverRef, base)).toBe(true);
+    for (let index = 0; index < 9; index++) await writeFile(join(writerDir, `remote-${index}.md`), 'target bytes\n');
+    await writeFile(join(writerDir, '.gitignore'), '/.local-cache/\n*.bak\n');
+    for (let index = 0; index < 4; index++) await writeFile(join(writerDir, `new-${index}.md`), 'new target bytes\n');
+    await mkdirp(join(writerDir, 'target-one'));
+    await mkdirp(join(writerDir, 'target-two'));
+    expect((await writer.syncOnce()).status).toBe('Synced');
+    const target = (await writer.readState()).local_main;
+    const transferred = await core.pull(baseState.vault_id, baseState.device_id, await core.readDeviceToken(), base,
+      target, baseState.last_event_seq);
+    expect(transferred.manifest.target_main).toBe(target);
+    expect(Object.keys(transferred.manifest.target_file_sizes)).toHaveLength(3274);
+    expect(transferred.manifest.explicit_directories).toHaveLength(56);
+    const checkpointPath = join(phoneDir, '.obts', 'pull-transfer.json');
+    const checkpoint = JSON.parse(await readFile(checkpointPath, 'utf8')) as Record<string, any>;
+    const baseTree = (await git.readCommit({ fs: core.fs, dir: core.vaultDir, gitdir: core.gitdir, oid: base })).commit.tree;
+    const pending = await git.commit({ fs: core.fs, dir: core.vaultDir, gitdir: core.gitdir,
+      ref: 'refs/heads/orphan', tree: baseTree, parent: [base], message: 'obsolete empty directory proposal',
+      author: { name: 'Test', email: 'test@example.com' } });
+    await core.updateRef('refs/heads/local', pending, null, true);
+    await core.writeState({ ...baseState, local_head: pending });
+    const editPaths = Array.from({ length: 3 }, (_, index) => `edit-${index}.md`);
+    await core.writeQueue({ pending_commit: pending, expected_device_ref: serverRef, status: 'queued_local',
+      attempts: 0, change_seq: 3, changed_paths: editPaths, updated_at: new Date().toISOString() });
+    const intent = { op: 'delete', path: '.local-cache', intent_id: 'dir_123_1_abcdefabcdef', generation: 1,
+      provenance: 'local_v2', base_main: base, base_event_seq: baseState.last_applied_event_seq,
+      replaces_intent_id: null, recreated_after_delete: false, created_at: new Date().toISOString() };
+    const directoryState = await core.readDirectoryState();
+    expect(directoryState.observed_dirs).toHaveLength(123);
+    expect(directoryState.explicit_empty_dirs).toHaveLength(54);
+    await core.writeDirectoryState({ ...directoryState, explicit_empty_dirs: directoryState.explicit_empty_dirs.slice(0, 52),
+      pending_intents: [intent] });
+    await mkdirp(join(phoneDir, '.local-cache'));
+    const localOnlyPaths: string[] = ['.local-cache'];
+    for (let index = 0; index < 3893; index++) {
+      const filePath = `.local-cache/ignored-${index}.md`;
+      localOnlyPaths.push(filePath);
+      await writeFile(join(phoneDir, filePath), `ignored bytes ${index}\n`);
+    }
+    expect(localOnlyPaths).toHaveLength(3894);
+    for (const filePath of editPaths) await writeFile(join(phoneDir, filePath), `visible unsynced ${filePath}\n`);
+    const advanced = [...transferred.manifest.directory_intents, { op: 'delete', path: intent.path }];
+    checkpoint.manifest.directory_intents = advanced;
+    checkpoint.manifest_sha256 = createHash('sha256').update(JSON.stringify(checkpoint.manifest)).digest('hex');
+    await writeFile(checkpointPath, `${JSON.stringify(checkpoint)}\n`);
+    const groups = transferOutcome === 'completed' ? [[pending]] : [];
+    const planSha = createHash('sha256').update(JSON.stringify(groups)).digest('hex');
+    const basePolicy = await core.targetApplyPolicy(base);
+    const proposalBody = { schema_version: 2, base_main: base, base_event_seq: intent.base_event_seq, intents: [intent] };
+    const proposalId = `dirprop_${createHash('sha256').update(JSON.stringify([baseState.device_id, pending, proposalBody])).digest('hex')}`;
+    const transferRequest = { api_version: API_VERSION, plugin_version: RECOMMENDED_PLUGIN_VERSION,
+      vault_id: baseState.vault_id, device_id: baseState.device_id,
+      target_commit: pending, expected_device_ref: serverRef, client_known_main: base,
+      root_ignore_capability: 'root-ignore-v1', root_ignore_oid: basePolicy.oid,
+      directory_proposal: { ...proposalBody, proposal_id: proposalId }, chunk_count: groups.length, plan_sha256: planSha };
+    const attemptId = `xfer_${createHash('sha256').update(JSON.stringify(transferRequest)).digest('hex').slice(0, 32)}`;
+    const token = await core.readDeviceToken();
+    const createdTransfer = await fetch(`${baseUrl}/api/v1/vaults/${baseState.vault_id}/sync/push-transfers`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ ...transferRequest, attempt_id: attemptId })
+    });
+    expect(createdTransfer.status).toBe(201);
+    const transfer = await createdTransfer.json() as { transfer_id: string; status: string; target_commit: string };
+    expect(transfer).toMatchObject({ status: 'open', target_commit: pending });
+    const upload = { version: 1, identity: 'a'.repeat(64), target_commit: pending, transfer_id: transfer.transfer_id,
+      attempt_id: attemptId, groups, transfer_request: transferRequest, directory_proposal: transferRequest.directory_proposal };
+    await writeFile(join(phoneDir, '.obts', 'upload-transfer.json'), `${JSON.stringify(upload)}\n`);
+    const baseline = { version: 1, phase: 'main_advanced', vault_id: baseState.vault_id, device_id: baseState.device_id,
+      local_main: base, local_head: pending, server_device_ref: serverRef,
+      last_event_seq: baseState.last_event_seq, last_applied_event_seq: baseState.last_applied_event_seq,
+      pending_commit: pending, original_pending_intents: [intent], target_main: target,
+      target_explicit_directories: transferred.manifest.explicit_directories,
+      advanced_directory_intents: advanced, recovered_event_seq: transferred.manifest.event_seq,
+      recovered_server_device_ref: serverRef, checkpoint_removal_authorized: false,
+      rejected_transfer_id: upload.transfer_id, rejected_checkpoint_identity: upload.identity,
+      rejected_attempt_id: attemptId, rejected_plan_sha256: planSha };
+    await writeFile(join(phoneDir, '.obts', 'directory-baseline-recovery.json'), `${JSON.stringify(baseline)}\n`);
+    const affected = transferred.manifest.changed_paths as string[];
+    expect(affected).toHaveLength(14);
+    const preflightEntries = await Promise.all(affected.map(async (filePath) => [filePath, (await core.readRecoveryFileSnapshot(filePath)).fingerprint]));
+    const preflight = Object.fromEntries(preflightEntries);
+    const apply = { journal_version: 6, apply_id: 'apply_legacy_advance', operation_type: 'pull_apply',
+      target_main: target, target_file_sizes: {}, expected_prior_local_main: base,
+      expected_prior_local_device_ref: serverRef, phase: 'writing_files', affected_paths: affected,
+      preflight_sha256: Object.fromEntries(preflightEntries.map(([filePath, value]) => [filePath, (value as { sha256: string | null }).sha256])),
+      preflight_fingerprints: preflight, directory_intents: transferred.manifest.directory_intents,
+      explicit_directories: transferred.manifest.explicit_directories, pre_apply_directories: [],
+      pre_apply_directory_ctimes: {}, confirmed_directory_roots: [], confirmed_directory_inventory: null,
+      preserve_local_changes: false, event_seq: transferred.manifest.event_seq, recovery_bundle_id: null,
+      last_completed_step: 'recovery_bundle', redacted_error_category: null,
+      target_root_ignore_oid: transferred.manifest.root_ignore_oid,
+      local_only_paths: localOnlyPaths.sort(), local_only_presence: Object.fromEntries(localOnlyPaths.map((filePath) => [filePath, true])),
+      deferred_local_paths: [] };
+    await writeFile(join(phoneDir, '.obts', 'apply-journal.json'), `${JSON.stringify(apply)}\n`);
+    await publishRecoveryFixture(phoneDir);
+    await phone.initialize();
+    expect(await readFile(join(phoneDir, '.obts', 'apply-journal.json'), 'utf8').catch(() => null)).toBeNull();
+    const resumedState = await phone.readState();
+    expect(resumedState.local_main).toBe(target);
+    expect(await core.resolveRef('refs/heads/main')).toBe(target);
+    expect(await core.resolveRef('refs/heads/local')).toBe(resumedState.local_head);
+    expect(resumedState.server_device_ref).toBe(serverRef);
+    expect(resumedState.last_event_seq).toBeGreaterThanOrEqual(baseline.recovered_event_seq);
+    expect(resumedState.last_applied_event_seq).toBeGreaterThanOrEqual(baseline.recovered_event_seq);
+    expect(await core.isAncestor(serverRef, pending)).toBe(true);
+    expect(await phone.readQueue()).toMatchObject({ changed_paths: editPaths });
+    for (const filePath of editPaths) expect(await readFile(join(phoneDir, filePath), 'utf8')).toBe(`visible unsynced ${filePath}\n`);
+    expect(await readFile(join(phoneDir, '.local-cache', 'ignored-0.md'), 'utf8')).toBe('ignored bytes 0\n');
+    const rename = core.fsp.rename.bind(core.fsp);
+    let checkedArchiveBeforeAuthorization = false;
+    core.fsp.rename = async (source: string, destination: string) => {
+      if (destination === core.directoryBaselineRecoveryPath) {
+        const writing = JSON.parse(await core.fsp.readFile(source, 'utf8'));
+        if (writing.phase === 'legacy_retirement_authorized') {
+          const files = await readdir(join(phoneDir, '.obts', 'recovery'));
+          const archived = JSON.parse(await readFile(join(phoneDir, '.obts', 'recovery',
+            files.find((name) => name.startsWith('legacy-baseline-'))!), 'utf8'));
+          expect(archived.digest).toBe(createHash('sha256').update(JSON.stringify(archived.evidence)).digest('hex'));
+          expect(archived.evidence.journal.pending_commit).toBe(pending);
+          expect(archived.evidence.upload.transfer_id).toBe(transfer.transfer_id);
+          expect(archived.evidence.pull.target_main).toBe(target);
+          expect(archived.evidence.queue.changed_paths).toEqual(editPaths);
+          checkedArchiveBeforeAuthorization = true;
+        }
+      }
+      return rename(source, destination);
+    };
+    if (transferOutcome !== 'open') {
+      let acceptedOutcome: Record<string, unknown> | null = null;
+      if (transferOutcome === 'injected-processing') {
+        const sessionPath = join(server.config.transferDir, transfer.transfer_id, 'session.json');
+        const session = JSON.parse(await readFile(sessionPath, 'utf8')) as Record<string, any>;
+        session.status = 'processing';
+        session.processing_attempts = 1;
+        session.processing_error_code = 'server_processing_error';
+        session.retry_at = new Date(Date.now() + 120_000).toISOString();
+        await writeFile(sessionPath, `${JSON.stringify(session)}\n`);
+      } else {
+        const auth = await server.auth.authenticateDevice(`Bearer ${token}`, baseState.vault_id);
+        const pack = await core.createPackForCommit(pending, [base]);
+        await server.chunkTransfers.putChunk(auth, transfer.transfer_id, 0, pack,
+          createHash('sha256').update(pack).digest('hex'));
+        acceptedOutcome = await server.chunkTransfers.finalizePush(auth, transfer.transfer_id);
+        expect(['noop', 'merged']).toContain(acceptedOutcome.status);
+        expect(acceptedOutcome.device_ref).toBe(pending);
+        const acceptedState = await server.store.snapshot();
+        const acceptedDevice = acceptedState.devices.find((device) => device.device_id === baseState.device_id);
+        expect(acceptedDevice).toBeDefined();
+        expect(await server.git.getRef(baseState.vault_id, acceptedDevice!.device_ref)).toBe(pending);
+        expect(acceptedState.sync_operations.find((operation) => operation.target_commit === pending)?.status).toBe('committed');
+      }
+      await expect(phone.syncOnce()).rejects.toMatchObject({ code: 'legacy_directory_advance_unsafe' });
+      core.fsp.rename = rename;
+      expect(checkedArchiveBeforeAuthorization).toBe(transferOutcome === 'injected-processing');
+      expect(await readFile(join(phoneDir, '.obts', 'directory-baseline-recovery.json'), 'utf8'))
+        .toContain(transferOutcome === 'injected-processing' ? 'legacy_retirement_authorized' : 'main_advanced');
+      expect(await readFile(join(phoneDir, '.obts', 'upload-transfer.json'), 'utf8')).toBeTruthy();
+      expect(await phone.readQueue()).toMatchObject({ changed_paths: editPaths });
+      const stillPresent = await fetch(`${baseUrl}/api/v1/vaults/${baseState.vault_id}/sync/push-transfers/${transfer.transfer_id}`, {
+        headers: { authorization: `Bearer ${token}` }
+      });
+      expect(stillPresent.status).toBe(200);
+      const persisted = await stillPresent.json();
+      expect(persisted.status).toBe(transferOutcome === 'injected-processing' ? 'processing' : 'completed');
+      if (acceptedOutcome) expect(persisted.result).toEqual(acceptedOutcome);
+      if (acceptedOutcome) {
+        const settledState = await server.store.snapshot();
+        const settledDevice = settledState.devices.find((device) => device.device_id === baseState.device_id);
+        expect(settledDevice).toBeDefined();
+        expect(await server.git.getRef(baseState.vault_id, settledDevice!.device_ref)).toBe(pending);
+        expect(settledState.sync_operations.find((operation) => operation.target_commit === pending)?.status).toBe('committed');
+      }
+      return;
+    }
+    let settled = await phone.syncOnce();
+    for (let attempt = 0; attempt < 3 && settled.status !== 'Synced'; attempt++) settled = await phone.syncOnce();
+    expect(settled.status).toBe('Synced');
+    await mkdirp(join(phoneDir, 'new-local-empty'));
+    expect(await phone.syncOnce()).toMatchObject({ status: 'Synced' });
+    core.fsp.rename = rename;
+    expect(checkedArchiveBeforeAuthorization).toBe(true);
+    const removedTransfer = await fetch(`${baseUrl}/api/v1/vaults/${baseState.vault_id}/sync/push-transfers/${transfer.transfer_id}`, {
+      headers: { authorization: `Bearer ${token}` }
+    });
+    expect(removedTransfer.status).toBe(404);
+    expect(await readFile(join(phoneDir, '.obts', 'directory-baseline-recovery.json'), 'utf8').catch(() => null)).toBeNull();
+    expect(await readFile(join(phoneDir, '.obts', 'upload-transfer.json'), 'utf8').catch(() => null)).toBeNull();
+    const archiveFiles = await readdir(join(phoneDir, '.obts', 'recovery'));
+    expect(archiveFiles.some((name) => name.startsWith('legacy-baseline-'))).toBe(true);
+    const stored = await server.store.snapshot();
+    const oldAttempt = stored.sync_operations.find((operation) => operation.target_commit === pending);
+    expect(oldAttempt).toBeUndefined();
+    const uploaded = stored.sync_operations.find((operation) => operation.device_id === baseState.device_id &&
+      operation.target_commit !== pending && operation.status === 'committed' &&
+      operation.prepared_manifest?.directory_proposal != null);
+    expect(uploaded).toBeDefined();
+    const uploadedProposal = uploaded?.prepared_manifest?.directory_proposal as { intents?: unknown[] } | undefined;
+    expect(uploadedProposal).toBeTruthy();
+    expect(Array.isArray(uploadedProposal?.intents)).toBe(true);
+    expect(uploadedProposal!.intents).toEqual(expect.arrayContaining([expect.objectContaining({ op: 'create', path: 'new-local-empty' })]));
+    expect(uploadedProposal!.intents).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: intent.path })])
+    );
+    expect(stored.devices.find((device) => device.device_id === baseState.device_id)?.last_applied_event_seq)
+      .toBeGreaterThanOrEqual(baseline.recovered_event_seq);
+    expect((await phone.readQueue()).pending_commit).toBeNull();
+    await writer.pollRemoteEventsAndApply();
+    for (const filePath of editPaths) expect(await readFile(join(writerDir, filePath), 'utf8'))
+      .toBe(`visible unsynced ${filePath}\n`);
+    expect(await readFile(join(phoneDir, '.local-cache', 'ignored-0.md'), 'utf8')).toBe('ignored bytes 0\n');
+    expect(await phone.syncOnce()).toMatchObject({ status: 'Synced' });
+  }, 180_000);
 
   it('repairs a stale directory baseline without replacing queued local history', async () => {
     const admin = await setupAdminAndVault(baseUrl);

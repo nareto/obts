@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "modelId": "OBTS-FM-002",
-  "architectureRevision": 27,
+  "architectureRevision": 32,
   "rootModule": "OBTSDistributedSync.tla",
   "traceSchema": "trace/trace-schema.json",
   "instrumentationStatus": "static-map-only; runtime emission and replay are omitted and no implementation conformance is claimed",
@@ -42,6 +42,10 @@
       "obsidian-plugin/src/main.cjs:3242-3711",
       "src/server/syncService.ts:2020-2140",
       "tests/plugin-large-vault.test.ts:480-650"
+    ],
+    "legacyDirectoryRetirement": [
+      "obsidian-plugin/src/main.cjs:7629-7859",
+      "tests/plugin-legacy-directory-advance.test.ts"
     ]
   },
   "actions": {
@@ -1878,6 +1882,168 @@
       "tests": [
         "tests/directory-baseline-cursor.test.ts"
       ]
+    },
+    "LegacyAuthorizeRetirement": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-PER-CLIENT-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:7817-7831"
+      ],
+      "tests": [
+        "tests/plugin-legacy-directory-advance.test.ts"
+      ]
+    },
+    "LegacyClearJournal": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-PER-CLIENT-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:7853-7885"
+      ],
+      "tests": [
+        "tests/plugin-legacy-directory-advance.test.ts"
+      ]
+    },
+    "LegacyPreserveQueue": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:7839-7844"
+      ],
+      "tests": [
+        "tests/plugin-legacy-directory-advance.test.ts"
+      ]
+    },
+    "LegacyPublishArchive": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-PER-CLIENT-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:7804-7827"
+      ],
+      "tests": [
+        "tests/plugin-legacy-directory-advance.test.ts"
+      ]
+    },
+    "LegacyRetirePull": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:7845-7852"
+      ],
+      "tests": [
+        "tests/plugin-legacy-directory-advance.test.ts"
+      ]
+    },
+    "LegacyRetireUpload": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:7629-7655",
+        "obsidian-plugin/src/main.cjs:7832-7838"
+      ],
+      "tests": [
+        "tests/plugin-legacy-directory-advance.test.ts"
+      ]
+    },
+    "LegacyValidateCompletedAdvance": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": [
+        "OBTS-SYNC-ACK-001"
+      ],
+      "code": [
+        "obsidian-plugin/src/main.cjs:7657-7803"
+      ],
+      "tests": [
+        "tests/plugin-legacy-directory-advance.test.ts"
+      ]
+    },
+    "LegacyCorruptEvidence": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": ["OBTS-PER-CLIENT-001"],
+      "code": ["obsidian-plugin/src/main.cjs"],
+      "tests": ["tests/plugin-legacy-directory-advance.test.ts"]
+    },
+    "LegacyObserveTransferStatus": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": ["OBTS-SYNC-ACK-001"],
+      "code": ["src/server/chunkTransferService.ts"],
+      "tests": ["tests/phase1.test.ts"]
+    },
+    "LegacyCancelTransfer": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": ["OBTS-SYNC-ACK-001"],
+      "code": ["obsidian-plugin/src/main.cjs"],
+      "tests": ["tests/phase1.test.ts"]
+    },
+    "LegacyLateAcceptance": {
+      "category": "server",
+      "controlOnly": false,
+      "contracts": ["OBTS-SYNC-ACK-001"],
+      "code": ["src/server/chunkTransferService.ts"],
+      "tests": ["tests/phase1.test.ts:6458-6700"]
+    },
+    "LegacyChangeQueue": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": ["OBTS-SYNC-ACK-001"],
+      "code": ["obsidian-plugin/src/main.cjs"],
+      "tests": ["tests/plugin-legacy-directory-advance.test.ts"]
+    },
+    "LegacyChangeHint": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": ["OBTS-SYNC-ACK-001"],
+      "code": ["obsidian-plugin/src/main.cjs"],
+      "tests": ["tests/plugin-legacy-directory-advance.test.ts"]
+    },
+    "LegacyObserveVisibleEdit": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": ["OBTS-SYNC-ACK-001"],
+      "code": ["obsidian-plugin/src/main.cjs"],
+      "tests": ["tests/plugin-legacy-directory-advance.test.ts"]
+    },
+    "LegacyBlockUnsafeQueue": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": ["OBTS-SYNC-ACK-001"],
+      "code": ["obsidian-plugin/src/main.cjs"],
+      "tests": ["tests/plugin-legacy-directory-advance.test.ts"]
+    },
+    "LegacyBlockUnsafeTransfer": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": ["OBTS-SYNC-ACK-001"],
+      "code": ["obsidian-plugin/src/main.cjs"],
+      "tests": ["tests/phase1.test.ts"]
+    },
+    "LegacyNormalUpload": {
+      "category": "client",
+      "controlOnly": false,
+      "contracts": ["OBTS-SYNC-ACK-001"],
+      "code": ["obsidian-plugin/src/main.cjs"],
+      "tests": ["tests/phase1.test.ts"]
     }
   }
 }

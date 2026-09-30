@@ -4,7 +4,7 @@ INSTANCE OBTSApplyRefinement
 INSTANCE OBTSSafety
 
 (***************************************************************************
-OBTS-FM-002, architecture revision 27. This is a bounded refinement of the
+OBTS-FM-002, architecture revision 32. This is a bounded refinement of the
 architecture contracts, not a definition of product behavior. Persist/commit
 steps assume their named durable facts survive restart. Git ancestry, bytes,
 flush semantics, process kill, and runtime trace conformance remain external.
@@ -117,7 +117,7 @@ EditOrderAllows(c) ==
     [] OTHER -> TRUE
 NetworkFaultActor(c) == c = Plugin1 /\ Scenario \in {"all-actors", "network"}
 NetworkFaultCopy(c, copy) == NetworkFaultActor(c) /\ (Scenario # "all-actors" \/ copy = 1)
-ClientCrashAllowed(c) == c = BridgeNode /\ Scenario \in {"bridge-handoff", "all-actors"}
+ClientCrashAllowed(c) == (c = BridgeNode /\ Scenario \in {"bridge-handoff", "all-actors"}) \/ (c = Plugin1 /\ Scenario = "legacy-retirement")
 AllScenarioProposalsTerminal ==
   CASE Scenario = "disjoint-directory" -> client.proposalPhase[Plugin1] = "Terminal" /\ client.proposalPhase[BridgeNode] = "Terminal"
     [] Scenario = "all-actors" -> \A c \in Clients: client.proposalPhase[c] = "Terminal"
@@ -208,7 +208,19 @@ Init ==
        cursorFixtureReady |-> FALSE, cursorEventAppended |-> FALSE, cursorAcknowledged |-> FALSE, cursorProposalQueued |-> FALSE,
        proposalBaseCursor |-> 0, proposalBaseSnapshot |-> "baseline", proposalOutcome |-> "Pending", proposalRebased |-> FALSE,
        acknowledgedMainEpoch |-> 0, targetMainEventSeq |-> 0, mainAdvancedAfterAck |-> FALSE,
-       recoveryOutcome |-> "Pending", recoveryCursor |-> 0, recoverySnapshot |-> "baseline"]
+       recoveryOutcome |-> "Pending", recoveryCursor |-> 0, recoverySnapshot |-> "baseline",
+       legacyPhase |-> "Orphan", legacyJournalPresent |-> TRUE,
+       legacyApplyPending |-> FaultMode = "LegacyPendingApply", legacyEvidenceSafe |-> TRUE,
+       legacyDeleteIgnored |-> TRUE,
+       legacyQueue |-> IF FaultMode \in {"LegacyChangedQueue", "LegacySkipArchivedQueueBinding"} THEN "newX" ELSE "old",
+       legacyArchivedQueue |-> "none", legacyQueueChanged |-> FALSE,
+       legacyHints |-> {"edit"}, legacyArchivedHints |-> {},
+       legacyVisible |-> "edit", legacyArchivedVisible |-> "none", legacyVisibleChanged |-> FALSE,
+       legacyUploaded |-> "none", legacyDeleteUploaded |-> FALSE,
+       legacyTransfer |-> "unknown", legacyServerRef |-> "old", legacyLateAcceptance |-> FALSE,
+       legacyCancelledAttempt |-> FALSE,
+       legacyArchive |-> FALSE, legacyUploadRetired |-> FALSE, legacyPullRetired |-> FALSE,
+       legacyVolatile |-> 0, legacyArchivedVolatile |-> 0, legacyRestarted |-> FALSE]
   /\ coverage = [actions |-> {}, classifications |-> {}, actorsProposed |-> {}, conflictPartial |-> FALSE, replyLostAfterOutcome |-> FALSE]
   /\ ghost = [captured |-> {}, overwritten |-> {}]
   /\ lastAction = "Init"
@@ -748,6 +760,147 @@ ReconstructDirectoryBaseline ==
   /\ coverage' = Mark("ReconstructDirectoryBaseline") /\ lastAction' = "ReconstructDirectoryBaseline"
   /\ UNCHANGED <<client, network, server, bridge, ghost>>
 
+LegacyQueueCovered ==
+  (directory.legacyPhase # "Archived" \/ directory.legacyQueue = directory.legacyArchivedQueue) /\
+  (directory.legacyArchivedQueue = "old" \/ FaultMode = "LegacySkipArchivedQueueBinding" \/
+   directory.legacyQueue \in {"newX", "newDesc"}) /\
+  directory.legacyArchivedHints \subseteq directory.legacyHints
+
+LegacyCorruptEvidence ==
+  /\ Scenario = "legacy-retirement" /\ FaultMode = "LegacyUnsafeEvidence"
+  /\ directory.legacyPhase = "Orphan" /\ directory.legacyEvidenceSafe
+  /\ directory' = [directory EXCEPT !.legacyEvidenceSafe = FALSE, !.legacyDeleteIgnored = FALSE]
+  /\ coverage' = Mark("LegacyCorruptEvidence") /\ lastAction' = "LegacyCorruptEvidence"
+  /\ UNCHANGED <<client, network, server, bridge, ghost>>
+
+LegacyValidateCompletedAdvance ==
+  /\ Scenario = "legacy-retirement" /\ NormalClient(Plugin1) /\ directory.legacyPhase = "Orphan"
+  /\ (FaultMode # "LegacyUnsafeEvidence" \/ ~directory.legacyEvidenceSafe)
+  /\ directory' = [directory EXCEPT
+       !.legacyPhase = IF directory.legacyApplyPending \/ ~directory.legacyEvidenceSafe \/ ~directory.legacyDeleteIgnored THEN "Blocked" ELSE "Verified"]
+  /\ coverage' = Mark("LegacyValidateCompletedAdvance") /\ lastAction' = "LegacyValidateCompletedAdvance"
+  /\ UNCHANGED <<client, network, server, bridge, ghost>>
+
+LegacyPublishArchive ==
+  /\ Scenario = "legacy-retirement" /\ NormalClient(Plugin1) /\ directory.legacyPhase = "Verified"
+  /\ directory' = [directory EXCEPT !.legacyArchive = TRUE, !.legacyPhase = "Archived",
+       !.legacyArchivedQueue = directory.legacyQueue, !.legacyArchivedHints = directory.legacyHints,
+       !.legacyArchivedVisible = directory.legacyVisible, !.legacyArchivedVolatile = directory.legacyVolatile]
+  /\ coverage' = Mark("LegacyPublishArchive") /\ lastAction' = "LegacyPublishArchive"
+  /\ UNCHANGED <<client, network, server, bridge, ghost>>
+
+LegacyAuthorizeRetirement ==
+  /\ Scenario = "legacy-retirement" /\ NormalClient(Plugin1) /\ directory.legacyPhase = "Archived"
+  /\ directory.legacyArchive /\ LegacyQueueCovered /\ directory.legacyEvidenceSafe
+  /\ (FaultMode # "LegacyRequireVolatileArchiveEquality" \/ directory.legacyVolatile = directory.legacyArchivedVolatile)
+  /\ directory' = [directory EXCEPT !.legacyPhase = "Authorized"]
+  /\ coverage' = Mark("LegacyAuthorizeRetirement") /\ lastAction' = "LegacyAuthorizeRetirement"
+  /\ UNCHANGED <<client, network, server, bridge, ghost>>
+
+LegacyObserveTransferStatus(status) ==
+  /\ Scenario = "legacy-retirement" /\ NormalClient(Plugin1)
+  /\ directory.legacyPhase = "Authorized" /\ directory.legacyTransfer = "unknown"
+  /\ status \in {"open", "rejected", "processing", "accepted", "expired"}
+  /\ directory' = [directory EXCEPT !.legacyTransfer = status,
+       !.legacyServerRef = IF status = "accepted" THEN "moved" ELSE @]
+  /\ coverage' = Mark("LegacyObserveTransferStatus") /\ lastAction' = "LegacyObserveTransferStatus"
+  /\ UNCHANGED <<client, network, server, bridge, ghost>>
+
+LegacyCancelTransfer ==
+  /\ Scenario = "legacy-retirement" /\ NormalClient(Plugin1) /\ directory.legacyPhase = "Authorized"
+  /\ directory.legacyTransfer \in {"open", "rejected"}
+  /\ directory' = [directory EXCEPT !.legacyTransfer = "cancelled", !.legacyCancelledAttempt = TRUE]
+  /\ coverage' = Mark("LegacyCancelTransfer") /\ lastAction' = "LegacyCancelTransfer"
+  /\ UNCHANGED <<client, network, server, bridge, ghost>>
+
+LegacyLateAcceptance ==
+  /\ Scenario = "legacy-retirement" /\ directory.legacyPhase \in {"Authorized", "UploadRetired", "QueueSettled", "PullRetired", "Settled"}
+  /\ directory.legacyTransfer \in {"open", "expired", "cancelled"} /\ directory.legacyServerRef = "old"
+  /\ ~directory.legacyLateAcceptance
+  /\ directory' = [directory EXCEPT !.legacyTransfer = "accepted", !.legacyServerRef = "moved",
+       !.legacyLateAcceptance = TRUE]
+  /\ coverage' = Mark("LegacyLateAcceptance") /\ lastAction' = "LegacyLateAcceptance"
+  /\ UNCHANGED <<client, network, server, bridge, ghost>>
+
+LegacyChangeQueue(next) ==
+  /\ Scenario = "legacy-retirement" /\ directory.legacyPhase \in {"Archived", "Authorized", "UploadRetired", "QueueSettled", "PullRetired"}
+  /\ ~directory.legacyQueueChanged /\ next \in {"old", "none", "newY", "newDesc"} /\ next # directory.legacyQueue
+  /\ directory' = [directory EXCEPT !.legacyQueue = next, !.legacyQueueChanged = TRUE]
+  /\ coverage' = Mark("LegacyChangeQueue") /\ lastAction' = "LegacyChangeQueue"
+  /\ UNCHANGED <<client, network, server, bridge, ghost>>
+
+LegacyChangeHint ==
+  /\ Scenario = "legacy-retirement" /\ directory.legacyPhase \in {"Archived", "Authorized", "UploadRetired", "QueueSettled", "PullRetired"}
+  /\ directory.legacyHints = {"edit"}
+  /\ directory' = [directory EXCEPT !.legacyHints = {}]
+  /\ coverage' = Mark("LegacyChangeHint") /\ lastAction' = "LegacyChangeHint"
+  /\ UNCHANGED <<client, network, server, bridge, ghost>>
+
+LegacyObserveVisibleEdit ==
+  /\ Scenario = "legacy-retirement" /\ directory.legacyPhase \in {"Archived", "Authorized", "UploadRetired", "QueueSettled", "PullRetired"}
+  /\ ~directory.legacyVisibleChanged
+  /\ directory' = [directory EXCEPT !.legacyVisible = "later-edit", !.legacyVisibleChanged = TRUE]
+  /\ coverage' = Mark("LegacyObserveVisibleEdit") /\ lastAction' = "LegacyObserveVisibleEdit"
+  /\ UNCHANGED <<client, network, server, bridge, ghost>>
+
+LegacyBlockUnsafeQueue ==
+  /\ Scenario = "legacy-retirement" /\ NormalClient(Plugin1) /\ directory.legacyArchive
+  /\ directory.legacyPhase \in {"Archived", "Authorized", "UploadRetired", "QueueSettled", "PullRetired"}
+  /\ ~LegacyQueueCovered
+  /\ directory' = [directory EXCEPT !.legacyPhase = "Blocked"]
+  /\ coverage' = Mark("LegacyBlockUnsafeQueue") /\ lastAction' = "LegacyBlockUnsafeQueue"
+  /\ UNCHANGED <<client, network, server, bridge, ghost>>
+
+LegacyBlockUnsafeTransfer ==
+  /\ Scenario = "legacy-retirement" /\ NormalClient(Plugin1) /\ directory.legacyPhase = "Authorized"
+  /\ (directory.legacyTransfer \in {"processing", "accepted"} \/ directory.legacyServerRef = "moved")
+  /\ directory' = [directory EXCEPT !.legacyPhase = "Blocked"]
+  /\ coverage' = Mark("LegacyBlockUnsafeTransfer") /\ lastAction' = "LegacyBlockUnsafeTransfer"
+  /\ UNCHANGED <<client, network, server, bridge, ghost>>
+
+LegacyRetireUpload ==
+  /\ Scenario = "legacy-retirement" /\ NormalClient(Plugin1) /\ directory.legacyPhase = "Authorized"
+  /\ directory.legacyArchive /\ LegacyQueueCovered /\ directory.legacyServerRef = "old"
+  /\ directory.legacyTransfer \in {"cancelled", "expired"}
+  /\ directory' = [directory EXCEPT !.legacyUploadRetired = TRUE, !.legacyPhase = "UploadRetired"]
+  /\ coverage' = Mark("LegacyRetireUpload") /\ lastAction' = "LegacyRetireUpload"
+  /\ UNCHANGED <<client, network, server, bridge, ghost>>
+
+LegacyPreserveQueue ==
+  /\ Scenario = "legacy-retirement" /\ NormalClient(Plugin1) /\ directory.legacyPhase = "UploadRetired"
+  /\ LegacyQueueCovered
+  /\ directory' = [directory EXCEPT !.legacyQueue = IF @ = "old" THEN "none" ELSE @,
+       !.legacyPhase = "QueueSettled"]
+  /\ coverage' = Mark("LegacyPreserveQueue") /\ lastAction' = "LegacyPreserveQueue"
+  /\ UNCHANGED <<client, network, server, bridge, ghost>>
+
+LegacyRetirePull ==
+  /\ Scenario = "legacy-retirement" /\ NormalClient(Plugin1) /\ directory.legacyPhase = "QueueSettled"
+  /\ LegacyQueueCovered
+  /\ directory' = [directory EXCEPT !.legacyPullRetired = TRUE, !.legacyPhase = "PullRetired"]
+  /\ coverage' = Mark("LegacyRetirePull") /\ lastAction' = "LegacyRetirePull"
+  /\ UNCHANGED <<client, network, server, bridge, ghost>>
+
+LegacyClearJournal ==
+  /\ Scenario = "legacy-retirement" /\ NormalClient(Plugin1)
+  /\ (directory.legacyPhase = "PullRetired" \/
+       (FaultMode = "LegacyClearJournalEarly" /\ directory.legacyPhase = "Authorized"))
+  /\ directory.legacyArchive
+  /\ (FaultMode = "LegacyClearJournalEarly" \/
+       (directory.legacyUploadRetired /\ directory.legacyPullRetired /\ LegacyQueueCovered))
+  /\ directory' = [directory EXCEPT !.legacyPhase = "Settled", !.legacyJournalPresent = FALSE]
+  /\ coverage' = Mark("LegacyClearJournal") /\ lastAction' = "LegacyClearJournal"
+  /\ UNCHANGED <<client, network, server, bridge, ghost>>
+
+LegacyNormalUpload ==
+  /\ Scenario = "legacy-retirement" /\ NormalClient(Plugin1) /\ directory.legacyPhase = "Settled"
+  /\ directory.legacyQueue \in {"newX", "newDesc", "newY"} /\ directory.legacyServerRef = "old"
+  /\ directory.legacyUploaded = "none"
+  /\ directory' = [directory EXCEPT !.legacyUploaded = directory.legacyQueue,
+       !.legacyDeleteUploaded = ~directory.legacyDeleteIgnored, !.legacyServerRef = "new"]
+  /\ coverage' = Mark("LegacyNormalUpload") /\ lastAction' = "LegacyNormalUpload"
+  /\ UNCHANGED <<client, network, server, bridge, ghost>>
+
 EvictDeliveredAckSnapshot ==
   /\ FaultMode = "EvictDeliveredAckSnapshot" /\ NormalServer /\ client.ackIntent[Plugin2] /\ client.durableApplied[Plugin2]
   /\ client.localMainEpoch[Plugin2] < server.mainEpoch
@@ -853,10 +1006,12 @@ FailProjection ==
 
 CrashClient(c) ==
   /\ ClientCrashAllowed(c) /\ NormalClient(c) /\ client.crashCount[c] < MaxClientCrashes
-  /\ (Scenario # "all-actors" \/ (bridge.nodeHintDurable /\ client.proposalPhase[c] = "Observed"))
+  /\ (Scenario = "legacy-retirement" \/ Scenario # "all-actors" \/ (bridge.nodeHintDurable /\ client.proposalPhase[c] = "Observed"))
   /\ client' = [client EXCEPT !.up[c] = FALSE, !.crashCount[c] = @ + 1]
+  /\ directory' = IF Scenario = "legacy-retirement" THEN
+       [directory EXCEPT !.legacyVolatile = @ + 1] ELSE directory
   /\ coverage' = Mark("CrashClient") /\ lastAction' = "CrashClient"
-  /\ UNCHANGED <<network, server, bridge, directory, ghost>>
+  /\ UNCHANGED <<network, server, bridge, ghost>>
 
 RestartClient(c) ==
   /\ ~client.up[c]
@@ -867,14 +1022,17 @@ RestartClient(c) ==
 
 ClassifyClientRestart(c) ==
   /\ client.up[c] /\ client.recovering[c]
-  /\ LET disposition == IF client.journalPresent[c] /\ client.recoveryRoots[c] # {} THEN "Resume"
+  /\ LET disposition == IF Scenario = "legacy-retirement" /\ c = Plugin1 THEN "Resume"
+                         ELSE IF client.journalPresent[c] /\ client.recoveryRoots[c] # {} THEN "Resume"
                          ELSE IF client.ackIntent[c] /\ client.durableApplied[c] THEN "RollForward"
                          ELSE IF client.proposalPhase[c] \in {"Queued", "Transferring"} /\ client.queueTarget[c] \in client.localGit[c] THEN "Resume"
                          ELSE IF client.observed[c] \subseteq client.localGit[c] THEN "RollForward"
                          ELSE "Block" IN
        client' = [client EXCEPT !.recovering[c] = FALSE, !.restartDisposition[c] = disposition, !.blocked[c] = disposition = "Block"]
+  /\ directory' = IF Scenario = "legacy-retirement" /\ c = Plugin1 THEN
+       [directory EXCEPT !.legacyRestarted = TRUE] ELSE directory
   /\ coverage' = Mark("ClassifyClientRestart") /\ lastAction' = "ClassifyClientRestart"
-  /\ UNCHANGED <<network, server, bridge, directory, ghost>>
+  /\ UNCHANGED <<network, server, bridge, ghost>>
 
 CrashServer ==
   /\ ServerCrashAllowed /\ NormalServer /\ server.crashCount < MaxServerCrashes
@@ -1091,7 +1249,11 @@ RootActions == {
  "DiscardLocalOnly", "DiscardIgnoredBridgeWrite", "PublishExcludedRows", "MutateAttemptPolicy", "UnsafeOldClientPoll", "AcceptStalePolicyProposal", "ActivateLegacyWithoutReconciliation", "AdmitExcludedCandidate",
  "EvictDeliveredAckSnapshot", "LoseAllAckEvidence", "AcknowledgeHistorical",
  "DirectoryBaselineFixture", "AppendDirectoryBaselineEvent", "AcknowledgeDirectoryBaseline", "QueueDirectoryBaselineProposal",
- "ClassifyDirectoryBaselineProposal", "AdvanceDirectoryBaselineMain", "ReconstructDirectoryBaseline"
+ "ClassifyDirectoryBaselineProposal", "AdvanceDirectoryBaselineMain", "ReconstructDirectoryBaseline",
+ "LegacyCorruptEvidence", "LegacyValidateCompletedAdvance", "LegacyPublishArchive", "LegacyAuthorizeRetirement",
+ "LegacyObserveTransferStatus", "LegacyCancelTransfer", "LegacyLateAcceptance", "LegacyChangeQueue", "LegacyChangeHint",
+ "LegacyObserveVisibleEdit", "LegacyBlockUnsafeQueue", "LegacyBlockUnsafeTransfer", "LegacyRetireUpload",
+ "LegacyPreserveQueue", "LegacyRetirePull", "LegacyClearJournal", "LegacyNormalUpload"
 }
 
 ClientActions(c) ==
@@ -1113,7 +1275,11 @@ BridgeActions == RustValidateWrite \/ RustAtomicVisibleWrite \/ NodePersistBridg
 
 DirectoryActions == ObserveDirectoryDescendant(Plugin1) \/ RemoveDirectoryDescendant(Plugin1) \/ PreflightEmptyDirectory(Plugin1) \/ DeleteEmptyDirectory(Plugin1) \/
   DirectoryBaselineFixture \/ AppendDirectoryBaselineEvent \/ AcknowledgeDirectoryBaseline \/ QueueDirectoryBaselineProposal \/ ClassifyDirectoryBaselineProposal \/
-  AdvanceDirectoryBaselineMain \/ ReconstructDirectoryBaseline
+  AdvanceDirectoryBaselineMain \/ ReconstructDirectoryBaseline \/ LegacyCorruptEvidence \/ LegacyValidateCompletedAdvance \/ LegacyPublishArchive \/
+  LegacyAuthorizeRetirement \/ (\E outcome \in {"open", "rejected", "processing", "accepted", "expired"}: LegacyObserveTransferStatus(outcome)) \/
+  LegacyCancelTransfer \/ LegacyLateAcceptance \/ (\E next \in {"old", "none", "newY", "newDesc"}: LegacyChangeQueue(next)) \/
+  LegacyChangeHint \/ LegacyObserveVisibleEdit \/ LegacyBlockUnsafeQueue \/ LegacyBlockUnsafeTransfer \/
+  LegacyRetireUpload \/ LegacyPreserveQueue \/ LegacyRetirePull \/ LegacyClearJournal \/ LegacyNormalUpload
 
 FaultActions == ReplaceInflightTarget \/ DropAcceptedProposal \/ MoveCoveredRefBackward \/ DiscardDivergence \/ MoveMainBeforePreparedEffects \/
   AckBeforeDurableApply \/ EvictDeliveredAckSnapshot \/ LoseAllAckEvidence \/ OverwriteUncapturedBridgeWrite \/ RecursiveDirectoryDelete \/ RestartAbortsMovedRef \/ DuplicateNonIdempotentProcessing \/
@@ -1183,6 +1349,23 @@ TypeOK ==
   /\ directory.proposalOutcome \in DirectoryProposalOutcomes /\ directory.proposalRebased \in BOOLEAN
   /\ directory.acknowledgedMainEpoch \in Nat /\ directory.targetMainEventSeq \in Nat /\ directory.mainAdvancedAfterAck \in BOOLEAN
   /\ directory.recoveryOutcome \in DirectoryRecoveryOutcomes /\ directory.recoveryCursor \in Nat /\ directory.recoverySnapshot \in DirectorySnapshotStates
+  /\ directory.legacyPhase \in {"Orphan", "Verified", "Archived", "Authorized", "UploadRetired", "QueueSettled", "PullRetired", "Settled", "Blocked"}
+  /\ directory.legacyQueue \in {"old", "none", "newX", "newY", "newDesc"}
+  /\ directory.legacyArchivedQueue \in {"old", "none", "newX", "newY", "newDesc"}
+  /\ directory.legacyApplyPending \in BOOLEAN /\ directory.legacyEvidenceSafe \in BOOLEAN
+  /\ directory.legacyDeleteIgnored \in BOOLEAN /\ directory.legacyQueueChanged \in BOOLEAN
+  /\ directory.legacyJournalPresent \in BOOLEAN /\ directory.legacyArchive \in BOOLEAN
+  /\ directory.legacyUploadRetired \in BOOLEAN /\ directory.legacyPullRetired \in BOOLEAN
+  /\ directory.legacyHints \subseteq {"edit"} /\ directory.legacyArchivedHints \subseteq {"edit"}
+  /\ directory.legacyVisible \in {"edit", "later-edit", "none"}
+  /\ directory.legacyArchivedVisible \in {"edit", "later-edit", "none"}
+  /\ directory.legacyVisibleChanged \in BOOLEAN /\ directory.legacyLateAcceptance \in BOOLEAN
+  /\ directory.legacyCancelledAttempt \in BOOLEAN
+  /\ directory.legacyUploaded \in {"none", "newX", "newY", "newDesc", "old"}
+  /\ directory.legacyDeleteUploaded \in BOOLEAN
+  /\ directory.legacyTransfer \in {"unknown", "open", "rejected", "processing", "accepted", "expired", "cancelled"}
+  /\ directory.legacyServerRef \in {"old", "moved", "new"}
+  /\ directory.legacyVolatile \in Nat /\ directory.legacyArchivedVolatile \in Nat /\ directory.legacyRestarted \in BOOLEAN
   /\ coverage.actions \subseteq RootActions \cup {"BridgeNodeCaptured", "PluginCaptured", "CASOld", "CASTarget", "CASForeign", "CASUncertain", "AcknowledgeHistorical"}
   /\ coverage.classifications \subseteq Classifications /\ coverage.actorsProposed \subseteq Clients /\ coverage.conflictPartial \in BOOLEAN /\ coverage.replyLostAfterOutcome \in BOOLEAN
   /\ ghost.captured \subseteq Versions /\ ghost.overwritten \subseteq Versions /\ lastAction \in RootActions \cup {"Init"}
@@ -1238,6 +1421,45 @@ DirectoryHistoricalSnapshotCoherent == directory.recoveryOutcome # "Available" \
 DirectoryRecoveryUnprovenUnavailable == Scenario # "directory-baseline" \/
   FaultMode \notin {"DirectoryBaselineInterveningIntent", "DirectoryBaselineHistoryLost"} \/
   directory.recoveryOutcome # "Available"
+LegacyRetirementSafe == Scenario # "legacy-retirement" \/
+  (directory.legacyVisible \in {"edit", "later-edit"} /\
+   directory.legacyUploaded # "old" /\ ~directory.legacyDeleteUploaded /\
+   (directory.legacyLateAcceptance => directory.legacyUploaded = "none") /\
+   (directory.legacyPhase \in {"UploadRetired", "QueueSettled", "PullRetired", "Settled"} => directory.legacyArchive) /\
+   (directory.legacyPhase # "Settled" => directory.legacyJournalPresent) /\
+   (directory.legacyPhase = "Settled" =>
+     ~directory.legacyJournalPresent /\ ~directory.legacyApplyPending /\ directory.legacyEvidenceSafe /\
+     directory.legacyDeleteIgnored /\ directory.legacyArchive /\ directory.legacyUploadRetired /\
+     directory.legacyPullRetired /\ LegacyQueueCovered /\
+     directory.legacyArchivedHints \subseteq directory.legacyHints))
+LegacyArchivedQueueBound == Scenario # "legacy-retirement" \/
+  (directory.legacyPhase = "Settled" /\ directory.legacyArchivedQueue = "newX" =>
+   directory.legacyQueue \in {"newX", "newDesc"})
+LegacyUnsafeBlocks == Scenario # "legacy-retirement" \/
+  (~directory.legacyApplyPending /\ directory.legacyEvidenceSafe) \/ directory.legacyPhase # "Settled"
+LegacyArchiveReusable == Scenario # "legacy-retirement" \/
+  (directory.legacyPhase = "Archived" /\ client.up[Plugin1] /\ ~client.recovering[Plugin1] /\
+   LegacyQueueCovered /\ directory.legacyEvidenceSafe => ENABLED LegacyAuthorizeRetirement)
+NeverLegacySettled == directory.legacyPhase # "Settled"
+NeverLegacyBlocked == directory.legacyPhase # "Blocked"
+NeverLegacyRestartedSettled == ~(directory.legacyPhase = "Settled" /\ directory.legacyRestarted /\
+  directory.legacyVolatile > directory.legacyArchivedVolatile)
+NeverLegacyUnsafeQueueBlocked == ~(directory.legacyPhase = "Blocked" /\ directory.legacyArchivedQueue = "newX" /\
+  directory.legacyQueue \in {"old", "none", "newY"})
+NeverLegacyDescendantSettled == ~(directory.legacyPhase = "Settled" /\ directory.legacyArchivedQueue = "newX" /\
+  directory.legacyQueue = "newDesc")
+NeverLegacyHintBlocked == ~(directory.legacyPhase = "Blocked" /\ directory.legacyArchive /\ directory.legacyHints = {})
+NeverLegacyProcessingBlocked == ~(directory.legacyPhase = "Blocked" /\ directory.legacyTransfer = "processing")
+NeverLegacyAcceptedBlocked == ~(directory.legacyPhase = "Blocked" /\ directory.legacyTransfer = "accepted")
+NeverLegacyLateCASBlocked == ~(directory.legacyPhase = "Settled" /\ directory.legacyLateAcceptance /\
+  directory.legacyServerRef = "moved" /\ directory.legacyUploaded = "none")
+NeverLegacyNewUpload == ~(directory.legacyPhase = "Settled" /\ directory.legacyUploaded = "newX")
+NeverLegacyCancelledRace == ~(directory.legacyPhase = "Settled" /\ directory.legacyLateAcceptance /\
+  directory.legacyCancelledAttempt /\ directory.legacyServerRef = "moved" /\
+  directory.legacyQueue = "newX" /\ directory.legacyUploaded = "none")
+NeverLegacyRestartedArchive == ~(directory.legacyPhase = "Archived" /\ directory.legacyRestarted /\
+  directory.legacyVolatile > directory.legacyArchivedVolatile)
+
 PolicyProjectionExcludesCurrentRows == bridge.projectionPolicy # "exclude-a" \/ ~bridge.rowsComplete \/ (PathA \notin bridge.projectedPaths /\ bridge.auditRetained)
 BridgeExcludedLocalWriteRetained == ~PolicyScenario \/ server.policy # "exclude-a" \/ ~bridge.acknowledged \/ client.visible[BridgeNode][PathA] = BridgeVersion
 StalePolicyRefProtected == ~PolicyScenario \/ server.opPolicy = server.policy \/ server.classification # "Divergent" \/ server.opTarget \in server.processingRoots \cup server.conflictRoots
@@ -1248,7 +1470,7 @@ AllSafety == /\ TypeOK /\ CapturedOnlyAfterDurablePublication /\ OBTS_SAF_001_Ca
   /\ OBTS_SAF_006_DirectoryDeletionNonRecursive /\ NoDeviceRefRewind /\ AttemptIdentityImmutable /\ ServerProcessesAttemptOnce /\ DivergenceDoesNotMoveDeviceRef
   /\ DivergentProposalProtected /\ ConflictProtectionCompleteOrRetained /\ NoEmptyConflictRoot /\ MainMoveWasPrepared /\ CASSideEffectRecoveryByReading /\ ExactPreparedOperationRecovery
   /\ SoundApplyAcknowledgement /\ AckIntentResolvable /\ SeenAppliedSeparation /\ DirectoryDeletionCausal /\ GitDirectoryEventAgreement /\ DisjointEditsSurvive
-  /\ BridgeAcknowledgedWritePreserved /\ ProjectionVerifiedBeforeCursor /\ ProjectionFailureRetainsCursor /\ ProjectionIsDerivedOnly
+  /\ LegacyRetirementSafe /\ LegacyArchivedQueueBound /\ LegacyUnsafeBlocks /\ LegacyArchiveReusable /\ BridgeAcknowledgedWritePreserved /\ ProjectionVerifiedBeforeCursor /\ ProjectionFailureRetainsCursor /\ ProjectionIsDerivedOnly
   /\ ApplyRefinementBoundary /\ ApplyProjectionConsistent /\ CandidateAdmittedOnlyWhenPolicyValid /\ PolicyTransitionRemovesOnlyCanonicalCopy
   /\ LocalOnlyApplyRetainsVisible /\ OldClientCannotApply /\ DirectoryCursorProposalAcceptanceSound
   /\ DirectoryHistoricalSnapshotCoherent /\ DirectoryCursorUnprovenProposalRejected /\ DirectoryRecoveryUnprovenUnavailable

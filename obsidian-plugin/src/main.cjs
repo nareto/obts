@@ -2360,6 +2360,7 @@ class ObtsObsidianClient {
     if (!state.vault_id || !state.device_id) {
       throw new ObtsBlockedError("not_paired", "Device is not paired.");
     }
+    if (await this.settleCompletedLegacyDirectoryAdvance()) state = await this.readState();
     if (state.last_error_code === "stale_directory_proposal_base" || await exists(this.fsp, this.directoryBaselineRecoveryPath)) {
       await this.recoverStaleDirectoryProposalBase();
       state = await this.readState();
@@ -7625,6 +7626,265 @@ class ObtsObsidianClient {
     return await run;
   }
 
+  async cancelLegacyDirectoryTransfer(state, original, token) {
+    const response = await fetchWithTimeout(
+      this.url(`/api/v1/vaults/${state.vault_id}/sync/push-transfers/${original.rejected_transfer_id}`),
+      { headers: { authorization: `Bearer ${token}` } }
+    );
+    if (response.status !== 404 && response.status !== 410) {
+      if (!response.ok) await throwResponseError(response);
+      const descriptor = await response.json();
+      if (descriptor.transfer_id !== original.rejected_transfer_id ||
+        descriptor.target_commit !== original.pending_commit ||
+        !["open", "rejected", "aborted"].includes(descriptor.status)) {
+        throw new ObtsBlockedError("legacy_directory_advance_unsafe", "The rejected transfer is processing, accepted, or mismatched; preserve its evidence for assisted recovery.");
+      }
+      const cancelled = await fetchWithTimeout(
+        this.url(`/api/v1/vaults/${state.vault_id}/sync/push-transfers/${original.rejected_transfer_id}`),
+        { method: "DELETE", headers: { authorization: `Bearer ${token}` } }
+      );
+      if (cancelled.status !== 204 && cancelled.status !== 404 && cancelled.status !== 410) {
+        if (!cancelled.ok) await throwResponseError(cancelled);
+        throw new ObtsBlockedError("legacy_directory_advance_unsafe", "The obsolete transfer could not be cancelled safely.");
+      }
+    }
+    const current = await this.getDeviceSelf(token);
+    if (current.server_device_ref !== original.server_device_ref) {
+      throw new ObtsBlockedError("legacy_directory_advance_unsafe", "The device ref changed during legacy transfer settlement; preserve the evidence for assisted recovery.");
+    }
+  }
+
+  async settleCompletedLegacyDirectoryAdvance() {
+    const journal = await readRecoveryJsonStrict(
+      this.fsp, this.directoryBaselineRecoveryPath,
+      "directory_baseline_recovery_journal_invalid", "The directory baseline recovery journal is malformed."
+    );
+    if (!journal || !["main_advanced", "legacy_retirement_authorized"].includes(journal.phase)) return false;
+    const fail = () => { throw new ObtsBlockedError(
+      "legacy_directory_advance_unsafe",
+      "The completed legacy directory advance cannot be verified. Preserve the journal, checkpoints, queue, and recovery archive for assisted recovery."
+    ); };
+    if (await exists(this.fsp, this.applyJournalPath)) fail();
+    if (!Platform?.isMobile && (typeof this.adapter.syncFile !== "function" ||
+      typeof this.adapter.syncDirectory !== "function")) fail();
+    const state = await this.readState();
+    if (![null, "stale_directory_proposal_base"].includes(state.last_error_code) || state.apply_validation_reason) fail();
+    const queue = await this.readQueue();
+    const directoryState = await this.readDirectoryState();
+    const upload = await readRecoveryJsonStrict(this.fsp, this.uploadTransferPath,
+      "legacy_directory_advance_unsafe", "The legacy upload checkpoint is unreadable.");
+    const pull = await readRecoveryJsonStrict(this.fsp, this.pullTransferPath,
+      "legacy_directory_advance_unsafe", "The legacy pull checkpoint is unreadable.");
+    const authorized = journal.phase === "legacy_retirement_authorized";
+    const archiveId = sha256(Buffer.from(stableJson([
+      journal.vault_id, journal.device_id, journal.pending_commit, journal.target_main, journal.rejected_checkpoint_identity
+    ])));
+    const archivePath = path.join(this.obtsDir, "recovery", `legacy-baseline-${archiveId}.json`);
+    const archive = await readRecoveryJsonStrict(this.fsp, archivePath,
+      "legacy_directory_advance_unsafe", "The legacy recovery archive is unreadable.");
+    if (authorized && (!archive || archive.digest !== journal.legacy_archive_digest ||
+      archive.digest !== sha256(Buffer.from(stableJson(archive.evidence))) ||
+      archive.evidence?.journal?.phase !== "main_advanced" ||
+      !Array.isArray(archive.evidence?.queue?.changed_paths))) fail();
+    if (!authorized && archive && (archive.digest !== sha256(Buffer.from(stableJson(archive.evidence))) ||
+      stableJson(archive.evidence?.journal) !== stableJson(journal) ||
+      !archive.evidence?.state || !archive.evidence?.queue || !archive.evidence?.directoryState ||
+      !legacySettlementStateAgrees(archive.evidence.state, state) ||
+      !legacySettlementQueueAgrees(archive.evidence.queue, queue) ||
+      !legacySettlementDirectoryAgrees(archive.evidence.directoryState, directoryState) ||
+      stableJson(archive.evidence.upload) !== stableJson(upload) ||
+      stableJson(archive.evidence.pull) !== stableJson(pull))) fail();
+    const original = authorized ? archive.evidence.journal : journal;
+    const oldUpload = authorized ? archive.evidence.upload : upload;
+    const oldPull = authorized ? archive.evidence.pull : pull;
+    const originalIntent = original.original_pending_intents;
+    if (original.version !== 1 || original.phase !== "main_advanced" ||
+      original.vault_id !== state.vault_id || original.device_id !== state.device_id ||
+      !isGitObjectId(original.local_main) || !isGitObjectId(original.pending_commit) ||
+      !isGitObjectId(original.target_main) || original.local_head !== original.pending_commit ||
+      !Number.isSafeInteger(original.last_event_seq) ||
+      original.last_event_seq !== original.last_applied_event_seq ||
+      !Number.isSafeInteger(original.recovered_event_seq) ||
+      original.recovered_event_seq <= original.last_event_seq ||
+      original.server_device_ref !== original.recovered_server_device_ref ||
+      original.server_device_ref !== state.server_device_ref ||
+      !isGitObjectId(original.server_device_ref) ||
+      !Array.isArray(originalIntent) || originalIntent.length !== 1 ||
+      !isStoredDirectoryIntent(originalIntent[0]) || originalIntent[0].op !== "delete" ||
+      originalIntent[0].base_main !== original.local_main ||
+      originalIntent[0].base_event_seq !== original.last_applied_event_seq ||
+      !Array.isArray(original.target_explicit_directories) ||
+      !Array.isArray(original.advanced_directory_intents) ||
+      original.advanced_directory_intents.length !== 3 ||
+      original.advanced_directory_intents.some((intent) => !intent ||
+        !["create", "delete"].includes(intent.op) || !isSafeJournalPath(intent.path)) ||
+      original.advanced_directory_intents.filter((intent) => intent.op === "delete" && intent.path === originalIntent[0].path).length !== 1 ||
+      original.advanced_directory_intents.filter((intent) => intent.op === "create").length !== 2 ||
+      original.checkpoint_removal_authorized !== false ||
+      typeof original.rejected_transfer_id !== "string" ||
+      !/^trn_[A-Za-z0-9]+$/u.test(original.rejected_transfer_id) ||
+      state.local_main !== original.target_main ||
+      state.last_event_seq < original.recovered_event_seq ||
+      state.last_applied_event_seq < original.recovered_event_seq ||
+      await this.resolveRef("refs/heads/main") !== original.target_main ||
+      await this.resolveRef("refs/heads/local") !== state.local_head ||
+      !await this.commitExists(original.local_main) ||
+      !await this.commitExists(original.target_main) ||
+      !await this.commitExists(original.pending_commit) ||
+      !await this.isAncestor(original.local_main, original.target_main) ||
+      !await this.isAncestor(original.server_device_ref, original.local_main) ||
+      original.server_device_ref === original.local_main ||
+      !await this.isAncestor(original.server_device_ref, original.pending_commit)) fail();
+    const [baseCommit, emptyCommit] = await Promise.all([
+      git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: original.local_main }),
+      git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: original.pending_commit })
+    ]);
+    if (emptyCommit.commit.parent.length !== 1 || emptyCommit.commit.parent[0] !== original.local_main ||
+      emptyCommit.commit.tree !== baseCommit.commit.tree) fail();
+    const [targetPolicy, basePolicy] = await Promise.all([
+      this.targetApplyPolicy(original.target_main), this.targetApplyPolicy(original.local_main)
+    ]);
+    const deletePrefix = `${originalIntent[0].path}/`;
+    const baseEntries = await this.listTreeBlobOids(original.local_main);
+    if (!targetPolicy.policy.ignores(originalIntent[0].path, true) ||
+      [...targetPolicy.entries.keys(), ...baseEntries.keys()].some((filePath) =>
+        filePath === originalIntent[0].path || filePath.startsWith(deletePrefix))) fail();
+    const queuedNew = queue.pending_commit && queue.pending_commit !== original.pending_commit;
+    if (queue.status !== "queued_local" || queue.expected_device_ref !== original.server_device_ref ||
+      (queuedNew && (queue.pending_commit !== state.local_head ||
+        queue.pending_commit === original.target_main ||
+        !await this.commitExists(queue.pending_commit) ||
+        !await this.isAncestor(original.target_main, queue.pending_commit))) ||
+      (!queuedNew && state.local_head !== original.target_main) ||
+      (queue.pending_commit !== original.pending_commit && !queuedNew &&
+        !(authorized && queue.pending_commit === null)) ||
+      (authorized && (!legacySettlementQueueAgrees(archive.evidence.queue, queue, true) ||
+        (archive.evidence.queue.pending_commit !== original.pending_commit &&
+          (!queuedNew || !await this.isAncestor(archive.evidence.queue.pending_commit, queue.pending_commit)))))) fail();
+    if (directoryState.pending_intents.some((intent) => intent.intent_id === originalIntent[0].intent_id) ||
+      directoryState.pending_intents.some((intent) => !targetPolicy.policy.ignores(intent.path, true))) fail();
+    if (!oldUpload || !isUploadTransferCheckpoint(oldUpload) ||
+      oldUpload.target_commit !== original.pending_commit ||
+      oldUpload.identity !== original.rejected_checkpoint_identity ||
+      oldUpload.attempt_id !== original.rejected_attempt_id ||
+      oldUpload.transfer_id !== original.rejected_transfer_id ||
+      oldUpload.transfer_request.plan_sha256 !== original.rejected_plan_sha256 ||
+      oldUpload.transfer_request.expected_device_ref !== original.server_device_ref ||
+      oldUpload.transfer_request.root_ignore_capability !== "root-ignore-v1" ||
+      oldUpload.transfer_request.root_ignore_oid !== basePolicy.oid ||
+      stableJson(oldUpload.transfer_request.directory_proposal) !== stableJson(oldUpload.directory_proposal) ||
+      !oldUpload.directory_proposal ||
+      oldUpload.directory_proposal.base_main !== original.local_main ||
+      oldUpload.directory_proposal.base_event_seq !== original.last_applied_event_seq ||
+      oldUpload.directory_proposal.intents?.length !== 1 ||
+      stableJson(oldUpload.directory_proposal.intents[0]) !== stableJson(originalIntent[0]) ||
+      (upload && stableJson(upload) !== stableJson(oldUpload)) ||
+      (!upload && !authorized)) fail();
+    if (!oldPull || !isCompletePullCheckpoint(oldPull) ||
+      oldPull.target_main !== original.target_main ||
+      oldPull.current_local_main !== original.local_main ||
+      oldPull.manifest.event_seq !== original.recovered_event_seq ||
+      stableJson(oldPull.manifest.explicit_directories) !== stableJson(original.target_explicit_directories) ||
+      stableJson(oldPull.manifest.directory_intents.map((intent) => [intent.op, intent.path]).sort()) !==
+        stableJson(original.advanced_directory_intents.map((intent) => [intent.op, intent.path]).sort()) ||
+      oldPull.manifest.root_ignore_oid !== targetPolicy.oid ||
+      state.last_applied_event_seq < oldPull.manifest.event_seq ||
+      (pull && stableJson(pull) !== stableJson(oldPull)) ||
+      (!pull && !authorized)) fail();
+    await this.validateCompleteTransferCheckpoint(oldPull, original.local_main);
+    const pendingAck = await this.readPendingAppliedAcknowledgement();
+    if (pendingAck && (pendingAck.target_main !== original.target_main ||
+      pendingAck.event_seq < original.recovered_event_seq)) fail();
+    const token = await this.readDeviceToken();
+    const serverDevice = await this.getDeviceSelf(token);
+    if (serverDevice.server_device_ref !== original.server_device_ref ||
+      !await this.isAncestor(serverDevice.server_device_ref, original.pending_commit) ||
+      serverDevice.server_device_ref === original.pending_commit ||
+      (serverDevice.last_applied_main !== original.target_main && !pendingAck)) fail();
+    if (!authorized) {
+      const evidence = { journal: original, state, queue, directoryState, upload, pull };
+      const digest = sha256(Buffer.from(stableJson(evidence)));
+      if (!legacySettlementQueueAgrees(queue, await this.readQueue()) ||
+        !legacySettlementStateAgrees(state, await this.readState()) ||
+        !legacySettlementDirectoryAgrees(directoryState, await this.readDirectoryState()) ||
+        stableJson(await readRecoveryJsonStrict(this.fsp, this.uploadTransferPath, "legacy_directory_advance_unsafe", "The upload checkpoint changed.")) !== stableJson(upload)) fail();
+      if (archive && (archive.digest !== digest && !legacySettlementEvidenceAgrees(archive.evidence, evidence))) fail();
+      if (!archive) {
+        await this.fsp.mkdir(path.dirname(archivePath), { recursive: true, mode: 0o700 });
+        if (typeof this.fsp.syncDirectory === "function") await this.fsp.syncDirectory(this.obtsDir);
+        await writeJson(this.fsp, archivePath, { version: 1, digest, evidence });
+      }
+      const published = await readRecoveryJsonStrict(this.fsp, archivePath,
+        "legacy_directory_advance_unsafe", "The recovery archive was not published.");
+      if (!published || published.digest !== sha256(Buffer.from(stableJson(published.evidence))) ||
+        !legacySettlementEvidenceAgrees(published.evidence, evidence) ||
+        !legacySettlementQueueAgrees(queue, await this.readQueue()) ||
+        !legacySettlementStateAgrees(state, await this.readState()) ||
+        !legacySettlementDirectoryAgrees(directoryState, await this.readDirectoryState()) ||
+        stableJson(await readRecoveryJsonStrict(this.fsp, this.uploadTransferPath,
+          "legacy_directory_advance_unsafe", "The upload checkpoint changed.")) !== stableJson(upload) ||
+        stableJson(await readRecoveryJsonStrict(this.fsp, this.pullTransferPath,
+          "legacy_directory_advance_unsafe", "The pull checkpoint changed.")) !== stableJson(pull)) fail();
+      await writeJson(this.fsp, this.directoryBaselineRecoveryPath, Object.assign({}, original, {
+        phase: "legacy_retirement_authorized", legacy_archive_digest: published.digest, updated_at: nowIso()
+      }));
+    }
+    if (upload) {
+      await this.cancelLegacyDirectoryTransfer(state, original, token);
+      if (stableJson(await readRecoveryJsonStrict(this.fsp, this.uploadTransferPath,
+        "legacy_directory_advance_unsafe", "The upload checkpoint changed.")) !== stableJson(oldUpload)) fail();
+      await this.fsp.rm(this.uploadTransferPath, { force: true });
+      if (typeof this.fsp.syncDirectory === "function") await this.fsp.syncDirectory(this.obtsDir);
+    }
+    if (queue.pending_commit === original.pending_commit) {
+      await this.updateQueue(async (current) => {
+        if (!legacySettlementQueueAgrees(queue, current)) fail();
+        return Object.assign({}, current, { pending_commit: null, status: "queued_local", attempts: 0, updated_at: nowIso() });
+      });
+    }
+    if (pull) {
+      if (stableJson(await readRecoveryJsonStrict(this.fsp, this.pullTransferPath,
+        "legacy_directory_advance_unsafe", "The pull checkpoint changed.")) !== stableJson(oldPull)) fail();
+      await this.retryPendingAppliedAcknowledgement();
+      await this.settlePreviouslyAppliedPullCheckpoint();
+      if (await exists(this.fsp, this.pullTransferPath)) fail();
+      if (typeof this.fsp.syncDirectory === "function") await this.fsp.syncDirectory(this.obtsDir);
+    }
+    if (await exists(this.fsp, this.uploadTransferPath) || await exists(this.fsp, this.pullTransferPath)) fail();
+    const currentState = await this.readState();
+    const finalQueue = await this.readQueue();
+    if (currentState.local_main !== original.target_main ||
+      ![original.target_main, finalQueue.pending_commit].includes(currentState.local_head) ||
+      currentState.server_device_ref !== original.server_device_ref ||
+      finalQueue.expected_device_ref !== original.server_device_ref ||
+      !legacySettlementQueueAgrees(archive?.evidence.queue || queue, finalQueue, true) ||
+      (archive && archive.evidence.queue.pending_commit !== original.pending_commit &&
+        !await this.isAncestor(archive.evidence.queue.pending_commit, finalQueue.pending_commit)) ||
+      (finalQueue.pending_commit !== null && finalQueue.pending_commit !== queue.pending_commit) ||
+      finalQueue.status !== "queued_local" ||
+      currentState.last_event_seq < original.recovered_event_seq ||
+      currentState.last_applied_event_seq < original.recovered_event_seq ||
+      await this.resolveRef("refs/heads/main") !== original.target_main ||
+      await this.resolveRef("refs/heads/local") !== currentState.local_head) fail();
+    if (currentState.last_error_code === "stale_directory_proposal_base") {
+      await this.writeState(Object.assign({}, currentState, {
+        last_error_code: null, last_error_details: null, updated_at: nowIso()
+      }));
+    }
+    const finalArchive = await readRecoveryJsonStrict(this.fsp, archivePath,
+      "legacy_directory_advance_unsafe", "The recovery archive disappeared.");
+    const finalJournal = await readRecoveryJsonStrict(this.fsp, this.directoryBaselineRecoveryPath,
+      "legacy_directory_advance_unsafe", "The authorized journal disappeared.");
+    if (!finalArchive || finalArchive.digest !== sha256(Buffer.from(stableJson(finalArchive.evidence))) ||
+      finalJournal?.phase !== "legacy_retirement_authorized" ||
+      finalJournal.legacy_archive_digest !== finalArchive.digest ||
+      !legacySettlementEvidenceAgrees(finalArchive.evidence,
+        archive?.evidence || { journal: original, state, queue, directoryState, upload, pull })) fail();
+    await this.fsp.rm(this.directoryBaselineRecoveryPath, { force: true });
+    if (typeof this.fsp.syncDirectory === "function") await this.fsp.syncDirectory(this.obtsDir);
+    return true;
+  }
+
   async recoverStaleDirectoryProposalBase() {
     const state = await this.readState();
     const queue = await this.readQueue();
@@ -10469,6 +10729,39 @@ function buildDirectoryProposal(state, targetCommit, pendingIntents) {
   });
 }
 
+function legacySettlementStateAgrees(saved, current) {
+  if (!saved || !current) return false;
+  return ["vault_id", "device_id", "device_ref", "local_main", "local_head", "server_device_ref"]
+    .every((key) => saved[key] === current[key]) &&
+    Number.isSafeInteger(current.last_event_seq) && current.last_event_seq >= saved.last_event_seq &&
+    Number.isSafeInteger(current.last_applied_event_seq) && current.last_applied_event_seq >= saved.last_applied_event_seq;
+}
+
+function legacySettlementQueueAgrees(saved, current, allowNewCommit = false) {
+  return Boolean(saved && current && Array.isArray(saved.changed_paths) && Array.isArray(current.changed_paths) &&
+    current.status === "queued_local" && saved.status === "queued_local" &&
+    current.expected_device_ref === saved.expected_device_ref &&
+    Number.isSafeInteger(current.change_seq) && current.change_seq >= saved.change_seq &&
+    saved.changed_paths.every((filePath) => current.changed_paths.includes(filePath)) &&
+    (allowNewCommit || current.pending_commit === saved.pending_commit));
+}
+
+function legacySettlementDirectoryAgrees(saved, current) {
+  return Boolean(saved && current &&
+    ["pending_intents", "observed_dirs", "observed_directory_ctimes", "explicit_empty_dirs", "next_generation"]
+      .every((key) => stableJson(saved[key]) === stableJson(current[key])));
+}
+
+function legacySettlementEvidenceAgrees(saved, current) {
+  return Boolean(saved && current &&
+    stableJson(saved.journal) === stableJson(current.journal) &&
+    legacySettlementStateAgrees(saved.state, current.state) &&
+    legacySettlementQueueAgrees(saved.queue, current.queue) &&
+    legacySettlementDirectoryAgrees(saved.directoryState, current.directoryState) &&
+    stableJson(saved.upload) === stableJson(current.upload) &&
+    stableJson(saved.pull) === stableJson(current.pull));
+}
+
 function stableJson(value) {
   return JSON.stringify(value);
 }
@@ -10875,7 +11168,7 @@ function isConflictResultStatus(status) {
 function blockStatusLabel(code, details = null) {
   if (code === "conflict_review_required") return "Conflict resolution needed";
   if (code === "object_too_large_for_chunk") return details?.object_type === "blob" ? "Out of sync — file exceeds upload limit" : "Out of sync — upload limit exceeded";
-  if (["unsafe_local_state", "apply_journal_recovery_required", "apply_recovery_required", "recovery_bundle_failed", "recovery_bundle_verification_failed", "recovery_bundle_durability_unavailable", "directory_baseline_recovery_journal_invalid", "directory_baseline_recovery_unsafe", "directory_recovery_journal_invalid", "directory_recovery_journal_mismatch", "directory_recovery_decision_required", "directory_recovery_changed", "local_ref_recovery_required", "replace_local_with_server_required", "server_recovery_required", "stale_device_ref", "same_device_non_fast_forward", "local_state_incomplete"].includes(code)) {
+  if (["unsafe_local_state", "apply_journal_recovery_required", "apply_recovery_required", "recovery_bundle_failed", "recovery_bundle_verification_failed", "recovery_bundle_durability_unavailable", "directory_baseline_recovery_journal_invalid", "directory_baseline_recovery_unsafe", "legacy_directory_advance_unsafe", "directory_recovery_journal_invalid", "directory_recovery_journal_mismatch", "directory_recovery_decision_required", "directory_recovery_changed", "local_ref_recovery_required", "replace_local_with_server_required", "server_recovery_required", "stale_device_ref", "same_device_non_fast_forward", "local_state_incomplete"].includes(code)) {
     return "Out of sync — local recovery required";
   }
   if (code === "local_snapshot_changed") return "Checking";
@@ -10923,6 +11216,7 @@ function localSyncFailureExplanation(code, details) {
   if (safeCode === "recovery_bundle_failed") return "Recovery evidence could not be completed, so destructive apply stopped. Check local storage and permissions; preserve the vault and .obts state before retrying.";
   if (safeCode === "recovery_bundle_verification_failed" || safeCode === "recovery_bundle_durability_unavailable") return `Recovery evidence is not verified or durable (${safeCode}), so destructive apply stopped. Preserve the vault and .obts state; check storage and permissions, then seek assisted recovery if it persists.`;
   if (safeCode === "local_ref_recovery_required") return "A local Git ref lock or lease could not be recovered safely. Do not remove it manually; preserve the vault and .obts state for assisted recovery.";
+  if (safeCode === "legacy_directory_advance_unsafe") return "Legacy directory advance settlement stopped. Preserve the vault, .obts journal, recovery archive, and transfer checkpoints for assisted recovery; do not reset sync.";
   if (safeCode === "directory_baseline_recovery_unsafe" || safeCode === "directory_baseline_recovery_journal_invalid") return `Directory baseline recovery stopped (${safeCode}). Preserve the vault and .obts state, including the directory recovery journal; seek assisted recovery rather than resetting sync.`;
   if (safeCode === "unsafe_local_state") return "A previous apply safety check stopped. Preserve the vault and .obts state; inspect the local recovery journal before attempting further changes.";
   if (blockStatusLabel(safeCode) === "Out of sync — local recovery required") return `Sync needs local recovery (${safeCode}). Preserve the vault and .obts state; use the existing recovery flow or seek assisted recovery rather than resetting sync.`;

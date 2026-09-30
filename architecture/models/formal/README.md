@@ -78,10 +78,10 @@ The model does not cover directories, multiple paths, write concurrency, editor-
 | Field | Value |
 | --- | --- |
 | Status | Accepted bounded composed model |
-| Architecture revision | 27 |
-| Refined contracts | `OBTS-SAF-001` through `OBTS-SAF-006`, `OBTS-SAF-010`, `OBTS-SYNC-IMM-001`, `OBTS-SYNC-IGN-001`, `OBTS-SYNC-ACK-001`, `OBTS-PER-OP-001`, `OBTS-BRG-PROJ-001` |
+| Architecture revision | 32 |
+| Refined contracts | `OBTS-SAF-001` through `OBTS-SAF-006`, `OBTS-SAF-010`, `OBTS-SYNC-IMM-001`, `OBTS-SYNC-IGN-001`, `OBTS-SYNC-ACK-001`, `OBTS-PER-OP-001`, `OBTS-PER-CLIENT-001`, `OBTS-BRG-PROJ-001` |
 | Root specification | `OBTSDistributedSync.tla` |
-| Check matrix | `checks.json` (91 required checks: original 52, 23 root-ignore, 2 acknowledgement-evidence, and 14 directory-baseline checks) |
+| Check matrix | `checks.json` (109 required checks: original 52, 23 root-ignore, 2 acknowledgement-evidence, 14 directory-baseline, and 18 legacy-retirement checks) |
 | Static transition map / future trace schema | `trace/transition-map.json`, `trace/trace-schema.json` |
 | Executable check | `npm run test:formal` |
 
@@ -100,7 +100,7 @@ Local apply state projects non-vacuously through `modules/OBTSApplyRefinement.tl
 
 ### Check matrix and assumptions
 
-The required matrix contains the original six FM-001 checks; seven FM-002 positive safety checks; four separately fair liveness checks; twenty-one trigger/action reachability checks; and sixteen distributed negative controls. Revision 15 adds four positive root-policy safety checks, nine non-vacuity witnesses, and nine independent negative controls. Revision 17 adds the acknowledgement-evidence reach and negative checks above. Revision 27 adds five directory-baseline safety checks, five progress/reconstruction witnesses, and four negative controls for the exact-cursor block, unsafe rebase, missing history, and mislabeled historical snapshot. Removing or retyping any required check fails validation. Accepted architecture status requires zero candidate counterexamples and all required positives.
+The required matrix contains the original six FM-001 checks; seven FM-002 positive safety checks; four separately fair liveness checks; twenty-one trigger/action reachability checks; and sixteen distributed negative controls. Revision 15 adds four positive root-policy safety checks, nine non-vacuity witnesses, and nine independent negative controls. Revision 17 adds the acknowledgement-evidence reach and negative checks above. Revision 27 adds five directory-baseline safety checks, five progress/reconstruction witnesses, and four negative controls for the exact-cursor block, unsafe rebase, missing history, and mislabeled historical snapshot. Revision 32 adds four legacy-retirement witnesses, a full positive safety exploration, ten additional witnesses for queue changes, transfer outcomes, uploads, and restart, and three single-fault negative controls. Removing or retyping any required check fails validation. Accepted architecture status requires zero candidate counterexamples and all required positives.
 
 Liveness is conditional on bounded edits/crashes, eventual restart, retry/delivery, and no permanent storage failure. Fairness is attached to the concrete action/actor sequence for proposal/result consumption, Rust write to Node capture, server restart/recovery, and main event to durable apply/server acknowledgement. Each obligation has a separate reachable-trigger check; there is no broad fairness disjunction.
 
@@ -125,6 +125,12 @@ This is a **bounded design model**, not feature implementation evidence. The act
 The bounded `directory-baseline` scenario starts with a locally applied main and queued local work at cursor 1, then advances the server cursor through either a neutral event or a directory intent before acknowledgement. The delivered-snapshot case keeps the cursor aligned. The compatibility case accepts a trailing proposal cursor only when the retained interval is neutral and the snapshot matches; an intervening directory intent or unavailable history rejects it. A second main advance exercises historical reconstruction: a newer acknowledged snapshot may be returned for an older main only with its true cursor and neutral intervening history. Negative controls require exact-cursor rejection, unsupported rebasing over a directory intent or missing history, and the former older-cursor/newer-snapshot label to violate their target properties.
 
 The model abstracts the event interval as a contiguous-retained flag plus its latest directory-affecting sequence. It does not implement event storage or payload parsing; executable regressions cover those production details.
+
+### Completed legacy advance retirement (revision 32)
+
+The `legacy-retirement` scenario models archived queue identity, changing hints and visible edits, nondeterministic transfer status, open-transfer cancellation, processing/accepted rejection, and late acceptance after a missing, expired, or ambiguously cancelled transfer. The late acceptance moves the device ref and prevents a later upload with the old expected ref; an already completed new upload likewise prevents the old transfer's CAS. After authorization a newer queued commit may remain identical to the archived one or advance to a known descendant; an unrelated commit blocks. A separate settled-state invariant enforces this even when the action guard is mutated. The archive is published before authorization, the obsolete upload, queue and pull coordination retire in order, and the journal is cleared last. Plugin1 may crash after any write and resume with a changed volatile counter that does not invalidate the archived stable evidence.
+
+The 109-check matrix includes bounded positive safety exploration, 14 legacy reachability witnesses, and three permanent negative controls. Removing the archived newer-queue binding violates `LegacyArchivedQueueBound` on journal clearance; requiring volatile archive equality violates `LegacyArchiveReusable` after restart; clearing the journal early violates `LegacyRetirementSafe`. A temporary mutation that uploads the ignored delete also violated `AllSafety` at `LegacyNormalUpload`. The model uses symbolic commit ancestry, status, and one preserved edit; the plugin and real local-server tests check Git content, persisted checkpoints, and HTTP cancellation separately. Late acceptance after transfer expiry is modeled but has no end-to-end race test.
 
 ### Implementation recovery check
 
