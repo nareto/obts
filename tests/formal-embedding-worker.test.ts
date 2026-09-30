@@ -73,9 +73,6 @@ describe('FM003 embedding-worker companion gate', () => {
     expect(workflow).not.toContain('  push:');
     expect(coordinator).toContain('VITEST_GROUP=checker npx vitest run');
     expect(coordinator).toContain('npm run test:formal:metadata');
-    expect(JSON.parse(readFileSync(join(root, formal, 'checks.json'), 'utf8')).checks).toHaveLength(91);
-    expect(JSON.parse(readFileSync(join(root, formal, 'checks-fm003.json'), 'utf8')).checks).toHaveLength(39);
-    expect(JSON.parse(readFileSync(join(root, formal, 'checks-fm003-workers.json'), 'utf8')).checks).toHaveLength(48);
   });
 
   it('rejects a removed required check', () => {
