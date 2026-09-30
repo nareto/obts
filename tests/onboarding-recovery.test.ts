@@ -128,11 +128,12 @@ describe('durable onboarding recovery admission', () => {
     const displace = core.displaceApplyPath.bind(core);
     let interrupted = false;
     core.displaceApplyPath = async (...args: any[]) => {
-      await displace(...args);
+      const retainedFile = await displace(...args);
       if (!interrupted) {
         interrupted = true;
         throw new Error('Synthetic interruption after displacement');
       }
+      return retainedFile;
     };
     await expect(core.applyTargetMain(target, ['a.md', 'b.md'], true, [], false, [], [], 1, false, null, { 'a.md': 9, 'b.md': 9 }))
       .rejects.toThrow('Synthetic interruption after displacement');

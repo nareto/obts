@@ -1,6 +1,6 @@
 import { fork } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createObtsServer, type ObtsServer } from '../src/server/app.js';
@@ -439,6 +439,7 @@ describe('packaged mobile onboarding recovery', () => {
       await desktop.syncOnce();
     }
     const { h, phoneRoot } = await prepared();
+    const originalFileIdentity = (await stat(join(phoneRoot, 'note.md'))).ino;
     h.dispose();
     const killed = await child(phoneRoot, boundary);
     expect(killed).toMatchObject({ message: { boundary }, signal: 'SIGKILL' });
@@ -450,7 +451,8 @@ describe('packaged mobile onboarding recovery', () => {
       const journal = JSON.parse(await readFile(join(phoneRoot, '.obts/apply-journal.json'), 'utf8'));
       expect(journal.phase).toBe('writing_files');
       expect(await readFile(join(phoneRoot, '.obts/apply-displaced', journal.apply_id, 'note.md.entry'), 'utf8')).toBe('local recovery bytes\n');
-      await expect(readFile(join(phoneRoot, 'note.md'))).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(await readFile(join(phoneRoot, 'note.md'), 'utf8')).toBe('local recovery bytes\n');
+      expect((await stat(join(phoneRoot, 'note.md'))).ino).toBe(originalFileIdentity);
       await verifyRecovery(phoneRoot);
     }
     const savedCursor = boundary === 'chunk' ? JSON.parse(await readFile(join(phoneRoot, '.obts/pull-transfer.json'), 'utf8')).next_cursor : null;
@@ -464,6 +466,7 @@ describe('packaged mobile onboarding recovery', () => {
     }
     if (boundary === 'checkpoint') expect(completed.message.cursors).toHaveLength(0);
     expect(await readFile(join(phoneRoot, 'note.md'), 'utf8')).toBe('server bytes\n');
+    expect((await stat(join(phoneRoot, 'note.md'))).ino).toBe(originalFileIdentity);
     expect(await readdir(phoneRoot)).toContain('empty');
     expect((await server.store.snapshot()).devices).toHaveLength(2);
     const device = (await server.store.snapshot()).devices.find(device => device.device_name === 'Recovery device')!;

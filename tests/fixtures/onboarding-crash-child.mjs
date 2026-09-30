@@ -53,8 +53,9 @@ core.updateRef = async (...args) => {
 };
 const displace = core.displaceApplyPath.bind(core);
 core.displaceApplyPath = async (...args) => {
-  await displace(...args);
+  const retainedFile = await displace(...args);
   if (args[1] === 'note.md') await stop('displaced');
+  return retainedFile;
 };
 const write = core.writeTargetFilesFromJournal.bind(core);
 core.writeTargetFilesFromJournal = async (...args) => { await write(...args); await stop('files'); };

@@ -491,9 +491,8 @@ describe('large-vault client checkpoints', () => {
       .toContain('shared.md');
   });
 
-  it('preserves a path created at the exclusive-write boundary', async () => {
+  it('preserves a new path created at the exclusive-write boundary', async () => {
     const { root, core } = await clientFixture();
-    await writeFile(join(root, 'shared.md'), 'captured local bytes\n');
     const preflight = await core.readRecoveryFileSnapshot('shared.md');
     await writeFile(join(root, 'target-source.md'), 'server target bytes\n');
     const target = await core.createLocalCommit('exclusive write race target');
@@ -526,13 +525,7 @@ describe('large-vault client checkpoints', () => {
     expect(await readFile(join(root, 'shared.md'), 'utf8')).toBe('last-moment local edit\n');
     expect(JSON.parse(await readFile(join(root, '.obts/apply-journal.json'), 'utf8')).deferred_local_paths)
       .toContain('shared.md');
-    expect(await readFile(join(
-      root,
-      '.obts',
-      'apply-displaced',
-      'apply_exclusive_write_race',
-      `${encodeURIComponent('shared.md')}.entry`
-    ), 'utf8')).toBe('captured local bytes\n');
+    expect(await core.applyDisplacedEntryExists({ apply_id: 'apply_exclusive_write_race' }, 'shared.md')).toBe(false);
   });
 
   it('captures displaced file evidence by copy without renaming the live path', async () => {

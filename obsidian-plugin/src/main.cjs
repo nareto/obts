@@ -4930,9 +4930,9 @@ class ObtsObsidianClient {
     }, async (filePath) => (await this.readRecoveryFileSnapshot(filePath, budget)).fingerprint);
     const targetMatchedPaths = new Set();
     const divergedPaths = [];
-    // A verified displaced entry is durable evidence that this path was removed
-    // as part of the apply; it stays valid while the recovery admission is
-    // already blocked, not only during active writes.
+    // A verified displaced entry preserves the preflight image; it does not
+    // prove removal. An in-place write may leave old, target, or unknown bytes
+    // beside the copy, including while recovery admission is already blocked.
     const displacedEvidencePhase = journal.phase === "writing_files" || journal.phase === "verifying" || journal.phase === "blocked_recovery";
     const activeWritePhase = journal.phase === "writing_files" || journal.phase === "verifying";
     for (let index = 0; index < paths.length; index += 1) {
@@ -4944,19 +4944,24 @@ class ObtsObsidianClient {
         await this.applyDisplacedEntryMatchesPreflight(journal, filePath) &&
         [...targetEntries.keys()].some((targetPath) => targetPath.startsWith(`${filePath}/`))
       ) continue;
+      const hasDisplacedEntry = await this.applyDisplacedEntryExists(journal, filePath);
+      const displacedPreflight = displacedEvidencePhase && hasDisplacedEntry &&
+        await this.applyDisplacedEntryMatchesPreflight(journal, filePath);
       const matchesTarget = this.fingerprintMatchesTarget(fingerprint, targetEntries.get(filePath));
-      if (matchesTarget && !(await this.applyDisplacedEntryExists(journal, filePath))) targetMatchedPaths.add(filePath);
+      // Only completed file writes become protected target matches. A copied,
+      // removed child must not defer its parent's pending directory-to-file write.
+      if (matchesTarget && (!hasDisplacedEntry || (displacedPreflight && fingerprint.kind === "file"))) {
+        targetMatchedPaths.add(filePath);
+      }
       const matchesPreflight = this.fingerprintMatchesPreflight(
         fingerprint,
         journal.preflight_sha256[filePath] || null,
         journal.preflight_fingerprints?.[filePath]
       );
-      const displacedPreflight =
-        displacedEvidencePhase &&
-        fingerprint.kind === "missing" &&
-        await this.applyDisplacedEntryMatchesPreflight(journal, filePath);
-      if (displacedPreflight) continue;
-      if (!matchesPreflight && (!activeWritePhase || !matchesTarget)) {
+      // Missing + copy remains valid for legacy interrupted removals. Other
+      // unknown bytes are local work, never authorization to overwrite them.
+      if (fingerprint.kind === "missing" && displacedPreflight) continue;
+      if (!matchesPreflight && (!(activeWritePhase || displacedPreflight) || !matchesTarget)) {
         divergedPaths.push(filePath);
       }
     }
@@ -5010,6 +5015,7 @@ class ObtsObsidianClient {
           throw new LocalSnapshotChangedError(filePath);
         }
       }
+      return current;
     };
     const assertRecoveredDescendants = async (filePath) => {
       const descendants = await this.listLocalDescendantFiles(filePath);
@@ -5131,15 +5137,21 @@ class ObtsObsidianClient {
                   return;
                 }
               }
-              await this.displaceApplyPath(journal, filePath, assertCurrentPreflight, assertRecoveredDescendants);
-              await ensureAdapterDir(this.adapter, parentPath);
-              try {
-                await this.adapterWriteBinaryExclusive(filePath, content);
-              } catch (error) {
-                if (error?.code === "EEXIST" && await this.adapterExists(filePath)) {
-                  throw new LocalSnapshotChangedError(filePath, error);
+              const retainedFile = await this.displaceApplyPath(
+                journal, filePath, assertCurrentPreflight, assertRecoveredDescendants, true
+              );
+              if (retainedFile) {
+                await this.adapterModifyBinaryRevalidated(filePath, content, journal);
+              } else {
+                await ensureAdapterDir(this.adapter, parentPath);
+                try {
+                  await this.adapterWriteBinaryExclusive(filePath, content);
+                } catch (error) {
+                  if (error?.code === "EEXIST" && await this.adapterExists(filePath)) {
+                    throw new LocalSnapshotChangedError(filePath, error);
+                  }
+                  throw error;
                 }
-                throw error;
               }
               onProgress();
             } catch (error) {
@@ -6983,6 +6995,8 @@ class ObtsObsidianClient {
         if (await this.adapterExists(archiveRoot)) {
           throw new ObtsBlockedError("displaced_recovery_archive_exists", "Displaced recovery evidence already exists for this apply operation.");
         }
+        // Copies from in-place writes and evidence from legacy removals share
+        // the same archive lifecycle; neither may be discarded on completion.
         await this.fsp.rename(displacedRoot, archiveRoot);
       }
     }
@@ -8733,6 +8747,32 @@ class ObtsObsidianClient {
     await this.adapter.writeBinary(filePath, arrayBuffer);
   }
 
+  async adapterModifyBinaryRevalidated(filePath, content, journal) {
+    const vault = this.plugin.app && this.plugin.app.vault;
+    const existing = vault && typeof vault.getAbstractFileByPath === "function" ? vault.getAbstractFileByPath(filePath) : null;
+    const arrayBuffer = toArrayBuffer(content);
+    const writers = existing && !existing.children && typeof vault.modifyBinary === "function"
+      ? [() => vault.modifyBinary(existing, arrayBuffer), () => this.adapter.writeBinary(filePath, arrayBuffer)]
+      : [() => this.adapter.writeBinary(filePath, arrayBuffer)];
+    for (let index = 0; index < writers.length; index += 1) {
+      // Prepare everything before this final read. Issue the write immediately
+      // after comparison, including a fresh comparison before raw API fallback.
+      // This is not an atomic CAS; the remaining writer race is OBTS issue #33.
+      const current = (await this.readRecoveryFileSnapshot(filePath)).fingerprint;
+      if (current.kind !== "file" || !this.fingerprintMatchesPreflight(
+        current, journal.preflight_sha256[filePath] || null, journal.preflight_fingerprints?.[filePath]
+      )) throw new LocalSnapshotChangedError(filePath);
+      try {
+        await writers[index]();
+        return;
+      } catch (error) {
+        // Vault APIs can reject system/unindexed paths. Never retry against
+        // different local bytes, and propagate failure of the raw adapter.
+        if (index === writers.length - 1) throw error;
+      }
+    }
+  }
+
   async adapterWriteBinaryExclusive(filePath, content) {
     await ensureAdapterDir(this.adapter, path.posix.dirname(filePath));
     const vault = this.plugin.app && this.plugin.app.vault;
@@ -8954,7 +8994,7 @@ class ObtsObsidianClient {
     return { files: Array.from(new Set(files)).sort(), directories: Array.from(new Set(directories)).sort() };
   }
 
-  async displaceApplyPath(journal, filePath, assertCurrentPreflight, assertRecoveredDescendants) {
+  async displaceApplyPath(journal, filePath, assertCurrentPreflight, assertRecoveredDescendants, retainTargetFile = false) {
     if ((journal.local_only_paths || []).some((retained) =>
       retained === filePath || retained.startsWith(`${filePath}/`) || filePath.startsWith(`${retained}/`))) {
       throw new ObtsBlockedError("local_only_collision", "A write collides with retained local-only content.");
@@ -8976,20 +9016,22 @@ class ObtsObsidianClient {
         if (await this.adapterIsDirectory(candidate)) continue;
         throw new LocalSnapshotChangedError(candidate);
       }
-      await assertCurrentPreflight(candidate);
-      const displacedDirectory = await this.adapterIsDirectory(candidate);
+      const current = await assertCurrentPreflight(candidate);
+      const displacedDirectory = current.kind === "directory";
+      const retainLiveFile = retainTargetFile && candidate === filePath && current.kind === "file";
       if (displacedDirectory) await assertRecoveredDescendants(candidate);
       const displacedPath = this.applyDisplacedPath(journal, candidate);
       await ensureAdapterDir(this.adapter, path.posix.dirname(displacedPath));
       if (await this.adapterExists(displacedPath)) {
         // An earlier interrupted attempt already captured the evidence copy.
-        // Complete the displacement by clearing the live path only after the
-        // copy validates against the preflight identity.
+        // Only removals/type changes clear the live path; file updates retain
+        // the same path and editor binding after validating the copy.
         if (!(await this.applyDisplacedEntryMatchesPreflight(journal, candidate))) {
           throw new LocalSnapshotChangedError(candidate);
         }
         await assertCurrentPreflight(candidate);
         if (displacedDirectory) await assertRecoveredDescendants(candidate);
+        if (retainLiveFile) return true;
         await this.adapterRemove(candidate);
         continue;
       }
@@ -9008,8 +9050,10 @@ class ObtsObsidianClient {
       }
       await assertCurrentPreflight(candidate);
       if (displacedDirectory) await assertRecoveredDescendants(candidate);
+      if (retainLiveFile) return true;
       await this.adapterRemove(candidate);
     }
+    return false;
   }
 
   async captureDisplacedCandidate(candidate, displacedPath, displacedDirectory) {

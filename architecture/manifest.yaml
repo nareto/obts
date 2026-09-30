@@ -1,5 +1,5 @@
 schema_version: 1
-revision: 34
+revision: 35
 status: current
 updated: 2026-09-30
 authoritative_artifacts:
@@ -18,6 +18,8 @@ formal_models:
     status: accepted
     path: architecture/models/formal/OBTSApplyRecovery.tla
     architecture_revision: 2
+    companion_path: architecture/models/formal/OBTSApplyInPlace.tla
+    companion_architecture_revision: 34
     refines:
       - OBTS-SAF-001
       - OBTS-SAF-002
@@ -107,7 +109,7 @@ formal_models:
   - id: OBTS-FM-009
     status: focused bounded model
     path: architecture/models/formal/OBTSVaultSettings.tla
-    architecture_revision: 34
+    architecture_revision: 35
     checks: architecture/models/formal/OBTSVaultSettings.cfg
     refines:
       - OBTS-SYNC-MERGE-001

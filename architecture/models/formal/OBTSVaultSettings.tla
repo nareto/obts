@@ -2,7 +2,7 @@
 EXTENDS Naturals, FiniteSets, TLC
 
 (***************************************************************************
-OBTS-FM-009, architecture revision 34. Focused bounded refinement of
+OBTS-FM-009, architecture revision 35. Focused bounded refinement of
 server-managed vault configuration and timestamp-only Markdown overlap.
 Git bytes, Git-ignore matching, YAML parsing, timestamp parsing, and runtime
 operation durability are represented by verified symbolic inputs. Concrete
