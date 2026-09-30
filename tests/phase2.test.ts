@@ -251,6 +251,92 @@ describe('Phase 2 dashboard conflict resolution', () => {
     db.event_seq_by_vault = structuredClone(beforeRefresh.event_seq_by_vault);
   }
 
+  it('recovers a timestamp merge from its captured rules and validator result after the main ref moved', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'timestamp-device');
+    await mkdir(deviceDir, { recursive: true });
+    const device = await pairPlugin(admin, deviceDir, 'timestamp-device');
+    const baseText = '---\nupdated: 2026-01-01T00:00:00Z\n---\nbody\n';
+    const serverText = '---\nupdated: 2026-01-03T00:00:00Z\n---\nbody\n';
+    const deviceText = '---\nupdated: 2026-01-02T00:00:00Z\n---\nbody\n';
+    await writeFile(join(deviceDir, 'note.md'), baseText);
+    expect((await device.syncOnce()).status).toBe('Synced');
+    const initial = await server.store.snapshot();
+    const vault = initial.vaults.find((item) => item.vault_id === admin.vaultId)!;
+    const baseMain = vault.current_main;
+    const serverTree = await server.git.createTreeFromCommitWithChanges({
+      vaultId: admin.vaultId, sourceCommit: baseMain, writes: new Map([['note.md', Buffer.from(serverText)]])
+    });
+    const serverMain = await server.git.createMainCommitFromTree({
+      vaultId: admin.vaultId, tree: serverTree, parentMain: baseMain, subject: 'server timestamp', body: '', actor: 'timestamp-test'
+    });
+    await server.git.updateRef(admin.vaultId, 'refs/heads/main', serverMain, baseMain);
+    await server.store.mutate((db) => {
+      db.vaults.find((item) => item.vault_id === admin.vaultId)!.current_main = serverMain;
+      db.vaults.find((item) => item.vault_id === admin.vaultId)!.metadata_conflict_rules = [
+        { field: 'updated', strategy: 'latest_timestamp' }
+      ];
+    });
+    await writeFile(join(deviceDir, 'note.md'), deviceText);
+
+    let interruptStore = false;
+    let interruptRef = true;
+    const store = server.store as unknown as { mutate: (fn: (db: MetadataDb) => unknown) => Promise<unknown> };
+    const originalMutate = store.mutate.bind(server.store);
+    store.mutate = async (fn) => {
+      if (interruptStore) {
+        interruptStore = false;
+        throw new Error('simulated interruption after merge ref movement');
+      }
+      return await originalMutate(fn);
+    };
+    const git = server.git as unknown as {
+      updateRef: (vaultId: string, ref: string, next: string, expected: string | null, force?: boolean) => Promise<void>;
+    };
+    const originalUpdateRef = git.updateRef.bind(server.git);
+    git.updateRef = async (targetVaultId, ref, next, expected, force) => {
+      await originalUpdateRef(targetVaultId, ref, next, expected, force);
+      if (interruptRef && targetVaultId === admin.vaultId && ref === 'refs/heads/main' && expected === serverMain) {
+        interruptRef = false;
+        interruptStore = true;
+      }
+    };
+    try { await device.syncOnce(); } catch { /* The injected metadata publication interruption is recovered on restart. */ }
+    expect(interruptRef).toBe(false);
+    const movedMain = await server.git.getRef(admin.vaultId, 'refs/heads/main');
+    expect(movedMain).not.toBe(serverMain);
+    const preparedDb = await originalMutate((db) => db) as MetadataDb;
+    const prepared = preparedDb.sync_operations.find((operation) =>
+      operation.operation_type === 'server_merge' && operation.status === 'prepared' && operation.target_commit === movedMain
+    );
+    expect(prepared?.prepared_manifest).toMatchObject({
+      metadata_conflict_rules: [{ field: 'updated', strategy: 'latest_timestamp' }],
+      validator_results: { metadata_timestamp_fields: [{ path: 'note.md', field: 'updated', winner: 'server' }] }
+    });
+
+    await server.app.close();
+    server = await createObtsServer({
+      dataDir: join(root, 'server-data'), publicBaseUrl: 'http://127.0.0.1:0',
+      sessionSecret: 'test-session-secret-with-enough-entropy'
+    });
+    const recoveredDb = await server.store.snapshot();
+    const recoveredOperation = recoveredDb.sync_operations.find((operation) => operation.operation_id === prepared?.operation_id);
+    expect(recoveredDb.vaults.find((item) => item.vault_id === admin.vaultId)?.current_main).toBe(movedMain);
+    expect(recoveredOperation).toMatchObject({
+      status: 'committed',
+      prepared_manifest: {
+        metadata_conflict_rules: [{ field: 'updated', strategy: 'latest_timestamp' }],
+        validator_results: { metadata_timestamp_fields: [{ path: 'note.md', field: 'updated', winner: 'server' }] }
+      },
+      result: {
+        metadata_conflict_rules: [{ field: 'updated', strategy: 'latest_timestamp' }],
+        validator_results: { metadata_timestamp_fields: [{ path: 'note.md', field: 'updated', winner: 'server' }] }
+      }
+    });
+    expect((await server.git.readBlobAtPath(admin.vaultId, movedMain!, 'note.md')).toString('utf8')).toBe(serverText);
+    baseUrl = await server.app.listen({ port: 0, host: '127.0.0.1' });
+  });
+
   it('serves the built dashboard shell and returns a normal 404 for missing static assets', async () => {
     const dashboard = await fetch(`${baseUrl}/dashboard`);
     expect(dashboard.status).toBe(200);

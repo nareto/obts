@@ -3,7 +3,7 @@
 ## Authoritative State
 
 - **Vault content history:** per-vault server Git object database and protected refs.
-- **Canonical directory state and workflow metadata:** metadata store records coordinated with Git operations.
+- **Canonical directory state and workflow metadata:** metadata store records coordinated with Git operations. Per-vault metadata conflict rules are owner-scoped durable metadata; ordinary merge operations snapshot them into their prepared manifest with validator outcomes.
 - **Visible device state:** the device's visible vault, with `.obts/git` as its durable journal and recovery substrate.
 - **Device coordination:** journals, queues, credentials, cursors, scan state, directory intent, and recovery evidence under `.obts/`.
 - **OBTS Bridge device state:** its persistent visible headless vault and `.obts/` state; these may hold the only copy of a pending agent edit.
@@ -66,7 +66,7 @@ Every ordinary synchronization, merge, restore, conflict-resolution, and other r
 1. acquire the per-vault mutation lock;
 2. persist an operation identity and expected refs;
 3. validate authorization, objects, ancestry, path policy, limits, and operation invariants in quarantine;
-4. persist a prepared manifest containing every metadata, directory, conflict, audit, event, derived-index, and result effect required after ref movement;
+4. persist a prepared manifest containing every metadata, directory, conflict, audit, event, derived-index, and result effect required after ref movement. Dashboard root-exclusion edits pin the expected main/policy identity, exact candidate tree, directory removals, and associated metadata settings in this manifest; restart applies those effects only for the exact moved target;
 5. promote validated objects;
 6. update the target ref with compare-and-swap semantics;
 7. atomically apply the prepared metadata effects and mark the operation committed;

@@ -12,7 +12,10 @@ import type {
   Session,
   VaultDeletionListResponse,
   VaultDeletionStatus,
-  VaultSummary
+  VaultSummary,
+  VaultSyncSettings,
+  VaultSyncSettingsPreview,
+  MetadataConflictRule
 } from './types';
 
 export class ApiError extends Error {
@@ -104,6 +107,29 @@ export class DashboardApi {
       method: 'PATCH',
       csrf: true,
       body: { display_name: displayName }
+    });
+  }
+
+  async vaultSyncSettings(vaultId: string): Promise<VaultSyncSettings> {
+    return await this.request(`/vaults/${vaultId}/sync-settings`);
+  }
+
+  async previewVaultSyncSettings(vaultId: string, input: {
+    expected_main: string; expected_root_ignore_oid: string | null; root_ignore: string | null;
+    metadata_conflict_rules: MetadataConflictRule[];
+  }): Promise<VaultSyncSettingsPreview> {
+    return await this.request(`/vaults/${vaultId}/sync-settings/preview`, {
+      method: 'POST', csrf: true, body: input
+    });
+  }
+
+  async saveVaultSyncSettings(vaultId: string, input: {
+    expected_main: string; expected_root_ignore_oid: string | null; preview_tree: string; review_fingerprint: string;
+    root_ignore: string | null; metadata_conflict_rules: MetadataConflictRule[];
+    expected_metadata_conflict_rules: MetadataConflictRule[];
+  }): Promise<VaultSyncSettings> {
+    return await this.request(`/vaults/${vaultId}/sync-settings`, {
+      method: 'PUT', csrf: true, body: input
     });
   }
 

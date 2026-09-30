@@ -109,6 +109,7 @@ describe('mobile plugin artifact', () => {
     const renderedSettingNames: string[] = [];
     const renderedSettingDescriptions: string[] = [];
     const renderedElementTexts: string[] = [];
+    const renderedElementOptions: Array<Record<string, unknown>> = [];
     const renderedButtons: Array<{ text: string; disabled: boolean; click?: () => unknown }> = [];
     const renderedContainers: Array<{ className?: string; textContent?: string }> = [];
     const settingsRefreshCallbacks: Array<() => void> = [];
@@ -143,6 +144,7 @@ describe('mobile plugin artifact', () => {
           renderedButtons.length = 0;
         },
         createEl(_tag: string, options: { text?: string } = {}) {
+          renderedElementOptions.push(options as Record<string, unknown>);
           if (options.text) renderedElementTexts.push(options.text);
           return createContainer();
         },
@@ -1100,8 +1102,7 @@ describe('mobile plugin artifact', () => {
     expect(renderedSettingNames).toContain('Status');
     expect(renderedSettingNames).toContain('Current operation');
     expect(renderedSettingNames).toContain('Vault-root .gitignore');
-    expect(renderedButtons.find((button) => button.text === 'Preview effect')).toBeDefined();
-    expect(renderedButtons.find((button) => button.text === 'Save .gitignore')).toMatchObject({ disabled: true });
+    expect(renderedContainers.some((container) => container.textContent?.includes('local applied copy') && container.textContent.includes('stale while offline'))).toBe(true);
     expect(renderedSettingDescriptions.some((description) => description.includes('400/6028'))).toBe(true);
     expect(renderedButtons.find((button) => button.text === 'Sync now')).toMatchObject({ disabled: true });
     expect(renderedButtons.find((button) => button.text === 'Unpair...')).toMatchObject({ disabled: true });
@@ -1139,8 +1140,12 @@ describe('mobile plugin artifact', () => {
       (plugin as any).sendTroubleshootingSnapshotNow()
     ]);
     (plugin as any).endSync();
+    (plugin as any).settings.serverUrl = 'http://127.0.0.1:3000';
     await settingTabs[0]!.display();
     expect(renderedButtons.find((button) => button.text === 'Sync now')).toMatchObject({ disabled: false });
+    expect(renderedElementTexts).toContain('Manage sync rules on server');
+    expect(renderedElementOptions.some((options) => typeof options.href === 'string' && options.href.includes('vault=vlt_diagnostic'))).toBe(true);
+    expect(renderedContainers.some((container) => container.textContent?.includes('local applied copy') && container.textContent.includes('stale while offline'))).toBe(true);
     (settingTabs[0] as any).hide();
     expect(requests).toHaveLength(requestsBeforeSnapshot + 1);
     expect(writesBeforeSnapshot).not.toHaveBeenCalled();
@@ -1394,24 +1399,11 @@ describe('mobile plugin artifact', () => {
     expect((successor as any).clientReady).toBe(true);
     expect(overlappingWrites).toBe(0);
 
-    const rootEditorClient = (successor as any).client;
-    const writeRoot = async (contents: string) => {
-      const bytes = Buffer.from(contents, 'utf8');
-      await reloadAdapter.writeBinary('.gitignore', bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer);
-    };
-    const absentRoot = await rootEditorClient.readRootIgnorePolicy();
-    expect(absentRoot.bytes).toBeNull();
-    expect((await rootEditorClient.previewRootIgnoreDraft('private/\n')).includedFiles).toBeGreaterThanOrEqual(0);
-    await rootEditorClient.saveRootIgnoreDraft('private/\n');
-    expect(Buffer.from(await reloadAdapter.readBinary('.gitignore')).toString('utf8')).toBe('private/\n');
-    await rootEditorClient.saveRootIgnoreDraft('*.tmp\n');
-    await writeRoot('other/\n');
-    await rootEditorClient.saveRootIgnoreDraft('draft/\n');
-    expect(Buffer.from(await reloadAdapter.readBinary('.gitignore')).toString('utf8')).toBe('draft/\n');
-    await rootEditorClient.saveRootIgnoreDraft('');
-    expect(await reloadAdapter.exists('.gitignore')).toBe(true);
-    await expect(rootEditorClient.previewRootIgnoreDraft('\u0000')).rejects.toThrow(/NUL/u);
-    await expect(rootEditorClient.previewRootIgnoreDraft('\ud800')).rejects.toThrow(/UTF-8/u);
+    const readOnlyClient = (successor as any).client;
+    const localPolicy = await readOnlyClient.readRootIgnorePolicy();
+    expect(localPolicy.bytes).toBeNull();
+    expect(readOnlyClient.previewRootIgnoreDraft).toBeUndefined();
+    expect(readOnlyClient.saveRootIgnoreDraft).toBeUndefined();
     (successor as any).onunload();
   });
 });

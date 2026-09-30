@@ -22,7 +22,7 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
         transportClient = component "Transport client" "Creates/resumes chunk transfers, uploads missing chunks, requests asynchronous finalization, and polls terminal outcomes." "HTTPS"
         directoryTracker = component "Directory tracker" "Persists causal empty-directory intents, exact acknowledgement generations, and crash-safe stale-baseline recovery evidence." "JSON under .obts"
         applyEngine = component "Apply and recovery engine" "Stages recovery evidence and safely materializes accepted files and explicit directories through Obsidian APIs." "Obsidian Vault API"
-        statusSurface = component "Status surface" "Shows monotonic checking, content verification, baseline repair, preparing, uploading, merging, applying, and settled states." "Obsidian UI"
+        statusSurface = component "Status surface" "Shows monotonic checking, content verification, baseline repair, preparing, uploading, merging, applying, and settled states, plus read-only shared exclusion status and a dashboard link." "Obsidian UI"
       }
 
       dashboard = container "Dashboard SPA" "Authenticated vault selection, device status, conflict review, diagnostics, history, and maintenance UI served by the server." "Svelte, TypeScript, Vite" {
@@ -32,6 +32,7 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
         conflictWorkbench = component "Conflict workbench" "Reviews and resolves content, path, directory, and mixed conflicts with explicit server/device provenance." "Svelte"
         historyView = component "History and restore view" "Queries canonical note history and submits forward-only restores." "Svelte"
         diagnosticsView = component "Diagnostics and maintenance views" "Shows consented redacted diagnostics, readiness, backup contract, and maintenance state." "Svelte"
+        syncSettingsView = component "Vault sync settings" "Previews and submits selected-vault exclusions and frontmatter timestamp merge rules against current server state." "Svelte"
       }
 
       server = container "Server API and CLI" "Authenticates clients, receives immutable proposals, fairly serializes canonical integration, merges Git history, persists conflicts, serves the dashboard, and exposes operator commands." "TypeScript, Node.js, Fastify" {
@@ -43,7 +44,7 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
         metadataStoreService = component "Metadata store" "Atomically persists users, vaults, devices, operations, transfer-independent proposal outcomes, events, and conflicts." "TypeScript"
         diagnosticService = component "Diagnostic service" "Accepts and retains opt-in redacted client diagnostics." "TypeScript"
         deletionCoordinator = component "Vault deletion coordinator" "Closes per-vault admissions, durably publishes deletion intent and revocation, drains detached work, erases attributable server material, and retries completion/receipt publication." "TypeScript"
-        dashboardHost = component "Dashboard host" "Serves the built SPA and dashboard APIs." "Fastify"
+        dashboardHost = component "Dashboard host" "Serves the built SPA and dashboard APIs, including owner-scoped sync settings preview and save." "Fastify"
       }
 
       bridge = container "OBTS Bridge API and indexer" "Exposes scoped REST/MCP tools, performs SQL-first ACL/metadata query planning, mutates ordinary headless-vault files, and hydrates only selected attested bodies within finite per-file/in-flight/batch budgets." "Rust, Axum, SQLx"
@@ -94,7 +95,7 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
         "protocol" "HTTP"
       }
     }
-    obts.dashboard -> obts.server "Calls authenticated dashboard and conflict APIs" "HTTPS" {
+    obts.dashboard -> obts.server "Calls authenticated dashboard, conflict, and vault sync-settings APIs" "HTTPS" {
       properties {
         "ops" "read,write,admin"
         "protocol" "HTTPS"

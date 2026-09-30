@@ -7,6 +7,7 @@ import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 
 import { assertSyncableTreePaths, PathPolicyViolation } from '../shared/pathPolicy.js';
 import { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } from '../shared/rootIgnore.cjs';
+import { mergeLatestTimestampFrontmatter, type MetadataConflictRule } from './frontmatterTimestampMerge.js';
 import type { ServerConfig } from './config.js';
 import { fsyncDurableDirectory, fsyncDurableTree, type DurableFilePersistence } from './durableFile.js';
 
@@ -821,7 +822,8 @@ export class GitService {
     currentMain: string,
     deviceCommit: string,
     deviceChanges: GitDiffEntry[],
-    mergedTextPaths: string[]
+    mergedTextPaths: string[],
+    metadataRules: MetadataConflictRule[] = []
   ): Promise<MergeTreeResult | null> {
     const repo = this.repoPath(vaultId);
     let tree: string;
@@ -838,14 +840,14 @@ export class GitService {
       tree = asText(stdout).trim();
     } catch (error) {
       if (error instanceof GitDurabilityError) throw error;
-      return await this.trySemanticOverlayMergeTree(vaultId, base, currentMain, deviceCommit, deviceChanges, mergedTextPaths);
+      return await this.trySemanticOverlayMergeTree(vaultId, base, currentMain, deviceCommit, deviceChanges, mergedTextPaths, metadataRules);
     }
 
     if (!/^[0-9a-f]{40}$/u.test(tree)) {
-      return await this.trySemanticOverlayMergeTree(vaultId, base, currentMain, deviceCommit, deviceChanges, mergedTextPaths);
+      return await this.trySemanticOverlayMergeTree(vaultId, base, currentMain, deviceCommit, deviceChanges, mergedTextPaths, metadataRules);
     }
 
-    let validation: { contentOverrides: Map<string, Buffer>; semanticKinds: Set<string> };
+    let validation: { contentOverrides: Map<string, Buffer>; semanticKinds: Set<string>; timestampFields: Array<{ path: string; field: string; winner: 'server' | 'device' | 'tie_server' }> };
     try {
       await this.validateTreePathPolicy(vaultId, tree);
       validation = await this.validateMergedTextPaths(vaultId, {
@@ -853,7 +855,8 @@ export class GitService {
         base,
         currentMain,
         deviceCommit,
-        paths: mergedTextPaths
+        paths: mergedTextPaths,
+        metadataRules
       });
       if (validation.contentOverrides.size > 0) {
         tree = await this.createTreeWithFileContents(vaultId, tree, validation.contentOverrides);
@@ -861,7 +864,7 @@ export class GitService {
       }
     } catch (error) {
       if (error instanceof GitDurabilityError) throw error;
-      return await this.trySemanticOverlayMergeTree(vaultId, base, currentMain, deviceCommit, deviceChanges, mergedTextPaths);
+      return await this.trySemanticOverlayMergeTree(vaultId, base, currentMain, deviceCommit, deviceChanges, mergedTextPaths, metadataRules);
     }
 
     return {
@@ -872,7 +875,8 @@ export class GitService {
         overlapping_path_count: mergedTextPaths.length,
         ...(validation.semanticKinds.size > 0
           ? { semantic_merge_kinds: [...validation.semanticKinds].sort() }
-          : {})
+          : {}),
+        ...(validation.timestampFields.length > 0 ? { metadata_timestamp_fields: validation.timestampFields } : {})
       }
     };
   }
@@ -1380,13 +1384,17 @@ export class GitService {
 
   private async validateMergedTextPaths(
     vaultId: string,
-    input: { tree: string; base: string; currentMain: string; deviceCommit: string; paths: string[] }
-  ): Promise<{ contentOverrides: Map<string, Buffer>; semanticKinds: Set<string> }> {
+    input: { tree: string; base: string; currentMain: string; deviceCommit: string; paths: string[]; metadataRules: MetadataConflictRule[] }
+  ): Promise<{ contentOverrides: Map<string, Buffer>; semanticKinds: Set<string>; timestampFields: Array<{ path: string; field: string; winner: 'server' | 'device' | 'tie_server' }> }> {
     const contentOverrides = new Map<string, Buffer>();
     const semanticKinds = new Set<string>();
+    const timestampFields: Array<{ path: string; field: string; winner: 'server' | 'device' | 'tie_server' }> = [];
+    const candidatePaths = new Set((await this.listTreeEntries(vaultId, input.tree)).map((entry) => entry.path));
     for (const path of input.paths) {
+      if (!candidatePaths.has(path)) continue;
       const mergedText = await this.readTextAtPathIfPresent(vaultId, input.tree, path);
       if (mergedText === null) {
+        if (path.endsWith('.md')) throw new GitCommandError('Overlapping Markdown candidate is not valid UTF-8.', '');
         continue;
       }
       const text = mergedText;
@@ -1396,8 +1404,22 @@ export class GitService {
       const baseText = await this.readTextAtPathIfPresent(vaultId, input.base, path);
       const currentText = await this.readTextAtPathIfPresent(vaultId, input.currentMain, path);
       const deviceText = await this.readTextAtPathIfPresent(vaultId, input.deviceCommit, path);
+      if (path.endsWith('.md') && (baseText === null || currentText === null || deviceText === null)) {
+        throw new GitCommandError('Overlapping Markdown inputs are absent or unreadable.', '');
+      }
       if (path.endsWith('.md') && baseText !== null && currentText !== null && deviceText !== null) {
-        assertMarkdownMergeAllowed(baseText, currentText, deviceText);
+        const timestampMerge = mergeLatestTimestampFrontmatter(currentText, deviceText, input.metadataRules);
+        assertMarkdownMergeAllowed(
+          baseText,
+          currentText,
+          deviceText,
+          timestampMerge ? new Set(input.metadataRules.map((rule) => rule.field)) : new Set()
+        );
+        if (timestampMerge) {
+          contentOverrides.set(path, Buffer.from(timestampMerge.content, 'utf8'));
+          semanticKinds.add('markdown_frontmatter_timestamp');
+          timestampFields.push(...timestampMerge.fields.map((field) => ({ path, ...field })));
+        }
       }
       if (path.endsWith('.canvas')) {
         assertValidJsonCanvas(text);
@@ -1411,12 +1433,13 @@ export class GitService {
         semanticKinds.add('obsidian_bases');
       }
     }
-    return { contentOverrides, semanticKinds };
+    return { contentOverrides, semanticKinds, timestampFields };
   }
 
   private async readTextAtPathIfPresent(vaultId: string, treeish: string, path: string): Promise<string | null> {
     try {
-      return (await this.readBlobAtPath(vaultId, treeish, path)).toString('utf8');
+      return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
+        .decode(await this.readBlobAtPath(vaultId, treeish, path));
     } catch (error) {
       if (error instanceof GitDurabilityError) throw error;
       return null;
@@ -1429,10 +1452,12 @@ export class GitService {
     currentMain: string,
     deviceCommit: string,
     deviceChanges: GitDiffEntry[],
-    overlappingPaths: string[]
+    overlappingPaths: string[],
+    metadataRules: MetadataConflictRule[] = []
   ): Promise<MergeTreeResult | null> {
     const contentOverrides = new Map<string, Buffer>();
     const semanticKinds = new Set<string>();
+    const timestampFields: Array<{ path: string; field: string; winner: 'server' | 'device' | 'tie_server' }> = [];
     try {
       for (const path of overlappingPaths) {
         const baseText = await this.readTextAtPathIfPresent(vaultId, base, path);
@@ -1447,6 +1472,18 @@ export class GitService {
         } else if (path.endsWith('.base')) {
           contentOverrides.set(path, Buffer.from(semanticMergeBasesFile(baseText, currentText, deviceText), 'utf8'));
           semanticKinds.add('obsidian_bases');
+        } else if (path.endsWith('.md')) {
+          const timestampMerge = mergeLatestTimestampFrontmatter(currentText, deviceText, metadataRules);
+          if (!timestampMerge) return null;
+          assertMarkdownMergeAllowed(
+            baseText,
+            currentText,
+            deviceText,
+            new Set(metadataRules.map((rule) => rule.field))
+          );
+          contentOverrides.set(path, Buffer.from(timestampMerge.content, 'utf8'));
+          semanticKinds.add('markdown_frontmatter_timestamp');
+          timestampFields.push(...timestampMerge.fields.map((field) => ({ path, ...field })));
         } else {
           return null;
         }
@@ -1459,6 +1496,7 @@ export class GitService {
           native_git_merge: 'conflicted',
           semantic_merge: 'clean',
           semantic_merge_kinds: [...semanticKinds].sort(),
+          ...(timestampFields.length > 0 ? { metadata_timestamp_fields: timestampFields } : {}),
           conflict_markers: 'absent',
           overlapping_path_count: overlappingPaths.length
         }
@@ -1602,7 +1640,12 @@ function assertValidCanvasNode(node: Record<string, unknown>): void {
   }
 }
 
-function assertMarkdownMergeAllowed(baseText: string, currentText: string, deviceText: string): void {
+function assertMarkdownMergeAllowed(
+  baseText: string,
+  currentText: string,
+  deviceText: string,
+  resolvedTimestampFields: Set<string> = new Set()
+): void {
   const base = parseFrontmatter(baseText);
   const current = parseFrontmatter(currentText);
   const device = parseFrontmatter(deviceText);
@@ -1612,7 +1655,7 @@ function assertMarkdownMergeAllowed(baseText: string, currentText: string, devic
   const currentChanged = changedFrontmatterKeys(base.keys, current.keys);
   const deviceChanged = changedFrontmatterKeys(base.keys, device.keys);
   for (const key of currentChanged) {
-    if (deviceChanged.has(key) && current.keys.get(key) !== device.keys.get(key)) {
+    if (deviceChanged.has(key) && current.keys.get(key) !== device.keys.get(key) && !resolvedTimestampFields.has(key)) {
       throw new GitCommandError('Markdown frontmatter same-key edits require review.', '');
     }
   }

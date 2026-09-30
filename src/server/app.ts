@@ -9,7 +9,8 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import { DIAGNOSTIC_MAX_BODY_BYTES } from '../shared/diagnostics.js';
 import { newId, nowIso } from '../shared/ids.js';
 import { isSyncableVaultPath, PathPolicyViolation } from '../shared/pathPolicy.js';
-import { RootIgnorePolicyError } from '../shared/rootIgnore.cjs';
+import { MAX_ROOT_IGNORE_BYTES, RootIgnorePolicyError } from '../shared/rootIgnore.cjs';
+import { validateMetadataConflictRules } from './frontmatterTimestampMerge.js';
 import {
   describePluginCompatibility,
   isPluginVersionAtLeast,
@@ -514,6 +515,37 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       displayName: readDisplayName(requestBody(request), 'display_name')
     });
     return vault;
+  });
+
+  app.get('/api/v1/vaults/:vaultId/sync-settings', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const { vaultId } = pathParams(request);
+    return await sync.getVaultSyncSettings(vaultId, session.user.user_id);
+  });
+
+  app.post('/api/v1/vaults/:vaultId/sync-settings/preview', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
+    const { vaultId } = pathParams(request);
+    const body = requestBody(request);
+    return await sync.previewVaultSyncSettings({
+      vaultId, actorUserId: session.user.user_id, expectedMain: readCommitId(body, 'expected_main'),
+      expectedRootIgnoreOid: readRequiredNullableCommitId(body, 'expected_root_ignore_oid'),
+      rootIgnore: readNullableText(body, 'root_ignore'), metadataConflictRules: readMetadataConflictRules(body)
+    });
+  });
+
+  app.put('/api/v1/vaults/:vaultId/sync-settings', async (request) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
+    const { vaultId } = pathParams(request);
+    const body = requestBody(request);
+    return await sync.saveVaultSyncSettings({
+      vaultId, actorUserId: session.user.user_id, expectedMain: readCommitId(body, 'expected_main'),
+      expectedRootIgnoreOid: readRequiredNullableCommitId(body, 'expected_root_ignore_oid'),
+      expectedPreviewTree: readCommitId(body, 'preview_tree'), expectedReviewFingerprint: readBoundedString(body, 'review_fingerprint', 64), rootIgnore: readNullableText(body, 'root_ignore'),
+      metadataConflictRules: readMetadataConflictRules(body), expectedMetadataConflictRules: readMetadataConflictRules(body, 'expected_metadata_conflict_rules')
+    });
   });
 
   app.get('/api/v1/vaults/:vaultId/main', async (request) => {
@@ -2670,6 +2702,33 @@ function readNullableBoundedString(record: Record<string, unknown>, key: string,
   return value;
 }
 
+function readMetadataConflictRules(record: Record<string, unknown>, key = 'metadata_conflict_rules') {
+  try {
+    return validateMetadataConflictRules(record[key]);
+  } catch (error) {
+    throw new ValidationError('invalid_request', error instanceof Error ? error.message : `${key} is invalid.`);
+  }
+}
+
+function readRequiredNullableCommitId(record: Record<string, unknown>, key: string): string | null {
+  if (!Object.prototype.hasOwnProperty.call(record, key)) {
+    throw new ValidationError('invalid_request', `${key} is required.`);
+  }
+  return readNullableCommitId(record, key);
+}
+
+function readNullableText(record: Record<string, unknown>, key: string): string | null {
+  if (!Object.prototype.hasOwnProperty.call(record, key)) {
+    throw new ValidationError('invalid_request', `${key} is required.`);
+  }
+  const value = record[key];
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > MAX_ROOT_IGNORE_BYTES) {
+    throw new ValidationError('invalid_request', `${key} must be UTF-8 text within the byte limit or null.`);
+  }
+  return value;
+}
+
 function readNullableCommitId(record: Record<string, unknown>, key: string): string | null {
   const value = record[key];
   if (value === null || value === undefined) {
@@ -3668,7 +3727,7 @@ async function reconcileStartupOperations(store: MetadataStore, git: GitService)
 
     const allTargetsAlreadyMoved = targetRefs.every(([ref, target]) => actualRefs.get(ref) === target);
     if (allTargetsAlreadyMoved) {
-      await rollForwardPreparedOperation(store, operation.operation_id);
+      await rollForwardPreparedOperation(store, git, operation.operation_id);
       continue;
     }
 
@@ -3759,10 +3818,88 @@ async function blockVaultIntegrity(store: MetadataStore, operation: SyncOperatio
   });
 }
 
-async function rollForwardPreparedOperation(store: MetadataStore, operationId: string): Promise<void> {
+async function rollForwardPreparedOperation(store: MetadataStore, git: GitService, operationId: string): Promise<void> {
+  const snapshot = await store.snapshot();
+  const pending = snapshot.sync_operations.find((candidate) => candidate.operation_id === operationId);
+  if (pending?.operation_type === 'server_merge' &&
+      Object.prototype.hasOwnProperty.call(pending.prepared_manifest ?? {}, 'metadata_conflict_rules')) {
+    const manifest = pending.prepared_manifest ?? {};
+    try {
+      const rules = validateMetadataConflictRules(manifest.metadata_conflict_rules);
+      const validatorResults = manifest.validator_results;
+      if (manifest.metadata_conflict_rules_sha256 !== sha256Hex(JSON.stringify(rules)) ||
+          !validatorResults || typeof validatorResults !== 'object' || Array.isArray(validatorResults)) {
+        throw new Error('prepared merge evidence is incomplete');
+      }
+    } catch {
+      await blockVaultIntegrity(store, pending, 'prepared merge evidence cannot be verified');
+      return;
+    }
+  }
+  if (pending?.operation_type === 'vault_settings') {
+    const manifest = pending.prepared_manifest ?? {};
+    const expectedOid = manifest.target_root_ignore_oid;
+    const targetMain = stringValue(manifest.target_main);
+    try {
+      if (!targetMain || typeof expectedOid !== 'string' && expectedOid !== null ||
+          await git.validateTreeRootIgnorePolicy(pending.vault_id, targetMain) !== expectedOid) {
+        throw new Error('prepared settings root policy does not match target main');
+      }
+    } catch {
+      await blockVaultIntegrity(store, pending, 'prepared vault settings root policy cannot be verified');
+      return;
+    }
+  }
   await store.mutate((db) => {
     const operation = db.sync_operations.find((candidate) => candidate.operation_id === operationId);
     if (!operation || operation.status !== 'prepared') {
+      return;
+    }
+    if (operation.operation_type === 'vault_settings') {
+      const manifest = operation.prepared_manifest ?? {};
+      const previousMain = stringValue(manifest.previous_main);
+      const targetMain = stringValue(manifest.target_main);
+      const actorUserId = stringValue(manifest.actor_user_id);
+      const removedDirectories = stringArrayValue(manifest.removed_directories);
+      const vault = db.vaults.find((candidate) => candidate.vault_id === operation.vault_id);
+      let rules;
+      try {
+        rules = validateMetadataConflictRules(manifest.metadata_conflict_rules);
+      } catch {
+        rules = null;
+      }
+      if (!vault || !previousMain || !targetMain || !actorUserId || !removedDirectories || !rules ||
+          vault.current_main !== previousMain || operation.expected_refs['refs/heads/main'] !== previousMain ||
+          operation.target_refs['refs/heads/main'] !== targetMain || operation.target_commit !== targetMain) {
+        operation.result = { reason: 'vault_settings_reconciliation_failed' };
+        operation.updated_at = nowIso();
+        if (vault) { vault.status = 'blocked_integrity'; vault.updated_at = nowIso(); }
+        return;
+      }
+      const intents = removedDirectories.map((path) => ({ op: 'delete' as const, path }));
+      vault.current_main = targetMain;
+      vault.metadata_conflict_rules = rules;
+      vault.updated_at = nowIso();
+      const event = store.appendEvent(db, {
+        event_type: 'main_advanced', vault_id: operation.vault_id, resource_ids: {},
+        commit_cursors: { previous_main: previousMain, main: targetMain },
+        payload: { settings_updated: true, root_ignore_oid: manifest.target_root_ignore_oid ?? null, directory_intents: intents }
+      });
+      const directoryState = db.directory_state_by_vault[operation.vault_id] ?? {
+        explicit_dirs: [], updated_at: nowIso(), last_event_seq: 0
+      };
+      const removed = new Set(removedDirectories);
+      directoryState.explicit_dirs = directoryState.explicit_dirs.filter((path) => !removed.has(path));
+      directoryState.last_event_seq = event.event_seq;
+      directoryState.updated_at = nowIso();
+      db.directory_state_by_vault[operation.vault_id] = directoryState;
+      db.audit_log.push({
+        audit_id: newId('aud'), actor_user_id: actorUserId, actor_device_id: null, vault_id: operation.vault_id,
+        action: 'vault_sync_settings_updated', resource_class: 'vault', resource_id: operation.vault_id, created_at: nowIso()
+      });
+      operation.status = 'committed';
+      operation.result = { target_main: targetMain, event_seq: event.event_seq, reconciled_after_startup: true };
+      operation.updated_at = nowIso();
       return;
     }
     if (operation.operation_type === 'conflict_refresh') {
@@ -4001,6 +4138,13 @@ async function rollForwardPreparedOperation(store: MetadataStore, operationId: s
                 path_id: typeof manifest.path === 'string' ? redactedPathId(manifest.path) : null
               }
             : { merge_commit: targetMain }),
+        ...(operation.operation_type === 'server_merge'
+          ? {
+              validator_results: manifest.validator_results ?? null,
+              metadata_conflict_rules: manifest.metadata_conflict_rules ?? null,
+              metadata_conflict_rules_sha256: manifest.metadata_conflict_rules_sha256 ?? null
+            }
+          : {}),
         reconciled_after_startup: true
       };
       operation.updated_at = nowIso();
@@ -4025,6 +4169,13 @@ async function rollForwardPreparedOperation(store: MetadataStore, operationId: s
                 : 'merged',
           merge_sequence: manifest.merge_sequence ?? null,
           merge_policy_version: manifest.merge_policy_version ?? null,
+          ...(operation.operation_type === 'server_merge'
+            ? {
+                validator_results: manifest.validator_results ?? null,
+                metadata_conflict_rules: manifest.metadata_conflict_rules ?? null,
+                metadata_conflict_rules_sha256: manifest.metadata_conflict_rules_sha256 ?? null
+              }
+            : {}),
           ...(operation.operation_type === 'conflict_resolve'
             ? { conflict_id: conflictId, resolution_kind: resolutionKind }
             : {}),

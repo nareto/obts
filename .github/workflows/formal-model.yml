@@ -52,5 +52,6 @@ jobs:
             onboarding) npm run test:formal:onboarding ;;
             diagnostics) npm run test:formal:diagnostics ;;
             client-state) npm run test:formal:client-state ;;
+            vault-settings) npm run test:formal:vault-settings ;;
             *) echo "Unknown formal family: $FAMILY" >&2; exit 1 ;;
           esac

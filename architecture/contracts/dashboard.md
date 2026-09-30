@@ -29,9 +29,11 @@ Statuses combine text and icon; color is never the sole signal.
 
 Long-running local work remains an active truthful operation with elapsed/detail information. The shared dashboard displays coarse progress (10% buckets) rather than exact client-reported counts; exact progress stays local. It does not become Offline solely because local processing took time. Device convergence comes from fresh server/client reports, not browser-side aging guesses.
 
-### OBTS-DASH-IGN-001: Advanced Root-Ignore Editing
+### OBTS-DASH-SET-001: Vault Sync Settings
 
-The plugin's Advanced view edits the shared vault-root `.gitignore` as a normal user file, not a hidden server policy. It shows the current bytes, local-only effect on already tracked paths, and a preview under the same full Git matcher used for scanning. Save rechecks the file's original identity and refuses to overwrite concurrent edits; failure preserves the draft. Creating, editing or deleting the file uses normal local capture and immutable proposal flow. The editor does not silently rewrite rules, delete matched local files, or truncate queued history. Saving a rule change does not remove an object already accepted into shared history, but an unaccepted queued attempt whose retained ancestry is the accepted device ref is rebuilt under the current policy before packing, so newly excluded paths stop being uploaded while their local bytes remain. If this client or server cannot safely interpret or activate the policy, editing/sync blocks with an explicit update action rather than producing a scanner-only partial result.
+Selected-vault Settings groups shared sync exclusions and metadata conflict rules under **Sync**. The exclusions editor previews the existing vault-root `.gitignore` bytes with the same Git matcher as sync, names newly excluded canonical files/directories, and saves through a stale-main and stale-policy protected server operation. It clearly explains that this is versioned `.gitignore` content consumed by clients, while direct file edits remain ordinary sync proposals. Newly excluded content remains in each device's visible vault as local-only; accepted history remains protected and unignore does not restore old content automatically. The plugin shows the effective shared file read-only and links to server Settings; it may still show a pre-pairing local copy, and reports offline/loading/error state truthfully.
+
+Metadata conflict rules are explicit per-vault frontmatter field names and the supported `Latest timestamp` strategy. UI text states the supported timestamp format: explicit-offset ISO-8601, up to nine fractional digits; unzoned, malformed, invalid, or higher-precision values fall back to normal conflict review. Rule changes affect future integrations only. Settings drafts and previews are scoped to the selected account, vault, current main, and policy identity; switching scope invalidates them. Failed saves retain the draft and explain stale reviews so the user can reload and preview again.
 
 ## Overview And Devices
 
@@ -61,7 +63,7 @@ Restore advances history; it does not rewrite it.
 
 Maintenance presents checklist rows for metadata/database, Git store, temporary workspace, migrations, native Git, permissions, event delivery, and backup contract. Actions explain blocking state and preserve the dashboard/repair surface when one vault is integrity-blocked.
 
-Settings exposes consented redacted diagnostics and account/session actions. Confirmation dialogs state target and consequence. An active authenticated session is not interrupted by username/password re-entry; high-impact destructive intent uses an operation-specific typed phrase.
+Settings exposes selected-vault Sync controls, consented redacted diagnostics, and account/session actions. Vault-scoped sync controls are unavailable without a selected, accessible vault and remain separate from account controls. Confirmation dialogs state target and consequence. An active authenticated session is not interrupted by username/password re-entry; high-impact destructive intent uses an operation-specific typed phrase.
 
 ### OBTS-DASH-DEL-001: Truthful Whole-Vault Deletion Workflow
 

@@ -16,7 +16,8 @@ const formalPaths = new Map([
   ['bridge-protocol', /^(?:architecture\/models\/formal\/(?:OBTSBridgeExternalProtocol(?:\.tla)?|checks-fm005\.json|fm005-.*))$/],
   ['onboarding', /^(?:architecture\/models\/formal\/(?:OBTSOnboarding(?:Recovery)?(?:\.tla)?|checks-fm006\.json|configs\/fm006-.*))$/],
   ['diagnostics', /^(?:architecture\/models\/formal\/OBTSDiagnosticAdmission\.tla)$/],
-  ['client-state', /^(?:architecture\/models\/formal\/OBTSClientStateRecovery\.tla)$/]
+  ['client-state', /^(?:architecture\/models\/formal\/OBTSClientStateRecovery\.tla)$/],
+  ['vault-settings', /^(?:architecture\/models\/formal\/(?:OBTSVaultSettings(?:\.tla|\.cfg)?|VaultSettings(?:AutoMerge|ConflictFallback|DeleteLocal|RecomputeMerge|StaleSave)\.cfg|negative\/VaultSettings.*\.cfg))$/]
 ]);
 function git(args, cwd) {
   return spawnSync('git', args, { cwd, encoding: 'buffer', maxBuffer: 16 * 1024 * 1024 });

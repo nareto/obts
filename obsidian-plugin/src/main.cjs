@@ -5545,34 +5545,6 @@ class ObtsObsidianClient {
       policy: createRootIgnorePolicy(bytes) };
   }
 
-  rootIgnoreDraftPolicy(draft) {
-    if (typeof draft !== "string" || Buffer.from(draft, "utf8").toString("utf8") !== draft) {
-      throw new ObtsBlockedError("invalid_root_ignore_draft", "Root .gitignore must be valid UTF-8 text.");
-    }
-    const bytes = Buffer.from(draft, "utf8");
-    return { bytes, policy: createRootIgnorePolicy(bytes) };
-  }
-
-  async previewRootIgnoreDraft(draft) {
-    const { policy } = this.rootIgnoreDraftPolicy(draft);
-    const local = await this.listLocalVaultInventory("", policy);
-    const head = await this.resolveRef("refs/heads/local");
-    const tracked = head ? [...(await this.listTreeBlobOids(head)).keys()] : [];
-    const newlyLocal = tracked.filter((filePath) => filePath !== ".gitignore" && policy.ignores(filePath));
-    return { includedFiles: local.files.filter((filePath) => isSyncableVaultPath(filePath)).length,
-      newlyLocal: newlyLocal.sort() };
-  }
-
-  async saveRootIgnoreDraft(draft) {
-    const { bytes } = this.rootIgnoreDraftPolicy(draft);
-    await this.adapter.writeBinary(".gitignore", bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
-    const saved = await this.readRootIgnorePolicy();
-    if (saved.bytes === null || !saved.bytes.equals(bytes)) {
-      throw new ObtsBlockedError("root_ignore_save_uncertain", "Root .gitignore changed during save. Keep your draft and inspect the local file.");
-    }
-    return saved;
-  }
-
   async rootIgnoreProtocolCapability() {
     await this.readRootIgnorePolicy();
     return "root-ignore-v1";
@@ -6571,7 +6543,8 @@ class ObtsObsidianClient {
         local_head: state.local_head,
         path_capabilities: {
           adapter: "obsidian-data-adapter",
-          platform: runtimePlatform()
+          platform: runtimePlatform(),
+          root_ignore: true
         }
       })
     });
@@ -9809,7 +9782,6 @@ class ObtsSettingTab extends PluginSettingTab {
     super(app, plugin);
     this.plugin = plugin;
     this.operationRefreshTimer = null;
-    this.rootIgnoreEditor = null;
   }
 
   clearOperationRefreshTimer() {
@@ -10210,112 +10182,37 @@ class ObtsSettingTab extends PluginSettingTab {
         );
     }
 
-    await this.renderRootIgnoreEditor(containerEl);
+    await this.renderRootIgnoreStatus(containerEl);
   }
 
-  async renderRootIgnoreEditor(containerEl) {
-    containerEl.createEl("h3", { text: "Advanced: sync exclusions", cls: "obts-settings-section-header" });
+  async renderRootIgnoreStatus(containerEl) {
+    containerEl.createEl("h3", { text: "Sync policy", cls: "obts-settings-section-header" });
     new Setting(containerEl)
       .setName("Vault-root .gitignore")
-      .setDesc("Shared with your other devices. Preview before saving. Excluded files stay in this local vault; changing a rule does not remove oversized objects from queued history.");
-    const feedback = containerEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
-    let editor = this.rootIgnoreEditor;
+      .setDesc("This versioned file remains the shared exclusion policy. Edit its effective rules in the server dashboard.");
+    const status = containerEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
     try {
-      const pin = await this.plugin.client.readRootIgnorePolicy();
-      if (!editor) {
-        editor = { baseline: pin.bytes, draft: pin.bytes === null ? "" : Buffer.from(pin.bytes).toString("utf8") };
-        this.rootIgnoreEditor = editor;
-      } else if ((editor.baseline === null) !== (pin.bytes === null) ||
-                 (editor.baseline !== null && !Buffer.from(editor.baseline).equals(pin.bytes))) {
-        setFeedback(feedback, "The local .gitignore changed since you opened this draft. Reload to see the new version, or preview and overwrite it with your draft.", "muted");
-      }
-    } catch (error) {
-      setFeedback(feedback, error instanceof Error ? error.message : "Cannot safely read root .gitignore on this device.", "error");
-      return;
+      const policy = await this.plugin.client.readRootIgnorePolicy();
+      const rules = policy.bytes === null ? "No root .gitignore is currently applied on this device." : new TextDecoder("utf-8", { fatal: true }).decode(policy.bytes);
+      setFeedback(status, `${rules}\n\nThis is the local applied copy (policy ${policy.oid || "absent"}); it may be stale while offline or before pairing.`, "muted");
+    } catch {
+      setFeedback(status, "The local applied exclusion policy is unavailable. This may happen offline or before pairing; no current server policy is implied.", "muted");
     }
-    const input = containerEl.createEl("textarea", {
-      cls: "obts-ignore-editor",
-      attr: { "aria-label": "Vault-root .gitignore rules", spellcheck: "false", rows: "8" }
-    });
-    input.value = editor.draft;
-    const previewEl = containerEl.createDiv({ cls: "obts-ignore-preview", attr: { "aria-live": "polite" } });
-    let previewedDraft = null;
-    let saveButton;
-    input.addEventListener("input", () => {
-      editor.draft = input.value;
-      previewedDraft = null;
-      previewEl.empty();
-      if (saveButton) saveButton.setDisabled(true);
-    });
-    new Setting(containerEl)
-      .setName("Reload file")
-      .setDesc("Discard this draft and read the current local .gitignore again.")
-      .addButton((button) => button.setButtonText("Reload from vault").onClick(async () => {
-        if (editor.draft !== (editor.baseline === null ? "" : Buffer.from(editor.baseline).toString("utf8")) &&
-            !window.confirm("Discard your unsaved .gitignore draft and reload the local file?")) return;
-        button.setDisabled(true);
-        try {
-          const current = await this.plugin.client.readRootIgnorePolicy();
-          editor.baseline = current.bytes;
-          editor.draft = current.bytes === null ? "" : Buffer.from(current.bytes).toString("utf8");
-          input.value = editor.draft;
-          previewedDraft = null;
-          previewEl.empty();
-          if (saveButton) saveButton.setDisabled(true);
-          setFeedback(feedback, "Loaded the current local .gitignore. Preview before saving.", "muted");
-        } catch (error) {
-          setFeedback(feedback, error instanceof Error ? error.message : "Cannot reload root .gitignore.", "error");
-        } finally {
-          button.setDisabled(false);
-        }
-      }));
-    new Setting(containerEl)
-      .setName("Review and save")
-      .addButton((button) => button.setButtonText("Preview effect").onClick(async () => {
-        button.setDisabled(true);
-        previewedDraft = null;
-        if (saveButton) saveButton.setDisabled(true);
-        try {
-          const draft = input.value;
-          const result = await this.plugin.client.previewRootIgnoreDraft(draft);
-          if (draft !== input.value) return;
-          previewedDraft = draft;
-          previewEl.empty();
-          previewEl.createEl("p", { text: `${result.includedFiles} syncable files remain in this vault. ${result.newlyLocal.length} tracked files would become local only.` });
-          if (result.newlyLocal.length) {
-            previewEl.createEl("p", { text: `Newly local-only: ${result.newlyLocal.slice(0, 10).join(", ")}${result.newlyLocal.length > 10 ? " (and more)" : ""}` });
-          }
-          if (saveButton) saveButton.setDisabled(false);
-          setFeedback(feedback, "Preview ready. Save only after reviewing the local-only paths.", "success");
-        } catch (error) {
-          setFeedback(feedback, error instanceof Error ? error.message : "Unable to preview .gitignore.", "error");
-        } finally {
-          button.setDisabled(false);
-        }
-      }))
-      .addButton((button) => {
-        saveButton = button.setButtonText("Save .gitignore").setDisabled(true).onClick(async () => {
-          if (previewedDraft !== input.value) return;
-          const submitted = input.value;
-          button.setDisabled(true);
-          input.disabled = true;
-          try {
-            const saved = await this.plugin.runExclusiveAction(
-              () => this.plugin.client.saveRootIgnoreDraft(submitted),
-              "Saving root .gitignore"
-            );
-            editor.baseline = saved.bytes;
-            editor.draft = submitted;
-            previewedDraft = null;
-            previewEl.empty();
-            setFeedback(feedback, "Saved locally. Sync will propose this file and the previewed exclusions.", "success");
-          } catch (error) {
-            setFeedback(feedback, error instanceof Error ? error.message : "Unable to save .gitignore. Your draft is preserved.", "error");
-          } finally {
-            input.disabled = false;
-          }
+    const state = await this.plugin.client.readState().catch(() => null);
+    const dashboardBase = normalizedServerDestination(this.plugin.settings.serverUrl);
+    if (state && state.vault_id && dashboardBase) {
+      try {
+        const dashboardUrl = new URL("/", dashboardBase);
+        dashboardUrl.searchParams.set("vault", state.vault_id);
+        containerEl.createEl("a", {
+          text: "Manage sync rules on server",
+          href: dashboardUrl.toString(),
+          attr: { target: "_blank", rel: "noopener noreferrer" }
         });
-      });
+      } catch {
+        // Invalid or unset server URLs do not produce a misleading link.
+      }
+    }
   }
 }
 

@@ -362,6 +362,69 @@ paths:
                 $ref: "#/components/schemas/DashboardSummary"
         "404":
           $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/sync-settings:
+    get:
+      summary: Read owner-scoped shared exclusions and metadata merge rules for an owned vault.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+      responses:
+        "200":
+          description: Current shared sync settings and canonical version.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VaultSyncSettings"
+        "404":
+          $ref: "#/components/responses/Error"
+    put:
+      summary: Save previewed shared sync settings and apply root exclusions through a forward-only canonical commit.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - $ref: "#/components/parameters/CsrfHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SaveVaultSyncSettingsRequest"
+      responses:
+        "200":
+          description: Saved settings and resulting canonical main.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VaultSyncSettings"
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/sync-settings/preview:
+    post:
+      summary: Preview root exclusions and metadata merge rules against the current canonical main.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - $ref: "#/components/parameters/CsrfHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PreviewVaultSyncSettingsRequest"
+      responses:
+        "200":
+          description: Exact proposed policy bytes, canonical paths/directories affected, and candidate tree identity.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VaultSyncSettingsPreview"
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
   /connections:
     post:
       summary: Start browser-assisted plugin onboarding.
@@ -2961,6 +3024,103 @@ components:
         created_at:
           type: string
           format: date-time
+    VaultSyncSettings:
+      type: object
+      required: [vault_id, current_main, root_ignore, root_ignore_oid, metadata_conflict_rules]
+      properties:
+        vault_id:
+          type: string
+        current_main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        root_ignore:
+          type: [string, "null"]
+          description: Exact versioned root .gitignore text; null means absent.
+        root_ignore_oid:
+          type: [string, "null"]
+          description: Git blob identity for the currently saved root exclusion file.
+        metadata_conflict_rules:
+          type: array
+          items:
+            $ref: "#/components/schemas/MetadataConflictRule"
+    MetadataConflictRule:
+      type: object
+      required: [field, strategy]
+      properties:
+        field:
+          type: string
+          maxLength: 128
+          pattern: "^[A-Za-z0-9_-]+$"
+        strategy:
+          type: string
+          const: latest_timestamp
+    PreviewVaultSyncSettingsRequest:
+      type: object
+      required: [expected_main, expected_root_ignore_oid, root_ignore, metadata_conflict_rules]
+      properties:
+        expected_main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        expected_root_ignore_oid:
+          type: [string, "null"]
+        root_ignore:
+          type: [string, "null"]
+          maxLength: 1048576
+        metadata_conflict_rules:
+          type: array
+          maxItems: 64
+          items:
+            $ref: "#/components/schemas/MetadataConflictRule"
+    SaveVaultSyncSettingsRequest:
+      allOf:
+        - $ref: "#/components/schemas/PreviewVaultSyncSettingsRequest"
+        - type: object
+          required: [preview_tree, review_fingerprint, expected_metadata_conflict_rules]
+          properties:
+            preview_tree:
+              type: string
+              pattern: "^[0-9a-f]{40}$"
+            review_fingerprint:
+              type: string
+              pattern: "^[0-9a-f]{64}$"
+            expected_metadata_conflict_rules:
+              type: array
+              maxItems: 64
+              items:
+                $ref: "#/components/schemas/MetadataConflictRule"
+    VaultSyncSettingsPreview:
+      type: object
+      required: [vault_id, expected_main, expected_root_ignore_oid, preview_tree, review_fingerprint, root_ignore_oid, affected_paths, affected_directories, metadata_conflict_rules]
+      properties:
+        vault_id:
+          type: string
+        expected_main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        expected_root_ignore_oid:
+          type: [string, "null"]
+        preview_tree:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        review_fingerprint:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        root_ignore_oid:
+          type: [string, "null"]
+        affected_paths:
+          type: array
+          items:
+            type: string
+        affected_directories:
+          type: array
+          items:
+            type: string
+        metadata_conflict_rules:
+          type: array
+          items:
+            $ref: "#/components/schemas/MetadataConflictRule"
+        changes_main:
+          type: boolean
     DashboardSummary:
       type: object
       required: [vault, devices, recommended_plugin_version, unresolved_conflict_count, conflicts, recent_activity, maintenance, health]

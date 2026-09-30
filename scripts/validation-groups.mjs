@@ -31,5 +31,5 @@ export const checkerTests = [
 ];
 
 export const formalFamilies = [
-  'sync', 'bridge-body', 'workers', 'deletion', 'bridge-protocol', 'onboarding', 'diagnostics', 'client-state'
+  'sync', 'bridge-body', 'workers', 'deletion', 'bridge-protocol', 'onboarding', 'diagnostics', 'client-state', 'vault-settings'
 ];

@@ -37,6 +37,23 @@ describe('OpenAPI Phase 3 contract', () => {
       expect(() => parser({ ...value, root_ignore_capability: 'root-ignore-v1', root_ignore_oid: 'not-an-oid' })).toThrow();
     }
   });
+  it('allows save-only review fields when composing vault settings request schemas', async () => {
+    const contract = parse(await readFile(join(process.cwd(), 'openapi', 'openapi.yaml'), 'utf8')) as {
+      components: { schemas: Record<string, {
+        additionalProperties?: boolean;
+        allOf?: Array<{ $ref?: string; required?: string[] }>;
+        properties?: Record<string, unknown>;
+      }> };
+    };
+    const preview = contract.components.schemas.PreviewVaultSyncSettingsRequest!;
+    const save = contract.components.schemas.SaveVaultSyncSettingsRequest!;
+    expect(save.allOf?.[0]?.$ref).toBe('#/components/schemas/PreviewVaultSyncSettingsRequest');
+    // A closed referenced schema would reject every extra property introduced by allOf.
+    expect(preview.additionalProperties).not.toBe(false);
+    expect(save.allOf?.[1]?.required).toEqual(['preview_tree', 'review_fingerprint', 'expected_metadata_conflict_rules']);
+    expect(contract.components.schemas.MetadataConflictRule?.properties?.field).toMatchObject({ maxLength: 128 });
+  });
+
   it('commits the endpoints and version used by the server and plugin', async () => {
     const contract = await readFile(join(process.cwd(), 'openapi', 'openapi.yaml'), 'utf8');
     const document = parse(contract) as {
@@ -64,6 +81,8 @@ describe('OpenAPI Phase 3 contract', () => {
       '/vaults/{vault_id}',
       '/vaults/{vault_id}/main',
       '/vaults/{vault_id}/dashboard',
+      '/vaults/{vault_id}/sync-settings',
+      '/vaults/{vault_id}/sync-settings/preview',
       '/connections',
       '/connections/{connection_id}',
       '/connections/{connection_id}/review',

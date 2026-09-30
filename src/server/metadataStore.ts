@@ -7,6 +7,7 @@ import { assertNoSymlinkComponents } from './deletionRoot.js';
 import { newId, nowIso } from '../shared/ids.js';
 import { DISPLAY_NAME_MAX_LENGTH, normalizeDisplayName } from '../shared/validators.js';
 import type { DiagnosticEvent } from '../shared/diagnostics.js';
+import type { MetadataConflictRule } from './frontmatterTimestampMerge.js';
 import type {
   ConflictRecord,
   DirectoryIntentAcknowledgement,
@@ -67,6 +68,7 @@ export type VaultRow = {
   status: 'active' | 'blocked_integrity' | 'deleting';
   root_commit?: string | null;
   current_main: string;
+  metadata_conflict_rules?: MetadataConflictRule[];
   created_at: string;
   updated_at: string;
 };
@@ -163,7 +165,7 @@ export type SyncOperationRow = {
   operation_id: string;
   vault_id: string;
   device_id: string | null;
-  operation_type: 'device_push' | 'server_merge' | 'conflict_create' | 'conflict_refresh' | 'conflict_resolve' | 'note_restore' | 'git_maintenance';
+  operation_type: 'device_push' | 'server_merge' | 'conflict_create' | 'conflict_refresh' | 'conflict_resolve' | 'note_restore' | 'git_maintenance' | 'vault_settings';
   expected_refs: Record<string, string | null>;
   target_refs: Record<string, string | null>;
   target_commit: string | null;

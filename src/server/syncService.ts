@@ -1,8 +1,10 @@
 import { posix } from 'node:path';
+import { createHash } from 'node:crypto';
 
 import { newId, nowIso } from '../shared/ids.js';
 import { assertSyncableTreePaths, PathPolicyViolation } from '../shared/pathPolicy.js';
-import { RootIgnorePolicyError } from '../shared/rootIgnore.cjs';
+import { createRootIgnorePolicy, RootIgnorePolicyError } from '../shared/rootIgnore.cjs';
+import { validateMetadataConflictRules, type MetadataConflictRule } from './frontmatterTimestampMerge.js';
 import type {
   ConflictPreviewFile,
   ConflictRecord,
@@ -113,6 +115,200 @@ export class SyncService {
 
   async runWithVaultLock<T>(vaultId: string, fn: () => Promise<T>): Promise<T> {
     return await this.withVaultLock(vaultId, fn);
+  }
+
+  async getVaultSyncSettings(vaultId: string, actorUserId: string): Promise<Record<string, unknown>> {
+    return await this.withVaultLock(vaultId, async () => {
+      const db = await this.store.snapshot();
+      const vault = requireVault(db, vaultId);
+      if (vault.owner_user_id !== actorUserId) throw new AuthError(404, 'not_found', 'Resource not found.');
+      const policy = await this.git.readRootIgnoreBlob(vaultId, vault.current_main);
+      let rootIgnore: string | null = null;
+      if (policy.bytes !== null) rootIgnore = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(policy.bytes);
+      return {
+        vault_id: vault.vault_id,
+        current_main: vault.current_main,
+        root_ignore_oid: policy.oid,
+        root_ignore: rootIgnore,
+        metadata_conflict_rules: validateMetadataConflictRules(vault.metadata_conflict_rules ?? [])
+      };
+    });
+  }
+
+  async previewVaultSyncSettings(input: {
+    vaultId: string; actorUserId: string; expectedMain: string; expectedRootIgnoreOid: string | null;
+    rootIgnore: string | null; metadataConflictRules: unknown;
+  }): Promise<Record<string, unknown>> {
+    return await (async () => {
+      const db = await this.store.snapshot();
+      const vault = requireVault(db, input.vaultId);
+      if (vault.owner_user_id !== input.actorUserId) throw new AuthError(404, 'not_found', 'Resource not found.');
+      if (vault.status !== 'active') throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+      if (vault.current_main !== input.expectedMain) throw new AuthError(409, 'stale_settings', 'Vault main changed; reload settings before saving.');
+      const previousPolicy = await this.git.readRootIgnoreBlob(input.vaultId, vault.current_main);
+      if (previousPolicy.oid !== input.expectedRootIgnoreOid) throw new AuthError(409, 'stale_settings', 'Root .gitignore changed; reload settings before saving.');
+      const rules = validateMetadataConflictRules(input.metadataConflictRules);
+      const currentRules = validateMetadataConflictRules(vault.metadata_conflict_rules ?? []);
+      const bytes = input.rootIgnore === null ? null : Buffer.from(input.rootIgnore, 'utf8');
+      const policy = createRootIgnorePolicy(bytes);
+      const entries = await this.git.listTreeEntries(input.vaultId, vault.current_main);
+      const excludedPaths = entries.filter((entry) => entry.type === 'blob' && policy.ignores(entry.path)).map((entry) => entry.path).sort();
+      const currentDirs = db.directory_state_by_vault[input.vaultId]?.explicit_dirs ?? [];
+      const excludedDirectories = currentDirs.filter((path) => policy.ignores(path, true)).sort();
+      const previousDirectoryOutcomes = new Set(currentDirs.filter((path) => previousPolicy.bytes !== null &&
+        createRootIgnorePolicy(previousPolicy.bytes).ignores(path, true)));
+      const directoryOutcomesChanged = currentDirs.some((path) => previousDirectoryOutcomes.has(path) !== policy.ignores(path, true));
+      const writes = new Map<string, Buffer>();
+      const deletes = [...excludedPaths];
+      if (bytes === null) deletes.push('.gitignore');
+      else writes.set('.gitignore', bytes);
+      const tree = await this.git.createTreeFromCommitWithChanges({
+        vaultId: input.vaultId, sourceCommit: vault.current_main, writes, deletes
+      });
+      const rootIgnoreOid = await this.git.validateTreeRootIgnorePolicy(input.vaultId, tree);
+      if (directoryOutcomesChanged && tree === await this.git.treeHash(input.vaultId, vault.current_main)) {
+        throw new AuthError(409, 'directory_outcome_requires_main_advance', 'The directory policy outcome requires a main history change; no safe change can advance main.');
+      }
+      const reviewFingerprint = createHash('sha256').update(JSON.stringify({
+        vault_id: vault.vault_id, expected_main: vault.current_main, expected_root_ignore_oid: previousPolicy.oid,
+        expected_metadata_conflict_rules: currentRules, proposed_root_ignore_oid: rootIgnoreOid,
+        proposed_root_ignore: input.rootIgnore, proposed_metadata_conflict_rules: rules,
+        preview_tree: tree, affected_paths: excludedPaths, affected_directories: excludedDirectories
+      })).digest('hex');
+      return {
+        vault_id: vault.vault_id,
+        expected_main: vault.current_main,
+        expected_root_ignore_oid: previousPolicy.oid,
+        preview_tree: tree,
+        root_ignore_oid: rootIgnoreOid,
+        affected_paths: excludedPaths,
+        affected_directories: excludedDirectories,
+        review_fingerprint: reviewFingerprint,
+        metadata_conflict_rules: rules,
+        changes_main: tree !== await this.git.treeHash(input.vaultId, vault.current_main)
+      };
+    })();
+  }
+
+  async saveVaultSyncSettings(input: {
+    vaultId: string; actorUserId: string; expectedMain: string; expectedRootIgnoreOid: string | null;
+    expectedPreviewTree: string; expectedReviewFingerprint: string; rootIgnore: string | null; metadataConflictRules: unknown;
+    expectedMetadataConflictRules: unknown;
+  }): Promise<Record<string, unknown>> {
+    return await this.withVaultLock(input.vaultId, async () => {
+      const preview = await this.previewVaultSyncSettings({ ...input, metadataConflictRules: input.metadataConflictRules });
+      if (preview.preview_tree !== input.expectedPreviewTree || preview.review_fingerprint !== input.expectedReviewFingerprint) throw new AuthError(409, 'stale_settings', 'Settings preview changed; review it again before saving.');
+      const db = await this.store.snapshot();
+      const vault = requireVault(db, input.vaultId);
+      const rules = validateMetadataConflictRules(input.metadataConflictRules);
+      const expectedRules = validateMetadataConflictRules(input.expectedMetadataConflictRules);
+      if (JSON.stringify(vault.metadata_conflict_rules ?? []) !== JSON.stringify(expectedRules)) {
+        throw new AuthError(409, 'stale_settings', 'Metadata conflict rules changed; reload settings before saving.');
+      }
+      const latestPolicy = await this.git.readRootIgnoreBlob(input.vaultId, vault.current_main);
+      if (latestPolicy.oid !== input.expectedRootIgnoreOid) throw new AuthError(409, 'stale_settings', 'Root .gitignore changed; reload settings before saving.');
+      const targetTree = String(preview.preview_tree);
+      const currentTree = await this.git.treeHash(input.vaultId, vault.current_main);
+      if (targetTree === currentTree) {
+        await this.store.mutate((mutableDb) => {
+          const current = requireVault(mutableDb, input.vaultId);
+          if (current.current_main !== input.expectedMain) throw new AuthError(409, 'stale_settings', 'Vault main changed; reload settings before saving.');
+          current.metadata_conflict_rules = rules;
+          current.updated_at = nowIso();
+          mutableDb.audit_log.push({
+            audit_id: newId('aud'), actor_user_id: input.actorUserId, actor_device_id: null, vault_id: input.vaultId,
+            action: 'vault_sync_settings_updated', resource_class: 'vault', resource_id: input.vaultId, created_at: nowIso()
+          });
+        });
+        return { vault_id: vault.vault_id, current_main: vault.current_main, root_ignore: input.rootIgnore,
+          metadata_conflict_rules: rules, root_ignore_oid: preview.root_ignore_oid };
+      }
+
+      const incompatible = db.devices.find((device) => device.vault_id === input.vaultId && device.status !== 'revoked' &&
+        device.path_capabilities?.root_ignore !== true);
+      if (incompatible) throw new AuthError(409, 'root_ignore_capability_required', 'Update every paired device before changing root .gitignore.');
+      const targetMain = await this.git.createMainCommitFromTree({
+        vaultId: input.vaultId, tree: targetTree, parentMain: vault.current_main,
+        subject: 'obts: update vault sync settings',
+        body: `actor_user_id=${input.actorUserId}\nroot_ignore_oid=${String(preview.root_ignore_oid)}\n`, actor: 'obts-settings'
+      });
+      const removedDirectories = preview.affected_directories as string[];
+      const operationId = await this.store.mutate((mutableDb) => {
+        const current = requireVault(mutableDb, input.vaultId);
+        if (current.current_main !== input.expectedMain) throw new AuthError(409, 'stale_settings', 'Vault main changed; reload settings before saving.');
+        const operation = this.store.startOperation(mutableDb, {
+          vault_id: input.vaultId, device_id: null, operation_type: 'vault_settings',
+          expected_refs: { 'refs/heads/main': input.expectedMain }, target_refs: { 'refs/heads/main': targetMain }, target_commit: targetMain
+        });
+        operation.status = 'prepared';
+        operation.prepared_manifest = {
+          actor_user_id: input.actorUserId, previous_main: input.expectedMain, target_main: targetMain,
+          target_root_ignore_oid: preview.root_ignore_oid, metadata_conflict_rules: rules,
+          removed_directories: removedDirectories, target_refs: { 'refs/heads/main': targetMain }
+        };
+        operation.updated_at = nowIso();
+        return operation.operation_id;
+      });
+      try {
+        await this.git.updateRef(input.vaultId, 'refs/heads/main', targetMain, input.expectedMain);
+      } catch (error) {
+        const actual = await this.git.getRef(input.vaultId, 'refs/heads/main');
+        if (actual === input.expectedMain) {
+          await this.abortOperation(operationId, 'vault_settings_ref_not_moved');
+          throw error;
+        }
+        if (actual !== targetMain) {
+          await this.blockPreparedOperationForIntegrity(operationId, 'vault settings ref cannot be reconciled');
+          throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+        }
+      }
+      await this.commitVaultSettingsOperation(operationId);
+      return { vault_id: vault.vault_id, current_main: targetMain, root_ignore: input.rootIgnore,
+        metadata_conflict_rules: rules, root_ignore_oid: preview.root_ignore_oid };
+    });
+  }
+
+  private async commitVaultSettingsOperation(operationId: string): Promise<void> {
+    await this.store.mutate((db) => {
+      const operation = requireOperation(db, operationId);
+      const vault = requireVault(db, operation.vault_id);
+      const manifest = operation.prepared_manifest ?? {};
+      const targetMain = typeof manifest.target_main === 'string' ? manifest.target_main : null;
+      const actorUserId = typeof manifest.actor_user_id === 'string' ? manifest.actor_user_id : null;
+      const rules = validateMetadataConflictRules(manifest.metadata_conflict_rules);
+      const removedDirectories = Array.isArray(manifest.removed_directories) &&
+        manifest.removed_directories.every((path): path is string => typeof path === 'string')
+        ? manifest.removed_directories : null;
+      if (operation.status !== 'prepared' || !targetMain || !actorUserId || !removedDirectories ||
+          operation.target_refs['refs/heads/main'] !== targetMain || operation.target_commit !== targetMain) {
+        throw new Error('Prepared vault settings operation is invalid.');
+      }
+      const previousMain = vault.current_main;
+      vault.current_main = targetMain;
+      vault.metadata_conflict_rules = rules;
+      vault.updated_at = nowIso();
+      const intents: DirectoryIntent[] = removedDirectories.map((path) => ({ op: 'delete', path }));
+      const event = this.store.appendEvent(db, {
+        event_type: 'main_advanced', vault_id: operation.vault_id, resource_ids: {},
+        commit_cursors: { previous_main: previousMain, main: targetMain },
+        payload: { settings_updated: true, root_ignore_oid: manifest.target_root_ignore_oid ?? null, directory_intents: intents }
+      });
+      applyDirectoryIntents(db, operation.vault_id, intents, event.event_seq);
+      db.audit_log.push({
+        audit_id: newId('aud'), actor_user_id: actorUserId, actor_device_id: null, vault_id: operation.vault_id,
+        action: 'vault_sync_settings_updated', resource_class: 'vault', resource_id: operation.vault_id, created_at: nowIso()
+      });
+      operation.status = 'committed';
+      operation.result = { target_main: targetMain, event_seq: event.event_seq };
+      operation.updated_at = nowIso();
+    });
+  }
+
+  async metadataConflictRules(vaultId: string): Promise<MetadataConflictRule[]> {
+    const db = await this.store.snapshot();
+    const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
+    if (!vault) throw new AuthError(404, 'not_found', 'Resource not found.');
+    return validateMetadataConflictRules(vault.metadata_conflict_rules ?? []);
   }
 
   async resumePendingMerges(): Promise<void> {
@@ -1365,6 +1561,7 @@ export class SyncService {
     const directoryPlan = directoryProposal
       ? await this.classifyDirectoryProposal(vaultId, deviceId, directoryProposal)
       : null;
+    const metadataRules = await this.metadataConflictRules(vaultId);
     const mainChanges = await this.git.changedPaths(vaultId, base, main);
     const deviceChanges = await this.git.changedPaths(vaultId, base, deviceCommit);
     if (detachedProposal && hasDestructiveChanges(deviceChanges)) {
@@ -1438,7 +1635,8 @@ export class SyncService {
         deviceCommit,
         deviceChanges,
         overlapping,
-        directoryPlan
+        directoryPlan,
+        metadataRules
       );
       if (cleanMerge) {
         return cleanMerge;
@@ -1479,7 +1677,7 @@ export class SyncService {
       operation.updated_at = nowIso();
       return { mergeSequence, operationId: operation.operation_id };
     });
-    let mergeCommit: string;
+    let mergeCommit: string | null = null;
     try {
       const mergeTree = await this.git.createDisjointMergeTree(vaultId, base, main, deviceCommit);
       mergeCommit = await this.git.createMergeCommitObjectFromTree({
@@ -1496,13 +1694,22 @@ export class SyncService {
       await this.prepareMergeRefUpdate(mergePreparation.operationId, mergeCommit);
       await this.git.updateRef(vaultId, 'refs/heads/main', mergeCommit, main);
     } catch (error) {
-      await this.abortOperation(mergePreparation.operationId, 'merge_git_error');
-      if (error instanceof PathPolicyViolation || error instanceof RootIgnorePolicyError) {
-        return await this.createConflict(vaultId, deviceId, base, main, deviceCommit,
-          policyConflictPaths(error), 'root_ignore_merge_policy', directoryPlan);
+      if (error instanceof GitDurabilityError) throw error;
+      const actualMain = await this.git.getRef(vaultId, 'refs/heads/main');
+      if (!mergeCommit || actualMain !== mergeCommit) {
+        if (actualMain !== main) {
+          await this.blockPreparedOperationForIntegrity(mergePreparation.operationId, 'merge main ref cannot be reconciled');
+          throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+        }
+        await this.abortOperation(mergePreparation.operationId, 'merge_git_error');
+        if (error instanceof PathPolicyViolation || error instanceof RootIgnorePolicyError) {
+          return await this.createConflict(vaultId, deviceId, base, main, deviceCommit,
+            policyConflictPaths(error), 'root_ignore_merge_policy', directoryPlan);
+        }
+        throw error;
       }
-      throw error;
     }
+    if (!mergeCommit) throw new Error('Prepared merge did not produce a commit.');
     const eventSeq = await this.store.mutate((db) => {
       const operation = requireOperation(db, mergePreparation.operationId);
       operation.status = 'committed';
@@ -1709,7 +1916,7 @@ export class SyncService {
       return { mergeSequence, operationId: operation.operation_id };
     });
 
-    let mergeCommit: string;
+    let mergeCommit: string | null = null;
     try {
       mergeCommit = await this.git.createOverlayMergeCommitObject(
         vaultId,
@@ -1724,13 +1931,22 @@ export class SyncService {
       await this.prepareMergeRefUpdate(mergePreparation.operationId, mergeCommit);
       await this.git.updateRef(vaultId, 'refs/heads/main', mergeCommit, currentMain);
     } catch (error) {
-      await this.abortOperation(mergePreparation.operationId, 'merge_git_error');
-      if (error instanceof PathPolicyViolation || error instanceof RootIgnorePolicyError) {
-        return await this.createConflict(vaultId, deviceId, base, currentMain, deviceCommit,
-          policyConflictPaths(error), 'root_ignore_merge_policy', directoryPlan);
+      if (error instanceof GitDurabilityError) throw error;
+      const actualMain = await this.git.getRef(vaultId, 'refs/heads/main');
+      if (!mergeCommit || actualMain !== mergeCommit) {
+        if (actualMain !== currentMain) {
+          await this.blockPreparedOperationForIntegrity(mergePreparation.operationId, 'merge main ref cannot be reconciled');
+          throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+        }
+        await this.abortOperation(mergePreparation.operationId, 'merge_git_error');
+        if (error instanceof PathPolicyViolation || error instanceof RootIgnorePolicyError) {
+          return await this.createConflict(vaultId, deviceId, base, currentMain, deviceCommit,
+            policyConflictPaths(error), 'root_ignore_merge_policy', directoryPlan);
+        }
+        throw error;
       }
-      throw error;
     }
+    if (!mergeCommit) throw new Error('Prepared merge did not produce a commit.');
 
     const eventSeq = await this.store.mutate((db) => {
       const operation = requireOperation(db, mergePreparation.operationId);
@@ -2066,13 +2282,14 @@ export class SyncService {
     deviceCommit: string,
     deviceChanges: GitDiffEntry[],
     overlapping: string[],
-    directoryPlan: DirectoryMergePlan | null = null
+    directoryPlan: DirectoryMergePlan | null = null,
+    metadataRules: MetadataConflictRule[] = []
   ): Promise<PushResult | null> {
     if (!overlapping.every(isNativeTextMergePath)) {
       return null;
     }
 
-    const mergeTree = await this.git.tryPolicyMergeTree(vaultId, base, currentMain, deviceCommit, deviceChanges, overlapping);
+    const mergeTree = await this.git.tryPolicyMergeTree(vaultId, base, currentMain, deviceCommit, deviceChanges, overlapping, metadataRules);
     if (!mergeTree) {
       return null;
     }
@@ -2102,13 +2319,15 @@ export class SyncService {
         device_commit: deviceCommit,
         decision: 'merge',
         validator_results: mergeTree.validatorResults,
+        metadata_conflict_rules: metadataRules,
+        metadata_conflict_rules_sha256: sha256Hex(JSON.stringify(metadataRules)),
         directory_plan: storedDirectoryPlan(directoryPlan)
       };
       operation.updated_at = nowIso();
       return { mergeSequence, operationId: operation.operation_id };
     });
 
-    let mergeCommit: string;
+    let mergeCommit: string | null = null;
     try {
       mergeCommit = await this.git.createMergeCommitObjectFromTree({
         vaultId,
@@ -2124,13 +2343,22 @@ export class SyncService {
       await this.prepareMergeRefUpdate(mergePreparation.operationId, mergeCommit);
       await this.git.updateRef(vaultId, 'refs/heads/main', mergeCommit, currentMain);
     } catch (error) {
-      await this.abortOperation(mergePreparation.operationId, 'merge_git_error');
-      if (error instanceof PathPolicyViolation || error instanceof RootIgnorePolicyError) {
-        return await this.createConflict(vaultId, deviceId, base, currentMain, deviceCommit,
-          policyConflictPaths(error), 'root_ignore_merge_policy', directoryPlan);
+      if (error instanceof GitDurabilityError) throw error;
+      const actualMain = await this.git.getRef(vaultId, 'refs/heads/main');
+      if (!mergeCommit || actualMain !== mergeCommit) {
+        if (actualMain !== currentMain) {
+          await this.blockPreparedOperationForIntegrity(mergePreparation.operationId, 'merge main ref cannot be reconciled');
+          throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+        }
+        await this.abortOperation(mergePreparation.operationId, 'merge_git_error');
+        if (error instanceof PathPolicyViolation || error instanceof RootIgnorePolicyError) {
+          return await this.createConflict(vaultId, deviceId, base, currentMain, deviceCommit,
+            policyConflictPaths(error), 'root_ignore_merge_policy', directoryPlan);
+        }
+        throw error;
       }
-      throw error;
     }
+    if (!mergeCommit) throw new Error('Prepared merge did not produce a commit.');
 
     const eventSeq = await this.store.mutate((db) => {
       const operation = requireOperation(db, mergePreparation.operationId);

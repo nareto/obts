@@ -30,7 +30,10 @@
     NoteHistoryVersion,
     NoteHistoryVersionResponse,
     Session,
-    VaultSummary
+    VaultSummary,
+    MetadataConflictRule,
+    VaultSyncSettings,
+    VaultSyncSettingsPreview
   } from './api/types';
 
   const api = new DashboardApi();
@@ -53,6 +56,12 @@
   let renameVaultName = '';
   let renameVaultOpen = false;
   let dashboard: DashboardSummary | null = null;
+  let vaultSyncSettings: VaultSyncSettings | null = null;
+  let vaultSyncSettingsError = '';
+  let vaultSyncSettingsLoading = false;
+  let vaultSyncSettingsSaving = false;
+  let vaultSyncSettingsLoadedFor = '';
+  let vaultSyncSettingsGeneration = 0;
   let diagnostics: DiagnosticEventsResponse | null = null;
   let diagnosticsError = '';
   let diagnosticsLoading = false;
@@ -107,6 +116,9 @@
   let deletionRefreshInFlight = false;
 
   $: selectedVault = vaults.find((vault) => vault.vault_id === vaultId) ?? null;
+  $: if (session && page === 'Settings' && selectedVault && vaultSyncSettingsLoadedFor !== selectedVault.vault_id && !vaultSyncSettingsLoading && !vaultSyncSettingsError) {
+    void loadVaultSyncSettings();
+  }
   $: unresolvedCount = dashboard?.unresolved_conflict_count ?? conflicts.filter((conflict) => conflict.status === 'open').length;
   $: selectedConflict = conflicts.find((conflict) => conflict.conflict_id === selectedConflictId) ?? null;
   $: selectedDeletion = deletions.find((deletion) => deletion.vault_id === vaultId) ?? null;
@@ -136,6 +148,12 @@
     dashboardRefreshOwner = null;
     dashboardRefreshInFlight = false;
     dashboard = null;
+    vaultSyncSettings = null;
+    vaultSyncSettingsError = '';
+    vaultSyncSettingsLoading = false;
+    vaultSyncSettingsSaving = false;
+    vaultSyncSettingsLoadedFor = '';
+    vaultSyncSettingsGeneration += 1;
     if (clearAccount) {
       accountEpoch += 1;
       diagnostics = null;
@@ -379,7 +397,11 @@
     const previousVaultId = vaultId;
     if (previousVaultId && !nextVaults.some((vault) => vault.vault_id === previousVaultId)) clearTargetPresentation(previousVaultId);
     vaults = nextVaults;
-    if (!vaults.some((vault) => vault.vault_id === vaultId)) vaultId = vaults[0]?.vault_id ?? '';
+    const requestedVault = new URLSearchParams(window.location.search).get('vault');
+    if (requestedVault && nextVaults.some((vault) => vault.vault_id === requestedVault)) {
+      vaultId = requestedVault;
+      page = 'Settings';
+    } else if (!vaults.some((vault) => vault.vault_id === vaultId)) vaultId = vaults[0]?.vault_id ?? '';
     deletions = deletionList.deletions;
     if (vaults.length === 0 && deletions.length > 0) page = 'Settings';
     await Promise.all([refreshVault(), refreshDiagnostics()]);
@@ -762,6 +784,91 @@
       if (dashboardRefreshOwner?.generation === requestGeneration) {
         dashboardRefreshInFlight = false;
         dashboardRefreshOwner = null;
+      }
+    }
+  }
+
+  async function loadVaultSyncSettings() {
+    const target = selectedVault;
+    if (!session || !target || target.status !== 'active' || vaultSyncSettingsLoading) return;
+    const generation = ++vaultSyncSettingsGeneration;
+    const epoch = stateEpoch;
+    const account = accountEpoch;
+    const userId = session.user_id;
+    vaultSyncSettingsLoading = true;
+    vaultSyncSettingsError = '';
+    try {
+      const result = await api.vaultSyncSettings(target.vault_id);
+      if (session?.user_id !== userId || accountEpoch !== account || stateEpoch !== epoch || vaultId !== target.vault_id || generation !== vaultSyncSettingsGeneration) return;
+      vaultSyncSettings = result;
+      vaultSyncSettingsLoadedFor = target.vault_id;
+      return true;
+    } catch (error) {
+      if (session?.user_id === userId && accountEpoch === account && stateEpoch === epoch && vaultId === target.vault_id && generation === vaultSyncSettingsGeneration) {
+        vaultSyncSettingsError = error instanceof Error ? error.message : 'Unable to load vault sync settings.';
+      }
+      return false;
+    } finally {
+      if (generation === vaultSyncSettingsGeneration) vaultSyncSettingsLoading = false;
+    }
+  }
+
+  async function previewVaultSyncSettings(rootIgnore: string | null, rules: MetadataConflictRule[]): Promise<VaultSyncSettingsPreview> {
+    if (!vaultSyncSettings || !selectedVault) throw new Error('Load vault settings before previewing changes.');
+    return await api.previewVaultSyncSettings(selectedVault.vault_id, {
+      expected_main: vaultSyncSettings.current_main,
+      expected_root_ignore_oid: vaultSyncSettings.root_ignore_oid,
+      root_ignore: rootIgnore,
+      metadata_conflict_rules: rules
+    });
+  }
+
+  async function saveVaultSyncSettings(rootIgnore: string | null, rules: MetadataConflictRule[], preview: VaultSyncSettingsPreview) {
+    const original = vaultSyncSettings;
+    const target = selectedVault;
+    const userId = session?.user_id;
+    const epoch = stateEpoch;
+    const account = accountEpoch;
+    if (!original || !target || !userId) throw new Error('Load vault settings before saving changes.');
+    vaultSyncSettingsSaving = true;
+    vaultSyncSettingsError = '';
+    try {
+      const saved = await api.saveVaultSyncSettings(target.vault_id, {
+        expected_main: original.current_main,
+        expected_root_ignore_oid: original.root_ignore_oid,
+        preview_tree: preview.preview_tree,
+        review_fingerprint: preview.review_fingerprint,
+        root_ignore: rootIgnore,
+        metadata_conflict_rules: rules,
+        expected_metadata_conflict_rules: original.metadata_conflict_rules
+      });
+      if (session?.user_id !== userId || accountEpoch !== account || stateEpoch !== epoch || selectedVault?.vault_id !== target.vault_id) return;
+      vaultSyncSettings = saved;
+      vaultSyncSettingsLoadedFor = target.vault_id;
+      notice = 'Vault sync settings saved.';
+      try {
+        const refreshed = await api.vaultSyncSettings(target.vault_id);
+        if (session?.user_id === userId && accountEpoch === account && stateEpoch === epoch && selectedVault?.vault_id === target.vault_id) vaultSyncSettings = refreshed;
+      } catch (refreshError) {
+        if (session?.user_id === userId && accountEpoch === account && stateEpoch === epoch && selectedVault?.vault_id === target.vault_id) {
+          vaultSyncSettingsError = `Settings were saved, but refresh failed: ${refreshError instanceof Error ? refreshError.message : 'unable to load the latest settings.'}`;
+        }
+      }
+      try {
+        await refreshVault();
+      } catch {
+        if (session?.user_id === userId && accountEpoch === account && stateEpoch === epoch && selectedVault?.vault_id === target.vault_id) {
+          vaultSyncSettingsError = 'Settings were saved, but dashboard status could not be refreshed.';
+        }
+      }
+    } catch (error) {
+      if (session?.user_id === userId && accountEpoch === account && stateEpoch === epoch && selectedVault?.vault_id === target.vault_id) {
+        vaultSyncSettingsError = error instanceof Error ? error.message : 'Unable to save vault sync settings.';
+      }
+      throw error;
+    } finally {
+      if (session?.user_id === userId && accountEpoch === account && stateEpoch === epoch && selectedVault?.vault_id === target.vault_id) {
+        vaultSyncSettingsSaving = false;
       }
     }
   }
@@ -1386,6 +1493,14 @@
           onSignOut={logout}
           {deletions}
           {selectedVault}
+          currentMain={dashboard?.vault.current_main ?? ''}
+          syncSettings={vaultSyncSettings}
+          syncSettingsError={vaultSyncSettingsError}
+          syncSettingsLoading={vaultSyncSettingsLoading}
+          syncSettingsSaving={vaultSyncSettingsSaving}
+          onLoadSyncSettings={loadVaultSyncSettings}
+          onPreviewSyncSettings={previewVaultSyncSettings}
+          onSaveSyncSettings={saveVaultSyncSettings}
           vaultDeleting={selectedVaultDeleting}
           deletionBusy={deletionRequestInFlight}
           onOpenVaultDeletion={openVaultDeletion}
@@ -1526,6 +1641,14 @@
           onSignOut={logout}
           {deletions}
           {selectedVault}
+          currentMain={dashboard?.vault.current_main ?? ''}
+          syncSettings={vaultSyncSettings}
+          syncSettingsError={vaultSyncSettingsError}
+          syncSettingsLoading={vaultSyncSettingsLoading}
+          syncSettingsSaving={vaultSyncSettingsSaving}
+          onLoadSyncSettings={loadVaultSyncSettings}
+          onPreviewSyncSettings={previewVaultSyncSettings}
+          onSaveSyncSettings={saveVaultSyncSettings}
           vaultDeleting={selectedVaultDeleting}
           deletionBusy={deletionRequestInFlight}
           onOpenVaultDeletion={openVaultDeletion}

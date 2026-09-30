@@ -11,38 +11,38 @@ graph LR
     subgraph 6 ["Obsidian True Sync"]
 
       17["Dashboard SPA [Container: Svelte, TypeScript, Vite]"]
-      24["Server API and CLI [Container: TypeScript, Node.js, Fastify]"]
-      34["OBTS Bridge API and indexer [Container: Rust, Axum, SQLx]"]
-      35["Headless OBTS client [Container: Node.js, TypeScript]"]
-      36["Bridge visible vault and .obts state [Container: Filesystem]"]
-      37[("Bridge PostgreSQL state [Container: PostgreSQL, pgvector]")]
-      38["Visible vault [Container: Obsidian Vault API, filesystem]"]
-      39[".obts local store [Container: Filesystem]"]
-      40[("Metadata store [Container: JSON file adapter]")]
-      41["Vault Git stores [Container: Native Git bare repositories]"]
-      42["Transfer quarantine [Container: Filesystem, temporary bare Git repositories]"]
-      43["Semantic merge workspace [Container: Temporary filesystem]"]
+      25["Server API and CLI [Container: TypeScript, Node.js, Fastify]"]
+      35["OBTS Bridge API and indexer [Container: Rust, Axum, SQLx]"]
+      36["Headless OBTS client [Container: Node.js, TypeScript]"]
+      37["Bridge visible vault and .obts state [Container: Filesystem]"]
+      38[("Bridge PostgreSQL state [Container: PostgreSQL, pgvector]")]
+      39["Visible vault [Container: Obsidian Vault API, filesystem]"]
+      40[".obts local store [Container: Filesystem]"]
+      41[("Metadata store [Container: JSON file adapter]")]
+      42["Vault Git stores [Container: Native Git bare repositories]"]
+      43["Transfer quarantine [Container: Filesystem, temporary bare Git repositories]"]
+      44["Semantic merge workspace [Container: Temporary filesystem]"]
       7["Obsidian plugin [Container: JavaScript, TypeScript, Obsidian Plugin API]"]
     end
 
     1-. "Connects devices and reviews conflicts [HTTPS]" .->17
     2-. "Edits notes and observes synchronization [Obsidian UI]" .->7
-    3-. "Runs setup, health, repair, and maintenance commands [CLI and HTTPS]" .->24
-    4-. "Uses context-scoped note, search, graph, Base, create, and edit tools [REST, MCP]" .->34
+    3-. "Runs setup, health, repair, and maintenance commands [CLI and HTTPS]" .->25
+    4-. "Uses context-scoped note, search, graph, Base, create, and edit tools [REST, MCP]" .->35
     7-. "Uses plugin lifecycle, vault, workspace, request, and status APIs [Obsidian Plugin API]" .->5
-    24-. "Serves static dashboard assets [HTTP]" .->17
-    17-. "Calls authenticated dashboard and conflict APIs [HTTPS]" .->24
-    7-. "Uploads immutable Git/directory proposals, polls processing outcomes, pulls canonical state, and reports status [HTTPS]" .->24
-    34-. "Supervises lifecycle and sends administrative or synchronization commands [JSON Lines over stdin/stdout]" .->35
-    34-. "Reads selected ordinary files under the shared headless/filesystem lock, verifies revision/OID, and atomically writes authorized files; releases bounded body work after each operation [Filesystem]" .->36
-    34-. "Queries paginated ACL-visible metadata and candidates, writes verified derived batches/cursors, and retains access/audit records without a full snapshot or raw-body fallback [PostgreSQL]" .->37
-    35-. "Owns visible-state reconciliation, hidden Git, credentials, journals, queues, apply, and recovery [Filesystem]" .->36
-    35-. "Pairs and synchronizes as a normal protected OBTS device [HTTPS]" .->24
-    7-. "Scans and safely applies visible vault content [Obsidian Vault API]" .->38
-    7-. "Persists local journal, immutable upload identity, credentials, cursors, and recovery evidence [Filesystem]" .->39
-    24-. "Reads and atomically replaces application metadata [Filesystem]" .->40
-    24-. "Validates objects and maintains canonical, device, and conflict refs [Git object and ref operations]" .->41
-    24-. "Persists resumable chunks, staged objects, and asynchronous terminal results [Filesystem]" .->42
-    24-. "Materializes only overlapping candidates requiring semantic validation [Filesystem]" .->43
+    25-. "Serves static dashboard assets [HTTP]" .->17
+    17-. "Calls authenticated dashboard, conflict, and vault sync-settings APIs [HTTPS]" .->25
+    7-. "Uploads immutable Git/directory proposals, polls processing outcomes, pulls canonical state, and reports status [HTTPS]" .->25
+    35-. "Supervises lifecycle and sends administrative or synchronization commands [JSON Lines over stdin/stdout]" .->36
+    35-. "Reads selected ordinary files under the shared headless/filesystem lock, verifies revision/OID, and atomically writes authorized files; releases bounded body work after each operation [Filesystem]" .->37
+    35-. "Queries paginated ACL-visible metadata and candidates, writes verified derived batches/cursors, and retains access/audit records without a full snapshot or raw-body fallback [PostgreSQL]" .->38
+    36-. "Owns visible-state reconciliation, hidden Git, credentials, journals, queues, apply, and recovery [Filesystem]" .->37
+    36-. "Pairs and synchronizes as a normal protected OBTS device [HTTPS]" .->25
+    7-. "Scans and safely applies visible vault content [Obsidian Vault API]" .->39
+    7-. "Persists local journal, immutable upload identity, credentials, cursors, and recovery evidence [Filesystem]" .->40
+    25-. "Reads and atomically replaces application metadata [Filesystem]" .->41
+    25-. "Validates objects and maintains canonical, device, and conflict refs [Git object and ref operations]" .->42
+    25-. "Persists resumable chunks, staged objects, and asynchronous terminal results [Filesystem]" .->43
+    25-. "Materializes only overlapping candidates requiring semantic validation [Filesystem]" .->44
 
   end

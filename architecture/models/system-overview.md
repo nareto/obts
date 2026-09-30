@@ -4,15 +4,15 @@
 
 ### Obsidian plugin
 
-Owns local observation, visible-vault reconciliation, hidden local Git, immutable upload journal, directory intent, apply/recovery, browser-assisted onboarding state, and user-visible plugin status. It uses Obsidian APIs and a mobile-safe isomorphic-git implementation; it does not use native Git or Node/Electron-only APIs on the sync path.
+Owns local observation, visible-vault reconciliation, hidden local Git, immutable upload journal, directory intent, apply/recovery, browser-assisted onboarding state, and user-visible plugin status. It consumes the shared vault-root `.gitignore` policy before sync and displays its effective bytes read-only with a link to server Settings. It uses Obsidian APIs and a mobile-safe isomorphic-git implementation; it does not use native Git or Node/Electron-only APIs on the sync path.
 
 ### OBTS server
 
-Owns dashboard/device authentication, account and vault authorization, connection approval, transfer receipt, proposal validation, canonical integration order, native-Git refs and objects, canonical directory state, conflicts, event/audit metadata, history/restore, integrity, and maintenance.
+Owns dashboard/device authentication, account and vault authorization, connection approval, transfer receipt, proposal validation, canonical integration order, native-Git refs and objects, canonical directory state, conflicts, per-vault merge settings, versioned root-ignore settings operations, event/audit metadata, history/restore, integrity, and maintenance.
 
 ### Dashboard SPA
 
-Owns authenticated presentation and user intent collection. It does not decide sync outcomes independently of server state and does not maintain an authoritative convergence clock.
+Owns authenticated presentation and user intent collection, including preview-before-save controls for server-managed vault sync settings. It does not decide sync outcomes independently of server state and does not maintain an authoritative convergence clock.
 
 ### OBTS Bridge
 

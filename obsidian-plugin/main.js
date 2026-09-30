@@ -42,9 +42,9 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 ));
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
-// node_modules/base64-js/index.js
+// ../../obts/node_modules/base64-js/index.js
 var require_base64_js = __commonJS({
-  "node_modules/base64-js/index.js"(exports2) {
+  "../../obts/node_modules/base64-js/index.js"(exports2) {
     "use strict";
     exports2.byteLength = byteLength;
     exports2.toByteArray = toByteArray;
@@ -143,9 +143,9 @@ var require_base64_js = __commonJS({
   }
 });
 
-// node_modules/ieee754/index.js
+// ../../obts/node_modules/ieee754/index.js
 var require_ieee754 = __commonJS({
-  "node_modules/ieee754/index.js"(exports2) {
+  "../../obts/node_modules/ieee754/index.js"(exports2) {
     exports2.read = function(buffer, offset, isLE, mLen, nBytes) {
       var e, m;
       var eLen = nBytes * 8 - mLen - 1;
@@ -226,9 +226,9 @@ var require_ieee754 = __commonJS({
   }
 });
 
-// node_modules/buffer/index.js
+// ../../obts/node_modules/buffer/index.js
 var require_buffer = __commonJS({
-  "node_modules/buffer/index.js"(exports2) {
+  "../../obts/node_modules/buffer/index.js"(exports2) {
     "use strict";
     var base64 = require_base64_js();
     var ieee754 = require_ieee754();
@@ -1818,9 +1818,9 @@ var require_buffer = __commonJS({
   }
 });
 
-// node_modules/async-lock/lib/index.js
+// ../../obts/node_modules/async-lock/lib/index.js
 var require_lib = __commonJS({
-  "node_modules/async-lock/lib/index.js"(exports2, module2) {
+  "../../obts/node_modules/async-lock/lib/index.js"(exports2, module2) {
     "use strict";
     var AsyncLock2 = function(opts) {
       opts = opts || {};
@@ -2043,17 +2043,17 @@ var require_lib = __commonJS({
   }
 });
 
-// node_modules/async-lock/index.js
+// ../../obts/node_modules/async-lock/index.js
 var require_async_lock = __commonJS({
-  "node_modules/async-lock/index.js"(exports2, module2) {
+  "../../obts/node_modules/async-lock/index.js"(exports2, module2) {
     "use strict";
     module2.exports = require_lib();
   }
 });
 
-// node_modules/inherits/inherits_browser.js
+// ../../obts/node_modules/inherits/inherits_browser.js
 var require_inherits_browser = __commonJS({
-  "node_modules/inherits/inherits_browser.js"(exports2, module2) {
+  "../../obts/node_modules/inherits/inherits_browser.js"(exports2, module2) {
     if (typeof Object.create === "function") {
       module2.exports = function inherits(ctor, superCtor) {
         if (superCtor) {
@@ -2083,9 +2083,9 @@ var require_inherits_browser = __commonJS({
   }
 });
 
-// node_modules/safe-buffer/index.js
+// ../../obts/node_modules/safe-buffer/index.js
 var require_safe_buffer = __commonJS({
-  "node_modules/safe-buffer/index.js"(exports2, module2) {
+  "../../obts/node_modules/safe-buffer/index.js"(exports2, module2) {
     var buffer = require_buffer();
     var Buffer3 = buffer.Buffer;
     function copyProps(src, dst) {
@@ -2141,9 +2141,9 @@ var require_safe_buffer = __commonJS({
   }
 });
 
-// node_modules/isarray/index.js
+// ../../obts/node_modules/isarray/index.js
 var require_isarray = __commonJS({
-  "node_modules/isarray/index.js"(exports2, module2) {
+  "../../obts/node_modules/isarray/index.js"(exports2, module2) {
     var toString = {}.toString;
     module2.exports = Array.isArray || function(arr) {
       return toString.call(arr) == "[object Array]";
@@ -2151,121 +2151,121 @@ var require_isarray = __commonJS({
   }
 });
 
-// node_modules/es-errors/type.js
+// ../../obts/node_modules/es-errors/type.js
 var require_type = __commonJS({
-  "node_modules/es-errors/type.js"(exports2, module2) {
+  "../../obts/node_modules/es-errors/type.js"(exports2, module2) {
     "use strict";
     module2.exports = TypeError;
   }
 });
 
-// node_modules/es-object-atoms/index.js
+// ../../obts/node_modules/es-object-atoms/index.js
 var require_es_object_atoms = __commonJS({
-  "node_modules/es-object-atoms/index.js"(exports2, module2) {
+  "../../obts/node_modules/es-object-atoms/index.js"(exports2, module2) {
     "use strict";
     module2.exports = Object;
   }
 });
 
-// node_modules/es-errors/index.js
+// ../../obts/node_modules/es-errors/index.js
 var require_es_errors = __commonJS({
-  "node_modules/es-errors/index.js"(exports2, module2) {
+  "../../obts/node_modules/es-errors/index.js"(exports2, module2) {
     "use strict";
     module2.exports = Error;
   }
 });
 
-// node_modules/es-errors/eval.js
+// ../../obts/node_modules/es-errors/eval.js
 var require_eval = __commonJS({
-  "node_modules/es-errors/eval.js"(exports2, module2) {
+  "../../obts/node_modules/es-errors/eval.js"(exports2, module2) {
     "use strict";
     module2.exports = EvalError;
   }
 });
 
-// node_modules/es-errors/range.js
+// ../../obts/node_modules/es-errors/range.js
 var require_range = __commonJS({
-  "node_modules/es-errors/range.js"(exports2, module2) {
+  "../../obts/node_modules/es-errors/range.js"(exports2, module2) {
     "use strict";
     module2.exports = RangeError;
   }
 });
 
-// node_modules/es-errors/ref.js
+// ../../obts/node_modules/es-errors/ref.js
 var require_ref = __commonJS({
-  "node_modules/es-errors/ref.js"(exports2, module2) {
+  "../../obts/node_modules/es-errors/ref.js"(exports2, module2) {
     "use strict";
     module2.exports = ReferenceError;
   }
 });
 
-// node_modules/es-errors/syntax.js
+// ../../obts/node_modules/es-errors/syntax.js
 var require_syntax = __commonJS({
-  "node_modules/es-errors/syntax.js"(exports2, module2) {
+  "../../obts/node_modules/es-errors/syntax.js"(exports2, module2) {
     "use strict";
     module2.exports = SyntaxError;
   }
 });
 
-// node_modules/es-errors/uri.js
+// ../../obts/node_modules/es-errors/uri.js
 var require_uri = __commonJS({
-  "node_modules/es-errors/uri.js"(exports2, module2) {
+  "../../obts/node_modules/es-errors/uri.js"(exports2, module2) {
     "use strict";
     module2.exports = URIError;
   }
 });
 
-// node_modules/math-intrinsics/abs.js
+// ../../obts/node_modules/math-intrinsics/abs.js
 var require_abs = __commonJS({
-  "node_modules/math-intrinsics/abs.js"(exports2, module2) {
+  "../../obts/node_modules/math-intrinsics/abs.js"(exports2, module2) {
     "use strict";
     module2.exports = Math.abs;
   }
 });
 
-// node_modules/math-intrinsics/floor.js
+// ../../obts/node_modules/math-intrinsics/floor.js
 var require_floor = __commonJS({
-  "node_modules/math-intrinsics/floor.js"(exports2, module2) {
+  "../../obts/node_modules/math-intrinsics/floor.js"(exports2, module2) {
     "use strict";
     module2.exports = Math.floor;
   }
 });
 
-// node_modules/math-intrinsics/max.js
+// ../../obts/node_modules/math-intrinsics/max.js
 var require_max = __commonJS({
-  "node_modules/math-intrinsics/max.js"(exports2, module2) {
+  "../../obts/node_modules/math-intrinsics/max.js"(exports2, module2) {
     "use strict";
     module2.exports = Math.max;
   }
 });
 
-// node_modules/math-intrinsics/min.js
+// ../../obts/node_modules/math-intrinsics/min.js
 var require_min = __commonJS({
-  "node_modules/math-intrinsics/min.js"(exports2, module2) {
+  "../../obts/node_modules/math-intrinsics/min.js"(exports2, module2) {
     "use strict";
     module2.exports = Math.min;
   }
 });
 
-// node_modules/math-intrinsics/pow.js
+// ../../obts/node_modules/math-intrinsics/pow.js
 var require_pow = __commonJS({
-  "node_modules/math-intrinsics/pow.js"(exports2, module2) {
+  "../../obts/node_modules/math-intrinsics/pow.js"(exports2, module2) {
     "use strict";
     module2.exports = Math.pow;
   }
 });
 
-// node_modules/math-intrinsics/round.js
+// ../../obts/node_modules/math-intrinsics/round.js
 var require_round = __commonJS({
-  "node_modules/math-intrinsics/round.js"(exports2, module2) {
+  "../../obts/node_modules/math-intrinsics/round.js"(exports2, module2) {
     "use strict";
     module2.exports = Math.round;
   }
 });
 
-// node_modules/math-intrinsics/isNaN.js
+// ../../obts/node_modules/math-intrinsics/isNaN.js
 var require_isNaN = __commonJS({
-  "node_modules/math-intrinsics/isNaN.js"(exports2, module2) {
+  "../../obts/node_modules/math-intrinsics/isNaN.js"(exports2, module2) {
     "use strict";
     module2.exports = Number.isNaN || function isNaN2(a) {
       return a !== a;
@@ -2273,9 +2273,9 @@ var require_isNaN = __commonJS({
   }
 });
 
-// node_modules/math-intrinsics/sign.js
+// ../../obts/node_modules/math-intrinsics/sign.js
 var require_sign = __commonJS({
-  "node_modules/math-intrinsics/sign.js"(exports2, module2) {
+  "../../obts/node_modules/math-intrinsics/sign.js"(exports2, module2) {
     "use strict";
     var $isNaN = require_isNaN();
     module2.exports = function sign(number) {
@@ -2287,17 +2287,17 @@ var require_sign = __commonJS({
   }
 });
 
-// node_modules/gopd/gOPD.js
+// ../../obts/node_modules/gopd/gOPD.js
 var require_gOPD = __commonJS({
-  "node_modules/gopd/gOPD.js"(exports2, module2) {
+  "../../obts/node_modules/gopd/gOPD.js"(exports2, module2) {
     "use strict";
     module2.exports = Object.getOwnPropertyDescriptor;
   }
 });
 
-// node_modules/gopd/index.js
+// ../../obts/node_modules/gopd/index.js
 var require_gopd = __commonJS({
-  "node_modules/gopd/index.js"(exports2, module2) {
+  "../../obts/node_modules/gopd/index.js"(exports2, module2) {
     "use strict";
     var $gOPD = require_gOPD();
     if ($gOPD) {
@@ -2311,9 +2311,9 @@ var require_gopd = __commonJS({
   }
 });
 
-// node_modules/es-define-property/index.js
+// ../../obts/node_modules/es-define-property/index.js
 var require_es_define_property = __commonJS({
-  "node_modules/es-define-property/index.js"(exports2, module2) {
+  "../../obts/node_modules/es-define-property/index.js"(exports2, module2) {
     "use strict";
     var $defineProperty = Object.defineProperty || false;
     if ($defineProperty) {
@@ -2327,9 +2327,9 @@ var require_es_define_property = __commonJS({
   }
 });
 
-// node_modules/has-symbols/shams.js
+// ../../obts/node_modules/has-symbols/shams.js
 var require_shams = __commonJS({
-  "node_modules/has-symbols/shams.js"(exports2, module2) {
+  "../../obts/node_modules/has-symbols/shams.js"(exports2, module2) {
     "use strict";
     module2.exports = function hasSymbols() {
       if (typeof Symbol !== "function" || typeof Object.getOwnPropertySymbols !== "function") {
@@ -2382,9 +2382,9 @@ var require_shams = __commonJS({
   }
 });
 
-// node_modules/has-symbols/index.js
+// ../../obts/node_modules/has-symbols/index.js
 var require_has_symbols = __commonJS({
-  "node_modules/has-symbols/index.js"(exports2, module2) {
+  "../../obts/node_modules/has-symbols/index.js"(exports2, module2) {
     "use strict";
     var origSymbol = typeof Symbol !== "undefined" && Symbol;
     var hasSymbolSham = require_shams();
@@ -2406,26 +2406,26 @@ var require_has_symbols = __commonJS({
   }
 });
 
-// node_modules/get-proto/Reflect.getPrototypeOf.js
+// ../../obts/node_modules/get-proto/Reflect.getPrototypeOf.js
 var require_Reflect_getPrototypeOf = __commonJS({
-  "node_modules/get-proto/Reflect.getPrototypeOf.js"(exports2, module2) {
+  "../../obts/node_modules/get-proto/Reflect.getPrototypeOf.js"(exports2, module2) {
     "use strict";
     module2.exports = typeof Reflect !== "undefined" && Reflect.getPrototypeOf || null;
   }
 });
 
-// node_modules/get-proto/Object.getPrototypeOf.js
+// ../../obts/node_modules/get-proto/Object.getPrototypeOf.js
 var require_Object_getPrototypeOf = __commonJS({
-  "node_modules/get-proto/Object.getPrototypeOf.js"(exports2, module2) {
+  "../../obts/node_modules/get-proto/Object.getPrototypeOf.js"(exports2, module2) {
     "use strict";
     var $Object = require_es_object_atoms();
     module2.exports = $Object.getPrototypeOf || null;
   }
 });
 
-// node_modules/function-bind/implementation.js
+// ../../obts/node_modules/function-bind/implementation.js
 var require_implementation = __commonJS({
-  "node_modules/function-bind/implementation.js"(exports2, module2) {
+  "../../obts/node_modules/function-bind/implementation.js"(exports2, module2) {
     "use strict";
     var ERROR_MESSAGE = "Function.prototype.bind called on incompatible ";
     var toStr = Object.prototype.toString;
@@ -2499,42 +2499,42 @@ var require_implementation = __commonJS({
   }
 });
 
-// node_modules/function-bind/index.js
+// ../../obts/node_modules/function-bind/index.js
 var require_function_bind = __commonJS({
-  "node_modules/function-bind/index.js"(exports2, module2) {
+  "../../obts/node_modules/function-bind/index.js"(exports2, module2) {
     "use strict";
     var implementation = require_implementation();
     module2.exports = Function.prototype.bind || implementation;
   }
 });
 
-// node_modules/call-bind-apply-helpers/functionCall.js
+// ../../obts/node_modules/call-bind-apply-helpers/functionCall.js
 var require_functionCall = __commonJS({
-  "node_modules/call-bind-apply-helpers/functionCall.js"(exports2, module2) {
+  "../../obts/node_modules/call-bind-apply-helpers/functionCall.js"(exports2, module2) {
     "use strict";
     module2.exports = Function.prototype.call;
   }
 });
 
-// node_modules/call-bind-apply-helpers/functionApply.js
+// ../../obts/node_modules/call-bind-apply-helpers/functionApply.js
 var require_functionApply = __commonJS({
-  "node_modules/call-bind-apply-helpers/functionApply.js"(exports2, module2) {
+  "../../obts/node_modules/call-bind-apply-helpers/functionApply.js"(exports2, module2) {
     "use strict";
     module2.exports = Function.prototype.apply;
   }
 });
 
-// node_modules/call-bind-apply-helpers/reflectApply.js
+// ../../obts/node_modules/call-bind-apply-helpers/reflectApply.js
 var require_reflectApply = __commonJS({
-  "node_modules/call-bind-apply-helpers/reflectApply.js"(exports2, module2) {
+  "../../obts/node_modules/call-bind-apply-helpers/reflectApply.js"(exports2, module2) {
     "use strict";
     module2.exports = typeof Reflect !== "undefined" && Reflect && Reflect.apply;
   }
 });
 
-// node_modules/call-bind-apply-helpers/actualApply.js
+// ../../obts/node_modules/call-bind-apply-helpers/actualApply.js
 var require_actualApply = __commonJS({
-  "node_modules/call-bind-apply-helpers/actualApply.js"(exports2, module2) {
+  "../../obts/node_modules/call-bind-apply-helpers/actualApply.js"(exports2, module2) {
     "use strict";
     var bind = require_function_bind();
     var $apply = require_functionApply();
@@ -2544,9 +2544,9 @@ var require_actualApply = __commonJS({
   }
 });
 
-// node_modules/call-bind-apply-helpers/index.js
+// ../../obts/node_modules/call-bind-apply-helpers/index.js
 var require_call_bind_apply_helpers = __commonJS({
-  "node_modules/call-bind-apply-helpers/index.js"(exports2, module2) {
+  "../../obts/node_modules/call-bind-apply-helpers/index.js"(exports2, module2) {
     "use strict";
     var bind = require_function_bind();
     var $TypeError = require_type();
@@ -2561,9 +2561,9 @@ var require_call_bind_apply_helpers = __commonJS({
   }
 });
 
-// node_modules/dunder-proto/get.js
+// ../../obts/node_modules/dunder-proto/get.js
 var require_get = __commonJS({
-  "node_modules/dunder-proto/get.js"(exports2, module2) {
+  "../../obts/node_modules/dunder-proto/get.js"(exports2, module2) {
     "use strict";
     var callBind = require_call_bind_apply_helpers();
     var gOPD = require_gopd();
@@ -2592,9 +2592,9 @@ var require_get = __commonJS({
   }
 });
 
-// node_modules/get-proto/index.js
+// ../../obts/node_modules/get-proto/index.js
 var require_get_proto = __commonJS({
-  "node_modules/get-proto/index.js"(exports2, module2) {
+  "../../obts/node_modules/get-proto/index.js"(exports2, module2) {
     "use strict";
     var reflectGetProto = require_Reflect_getPrototypeOf();
     var originalGetProto = require_Object_getPrototypeOf();
@@ -2612,9 +2612,9 @@ var require_get_proto = __commonJS({
   }
 });
 
-// node_modules/hasown/index.js
+// ../../obts/node_modules/hasown/index.js
 var require_hasown = __commonJS({
-  "node_modules/hasown/index.js"(exports2, module2) {
+  "../../obts/node_modules/hasown/index.js"(exports2, module2) {
     "use strict";
     var call = Function.prototype.call;
     var $hasOwn = Object.prototype.hasOwnProperty;
@@ -2623,9 +2623,9 @@ var require_hasown = __commonJS({
   }
 });
 
-// node_modules/get-intrinsic/index.js
+// ../../obts/node_modules/get-intrinsic/index.js
 var require_get_intrinsic = __commonJS({
-  "node_modules/get-intrinsic/index.js"(exports2, module2) {
+  "../../obts/node_modules/get-intrinsic/index.js"(exports2, module2) {
     "use strict";
     var undefined2;
     var $Object = require_es_object_atoms();
@@ -2954,9 +2954,9 @@ var require_get_intrinsic = __commonJS({
   }
 });
 
-// node_modules/call-bound/index.js
+// ../../obts/node_modules/call-bound/index.js
 var require_call_bound = __commonJS({
-  "node_modules/call-bound/index.js"(exports2, module2) {
+  "../../obts/node_modules/call-bound/index.js"(exports2, module2) {
     "use strict";
     var GetIntrinsic = require_get_intrinsic();
     var callBindBasic = require_call_bind_apply_helpers();
@@ -2977,9 +2977,9 @@ var require_call_bound = __commonJS({
   }
 });
 
-// node_modules/is-callable/index.js
+// ../../obts/node_modules/is-callable/index.js
 var require_is_callable = __commonJS({
-  "node_modules/is-callable/index.js"(exports2, module2) {
+  "../../obts/node_modules/is-callable/index.js"(exports2, module2) {
     "use strict";
     var fnToStr = Function.prototype.toString;
     var reflectApply = typeof Reflect === "object" && Reflect !== null && Reflect.apply;
@@ -3095,9 +3095,9 @@ var require_is_callable = __commonJS({
   }
 });
 
-// node_modules/for-each/index.js
+// ../../obts/node_modules/for-each/index.js
 var require_for_each = __commonJS({
-  "node_modules/for-each/index.js"(exports2, module2) {
+  "../../obts/node_modules/for-each/index.js"(exports2, module2) {
     "use strict";
     var isCallable = require_is_callable();
     var toStr = Object.prototype.toString;
@@ -3155,9 +3155,9 @@ var require_for_each = __commonJS({
   }
 });
 
-// node_modules/possible-typed-array-names/index.js
+// ../../obts/node_modules/possible-typed-array-names/index.js
 var require_possible_typed_array_names = __commonJS({
-  "node_modules/possible-typed-array-names/index.js"(exports2, module2) {
+  "../../obts/node_modules/possible-typed-array-names/index.js"(exports2, module2) {
     "use strict";
     module2.exports = [
       "Float16Array",
@@ -3176,9 +3176,9 @@ var require_possible_typed_array_names = __commonJS({
   }
 });
 
-// node_modules/available-typed-arrays/index.js
+// ../../obts/node_modules/available-typed-arrays/index.js
 var require_available_typed_arrays = __commonJS({
-  "node_modules/available-typed-arrays/index.js"(exports2, module2) {
+  "../../obts/node_modules/available-typed-arrays/index.js"(exports2, module2) {
     "use strict";
     var possibleNames = require_possible_typed_array_names();
     var g = typeof globalThis === "undefined" ? global : globalThis;
@@ -3194,9 +3194,9 @@ var require_available_typed_arrays = __commonJS({
   }
 });
 
-// node_modules/define-data-property/index.js
+// ../../obts/node_modules/define-data-property/index.js
 var require_define_data_property = __commonJS({
-  "node_modules/define-data-property/index.js"(exports2, module2) {
+  "../../obts/node_modules/define-data-property/index.js"(exports2, module2) {
     "use strict";
     var $defineProperty = require_es_define_property();
     var $SyntaxError = require_syntax();
@@ -3242,9 +3242,9 @@ var require_define_data_property = __commonJS({
   }
 });
 
-// node_modules/has-property-descriptors/index.js
+// ../../obts/node_modules/has-property-descriptors/index.js
 var require_has_property_descriptors = __commonJS({
-  "node_modules/has-property-descriptors/index.js"(exports2, module2) {
+  "../../obts/node_modules/has-property-descriptors/index.js"(exports2, module2) {
     "use strict";
     var $defineProperty = require_es_define_property();
     var hasPropertyDescriptors = function hasPropertyDescriptors2() {
@@ -3264,9 +3264,9 @@ var require_has_property_descriptors = __commonJS({
   }
 });
 
-// node_modules/set-function-length/index.js
+// ../../obts/node_modules/set-function-length/index.js
 var require_set_function_length = __commonJS({
-  "node_modules/set-function-length/index.js"(exports2, module2) {
+  "../../obts/node_modules/set-function-length/index.js"(exports2, module2) {
     "use strict";
     var GetIntrinsic = require_get_intrinsic();
     var define2 = require_define_data_property();
@@ -3317,9 +3317,9 @@ var require_set_function_length = __commonJS({
   }
 });
 
-// node_modules/call-bind-apply-helpers/applyBind.js
+// ../../obts/node_modules/call-bind-apply-helpers/applyBind.js
 var require_applyBind = __commonJS({
-  "node_modules/call-bind-apply-helpers/applyBind.js"(exports2, module2) {
+  "../../obts/node_modules/call-bind-apply-helpers/applyBind.js"(exports2, module2) {
     "use strict";
     var bind = require_function_bind();
     var $apply = require_functionApply();
@@ -3330,9 +3330,9 @@ var require_applyBind = __commonJS({
   }
 });
 
-// node_modules/call-bind/index.js
+// ../../obts/node_modules/call-bind/index.js
 var require_call_bind = __commonJS({
-  "node_modules/call-bind/index.js"(exports2, module2) {
+  "../../obts/node_modules/call-bind/index.js"(exports2, module2) {
     "use strict";
     var setFunctionLength = require_set_function_length();
     var $defineProperty = require_es_define_property();
@@ -3355,9 +3355,9 @@ var require_call_bind = __commonJS({
   }
 });
 
-// node_modules/has-tostringtag/shams.js
+// ../../obts/node_modules/has-tostringtag/shams.js
 var require_shams2 = __commonJS({
-  "node_modules/has-tostringtag/shams.js"(exports2, module2) {
+  "../../obts/node_modules/has-tostringtag/shams.js"(exports2, module2) {
     "use strict";
     var hasSymbols = require_shams();
     module2.exports = function hasToStringTagShams() {
@@ -3366,9 +3366,9 @@ var require_shams2 = __commonJS({
   }
 });
 
-// node_modules/which-typed-array/index.js
+// ../../obts/node_modules/which-typed-array/index.js
 var require_which_typed_array = __commonJS({
-  "node_modules/which-typed-array/index.js"(exports2, module2) {
+  "../../obts/node_modules/which-typed-array/index.js"(exports2, module2) {
     "use strict";
     var forEach = require_for_each();
     var availableTypedArrays = require_available_typed_arrays();
@@ -3490,9 +3490,9 @@ var require_which_typed_array = __commonJS({
   }
 });
 
-// node_modules/is-typed-array/index.js
+// ../../obts/node_modules/is-typed-array/index.js
 var require_is_typed_array = __commonJS({
-  "node_modules/is-typed-array/index.js"(exports2, module2) {
+  "../../obts/node_modules/is-typed-array/index.js"(exports2, module2) {
     "use strict";
     var whichTypedArray = require_which_typed_array();
     module2.exports = function isTypedArray(value) {
@@ -3501,9 +3501,9 @@ var require_is_typed_array = __commonJS({
   }
 });
 
-// node_modules/typed-array-buffer/index.js
+// ../../obts/node_modules/typed-array-buffer/index.js
 var require_typed_array_buffer = __commonJS({
-  "node_modules/typed-array-buffer/index.js"(exports2, module2) {
+  "../../obts/node_modules/typed-array-buffer/index.js"(exports2, module2) {
     "use strict";
     var $TypeError = require_type();
     var callBound = require_call_bound();
@@ -3518,9 +3518,9 @@ var require_typed_array_buffer = __commonJS({
   }
 });
 
-// node_modules/to-buffer/index.js
+// ../../obts/node_modules/to-buffer/index.js
 var require_to_buffer = __commonJS({
-  "node_modules/to-buffer/index.js"(exports2, module2) {
+  "../../obts/node_modules/to-buffer/index.js"(exports2, module2) {
     "use strict";
     var Buffer3 = require_safe_buffer().Buffer;
     var isArray = require_isarray();
@@ -3582,9 +3582,9 @@ var require_to_buffer = __commonJS({
   }
 });
 
-// node_modules/sha.js/hash.js
+// ../../obts/node_modules/sha.js/hash.js
 var require_hash = __commonJS({
-  "node_modules/sha.js/hash.js"(exports2, module2) {
+  "../../obts/node_modules/sha.js/hash.js"(exports2, module2) {
     "use strict";
     var Buffer3 = require_safe_buffer().Buffer;
     var toBuffer = require_to_buffer();
@@ -3643,9 +3643,9 @@ var require_hash = __commonJS({
   }
 });
 
-// node_modules/sha.js/sha1.js
+// ../../obts/node_modules/sha.js/sha1.js
 var require_sha1 = __commonJS({
-  "node_modules/sha.js/sha1.js"(exports2, module2) {
+  "../../obts/node_modules/sha.js/sha1.js"(exports2, module2) {
     "use strict";
     var inherits = require_inherits_browser();
     var Hash2 = require_hash();
@@ -3730,9 +3730,9 @@ var require_sha1 = __commonJS({
   }
 });
 
-// node_modules/crc-32/crc32.js
+// ../../obts/node_modules/crc-32/crc32.js
 var require_crc32 = __commonJS({
-  "node_modules/crc-32/crc32.js"(exports2) {
+  "../../obts/node_modules/crc-32/crc32.js"(exports2) {
     var CRC32;
     (function(factory) {
       if (typeof DO_NOT_EXPORT_CRC === "undefined") {
@@ -3828,9 +3828,9 @@ var require_crc32 = __commonJS({
   }
 });
 
-// node_modules/pako/lib/utils/common.js
+// ../../obts/node_modules/pako/lib/utils/common.js
 var require_common = __commonJS({
-  "node_modules/pako/lib/utils/common.js"(exports2) {
+  "../../obts/node_modules/pako/lib/utils/common.js"(exports2) {
     "use strict";
     var TYPED_OK = typeof Uint8Array !== "undefined" && typeof Uint16Array !== "undefined" && typeof Int32Array !== "undefined";
     function _has(obj, key) {
@@ -3919,9 +3919,9 @@ var require_common = __commonJS({
   }
 });
 
-// node_modules/pako/lib/zlib/trees.js
+// ../../obts/node_modules/pako/lib/zlib/trees.js
 var require_trees = __commonJS({
-  "node_modules/pako/lib/zlib/trees.js"(exports2) {
+  "../../obts/node_modules/pako/lib/zlib/trees.js"(exports2) {
     "use strict";
     var utils = require_common();
     var Z_FIXED = 4;
@@ -4561,9 +4561,9 @@ var require_trees = __commonJS({
   }
 });
 
-// node_modules/pako/lib/zlib/adler32.js
+// ../../obts/node_modules/pako/lib/zlib/adler32.js
 var require_adler32 = __commonJS({
-  "node_modules/pako/lib/zlib/adler32.js"(exports2, module2) {
+  "../../obts/node_modules/pako/lib/zlib/adler32.js"(exports2, module2) {
     "use strict";
     function adler32(adler, buf, len, pos) {
       var s1 = adler & 65535 | 0, s2 = adler >>> 16 & 65535 | 0, n = 0;
@@ -4583,9 +4583,9 @@ var require_adler32 = __commonJS({
   }
 });
 
-// node_modules/pako/lib/zlib/crc32.js
+// ../../obts/node_modules/pako/lib/zlib/crc32.js
 var require_crc322 = __commonJS({
-  "node_modules/pako/lib/zlib/crc32.js"(exports2, module2) {
+  "../../obts/node_modules/pako/lib/zlib/crc32.js"(exports2, module2) {
     "use strict";
     function makeTable() {
       var c, table = [];
@@ -4611,9 +4611,9 @@ var require_crc322 = __commonJS({
   }
 });
 
-// node_modules/pako/lib/zlib/messages.js
+// ../../obts/node_modules/pako/lib/zlib/messages.js
 var require_messages = __commonJS({
-  "node_modules/pako/lib/zlib/messages.js"(exports2, module2) {
+  "../../obts/node_modules/pako/lib/zlib/messages.js"(exports2, module2) {
     "use strict";
     module2.exports = {
       2: "need dictionary",
@@ -4638,9 +4638,9 @@ var require_messages = __commonJS({
   }
 });
 
-// node_modules/pako/lib/zlib/deflate.js
+// ../../obts/node_modules/pako/lib/zlib/deflate.js
 var require_deflate = __commonJS({
-  "node_modules/pako/lib/zlib/deflate.js"(exports2) {
+  "../../obts/node_modules/pako/lib/zlib/deflate.js"(exports2) {
     "use strict";
     var utils = require_common();
     var trees = require_trees();
@@ -5687,9 +5687,9 @@ var require_deflate = __commonJS({
   }
 });
 
-// node_modules/pako/lib/utils/strings.js
+// ../../obts/node_modules/pako/lib/utils/strings.js
 var require_strings = __commonJS({
-  "node_modules/pako/lib/utils/strings.js"(exports2) {
+  "../../obts/node_modules/pako/lib/utils/strings.js"(exports2) {
     "use strict";
     var utils = require_common();
     var STR_APPLY_OK = true;
@@ -5829,9 +5829,9 @@ var require_strings = __commonJS({
   }
 });
 
-// node_modules/pako/lib/zlib/zstream.js
+// ../../obts/node_modules/pako/lib/zlib/zstream.js
 var require_zstream = __commonJS({
-  "node_modules/pako/lib/zlib/zstream.js"(exports2, module2) {
+  "../../obts/node_modules/pako/lib/zlib/zstream.js"(exports2, module2) {
     "use strict";
     function ZStream() {
       this.input = null;
@@ -5851,9 +5851,9 @@ var require_zstream = __commonJS({
   }
 });
 
-// node_modules/pako/lib/deflate.js
+// ../../obts/node_modules/pako/lib/deflate.js
 var require_deflate2 = __commonJS({
-  "node_modules/pako/lib/deflate.js"(exports2) {
+  "../../obts/node_modules/pako/lib/deflate.js"(exports2) {
     "use strict";
     var zlib_deflate = require_deflate();
     var utils = require_common();
@@ -6012,9 +6012,9 @@ var require_deflate2 = __commonJS({
   }
 });
 
-// node_modules/pako/lib/zlib/inffast.js
+// ../../obts/node_modules/pako/lib/zlib/inffast.js
 var require_inffast = __commonJS({
-  "node_modules/pako/lib/zlib/inffast.js"(exports2, module2) {
+  "../../obts/node_modules/pako/lib/zlib/inffast.js"(exports2, module2) {
     "use strict";
     var BAD = 30;
     var TYPE = 12;
@@ -6241,9 +6241,9 @@ var require_inffast = __commonJS({
   }
 });
 
-// node_modules/pako/lib/zlib/inftrees.js
+// ../../obts/node_modules/pako/lib/zlib/inftrees.js
 var require_inftrees = __commonJS({
-  "node_modules/pako/lib/zlib/inftrees.js"(exports2, module2) {
+  "../../obts/node_modules/pako/lib/zlib/inftrees.js"(exports2, module2) {
     "use strict";
     var utils = require_common();
     var MAXBITS = 15;
@@ -6557,9 +6557,9 @@ var require_inftrees = __commonJS({
   }
 });
 
-// node_modules/pako/lib/zlib/inflate.js
+// ../../obts/node_modules/pako/lib/zlib/inflate.js
 var require_inflate = __commonJS({
-  "node_modules/pako/lib/zlib/inflate.js"(exports2) {
+  "../../obts/node_modules/pako/lib/zlib/inflate.js"(exports2) {
     "use strict";
     var utils = require_common();
     var adler32 = require_adler32();
@@ -7796,9 +7796,9 @@ var require_inflate = __commonJS({
   }
 });
 
-// node_modules/pako/lib/zlib/constants.js
+// ../../obts/node_modules/pako/lib/zlib/constants.js
 var require_constants = __commonJS({
-  "node_modules/pako/lib/zlib/constants.js"(exports2, module2) {
+  "../../obts/node_modules/pako/lib/zlib/constants.js"(exports2, module2) {
     "use strict";
     module2.exports = {
       /* Allowed flush values; see deflate() and inflate() below for details */
@@ -7843,9 +7843,9 @@ var require_constants = __commonJS({
   }
 });
 
-// node_modules/pako/lib/zlib/gzheader.js
+// ../../obts/node_modules/pako/lib/zlib/gzheader.js
 var require_gzheader = __commonJS({
-  "node_modules/pako/lib/zlib/gzheader.js"(exports2, module2) {
+  "../../obts/node_modules/pako/lib/zlib/gzheader.js"(exports2, module2) {
     "use strict";
     function GZheader() {
       this.text = 0;
@@ -7863,9 +7863,9 @@ var require_gzheader = __commonJS({
   }
 });
 
-// node_modules/pako/lib/inflate.js
+// ../../obts/node_modules/pako/lib/inflate.js
 var require_inflate2 = __commonJS({
-  "node_modules/pako/lib/inflate.js"(exports2) {
+  "../../obts/node_modules/pako/lib/inflate.js"(exports2) {
     "use strict";
     var zlib_inflate = require_inflate();
     var utils = require_common();
@@ -8037,9 +8037,9 @@ var require_inflate2 = __commonJS({
   }
 });
 
-// node_modules/pako/index.js
+// ../../obts/node_modules/pako/index.js
 var require_pako = __commonJS({
-  "node_modules/pako/index.js"(exports2, module2) {
+  "../../obts/node_modules/pako/index.js"(exports2, module2) {
     "use strict";
     var assign = require_common().assign;
     var deflate2 = require_deflate2();
@@ -8051,9 +8051,9 @@ var require_pako = __commonJS({
   }
 });
 
-// node_modules/pify/index.js
+// ../../obts/node_modules/pify/index.js
 var require_pify = __commonJS({
-  "node_modules/pify/index.js"(exports2, module2) {
+  "../../obts/node_modules/pify/index.js"(exports2, module2) {
     "use strict";
     var processFn = (fn, options) => function(...args) {
       const P = options.promiseModule;
@@ -8116,9 +8116,9 @@ var require_pify = __commonJS({
   }
 });
 
-// node_modules/ignore/index.js
+// ../../obts/node_modules/ignore/index.js
 var require_ignore = __commonJS({
-  "node_modules/ignore/index.js"(exports2, module2) {
+  "../../obts/node_modules/ignore/index.js"(exports2, module2) {
     function makeArray(subject) {
       return Array.isArray(subject) ? subject : [subject];
     }
@@ -8503,9 +8503,9 @@ var require_ignore = __commonJS({
   }
 });
 
-// node_modules/clean-git-ref/lib/index.js
+// ../../obts/node_modules/clean-git-ref/lib/index.js
 var require_lib2 = __commonJS({
-  "node_modules/clean-git-ref/lib/index.js"(exports2, module2) {
+  "../../obts/node_modules/clean-git-ref/lib/index.js"(exports2, module2) {
     "use strict";
     function escapeRegExp(string) {
       return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -8536,9 +8536,9 @@ var require_lib2 = __commonJS({
   }
 });
 
-// node_modules/diff3/onp.js
+// ../../obts/node_modules/diff3/onp.js
 var require_onp = __commonJS({
-  "node_modules/diff3/onp.js"(exports2, module2) {
+  "../../obts/node_modules/diff3/onp.js"(exports2, module2) {
     module2.exports = function(a_, b_) {
       var a = a_, b = b_, m = a.length, n = b.length, reverse = false, ed = null, offset = m + 1, path2 = [], pathposi = [], ses = [], lcs = "", SES_DELETE = -1, SES_COMMON = 0, SES_ADD = 1;
       var tmp1, tmp2;
@@ -8665,9 +8665,9 @@ var require_onp = __commonJS({
   }
 });
 
-// node_modules/diff3/diff3.js
+// ../../obts/node_modules/diff3/diff3.js
 var require_diff3 = __commonJS({
-  "node_modules/diff3/diff3.js"(exports2, module2) {
+  "../../obts/node_modules/diff3/diff3.js"(exports2, module2) {
     var onp = require_onp();
     function longestCommonSubsequence(file1, file2) {
       var diff = new onp(file1, file2);
@@ -8867,7 +8867,7 @@ var require_diff3 = __commonJS({
   }
 });
 
-// node_modules/isomorphic-git/index.js
+// ../../obts/node_modules/isomorphic-git/index.js
 var isomorphic_git_exports = {};
 __export(isomorphic_git_exports, {
   Errors: () => Errors,
@@ -16526,7 +16526,7 @@ async function writeTree({ fs, dir, gitdir = join(dir, ".git"), tree }) {
 }
 var import_async_lock, import_sha1, import_crc_32, import_pako, import_pify, import_ignore, import_clean_git_ref, import_diff3, BaseError, UnmergedPathsError, InternalError, UnsafeFilepathError, BufferCursor, MAX_UINT32, supportsSubtleSHA1, GitIndex, lock, IndexCache, GitIndexManager, GitWalkerIndex, GitWalkSymbol, NotFoundError, ObjectTypeError, InvalidOidError, NoRefspecError, GitPackedRefs, GitRefSpec, GitRefSpecSet, num, bool, schema, SECTION_LINE_REGEX, SECTION_REGEX, VARIABLE_LINE_REGEX, VARIABLE_NAME_REGEX, VARIABLE_VALUE_COMMENT_REGEX, extractSectionLine, extractVariableLine, removeComments, hasOddNumberOfQuotes, removeQuotes, lower, getPath, normalizePath, findLastIndex, GitConfig, GitConfigManager, refpaths, GIT_FILES, lock$1, GitRefManager, GitTree, GitObject, StreamReader, supportsDecompressionStream, GitPackIndex, PackfileCache, AlreadyExistsError, AmbiguousError, CheckoutConflictError, CherryPickMergeCommitError, CherryPickRootCommitError, CommitNotFetchedError, EmptyServerResponseError, FastForwardError, GitPushError, HttpError, InvalidFilepathError, InvalidRefNameError, MaxDepthError, MergeNotSupportedError, MergeConflictError, MissingNameError, MissingParameterError, MultipleGitError, ParseError, PushRejectedError, RemoteCapabilityError, SmartHttpError, UnknownTransportError, UrlParseError, UserCanceledError, IndexResetError, NoCommitError, Errors, GitAnnotatedTag, GitCommit, GitWalkerRepo, GitWalkerFs, flat, RunningMinimum, commands, FileSystem, GitIgnoreManager, supportsCompressionStream, bad, worthWalking, LINEBREAKS, _TreeMap, lock$2, abbreviateRx, GitPktLine, corsProxify, updateHeaders, stringifyBody, GitRemoteHTTP, GitRemoteManager, lock$3, GitShallowManager, pkg, FIFO, GitSideBand, EMPTY_OID, types, GitRefStash, GitStashManager, index, isomorphic_git_default;
 var init_isomorphic_git = __esm({
-  "node_modules/isomorphic-git/index.js"() {
+  "../../obts/node_modules/isomorphic-git/index.js"() {
     import_async_lock = __toESM(require_async_lock(), 1);
     import_sha1 = __toESM(require_sha1(), 1);
     import_crc_32 = __toESM(require_crc32(), 1);
@@ -20250,9 +20250,9 @@ ${obj.gpgsig ? obj.gpgsig : ""}`;
   }
 });
 
-// node_modules/path-browserify/index.js
+// ../../obts/node_modules/path-browserify/index.js
 var require_path_browserify = __commonJS({
-  "node_modules/path-browserify/index.js"(exports2, module2) {
+  "../../obts/node_modules/path-browserify/index.js"(exports2, module2) {
     "use strict";
     function assertPath(path2) {
       if (typeof path2 !== "string") {
@@ -20657,9 +20657,9 @@ var require_path_browserify = __commonJS({
   }
 });
 
-// node_modules/sha.js/sha.js
+// ../../obts/node_modules/sha.js/sha.js
 var require_sha = __commonJS({
-  "node_modules/sha.js/sha.js"(exports2, module2) {
+  "../../obts/node_modules/sha.js/sha.js"(exports2, module2) {
     "use strict";
     var inherits = require_inherits_browser();
     var Hash2 = require_hash();
@@ -20741,9 +20741,9 @@ var require_sha = __commonJS({
   }
 });
 
-// node_modules/sha.js/sha256.js
+// ../../obts/node_modules/sha.js/sha256.js
 var require_sha256 = __commonJS({
-  "node_modules/sha.js/sha256.js"(exports2, module2) {
+  "../../obts/node_modules/sha.js/sha256.js"(exports2, module2) {
     "use strict";
     var inherits = require_inherits_browser();
     var Hash2 = require_hash();
@@ -20903,9 +20903,9 @@ var require_sha256 = __commonJS({
   }
 });
 
-// node_modules/sha.js/sha224.js
+// ../../obts/node_modules/sha.js/sha224.js
 var require_sha224 = __commonJS({
-  "node_modules/sha.js/sha224.js"(exports2, module2) {
+  "../../obts/node_modules/sha.js/sha224.js"(exports2, module2) {
     "use strict";
     var inherits = require_inherits_browser();
     var Sha256 = require_sha256();
@@ -20944,9 +20944,9 @@ var require_sha224 = __commonJS({
   }
 });
 
-// node_modules/sha.js/sha512.js
+// ../../obts/node_modules/sha.js/sha512.js
 var require_sha512 = __commonJS({
-  "node_modules/sha.js/sha512.js"(exports2, module2) {
+  "../../obts/node_modules/sha.js/sha512.js"(exports2, module2) {
     "use strict";
     var inherits = require_inherits_browser();
     var Hash2 = require_hash();
@@ -21287,9 +21287,9 @@ var require_sha512 = __commonJS({
   }
 });
 
-// node_modules/sha.js/sha384.js
+// ../../obts/node_modules/sha.js/sha384.js
 var require_sha384 = __commonJS({
-  "node_modules/sha.js/sha384.js"(exports2, module2) {
+  "../../obts/node_modules/sha.js/sha384.js"(exports2, module2) {
     "use strict";
     var inherits = require_inherits_browser();
     var SHA512 = require_sha512();
@@ -21339,9 +21339,9 @@ var require_sha384 = __commonJS({
   }
 });
 
-// node_modules/sha.js/index.js
+// ../../obts/node_modules/sha.js/index.js
 var require_sha2 = __commonJS({
-  "node_modules/sha.js/index.js"(exports2, module2) {
+  "../../obts/node_modules/sha.js/index.js"(exports2, module2) {
     "use strict";
     module2.exports = function SHA(algorithm) {
       var alg = algorithm.toLowerCase();
@@ -22180,7 +22180,7 @@ var { createByteBudget, runBoundedWork } = require_work_pool();
 var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.12";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.13";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var PERIODIC_INVENTORY_INTERVAL_MS = 6 * 60 * 60 * 1e3;
@@ -27192,33 +27192,6 @@ var ObtsObsidianClient = class {
       policy: createRootIgnorePolicy(bytes)
     };
   }
-  rootIgnoreDraftPolicy(draft) {
-    if (typeof draft !== "string" || Buffer2.from(draft, "utf8").toString("utf8") !== draft) {
-      throw new ObtsBlockedError("invalid_root_ignore_draft", "Root .gitignore must be valid UTF-8 text.");
-    }
-    const bytes = Buffer2.from(draft, "utf8");
-    return { bytes, policy: createRootIgnorePolicy(bytes) };
-  }
-  async previewRootIgnoreDraft(draft) {
-    const { policy } = this.rootIgnoreDraftPolicy(draft);
-    const local = await this.listLocalVaultInventory("", policy);
-    const head = await this.resolveRef("refs/heads/local");
-    const tracked = head ? [...(await this.listTreeBlobOids(head)).keys()] : [];
-    const newlyLocal = tracked.filter((filePath) => filePath !== ".gitignore" && policy.ignores(filePath));
-    return {
-      includedFiles: local.files.filter((filePath) => isSyncableVaultPath(filePath)).length,
-      newlyLocal: newlyLocal.sort()
-    };
-  }
-  async saveRootIgnoreDraft(draft) {
-    const { bytes } = this.rootIgnoreDraftPolicy(draft);
-    await this.adapter.writeBinary(".gitignore", bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
-    const saved = await this.readRootIgnorePolicy();
-    if (saved.bytes === null || !saved.bytes.equals(bytes)) {
-      throw new ObtsBlockedError("root_ignore_save_uncertain", "Root .gitignore changed during save. Keep your draft and inspect the local file.");
-    }
-    return saved;
-  }
   async rootIgnoreProtocolCapability() {
     await this.readRootIgnorePolicy();
     return "root-ignore-v1";
@@ -28127,7 +28100,8 @@ var ObtsObsidianClient = class {
         local_head: state.local_head,
         path_capabilities: {
           adapter: "obsidian-data-adapter",
-          platform: runtimePlatform()
+          platform: runtimePlatform(),
+          root_ignore: true
         }
       })
     });
@@ -30906,7 +30880,6 @@ var ObtsSettingTab = class extends PluginSettingTab {
     super(app, plugin);
     this.plugin = plugin;
     this.operationRefreshTimer = null;
-    this.rootIgnoreEditor = null;
   }
   clearOperationRefreshTimer() {
     if (this.operationRefreshTimer !== null) {
@@ -31176,101 +31149,35 @@ var ObtsSettingTab = class extends PluginSettingTab {
         (button) => button.setButtonText("Set up sync").setCta().onClick(() => new ObtsOnboardingModal(this.app, this.plugin).open())
       );
     }
-    await this.renderRootIgnoreEditor(containerEl);
+    await this.renderRootIgnoreStatus(containerEl);
   }
-  async renderRootIgnoreEditor(containerEl) {
-    containerEl.createEl("h3", { text: "Advanced: sync exclusions", cls: "obts-settings-section-header" });
-    new Setting(containerEl).setName("Vault-root .gitignore").setDesc("Shared with your other devices. Preview before saving. Excluded files stay in this local vault; changing a rule does not remove oversized objects from queued history.");
-    const feedback = containerEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
-    let editor = this.rootIgnoreEditor;
+  async renderRootIgnoreStatus(containerEl) {
+    containerEl.createEl("h3", { text: "Sync policy", cls: "obts-settings-section-header" });
+    new Setting(containerEl).setName("Vault-root .gitignore").setDesc("This versioned file remains the shared exclusion policy. Edit its effective rules in the server dashboard.");
+    const status2 = containerEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
     try {
-      const pin = await this.plugin.client.readRootIgnorePolicy();
-      if (!editor) {
-        editor = { baseline: pin.bytes, draft: pin.bytes === null ? "" : Buffer2.from(pin.bytes).toString("utf8") };
-        this.rootIgnoreEditor = editor;
-      } else if (editor.baseline === null !== (pin.bytes === null) || editor.baseline !== null && !Buffer2.from(editor.baseline).equals(pin.bytes)) {
-        setFeedback(feedback, "The local .gitignore changed since you opened this draft. Reload to see the new version, or preview and overwrite it with your draft.", "muted");
-      }
-    } catch (error) {
-      setFeedback(feedback, error instanceof Error ? error.message : "Cannot safely read root .gitignore on this device.", "error");
-      return;
+      const policy = await this.plugin.client.readRootIgnorePolicy();
+      const rules = policy.bytes === null ? "No root .gitignore is currently applied on this device." : new TextDecoder("utf-8", { fatal: true }).decode(policy.bytes);
+      setFeedback(status2, `${rules}
+
+This is the local applied copy (policy ${policy.oid || "absent"}); it may be stale while offline or before pairing.`, "muted");
+    } catch {
+      setFeedback(status2, "The local applied exclusion policy is unavailable. This may happen offline or before pairing; no current server policy is implied.", "muted");
     }
-    const input = containerEl.createEl("textarea", {
-      cls: "obts-ignore-editor",
-      attr: { "aria-label": "Vault-root .gitignore rules", spellcheck: "false", rows: "8" }
-    });
-    input.value = editor.draft;
-    const previewEl = containerEl.createDiv({ cls: "obts-ignore-preview", attr: { "aria-live": "polite" } });
-    let previewedDraft = null;
-    let saveButton;
-    input.addEventListener("input", () => {
-      editor.draft = input.value;
-      previewedDraft = null;
-      previewEl.empty();
-      if (saveButton) saveButton.setDisabled(true);
-    });
-    new Setting(containerEl).setName("Reload file").setDesc("Discard this draft and read the current local .gitignore again.").addButton((button) => button.setButtonText("Reload from vault").onClick(async () => {
-      if (editor.draft !== (editor.baseline === null ? "" : Buffer2.from(editor.baseline).toString("utf8")) && !window.confirm("Discard your unsaved .gitignore draft and reload the local file?")) return;
-      button.setDisabled(true);
+    const state = await this.plugin.client.readState().catch(() => null);
+    const dashboardBase = normalizedServerDestination(this.plugin.settings.serverUrl);
+    if (state && state.vault_id && dashboardBase) {
       try {
-        const current = await this.plugin.client.readRootIgnorePolicy();
-        editor.baseline = current.bytes;
-        editor.draft = current.bytes === null ? "" : Buffer2.from(current.bytes).toString("utf8");
-        input.value = editor.draft;
-        previewedDraft = null;
-        previewEl.empty();
-        if (saveButton) saveButton.setDisabled(true);
-        setFeedback(feedback, "Loaded the current local .gitignore. Preview before saving.", "muted");
-      } catch (error) {
-        setFeedback(feedback, error instanceof Error ? error.message : "Cannot reload root .gitignore.", "error");
-      } finally {
-        button.setDisabled(false);
+        const dashboardUrl = new URL("/", dashboardBase);
+        dashboardUrl.searchParams.set("vault", state.vault_id);
+        containerEl.createEl("a", {
+          text: "Manage sync rules on server",
+          href: dashboardUrl.toString(),
+          attr: { target: "_blank", rel: "noopener noreferrer" }
+        });
+      } catch {
       }
-    }));
-    new Setting(containerEl).setName("Review and save").addButton((button) => button.setButtonText("Preview effect").onClick(async () => {
-      button.setDisabled(true);
-      previewedDraft = null;
-      if (saveButton) saveButton.setDisabled(true);
-      try {
-        const draft = input.value;
-        const result = await this.plugin.client.previewRootIgnoreDraft(draft);
-        if (draft !== input.value) return;
-        previewedDraft = draft;
-        previewEl.empty();
-        previewEl.createEl("p", { text: `${result.includedFiles} syncable files remain in this vault. ${result.newlyLocal.length} tracked files would become local only.` });
-        if (result.newlyLocal.length) {
-          previewEl.createEl("p", { text: `Newly local-only: ${result.newlyLocal.slice(0, 10).join(", ")}${result.newlyLocal.length > 10 ? " (and more)" : ""}` });
-        }
-        if (saveButton) saveButton.setDisabled(false);
-        setFeedback(feedback, "Preview ready. Save only after reviewing the local-only paths.", "success");
-      } catch (error) {
-        setFeedback(feedback, error instanceof Error ? error.message : "Unable to preview .gitignore.", "error");
-      } finally {
-        button.setDisabled(false);
-      }
-    })).addButton((button) => {
-      saveButton = button.setButtonText("Save .gitignore").setDisabled(true).onClick(async () => {
-        if (previewedDraft !== input.value) return;
-        const submitted = input.value;
-        button.setDisabled(true);
-        input.disabled = true;
-        try {
-          const saved = await this.plugin.runExclusiveAction(
-            () => this.plugin.client.saveRootIgnoreDraft(submitted),
-            "Saving root .gitignore"
-          );
-          editor.baseline = saved.bytes;
-          editor.draft = submitted;
-          previewedDraft = null;
-          previewEl.empty();
-          setFeedback(feedback, "Saved locally. Sync will propose this file and the previewed exclusions.", "success");
-        } catch (error) {
-          setFeedback(feedback, error instanceof Error ? error.message : "Unable to save .gitignore. Your draft is preserved.", "error");
-        } finally {
-          input.disabled = false;
-        }
-      });
-    });
+    }
   }
 };
 function normalizeDisplayName(value) {

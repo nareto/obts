@@ -155,6 +155,8 @@ describe('validation selection', () => {
     expect(makePlan(['architecture/models/formal/configs/fm004-safety.cfg']).formalFamilies).toEqual(['deletion']);
     expect(makePlan(['architecture/models/formal/OBTSApplyRecovery.cfg']).formalFamilies).toEqual(['sync']);
     expect(makePlan(['architecture/models/formal/OBTSApplyRecoveryLiveness.cfg']).formalFamilies).toEqual(['sync']);
+    expect(makePlan(['architecture/models/formal/OBTSVaultSettings.tla']).formalFamilies).toEqual(['vault-settings']);
+    expect(makePlan(['architecture/models/formal/negative/VaultSettingsStaleSave.cfg']).formalFamilies).toEqual(['vault-settings']);
     expect(makePlan(['architecture/models/formal/modules/OBTSDomain.tla']).executableGroup).toBe('all');
     expect(makePlan(['architecture/models/formal/README.md']).executableGroup).toBe('all');
     expect(makePlan(['architecture/models/formal/checks-fm004.json', 'README.md']).executableGroup).toBe('all');

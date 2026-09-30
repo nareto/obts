@@ -656,11 +656,12 @@ try {
     await expect(page.getByRole('heading', {name: 'Overview', level: 1, exact: true})).toBeFocused();
   });
 
-  await scenario('remaining pages stay compact and fit responsive widths', async ({page, navigate}) => {
+  await scenario('remaining pages stay compact and fit responsive widths', async ({page, navigate, capture}) => {
     for (const width of [1440, 768, 390, 320]) {
       await page.setViewportSize({width, height: 900});
       for (const view of ['History', 'Maintenance', 'Settings']) {
         await navigate(view);
+        if (view === 'Settings' && (width === 1440 || width === 390)) await capture(`settings-${width}-light`);
         const layout = await page.evaluate(() => ({width: innerWidth, scroll: document.documentElement.scrollWidth}));
         assert.ok(layout.scroll <= layout.width + 1, `${view} at ${width}: no document overflow`);
       }
@@ -785,6 +786,104 @@ try {
       await expect(diagnostics).toContainText('new account');
       await expect(diagnostics).not.toContainText('old account');
     } finally { release(); }
+  });
+
+  await scenario('vault sync rules preview and save use a reviewed snapshot', async ({page, fixture, capture, navigate}) => {
+    await navigate('Settings');
+    const panel = page.locator('.vault-sync-settings');
+    await expect(panel).toContainText('Sync rules');
+    await capture('settings-desktop-light');
+    await page.getByRole('checkbox', {name: 'Use shared sync exclusions', exact: true}).check();
+    await page.getByRole('textbox', {name: 'Excluded files and folders', exact: true}).fill('private/\n');
+    await expect(page.getByRole('textbox', {name: /Frontmatter fields/u})).toHaveAttribute('placeholder', 'updated\nmodified');
+    await page.getByRole('textbox', {name: /Frontmatter fields/u}).fill('updated');
+    await page.getByRole('button', {name: 'Preview changes', exact: true}).click();
+    await expect(panel).toContainText('Preview is current');
+    await expect.poll(() => fixture.requests.some(request => request.path.endsWith('/sync-settings/preview'))).toBe(true);
+    fixture.setFailure({path:'/vaults/sample-vault/sync-settings',status:409});
+    await page.getByRole('button', {name: 'Save settings', exact: true}).click();
+    await expect(panel).toContainText('temporarily unavailable');
+    await expect(panel).not.toContainText('Settings saved.');
+    await expect(page.getByRole('textbox', {name: 'Excluded files and folders', exact: true})).toHaveValue('private/\n');
+    await expect(page.getByRole('button', {name: 'Save settings', exact: true})).toBeEnabled();
+    fixture.setFailure(null);
+    await page.getByRole('button', {name: 'Save settings', exact: true}).click();
+    await expect(panel).toContainText('Settings saved.');
+    await page.setViewportSize({width: 390, height: 844});
+    await capture('settings-mobile-light');
+    assert.ok((await page.evaluate(() => document.documentElement.scrollWidth)) <= 391, 'Settings fit mobile viewport');
+  });
+
+  await scenario('newer main invalidates a settings preview without erasing its draft', async ({page, fixture, navigate}) => {
+    await navigate('Settings');
+    await page.getByRole('checkbox', {name: 'Use shared sync exclusions', exact: true}).check();
+    await page.getByRole('textbox', {name: 'Excluded files and folders', exact: true}).fill('private/\n');
+    await page.getByRole('button', {name: 'Preview changes', exact: true}).click();
+    await expect(page.locator('.settings-preview')).toBeVisible();
+    fixture.summary.vault.current_main = 'c'.repeat(40);
+    const refreshed = page.waitForResponse(response => new URL(response.url()).pathname.endsWith('/dashboard'));
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+    await refreshed;
+    await expect(page.locator('.vault-sync-settings')).toContainText('Vault main advanced');
+    await expect(page.getByRole('textbox', {name: 'Excluded files and folders', exact: true})).toHaveValue('private/\n');
+    await expect(page.getByRole('button', {name: 'Save settings', exact: true})).toBeDisabled();
+    page.once('dialog', dialog => dialog.dismiss());
+    await page.getByRole('button', {name: 'Reload settings', exact: true}).click();
+    await expect(page.getByRole('textbox', {name: 'Excluded files and folders', exact: true})).toHaveValue('private/\n');
+    page.once('dialog', dialog => dialog.accept());
+    await page.getByRole('button', {name: 'Reload settings', exact: true}).click();
+    await expect(page.getByRole('checkbox', {name: 'Use shared sync exclusions', exact: true})).not.toBeChecked();
+  });
+
+  await scenario('a previous vault preview cannot publish results or clear a newer busy request', async ({page, fixture, navigate}) => {
+    let releaseOld;
+    let releaseNew;
+    const oldGate = new Promise(resolve => releaseOld = resolve);
+    const newGate = new Promise(resolve => releaseNew = resolve);
+    await page.route('**/api/v1/vaults/*/sync-settings/preview', async route => {
+      const body = route.request().postDataJSON();
+      const old = new URL(route.request().url()).pathname.includes('/sample-vault/');
+      await (old ? oldGate : newGate);
+      await route.fulfill({status: 200, json: {
+        vault_id: old ? 'sample-vault' : 'old-test-vault', expected_main: body.expected_main,
+        expected_root_ignore_oid: null, preview_tree: 'b'.repeat(40), review_fingerprint: 'c'.repeat(64),
+        root_ignore_oid: null, affected_paths: old ? ['old-private.md'] : [], affected_directories: [],
+        metadata_conflict_rules: body.metadata_conflict_rules, changes_main: false
+      }});
+    });
+    try {
+      await navigate('Settings');
+      const oldRequest = page.waitForRequest('**/vaults/sample-vault/sync-settings/preview');
+      await page.getByRole('button', {name: 'Preview changes', exact: true}).click();
+      await oldRequest;
+      await page.getByRole('combobox', {name: 'Current vault', exact: true}).selectOption('old-test-vault');
+      const newerRequest = page.waitForRequest('**/vaults/old-test-vault/sync-settings/preview');
+      await page.getByRole('button', {name: 'Preview changes', exact: true}).click();
+      await newerRequest;
+      const oldResponse = page.waitForResponse('**/vaults/sample-vault/sync-settings/preview');
+      releaseOld();
+      await oldResponse;
+      await page.waitForTimeout(30);
+      await expect(page.getByRole('button', {name: 'Preview changes', exact: true})).toBeDisabled();
+      await expect(page.getByRole('button', {name: 'Save settings', exact: true})).toBeDisabled();
+      await expect(page.locator('.vault-sync-settings')).not.toContainText('old-private.md');
+      releaseNew();
+      await expect(page.getByRole('button', {name: 'Preview changes', exact: true})).toBeEnabled();
+      await expect(page.getByRole('button', {name: 'Save settings', exact: true})).toBeEnabled();
+    } finally { releaseOld(); releaseNew(); }
+  });
+
+  await scenario('blocked vault settings explain why editing is unavailable', async ({page, navigate}) => {
+    await navigate('Settings');
+    await expect(page.locator('.vault-sync-settings')).toContainText('vault is blocked');
+    await expect(page.getByRole('button', {name: 'Reload settings', exact: true})).toBeDisabled();
+    await expect(page.getByRole('textbox', {name: /Frontmatter fields/u})).toHaveCount(0);
+  }, {prepare: async ({fixture}) => { fixture.vault.status = 'blocked_integrity'; }});
+
+  await scenario('vault query deep links select only an owned vault and open Settings', async ({page}) => {
+    await page.goto(new URL('/?vault=old-test-vault', server.resolvedUrls.local[0]).toString());
+    await expect(page.getByRole('combobox', {name: 'Current vault', exact: true})).toHaveValue('old-test-vault');
+    await expect(page.getByRole('heading', {name: 'Settings', level: 1, exact: true})).toBeVisible();
   });
 
   await scenario('vault deletion requires the exact full-ID phrase and states server-only consequences', async ({page, fixture}) => {

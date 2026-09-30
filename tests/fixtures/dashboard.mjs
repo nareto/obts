@@ -12,8 +12,9 @@ export function createFixtures() {
   const labels = ['Metadata database','Server Git store','Temporary workspace','Migrations','Native Git','Filesystem permissions','Event delivery','Persistent-state backup contract'];
   const summary = {vault,devices,recommended_plugin_version:'0.3.25',unresolved_conflict_count:1,conflicts:[conflict],recent_activity:['Device synchronized','Changes merged into server main','Conflict recorded','Device connected'].map((label,i)=>({event_id:`sample-event-${i}`,event_seq:100-i,event_type:'sample',label,created_at:ago(i*8),device_id:devices[i%3].device_id,main})),maintenance:checks.map((key,i)=>({key,label:labels[i],status_label:'Synced',last_checked_at:now,detail:i===7?'Backup must include metadata and Git stores.':'Check passed',...(i===1?{action:'start_git_maintenance'}:i===7?{action:'view_backup_contract'}:{})})),health:{status:'ready',checks:Object.fromEntries(checks.map(k=>[k,true])),detail:null,git_version:'git version 2.49.0'}};
   const oldSummary = {...summary,vault:oldVault,devices:[],conflicts:[],unresolved_conflict_count:0,recent_activity:[]};
+  const syncSettings = {vault_id:vault.vault_id,current_main:main,root_ignore_oid:null,root_ignore:null,metadata_conflict_rules:[]};
   const diagnostic = {event_id:'sample-diagnostic-0',plugin_version:'0.3.25',obsidian_version:'1.8.0',platform_family:'linux',flow:'sync',stage:'upload',failure_code:'sample_failure',error_class:'network',retryable:true,breadcrumbs:[{point:'request',outcome:'failed',value_kind:'none',size_bucket:'small',error_code:'timeout'}],received_at:now};
-  const routes = {'/setup/status':{setup_complete:true},'/auth/session':{user_id:'sample-owner',csrf_token:'',recent_auth_expires_at:'2099-01-01T00:00:00Z'},'/vaults':{vaults:[vault,oldVault]},'/vault-deletions':{deletions:[]},'/diagnostic-events':{ingestion_enabled:false,retention_days:30,events:[diagnostic],next_cursor:null},'/vaults/sample-vault/dashboard':summary,'/vaults/old-test-vault/dashboard':oldSummary,'/vaults/sample-vault/conflicts':{conflicts:[conflict]},'/vaults/old-test-vault/conflicts':{conflicts:[]},'/vaults/sample-vault/conflicts/sample-conflict':review};
+  const routes = {'/setup/status':{setup_complete:true},'/auth/session':{user_id:'sample-owner',csrf_token:'',recent_auth_expires_at:'2099-01-01T00:00:00Z'},'/vaults':{vaults:[vault,oldVault]},'/vault-deletions':{deletions:[]},'/diagnostic-events':{ingestion_enabled:false,retention_days:30,events:[diagnostic],next_cursor:null},'/vaults/sample-vault/dashboard':summary,'/vaults/old-test-vault/dashboard':oldSummary,'/vaults/sample-vault/sync-settings':syncSettings,'/vaults/old-test-vault/sync-settings':{...syncSettings,vault_id:oldVault.vault_id,current_main:oldVault.current_main},'/vaults/sample-vault/conflicts':{conflicts:[conflict]},'/vaults/old-test-vault/conflicts':{conflicts:[]},'/vaults/sample-vault/conflicts/sample-conflict':review};
   const requests = [];
   const unexpected = [];
   let failure = null;
@@ -33,6 +34,17 @@ export function createFixtures() {
       }
       if(method==='GET'&&routes[path]!==undefined){await route.fulfill({status:200,json:routes[path]});return;}
       if(method==='POST'&&path==='/auth/login'){await route.fulfill({status:200,json:routes['/auth/session']});return;}
+      if(method==='POST'&&path==='/vaults/sample-vault/sync-settings/preview'){
+        const body=request.postDataJSON();
+        const fingerprint='b'.repeat(64);
+        await route.fulfill({status:200,json:{vault_id:'sample-vault',expected_main:body.expected_main,expected_root_ignore_oid:null,preview_tree:main,review_fingerprint:fingerprint,root_ignore_oid:null,affected_paths:[],affected_directories:[],metadata_conflict_rules:body.metadata_conflict_rules,changes_main:false}});return;
+      }
+      if(method==='PUT'&&path==='/vaults/sample-vault/sync-settings'){
+        const body=request.postDataJSON();
+        if(body.review_fingerprint!=='b'.repeat(64)){await route.fulfill({status:409,json:{error:{code:'stale_settings',message:'Review settings again.'}}});return;}
+        Object.assign(syncSettings,{root_ignore:body.root_ignore,metadata_conflict_rules:body.metadata_conflict_rules});
+        await route.fulfill({status:200,json:syncSettings});return;
+      }
       if(method==='POST'&&path==='/auth/reauthenticate'){await route.fulfill({status:200,json:routes['/auth/session']});return;}
       if(method==='POST'&&path==='/vaults/sample-vault/history/query'){
         await route.fulfill({status:200,json:{path:'Notes/Sample.md',current_main:main,versions:[{commit:main,parent_commit:'1'.repeat(40),tree:'2'.repeat(40),path:'Notes/Sample.md',operation_type:'update',timestamp:now,author_name:'Sample owner',author_email:'',subject:'Sample note update'}]}});return;

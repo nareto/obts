@@ -1794,6 +1794,7 @@ pre {
 
 .session-panel,
 .diagnostics-settings,
+.vault-sync-settings,
 .deletion-settings,
 .settings-create-panel {
   display: grid;
@@ -1802,6 +1803,7 @@ pre {
 
 .session-panel .section-heading,
 .diagnostics-settings .section-heading,
+.vault-sync-settings .section-heading,
 .deletion-settings .section-heading,
 .settings-create-panel .section-heading {
   margin-bottom: 0;
@@ -1814,6 +1816,64 @@ pre {
 .settings-note {
   margin: 0;
   font-size: 12px;
+}
+
+.vault-sync-settings fieldset {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.settings-check {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-weight: 650;
+}
+
+.settings-check input {
+  width: 18px;
+  min-height: 18px;
+}
+
+.settings-editor-label {
+  display: grid;
+  gap: 7px;
+  font-weight: 650;
+}
+
+.settings-textarea {
+  min-height: 128px;
+  resize: vertical;
+  font: 13px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.settings-fields {
+  min-height: 82px;
+}
+
+.settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+}
+
+.settings-preview {
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+  overflow-wrap: anywhere;
+}
+
+.settings-preview h3,
+.settings-preview p {
+  margin: 0 0 8px;
+}
+
+.settings-preview p:last-child {
+  margin-bottom: 0;
 }
 
 .diagnostics-settings > .diagnostics-panel {

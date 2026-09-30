@@ -1,7 +1,7 @@
 schema_version: 1
-revision: 33
+revision: 34
 status: current
-updated: 2026-09-29
+updated: 2026-09-30
 authoritative_artifacts:
   - architecture/manifest.yaml
   - architecture/README.md
@@ -104,3 +104,13 @@ formal_models:
     refines:
       - OBTS-PER-CLIENT-001
       - OBTS-SYNC-IMM-001
+  - id: OBTS-FM-009
+    status: focused bounded model
+    path: architecture/models/formal/OBTSVaultSettings.tla
+    architecture_revision: 34
+    checks: architecture/models/formal/OBTSVaultSettings.cfg
+    refines:
+      - OBTS-SYNC-MERGE-001
+      - OBTS-SYNC-IGN-001
+      - OBTS-PER-OP-001
+      - OBTS-DASH-SET-001

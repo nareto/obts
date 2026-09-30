@@ -36,6 +36,27 @@ export type VaultSummary = {
   updated_at: string;
 };
 
+export type MetadataConflictRule = { field: string; strategy: 'latest_timestamp' };
+export type VaultSyncSettings = {
+  vault_id: string;
+  current_main: string;
+  root_ignore_oid: string | null;
+  root_ignore: string | null;
+  metadata_conflict_rules: MetadataConflictRule[];
+};
+export type VaultSyncSettingsPreview = {
+  vault_id: string;
+  expected_main: string;
+  expected_root_ignore_oid: string | null;
+  preview_tree: string;
+  review_fingerprint: string;
+  root_ignore_oid: string | null;
+  affected_paths: string[];
+  affected_directories: string[];
+  metadata_conflict_rules: MetadataConflictRule[];
+  changes_main: boolean;
+};
+
 export type VaultDeletionStatus = {
   vault_id: string;
   status: 'deleting' | 'deleted';
