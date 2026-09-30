@@ -12,6 +12,7 @@ export const fastTests = [
 
 export const pluginTests = [
   'tests/plugin-mobile-build.test.ts',
+  'tests/plugin-packaged-client.test.ts',
   'tests/plugin-root-ignore-scan.test.ts',
   'tests/plugin-root-ignore-apply.test.ts',
   'tests/client-state-authority.test.ts',
