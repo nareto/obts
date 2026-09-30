@@ -7698,6 +7698,9 @@ class ObtsObsidianClient {
     const oldUpload = authorized ? archive.evidence.upload : upload;
     const oldPull = authorized ? archive.evidence.pull : pull;
     const originalIntent = original.original_pending_intents;
+    const originalExplicitDirectories = Array.isArray(original.target_explicit_directories)
+      ? original.target_explicit_directories
+      : original.advanced_explicit_directories;
     if (original.version !== 1 || original.phase !== "main_advanced" ||
       original.vault_id !== state.vault_id || original.device_id !== state.device_id ||
       !isGitObjectId(original.local_main) || !isGitObjectId(original.pending_commit) ||
@@ -7713,7 +7716,8 @@ class ObtsObsidianClient {
       !isStoredDirectoryIntent(originalIntent[0]) || originalIntent[0].op !== "delete" ||
       originalIntent[0].base_main !== original.local_main ||
       originalIntent[0].base_event_seq !== original.last_applied_event_seq ||
-      !Array.isArray(original.target_explicit_directories) ||
+      !Array.isArray(originalExplicitDirectories) ||
+      originalExplicitDirectories.some((dirPath) => typeof dirPath !== "string") ||
       !Array.isArray(original.advanced_directory_intents) ||
       original.advanced_directory_intents.length !== 3 ||
       original.advanced_directory_intents.some((intent) => !intent ||
@@ -7784,7 +7788,7 @@ class ObtsObsidianClient {
       oldPull.target_main !== original.target_main ||
       oldPull.current_local_main !== original.local_main ||
       oldPull.manifest.event_seq !== original.recovered_event_seq ||
-      stableJson(oldPull.manifest.explicit_directories) !== stableJson(original.target_explicit_directories) ||
+      stableJson(oldPull.manifest.explicit_directories) !== stableJson(originalExplicitDirectories) ||
       stableJson(oldPull.manifest.directory_intents.map((intent) => [intent.op, intent.path]).sort()) !==
         stableJson(original.advanced_directory_intents.map((intent) => [intent.op, intent.path]).sort()) ||
       oldPull.manifest.root_ignore_oid !== targetPolicy.oid ||

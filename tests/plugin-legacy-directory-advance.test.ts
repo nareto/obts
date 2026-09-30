@@ -127,6 +127,26 @@ describe('completed legacy directory advance settlement', () => {
     expect(await core.settleCompletedLegacyDirectoryAdvance()).toBe(false);
   });
 
+  it('settles a journal written before the explicit-directory field was renamed', async () => {
+    const { root, core, journal } = await fixture();
+    const legacy = { ...journal } as Record<string, unknown>;
+    legacy.advanced_explicit_directories = journal.target_explicit_directories;
+    delete legacy.target_explicit_directories;
+    await save(root, 'directory-baseline-recovery.json', legacy);
+    await expect(core.settleCompletedLegacyDirectoryAdvance()).resolves.toBe(true);
+    expect(await readFile(join(root, '.obts', 'directory-baseline-recovery.json'), 'utf8').catch(() => null)).toBeNull();
+  });
+
+  it('rejects a renamed explicit-directory field that disagrees with the pull checkpoint', async () => {
+    const { root, core, journal } = await fixture();
+    const legacy = { ...journal } as Record<string, unknown>;
+    legacy.advanced_explicit_directories = ['not-the-advanced-snapshot'];
+    delete legacy.target_explicit_directories;
+    await save(root, 'directory-baseline-recovery.json', legacy);
+    await expect(core.settleCompletedLegacyDirectoryAdvance())
+      .rejects.toMatchObject({ code: 'legacy_directory_advance_unsafe' });
+  });
+
   it('cancels a matching open rejected transfer and rejects a completed late outcome', async () => {
     const { core, journal } = await fixture();
     const cancel = Object.getPrototypeOf(core).cancelLegacyDirectoryTransfer;
