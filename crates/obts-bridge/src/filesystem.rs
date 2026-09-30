@@ -36,6 +36,8 @@ pub struct FilesystemSource {
     pub(crate) input_highwater: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     write_stage_gate: Arc<std::sync::Mutex<Option<Arc<WriteStageGate>>>>,
+    #[cfg(test)]
+    last_persisted_projection_state: Arc<RwLock<Option<ObtsProjectionState>>>,
     pub(crate) projection_lock: Arc<tokio::sync::RwLock<()>>,
     // Serializes Rust stages; the service holds the headless guard against Node writes.
     mutation_lock: Arc<tokio::sync::Mutex<()>>,
@@ -196,6 +198,8 @@ impl FilesystemSource {
             input_highwater: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             write_stage_gate: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            last_persisted_projection_state: Arc::new(RwLock::new(None)),
             projection_lock: Arc::new(tokio::sync::RwLock::new(())),
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
@@ -428,6 +432,13 @@ impl FilesystemSource {
         &self,
         state: ObtsProjectionState,
     ) -> Result<(), FilesystemError> {
+        #[cfg(test)]
+        {
+            *self
+                .last_persisted_projection_state
+                .write()
+                .expect("projection state lock") = Some(state.clone());
+        }
         if let Some(persistence) = self.persistence.as_ref() {
             persistence
                 .save_obts_projection_state(&state)
@@ -880,6 +891,19 @@ pub async fn synchronize_commit_projection(
             .read_index_delta(client, indexed_commit.as_deref())
             .await
             .map_err(|error| FilesystemError::Headless(error.to_string()))?;
+        let (delta, recheck_rebuild) =
+            resolve_projection_delta_for_source(source, delta, || async {
+                guard
+                    .read_index_delta(client, None)
+                    .await
+                    .map_err(|error| FilesystemError::Headless(error.to_string()))
+            })
+            .await?;
+        let recheck_commit = if recheck_rebuild {
+            None
+        } else {
+            indexed_commit.clone()
+        };
         let changed = apply_commit_delta_inner(
             store,
             source,
@@ -887,7 +911,12 @@ pub async fn synchronize_commit_projection(
             delta,
             full_audit,
             hydrate_runtime,
-            Some((guard, client)),
+            Some(async move {
+                guard
+                    .read_index_delta(client, recheck_commit.as_deref())
+                    .await
+                    .map_err(|error| FilesystemError::Headless(error.to_string()))
+            }),
         )
         .await?;
         Ok(changed)
@@ -895,6 +924,44 @@ pub async fn synchronize_commit_projection(
     .await;
     source.record_projection_result(full_audit, &result);
     result
+}
+
+async fn resolve_projection_delta_for_source<F, Fut>(
+    source: &FilesystemSource,
+    delta: crate::headless::HeadlessIndexDelta,
+    fetch_rebuild: F,
+) -> Result<(crate::headless::HeadlessIndexDelta, bool), FilesystemError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<crate::headless::HeadlessIndexDelta, FilesystemError>>,
+{
+    let target = delta.head.clone();
+    let result = resolve_projection_delta(delta, fetch_rebuild).await;
+    if let (Some(target), Err(error)) = (target, &result) {
+        source.record_projection_failure(&target, error).await;
+    }
+    result
+}
+
+async fn resolve_projection_delta<F, Fut>(
+    delta: crate::headless::HeadlessIndexDelta,
+    fetch_rebuild: F,
+) -> Result<(crate::headless::HeadlessIndexDelta, bool), FilesystemError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<crate::headless::HeadlessIndexDelta, FilesystemError>>,
+{
+    if delta.mode != "diverged" {
+        return Ok((delta, false));
+    }
+    info!("projection cursor diverged; rebuilding");
+    let rebuild = fetch_rebuild().await?;
+    if rebuild.mode != "rebuild" || rebuild.base.is_some() {
+        return Err(FilesystemError::InvalidDelta(
+            "diverged projection requires a full rebuild delta".to_string(),
+        ));
+    }
+    Ok((rebuild, true))
 }
 
 pub(crate) async fn apply_commit_delta(
@@ -912,21 +979,30 @@ pub(crate) async fn apply_commit_delta(
         delta,
         full_audit,
         hydrate_runtime,
-        None,
+        None::<std::future::Ready<Result<crate::headless::HeadlessIndexDelta, FilesystemError>>>,
     )
     .await
 }
 
-async fn apply_commit_delta_inner(
+async fn apply_commit_delta_inner<F>(
     store: &VaultStore,
     source: &FilesystemSource,
     indexed_commit: Option<String>,
     delta: crate::headless::HeadlessIndexDelta,
     full_audit: bool,
     hydrate_runtime: bool,
-    mut headless: Option<(&mut HeadlessFilesystemGuard<'_>, &HeadlessClient)>,
-) -> Result<usize, FilesystemError> {
+    recheck: Option<F>,
+) -> Result<usize, FilesystemError>
+where
+    F: std::future::Future<Output = Result<crate::headless::HeadlessIndexDelta, FilesystemError>>,
+{
     let _projection_guard = source.projection_lock.write().await;
+    if delta.mode != "incremental" && delta.mode != "rebuild" {
+        return Err(FilesystemError::InvalidDelta(format!(
+            "unsupported projection mode {}",
+            delta.mode
+        )));
+    }
     let policy = Arc::new(RootIgnorePolicy::read(source.root())?);
     attest_target_policy(&delta, &policy)?;
     store.drain_projection_writes().await;
@@ -937,12 +1013,6 @@ async fn apply_commit_delta_inner(
         ));
     };
     validate_commit_id(&target_commit)?;
-    if delta.mode != "incremental" && delta.mode != "rebuild" {
-        return Err(FilesystemError::InvalidDelta(format!(
-            "unsupported projection mode {}",
-            delta.mode
-        )));
-    }
     if delta.mode == "incremental" && delta.base != indexed_commit {
         return Err(FilesystemError::InvalidDelta(
             "incremental projection base does not match the durable cursor".to_string(),
@@ -992,12 +1062,8 @@ async fn apply_commit_delta_inner(
         }
         source.purge_persisted_raw_content().await?;
         attest_policy_unchanged(source, &policy)?;
-        if let Some((guard, client)) = headless.as_mut() {
-            let latest = guard
-                .read_index_delta(client, indexed_commit.as_deref())
-                .await
-                .map_err(|error| FilesystemError::Headless(error.to_string()))?;
-            if latest != delta {
+        if let Some(recheck) = recheck {
+            if recheck.await? != delta {
                 return Err(FilesystemError::ProjectionChanged);
             }
         }
@@ -1823,9 +1889,10 @@ mod tests {
     use crate::store::VaultStore;
 
     use super::{
-        FilesystemError, FilesystemSource, apply_commit_delta, attest_policy_unchanged,
-        git_blob_oid, hydrate_runtime_snapshot, project_file, projection_required,
-        projection_retry_delay, synchronize_snapshot,
+        FilesystemError, FilesystemSource, apply_commit_delta, apply_commit_delta_inner,
+        attest_policy_unchanged, git_blob_oid, hydrate_runtime_snapshot, project_file,
+        projection_required, projection_retry_delay, resolve_projection_delta,
+        resolve_projection_delta_for_source, synchronize_snapshot,
     };
 
     #[tokio::test]
@@ -2129,6 +2196,278 @@ mod tests {
         );
         assert_eq!(store.indexed_vault_file_revisions().await.len(), 1);
         assert!(root.path().join("Local.md").exists());
+    }
+
+    #[tokio::test]
+    async fn diverged_cursor_rebuilds_without_audit_or_hydration_and_cleans_superseded_rows() {
+        let root = tempdir().unwrap();
+        let source = FilesystemSource::new(root.path()).unwrap();
+        let store = VaultStore::new(10);
+        fs::write(root.path().join("old.md"), "old").unwrap();
+        let old = "1".repeat(40);
+        apply_commit_delta(
+            &store,
+            &source,
+            None,
+            HeadlessIndexDelta {
+                head: Some(old.clone()),
+                base: None,
+                mode: "rebuild".into(),
+                files: vec![HeadlessIndexFile {
+                    path: "old.md".into(),
+                    oid: git_blob_oid(b"old"),
+                }],
+                changes: vec![],
+            },
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        fs::remove_file(root.path().join("old.md")).unwrap();
+        fs::write(root.path().join("new.md"), "new").unwrap();
+        let head = "2".repeat(40);
+        let (delta, rebuilt) = resolve_projection_delta(
+            HeadlessIndexDelta {
+                head: Some(head.clone()),
+                base: Some(old.clone()),
+                mode: "diverged".into(),
+                files: vec![],
+                changes: vec![],
+            },
+            || async {
+                assert_eq!(source.indexed_commit(), Some(old.clone()));
+                Ok(HeadlessIndexDelta {
+                    head: Some(head.clone()),
+                    base: None,
+                    mode: "rebuild".into(),
+                    files: vec![HeadlessIndexFile {
+                        path: "new.md".into(),
+                        oid: git_blob_oid(b"new"),
+                    }],
+                    changes: vec![],
+                })
+            },
+        )
+        .await
+        .unwrap();
+        assert!(rebuilt);
+        assert_eq!(source.indexed_commit(), Some(old.clone()));
+        assert_eq!(
+            apply_commit_delta(&store, &source, Some(old), delta, false, false)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(source.indexed_commit(), Some(head));
+        assert_eq!(
+            store
+                .indexed_vault_file_revisions()
+                .await
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["new.md"]
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_recheck_rejects_changed_head_and_retains_cursor() {
+        let root = tempdir().unwrap();
+        let source = FilesystemSource::new(root.path()).unwrap();
+        let store = VaultStore::new(10);
+        fs::write(root.path().join("note.md"), "original").unwrap();
+        let old = "1".repeat(40);
+        let files = vec![HeadlessIndexFile {
+            path: "note.md".into(),
+            oid: git_blob_oid(b"original"),
+        }];
+        apply_commit_delta(
+            &store,
+            &source,
+            None,
+            HeadlessIndexDelta {
+                head: Some(old.clone()),
+                base: None,
+                mode: "rebuild".into(),
+                files: files.clone(),
+                changes: vec![],
+            },
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let head = "2".repeat(40);
+        let rebuild = HeadlessIndexDelta {
+            head: Some(head.clone()),
+            base: None,
+            mode: "rebuild".into(),
+            files: files.clone(),
+            changes: vec![],
+        };
+        let changed_head = HeadlessIndexDelta {
+            head: Some("3".repeat(40)),
+            ..rebuild.clone()
+        };
+        assert!(matches!(
+            apply_commit_delta_inner(
+                &store,
+                &source,
+                Some(old.clone()),
+                rebuild,
+                false,
+                false,
+                Some(async move { Ok(changed_head) }),
+            )
+            .await,
+            Err(FilesystemError::ProjectionChanged)
+        ));
+        assert_eq!(source.indexed_commit(), Some(old.clone()));
+        let recorded = source
+            .last_persisted_projection_state
+            .read()
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert_eq!(recorded.indexed_commit, Some(old));
+        assert_eq!(recorded.target_commit, Some(head));
+        assert_eq!(recorded.failure_code.as_deref(), Some("projection_changed"));
+    }
+
+    #[tokio::test]
+    async fn diverged_fetch_and_failed_rebuild_retain_previous_cursor() {
+        let root = tempdir().unwrap();
+        let source = FilesystemSource::new(root.path()).unwrap();
+        let store = VaultStore::new(10);
+        fs::write(root.path().join("note.md"), "original").unwrap();
+        let old = "1".repeat(40);
+        apply_commit_delta(
+            &store,
+            &source,
+            None,
+            HeadlessIndexDelta {
+                head: Some(old.clone()),
+                base: None,
+                mode: "rebuild".into(),
+                files: vec![HeadlessIndexFile {
+                    path: "note.md".into(),
+                    oid: git_blob_oid(b"original"),
+                }],
+                changes: vec![],
+            },
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let divergent = HeadlessIndexDelta {
+            head: Some("2".repeat(40)),
+            base: Some(old.clone()),
+            mode: "diverged".into(),
+            files: vec![],
+            changes: vec![],
+        };
+        assert!(matches!(
+            resolve_projection_delta_for_source(&source, divergent.clone(), || async {
+                Err(FilesystemError::Headless("unavailable".into()))
+            })
+            .await,
+            Err(FilesystemError::Headless(_))
+        ));
+        assert_eq!(source.indexed_commit(), Some(old.clone()));
+        let recorded = source
+            .last_persisted_projection_state
+            .read()
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert_eq!(recorded.indexed_commit, Some(old.clone()));
+        assert_eq!(recorded.target_commit, Some("2".repeat(40)));
+        assert_eq!(recorded.failure_code.as_deref(), Some("headless_error"));
+        assert!(matches!(
+            resolve_projection_delta_for_source(&source, divergent.clone(), || async {
+                Ok(HeadlessIndexDelta {
+                    head: Some("3".repeat(40)),
+                    mode: "incremental".into(),
+                    ..divergent.clone()
+                })
+            })
+            .await,
+            Err(FilesystemError::InvalidDelta(_))
+        ));
+        let recorded = source
+            .last_persisted_projection_state
+            .read()
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert_eq!(recorded.indexed_commit, Some(old.clone()));
+        assert_eq!(recorded.target_commit, Some("2".repeat(40)));
+        assert_eq!(recorded.failure_code.as_deref(), Some("invalid_delta"));
+        let (bad_rebuild, _) = resolve_projection_delta(divergent, || async {
+            Ok(HeadlessIndexDelta {
+                head: Some("2".repeat(40)),
+                base: None,
+                mode: "rebuild".into(),
+                files: vec![HeadlessIndexFile {
+                    path: "note.md".into(),
+                    oid: git_blob_oid(b"wrong"),
+                }],
+                changes: vec![],
+            })
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            apply_commit_delta(&store, &source, Some(old.clone()), bad_rebuild, true, true).await,
+            Err(FilesystemError::CommitContentMismatch { .. })
+        ));
+        assert_eq!(source.indexed_commit(), Some(old));
+    }
+
+    #[tokio::test]
+    async fn unexpected_mode_is_rejected_before_policy_attestation() {
+        let root = tempdir().unwrap();
+        let source = FilesystemSource::new(root.path()).unwrap();
+        let store = VaultStore::new(10);
+        fs::write(root.path().join(".gitignore"), "*.md\n").unwrap();
+        for mode in ["unknown", "diverged"] {
+            let result = apply_commit_delta(
+                &store,
+                &source,
+                None,
+                HeadlessIndexDelta {
+                    head: Some("1".repeat(40)),
+                    base: None,
+                    mode: mode.into(),
+                    files: vec![],
+                    changes: vec![],
+                },
+                false,
+                false,
+            )
+            .await;
+            assert!(matches!(result, Err(FilesystemError::InvalidDelta(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn incremental_delta_does_not_fetch_rebuild() {
+        let delta = HeadlessIndexDelta {
+            head: Some("2".repeat(40)),
+            base: Some("1".repeat(40)),
+            mode: "incremental".into(),
+            files: vec![],
+            changes: vec![],
+        };
+        let (resolved, rebuilt) = resolve_projection_delta(delta.clone(), || async {
+            panic!("incremental delta must not request a rebuild")
+        })
+        .await
+        .unwrap();
+        assert_eq!(resolved, delta);
+        assert!(!rebuilt);
     }
 
     #[tokio::test]
