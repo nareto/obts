@@ -244,6 +244,15 @@ function createDataAdapterFs(adapter) {
     }
   };
 
+  if (typeof adapter.readBinaryRange === "function") {
+    promises.readFileRange = async (filePath, position, length) => {
+      if (!Number.isSafeInteger(position) || position < 0 || !Number.isSafeInteger(length) || length < 0 || length > 256) {
+        throw new RangeError("Invalid bounded read range.");
+      }
+      return Buffer.from(await adapter.readBinaryRange(adapterPath(filePath), position, length));
+    };
+  }
+
   return { promises };
 }
 

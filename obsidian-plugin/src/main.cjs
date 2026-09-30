@@ -7,6 +7,7 @@ const path = require("path-browserify");
 const createSha = require("sha.js");
 const { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require("./data-adapter-fs.cjs");
 const { createByteBudget, runBoundedWork } = require("./work-pool.cjs");
+const { blobSizeFromGit } = require("./blob-size-reader.cjs");
 const { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require("../../src/shared/rootIgnore.cjs");
 
 const API_VERSION = obtsRuntime.obtsApiVersion || "__OBTS_API_VERSION__";
@@ -4383,7 +4384,9 @@ class ObtsObsidianClient {
     const deferredPaths = validation.matches
       ? new Set(journal.deferred_local_paths || [])
       : this.expandDeferredDivergedPaths(journal, validation.targetMatchedPaths, validation.divergedPaths);
-    return await this.completeInterruptedApply(journal, state, targetEntries, validation, deferredPaths);
+    const targetFileSizes = await this.recoverJournalTargetSizes(journal, targetEntries, validation.targetMatchedPaths, deferredPaths);
+    if (!targetFileSizes) return false;
+    return await this.completeInterruptedApply(journal, state, targetEntries, validation, deferredPaths, targetFileSizes);
   }
 
   async recoverDivergedApplyWithPreservedLocalChanges(journal, state) {
@@ -4399,13 +4402,37 @@ class ObtsObsidianClient {
     // holds content the user changed while the apply was interrupted. Preserve
     // those bytes and complete the operation around them; empty divergence is
     // an ordinary resume.
-    return await this.completeInterruptedApply(
-      journal,
-      state,
-      targetEntries,
-      validation,
-      this.expandDeferredDivergedPaths(journal, validation.targetMatchedPaths, validation.divergedPaths)
+    const deferredPaths = this.expandDeferredDivergedPaths(journal, validation.targetMatchedPaths, validation.divergedPaths);
+    const targetFileSizes = await this.recoverJournalTargetSizes(journal, targetEntries, validation.targetMatchedPaths, deferredPaths);
+    if (!targetFileSizes) return false;
+    return await this.completeInterruptedApply(journal, state, targetEntries, validation, deferredPaths, targetFileSizes);
+  }
+
+  async recoverJournalTargetSizes(journal, targetEntries, targetMatchedPaths, deferredPaths) {
+    try {
+      return await this.backfillApplyJournalTargetSizes(journal, targetEntries, targetMatchedPaths, deferredPaths);
+    } catch {
+      journal.redacted_error_category = "target_blob_size_unavailable";
+      await writeJson(this.fsp, this.applyJournalPath, journal);
+      return null;
+    }
+  }
+
+  async backfillApplyJournalTargetSizes(journal, targetEntries, targetMatchedPaths, deferredPaths) {
+    const excluded = [...targetMatchedPaths, ...(journal.deferred_local_paths || []), ...deferredPaths];
+    const writes = journal.affected_paths.filter((filePath) =>
+      targetEntries.has(filePath) && !excluded.some((deferred) => changedPathsConflict(deferred, filePath))
     );
+    const sizes = Object.assign({}, journal.target_file_sizes || {});
+    for (const filePath of writes) {
+      if (Number.isSafeInteger(sizes[filePath]) && sizes[filePath] >= 0) continue;
+      const size = await blobSizeFromGit(this.fsp, this.gitdir, targetEntries.get(filePath));
+      if (!Number.isSafeInteger(size) || size < 0 || size > this.fileBufferBudgetBytes) {
+        throw new ObtsBlockedError("target_blob_size_unavailable", "The server did not provide a bounded size for a target file.");
+      }
+      sizes[filePath] = size;
+    }
+    return sizes;
   }
 
   expandDeferredDivergedPaths(journal, targetMatchedPaths, divergedPaths) {
@@ -4435,7 +4462,7 @@ class ObtsObsidianClient {
     return new Set(deferred);
   }
 
-  async completeInterruptedApply(journal, state, targetEntries, validation, deferredDivergedPaths) {
+  async completeInterruptedApply(journal, state, targetEntries, validation, deferredDivergedPaths, targetFileSizes) {
     const preservedDeferredPaths = new Set([
       ...(journal.deferred_local_paths || []),
       ...(deferredDivergedPaths || [])
@@ -4470,7 +4497,8 @@ class ObtsObsidianClient {
       await this.writeTargetFilesFromJournal(
         journal,
         targetEntries,
-        new Set([...validation.targetMatchedPaths, ...preservedDeferredPaths])
+        new Set([...validation.targetMatchedPaths, ...preservedDeferredPaths]),
+        targetFileSizes
       );
       const residualTombstoneDirectories = await this.applyDirectoryChanges(
         journal.directory_intents || [],
@@ -4934,7 +4962,7 @@ class ObtsObsidianClient {
     return { matches: divergedPaths.length === 0, targetMatchedPaths, divergedPaths };
   }
 
-  async writeTargetFilesFromJournal(journal, targetEntries, targetMatchedPaths) {
+  async writeTargetFilesFromJournal(journal, targetEntries, targetMatchedPaths, targetFileSizes = journal.target_file_sizes || {}) {
     if (journal.journal_version >= 5 && !(await this.validateApplyJournalPolicy(journal))) {
       throw new ObtsBlockedError("target_policy_changed", "The pinned target policy or retained local-only paths changed.");
     }
@@ -5039,7 +5067,7 @@ class ObtsObsidianClient {
     await this.writeTargetFileBatch(
       writes,
       targetEntries,
-      journal.target_file_sizes || {},
+      targetFileSizes,
       journal,
       assertRecoveredDescendants,
       assertCurrentPreflight,

@@ -4,6 +4,7 @@ import {
   mkdir,
   open,
   readFile,
+  realpath,
   readdir,
   rename,
   rm,
@@ -11,7 +12,7 @@ import {
   unlink,
   writeFile
 } from 'node:fs/promises';
-import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 
 export type AdapterStat = {
   type: 'file' | 'folder';
@@ -31,6 +32,36 @@ export class NodeDataAdapter {
   async readBinary(adapterPath: string): Promise<ArrayBuffer> {
     const data = await readFile(this.resolvePath(adapterPath));
     return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+  }
+
+  async readBinaryRange(adapterPath: string, position: number, length: number): Promise<ArrayBuffer> {
+    if (!Number.isSafeInteger(position) || position < 0 || !Number.isSafeInteger(length) || length < 0 || length > 256) {
+      throw new RangeError('Invalid bounded read range.');
+    }
+    if (!constants.O_NOFOLLOW) throw new Error('Ranged reads require O_NOFOLLOW.');
+    const target = this.resolvePath(adapterPath);
+    const parent = dirname(target);
+    const expectedParent = async () => resolve(await realpath(this.root), relative(this.root, parent));
+    const confined = async () => (await realpath(parent)) === await expectedParent();
+    if (!await confined()) throw new Error('Ranged read crosses a symlink.');
+    const before = await lstat(target);
+    if (!before.isFile()) throw new Error('Ranged read requires a regular file.');
+    const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const opened = await handle.stat();
+      if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || !await confined()) {
+        throw new Error('Ranged read target changed while opening.');
+      }
+      const data = Buffer.alloc(length);
+      const { bytesRead } = await handle.read(data, 0, length, position);
+      const after = await lstat(target);
+      if (!after.isFile() || after.dev !== opened.dev || after.ino !== opened.ino || !await confined()) {
+        throw new Error('Ranged read target changed while reading.');
+      }
+      return data.buffer.slice(data.byteOffset, data.byteOffset + bytesRead) as ArrayBuffer;
+    } finally {
+      await handle.close();
+    }
   }
 
   async readRootIgnorePolicyNoFollow(maxBytes: number): Promise<ArrayBuffer | null> {

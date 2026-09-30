@@ -21,11 +21,126 @@ async function clientFixture(): Promise<{ root: string; plugin: ObtsPluginClient
   return { root, plugin, core: (plugin as any).client };
 }
 
+async function interruptedSizeJournalFixture() {
+  const { root, core } = await clientFixture();
+  await writeFile(join(root, 'shared.md'), 'target bytes\n');
+  const target = await core.createLocalCommit('target for size backfill');
+  const entries = await core.listTreeBlobOids(target);
+  await writeFile(join(root, 'shared.md'), 'local bytes\n');
+  const preflight = await core.readRecoveryFileSnapshot('shared.md');
+  const journal = {
+    journal_version: 6, apply_id: 'apply_size_backfill', operation_type: 'pull_apply',
+    target_main: target, target_file_sizes: {}, expected_prior_local_main: null,
+    expected_prior_local_device_ref: null, phase: 'writing_files', affected_paths: ['shared.md'],
+    preflight_sha256: { 'shared.md': preflight.fingerprint.sha256 },
+    preflight_fingerprints: { 'shared.md': preflight.fingerprint },
+    directory_intents: [], explicit_directories: [], pre_apply_directories: [],
+    pre_apply_directory_ctimes: {}, confirmed_directory_roots: [], confirmed_directory_inventory: null,
+    preserve_local_changes: false, event_seq: null, recovery_bundle_id: 'rec_size_backfill',
+    last_completed_step: 'recovery_bundle', redacted_error_category: null,
+    target_root_ignore_oid: null, local_only_paths: [], local_only_presence: {}, deferred_local_paths: []
+  };
+  const journalPath = join(root, '.obts/apply-journal.json');
+  await writeFile(journalPath, `${JSON.stringify(journal)}\n`);
+  await publishRecoveryFixture(root);
+  const bundleId = JSON.parse(await readFile(journalPath, 'utf8')).recovery_bundle_id;
+  return { root, core, journalPath, entries, bundleId };
+}
+
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
 describe('large-vault client checkpoints', () => {
+  it('resumes a version-6 journal from an immutable empty-size recovery bundle without persisting derived sizes', async () => {
+    const { root, core, entries, journalPath, bundleId } = await interruptedSizeJournalFixture();
+    const restarted = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'size-backfill' });
+    const resumed = (restarted as any).client;
+    const originalWrite = resumed.writeTargetFileBatch.bind(resumed);
+    let passedSizes: Record<string, number> | null = null;
+    let persisted: Record<string, number> | null = null;
+    resumed.writeTargetFileBatch = async (...args: any[]) => {
+      passedSizes = args[2];
+      persisted = JSON.parse(await readFile(journalPath, 'utf8')).target_file_sizes;
+      return originalWrite(...args);
+    };
+    await restarted.initialize();
+    expect(passedSizes).toEqual({ 'shared.md': Buffer.byteLength('target bytes\n') });
+    expect(persisted).toEqual({});
+    expect(JSON.parse(await readFile(join(root, '.obts/recovery', bundleId, 'journal/apply-journal.json'), 'utf8')).target_file_sizes)
+      .toEqual({});
+    expect(await readFile(join(root, 'shared.md'), 'utf8')).toBe('target bytes\n');
+    expect(await readFile(journalPath, 'utf8').catch(() => null)).toBeNull();
+
+    await expect(core.writeTargetFileBatch(
+      ['shared.md'], entries, { 'shared.md': 1 }, {}, async () => undefined,
+      async () => undefined, () => undefined
+    )).rejects.toMatchObject({ code: 'target_blob_size_mismatch' });
+  });
+
+  it('restarts after a failed target write without changing the immutable size map', async () => {
+    const { root, journalPath } = await interruptedSizeJournalFixture();
+    const first = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'size-backfill' });
+    const firstCore = (first as any).client;
+    firstCore.writeTargetFileBatch = vi.fn(async () => { throw new Error('synthetic interrupted target write'); });
+    await first.initialize();
+    expect(firstCore.writeTargetFileBatch).toHaveBeenCalledOnce();
+    expect(JSON.parse(await readFile(journalPath, 'utf8')).target_file_sizes).toEqual({});
+    const restarted = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'size-backfill' });
+    await restarted.initialize();
+    expect(await readFile(join(root, 'shared.md'), 'utf8')).toBe('target bytes\n');
+    expect(await readFile(journalPath, 'utf8').catch(() => null)).toBeNull();
+  });
+
+  it('blocks startup without ranged reads without materializing objects for size discovery', async () => {
+    const { root, journalPath } = await interruptedSizeJournalFixture();
+    const restarted = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'size-backfill' });
+    const core = (restarted as any).client;
+    const original = core.backfillApplyJournalTargetSizes.bind(core);
+    const readBinary = core.adapter.readBinary.bind(core.adapter);
+    let deriving = false;
+    const materialized: string[] = [];
+    core.backfillApplyJournalTargetSizes = async (...args: any[]) => {
+      deriving = true;
+      try { return await original(...args); } finally { deriving = false; }
+    };
+    core.adapter.readBinary = async (filePath: string) => {
+      if (deriving && filePath.startsWith('.obts/git/objects/')) materialized.push(filePath);
+      return readBinary(filePath);
+    };
+    core.fsp.readFileRange = undefined;
+    await restarted.initialize();
+    expect(materialized).toEqual([]);
+    expect(JSON.parse(await readFile(journalPath, 'utf8'))).toMatchObject({
+      target_file_sizes: {}, redacted_error_category: 'target_blob_size_unavailable'
+    });
+    expect(await readFile(join(root, 'shared.md'), 'utf8')).toBe('local bytes\n');
+  });
+
+  it('fails closed at startup when size discovery throws unexpectedly', async () => {
+    const { root, journalPath } = await interruptedSizeJournalFixture();
+    const restarted = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'size-backfill' });
+    (restarted as any).client.fsp.readFileRange = async () => { throw new Error('unexpected ranged read failure'); };
+    await restarted.initialize();
+    expect(JSON.parse(await readFile(journalPath, 'utf8'))).toMatchObject({
+      target_file_sizes: {}, redacted_error_category: 'target_blob_size_unavailable'
+    });
+    expect(await readFile(join(root, 'shared.md'), 'utf8')).toBe('local bytes\n');
+  });
+
+  it('blocks missing objects without persisting a partial derived map', async () => {
+    const { root, core } = await clientFixture();
+    await writeFile(join(root, 'available.md'), 'present\n');
+    const target = await core.createLocalCommit('partial backfill target');
+    const available = (await core.listTreeBlobOids(target)).get('available.md');
+    const journal = { affected_paths: ['available.md', 'note.md'], target_file_sizes: {} };
+    const entries = new Map([['available.md', available], ['note.md', 'f'.repeat(40)]]);
+    await expect(core.backfillApplyJournalTargetSizes(
+      journal, entries, new Set(), new Set()
+    )).rejects.toMatchObject({ code: 'target_blob_size_unavailable' });
+    expect(journal.target_file_sizes).toEqual({});
+  });
+
   it('rejects an oversized target blob before materializing it', async () => {
     const { core } = await clientFixture();
     core.fileBufferBudgetBytes = 4;
