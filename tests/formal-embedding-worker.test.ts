@@ -55,13 +55,15 @@ describe('FM003 embedding-worker companion gate', () => {
       'node scripts/check-onboarding-model.mjs',
       'node scripts/check-onboarding-recovery-model.mjs',
       'node scripts/check-diagnostic-admission-model.mjs',
-      'node scripts/check-client-state-model.mjs'
+      'node scripts/check-client-state-model.mjs',
+      'node scripts/check-vault-settings-model.mjs'
     ]);
     expect(scripts['test:formal:bridge'].split(' && ')).toEqual([
       'node scripts/check-bridge-bounded-model.mjs',
       'node scripts/check-bridge-bounded-model.mjs --worker-companion',
       'node scripts/check-bridge-external-protocol.mjs'
     ]);
+    expect(scripts['test:formal:vault-settings']).toBe('node scripts/check-vault-settings-model.mjs');
     expect(scripts['test:formal:onboarding']).toBe('node scripts/check-onboarding-model.mjs && node scripts/check-onboarding-recovery-model.mjs');
     expect(scripts['test:bridge:stack']).toContain('node scripts/check-bridge-stack.mjs');
     const workflow = readFileSync(join(root, '.github/workflows/formal-model.yml'), 'utf8');
@@ -70,6 +72,7 @@ describe('FM003 embedding-worker companion gate', () => {
     expect(workflow).toContain('max-parallel: 2');
     expect(workflow).toContain('bridge-body) npm run test:formal:bridge-body');
     expect(workflow).toContain('workers) npm run test:formal:workers');
+    expect(workflow).toContain('vault-settings) npm run test:formal:vault-settings');
     expect(workflow).not.toContain('  push:');
     expect(coordinator).toContain('VITEST_GROUP=checker npx vitest run');
     expect(coordinator).toContain('npm run test:formal:metadata');
