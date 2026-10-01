@@ -3,10 +3,11 @@ import { mkdtemp, readFile, readdir, rename, rm, stat, utimes, writeFile } from 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import git from 'isomorphic-git';
 import { publishRecoveryFixture } from './helpers/publishRecoveryFixture.js';
 
+import { NodeDataAdapter } from '../src/client/nodeDataAdapter.js';
 import { ObtsPluginClient, PluginBlockedError } from '../obsidian-plugin/src/core/client.js';
 import { LocalGitEngine } from '../obsidian-plugin/src/core/localGit.js';
 import { TransportClient } from '../obsidian-plugin/src/core/transport.js';
@@ -680,6 +681,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       expect.arrayContaining(['during-upload.md', 'first.md'])
     );
     expect(await readFile(join(deviceDir, 'first.md'), 'utf8')).toBe(editExisting ? 'newer accepted edit\n' : 'first upload\n');
+    expect((await server.git.readBlobAtPath(admin.vaultId, finalMain!, 'first.md')).toString()).toBe(editExisting ? 'newer accepted edit\n' : 'first upload\n');
     await expect(stat(join(deviceDir, '.obts', 'pull-transfer.json'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
@@ -947,47 +949,63 @@ describe('Phase 1 sync without conflict resolution', () => {
   });
 
   it('syncs folder delete tombstones without pruning individually emptied folders', async () => {
-    const admin = await setupAdminAndVault(baseUrl);
-    const desktopDir = join(root, 'folder-delete-desktop');
-    const phoneDir = join(root, 'folder-delete-phone');
-    await mkdirp(desktopDir);
-    await mkdirp(phoneDir);
-    await mkdirp(join(desktopDir, 'Delete Me', 'nested', 'deeper'));
-    await mkdirp(join(desktopDir, 'Delete Me', 'empty-sibling', 'leaf'));
-    await mkdirp(join(desktopDir, 'Keep Shell'));
-    await writeFile(join(desktopDir, 'Delete Me', 'nested', 'deeper', 'note.md'), 'delete me\n');
-    await writeFile(join(desktopDir, 'Keep Shell', 'note.md'), 'keep shell\n');
-    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
-    expect((await desktop.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
-    const phone = await pairPlugin(admin, phoneDir, 'phone');
-
-    await rm(join(desktopDir, 'Delete Me'), { recursive: true, force: true });
-    await rm(join(desktopDir, 'Keep Shell', 'note.md'));
-    expect((await desktop.syncOnce()).status).toBe('Synced');
-    const phoneInternal = (phone as unknown as { client: { adapter: { rmdir: (path: string, recursive: boolean) => Promise<void> } } }).client;
-    const originalRmdir = phoneInternal.adapter.rmdir.bind(phoneInternal.adapter);
+    const originalRmdir = NodeDataAdapter.prototype.rmdir;
+    let phoneAdapter: NodeDataAdapter | undefined;
+    let armed = false;
     const recursiveDeleteFlags: boolean[] = [];
+    const deletedPaths: string[] = [];
+    let failedPath: string | undefined;
     let injectedRmdirFailure = false;
-    phoneInternal.adapter.rmdir = async (path, recursive) => {
-      if (path === 'Delete Me' || path.startsWith('Delete Me/')) {
+    const rmdirSpy = vi.spyOn(NodeDataAdapter.prototype, 'rmdir').mockImplementation(async function (this: NodeDataAdapter, path, recursive = false) {
+      if (armed && this === phoneAdapter && (path === 'Delete Me' || path.startsWith('Delete Me/'))) {
         recursiveDeleteFlags.push(recursive);
+        deletedPaths.push(path);
         if (!injectedRmdirFailure) {
           injectedRmdirFailure = true;
+          failedPath = path;
           const error = new Error('simulated transient directory adapter failure') as Error & { code?: string };
           error.code = 'EIO';
           throw error;
         }
       }
-      await originalRmdir(path, recursive);
-    };
-    expect((await phone.syncOnce()).status).toBe('Synced');
+      await originalRmdir.call(this, path, recursive);
+    });
+    try {
+      const admin = await setupAdminAndVault(baseUrl);
+      const desktopDir = join(root, 'folder-delete-desktop');
+      const phoneDir = join(root, 'folder-delete-phone');
+      await mkdirp(desktopDir);
+      await mkdirp(phoneDir);
+      await mkdirp(join(desktopDir, 'Delete Me', 'nested', 'deeper'));
+      await mkdirp(join(desktopDir, 'Delete Me', 'empty-sibling', 'leaf'));
+      await mkdirp(join(desktopDir, 'Keep Shell'));
+      await writeFile(join(desktopDir, 'Delete Me', 'nested', 'deeper', 'note.md'), 'delete me\n');
+      await writeFile(join(desktopDir, 'Keep Shell', 'note.md'), 'keep shell\n');
+      const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+      expect((await desktop.syncOnce({ confirmInitialImport: true })).status).toBe('Synced');
+      const phone = await pairPlugin(admin, phoneDir, 'phone');
 
-    expect(injectedRmdirFailure).toBe(true);
-    expect(recursiveDeleteFlags.length).toBeGreaterThan(1);
-    expect(recursiveDeleteFlags.every((recursive) => recursive === false)).toBe(true);
-    expect(await exists(join(phoneDir, 'Delete Me'))).toBe(false);
-    expect(await isDirectory(join(phoneDir, 'Keep Shell'))).toBe(true);
-    expect(await exists(join(phoneDir, 'Keep Shell', 'note.md'))).toBe(false);
+      // This tests ordinary tombstones, not an old editor save in the apply horizon.
+      await new Promise((resolve) => setTimeout(resolve, 3100));
+      expect((await desktop.syncOnce()).status).toBe('Synced');
+      await rm(join(desktopDir, 'Delete Me'), { recursive: true, force: true });
+      await rm(join(desktopDir, 'Keep Shell', 'note.md'));
+      expect((await desktop.syncOnce()).status).toBe('Synced');
+      const phoneInternal = (phone as unknown as { client: { adapter: NodeDataAdapter } }).client;
+      phoneAdapter = phoneInternal.adapter;
+      armed = true;
+      expect((await phone.syncOnce()).status).toBe('Synced');
+
+      expect(injectedRmdirFailure).toBe(true);
+      expect(recursiveDeleteFlags.length).toBeGreaterThan(1);
+      expect(deletedPaths.filter((path) => path === failedPath).length).toBeGreaterThan(1);
+      expect(recursiveDeleteFlags.every((recursive) => recursive === false)).toBe(true);
+      expect(await exists(join(phoneDir, 'Delete Me'))).toBe(false);
+      expect(await isDirectory(join(phoneDir, 'Keep Shell'))).toBe(true);
+      expect(await exists(join(phoneDir, 'Keep Shell', 'note.md'))).toBe(false);
+    } finally {
+      rmdirSpy.mockRestore();
+    }
   });
 
   it('does not resurrect a deleted nested folder hierarchy from another device', async () => {
@@ -1033,6 +1051,9 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect((await receiver.syncOnce()).status).toBe('Synced');
     expect(await isDirectory(join(receiverDir, 'mainvault', 'Nested', 'Empty Leaf'))).toBe(true);
 
+    // Exercise ordinary directory moves after the conservative apply horizon.
+    await new Promise((resolve) => setTimeout(resolve, 3100));
+    expect((await source.syncOnce()).status).toBe('Synced');
     await mkdirp(join(sourceDir, '.trash'));
     await rename(join(sourceDir, 'mainvault'), join(sourceDir, '.trash', 'mainvault'));
     expect((await source.syncOnce()).status).toBe('Synced');
@@ -1138,6 +1159,9 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect((await receiver.syncOnce()).status).toBe('Synced');
     expect(await isDirectory(join(receiverDir, 'mainvault', 'Nested'))).toBe(true);
 
+    // Exercise ordinary directory moves after the conservative apply horizon.
+    await new Promise((resolve) => setTimeout(resolve, 3100));
+    expect((await source.syncOnce()).status).toBe('Synced');
     await mkdirp(join(sourceDir, '.trash'));
     await rename(join(sourceDir, 'mainvault'), join(sourceDir, '.trash', 'mainvault'));
     expect((await source.syncOnce()).status).toBe('Synced');
@@ -1483,7 +1507,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await exists(join(receiverDir, 'Crash Tree'))).toBe(true);
     expect(await exists(join(receiverDir, 'Crash Tree', 'Nested', 'note.md'))).toBe(false);
     expect(JSON.parse(await readFile(join(receiverDir, '.obts', 'apply-journal.json'), 'utf8'))).toMatchObject({
-      journal_version: 6,
+      journal_version: 7,
       phase: 'writing_files',
       directory_intents: [{ op: 'delete', path: 'Crash Tree' }],
       preserve_local_changes: true
@@ -1588,7 +1612,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       phase: string;
       event_seq: number;
     };
-    expect(committedJournal).toMatchObject({ journal_version: 6, phase: 'committed', event_seq: expect.any(Number) });
+    expect(committedJournal).toMatchObject({ journal_version: 7, phase: 'committed', event_seq: expect.any(Number) });
     expect(await exists(join(receiverDir, 'Committed Tree'))).toBe(false);
 
     const restarted = new ObtsPluginClient(receiverDir, { serverUrl: baseUrl, deviceName: 'committed-tombstone-receiver' });
@@ -1789,20 +1813,13 @@ describe('Phase 1 sync without conflict resolution', () => {
       return result;
     };
 
-    const firstFixtureBSync = await fixtureB.syncOnce();
-    expect(firstFixtureBSync.status).toBe('Checking');
+    expect((await fixtureB.syncOnce()).status).toBe('Conflict resolution needed');
     expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('fixtureB must survive\n');
-    expect(await fixtureB.readQueue()).toMatchObject({
-      pending_commit: null,
-      status: 'queued_local'
-    });
-
-    const secondFixtureBSync = await fixtureB.syncOnce();
-    expect(secondFixtureBSync.status).toBe('Synced');
-    expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('fixtureB must survive\n');
-    const finalMain = (await fixtureB.readState()).local_main!;
-    expect((await server.git.readBlobAtPath(admin.vaultId, finalMain, 'shared.md')).toString('utf8'))
-      .toBe('fixtureB must survive\n');
+    const queue = await fixtureB.readQueue();
+    expect(queue).toMatchObject({ status: 'conflicted', pending_proposal_base: expect.any(String) });
+    const main = await server.git.getRef(admin.vaultId, 'refs/heads/main');
+    expect((await server.git.readBlobAtPath(admin.vaultId, main!, 'shared.md')).toString()).toBe('fixtureA accepted\n');
+    expect((await server.git.readBlobAtPath(admin.vaultId, queue.pending_commit!, 'shared.md')).toString()).toBe('fixtureB must survive\n');
   });
 
   it('flushes dirty open editor content before applying remote main', async () => {
@@ -1851,6 +1868,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     const fixtureB = await pairPlugin(admin, fixtureBDir, 'fixtureB-prep');
     expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('base\n');
 
+    const authoringBase = (await fixtureB.readState()).local_main!;
     await writeFile(join(fixtureADir, 'shared.md'), 'fixtureA accepted\n');
     expect((await fixtureA.syncOnce()).status).toBe('Synced');
 
@@ -1866,21 +1884,20 @@ describe('Phase 1 sync without conflict resolution', () => {
       return await originalStageRecoveryBundle(...args);
     };
 
-    const firstFixtureBSync = await fixtureB.syncOnce();
-    expect(firstFixtureBSync.status).toBe('Checking');
+    const result = await fixtureB.syncOnce();
+    expect(result.status).toBe('Conflict resolution needed');
     expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('fixtureB during apply prep\n');
     expect(await exists(join(fixtureBDir, '.obts', 'apply-journal.json'))).toBe(false);
-    expect(await fixtureB.readQueue()).toMatchObject({
-      status: 'queued_local'
-    });
-    expect((await fixtureB.readState()).local_main).not.toBeNull();
-
-    const secondFixtureBSync = await fixtureB.syncOnce();
-    expect(secondFixtureBSync.status).toBe('Synced');
-    expect(await readFile(join(fixtureBDir, 'shared.md'), 'utf8')).toBe('fixtureB during apply prep\n');
-    const finalMain = (await fixtureB.readState()).local_main!;
-    expect((await server.git.readBlobAtPath(admin.vaultId, finalMain, 'shared.md')).toString('utf8'))
+    const queue = await fixtureB.readQueue();
+    expect(queue).toMatchObject({ status: 'conflicted', pending_proposal_base: authoringBase });
+    const currentMain = await server.git.getRef(admin.vaultId, 'refs/heads/main');
+    expect((await server.git.readBlobAtPath(admin.vaultId, currentMain!, 'shared.md')).toString())
+      .toBe('fixtureA accepted\n');
+    expect((await server.git.readBlobAtPath(admin.vaultId, queue.pending_commit!, 'shared.md')).toString())
       .toBe('fixtureB during apply prep\n');
+    const review = await admin.get<{ conflict: { base_commit: string; expected_main: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${(await server.store.snapshot()).conflicts.find((c) => c.device_commit === queue.pending_commit)!.conflict_id}`);
+    expect(review.body.conflict).toMatchObject({ base_commit: authoringBase, expected_main: currentMain });
   });
 
   it('preserves user folder deletions made while a remote apply is writing files', async () => {
@@ -1915,18 +1932,17 @@ describe('Phase 1 sync without conflict resolution', () => {
     };
 
     const applyResult = await fixtureB.syncOnce();
-    expect(applyResult.status).toBe('Synced');
+    expect(applyResult.status).toBe('Conflict resolution needed');
     expect(await readFile(join(fixtureBDir, 'incoming', 'keep', 'a.md'), 'utf8')).toBe('keep a\n');
     expect(await exists(join(fixtureBDir, 'incoming', 'remove', 'b.md'))).toBe(false);
-    expect(await fixtureB.readQueue()).toMatchObject({ status: 'idle' });
+    expect(await fixtureB.readQueue()).toMatchObject({ status: 'conflicted', pending_proposal_base: expect.any(String) });
     expect(await exists(join(fixtureBDir, '.obts', 'apply-journal.json'))).toBe(false);
 
-    expect((await fixtureB.syncOnce()).status).toBe('Synced');
-    const main = (await fixtureB.readState()).local_main!;
+    const main = (await server.git.getRef(admin.vaultId, 'refs/heads/main'))!;
     const serverPaths = await server.git.listTreePaths(admin.vaultId, main);
     expect(serverPaths).toContain('incoming/keep/a.md');
-    expect(serverPaths).not.toContain('incoming/remove/b.md');
-    expect(serverPaths).not.toContain('incoming/remove/c.md');
+    expect(serverPaths).toContain('incoming/remove/b.md');
+    expect(serverPaths).toContain('incoming/remove/c.md');
   });
 
   it('recovers blocked apply journals with user deletions after files were written', async () => {
@@ -1996,12 +2012,14 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await restartedFixtureB.readQueue()).toMatchObject({ status: 'queued_local' });
     expect((await restartedFixtureB.readState()).status_label).toBe('Ahead');
 
-    expect((await restartedFixtureB.syncOnce()).status).toBe('Synced');
+    expect((await restartedFixtureB.syncOnce()).status).toBe('Conflict resolution needed');
+    expect(await restartedFixtureB.readQueue()).toMatchObject({ status: 'conflicted', pending_proposal_base: priorFixtureBState.local_main });
+    expect(await exists(join(fixtureBDir, 'incoming', 'remove', 'b.md'))).toBe(false);
     const main = (await restartedFixtureB.readState()).local_main!;
     const serverPaths = await server.git.listTreePaths(admin.vaultId, main);
     expect(serverPaths).toContain('incoming/keep/a.md');
-    expect(serverPaths).not.toContain('incoming/remove/b.md');
-    expect(serverPaths).not.toContain('incoming/remove/c.md');
+    expect(serverPaths).toContain('incoming/remove/b.md');
+    expect(serverPaths).toContain('incoming/remove/c.md');
   });
 
   it('surfaces Uploading while a queued local commit is being pushed', async () => {
@@ -2082,15 +2100,18 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(scanner).not.toContain('path.relative');
 
     const adapterWrite = sourceSection(artifact, 'async adapterWriteBinary', 'async adapterRemove');
-    expect(adapterWrite).toContain('vault.modifyBinary');
-    expect(adapterWrite).toContain('vault.createBinary');
-    expect(adapterWrite).toContain('this.adapter.writeBinary');
+    expect(adapterWrite).toContain('this.pathMutationGate.withExclusive');
+    expect(adapterWrite).toContain('this.readRecoveryFileSnapshot');
+    expect(adapterWrite).toContain('raw.writeBinary');
+    expect(adapterWrite).not.toContain('vault.modifyBinary');
+    expect(adapterWrite).not.toContain('vault.createBinary');
 
     const adapterRemove = sourceSection(artifact, 'async adapterRemove', 'async adapterSha256');
     expect(adapterRemove).not.toContain('fsp.rm');
-    expect(adapterRemove).toContain('vault.delete');
-    expect(adapterRemove).toContain('this.adapter.rmdir');
-    expect(adapterRemove).toContain('this.adapter.remove');
+    expect(adapterRemove).not.toContain('vault.delete');
+    expect(adapterRemove).toContain('raw.rmdir');
+    expect(adapterRemove).toContain('raw.remove');
+    expect(adapterRemove).toContain('this.pathMutationGate.withExclusive');
   });
 
   it('stores new dashboard passwords with the architecture security-contract Argon2id parameters', async () => {
@@ -5894,13 +5915,14 @@ describe('Phase 1 sync without conflict resolution', () => {
       return bundleId;
     };
 
-    expect((await plugin2.syncOnce()).status).toBe('Checking');
+    expect((await plugin2.syncOnce()).status).toBe('Conflict resolution needed');
     expect(await readFile(join(device2Dir, 'shared.md'), 'utf8')).toBe('changed after preflight\n');
     expect(await exists(join(device2Dir, '.obts', 'apply.lock'))).toBe(false);
     expect(await exists(join(device2Dir, '.obts', 'apply-journal.json'))).toBe(false);
     expect(await plugin2.readQueue()).toMatchObject({
-      pending_commit: null,
-      status: 'queued_local'
+      pending_commit: expect.any(String),
+      pending_proposal_base: expect.any(String),
+      status: 'conflicted'
     });
   });
 

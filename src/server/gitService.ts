@@ -19,6 +19,14 @@ export type GitDiffEntry = {
   oldPath?: string;
 };
 
+export type GitMergeRename = { sourcePath: string; targetPath: string };
+
+export class GitMergeOwnershipError extends Error {
+  constructor(readonly affectedPaths: string[]) {
+    super('Native merge changed paths outside the authored or rename-carried footprint.');
+  }
+}
+
 export type GitHistoryCommit = {
   commit: string;
   parentCommit: string | null;
@@ -581,12 +589,12 @@ export class GitService {
     return (await this.listTreeEntriesInRepo(repo, commit, alternateObjectStore)).map((entry) => entry.path);
   }
 
-  async listTreeEntries(vaultId: string, commit: string): Promise<GitTreeEntry[]> {
-    return await this.listTreeEntriesInRepo(this.repoPath(vaultId), commit);
+  async listTreeEntries(vaultId: string, commit: string, includeDirectories = false): Promise<GitTreeEntry[]> {
+    return await this.listTreeEntriesInRepo(this.repoPath(vaultId), commit, undefined, includeDirectories);
   }
 
-  private async listTreeEntriesInRepo(repo: string, commit: string, alternateObjectStore?: string): Promise<GitTreeEntry[]> {
-    const { stdout } = await this.exec(repo, ['ls-tree', '-r', '-l', '-z', commit], undefined, undefined, {
+  private async listTreeEntriesInRepo(repo: string, commit: string, alternateObjectStore?: string, includeDirectories = false): Promise<GitTreeEntry[]> {
+    const { stdout } = await this.exec(repo, ['ls-tree', '-r', ...(includeDirectories ? ['-t'] : []), '-l', '-z', commit], undefined, undefined, {
       encoding: 'buffer',
       allowedAlternateObjectStore: alternateObjectStore
     });
@@ -823,10 +831,21 @@ export class GitService {
     deviceCommit: string,
     deviceChanges: GitDiffEntry[],
     mergedTextPaths: string[],
+    authoredBase = base,
+    mainRenames: GitMergeRename[] = [],
     metadataRules: MetadataConflictRule[] = []
   ): Promise<MergeTreeResult | null> {
     const repo = this.repoPath(vaultId);
     let tree: string;
+    // The explicit ancestor supplies content, not the device delta. Project only
+    // K->D onto that ancestor so merge-tree cannot reinterpret inherited history.
+    let mergeDevice = deviceCommit;
+    if (authoredBase !== base) {
+      const proposalTree = await this.createDisjointMergeTree(vaultId, authoredBase, base, deviceCommit);
+      mergeDevice = asText((await this.exec(repo, [
+        'commit-tree', proposalTree, '-p', base, '-m', 'obts: projected proposal ancestor'
+      ], undefined, serverGitEnv('obts-merge'))).stdout).trim();
+    }
     try {
       const { stdout } = await this.exec(repo, [
         'merge-tree',
@@ -835,7 +854,7 @@ export class GitService {
         '--merge-base',
         base,
         currentMain,
-        deviceCommit
+        mergeDevice
       ]);
       tree = asText(stdout).trim();
     } catch (error) {
@@ -867,6 +886,34 @@ export class GitService {
       return await this.trySemanticOverlayMergeTree(vaultId, base, currentMain, deviceCommit, deviceChanges, mergedTextPaths, metadataRules);
     }
 
+    if (authoredBase !== base) {
+      const authoredPaths = new Set(deviceChanges.flatMap((entry) => entry.oldPath ? [entry.oldPath, entry.path] : [entry.path]));
+      const authorizedPaths = new Set(authoredPaths);
+      // Pairs are confirmed against K, not the older content ancestor. Only
+      // modifications/deletions of K-existing sources can follow those renames;
+      // additions/resurrections must never authorize an inherited destination.
+      const changedExistingSources = new Set(deviceChanges.flatMap((entry) =>
+        entry.status.startsWith('R') && entry.oldPath ? [entry.oldPath]
+          : entry.status.startsWith('M') || entry.status.startsWith('D') ? [entry.path] : []));
+      for (const rename of mainRenames) {
+        if (changedExistingSources.has(rename.sourcePath)) authorizedPaths.add(rename.targetPath);
+      }
+      const nativeTree = tree;
+      tree = await this.createDisjointMergeTree(vaultId, currentMain, currentMain, nativeTree, authorizedPaths);
+      // Never settle D as a parent while silently dropping an unexplained native
+      // result. Include the authored sources so conflict recovery owns their bytes.
+      const [nativeChanges, droppedChanges] = await Promise.all([
+        this.changedPaths(vaultId, currentMain, nativeTree),
+        this.changedPaths(vaultId, tree, nativeTree)
+      ]);
+      const outsidePaths = nativeChanges
+        .flatMap((entry) => entry.oldPath ? [entry.oldPath, entry.path] : [entry.path])
+        .filter((path) => !authorizedPaths.has(path));
+      if (outsidePaths.length > 0 || droppedChanges.length > 0) {
+        const droppedPaths = droppedChanges.flatMap((entry) => entry.oldPath ? [entry.oldPath, entry.path] : [entry.path]);
+        throw new GitMergeOwnershipError([...new Set([...authoredPaths, ...outsidePaths, ...droppedPaths])].sort());
+      }
+    }
     return {
       tree,
       validatorResults: {
@@ -885,7 +932,8 @@ export class GitService {
     vaultId: string,
     base: string,
     currentMain: string,
-    deviceCommit: string
+    deviceCommit: string,
+    selectedPaths?: Set<string>
   ): Promise<string> {
     const repo = this.repoPath(vaultId);
     const tempRoot = join(this.config.tempDir, `merge-${vaultId}-${randomBytes(8).toString('hex')}`);
@@ -913,6 +961,7 @@ export class GitService {
         if (!match?.[1] || !match[2] || !match[3] || path === undefined || path.length === 0) {
           throw new GitCommandError('Malformed raw Git tree diff.', '');
         }
+        if (selectedPaths && !selectedPaths.has(path)) continue;
         const entry = match[3] === 'D'
           ? `0 ${ZERO_OID}\t${path}\0`
           : `${match[1]} ${match[2]}\t${path}\0`;

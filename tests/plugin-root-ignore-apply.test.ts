@@ -83,7 +83,7 @@ describe('root ignore pull apply journal', () => {
     };
     await expect(apply(f, ['ignored.md', '.gitignore'])).rejects.toThrow('injected crash');
     const journal = JSON.parse(await readFile(join(f.root, '.obts/apply-journal.json'), 'utf8'));
-    expect(journal).toMatchObject({ journal_version: 6, target_root_ignore_oid: f.targetEntries.get('.gitignore'), local_only_paths: ['ignored.md'] });
+    expect(journal).toMatchObject({ journal_version: 7, target_root_ignore_oid: f.targetEntries.get('.gitignore'), local_only_paths: ['ignored.md'] });
     const restarted = new ObtsPluginClient(f.root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'ignore-replay' });
     await restarted.initialize();
     expect(await readFile(join(f.root, 'ignored.md'), 'utf8')).toBe('local\n');

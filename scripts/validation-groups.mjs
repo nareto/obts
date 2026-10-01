@@ -4,6 +4,7 @@ export const fastTests = [
   'tests/headless-protocol.test.ts',
   'tests/plugin-mobile-fs.test.ts',
   'tests/work-pool.test.ts',
+  'tests/path-mutation-gate.test.ts',
   'tests/conflict-workbench-ui.test.ts',
   'tests/dashboard-deletion-ui.test.ts',
   'tests/dashboard-live-status.test.ts',
@@ -12,6 +13,8 @@ export const fastTests = [
 
 export const pluginTests = [
   'tests/plugin-in-place-apply.test.ts',
+  'tests/plugin-adapter-write-gate.test.ts',
+  'tests/plugin-stale-proposal.test.ts',
   'tests/plugin-mobile-build.test.ts',
   'tests/plugin-packaged-client.test.ts',
   'tests/plugin-root-ignore-scan.test.ts',

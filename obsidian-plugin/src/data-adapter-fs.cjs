@@ -27,10 +27,14 @@ async function withAdapterPathLocks(adapter, paths, operation) {
   }
 }
 
-function createDataAdapterFs(adapter) {
+function createDataAdapterFs(adapter, gate = null) {
   if (!adapter) {
     throw new Error("An Obsidian DataAdapter is required.");
   }
+
+  const withPathLocks = (keys, operation) => gate
+    ? gate.withExclusive(keys, (raw) => withAdapterPathLocks(adapter, keys, () => operation(raw)))
+    : withAdapterPathLocks(adapter, keys, () => operation(adapter));
 
   const promises = {
     async readFile(filePath, options) {
@@ -46,7 +50,7 @@ function createDataAdapterFs(adapter) {
 
     async readFileBounded(filePath, maxBytes, options) {
       const normalized = adapterPath(filePath);
-      return await withAdapterPathLocks(adapter, [normalized], async () => {
+      return await withPathLocks([normalized], async (adapter) => {
         const metadata = await adapterStat(adapter, normalized);
         if (!metadata) throw fsError("ENOENT", normalized);
         if (metadata.type !== "file") throw fsError("EISDIR", normalized);
@@ -69,7 +73,7 @@ function createDataAdapterFs(adapter) {
       const normalized = adapterPath(filePath);
       const flag = typeof options === "object" && options ? options.flag : undefined;
       const bytes = typeof data === "string" ? Buffer.from(data, options.encoding || "utf8") : Buffer.from(data);
-      await withAdapterPathLocks(adapter, [normalized], async () => {
+      await withPathLocks([normalized], async (adapter) => {
         if (flag === "wx" && await adapterStat(adapter, normalized)) {
           throw fsError("EEXIST", normalized);
         }
@@ -204,7 +208,7 @@ function createDataAdapterFs(adapter) {
     async rename(oldPath, newPath) {
       const source = adapterPath(oldPath);
       const destination = adapterPath(newPath);
-      await withAdapterPathLocks(adapter, [source, destination], async () => {
+      await withPathLocks([source, destination], async (adapter) => {
         const sourceStat = await adapterStat(adapter, source);
         if (!sourceStat) throw fsError("ENOENT", source);
         await ensureParentDirectories(adapter, destination);

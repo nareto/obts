@@ -20,6 +20,66 @@ const requiredChecks = new Map([
   ['fm001-in-place-safety', 'positive-safety'], ['fm001-in-place-liveness', 'positive-liveness'],
   ...['old', 'target', 'unknown'].map((image) => [`fm001-in-place-reach-${image}`, 'reachability']),
   ['fm001-in-place-negative-non-atomic', 'negative-control'],
+  ['fm001-in-place-delete-safety', 'positive-safety'],
+  ['fm001-in-place-negative-external', 'negative-control'],
+  ['fm001-in-place-delete-negative-gate-off', 'negative-control'],
+  ['fm001-in-place-delete-negative-external', 'negative-control'],
+  ['fm001-in-place-delete-liveness', 'positive-liveness'],
+  ['fm001-in-place-reach-gate-crash', 'reachability'],
+  ['fm001-in-place-reach-delete-seam', 'reachability'],
+  ['fm001-stale-handover', 'positive-safety'],
+  ['fm001-stale-held', 'positive-safety'],
+  ['fm001-stale-held-repair', 'positive-safety'],
+  ['fm001-stale-negative-held-repair-exemption', 'negative-control'],
+  ['fm001-stale-negative-held-old-base', 'negative-control'],
+  ['fm001-stale-negative-held-new-fallback', 'negative-control'],
+  ['fm001-stale-negative-noncohort-base', 'negative-control'],
+  ['fm001-stale-ack', 'positive-safety'],
+  ['fm001-stale-noop', 'positive-safety'],
+  ['fm001-stale-negative-retire-first', 'negative-control'],
+  ['fm001-stale-negative-noop-retire-first', 'negative-control'],
+  ['fm001-stale-reach-retirement-save', 'reachability'],
+  ['fm001-stale-reach-noop', 'reachability'],
+  ['fm001-stale-reach-ack', 'reachability'],
+  ['fm001-stale-disjoint', 'positive-safety'],
+  ['fm001-stale-overlap', 'positive-safety'],
+  ['fm001-stale-binary', 'positive-safety'],
+  ['fm001-stale-delete', 'positive-safety'],
+  ['fm001-stale-identical', 'positive-safety'],
+  ['fm001-stale-reach-disjoint-merge', 'reachability'],
+  ['fm001-stale-reach-overlapping-conflict', 'reachability'],
+  ['fm001-stale-reach-sticky-second-edit', 'reachability'],
+  ['fm001-stale-reach-pre-mutation-save', 'reachability'],
+  ['fm001-stale-reach-gate-queued-save', 'reachability'],
+  ['fm001-stale-reach-post-apply-flush', 'reachability'],
+  ['fm001-stale-reach-commit-crash', 'reachability'],
+  ['fm001-stale-reach-queue-crash', 'reachability'],
+  ['fm001-stale-reach-cleanup-crash', 'reachability'],
+  ['fm001-stale-reach-device-ref-retry', 'reachability'],
+  ['fm001-stale-reach-horizon-drain', 'reachability'],
+  ['fm001-stale-reach-sequential-fresh-revert', 'reachability'],
+  ['fm001-stale-reach-latest-sticky-settlement', 'reachability'],
+  ['fm001-stale-reach-inherited-canonical', 'reachability'],
+  ['fm001-stale-negative-base-c', 'negative-control'],
+  ['fm001-stale-negative-cleanup-provenance', 'negative-control'],
+  ['fm001-stale-negative-retry-null', 'negative-control'],
+  ['fm001-stale-negative-mixed-fresh-revert', 'negative-control'],
+  ['fm001-stale-negative-silent-replacement', 'negative-control'],
+  ['fm001-stale-reach-untouched-fresh', 'reachability'],
+  ['fm001-stale-reach-different-retry-base', 'reachability'],
+  ['fm001-stale-reach-active-horizon-restart', 'reachability'],
+  ['fm001-stale-mixed-binary', 'positive-safety'],
+  ['fm001-stale-mixed-delete', 'positive-safety'],
+  ['fm001-stale-later-apply', 'positive-safety'],
+  ['fm001-stale-reach-mixed-binary', 'reachability'],
+  ['fm001-stale-reach-mixed-delete', 'reachability'],
+  ['fm001-stale-reach-later-apply-oldest-base', 'reachability'],
+  ['fm001-stale-reach-rejected-then-same-base', 'reachability'],
+  ['fm001-stale-negative-older-base-diff', 'negative-control'],
+  ['fm001-stale-negative-older-base-false-conflict', 'negative-control'],
+  ['fm001-stale-negative-all-or-nothing-identity', 'negative-control'],
+  ['fm001-stale-negative-rebind-retry', 'negative-control'],
+  ['fm001-stale-negative-replace-oldest-base', 'negative-control'],
   ...['same-path', 'disjoint-directory', 'server-recovery-contract', 'bridge-handoff', 'all-actors', 'apply-refinement',
     'directory-baseline-delivered', 'directory-baseline-rebase', 'directory-baseline-intervening', 'directory-baseline-history-lost', 'directory-baseline-historical']
     .map((id) => [`fm002-${id}`, 'positive-safety']),
@@ -224,6 +284,27 @@ function validateTransitionMap(path) {
     const unknownContracts = entry.contracts.filter((id) => !knownContracts.has(id));
     if (unknownContracts.length) throw new Error(`transition ${action} maps unknown contract IDs: ${unknownContracts.join(', ')}.`);
     for (const ref of [...entry.code, ...entry.tests]) validateSourceReference(ref, `transition ${action}`);
+  }
+  if (!testMode && ['OBTSApplyInPlace', 'OBTSStaleProposal'].some((name) => !map.companionModels?.[name])) {
+    throw new Error('Required gate/provenance companion transition map removed.');
+  }
+  for (const [name, companion] of Object.entries(map.companionModels ?? {})) {
+    const path = safeRelative(companion.rootModule, `companion ${name} module`);
+    requireFile(path, `companion ${name} module`);
+    const declared = readFileSync(path, 'utf8').match(/CompanionActions\s*==\s*\{([\s\S]*?)\n\}/u);
+    if (!declared) throw new Error(`companion ${name} has no action inventory.`);
+    const actions = [...declared[1].matchAll(/"([A-Za-z][A-Za-z0-9]*)"/gu)].map((item) => item[1]);
+    const mapped = Object.keys(companion.actions ?? {});
+    if (actions.some((action) => !mapped.includes(action)) || mapped.some((action) => !actions.includes(action))) {
+      throw new Error(`companion ${name} action map mismatch.`);
+    }
+    for (const [action, entry] of Object.entries(companion.actions)) {
+      for (const field of ['contracts', 'code', 'tests']) {
+        if (!Array.isArray(entry[field]) || entry[field].length === 0) throw new Error(`companion ${name}.${action} has no ${field}.`);
+      }
+      if (entry.contracts.some((id) => !knownContracts.has(id))) throw new Error(`companion ${name}.${action} has unknown contract.`);
+      for (const ref of [...entry.code, ...entry.tests]) validateSourceReference(ref, `companion ${name}.${action}`);
+    }
   }
   for (const [family, refs] of Object.entries(map.productionFamilies)) {
     if (!Array.isArray(refs) || refs.length === 0) throw new Error(`production family ${family} has no source evidence.`);

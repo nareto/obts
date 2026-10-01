@@ -1104,3 +1104,31 @@ describe('large-vault client checkpoints', () => {
     expect(await core.resolveRef('refs/heads/local')).toBeNull();
   });
 });
+
+
+it('indexes a large active-provenance inventory without a full snapshot traversal per touched path', async () => {
+  const { root, core } = await clientFixture();
+  await writeFile(join(root, 'base.md'), 'base\n');
+  const base = await core.createLocalCommit('scale authoring base');
+  const count = 50000;
+  const target = new Map<string, string>();
+  const entries = new Map<string, any>();
+  const before = 'a'.repeat(40), after = 'b'.repeat(40);
+  for (let i = 0; i < count; i++) {
+    const path = `notes/n${String(i).padStart(6, '0')}.md`;
+    target.set(path, before); entries.set(path, { entry: { oid: i < 64 ? after : before } });
+  }
+  const touched = [...target.keys()].slice(0, 64);
+  await core.mutateStaleProvenance(async (saved: any) => {
+    saved.horizons = [{ apply_id: 'apply_scale', base, touched, expiry: Date.now() + 60000 }];
+  });
+  core.listTreeBlobOids = async () => target;
+  let visits = 0;
+  const iterate = entries[Symbol.iterator].bind(entries);
+  entries[Symbol.iterator] = function* () { for (const item of iterate()) { visits++; yield item; } return undefined; };
+  const started = performance.now();
+  const stale = await core.classifyStaleSnapshot(base, { entries });
+  expect(stale).toHaveLength(64);
+  expect(visits).toBeLessThan(count * 4);
+  expect(performance.now() - started).toBeLessThan(10000);
+});

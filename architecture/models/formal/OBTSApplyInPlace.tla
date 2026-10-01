@@ -2,35 +2,26 @@
 EXTENDS OBTSApplyRecovery
 
 (***************************************************************************
-FM001 companion; architecture revision 34.
-Refines OBTS-SAF-001, OBTS-SAF-002, OBTS-SAF-005.
-
-Existing regular file -> regular file: publish a verified pre-image COPY, leave
-its live path intact, compare its current bytes, then modify in place. Copy
-presence does not imply removal. Crash/restart classifies old, target, or unknown
-bytes (including an interrupted write); unknown bytes are durably preserved and
-retained as local work, never replaced on the strength of the copy alone.
-
-The unchanged losslessness predicates describe the required conditional mutation
-seam. NonAtomicWrite=TRUE exposes the actual compare-to-storage-write gap, also
-present before delete in the previous implementation. Its required negative
-control records the unresolved implementation defect tracked as OBTS issue #33;
-positive TLC does NOT prove modifyBinary is a conditional byte-write primitive.
-
-One client, one regular path, one complete local edit, one crash, one symbolic
-partial target. Inherited bundle publication assumptions remain unchanged.
-RecoverUnknownImage / DeferChangedImage abstract COMPLETE durable preservation
-publication plus local-work scheduling, not a successful write Promise alone.
-Deletion, exclusive new-file creation and type changes retain the FM001 pilot
-and executable coverage; this companion does not model those filesystem types.
+FM001 companion; architecture revision 36.
+Refines OBTS-SAF-001, OBTS-SAF-002, OBTS-SAF-005, OBTS-PER-GATE-001.
+Split final compare and raw mutation, with a volatile same-adapter gate held
+across both actions. NonAtomicWrite disables that gate (historical control ID).
+ExternalWriter bypasses it and documents the unsupported writer residual.
+DeleteMutation interprets Target as absence: verified copy, compare, raw remove.
+A crash releases the gate; restart reclassifies durable old/target/unknown bytes.
+One path, one local edit, one crash, one symbolic interrupted regular-file write.
+Atomic bundle publication is inherited, not proven. Gate lifecycle, hierarchy,
+FIFO, watchdog and native storage semantics need separate executable evidence.
 ***************************************************************************)
 
-CONSTANT NonAtomicWrite
+CONSTANTS NonAtomicWrite, ExternalWriter, DeleteMutation
 ASSUME NonAtomicWrite \in BOOLEAN
+ASSUME ExternalWriter \in BOOLEAN
+ASSUME DeleteMutation \in BOOLEAN
 
 PartialTarget == "partial-target"
-VARIABLES copiedPreimage, comparisonComplete, recoveredImage
-extraVars == <<copiedPreimage, comparisonComplete, recoveredImage>>
+VARIABLES copiedPreimage, comparisonComplete, recoveredImage, gateHeld
+extraVars == <<copiedPreimage, comparisonComplete, recoveredImage, gateHeld>>
 inPlaceVars == <<vars, extraVars>>
 
 InPlaceInit ==
@@ -38,49 +29,63 @@ InPlaceInit ==
   /\ copiedPreimage = NoVersion
   /\ comparisonComplete = FALSE
   /\ recoveredImage = "none"
+  /\ gateHeld = FALSE
 
 CopyVerifiedPreimage ==
   /\ Normal /\ phase = "Writing"
   /\ copiedPreimage = NoVersion
   /\ visible = preflight /\ preflight \in recoveryVersions
   /\ copiedPreimage' = visible
-  /\ UNCHANGED <<vars, comparisonComplete, recoveredImage>>
+  /\ UNCHANGED <<vars, comparisonComplete, recoveredImage, gateHeld>>
 
 CompareCurrentBytes ==
   /\ Normal /\ phase = "Writing"
   /\ copiedPreimage = preflight /\ visible = preflight
   /\ ~comparisonComplete
   /\ comparisonComplete' = TRUE
+  /\ gateHeld' = ~NonAtomicWrite
   /\ UNCHANGED <<vars, copiedPreimage, recoveredImage>>
 
 CanModify ==
   /\ Normal /\ phase = "Writing"
   /\ copiedPreimage = preflight /\ comparisonComplete
   /\ visible # Target
-  /\ (NonAtomicWrite \/ visible = preflight)
+  /\ (NonAtomicWrite \/ gateHeld)
 
 ModifyExistingFile ==
-  /\ CanModify
+  /\ ~DeleteMutation /\ CanModify
   /\ overwrittenVersions' = overwrittenVersions \cup {visible}
   /\ visible' = Target
+  /\ gateHeld' = FALSE /\ comparisonComplete' = FALSE
   /\ UNCHANGED <<phase, running, recovering, crashCount, preflight,
        initialBundleState, postWriteBundleState, recoveryVersions, gitVersions,
        observedLocalVersions, refsMain, coordinationMain, ackIntentDurable,
-       editOccurred, journalPresent, extraVars>>
+       editOccurred, journalPresent, copiedPreimage, recoveredImage>>
+
+DeleteExistingFile ==
+  /\ DeleteMutation /\ CanModify
+  /\ overwrittenVersions' = overwrittenVersions \cup {visible}
+  /\ visible' = Target
+  /\ gateHeld' = FALSE /\ comparisonComplete' = FALSE
+  /\ UNCHANGED <<phase, running, recovering, crashCount, preflight,
+       initialBundleState, postWriteBundleState, recoveryVersions, gitVersions,
+       observedLocalVersions, refsMain, coordinationMain, ackIntentDurable,
+       editOccurred, journalPresent, copiedPreimage, recoveredImage>>
 
 InterruptExistingWrite ==
-  /\ CanModify /\ crashCount < MaxCrashes
+  /\ ~DeleteMutation /\ CanModify /\ crashCount < MaxCrashes
   /\ overwrittenVersions' = overwrittenVersions \cup {visible}
   /\ visible' = PartialTarget
   /\ running' = FALSE /\ crashCount' = crashCount + 1
   /\ comparisonComplete' = FALSE
+  /\ gateHeld' = FALSE
   /\ UNCHANGED <<phase, recovering, preflight, initialBundleState,
        postWriteBundleState, recoveryVersions, gitVersions, observedLocalVersions,
        refsMain, coordinationMain, ackIntentDurable, editOccurred, journalPresent,
        copiedPreimage, recoveredImage>>
 
 LocalWriteBetweenCompareAndModify ==
-  /\ comparisonComplete /\ ConcurrentEdit
+  /\ comparisonComplete /\ (~gateHeld \/ ExternalWriter) /\ ConcurrentEdit
   /\ UNCHANGED extraVars
 
 OtherConcurrentEdit ==
@@ -90,7 +95,9 @@ OtherConcurrentEdit ==
 InPlaceCrash ==
   /\ Crash
   /\ comparisonComplete' = FALSE
-  /\ UNCHANGED <<copiedPreimage, recoveredImage>>
+  /\ gateHeld' = FALSE
+  /\ recoveredImage' = IF gateHeld THEN "gate-crash" ELSE recoveredImage
+  /\ UNCHANGED copiedPreimage
 
 RecoverOldImage ==
   /\ running /\ recovering /\ phase = "Writing"
@@ -100,7 +107,7 @@ RecoverOldImage ==
        initialBundleState, postWriteBundleState, recoveryVersions, gitVersions,
        observedLocalVersions, overwrittenVersions, refsMain, coordinationMain,
        ackIntentDurable, editOccurred, journalPresent, copiedPreimage,
-       comparisonComplete>>
+       comparisonComplete, gateHeld>>
 
 RecoverTargetImage ==
   /\ running /\ recovering /\ phase = "Writing"
@@ -110,17 +117,18 @@ RecoverTargetImage ==
   /\ UNCHANGED <<running, crashCount, visible, preflight, initialBundleState,
        postWriteBundleState, recoveryVersions, gitVersions, observedLocalVersions,
        overwrittenVersions, refsMain, coordinationMain, ackIntentDurable,
-       editOccurred, journalPresent, copiedPreimage, comparisonComplete>>
+       editOccurred, journalPresent, copiedPreimage, comparisonComplete, gateHeld>>
 
 PreserveChangedImage ==
   /\ phase = "Writing" /\ visible \in {LocalEdit, PartialTarget}
   /\ recoveryVersions' = recoveryVersions \cup {visible}
   /\ observedLocalVersions' = observedLocalVersions \cup {visible}
   /\ phase' = "Verifying"
+  /\ gateHeld' = FALSE /\ comparisonComplete' = FALSE
   /\ UNCHANGED <<running, crashCount, visible, preflight, initialBundleState,
        postWriteBundleState, gitVersions, overwrittenVersions, refsMain,
        coordinationMain, ackIntentDurable, editOccurred, journalPresent,
-       copiedPreimage, comparisonComplete>>
+       copiedPreimage>>
 
 RecoverUnknownImage ==
   /\ running /\ recovering /\ copiedPreimage = preflight
@@ -148,7 +156,7 @@ OtherProtocolProgress ==
   /\ UNCHANGED extraVars
 
 InPlaceProgress ==
-  CopyVerifiedPreimage \/ CompareCurrentBytes \/ ModifyExistingFile
+  CopyVerifiedPreimage \/ CompareCurrentBytes \/ ModifyExistingFile \/ DeleteExistingFile
   \/ RecoverOldImage \/ RecoverTargetImage \/ RecoverUnknownImage
   \/ DeferChangedImage \/ OtherProtocolProgress
 
@@ -175,10 +183,30 @@ InPlaceTypeOK ==
   /\ journalPresent \in BOOLEAN
   /\ copiedPreimage \in LocalVersions \cup {NoVersion}
   /\ comparisonComplete \in BOOLEAN
-  /\ recoveredImage \in {"none", "old", "target", "unknown"}
+  /\ gateHeld \in BOOLEAN
+  /\ (~running => ~gateHeld)
+  /\ recoveredImage \in {"none", "old", "target", "unknown", "gate-crash"}
+
+NoGateCrashRelease == recoveredImage # "gate-crash"
+NoDeleteSeam == ~(DeleteMutation /\ visible = Target /\ phase = "Writing")
 
 NoOldImageRecovery == recoveredImage # "old"
 NoTargetImageRecovery == recoveredImage # "target"
 NoUnknownImageRecovery == ~(recoveredImage = "unknown" /\ visible = PartialTarget)
 
+CompanionActions == {
+  "CopyVerifiedPreimage",
+  "CompareCurrentBytes",
+  "ModifyExistingFile",
+  "DeleteExistingFile",
+  "InterruptExistingWrite",
+  "LocalWriteBetweenCompareAndModify",
+  "OtherConcurrentEdit",
+  "InPlaceCrash",
+  "RecoverOldImage",
+  "RecoverTargetImage",
+  "RecoverUnknownImage",
+  "DeferChangedImage",
+  "OtherProtocolProgress"
+}
 =============================================================================

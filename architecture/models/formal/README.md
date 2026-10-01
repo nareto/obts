@@ -4,7 +4,7 @@ Formal models are bounded refinements of stable contracts in `architecture/contr
 
 ## Validation Families
 
-`npm run test:formal` remains the unchanged complete TLC chain. CI can select complete family entrypoints: `sync` (FM001/FM002), `bridge-body`, `workers`, `deletion`, `bridge-protocol`, `onboarding` (including recovery), `diagnostics`, and `client-state`. Isolated model/config/check-manifest edits can run their entire affected family; shared model modules, checker infrastructure, unknown paths, and shared dependencies require broad formal validation. The fast metadata command invokes `--validate-only` only for sync, bridge-body, workers, deletion, bridge-protocol, and onboarding entrypoints; diagnostic admission, onboarding recovery, and client-state do not implement metadata-only mode and must never receive that flag. A selected family is a complete checker matrix, not a partial check list. Unchanged models do not prove implementation conformance; executable and operator evidence remain independently required.
+`npm run test:formal` remains the unchanged complete TLC chain. CI can select complete family entrypoints: `sync` (FM001/FM002), `bridge-body`, `workers`, `deletion`, `bridge-protocol`, `onboarding` (including recovery), `diagnostics`, `client-state`, and `vault-settings`. Isolated model/config/check-manifest edits can run their entire affected family; shared model modules, checker infrastructure, unknown paths, and shared dependencies require broad formal validation. The fast metadata command invokes `--validate-only` only for sync, bridge-body, workers, deletion, bridge-protocol, and onboarding entrypoints; diagnostic admission, onboarding recovery, and client-state do not implement metadata-only mode and must never receive that flag. A selected family is a complete checker matrix, not a partial check list. Unchanged models do not prove implementation conformance; executable and operator evidence remain independently required.
 
 ## OBTS-FM-001: Local Apply And Recovery
 
@@ -16,7 +16,7 @@ Formal models are bounded refinements of stable contracts in `architecture/contr
 | Specification | `OBTSApplyRecovery.tla` |
 | TLC configuration | `OBTSApplyRecovery.cfg`, `OBTSApplyRecoveryLiveness.cfg` |
 | Executable check | `npm run test:formal` |
-| In-place companion / revision | `OBTSApplyInPlace.tla`, revision 34; six required `configs/in-place-*.cfg` checks |
+| In-place companion / revision | `OBTSApplyInPlace.tla`, revision 36; gated modify/delete safety, liveness, recovery/seam witnesses and gate-off/external controls; `OBTSStaleProposal.tla` provenance companion (revision 36) |
 
 The model covers one client, one path, the captured local version, one concurrent local edit, a target server version, recovery staging/publication, mutation, verification, ref and coordination publication, acknowledgement intent, cleanup, one crash, and restart. Values stand for exact bytes plus path identity and provenance.
 
@@ -65,16 +65,110 @@ On `tla-tools` 1.7.4 / TLC 2.19 with one worker and fingerprint polynomial 0:
 | --- | --- |
 | `StartApply` / planned journal | `ObtsObsidianClient.applyTargetMain` publishes `.obts/apply-journal.json` before destructive work; phase/restart tests live in `tests/phase1.test.ts`. |
 | `StageInitialBundle`, `PublishInitialBundle`, `RecordRecoveryPublication` | `stageRecoveryBundleFiles` and `finalizeRecoveryBundle` stage snapshots, manifest, Git closure, checksums, completion marker, rename, then journal the bundle ID. |
-| `BeginWriting`, `WriteTarget`, `BlockChangedPath`; companion copy/compare/modify/recovery actions | `writeTargetFilesFromJournal` captures each affected path into journal-addressed `.obts/apply-displaced` preservation as a verified copy (never by renaming a vault-visible path). Regular-file updates retain the live path and use `Vault.modifyBinary` or an unindexed binary adapter overwrite after final revalidation. Removals/type changes still remove only after evidence validation; new files use Obsidian `Vault.createBinary` or Node `writeFile(..., {flag:"wx"})`. Cleanup archives evidence under `.obts/recovery-displaced`. The intended atomic mutation guard is **not** a proven implementation primitive: OBTS issue #33 tracks the existing compare-to-delete/overwrite gap. Stale-file, no-delete-event, ancestor, directory, primitive-boundary, and restart regressions live in `tests/plugin-large-vault.test.ts`. |
+| `BeginWriting`, `WriteTarget`, `BlockChangedPath`; companion copy/compare/modify/delete/recovery actions | `writeTargetFilesFromJournal` / mutation helpers are Phase-2 regression sites: verified copy outside the gate; final raw freshness compare + raw write/remove/create inside it; no live-file rename or Vault call under the claim. Directory/restore seams require expected-state guards. Production implements the revision-36 adapter gate and stale proposals, with executable assertions in `tests/plugin-adapter-write-gate.test.ts`, `tests/plugin-in-place-apply.test.ts`, `tests/plugin-large-vault.test.ts` and `tests/plugin-stale-proposal.test.ts`. |
 | Post-write bundle actions | `localChangedPathsFromTree` plus `createRecoveryBundle` preserve edits detected after materialization before refs advance. |
 | Ref, coordination, acknowledgement, cleanup actions | `updateRef`, `writeState`, `writePendingAppliedAcknowledgement`, and `clearApplyState` are separate durable calls. |
 | `Crash`, `Restart`, recovery classifiers | `initialize`, `recoverIncompleteApplyJournal`, and `recoverBlockedApplyWithPreservedLocalChanges` classify persisted journal, visible tree, target commit, refs, and preservation evidence. |
 
-### In-place companion and known implementation deviation
+### Gated compare/mutate companion (revision 36)
 
-`OBTSApplyInPlace.tla` reuses the pilot's preservation predicates and publication assumptions without weakening them. It separates verified pre-image copy, final comparison, and mutation; copy evidence never implies that the live path disappeared. Restart witnesses exercise copy + old image, copy + target image, and an interrupted write leaving a symbolic partial target. Unknown bytes are durably preserved and retained as local work. The original pilot/configurations remain unchanged for historical checks and deletion/type-change abstraction.
+`OBTSApplyInPlace.tla` keeps the original pilot unchanged and extends the companion's verified-copy/separate-compare/separate-mutate seam. `gateHeld` excludes same-adapter writers after comparison, is released after modification/removal or error/crash, and is reacquired only after restart classification. `DeleteMutation=TRUE` interprets Target as absence; it uses `DeleteExistingFile` rather than interrupted-write behavior. Gate-off uses the historical `NonAtomicWrite=TRUE` config/ID; `ExternalWriter=TRUE` deliberately bypasses the held gate. Both modify and delete controls must fail `NoLocalVersionLost`, documenting implementation bugs or the external residual, respectively. The compare-held crash witness distinguishes a crash while the gate is actually held, not merely an arbitrary pre-write crash. Old/target/unknown recovery remains explicit; partial bytes are preserved, not inferred away from copy presence.
 
-Positive safety and conditional liveness each pass 631 generated / 476 distinct states at depth 23. Old-image, target-image, and interrupted-write recovery witnesses reach depths 10, 12, and 11 respectively. The required `NonAtomicWrite=TRUE` control retains a local-write environment action between compare and mutation and violates `NoLocalVersionLost` at depth 10 (89 generated / 66 distinct states). This is an **existing unresolved implementation defect**, not merely a hypothetical mutant: both delete/create and in-place binary writes lack an all-writer conditional mutation primitive. It is separately tracked as OBTS issue #33; positive checks describe the intended seam and must never be reported as proof of actual atomicity or complete lossless implementation conformance.
+Final measured generated/distinct/depth baselines are in `checks.json`; each check runs below the default limits. The unchanged pilot preserves historical safety/liveness/control evidence. TLC checks the bounded intended same-adapter design, not implementation conformance or arbitrary filesystem atomicity; the implemented gate and executable regressions provide separate evidence.
+
+### Focused stale-proposal companion (revision 36)
+
+`OBTSStaleProposal.tla` connects FM001 preservation to FM002 immutable proposal/server semantics without widening the composed state space. Four symbolic paths are p (touched stale text/binary/delete), q (inherited canonical change, optionally a known fresh revert after horizon expiry/drain), u (untouched ordinary work), and b (a stale cohort path identical to current main in mixed binary/delete scenarios). M0 precedes natural parent K; K and D trees freeze independently at commit creation. In the mixed scenarios canonical main independently reaches D[b], while K[b] differs. Token sets and kinds stand for exact symbolic values, not actual parsing or Git algorithms. There are eight integration scenarios plus four isolated publication projections described below, two local generations, one crash, one q canonical advance and at most one later apply with a distinct newer M1. The common transition relation bounds first q/u edits before capture and the second sticky edit just after queue publication; it does not enumerate all runtime schedules.
+
+D1/D2 classification is derived, not a scenario answer: `Changed(NaturalTree,ProposalTree)` gives the device-authored set; kind-and-content equality computes per-path identities, which are removed from divergence. Symbolic one-sided/native-text eligibility inspects that divergent set to select conflict or three-way output for each authored path. q values equal to K never enter authored changes; `InheritedCanonicalRetained` requires **exact** equality with pre-integration main on all inherited paths, including the later `new-remote-q` token, not merely retention of the original token. `AuthoredFromNaturalBase`, `IdentitySetExact`, `IdentityFilteredPerPath` and clean/mixed merge invariants independently audit those derived sets and outcomes. Mixed binary and mixed deletion witnesses combine `{b}` identity with `{p}` clean text divergence. Using the older explicit-base diff yields a false authored set and a separately witnessed false conflict after main advances q; all-or-nothing identity filtering yields a false mixed conflict.
+
+`StaleProposalUsesAuthoringBase` checks outstanding sticky obligations/pinned base, commit intent, queued base and integration base. Admission separately freezes `admittedBase`; requests explicitly offer a base. Equal offers resume, mismatches reject without changing base/ref/main, and a matching request after rejection can progress. `RetryAdmissionImmutable` and `RejectedRetryDidNotMoveState` check the admission identity and rejection snapshot. Crash resets volatile retry observation; restart records the same captured commit. The required ref-crash retry trace is now **Crash → Restart → offered M0 → equal-ref retry → integration with M0**, not a pre-crash retry followed by restart. A rebinding mutant fails immutable admission. At most one differing offer and two matching offers around one crash keep retry exploration finite.
+
+`NoSilentRemoteReplacement` checks true-base decisions, unchanged canonical main on conflict and remote-token retention on clean merge. `OriginCohortsSeparated` keeps known fresh work outside stale trees. Latest-generation settlement applies the server result before clearing an obligation; conflicts hand ownership to pending-conflict rules. The later-apply lane first settles generation 1, then defers still-sticky generation 2 under newer pre-apply M1 and a newer canonical target. It retains M0 and proposes from the newer applied parent/tree with M0 as explicit ancestor. `OldestBaseSurvivesLaterApply` and its successor-proposal witness challenge this branch; replacing the obligation with M1 fails the designated invariant.
+
+Reachability retains pre-mutation deferral, gate-queued save, post-apply flush, expiry then drain, first/second captures, clean merge/conflict, inherited advance, sequential held fresh work and all four crash seams. Wrong C base, cleanup provenance loss, null retry and mixed fresh revert controls remain required, alongside the five review-added classification/rebinding/oldest-base controls. The wrong-base integration control independently fails `NoSilentRemoteReplacement` for a lost remote token.
+
+The companion assumes crash-safe publication, protected Git closure, ordered M0/M1 ancestry and symbolic merge-validator results. It does not prove actual Git merge-base computation, tree/hierarchy assembly, parser/content merge algorithms, directory structural identity, real gate scheduling, filesystem durability, arbitrary editor timing or host reload. Repeated capture failure is abstracted by waiting ready with durable obligations. Conflict resolution remains delegated. The action map identifies existing Phase-2 code/test regression sites, not implementation conformance. The phase-2c fixes update the sync/persistence contracts within revision 36; the ADR and static allocation remain unchanged.
+
+The stale-proposal companion also checks acknowledged P as the global authoring base, the recorded older base for P's own stale cohort, and missing/already-contained fallbacks; atomic retirement-to-old-base horizon handover with a late buffer save; and drained no-diff local settlement with a fresh covering horizon, followed by expiry/drain before unpinning. Three bounded publication projections isolate these seams without multiplying the integration state space. The ordinary-retirement and no-op retire-before-horizon mutants violate `RetirementKeepsOldBase`; using P's older proposal base for the held fresh q revert when main re-changes q violates `KnownFreshRevertNotLost`. These projections assume validated durable identities and do not model accepted-record JSON parsing or the queue-clear crash seams, which have real-process regressions.
+
+The held-P rebuild projection records P identity and fallback before mutation, keeps older independent evidence, and waits for acknowledgment before proposing continued same-line work at P (or its recorded root-policy successor). Crash/restart preserves that evidence. Rejection/conflict uses the recorded fallback, never advanced C. `HeldOwnEditNoFalseConflict` rejects acknowledged continuation proposed at pre-P M0; `NoSilentRemoteReplacement` rejects a newer fallback that silently overwrites remote work. These bounded symbolic own-edit/fallback checks do not prove parser, host filesystem or implementation conformance. Baselines (generated/distinct/depth): held 228/97/7; old-base mutant 32/22/4; newer-fallback mutant 29/20/4.
+
+The isolated `held-repair` extension snapshots original pins in `PrepareOriginalPins` before any held or F5 fallback publication, choosing an older pin present or absent nondeterministically. `CorruptCompanion` loses path association but retains pins; `RepairCompanion` uses M0 when an older original pin exists, otherwise permitting P. A separate prior-held path durably publishes the M0 fallback in `HoldPDerived`, advances canonical to C while P stays queued (`AdvanceHeldCanonical`), and then corrupts/repairs with that fallback pin retained. This covers first corruption with/without older evidence and corruption after a prior canonical rebuild without conflating pre-publication and durable-held ordering. The required repair-horizon held-exemption mutant fails `HeldOlderWins` at `RepairCompanion` through `PrepareOriginalPins -> CorruptCompanion -> RepairCompanion`, not parsing or resource failure. The trace map uses exact plugin method ranges; `PrepareOriginalPins` maps to `rebuildFromServerMain:2584–2812`, specifically its original-ref snapshot block at lines 2609–2627. This bounded extension assumes comparable validated ancestry; implementation ambiguity fails closed. Repair baselines (generated/distinct/depth): positive 614/261/11; exemption mutant 22/15/4.
+
+### Revision-36 companion TLC evidence
+
+TLC 2.19, one worker, fingerprint polynomial 0, 1 GiB heap. `REACHED` and `REJECTED` mean required invariant-counterexample witnesses, not unexpected failures. Measured generated/distinct/depth baselines and half-baseline floors are enforced in `checks.json`.
+
+| Check | Result | Generated | Distinct | Depth |
+| --- | --- | ---: | ---: | ---: |
+| `fm001-in-place-safety` | PASS | 548 | 411 | 23 |
+| `fm001-in-place-liveness` | PASS | 548 | 411 | 23 |
+| `fm001-in-place-reach-old` | REACHED | 91 | 71 | 10 |
+| `fm001-in-place-reach-target` | REACHED | 134 | 110 | 12 |
+| `fm001-in-place-reach-unknown` | REACHED | 107 | 85 | 11 |
+| `fm001-in-place-negative-non-atomic` | REJECTED | 87 | 66 | 10 |
+| `fm001-in-place-delete-safety` | PASS | 522 | 393 | 23 |
+| `fm001-in-place-negative-external` | REJECTED | 87 | 67 | 10 |
+| `fm001-in-place-delete-negative-gate-off` | REJECTED | 86 | 65 | 10 |
+| `fm001-in-place-delete-negative-external` | REJECTED | 86 | 66 | 10 |
+| `fm001-in-place-delete-liveness` | PASS | 522 | 393 | 23 |
+| `fm001-in-place-reach-gate-crash` | REACHED | 67 | 53 | 9 |
+| `fm001-in-place-reach-delete-seam` | REACHED | 66 | 52 | 9 |
+| `fm001-stale-disjoint` | PASS | 93,810 | 52,872 | 36 |
+| `fm001-stale-overlap` | PASS | 23,412 | 12,912 | 24 |
+| `fm001-stale-binary` | PASS | 23,412 | 12,912 | 24 |
+| `fm001-stale-delete` | PASS | 23,412 | 12,912 | 24 |
+| `fm001-stale-identical` | PASS | 93,810 | 52,872 | 36 |
+| `fm001-stale-reach-disjoint-merge` | REACHED | 475 | 303 | 9 |
+| `fm001-stale-reach-overlapping-conflict` | REACHED | 475 | 303 | 9 |
+| `fm001-stale-reach-sticky-second-edit` | REACHED | 94 | 48 | 6 |
+| `fm001-stale-reach-pre-mutation-save` | REACHED | 2 | 2 | 2 |
+| `fm001-stale-reach-gate-queued-save` | REACHED | 5 | 5 | 3 |
+| `fm001-stale-reach-post-apply-flush` | REACHED | 7 | 6 | 3 |
+| `fm001-stale-reach-commit-crash` | REACHED | 97 | 51 | 6 |
+| `fm001-stale-reach-queue-crash` | REACHED | 172 | 98 | 7 |
+| `fm001-stale-reach-cleanup-crash` | REACHED | 289 | 177 | 8 |
+| `fm001-stale-reach-device-ref-retry` | REACHED | 3,329 | 2,257 | 13 |
+| `fm001-stale-reach-horizon-drain` | REACHED | 71 | 38 | 5 |
+| `fm001-stale-reach-sequential-fresh-revert` | REACHED | 7,173 | 4,724 | 15 |
+| `fm001-stale-reach-latest-sticky-settlement` | REACHED | 24,120 | 14,397 | 19 |
+| `fm001-stale-reach-inherited-canonical` | REACHED | 758 | 496 | 10 |
+| `fm001-stale-negative-base-c` | REJECTED | 14 | 11 | 4 |
+| `fm001-stale-negative-cleanup-provenance` | REJECTED | 95 | 49 | 6 |
+| `fm001-stale-negative-retry-null` | REJECTED | 761 | 498 | 10 |
+| `fm001-stale-negative-mixed-fresh-revert` | REJECTED | 244 | 146 | 8 |
+| `fm001-stale-negative-silent-replacement` | REJECTED | 475 | 302 | 9 |
+| `fm001-stale-reach-untouched-fresh` | REACHED | 1,930 | 1,310 | 12 |
+| `fm001-stale-reach-different-retry-base` | REACHED | 764 | 500 | 10 |
+| `fm001-stale-reach-active-horizon-restart` | REACHED | 97 | 51 | 6 |
+| `fm001-stale-mixed-binary` | PASS | 93,810 | 52,872 | 36 |
+| `fm001-stale-mixed-delete` | PASS | 93,810 | 52,872 | 36 |
+| `fm001-stale-later-apply` | PASS | 163,416 | 91,512 | 37 |
+| `fm001-stale-reach-mixed-binary` | REACHED | 475 | 303 | 9 |
+| `fm001-stale-reach-mixed-delete` | REACHED | 475 | 303 | 9 |
+| `fm001-stale-reach-later-apply-oldest-base` | REACHED | 26,850 | 15,974 | 19 |
+| `fm001-stale-reach-rejected-then-same-base` | REACHED | 3,316 | 2,251 | 13 |
+| `fm001-stale-negative-older-base-diff` | REJECTED | 475 | 303 | 9 |
+| `fm001-stale-negative-older-base-false-conflict` | REJECTED | 758 | 496 | 10 |
+| `fm001-stale-negative-all-or-nothing-identity` | REJECTED | 475 | 303 | 9 |
+| `fm001-stale-negative-rebind-retry` | REJECTED | 764 | 500 | 10 |
+| `fm001-stale-negative-replace-oldest-base` | REJECTED | 1,974 | 1,339 | 12 |
+
+| `fm001-stale-handover` | PASS | 8 | 3 | 3 |
+| `fm001-stale-ack` | PASS | 17 | 6 | 2 |
+| `fm001-stale-noop` | PASS | 26 | 9 | 6 |
+| `fm001-stale-negative-noop-retire-first` | REJECTED | 6 | 3 | 3 |
+| `fm001-stale-negative-retire-first` | REJECTED | 5 | 3 | 3 |
+| `fm001-stale-reach-retirement-save` | REACHED | 5 | 3 | 3 |
+| `fm001-stale-reach-noop` | REACHED | 3 | 2 | 2 |
+| `fm001-stale-reach-ack` | REACHED | 3 | 2 | 2 |
+| `fm001-stale-negative-noncohort-base` | REJECTED | 5 | 4 | 2 |
+| `fm001-stale-held` | PASS | 228 | 97 | 7 |
+| `fm001-stale-negative-held-old-base` | REJECTED | 32 | 22 | 4 |
+| `fm001-stale-negative-held-new-fallback` | REJECTED | 29 | 20 | 4 |
+| `fm001-stale-held-repair` | PASS | 614 | 261 | 11 |
+| `fm001-stale-negative-held-repair-exemption` | REJECTED | 22 | 15 | 4 |
 
 ### Known omissions
 
@@ -88,7 +182,7 @@ The pilot does not cover directories, multiple paths, write concurrency, editor-
 | Architecture revision | 32 |
 | Refined contracts | `OBTS-SAF-001` through `OBTS-SAF-006`, `OBTS-SAF-010`, `OBTS-SYNC-IMM-001`, `OBTS-SYNC-IGN-001`, `OBTS-SYNC-ACK-001`, `OBTS-PER-OP-001`, `OBTS-PER-CLIENT-001`, `OBTS-BRG-PROJ-001` |
 | Root specification | `OBTSDistributedSync.tla` |
-| Check matrix | `checks.json` (115 required checks: original 52, 23 root-ignore, 2 acknowledgement-evidence, 14 directory-baseline, 18 legacy-retirement, and 6 FM001 in-place companion checks) |
+| Check matrix | `checks.json` (revision-36 matrix retains all 115 previous checks and adds bounded gate/provenance checks; exact required IDs and measured baselines are machine-readable) |
 | Static transition map / future trace schema | `trace/transition-map.json`, `trace/trace-schema.json` |
 | Executable check | `npm run test:formal` |
 
@@ -107,7 +201,7 @@ Local apply state projects non-vacuously through `modules/OBTSApplyRefinement.tl
 
 ### Check matrix and assumptions
 
-The required matrix contains the original six FM-001 checks plus six in-place companion checks; seven FM-002 positive safety checks; four separately fair liveness checks; twenty-one trigger/action reachability checks; and sixteen distributed negative controls. Revision 15 adds four positive root-policy safety checks, nine non-vacuity witnesses, and nine independent negative controls. Revision 17 adds the acknowledgement-evidence reach and negative checks above. Revision 27 adds five directory-baseline safety checks, five progress/reconstruction witnesses, and four negative controls for the exact-cursor block, unsafe rebase, missing history, and mislabeled historical snapshot. Revision 32 adds four legacy-retirement witnesses, a full positive safety exploration, ten additional witnesses for queue changes, transfer outcomes, uploads, and restart, and three single-fault negative controls. Removing or retyping any required check fails validation. Accepted architecture status requires zero candidate counterexamples and all required positives.
+The required matrix contains the original six FM-001 checks plus the revision-36 gate/provenance companion checks; seven FM-002 positive safety checks; four separately fair liveness checks; twenty-one trigger/action reachability checks; and sixteen distributed negative controls. Revision 15 adds four positive root-policy safety checks, nine non-vacuity witnesses, and nine independent negative controls. Revision 17 adds the acknowledgement-evidence reach and negative checks above. Revision 27 adds five directory-baseline safety checks, five progress/reconstruction witnesses, and four negative controls for the exact-cursor block, unsafe rebase, missing history, and mislabeled historical snapshot. Revision 32 adds four legacy-retirement witnesses, a full positive safety exploration, ten additional witnesses for queue changes, transfer outcomes, uploads, and restart, and three single-fault negative controls. Removing or retyping any required check fails validation. Accepted architecture status requires zero candidate counterexamples and all required positives.
 
 Liveness is conditional on bounded edits/crashes, eventual restart, retry/delivery, and no permanent storage failure. Fairness is attached to the concrete action/actor sequence for proposal/result consumption, Rust write to Node capture, server restart/recovery, and main event to durable apply/server acknowledgement. Each obligation has a separate reachable-trigger check; there is no broad fairness disjunction.
 

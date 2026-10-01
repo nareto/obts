@@ -209,14 +209,14 @@ describe('owner-managed vault sync settings', () => {
     const device = await commitWith(base, Buffer.from(deviceSource));
     const changes = await server!.git.changedPaths(vaultId, base, device);
     const rules = [{ field: 'updated', strategy: 'latest_timestamp' as const }];
-    const merged = await server!.git.tryPolicyMergeTree(vaultId, base, current, device, changes, ['merge.md'], rules);
+    const merged = await server!.git.tryPolicyMergeTree(vaultId, base, current, device, changes, ['merge.md'], base, [], rules);
     expect(merged).not.toBeNull();
     expect(await server!.git.readBlobAtPath(vaultId, merged!.tree, 'merge.md')).toEqual(Buffer.from(serverSource));
     expect(merged!.validatorResults.metadata_timestamp_fields).toEqual([{ path: 'merge.md', field: 'updated', winner: 'server' }]);
 
     const invalidServerBytes = Buffer.concat([Buffer.from(serverSource), Buffer.from([0xff])]);
     const invalidCurrent = await commitWith(base, invalidServerBytes);
-    const invalidMerge = await server!.git.tryPolicyMergeTree(vaultId, base, invalidCurrent, device, changes, ['merge.md'], rules);
+    const invalidMerge = await server!.git.tryPolicyMergeTree(vaultId, base, invalidCurrent, device, changes, ['merge.md'], base, [], rules);
     expect(invalidMerge).toBeNull();
 
     const invalidBaseBytes = Buffer.concat([Buffer.from('line one\nline two\n'), Buffer.from([0xff, 0xfe]), Buffer.from('\n')]);
@@ -224,7 +224,7 @@ describe('owner-managed vault sync settings', () => {
     const nativeCurrent = await commitWith(invalidBase, Buffer.concat([Buffer.from('server line\nline two\n'), Buffer.from([0xff, 0xfe]), Buffer.from('\n')]));
     const nativeDevice = await commitWith(invalidBase, Buffer.concat([Buffer.from('line one\ndevice line\n'), Buffer.from([0xff, 0xfe]), Buffer.from('\n')]));
     const nativeChanges = await server!.git.changedPaths(vaultId, invalidBase, nativeDevice);
-    const invalidNative = await server!.git.tryPolicyMergeTree(vaultId, invalidBase, nativeCurrent, nativeDevice, nativeChanges, ['merge.md'], rules);
+    const invalidNative = await server!.git.tryPolicyMergeTree(vaultId, invalidBase, nativeCurrent, nativeDevice, nativeChanges, ['merge.md'], invalidBase, [], rules);
     expect(invalidNative).toBeNull();
   });
 

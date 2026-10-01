@@ -4,7 +4,10 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ObtsPluginClient } from '../src/client/core.js';
+import { NodeDataAdapter } from '../src/client/nodeDataAdapter.js';
 import { publishRecoveryFixture } from './helpers/publishRecoveryFixture.js';
+
+const nativeWrite = NodeDataAdapter.prototype.writeBinary;
 
 const roots: string[] = [];
 const before = Buffer.from('captured local bytes\r\n');
@@ -13,6 +16,10 @@ const target = Buffer.from('\ufeffserver target bytes\r\n');
 async function fixture(filePath = 'shared.md', targetBytes = target) {
   const root = await mkdtemp(join(tmpdir(), 'obts-in-place-'));
   roots.push(root);
+  const rawWrite = vi.spyOn(NodeDataAdapter.prototype, 'writeBinary');
+  const rawRemove = vi.spyOn(NodeDataAdapter.prototype, 'remove');
+  const rawRmdir = vi.spyOn(NodeDataAdapter.prototype, 'rmdir');
+  const rawRename = vi.spyOn(NodeDataAdapter.prototype, 'rename');
   const plugin = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'in-place' });
   await plugin.initialize();
   const core = plugin.client as any;
@@ -34,7 +41,7 @@ async function fixture(filePath = 'shared.md', targetBytes = target) {
     last_completed_step: 'recovery_bundle', redacted_error_category: null as string | null
   };
   const evidence = join(root, '.obts', 'apply-displaced', journal.apply_id, `${encodeURIComponent(filePath)}.entry`);
-  return { root, core, journal, entries, evidence, filePath, targetBytes };
+  return { root, core, journal, entries, evidence, filePath, targetBytes, rawWrite, rawRemove, rawRmdir, rawRename };
 }
 
 function recordVault(core: any, filePath: string, indexed = true) {
@@ -81,38 +88,40 @@ async function archivedPreimage(value: Awaited<ReturnType<typeof fixture>>) {
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
 describe('in-place remote apply', () => {
   it('modifies the existing TFile without deletion, delete events, recreation, or rename', async () => {
     const value = await fixture();
-    const { core, journal, entries, root, evidence, filePath } = value;
+    const { core, journal, entries, root, evidence, filePath, rawWrite, rawRemove, rawRmdir, rawRename } = value;
     const { vault, deleteEvents, file } = recordVault(core, filePath);
-    const rename = vi.spyOn(core.adapter, 'rename');
     await core.writeTargetFilesFromJournal(journal, entries, new Set());
     expect(vault.delete).not.toHaveBeenCalled();
     expect(deleteEvents).toEqual([]);
     expect(vault.createBinary).not.toHaveBeenCalled();
-    expect(vault.modifyBinary).toHaveBeenCalledOnce();
-    expect(vault.modifyBinary.mock.calls[0][0]).toBe(file);
+    expect(vault.modifyBinary).not.toHaveBeenCalled();
+    expect(rawWrite.mock.calls.filter(([path]) => path === filePath)).toHaveLength(1);
     expect(vault.getAbstractFileByPath(filePath)).toBe(file);
-    expect(rename).not.toHaveBeenCalled();
+    expect(rawRename.mock.calls.filter(([source]) => source === filePath)).toHaveLength(0);
+    expect(rawRemove.mock.calls.filter(([path]) => path === filePath)).toHaveLength(0);
+    expect(rawRmdir.mock.calls.filter(([path]) => path === filePath)).toHaveLength(0);
     expect(await readFile(join(root, filePath))).toEqual(target);
     expect(await readFile(evidence)).toEqual(before);
   });
 
   it('overwrites an unindexed dot-path in place with exact binary bytes', async () => {
     const bytes = Buffer.from([0, 255, 254, 13, 10, 128]);
-    const { core, journal, entries, root, evidence, filePath } = await fixture('.hidden-note', bytes);
+    const { core, journal, entries, root, evidence, filePath, rawRemove, rawRmdir } = await fixture('.hidden-note', bytes);
     const { vault, deleteEvents } = recordVault(core, filePath, false);
-    const remove = vi.spyOn(core.adapter, 'remove');
     await core.writeTargetFilesFromJournal(journal, entries, new Set());
     expect(vault.delete).not.toHaveBeenCalled();
     expect(deleteEvents).toEqual([]);
     expect(vault.modifyBinary).not.toHaveBeenCalled();
     expect(vault.createBinary).not.toHaveBeenCalled();
-    expect(remove).not.toHaveBeenCalled();
+    expect(rawRemove.mock.calls.filter(([path]) => path === filePath)).toHaveLength(0);
+    expect(rawRmdir.mock.calls.filter(([path]) => path === filePath)).toHaveLength(0);
     expect(await readFile(join(root, filePath))).toEqual(bytes);
     expect(await readFile(evidence)).toEqual(before);
   });
@@ -133,12 +142,13 @@ describe('in-place remote apply', () => {
     expect(await readFile(evidence)).toEqual(before);
   });
 
-  it('falls back to an exact adapter overwrite when the Vault rejects an unchanged path', async () => {
-    const { core, journal, entries, root, evidence, filePath } = await fixture();
+  it('uses an exact raw adapter overwrite even when Vault methods would reject', async () => {
+    const { core, journal, entries, root, evidence, filePath, rawWrite } = await fixture();
     const { vault, deleteEvents } = recordVault(core, filePath);
     vault.modifyBinary.mockRejectedValue(new Error('Vault API rejected path'));
     await core.writeTargetFilesFromJournal(journal, entries, new Set());
-    expect(vault.modifyBinary).toHaveBeenCalledOnce();
+    expect(vault.modifyBinary).not.toHaveBeenCalled();
+    expect(rawWrite.mock.calls.filter(([path]) => path === filePath)).toHaveLength(1);
     expect(vault.delete).not.toHaveBeenCalled();
     expect(vault.createBinary).not.toHaveBeenCalled();
     expect(deleteEvents).toEqual([]);
@@ -146,17 +156,18 @@ describe('in-place remote apply', () => {
     expect(await readFile(evidence)).toEqual(before);
   });
 
-  it('revalidates local bytes before falling back from a rejected Vault modify', async () => {
+  it('revalidates local bytes before the raw write after evidence publication', async () => {
     const { core, journal, entries, root, filePath } = await fixture();
     const { vault } = recordVault(core, filePath);
-    vault.modifyBinary.mockImplementation(async () => {
-      await writeFile(join(root, filePath), 'edit during failed Vault write\n');
-      throw new Error('Vault API rejected path');
-    });
+    const capture = core.captureDisplacedCandidate.bind(core);
+    core.captureDisplacedCandidate = async (...args: any[]) => {
+      await capture(...args);
+      await core.adapter.writeBinary(filePath, Buffer.from('edit after evidence publication\n'));
+    };
     await core.writeTargetFilesFromJournal(journal, entries, new Set());
-    expect(vault.modifyBinary).toHaveBeenCalledOnce();
+    expect(vault.modifyBinary).not.toHaveBeenCalled();
     expect(vault.delete).not.toHaveBeenCalled();
-    expect(await readFile(join(root, filePath), 'utf8')).toBe('edit during failed Vault write\n');
+    expect(await readFile(join(root, filePath), 'utf8')).toBe('edit after evidence publication\n');
     expect(journal).toMatchObject({ deferred_local_paths: [filePath] });
   });
 
@@ -190,11 +201,12 @@ describe('in-place remote apply', () => {
   });
 
   it('still deletes genuinely remotely removed notes', async () => {
-    const { core, journal, root, evidence, filePath } = await fixture();
+    const { core, journal, root, evidence, filePath, rawRemove } = await fixture();
     const { vault, deleteEvents } = recordVault(core, filePath);
     await core.writeTargetFilesFromJournal(journal, new Map(), new Set());
-    expect(vault.delete).toHaveBeenCalledOnce();
-    expect(deleteEvents).toEqual([filePath]);
+    expect(vault.delete).not.toHaveBeenCalled();
+    expect(rawRemove).toHaveBeenCalledWith(filePath);
+    expect(deleteEvents).toEqual([]);
     expect(vault.modifyBinary).not.toHaveBeenCalled();
     expect(await readFile(join(root, filePath)).catch(() => null)).toBeNull();
     expect(await readFile(evidence)).toEqual(before);
@@ -207,7 +219,8 @@ describe('in-place remote apply', () => {
     await plugin.initialize();
     expect(vault.delete).not.toHaveBeenCalled();
     expect(deleteEvents).toEqual([]);
-    expect(vault.modifyBinary).toHaveBeenCalledOnce();
+    expect(vault.modifyBinary).not.toHaveBeenCalled();
+    expect(value.rawWrite.mock.calls.filter(([path]) => path === value.filePath)).toHaveLength(1);
     expect(await readFile(join(value.root, value.filePath))).toEqual(target);
     expect(await archivedPreimage(value)).toEqual(before);
     expect(await readFile(join(value.root, '.obts/apply-journal.json')).catch(() => null)).toBeNull();
@@ -216,18 +229,20 @@ describe('in-place remote apply', () => {
   it.each(['before', 'partial', 'after'])('recovers a storage interruption %s the in-place write', async (point) => {
     const value = await fixture();
     await stageCopy(value);
-    const write = value.core.adapter.writeBinary.bind(value.core.adapter);
-    value.core.adapter.writeBinary = async (path: string, bytes: ArrayBuffer) => {
-      if (path !== value.filePath) return write(path, bytes);
+    value.rawWrite.mockImplementation(async function (this: NodeDataAdapter, path: string, bytes: ArrayBuffer) {
+      if (path !== value.filePath) return nativeWrite.call(this, path, bytes);
       if (point !== 'before') {
         const content = Buffer.from(bytes);
-        await write(path, point === 'partial' ? content.subarray(0, 9) : content);
+        const written = point === 'partial' ? content.subarray(0, 9) : content;
+        await nativeWrite.call(this, path, written.buffer.slice(written.byteOffset, written.byteOffset + written.byteLength) as ArrayBuffer);
       }
       throw new Error('synthetic interrupted storage write');
-    };
+    });
     await expect(value.core.writeTargetFilesFromJournal(value.journal, value.entries, new Set()))
       .rejects.toThrow('synthetic interrupted storage write');
     expect(await readFile(value.evidence)).toEqual(before);
+    value.rawWrite.mockImplementation(nativeWrite);
+    value.rawWrite.mockClear();
     const { plugin, vault, deleteEvents } = restart(value);
     await plugin.initialize();
     expect(vault.delete).not.toHaveBeenCalled();
@@ -235,7 +250,8 @@ describe('in-place remote apply', () => {
     const expected = point === 'partial' ? target.subarray(0, 9) : target;
     expect(await readFile(join(value.root, value.filePath))).toEqual(expected);
     expect(await archivedPreimage(value)).toEqual(before);
-    expect(vault.modifyBinary).toHaveBeenCalledTimes(point === 'before' ? 1 : 0);
+    expect(vault.modifyBinary).not.toHaveBeenCalled();
+    expect(value.rawWrite.mock.calls.filter(([path]) => path === value.filePath)).toHaveLength(point === 'before' ? 1 : 0);
     if (point === 'partial') {
       const queue = await plugin.readQueue();
       expect(queue.pending_commit).toMatch(/^[0-9a-f]{40}$/u);

@@ -92,6 +92,7 @@ export type OnboardingJournal = {
 
 export type QueueState = {
   pending_commit: string | null;
+  pending_proposal_base?: string | null;
   expected_device_ref: string | null;
   status: 'idle' | 'queued_local' | 'uploading' | 'uploaded' | 'merged' | 'conflicted' | 'blocked_recovery';
   attempts: number;
@@ -181,7 +182,10 @@ type SharedClientInternals = SharedClientCore & {
 
 type MutableMethod = (...args: any[]) => any;
 
+type PathMutationGate = { ready: Promise<void>; release(): void };
+
 type SharedModule = {
+  installPathMutationGate: (adapter: NodeDataAdapter, owner: object) => PathMutationGate;
   ObtsClientCore: new (plugin: NodePluginHost) => SharedClientCore;
   PluginBlockedError: new (code: string, message: string) => Error & { code: string };
   TransportError: new (status: number, code: string, message: string, details?: unknown) => Error & {
@@ -208,6 +212,7 @@ export class ObtsPluginClient {
   constructor(vaultDir: string, settings: ObtsPluginSettings) {
     this.settings = settings;
     this.host = createNodePluginHost(vaultDir, settings);
+    this.host.pathMutationGate = shared.installPathMutationGate(this.host.app.vault.adapter, this.host);
     this.host.flushOpenMarkdownEditorsToDisk = () => this.flushEditorBuffersToDisk();
     this.client = new shared.ObtsClientCore(this.host) as SharedClientInternals;
     this.git = exposeMutableMethods(this.client, ['createLocalCommit', 'importPack', 'readBlob']);
@@ -520,6 +525,7 @@ function createNodePluginHost(vaultDir: string, settings: ObtsPluginSettings) {
     vaultName: settings.vaultId ?? 'OBTS Headless Vault',
     lifecycleAbortController: new AbortController(),
     unloaded: false,
+    pathMutationGate: null as PathMutationGate | null,
     syncQueued: false,
     isApplying: false,
     clientReady: true,

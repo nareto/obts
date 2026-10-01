@@ -15,6 +15,83 @@ const { createDataAdapterFs } = require('../obsidian-plugin/src/data-adapter-fs.
   createDataAdapterFs: (adapter: MemoryDataAdapter) => any;
 };
 
+async function lifecycleFixture() {
+  const artifact = await readFile('obsidian-plugin/main.js', 'utf8');
+  const module = { exports: {} as any };
+  const context = vm.createContext({
+    module, exports: module.exports,
+    require: (name: string) => {
+      if (name !== 'obsidian') throw new Error(`Unexpected runtime require: ${name}`);
+      return { Plugin: class {}, PluginSettingTab: class {}, Setting: class {}, Notice: class {}, Modal: class {}, Platform: { isMobile: false } };
+    },
+    globalThis: null, window: null, AbortController, setTimeout, clearTimeout, setInterval, clearInterval,
+    TextEncoder, TextDecoder, crypto: webcrypto, console
+  });
+  Object.assign(context, { globalThis: context, window: context });
+  new vm.Script(artifact, { filename: 'obsidian-plugin/main.js' }).runInContext(context);
+  const plugin = new module.exports();
+  const adapter = new MemoryDataAdapter();
+  Object.defineProperty(adapter, 'writeBinary', {
+    value: adapter.writeBinary.bind(adapter), configurable: true, writable: true, enumerable: false
+  });
+  const descriptors = Object.getOwnPropertyDescriptors(adapter);
+  plugin.app = { vault: { adapter }, workspace: {} };
+  plugin.addStatusBarItem = vi.fn(() => { throw new Error('An unloaded client must not reach UI construction'); });
+  return { plugin, adapter, descriptors, context };
+}
+
+describe('plugin gate loading lifecycle', () => {
+  it('restores original descriptors when settings loading fails', async () => {
+    const { plugin, adapter, descriptors } = await lifecycleFixture();
+    const error = new Error('settings read failed');
+    plugin.loadData = vi.fn().mockRejectedValue(error);
+    await expect(plugin.onload()).rejects.toBe(error);
+    expect(plugin.unloaded).toBe(true);
+    expect(plugin.lifecycleAbortController.signal.aborted).toBe(true);
+    expect(Object.getOwnPropertyDescriptors(adapter)).toEqual(descriptors);
+    expect(Object.hasOwn(adapter, 'mkdir')).toBe(false);
+    expect(plugin.client).toBeUndefined();
+    expect(plugin.addStatusBarItem).not.toHaveBeenCalled();
+    expect(() => plugin.onunload()).not.toThrow();
+    expect(Object.getOwnPropertyDescriptors(adapter)).toEqual(descriptors);
+  });
+
+  it('preserves an unload during settings loading and never constructs a client afterward', async () => {
+    const { plugin, adapter, descriptors } = await lifecycleFixture();
+    let finishSettings!: (settings: object) => void;
+    plugin.loadData = vi.fn(() => new Promise<object>((resolve) => { finishSettings = resolve; }));
+    const loading = plugin.onload();
+    expect(plugin.loadData).toHaveBeenCalledOnce();
+    expect(adapter.writeBinary).not.toBe(descriptors.writeBinary.value);
+    expect(() => plugin.onunload()).not.toThrow();
+    expect(plugin.unloaded).toBe(true);
+    expect(Object.getOwnPropertyDescriptors(adapter)).toEqual(descriptors);
+    finishSettings({});
+    await loading;
+    expect(plugin.unloaded).toBe(true);
+    expect(plugin.lifecycleAbortController.signal.aborted).toBe(true);
+    expect(plugin.client).toBeUndefined();
+    expect(plugin.addStatusBarItem).not.toHaveBeenCalled();
+    expect(Object.getOwnPropertyDescriptors(adapter)).toEqual(descriptors);
+    expect(Object.hasOwn(adapter, 'mkdir')).toBe(false);
+  });
+
+  it("retains a failed load's gate until its owned active operation completes", async () => {
+    const { plugin, adapter, descriptors, context } = await lifecycleFixture();
+    let completeOperation!: () => void;
+    const lease = { owner: plugin, retiring: false, completion: new Promise<void>((resolve) => { completeOperation = resolve; }) };
+    (context as any).__obtsOperationRegistry = new WeakMap([[adapter, lease]]);
+    const error = new Error('settings read failed during an owned operation');
+    plugin.loadData = vi.fn().mockRejectedValue(error);
+    await expect(plugin.onload()).rejects.toBe(error);
+    expect(lease.retiring).toBe(true);
+    expect(adapter.writeBinary).not.toBe(descriptors.writeBinary.value);
+    completeOperation();
+    for (let index = 0; index < 12; index += 1) await Promise.resolve();
+    expect(Object.getOwnPropertyDescriptors(adapter)).toEqual(descriptors);
+  });
+});
+
 describe('mobile plugin artifact', () => {
   it('is advertised for mobile and contains no unresolved desktop runtime dependencies', async () => {
     const manifest = JSON.parse(await readFile('obsidian-plugin/manifest.json', 'utf8')) as { isDesktopOnly: boolean };
@@ -273,6 +350,8 @@ describe('mobile plugin artifact', () => {
     expect(typeof (context as any).Buffer).toBe('function');
 
     const adapter = new MemoryDataAdapter();
+    const originalAdapterWriteBinary = adapter.writeBinary.bind(adapter);
+    const adapterWriteSpy = vi.spyOn(adapter, 'writeBinary');
     await adapter.mkdir('.obts');
     await adapter.mkdir('.obts/git');
     await adapter.mkdir('.obts/git/objects');
@@ -638,6 +717,16 @@ describe('mobile plugin artifact', () => {
     (context as any).clearTimeout = originalWindowClearTimeout;
 
     const runtimeAdapter = new MemoryDataAdapter();
+    // Fault hooks must exist before installation: apply uses captured raw methods,
+    // not later replacements of the public, gated instance methods.
+    const runtimeRmdir = runtimeAdapter.rmdir.bind(runtimeAdapter);
+    const runtimeMkdir = runtimeAdapter.mkdir.bind(runtimeAdapter);
+    const runtimeStat = runtimeAdapter.stat.bind(runtimeAdapter);
+    const runtimeList = runtimeAdapter.list.bind(runtimeAdapter);
+    const runtimeRmdirSpy = vi.spyOn(runtimeAdapter, 'rmdir');
+    const runtimeMkdirSpy = vi.spyOn(runtimeAdapter, 'mkdir');
+    const runtimeStatSpy = vi.spyOn(runtimeAdapter, 'stat');
+    const runtimeListSpy = vi.spyOn(runtimeAdapter, 'list');
     const runtimeLayoutReadyCallbacks: Array<() => void> = [];
     const runtimeVaultCallbacks = new Map<string, (...args: any[]) => void>();
     const runtimePlugin = new PluginClass();
@@ -743,12 +832,11 @@ describe('mobile plugin artifact', () => {
     await runtimeAdapter.mkdir('mobile-delete');
     await runtimeAdapter.mkdir('mobile-delete/nested');
     await runtimeAdapter.mkdir('mobile-delete/nested/leaf');
-    const runtimeRmdir = runtimeAdapter.rmdir.bind(runtimeAdapter);
     const runtimeRecursiveFlags: boolean[] = [];
-    runtimeAdapter.rmdir = async (path: string, recursive = false) => {
+    runtimeRmdirSpy.mockImplementation(async (path: string, recursive = false) => {
       if (path === 'mobile-delete' || path.startsWith('mobile-delete/')) runtimeRecursiveFlags.push(recursive);
       await runtimeRmdir(path, recursive);
-    };
+    });
     const mobileDeleteDirectories = ['mobile-delete', 'mobile-delete/nested', 'mobile-delete/nested/leaf'];
     const residual = await runtimeClient.applyDirectoryChanges(
       [{ op: 'delete', path: 'mobile-delete' }],
@@ -761,15 +849,15 @@ describe('mobile plugin artifact', () => {
     expect(runtimeRecursiveFlags).toEqual([false, false, false]);
 
     await runtimeAdapter.mkdir('persistent-rmdir-failure');
-    const workingRmdir = runtimeAdapter.rmdir.bind(runtimeAdapter);
+    const workingRmdir = runtimeRmdir;
     let failedRmdirAttempts = 0;
-    runtimeAdapter.rmdir = async (path: string, recursive = false) => {
+    runtimeRmdirSpy.mockImplementation(async (path: string, recursive = false) => {
       if (path === 'persistent-rmdir-failure') {
         failedRmdirAttempts += 1;
         throw Object.assign(new Error('simulated persistent mobile rmdir failure'), { code: 'EIO' });
       }
       await workingRmdir(path, recursive);
-    };
+    });
     await expect(runtimeClient.applyDirectoryChanges(
       [{ op: 'delete', path: 'persistent-rmdir-failure' }],
       [],
@@ -778,7 +866,7 @@ describe('mobile plugin artifact', () => {
     )).rejects.toMatchObject({ code: 'directory_delete_failed' });
     expect(failedRmdirAttempts).toBe(3);
     expect(await runtimeAdapter.exists('persistent-rmdir-failure')).toBe(true);
-    runtimeAdapter.rmdir = workingRmdir;
+    runtimeRmdirSpy.mockImplementation(workingRmdir);
 
     await runtimeAdapter.mkdir('missing-directory-identity');
     await expect(runtimeClient.applyDirectoryChanges(
@@ -791,43 +879,40 @@ describe('mobile plugin artifact', () => {
 
     await runtimeAdapter.mkdir('directory-inspection-failure');
     const inspectionCtime = (await runtimeAdapter.stat('directory-inspection-failure'))?.ctime ?? null;
-    const runtimeStat = runtimeAdapter.stat.bind(runtimeAdapter);
-    runtimeAdapter.stat = async (path: string) => {
+    runtimeStatSpy.mockImplementation(async (path: string) => {
       if (path === 'directory-inspection-failure') throw Object.assign(new Error('simulated mobile stat failure'), { code: 'EIO' });
       return await runtimeStat(path);
-    };
+    });
     await expect(runtimeClient.applyDirectoryChanges(
       [{ op: 'delete', path: 'directory-inspection-failure' }],
       [],
       new Set(['directory-inspection-failure']),
       { 'directory-inspection-failure': inspectionCtime }
     )).rejects.toMatchObject({ code: 'directory_inspection_failed' });
-    runtimeAdapter.stat = runtimeStat;
+    runtimeStatSpy.mockImplementation(runtimeStat);
 
     await runtimeAdapter.mkdir('directory-list-failure');
     const listFailureCtime = (await runtimeAdapter.stat('directory-list-failure'))?.ctime ?? null;
-    const runtimeList = runtimeAdapter.list.bind(runtimeAdapter);
-    runtimeAdapter.list = async (path: string) => {
+    runtimeListSpy.mockImplementation(async (path: string) => {
       if (path === 'directory-list-failure') throw Object.assign(new Error('simulated mobile list failure'), { code: 'EIO' });
       return await runtimeList(path);
-    };
+    });
     await expect(runtimeClient.applyDirectoryChanges(
       [{ op: 'delete', path: 'directory-list-failure' }],
       [],
       new Set(['directory-list-failure']),
       { 'directory-list-failure': listFailureCtime }
     )).rejects.toMatchObject({ code: 'directory_inspection_failed' });
-    runtimeAdapter.list = runtimeList;
+    runtimeListSpy.mockImplementation(runtimeList);
 
-    const runtimeMkdir = runtimeAdapter.mkdir.bind(runtimeAdapter);
-    runtimeAdapter.mkdir = async (path: string) => {
+    runtimeMkdirSpy.mockImplementation(async (path: string) => {
       if (path === 'failed-authoritative-directory') throw Object.assign(new Error('simulated mobile mkdir failure'), { code: 'EIO' });
       await runtimeMkdir(path);
-    };
+    });
     await expect(runtimeClient.applyDirectoryChanges([], ['failed-authoritative-directory'], new Set(), {})).rejects.toMatchObject({
       code: 'directory_materialization_failed'
     });
-    runtimeAdapter.mkdir = runtimeMkdir;
+    runtimeMkdirSpy.mockImplementation(runtimeMkdir);
     await runtimeClient.refreshDirectoryStateFromDisk([]);
 
     runtimeClient.pollEvents = async () => ({ current_event_seq: 0, events: [] });
@@ -1122,11 +1207,10 @@ describe('mobile plugin artifact', () => {
     (plugin as any).endSync();
 
     const writesBeforeSnapshot = vi.fn();
-    const originalAdapterWriteBinary = adapter.writeBinary.bind(adapter);
-    adapter.writeBinary = async (...args: Parameters<typeof adapter.writeBinary>) => {
+    adapterWriteSpy.mockImplementation(async (...args: Parameters<typeof adapter.writeBinary>) => {
       writesBeforeSnapshot();
       return await originalAdapterWriteBinary(...args);
-    };
+    });
     const requestsBeforeSnapshot = requests.length;
     expect((plugin as any).beginSync('Applying server changes')).toBe(true);
     (plugin as any).setOperationProgress('Applying 12/6028', 'apply_write');
@@ -1212,7 +1296,7 @@ describe('mobile plugin artifact', () => {
     (plugin as any).settings.diagnosticConsentServer = 'http://127.0.0.1:3000';
     expect(writesBeforeSnapshot).not.toHaveBeenCalled();
     expect(JSON.stringify(requests.slice(requestsBeforeAutomaticSnapshots))).not.toContain('c'.repeat(40));
-    adapter.writeBinary = originalAdapterWriteBinary;
+    adapterWriteSpy.mockImplementation(originalAdapterWriteBinary);
 
     const savedPrimaryState = await adapter.readBinary('.obts/state.json');
     await adapter.writeBinary('.obts/state.json', new TextEncoder().encode('{"unexpected":"state"}').buffer);
@@ -1380,15 +1464,26 @@ describe('mobile plugin artifact', () => {
       },
       workspace: { getLeavesOfType: () => [] }
     };
+    const reloadOriginalWrite = reloadAdapter.writeBinary;
     const retiring = new PluginClass();
     retiring.app = reloadApp;
     const retiringLoad = (retiring as any).onload();
     await initializationStarted;
+    const sharedWriteWrapper = reloadAdapter.writeBinary;
+    expect(sharedWriteWrapper).not.toBe(reloadOriginalWrite);
     const successor = new PluginClass();
     successor.app = reloadApp;
     await (successor as any).onload();
     expect((successor as any).clientReady).toBe(false);
+    expect(reloadAdapter.writeBinary).toBe(sharedWriteWrapper);
+    expect((successor as any).pathMutationGate.raw).toBe((retiring as any).pathMutationGate.raw);
     expect(overlappingWrites).toBe(0);
+    let releaseVisible!: () => void;
+    const visibleBarrier = new Promise<void>((resolve) => { releaseVisible = resolve; });
+    const visibleClaim = (retiring as any).pathMutationGate.withExclusive(['reload.md'], () => visibleBarrier);
+    for (let i = 0; i < 12; i += 1) await Promise.resolve();
+    const queuedVisibleWriter = reloadAdapter.writeBinary('reload.md', new TextEncoder().encode('queued across reload\n').buffer);
+    expect(await reloadAdapter.exists('reload.md')).toBe(false);
     const retiringInitialization = (retiring as any).clientInitialization;
     (retiring as any).onunload();
     released = true;
@@ -1398,6 +1493,10 @@ describe('mobile plugin artifact', () => {
     await expect((successor as any).ensureClientReady()).resolves.toBe(true);
     expect((successor as any).clientReady).toBe(true);
     expect(overlappingWrites).toBe(0);
+    expect(reloadAdapter.writeBinary).toBe(sharedWriteWrapper);
+    releaseVisible();
+    await Promise.all([visibleClaim, queuedVisibleWriter]);
+    expect(Buffer.from(await reloadAdapter.readBinary('reload.md')).toString('utf8')).toBe('queued across reload\n');
 
     const readOnlyClient = (successor as any).client;
     const localPolicy = await readOnlyClient.readRootIgnorePolicy();
@@ -1405,5 +1504,6 @@ describe('mobile plugin artifact', () => {
     expect(readOnlyClient.previewRootIgnoreDraft).toBeUndefined();
     expect(readOnlyClient.saveRootIgnoreDraft).toBeUndefined();
     (successor as any).onunload();
+    expect(reloadAdapter.writeBinary).toBe(reloadOriginalWrite);
   });
 });

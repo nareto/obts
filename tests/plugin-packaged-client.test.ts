@@ -19,6 +19,7 @@ describe('packaged shared client', () => {
 
       expect(packaged).toContain('main.cjs');
       expect(packaged).toContain('blob-size-reader.cjs');
+      expect(packaged).toContain('path-mutation-gate.cjs');
       expect(await readFile(join(destination, 'dist', 'src', 'shared', 'rootIgnore.cjs'), 'utf8')).not.toBe('');
 
       const present = await readdir(pluginDirectory);

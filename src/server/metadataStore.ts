@@ -170,6 +170,8 @@ export type SyncOperationRow = {
   target_refs: Record<string, string | null>;
   target_commit: string | null;
   status: 'started' | 'prepared' | 'committed' | 'aborted';
+  // Absent on legacy pushes; null binds the original natural-base (no explicit base) rule.
+  proposal_base?: string | null;
   prepared_manifest: Record<string, unknown> | null;
   result: Record<string, unknown> | null;
   created_at: string;

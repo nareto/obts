@@ -18,7 +18,8 @@
     "OBTSDistributedSync",
     "modules/OBTSDomain",
     "modules/OBTSApplyRefinement",
-    "modules/OBTSSafety"
+    "modules/OBTSSafety",
+    "OBTSStaleProposal"
   ],
   "checks": [
     {
@@ -115,7 +116,14 @@
       "config": "configs/in-place-safety.cfg",
       "kind": "positive-safety",
       "maximumDepth": 250,
-      "baseline": { "generated": 631, "distinct": 476, "depth": 23, "minGenerated": 315, "minDistinct": 238, "minDepth": 11 }
+      "baseline": {
+        "generated": 548,
+        "distinct": 411,
+        "depth": 23,
+        "minGenerated": 274,
+        "minDistinct": 205,
+        "minDepth": 11
+      }
     },
     {
       "id": "fm001-in-place-liveness",
@@ -123,7 +131,14 @@
       "config": "configs/in-place-liveness.cfg",
       "kind": "positive-liveness",
       "maximumDepth": 250,
-      "baseline": { "generated": 631, "distinct": 476, "depth": 23, "minGenerated": 315, "minDistinct": 238, "minDepth": 11 }
+      "baseline": {
+        "generated": 548,
+        "distinct": 411,
+        "depth": 23,
+        "minGenerated": 274,
+        "minDistinct": 205,
+        "minDepth": 11
+      }
     },
     {
       "id": "fm001-in-place-reach-old",
@@ -133,7 +148,15 @@
       "maximumDepth": 250,
       "expectedInvariant": "NoOldImageRecovery",
       "requiredWitness": "RecoverOldImage",
-      "minimumTraceDepth": 10
+      "minimumTraceDepth": 10,
+      "baseline": {
+        "generated": 91,
+        "distinct": 71,
+        "depth": 10,
+        "minGenerated": 45,
+        "minDistinct": 35,
+        "minDepth": 5
+      }
     },
     {
       "id": "fm001-in-place-reach-target",
@@ -143,7 +166,15 @@
       "maximumDepth": 250,
       "expectedInvariant": "NoTargetImageRecovery",
       "requiredWitness": "RecoverTargetImage",
-      "minimumTraceDepth": 12
+      "minimumTraceDepth": 12,
+      "baseline": {
+        "generated": 134,
+        "distinct": 110,
+        "depth": 12,
+        "minGenerated": 67,
+        "minDistinct": 55,
+        "minDepth": 6
+      }
     },
     {
       "id": "fm001-in-place-reach-unknown",
@@ -153,7 +184,15 @@
       "maximumDepth": 250,
       "expectedInvariant": "NoUnknownImageRecovery",
       "requiredWitness": "RecoverUnknownImage",
-      "minimumTraceDepth": 11
+      "minimumTraceDepth": 11,
+      "baseline": {
+        "generated": 107,
+        "distinct": 85,
+        "depth": 11,
+        "minGenerated": 53,
+        "minDistinct": 42,
+        "minDepth": 5
+      }
     },
     {
       "id": "fm001-in-place-negative-non-atomic",
@@ -163,7 +202,15 @@
       "maximumDepth": 250,
       "expectedInvariant": "NoLocalVersionLost",
       "requiredWitness": "LocalWriteBetweenCompareAndModify",
-      "minimumTraceDepth": 10
+      "minimumTraceDepth": 10,
+      "baseline": {
+        "generated": 87,
+        "distinct": 66,
+        "depth": 10,
+        "minGenerated": 43,
+        "minDistinct": 33,
+        "minDepth": 5
+      }
     },
     {
       "id": "fm002-same-path",
@@ -1560,6 +1607,1221 @@
       "expectedInvariant": "LegacyRetirementSafe",
       "requiredWitness": "LegacyClearJournal",
       "minimumTraceDepth": 5
+    },
+    {
+      "id": "fm001-in-place-delete-safety",
+      "model": "OBTSApplyInPlace",
+      "config": "configs/in-place-delete-safety.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "baseline": {
+        "generated": 522,
+        "distinct": 393,
+        "depth": 23,
+        "minGenerated": 261,
+        "minDistinct": 196,
+        "minDepth": 11
+      }
+    },
+    {
+      "id": "fm001-in-place-negative-external",
+      "model": "OBTSApplyInPlace",
+      "config": "configs/in-place-negative-external.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoLocalVersionLost",
+      "requiredWitness": "ModifyExistingFile",
+      "minimumTraceDepth": 10,
+      "baseline": {
+        "generated": 87,
+        "distinct": 67,
+        "depth": 10,
+        "minGenerated": 43,
+        "minDistinct": 33,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm001-in-place-delete-negative-gate-off",
+      "model": "OBTSApplyInPlace",
+      "config": "configs/in-place-delete-negative-gate-off.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoLocalVersionLost",
+      "requiredWitness": "DeleteExistingFile",
+      "minimumTraceDepth": 10,
+      "baseline": {
+        "generated": 86,
+        "distinct": 65,
+        "depth": 10,
+        "minGenerated": 43,
+        "minDistinct": 32,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm001-in-place-delete-negative-external",
+      "model": "OBTSApplyInPlace",
+      "config": "configs/in-place-delete-negative-external.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoLocalVersionLost",
+      "requiredWitness": "DeleteExistingFile",
+      "minimumTraceDepth": 10,
+      "baseline": {
+        "generated": 86,
+        "distinct": 66,
+        "depth": 10,
+        "minGenerated": 43,
+        "minDistinct": 33,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm001-in-place-delete-liveness",
+      "model": "OBTSApplyInPlace",
+      "config": "configs/in-place-delete-liveness.cfg",
+      "kind": "positive-liveness",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "baseline": {
+        "generated": 522,
+        "distinct": 393,
+        "depth": 23,
+        "minGenerated": 261,
+        "minDistinct": 196,
+        "minDepth": 11
+      }
+    },
+    {
+      "id": "fm001-in-place-reach-gate-crash",
+      "model": "OBTSApplyInPlace",
+      "config": "configs/in-place-reach-gate-crash.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoGateCrashRelease",
+      "requiredWitness": "InPlaceCrash",
+      "minimumTraceDepth": 8,
+      "baseline": {
+        "generated": 67,
+        "distinct": 53,
+        "depth": 9,
+        "minGenerated": 33,
+        "minDistinct": 26,
+        "minDepth": 4
+      }
+    },
+    {
+      "id": "fm001-in-place-reach-delete-seam",
+      "model": "OBTSApplyInPlace",
+      "config": "configs/in-place-reach-delete-seam.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoDeleteSeam",
+      "requiredWitness": "DeleteExistingFile",
+      "minimumTraceDepth": 8,
+      "baseline": {
+        "generated": 66,
+        "distinct": 52,
+        "depth": 9,
+        "minGenerated": 33,
+        "minDistinct": 26,
+        "minDepth": 4
+      }
+    },
+    {
+      "id": "fm001-stale-disjoint",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-disjoint.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "baseline": {
+        "generated": 93810,
+        "distinct": 52872,
+        "depth": 36,
+        "minGenerated": 46905,
+        "minDistinct": 26436,
+        "minDepth": 18
+      }
+    },
+    {
+      "id": "fm001-stale-overlap",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-overlap.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "baseline": {
+        "generated": 23412,
+        "distinct": 12912,
+        "depth": 24,
+        "minGenerated": 11706,
+        "minDistinct": 6456,
+        "minDepth": 12
+      }
+    },
+    {
+      "id": "fm001-stale-binary",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-binary.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "baseline": {
+        "generated": 23412,
+        "distinct": 12912,
+        "depth": 24,
+        "minGenerated": 11706,
+        "minDistinct": 6456,
+        "minDepth": 12
+      }
+    },
+    {
+      "id": "fm001-stale-delete",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-delete.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "baseline": {
+        "generated": 23412,
+        "distinct": 12912,
+        "depth": 24,
+        "minGenerated": 11706,
+        "minDistinct": 6456,
+        "minDepth": 12
+      }
+    },
+    {
+      "id": "fm001-stale-identical",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-identical.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "baseline": {
+        "generated": 93810,
+        "distinct": 52872,
+        "depth": 36,
+        "minGenerated": 46905,
+        "minDistinct": 26436,
+        "minDepth": 18
+      }
+    },
+    {
+      "id": "fm001-stale-reach-disjoint-merge",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-disjoint-merge.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoDisjointMerge",
+      "requiredWitness": "IntegrateThreeWay",
+      "minimumTraceDepth": 9,
+      "baseline": {
+        "generated": 475,
+        "distinct": 303,
+        "depth": 9,
+        "minGenerated": 237,
+        "minDistinct": 151,
+        "minDepth": 4
+      }
+    },
+    {
+      "id": "fm001-stale-reach-overlapping-conflict",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-overlapping-conflict.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoOverlappingConflict",
+      "requiredWitness": "IntegrateThreeWay",
+      "minimumTraceDepth": 9,
+      "baseline": {
+        "generated": 475,
+        "distinct": 303,
+        "depth": 9,
+        "minGenerated": 237,
+        "minDistinct": 151,
+        "minDepth": 4
+      }
+    },
+    {
+      "id": "fm001-stale-reach-sticky-second-edit",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-sticky-second-edit.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoStickySecondEdit",
+      "requiredWitness": "StickySecondEdit",
+      "minimumTraceDepth": 5,
+      "baseline": {
+        "generated": 94,
+        "distinct": 48,
+        "depth": 6,
+        "minGenerated": 47,
+        "minDistinct": 24,
+        "minDepth": 3
+      }
+    },
+    {
+      "id": "fm001-stale-reach-pre-mutation-save",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-pre-mutation-save.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoPreMutationSave",
+      "requiredWitness": "PreMutationSave",
+      "minimumTraceDepth": 2,
+      "baseline": {
+        "generated": 2,
+        "distinct": 2,
+        "depth": 2,
+        "minGenerated": 1,
+        "minDistinct": 1,
+        "minDepth": 1
+      }
+    },
+    {
+      "id": "fm001-stale-reach-gate-queued-save",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-gate-queued-save.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoGateQueuedSave",
+      "requiredWitness": "GateQueuedSave",
+      "minimumTraceDepth": 3,
+      "baseline": {
+        "generated": 5,
+        "distinct": 5,
+        "depth": 3,
+        "minGenerated": 2,
+        "minDistinct": 2,
+        "minDepth": 1
+      }
+    },
+    {
+      "id": "fm001-stale-reach-post-apply-flush",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-post-apply-flush.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoPostApplyFlush",
+      "requiredWitness": "PostApplyFlush",
+      "minimumTraceDepth": 3,
+      "baseline": {
+        "generated": 7,
+        "distinct": 6,
+        "depth": 3,
+        "minGenerated": 3,
+        "minDistinct": 3,
+        "minDepth": 1
+      }
+    },
+    {
+      "id": "fm001-stale-reach-commit-crash",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-commit-crash.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoCommitCrashRestart",
+      "requiredWitness": "Restart",
+      "minimumTraceDepth": 6,
+      "baseline": {
+        "generated": 97,
+        "distinct": 51,
+        "depth": 6,
+        "minGenerated": 48,
+        "minDistinct": 25,
+        "minDepth": 3
+      }
+    },
+    {
+      "id": "fm001-stale-reach-queue-crash",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-queue-crash.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoQueueCrashRestart",
+      "requiredWitness": "Restart",
+      "minimumTraceDepth": 7,
+      "baseline": {
+        "generated": 172,
+        "distinct": 98,
+        "depth": 7,
+        "minGenerated": 86,
+        "minDistinct": 49,
+        "minDepth": 3
+      }
+    },
+    {
+      "id": "fm001-stale-reach-cleanup-crash",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-cleanup-crash.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoCleanupCrashRestart",
+      "requiredWitness": "Restart",
+      "minimumTraceDepth": 8,
+      "baseline": {
+        "generated": 289,
+        "distinct": 177,
+        "depth": 8,
+        "minGenerated": 144,
+        "minDistinct": 88,
+        "minDepth": 4
+      }
+    },
+    {
+      "id": "fm001-stale-reach-device-ref-retry",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-device-ref-retry.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoRefCrashRetry",
+      "requiredWitness": "IntegrateThreeWay",
+      "minimumTraceDepth": 13,
+      "baseline": {
+        "generated": 3329,
+        "distinct": 2257,
+        "depth": 13,
+        "minGenerated": 1664,
+        "minDistinct": 1128,
+        "minDepth": 6
+      }
+    },
+    {
+      "id": "fm001-stale-reach-horizon-drain",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-horizon-drain.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoHorizonDrain",
+      "requiredWitness": "EndHorizon",
+      "minimumTraceDepth": 5,
+      "baseline": {
+        "generated": 71,
+        "distinct": 38,
+        "depth": 5,
+        "minGenerated": 35,
+        "minDistinct": 19,
+        "minDepth": 2
+      }
+    },
+    {
+      "id": "fm001-stale-reach-sequential-fresh-revert",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-sequential-fresh-revert.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoSequentialFreshRevert",
+      "requiredWitness": "SettleFreshSequentially",
+      "minimumTraceDepth": 11,
+      "baseline": {
+        "generated": 7173,
+        "distinct": 4724,
+        "depth": 15,
+        "minGenerated": 3586,
+        "minDistinct": 2362,
+        "minDepth": 7
+      }
+    },
+    {
+      "id": "fm001-stale-reach-latest-sticky-settlement",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-latest-sticky-settlement.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoLaterStickySettlement",
+      "requiredWitness": "ApplySettledContent",
+      "minimumTraceDepth": 17,
+      "baseline": {
+        "generated": 24120,
+        "distinct": 14397,
+        "depth": 19,
+        "minGenerated": 12060,
+        "minDistinct": 7198,
+        "minDepth": 9
+      }
+    },
+    {
+      "id": "fm001-stale-reach-inherited-canonical",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-inherited-canonical.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoInheritedAdvance",
+      "requiredWitness": "IntegrateThreeWay",
+      "minimumTraceDepth": 10,
+      "baseline": {
+        "generated": 758,
+        "distinct": 496,
+        "depth": 10,
+        "minGenerated": 379,
+        "minDistinct": 248,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm001-stale-negative-base-c",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-negative-base-c.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "StaleProposalUsesAuthoringBase",
+      "requiredWitness": "CreateCohortCommit",
+      "minimumTraceDepth": 4,
+      "baseline": {
+        "generated": 14,
+        "distinct": 11,
+        "depth": 4,
+        "minGenerated": 7,
+        "minDistinct": 5,
+        "minDepth": 2
+      }
+    },
+    {
+      "id": "fm001-stale-negative-cleanup-provenance",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-negative-cleanup-provenance.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "StaleProposalUsesAuthoringBase",
+      "requiredWitness": "CleanupJournal",
+      "minimumTraceDepth": 6,
+      "baseline": {
+        "generated": 95,
+        "distinct": 49,
+        "depth": 6,
+        "minGenerated": 47,
+        "minDistinct": 24,
+        "minDepth": 3
+      }
+    },
+    {
+      "id": "fm001-stale-negative-retry-null",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-negative-retry-null.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "StaleProposalUsesAuthoringBase",
+      "requiredWitness": "RetryExistingDeviceCommit",
+      "minimumTraceDepth": 10,
+      "baseline": {
+        "generated": 761,
+        "distinct": 498,
+        "depth": 10,
+        "minGenerated": 380,
+        "minDistinct": 249,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm001-stale-negative-mixed-fresh-revert",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-negative-mixed-fresh-revert.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "OriginCohortsSeparated",
+      "requiredWitness": "CreateCohortCommit",
+      "minimumTraceDepth": 4,
+      "baseline": {
+        "generated": 244,
+        "distinct": 146,
+        "depth": 8,
+        "minGenerated": 122,
+        "minDistinct": 73,
+        "minDepth": 4
+      }
+    },
+    {
+      "id": "fm001-stale-negative-silent-replacement",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-negative-silent-replacement.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoSilentRemoteReplacement",
+      "requiredWitness": "IntegrateThreeWay",
+      "minimumTraceDepth": 9,
+      "baseline": {
+        "generated": 475,
+        "distinct": 302,
+        "depth": 9,
+        "minGenerated": 237,
+        "minDistinct": 151,
+        "minDepth": 4
+      }
+    },
+    {
+      "id": "fm001-stale-reach-untouched-fresh",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-untouched-fresh.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoUntouchedFreshSettlement",
+      "requiredWitness": "SettleFreshSequentially",
+      "minimumTraceDepth": 12,
+      "baseline": {
+        "generated": 1930,
+        "distinct": 1310,
+        "depth": 12,
+        "minGenerated": 965,
+        "minDistinct": 655,
+        "minDepth": 6
+      }
+    },
+    {
+      "id": "fm001-stale-reach-different-retry-base",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-different-retry-base.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoDifferentRetryRejected",
+      "requiredWitness": "RejectDifferentRetryBase",
+      "minimumTraceDepth": 9,
+      "baseline": {
+        "generated": 764,
+        "distinct": 500,
+        "depth": 10,
+        "minGenerated": 382,
+        "minDistinct": 250,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm001-stale-reach-active-horizon-restart",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-active-horizon-restart.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoHorizonCrashRestart",
+      "requiredWitness": "Restart",
+      "minimumTraceDepth": 6,
+      "baseline": {
+        "generated": 97,
+        "distinct": 51,
+        "depth": 6,
+        "minGenerated": 48,
+        "minDistinct": 25,
+        "minDepth": 3
+      }
+    },
+    {
+      "id": "fm001-stale-mixed-binary",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-mixed-binary.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "baseline": {
+        "generated": 93810,
+        "distinct": 52872,
+        "depth": 36,
+        "minGenerated": 46905,
+        "minDistinct": 26436,
+        "minDepth": 18
+      }
+    },
+    {
+      "id": "fm001-stale-mixed-delete",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-mixed-delete.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "baseline": {
+        "generated": 93810,
+        "distinct": 52872,
+        "depth": 36,
+        "minGenerated": 46905,
+        "minDistinct": 26436,
+        "minDepth": 18
+      }
+    },
+    {
+      "id": "fm001-stale-later-apply",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-later-apply.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "baseline": {
+        "generated": 163416,
+        "distinct": 91512,
+        "depth": 37,
+        "minGenerated": 81708,
+        "minDistinct": 45756,
+        "minDepth": 18
+      }
+    },
+    {
+      "id": "fm001-stale-reach-mixed-binary",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-mixed-binary.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoMixedIdentityMerge",
+      "requiredWitness": "IntegrateThreeWay",
+      "minimumTraceDepth": 9,
+      "baseline": {
+        "generated": 475,
+        "distinct": 303,
+        "depth": 9,
+        "minGenerated": 237,
+        "minDistinct": 151,
+        "minDepth": 4
+      }
+    },
+    {
+      "id": "fm001-stale-reach-mixed-delete",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-mixed-delete.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoMixedIdentityMerge",
+      "requiredWitness": "IntegrateThreeWay",
+      "minimumTraceDepth": 9,
+      "baseline": {
+        "generated": 475,
+        "distinct": 303,
+        "depth": 9,
+        "minGenerated": 237,
+        "minDistinct": 151,
+        "minDepth": 4
+      }
+    },
+    {
+      "id": "fm001-stale-reach-later-apply-oldest-base",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-later-apply-oldest-base.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoLaterApplyProposal",
+      "requiredWitness": "LaterApplyDefersSticky",
+      "minimumTraceDepth": 19,
+      "baseline": {
+        "generated": 26850,
+        "distinct": 15974,
+        "depth": 19,
+        "minGenerated": 13425,
+        "minDistinct": 7987,
+        "minDepth": 9
+      }
+    },
+    {
+      "id": "fm001-stale-reach-rejected-then-same-base",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-rejected-then-same-base.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoRejectedThenSameBaseIntegration",
+      "requiredWitness": "RetryExistingDeviceCommit",
+      "minimumTraceDepth": 13,
+      "baseline": {
+        "generated": 3316,
+        "distinct": 2251,
+        "depth": 13,
+        "minGenerated": 1658,
+        "minDistinct": 1125,
+        "minDepth": 6
+      }
+    },
+    {
+      "id": "fm001-stale-negative-older-base-diff",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-negative-older-base-diff.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "AuthoredFromNaturalBase",
+      "requiredWitness": "IntegrateThreeWay",
+      "minimumTraceDepth": 9,
+      "baseline": {
+        "generated": 475,
+        "distinct": 303,
+        "depth": 9,
+        "minGenerated": 237,
+        "minDistinct": 151,
+        "minDepth": 4
+      }
+    },
+    {
+      "id": "fm001-stale-negative-older-base-false-conflict",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-negative-older-base-false-conflict.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "CleanTextProposalMerged",
+      "requiredWitness": "IntegrateThreeWay",
+      "minimumTraceDepth": 10,
+      "baseline": {
+        "generated": 758,
+        "distinct": 496,
+        "depth": 10,
+        "minGenerated": 379,
+        "minDistinct": 248,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm001-stale-negative-all-or-nothing-identity",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-negative-all-or-nothing-identity.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "MixedProposalMerged",
+      "requiredWitness": "IntegrateThreeWay",
+      "minimumTraceDepth": 9,
+      "baseline": {
+        "generated": 475,
+        "distinct": 303,
+        "depth": 9,
+        "minGenerated": 237,
+        "minDistinct": 151,
+        "minDepth": 4
+      }
+    },
+    {
+      "id": "fm001-stale-negative-rebind-retry",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-negative-rebind-retry.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "RetryAdmissionImmutable",
+      "requiredWitness": "RebindDifferentRetryBase",
+      "minimumTraceDepth": 10,
+      "baseline": {
+        "generated": 764,
+        "distinct": 500,
+        "depth": 10,
+        "minGenerated": 382,
+        "minDistinct": 250,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm001-stale-negative-replace-oldest-base",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-negative-replace-oldest-base.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "OldestBaseSurvivesLaterApply",
+      "requiredWitness": "LaterApplyDefersSticky",
+      "minimumTraceDepth": 12,
+      "baseline": {
+        "generated": 1974,
+        "distinct": 1339,
+        "depth": 12,
+        "minGenerated": 987,
+        "minDistinct": 669,
+        "minDepth": 6
+      }
+    },
+    {
+      "id": "fm001-stale-handover",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-handover.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "baseline": {
+        "generated": 8,
+        "distinct": 3,
+        "depth": 3,
+        "minGenerated": 4,
+        "minDistinct": 1,
+        "minDepth": 1
+      }
+    },
+    {
+      "id": "fm001-stale-ack",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-ack.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "baseline": {
+        "generated": 17,
+        "distinct": 6,
+        "depth": 2,
+        "minGenerated": 8,
+        "minDistinct": 3,
+        "minDepth": 1
+      }
+    },
+    {
+      "id": "fm001-stale-noop",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-noop.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "baseline": {
+        "generated": 26,
+        "distinct": 9,
+        "depth": 6,
+        "minGenerated": 13,
+        "minDistinct": 4,
+        "minDepth": 3
+      }
+    },
+    {
+      "id": "fm001-stale-negative-retire-first",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-negative-retire-first.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "RetirementKeepsOldBase",
+      "requiredWitness": "LateRetirementSave",
+      "minimumTraceDepth": 2,
+      "baseline": {
+        "generated": 5,
+        "distinct": 3,
+        "depth": 3,
+        "minGenerated": 2,
+        "minDistinct": 1,
+        "minDepth": 1
+      }
+    },
+    {
+      "id": "fm001-stale-reach-retirement-save",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-retirement-save.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoRetirementSave",
+      "requiredWitness": "LateRetirementSave",
+      "minimumTraceDepth": 2,
+      "baseline": {
+        "generated": 5,
+        "distinct": 3,
+        "depth": 3,
+        "minGenerated": 2,
+        "minDistinct": 1,
+        "minDepth": 1
+      }
+    },
+    {
+      "id": "fm001-stale-reach-noop",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-noop.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoNoopSettlement",
+      "requiredWitness": "NoopSettlement",
+      "minimumTraceDepth": 2,
+      "baseline": {
+        "generated": 3,
+        "distinct": 2,
+        "depth": 2,
+        "minGenerated": 1,
+        "minDistinct": 1,
+        "minDepth": 1
+      }
+    },
+    {
+      "id": "fm001-stale-reach-ack",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-ack.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoAcknowledgedProposal",
+      "requiredWitness": "AcknowledgeProposal",
+      "minimumTraceDepth": 2,
+      "baseline": {
+        "generated": 3,
+        "distinct": 2,
+        "depth": 2,
+        "minGenerated": 1,
+        "minDistinct": 1,
+        "minDepth": 1
+      }
+    },
+    {
+      "id": "fm001-stale-negative-noncohort-base",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-negative-noncohort-base.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "KnownFreshRevertNotLost",
+      "requiredWitness": "AcknowledgeProposal",
+      "minimumTraceDepth": 2,
+      "baseline": {
+        "generated": 5,
+        "distinct": 4,
+        "depth": 2,
+        "minGenerated": 2,
+        "minDistinct": 2,
+        "minDepth": 1
+      }
+    },
+    {
+      "id": "fm001-stale-negative-noop-retire-first",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-negative-noop-retire-first.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "RetirementKeepsOldBase",
+      "requiredWitness": "LateRetirementSave",
+      "minimumTraceDepth": 2,
+      "baseline": {
+        "generated": 6,
+        "distinct": 3,
+        "depth": 3,
+        "minGenerated": 2,
+        "minDistinct": 1,
+        "minDepth": 1
+      }
+    },
+    {
+      "id": "fm001-stale-held",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-held.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "baseline": {
+        "generated": 228,
+        "distinct": 97,
+        "depth": 7,
+        "minGenerated": 114,
+        "minDistinct": 48,
+        "minDepth": 3
+      }
+    },
+    {
+      "id": "fm001-stale-negative-held-old-base",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-negative-held-old-base.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "HeldOwnEditNoFalseConflict",
+      "requiredWitness": "ProposeHeldP",
+      "minimumTraceDepth": 4,
+      "baseline": {
+        "generated": 32,
+        "distinct": 22,
+        "depth": 4,
+        "minGenerated": 16,
+        "minDistinct": 11,
+        "minDepth": 2
+      }
+    },
+    {
+      "id": "fm001-stale-negative-held-new-fallback",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-negative-held-new-fallback.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoSilentRemoteReplacement",
+      "requiredWitness": "ProposeHeldP",
+      "minimumTraceDepth": 4,
+      "baseline": {
+        "generated": 29,
+        "distinct": 20,
+        "depth": 4,
+        "minGenerated": 14,
+        "minDistinct": 10,
+        "minDepth": 2
+      }
+    },
+    {
+      "id": "fm001-stale-held-repair",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-held-repair.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "baseline": {
+        "generated": 614,
+        "distinct": 261,
+        "depth": 11,
+        "minGenerated": 307,
+        "minDistinct": 130,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm001-stale-negative-held-repair-exemption",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-negative-held-repair-exemption.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "HeldOlderWins",
+      "requiredWitness": "RepairCompanion",
+      "minimumTraceDepth": 4,
+      "baseline": {
+        "generated": 22,
+        "distinct": 15,
+        "depth": 4,
+        "minGenerated": 11,
+        "minDistinct": 7,
+        "minDepth": 2
+      }
     }
   ]
 }

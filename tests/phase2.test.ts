@@ -2186,15 +2186,19 @@ describe('Phase 2 dashboard conflict resolution', () => {
     const fixture = await createConsumedResolutionFixture('consumed-resolution-missed-watcher');
     await writeFile(join(fixture.tabletDir, 'shared.md'), 'unreported newer local edit\n');
 
-    expect(await fixture.tablet.pollRemoteEventsAndApply()).toMatchObject({ applied: true, status: 'Synced' });
+    expect(await fixture.tablet.pollRemoteEventsAndApply()).toMatchObject({ applied: true, status: 'Conflict resolution needed' });
     const state = await fixture.tablet.readState();
     expect(state.local_main).not.toBe(fixture.preResolutionMain);
-    expect(state.status_label).toBe('Synced');
-    expect(state.last_error_code).toBeNull();
-    expect(await fixture.tablet.readQueue()).toMatchObject({ pending_commit: null, status: 'idle' });
+    expect(state.status_label).toBe('Conflict resolution needed');
+    expect(state.last_error_code).toBe('conflict_review_required');
+    const queue = await fixture.tablet.readQueue();
+    expect(queue).toMatchObject({ status: 'conflicted', pending_proposal_base: fixture.preResolutionMain });
     expect(await readFile(join(fixture.tabletDir, 'shared.md'), 'utf8')).toBe('unreported newer local edit\n');
-    expect((await server.git.readBlobAtPath(fixture.admin.vaultId, state.local_main!, 'shared.md')).toString('utf8'))
+    expect(await server.git.getRef(fixture.admin.vaultId, 'refs/heads/main')).toBe(fixture.resolutionCommit);
+    expect((await server.git.readBlobAtPath(fixture.admin.vaultId, queue.pending_commit!, 'shared.md')).toString())
       .toBe('unreported newer local edit\n');
+    expect((await server.git.readBlobAtPath(fixture.admin.vaultId, state.local_main!, 'shared.md')).toString('utf8'))
+      .toBe('selected device version\n');
     expect((await server.git.readBlobAtPath(fixture.admin.vaultId, fixture.resolutionCommit, 'shared.md')).toString('utf8')).toBe(
       'selected device version\n'
     );

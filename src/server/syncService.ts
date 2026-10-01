@@ -26,7 +26,7 @@ import type {
   ResolveConflictResponse
 } from '../shared/types.js';
 import { AuthError, type AuthenticatedDevice } from './authService.js';
-import { GitCommandError, GitDurabilityError, GitMalformedPackError, GitService, sha256Hex, type GitDiffEntry, type GitObjectReader } from './gitService.js';
+import { GitCommandError, GitDurabilityError, GitMalformedPackError, GitMergeOwnershipError, GitService, sha256Hex, type GitDiffEntry, type GitMergeRename, type GitObjectReader, type MergeTreeResult } from './gitService.js';
 import { hasDurableDeletionRecord } from './metadataStore.js';
 import type { VaultLifecycleCoordinator } from './vaultLifecycleCoordinator.js';
 import type {
@@ -354,7 +354,7 @@ export class SyncService {
           device.device_id,
           operation.target_commit!,
           this.latestEventSeq(vault.vault_id, currentDb),
-          null,
+          operation.proposal_base ?? null,
           false,
           storedDirectoryProposal(operation.prepared_manifest?.directory_proposal),
           operation.prepared_manifest?.root_ignore_capability === 'root-ignore-v1'
@@ -401,6 +401,17 @@ export class SyncService {
               throw new AuthError(409, 'attempt_mismatch', 'Upload attempt does not match its original request.');
             }
           }
+          const priorAdmissions = db.sync_operations.filter((candidate) =>
+            candidate.vault_id === auth.vault.vault_id && candidate.device_id === device.device_id &&
+            candidate.operation_type === 'device_push' && candidate.target_commit === manifest.target_commit
+          );
+          // Once a legacy admission is retried, prefer its newly bound operation.
+          const admitted = priorAdmissions.find((candidate) => candidate.proposal_base !== undefined) ??
+            priorAdmissions.find((candidate) => candidate.status === 'prepared' || candidate.status === 'committed');
+          if (admitted?.proposal_base !== undefined &&
+              (admitted.prepared_manifest?.requested_base_commit ?? admitted.proposal_base) !== (manifest.base_commit ?? null)) {
+            throw new AuthError(409, 'proposal_base_mismatch', 'Proposal base does not match its original admission.');
+          }
           const started = this.store.startOperation(db, {
             vault_id: auth.vault.vault_id,
             device_id: device.device_id,
@@ -414,6 +425,15 @@ export class SyncService {
             target_commit: manifest.target_commit
           });
           if (attemptHash) started.prepared_manifest = { attempt_id: manifest.attempt_id, attempt_hash: attemptHash };
+          if (admitted) {
+            // Legacy admissions deliberately retain the old retry rule (natural merge base).
+            started.proposal_base = admitted.proposal_base ?? null;
+            started.prepared_manifest = {
+              ...(started.prepared_manifest ?? {}),
+              proposal_base: started.proposal_base,
+              requested_base_commit: manifest.base_commit ?? null
+            };
+          }
           return started;
         });
         operationId = operation.operation_id;
@@ -474,6 +494,7 @@ export class SyncService {
         await this.store.mutate((db) => {
           const op = requireOperation(db, operation.operation_id);
           op.status = 'prepared';
+          op.proposal_base = operation.proposal_base !== undefined ? operation.proposal_base : manifest.base_commit ?? null;
           op.expected_refs = {
             [auth.device.device_ref]: currentDeviceRef
           };
@@ -481,6 +502,8 @@ export class SyncService {
             ...(op.prepared_manifest ?? {}),
             actor: { user_id: auth.user.user_id, device_id: auth.device.device_id },
             operation_type: 'device_push',
+            proposal_base: op.proposal_base,
+            requested_base_commit: manifest.base_commit ?? null,
             expected_device_ref: currentDeviceRef,
             target_commit: manifest.target_commit,
             validation: {
@@ -556,7 +579,7 @@ export class SyncService {
           auth.device.device_id,
           manifest.target_commit,
           refEventSeq,
-          manifest.base_commit ?? null,
+          operation.proposal_base !== undefined ? operation.proposal_base : manifest.base_commit ?? null,
           detachedProposal,
           directoryProposal,
           manifest
@@ -1014,7 +1037,8 @@ export class SyncService {
       return conflict.affected_paths;
     }
     const mainChanges = await this.git.changedPaths(conflict.vault_id, conflict.base_commit, currentMain);
-    const deviceChanges = await this.git.changedPaths(conflict.vault_id, conflict.base_commit, conflict.device_commit);
+    const authoredBase = await this.git.mergeBase(conflict.vault_id, currentMain, conflict.device_commit) ?? conflict.base_commit;
+    const deviceChanges = await this.git.changedPaths(conflict.vault_id, authoredBase, conflict.device_commit);
     return [...new Set([...conflict.affected_paths, ...intersectChangedPaths(mainChanges, deviceChanges)])].sort();
   }
 
@@ -1237,7 +1261,11 @@ export class SyncService {
       const op = requireOperation(db, operation.operation_id);
       op.status = 'committed';
       op.result = { idempotent: true, target_commit: targetCommit };
+      op.proposal_base = operation.proposal_base ?? null;
       op.prepared_manifest = {
+        ...(op.prepared_manifest ?? {}),
+        proposal_base: op.proposal_base,
+        requested_base_commit: manifest.base_commit ?? null,
         root_ignore_capability: manifest.root_ignore_capability ?? null,
         root_ignore_oid: manifest.root_ignore_oid ?? null,
         directory_proposal: directoryProposal
@@ -1262,7 +1290,7 @@ export class SyncService {
         auth.device.device_id,
         targetCommit,
         fallbackEventSeq,
-        null,
+        operation.proposal_base ?? null,
         false,
         directoryProposal,
         manifest
@@ -1274,7 +1302,7 @@ export class SyncService {
         auth.device.device_id,
         targetCommit,
         fallbackEventSeq,
-        null,
+        operation.proposal_base ?? null,
         false,
         directoryProposal,
         manifest
@@ -1542,6 +1570,7 @@ export class SyncService {
         ['.gitignore'], 'root_ignore_capability_required');
     }
 
+    const naturalBase = await this.git.mergeBase(vaultId, main, deviceCommit);
     let base = proposalBase;
     if (base) {
       const baseIsValid =
@@ -1552,9 +1581,9 @@ export class SyncService {
         return await this.createConflict(vaultId, deviceId, '', main, deviceCommit, [], 'invalid_proposal_base');
       }
     } else {
-      base = await this.git.mergeBase(vaultId, main, deviceCommit);
+      base = naturalBase;
     }
-    if (!base) {
+    if (!base || !naturalBase) {
       return await this.createConflict(vaultId, deviceId, '', main, deviceCommit, [], 'no_merge_base');
     }
 
@@ -1563,7 +1592,19 @@ export class SyncService {
       : null;
     const metadataRules = await this.metadataConflictRules(vaultId);
     const mainChanges = await this.git.changedPaths(vaultId, base, main);
-    const deviceChanges = await this.git.changedPaths(vaultId, base, deviceCommit);
+    const deviceChanges = await this.git.changedPaths(vaultId, naturalBase, deviceCommit);
+    const [mainEntries, deviceEntries] = await Promise.all([
+      this.git.listTreeEntries(vaultId, main, true), this.git.listTreeEntries(vaultId, deviceCommit, true)
+    ]);
+    const mainValues = new Map(mainEntries.map((entry) => [entry.path, entry]));
+    const deviceValues = new Map(deviceEntries.map((entry) => [entry.path, entry]));
+    const identicalPaths = new Set([...changedPathSet(deviceChanges)].filter((path) => {
+      const left = mainValues.get(path);
+      const right = deviceValues.get(path);
+      return left?.type === right?.type && left?.oid === right?.oid;
+    }));
+    const divergentDeviceChanges = changesWithoutIdentities(deviceChanges, identicalPaths);
+    const divergentMainChanges = changesWithoutIdentities(mainChanges, identicalPaths);
     if (detachedProposal && hasDestructiveChanges(deviceChanges)) {
       return await this.createConflict(
         vaultId,
@@ -1576,13 +1617,15 @@ export class SyncService {
         directoryPlan
       );
     }
-    const structuralConflict = await this.classifyStructuralMergeConflict(
+    const { conflict: structuralConflict, mainRenames } = await this.classifyStructuralMergeConflict(
       vaultId,
       base,
       main,
       deviceCommit,
       mainChanges,
-      deviceChanges
+      deviceChanges,
+      naturalBase,
+      identicalPaths
     );
     if (structuralConflict) {
       const affectedPaths = directoryPlan && directoryPlan.affectedRoots.length > 0
@@ -1599,7 +1642,7 @@ export class SyncService {
         directoryPlan
       );
     }
-    const overlapping = intersectChangedPaths(mainChanges, deviceChanges);
+    const overlapping = intersectChangedPaths(divergentMainChanges, divergentDeviceChanges);
     if (directoryPlan && directoryPlan.affectedRoots.length > 0) {
       const fileAffected = overlapping;
       return await this.createConflict(
@@ -1613,7 +1656,8 @@ export class SyncService {
         directoryPlan
       );
     }
-    if (overlapping.length > 0) {
+    const identicalOverlaps = intersectChangedPaths(mainChanges, deviceChanges).filter((path) => identicalPaths.has(path));
+    if (overlapping.length === 0 && identicalOverlaps.length > 0) {
       const identityMerge = await this.tryIdentityOverlappingMerge(
         vaultId,
         deviceId,
@@ -1621,12 +1665,14 @@ export class SyncService {
         main,
         deviceCommit,
         deviceChanges,
-        overlapping,
+        identicalOverlaps,
         directoryPlan
       );
       if (identityMerge) {
         return identityMerge;
       }
+    }
+    if (overlapping.length > 0) {
       const cleanMerge = await this.tryCleanOverlappingMerge(
         vaultId,
         deviceId,
@@ -1636,6 +1682,8 @@ export class SyncService {
         deviceChanges,
         overlapping,
         directoryPlan,
+        naturalBase,
+        mainRenames,
         metadataRules
       );
       if (cleanMerge) {
@@ -1679,7 +1727,7 @@ export class SyncService {
     });
     let mergeCommit: string | null = null;
     try {
-      const mergeTree = await this.git.createDisjointMergeTree(vaultId, base, main, deviceCommit);
+      const mergeTree = await this.git.createDisjointMergeTree(vaultId, naturalBase, main, deviceCommit);
       mergeCommit = await this.git.createMergeCommitObjectFromTree({
         vaultId,
         tree: mergeTree,
@@ -1828,12 +1876,15 @@ export class SyncService {
     currentMain: string,
     deviceCommit: string,
     mainChanges: GitDiffEntry[],
-    deviceChanges: GitDiffEntry[]
-  ): Promise<StructuralConflict | null> {
-    const [baseBlobs, currentBlobs, deviceBlobs] = await Promise.all([
+    deviceChanges: GitDiffEntry[],
+    deviceBase = base,
+    identicalPaths = new Set<string>()
+  ): Promise<{ conflict: StructuralConflict | null; mainRenames: GitMergeRename[] }> {
+    const [baseBlobs, currentBlobs, deviceBlobs, deviceBaseBlobs] = await Promise.all([
       this.blobOidMap(vaultId, base),
       this.blobOidMap(vaultId, currentMain),
-      this.blobOidMap(vaultId, deviceCommit)
+      this.blobOidMap(vaultId, deviceCommit),
+      this.blobOidMap(vaultId, deviceBase)
     ]);
     const readBlob = async (commit: string, path: string): Promise<Buffer | null> =>
       await this.readOptionalBlob(vaultId, commit, path);
@@ -1846,14 +1897,45 @@ export class SyncService {
       readBlob
     });
     const deviceSummary = await summarizeStructuralChanges({
-      baseCommit: base,
+      baseCommit: deviceBase,
       targetCommit: deviceCommit,
       changes: deviceChanges,
-      baseBlobs,
+      baseBlobs: deviceBaseBlobs,
       targetBlobs: deviceBlobs,
       readBlob
     });
-    return structuralMergeConflict(mainSummary, deviceSummary);
+    // Pair renames (including inferred delete+add pairs) before stripping identity
+    // bytes. Their identical sources remain only as divergent-destination lineage.
+    const structuralIdentities = new Set(identicalPaths);
+    for (const summary of [mainSummary, deviceSummary]) {
+      for (const [source, targets] of summary.renameCandidatesByBasePath) {
+        if ([...targets].some((target) => !identicalPaths.has(target))) structuralIdentities.delete(source);
+      }
+    }
+    // Ownership follows only renames AFTER K. The older explicit ancestor still
+    // governs conservative classification above, but cannot redirect a resurrected
+    // K->D addition through an already inherited rename.
+    const authorizationSummary = deviceBase === base ? mainSummary : await summarizeStructuralChanges({
+      baseCommit: deviceBase,
+      targetCommit: currentMain,
+      changes: await this.git.changedPaths(vaultId, deviceBase, currentMain),
+      baseBlobs: deviceBaseBlobs,
+      targetBlobs: currentBlobs,
+      readBlob
+    });
+    const changedExistingSources = new Set(deviceSummary.actions
+      .filter((action) => action.kind === 'edit' || action.kind === 'delete' || action.kind === 'rename')
+      .map((action) => action.basePath));
+    return {
+      conflict: structuralMergeConflict(
+        structuralSummaryWithoutIdentities(mainSummary, structuralIdentities),
+        structuralSummaryWithoutIdentities(deviceSummary, structuralIdentities)
+      ),
+      mainRenames: authorizationSummary.actions
+        .filter((action) => action.kind === 'rename' && action.basePath !== null && action.targetPath !== null &&
+          deviceBaseBlobs.has(action.basePath) && changedExistingSources.has(action.basePath))
+        .map((action) => ({ sourcePath: action.basePath!, targetPath: action.targetPath! }))
+    };
   }
 
   private async blobOidMap(vaultId: string, commit: string): Promise<Map<string, string>> {
@@ -1871,17 +1953,6 @@ export class SyncService {
     overlapping: string[],
     directoryPlan: DirectoryMergePlan | null = null
   ): Promise<PushResult | null> {
-    for (const path of overlapping) {
-      const currentContent = await this.readOptionalBlob(vaultId, currentMain, path);
-      const deviceContent = await this.readOptionalBlob(vaultId, deviceCommit, path);
-      if (currentContent === null && deviceContent === null) {
-        continue;
-      }
-      if (currentContent === null || deviceContent === null || !currentContent.equals(deviceContent)) {
-        return null;
-      }
-    }
-
     const mergePreparation = await this.store.mutate((db) => {
       const device = requireDevice(db, deviceId);
       const mergeSequence = this.store.nextMergeSequence(db, vaultId);
@@ -2261,7 +2332,8 @@ export class SyncService {
     if (!conflict.directory_context && fileAffectedPaths.length === 0) {
       return await this.git.treeHash(conflict.vault_id, conflict.expected_main);
     }
-    const deviceChanges = await this.git.changedPaths(conflict.vault_id, conflict.base_commit, conflict.device_commit);
+    const authoredBase = await this.git.mergeBase(conflict.vault_id, conflict.current_main, conflict.device_commit) ?? conflict.base_commit;
+    const deviceChanges = await this.git.changedPaths(conflict.vault_id, authoredBase, conflict.device_commit);
     const nonConflictingDeviceChanges = changesOutsideAffectedPaths(deviceChanges, fileAffectedPaths);
     if (nonConflictingDeviceChanges.length === 0) {
       return await this.git.treeHash(conflict.vault_id, conflict.expected_main);
@@ -2283,13 +2355,22 @@ export class SyncService {
     deviceChanges: GitDiffEntry[],
     overlapping: string[],
     directoryPlan: DirectoryMergePlan | null = null,
+    authoredBase = base,
+    mainRenames: GitMergeRename[] = [],
     metadataRules: MetadataConflictRule[] = []
   ): Promise<PushResult | null> {
     if (!overlapping.every(isNativeTextMergePath)) {
       return null;
     }
 
-    const mergeTree = await this.git.tryPolicyMergeTree(vaultId, base, currentMain, deviceCommit, deviceChanges, overlapping, metadataRules);
+    let mergeTree: MergeTreeResult | null;
+    try {
+      mergeTree = await this.git.tryPolicyMergeTree(vaultId, base, currentMain, deviceCommit, deviceChanges, overlapping, authoredBase, mainRenames, metadataRules);
+    } catch (error) {
+      if (!(error instanceof GitMergeOwnershipError)) throw error;
+      return await this.createConflict(vaultId, deviceId, base, currentMain, deviceCommit,
+        error.affectedPaths, 'unexplained_native_merge_paths', directoryPlan);
+    }
     if (!mergeTree) {
       return null;
     }
@@ -3350,6 +3431,39 @@ function affectedPathsForReviewGroup(affectedPaths: string[], anchors: Array<str
   return affectedPaths
     .filter((path) => concreteAnchors.some((anchor) => changedPathsConflict(path, anchor)))
     .sort();
+}
+
+function structuralSummaryWithoutIdentities(summary: StructuralSummary, identities: Set<string>): StructuralSummary {
+  const actions = summary.actions.flatMap((action): StructuralAction[] => {
+    if (action.kind === 'rename' && action.basePath && action.targetPath) {
+      if (!identities.has(action.targetPath)) return [action];
+      return identities.has(action.basePath) ? [] : [{ ...action, kind: 'delete', targetPath: null, targetOid: null, renameConfidence: null }];
+    }
+    const path = action.targetPath ?? action.basePath;
+    return path && identities.has(path) ? [] : [action];
+  });
+  return {
+    actions,
+    byBasePath: new Map(actions.filter((action) => action.basePath !== null).map((action) => [action.basePath!, action])),
+    addsByPath: new Map(actions.filter((action) => action.kind === 'add' && action.targetPath !== null).map((action) => [action.targetPath!, action])),
+    renameCandidatesByBasePath: new Map([...summary.renameCandidatesByBasePath]
+      .filter(([path]) => !identities.has(path))
+      .map(([path, targets]) => [path, new Set([...targets].filter((target) => !identities.has(target)))]))
+  };
+}
+
+// Retain a rename when both endpoints diverge; split it when only one endpoint does.
+function changesWithoutIdentities(changes: GitDiffEntry[], identities: Set<string>): GitDiffEntry[] {
+  return changes.flatMap((entry) => {
+    if (entry.oldPath !== undefined) {
+      if (!identities.has(entry.path) && !identities.has(entry.oldPath)) return [entry];
+      return [
+        ...(!identities.has(entry.oldPath) ? [{ status: 'D', path: entry.oldPath }] : []),
+        ...(!identities.has(entry.path) ? [{ status: 'A', path: entry.path }] : [])
+      ];
+    }
+    return identities.has(entry.path) ? [] : [entry];
+  });
 }
 
 function intersectChangedPaths(left: GitDiffEntry[], right: GitDiffEntry[]): string[] {
