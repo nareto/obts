@@ -1120,11 +1120,14 @@ async fn readiness(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
+// Status and metrics report degraded readiness instead of being gated on it:
+// operators and alerting need them most while the projection is catching up or
+// the headless child is down.
 async fn status(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<StatusResponse>, ApiError> {
-    let auth = auth_from_headers(&state, &headers).await?;
+    let auth = authorize_from_headers(&state, &headers).await?;
     let mut response = state.service.status().await;
     response.config_reload = state.runtime_config.reload_status().await;
     log_access(&state, &auth, "/api/v1/status", &json!({}), &[]).await;
@@ -1132,7 +1135,7 @@ async fn status(
 }
 
 async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
-    let auth = auth_from_headers(&state, &headers).await?;
+    let auth = authorize_from_headers(&state, &headers).await?;
     metrics_response(&state, auth.context.as_str()).await
 }
 
@@ -1669,6 +1672,95 @@ mod tests {
             stale,
             Err(ApiError::Service(ServiceError::IndexCatchingUp))
         ));
+    }
+
+    async fn diagnostic_response(
+        app: &axum::Router,
+        endpoint: &str,
+        token: Option<&str>,
+    ) -> (StatusCode, Vec<u8>) {
+        let mut request = Request::builder().uri(endpoint);
+        if let Some(token) = token {
+            request = request.header("x-api-key", token);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).expect("diagnostic request"))
+            .await
+            .expect("diagnostic response");
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("diagnostic body")
+            .to_bytes()
+            .to_vec();
+        (status, body)
+    }
+
+    // Regression for OBTS issue #34: status and metrics are the signals operators
+    // need while the projection is stale or the headless child is down, so they
+    // keep authentication but must not be gated on readiness themselves.
+    #[tokio::test]
+    async fn diagnostics_stay_authenticated_and_available_while_degraded() {
+        let config = AppConfig::default();
+        let runtime_config = RuntimeConfigState::for_tests(&config);
+        let root = tempdir().expect("source root");
+        let source =
+            std::sync::Arc::new(FilesystemSource::new(root.path()).expect("filesystem source"));
+        let script_dir = tempdir().expect("script directory");
+        let headless = crate::headless::test_support::spawn_scripted_client(
+            script_dir.path(),
+            true,
+            "read -r _\nsleep 5",
+            1,
+        )
+        .await;
+        crate::headless::test_support::quarantine_by_timeout(&headless).await;
+        let state = AppState {
+            service: VaultBridgeService::new_with_filesystem(
+                VaultStore::new_with_auth_config(10, runtime_config.auth_config()),
+                source,
+                Some(headless),
+            ),
+            api_tokens: ApiTokenState::for_tests([("monitor", "secret-token", "admin")]),
+            mcp: None,
+            runtime_config,
+        };
+        let app = super::app_router(state);
+
+        for endpoint in ["/api/v1/status", "/api/v1/metrics"] {
+            for token in [None, Some("wrong-token")] {
+                let (status, _) = diagnostic_response(&app, endpoint, token).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{endpoint}");
+            }
+        }
+
+        let (status, body) =
+            diagnostic_response(&app, "/api/v1/status", Some("secret-token")).await;
+        assert_eq!(status, StatusCode::OK);
+        let body: Value = serde_json::from_slice(&body).expect("status JSON");
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(body["dependencies"]["obts_client"], "unavailable");
+        assert_eq!(body["dependencies"]["headless_vault"], "index_catching_up");
+        assert_eq!(body["headless_process"]["up"], false);
+
+        let (status, body) =
+            diagnostic_response(&app, "/api/v1/metrics", Some("secret-token")).await;
+        assert_eq!(status, StatusCode::OK);
+        let body = String::from_utf8(body).expect("metrics text");
+        assert!(body.contains("obts_bridge_headless_process_up 0"));
+        assert!(body.contains("obts_bridge_dependency_up{dependency=\"obts_client\"} 0"));
+        assert!(body.contains("obts_bridge_dependency_up{dependency=\"headless_vault\"} 0"));
+
+        // Content routes still fail closed with a retryable error.
+        let (status, body) =
+            diagnostic_response(&app, "/api/v1/notes/Note.md", Some("secret-token")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = serde_json::from_slice(&body).expect("error JSON");
+        assert_eq!(body["isRetryable"], true);
+        assert_eq!(body["errorCategory"], "transient");
     }
 
     #[tokio::test]

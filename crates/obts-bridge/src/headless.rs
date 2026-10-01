@@ -12,13 +12,71 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, MutexGuard};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep, timeout};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::ClientConfig;
 use crate::filesystem::FilesystemSource;
 use crate::store::HeadlessProcessStatus;
 
 const MAX_HEADLESS_MESSAGE_BYTES: usize = 1024 * 1024;
+/// Commands at least this slow are logged at info level with their progress
+/// checkpoints; faster ones only at debug level.
+const SLOW_HEADLESS_COMMAND: Duration = Duration::from_secs(5);
+const MAX_TRACED_CHECKPOINTS: usize = 32;
+
+/// Timing evidence for one supervised command: when it started and when each
+/// distinct progress diagnostic point was first reached. Diagnostic points are
+/// closed, redacted identifiers (see the progress event schema), so the trace
+/// never carries paths or content.
+#[derive(Debug)]
+struct CommandTrace {
+    started: Instant,
+    checkpoints: Vec<(String, u128)>,
+    last_point: Option<String>,
+    omitted: usize,
+}
+
+impl CommandTrace {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            checkpoints: Vec::new(),
+            last_point: None,
+            omitted: 0,
+        }
+    }
+
+    fn elapsed_ms(&self) -> u128 {
+        self.started.elapsed().as_millis()
+    }
+
+    fn record(&mut self, diagnostic_point: &str) {
+        if self.last_point.as_deref() == Some(diagnostic_point) {
+            return;
+        }
+        self.last_point = Some(diagnostic_point.to_owned());
+        if self.checkpoints.len() >= MAX_TRACED_CHECKPOINTS {
+            self.omitted = self.omitted.saturating_add(1);
+            return;
+        }
+        let elapsed_ms = self.elapsed_ms();
+        self.checkpoints
+            .push((diagnostic_point.to_owned(), elapsed_ms));
+    }
+
+    fn summary(&self) -> String {
+        let mut summary = self
+            .checkpoints
+            .iter()
+            .map(|(point, elapsed_ms)| format!("{point}@{elapsed_ms}ms"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if self.omitted > 0 {
+            summary.push_str(&format!(" (+{} more)", self.omitted));
+        }
+        summary
+    }
+}
 
 #[derive(Clone)]
 pub struct HeadlessClient {
@@ -61,6 +119,7 @@ struct ActiveRequest<'a> {
     process: &'a mut HeadlessProcess,
     healthy: &'a AtomicBool,
     command: String,
+    trace: CommandTrace,
     armed: bool,
 }
 
@@ -70,12 +129,9 @@ impl<'a> ActiveRequest<'a> {
             process,
             healthy,
             command: command.to_owned(),
+            trace: CommandTrace::new(),
             armed: true,
         }
-    }
-
-    fn process(&mut self) -> &mut HeadlessProcess {
-        self.process
     }
 
     fn disarm(&mut self) {
@@ -89,6 +145,8 @@ impl Drop for ActiveRequest<'_> {
             warn!(
                 command = %self.command,
                 pid = ?self.process.pid,
+                elapsed_ms = self.trace.elapsed_ms(),
+                checkpoints = %self.trace.summary(),
                 "headless request cancelled while in flight; quarantining supervised child"
             );
             let _ = self.process.child.start_kill();
@@ -223,34 +281,25 @@ impl HeadlessFilesystemGuard<'_> {
         }
     }
 
+    /// Record a local-change hint for a Bridge write. Synchronization is left
+    /// to the maintenance supervisor, which syncs a `queued_local` queue on its
+    /// next tick: running `sync-once` here would tie a long operation to the
+    /// caller's HTTP request, and cancelling that request quarantines the child
+    /// mid-synchronization.
     pub async fn notify_local_change(
         &mut self,
         client: &HeadlessClient,
         path: &str,
     ) -> Result<Value, HeadlessError> {
-        let inactivity_timeout = client.inactivity_timeout();
-        let result = async {
-            supervised_request_on_process(
-                &mut self.process,
-                &client.next_id,
-                &client.state,
-                "record-local-change",
-                json!({ "paths": [path] }),
-                inactivity_timeout,
-                &client.healthy,
-            )
-            .await?;
-            supervised_request_on_process(
-                &mut self.process,
-                &client.next_id,
-                &client.state,
-                "sync-once",
-                Value::Null,
-                inactivity_timeout,
-                &client.healthy,
-            )
-            .await
-        }
+        let result = supervised_request_on_process(
+            &mut self.process,
+            &client.next_id,
+            &client.state,
+            "record-local-change",
+            json!({ "paths": [path] }),
+            client.inactivity_timeout(),
+            &client.healthy,
+        )
         .await;
         match result {
             Ok(value) => {
@@ -282,13 +331,19 @@ impl HeadlessClient {
         })
     }
 
+    /// Whether the last known device state is paired. This reports pairing
+    /// only; a quarantined or restarting child keeps its last known pairing,
+    /// see [`Self::is_available`].
     pub fn is_paired(&self) -> bool {
-        if !self.healthy.load(Ordering::Acquire) {
-            return false;
-        }
         let state = self.state.read().expect("headless state lock");
         state.get("vault_id").is_some_and(|value| !value.is_null())
             && state.get("device_id").is_some_and(|value| !value.is_null())
+    }
+
+    /// Whether the supervised child can currently serve requests: it is
+    /// healthy and the restart circuit is closed.
+    pub fn is_available(&self) -> bool {
+        self.runtime_status().up
     }
 
     pub fn local_head(&self) -> Option<String> {
@@ -467,10 +522,10 @@ impl HeadlessClient {
         self.request("read-state", Value::Null).await
     }
 
+    /// See [`HeadlessFilesystemGuard::notify_local_change`].
     pub async fn notify_local_change(&self, path: &str) -> Result<Value, HeadlessError> {
         self.request("record-local-change", json!({ "paths": [path] }))
-            .await?;
-        self.request("sync-once", Value::Null).await
+            .await
     }
 }
 
@@ -530,7 +585,8 @@ async fn supervised_request_on_process(
 ) -> Result<Value, HeadlessError> {
     let mut active = ActiveRequest::new(process, healthy, command);
     let result = request_on_process(
-        active.process(),
+        &mut *active.process,
+        &mut active.trace,
         next_id,
         state,
         command,
@@ -539,11 +595,35 @@ async fn supervised_request_on_process(
     )
     .await;
     active.disarm();
+    let elapsed = active.trace.started.elapsed();
+    let outcome = match &result {
+        Ok(_) => "ok",
+        Err(error) if error.is_process_failure() => "process_failure",
+        Err(_) => "error",
+    };
+    if elapsed >= SLOW_HEADLESS_COMMAND {
+        info!(
+            command = %command,
+            duration_ms = elapsed.as_millis(),
+            outcome,
+            checkpoints = %active.trace.summary(),
+            "slow headless command finished"
+        );
+    } else {
+        debug!(
+            command = %command,
+            duration_ms = elapsed.as_millis(),
+            outcome,
+            checkpoints = %active.trace.summary(),
+            "headless command finished"
+        );
+    }
     result
 }
 
 async fn request_on_process(
     process: &mut HeadlessProcess,
+    trace: &mut CommandTrace,
     next_id: &AtomicU64,
     state: &RwLock<Value>,
     command: &str,
@@ -582,7 +662,12 @@ async fn request_on_process(
         let message: Value = serde_json::from_str(&line)?;
         match message.get("type").and_then(Value::as_str) {
             Some("event") => match message.get("event").and_then(Value::as_str) {
-                Some("progress") if is_valid_progress_event(&message) => continue,
+                Some("progress") if is_valid_progress_event(&message) => {
+                    if let Some(point) = message.get("diagnosticPoint").and_then(Value::as_str) {
+                        trace.record(point);
+                    }
+                    continue;
+                }
                 Some("state")
                     if !state_event_seen
                         && has_exact_keys(&message, &["type", "event", "state"])
@@ -734,14 +819,12 @@ fn is_valid_state(value: &Value) -> bool {
         state
             .get(*key)
             .is_none_or(|field| field.is_null() || field.is_string())
+    }) && state.get("apply_validation_reason").is_none_or(|field| {
+        field.is_null()
+            || field
+                .as_str()
+                .is_some_and(|code| !code.is_empty() && code.len() <= 128)
     }) && state
-        .get("apply_validation_reason")
-        .is_none_or(|field| {
-            field.is_null()
-                || field
-                    .as_str()
-                    .is_some_and(|code| !code.is_empty() && code.len() <= 128)
-        }) && state
         .get("last_error_details")
         .is_none_or(|field| field.is_null() || field.is_object())
         && state
@@ -1080,6 +1163,76 @@ impl HeadlessError {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::Path;
+
+    use serde_json::{Value, json};
+
+    use crate::config::ClientConfig;
+
+    use super::{HeadlessClient, HeadlessError};
+
+    /// A schema-valid headless state for a paired (`paired == true`) or
+    /// unpaired device.
+    pub(crate) fn state(paired: bool) -> Value {
+        let identity = |value: &str| {
+            if paired { json!(value) } else { Value::Null }
+        };
+        json!({
+            "user_id": identity("user-1"),
+            "vault_id": identity("vault-1"),
+            "device_id": identity("device-1"),
+            "device_ref": null,
+            "server_device_ref": null,
+            "local_main": null,
+            "local_head": null,
+            "initial_import_confirmed": paired,
+            "status_label": if paired { "Synced" } else { "Checking" },
+            "last_error_code": null,
+            "last_event_seq": 0,
+            "last_applied_event_seq": 0,
+            "updated_at": "2026-10-01T00:00:00.000Z"
+        })
+    }
+
+    /// Spawn a supervised child that announces readiness with `state(paired)`
+    /// and then runs `body` as a POSIX shell script.
+    pub(crate) async fn spawn_scripted_client(
+        directory: &Path,
+        paired: bool,
+        body: &str,
+        request_inactivity_timeout_seconds: u64,
+    ) -> HeadlessClient {
+        let script_path = directory.join("scripted-headless.sh");
+        let ready = json!({ "type": "event", "event": "ready", "state": state(paired) });
+        std::fs::write(&script_path, format!("printf '%s\\n' '{ready}'\n{body}\n"))
+            .expect("write scripted headless child");
+        let vault_dir = directory.join("vault");
+        std::fs::create_dir_all(&vault_dir).expect("create scripted vault directory");
+        let config = ClientConfig {
+            headless_command: format!("sh {}", script_path.display()),
+            vault_dir: vault_dir.display().to_string(),
+            request_inactivity_timeout_seconds,
+            ..ClientConfig::default()
+        };
+        HeadlessClient::spawn(&config)
+            .await
+            .expect("spawn scripted headless child")
+    }
+
+    /// Quarantine a scripted child whose body stays silent after reading one
+    /// request, the way a supervised timeout quarantines a stuck child.
+    pub(crate) async fn quarantine_by_timeout(client: &HeadlessClient) {
+        let error = client
+            .request("long-command", Value::Null)
+            .await
+            .expect_err("silent child should time out");
+        assert!(matches!(error, HeadlessError::Timeout));
+        assert!(!client.runtime_status().up);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::fs::write;
     use std::process::Stdio;
@@ -1096,8 +1249,8 @@ mod tests {
     use crate::filesystem::FilesystemSource;
 
     use super::{
-        HeadlessClient, HeadlessError, HeadlessProcess, HeadlessRuntimeState, register_failure,
-        request_on_process, spawn_maintenance,
+        CommandTrace, HeadlessClient, HeadlessError, HeadlessProcess, HeadlessRuntimeState,
+        MAX_TRACED_CHECKPOINTS, register_failure, request_on_process, spawn_maintenance,
     };
 
     fn valid_state() -> Value {
@@ -1150,7 +1303,10 @@ mod tests {
 
         state["apply_validation_reason"] = json!("validation_rejected");
         assert!(super::is_valid_state(&state));
-        assert_eq!(super::redact_state(&state)["apply_validation_reason"], "validation_rejected");
+        assert_eq!(
+            super::redact_state(&state)["apply_validation_reason"],
+            "validation_rejected"
+        );
 
         state["apply_validation_reason"] = Value::Null;
         assert!(super::is_valid_state(&state));
@@ -1159,7 +1315,10 @@ mod tests {
             assert!(!super::is_valid_state(&state));
         }
 
-        state.as_object_mut().unwrap().remove("apply_validation_reason");
+        state
+            .as_object_mut()
+            .unwrap()
+            .remove("apply_validation_reason");
         state["unknown_internal_field"] = json!(true);
         assert!(!super::is_valid_state(&state));
     }
@@ -1227,12 +1386,15 @@ mod tests {
             sleep 0.03
             printf '%s\n' '{"type":"event","event":"progress","status":"two","diagnosticPoint":"sync_download"}'
             sleep 0.03
+            printf '%s\n' '{"type":"event","event":"progress","status":"three","diagnosticPoint":"upload_finalize"}'
             printf '%s\n' '{"type":"response","id":1,"ok":true,"result":{"status":"done"}}'"#,
         )
         .await;
         let started = Instant::now();
+        let mut trace = CommandTrace::new();
         let result = request_on_process(
             &mut process,
+            &mut trace,
             &AtomicU64::new(1),
             &RwLock::new(Value::Null),
             "long-command",
@@ -1244,6 +1406,33 @@ mod tests {
 
         assert!(started.elapsed() >= Duration::from_millis(75));
         assert_eq!(result, json!({ "status": "done" }));
+        let points: Vec<&str> = trace
+            .checkpoints
+            .iter()
+            .map(|(point, _)| point.as_str())
+            .collect();
+        assert_eq!(points, ["sync_download", "upload_finalize"]);
+        assert!(trace.checkpoints[1].1 >= trace.checkpoints[0].1 + 50);
+    }
+
+    #[test]
+    fn command_trace_is_bounded_and_collapses_repeated_points() {
+        let mut trace = CommandTrace::new();
+        trace.record("local_snapshot");
+        trace.record("local_snapshot");
+        for index in 0..MAX_TRACED_CHECKPOINTS + 3 {
+            trace.record(if index % 2 == 0 {
+                "sync_download"
+            } else {
+                "upload_prepare"
+            });
+        }
+
+        assert_eq!(trace.checkpoints.len(), MAX_TRACED_CHECKPOINTS);
+        assert_eq!(trace.checkpoints[0].0, "local_snapshot");
+        assert_eq!(trace.omitted, 4);
+        assert!(trace.summary().starts_with("local_snapshot@"));
+        assert!(trace.summary().ends_with(" (+4 more)"));
     }
 
     #[tokio::test]
@@ -1256,6 +1445,7 @@ mod tests {
         .await;
         let error = request_on_process(
             &mut process,
+            &mut CommandTrace::new(),
             &AtomicU64::new(1),
             &RwLock::new(Value::Null),
             "silent-command",
@@ -1278,6 +1468,7 @@ mod tests {
         .await;
         let error = request_on_process(
             &mut process,
+            &mut CommandTrace::new(),
             &AtomicU64::new(1),
             &RwLock::new(Value::Null),
             "invalid-command",
@@ -1302,6 +1493,7 @@ mod tests {
                 scripted_process(&format!("read -r _\nprintf '%s\\n' '{message}'")).await;
             let error = request_on_process(
                 &mut process,
+                &mut CommandTrace::new(),
                 &AtomicU64::new(1),
                 &RwLock::new(Value::Null),
                 "invalid-command",
@@ -1323,6 +1515,7 @@ printf '%s' '{"type":"response","id":1,"ok":true,"result":null}'"#,
         .await;
         let error = request_on_process(
             &mut process,
+            &mut CommandTrace::new(),
             &AtomicU64::new(1),
             &RwLock::new(Value::Null),
             "unterminated-command",
@@ -1344,6 +1537,7 @@ sleep 1"#,
         .await;
         let error = request_on_process(
             &mut process,
+            &mut CommandTrace::new(),
             &AtomicU64::new(1),
             &RwLock::new(Value::Null),
             "oversized-command",
@@ -1640,5 +1834,89 @@ fi
             .await
             .expect("replacement child should answer");
         assert_eq!(result, json!({ "status": "recovered" }));
+    }
+
+    // Regression for OBTS issue #35: a Bridge write used to run `sync-once`
+    // inline while its HTTP caller waited, so a client timeout cancelled the
+    // request mid-synchronization and the cancellation guard killed the child.
+    #[tokio::test]
+    async fn local_change_notification_records_the_hint_without_an_inline_sync() {
+        let directory = tempdir().expect("temporary script directory");
+        let second_command = directory.path().join("second-command");
+        let client = super::test_support::spawn_scripted_client(
+            directory.path(),
+            true,
+            &format!(
+                r#"read -r request
+case "$request" in
+  *'"command":"record-local-change"'*)
+    printf '%s\n' '{{"type":"response","id":1,"ok":true,"result":{{"status":"recorded"}}}}' ;;
+  *) exit 3 ;;
+esac
+read -r request
+printf '%s\n' "$request" > '{second}'
+sleep 5"#,
+                second = second_command.display()
+            ),
+            5,
+        )
+        .await;
+
+        let mut guard = client.lock_filesystem().await.expect("filesystem lock");
+        let notified = tokio::time::timeout(
+            Duration::from_secs(2),
+            guard.notify_local_change(&client, "Note.md"),
+        )
+        .await;
+        drop(guard);
+
+        let recorded = notified
+            .expect("the write path must not wait for a synchronization round")
+            .expect("the local change hint should be recorded");
+        assert_eq!(recorded, json!({ "status": "recorded" }));
+        assert!(
+            client.runtime_status().up,
+            "recording a write must not quarantine the child"
+        );
+        assert!(
+            !second_command.exists(),
+            "the write path must leave synchronization to the maintenance supervisor"
+        );
+    }
+
+    // Regression for OBTS issue #36: quarantining or restarting the child must
+    // not make a paired device look unpaired.
+    #[tokio::test]
+    async fn quarantined_child_keeps_its_last_known_pairing() {
+        let directory = tempdir().expect("temporary script directory");
+        let client = super::test_support::spawn_scripted_client(
+            directory.path(),
+            true,
+            "read -r _\nsleep 5",
+            1,
+        )
+        .await;
+        assert!(client.is_paired());
+        assert!(client.is_available());
+
+        super::test_support::quarantine_by_timeout(&client).await;
+
+        assert!(client.is_paired(), "quarantine is not unpairing");
+        assert!(!client.is_available());
+    }
+
+    #[tokio::test]
+    async fn unpaired_child_reports_unpaired_while_available() {
+        let directory = tempdir().expect("temporary script directory");
+        let client = super::test_support::spawn_scripted_client(
+            directory.path(),
+            false,
+            "read -r _\nsleep 5",
+            1,
+        )
+        .await;
+
+        assert!(client.is_available());
+        assert!(!client.is_paired());
     }
 }

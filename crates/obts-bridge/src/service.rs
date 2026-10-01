@@ -67,12 +67,15 @@ impl VaultBridgeService {
     }
 
     pub fn ensure_index_current(&self) -> Result<(), ServiceError> {
-        if self
-            .headless
-            .as_ref()
-            .is_some_and(|client| !client.is_paired())
-        {
-            return Err(ServiceError::HeadlessNotPaired);
+        if let Some(client) = self.headless.as_ref() {
+            if !client.is_paired() {
+                return Err(ServiceError::HeadlessNotPaired);
+            }
+            // A quarantined, restarting or circuit-paused child is a transient
+            // outage of a paired device, not a pairing problem.
+            if !client.is_available() {
+                return Err(ServiceError::Headless(HeadlessError::Unavailable));
+            }
         }
         if self
             .filesystem
@@ -539,8 +542,10 @@ impl VaultBridgeService {
                 status.status = "degraded";
                 if status.headless_process.circuit_open {
                     "circuit_open"
-                } else {
+                } else if !headless.is_paired() {
                     "not_paired"
+                } else {
+                    "unavailable"
                 }
             };
         }
@@ -843,7 +848,7 @@ impl VaultBridgeService {
             headless.notify_local_change(path).await
         };
         if let Err(error) = result {
-            warn!(error = %error, path_hash = %lookup_fingerprint("vault_file", path), "file is durable locally but headless synchronization did not complete");
+            warn!(error = %error, path_hash = %lookup_fingerprint("vault_file", path), "file is durable locally but the headless change hint was not recorded");
         }
     }
 
@@ -1581,6 +1586,61 @@ mod obts_tests {
                 .await
                 .expect("reset projection"),
             serde_json::json!({ "status": "index_projection_reset" })
+        );
+    }
+
+    // Regression for OBTS issue #36: a paired device whose child is quarantined
+    // or restarting is temporarily unavailable, not unpaired.
+    #[tokio::test]
+    async fn unavailable_paired_child_is_retryable_rather_than_unpaired() {
+        let directory = tempdir().expect("script directory");
+        let headless = crate::headless::test_support::spawn_scripted_client(
+            directory.path(),
+            true,
+            "read -r _\nsleep 5",
+            1,
+        )
+        .await;
+        let root = tempdir().expect("vault root");
+        let source = Arc::new(FilesystemSource::new(root.path()).expect("filesystem source"));
+        let service =
+            VaultBridgeService::new_with_filesystem(VaultStore::new(10), source, Some(headless));
+        let headless = service.headless.as_ref().expect("headless client");
+        crate::headless::test_support::quarantine_by_timeout(headless).await;
+
+        assert!(matches!(
+            service.ensure_index_current(),
+            Err(ServiceError::Headless(
+                crate::headless::HeadlessError::Unavailable
+            ))
+        ));
+        let status = service.status().await;
+        assert_eq!(status.status, "degraded");
+        assert_eq!(status.dependencies.obts_client, "unavailable");
+    }
+
+    #[tokio::test]
+    async fn unpaired_available_child_still_requires_pairing() {
+        let directory = tempdir().expect("script directory");
+        let headless = crate::headless::test_support::spawn_scripted_client(
+            directory.path(),
+            false,
+            "read -r _\nsleep 5",
+            1,
+        )
+        .await;
+        let root = tempdir().expect("vault root");
+        let source = Arc::new(FilesystemSource::new(root.path()).expect("filesystem source"));
+        let service =
+            VaultBridgeService::new_with_filesystem(VaultStore::new(10), source, Some(headless));
+
+        assert!(matches!(
+            service.ensure_index_current(),
+            Err(ServiceError::HeadlessNotPaired)
+        ));
+        assert_eq!(
+            service.status().await.dependencies.obts_client,
+            "not_paired"
         );
     }
 }

@@ -712,7 +712,7 @@ pub(crate) fn openapi_spec() -> Value {
                     "properties": {
                         "postgres": {"type": "string", "enum": ["healthy", "unavailable", "disabled"]},
                         "couchdb": {"type": "string", "enum": ["healthy", "unavailable", "disabled"]},
-                        "obts_client": {"type": "string", "enum": ["healthy", "not_paired", "circuit_open", "disabled"]},
+                        "obts_client": {"type": "string", "enum": ["healthy", "not_paired", "unavailable", "circuit_open", "disabled"]},
                         "headless_vault": {"type": "string", "enum": ["healthy", "index_catching_up", "disabled"]}
                     }
                 },

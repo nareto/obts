@@ -152,7 +152,7 @@ pub(crate) fn service_error_metadata(
             ErrorCategory::Transient,
             true,
             "headless client unavailable",
-            "The headless OBTS client could not complete the requested administration operation",
+            "The headless OBTS client is temporarily unavailable or could not complete the operation; retry after its supervised recovery",
         )
         .with_http_status(503),
         ServiceError::FilesystemWrite(error) => match error {
