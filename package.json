@@ -1,6 +1,6 @@
 {
   "name": "obts",
-  "version": "0.3.36",
+  "version": "0.3.37",
   "private": true,
   "type": "module",
   "description": "Obsidian True Sync deployable history, restore, diagnostics, and maintenance implementation.",
