@@ -476,11 +476,8 @@ it('protects an already captured stale cohort when new vault settings exclude it
   await f.core.queueStaleCohort(c, f.m0);
   const queue = await assertProposal(f, c);
   await f.core.reportDeviceStatus();
-  // Existing server safePathCapabilities drops root_ignore from real status reports.
-  // Seed the advertised capability until that separate sanitizer gap is fixed.
-  await f.server.store.mutate((db) => {
-    db.devices.find((device) => device.vault_id === f.vaultId)!.path_capabilities = { root_ignore: true };
-  });
+  expect((await f.server.store.snapshot()).devices.find((device) => device.vault_id === f.vaultId)!.path_capabilities)
+    .toMatchObject({ root_ignore: true });
   const actorUserId = (await f.server.store.snapshot()).users[0]!.user_id;
   const before = await f.server.sync.getVaultSyncSettings(f.vaultId, actorUserId);
   const input = { vaultId: f.vaultId, actorUserId, expectedMain: String(before.current_main),

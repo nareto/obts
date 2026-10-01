@@ -2407,10 +2407,18 @@ components:
             - type: string
               pattern: "^[0-9a-f]{40}$"
         path_capabilities:
-          description: Only adapter and platform from the supported fixed vocabulary are retained; other fields are discarded.
+          description: Adapter and platform are retained from the supported fixed vocabulary; root_ignore is retained only when exactly true. Other fields are discarded.
           oneOf:
             - type: "null"
             - type: object
+              properties:
+                adapter:
+                  type: string
+                platform:
+                  type: string
+                root_ignore:
+                  type: boolean
+                  const: true
     DeviceStatusResponse:
       type: object
       required: [status, device_name, vault_status, plugin]

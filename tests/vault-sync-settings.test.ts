@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { createObtsServer, type ObtsServer } from '../src/server/app.js';
+import { hashToken } from '../src/server/authService.js';
 
 describe('owner-managed vault sync settings', () => {
   let root: string | undefined;
@@ -50,6 +51,43 @@ describe('owner-managed vault sync settings', () => {
         explicit_dirs: ['private'], updated_at: new Date().toISOString(),
         last_event_seq: mutable.event_seq_by_vault[vaultId] ?? 0
       };
+    });
+  }
+
+  async function pairTestDevice(status: 'paired' | 'revoked' = 'paired') {
+    const deviceId = `device-settings-${Math.random().toString(36).slice(2)}`;
+    const deviceToken = `test-device-token-${deviceId}`;
+    const tokenHash = hashToken(deviceToken);
+    const timestamp = new Date().toISOString();
+    await server!.store.mutate((db) => {
+      db.devices.push({
+        device_id: deviceId, vault_id: vaultId, user_id: db.users[0]!.user_id, device_name: 'Settings device',
+        device_ref: `refs/obts/devices/${deviceId}`, device_ref_head: null, status, last_applied_main: null,
+        last_applied_event_seq: 0, last_applied_explicit_dirs: null, pending_applied_main: null,
+        pending_applied_event_seq: 0, pending_applied_explicit_dirs: null, last_seen_at: null, last_successful_sync_at: null,
+        local_status_label: null, local_error_code: null, local_queue_status: null, local_main: null, local_head: null,
+        plugin_version: null, path_capabilities: null, last_status_report_at: null, onboarding_status: 'complete', onboarding_mode: 'initialize',
+        initial_proposal_kind: null, initial_proposal_base: null, onboarding_connection_id: null, onboarding_completed_at: null,
+        created_at: timestamp, revoked_at: status === 'revoked' ? timestamp : null
+      });
+      db.tokens.push({
+        token_id: `token-${deviceId}`, kind: 'device', lookup_prefix: tokenHash.lookupPrefix, token_hash: tokenHash.hash,
+        user_id: db.users[0]!.user_id, vault_id: vaultId, device_id: deviceId, expires_at: null, consumed_at: null,
+        failed_attempts: 0, revoked_at: null, metadata: {}, created_at: timestamp
+      });
+    });
+    return { deviceId, deviceToken };
+  }
+
+  async function reportCapabilities(deviceToken: string, capabilities?: unknown) {
+    return await server!.app.inject({
+      method: 'POST', url: `/api/v1/vaults/${vaultId}/sync/device-status`,
+      headers: { authorization: `Bearer ${deviceToken}` },
+      payload: {
+        plugin_version: '0.4.40', local_status_label: 'Synced', local_error_code: null, local_queue_status: 'idle',
+        local_main: null, local_head: null,
+        ...(capabilities === undefined ? {} : { path_capabilities: capabilities })
+      }
     });
   }
 
@@ -155,23 +193,38 @@ describe('owner-managed vault sync settings', () => {
     expect((await server.store.snapshot()).directory_state_by_vault[vaultId]?.explicit_dirs).toEqual([]);
   });
 
-  it('blocks policy changes until every paired device supports the root ignore contract', async () => {
+  it('accepts a paired device capability reported through the status endpoint', async () => {
     await setup();
-    await server!.store.mutate((db) => {
-      db.devices.push({
-        device_id: 'device-legacy', vault_id: vaultId, user_id: db.users[0]!.user_id, device_name: 'Legacy',
-        device_ref: 'refs/obts/devices/device-legacy', device_ref_head: null, status: 'paired', last_applied_main: null,
-        last_applied_event_seq: 0, last_applied_explicit_dirs: null, pending_applied_main: null,
-        pending_applied_event_seq: 0, pending_applied_explicit_dirs: null, last_seen_at: null, last_successful_sync_at: null,
-        local_status_label: null, local_error_code: null, local_queue_status: null, local_main: null, local_head: null,
-        plugin_version: null, path_capabilities: {}, last_status_report_at: null, onboarding_status: 'complete', onboarding_mode: 'initialize',
-        initial_proposal_kind: null, initial_proposal_base: null, onboarding_connection_id: null, onboarding_completed_at: null,
-        created_at: new Date().toISOString(), revoked_at: null
-      });
+    const device = await pairTestDevice();
+    const reported = await reportCapabilities(device.deviceToken, {
+      adapter: 'obsidian-data-adapter', platform: 'linux', root_ignore: true
     });
+    expect(reported.statusCode).toBe(200);
     const before = await settings();
     const proposed = await preview(before, 'private/\n', []);
-    expect((await save(before, proposed, 'private/\n', [])).statusCode).toBe(409);
+    expect((await save(before, proposed, 'private/\n', [])).statusCode).toBe(200);
+  });
+
+  it.each(['true', 1, {}, false, undefined])('rejects a paired device when root_ignore is %s', async (reportedValue) => {
+    await setup();
+    const device = await pairTestDevice();
+    expect((await reportCapabilities(device.deviceToken, {
+      adapter: 'obsidian-data-adapter', platform: 'linux', ...(reportedValue === undefined ? {} : { root_ignore: reportedValue })
+    })).statusCode).toBe(200);
+    const before = await settings();
+    const proposed = await preview(before, 'private/\n', []);
+    const rejected = await save(before, proposed, 'private/\n', []);
+    expect(rejected.statusCode).toBe(409);
+    expect(rejected.json()).toMatchObject({ error: { code: 'root_ignore_capability_required' } });
+  });
+
+  it('ignores revoked devices when checking root ignore capability', async () => {
+    await setup();
+    const device = await pairTestDevice('revoked');
+    const before = await settings();
+    const proposed = await preview(before, 'private/\n', []);
+    expect((await save(before, proposed, 'private/\n', [])).statusCode).toBe(200);
+    expect((await reportCapabilities(device.deviceToken, { root_ignore: true })).statusCode).toBe(404);
   });
 
   it('requires CSRF protection for preview and save', async () => {

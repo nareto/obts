@@ -2660,7 +2660,8 @@ function safePathCapabilities(value: Record<string, unknown> | null): Record<str
   if (value === null) return null;
   return {
     adapter: value.adapter === 'obsidian-data-adapter' ? value.adapter : 'unknown',
-    platform: typeof value.platform === 'string' && ['ios', 'android', 'linux', 'darwin', 'win32'].includes(value.platform) ? value.platform : 'unknown'
+    platform: typeof value.platform === 'string' && ['ios', 'android', 'linux', 'darwin', 'win32'].includes(value.platform) ? value.platform : 'unknown',
+    ...(value.root_ignore === true ? { root_ignore: true } : {})
   };
 }
 
