@@ -2483,6 +2483,7 @@ class ObtsObsidianClient {
       await this.pullAndApply(true);
       state = await this.readState();
     }
+    await this.repairRewoundLocalRef(await this.readState());
     await this.reconcileQueueWithLocalHead(await this.readState());
     const queueBeforeScan = await this.readQueue();
     let uploaded = false;
@@ -5518,9 +5519,14 @@ class ObtsObsidianClient {
       if (!queue.pending_proposal_base) return false;
       // Committed-journal recovery may have just restored C. The already queued
       // immutable cohort still owns local_head, including its original base.
-      await this.updateRef("refs/heads/local", queue.pending_commit, null, true);
-      await this.writeState(Object.assign({}, await this.readState(), { local_head: queue.pending_commit, updated_at: nowIso() }));
-      return true;
+      // A conflicted proposal that C already contains was settled by C's
+      // resolution and owns nothing: restoring it would rewind the ref behind
+      // local_head. Its remaining obligations form a new cohort on C below.
+      if (!(await this.isAncestor(queue.pending_commit, targetMain))) {
+        await this.updateRef("refs/heads/local", queue.pending_commit, null, true);
+        await this.writeState(Object.assign({}, await this.readState(), { local_head: queue.pending_commit, updated_at: nowIso() }));
+        return true;
+      }
     }
     const saved = await this.readStaleProvenance();
     if (!saved.horizons.length && !Object.keys(saved.obligations).length) return false;
@@ -7928,6 +7934,41 @@ class ObtsObsidianClient {
     return await this.isAncestor(baseline.main, manifest.target_main);
   }
 
+  // OBTS-PER-CLIENT-001: earlier clients could leave refs/heads/local on a
+  // strict ancestor of an agreed local_head after applying a conflict
+  // resolution. Fast-forward it only when no path changed between them still
+  // shows the ref's bytes or absence; otherwise the commit CAS keeps sync
+  // blocked with that evidence. local_head never follows the ref backwards.
+  async repairRewoundLocalRef(state) {
+    const head = state.local_head;
+    if (!head || state.local_main !== head) return false;
+    if ((await this.readQueue()).pending_commit) return false;
+    if (await readApplyJournalStrict(this.fsp, this.applyJournalPath).catch(() => true)) return false;
+    for (const owner of [this.catchupPath, this.uploadTransferPath, this.uploadRecoveryPath, this.pullTransferPath]) {
+      if (await exists(this.fsp, owner)) return false;
+    }
+    if (await this.resolveRef("refs/heads/main") !== head) return false;
+    const localRef = await this.resolveRef("refs/heads/local");
+    if (!localRef || localRef === head || !(await this.isAncestor(localRef, head))) return false;
+    const refEntries = await this.listTreeBlobOids(localRef);
+    const headEntries = await this.listTreeBlobOids(head);
+    const changedPaths = [...new Set([...refEntries.keys(), ...headEntries.keys()])]
+      .filter((filePath) => refEntries.get(filePath) !== headEntries.get(filePath)).sort();
+    for (const filePath of changedPaths) {
+      let fingerprint;
+      try {
+        ({ fingerprint } = await this.readRecoveryFileSnapshot(filePath));
+      } catch (error) {
+        if (!(error instanceof LocalSnapshotChangedError)) throw error;
+        this.plugin.syncQueued = true;
+        throw new ObtsBlockedError("local_snapshot_changed", "Local files changed while obts was checking them. Sync will retry.");
+      }
+      if (this.fingerprintMatchesTarget(fingerprint, refEntries.get(filePath))) return false;
+    }
+    await this.updateRef("refs/heads/local", head, localRef);
+    return true;
+  }
+
   async reconcileQueueWithLocalHead(state) {
     const queue = await this.readQueue();
     if (queue.pending_commit || !state.local_head || !(await this.commitExists(state.local_head))) {
@@ -8146,7 +8187,10 @@ class ObtsObsidianClient {
       await this.assertRefLeaseOwner(leasePath, nonce);
       if (!force && expected) {
         const current = await this.resolveRef(ref);
-        if (current !== expected) throw new ObtsBlockedError("local_ref_changed", "A local Git ref changed while it was being updated.");
+        if (current !== expected) {
+          throw new ObtsBlockedError("local_ref_changed", `Local Git ref ${ref} changed while it was being updated.`,
+            { ref, expected, actual: current });
+        }
       }
       await this.assertRefLeaseOwner(leasePath, nonce);
       await this.fsp.rename(stagePath, refPath);
@@ -12358,6 +12402,7 @@ function localSyncFailureExplanation(code, details) {
   if (safeCode === "apply_lock_active") return "A local apply lock is active. Another operation may still own it; do not remove the lock. If it persists after restarting Obsidian, preserve the vault and .obts state for recovery support.";
   if (safeCode === "recovery_bundle_failed") return "Recovery evidence could not be completed, so destructive apply stopped. Check local storage and permissions; preserve the vault and .obts state before retrying.";
   if (safeCode === "recovery_bundle_verification_failed" || safeCode === "recovery_bundle_durability_unavailable") return `Recovery evidence is not verified or durable (${safeCode}), so destructive apply stopped. Preserve the vault and .obts state; check storage and permissions, then seek assisted recovery if it persists.`;
+  if (safeCode === "local_ref_changed") return "Sync stopped because this device's local sync history moved while it was being updated. Your notes were not changed. Run Sync now once more; if this keeps happening, keep the vault and its .obts folder as they are and run Send troubleshooting snapshot now from the command palette.";
   if (safeCode === "local_ref_recovery_required") return "A local Git ref lock or lease could not be recovered safely. Do not remove it manually; preserve the vault and .obts state for assisted recovery.";
   if (safeCode === "legacy_directory_advance_unsafe") return "Legacy directory advance settlement stopped. Preserve the vault, .obts journal, recovery archive, and transfer checkpoints for assisted recovery; do not reset sync.";
   if (safeCode === "upload_checkpoint_recovery_required" || safeCode === "legacy_upload_checkpoint" || safeCode === "upload_checkpoint_mismatch") return "Run Recover upload checkpoint from the command palette. It preserves both proposals and reconciles the saved transfer with the server. If recovery still fails, preserve the vault and .obts files and send a troubleshooting snapshot for assisted recovery; do not reset sync.";

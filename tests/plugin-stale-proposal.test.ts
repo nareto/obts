@@ -1995,3 +1995,134 @@ it('fails closed rather than selecting a newer held base from incomparable origi
   expect(await f.canonical()).toBe(BASE);
   expect(await readFile(join(f.dir, 'note.md'), 'utf8')).toBe(f.latest);
 });
+
+describe('local ref after an applied stale-cohort conflict resolution', () => {
+  const APPLIED = BASE.replace('last', 'remote last');
+  const DEVICE = BASE.replace('last', 'device last');
+  const RESOLVED = BASE.replace('last', 'remote last\ndevice last');
+
+  async function openStaleConflict() {
+    const f = await fixture();
+    await f.remote(APPLIED);
+    const original = f.core.stageRecoveryBundleFiles.bind(f.core);
+    let injected = false;
+    f.core.stageRecoveryBundleFiles = async (...args: any[]) => {
+      if (!injected) {
+        injected = true;
+        await f.core.adapter.write('note.md', DEVICE);
+      }
+      return original(...args);
+    };
+    await f.core.pullAndApply(true);
+    expect((await f.plugin.syncOnce()).status).toBe('Conflict resolution needed');
+    return f;
+  }
+
+  async function resolveOpenConflict(f: Awaited<ReturnType<typeof fixture>>, manual: string) {
+    const conflict = (await f.server.store.snapshot()).conflicts.find((r) => r.status === 'open')!;
+    const review = await f.server.app.inject({ method: 'GET', headers: f.headers,
+      url: `/api/v1/vaults/${f.vaultId}/conflicts/${conflict.conflict_id}` });
+    expect((await f.server.app.inject({ method: 'POST', headers: f.headers,
+      url: `/api/v1/vaults/${f.vaultId}/conflicts/${conflict.conflict_id}/resolve`,
+      payload: { expected_main: review.json().conflict.expected_main, resolution_kind: 'manual', manual_files: { 'note.md': manual } }
+    })).statusCode).toBe(200);
+    return conflict;
+  }
+
+  async function localRefAndHead(f: Awaited<ReturnType<typeof fixture>>) {
+    return { ref: await f.core.resolveRef('refs/heads/local'), head: (await f.plugin.readState()).local_head };
+  }
+
+  it('keeps the ref on the resolution when the conflicted note changed again during review', async () => {
+    const f = await openStaleConflict();
+    await resolveOpenConflict(f, RESOLVED);
+    await f.plugin.pollRemoteEventsAndApply();
+    // An append inside the horizon is a stale cohort, which conflicts again.
+    await f.core.adapter.write('note.md', `${RESOLVED}appended\n`);
+    expect((await f.plugin.syncOnce()).status).toBe('Conflict resolution needed');
+    const edited = `${RESOLVED}appended\nedited during review\n`;
+    await f.core.adapter.write('note.md', edited);
+    const reviewed = await resolveOpenConflict(f, `${RESOLVED}appended resolved\n`);
+    await f.plugin.pollRemoteEventsAndApply();
+
+    const { ref, head } = await localRefAndHead(f);
+    expect(ref).not.toBe(reviewed.device_commit);
+    expect(ref).toBe(head);
+    // The edit made during review is proposed on the resolution and conflicts with it.
+    await expect(f.plugin.syncOnce()).rejects.toMatchObject({ code: 'conflict_review_required' });
+    expect(await readFile(join(f.dir, 'note.md'), 'utf8')).toBe(edited);
+    expect(await f.canonical()).toBe(`${RESOLVED}appended resolved\n`);
+    const open = (await f.server.store.snapshot()).conflicts.filter((r) => r.status === 'open');
+    expect(open).toHaveLength(1);
+    const proposal = open[0]!.device_commit;
+    expect(proposal).not.toBe(reviewed.device_commit);
+    expect(await f.core.isAncestor(head, proposal)).toBe(true);
+    expect((await f.server.git.readBlobAtPath(f.vaultId, proposal, 'note.md')).toString()).toBe(edited);
+  });
+
+  // Earlier clients restored the settled conflicted proposal onto the local ref
+  // while local_head stayed on the applied resolution.
+  function emulateLegacyProposalRestore(core: any) {
+    const original = core.queueStaleCohort.bind(core);
+    core.queueStaleCohort = async (...args: any[]) => {
+      const queue = await core.readQueue();
+      if (queue.status !== 'conflicted' || !queue.pending_commit || !queue.pending_proposal_base) return original(...args);
+      core.queueStaleCohort = original;
+      await core.updateRef('refs/heads/local', queue.pending_commit, null, true);
+      await core.writeState({ ...await core.readState(), local_head: queue.pending_commit });
+      return true;
+    };
+  }
+
+  async function legacySplitDevice() {
+    const f = await openStaleConflict();
+    await resolveOpenConflict(f, RESOLVED);
+    await f.plugin.pollRemoteEventsAndApply();
+    const proposed = `${RESOLVED}appended\n`;
+    await f.core.adapter.write('note.md', proposed);
+    expect((await f.plugin.syncOnce()).status).toBe('Conflict resolution needed');
+    const edited = `${proposed}edited during review\n`;
+    await f.core.adapter.write('note.md', edited);
+    const resolution = `${RESOLVED}appended resolved\n`;
+    const reviewed = await resolveOpenConflict(f, resolution);
+    emulateLegacyProposalRestore(f.core);
+    await f.plugin.pollRemoteEventsAndApply();
+    const { ref, head } = await localRefAndHead(f);
+    expect(ref).toBe(reviewed.device_commit);
+    expect(head).not.toBe(ref);
+    expect(await f.core.isAncestor(ref, head)).toBe(true);
+    expect((await f.provenance()).obligations['note.md']).toBeDefined();
+    return { f, proposed, edited, resolution, reviewed, head: head! };
+  }
+
+  it('fast-forwards a rewound local ref when no changed path shows its bytes', async () => {
+    const { f, edited, resolution, head } = await legacySplitDevice();
+    expect((await f.plugin.syncOnce()).status).toBe('Conflict resolution needed');
+    expect(await readFile(join(f.dir, 'note.md'), 'utf8')).toBe(edited);
+    expect(await f.canonical()).toBe(resolution);
+    const after = await localRefAndHead(f);
+    expect(after.ref).toBe(after.head);
+    expect(await f.core.isAncestor(head, after.head)).toBe(true);
+    const open = (await f.server.store.snapshot()).conflicts.filter((r) => r.status === 'open');
+    expect(open).toHaveLength(1);
+    const proposal = open[0]!.device_commit;
+    expect(await f.core.isAncestor(head, proposal)).toBe(true);
+    expect((await f.server.git.readBlobAtPath(f.vaultId, proposal, 'note.md')).toString()).toBe(edited);
+  });
+
+  it('keeps a rewound local ref blocked while a changed path still shows its bytes', async () => {
+    const { f, proposed, resolution, reviewed, head } = await legacySplitDevice();
+    await f.core.adapter.write('note.md', proposed);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await expect(f.plugin.syncOnce()).rejects.toMatchObject({
+        code: 'local_ref_changed',
+        details: { ref: 'refs/heads/local', expected: head, actual: reviewed.device_commit }
+      });
+    }
+    expect(await localRefAndHead(f)).toEqual({ ref: reviewed.device_commit, head });
+    expect(await readFile(join(f.dir, 'note.md'), 'utf8')).toBe(proposed);
+    expect(await f.canonical()).toBe(resolution);
+    expect((await f.provenance()).obligations['note.md']).toBeDefined();
+    expect((await f.server.store.snapshot()).conflicts.filter((r) => r.status === 'open')).toEqual([]);
+  });
+});

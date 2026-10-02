@@ -15,9 +15,11 @@
     {
       "model": "architecture/models/formal/OBTSClientStateRecovery.tla",
       "checker": "scripts/check-client-state-model.mjs",
+      "architectureRevision": 41,
       "contracts": ["OBTS-PER-CLIENT-001", "OBTS-SYNC-IMM-001"],
       "mappings": [
-        {"actions": ["Observe", "StaleLocalWrite", "EqualServerRef", "SplitLocalRefs", "Read", "Crash", "Restart"], "implementation": ["obsidian-plugin/src/main.cjs: reconcileDeviceBlocked, readState, preferRecoverableBackupState, restoreRecoveredBackupState, backupStateCursorsDescend, cursorDescends"], "tests": ["tests/client-state-authority.test.ts", "tests/phase1.test.ts: genuine newer backup and stale-writer recovery", "tests/phase2.test.ts: resolved blocked-device restart", "tests/plugin-mobile-build.test.ts: packaged state selection"], "checks": ["safety", "liveness", "restart-recovery", "queue-rollback", "stale-primary", "attempt-rewrite", "equal-ref-error", "incomparable-head"]}
+        {"actions": ["Observe", "StaleLocalWrite", "EqualServerRef", "SplitLocalRefs", "Read", "Crash", "Restart"], "implementation": ["obsidian-plugin/src/main.cjs: reconcileDeviceBlocked, readState, preferRecoverableBackupState, restoreRecoveredBackupState, backupStateCursorsDescend, cursorDescends"], "tests": ["tests/client-state-authority.test.ts", "tests/phase1.test.ts: genuine newer backup and stale-writer recovery", "tests/phase2.test.ts: resolved blocked-device restart", "tests/plugin-mobile-build.test.ts: packaged state selection"], "checks": ["safety", "liveness", "restart-recovery", "queue-rollback", "stale-primary", "attempt-rewrite", "equal-ref-error", "incomparable-head"]},
+        {"actions": ["ApplyResolution", "PreserveEdits", "Repair", "QueueCohort", "Propose"], "implementation": ["obsidian-plugin/src/main.cjs: applyTargetMain, queuePreservedLocalChanges, queueStaleCohort, repairRewoundLocalRef, commitTree, updateRef"], "tests": ["tests/plugin-stale-proposal.test.ts: local ref after an applied stale-cohort conflict resolution"], "checks": ["safety", "liveness", "settled-proposal-restore", "state-follows-ref", "unverified-ref-repair", "missing-ref-repair"]}
       ]
     }
   ],

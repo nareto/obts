@@ -1,5 +1,5 @@
 schema_version: 1
-revision: 40
+revision: 41
 status: current
 updated: 2026-10-02
 authoritative_artifacts:
@@ -110,7 +110,7 @@ formal_models:
   - id: OBTS-FM-008
     status: accepted
     path: architecture/models/formal/OBTSClientStateRecovery.tla
-    architecture_revision: 23
+    architecture_revision: 41
     trace_map: architecture/models/formal/trace/fm007-fm008-map.json
     refines:
       - OBTS-PER-CLIENT-001
