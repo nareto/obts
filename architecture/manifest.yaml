@@ -1,7 +1,7 @@
 schema_version: 1
-revision: 38
+revision: 39
 status: current
-updated: 2026-10-01
+updated: 2026-10-02
 authoritative_artifacts:
   - architecture/manifest.yaml
   - architecture/README.md
@@ -125,3 +125,11 @@ formal_models:
       - OBTS-SYNC-IGN-001
       - OBTS-PER-OP-001
       - OBTS-DASH-SET-001
+  - id: OBTS-FM-010
+    status: accepted
+    path: architecture/models/formal/OBTSUploadCheckpointRecovery.tla
+    architecture_revision: 39
+    checks: architecture/models/formal/OBTSUploadCheckpointRecovery.cfg
+    refines:
+      - OBTS-SYNC-IMM-001
+      - OBTS-PER-CLIENT-001

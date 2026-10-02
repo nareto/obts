@@ -4,7 +4,7 @@ Formal models are bounded refinements of stable contracts in `architecture/contr
 
 ## Validation Families
 
-`npm run test:formal` remains the unchanged complete TLC chain. CI can select complete family entrypoints: `sync` (FM001/FM002), `bridge-body`, `workers`, `deletion`, `bridge-protocol`, `onboarding` (including recovery), `diagnostics`, `client-state`, and `vault-settings`. Isolated model/config/check-manifest edits can run their entire affected family; shared model modules, checker infrastructure, unknown paths, and shared dependencies require broad formal validation. The fast metadata command invokes `--validate-only` only for sync, bridge-body, workers, deletion, bridge-protocol, and onboarding entrypoints; diagnostic admission, onboarding recovery, and client-state do not implement metadata-only mode and must never receive that flag. A selected family is a complete checker matrix, not a partial check list. Unchanged models do not prove implementation conformance; executable and operator evidence remain independently required.
+`npm run test:formal` remains the unchanged complete TLC chain. CI can select complete family entrypoints: `sync` (FM001/FM002), `bridge-body`, `workers`, `deletion`, `bridge-protocol`, `onboarding` (including recovery), `diagnostics`, `client-state` (FM008 and FM010 upload recovery), and `vault-settings`. Isolated model/config/check-manifest edits can run their entire affected family; shared model modules, checker infrastructure, unknown paths, and shared dependencies require broad formal validation. The fast metadata command invokes `--validate-only` only for sync, bridge-body, workers, deletion, bridge-protocol, and onboarding entrypoints; diagnostic admission, onboarding recovery, and client-state do not implement metadata-only mode and must never receive that flag. A selected family is a complete checker matrix, not a partial check list. Unchanged models do not prove implementation conformance; executable and operator evidence remain independently required.
 
 ## OBTS-FM-001: Local Apply And Recovery
 
@@ -173,6 +173,21 @@ TLC 2.19, one worker, fingerprint polynomial 0, 1 GiB heap. `REACHED` and `REJEC
 ### Known omissions
 
 The pilot does not cover directories, multiple paths, write concurrency, editor-buffer capture, Git object structure, network/server acknowledgement, byte/checksum implementation, mobile lifecycle, process kill, power loss, filesystem semantics, corrupted finalized bundles, or competing client instances. The companion adds the bounded compare/write interleaving and one symbolic interrupted write, not a proof of byte-level storage atomicity. Those require executable fault tests and platform evidence; a green TLC result makes no claim about them.
+
+## OBTS-FM-010: Upload Checkpoint Handoff
+
+| Field | Value |
+| --- | --- |
+| Status | Accepted bounded model |
+| Architecture revision | 39 |
+| Refined contracts | `OBTS-SYNC-IMM-001`, `OBTS-PER-CLIENT-001`, local publication |
+| Specification / configuration | `OBTSUploadCheckpointRecovery.tla`, `OBTSUploadCheckpointRecovery.cfg` |
+| Executable check | `node scripts/check-upload-recovery-model.mjs` (also selected by `test:formal:client-state`) |
+| Implementation / regression | `recoverUploadCheckpointIfNeeded`, `settleUploadCheckpointHandoff`; `tests/plugin-upload-recovery.test.ts` |
+
+The bounded model starts with either a matching or already-replaced queue. It checks protected old/base and successor evidence, watcher hints, fresh replay of the same target/base, real integration results, and restart after queue publication. Device-ref movement can precede integration and cannot authorize a fabricated result. Processing must complete before settlement; missing/expired/open/rejected sessions replay through a real server result without cancellation. Eight negative controls independently remove protection, retire early, lose successor/hints, rebind either base, infer acceptance from the ref, or forget a published settlement.
+
+The runner requires nontrivial state/depth counts and each negative control's exact invariant failure. Safety explores 604 distinct states at depth 9. It abstracts authenticated server responses, Git closure and atomic filesystem publication; executable real-server and fault tests cover those boundaries. It does not prove filesystem power-loss durability, mobile lifecycle behavior, conflict-review internals, or unbounded liveness.
 
 ## OBTS-FM-002: Composed Distributed Synchronization
 

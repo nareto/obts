@@ -156,6 +156,11 @@ describe('validation selection', () => {
     expect(makePlan(['architecture/models/formal/OBTSApplyRecovery.cfg']).formalFamilies).toEqual(['sync']);
     expect(makePlan(['architecture/models/formal/OBTSApplyRecoveryLiveness.cfg']).formalFamilies).toEqual(['sync']);
     expect(makePlan(['architecture/models/formal/OBTSVaultSettings.tla']).formalFamilies).toEqual(['vault-settings']);
+    for (const extension of ['tla', 'cfg']) {
+      const plan = makePlan([`architecture/models/formal/OBTSUploadCheckpointRecovery.${extension}`]);
+      expect(plan.formalFamilies).toEqual(['client-state']);
+      expect(plan.executableGroup).toBe('fast');
+    }
     expect(makePlan(['architecture/models/formal/negative/VaultSettingsStaleSave.cfg']).formalFamilies).toEqual(['vault-settings']);
     expect(makePlan(['architecture/models/formal/modules/OBTSDomain.tla']).executableGroup).toBe('all');
     expect(makePlan(['architecture/models/formal/README.md']).executableGroup).toBe('all');

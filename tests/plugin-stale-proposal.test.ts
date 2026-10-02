@@ -16,6 +16,11 @@ const MERGED = REMOTE.replace('last', 'local');
 const roots: string[] = [];
 const servers: ObtsServer[] = [];
 const nativeWrite = NodeDataAdapter.prototype.writeBinary;
+const stableJson = (value: any): string => JSON.stringify(value, (_key, item) =>
+  item && typeof item === 'object' && !Array.isArray(item)
+    ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b)))
+    : item
+);
 
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -384,6 +389,39 @@ describe('client stale authoring cohorts with the real server', () => {
     expect((await next.plugin.readQueue()).pending_proposal_base).toBe(f.m0);
     expect((await next.core.uploadQueuedCommit(await next.plugin.readQueue())).status).toBe('merged');
     expect(await f.canonical()).toBe(MERGED);
+  });
+
+  it('journals a legacy checkpoint before replacing its queued successor', async () => {
+    const f = await fixture();
+    const c = await f.remote();
+    await f.core.pullAndApply(true);
+    await f.core.adapter.write('note.md', LOCAL);
+    await f.core.queueStaleCohort(c, f.m0);
+    const putChunk = f.core.putPushChunk.bind(f.core);
+    f.core.putPushChunk = async () => { throw new Error('offline mid-upload'); };
+    await expect(f.core.uploadQueuedCommit(await f.plugin.readQueue())).rejects.toThrow('offline mid-upload');
+    const checkpointPath = join(f.dir, '.obts', 'upload-transfer.json');
+    const checkpoint = JSON.parse(await readFile(checkpointPath, 'utf8'));
+    delete checkpoint.transfer_request.root_ignore_capability;
+    delete checkpoint.transfer_request.root_ignore_oid;
+    const { createHash } = await import('node:crypto');
+    checkpoint.attempt_id = `xfer_${createHash('sha256').update(JSON.stringify(checkpoint.transfer_request)).digest('hex').slice(0, 32)}`;
+    await writeFile(checkpointPath, JSON.stringify(checkpoint));
+    const oldQueue = await f.plugin.readQueue();
+    await f.core.adapter.write('note.md', 'successor local edit\n');
+    const successor = await f.core.createLocalCommit('replacement successor');
+    await f.core.writeQueue({ ...oldQueue, pending_commit: successor, status: 'queued_local' });
+    const recovery = JSON.parse(await readFile(join(f.dir, '.obts', 'upload-recovery.json'), 'utf8'));
+    expect(recovery).toMatchObject({ old_commit: oldQueue.pending_commit, successor_commit: successor });
+    expect(recovery.checkpoint).toMatchObject({ target_commit: oldQueue.pending_commit });
+    expect((await f.plugin.readQueue()).pending_commit).toBe(successor);
+    expect(await f.core.resolveRef(`refs/obts/upload-recovery/${oldQueue.pending_commit}`)).toBe(oldQueue.pending_commit);
+    f.core.putPushChunk = putChunk;
+    const reconciled = await f.core.uploadQueuedCommit(await f.plugin.readQueue());
+    expect(reconciled.status).toBe('merged');
+    expect(await f.canonical()).toBe(MERGED);
+    expect(await f.plugin.readQueue()).toMatchObject({ pending_commit: successor });
+    expect(await readFile(join(f.dir, '.obts', 'upload-recovery.json'), 'utf8').catch(() => null)).toBeNull();
   });
 
   it('preserves M0 through an expired chunk-transfer replacement', async () => {

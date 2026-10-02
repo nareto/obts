@@ -22314,7 +22314,7 @@ var { createByteBudget, runBoundedWork } = require_work_pool();
 var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.16";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.17";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var STALE_SETTLE_MARGIN_MS = 250;
@@ -22457,6 +22457,14 @@ module.exports = class ObtsPlugin extends Plugin {
         callback: async () => {
           const result = await this.runUserAction(() => this.syncOnceOrPollResolvedConflict({ confirmInitialImport: false }));
           if (result && shouldShowRoutineStatusNotice(result.status)) new Notice(`obts: ${result.status}`);
+        }
+      });
+      this.addCommand({
+        id: "obts-recover-upload-checkpoint",
+        name: "Recover upload checkpoint",
+        callback: async () => {
+          const result = await this.runUserAction(() => this.client.recoverUploadCheckpoint(), true, "Recovering upload checkpoint");
+          if (result) new Notice(`obts: ${result.status}`);
         }
       });
       this.addCommand({
@@ -23535,6 +23543,7 @@ var ObtsObsidianClient = class {
     this.pullTransferPath = path.join(this.obtsDir, "pull-transfer.json");
     this.catchupPath = path.join(this.obtsDir, "catchup.json");
     this.uploadTransferPath = path.join(this.obtsDir, "upload-transfer.json");
+    this.uploadRecoveryPath = path.join(this.obtsDir, "upload-recovery.json");
     this.pendingAppliedAckPath = path.join(this.obtsDir, "pending-applied-ack.json");
     this.directoryRecoveryPath = path.join(this.obtsDir, "directory-recovery.json");
     this.directoryBaselineRecoveryPath = path.join(this.obtsDir, "directory-baseline-recovery.json");
@@ -23623,6 +23632,20 @@ var ObtsObsidianClient = class {
     await git.init({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, defaultBranch: "local" });
     await git.writeRef({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, ref: "HEAD", value: "refs/heads/local", symbolic: true, force: true });
     await this.recoverInterruptedRefLocks();
+    try {
+      if (await this.readUploadCheckpoint() || await this.readUploadRecovery()) {
+        const queue = await readRecoveryJsonStrict(this.fsp, this.queuePath, "upload_checkpoint_recovery_required", "The saved upload queue is unreadable; preserve recovery evidence.");
+        if (!isUploadRecoveryQueue(queue)) throw this.uploadRecoveryError("The saved upload queue is invalid.");
+      }
+    } catch (error) {
+      if (error.code !== "upload_checkpoint_recovery_required") throw error;
+      await this.writeState(Object.assign({}, await this.readState(), {
+        status_label: "Out of sync \u2014 local recovery required",
+        last_error_code: error.code,
+        updated_at: nowIso()
+      }));
+      return;
+    }
     try {
       await this.restartStaleProvenance();
     } catch (error) {
@@ -24518,6 +24541,8 @@ var ObtsObsidianClient = class {
       throw new ObtsBlockedError("not_paired", "Device is not paired.");
     }
     if (await this.settleCompletedLegacyDirectoryAdvance()) state = await this.readState();
+    const uploadRecovery = await this.recoverUploadCheckpointIfNeeded();
+    if (uploadRecovery) return { status: (await this.readState()).status_label, upload: uploadRecovery };
     if (state.last_error_code === "stale_directory_proposal_base" || await exists(this.fsp, this.directoryBaselineRecoveryPath)) {
       await this.recoverStaleDirectoryProposalBase();
       state = await this.readState();
@@ -24686,6 +24711,7 @@ var ObtsObsidianClient = class {
   }
   async rebuildFromServerMain() {
     await this.initialize();
+    await this.recoverUploadCheckpointIfNeeded();
     const state = await this.readState();
     if (!state.vault_id || !state.device_id) {
       throw new ObtsBlockedError("not_paired", "Device is not paired.");
@@ -24956,6 +24982,8 @@ var ObtsObsidianClient = class {
     }));
   }
   async uploadQueuedCommit(queue) {
+    const recovered = await this.recoverUploadCheckpointIfNeeded(queue);
+    if (recovered) return recovered;
     let state = await this.readState();
     const token = await this.readDeviceToken();
     await this.writeState(Object.assign({}, state, {
@@ -24968,13 +24996,10 @@ var ObtsObsidianClient = class {
     const allDirectoryIntents = (await this.readDirectoryState()).pending_intents;
     const staleIntent = queue.pending_proposal_base ? (await this.readStaleProvenance()).intent : null;
     const pendingDirectoryIntents = queue.pending_proposal_base ? allDirectoryIntents.filter((intent) => Object.keys(staleIntent?.captures || {}).some((p) => changedPathsConflict(p, intent.path))) : allDirectoryIntents;
-    const uploadCheckpoint = await readJson(this.fsp, this.uploadTransferPath, null);
+    const uploadCheckpoint = await this.readUploadCheckpoint();
     let directoryProposal = isUploadTransferCheckpoint(uploadCheckpoint) && uploadCheckpoint.target_commit === queue.pending_commit ? uploadCheckpoint.directory_proposal || null : null;
     let result;
     try {
-      if (uploadCheckpoint && (!isUploadTransferCheckpoint(uploadCheckpoint) || uploadCheckpoint.target_commit !== queue.pending_commit || (uploadCheckpoint.transfer_request.base_commit || null) !== this.proposalBase(queue, state) || uploadCheckpoint.transfer_request.root_ignore_capability !== "root-ignore-v1" || !Object.hasOwn(uploadCheckpoint.transfer_request, "root_ignore_oid"))) {
-        throw new ObtsBlockedError("legacy_upload_checkpoint", "Existing upload checkpoint needs explicit recovery; it will not be replaced or reinterpreted.");
-      }
       if (!uploadCheckpoint && queue.pending_commit && await this.queuedCommitRootPolicyIsStale(queue.pending_commit)) {
         const rebuilt = await this.rebuildQueuedCommitForRootPolicy(queue.pending_commit, state, queue);
         if (rebuilt) {
@@ -24989,14 +25014,26 @@ var ObtsObsidianClient = class {
         );
         if (existingResponse.ok) {
           const descriptor = await existingResponse.json();
+          this.validateUploadDescriptor(descriptor, uploadCheckpoint);
           if (descriptor.status === "completed") result = this.completedTransferResult(descriptor);
           else if (descriptor.status === "rejected") this.throwRejectedTransfer(descriptor);
-          else if (descriptor.status === "processing") result = await this.pollPushTransfer(state, token, descriptor);
+          else if (descriptor.status === "processing") result = await this.pollPushTransfer(state, token, descriptor, uploadCheckpoint);
         } else if (existingResponse.status !== 404 && existingResponse.status !== 410) {
           await throwResponseError(existingResponse);
         }
       }
       let capabilities = null;
+      if (!result && uploadCheckpoint) {
+        capabilities = await this.syncCapabilities();
+        result = await this.pushInChunks(
+          state,
+          queue,
+          token,
+          directoryProposal,
+          capabilities,
+          uploadCheckpoint.transfer_request.root_ignore_oid
+        );
+      }
       if (!result) {
         const serverState = await this.getDeviceSelf(token);
         await this.reconcileServerVaultStatus(serverState.vault_status, true);
@@ -25101,7 +25138,7 @@ var ObtsObsidianClient = class {
       const exactAcknowledgement = Boolean(
         directoryProposal && acknowledgement && acknowledgement.proposal_id === directoryProposal.proposal_id && (result.status === "merged" ? acknowledgement.status === "accepted" : acknowledgement.status === "accepted" || acknowledgement.status === "duplicate") && receivedAcknowledgementKeys.size === expectedAcknowledgementKeys.size && [...expectedAcknowledgementKeys].every((key) => receivedAcknowledgementKeys.has(key))
       );
-      if (pendingDirectoryIntents.length > 0 && !exactAcknowledgement) {
+      if ((uploadCheckpoint ? (directoryProposal?.intents || []).length : pendingDirectoryIntents.length) > 0 && !exactAcknowledgement) {
         await this.updateQueuedCommit(queue.pending_commit, async (current) => Object.assign({}, current, {
           status: "queued_local",
           updated_at: nowIso()
@@ -25144,6 +25181,176 @@ var ObtsObsidianClient = class {
       await this.clearAcknowledgedDirectoryIntents(acknowledgement?.acknowledged_intents ?? []);
     }
     return result;
+  }
+  async recoverUploadCheckpointIfNeeded(queue = null) {
+    queue || (queue = await this.readQueue());
+    const state = await this.readState();
+    let journal = await this.readUploadRecovery();
+    const checkpoint = await this.readUploadCheckpoint();
+    if (!journal && !checkpoint) return null;
+    const queueEvidence = await readRecoveryJsonStrict(
+      this.fsp,
+      this.queuePath,
+      "upload_checkpoint_recovery_required",
+      "The saved queue is unreadable. Preserve the vault and .obts files for assisted recovery."
+    );
+    if (!isUploadRecoveryQueue(queueEvidence) || queueEvidence.pending_commit !== queue.pending_commit) throw this.uploadRecoveryError("The saved queue identity is invalid.");
+    if (journal && !checkpoint && !journal.result) throw this.uploadRecoveryError("The original checkpoint is missing before reconciliation.");
+    if (!journal) {
+      const request = checkpoint.transfer_request;
+      if (request.vault_id !== state.vault_id || request.device_id !== state.device_id) {
+        throw this.uploadRecoveryError("The checkpoint belongs to a different paired identity.");
+      }
+      if (checkpoint.target_commit === queue.pending_commit && queue.pending_proposal_base && request.base_commit !== queue.pending_proposal_base) {
+        throw this.uploadRecoveryError("The queue and checkpoint disagree about the same proposal's authoring base.");
+      }
+      if (checkpoint.target_commit === queue.pending_commit && isModernUploadCheckpoint(checkpoint)) return null;
+      await this.mutateQueue(async () => {
+        const current = await this.readQueue();
+        if (current.pending_commit !== queue.pending_commit) throw this.uploadRecoveryError("The queue changed during recovery preparation.");
+        journal = await this.publishUploadHandoff(checkpoint, current, current, state);
+      });
+    }
+    if (checkpoint && sha256(Buffer2.from(await this.fsp.readFile(this.uploadTransferPath, "utf8"))) !== journal.checkpoint_sha256 && // A current attempt's transfer ID/timestamp may have been filled in by
+    // immutable resume. Its request, plan and attempt must still be exact.
+    !(isModernUploadCheckpoint(journal.checkpoint) && sameUploadAttempt(checkpoint, journal.checkpoint))) {
+      throw this.uploadRecoveryError("The checkpoint changed after recovery was published.");
+    }
+    if (await readApplyJournalStrict(this.fsp, this.applyJournalPath)) throw this.uploadRecoveryError("Finish interrupted apply recovery before recovering the upload.");
+    await this.protectUploadRecoveryCommits([
+      journal.old_commit,
+      journal.original_base,
+      journal.checkpoint.transfer_request.expected_device_ref,
+      journal.checkpoint.transfer_request.client_known_main,
+      journal.successor_commit,
+      journal.successor_queue.expected_device_ref,
+      journal.successor_queue.pending_proposal_base,
+      journal.successor_queue.pending_upload_base,
+      journal.checkpoint.directory_proposal?.base_main,
+      ...(journal.checkpoint.directory_proposal?.intents || []).map((intent) => intent.base_main)
+    ]);
+    const oldObjects = new Set(await this.collectIncrementalPackObjects(journal.old_commit, []));
+    if (journal.checkpoint.groups.some((group) => group.some((oid) => !oldObjects.has(oid)))) {
+      throw this.uploadRecoveryError("The archived object plan contains objects outside the protected proposal.");
+    }
+    if (!journal.result) {
+      const result = await this.reconcileUploadCheckpointHandoff(journal, state, await this.readDeviceToken());
+      if (!isUploadRecoveryResult(result)) throw this.uploadRecoveryError("The server did not return a valid integration result.");
+      const replayCheckpoint = await this.readUploadCheckpoint(path.join(this.obtsDir, "upload-recovery-transfer.json"));
+      if (replayCheckpoint && !isUploadRecoveryReplay(replayCheckpoint, journal.checkpoint)) throw this.uploadRecoveryError("The replay checkpoint does not match the reconciled proposal.");
+      journal = await this.writeUploadRecovery(Object.assign({}, journal, { phase: "result", result, replay_checkpoint: replayCheckpoint }));
+    }
+    return await this.settleUploadCheckpointHandoff(journal);
+  }
+  async reconcileUploadCheckpointHandoff(journal, state, token) {
+    const checkpoint = journal.checkpoint;
+    if (checkpoint.transfer_id) {
+      const response = await fetchWithTimeout(
+        this.url(`/api/v1/vaults/${state.vault_id}/sync/push-transfers/${checkpoint.transfer_id}`),
+        { headers: { authorization: `Bearer ${token}` } }
+      );
+      if (response.ok) {
+        const descriptor = await response.json();
+        this.validateUploadDescriptor(descriptor, checkpoint);
+        if (descriptor.status === "completed") return this.completedTransferResult(descriptor);
+        if (descriptor.status === "processing") return await this.pollPushTransfer(state, token, descriptor, checkpoint);
+        if (!["open", "rejected"].includes(descriptor.status)) throw this.uploadRecoveryError("The old transfer has an unknown status.");
+      } else if (response.status !== 404 && response.status !== 410) await throwResponseError(response);
+    }
+    const capabilities = await this.syncCapabilities();
+    if (!capabilities.capabilities.includes("git-object-pack-chunks-v1")) throw this.uploadRecoveryError("Update the server before recovering this upload.");
+    const modern = isModernUploadCheckpoint(checkpoint);
+    const replayPath = modern ? this.uploadTransferPath : path.join(this.obtsDir, "upload-recovery-transfer.json");
+    const replayCheckpoint = await this.readUploadCheckpoint(replayPath);
+    if (!modern && replayCheckpoint && !isUploadRecoveryReplay(replayCheckpoint, checkpoint)) {
+      throw this.uploadRecoveryError("The recovery attempt does not match the saved proposal.");
+    }
+    const rootIgnoreOid = await this.validateUploadTargetRootIgnore(journal.old_commit);
+    const replayState = Object.assign({}, state, { local_main: checkpoint.transfer_request.client_known_main });
+    return await this.pushInChunks(
+      replayState,
+      journal.old_queue,
+      token,
+      checkpoint.directory_proposal,
+      capabilities,
+      rootIgnoreOid,
+      false,
+      journal.original_base,
+      { checkpointPath: replayPath, recovery: true }
+    );
+  }
+  validateUploadDescriptor(descriptor, checkpoint) {
+    if (!descriptor || descriptor.target_commit !== checkpoint.target_commit || checkpoint.transfer_id && descriptor.transfer_id !== checkpoint.transfer_id || descriptor.chunk_count !== checkpoint.groups.length) {
+      throw this.uploadRecoveryError("The server transfer identity does not match the saved request.");
+    }
+  }
+  async settleUploadCheckpointHandoff(journal) {
+    const replayCheckpoint = await this.readUploadCheckpoint(path.join(this.obtsDir, "upload-recovery-transfer.json"));
+    if (replayCheckpoint && (!journal.replay_checkpoint || !sameUploadAttempt(replayCheckpoint, journal.replay_checkpoint) || replayCheckpoint.transfer_id !== journal.replay_checkpoint.transfer_id)) {
+      throw this.uploadRecoveryError("The replay checkpoint changed before settlement.");
+    }
+    const checkpoint = await this.readUploadCheckpoint();
+    if (checkpoint && sha256(Buffer2.from(await this.fsp.readFile(this.uploadTransferPath, "utf8"))) !== journal.checkpoint_sha256 && !(isModernUploadCheckpoint(journal.checkpoint) && sameUploadAttempt(checkpoint, journal.checkpoint))) {
+      throw this.uploadRecoveryError("The checkpoint changed before its result could be settled.");
+    }
+    const result = journal.result;
+    const proposal = journal.checkpoint.directory_proposal;
+    const ack = result.directory_ack;
+    if (result.status !== "conflicted" && proposal) {
+      const expected = (proposal.intents || []).map(directoryIntentGenerationKey).sort();
+      if (!Array.isArray(ack?.acknowledged_intents) || ack.acknowledged_intents.some((intent) => !intent || typeof intent.intent_id !== "string" || !Number.isSafeInteger(intent.generation) || intent.generation < 0)) {
+        throw this.uploadRecoveryError("The old directory acknowledgement is malformed.");
+      }
+      const received = ack.acknowledged_intents.map(directoryIntentGenerationKey).sort();
+      if (!ack || ack.proposal_id !== proposal.proposal_id || !["accepted", ...result.status === "noop" ? ["duplicate"] : []].includes(ack.status) || stableJson(expected) !== stableJson(received)) {
+        throw this.uploadRecoveryError("The old directory proposal lacks an exact server acknowledgement.");
+      }
+    }
+    await this.recordStaleProposalResult(journal.old_queue, result, true);
+    await this.mutateQueue(async () => {
+      const current = await this.readQueue();
+      const successor = journal.successor_queue;
+      const nextCommit = successor.pending_commit === journal.old_commit ? null : successor.pending_commit;
+      if (![journal.old_commit, successor.pending_commit, nextCommit].includes(current.pending_commit) || current.pending_commit === successor.pending_commit && current.pending_commit && ((current.pending_proposal_base || null) !== (successor.pending_proposal_base || null) || ![successor.expected_device_ref, result.device_ref].includes(current.expected_device_ref) || Object.hasOwn(current, "pending_upload_base") && current.pending_upload_base !== successor.pending_upload_base)) {
+        throw this.uploadRecoveryError("The active queue no longer belongs to this handoff.");
+      }
+      const hints = [.../* @__PURE__ */ new Set([...current.changed_paths || [], ...successor.changed_paths])].sort();
+      await writeJson(this.fsp, this.queuePath, this.normalizedQueueForWrite(Object.assign({}, successor, {
+        pending_commit: nextCommit,
+        expected_device_ref: result.device_ref,
+        // Only the old proposal was classified as conflicted. Marking a saved
+        // successor conflicted would let resolution apply discard its bytes.
+        status: nextCommit ? "queued_local" : result.status === "conflicted" ? "conflicted" : hints.length ? "queued_local" : "idle",
+        change_seq: Math.max(current.change_seq || 0, successor.change_seq || 0),
+        changed_paths: hints,
+        updated_at: nowIso()
+      }), current));
+    });
+    const currentState = await this.readState();
+    const settledQueue = await this.readQueue();
+    await this.writeState(Object.assign({}, currentState, {
+      server_device_ref: result.device_ref,
+      local_head: await this.resolveRef("refs/heads/local") || currentState.local_head,
+      status_label: result.status === "conflicted" ? "Review needed" : settledQueue.pending_commit ? "Ahead" : result.main !== currentState.local_main ? "Behind" : "Checking",
+      last_error_code: result.status === "conflicted" ? "conflict_review_required" : null,
+      last_event_seq: Math.max(currentState.last_event_seq || 0, result.event_seq || 0),
+      updated_at: nowIso()
+    }));
+    if (result.status !== "conflicted" && proposal) await this.clearAcknowledgedDirectoryIntents(ack.acknowledged_intents);
+    const archivePath = path.join(this.obtsDir, "upload-recovery", `${journal.checkpoint_sha256}.json`);
+    await writeJson(this.fsp, archivePath, journal);
+    const archive = await readRecoveryJsonStrict(this.fsp, archivePath, "upload_checkpoint_recovery_required", "The recovery archive could not be verified.");
+    if (!isUploadCheckpointHandoff(archive) || stableJson(archive) !== stableJson(journal)) throw this.uploadRecoveryError("The recovery archive changed.");
+    await this.fsp.rm(this.uploadTransferPath, { force: true });
+    await this.fsp.rm(path.join(this.obtsDir, "upload-recovery-transfer.json"), { force: true });
+    await this.fsp.rm(this.uploadRecoveryPath, { force: true });
+    return result;
+  }
+  async recoverUploadCheckpoint() {
+    await this.initialize();
+    const result = await this.recoverUploadCheckpointIfNeeded();
+    if (!result && await this.readUploadCheckpoint()) await this.uploadQueuedCommit(await this.readQueue());
+    return { status: (await this.readState()).status_label };
   }
   async putPushChunk({ vaultId, token, transferId, index: index2, packfile }) {
     const response = await fetchWithTimeout(
@@ -25334,7 +25541,9 @@ var ObtsObsidianClient = class {
       }
     }
   }
-  async pushInChunks(state, queue, token, directoryProposal, capabilities, rootIgnoreOid, allowStaleRetry = true) {
+  async pushInChunks(state, queue, token, directoryProposal, capabilities, rootIgnoreOid, allowStaleRetry = true, proposalBaseOverride = void 0, options = {}) {
+    const checkpointPath = options.checkpointPath || this.uploadTransferPath;
+    const proposalBase = proposalBaseOverride === void 0 ? this.proposalBase(queue, state) : proposalBaseOverride;
     const transferIdentity = sha256(Buffer2.from(stableJson({
       target_commit: queue.pending_commit,
       ...queue.pending_proposal_base ? { base_commit: queue.pending_proposal_base } : {},
@@ -25346,11 +25555,11 @@ var ObtsObsidianClient = class {
       target_chunk_bytes: capabilities.target_chunk_bytes,
       max_chunk_bytes: capabilities.max_chunk_bytes
     })));
-    let checkpoint = await readJson(this.fsp, this.uploadTransferPath, null);
+    let checkpoint = await this.readUploadCheckpoint(checkpointPath);
     let groups;
     let transferRequest;
     let attemptId;
-    if (isUploadTransferCheckpoint(checkpoint) && checkpoint.identity === transferIdentity && checkpoint.transfer_request.root_ignore_capability === "root-ignore-v1" && checkpoint.transfer_request.root_ignore_oid === rootIgnoreOid) {
+    if (isModernUploadCheckpoint(checkpoint) && checkpoint.target_commit === queue.pending_commit && checkpoint.transfer_request.vault_id === state.vault_id && checkpoint.transfer_request.device_id === state.device_id && checkpoint.transfer_request.root_ignore_oid === rootIgnoreOid) {
       groups = checkpoint.groups;
       transferRequest = checkpoint.transfer_request;
       attemptId = checkpoint.attempt_id;
@@ -25376,7 +25585,7 @@ var ObtsObsidianClient = class {
         root_ignore_capability: "root-ignore-v1",
         root_ignore_oid: rootIgnoreOid,
         client_known_main: state.local_main,
-        ...this.proposalBase(queue, state) ? { base_commit: this.proposalBase(queue, state) } : {},
+        ...proposalBase ? { base_commit: proposalBase } : {},
         ...directoryProposal ? { directory_proposal: directoryProposal } : {},
         chunk_count: groups.length,
         plan_sha256: sha256(Buffer2.from(JSON.stringify(groups)))
@@ -25393,14 +25602,14 @@ var ObtsObsidianClient = class {
         transfer_id: null,
         updated_at: nowIso()
       };
-      await writeJson(this.fsp, this.uploadTransferPath, checkpoint);
+      await writeJson(this.fsp, checkpointPath, checkpoint);
     }
-    await this.updateQueuedCommit(queue.pending_commit, async (current) => Object.assign({}, current, {
+    if (!options.recovery) await this.updateQueuedCommit(queue.pending_commit, async (current) => Object.assign({}, current, {
       status: "uploading",
       attempts: Math.max(current.attempts || 0, queue.attempts || 0) + 1,
       updated_at: nowIso()
     }));
-    await this.writeState(Object.assign({}, state, { status_label: "Uploading", last_error_code: null, updated_at: nowIso() }));
+    await this.writeState(Object.assign({}, await this.readState(), { status_label: "Uploading", last_error_code: null, updated_at: nowIso() }));
     this.plugin.setStatus("Uploading");
     await this.reportDeviceStatus().catch(() => void 0);
     try {
@@ -25411,12 +25620,13 @@ var ObtsObsidianClient = class {
       });
       if (!createResponse.ok) await throwResponseError(createResponse);
       let descriptor = await createResponse.json();
+      this.validateUploadDescriptor(descriptor, Object.assign({}, checkpoint, { transfer_id: null }));
       checkpoint = Object.assign({}, checkpoint, { transfer_id: descriptor.transfer_id, updated_at: nowIso() });
-      await writeJson(this.fsp, this.uploadTransferPath, checkpoint);
+      await writeJson(this.fsp, checkpointPath, checkpoint);
       if (descriptor.status === "completed") return this.completedTransferResult(descriptor);
       if (descriptor.status === "rejected") this.throwRejectedTransfer(descriptor);
       if (descriptor.status === "processing") {
-        return await this.pollPushTransfer(state, token, descriptor);
+        return await this.pollPushTransfer(state, token, descriptor, checkpoint);
       }
       if (descriptor.status !== "open") {
         throw new ObtsBlockedError("transfer_closed", "The resumable transfer is closed without an accepted result.");
@@ -25456,7 +25666,7 @@ var ObtsObsidianClient = class {
       if (!finalizeResponse.ok) await throwResponseError(finalizeResponse);
       descriptor = await finalizeResponse.json();
       if (!useAsyncFinalize) return descriptor;
-      return await this.pollPushTransfer(state, token, descriptor);
+      return await this.pollPushTransfer(state, token, descriptor, checkpoint);
     } catch (error) {
       if (allowStaleRetry && error instanceof ObtsTransportError && error.code === "stale_device_ref") {
         const self = await this.getDeviceSelf(token);
@@ -25466,15 +25676,16 @@ var ObtsObsidianClient = class {
           await this.writeQueue(recoveredQueue);
           await this.writeState(Object.assign({}, state, { server_device_ref: recoveredRef, status_label: "Preparing upload", updated_at: nowIso() }));
           await this.fsp.rm(this.uploadTransferPath, { force: true });
-          return await this.pushInChunks(Object.assign({}, state, { server_device_ref: recoveredRef }), recoveredQueue, token, directoryProposal, capabilities, rootIgnoreOid, false);
+          return await this.pushInChunks(Object.assign({}, state, { server_device_ref: recoveredRef }), recoveredQueue, token, directoryProposal, capabilities, rootIgnoreOid, false, proposalBaseOverride, options);
         }
       }
       throw error;
     }
   }
-  async pollPushTransfer(state, token, descriptor) {
+  async pollPushTransfer(state, token, descriptor, checkpoint = null) {
     await this.updatePushProcessingStatus(descriptor);
     while (true) {
+      if (checkpoint) this.validateUploadDescriptor(descriptor, checkpoint);
       if (descriptor.status === "completed") return this.completedTransferResult(descriptor);
       if (descriptor.status === "rejected") this.throwRejectedTransfer(descriptor);
       if (descriptor.status === "open") {
@@ -26956,7 +27167,7 @@ var ObtsObsidianClient = class {
     return preservedPaths;
   }
   proposalBase(queue, state) {
-    return queue.pending_proposal_base || (queue.expected_device_ref === null ? state.local_main : null);
+    return queue.pending_proposal_base || (Object.hasOwn(queue, "pending_upload_base") ? queue.pending_upload_base : queue.expected_device_ref === null ? state.local_main : null);
   }
   async readStaleProvenance() {
     const saved = await readRecoveryJsonStrict(
@@ -27314,7 +27525,7 @@ var ObtsObsidianClient = class {
     horizon.expiry = Date.now() + 3e3;
     delete saved.obligations[filePath];
   }
-  async recordStaleProposalResult(queue, result) {
+  async recordStaleProposalResult(queue, result, detachedRecovery = false) {
     await this.mutateStaleProvenance(async (saved) => {
       if (["merged", "noop"].includes(result.status)) saved.accepted_proposal = {
         commit: queue.pending_commit,
@@ -27327,6 +27538,7 @@ var ObtsObsidianClient = class {
       }
       if (result.status === "conflicted") await this.settleHeldProposal(saved, queue.pending_commit, result.main, false);
       if (!queue.pending_proposal_base) return;
+      if (detachedRecovery && saved.intent?.commit !== queue.pending_commit) return;
       if (saved.intent?.commit !== queue.pending_commit) throw new ObtsBlockedError("stale_intent_mismatch", "The stale result has no matching durable intent.");
       saved.intent.outcome = result.status;
       saved.intent.main = result.main || null;
@@ -29887,16 +30099,21 @@ var ObtsObsidianClient = class {
   normalizedQueueForWrite(queue, existing = null) {
     const preserveChangedPaths = queue.pending_commit === null && queue.status === "queued_local";
     const changedPaths = Array.from(new Set((Array.isArray(queue.changed_paths) ? queue.changed_paths : preserveChangedPaths && Array.isArray(existing && existing.changed_paths) ? existing.changed_paths : []).filter((filePath) => typeof filePath === "string" && isSyncableVaultPath(filePath)).map((filePath) => normalizePath2(filePath)))).sort();
-    return Object.assign({}, queue, {
+    const normalized = Object.assign({}, queue, {
       pending_proposal_base: queue.pending_commit ? queue.pending_proposal_base || (existing?.pending_commit === queue.pending_commit ? existing.pending_proposal_base : null) || null : null,
+      ...queue.pending_commit && !Object.hasOwn(queue, "pending_upload_base") && existing?.pending_commit === queue.pending_commit && Object.hasOwn(existing, "pending_upload_base") ? { pending_upload_base: existing.pending_upload_base } : {},
       change_seq: Number.isSafeInteger(queue.change_seq) && queue.change_seq >= 0 ? queue.change_seq : Number.isSafeInteger(existing && existing.change_seq) && existing.change_seq >= 0 ? existing.change_seq : 0,
       changed_paths: changedPaths
     });
+    if (!queue.pending_commit) delete normalized.pending_upload_base;
+    return normalized;
   }
   async writeQueue(queue) {
     await this.mutateQueue(async () => {
-      const existing = await readJson(this.fsp, this.queuePath, null);
-      await writeJson(this.fsp, this.queuePath, this.normalizedQueueForWrite(queue, existing));
+      const existing = await this.readQueue();
+      const normalized = this.normalizedQueueForWrite(queue, existing);
+      if (normalized.pending_commit !== existing.pending_commit) await this.preserveUploadCheckpointHandoff(existing, normalized);
+      await writeJson(this.fsp, this.queuePath, normalized);
     });
   }
   async updateQueue(mutator) {
@@ -29905,8 +30122,143 @@ var ObtsObsidianClient = class {
       const next = await mutator(existing);
       if (!next) return existing;
       const normalized = this.normalizedQueueForWrite(next, existing);
+      if (normalized.pending_commit !== existing.pending_commit) await this.preserveUploadCheckpointHandoff(existing, normalized);
       await writeJson(this.fsp, this.queuePath, normalized);
       return normalized;
+    });
+  }
+  async preserveUploadCheckpointHandoff(previousQueue, successorQueue) {
+    const checkpoint = await this.readUploadCheckpoint();
+    const existing = await this.readUploadRecovery();
+    if (!checkpoint && !existing) return;
+    const queueEvidence = await readRecoveryJsonStrict(this.fsp, this.queuePath, "upload_checkpoint_recovery_required", "The queue is unreadable; preserve recovery evidence.");
+    if (!isUploadRecoveryQueue(queueEvidence) || queueEvidence.pending_commit !== previousQueue.pending_commit) throw this.uploadRecoveryError("The saved queue identity is invalid.");
+    const state = await this.readState();
+    await this.protectUploadRecoveryCommits([successorQueue.pending_commit, successorQueue.pending_proposal_base]);
+    if (existing) {
+      if (existing.successor_commit === successorQueue.pending_commit) return;
+      throw this.uploadRecoveryError("Finish the saved handoff before replacing another queued proposal.");
+    }
+    await this.publishUploadHandoff(checkpoint, previousQueue, successorQueue, state);
+  }
+  uploadRecoveryError(message) {
+    return new ObtsBlockedError(
+      "upload_checkpoint_recovery_required",
+      `${message} Run Recover upload checkpoint to retry. If it still fails, preserve the vault and .obts files and send a troubleshooting snapshot for assisted recovery; do not reset sync.`
+    );
+  }
+  async readUploadCheckpoint(filePath = this.uploadTransferPath) {
+    let bytes;
+    try {
+      bytes = Buffer2.from(await this.fsp.readFile(filePath));
+    } catch (error) {
+      if (error.code === "ENOENT") return null;
+      throw this.uploadRecoveryError("The upload checkpoint is unreadable.");
+    }
+    const raw = bytes.toString("utf8");
+    if (!Buffer2.from(raw).equals(bytes)) throw this.uploadRecoveryError("The upload checkpoint is not valid UTF-8.");
+    let checkpoint;
+    try {
+      checkpoint = JSON.parse(raw);
+    } catch {
+      throw this.uploadRecoveryError("The upload checkpoint is not valid JSON.");
+    }
+    if (!isUploadTransferCheckpoint(checkpoint)) throw this.uploadRecoveryError("The saved upload identity is invalid.");
+    return checkpoint;
+  }
+  async readUploadRecovery() {
+    const journal = await readRecoveryJsonStrict(
+      this.fsp,
+      this.uploadRecoveryPath,
+      "upload_checkpoint_recovery_required",
+      "The upload recovery journal is unreadable. Preserve the vault and .obts files and send a troubleshooting snapshot; do not reset sync."
+    );
+    if (!journal) return null;
+    const state = await this.readState();
+    if (!isUploadCheckpointHandoff(journal) || journal.vault_id !== state.vault_id || journal.device_id !== state.device_id) {
+      throw this.uploadRecoveryError("The upload recovery journal identity or checksum is invalid.");
+    }
+    return journal;
+  }
+  async writeUploadRecovery(journal) {
+    const sealed = Object.assign({}, journal);
+    delete sealed.journal_sha256;
+    sealed.journal_sha256 = sha256(Buffer2.from(stableJson(sealed)));
+    if (!isUploadCheckpointHandoff(sealed)) throw this.uploadRecoveryError("The handoff cannot be bound to its original proposal.");
+    await writeJson(this.fsp, this.uploadRecoveryPath, sealed);
+    return sealed;
+  }
+  async protectUploadRecoveryCommits(commits) {
+    for (const commit2 of new Set(commits.filter(Boolean))) {
+      if (!isGitObjectId(commit2)) throw this.uploadRecoveryError("A recovery commit identity is invalid.");
+      const objects = await this.collectIncrementalPackObjects(commit2, []).catch(() => null);
+      if (!objects) throw this.uploadRecoveryError("A recovery commit's history is unavailable.");
+      for (const oid of objects) {
+        try {
+          await git.readObject({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid, format: "content" });
+        } catch {
+          throw this.uploadRecoveryError("A recovery Git object is unavailable.");
+        }
+      }
+      const ref = `refs/obts/upload-recovery/${commit2}`;
+      await this.updateRef(ref, commit2, await this.resolveRef(ref));
+    }
+  }
+  async publishUploadHandoff(checkpoint, previousQueue, successorQueue, state) {
+    const bytes = Buffer2.from(await this.fsp.readFile(this.uploadTransferPath));
+    const raw = bytes.toString("utf8");
+    if (!Buffer2.from(raw).equals(bytes)) throw this.uploadRecoveryError("The checkpoint became unreadable during publication.");
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw this.uploadRecoveryError("The checkpoint became unreadable during publication.");
+    }
+    if (stableJson(parsed) !== stableJson(checkpoint) || checkpoint.transfer_request.vault_id !== state.vault_id || checkpoint.transfer_request.device_id !== state.device_id || !isUploadRecoveryQueue(previousQueue) || !isUploadRecoveryQueue(successorQueue)) {
+      throw this.uploadRecoveryError("The checkpoint and local identity do not agree.");
+    }
+    const request = checkpoint.transfer_request;
+    const originalBase = request.base_commit || null;
+    const successor = Object.assign({}, successorQueue, {
+      ...successorQueue.pending_commit && successorQueue.pending_commit !== checkpoint.target_commit ? { pending_upload_base: this.proposalBase(successorQueue, state) } : {},
+      changed_paths: [.../* @__PURE__ */ new Set([...previousQueue.changed_paths || [], ...successorQueue.changed_paths || []])].sort(),
+      change_seq: Math.max(previousQueue.change_seq || 0, successorQueue.change_seq || 0)
+    });
+    const oldQueue = Object.assign({}, previousQueue, {
+      pending_commit: checkpoint.target_commit,
+      expected_device_ref: request.expected_device_ref,
+      pending_proposal_base: previousQueue.pending_commit === checkpoint.target_commit && previousQueue.pending_proposal_base === originalBase ? originalBase : null,
+      pending_upload_base: originalBase,
+      status: "queued_local"
+    });
+    await this.protectUploadRecoveryCommits([
+      checkpoint.target_commit,
+      originalBase,
+      request.expected_device_ref,
+      request.client_known_main,
+      previousQueue.pending_commit,
+      previousQueue.pending_proposal_base,
+      successor.pending_commit,
+      successor.expected_device_ref,
+      successor.pending_proposal_base,
+      successor.pending_upload_base,
+      checkpoint.directory_proposal?.base_main,
+      ...(checkpoint.directory_proposal?.intents || []).map((intent) => intent.base_main)
+    ]);
+    return await this.writeUploadRecovery({
+      version: 1,
+      vault_id: state.vault_id,
+      device_id: state.device_id,
+      old_commit: checkpoint.target_commit,
+      original_base: originalBase,
+      old_queue: oldQueue,
+      checkpoint,
+      checkpoint_raw: raw,
+      checkpoint_sha256: sha256(Buffer2.from(raw)),
+      successor_commit: successor.pending_commit,
+      successor_queue: successor,
+      phase: "prepared",
+      result: null
     });
   }
   async updateQueuedCommit(expectedCommit, mutator) {
@@ -32524,11 +32876,44 @@ function isCompletePullCheckpoint(value) {
     )
   );
 }
+function isUploadRecoveryQueue(value) {
+  const nullableOid = (oid) => oid === null || isGitObjectId(oid);
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) && nullableOid(value.pending_commit) && nullableOid(value.expected_device_ref) && (value.pending_proposal_base === void 0 || nullableOid(value.pending_proposal_base)) && (value.pending_upload_base === void 0 || nullableOid(value.pending_upload_base)) && ["idle", "queued_local", "uploading", "uploaded", "merged", "conflicted", "blocked_recovery"].includes(value.status) && Number.isSafeInteger(value.attempts) && value.attempts >= 0 && Number.isSafeInteger(value.change_seq) && value.change_seq >= 0 && Array.isArray(value.changed_paths) && value.changed_paths.every((p) => typeof p === "string" && isSafeJournalPath(p)));
+}
+function isUploadRecoveryResult(value) {
+  return Boolean(value && ["merged", "noop", "conflicted"].includes(value.status) && isGitObjectId(value.device_ref) && isGitObjectId(value.main) && Number.isSafeInteger(value.event_seq) && value.event_seq >= 0 && (value.status !== "merged" || isGitObjectId(value.merge_commit)) && (value.status !== "conflicted" || typeof value.conflict_id === "string" && value.conflict_id.length > 0));
+}
+function isUploadCheckpointHandoff(value) {
+  try {
+    const unsigned = Object.assign({}, value);
+    delete unsigned.journal_sha256;
+    return Boolean(value && value.version === 1 && value.journal_sha256 === sha256(Buffer2.from(stableJson(unsigned))) && isUploadTransferCheckpoint(value.checkpoint) && typeof value.checkpoint_raw === "string" && value.checkpoint_sha256 === sha256(Buffer2.from(value.checkpoint_raw)) && stableJson(JSON.parse(value.checkpoint_raw)) === stableJson(value.checkpoint) && value.vault_id === value.checkpoint.transfer_request.vault_id && value.device_id === value.checkpoint.transfer_request.device_id && value.old_commit === value.checkpoint.target_commit && value.original_base === (value.checkpoint.transfer_request.base_commit || null) && isUploadRecoveryQueue(value.old_queue) && value.old_queue.pending_commit === value.old_commit && value.old_queue.expected_device_ref === value.checkpoint.transfer_request.expected_device_ref && value.old_queue.pending_upload_base === value.original_base && (!value.old_queue.pending_proposal_base || value.old_queue.pending_proposal_base === value.original_base) && isUploadRecoveryQueue(value.successor_queue) && value.successor_queue.pending_commit === value.successor_commit && (value.phase === "prepared" && value.result === null || value.phase === "result" && isUploadRecoveryResult(value.result) && (value.replay_checkpoint === null || isUploadRecoveryReplay(value.replay_checkpoint, value.checkpoint))));
+  } catch {
+    return false;
+  }
+}
+function isModernUploadCheckpoint(value) {
+  return isUploadTransferCheckpoint(value) && value.transfer_request.root_ignore_capability === "root-ignore-v1" && Object.hasOwn(value.transfer_request, "root_ignore_oid");
+}
+function isUploadRecoveryReplay(value, original) {
+  return isModernUploadCheckpoint(value) && value.target_commit === original.target_commit && value.transfer_request.vault_id === original.transfer_request.vault_id && value.transfer_request.device_id === original.transfer_request.device_id && value.transfer_request.expected_device_ref === original.transfer_request.expected_device_ref && value.transfer_request.client_known_main === original.transfer_request.client_known_main && (value.transfer_request.base_commit || null) === (original.transfer_request.base_commit || null) && stableJson(value.directory_proposal) === stableJson(original.directory_proposal);
+}
+function sameUploadAttempt(first, second) {
+  return first.identity === second.identity && first.attempt_id === second.attempt_id && stableJson(first.transfer_request) === stableJson(second.transfer_request) && stableJson(first.groups) === stableJson(second.groups) && stableJson(first.directory_proposal) === stableJson(second.directory_proposal);
+}
 function isUploadTransferCheckpoint(value) {
   if (!value || typeof value !== "object" || Array.isArray(value) || value.version !== 1 || typeof value.identity !== "string" || !/^[0-9a-f]{64}$/u.test(value.identity) || !isGitObjectId(value.target_commit) || !Array.isArray(value.groups) || value.groups.some(
     (group) => !Array.isArray(group) || group.some((oid) => !isGitObjectId(oid))
   ) || !value.transfer_request || typeof value.transfer_request !== "object" || Array.isArray(value.transfer_request) || value.transfer_request.target_commit !== value.target_commit || value.transfer_request.chunk_count !== value.groups.length || value.transfer_request.plan_sha256 !== sha256(Buffer2.from(JSON.stringify(value.groups))) || typeof value.attempt_id !== "string" || !/^[A-Za-z0-9_-]{8,128}$/u.test(value.attempt_id) || value.attempt_id !== `xfer_${sha256(Buffer2.from(stableJson(value.transfer_request))).slice(0, 32)}` || !(value.transfer_id === null || typeof value.transfer_id === "string" && /^trn_[A-Za-z0-9]+$/u.test(value.transfer_id))) return false;
-  return value.directory_proposal === null || typeof value.directory_proposal === "object" && !Array.isArray(value.directory_proposal);
+  const request = value.transfer_request;
+  const nullableOid = (oid) => oid === null || isGitObjectId(oid);
+  if (request.api_version !== API_VERSION || typeof request.vault_id !== "string" || !request.vault_id || typeof request.device_id !== "string" || !request.device_id || !nullableOid(request.expected_device_ref) || !nullableOid(request.client_known_main) || request.base_commit !== void 0 && !nullableOid(request.base_commit) || request.root_ignore_capability !== void 0 && request.root_ignore_capability !== "root-ignore-v1" || request.root_ignore_oid !== void 0 && !nullableOid(request.root_ignore_oid) || request.directory_intents !== void 0 && (!Array.isArray(request.directory_intents) || request.directory_intents.length > 0) || stableJson(request.directory_proposal || null) !== stableJson(value.directory_proposal)) return false;
+  if (value.directory_proposal === null) return true;
+  const proposal = value.directory_proposal;
+  if (!proposal || proposal.schema_version !== 2 || !nullableOid(proposal.base_main) || !Number.isSafeInteger(proposal.base_event_seq) || proposal.base_event_seq < 0 || !Array.isArray(proposal.intents) || !proposal.intents.every(isStoredDirectoryIntent)) return false;
+  const body = Object.assign({}, proposal);
+  delete body.proposal_id;
+  return proposal.proposal_id === `dirprop_${sha256(Buffer2.from(stableJson([request.device_id, value.target_commit, body]), "utf8"))}`;
 }
 function isStoredDirectoryIntent(value) {
   return Boolean(
@@ -32779,7 +33164,7 @@ function isConflictResultStatus(status2) {
 function blockStatusLabel(code, details = null) {
   if (code === "conflict_review_required") return "Conflict resolution needed";
   if (code === "object_too_large_for_chunk") return details?.object_type === "blob" ? "Out of sync \u2014 file exceeds upload limit" : "Out of sync \u2014 upload limit exceeded";
-  if (["unsafe_local_state", "apply_journal_recovery_required", "apply_recovery_required", "recovery_bundle_failed", "recovery_bundle_verification_failed", "recovery_bundle_durability_unavailable", "directory_baseline_recovery_journal_invalid", "directory_baseline_recovery_unsafe", "legacy_directory_advance_unsafe", "directory_recovery_journal_invalid", "directory_recovery_journal_mismatch", "directory_recovery_decision_required", "directory_recovery_changed", "local_ref_recovery_required", "replace_local_with_server_required", "server_recovery_required", "stale_device_ref", "same_device_non_fast_forward", "local_state_incomplete"].includes(code)) {
+  if (["unsafe_local_state", "apply_journal_recovery_required", "apply_recovery_required", "recovery_bundle_failed", "recovery_bundle_verification_failed", "recovery_bundle_durability_unavailable", "directory_baseline_recovery_journal_invalid", "directory_baseline_recovery_unsafe", "legacy_directory_advance_unsafe", "directory_recovery_journal_invalid", "directory_recovery_journal_mismatch", "directory_recovery_decision_required", "directory_recovery_changed", "local_ref_recovery_required", "replace_local_with_server_required", "server_recovery_required", "stale_device_ref", "same_device_non_fast_forward", "local_state_incomplete", "upload_checkpoint_recovery_required"].includes(code)) {
     return "Out of sync \u2014 local recovery required";
   }
   if (code === "local_snapshot_changed") return "Checking";
@@ -32817,6 +33202,7 @@ function localSyncFailureExplanation(code, details) {
   if (safeCode === "recovery_bundle_verification_failed" || safeCode === "recovery_bundle_durability_unavailable") return `Recovery evidence is not verified or durable (${safeCode}), so destructive apply stopped. Preserve the vault and .obts state; check storage and permissions, then seek assisted recovery if it persists.`;
   if (safeCode === "local_ref_recovery_required") return "A local Git ref lock or lease could not be recovered safely. Do not remove it manually; preserve the vault and .obts state for assisted recovery.";
   if (safeCode === "legacy_directory_advance_unsafe") return "Legacy directory advance settlement stopped. Preserve the vault, .obts journal, recovery archive, and transfer checkpoints for assisted recovery; do not reset sync.";
+  if (safeCode === "upload_checkpoint_recovery_required" || safeCode === "legacy_upload_checkpoint" || safeCode === "upload_checkpoint_mismatch") return "Run Recover upload checkpoint from the command palette. It preserves both proposals and reconciles the saved transfer with the server. If recovery still fails, preserve the vault and .obts files and send a troubleshooting snapshot for assisted recovery; do not reset sync.";
   if (safeCode === "directory_baseline_recovery_unsafe" || safeCode === "directory_baseline_recovery_journal_invalid") return `Directory baseline recovery stopped (${safeCode}). Preserve the vault and .obts state, including the directory recovery journal; seek assisted recovery rather than resetting sync.`;
   if (safeCode === "unsafe_local_state") return "A previous apply safety check stopped. Preserve the vault and .obts state; inspect the local recovery journal before attempting further changes.";
   if (blockStatusLabel(safeCode) === "Out of sync \u2014 local recovery required") return `Sync needs local recovery (${safeCode}). Preserve the vault and .obts state; use the existing recovery flow or seek assisted recovery rather than resetting sync.`;

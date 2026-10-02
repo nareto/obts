@@ -202,7 +202,9 @@ describe('opt-in root .gitignore local scan', () => {
       delete old.transfer_request.root_ignore_capability;
       delete old.transfer_request.root_ignore_oid;
       await writeFile(checkpointPath, JSON.stringify(old));
-      await expect(core.uploadQueuedCommit(await core.readQueue())).rejects.toMatchObject({ code: 'legacy_upload_checkpoint' });
+      // Removing request fields without updating the attempt digest is corrupt
+      // evidence, rather than a recoverable legacy request.
+      await expect(core.uploadQueuedCommit(await core.readQueue())).rejects.toMatchObject({ code: 'upload_checkpoint_recovery_required' });
       expect(JSON.parse(await readFile(checkpointPath, 'utf8'))).toEqual(old);
     } finally {
       vi.unstubAllGlobals();
