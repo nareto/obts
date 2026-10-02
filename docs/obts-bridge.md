@@ -49,6 +49,10 @@ Supported commands include pairing, onboarding analysis/completion, synchronizat
 
 Long headless operations emit redacted startup and operation progress events. `client.request_inactivity_timeout_seconds` (default 300) bounds silence between closed-schema protocol messages rather than total command duration during startup recovery, request writes, and response reads; each valid progress event resets the inactivity window. Child stdout frames are capped at 1 MiB; `read-index-delta` inventories are returned in cursor-bound pages below that cap and reassembled under the Bridge filesystem lock. State events precede their correlated response, are schema-checked, and are limited to one per request; missing or extra protocol fields fail closed. Invalid, unrelated, oversized, cancelled, or silent child traffic is quarantined and restarted through the bounded circuit, while onboarding and transfer authority remains in the Node client's durable `.obts` journals rather than Rust memory.
 
+## Read availability
+
+Read admission uses the SQL projection guard and captures `X-OBTS-Sync` (REST) or `_meta.sync_status` (MCP) at that point. Healthy synchronization can report `pending` while reads remain available; successful Bridge writes become readable immediately after their local projection finishes. An unknown or incomplete projection, stale authorization state, or failed publication fails closed with a retryable `503`. If a selected file's bytes no longer match its attested revision, that operation retries while unrelated reads may continue. Foreground writes have bounded admission to the shared headless lock so a busy sync process does not make read traffic wait.
+
 ## Write semantics
 
 Rust validates the effective ACL, prepares the complete candidate content, and writes ordinary vault files atomically. It then wakes the headless client, which detects the change and processes it through the normal OBTS commit, queue, push, merge, conflict, and recovery path.

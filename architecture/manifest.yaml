@@ -1,5 +1,5 @@
 schema_version: 1
-revision: 39
+revision: 40
 status: current
 updated: 2026-10-02
 authoritative_artifacts:
@@ -133,3 +133,11 @@ formal_models:
     refines:
       - OBTS-SYNC-IMM-001
       - OBTS-PER-CLIENT-001
+  - id: OBTS-FM-011
+    status: architecture-stage
+    path: architecture/models/formal/OBTSBridgeReadAvailability.tla
+    architecture_revision: 40
+    checks: architecture/models/formal/checks-fm010.json
+    refines:
+      - OBTS-BRG-READ-001
+

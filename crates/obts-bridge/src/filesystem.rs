@@ -51,6 +51,9 @@ struct FilesystemWatermark {
     observed_generation: u64,
     indexed_generation: u64,
     indexed_files: BTreeMap<String, AttestedFile>,
+    pending_local_files: BTreeMap<String, Option<AttestedFile>>,
+    read_view_ready: bool,
+    unpublished_local_files: HashSet<String>,
     indexed_policy: Option<Option<String>>,
     projection_status: FilesystemProjectionStatus,
 }
@@ -283,10 +286,23 @@ impl FilesystemSource {
 
     pub fn is_index_current(&self) -> bool {
         let watermark = self.watermark.read().expect("filesystem watermark lock");
-        !watermark.observed.is_empty()
+        watermark.read_view_ready
+            && watermark.unpublished_local_files.is_empty()
+            && !watermark.observed.is_empty()
             && watermark.observed == watermark.indexed
             && watermark.observed_generation == watermark.generation
             && watermark.indexed_generation == watermark.generation
+            && RootIgnorePolicy::read(self.root())
+                .ok()
+                .map(|policy| policy.blob_oid)
+                == watermark.indexed_policy
+    }
+
+    pub fn is_read_available(&self) -> bool {
+        let watermark = self.watermark.read().expect("filesystem watermark lock");
+        watermark.read_view_ready
+            && watermark.unpublished_local_files.is_empty()
+            && !watermark.indexed.is_empty()
             && RootIgnorePolicy::read(self.root())
                 .ok()
                 .map(|policy| policy.blob_oid)
@@ -327,6 +343,9 @@ impl FilesystemSource {
             watermark.observed_generation = watermark.generation;
             watermark.indexed_generation = 0;
             watermark.indexed_files.clear();
+            watermark.pending_local_files.clear();
+            watermark.unpublished_local_files.clear();
+            watermark.read_view_ready = false;
             watermark.indexed_policy = None;
         }
         self.persist_projection_state(ObtsProjectionState {
@@ -342,6 +361,7 @@ impl FilesystemSource {
     async fn begin_commit_projection(&self, target: &str) -> Result<u64, FilesystemError> {
         let (generation, indexed_commit) = {
             let mut watermark = self.watermark.write().expect("filesystem watermark lock");
+            watermark.read_view_ready = false;
             watermark.generation = watermark.generation.wrapping_add(1);
             watermark.observed = target.to_string();
             watermark.observed_generation = watermark.generation;
@@ -395,8 +415,11 @@ impl FilesystemSource {
                 true
             } else {
                 watermark.indexed = target.to_string();
+                watermark.read_view_ready = true;
                 watermark.indexed_generation = generation;
                 watermark.indexed_files = indexed_files;
+                watermark.pending_local_files.clear();
+                watermark.unpublished_local_files.clear();
                 watermark.indexed_policy = Some(policy_oid);
                 false
             }
@@ -416,6 +439,10 @@ impl FilesystemSource {
     }
 
     async fn record_projection_failure(&self, target: &str, error: &FilesystemError) {
+        self.watermark
+            .write()
+            .expect("filesystem watermark lock")
+            .read_view_ready = false;
         let state = ObtsProjectionState {
             indexed_commit: self.indexed_commit(),
             target_commit: Some(target.to_string()),
@@ -459,6 +486,9 @@ impl FilesystemSource {
             watermark.indexed = indexed;
             watermark.indexed_generation = watermark.generation;
             watermark.indexed_policy = policy;
+            watermark.read_view_ready = true;
+            watermark.pending_local_files.clear();
+            watermark.unpublished_local_files.clear();
             watermark.indexed_files = files
                 .iter()
                 .map(|(path, file)| {
@@ -502,6 +532,9 @@ impl FilesystemSource {
             watermark.indexed_generation = watermark.generation;
             watermark.indexed_files = revisions;
             watermark.indexed_policy = Some(policy_oid);
+            watermark.read_view_ready = true;
+            watermark.pending_local_files.clear();
+            watermark.unpublished_local_files.clear();
         }
     }
 
@@ -516,6 +549,9 @@ impl FilesystemSource {
     fn record_projection_result(&self, full_audit: bool, result: &Result<usize, FilesystemError>) {
         let now = Utc::now();
         let mut watermark = self.watermark.write().expect("filesystem watermark lock");
+        if result.is_err() {
+            watermark.read_view_ready = false;
+        }
         let status = &mut watermark.projection_status;
         status.attempts_total = status.attempts_total.saturating_add(1);
         match result {
@@ -656,17 +692,18 @@ impl FilesystemSource {
         revision: &str,
         lease: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     ) -> Result<FilesystemFile, FilesystemError> {
-        let expected = self
-            .watermark
-            .read()
-            .expect("filesystem watermark lock")
-            .indexed_files
-            .get(path)
-            .cloned();
+        let expected = {
+            let watermark = self.watermark.read().expect("filesystem watermark lock");
+            watermark
+                .pending_local_files
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| watermark.indexed_files.get(path).cloned())
+        };
         let result = async {
             let file = self.read_with_lease(path, lease).await?;
             if file.revision != revision
-                || expected.as_ref().is_some_and(|expected| {
+                || expected.as_ref().is_none_or(|expected| {
                     expected.revision != revision || expected.oid != file.oid
                 })
             {
@@ -675,8 +712,15 @@ impl FilesystemSource {
             Ok(file)
         }
         .await;
-        if result.is_err() {
-            self.mark_dirty();
+        if let Err(error) = &result {
+            if matches!(
+                error,
+                FilesystemError::ProjectionChanged | FilesystemError::NotFound
+            ) {
+                self.mark_sync_pending();
+            } else {
+                self.mark_dirty();
+            }
         }
         result
     }
@@ -711,6 +755,11 @@ impl FilesystemSource {
         let target = self.safe_target(path)?;
         let content = content.to_owned();
         let revision = content_revision(content.as_bytes());
+        let attestation = AttestedFile {
+            oid: git_blob_oid(content.as_bytes()),
+            revision: revision.clone(),
+            bytes: content.len() as u64,
+        };
         #[cfg(test)]
         let gate = self
             .write_stage_gate
@@ -730,7 +779,7 @@ impl FilesystemSource {
         })
         .await
         .map_err(|error| FilesystemError::Task(error.to_string()))??;
-        self.commit_visible_write(&target, temporary, true)?;
+        self.commit_visible_write(&target, temporary, true, path, Some(attestation))?;
         Ok(revision)
     }
 
@@ -745,6 +794,11 @@ impl FilesystemSource {
         let target = self.safe_target(path)?;
         let content = content.to_owned();
         let revision = content_revision(content.as_bytes());
+        let attestation = AttestedFile {
+            oid: git_blob_oid(content.as_bytes()),
+            revision: revision.clone(),
+            bytes: content.len() as u64,
+        };
         let expected_revision = expected_revision.map(ToOwned::to_owned);
         let max_text_bytes = self.max_text_bytes;
         #[cfg(test)]
@@ -773,7 +827,7 @@ impl FilesystemSource {
         })
         .await
         .map_err(|error| FilesystemError::Task(error.to_string()))??;
-        self.commit_visible_write(&target, temporary, false)?;
+        self.commit_visible_write(&target, temporary, false, path, Some(attestation))?;
         Ok(revision)
     }
 
@@ -782,11 +836,19 @@ impl FilesystemSource {
         target: &Path,
         temporary: tempfile::NamedTempFile,
         create_new: bool,
+        path: &str,
+        attestation: Option<AttestedFile>,
     ) -> Result<(), FilesystemError> {
         // The visible replacement and dirty marker must complete before this task can be canceled.
         let commit = || {
             commit_atomic_write(target, self.root(), temporary, create_new, || {
-                self.mark_dirty()
+                let mut watermark = self.watermark.write().expect("filesystem watermark lock");
+                watermark.generation = watermark.generation.wrapping_add(1);
+                watermark.observed = "dirty".to_string();
+                watermark.unpublished_local_files.insert(path.to_string());
+                watermark
+                    .pending_local_files
+                    .insert(path.to_string(), attestation);
             })
         };
         if matches!(
@@ -803,6 +865,22 @@ impl FilesystemSource {
         let mut watermark = self.watermark.write().expect("filesystem watermark lock");
         watermark.generation = watermark.generation.wrapping_add(1);
         watermark.observed = "dirty".to_string();
+        watermark.read_view_ready = false;
+    }
+
+    pub fn mark_sync_pending(&self) {
+        let mut watermark = self.watermark.write().expect("filesystem watermark lock");
+        watermark.generation = watermark.generation.wrapping_add(1);
+        watermark.observed = "dirty".to_string();
+    }
+
+    pub(crate) fn finish_local_projection(&self, path: &str, applied: bool) {
+        let mut watermark = self.watermark.write().expect("filesystem watermark lock");
+        if applied {
+            watermark.unpublished_local_files.remove(path);
+        } else {
+            watermark.read_view_ready = false;
+        }
     }
 
     async fn path_exists(&self, path: &str) -> Result<bool, FilesystemError> {
@@ -964,6 +1042,7 @@ where
     Ok((rebuild, true))
 }
 
+#[cfg(test)]
 pub(crate) async fn apply_commit_delta(
     store: &VaultStore,
     source: &FilesystemSource,
@@ -1032,6 +1111,36 @@ where
             return Err(FilesystemError::InvalidDelta(format!(
                 "duplicate target path {path}"
             )));
+        }
+    }
+
+    // A local write can be fully queryable before the headless client commits it.
+    // Wait for its commit instead of rewriting rows against an older manifest.
+    let pending = {
+        let watermark = source.watermark.read().expect("filesystem watermark lock");
+        watermark
+            .pending_local_files
+            .iter()
+            .filter(|(path, _)| {
+                watermark.read_view_ready && !watermark.unpublished_local_files.contains(*path)
+            })
+            .map(|(path, file)| (path.clone(), file.clone()))
+            .collect::<Vec<_>>()
+    };
+    for (path, attestation) in pending {
+        if policy.ignores(&path, false)? {
+            continue;
+        }
+        if let Some(expected) = attestation
+            && target_manifest.get(&path) != Some(&expected.oid)
+        {
+            match source.read(&path).await {
+                Ok(file) if file.revision == expected.revision && file.oid == expected.oid => {
+                    return Ok(0);
+                }
+                Ok(_) | Err(FilesystemError::NotFound) => {}
+                Err(error) => return Err(error),
+            }
         }
     }
 

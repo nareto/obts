@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "modelId": "OBTS-FM-011",
+  "architectureRevision": 40,
+  "architectureStatus": "architecture-stage",
+  "tooling": {
+    "workers": 1,
+    "fingerprintPolynomial": 0,
+    "defaultTimeoutMs": 60000,
+    "defaultHeapMb": 1024,
+    "maximumDistinctStates": 10000
+  },
+  "model": "OBTSBridgeReadAvailability.tla",
+  "checks": [
+    {"id":"fm010-held-sync-safety","config":"fm010-held-sync.cfg","kind":"positive","maximumDepth":100},
+    {"id":"fm010-own-write-safety","config":"fm010-own-write.cfg","kind":"positive","maximumDepth":100},
+    {"id":"fm010-race-safety","config":"fm010-race.cfg","kind":"positive","maximumDepth":100},
+    {"id":"fm010-publication-safety","config":"fm010-publication.cfg","kind":"positive","maximumDepth":100},
+    {"id":"fm010-failure-safety","config":"fm010-failed.cfg","kind":"positive","maximumDepth":100},
+    {"id":"fm010-authorization-safety","config":"fm010-unauthorized.cfg","kind":"positive","maximumDepth":100},
+    {"id":"fm010-reach-held-sync-read","config":"fm010-reach-held-sync.cfg","kind":"reachability","expectedInvariant":"NeverHeldRead","requiredWitness":"HydrateRead","minimumTraceDepth":3},
+    {"id":"fm010-reach-own-write-read","config":"fm010-reach-own-write.cfg","kind":"reachability","expectedInvariant":"NeverOwnRead","requiredWitness":"HydrateRead","minimumTraceDepth":5},
+    {"id":"fm010-reach-unrelated-read","config":"fm010-reach-unrelated-read.cfg","kind":"reachability","expectedInvariant":"NeverUnrelatedRead","requiredWitness":"ReadUnrelated","minimumTraceDepth":5},
+    {"id":"fm010-reach-post-response-drift","config":"fm010-reach-post-response-drift.cfg","kind":"reachability","expectedInvariant":"NeverPostResponseDrift","requiredWitness":"ChangeSource","minimumTraceDepth":4},
+    {"id":"fm010-negative-partial-publication","config":"fm010-negative-partial-publication.cfg","kind":"negative-control","expectedInvariant":"CompleteSelection","requiredWitness":"SelectRead","minimumTraceDepth":3},
+    {"id":"fm010-negative-body-mismatch","config":"fm010-negative-body-mismatch.cfg","kind":"negative-control","expectedInvariant":"BodyAttested","requiredWitness":"HydrateRead","minimumTraceDepth":4},
+    {"id":"fm010-negative-unauthorized-hydration","config":"fm010-negative-unauthorized.cfg","kind":"negative-control","expectedInvariant":"AuthorizedHydration","requiredWitness":"HydrateRead","minimumTraceDepth":3},
+    {"id":"fm010-negative-sync-lock","config":"fm010-negative-sync-lock.cfg","kind":"negative-liveness","expectedProperty":"ReadEventually","requiredWitness":"Init","minimumTraceDepth":1}
+  ]
+}

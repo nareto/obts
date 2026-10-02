@@ -564,21 +564,32 @@ async fn mcp_endpoint(
                 );
             }
 
-            let response =
-                match execute_tool_call(&state, &auth, &params.name, &params.arguments).await {
-                    Ok(response) => response,
-                    Err(error) => {
-                        return respond_with_log(
-                            "/mcp",
-                            "tools/call",
-                            Some(params.name.as_str()),
-                            tool_error_response(id, error.to_error_metadata(Some(&params.name))),
-                            true,
-                        );
-                    }
-                };
+            let (result, freshness) = crate::service::with_read_sync_status(execute_tool_call(
+                &state,
+                &auth,
+                &params.name,
+                &params.arguments,
+            ))
+            .await;
+            let response = match result {
+                Ok(response) => response,
+                Err(error) => {
+                    return respond_with_log(
+                        "/mcp",
+                        "tools/call",
+                        Some(params.name.as_str()),
+                        tool_error_response(id, error.to_error_metadata(Some(&params.name))),
+                        true,
+                    );
+                }
+            };
 
-            match response.finish(id.clone(), &params.name, &params.arguments) {
+            match response.finish(
+                id.clone(),
+                &params.name,
+                &params.arguments,
+                freshness.unwrap_or("pending"),
+            ) {
                 Ok(response) => respond_with_log(
                     "/mcp",
                     "tools/call",
@@ -654,7 +665,9 @@ async fn handle_resource_read(
         );
     }
 
-    let contents = match read_resource_contents(state, auth, uri).await {
+    let (result, freshness) =
+        crate::service::with_read_sync_status(read_resource_contents(state, auth, uri)).await;
+    let contents = match result {
         Ok(contents) => contents,
         Err(error) => {
             return respond_with_log(
@@ -671,7 +684,10 @@ async fn handle_resource_read(
         "/mcp",
         "resources/read",
         None,
-        json_result(id, json!({ "contents": contents })),
+        json_result(
+            id,
+            json!({ "contents": contents, "_meta": { "sync_status": freshness } }),
+        ),
         true,
     )
 }
@@ -735,10 +751,6 @@ async fn read_resource_contents(
                 ));
             }
 
-            state
-                .service
-                .ensure_index_current()
-                .map_err(|error| service_error_metadata(&error, Some("resources/read")))?;
             let response = state
                 .service
                 .get_vault_file(auth, &NoteId::new(file_id))
@@ -955,10 +967,6 @@ async fn execute_tool_call(
     tool_name: &str,
     arguments: &Value,
 ) -> Result<ToolValue, McpError> {
-    state
-        .service
-        .ensure_index_current()
-        .map_err(McpError::Service)?;
     match tool_name {
         "get_vault_file" => {
             let id = required_string(arguments, "id")?;
@@ -1105,10 +1113,11 @@ impl ToolValue {
         id: Option<Value>,
         tool: &str,
         arguments: &Value,
+        freshness: &'static str,
     ) -> Result<Response, McpError> {
         let Self { value, lease } = self;
         let (value, report) = sanitize_tool_response(tool, arguments, value)?;
-        let mut response = tool_success_response(id, value, report);
+        let mut response = tool_success_response(id, value, report, freshness);
         if let Some(lease) = lease {
             response.extensions_mut().insert(lease);
         }
@@ -1208,6 +1217,7 @@ fn tool_success_response(
     id: Option<Value>,
     response: Value,
     sanitization_report: Option<SanitizationReport>,
+    freshness: &'static str,
 ) -> Response {
     let pretty = serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string());
 
@@ -1219,7 +1229,8 @@ fn tool_success_response(
             }
         ],
         "structuredContent": response,
-        "isError": false
+        "isError": false,
+        "_meta": {"sync_status": freshness}
     });
     if let Some(report) = sanitization_report {
         payload["meta"] = json!({
@@ -2404,14 +2415,16 @@ mod body_ownership_tests {
         let response = ToolValue::file(file).unwrap();
         assert_eq!(slots.available_permits(), 0);
         assert!(response.value.get("_body_lease").is_none());
-        let response = response.finish(None, "get_vault_file", &json!({})).unwrap();
+        let response = response
+            .finish(None, "get_vault_file", &json!({}), "current")
+            .unwrap();
         assert_eq!(slots.available_permits(), 0);
         drop(response);
         assert_eq!(slots.available_permits(), 1);
         let response = ToolValue::file(leased_file(&slots).await).unwrap();
         assert!(
             response
-                .finish(None, "get_vault_file", &json!({"raw":"invalid"}))
+                .finish(None, "get_vault_file", &json!({"raw":"invalid"}), "current")
                 .is_err()
         );
         assert_eq!(slots.available_permits(), 1);
@@ -2433,7 +2446,9 @@ mod body_ownership_tests {
         let response = ToolValue::notes(notes).unwrap();
         assert_eq!(slots.available_permits(), 0);
         assert!(response.value.get("_body_lease").is_none());
-        let response = response.finish(None, "query_notes", &json!({})).unwrap();
+        let response = response
+            .finish(None, "query_notes", &json!({}), "current")
+            .unwrap();
         assert_eq!(slots.available_permits(), 0);
         drop(response);
         assert_eq!(slots.available_permits(), 1);

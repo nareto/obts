@@ -158,6 +158,8 @@ async fn root_ignore_removes_stale_sql_projection_without_touching_file() {
         .await
         .unwrap();
     assert_eq!(read.content, "# Local\n");
+    let expected_revision = read.revision.clone();
+    drop(read);
     let updated = f
         .service
         .update_note(
@@ -168,7 +170,7 @@ async fn root_ignore_removes_stale_sql_projection_without_touching_file() {
                 content_patch: None,
                 tags: None,
                 metadata: None,
-                expected_revision: Some(read.revision),
+                expected_revision: Some(expected_revision),
             },
         )
         .await
@@ -181,6 +183,562 @@ async fn root_ignore_removes_stale_sql_projection_without_touching_file() {
     );
     f.project().await;
     assert_eq!(f.service.store.sql_revisions().await.unwrap().len(), 1);
+    f.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires synthetic PostgreSQL; run explicitly with --ignored"]
+async fn postgres_foreground_read_completes_while_shared_headless_lock_is_held() {
+    let mut f = Fixture::new().await;
+    std::fs::write(
+        f.root.path().join("Visible.md"),
+        "# Visible\n\nReadable body.\n",
+    )
+    .unwrap();
+    f.project().await;
+    let script_dir = tempfile::tempdir().unwrap();
+    let headless =
+        crate::headless::test_support::spawn_scripted_client(script_dir.path(), true, "sleep 5", 1)
+            .await;
+    f.service.headless = Some(headless.clone());
+    let held = headless.lock_filesystem().await.unwrap();
+    let note = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        f.service.get_note(&reader(), &NoteId::new("Visible.md")),
+    )
+    .await
+    .expect("read should not wait for the shared headless lock")
+    .unwrap();
+    assert!(note.content.contains("Readable body"));
+    drop(note);
+    let started = std::time::Instant::now();
+    let writer_auth = admin();
+    let writer_id = NoteId::new("Visible.md");
+    let writer = f.service.update_note(
+        &writer_auth,
+        &writer_id,
+        UpdateNoteRequest {
+            content: Some("# Visible\n\nUpdated body.\n".into()),
+            content_patch: None,
+            tags: None,
+            metadata: None,
+            expected_revision: None,
+        },
+    );
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_millis(2500), writer)
+            .await
+            .expect("writer admission must be bounded"),
+        Err(crate::service::ServiceError::Headless(
+            crate::headless::HeadlessError::Busy
+        ))
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_millis(2500));
+    drop(held);
+    f.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires synthetic PostgreSQL; run explicitly with --ignored"]
+async fn postgres_transport_freshness_and_failclosed_contracts() {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let mut f = Fixture::new().await;
+    std::fs::write(
+        f.root.path().join("Visible.md"),
+        "# Visible\\n\\nReadable body.\\n",
+    )
+    .unwrap();
+    f.project().await;
+    let script_dir = tempfile::tempdir().unwrap();
+    let headless =
+        crate::headless::test_support::spawn_scripted_client(script_dir.path(), true, "sleep 5", 1)
+            .await;
+    f.service.headless = Some(headless.clone());
+
+    let config = crate::config::AppConfig::default();
+    let runtime_config = crate::runtime_config::RuntimeConfigState::for_tests(&config);
+    let mcp = crate::mcp::McpState::new(
+        f.service.clone(),
+        Some("mcp-secret".into()),
+        None,
+        None,
+        std::collections::BTreeMap::from([(
+            "env-token".into(),
+            crate::config::McpTokenConfig {
+                context: "reader".into(),
+            },
+        )]),
+    )
+    .unwrap();
+    let app = crate::api::app_router(crate::api::AppState {
+        service: f.service.clone(),
+        api_tokens: crate::api::ApiTokenState::for_tests([("reader", "rest-secret", "reader")]),
+        mcp: Some(mcp),
+        runtime_config,
+    });
+
+    let held = headless.lock_filesystem().await.unwrap();
+    let ready = app
+        .clone()
+        .oneshot(Request::get("/health/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        ready.status(),
+        StatusCode::OK,
+        "healthy sync-pending service remains ready"
+    );
+
+    let rest = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/notes/get")
+                .header("x-api-key", "rest-secret")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"id":"Visible.md"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rest.status(), StatusCode::OK);
+    assert_eq!(rest.headers().get("x-obts-sync").unwrap(), "pending");
+    drop(rest.into_body().collect().await.unwrap());
+
+    let mcp_tool = app.clone().oneshot(
+        Request::post("/mcp")
+            .header("authorization", "Bearer mcp-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_vault_file","arguments":{"id":"Visible.md"}}}"#)).unwrap(),
+    ).await.unwrap();
+    assert_eq!(mcp_tool.status(), StatusCode::OK);
+    let tool_body = mcp_tool.into_body().collect().await.unwrap().to_bytes();
+    let tool_json: serde_json::Value = serde_json::from_slice(&tool_body).unwrap();
+    assert_eq!(tool_json["result"]["_meta"]["sync_status"], "pending");
+
+    let mcp_resource = app.clone().oneshot(
+        Request::post("/mcp")
+            .header("authorization", "Bearer mcp-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"obts-bridge://files/Visible.md"}}"#)).unwrap(),
+    ).await.unwrap();
+    assert_eq!(mcp_resource.status(), StatusCode::OK);
+    let resource_body = mcp_resource.into_body().collect().await.unwrap().to_bytes();
+    let resource_json: serde_json::Value = serde_json::from_slice(&resource_body).unwrap();
+    assert_eq!(resource_json["result"]["_meta"]["sync_status"], "pending");
+    drop(held);
+
+    let projection = f
+        .service
+        .filesystem
+        .as_ref()
+        .unwrap()
+        .projection_lock
+        .write()
+        .await;
+    let started = std::time::Instant::now();
+    let busy = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/notes/get")
+                .header("x-api-key", "rest-secret")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"id":"Visible.md"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(started.elapsed() < std::time::Duration::from_millis(200));
+    drop(projection);
+
+    std::fs::write(
+        f.root.path().join("Visible.md"),
+        "# Changed outside bridge\\n",
+    )
+    .unwrap();
+    let mismatch = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/notes/Visible.md")
+                .header("x-api-key", "rest-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mismatch.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(mismatch.headers().get("retry-after").unwrap(), "2");
+    let mismatch_body = mismatch.into_body().collect().await.unwrap().to_bytes();
+    let mismatch_json: serde_json::Value = serde_json::from_slice(&mismatch_body).unwrap();
+    assert_eq!(mismatch_json["retryAfterSeconds"], 2);
+
+    let mcp_mismatch = app.clone().oneshot(
+        Request::post("/mcp")
+            .header("authorization", "Bearer mcp-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_vault_file","arguments":{"id":"Visible.md"}}}"#)).unwrap(),
+    ).await.unwrap();
+    let mcp_mismatch_body = mcp_mismatch.into_body().collect().await.unwrap().to_bytes();
+    let mcp_mismatch_json: serde_json::Value = serde_json::from_slice(&mcp_mismatch_body).unwrap();
+    assert_eq!(
+        mcp_mismatch_json["result"]["structuredContent"]["retryAfterSeconds"],
+        2
+    );
+
+    f.service.store.db().pool.close().await;
+    let db_unavailable = app
+        .oneshot(Request::get("/health/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(db_unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    f.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires synthetic PostgreSQL; run explicitly with --ignored"]
+async fn postgres_own_write_is_immediately_readable_before_sync_tick() {
+    let mut f = Fixture::new().await;
+    use crate::filesystem::apply_commit_delta;
+    std::fs::write(
+        f.root.path().join("Own.md"),
+        "---\ntags: [first]\n---\n# Own\n\nBefore.\n",
+    )
+    .unwrap();
+    let first_commit = "1".repeat(40);
+    let source = f.service.filesystem.as_ref().unwrap();
+    let baseline_file = source.read("Own.md").await.unwrap();
+    let baseline_oid = baseline_file.oid.clone();
+    drop(baseline_file);
+    apply_commit_delta(
+        &f.service.store,
+        source,
+        None,
+        crate::headless::HeadlessIndexDelta {
+            head: Some(first_commit.clone()),
+            base: None,
+            mode: "rebuild".into(),
+            files: vec![crate::headless::HeadlessIndexFile {
+                path: "Own.md".into(),
+                oid: baseline_oid.clone(),
+            }],
+            changes: vec![crate::headless::HeadlessIndexChange {
+                path: "Own.md".into(),
+                kind: "add".into(),
+                oid: Some(baseline_oid.clone()),
+            }],
+        },
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    let headless_dir = tempfile::tempdir().unwrap();
+    let headless = crate::headless::test_support::spawn_scripted_client(
+        headless_dir.path(),
+        true,
+        r#"while read -r request; do
+  ID=$(printf '%s' "$request" | sed 's/.*"id":\([0-9]*\).*/\1/')
+  printf '{"type":"response","id":%s,"ok":true,"result":{"applied":false,"local_head":"2222222222222222222222222222222222222222"}}\n' "$ID"
+done"#,
+        1,
+    )
+    .await;
+    f.service.headless = Some(headless);
+    let before = f
+        .service
+        .get_vault_file(&admin(), &NoteId::new("Own.md"))
+        .await
+        .unwrap();
+    let expected_revision = before.revision.clone();
+    drop(before);
+    let first_edit = f
+        .service
+        .update_note(
+            &admin(),
+            &NoteId::new("Own.md"),
+            crate::new_note::UpdateNoteRequest {
+                content: Some("---\ntags: [second]\n---\n# Own\n\nAfter.\n".into()),
+                content_patch: None,
+                tags: Some(vec!["second".to_string()]),
+                metadata: None,
+                expected_revision: Some(expected_revision),
+            },
+        )
+        .await
+        .unwrap();
+    f.service
+        .update_note(
+            &admin(),
+            &NoteId::new("Own.md"),
+            UpdateNoteRequest {
+                content: Some("---\ntags: [second]\n---\n# Own\n\nAfter second edit.\n".into()),
+                content_patch: None,
+                tags: None,
+                metadata: None,
+                expected_revision: Some(first_edit.revision),
+            },
+        )
+        .await
+        .unwrap();
+
+    let own = f
+        .service
+        .get_note(&admin(), &NoteId::new("Own.md"))
+        .await
+        .unwrap();
+    assert!(own.content.contains("After second edit."));
+    drop(own);
+    assert!(
+        f.service
+            .query_notes(&admin(), QueryNotesRequest::default())
+            .await
+            .unwrap()
+            .total
+            > 0
+    );
+    assert!(
+        f.service
+            .list_tags(&admin(), NoteTimeFilter::default())
+            .await
+            .unwrap()
+            .tags
+            .iter()
+            .any(|tag| tag.tag == "second")
+    );
+    let raw = f
+        .service
+        .get_vault_file(&admin(), &NoteId::new("Own.md"))
+        .await
+        .unwrap();
+    assert!(raw.content.contains("After second edit."));
+    drop(raw);
+    let base = f
+        .service
+        .query_base(
+            &admin(),
+            QueryBaseRequest {
+                base_query: "views:\n  - type: table\n".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(base.total > 0);
+    let _neighbors = f
+        .service
+        .neighbors(&admin(), &NoteId::new("Own.md"), 1, NeighborDirection::Both)
+        .await
+        .unwrap();
+    let created = f
+        .service
+        .create_note(
+            &admin(),
+            NewNoteRequest {
+                title: "Fresh local create".into(),
+                content: "# Fresh local create\n\nImmediately projected.\n".into(),
+                template_id: None,
+                file_type: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+    let created_note = f.service.get_note(&admin(), &created.id).await.unwrap();
+    assert!(created_note.content.contains("Immediately projected."));
+    drop(created_note);
+
+    let old_tick = crate::headless::HeadlessIndexDelta {
+        head: Some(first_commit.clone()),
+        base: Some(first_commit.clone()),
+        mode: "incremental".into(),
+        files: vec![crate::headless::HeadlessIndexFile {
+            path: "Own.md".into(),
+            oid: baseline_oid.clone(),
+        }],
+        changes: Vec::new(),
+    };
+    apply_commit_delta(
+        &f.service.store,
+        source,
+        Some(first_commit.clone()),
+        old_tick,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(source.indexed_commit(), Some(first_commit.clone()));
+    assert!(f.service.read_available());
+    let still_current = f
+        .service
+        .get_note(&admin(), &NoteId::new("Own.md"))
+        .await
+        .unwrap();
+    assert!(still_current.content.contains("After second edit."));
+    drop(still_current);
+
+    let own_file = source.read("Own.md").await.unwrap();
+    let own_oid = own_file.oid.clone();
+    drop(own_file);
+    let created_file = source.read(created.id.as_str()).await.unwrap();
+    let created_oid = created_file.oid.clone();
+    drop(created_file);
+    let second_commit = "2".repeat(40);
+    apply_commit_delta(
+        &f.service.store,
+        source,
+        Some(first_commit.clone()),
+        crate::headless::HeadlessIndexDelta {
+            head: Some(second_commit.clone()),
+            base: Some(first_commit),
+            mode: "incremental".into(),
+            files: vec![
+                crate::headless::HeadlessIndexFile {
+                    path: "Own.md".into(),
+                    oid: own_oid.clone(),
+                },
+                crate::headless::HeadlessIndexFile {
+                    path: created.id.to_string(),
+                    oid: created_oid.clone(),
+                },
+            ],
+            changes: vec![
+                crate::headless::HeadlessIndexChange {
+                    path: "Own.md".into(),
+                    kind: "modify".into(),
+                    oid: Some(own_oid),
+                },
+                crate::headless::HeadlessIndexChange {
+                    path: created.id.to_string(),
+                    kind: "add".into(),
+                    oid: Some(created_oid),
+                },
+            ],
+        },
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(source.indexed_commit(), Some(second_commit.clone()));
+    assert!(f.service.read_available());
+
+    let persistence = f.service.store.persistence.as_ref().unwrap().clone();
+    let restarted_source = Arc::new(
+        FilesystemSource::new_with_persistence_and_budgets(
+            f.root.path(),
+            persistence.clone(),
+            64 * 1024 * 1024,
+            1,
+        )
+        .await
+        .unwrap(),
+    );
+    let restarted_store =
+        VaultStore::new_with_persistence(20, persistence).with_filesystem(restarted_source.clone());
+    restarted_store
+        .set_authorization_config(std::collections::BTreeMap::from([(
+            "admin".to_string(),
+            AccessPolicy::admin(),
+        )]))
+        .await;
+    let restarted_service =
+        VaultBridgeService::new_with_filesystem(restarted_store, restarted_source.clone(), None);
+    assert!(!restarted_service.read_available());
+    assert!(matches!(
+        restarted_service
+            .get_note(&admin(), &NoteId::new("Own.md"))
+            .await,
+        Err(crate::service::ServiceError::IndexCatchingUp)
+    ));
+    let own_after_restart = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        restarted_source.read("Own.md"),
+    )
+    .await
+    .expect("restart read must not wait for a body slot")
+    .unwrap();
+    let own_restart_oid = own_after_restart.oid.clone();
+    drop(own_after_restart);
+    let created_after_restart = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        restarted_source.read(created.id.as_str()),
+    )
+    .await
+    .expect("restart read must not wait for a body slot")
+    .unwrap();
+    let created_restart_oid = created_after_restart.oid.clone();
+    drop(created_after_restart);
+    let rebuild_files = vec![
+        crate::headless::HeadlessIndexFile {
+            path: "Own.md".into(),
+            oid: own_restart_oid,
+        },
+        crate::headless::HeadlessIndexFile {
+            path: created.id.to_string(),
+            oid: created_restart_oid,
+        },
+    ];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        apply_commit_delta(
+            &restarted_service.store,
+            &restarted_source,
+            None,
+            crate::headless::HeadlessIndexDelta {
+                head: Some(second_commit.clone()),
+                base: None,
+                mode: "rebuild".into(),
+                files: rebuild_files,
+                changes: Vec::new(),
+            },
+            true,
+            false,
+        ),
+    )
+    .await
+    .expect("restart projection must finish within its test budget")
+    .unwrap();
+    assert!(restarted_service.read_available());
+    let recovered = restarted_service
+        .get_note(&admin(), &NoteId::new("Own.md"))
+        .await
+        .unwrap();
+    assert!(recovered.content.contains("After second edit."));
+    drop(recovered);
+    f.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires synthetic PostgreSQL; run explicitly with --ignored"]
+async fn postgres_source_mismatch_does_not_block_unrelated_note_body_read() {
+    let f = Fixture::new().await;
+    std::fs::write(f.root.path().join("Alpha.md"), "# Alpha\n\nOld body.\n").unwrap();
+    std::fs::write(f.root.path().join("Beta.md"), "# Beta\n\nSafe body.\n").unwrap();
+    f.project().await;
+    std::fs::write(
+        f.root.path().join("Alpha.md"),
+        "# Alpha\n\nChanged outside bridge.\n",
+    )
+    .unwrap();
+
+    assert!(matches!(
+        f.service
+            .get_note(&reader(), &NoteId::new("Alpha.md"))
+            .await,
+        Err(crate::service::ServiceError::IndexCatchingUp)
+    ));
+    let beta = f
+        .service
+        .get_note(&reader(), &NoteId::new("Beta.md"))
+        .await
+        .unwrap();
+    assert!(beta.content.contains("Safe body"));
     f.cleanup().await;
 }
 

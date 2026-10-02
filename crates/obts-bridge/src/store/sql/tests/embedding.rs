@@ -265,7 +265,7 @@ async fn postgres_worker_real_shared_headless_single_slot_and_cancel_drain() {
             for cancel in [false, true] {
                 let mut f = private_fixture().await;
                 let script = f.root.path().join("synthetic-headless.cjs");
-                std::fs::write(&script,"console.log(JSON.stringify({type:'event',event:'ready',state:{vault_id:'synthetic',device_id:'synthetic'}}));process.stdin.resume();setInterval(()=>{},1000);").unwrap();
+                std::fs::write(&script,"console.log(JSON.stringify({type:'event',event:'ready',state:{user_id:'user-1',vault_id:'vault-1',device_id:'device-1',device_ref:null,server_device_ref:null,local_main:null,local_head:null,initial_import_confirmed:true,status_label:'Synced',last_error_code:null,last_event_seq:0,last_applied_event_seq:0,updated_at:'2026-10-01T00:00:00.000Z'}}));process.stdin.resume();setInterval(()=>{},1000);").unwrap();
                 let config = crate::config::ClientConfig {
                     headless_command: format!("node {}", script.display()),
                     vault_dir: f.root.path().display().to_string(),
@@ -313,12 +313,12 @@ async fn postgres_worker_real_shared_headless_single_slot_and_cancel_drain() {
                         .unwrap()
                 });
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                assert!(
+                let independent_guard =
                     timeout(Duration::from_millis(50), headless.lock_filesystem())
                         .await
-                        .is_err(),
-                    "API must hold the real shared headless guard while waiting for body"
-                );
+                        .expect("foreground read must not wait for the headless mutex")
+                        .unwrap();
+                drop(independent_guard);
                 if cancel {
                     work.abort();
                     assert!(work.await.unwrap_err().is_cancelled());

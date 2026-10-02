@@ -85,6 +85,11 @@ pub(crate) fn openapi_spec() -> Value {
                         },
                         "partialResult": {
                             "description": "Optional partial result when a request failed after producing usable data."
+                        },
+                        "retryAfterSeconds": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Suggested delay before retrying a retryable failure."
                         }
                     }
                 },
@@ -807,10 +812,10 @@ pub(crate) fn openapi_spec() -> Value {
                         }
                     ],
                     "responses": {
-                        "200": json_response("#/components/schemas/Note", "Note found"),
+                        "200": read_json_response("#/components/schemas/Note", "Note found"),
                         "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key"),
                         "404": json_response("#/components/schemas/ApiError", "Note not found or not visible to this context"),
-                        "503": json_response("#/components/schemas/ApiError", "Authorized note raw content is not yet available")
+                        "503": retryable_json_response("#/components/schemas/ApiError", "Authorized note raw content is not yet available")
                     }
                 },
                 "put": {
@@ -858,7 +863,7 @@ pub(crate) fn openapi_spec() -> Value {
                         query_param("limit", false, json!({"type": "integer", "minimum": 1}), "Result limit; runtime clamps to 50")
                     ],
                     "responses": {
-                        "200": json_response("#/components/schemas/SearchResponse", "Search results"),
+                        "200": read_json_response("#/components/schemas/SearchResponse", "Search results"),
                         "400": json_response("#/components/schemas/ApiError", "Missing or invalid query"),
                         "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key")
                     }
@@ -878,11 +883,11 @@ pub(crate) fn openapi_spec() -> Value {
                         }
                     },
                     "responses": {
-                        "200": json_response("#/components/schemas/Note", "Resolved note"),
+                        "200": read_json_response("#/components/schemas/Note", "Resolved note"),
                         "400": json_response("#/components/schemas/ApiError", "Neither id nor title was provided"),
                         "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key"),
                         "404": json_response("#/components/schemas/ApiError", "Matching note not found or not visible to this context"),
-                        "503": json_response("#/components/schemas/ApiError", "Authorized note raw content is not yet available")
+                        "503": retryable_json_response("#/components/schemas/ApiError", "Authorized note raw content is not yet available")
                     }
                 }
             },
@@ -897,7 +902,7 @@ pub(crate) fn openapi_spec() -> Value {
                         query_param("limit", false, json!({"type": "integer", "minimum": 1, "maximum": MAX_NOTE_LIST_LIMIT}), format!("Result limit; runtime clamps to {MAX_NOTE_LIST_LIMIT}"))
                     ],
                     "responses": {
-                        "200": json_response("#/components/schemas/RecentNotesResponse", "Recent notes"),
+                        "200": read_json_response("#/components/schemas/RecentNotesResponse", "Recent notes"),
                         "400": json_response("#/components/schemas/ApiError", "Invalid since or last_n_days"),
                         "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key")
                     }
@@ -917,7 +922,7 @@ pub(crate) fn openapi_spec() -> Value {
                         }
                     },
                     "responses": {
-                        "200": json_response("#/components/schemas/RecentNotesResponse", "Query results"),
+                        "200": read_json_response("#/components/schemas/RecentNotesResponse", "Query results"),
                         "400": json_response("#/components/schemas/ApiError", "Invalid query payload"),
                         "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key")
                     }
@@ -937,7 +942,7 @@ pub(crate) fn openapi_spec() -> Value {
                         }
                     },
                     "responses": {
-                        "200": json_response("#/components/schemas/QueryBaseResponse", "Structured table query results"),
+                        "200": read_json_response("#/components/schemas/QueryBaseResponse", "Structured table query results"),
                         "400": json_response("#/components/schemas/ApiError", "Invalid Base query payload or unsupported expression"),
                         "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key")
                     }
@@ -960,7 +965,7 @@ pub(crate) fn openapi_spec() -> Value {
                         query_param("direction", false, json!({"$ref": "#/components/schemas/NeighborDirection"}), "Traverse outgoing links, incoming links, or both; runtime defaults to both")
                     ],
                     "responses": {
-                        "200": json_response("#/components/schemas/NeighborsResponse", "Neighbor graph"),
+                        "200": read_json_response("#/components/schemas/NeighborsResponse", "Neighbor graph"),
                         "400": json_response("#/components/schemas/ApiError", "Invalid traversal parameters"),
                         "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key"),
                         "404": json_response("#/components/schemas/ApiError", "Center note not found or not visible to this context")
@@ -982,7 +987,7 @@ pub(crate) fn openapi_spec() -> Value {
                         }
                     ],
                     "responses": {
-                        "200": json_response("#/components/schemas/BacklinksResponse", "Backlinks for the note"),
+                        "200": read_json_response("#/components/schemas/BacklinksResponse", "Backlinks for the note"),
                         "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key"),
                         "404": json_response("#/components/schemas/ApiError", "Target note not found or not visible to this context")
                     }
@@ -1002,7 +1007,7 @@ pub(crate) fn openapi_spec() -> Value {
                         }
                     },
                     "responses": {
-                        "200": json_response("#/components/schemas/AssembleContextResponse", "Assembled context bundle"),
+                        "200": read_json_response("#/components/schemas/AssembleContextResponse", "Assembled context bundle"),
                         "400": json_response("#/components/schemas/ApiError", "Invalid context assembly payload"),
                         "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key")
                     }
@@ -1018,7 +1023,7 @@ pub(crate) fn openapi_spec() -> Value {
                         query_param("to", true, json!({"type": "string"}), "Target note identifier or path")
                     ],
                     "responses": {
-                        "200": json_response("#/components/schemas/PathResponse", "Shortest path result"),
+                        "200": read_json_response("#/components/schemas/PathResponse", "Shortest path result"),
                         "400": json_response("#/components/schemas/ApiError", "Invalid graph path parameters"),
                         "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key")
                     }
@@ -1036,7 +1041,7 @@ pub(crate) fn openapi_spec() -> Value {
                         query_param("updated_before", false, json!({"type": "string", "format": "date-time"}), "Only include tags from notes updated on or before this RFC3339 timestamp")
                     ],
                     "responses": {
-                        "200": json_response("#/components/schemas/TagsResponse", "Tag counts"),
+                        "200": read_json_response("#/components/schemas/TagsResponse", "Tag counts"),
                         "400": json_response("#/components/schemas/ApiError", "Invalid time filter"),
                         "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key")
                     }
@@ -1165,7 +1170,7 @@ pub(crate) fn openapi_spec() -> Value {
                         "schema": {"type": "string"}
                     }],
                     "responses": {
-                        "200": json_response("#/components/schemas/VaultFile", "Raw vault file"),
+                        "200": read_json_response("#/components/schemas/VaultFile", "Raw vault file"),
                         "401": json_response("#/components/schemas/ApiError", "Missing or invalid API key"),
                         "404": json_response("#/components/schemas/ApiError", "File not found or not visible"),
                         "503": json_response("#/components/schemas/ApiError", "Source reconciliation unavailable")
@@ -1234,6 +1239,28 @@ pub(crate) fn openapi_spec() -> Value {
             }
         }
     })
+}
+
+fn retryable_json_response(schema_ref: &str, description: &str) -> Value {
+    let mut response = json_response(schema_ref, description);
+    response["headers"] = json!({
+        "Retry-After": {
+            "description": "Suggested delay before retrying the request.",
+            "schema": {"type": "integer", "minimum": 0}
+        }
+    });
+    response
+}
+
+fn read_json_response(schema_ref: &str, description: &str) -> Value {
+    let mut response = json_response(schema_ref, description);
+    response["headers"] = json!({
+        "X-OBTS-Sync": {
+            "description": "Sync freshness captured at read admission.",
+            "schema": {"type": "string", "enum": ["current", "pending"]}
+        }
+    });
+    response
 }
 
 fn json_response(schema_ref: &str, description: &str) -> Value {

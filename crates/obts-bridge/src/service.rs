@@ -31,6 +31,21 @@ use crate::vault_export::{
 
 static MARKDOWN_EXPORT_SEMAPHORE: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(1)));
 
+tokio::task_local! {
+    static READ_SYNC_STATUS: std::cell::Cell<Option<&'static str>>;
+}
+
+pub(crate) async fn with_read_sync_status<T>(
+    operation: impl std::future::Future<Output = T>,
+) -> (T, Option<&'static str>) {
+    READ_SYNC_STATUS
+        .scope(std::cell::Cell::new(None), async {
+            let result = operation.await;
+            (result, READ_SYNC_STATUS.with(std::cell::Cell::get))
+        })
+        .await
+}
+
 #[derive(Clone, Debug)]
 pub struct VaultBridgeService {
     pub store: VaultStore,
@@ -66,6 +81,33 @@ impl VaultBridgeService {
         }
     }
 
+    async fn write_guard(&self) -> Result<tokio::sync::MutexGuard<'_, ()>, ServiceError> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.vault_write_lock.lock(),
+        )
+        .await
+        .map_err(|_| ServiceError::IndexCatchingUp)
+    }
+
+    fn ensure_read_available(&self) -> Result<(), ServiceError> {
+        if let Some(client) = self.headless.as_ref()
+            && (!client.is_paired() || !client.is_available())
+        {
+            return Err(ServiceError::Headless(HeadlessError::Unavailable));
+        }
+        if self.store.uses_sql_backend()
+            && self
+                .filesystem
+                .as_ref()
+                .is_some_and(|filesystem| !filesystem.is_read_available())
+        {
+            return Err(ServiceError::IndexCatchingUp);
+        }
+        self.capture_read_sync_status();
+        Ok(())
+    }
+
     pub fn ensure_index_current(&self) -> Result<(), ServiceError> {
         if let Some(client) = self.headless.as_ref() {
             if !client.is_paired() {
@@ -87,7 +129,29 @@ impl VaultBridgeService {
         Ok(())
     }
 
-    async fn sql_read_guard(
+    async fn sql_read_guard(&self) -> Result<tokio::sync::RwLockReadGuard<'_, ()>, ServiceError> {
+        let guard = self
+            .filesystem
+            .as_ref()
+            .expect("SQL filesystem")
+            .projection_lock
+            .try_read()
+            .map_err(|_| ServiceError::IndexCatchingUp)?;
+        self.ensure_read_available()?;
+        self.capture_read_sync_status();
+        Ok(guard)
+    }
+
+    fn capture_read_sync_status(&self) {
+        let status = self.sync_status();
+        let _ = READ_SYNC_STATUS.try_with(|captured| {
+            if captured.get() != Some("pending") {
+                captured.set(Some(status));
+            }
+        });
+    }
+
+    async fn strict_sql_read_guard(
         &self,
     ) -> Result<
         (
@@ -123,7 +187,7 @@ impl VaultBridgeService {
         &self,
         token: &crate::store::EmbeddingNoteToken,
     ) -> Result<Option<(crate::filesystem::FilesystemFile, String)>, ServiceError> {
-        let _guard = self.sql_read_guard().await?;
+        let _guard = self.strict_sql_read_guard().await?;
         let Some((path, title)) = self.store.embedding_source(token).await? else {
             return Ok(None);
         };
@@ -146,6 +210,7 @@ impl VaultBridgeService {
             let _guard = self.sql_read_guard().await?;
             return self.store.sql_get_note(auth, note_id).await;
         }
+        self.ensure_read_available()?;
         if let Some(note) = self.store.get_note_for_policy(auth, note_id).await {
             return Ok(note);
         }
@@ -168,6 +233,7 @@ impl VaultBridgeService {
             let _guard = self.sql_read_guard().await?;
             return self.store.sql_get_title(auth, title).await;
         }
+        self.ensure_read_available()?;
         if let Some(note) = self.store.get_note_by_title_for_policy(auth, title).await {
             return Ok(note);
         }
@@ -192,6 +258,7 @@ impl VaultBridgeService {
             let _guard = self.sql_read_guard().await?;
             return self.store.sql_search(auth, query, mode, limit).await;
         }
+        self.ensure_read_available()?;
         Ok(self.store.search_for_policy(auth, query, mode, limit).await)
     }
 
@@ -233,6 +300,7 @@ impl VaultBridgeService {
                 )
                 .await;
         }
+        self.ensure_read_available()?;
         self.store
             .recent_notes_for_policy(auth, since, last_n_days, limit)
             .await
@@ -248,6 +316,7 @@ impl VaultBridgeService {
             let _guard = self.sql_read_guard().await?;
             return self.store.sql_query_notes(auth, request).await;
         }
+        self.ensure_read_available()?;
         Ok(self.store.query_notes_for_policy(auth, request).await)
     }
 
@@ -260,6 +329,7 @@ impl VaultBridgeService {
             let _guard = self.sql_read_guard().await?;
             return self.store.sql_base(auth, request).await;
         }
+        self.ensure_read_available()?;
         self.store
             .query_base_for_policy(auth, request)
             .await
@@ -280,6 +350,7 @@ impl VaultBridgeService {
                 .sql_neighbors(auth, note_id, depth, direction)
                 .await;
         }
+        self.ensure_read_available()?;
         self.store
             .neighbors_for_policy(auth, note_id, depth, direction)
             .await
@@ -295,6 +366,7 @@ impl VaultBridgeService {
             let _guard = self.sql_read_guard().await?;
             return self.store.sql_backlinks(auth, note_id).await;
         }
+        self.ensure_read_available()?;
         self.store
             .backlinks_for_policy(auth, note_id)
             .await
@@ -311,6 +383,7 @@ impl VaultBridgeService {
             let _guard = self.sql_read_guard().await?;
             return self.store.sql_path(auth, from, to).await;
         }
+        self.ensure_read_available()?;
         Ok(self.store.shortest_path_for_policy(auth, from, to).await)
     }
 
@@ -323,6 +396,7 @@ impl VaultBridgeService {
             let _guard = self.sql_read_guard().await?;
             return self.store.sql_context(auth, request).await;
         }
+        self.ensure_read_available()?;
         Ok(self.store.assemble_context_for_policy(auth, request).await)
     }
 
@@ -335,6 +409,7 @@ impl VaultBridgeService {
             let _guard = self.sql_read_guard().await?;
             return self.store.sql_tags(auth, filter).await;
         }
+        self.ensure_read_available()?;
         Ok(self.store.tags_for_policy(auth, filter).await)
     }
 
@@ -393,7 +468,7 @@ impl VaultBridgeService {
         auth: &AuthContext,
         request: NewNoteRequest,
     ) -> Result<NewNoteResponse, ServiceError> {
-        let _vault_write_guard = self.vault_write_lock.lock().await;
+        let _vault_write_guard = self.write_guard().await?;
         let now = Utc::now();
         let path = self
             .store
@@ -423,7 +498,7 @@ impl VaultBridgeService {
         let mut headless_guard = if let Some(headless) = self.headless.as_ref() {
             Some(
                 headless
-                    .lock_filesystem()
+                    .lock_foreground_write()
                     .await
                     .map_err(ServiceError::Headless)?,
             )
@@ -463,7 +538,7 @@ impl VaultBridgeService {
         }
         let write_lock = self.vault_file_repair_lock(note_id.as_str()).await;
         let _write_guard = write_lock.lock().await;
-        let _vault_write_guard = self.vault_write_lock.lock().await;
+        let _vault_write_guard = self.write_guard().await?;
         let filesystem = self.filesystem.as_ref().expect("filesystem source");
         let indexed = matches!(filesystem.is_path_ignored(note_id.as_str()), Ok(false))
             && match self.refresh_vault_file_for_write(auth, note_id).await {
@@ -500,7 +575,7 @@ impl VaultBridgeService {
         let mut headless_guard = if let Some(headless) = self.headless.as_ref() {
             Some(
                 headless
-                    .lock_filesystem()
+                    .lock_foreground_write()
                     .await
                     .map_err(ServiceError::Headless)?,
             )
@@ -531,6 +606,36 @@ impl VaultBridgeService {
         })
     }
 
+    pub fn sync_status(&self) -> &'static str {
+        if self.headless.as_ref().is_some_and(|headless| {
+            headless.filesystem_busy()
+                || self
+                    .filesystem
+                    .as_ref()
+                    .is_some_and(|source| headless.local_head() != source.indexed_commit())
+        }) {
+            return "pending";
+        }
+        if self
+            .filesystem
+            .as_ref()
+            .is_none_or(|filesystem| filesystem.is_index_current())
+        {
+            "current"
+        } else {
+            "pending"
+        }
+    }
+
+    pub fn read_available(&self) -> bool {
+        self.headless
+            .as_ref()
+            .is_none_or(|headless| headless.is_paired() && headless.is_available())
+            && self.filesystem.as_ref().is_none_or(|filesystem| {
+                !self.store.uses_sql_backend() || filesystem.is_read_available()
+            })
+    }
+
     pub async fn status(&self) -> StatusResponse {
         let mut status = self.store.status().await;
         if let Some(headless) = self.headless.as_ref() {
@@ -551,8 +656,12 @@ impl VaultBridgeService {
         }
         if let Some(filesystem) = self.filesystem.as_ref() {
             status.filesystem_projection = filesystem.projection_status();
-            status.dependencies.headless_vault = if filesystem.is_index_current() {
-                "healthy"
+            status.dependencies.headless_vault = if filesystem.is_read_available() {
+                if self.sync_status() == "current" {
+                    "healthy"
+                } else {
+                    "sync_pending"
+                }
             } else {
                 status.status = "degraded";
                 "index_catching_up"
@@ -611,7 +720,7 @@ impl VaultBridgeService {
         auth: &AuthContext,
         request: NewNoteRequest,
     ) -> Result<NewNoteResponse, ServiceError> {
-        let _vault_write_guard = self.vault_write_lock.lock().await;
+        let _vault_write_guard = self.write_guard().await?;
         let now = Utc::now();
         let path = self
             .store
@@ -641,7 +750,7 @@ impl VaultBridgeService {
         let mut headless_guard = if let Some(headless) = self.headless.as_ref() {
             Some(
                 headless
-                    .lock_filesystem()
+                    .lock_foreground_write()
                     .await
                     .map_err(ServiceError::Headless)?,
             )
@@ -681,7 +790,7 @@ impl VaultBridgeService {
         }
         let write_lock = self.vault_file_repair_lock(file_id.as_str()).await;
         let _write_guard = write_lock.lock().await;
-        let _vault_write_guard = self.vault_write_lock.lock().await;
+        let _vault_write_guard = self.write_guard().await?;
         let filesystem = self.filesystem.as_ref().expect("filesystem source");
         let indexed = matches!(filesystem.is_path_ignored(file_id.as_str()), Ok(false))
             && match self.refresh_vault_file_for_write(auth, file_id).await {
@@ -712,7 +821,7 @@ impl VaultBridgeService {
         let mut headless_guard = if let Some(headless) = self.headless.as_ref() {
             Some(
                 headless
-                    .lock_filesystem()
+                    .lock_foreground_write()
                     .await
                     .map_err(ServiceError::Headless)?,
             )
@@ -750,11 +859,11 @@ impl VaultBridgeService {
         request: UpdateNoteRequest,
         raw: bool,
     ) -> Result<UpdateNoteResponse, ServiceError> {
-        let _write_guard = self.vault_write_lock.lock().await;
+        let _write_guard = self.write_guard().await?;
         let mut headless_guard = if let Some(client) = &self.headless {
             Some(
                 client
-                    .lock_filesystem()
+                    .lock_foreground_write()
                     .await
                     .map_err(ServiceError::Headless)?,
             )
@@ -771,7 +880,7 @@ impl VaultBridgeService {
         let source = self.filesystem.as_ref().expect("SQL filesystem");
         let indexed = matches!(source.is_path_ignored(id.as_str()), Ok(false));
         let write = if indexed {
-            self.ensure_index_current()?;
+            self.ensure_read_available()?;
             match self
                 .store
                 .sql_prepare_write(auth, id, request.clone(), raw)
@@ -854,6 +963,20 @@ impl VaultBridgeService {
 
     async fn finalize_prepared_write(
         &self,
+        write: PreparedVaultWrite,
+        revision: &str,
+    ) -> Result<LocalProjectionOutcome, ServiceError> {
+        let path = write.path.clone();
+        let result = self.finalize_prepared_write_inner(write, revision).await;
+        self.filesystem
+            .as_ref()
+            .expect("source")
+            .finish_local_projection(&path, matches!(result, Ok(LocalProjectionOutcome::Applied)));
+        result
+    }
+
+    async fn finalize_prepared_write_inner(
+        &self,
         mut write: PreparedVaultWrite,
         revision: &str,
     ) -> Result<LocalProjectionOutcome, ServiceError> {
@@ -920,19 +1043,22 @@ impl VaultBridgeService {
         file_id: &NoteId,
     ) -> Result<VaultFile, ServiceError> {
         if let Some(source) = self.filesystem.as_ref()
-            && !matches!(source.is_path_ignored(file_id.as_str()), Ok(false))
+            && source
+                .is_path_ignored(file_id.as_str())
+                .map_err(ServiceError::FilesystemWrite)?
         {
-            let _headless_guard = if let Some(headless) = self.headless.as_ref() {
-                Some(
-                    headless
-                        .lock_filesystem()
-                        .await
-                        .map_err(ServiceError::Headless)?,
-                )
-            } else {
-                None
-            };
-            let _projection_guard = source.projection_lock.read().await;
+            let _projection = source
+                .projection_lock
+                .try_read()
+                .map_err(|_| ServiceError::IndexCatchingUp)?;
+            if self
+                .headless
+                .as_ref()
+                .is_some_and(|client| !client.is_paired() || !client.is_available())
+            {
+                return Err(ServiceError::Headless(HeadlessError::Unavailable));
+            }
+            self.capture_read_sync_status();
             let file = source.read(file_id.as_str()).await.map_err(|error| {
                 if matches!(error, FilesystemError::NotFound) {
                     ServiceError::NotFound
@@ -940,6 +1066,12 @@ impl VaultBridgeService {
                     ServiceError::FilesystemWrite(error)
                 }
             })?;
+            if !source
+                .is_path_ignored(file_id.as_str())
+                .map_err(ServiceError::FilesystemWrite)?
+            {
+                return Err(ServiceError::IndexCatchingUp);
+            }
             if !self.store.source_file_readable(auth, &file).await {
                 return Err(ServiceError::NotFound);
             }
@@ -965,29 +1097,25 @@ impl VaultBridgeService {
             let _guard = self.sql_read_guard().await?;
             return self.store.sql_get_file(auth, file_id).await;
         }
+        let _projection = if self.filesystem.is_some() {
+            Some(self.sql_read_guard().await?)
+        } else {
+            self.ensure_read_available()?;
+            None
+        };
         if let Some(file) = self.store.get_vault_file_for_policy(auth, file_id).await {
             if let Some(filesystem) = self.filesystem.as_ref() {
-                let _headless_guard = if let Some(headless) = self.headless.as_ref() {
-                    Some(
-                        headless
-                            .lock_filesystem()
-                            .await
-                            .map_err(ServiceError::Headless)?,
-                    )
-                } else {
-                    None
-                };
                 let current = match filesystem.read(file_id.as_str()).await {
                     Ok(current) => current,
                     Err(FilesystemError::NotFound) => {
-                        filesystem.mark_dirty();
+                        filesystem.mark_sync_pending();
                         return Err(ServiceError::IndexCatchingUp);
                     }
                     Err(error) => return Err(ServiceError::FilesystemWrite(error)),
                 };
                 let current_sha256 = hex::encode(Sha256::digest(current.content.as_bytes()));
                 if current_sha256 != file.content_sha256 {
-                    filesystem.mark_dirty();
+                    filesystem.mark_sync_pending();
                     return Err(ServiceError::IndexCatchingUp);
                 }
                 return Ok(VaultFile {

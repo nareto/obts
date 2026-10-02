@@ -418,6 +418,18 @@ impl HeadlessClient {
         runtime.restart_count = runtime.restart_count.saturating_add(1);
     }
 
+    pub fn filesystem_busy(&self) -> bool {
+        self.inner.try_lock().is_err()
+    }
+
+    pub async fn lock_foreground_write(
+        &self,
+    ) -> Result<HeadlessFilesystemGuard<'_>, HeadlessError> {
+        timeout(Duration::from_secs(2), self.lock_filesystem())
+            .await
+            .map_err(|_| HeadlessError::Busy)?
+    }
+
     pub async fn lock_filesystem(&self) -> Result<HeadlessFilesystemGuard<'_>, HeadlessError> {
         if !self.healthy.load(Ordering::Acquire) {
             return Err(HeadlessError::Unavailable);
@@ -974,7 +986,7 @@ pub fn spawn_maintenance(
                     let applied = result.get("applied").and_then(Value::as_bool) == Some(true);
                     let local_head = result.get("local_head").and_then(Value::as_str);
                     if applied || local_head != filesystem.indexed_commit().as_deref() {
-                        filesystem.mark_dirty();
+                        filesystem.mark_sync_pending();
                     }
                 }
                 Err(error) if error.is_unpaired() => {}

@@ -7,7 +7,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
 };
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -391,7 +392,14 @@ impl IntoResponse for ApiError {
             metadata: self.metadata(),
         };
 
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                HeaderValue::from_static("2"),
+            );
+        }
+        response
     }
 }
 
@@ -532,17 +540,31 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/status", get(status))
         .route("/api/v1/metrics", get(metrics))
         .merge(api_docs::router::<AppState>())
-        .with_state(state);
+        .with_state(state.clone());
     if let Some(mcp_state) = mcp_state {
         router = router.merge(crate::mcp::app_router(mcp_state));
     }
-    router
+    router.layer(middleware::from_fn_with_state(state, freshness_headers))
+}
+
+async fn freshness_headers(
+    State(_state): State<AppState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let (mut response, freshness) = crate::service::with_read_sync_status(next.run(request)).await;
+    if response.status().is_success()
+        && let Some(freshness) = freshness
+    {
+        response
+            .headers_mut()
+            .insert("x-obts-sync", HeaderValue::from_static(freshness));
+    }
+    response
 }
 
 async fn auth_from_headers(state: &AppState, headers: &HeaderMap) -> Result<AuthContext, ApiError> {
-    let auth = authorize_from_headers(state, headers).await?;
-    state.service.ensure_index_current()?;
-    Ok(auth)
+    authorize_from_headers(state, headers).await
 }
 
 async fn authorize_from_headers(
@@ -1667,11 +1689,11 @@ mod tests {
 
         let mut valid_headers = HeaderMap::new();
         valid_headers.insert("x-api-key", HeaderValue::from_static("secret-token"));
-        let stale = auth_from_headers(&state, &valid_headers).await;
-        assert!(matches!(
-            stale,
-            Err(ApiError::Service(ServiceError::IndexCatchingUp))
-        ));
+        let authenticated = auth_from_headers(&state, &valid_headers).await;
+        assert!(
+            authenticated.is_ok(),
+            "authentication must not wait for index freshness"
+        );
     }
 
     async fn diagnostic_response(

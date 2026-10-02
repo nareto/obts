@@ -37,6 +37,21 @@ function fixture(path: string, mutate: (value: any, directory: string) => void) 
   return run(directory);
 }
 
+function readAvailabilityFixture(mutate: (value: any, directory: string) => void) {
+  const directory = mkdtempSync(join(tmpdir(), 'obts-read-formal-test-'));
+  directories.push(directory);
+  cpSync(join(root, 'architecture'), join(directory, 'architecture'), { recursive: true });
+  mkdirSync(join(directory, 'scripts'));
+  cpSync(join(root, 'scripts/check-bridge-read-availability.mjs'), join(directory, 'scripts/check-bridge-read-availability.mjs'));
+  const manifestPath = join(directory, formal, 'checks-fm010.json');
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  mutate(manifest, directory);
+  writeFileSync(manifestPath, `${JSON.stringify(manifest)}\n`);
+  return spawnSync(process.execPath, [join(directory, 'scripts/check-bridge-read-availability.mjs'), '--validate-only'], {
+    cwd: directory, encoding: 'utf8', env: process.env
+  });
+}
+
 describe('FM003 embedding-worker companion gate', () => {
   it('validates all 48 checks, action ranges and actual reduced counterexamples', () => {
     const result = run();
@@ -52,6 +67,7 @@ describe('FM003 embedding-worker companion gate', () => {
       'node scripts/check-bridge-bounded-model.mjs --worker-companion',
       'node scripts/check-deletion-model.mjs',
       'node scripts/check-bridge-external-protocol.mjs',
+      'node scripts/check-bridge-read-availability.mjs',
       'node scripts/check-onboarding-model.mjs',
       'node scripts/check-onboarding-recovery-model.mjs',
       'node scripts/check-diagnostic-admission-model.mjs',
@@ -62,8 +78,10 @@ describe('FM003 embedding-worker companion gate', () => {
     expect(scripts['test:formal:bridge'].split(' && ')).toEqual([
       'node scripts/check-bridge-bounded-model.mjs',
       'node scripts/check-bridge-bounded-model.mjs --worker-companion',
-      'node scripts/check-bridge-external-protocol.mjs'
+      'node scripts/check-bridge-external-protocol.mjs',
+      'node scripts/check-bridge-read-availability.mjs'
     ]);
+    expect(scripts['test:formal:bridge-body']).toContain('node scripts/check-bridge-read-availability.mjs');
     expect(scripts['test:formal:vault-settings']).toBe('node scripts/check-vault-settings-model.mjs');
     expect(scripts['test:formal:onboarding']).toBe('node scripts/check-onboarding-model.mjs && node scripts/check-onboarding-recovery-model.mjs');
     expect(scripts['test:bridge:stack']).toContain('node scripts/check-bridge-stack.mjs');
@@ -91,6 +109,23 @@ describe('FM003 embedding-worker companion gate', () => {
     });
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain('required kind changed');
+  });
+
+  it('rejects retyping a required read control', () => {
+    const result = readAvailabilityFixture((manifest) => {
+      manifest.checks.find((check: any) => check.id === 'fm010-held-sync-safety').kind = 'reachability';
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('required control metadata changed');
+  });
+
+  it('rejects dropping the required liveness property', () => {
+    const result = readAvailabilityFixture((_manifest, directory) => {
+      const config = join(directory, formal, 'fm010-held-sync.cfg');
+      writeFileSync(config, readFileSync(config, 'utf8').replace('PROPERTY ReadEventually\n', ''));
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('must check read liveness');
   });
 
   it('rejects a weakened stale-failure outcome', () => {

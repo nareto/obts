@@ -5,7 +5,7 @@ server:
   id: obts_bridge_mcp
   name: obts-bridge-mcp
   instructions: >
-    Use this server when you need scoped agent access to the user's OBTS-synchronized Obsidian vault.
+    Use this server when you need scoped agent access to the user's OBTS-synchronized Obsidian vault. Read tools include `_meta.sync_status` with `current` or `pending`, captured at read admission; `pending` means remote synchronization may lag while reads can remain available. An exact source mismatch is reported for that operation as retryable; it need not mean every unrelated read is unavailable. Unknown projection integrity or publication failure closes reads until reconciliation.
 
 resources:
   - id: tooling_catalog

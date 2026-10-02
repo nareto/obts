@@ -43,6 +43,8 @@ pub(crate) struct ErrorMetadata {
     partial_result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     details: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "retryAfterSeconds")]
+    retry_after_seconds: Option<u64>,
 }
 
 impl ErrorMetadata {
@@ -62,6 +64,7 @@ impl ErrorMetadata {
             attempted: None,
             partial_result: None,
             details: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -72,6 +75,11 @@ impl ErrorMetadata {
 
     pub(crate) fn with_http_status(mut self, status: u16) -> Self {
         self.http_status = Some(status);
+        self
+    }
+
+    pub(crate) fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after_seconds = Some(seconds);
         self
     }
 
@@ -142,7 +150,8 @@ pub(crate) fn service_error_metadata(
             "vault index catching up",
             "Retry after the filesystem projection reaches the current headless vault state",
         )
-        .with_http_status(503),
+        .with_http_status(503)
+        .with_retry_after(2),
         ServiceError::BadRequest(message) => {
             ErrorMetadata::new(ErrorCategory::Validation, false, "bad request", message)
                 .with_http_status(400)
@@ -154,7 +163,8 @@ pub(crate) fn service_error_metadata(
             "headless client unavailable",
             "The headless OBTS client is temporarily unavailable or could not complete the operation; retry after its supervised recovery",
         )
-        .with_http_status(503),
+        .with_http_status(503)
+        .with_retry_after(2),
         ServiceError::FilesystemWrite(error) => match error {
             crate::filesystem::FilesystemError::RootIgnore(_) => ErrorMetadata::new(
                 ErrorCategory::Business,
