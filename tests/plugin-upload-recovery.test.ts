@@ -125,17 +125,15 @@ describe('upload checkpoint recovery with the real server', () => {
     expect((await f.core.readState()).last_error_code).not.toBe('legacy_upload_checkpoint');
   });
 
-  it('preserves a modern checkpoint when its queued proposal base disagrees', async () => {
+  it('reconciles a modern checkpoint whose queued proposal base disagrees instead of dead-ending', async () => {
     const f = await fixture();
-    const checkpoint = await readFile(f.checkpointPath, 'utf8');
+    const before = JSON.parse(await readFile(f.checkpointPath, 'utf8'));
     await f.core.writeQueue({ ...(await f.core.readQueue()), pending_proposal_base: f.old });
-    const queue = await readFile(join(f.dir, '.obts/queue.json'), 'utf8');
-    const replay = vi.spyOn(f.core, 'pushInChunks');
-    await expect(f.core.uploadQueuedCommit(await f.core.readQueue()))
-      .rejects.toMatchObject({ code: 'upload_checkpoint_recovery_required' });
-    expect(replay).not.toHaveBeenCalled();
-    expect(await readFile(f.checkpointPath, 'utf8')).toBe(checkpoint);
-    expect(await readFile(join(f.dir, '.obts/queue.json'), 'utf8')).toBe(queue);
+    const create = vi.spyOn(f.server.chunkTransfers, 'createPush');
+    expect(['merged', 'noop']).toContain((await f.core.uploadQueuedCommit(await f.core.readQueue())).status);
+    // The immutable attempt is resumed under its own recorded authoring base.
+    expect(create.mock.calls.at(-1)![1].attempt_id).toBe(before.attempt_id);
+    expect(await f.canonical()).toBe('old captured version\n');
     expect(await readFile(join(f.dir, '.obts/upload-recovery.json'), 'utf8').catch(() => null)).toBeNull();
   });
 

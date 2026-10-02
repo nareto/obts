@@ -291,21 +291,26 @@ describe('client stale authoring cohorts with the real server', () => {
     if (transport === 'chunked') f.core.pollPushTransfer = async () => { await moved; throw new Error('client stopped polling'); };
     await expect(f.core.uploadQueuedCommit(await f.plugin.readQueue())).rejects.toThrow();
     fail.mockRestore();
+    if (transport === 'chunked') f.core.pollPushTransfer = Object.getPrototypeOf(f.core).pollPushTransfer;
     const queue = await f.plugin.readQueue();
     expect(await f.server.git.getRef(f.vaultId, (await f.plugin.readState()).device_ref!)).toBe(queue.pending_commit);
     if (transport === 'chunked') {
       const checkpoint = JSON.parse(await readFile(join(f.dir, '.obts', 'upload-transfer.json'), 'utf8'));
       expect(checkpoint.transfer_request.base_commit).toBe(f.m0);
       expect(checkpoint.identity).toMatch(/^[a-f0-9]{64}$/);
-      // Changing only the base must fail checkpoint reuse, before server admission.
+      // A corrupted queue base no longer dead-ends the attempt: recovery
+      // reconciles the immutable checkpoint under its original authoring base.
       await f.core.writeQueue({ ...queue, pending_proposal_base: c });
-      await expect(f.core.uploadQueuedCommit(await f.plugin.readQueue())).rejects.toMatchObject({ code: 'legacy_upload_checkpoint' });
+      expect((await f.core.uploadQueuedCommit(await f.plugin.readQueue())).status).toBe('merged');
       await f.core.writeQueue(queue);
     }
     const next = await f.restart();
     if (transport === 'multipart') next.core.syncCapabilities = async () => ({ capabilities: [] });
     expect((await next.plugin.readQueue()).pending_proposal_base).toBe(f.m0);
-    expect((await next.core.uploadQueuedCommit(await next.plugin.readQueue())).status).toBe('merged');
+    // Chunked recovery already reconciled the immutable attempt, so the
+    // repeated upload of the same target can be idempotent.
+    expect(transport === 'chunked' ? ['merged', 'noop'] : ['merged'])
+      .toContain((await next.core.uploadQueuedCommit(await next.plugin.readQueue())).status);
     expect(await f.canonical()).toBe(MERGED);
     const operation = (await f.server.store.snapshot()).sync_operations.find((o) => o.operation_type === 'device_push' && o.target_commit === queue.pending_commit)!;
     expect(operation.proposal_base).toBe(f.m0);

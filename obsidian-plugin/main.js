@@ -25186,6 +25186,7 @@ var ObtsObsidianClient = class {
     queue || (queue = await this.readQueue());
     const state = await this.readState();
     let journal = await this.readUploadRecovery();
+    if (!journal && await exists(this.fsp, this.directoryBaselineRecoveryPath)) return null;
     const checkpoint = await this.readUploadCheckpoint();
     if (!journal && !checkpoint) return null;
     const queueEvidence = await readRecoveryJsonStrict(
@@ -25201,10 +25202,7 @@ var ObtsObsidianClient = class {
       if (request.vault_id !== state.vault_id || request.device_id !== state.device_id) {
         throw this.uploadRecoveryError("The checkpoint belongs to a different paired identity.");
       }
-      if (checkpoint.target_commit === queue.pending_commit && queue.pending_proposal_base && request.base_commit !== queue.pending_proposal_base) {
-        throw this.uploadRecoveryError("The queue and checkpoint disagree about the same proposal's authoring base.");
-      }
-      if (checkpoint.target_commit === queue.pending_commit && isModernUploadCheckpoint(checkpoint)) return null;
+      if (checkpoint.target_commit === queue.pending_commit && isModernUploadCheckpoint(checkpoint) && (request.base_commit || null) === (this.proposalBase(queue, state) || null)) return null;
       await this.mutateQueue(async () => {
         const current = await this.readQueue();
         if (current.pending_commit !== queue.pending_commit) throw this.uploadRecoveryError("The queue changed during recovery preparation.");
@@ -30131,6 +30129,7 @@ var ObtsObsidianClient = class {
     const checkpoint = await this.readUploadCheckpoint();
     const existing = await this.readUploadRecovery();
     if (!checkpoint && !existing) return;
+    if (!existing && await exists(this.fsp, this.directoryBaselineRecoveryPath)) return;
     const queueEvidence = await readRecoveryJsonStrict(this.fsp, this.queuePath, "upload_checkpoint_recovery_required", "The queue is unreadable; preserve recovery evidence.");
     if (!isUploadRecoveryQueue(queueEvidence) || queueEvidence.pending_commit !== previousQueue.pending_commit) throw this.uploadRecoveryError("The saved queue identity is invalid.");
     const state = await this.readState();
@@ -32905,15 +32904,7 @@ function isUploadTransferCheckpoint(value) {
   if (!value || typeof value !== "object" || Array.isArray(value) || value.version !== 1 || typeof value.identity !== "string" || !/^[0-9a-f]{64}$/u.test(value.identity) || !isGitObjectId(value.target_commit) || !Array.isArray(value.groups) || value.groups.some(
     (group) => !Array.isArray(group) || group.some((oid) => !isGitObjectId(oid))
   ) || !value.transfer_request || typeof value.transfer_request !== "object" || Array.isArray(value.transfer_request) || value.transfer_request.target_commit !== value.target_commit || value.transfer_request.chunk_count !== value.groups.length || value.transfer_request.plan_sha256 !== sha256(Buffer2.from(JSON.stringify(value.groups))) || typeof value.attempt_id !== "string" || !/^[A-Za-z0-9_-]{8,128}$/u.test(value.attempt_id) || value.attempt_id !== `xfer_${sha256(Buffer2.from(stableJson(value.transfer_request))).slice(0, 32)}` || !(value.transfer_id === null || typeof value.transfer_id === "string" && /^trn_[A-Za-z0-9]+$/u.test(value.transfer_id))) return false;
-  const request = value.transfer_request;
-  const nullableOid = (oid) => oid === null || isGitObjectId(oid);
-  if (request.api_version !== API_VERSION || typeof request.vault_id !== "string" || !request.vault_id || typeof request.device_id !== "string" || !request.device_id || !nullableOid(request.expected_device_ref) || !nullableOid(request.client_known_main) || request.base_commit !== void 0 && !nullableOid(request.base_commit) || request.root_ignore_capability !== void 0 && request.root_ignore_capability !== "root-ignore-v1" || request.root_ignore_oid !== void 0 && !nullableOid(request.root_ignore_oid) || request.directory_intents !== void 0 && (!Array.isArray(request.directory_intents) || request.directory_intents.length > 0) || stableJson(request.directory_proposal || null) !== stableJson(value.directory_proposal)) return false;
-  if (value.directory_proposal === null) return true;
-  const proposal = value.directory_proposal;
-  if (!proposal || proposal.schema_version !== 2 || !nullableOid(proposal.base_main) || !Number.isSafeInteger(proposal.base_event_seq) || proposal.base_event_seq < 0 || !Array.isArray(proposal.intents) || !proposal.intents.every(isStoredDirectoryIntent)) return false;
-  const body = Object.assign({}, proposal);
-  delete body.proposal_id;
-  return proposal.proposal_id === `dirprop_${sha256(Buffer2.from(stableJson([request.device_id, value.target_commit, body]), "utf8"))}`;
+  return value.directory_proposal === null || typeof value.directory_proposal === "object" && !Array.isArray(value.directory_proposal);
 }
 function isStoredDirectoryIntent(value) {
   return Boolean(
