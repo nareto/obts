@@ -22317,6 +22317,7 @@ var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
 var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.15";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
+var STALE_SETTLE_MARGIN_MS = 250;
 var PERIODIC_INVENTORY_INTERVAL_MS = 6 * 60 * 60 * 1e3;
 var PERIODIC_FULL_AUDIT_INTERVAL_MS = 7 * 24 * 60 * 60 * 1e3;
 var MIGRATED_FULL_AUDIT_DELAY_MS = 24 * 60 * 60 * 1e3;
@@ -22361,6 +22362,8 @@ module.exports = class ObtsPlugin extends Plugin {
     this.unloaded = false;
     this.lifecycleAbortController = new AbortController();
     this.queuedSyncTimer = null;
+    this.staleSettleTimer = null;
+    this.staleSettleAt = null;
     this.pendingWatcherPaths = /* @__PURE__ */ new Set();
     this.retiredOperationTimer = null;
     this.observedRetiredLease = null;
@@ -22565,6 +22568,7 @@ module.exports = class ObtsPlugin extends Plugin {
       window.clearTimeout(this.queuedSyncTimer);
       this.queuedSyncTimer = null;
     }
+    this.clearStaleSettleTimer();
     if (this.retiredOperationTimer !== null) {
       window.clearTimeout(this.retiredOperationTimer);
       this.retiredOperationTimer = null;
@@ -23076,6 +23080,29 @@ module.exports = class ObtsPlugin extends Plugin {
       void this.runQueuedSync();
     }, delay);
   }
+  // An apply leaves a short authoring horizon behind. Wake the background check
+  // just after it elapses so an idle device settles it before the next edit.
+  scheduleStaleProvenanceSettle() {
+    if (this.unloaded || !this.clientReady || typeof this.client?.staleProvenanceSettleAt !== "function") return;
+    void this.client.staleProvenanceSettleAt().then((at) => {
+      if (this.unloaded || at === null) return;
+      if (this.staleSettleTimer != null) {
+        if (this.staleSettleAt <= at) return;
+        window.clearTimeout(this.staleSettleTimer);
+      }
+      this.staleSettleAt = at;
+      this.staleSettleTimer = window.setTimeout(() => {
+        this.staleSettleTimer = null;
+        this.staleSettleAt = null;
+        void this.runBackgroundSync();
+      }, Math.max(0, at - Date.now()) + STALE_SETTLE_MARGIN_MS);
+    }, () => void 0);
+  }
+  clearStaleSettleTimer() {
+    if (this.staleSettleTimer != null) window.clearTimeout(this.staleSettleTimer);
+    this.staleSettleTimer = null;
+    this.staleSettleAt = null;
+  }
   async runQueuedSync() {
     if (this.unloaded || !this.syncQueued || !await this.ensureClientReady()) return;
     const retryDelay = this.automaticRetryNotBefore - Date.now();
@@ -23472,6 +23499,7 @@ module.exports = class ObtsPlugin extends Plugin {
       if (lease && typeof lease.resolveCompletion === "function") lease.resolveCompletion();
     }
     this.syncRunning = false;
+    this.scheduleStaleProvenanceSettle();
   }
 };
 var ObtsObsidianClient = class {
@@ -27723,10 +27751,36 @@ var ObtsObsidianClient = class {
     if (Number.isFinite(nextFullAuditAt) ? Date.now() >= nextFullAuditAt : !Number.isFinite(lastFullAuditAt) || Date.now() - lastFullAuditAt >= PERIODIC_FULL_AUDIT_INTERVAL_MS) {
       return { required: true, mode: "full" };
     }
-    if (scanState.local_head !== state.local_head || scanState.directory_generation !== directoryState.next_generation || !Number.isFinite(lastInventoryAt) || Date.now() - lastInventoryAt >= PERIODIC_INVENTORY_INTERVAL_MS) {
+    if (scanState.local_head !== state.local_head || scanState.directory_generation !== directoryState.next_generation || !Number.isFinite(lastInventoryAt) || Date.now() - lastInventoryAt >= PERIODIC_INVENTORY_INTERVAL_MS || !state.last_error_code && await this.hasElapsedStaleHorizon()) {
       return { required: true, mode: "incremental" };
     }
     return { required: false, mode: "none" };
+  }
+  // Horizons end, and settled obligations retire, only inside a scan. An idle
+  // device must run that scan once a horizon elapses; otherwise the next edit
+  // still sees the old horizon and is proposed against its superseded base.
+  async hasElapsedStaleHorizon() {
+    let saved;
+    try {
+      saved = await this.readStaleProvenance();
+    } catch {
+      return false;
+    }
+    const now = Date.now();
+    return saved.horizons.some((h) => h.expiry <= now);
+  }
+  // Earliest future horizon expiry, so the host can wake its background check
+  // then. Already elapsed horizons are left to the regular background interval.
+  async staleProvenanceSettleAt() {
+    let saved;
+    try {
+      saved = await this.readStaleProvenance();
+    } catch {
+      return null;
+    }
+    const now = Date.now();
+    const pending = saved.horizons.map((h) => h.expiry).filter((expiry) => expiry > now);
+    return pending.length ? Math.min(...pending) : null;
   }
   async bootstrapScanCacheFromConvergedState(state, directoryState) {
     if (state.status_label !== "Synced" || state.last_error_code || !state.local_head || state.local_head !== state.local_main) return false;

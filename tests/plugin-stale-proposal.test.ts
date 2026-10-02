@@ -1296,6 +1296,148 @@ it('publishes a covering old-base horizon when conflict ownership removes obliga
   expect(await f.core.resolveRef(`refs/obts/stale-bases/${f.m0}`)).toBe(f.m0);
 });
 
+describe('idle settlement of elapsed stale provenance', () => {
+  const APPLIED = BASE.replace('last', 'remote last');
+  const APPENDED = `${APPLIED}appended one\nappended two\n`;
+
+  // An idle device must end elapsed horizons and retire settled obligations in
+  // the background, not lazily inside the next edit's scan.
+  async function idleTicks(f: Awaited<ReturnType<typeof fixture>>) {
+    for (let round = 0; round < 3; round += 1) {
+      await markHorizonsExpired(f.core);
+      await f.plugin.maintenanceTick();
+    }
+  }
+
+  it('proposes a later append on the applied main after an idle apply horizon elapses', async () => {
+    const f = await fixture();
+    await f.remote(APPLIED);
+    await f.core.pullAndApply(true);
+    // The first background check lands inside the horizon and records the scan.
+    expect((await f.plugin.syncOnce()).status).toBe('Synced');
+    expect((await f.provenance()).horizons).not.toEqual([]);
+    await idleTicks(f);
+    expect(await f.provenance()).toMatchObject({ horizons: [], obligations: {} });
+    expect(await f.plugin.maintenanceTick()).toMatchObject({ sync_performed: false, scan_mode: 'none' });
+    await f.core.adapter.write('note.md', APPENDED);
+    expect((await f.plugin.syncOnce()).status).toBe('Synced');
+    expect(await f.canonical()).toBe(APPENDED);
+    expect((await f.server.store.snapshot()).conflicts).toEqual([]);
+  });
+
+  it('proposes an append after an applied conflict resolution on the resolved main', async () => {
+    const f = await fixture();
+    await f.remote(APPLIED);
+    const original = f.core.stageRecoveryBundleFiles.bind(f.core);
+    let injected = false;
+    f.core.stageRecoveryBundleFiles = async (...args: any[]) => {
+      if (!injected) {
+        injected = true;
+        await f.core.adapter.write('note.md', BASE.replace('last', 'device last'));
+      }
+      return original(...args);
+    };
+    await f.core.pullAndApply(true);
+    expect((await f.plugin.syncOnce()).status).toBe('Conflict resolution needed');
+    const conflict = (await f.server.store.snapshot()).conflicts.find((r) => r.status === 'open')!;
+    expect(conflict.base_commit).toBe(f.m0);
+    const review = await f.server.app.inject({ method: 'GET', headers: f.headers,
+      url: `/api/v1/vaults/${f.vaultId}/conflicts/${conflict.conflict_id}` });
+    const resolved = BASE.replace('last', 'remote last\ndevice last');
+    expect((await f.server.app.inject({ method: 'POST', headers: f.headers,
+      url: `/api/v1/vaults/${f.vaultId}/conflicts/${conflict.conflict_id}/resolve`,
+      payload: { expected_main: review.json().conflict.expected_main, resolution_kind: 'manual', manual_files: { 'note.md': resolved } }
+    })).statusCode).toBe(200);
+    // Conflict review only polls; the poll applies the resolution.
+    await f.plugin.pollRemoteEventsAndApply();
+    expect(await readFile(join(f.dir, 'note.md'), 'utf8')).toBe(resolved);
+    expect((await f.plugin.readState()).last_error_code).toBeNull();
+    expect((await f.plugin.maintenanceTick()).sync_performed).toBe(true);
+    expect((await f.provenance()).horizons).not.toEqual([]);
+    await idleTicks(f);
+    const appended = `${resolved}appended one\nappended two\n`;
+    await f.core.adapter.write('note.md', appended);
+    expect((await f.plugin.syncOnce()).status).toBe('Synced');
+    expect(await f.canonical()).toBe(appended);
+    expect((await f.server.store.snapshot()).conflicts.filter((r) => r.status === 'open')).toEqual([]);
+  });
+
+  it('still proposes an edit made inside the horizon against the authoring base', async () => {
+    const f = await fixture();
+    await f.remote(APPLIED);
+    await f.core.pullAndApply(true);
+    await f.core.adapter.write('note.md', BASE.replace('first', 'old buffer first'));
+    await markHorizonsExpired(f.core);
+    expect(await f.plugin.maintenanceTick()).toMatchObject({ sync_performed: true });
+    expect(await f.canonical()).toBe(APPLIED.replace('first', 'old buffer first'));
+    expect((await f.server.store.snapshot()).conflicts).toEqual([]);
+  });
+
+  it('does not wake for elapsed horizons while conflict review blocks sync', async () => {
+    const f = await fixture();
+    await f.remote();
+    await f.core.pullAndApply(true);
+    await f.core.recordScanCompleted(false);
+    expect(await f.core.backgroundScanDecision()).toEqual({ required: false, mode: 'none' });
+    await markHorizonsExpired(f.core);
+    expect(await f.core.backgroundScanDecision()).toEqual({ required: true, mode: 'incremental' });
+    await f.core.writeState({ ...(await f.plugin.readState()), last_error_code: 'conflict_review_required' });
+    expect(await f.core.backgroundScanDecision()).toEqual({ required: false, mode: 'none' });
+  });
+
+  it('wakes the host background check just after the earliest pending horizon, once', async () => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    vi.stubGlobal('window', globalThis);
+    try {
+      const ArtifactPlugin = createRequire(import.meta.url)('../obsidian-plugin/src/main.cjs') as any;
+      let settleAt: number | null = Date.now() + 3000;
+      const host: any = Object.assign(Object.create(ArtifactPlugin.prototype), {
+        unloaded: false, clientReady: true, staleSettleTimer: null, staleSettleAt: null,
+        client: { staleProvenanceSettleAt: async () => settleAt },
+        runBackgroundSync: vi.fn(async () => undefined)
+      });
+      host.scheduleStaleProvenanceSettle();
+      await vi.advanceTimersByTimeAsync(0);
+      settleAt = Date.now() + 5000;
+      host.scheduleStaleProvenanceSettle();
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(host.runBackgroundSync).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(250);
+      expect(host.runBackgroundSync).toHaveBeenCalledTimes(1);
+      settleAt = null;
+      host.scheduleStaleProvenanceSettle();
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(host.runBackgroundSync).toHaveBeenCalledTimes(1);
+      settleAt = Date.now() + 1000;
+      host.scheduleStaleProvenanceSettle();
+      await vi.advanceTimersByTimeAsync(0);
+      host.clearStaleSettleTimer();
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(host.runBackgroundSync).toHaveBeenCalledTimes(1);
+      const ended: any = Object.assign(Object.create(ArtifactPlugin.prototype), {
+        app: { vault: { adapter: {} } }, clearOperationProgress: () => undefined, scheduleStaleProvenanceSettle: vi.fn()
+      });
+      ended.endSync();
+      expect(ended.scheduleStaleProvenanceSettle).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('reports the earliest future horizon expiry for the host wake-up only', async () => {
+    const f = await fixture();
+    await expire(f.core);
+    expect(await f.core.staleProvenanceSettleAt()).toBeNull();
+    await f.remote();
+    await f.core.pullAndApply(true);
+    const [horizon] = (await f.provenance()).horizons;
+    expect(await f.core.staleProvenanceSettleAt()).toBe(horizon.expiry);
+    await markHorizonsExpired(f.core);
+    expect(await f.core.staleProvenanceSettleAt()).toBeNull();
+  });
+});
+
 it('does not interpret a locally excluded queued path as a later deletion during rebuild', async () => {
   const f = await fixture();
   const c = await f.remote();
