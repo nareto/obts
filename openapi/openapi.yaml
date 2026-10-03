@@ -2071,7 +2071,7 @@ components:
       properties:
         point:
           type: string
-          enum: [onboarding_approved, bootstrap_response, multipart_pack, pack_persist_write, pack_persist_read, index_fs_stat, index_fs_read_file, index_fs_read, index_fs_write, index_pack, sync_request, apply, apply_recovery_prepare, apply_preflight_revalidate, apply_write, apply_verify, local_snapshot, upload_prepare, upload_finalize, recovery, startup_metadata, startup_git, startup_state, recovery_journal, recovery_target_commit, recovery_target_tree, recovery_file_validation, recovery_bundle, recovery_file_apply, recovery_refs, recovery_state]
+          enum: [onboarding_approved, bootstrap_response, multipart_pack, pack_persist_write, pack_persist_read, index_fs_stat, index_fs_read_file, index_fs_read, index_fs_write, index_pack, sync_request, sync_download, onboarding_download, transfer_checkpoint_verification, apply, apply_recovery_prepare, apply_preflight_revalidate, apply_write, apply_verify, apply_local_capture, apply_finalize, local_snapshot, upload_prepare, upload_finalize, recovery, recovery_directory_decision, startup_metadata, startup_git, startup_state, recovery_journal, recovery_target_commit, recovery_target_tree, recovery_file_validation, recovery_bundle, recovery_file_apply, recovery_refs, recovery_state]
         outcome:
           type: string
           enum: [started, returned, succeeded, failed]

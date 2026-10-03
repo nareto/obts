@@ -2303,6 +2303,36 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
   });
 
+  it('keeps allowlisted apply and request qualifiers through both dashboard normalization boundaries', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'qualified-progress-status-device');
+    await mkdirp(deviceDir);
+    await pairPlugin(admin, deviceDir, 'qualified-progress-device');
+    const labels = [
+      ['Applying (checking local edits) 3/10', 'Applying (checking local edits) (~30%)'],
+      ['Applying (listing vault files)', 'Applying (listing vault files)'],
+      ['Applying (finishing)', 'Applying (finishing)'],
+      ['Applying (verifying vault) 3/10', 'Applying (verifying vault) (~30%)'],
+      ['Checking (requesting changes)', 'Checking (requesting changes)'],
+      ['Applying (checking local edits) 9/10 (taking longer than expected)', 'Applying (checking local edits) (~90%) (taking longer than expected)'],
+      ['Applying (private/path.md) 3/10', 'Out of sync']
+    ];
+    for (const [reported, expected] of labels) {
+      await server.store.mutate((db) => {
+        const device = db.devices.find(candidate => candidate.device_name === 'qualified-progress-device')!;
+        device.status = 'synced';
+        device.local_status_label = reported!;
+        device.local_error_code = null;
+        device.local_queue_status = 'idle';
+        device.last_status_report_at = new Date().toISOString();
+      });
+      const dashboard = await admin.get<{ devices: Array<{ device_name: string; status_label: string }> }>(
+        `/api/v1/vaults/${admin.vaultId}/dashboard`
+      );
+      expect(dashboard.body.devices.find(device => device.device_name === 'qualified-progress-device')?.status_label).toBe(expected);
+    }
+  });
+
   it('does not report an uncommitted watcher marker as Ahead', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'uncommitted-watcher-status-device');
@@ -5987,19 +6017,27 @@ describe('Phase 1 sync without conflict resolution', () => {
     const internal = (plugin2 as unknown as { client: Record<string, any> }).client;
     const originalCapture = internal.captureLocalFileSnapshot.bind(internal);
     const diagnosticPoints: string[] = [];
+    const progressLabels: string[] = [];
     let snapshotCount = 0;
     internal.captureLocalFileSnapshot = async (...args: unknown[]) => {
       snapshotCount += 1;
       return await originalCapture(...args);
     };
-    internal.plugin.setOperationProgress = (_label: string, diagnosticPoint: string) => {
+    internal.plugin.setOperationProgress = (label: string, diagnosticPoint: string) => {
       diagnosticPoints.push(diagnosticPoint);
+      progressLabels.push(label);
     };
 
     expect((await plugin2.syncOnce()).status).toBe('Synced');
     expect(snapshotCount).toBe(3);
     expect(diagnosticPoints).toContain('local_snapshot');
     expect(diagnosticPoints).toContain('apply_verify');
+    expect(diagnosticPoints).toContain('apply_local_capture');
+    expect(diagnosticPoints).toContain('apply_finalize');
+    expect(diagnosticPoints).toContain('sync_request');
+    expect(progressLabels).toContain('Applying (listing vault files)');
+    expect(progressLabels).toContain('Applying (finishing)');
+    expect(progressLabels.some(label => /^Applying \(checking local edits\) [0-9]+\/[0-9]+$/u.test(label))).toBe(true);
   });
 
   it('rebuilds from server main and turns snapshot-only local edits into a recovery commit', async () => {

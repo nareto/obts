@@ -13,6 +13,7 @@ export const fastTests = [
 
 export const pluginTests = [
   'tests/plugin-in-place-apply.test.ts',
+  'tests/plugin-apply-progress.test.ts',
   'tests/plugin-adapter-write-gate.test.ts',
   'tests/plugin-stale-proposal.test.ts',
   'tests/plugin-upload-recovery.test.ts',

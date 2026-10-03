@@ -180,6 +180,22 @@ describe('opt-in error diagnostics backend', () => {
     expect((await fixture.server.store.snapshot()).diagnostic_events).toEqual([]);
   });
 
+  it('accepts existing transfer and new post-apply progress points in stalled reports', async () => {
+    const fixture = await setupFixture(true);
+    const connection = await createConnection(fixture.baseUrl);
+    await approveNewVault(fixture, connection.connection_id);
+    const points = ['sync_download', 'onboarding_download', 'transfer_checkpoint_verification', 'recovery_directory_decision', 'apply_local_capture', 'apply_finalize'];
+    for (const [index, point] of points.entries()) {
+      const progressReport = {
+        ...report,
+        event_id: `dgr_${index.toString(16).padStart(32, '0')}`,
+        failure_code: 'operation_stalled',
+        breadcrumbs: [{ point, outcome: 'started', value_kind: 'unknown', size_bucket: 'unknown', error_code: 'none' }]
+      };
+      expect((await postDiagnostic(`${fixture.baseUrl}/api/v1/connections/${connection.connection_id}/diagnostic-events`, connection.connection_secret, progressReport)).status).toBe(202);
+    }
+  });
+
   it('accepts troubleshooting schema v2 without changing schema v1 rows', async () => {
     const fixture = await setupFixture(true);
     const connection = await createConnection(fixture.baseUrl);

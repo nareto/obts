@@ -22314,7 +22314,7 @@ var { createByteBudget, runBoundedWork } = require_work_pool();
 var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.19";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.20";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var STALE_SETTLE_MARGIN_MS = 250;
@@ -22333,6 +22333,7 @@ var MOBILE_FILE_WORK_CONCURRENCY = 2;
 var DESKTOP_FILE_BUFFER_BUDGET_BYTES = 64 * 1024 * 1024;
 var MOBILE_FILE_BUFFER_BUDGET_BYTES = 16 * 1024 * 1024;
 var FILE_WORK_YIELD_EVERY = 25;
+var FILE_PROGRESS_INTERVAL_MS = 250;
 var MOBILE_PACK_READ_ATTEMPTS = 5;
 var MOBILE_PACK_READ_RETRY_MS = 100;
 var RETIRED_OPERATION_GRACE_MS = 1500;
@@ -26647,6 +26648,7 @@ var ObtsObsidianClient = class {
       let localScanPending = false;
       const shouldCapturePreservedChanges = requireCleanVisibleState || journal.deferred_local_paths.length > 0;
       const preserved = shouldCapturePreservedChanges ? await this.captureStableLocalChanges(targetEntries) : { paths: [], snapshot: null, stable: true, changedPath: null };
+      this.reportOperationProgress("Applying (finishing)", "apply_finalize");
       let preservedLocalChangePaths = preserved.stable ? preserved.paths : [];
       let preservedLocalSnapshot = preserved.stable ? preserved.snapshot : null;
       let preservedDirectoryIntents = [];
@@ -26667,6 +26669,7 @@ var ObtsObsidianClient = class {
           localScanPending = true;
         }
       }
+      this.reportOperationProgress("Applying (finishing)", "apply_finalize");
       if (requireCleanVisibleState) {
         preservedDirectoryIntents = await this.preserveDirectoryChangesFromTarget(
           targetEntries,
@@ -26964,7 +26967,7 @@ var ObtsObsidianClient = class {
       await this.flushEditorBuffersToDisk();
       if (keepResidualLocalChanges) {
         capturedChangeSeq = (await this.readQueue()).change_seq || 0;
-        const preserved = await this.captureStableLocalChanges(targetEntries);
+        const preserved = await this.captureStableLocalChanges(targetEntries, 3, true);
         if (preserved.stable) {
           preservedLocalChangePaths = preserved.paths;
           preservedLocalSnapshot = preserved.snapshot;
@@ -26974,7 +26977,7 @@ var ObtsObsidianClient = class {
             preservedDeferredPaths.clear();
             for (const filePath of updated) preservedDeferredPaths.add(filePath);
           }
-          await this.markLocalApplyScanPending(journal, targetEntries, preserved.changedPath ? [preserved.changedPath] : []);
+          await this.markLocalApplyScanPending(journal, targetEntries, preserved.changedPath ? [preserved.changedPath] : [], true);
           localScanPending = true;
         }
         if (preservedLocalChangePaths.length > 0) {
@@ -26985,7 +26988,7 @@ var ObtsObsidianClient = class {
             if (!(error instanceof LocalSnapshotChangedError)) throw error;
             preservedLocalChangePaths = [];
             preservedLocalSnapshot = null;
-            await this.markLocalApplyScanPending(journal, targetEntries, [error.filePath]);
+            await this.markLocalApplyScanPending(journal, targetEntries, [error.filePath], true);
             localScanPending = true;
             const updated = await this.recordDeferredApplyPaths(journal, [error.filePath], validation.targetMatchedPaths);
             preservedDeferredPaths.clear();
@@ -27075,8 +27078,10 @@ var ObtsObsidianClient = class {
     if (options.targetRootIgnoreOid !== void 0 && rootPolicy.oid !== options.targetRootIgnoreOid) {
       throw new ObtsBlockedError("target_policy_changed", "The visible root ignore policy changed during apply.");
     }
+    if (options.onListing) options.onListing();
     const localFiles = await this.scanSyncableFiles(rootPolicy.policy);
     const localSet = new Set(localFiles);
+    if (options.onProgress) options.onProgress(0, localFiles.length);
     const snapshot = await this.captureLocalFileSnapshot(localFiles, new Map(
       [...targetEntries].map(([filePath, oid]) => [filePath, { oid }])
     ), {
@@ -27084,10 +27089,11 @@ var ObtsObsidianClient = class {
       verifyInventory: includeSnapshot,
       rootPolicy,
       reportProgress: false,
-      onProgress: options.reportOperationProgress ? (completed, total) => this.reportOperationProgress(
+      beforeInventoryVerification: options.onListing,
+      onProgress: options.onProgress || (options.reportOperationProgress ? (completed, total) => this.reportOperationProgress(
         total > 0 ? `Applying (verifying vault) ${completed}/${total}` : "Applying (verifying vault)",
         "apply_verify"
-      ) : void 0
+      ) : void 0)
     });
     const paths = Array.from(/* @__PURE__ */ new Set([...localSet, ...targetEntries.keys()])).sort().filter((filePath) => {
       const localOid = snapshot.entries.get(filePath)?.entry.oid;
@@ -27095,12 +27101,33 @@ var ObtsObsidianClient = class {
     });
     return includeSnapshot ? { paths, snapshot } : paths;
   }
-  async captureStableLocalChanges(targetEntries, attempts = 3) {
+  createLocalApplyProgress(initialization = false) {
+    let lastLabel = null;
+    let lastReportedAt = 0;
+    return (label, completed = null, total = null) => {
+      const now = Date.now();
+      if (label === lastLabel && completed !== 0 && completed !== total && now - lastReportedAt < FILE_PROGRESS_INTERVAL_MS) return;
+      lastLabel = label;
+      lastReportedAt = now;
+      const progress = total > 0 ? `${label} ${completed}/${total}` : label;
+      if (initialization) this.plugin.updateInitializationProgress(progress);
+      else this.reportOperationProgress(progress, "apply_local_capture");
+    };
+  }
+  async captureStableLocalChanges(targetEntries, attempts = 3, initialization = false) {
+    const report = this.createLocalApplyProgress(initialization);
+    const listing = () => report("Applying (listing vault files)");
+    const checking = (completed, total) => report("Applying (checking local edits)", completed, total);
     let changedPath = null;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       try {
+        checking();
         await this.flushEditorBuffersToDisk();
-        const first = await this.localChangedPathsFromTree(targetEntries, true);
+        const first = await this.localChangedPathsFromTree(targetEntries, true, {
+          onListing: listing,
+          onProgress: (completed, total) => checking(completed, total * 2)
+        });
+        checking(first.snapshot.files.length, first.snapshot.files.length * 2);
         await this.flushEditorBuffersToDisk();
         const snapshot = await this.captureLocalFileSnapshot(first.snapshot.files, new Map(
           [...targetEntries].map(([filePath, oid]) => [filePath, { oid }])
@@ -27109,7 +27136,9 @@ var ObtsObsidianClient = class {
           verifyInventory: true,
           rootPolicy: first.snapshot.rootPolicy,
           forcePaths: first.paths,
-          reportProgress: false
+          reportProgress: false,
+          beforeInventoryVerification: listing,
+          onProgress: (completed, total) => checking(total + completed, total * 2)
         });
         const stable = sameStringArray(first.snapshot.files, snapshot.files) && first.snapshot.files.every(
           (filePath) => first.snapshot.entries.get(filePath)?.entry.oid === snapshot.entries.get(filePath)?.entry.oid
@@ -27122,7 +27151,9 @@ var ObtsObsidianClient = class {
     }
     return { paths: [], snapshot: null, stable: false, changedPath };
   }
-  async markLocalApplyScanPending(journal, targetEntries, additionalPaths = []) {
+  async markLocalApplyScanPending(journal, targetEntries, additionalPaths = [], initialization = false) {
+    const report = this.createLocalApplyProgress(initialization);
+    report("Applying (listing vault files)");
     const rootPolicy = await this.readRootIgnorePolicy();
     const localFiles = await this.scanSyncableFiles(rootPolicy.policy);
     const paths = [.../* @__PURE__ */ new Set([
@@ -28212,7 +28243,10 @@ var ObtsObsidianClient = class {
     });
     const rootPolicy = options.rootPolicy || await this.readRootIgnorePolicy();
     const snapshot = { files, entries: new Map(files.map((filePath, index2) => [filePath, values[index2]])), rootPolicy };
-    if (options.verifyInventory) await this.verifyLocalPolicySnapshot(snapshot);
+    if (options.verifyInventory) {
+      if (options.beforeInventoryVerification) options.beforeInventoryVerification();
+      await this.verifyLocalPolicySnapshot(snapshot);
+    }
     if (options.persistScanCache) await this.writeScanCache(snapshot.entries);
     return snapshot;
   }
@@ -29073,6 +29107,7 @@ var ObtsObsidianClient = class {
     }
   }
   async pull(vaultId, deviceId, token, currentLocalMain, requestedTarget = "latest", currentEventSeq = void 0) {
+    this.reportOperationProgress("Checking (requesting changes)", "sync_request");
     await this.admitApplyRecovery();
     await this.retryPendingAppliedAcknowledgement();
     if (await this.readPendingAppliedAcknowledgement()) throw new ObtsBlockedError("applied_main_acknowledgement_failed", "Settle the previous applied snapshot before pulling another.");
@@ -33801,16 +33836,17 @@ function diagnosticContextForError(error) {
 }
 function buildStalledOperationDiagnostic(diagnosticPoint) {
   const recovery = diagnosticPoint.startsWith("recovery_");
-  const apply = diagnosticPoint.startsWith("apply_");
-  const sync = diagnosticPoint === "local_snapshot" || diagnosticPoint === "upload_prepare" || diagnosticPoint === "upload_finalize";
+  const apply = diagnosticPoint === "apply" || diagnosticPoint.startsWith("apply_");
+  const onboarding = diagnosticPoint === "onboarding_download";
+  const sync = ["sync_request", "sync_download", "transfer_checkpoint_verification", "local_snapshot", "upload_prepare", "upload_finalize"].includes(diagnosticPoint);
   return {
     schema_version: 1,
     event_id: `dgr_${randomHex(16)}`,
     plugin_version: PLUGIN_VERSION,
     obsidian_version: typeof apiVersion === "string" && apiVersion ? apiVersion : "unknown",
     platform_family: Platform && Platform.isIosApp ? "ios" : Platform && Platform.isAndroidApp ? "android" : "desktop",
-    flow: recovery ? "recovery" : apply ? "apply" : sync ? "sync" : "plugin",
-    stage: recovery ? "recovery" : apply ? "apply" : sync ? "sync_request" : "plugin_lifecycle",
+    flow: recovery ? "recovery" : apply ? "apply" : onboarding ? "onboarding" : sync ? "sync" : "plugin",
+    stage: recovery ? "recovery" : apply ? "apply" : onboarding ? "bootstrap_request" : sync ? "sync_request" : "plugin_lifecycle",
     failure_code: "operation_stalled",
     error_class: "unknown",
     retryable: true,
@@ -33856,7 +33892,7 @@ function makeDiagnosticBreadcrumb(point, outcome, value = void 0, errorCode = "n
   });
 }
 function normalizeDiagnosticBreadcrumb(event) {
-  const points = /* @__PURE__ */ new Set(["onboarding_approved", "bootstrap_response", "multipart_pack", "pack_persist_write", "pack_persist_read", "index_fs_stat", "index_fs_read_file", "index_fs_read", "index_fs_write", "index_pack", "sync_request", "apply", "apply_recovery_prepare", "apply_preflight_revalidate", "apply_write", "apply_verify", "local_snapshot", "upload_prepare", "upload_finalize", "recovery"]);
+  const points = /* @__PURE__ */ new Set(["onboarding_approved", "bootstrap_response", "multipart_pack", "pack_persist_write", "pack_persist_read", "index_fs_stat", "index_fs_read_file", "index_fs_read", "index_fs_write", "index_pack", "sync_request", "sync_download", "onboarding_download", "transfer_checkpoint_verification", "apply", "apply_recovery_prepare", "apply_preflight_revalidate", "apply_write", "apply_verify", "apply_local_capture", "apply_finalize", "local_snapshot", "upload_prepare", "upload_finalize", "recovery", "recovery_directory_decision", "startup_metadata", "startup_git", "startup_state", "recovery_journal", "recovery_target_commit", "recovery_target_tree", "recovery_file_validation", "recovery_bundle", "recovery_file_apply", "recovery_refs", "recovery_state"]);
   const outcomes = /* @__PURE__ */ new Set(["started", "returned", "succeeded", "failed"]);
   const valueKinds = /* @__PURE__ */ new Set(["buffer", "uint8array", "arraybuffer", "string", "null", "other", "unknown"]);
   const sizeBuckets = /* @__PURE__ */ new Set(["empty", "under_64k", "under_1m", "under_16m", "under_64m", "over_64m", "unknown"]);

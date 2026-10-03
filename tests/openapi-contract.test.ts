@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
 
 import { API_VERSION } from '../src/shared/types.js';
+import { diagnosticPoints } from '../src/shared/diagnostics.js';
 import { parseChunkPushCreateRequest, parseDevicePushManifest } from '../src/shared/validators.js';
 
 describe('OpenAPI Phase 3 contract', () => {
@@ -207,6 +208,9 @@ describe('OpenAPI Phase 3 contract', () => {
         { $ref: '#/components/schemas/DiagnosticEventV1View' },
         { $ref: '#/components/schemas/DiagnosticEventV2View' }
       ]
+    });
+    expect(document.components.schemas.DiagnosticBreadcrumb).toMatchObject({
+      properties: { point: { enum: [...diagnosticPoints] } }
     });
     expect(document.components.schemas.DiagnosticEventV1).toMatchObject({ unevaluatedProperties: false });
     expect(document.components.schemas.DiagnosticEventV2).toMatchObject({ unevaluatedProperties: false });

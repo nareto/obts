@@ -38,6 +38,12 @@ and **Unpair** visible but disabled while recovery owns the vault lease, and
 distinguish slow progress from a reload that requires restart. Actionable
 transitions produce one notice, while brief routine polling and catch-up do not.
 
+Post-apply local-edit checks show file counts across both capture passes, with
+separate labels while listing vault files and finishing the apply. A retry may
+restart the counts. Requesting server changes has its own label rather than
+leaving the previous upload phase on screen. These labels make existing work
+visible; they do not shorten the checks or change local-edit preservation.
+
 A paired device can be renamed from plugin settings. The server owns the
 canonical display name, and the plugin reconciles owner-side renames made in
 the dashboard during status reporting. Device renames do not affect vault
