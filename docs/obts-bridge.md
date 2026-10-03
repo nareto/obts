@@ -59,6 +59,10 @@ Rust validates the effective ACL, prepares the complete candidate content, and w
 
 Every exact note/file read and successful write receipt returns an opaque whole-file `revision` (`v1:sha256:...`). Every existing-file mutation, including metadata-only and tag-only edits, must return that value unchanged as `expected_revision`. Missing preconditions return HTTP 428, stale preconditions return HTTP 412, and unknown mutation fields are rejected. The bridge compares the token against the authorized exact raw bytes before transformation and then carries the internal source revision to the atomic filesystem CAS seam; create-if-absent remains exclusive and does not take a revision. `content_sha256` remains informational and cannot authorize a write.
 
+Bridge-generated Markdown frontmatter `created` (on creation) and `updated` (on edits) use RFC3339 with whole-second precision and the runtime's local numeric UTC offset, for example `2026-10-03T05:28:26+02:00`. Existing `created` values are preserved on edits; this does not migrate older timestamps or change API/database timestamp serialization or date-based filename generation.
+
+Containers do not automatically inherit the host timezone. Configure the runtime with a named timezone and zoneinfo data (for example `TZ=Europe/Rome`), or mount the host's `/etc/localtime` read-only. Named zones supply daylight-saving transitions rather than a fixed offset. Recreate the container after changing a host timezone bind mount so it picks up the new file.
+
 ## Markdown export
 
 `GET /api/v1/vault-files/export?include=markdown` returns the current policy-visible, exact-source Markdown set as a deterministic schema-2 ZIP. `manifest.json` is first, paths are bytewise sorted and safe, each entry carries its whole-file revision and SHA-256, and denied paths/counts are never disclosed. Exact bodies unavailable from the pinned projection are omitted with only an aggregate count; PostgreSQL lexical text is never reconstructed as a body fallback. Strong ETags and weak `If-None-Match` matching support 304 responses.

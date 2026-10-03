@@ -37,7 +37,7 @@ use crate::markdown::{
 use crate::model::{Note, NoteId, UnscopedNote, VaultFile};
 use crate::new_note::{
     NewNoteFileType, NewNotePathSettings, NewNoteRequest, PersistenceFailureKind,
-    UpdateNoteRequest, WriteError, apply_content_patch,
+    UpdateNoteRequest, WriteError, apply_content_patch, frontmatter_timestamp,
 };
 use crate::persistence::{
     BlockSemanticMatch, PersistedAccessLogEntry, PersistedFileAlias, PersistedIngestDelta,
@@ -5228,7 +5228,10 @@ fn apply_markdown_raw_update(
             "tags".to_string(),
             Value::Array(tags.into_iter().map(Value::String).collect()),
         );
-        map.insert("updated".to_string(), Value::String(now.to_rfc3339()));
+        map.insert(
+            "updated".to_string(),
+            Value::String(frontmatter_timestamp(now)),
+        );
         if let Some(created) = existing_frontmatter.get("created") {
             map.insert("created".to_string(), created.clone());
         } else {
@@ -7548,23 +7551,61 @@ fn parse_seq_value(value: &str) -> i64 {
 mod tests {
     use std::collections::BTreeMap;
 
-    use chrono::{Duration, Utc};
+    use chrono::{DateTime, Duration, Local, Utc};
     use serde_json::{Value, json};
     use static_assertions::assert_not_impl_any;
 
     use super::{
         NeighborDirection, NoteInput, QueryBaseRequest, QueryNotesRequest, RuntimeSyncState,
         StoreSettings, StoredVaultFile, UnscopedBacklinkEntry, UnscopedNeighborNode,
-        UnscopedRecentNoteSummary, VaultStore, build_unscoped_note, find_case_insensitive,
-        get_note_from_inner, neighbors_from_inner, note_readable_for_policy_from_inner,
-        stale_file_recovery_targets_locked, status_from_inner, store_inner_from_persisted_notes,
-        upsert_note_locked,
+        UnscopedRecentNoteSummary, VaultStore, apply_markdown_raw_update, build_unscoped_note,
+        find_case_insensitive, get_note_from_inner, neighbors_from_inner,
+        note_readable_for_policy_from_inner, stale_file_recovery_targets_locked, status_from_inner,
+        store_inner_from_persisted_notes, upsert_note_locked,
     };
     use crate::authorization::{
         AccessMatcher, AccessPolicy, AccessRule, AuthContext, AuthorizationConfig, ContextName,
     };
     use crate::model::NoteId;
+    use crate::new_note::UpdateNoteRequest;
     use crate::persistence::{PersistedLinkRecord, PersistedNoteRecord};
+
+    #[test]
+    fn raw_update_frontmatter_timestamp_uses_local_offset_and_preserves_created() {
+        let now = DateTime::parse_from_rfc3339("2026-10-02T23:28:26.112472251+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        let created = "2025-10-02T12:47:53.112472251+00:00";
+        let request = UpdateNoteRequest {
+            content: None,
+            content_patch: None,
+            tags: None,
+            metadata: Some(json!({"created": "replacement", "updated": "replacement"})),
+            expected_revision: None,
+        };
+
+        for existing in [json!({"created": created}), json!({})] {
+            let content = apply_markdown_raw_update(
+                "---\ncreated: replacement\nupdated: replacement\ncustom: retained\n---\n\nBody",
+                &request,
+                &existing,
+                &[],
+                &[],
+                now,
+            )
+            .unwrap();
+            let (frontmatter, body) = crate::markdown::parse_frontmatter(&content);
+            assert_eq!(
+                frontmatter["updated"],
+                now.with_timezone(&Local)
+                    .format("%Y-%m-%dT%H:%M:%S%:z")
+                    .to_string()
+            );
+            assert_eq!(frontmatter.get("created"), existing.get("created"));
+            assert_eq!(frontmatter["custom"], "retained");
+            assert_eq!(body.trim(), "Body");
+        }
+    }
 
     #[test]
     fn unscoped_store_payloads_are_not_serializable() {

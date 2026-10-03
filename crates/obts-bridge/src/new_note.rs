@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use slug::slugify;
@@ -149,6 +149,11 @@ pub enum WriteError {
     Persistence { kind: PersistenceFailureKind },
 }
 
+pub(crate) fn frontmatter_timestamp(now: DateTime<Utc>) -> String {
+    now.with_timezone(&Local)
+        .to_rfc3339_opts(SecondsFormat::Secs, false)
+}
+
 impl NewNoteRequest {
     pub fn generate_path(&self) -> String {
         self.generate_path_at(Utc::now())
@@ -253,7 +258,7 @@ impl NewNoteRequest {
         };
         map.insert(
             "created".to_string(),
-            Value::String(created_at.to_rfc3339()),
+            Value::String(frontmatter_timestamp(created_at)),
         );
 
         if !add_tags.is_empty() {
@@ -290,7 +295,10 @@ impl UpdateNoteRequest {
             .unwrap_or_default();
 
         // Update the `updated` timestamp in frontmatter.
-        fm.insert("updated".to_string(), Value::String(now.to_rfc3339()));
+        fm.insert(
+            "updated".to_string(),
+            Value::String(frontmatter_timestamp(now)),
+        );
 
         // Apply tag override if provided.
         if let Some(tags) = &self.tags {
@@ -613,12 +621,14 @@ fn normalized_template(path_template: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{TimeZone, Utc};
+    use chrono::{DateTime, Local, TimeZone, Utc};
+    use serde_json::json;
 
     use super::{
         ContentPatchOperation, NewNoteFileType, NewNotePathSettings, NewNoteRequest,
-        UpdateNoteRequest, WriteError,
+        UpdateNoteRequest, WriteError, frontmatter_timestamp,
     };
+    use crate::markdown::parse_frontmatter;
 
     fn request(title: &str) -> NewNoteRequest {
         NewNoteRequest {
@@ -633,6 +643,99 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 2, 26, 12, 0, 0)
             .single()
             .expect("valid timestamp")
+    }
+
+    fn timestamp_fixtures() -> [DateTime<Utc>; 2] {
+        [
+            "2026-10-02T23:28:26.112472251+00:00",
+            "2026-01-02T23:28:26.112472251+00:00",
+        ]
+        .map(|value| DateTime::parse_from_rfc3339(value).unwrap().with_timezone(&Utc))
+    }
+
+    #[test]
+    fn frontmatter_timestamp_europe_rome_handles_dst() {
+        // A subprocess isolates TZ from concurrently running tests without mutating the environment.
+        if std::env::var("TZ").ok().as_deref() != Some("Europe/Rome") {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "new_note::tests::frontmatter_timestamp_europe_rome_handles_dst",
+                    "--nocapture",
+                ])
+                .env("TZ", "Europe/Rome")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "Rome timezone regression failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        for (utc, expected) in [
+            ("2026-10-02T23:28:26.112472251Z", "2026-10-03T01:28:26+02:00"),
+            ("2026-01-02T23:28:26.112472251Z", "2026-01-03T00:28:26+01:00"),
+            ("2026-03-29T00:59:59.999999999Z", "2026-03-29T01:59:59+01:00"),
+            ("2026-03-29T01:00:00Z", "2026-03-29T03:00:00+02:00"),
+            ("2026-10-25T00:59:59.999999999Z", "2026-10-25T02:59:59+02:00"),
+            ("2026-10-25T01:00:00Z", "2026-10-25T02:00:00+01:00"),
+        ] {
+            let now = DateTime::parse_from_rfc3339(utc).unwrap().with_timezone(&Utc);
+            assert_eq!(frontmatter_timestamp(now), expected);
+        }
+    }
+
+    #[test]
+    fn create_frontmatter_timestamp_uses_local_offset_and_whole_seconds() {
+        for now in timestamp_fixtures() {
+            let mut note = request("Test");
+            note.content = "---\ncreated: old\ncustom: retained\n---\n\nBody".to_string();
+            note.apply_markdown_create_metadata(now, &[], None).unwrap();
+
+            let (frontmatter, body) = parse_frontmatter(&note.content);
+            assert_eq!(
+                frontmatter["created"],
+                now.with_timezone(&Local)
+                    .format("%Y-%m-%dT%H:%M:%S%:z")
+                    .to_string()
+            );
+            assert_eq!(frontmatter["custom"], "retained");
+            assert_eq!(body.trim(), "Body");
+        }
+    }
+
+    #[test]
+    fn update_frontmatter_timestamp_uses_local_offset_and_preserves_created() {
+        let created = "2025-10-02T12:47:53.112472251+00:00";
+        let existing = json!({"created": created, "custom": "retained"});
+        let update = UpdateNoteRequest {
+            content: None,
+            content_patch: Some(vec![ContentPatchOperation::Append {
+                text: "\nAdded".to_string(),
+            }]),
+            tags: None,
+            metadata: Some(json!({"updated": "caller cannot override"})),
+            expected_revision: None,
+        };
+
+        for now in timestamp_fixtures() {
+            let content = update
+                .rebuild_markdown(&existing, "Body", &[], now)
+                .unwrap();
+            let (frontmatter, body) = parse_frontmatter(&content);
+            assert_eq!(
+                frontmatter["updated"],
+                now.with_timezone(&Local)
+                    .format("%Y-%m-%dT%H:%M:%S%:z")
+                    .to_string()
+            );
+            assert_eq!(frontmatter["created"], created);
+            assert_eq!(frontmatter["custom"], "retained");
+            assert_eq!(body.trim(), "Body\nAdded");
+        }
     }
 
     #[test]
