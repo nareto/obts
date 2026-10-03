@@ -567,10 +567,13 @@ pub struct DependencyStatus {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct HeadlessProcessStatus {
     pub up: bool,
+    pub busy: bool,
     pub restart_count: u64,
     pub unexpected_exits: u64,
     pub circuit_open: bool,
     pub recovery_attempts: u64,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "retryAfterSeconds")]
+    pub retry_after_seconds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -174,6 +174,18 @@ TLC 2.19, one worker, fingerprint polynomial 0, 1 GiB heap. `REACHED` and `REJEC
 
 The pilot does not cover directories, multiple paths, write concurrency, editor-buffer capture, Git object structure, network/server acknowledgement, byte/checksum implementation, mobile lifecycle, process kill, power loss, filesystem semantics, corrupted finalized bundles, or competing client instances. The companion adds the bounded compare/write interleaving and one symbolic interrupted write, not a proof of byte-level storage atomicity. Those require executable fault tests and platform evidence; a green TLC result makes no claim about them.
 
+## OBTS-FM-012: Bridge Write Admission
+
+| Field | Value |
+| --- | --- |
+| Status | Focused bounded model |
+| Architecture revision | 42 |
+| Refined contracts | `OBTS-BRG-WRITE-001`, `OBTS-BRG-READ-001` |
+| Specification / configurations | `OBTSBridgeWriteAdmission.tla`, `configs/write-admission-*.cfg` |
+| Checker | `npm run test:formal:bridge-read` |
+
+The companion bounds one foreground writer across service then headless mutex admission with one deadline, permits a read while queued, and revalidates the revision at ownership. Success liveness assumes maintenance releases before the deadline; it is not satisfied merely because no writer is queued initially. Eleven checks cover four positive cases, five mandatory success/read/timeout/cancel/stale witnesses and unsafe-write/healthy-child-cancellation controls. TLC generated/distinct/depth positive baselines are success 17/13/7, timeout 78/47/7, stale 177/99/9 and cancel 141/71/7; both negative controls produce their exact invariant/witness at depth 2. The checker bounds subprocess time, heap, state/depth, isolates metadirs, and supports the pinned CI JAR. This model does not prove multiple-writer FIFO, wall-clock timing, protocol-in-flight cancellation or runtime lock implementation; executable tests cover second-writer and real mutex behavior. FM011 remains architecture-stage at revision 40 with its original 14 checks unchanged.
+
 ## OBTS-FM-010: Upload Checkpoint Handoff
 
 | Field | Value |

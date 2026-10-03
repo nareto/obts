@@ -386,18 +386,21 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let metadata = self.metadata();
         let status = self.status();
+        let retry_after = metadata.retry_after_seconds();
         let body = ApiErrorResponse {
             error: self.legacy_error(),
-            metadata: self.metadata(),
+            metadata,
         };
 
         let mut response = (status, Json(body)).into_response();
-        if status == StatusCode::SERVICE_UNAVAILABLE {
-            response.headers_mut().insert(
-                axum::http::header::RETRY_AFTER,
-                HeaderValue::from_static("2"),
-            );
+        if let Some(seconds) = retry_after {
+            if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
+            }
         }
         response
     }
@@ -418,7 +421,7 @@ fn service_error_legacy_error(error: &ServiceError) -> String {
             "the vault file changed after it was read".to_string()
         }
         ServiceError::FilesystemWrite(error) => error.to_string(),
-        ServiceError::Headless(error) => error.to_string(),
+        ServiceError::Headless(_) => service_error_metadata(error, None).message().to_string(),
     }
 }
 
@@ -1925,14 +1928,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn headless_child_messages_are_redacted_from_legacy_rest_errors() {
+        let (_, body) = api_error_body(ApiError::Service(ServiceError::Headless(
+            crate::headless::HeadlessError::Remote {
+                code: "synthetic_failure".into(),
+                message: "PRIVATE_CHILD_MESSAGE_AND_PATH".into(),
+            },
+        )))
+        .await;
+        assert!(!body.to_string().contains("PRIVATE_CHILD_MESSAGE_AND_PATH"));
+        assert_eq!(body["error"], body["message"]);
+    }
+
+    #[tokio::test]
+    async fn retry_after_header_matches_busy_recovery_and_circuit_metadata() {
+        for error in [
+            crate::headless::HeadlessError::Busy,
+            crate::headless::HeadlessError::Unavailable,
+            crate::headless::HeadlessError::CircuitPaused {
+                retry_after_seconds: 17,
+            },
+        ] {
+            let response = ApiError::Service(ServiceError::Headless(error)).into_response();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let header = response.headers()["retry-after"]
+                .to_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["retryAfterSeconds"], header);
+            assert_eq!(value["isRetryable"], true);
+        }
+    }
+
+    #[tokio::test]
     async fn metrics_expose_fixed_cardinality_headless_process_counters() {
         let mut status = VaultStore::new(10).status().await;
         status.headless_process = HeadlessProcessStatus {
             up: false,
+            busy: false,
             restart_count: 2,
             unexpected_exits: 3,
             circuit_open: true,
             recovery_attempts: 4,
+            retry_after_seconds: Some(12),
             last_exit_code: None,
             last_exit_signal: Some(9),
         };

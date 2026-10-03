@@ -5,7 +5,7 @@ server:
   id: obts_bridge_mcp
   name: obts-bridge-mcp
   instructions: >
-    Use this server when you need scoped agent access to the user's OBTS-synchronized Obsidian vault. Read tools include `_meta.sync_status` with `current` or `pending`, captured at read admission; `pending` means remote synchronization may lag while reads can remain available. An exact source mismatch is reported for that operation as retryable; it need not mean every unrelated read is unavailable. Unknown projection integrity or publication failure closes reads until reconciliation.
+    Use this server when you need scoped agent access to the user's OBTS-synchronized Obsidian vault. Read tools include `_meta.sync_status` with `current` or `pending`, captured at read admission; `pending` means remote synchronization may lag while reads can remain available. An exact source mismatch is reported for that operation as retryable; it need not mean every unrelated read is unavailable. Unknown projection integrity or publication failure closes reads until reconciliation. Foreground writes retain their queue position for a configurable admission budget (120 seconds by default). Use `get_status` to distinguish healthy/busy headless work from recovery or a paused circuit; it stays authenticated and available during degraded readiness. Error text and structured data include suggested retry polling delays, not promises of completion.
 
 resources:
   - id: tooling_catalog
@@ -29,6 +29,14 @@ resourceTemplates:
 
 
 tools:
+  - id: get_status
+    name: get_status
+    description: "Report authenticated operational readiness (`ok` or `degraded`), dependency states, and headless status (`healthy`, `busy`, `recovering`, `circuit_paused`, `not_paired`, or `disabled`), including a suggested retry delay and the foreground admission timeout. Available even without content capabilities or during degraded readiness; excludes vault content, paths, counts, and global context/configuration details. Example: `{}`."
+    inputSchema:
+      type: object
+      additionalProperties: false
+      properties: {}
+
   - id: query_notes
     name: query_notes
     description: "Filter and rank visible indexed Markdown notes. Example: `{ \"tags_all\": [\"project\"], \"sort_by\": \"updated_at\", \"sort_order\": \"desc\" }` lists notes carrying the exact case-sensitive tag; add `text_query` and `search_mode: \"hybrid\"` for ranked search. Use `semantic`, `fulltext`, or `hybrid`, and combine tag/time/frontmatter/path/title filters. Empty `notes` means no visible matches after filters; limit defaults to 20 and caps at 500. Use result `id` with `get_vault_file`; `heading_title` is display-only."

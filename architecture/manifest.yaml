@@ -1,7 +1,7 @@
 schema_version: 1
-revision: 41
+revision: 42
 status: current
-updated: 2026-10-02
+updated: 2026-10-03
 authoritative_artifacts:
   - architecture/manifest.yaml
   - architecture/README.md
@@ -139,5 +139,12 @@ formal_models:
     architecture_revision: 40
     checks: architecture/models/formal/checks-fm010.json
     refines:
+      - OBTS-BRG-READ-001
+  - id: OBTS-FM-012
+    status: focused bounded model
+    path: architecture/models/formal/OBTSBridgeWriteAdmission.tla
+    architecture_revision: 42
+    refines:
+      - OBTS-BRG-WRITE-001
       - OBTS-BRG-READ-001
 

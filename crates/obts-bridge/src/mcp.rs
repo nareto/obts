@@ -875,7 +875,7 @@ fn tool_definitions_for_capabilities(capabilities: ContextToolCapabilities) -> V
         .filter(|tool| {
             required_capability_for_tool(&tool.name)
                 .map(|required| capabilities.allows(required))
-                .unwrap_or(false)
+                .unwrap_or(tool.name == "get_status")
         })
         .collect()
 }
@@ -968,6 +968,18 @@ async fn execute_tool_call(
     arguments: &Value,
 ) -> Result<ToolValue, McpError> {
     match tool_name {
+        "get_status" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct StatusArguments {}
+            serde_json::from_value::<StatusArguments>(arguments.clone()).map_err(|error| {
+                McpError::InvalidArguments {
+                    tool: tool_name.into(),
+                    message: error.to_string(),
+                }
+            })?;
+            to_tool_value(state.service.operational_status().await)
+        }
         "get_vault_file" => {
             let id = required_string(arguments, "id")?;
             let file = state
@@ -1699,7 +1711,8 @@ fn load_mcp_definition_file() -> McpDefinitionFile {
 fn supported_tool_name(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "get_vault_file"
+        "get_status"
+            | "get_vault_file"
             | "query_notes"
             | "query_base"
             | "get_neighbors"
@@ -2083,6 +2096,124 @@ mod tests {
         let rotated = state.authorize(&headers).await.expect("rotated context");
         assert_eq!(rotated.context.as_str(), "admin");
         assert_eq!(rotated.principal.as_str(), "mcp_token:agent");
+    }
+
+    #[test]
+    fn status_tool_is_available_without_content_capabilities() {
+        let tools =
+            super::tool_definitions_for_capabilities(super::ContextToolCapabilities::default());
+        assert!(tools.iter().any(|tool| tool.name == "get_status"));
+        assert!(!tools.iter().any(|tool| tool.name == "get_vault_file"));
+    }
+
+    #[tokio::test]
+    async fn status_tool_stays_authenticated_redacted_and_available_during_recovery() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let directory = tempdir().unwrap();
+        let token_file = directory.path().join("locked.txt");
+        std::fs::write(&token_file, "synthetic-status-token").unwrap();
+        let store = VaultStore::new(10);
+        store
+            .set_authorization_config(BTreeMap::from([(
+                "locked".into(),
+                crate::authorization::AccessPolicy::default(),
+            )]))
+            .await;
+        let child_dir = tempdir().unwrap();
+        let headless = crate::headless::test_support::spawn_scripted_client(
+            child_dir.path(),
+            true,
+            "read -r _\nsleep 5",
+            1,
+        )
+        .await;
+        crate::headless::test_support::quarantine_by_timeout(&headless).await;
+        let mut service = VaultBridgeService::new_for_tests(store);
+        service.headless = Some(headless.clone());
+        let state = McpState::new(
+            service,
+            None,
+            Some(token_file),
+            None,
+            BTreeMap::from([(
+                "locked".into(),
+                McpTokenConfig {
+                    context: "locked".into(),
+                },
+            )]),
+        )
+        .unwrap();
+        let app = super::app_router(state);
+        for token in [None, Some("wrong-token"), Some("synthetic-status-token")] {
+            let mut request = Request::post("/mcp").header("content-type", "application/json");
+            if let Some(token) = token {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            let response = app.clone().oneshot(request.body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#)).unwrap()).await.unwrap();
+            if token != Some("synthetic-status-token") {
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                continue;
+            }
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["result"]["isError"], false);
+            let status = &value["result"]["structuredContent"];
+            assert_eq!(status["readiness"], "degraded");
+            assert_eq!(status["headless"]["status"], "recovering");
+            assert_eq!(status["headless"]["retryAfterSeconds"], 2);
+            assert_eq!(status.as_object().unwrap().len(), 3);
+            assert!(status.get("context_stats").is_none());
+            assert!(status.get("config_reload").is_none());
+            assert!(status.get("index").is_none());
+        }
+        crate::headless::test_support::pause_circuit(&headless);
+        let response = app.oneshot(Request::post("/mcp").header("content-type", "application/json").header("authorization", "Bearer synthetic-status-token").body(Body::from(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#)).unwrap()).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["result"]["structuredContent"]["headless"]["status"],
+            "circuit_paused"
+        );
+        assert!(
+            value["result"]["structuredContent"]["headless"]["retryAfterSeconds"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+    }
+
+    #[tokio::test]
+    async fn error_text_and_structured_retry_hints_agree() {
+        use http_body_util::BodyExt;
+        for error in [
+            crate::headless::HeadlessError::Busy,
+            crate::headless::HeadlessError::Unavailable,
+            crate::headless::HeadlessError::CircuitPaused {
+                retry_after_seconds: 17,
+            },
+        ] {
+            let metadata = crate::error_metadata::service_error_metadata(
+                &crate::service::ServiceError::Headless(error),
+                Some("edit_vault_file"),
+            );
+            let seconds = metadata.retry_after_seconds().unwrap();
+            let response = super::tool_error_response(Some(json!(1)), metadata);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["result"]["isError"], true);
+            assert_eq!(
+                value["result"]["structuredContent"]["retryAfterSeconds"],
+                seconds
+            );
+            assert!(
+                value["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("{seconds} second(s)"))
+            );
+        }
     }
 
     #[test]

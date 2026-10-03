@@ -29,10 +29,13 @@ impl Fixture {
             .connect(&url)
             .await
             .expect("synthetic PostgreSQL must be available; this test never silently skips");
+        // A clock sample alone can collide across parallel test threads.
+        static NEXT_DATABASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let database = format!(
-            "bounded_{}_{}",
+            "bounded_{}_{}_{}",
             std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap()
+            Utc::now().timestamp_nanos_opt().unwrap(),
+            NEXT_DATABASE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         sqlx::query(&format!("CREATE DATABASE {database}"))
             .execute(&admin_pool)
@@ -130,6 +133,218 @@ fn reader() -> AuthContext {
     AuthContext::new(ContextName::new("reader"), "synthetic-reader".to_string())
 }
 
+async fn successful_headless(directory: &std::path::Path) -> crate::headless::HeadlessClient {
+    crate::headless::test_support::spawn_scripted_client(
+        directory,
+        true,
+        r#"while read -r request; do
+  ID=$(printf '%s' "$request" | sed 's/.*"id":\([0-9]*\).*/\1/')
+  printf '{"type":"response","id":%s,"ok":true,"result":{}}\n' "$ID"
+done"#,
+        1,
+    )
+    .await
+}
+
+fn edit_request(revision: String) -> UpdateNoteRequest {
+    UpdateNoteRequest {
+        content: Some("# Updated\n\nEdited body.\n".into()),
+        content_patch: None,
+        tags: None,
+        metadata: None,
+        expected_revision: Some(revision),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires synthetic PostgreSQL; run explicitly with --ignored"]
+async fn postgres_create_then_edit_waits_for_healthy_maintenance() {
+    let mut f = Fixture::new().await;
+    f.project().await;
+    let scripts = tempfile::tempdir().unwrap();
+    let headless = successful_headless(scripts.path()).await;
+    f.service.headless = Some(headless.clone());
+    let created = f
+        .service
+        .create_vault_file(
+            &admin(),
+            crate::new_note::NewNoteRequest {
+                title: "Admission regression".into(),
+                content: "# Original\n\nBefore edit.\n".into(),
+                template_id: None,
+                file_type: crate::new_note::NewNoteFileType::Md,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.local_projection, "applied");
+    let original = f
+        .service
+        .get_vault_file(&admin(), &created.id)
+        .await
+        .unwrap();
+    let original_bytes = original.content.clone();
+    let revision = original.revision.clone();
+    drop(original);
+    let held = headless.lock_filesystem().await.unwrap();
+    let service = f.service.clone();
+    let id = created.id.clone();
+    let edit = tokio::spawn(async move {
+        service
+            .edit_vault_file(&admin(), &id, edit_request(revision))
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    assert!(
+        !edit.is_finished(),
+        "healthy maintenance must not evict the queued writer after two seconds"
+    );
+    let read = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        f.service.get_vault_file(&admin(), &created.id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(read.content, original_bytes);
+    drop(read);
+    drop(held);
+    let updated = tokio::time::timeout(std::time::Duration::from_secs(3), edit)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let after = f
+        .service
+        .get_vault_file(&admin(), &created.id)
+        .await
+        .unwrap();
+    assert!(after.content.contains("Edited body."));
+    assert_eq!(updated.revision, after.revision);
+    assert!(headless.is_available());
+    drop(after);
+    f.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires synthetic PostgreSQL; run explicitly with --ignored"]
+async fn postgres_queued_writers_share_deadline_and_cancel_safely() {
+    let mut f = Fixture::new().await;
+    std::fs::write(f.root.path().join("Queued.md"), "# Original\n").unwrap();
+    f.project().await;
+    let scripts = tempfile::tempdir().unwrap();
+    let headless = successful_headless(scripts.path()).await;
+    f.service.headless = Some(headless.clone());
+    f.service = f
+        .service
+        .clone()
+        .with_foreground_write_timeout(std::time::Duration::from_secs(1));
+    let revision = f
+        .service
+        .get_vault_file(&admin(), &NoteId::new("Queued.md"))
+        .await
+        .unwrap()
+        .revision;
+    let held = headless.lock_filesystem().await.unwrap();
+    let service = f.service.clone();
+    let rev = revision.clone();
+    let first = tokio::spawn(async move {
+        service
+            .edit_vault_file(&admin(), &NoteId::new("Queued.md"), edit_request(rev))
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let service = f.service.clone();
+    let rev = revision.clone();
+    let second_started = std::time::Instant::now();
+    let second = tokio::spawn(async move {
+        service
+            .edit_vault_file(&admin(), &NoteId::new("Queued.md"), edit_request(rev))
+            .await
+    });
+    for result in [first, second] {
+        let error = tokio::time::timeout(std::time::Duration::from_millis(1500), result)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::service::ServiceError::Headless(crate::headless::HeadlessError::Busy)
+        ));
+    }
+    assert!(
+        second_started.elapsed() < std::time::Duration::from_millis(1400),
+        "second writer must not restart its budget at the headless mutex"
+    );
+    let service = f.service.clone();
+    let waiting = tokio::spawn(async move {
+        service
+            .edit_vault_file(&admin(), &NoteId::new("Queued.md"), edit_request(revision))
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!waiting.is_finished());
+    waiting.abort();
+    assert!(waiting.await.unwrap_err().is_cancelled());
+    assert!(headless.is_available());
+    assert_eq!(
+        std::fs::read_to_string(f.root.path().join("Queued.md")).unwrap(),
+        "# Original\n"
+    );
+    drop(held);
+    f.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires synthetic PostgreSQL; run explicitly with --ignored"]
+async fn postgres_revision_changed_during_admission_is_rejected() {
+    let mut f = Fixture::new().await;
+    std::fs::write(f.root.path().join("Stale.md"), "# Before\n").unwrap();
+    f.project().await;
+    let scripts = tempfile::tempdir().unwrap();
+    let headless = successful_headless(scripts.path()).await;
+    f.service.headless = Some(headless.clone());
+    let revision = f
+        .service
+        .get_vault_file(&admin(), &NoteId::new("Stale.md"))
+        .await
+        .unwrap()
+        .revision;
+    let held = headless.lock_filesystem().await.unwrap();
+    let service = f.service.clone();
+    let waiting = tokio::spawn(async move {
+        service
+            .edit_vault_file(&admin(), &NoteId::new("Stale.md"), edit_request(revision))
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!waiting.is_finished());
+    // Simulated Node apply owns the same guard while changing source/projection.
+    std::fs::write(
+        f.root.path().join("Stale.md"),
+        "# Newer background content\n",
+    )
+    .unwrap();
+    f.project().await;
+    drop(held);
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::service::ServiceError::Write(crate::new_note::WriteError::RevisionMismatch)
+    ));
+    assert_eq!(
+        std::fs::read_to_string(f.root.path().join("Stale.md")).unwrap(),
+        "# Newer background content\n"
+    );
+    assert!(headless.is_available());
+    f.cleanup().await;
+}
+
 #[tokio::test]
 #[ignore = "requires synthetic PostgreSQL; run explicitly with --ignored"]
 async fn root_ignore_removes_stale_sql_projection_without_touching_file() {
@@ -197,9 +412,7 @@ async fn postgres_foreground_read_completes_while_shared_headless_lock_is_held()
     .unwrap();
     f.project().await;
     let script_dir = tempfile::tempdir().unwrap();
-    let headless =
-        crate::headless::test_support::spawn_scripted_client(script_dir.path(), true, "sleep 5", 1)
-            .await;
+    let headless = successful_headless(script_dir.path()).await;
     f.service.headless = Some(headless.clone());
     let held = headless.lock_filesystem().await.unwrap();
     let note = tokio::time::timeout(
@@ -211,30 +424,50 @@ async fn postgres_foreground_read_completes_while_shared_headless_lock_is_held()
     .unwrap();
     assert!(note.content.contains("Readable body"));
     drop(note);
-    let started = std::time::Instant::now();
+    let expected_revision = f
+        .service
+        .get_note(&reader(), &NoteId::new("Visible.md"))
+        .await
+        .unwrap()
+        .revision;
+    let writer_service = f.service.clone();
     let writer_auth = admin();
     let writer_id = NoteId::new("Visible.md");
-    let writer = f.service.update_note(
-        &writer_auth,
-        &writer_id,
-        UpdateNoteRequest {
-            content: Some("# Visible\n\nUpdated body.\n".into()),
-            content_patch: None,
-            tags: None,
-            metadata: None,
-            expected_revision: None,
-        },
-    );
-    assert!(matches!(
-        tokio::time::timeout(std::time::Duration::from_millis(2500), writer)
+    let writer = tokio::spawn(async move {
+        writer_service
+            .update_note(
+                &writer_auth,
+                &writer_id,
+                UpdateNoteRequest {
+                    content: Some("# Visible\n\nUpdated body.\n".into()),
+                    content_patch: None,
+                    tags: None,
+                    metadata: None,
+                    expected_revision: Some(expected_revision),
+                },
+            )
             .await
-            .expect("writer admission must be bounded"),
-        Err(crate::service::ServiceError::Headless(
-            crate::headless::HeadlessError::Busy
-        ))
-    ));
-    assert!(started.elapsed() < std::time::Duration::from_millis(2500));
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    assert!(
+        !writer.is_finished(),
+        "writer should retain admission while maintenance holds the guard"
+    );
+    let during_wait = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        f.service.get_note(&reader(), &NoteId::new("Visible.md")),
+    )
+    .await
+    .expect("read must not wait behind the queued writer")
+    .unwrap();
+    assert!(during_wait.content.contains("Readable body"));
+    drop(during_wait);
     drop(held);
+    tokio::time::timeout(std::time::Duration::from_secs(3), writer)
+        .await
+        .expect("writer should proceed after healthy maintenance releases ownership")
+        .expect("writer task should complete")
+        .expect("revision-bound write should succeed");
     f.cleanup().await;
 }
 
@@ -321,6 +554,22 @@ async fn postgres_transport_freshness_and_failclosed_contracts() {
     let tool_json: serde_json::Value = serde_json::from_slice(&tool_body).unwrap();
     assert_eq!(tool_json["result"]["_meta"]["sync_status"], "pending");
 
+    let operational = app.clone().oneshot(
+        Request::post("/mcp").header("authorization", "Bearer mcp-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#)).unwrap(),
+    ).await.unwrap();
+    let operational_body = operational.into_body().collect().await.unwrap().to_bytes();
+    let operational_json: serde_json::Value = serde_json::from_slice(&operational_body).unwrap();
+    assert_eq!(
+        operational_json["result"]["structuredContent"]["headless"]["status"],
+        "busy"
+    );
+    assert_eq!(
+        operational_json["result"]["structuredContent"]["readiness"], "ok",
+        "healthy busy sync is not degraded readiness"
+    );
+
     let mcp_resource = app.clone().oneshot(
         Request::post("/mcp")
             .header("authorization", "Bearer mcp-secret")
@@ -357,6 +606,30 @@ async fn postgres_transport_freshness_and_failclosed_contracts() {
     assert!(started.elapsed() < std::time::Duration::from_millis(200));
     drop(projection);
 
+    f.service.filesystem.as_ref().unwrap().mark_dirty();
+    let projection_status = app.clone().oneshot(
+        Request::post("/mcp").header("authorization", "Bearer mcp-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#)).unwrap(),
+    ).await.unwrap();
+    let projection_body = projection_status
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let projection_json: serde_json::Value = serde_json::from_slice(&projection_body).unwrap();
+    assert_eq!(projection_json["result"]["isError"], false);
+    assert_eq!(
+        projection_json["result"]["structuredContent"]["readiness"],
+        "degraded"
+    );
+    assert_eq!(
+        projection_json["result"]["structuredContent"]["dependencies"]["headless_vault"],
+        "index_catching_up"
+    );
+    f.project().await;
+
     std::fs::write(
         f.root.path().join("Visible.md"),
         "# Changed outside bridge\\n",
@@ -392,6 +665,27 @@ async fn postgres_transport_freshness_and_failclosed_contracts() {
     );
 
     f.service.store.db().pool.close().await;
+    let unavailable_status = app.clone().oneshot(
+        Request::post("/mcp").header("authorization", "Bearer mcp-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#)).unwrap(),
+    ).await.unwrap();
+    let unavailable_body = unavailable_status
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let unavailable_json: serde_json::Value = serde_json::from_slice(&unavailable_body).unwrap();
+    assert_eq!(unavailable_json["result"]["isError"], false);
+    assert_eq!(
+        unavailable_json["result"]["structuredContent"]["readiness"],
+        "degraded"
+    );
+    assert_eq!(
+        unavailable_json["result"]["structuredContent"]["dependencies"]["postgres"],
+        "unavailable"
+    );
     let db_unavailable = app
         .oneshot(Request::get("/health/ready").body(Body::empty()).unwrap())
         .await

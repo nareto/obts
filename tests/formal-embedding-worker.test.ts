@@ -68,6 +68,7 @@ describe('FM003 embedding-worker companion gate', () => {
       'node scripts/check-deletion-model.mjs',
       'node scripts/check-bridge-external-protocol.mjs',
       'node scripts/check-bridge-read-availability.mjs',
+      'node scripts/check-bridge-write-admission-model.mjs',
       'node scripts/check-onboarding-model.mjs',
       'node scripts/check-onboarding-recovery-model.mjs',
       'node scripts/check-diagnostic-admission-model.mjs',
@@ -79,9 +80,12 @@ describe('FM003 embedding-worker companion gate', () => {
       'node scripts/check-bridge-bounded-model.mjs',
       'node scripts/check-bridge-bounded-model.mjs --worker-companion',
       'node scripts/check-bridge-external-protocol.mjs',
-      'node scripts/check-bridge-read-availability.mjs'
+      'node scripts/check-bridge-read-availability.mjs',
+      'node scripts/check-bridge-write-admission-model.mjs'
     ]);
     expect(scripts['test:formal:bridge-body']).toContain('node scripts/check-bridge-read-availability.mjs');
+    expect(scripts['test:formal:bridge-body']).toContain('node scripts/check-bridge-write-admission-model.mjs');
+    expect(scripts['test:formal:metadata']).toContain('node scripts/check-bridge-write-admission-model.mjs --validate-only');
     expect(scripts['test:formal:vault-settings']).toBe('node scripts/check-vault-settings-model.mjs');
     expect(scripts['test:formal:onboarding']).toBe('node scripts/check-onboarding-model.mjs && node scripts/check-onboarding-recovery-model.mjs');
     expect(scripts['test:bridge:stack']).toContain('node scripts/check-bridge-stack.mjs');
@@ -95,6 +99,14 @@ describe('FM003 embedding-worker companion gate', () => {
     expect(workflow).not.toContain('  push:');
     expect(coordinator).toContain('VITEST_GROUP=checker npx vitest run');
     expect(coordinator).toContain('npm run test:formal:metadata');
+  });
+
+  it('validates the write-admission positive, terminal witness and negative-control matrix', () => {
+    const result = spawnSync(process.execPath, [join(root, 'scripts/check-bridge-write-admission-model.mjs'), '--validate-only'], {
+      cwd: root, encoding: 'utf8', env: process.env
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain('11 required checks');
   });
 
   it('rejects a removed required check', () => {

@@ -152,6 +152,7 @@ pub struct ClientConfig {
     #[serde(rename = "projection_max_text_bytes", default)]
     pub legacy_projection_max_text_bytes: Option<u64>,
     pub request_inactivity_timeout_seconds: u64,
+    pub foreground_write_timeout_seconds: u64,
     pub restart_failure_window_seconds: u64,
     pub restart_max_failures: u32,
     pub restart_recovery_cooldown_seconds: u64,
@@ -175,6 +176,7 @@ impl Default for ClientConfig {
             projection_batch_bytes: 8 * 1024 * 1024,
             legacy_projection_max_text_bytes: None,
             request_inactivity_timeout_seconds: 5 * 60,
+            foreground_write_timeout_seconds: 120,
             restart_failure_window_seconds: 15 * 60,
             restart_max_failures: 3,
             restart_recovery_cooldown_seconds: 5 * 60,
@@ -225,6 +227,11 @@ impl ClientConfig {
         if self.request_inactivity_timeout_seconds == 0 {
             return Err(ConfigError::InvalidClient(
                 "client.request_inactivity_timeout_seconds must be at least 1".to_string(),
+            ));
+        }
+        if self.foreground_write_timeout_seconds == 0 {
+            return Err(ConfigError::InvalidClient(
+                "client.foreground_write_timeout_seconds must be at least 1".to_string(),
             ));
         }
         if self.projection_batch_rows == 0 {
@@ -985,6 +992,7 @@ mod tests {
         assert_eq!(config.client.projection_batch_rows, 128);
         assert_eq!(config.client.projection_batch_bytes, 8 * 1024 * 1024);
         assert_eq!(config.client.request_inactivity_timeout_seconds, 5 * 60);
+        assert_eq!(config.client.foreground_write_timeout_seconds, 120);
     }
 
     #[test]
@@ -999,6 +1007,21 @@ mod tests {
         let error = AppConfig::load_from_path(file.path()).expect_err("zero timeout must fail");
         assert!(
             matches!(error, ConfigError::InvalidClient(message) if message.contains("request_inactivity_timeout_seconds"))
+        );
+    }
+
+    #[test]
+    fn rejects_zero_foreground_write_timeout() {
+        let mut file = NamedTempFile::new().expect("temp file");
+        writeln!(
+            file,
+            "client:\n  foreground_write_timeout_seconds: 0\ncontexts:\n  smoke:\n    read: []\n    create: []\n    edit: []\n"
+        )
+        .expect("write config");
+
+        let error = AppConfig::load_from_path(file.path()).expect_err("zero timeout must fail");
+        assert!(
+            matches!(error, ConfigError::InvalidClient(message) if message.contains("foreground_write_timeout_seconds"))
         );
     }
 

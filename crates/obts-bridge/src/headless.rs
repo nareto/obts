@@ -95,6 +95,7 @@ struct HeadlessRuntimeState {
     unexpected_exits: u64,
     circuit_open: bool,
     recovery_attempts: u64,
+    recovery_deadline: Option<Instant>,
     last_counted_exit_pid: Option<u32>,
     last_exit_code: Option<i32>,
     last_exit_signal: Option<i32>,
@@ -363,6 +364,14 @@ impl HeadlessClient {
             unexpected_exits: runtime.unexpected_exits,
             circuit_open: runtime.circuit_open,
             recovery_attempts: runtime.recovery_attempts,
+            busy: self.filesystem_busy(),
+            retry_after_seconds: runtime.recovery_deadline.map(|deadline| {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                remaining
+                    .as_secs()
+                    .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+                    .max(1)
+            }),
             last_exit_code: runtime.last_exit_code,
             last_exit_signal: runtime.last_exit_signal,
         }
@@ -387,12 +396,14 @@ impl HeadlessClient {
         {
             let mut runtime = self.runtime.write().expect("headless runtime lock");
             runtime.recovery_attempts = runtime.recovery_attempts.saturating_add(1);
+            runtime.recovery_deadline = None;
         }
         self.restart().await?;
         {
             let mut runtime = self.runtime.write().expect("headless runtime lock");
             if runtime.circuit_open {
                 runtime.circuit_open = false;
+                runtime.recovery_deadline = None;
                 runtime.failures.clear();
             }
         }
@@ -425,20 +436,50 @@ impl HeadlessClient {
     pub async fn lock_foreground_write(
         &self,
     ) -> Result<HeadlessFilesystemGuard<'_>, HeadlessError> {
-        timeout(Duration::from_secs(2), self.lock_filesystem())
-            .await
-            .map_err(|_| HeadlessError::Busy)?
+        self.lock_foreground_write_until(
+            tokio::time::Instant::now()
+                + Duration::from_secs(self.config.foreground_write_timeout_seconds.max(1)),
+        )
+        .await
+    }
+
+    pub async fn lock_foreground_write_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<HeadlessFilesystemGuard<'_>, HeadlessError> {
+        self.lock_filesystem_until(deadline).await
+    }
+
+    pub(crate) fn availability_error(&self) -> HeadlessError {
+        let status = self.runtime_status();
+        match status.retry_after_seconds.filter(|_| status.circuit_open) {
+            Some(retry_after_seconds) => HeadlessError::CircuitPaused {
+                retry_after_seconds,
+            },
+            None => HeadlessError::Unavailable,
+        }
     }
 
     pub async fn lock_filesystem(&self) -> Result<HeadlessFilesystemGuard<'_>, HeadlessError> {
-        if !self.healthy.load(Ordering::Acquire) {
-            return Err(HeadlessError::Unavailable);
+        self.lock_filesystem_until(tokio::time::Instant::now() + self.inactivity_timeout())
+            .await
+    }
+
+    async fn lock_filesystem_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<HeadlessFilesystemGuard<'_>, HeadlessError> {
+        if !self.is_available() {
+            return Err(self.availability_error());
         }
-        let mut process = timeout(self.inactivity_timeout(), self.inner.lock())
+        if tokio::time::Instant::now() >= deadline {
+            return Err(HeadlessError::Busy);
+        }
+        let mut process = tokio::time::timeout_at(deadline, self.inner.lock())
             .await
             .map_err(|_| HeadlessError::Busy)?;
-        if !self.healthy.load(Ordering::Acquire) {
-            return Err(HeadlessError::Unavailable);
+        if !self.is_available() {
+            return Err(self.availability_error());
         }
         match process.child.try_wait() {
             Ok(None) => Ok(HeadlessFilesystemGuard { process }),
@@ -481,7 +522,7 @@ impl HeadlessClient {
             .circuit_open
             || !self.healthy.load(Ordering::Acquire)
         {
-            return Err(HeadlessError::Unavailable);
+            return Err(self.availability_error());
         }
         let result = self.request_inner(command, arguments).await;
         match result {
@@ -568,6 +609,8 @@ fn register_failure(
     }
     if runtime.failures.len() >= config.restart_max_failures as usize {
         runtime.circuit_open = true;
+        runtime.recovery_deadline =
+            Some(now + Duration::from_secs(config.restart_recovery_cooldown_seconds.max(1)));
         return None;
     }
     let exponent = runtime.failures.len().saturating_sub(1).min(10) as u32;
@@ -954,33 +997,34 @@ pub fn spawn_maintenance(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let cooldown = Duration::from_secs(client.recovery_cooldown_seconds());
-        let mut next_recovery_at: Option<Instant> = None;
         loop {
             if client.runtime_status().circuit_open {
                 let now = Instant::now();
-                let due = match next_recovery_at {
-                    Some(due) => due,
-                    None => {
-                        let due = now + cooldown;
-                        next_recovery_at = Some(due);
-                        due
-                    }
+                let due = {
+                    let mut runtime = client.runtime.write().expect("headless runtime lock");
+                    *runtime.recovery_deadline.get_or_insert(now + cooldown)
                 };
                 if now >= due {
                     match client.recover_circuit().await {
-                        Ok(_) => {
-                            next_recovery_at = None;
-                        }
+                        Ok(_) => {}
                         Err(error) => {
                             warn!(error = %error, "headless circuit recovery failed");
-                            next_recovery_at = Some(now + cooldown);
+                            client
+                                .runtime
+                                .write()
+                                .expect("headless runtime lock")
+                                .recovery_deadline = Some(now + cooldown);
                         }
                     }
                 }
                 sleep(interval).await;
                 continue;
             }
-            next_recovery_at = None;
+            client
+                .runtime
+                .write()
+                .expect("headless runtime lock")
+                .recovery_deadline = None;
             match client.request("maintenance-tick", Value::Null).await {
                 Ok(result) => {
                     let applied = result.get("applied").and_then(Value::as_bool) == Some(true);
@@ -1146,6 +1190,10 @@ pub enum HeadlessError {
     Protocol(String),
     #[error("headless command timed out")]
     Timeout,
+    #[error(
+        "headless restart circuit is paused; next recovery check in {retry_after_seconds} seconds"
+    )]
+    CircuitPaused { retry_after_seconds: u64 },
     #[error("headless process is unavailable pending restart")]
     Unavailable,
     #[error("headless command failed ({code}): {message}")]
@@ -1230,6 +1278,13 @@ pub(crate) mod test_support {
         HeadlessClient::spawn(&config)
             .await
             .expect("spawn scripted headless child")
+    }
+
+    pub(crate) fn pause_circuit(client: &HeadlessClient) {
+        for _ in 0..client.config.restart_max_failures {
+            client.register_process_failure(&HeadlessError::Unavailable);
+        }
+        assert!(client.runtime_status().circuit_open);
     }
 
     /// Quarantine a scripted child whose body stays silent after reading one
@@ -1914,6 +1969,58 @@ sleep 5"#,
         super::test_support::quarantine_by_timeout(&client).await;
 
         assert!(client.is_paired(), "quarantine is not unpairing");
+        assert!(!client.is_available());
+    }
+
+    #[tokio::test]
+    async fn admission_timeout_and_cancel_do_not_quarantine_healthy_owner() {
+        let directory = tempdir().unwrap();
+        let client = super::test_support::spawn_scripted_client(
+            directory.path(),
+            true,
+            "while read -r _; do :; done",
+            1,
+        )
+        .await;
+        let held = client.lock_filesystem().await.unwrap();
+        let error = client
+            .lock_foreground_write_until(tokio::time::Instant::now() + Duration::from_millis(50))
+            .await
+            .err()
+            .expect("bounded wait must expire");
+        assert!(matches!(error, HeadlessError::Busy));
+        assert!(client.is_available());
+        let waiting_client = client.clone();
+        let waiting =
+            tokio::spawn(async move { waiting_client.lock_foreground_write().await.is_ok() });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished());
+        waiting.abort();
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        assert!(client.is_available());
+        drop(held);
+        assert!(client.lock_foreground_write().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn paused_circuit_errors_and_status_share_supervisor_cooldown() {
+        let directory = tempdir().unwrap();
+        let client = super::test_support::spawn_scripted_client(
+            directory.path(),
+            true,
+            "while read -r _; do :; done",
+            1,
+        )
+        .await;
+        super::test_support::pause_circuit(&client);
+        let status = client.runtime_status();
+        assert!(status.retry_after_seconds.is_some());
+        assert!(status.retry_after_seconds.unwrap() <= 300);
+        let error = client.lock_foreground_write().await.err().unwrap();
+        assert!(
+            matches!(error, HeadlessError::CircuitPaused { retry_after_seconds } if Some(retry_after_seconds) == status.retry_after_seconds)
+        );
+        assert!(client.is_paired());
         assert!(!client.is_available());
     }
 

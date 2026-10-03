@@ -98,12 +98,22 @@ impl ErrorMetadata {
         &self.message
     }
 
+    pub(crate) fn retry_after_seconds(&self) -> Option<u64> {
+        self.retry_after_seconds
+    }
+
     pub(crate) fn summary(&self) -> String {
-        format!(
+        let summary = format!(
             "{} error: {}",
             self.error_category.as_str(),
             self.description
-        )
+        );
+        match self.retry_after_seconds {
+            Some(seconds) => format!(
+                "{summary}. Suggested next check in {seconds} second(s); this delay is not a completion guarantee."
+            ),
+            None => summary,
+        }
     }
 }
 
@@ -157,11 +167,28 @@ pub(crate) fn service_error_metadata(
                 .with_http_status(400)
         }
         ServiceError::Write(error) => write_error_metadata(error),
+        ServiceError::Headless(crate::headless::HeadlessError::Busy) => ErrorMetadata::new(
+            ErrorCategory::Transient,
+            true,
+            "write admission busy",
+            "The write admission deadline expired while another operation held a required lock; call get_status and retry after the suggested polling delay",
+        )
+        .with_http_status(503)
+        .with_retry_after(1),
+        ServiceError::Headless(crate::headless::HeadlessError::CircuitPaused { retry_after_seconds }) => ErrorMetadata::new(
+            ErrorCategory::Transient,
+            true,
+            "headless recovery circuit paused",
+            "Automatic headless recovery is paused; call get_status after the remaining cooldown before retrying",
+        )
+        .with_http_status(503)
+        .with_retry_after(*retry_after_seconds)
+        .with_details(serde_json::json!({"reason": "circuit_paused"})),
         ServiceError::Headless(_) => ErrorMetadata::new(
             ErrorCategory::Transient,
             true,
-            "headless client unavailable",
-            "The headless OBTS client is temporarily unavailable or could not complete the operation; retry after its supervised recovery",
+            "headless client recovering",
+            "The headless client is unavailable or recovering; call get_status before retrying after the suggested polling delay",
         )
         .with_http_status(503)
         .with_retry_after(2),
@@ -319,6 +346,28 @@ mod tests {
         assert_eq!(value["isRetryable"], false);
         assert_eq!(value["httpStatus"], 409);
         assert_eq!(value["message"], "root ignore policy unavailable");
+    }
+
+    #[test]
+    fn busy_and_recovery_errors_are_distinct_and_suggest_polling() {
+        let busy = service_error_metadata(
+            &ServiceError::Headless(crate::headless::HeadlessError::Busy),
+            Some("edit_vault_file"),
+        );
+        let busy_value = serde_json::to_value(&busy).expect("serialize busy metadata");
+        assert_eq!(busy_value["message"], "write admission busy");
+        assert_eq!(busy_value["retryAfterSeconds"], 1);
+        assert!(busy.summary().contains("not a completion guarantee"));
+        assert!(!busy.summary().contains("path"));
+
+        let recovering = service_error_metadata(
+            &ServiceError::Headless(crate::headless::HeadlessError::Unavailable),
+            None,
+        );
+        let recovering_value =
+            serde_json::to_value(recovering).expect("serialize recovery metadata");
+        assert_eq!(recovering_value["message"], "headless client recovering");
+        assert_eq!(recovering_value["retryAfterSeconds"], 2);
     }
 
     #[test]

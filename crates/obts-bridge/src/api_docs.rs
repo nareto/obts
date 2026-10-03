@@ -718,18 +718,20 @@ pub(crate) fn openapi_spec() -> Value {
                         "postgres": {"type": "string", "enum": ["healthy", "unavailable", "disabled"]},
                         "couchdb": {"type": "string", "enum": ["healthy", "unavailable", "disabled"]},
                         "obts_client": {"type": "string", "enum": ["healthy", "not_paired", "unavailable", "circuit_open", "disabled"]},
-                        "headless_vault": {"type": "string", "enum": ["healthy", "index_catching_up", "disabled"]}
+                        "headless_vault": {"type": "string", "enum": ["healthy", "sync_pending", "index_catching_up", "disabled"]}
                     }
                 },
                 "HeadlessProcessStatus": {
                     "type": "object",
-                    "required": ["up", "restart_count", "unexpected_exits", "circuit_open"],
+                    "required": ["up", "busy", "restart_count", "unexpected_exits", "circuit_open"],
                     "properties": {
                         "up": {"type": "boolean"},
+                        "busy": {"type": "boolean", "description": "A headless/filesystem operation currently owns the shared mutex; this alone is not degraded readiness."},
                         "restart_count": {"type": "integer", "minimum": 0},
                         "unexpected_exits": {"type": "integer", "minimum": 0},
                         "circuit_open": {"type": "boolean"},
                         "recovery_attempts": {"type": "integer", "minimum": 0},
+                        "retryAfterSeconds": {"type": ["integer", "null"], "minimum": 1},
                         "last_exit_code": {"type": ["integer", "null"]},
                         "last_exit_signal": {"type": ["integer", "null"]}
                     }

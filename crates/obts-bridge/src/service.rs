@@ -52,6 +52,7 @@ pub struct VaultBridgeService {
     pub filesystem: Option<Arc<FilesystemSource>>,
     pub headless: Option<HeadlessClient>,
     vault_write_lock: Arc<Mutex<()>>,
+    foreground_write_timeout: std::time::Duration,
     vault_file_repair_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
 }
 
@@ -63,6 +64,7 @@ impl VaultBridgeService {
             filesystem: None,
             headless: None,
             vault_write_lock: Arc::new(Mutex::new(())),
+            foreground_write_timeout: std::time::Duration::from_secs(120),
             vault_file_repair_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -77,24 +79,37 @@ impl VaultBridgeService {
             filesystem: Some(filesystem),
             headless,
             vault_write_lock: Arc::new(Mutex::new(())),
+            foreground_write_timeout: std::time::Duration::from_secs(120),
             vault_file_repair_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    async fn write_guard(&self) -> Result<tokio::sync::MutexGuard<'_, ()>, ServiceError> {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.vault_write_lock.lock(),
-        )
-        .await
-        .map_err(|_| ServiceError::IndexCatchingUp)
+    fn write_deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + self.foreground_write_timeout
+    }
+
+    async fn write_guard(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>, ServiceError> {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ServiceError::Headless(HeadlessError::Busy));
+        }
+        tokio::time::timeout_at(deadline, self.vault_write_lock.lock())
+            .await
+            .map_err(|_| ServiceError::Headless(HeadlessError::Busy))
+    }
+
+    pub fn with_foreground_write_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.foreground_write_timeout = timeout.max(std::time::Duration::from_secs(1));
+        self
     }
 
     fn ensure_read_available(&self) -> Result<(), ServiceError> {
         if let Some(client) = self.headless.as_ref()
             && (!client.is_paired() || !client.is_available())
         {
-            return Err(ServiceError::Headless(HeadlessError::Unavailable));
+            return Err(ServiceError::Headless(client.availability_error()));
         }
         if self.store.uses_sql_backend()
             && self
@@ -108,6 +123,35 @@ impl VaultBridgeService {
         Ok(())
     }
 
+    pub async fn operational_status(&self) -> serde_json::Value {
+        let status = self.status().await;
+        let process = &status.headless_process;
+        let headless_status = match self.headless.as_ref() {
+            None => "disabled",
+            Some(_) if process.circuit_open && process.retry_after_seconds.is_some() => {
+                "circuit_paused"
+            }
+            Some(_) if !process.up => "recovering",
+            Some(client) if !client.is_paired() => "not_paired",
+            Some(_) if process.busy => "busy",
+            Some(_) => "healthy",
+        };
+        let retry_after_seconds = process.retry_after_seconds.or(match headless_status {
+            "busy" => Some(1),
+            "recovering" => Some(2),
+            _ => None,
+        });
+        serde_json::json!({
+            "readiness": status.status,
+            "dependencies": status.dependencies,
+            "headless": {
+                "status": headless_status,
+                "retryAfterSeconds": retry_after_seconds,
+                "admissionTimeoutSeconds": self.foreground_write_timeout.as_secs()
+            }
+        })
+    }
+
     pub fn ensure_index_current(&self) -> Result<(), ServiceError> {
         if let Some(client) = self.headless.as_ref() {
             if !client.is_paired() {
@@ -116,7 +160,7 @@ impl VaultBridgeService {
             // A quarantined, restarting or circuit-paused child is a transient
             // outage of a paired device, not a pairing problem.
             if !client.is_available() {
-                return Err(ServiceError::Headless(HeadlessError::Unavailable));
+                return Err(ServiceError::Headless(client.availability_error()));
             }
         }
         if self
@@ -468,7 +512,8 @@ impl VaultBridgeService {
         auth: &AuthContext,
         request: NewNoteRequest,
     ) -> Result<NewNoteResponse, ServiceError> {
-        let _vault_write_guard = self.write_guard().await?;
+        let deadline = self.write_deadline();
+        let _vault_write_guard = self.write_guard(deadline).await?;
         let now = Utc::now();
         let path = self
             .store
@@ -498,7 +543,7 @@ impl VaultBridgeService {
         let mut headless_guard = if let Some(headless) = self.headless.as_ref() {
             Some(
                 headless
-                    .lock_foreground_write()
+                    .lock_foreground_write_until(deadline)
                     .await
                     .map_err(ServiceError::Headless)?,
             )
@@ -536,9 +581,12 @@ impl VaultBridgeService {
         if self.store.uses_sql_backend() {
             return self.sql_update(auth, note_id, request, false).await;
         }
+        let deadline = self.write_deadline();
         let write_lock = self.vault_file_repair_lock(note_id.as_str()).await;
-        let _write_guard = write_lock.lock().await;
-        let _vault_write_guard = self.write_guard().await?;
+        let _write_guard = tokio::time::timeout_at(deadline, write_lock.lock())
+            .await
+            .map_err(|_| ServiceError::Headless(HeadlessError::Busy))?;
+        let _vault_write_guard = self.write_guard(deadline).await?;
         let filesystem = self.filesystem.as_ref().expect("filesystem source");
         let indexed = matches!(filesystem.is_path_ignored(note_id.as_str()), Ok(false))
             && match self.refresh_vault_file_for_write(auth, note_id).await {
@@ -575,7 +623,7 @@ impl VaultBridgeService {
         let mut headless_guard = if let Some(headless) = self.headless.as_ref() {
             Some(
                 headless
-                    .lock_foreground_write()
+                    .lock_foreground_write_until(deadline)
                     .await
                     .map_err(ServiceError::Headless)?,
             )
@@ -720,7 +768,8 @@ impl VaultBridgeService {
         auth: &AuthContext,
         request: NewNoteRequest,
     ) -> Result<NewNoteResponse, ServiceError> {
-        let _vault_write_guard = self.write_guard().await?;
+        let deadline = self.write_deadline();
+        let _vault_write_guard = self.write_guard(deadline).await?;
         let now = Utc::now();
         let path = self
             .store
@@ -750,7 +799,7 @@ impl VaultBridgeService {
         let mut headless_guard = if let Some(headless) = self.headless.as_ref() {
             Some(
                 headless
-                    .lock_foreground_write()
+                    .lock_foreground_write_until(deadline)
                     .await
                     .map_err(ServiceError::Headless)?,
             )
@@ -788,9 +837,12 @@ impl VaultBridgeService {
         if self.store.uses_sql_backend() {
             return self.sql_update(auth, file_id, request, true).await;
         }
+        let deadline = self.write_deadline();
         let write_lock = self.vault_file_repair_lock(file_id.as_str()).await;
-        let _write_guard = write_lock.lock().await;
-        let _vault_write_guard = self.write_guard().await?;
+        let _write_guard = tokio::time::timeout_at(deadline, write_lock.lock())
+            .await
+            .map_err(|_| ServiceError::Headless(HeadlessError::Busy))?;
+        let _vault_write_guard = self.write_guard(deadline).await?;
         let filesystem = self.filesystem.as_ref().expect("filesystem source");
         let indexed = matches!(filesystem.is_path_ignored(file_id.as_str()), Ok(false))
             && match self.refresh_vault_file_for_write(auth, file_id).await {
@@ -821,7 +873,7 @@ impl VaultBridgeService {
         let mut headless_guard = if let Some(headless) = self.headless.as_ref() {
             Some(
                 headless
-                    .lock_foreground_write()
+                    .lock_foreground_write_until(deadline)
                     .await
                     .map_err(ServiceError::Headless)?,
             )
@@ -859,11 +911,12 @@ impl VaultBridgeService {
         request: UpdateNoteRequest,
         raw: bool,
     ) -> Result<UpdateNoteResponse, ServiceError> {
-        let _write_guard = self.write_guard().await?;
+        let deadline = self.write_deadline();
+        let _write_guard = self.write_guard(deadline).await?;
         let mut headless_guard = if let Some(client) = &self.headless {
             Some(
                 client
-                    .lock_foreground_write()
+                    .lock_foreground_write_until(deadline)
                     .await
                     .map_err(ServiceError::Headless)?,
             )
@@ -1051,12 +1104,10 @@ impl VaultBridgeService {
                 .projection_lock
                 .try_read()
                 .map_err(|_| ServiceError::IndexCatchingUp)?;
-            if self
-                .headless
-                .as_ref()
-                .is_some_and(|client| !client.is_paired() || !client.is_available())
+            if let Some(client) = self.headless.as_ref()
+                && (!client.is_paired() || !client.is_available())
             {
-                return Err(ServiceError::Headless(HeadlessError::Unavailable));
+                return Err(ServiceError::Headless(client.availability_error()));
             }
             self.capture_read_sync_status();
             let file = source.read(file_id.as_str()).await.map_err(|error| {
@@ -1553,6 +1604,17 @@ mod obts_tests {
             service.get_vault_file(&admin, &NoteId::new(path)).await,
             Err(ServiceError::IndexCatchingUp)
         ));
+    }
+
+    #[tokio::test]
+    async fn operational_status_is_redacted_and_includes_admission_budget() {
+        let service = VaultBridgeService::new_for_tests(VaultStore::new(10))
+            .with_foreground_write_timeout(std::time::Duration::from_secs(7));
+        let status = service.operational_status().await;
+        assert_eq!(status["headless"]["status"], "disabled");
+        assert_eq!(status["headless"]["admissionTimeoutSeconds"], 7);
+        assert!(status.get("context_stats").is_none());
+        assert!(status.get("config_path").is_none());
     }
 
     #[tokio::test]

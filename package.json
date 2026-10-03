@@ -20,14 +20,14 @@
     "lint": "npm run check",
     "test": "npm run build && npm run build:plugin:check && npm run test:executable:built",
     "test:dashboard:browser": "node scripts/check-dashboard-browser.mjs",
-    "test:formal": "node scripts/check-formal-model.mjs && node scripts/check-bridge-bounded-model.mjs && node scripts/check-bridge-bounded-model.mjs --worker-companion && node scripts/check-deletion-model.mjs && node scripts/check-bridge-external-protocol.mjs && node scripts/check-bridge-read-availability.mjs && node scripts/check-onboarding-model.mjs && node scripts/check-onboarding-recovery-model.mjs && node scripts/check-diagnostic-admission-model.mjs && node scripts/check-client-state-model.mjs && node scripts/check-upload-recovery-model.mjs && node scripts/check-vault-settings-model.mjs",
+    "test:formal": "node scripts/check-formal-model.mjs && node scripts/check-bridge-bounded-model.mjs && node scripts/check-bridge-bounded-model.mjs --worker-companion && node scripts/check-deletion-model.mjs && node scripts/check-bridge-external-protocol.mjs && node scripts/check-bridge-read-availability.mjs && node scripts/check-bridge-write-admission-model.mjs && node scripts/check-onboarding-model.mjs && node scripts/check-onboarding-recovery-model.mjs && node scripts/check-diagnostic-admission-model.mjs && node scripts/check-client-state-model.mjs && node scripts/check-upload-recovery-model.mjs && node scripts/check-vault-settings-model.mjs",
     "test:formal:vault-settings": "node scripts/check-vault-settings-model.mjs",
     "test:formal:deletion": "node scripts/check-deletion-model.mjs",
     "test:formal:onboarding": "node scripts/check-onboarding-model.mjs && node scripts/check-onboarding-recovery-model.mjs",
-    "test:formal:bridge": "node scripts/check-bridge-bounded-model.mjs && node scripts/check-bridge-bounded-model.mjs --worker-companion && node scripts/check-bridge-external-protocol.mjs && node scripts/check-bridge-read-availability.mjs",
-    "test:formal:bridge-read": "node scripts/check-bridge-read-availability.mjs",
+    "test:formal:bridge": "node scripts/check-bridge-bounded-model.mjs && node scripts/check-bridge-bounded-model.mjs --worker-companion && node scripts/check-bridge-external-protocol.mjs && node scripts/check-bridge-read-availability.mjs && node scripts/check-bridge-write-admission-model.mjs",
+    "test:formal:bridge-read": "node scripts/check-bridge-read-availability.mjs && node scripts/check-bridge-write-admission-model.mjs",
     "test:formal:bridge-protocol": "node scripts/check-bridge-external-protocol.mjs",
-    "test:formal:bridge-body": "node scripts/check-bridge-bounded-model.mjs && node scripts/check-bridge-read-availability.mjs",
+    "test:formal:bridge-body": "node scripts/check-bridge-bounded-model.mjs && node scripts/check-bridge-read-availability.mjs && node scripts/check-bridge-write-admission-model.mjs",
     "test:formal:diagnostics": "node scripts/check-diagnostic-admission-model.mjs",
     "test:formal:client-state": "node scripts/check-client-state-model.mjs && node scripts/check-upload-recovery-model.mjs",
     "test:formal:workers": "node scripts/check-bridge-bounded-model.mjs --worker-companion",
@@ -43,7 +43,7 @@
     "test:plugin-focused": "npm run build && VITEST_GROUP=plugin vitest run",
     "test:dashboard-focused": "npm run build && VITEST_GROUP=dashboard vitest run",
     "test:formal:sync": "node scripts/check-formal-model.mjs",
-    "test:formal:metadata": "node scripts/check-formal-model.mjs --validate-only && node scripts/check-bridge-bounded-model.mjs --validate-only && node scripts/check-bridge-bounded-model.mjs --worker-companion --validate-only && node scripts/check-deletion-model.mjs --validate-only && node scripts/check-bridge-external-protocol.mjs --validate-only && node scripts/check-bridge-read-availability.mjs --validate-only && node scripts/check-onboarding-model.mjs --validate-only"
+    "test:formal:metadata": "node scripts/check-formal-model.mjs --validate-only && node scripts/check-bridge-bounded-model.mjs --validate-only && node scripts/check-bridge-bounded-model.mjs --worker-companion --validate-only && node scripts/check-deletion-model.mjs --validate-only && node scripts/check-bridge-external-protocol.mjs --validate-only && node scripts/check-bridge-read-availability.mjs --validate-only && node scripts/check-bridge-write-admission-model.mjs --validate-only && node scripts/check-onboarding-model.mjs --validate-only"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",

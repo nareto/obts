@@ -162,7 +162,10 @@ async fn main() -> anyhow::Result<()> {
             Duration::from_secs(config.client.scan_interval_seconds.max(1)),
         ));
     }
-    let service = VaultBridgeService::new_with_filesystem(store, filesystem, headless);
+    let service = VaultBridgeService::new_with_filesystem(store, filesystem, headless)
+        .with_foreground_write_timeout(Duration::from_secs(
+            config.client.foreground_write_timeout_seconds.max(1),
+        ));
     if let Some(handle) = spawn_embedding_worker(service.clone(), &config) {
         worker_handles.push(handle);
     }
