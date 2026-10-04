@@ -200,20 +200,26 @@ describe('OpenAPI Phase 3 contract', () => {
     expect(document.components.schemas.DiagnosticEvent).toMatchObject({
       oneOf: [
         { $ref: '#/components/schemas/DiagnosticEventV1' },
-        { $ref: '#/components/schemas/DiagnosticEventV2' }
+        { $ref: '#/components/schemas/DiagnosticEventV2' },
+        { $ref: '#/components/schemas/DiagnosticEventV3' }
       ]
     });
     expect(document.components.schemas.DiagnosticEventView).toMatchObject({
       oneOf: [
         { $ref: '#/components/schemas/DiagnosticEventV1View' },
-        { $ref: '#/components/schemas/DiagnosticEventV2View' }
+        { $ref: '#/components/schemas/DiagnosticEventV2View' },
+        { $ref: '#/components/schemas/DiagnosticEventV3View' }
       ]
     });
     expect(document.components.schemas.DiagnosticBreadcrumb).toMatchObject({
       properties: { point: { enum: [...diagnosticPoints] } }
     });
+    expect(document.components.schemas.DiagnosticEventV3).toMatchObject({
+      allOf: [expect.any(Object), { properties: { phase: { enum: [...diagnosticPoints] } } }]
+    });
     expect(document.components.schemas.DiagnosticEventV1).toMatchObject({ unevaluatedProperties: false });
     expect(document.components.schemas.DiagnosticEventV2).toMatchObject({ unevaluatedProperties: false });
+    expect(document.components.schemas.DiagnosticEventV3).toMatchObject({ unevaluatedProperties: false });
     expect(document.components.schemas.TroubleshootingDiagnosticContext).toMatchObject({ additionalProperties: false });
     expect(document.components.schemas.TroubleshootingCursorRelations).toMatchObject({ additionalProperties: false });
     expect(document.paths['/connections/{connection_id}/diagnostic-events']?.post?.security).toEqual([{ connectionBearer: [] }]);

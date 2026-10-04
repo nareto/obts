@@ -1,4 +1,9 @@
 use std::collections::VecDeque;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -112,6 +117,8 @@ impl std::fmt::Debug for HeadlessClient {
 struct HeadlessProcess {
     child: Child,
     pid: Option<u32>,
+    group_owned: bool,
+    owner_lock_path: Option<PathBuf>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
 }
@@ -150,6 +157,7 @@ impl Drop for ActiveRequest<'_> {
                 checkpoints = %self.trace.summary(),
                 "headless request cancelled while in flight; quarantining supervised child"
             );
+            signal_owned_group(self.process);
             let _ = self.process.child.start_kill();
             self.healthy.store(false, Ordering::Release);
         }
@@ -481,17 +489,12 @@ impl HeadlessClient {
         if !self.is_available() {
             return Err(self.availability_error());
         }
-        match process.child.try_wait() {
-            Ok(None) => Ok(HeadlessFilesystemGuard { process }),
-            Ok(Some(status)) => {
-                self.healthy.store(false, Ordering::Release);
-                Err(exited_error(status, process.pid))
-            }
-            Err(error) => {
-                self.healthy.store(false, Ordering::Release);
-                Err(HeadlessError::Io(error))
-            }
+        if let Some(status) = peek_exit_status(process.pid)? {
+            self.healthy.store(false, Ordering::Release);
+            terminate_process_group(&mut process).await?;
+            return Err(exited_error(status, process.pid));
         }
+        Ok(HeadlessFilesystemGuard { process })
     }
 
     pub async fn restart(&self) -> Result<(), HeadlessError> {
@@ -499,12 +502,7 @@ impl HeadlessClient {
         let mut process = timeout(self.inactivity_timeout(), self.inner.lock())
             .await
             .map_err(|_| HeadlessError::Timeout)?;
-        if process.child.try_wait()?.is_none() {
-            process.child.start_kill()?;
-            timeout(Duration::from_secs(10), process.child.wait())
-                .await
-                .map_err(|_| HeadlessError::Timeout)??;
-        }
+        terminate_process_group(&mut process).await?;
         let (replacement, ready) = spawn_process(&self.config).await?;
         *process = replacement;
         *self.state.write().expect("headless state lock") = ready.clone();
@@ -623,10 +621,107 @@ fn register_failure(
 }
 
 async fn quarantine_process(process: &mut HeadlessProcess) {
-    if process.child.try_wait().ok().flatten().is_none() {
-        let _ = process.child.start_kill();
-        let _ = timeout(Duration::from_secs(10), process.child.wait()).await;
+    let _ = terminate_process_group(process).await;
+}
+
+#[cfg(target_os = "linux")]
+fn peek_exit_status(pid: Option<u32>) -> Result<Option<ExitStatus>, HeadlessError> {
+    let Some(pid) = pid else { return Ok(None) };
+    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
     }
+    if unsafe { info.si_pid() } == 0 {
+        return Ok(None);
+    }
+    let status = unsafe { info.si_status() };
+    let raw = if info.si_code == libc::CLD_EXITED {
+        status << 8
+    } else {
+        status
+    };
+    Ok(Some(ExitStatus::from_raw(raw)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peek_exit_status(_pid: Option<u32>) -> Result<Option<ExitStatus>, HeadlessError> {
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn signal_owned_group(process: &mut HeadlessProcess) {
+    if !process.group_owned {
+        return;
+    }
+    if let Some(pid) = process.pid {
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_owned_group(_process: &mut HeadlessProcess) {}
+
+async fn terminate_process_group(process: &mut HeadlessProcess) -> Result<(), HeadlessError> {
+    if process.group_owned {
+        signal_owned_group(process);
+        process.child.start_kill().ok();
+        timeout(Duration::from_secs(10), process.child.wait())
+            .await
+            .map_err(|_| HeadlessError::Timeout)??;
+        process.group_owned = false;
+    }
+    if let Some(path) = process.owner_lock_path.as_ref() {
+        verify_flock_released(path).await?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn verify_flock_released(path: &std::path::Path) -> Result<(), HeadlessError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+        let result = unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&file),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        };
+        if result == 0 {
+            unsafe {
+                libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_UN);
+            }
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EWOULDBLOCK)
+            && error.raw_os_error() != Some(libc::EAGAIN)
+        {
+            return Err(error.into());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(HeadlessError::Timeout);
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn verify_flock_released(_path: &std::path::Path) -> Result<(), HeadlessError> {
+    Ok(())
 }
 
 async fn supervised_request_on_process(
@@ -685,7 +780,7 @@ async fn request_on_process(
     arguments: Value,
     inactivity_timeout: Duration,
 ) -> Result<Value, HeadlessError> {
-    if let Some(status) = process.child.try_wait()? {
+    if let Some(status) = peek_exit_status(process.pid)? {
         return Err(exited_error(status, process.pid));
     }
     let id = next_id.fetch_add(1, Ordering::Relaxed);
@@ -816,7 +911,56 @@ fn is_valid_progress_event(message: &Value) -> bool {
         && message
             .get("diagnosticPoint")
             .and_then(Value::as_str)
-            .is_some_and(|point| !point.is_empty() && point.len() <= 128)
+            .is_some_and(is_allowed_progress_point)
+}
+
+fn is_allowed_progress_point(point: &str) -> bool {
+    matches!(
+        point,
+        "startup"
+            | "startup_recovery"
+            | "onboarding_approved"
+            | "bootstrap_response"
+            | "multipart_pack"
+            | "pack_persist_write"
+            | "pack_persist_read"
+            | "index_fs_stat"
+            | "index_fs_read_file"
+            | "index_fs_read"
+            | "index_fs_write"
+            | "index_pack"
+            | "sync_request"
+            | "sync_download"
+            | "onboarding_download"
+            | "transfer_checkpoint_verification"
+            | "apply"
+            | "apply_recovery_prepare"
+            | "apply_preflight_revalidate"
+            | "apply_write"
+            | "apply_verify"
+            | "apply_local_capture"
+            | "apply_finalize"
+            | "local_snapshot"
+            | "directory_inventory"
+            | "file_inventory_check"
+            | "local_preservation"
+            | "provenance"
+            | "upload_prepare"
+            | "upload_finalize"
+            | "recovery"
+            | "recovery_directory_decision"
+            | "startup_metadata"
+            | "startup_git"
+            | "startup_state"
+            | "recovery_journal"
+            | "recovery_target_commit"
+            | "recovery_target_tree"
+            | "recovery_file_validation"
+            | "recovery_bundle"
+            | "recovery_file_apply"
+            | "recovery_refs"
+            | "recovery_state"
+    )
 }
 
 fn is_valid_state(value: &Value) -> bool {
@@ -936,26 +1080,123 @@ fn protocol_fatal_error(message: &Value) -> HeadlessError {
     )
 }
 
+#[cfg(target_os = "linux")]
+fn prepare_managed_lock(vault_dir: &str) -> Result<std::path::PathBuf, HeadlessError> {
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::create_dir_all(vault_dir)?;
+    let canonical_vault = std::fs::canonicalize(vault_dir)?;
+    if !std::fs::metadata(&canonical_vault)?.is_dir() {
+        return Err(HeadlessError::Command(
+            "managed vault path is not a directory".to_string(),
+        ));
+    }
+    let obts_dir = canonical_vault.join(".obts");
+    std::fs::create_dir_all(&obts_dir)?;
+    let directory = std::fs::symlink_metadata(&obts_dir)?;
+    if !directory.is_dir() || directory.file_type().is_symlink() {
+        return Err(HeadlessError::Command(
+            "managed lock directory is unsafe".to_string(),
+        ));
+    }
+    std::fs::set_permissions(&obts_dir, std::fs::Permissions::from_mode(0o700))?;
+
+    let c_path = std::ffi::CString::new(canonical_vault.as_os_str().as_encoded_bytes())
+        .map_err(|_| HeadlessError::Command("managed vault path is invalid".to_string()))?;
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::statfs(c_path.as_ptr(), filesystem.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let filesystem = unsafe { filesystem.assume_init() };
+    let supported_filesystems = [
+        0x0000_ef53_i64,
+        0x5846_5342,
+        0x9123_683e_u32 as i64,
+        0x794c_7630,
+        0x0102_1994,
+    ];
+    if !supported_filesystems.contains(&(filesystem.f_type as i64)) {
+        return Err(HeadlessError::Command(
+            "managed lock filesystem is unsupported".to_string(),
+        ));
+    }
+
+    let lock_path = obts_dir.join("headless-owner.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&lock_path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(HeadlessError::Command(
+            "managed lock file is unsafe".to_string(),
+        ));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    drop(file);
+    Ok(canonical_vault)
+}
+
 async fn spawn_process(config: &ClientConfig) -> Result<(HeadlessProcess, Value), HeadlessError> {
     let parts = shell_words::split(&config.headless_command)
         .map_err(|error| HeadlessError::Command(error.to_string()))?;
     let (program, arguments) = parts
         .split_first()
         .ok_or_else(|| HeadlessError::Command("headless command is empty".to_string()))?;
-    let mut command = Command::new(program);
-    command
-        .args(arguments)
-        .arg("--vault-dir")
-        .arg(&config.vault_dir)
-        .arg("--server-url")
-        .arg(&config.server_url)
-        .arg("--device-name")
-        .arg(&config.device_name)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = command.spawn()?;
+    #[cfg(target_os = "linux")]
+    let owner_lock_path =
+        Some(prepare_managed_lock(&config.vault_dir)?.join(".obts/headless-owner.lock"));
+    #[cfg(target_os = "linux")]
+    let mut child = {
+        let lock_path = owner_lock_path.as_ref().expect("Linux managed lock path");
+        let canonical_vault = lock_path
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("managed lock path has a vault parent");
+        let mut flock = Command::new("flock");
+        flock
+            .arg("--exclusive")
+            .arg("--nonblock")
+            .arg("--no-fork")
+            .arg(&lock_path)
+            .arg(program)
+            .args(arguments)
+            .arg("--vault-dir")
+            .arg(&canonical_vault)
+            .arg("--server-url")
+            .arg(&config.server_url)
+            .arg("--device-name")
+            .arg(&config.device_name)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        flock.as_std_mut().process_group(0);
+        flock.spawn()?
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut child = {
+        let mut command = Command::new(program);
+        command
+            .args(arguments)
+            .arg("--vault-dir")
+            .arg(&config.vault_dir)
+            .arg("--server-url")
+            .arg(&config.server_url)
+            .arg("--device-name")
+            .arg(&config.device_name)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.as_std_mut().process_group(0);
+        command.spawn()?
+    };
     let stdin = child
         .stdin
         .take()
@@ -975,18 +1216,30 @@ async fn spawn_process(config: &ClientConfig) -> Result<(HeadlessProcess, Value)
         }
     });
 
+    let pid = child.id();
+    #[cfg(not(target_os = "linux"))]
+    let owner_lock_path = None;
     let mut process = HeadlessProcess {
-        pid: child.id(),
         child,
+        pid,
+        group_owned: pid.is_some(),
+        owner_lock_path,
         stdin,
         stdout: BufReader::new(stdout),
     };
-    let ready = read_until_event(
+    let ready = match read_until_event(
         &mut process,
         "ready",
         Duration::from_secs(config.request_inactivity_timeout_seconds.max(1)),
     )
-    .await?;
+    .await
+    {
+        Ok(ready) => ready,
+        Err(error) => {
+            let _ = terminate_process_group(&mut process).await;
+            return Err(error);
+        }
+    };
     Ok((process, ready))
 }
 
@@ -1065,9 +1318,7 @@ async fn next_process_line(process: &mut HeadlessProcess) -> Result<String, Head
                     "headless client closed an unterminated JSON-line message".to_string(),
                 ));
             }
-            return Err(process
-                .child
-                .try_wait()?
+            return Err(peek_exit_status(process.pid)?
                 .map(|status| exited_error(status, process.pid))
                 .unwrap_or(HeadlessError::Exited {
                     pid: process.pid,
@@ -1168,7 +1419,9 @@ fn redact_state(state: &Value) -> Value {
 
 impl Drop for HeadlessProcess {
     fn drop(&mut self) {
+        signal_owned_group(self);
         let _ = self.child.start_kill();
+        self.group_owned = false;
     }
 }
 
@@ -1317,7 +1570,8 @@ mod tests {
 
     use super::{
         CommandTrace, HeadlessClient, HeadlessError, HeadlessProcess, HeadlessRuntimeState,
-        MAX_TRACED_CHECKPOINTS, register_failure, request_on_process, spawn_maintenance,
+        MAX_TRACED_CHECKPOINTS, is_valid_progress_event, register_failure, request_on_process,
+        spawn_maintenance,
     };
 
     fn valid_state() -> Value {
@@ -1358,6 +1612,8 @@ mod tests {
         HeadlessProcess {
             child,
             pid,
+            group_owned: false,
+            owner_lock_path: None,
             stdin,
             stdout: BufReader::new(stdout),
         }
@@ -1442,6 +1698,16 @@ mod tests {
         assert!(error.is_unpaired());
         assert!(!error.is_process_failure());
         assert!(!HeadlessError::Busy.is_process_failure());
+    }
+
+    #[test]
+    fn progress_points_are_closed_and_accept_known_sync_phases() {
+        assert!(is_valid_progress_event(
+            &json!({"type":"event","event":"progress","status":"Scanning","diagnosticPoint":"directory_inventory"})
+        ));
+        assert!(!is_valid_progress_event(
+            &json!({"type":"event","event":"progress","status":"Scanning","diagnosticPoint":"Checking /private/path"})
+        ));
     }
 
     #[tokio::test]
@@ -1695,6 +1961,104 @@ fi
             .expect("replacement child should answer");
         assert_eq!(result, json!({ "status": "recovered" }));
         assert_eq!(client.runtime_status().restart_count, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn restart_terminates_owned_descendants_and_failed_startup_releases_lock() {
+        let directory = tempdir().expect("temporary process-group directory");
+        let script_path = directory.path().join("process-group.sh");
+        let counter_path = directory.path().join("launch-count");
+        let child_pid_path = directory.path().join("descendant.pid");
+        let vault_dir = directory.path().join("vault");
+        write(
+            &script_path,
+            format!(
+                r#"count=$(cat '{counter}' 2>/dev/null || echo 0)
+count=$((count + 1))
+printf '%s' "$count" > '{counter}'
+(sleep 60) &
+echo $! > '{pid}'
+if [ "$count" -eq 2 ]; then sleep 60; fi
+printf '%s\n' '{ready}'
+while read -r request; do printf '%s\n' '{{"type":"response","id":1,"ok":true,"result":{{"status":"ok"}}}}'; done
+"#,
+                counter = counter_path.display(),
+                pid = child_pid_path.display(),
+                ready = ready_line()
+            ),
+        )
+        .expect("write process-group script");
+        let config = ClientConfig {
+            headless_command: format!("sh {}", script_path.display()),
+            vault_dir: vault_dir.display().to_string(),
+            request_inactivity_timeout_seconds: 1,
+            ..ClientConfig::default()
+        };
+        let client = HeadlessClient::spawn(&config)
+            .await
+            .expect("spawn managed process");
+        let first_descendant: u32 = std::fs::read_to_string(&child_pid_path)
+            .expect("read first descendant PID")
+            .trim()
+            .parse()
+            .expect("parse PID");
+        assert_ne!(
+            std::process::Command::new("flock")
+                .args([
+                    "--exclusive",
+                    "--nonblock",
+                    &vault_dir
+                        .join(".obts/headless-owner.lock")
+                        .display()
+                        .to_string(),
+                    "true"
+                ])
+                .status()
+                .unwrap()
+                .code(),
+            Some(0)
+        );
+
+        assert!(matches!(
+            client.restart().await,
+            Err(HeadlessError::Timeout)
+        ));
+        assert!(!process_is_running(first_descendant));
+        assert_eq!(
+            std::process::Command::new("flock")
+                .args([
+                    "--exclusive",
+                    "--nonblock",
+                    &vault_dir
+                        .join(".obts/headless-owner.lock")
+                        .display()
+                        .to_string(),
+                    "true"
+                ])
+                .status()
+                .unwrap()
+                .code(),
+            Some(0),
+            "failed startup must release the managed lock before another launch"
+        );
+
+        client
+            .restart()
+            .await
+            .expect("restart after failed startup");
+        assert!(!process_is_running(first_descendant));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_is_running(pid: u32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        !stat
+            .split_whitespace()
+            .nth(2)
+            .is_some_and(|state| state == "Z")
     }
 
     #[tokio::test]

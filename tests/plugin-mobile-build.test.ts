@@ -1382,7 +1382,14 @@ describe('mobile plugin artifact', () => {
       return originalOperationSetTimeout(callback, milliseconds);
     };
     let operationStatusReports = 0;
+    const phaseObservations: Array<{ phaseId: string; observation: string }> = [];
+    const originalDiagnosticSharingEnabled = (plugin as any).diagnosticSharingEnabled.bind(plugin);
+    const originalReportOperationStall = (plugin as any).reportOperationStall.bind(plugin);
     (plugin as any).client.reportDeviceStatus = async () => { operationStatusReports += 1; };
+    (plugin as any).diagnosticSharingEnabled = () => true;
+    (plugin as any).reportOperationStall = async (phase: { phaseId: string; observation: string }) => {
+      phaseObservations.push({ phaseId: phase.phaseId, observation: phase.observation });
+    };
     expect((plugin as any).beginSync('Sync now')).toBe(true);
     (plugin as any).setOperationProgress('Applying 1/2', 'apply_write');
     expect((plugin as any).operationDetails()).toMatchObject({
@@ -1395,7 +1402,9 @@ describe('mobile plugin artifact', () => {
     expect((plugin as any).isSyncInProgress()).toBe(true);
     expect(statusItem.text).toBe('obts: Applying 1/2');
     const timersBeforeProgress = operationTimerCallbacks.slice();
+    const phaseId = (plugin as any).activeMeasuredPhase.phaseId;
     (plugin as any).setOperationProgress('Applying 2/2', 'apply_write');
+    expect((plugin as any).activeMeasuredPhase.phaseId).toBe(phaseId);
     for (const callback of timersBeforeProgress) callback();
     await Promise.resolve();
     await Promise.resolve();
@@ -1411,6 +1420,41 @@ describe('mobile plugin artifact', () => {
     });
     expect((plugin as any).syncBlockedMessage()).toContain('Applying 2/2');
     expect(statusItem.text).toContain('taking longer than expected');
+    expect(phaseObservations).toEqual([{ phaseId, observation: 'stalled' }]);
+    (plugin as any).setOperationProgress('Applying (finishing)', 'apply_finalize');
+    await Promise.resolve();
+    expect(phaseObservations).toEqual([
+      { phaseId, observation: 'stalled' },
+      { phaseId, observation: 'completed' }
+    ]);
+    expect(phaseObservations.some((observation) => observation.observation === 'succeeded')).toBe(false);
+    (plugin as any).reportOperationStall = originalReportOperationStall;
+    (plugin as any).diagnosticSharingEnabled = originalDiagnosticSharingEnabled;
+    (plugin as any).settings.serverUrl = 'http://127.0.0.1:3000';
+    (plugin as any).settings.diagnosticConsentServer = 'http://127.0.0.1:3000';
+    (plugin as any).settings.diagnosticConsentVersion = 2;
+    (plugin as any).settings.shareErrorDiagnostics = true;
+    const originalPhaseReadState = (plugin as any).client.readState;
+    const originalPhaseReadToken = (plugin as any).client.readDeviceToken;
+    let resolvePhaseState!: (state: unknown) => void;
+    (plugin as any).client.readState = () => new Promise((resolve) => { resolvePhaseState = resolve; });
+    (plugin as any).client.readDeviceToken = async () => 'phase-test-token';
+    const requestsBeforeDestinationChange = requests.length;
+    const destinationBoundReport = originalReportOperationStall({
+      point: 'local_snapshot', phaseId: 'dph_0123456789abcdef0123456789abcdef',
+      observation: 'stalled', elapsedMs: 90_000
+    });
+    await Promise.resolve();
+    (plugin as any).settings.diagnosticConsentServer = 'https://replacement.example';
+    resolvePhaseState({ vault_id: 'vlt_phase', device_id: 'dev_phase' });
+    await destinationBoundReport;
+    expect(requests).toHaveLength(requestsBeforeDestinationChange);
+    (plugin as any).client.readState = originalPhaseReadState;
+    (plugin as any).client.readDeviceToken = originalPhaseReadToken;
+    (plugin as any).settings.shareErrorDiagnostics = false;
+    (plugin as any).settings.diagnosticConsentServer = '';
+    (plugin as any).settings.diagnosticConsentVersion = 0;
+    (plugin as any).setOperationProgress('Applying 2/2', 'apply_write');
     (context as any).setTimeout = originalOperationSetTimeout;
     await (replacement as any).onload();
     expect((replacement as any).clientReady).toBe(false);
@@ -1418,7 +1462,10 @@ describe('mobile plugin artifact', () => {
     await expect((replacement as any).runOnboardingAction(async () => undefined)).rejects.toMatchObject({
       code: 'sync_lease_blocked'
     });
+    const observationsBeforeUnload = phaseObservations.slice();
     (plugin as any).onunload();
+    expect(phaseObservations).toEqual(observationsBeforeUnload);
+    expect(phaseObservations.some((observation) => observation.observation === 'succeeded')).toBe(false);
     expect((plugin as any).beginSync()).toBe(false);
     expect((replacement as any).beginSync()).toBe(false);
     expect((replacement as any).operationAvailability()).toBe('restart_required');
@@ -1435,7 +1482,18 @@ describe('mobile plugin artifact', () => {
     await expect((replacement as any).ensureClientReady()).resolves.toBe(true);
     expect((replacement as any).clientReady).toBe(true);
     expect((replacement as any).beginSync()).toBe(true);
+    const abandonedObservations: string[] = [];
+    (replacement as any).diagnosticSharingEnabled = () => true;
+    (replacement as any).reportOperationStall = async (phase: { observation: string }) => {
+      abandonedObservations.push(phase.observation);
+    };
+    (replacement as any).activeMeasuredPhase = {
+      point: 'local_snapshot', label: 'Checking changes', phaseId: 'dph_0123456789abcdef0123456789abcdef',
+      startedAt: Date.now(), stalled: true
+    };
     (replacement as any).endSync();
+    await Promise.resolve();
+    expect(abandonedObservations).toEqual(['abandoned']);
 
     const reloadAdapter = new MemoryDataAdapter();
     const writeBinary = reloadAdapter.writeBinary.bind(reloadAdapter);

@@ -124,6 +124,15 @@ export class HeadlessSession {
         await this.emitMessage({ type: 'response', id: request.id, ok: true, result });
         if (shouldStop) this.stopping = true;
       } catch (error) {
+        if (request.command === 'maintenance-tick' && error && typeof error === 'object' &&
+            'code' in error && error.code === 'catchup_local_changes') {
+          try {
+            const state = await this.client.readState();
+            if (state.last_error_code === 'catchup_local_changes') {
+              await this.emitMessage({ type: 'event', event: 'state', state: projectState(state) });
+            }
+          } catch {}
+        }
         await this.emitMessage({ type: 'response', id: request.id, ok: false, error: protocolError(error) });
       }
     });

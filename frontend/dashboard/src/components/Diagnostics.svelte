@@ -13,7 +13,7 @@
       <p class="eyebrow">Private server log</p>
       <h2>Troubleshooting diagnostics</h2>
       <p class="muted">
-        Sanitized failure and troubleshooting reports shared explicitly by your obts plugins. Reports are retained for
+        Sanitized failure, troubleshooting, and local phase-timing reports shared by your obts plugins. Reports are retained for
         {diagnostics.retention_days} days.
       </p>
     </div>
@@ -24,7 +24,7 @@
 
   {#if diagnostics.events.length === 0}
     <div class="empty-diagnostics">
-      <strong>No shared errors</strong>
+      <strong>No shared diagnostics</strong>
       <p class="muted">Plugins send nothing unless “Share sanitized troubleshooting diagnostics” is enabled.</p>
     </div>
   {:else}
@@ -33,7 +33,7 @@
         <article class="diagnostic-card">
           <div class="diagnostic-card-heading">
             <div>
-              <strong>{event.failure_code.replaceAll('_', ' ')}</strong>
+              <strong>{event.schema_version === 3 ? `Operation ${event.observation}` : event.failure_code.replaceAll('_', ' ')}</strong>
               <span>{event.flow} / {event.stage}</span>
             </div>
             <time datetime={event.received_at}>{new Date(event.received_at).toLocaleString()}</time>
@@ -44,6 +44,14 @@
             <span>Obsidian {event.obsidian_version}</span>
             <span>{event.error_class.replaceAll('_', ' ')}</span>
           </div>
+          {#if event.schema_version === 3}
+            <dl class="diagnostic-context">
+              <div><dt>Measured phase</dt><dd>{event.phase.replaceAll('_', ' ')}</dd></div>
+              <div><dt>Elapsed</dt><dd>{event.elapsed_bucket.replaceAll('_', ' ')} (includes suspension)</dd></div>
+              <div><dt>Observation</dt><dd>{event.observation.replaceAll('_', ' ')}</dd></div>
+              <div><dt>Phase correlation</dt><dd><code>{event.phase_id}</code></dd></div>
+            </dl>
+          {/if}
           {#if event.schema_version === 2}
             <dl class="diagnostic-context">
               <div><dt>Attempt</dt><dd><code>{event.context.attempt_id}</code></dd></div>

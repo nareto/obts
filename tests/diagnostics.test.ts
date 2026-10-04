@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DiagnosticService } from '../src/server/diagnosticService.js';
+import { parseDiagnosticEvent } from '../src/shared/diagnostics.js';
 
 import { createObtsServer, type ObtsServer } from '../src/server/app.js';
 
@@ -74,6 +75,29 @@ const troubleshootingReport = {
 } as const;
 
 describe('opt-in error diagnostics backend', () => {
+  it('accepts closed correlated phase observations and rejects unsafe schema-3 additions', () => {
+    const phaseEvent = {
+      schema_version: 3,
+      event_id: 'dgr_0123456789abcdef0123456789abcdef',
+      plugin_version: '0.5.21',
+      obsidian_version: '1.9.12',
+      platform_family: 'desktop',
+      flow: 'plugin',
+      stage: 'plugin_lifecycle',
+      failure_code: 'operation_stalled',
+      error_class: 'unknown',
+      retryable: false,
+      breadcrumbs: [],
+      phase: 'local_snapshot',
+      phase_id: 'dph_0123456789abcdef0123456789abcdef',
+      observation: 'completed',
+      elapsed_bucket: '5m_to_15m'
+    };
+    expect(parseDiagnosticEvent(phaseEvent)).toMatchObject({ observation: 'completed', elapsed_bucket: '5m_to_15m' });
+    expect(() => parseDiagnosticEvent({ ...phaseEvent, raw_duration_ms: 300_000 })).toThrow();
+    expect(() => parseDiagnosticEvent({ ...phaseEvent, phase: 'Checking /secret/path' })).toThrow();
+    expect(() => parseDiagnosticEvent({ ...phaseEvent, observation: 'succeeded' })).toThrow();
+  });
   const roots: string[] = [];
   const servers: ObtsServer[] = [];
 
@@ -144,17 +168,34 @@ describe('opt-in error diagnostics backend', () => {
         error_code: 'none'
       }]
     })).status).toBe(202);
+    expect((await postDiagnostic(`${fixture.baseUrl}/api/v1/device/diagnostic-events`, completion.device_token, {
+      schema_version: 3,
+      event_id: 'dgr_abcdef0123456789abcdef0123456789',
+      plugin_version: '0.5.21',
+      obsidian_version: '1.9.12',
+      platform_family: 'desktop',
+      flow: 'plugin',
+      stage: 'plugin_lifecycle',
+      failure_code: 'operation_stalled',
+      error_class: 'unknown',
+      retryable: false,
+      breadcrumbs: [],
+      phase: 'directory_inventory',
+      phase_id: 'dph_abcdef0123456789abcdef0123456789',
+      observation: 'stalled',
+      elapsed_bucket: '1m_to_5m'
+    })).status).toBe(202);
 
     const listed = await fixture.adminGet('/api/v1/diagnostic-events');
     expect(listed.status).toBe(200);
     expect(listed.body).toMatchObject({ ingestion_enabled: true, retention_days: 14 });
-    expect((listed.body.events as unknown[])).toHaveLength(4);
+    expect((listed.body.events as unknown[])).toHaveLength(5);
     const serialized = JSON.stringify(listed.body);
     expect(serialized).not.toContain(pending.connection_secret);
     expect(serialized).not.toContain(completion.device_token);
 
     const snapshot = await fixture.server.store.snapshot();
-    expect(snapshot.diagnostic_events).toHaveLength(4);
+    expect(snapshot.diagnostic_events).toHaveLength(5);
     expect(snapshot.diagnostic_events.every((event) => event.owner_user_id === fixture.userId)).toBe(true);
     expect(snapshot.diagnostic_events.every((event) => event.device_id === completion.device_id)).toBe(true);
 
@@ -176,7 +217,7 @@ describe('opt-in error diagnostics backend', () => {
 
     const deleted = await fixture.adminDelete('/api/v1/diagnostic-events');
     expect(deleted.status).toBe(200);
-    expect(deleted.body).toMatchObject({ deleted_count: 4 });
+    expect(deleted.body).toMatchObject({ deleted_count: 5 });
     expect((await fixture.server.store.snapshot()).diagnostic_events).toEqual([]);
   });
 

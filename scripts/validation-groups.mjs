@@ -21,6 +21,8 @@ export const pluginTests = [
   'tests/plugin-packaged-client.test.ts',
   'tests/plugin-root-ignore-scan.test.ts',
   'tests/plugin-root-ignore-apply.test.ts',
+  'tests/managed-headless-ownership.test.ts',
+  'tests/managed-headless-reporting.test.ts',
   'tests/client-state-authority.test.ts',
   'tests/applied-ack-barrier.test.ts'
 ];
@@ -37,5 +39,5 @@ export const checkerTests = [
 ];
 
 export const formalFamilies = [
-  'sync', 'bridge-body', 'workers', 'deletion', 'bridge-protocol', 'onboarding', 'diagnostics', 'client-state', 'vault-settings'
+  'sync', 'bridge-body', 'workers', 'deletion', 'bridge-protocol', 'onboarding', 'diagnostics', 'client-state', 'vault-settings', 'headless-ownership'
 ];

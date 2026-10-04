@@ -1,5 +1,5 @@
 schema_version: 1
-revision: 43
+revision: 44
 status: current
 updated: 2026-10-03
 authoritative_artifacts:
@@ -147,4 +147,12 @@ formal_models:
     refines:
       - OBTS-BRG-WRITE-001
       - OBTS-BRG-READ-001
+  - id: OBTS-FM-013
+    status: focused bounded model
+    path: architecture/models/formal/OBTSManagedHeadlessOwnership.tla
+    architecture_revision: 44
+    checks: architecture/models/formal/OBTSManagedHeadlessOwnership.cfg
+    refines:
+      - OBTS-SYNC-ACK-001
+      - OBTS-SYNC-STALE-001
 

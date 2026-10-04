@@ -4,6 +4,7 @@ import { once } from 'node:events';
 
 import { ObtsPluginClient } from './client/core.js';
 import { HeadlessSession, type HeadlessMessage } from './client/headlessProtocol.js';
+import { createManagedHeadlessOwnership } from './client/managedHeadlessOwnership.js';
 
 const MAX_LINE_BYTES = 1024 * 1024;
 
@@ -21,10 +22,11 @@ async function main(): Promise<void> {
 
   try {
     const config = readStartupConfig(process.argv.slice(2), process.env);
+    const managedHeadlessOwner = createManagedHeadlessOwnership(config.vaultDir);
     const client = new ObtsPluginClient(config.vaultDir, {
       serverUrl: config.serverUrl,
       deviceName: config.deviceName
-    });
+    }, managedHeadlessOwner);
     const session = new HeadlessSession(client, emit);
     let stopping = false;
 

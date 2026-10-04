@@ -20,7 +20,7 @@ RUN cargo build --release --locked -p obts_bridge
 
 FROM node:24-bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl gosu \
+    && apt-get install -y --no-install-recommends ca-certificates curl gosu util-linux \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 obts-bridge \
     && useradd --system --uid 10001 --gid obts-bridge --home-dir /var/lib/obts-bridge obts-bridge

@@ -4,7 +4,7 @@ Formal models are bounded refinements of stable contracts in `architecture/contr
 
 ## Validation Families
 
-`npm run test:formal` remains the unchanged complete TLC chain. CI can select complete family entrypoints: `sync` (FM001/FM002), `bridge-body`, `workers`, `deletion`, `bridge-protocol`, `bridge-read`, `onboarding` (including recovery), `diagnostics`, `client-state` (FM008 and FM010 upload recovery), and `vault-settings`. Isolated model/config/check-manifest edits can run their entire affected family; shared model modules, checker infrastructure, unknown paths, and shared dependencies require broad formal validation. The fast metadata command invokes `--validate-only` only for sync, bridge-body, workers, deletion, bridge-protocol, and onboarding entrypoints; diagnostic admission, onboarding recovery, and client-state do not implement metadata-only mode and must never receive that flag. A selected family is a complete checker matrix, not a partial check list. Unchanged models do not prove implementation conformance; executable and operator evidence remain independently required.
+`npm run test:formal` remains the unchanged complete TLC chain. CI can select complete family entrypoints: `sync` (FM001/FM002), `bridge-body`, `workers`, `deletion`, `bridge-protocol`, `bridge-read`, `onboarding` (including recovery), `diagnostics`, `client-state` (FM008 and FM010 upload recovery), `vault-settings`, and `headless-ownership` (FM013). Isolated model/config/check-manifest edits can run their entire affected family; shared model modules, checker infrastructure, unknown paths, and shared dependencies require broad formal validation. The fast metadata command invokes `--validate-only` only for sync, bridge-body, workers, deletion, bridge-protocol, and onboarding entrypoints; diagnostic admission, onboarding recovery, and client-state do not implement metadata-only mode and must never receive that flag. A selected family is a complete checker matrix, not a partial check list. Unchanged models do not prove implementation conformance; executable and operator evidence remain independently required.
 
 ## OBTS-FM-001: Local Apply And Recovery
 
@@ -173,6 +173,18 @@ TLC 2.19, one worker, fingerprint polynomial 0, 1 GiB heap. `REACHED` and `REJEC
 ### Known omissions
 
 The pilot does not cover directories, multiple paths, write concurrency, editor-buffer capture, Git object structure, network/server acknowledgement, byte/checksum implementation, mobile lifecycle, process kill, power loss, filesystem semantics, corrupted finalized bundles, or competing client instances. The companion adds the bounded compare/write interleaving and one symbolic interrupted write, not a proof of byte-level storage atomicity. Those require executable fault tests and platform evidence; a green TLC result makes no claim about them.
+
+## OBTS-FM-013: Managed Headless Ownership And Maintenance Failure
+
+| Field | Value |
+| --- | --- |
+| Status | Focused bounded model |
+| Architecture revision | 44 |
+| Refined contracts | `OBTS-SYNC-ACK-001`, `OBTS-SYNC-STALE-001` |
+| Specification / configuration | `OBTSManagedHeadlessOwnership.tla`, `OBTSManagedHeadlessOwnership.cfg` |
+| Executable check | `npm run test:formal:headless-ownership` |
+
+The bounded companion uses two competing actors and at most two launches. It covers process-lock ownership surviving supervisor death, descendants retaining ownership after leader exit, explicit owned-process-group termination before lock release/relaunch, generation-bound stale-marker reconciliation after a replacement launch, same-generation contention, unknown-marker preservation, delayed old-owner cleanup against a replacement marker, and truthful catch-up reporting. The model deliberately does not claim preservation of general ref/queue/evidence publication histories; that remains an executable-test obligation. Mandatory mutants challenge duplicate owners, same-generation reclamation, deleting a replacement marker, unknown-marker reclamation, supervisor-death release, leader reaping while a descendant remains, report mutation, and duplicate events. It abstracts Linux group signaling and flock implementation; executable process tests must establish containment, lock release, and descriptor/inode behavior. Supported managed commands must not daemonize or escape their process group. No cross-host/network-filesystem or external-writer guarantees are modeled.
 
 ## OBTS-FM-012: Bridge Write Admission
 

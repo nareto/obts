@@ -544,11 +544,11 @@
     withRecentAuth(async () => {
       try {
         if (!currentDiagnosticsDelete(target, generation)) return;
-        if (!confirm('Delete all error diagnostics shared with this server?')) return;
+        if (!confirm('Delete all diagnostics shared with this server?')) return;
         busy = true;
         const result = await api.deleteDiagnosticEvents();
         if (!currentDiagnosticsDelete(target, generation)) return;
-        notice = `Deleted ${result.deleted_count} error diagnostic${result.deleted_count === 1 ? '' : 's'}.`;
+        notice = `Deleted ${result.deleted_count} diagnostic report${result.deleted_count === 1 ? '' : 's'}.`;
         await refreshDiagnostics();
       } catch (error) {
         if (!currentDiagnosticsDelete(target, generation)) return;

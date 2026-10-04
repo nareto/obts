@@ -8,6 +8,7 @@ import {
 } from '../shared/types.js';
 import { PLUGIN_VERSION } from '../../obsidian-plugin/src/version.js';
 import { NodeDataAdapter } from './nodeDataAdapter.js';
+import type { ManagedHeadlessOwnership } from './managedHeadlessOwnership.js';
 
 export type ObtsPluginSettings = {
   serverUrl: string;
@@ -209,9 +210,10 @@ export class ObtsPluginClient {
   readonly recovery: Record<string, MutableMethod>;
   readonly transport: Record<string, MutableMethod>;
 
-  constructor(vaultDir: string, settings: ObtsPluginSettings) {
+  constructor(vaultDir: string, settings: ObtsPluginSettings, managedHeadlessOwner?: ManagedHeadlessOwnership | null) {
     this.settings = settings;
     this.host = createNodePluginHost(vaultDir, settings);
+    this.host.managedHeadlessOwner = managedHeadlessOwner ?? null;
     this.host.pathMutationGate = shared.installPathMutationGate(this.host.app.vault.adapter, this.host);
     this.host.flushOpenMarkdownEditorsToDisk = () => this.flushEditorBuffersToDisk();
     this.client = new shared.ObtsClientCore(this.host) as SharedClientInternals;
@@ -380,24 +382,40 @@ export class ObtsPluginClient {
   }
 
   async maintenanceTick(): Promise<HeadlessMaintenanceResult> {
-    const [queue, decision] = await Promise.all([
-      this.client.readQueue(),
-      this.client.backgroundScanDecision()
-    ]);
-    const syncPerformed = Boolean(
-      queue.pending_commit || queue.status === 'queued_local' || decision.required
-    );
-    const result = syncPerformed
-      ? await this.client.syncOnce({ fullAudit: decision.mode === 'full' })
-      : await this.client.pollRemoteEventsAndApply();
-    const state = await this.client.readState();
-    return {
-      applied: !syncPerformed && Boolean((result as { applied?: boolean }).applied),
-      sync_performed: syncPerformed,
-      scan_mode: decision.mode,
-      status: state.status_label,
-      local_head: state.local_head
-    };
+    try {
+      const [queue, decision] = await Promise.all([
+        this.client.readQueue(),
+        this.client.backgroundScanDecision()
+      ]);
+      const syncPerformed = Boolean(
+        queue.pending_commit || queue.status === 'queued_local' || decision.required
+      );
+      const result = syncPerformed
+        ? await this.client.syncOnce({ fullAudit: decision.mode === 'full' })
+        : await this.client.pollRemoteEventsAndApply();
+      const state = await this.client.readState();
+      return {
+        applied: !syncPerformed && Boolean((result as { applied?: boolean }).applied),
+        sync_performed: syncPerformed,
+        scan_mode: decision.mode,
+        status: state.status_label,
+        local_head: state.local_head
+      };
+    } catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'catchup_local_changes') {
+        try {
+          const state = await this.client.readState();
+          await this.client.writeState({
+            ...state,
+            status_label: 'Out of sync',
+            last_error_code: 'catchup_local_changes',
+            last_error_details: null,
+            updated_at: new Date().toISOString()
+          });
+        } catch {}
+      }
+      throw error;
+    }
   }
 
   writeState(state: unknown): Promise<void> {
@@ -522,6 +540,7 @@ function createNodePluginHost(vaultDir: string, settings: ObtsPluginSettings) {
       }
     },
     settings,
+    managedHeadlessOwner: null as ManagedHeadlessOwnership | null,
     vaultName: settings.vaultId ?? 'OBTS Headless Vault',
     lifecycleAbortController: new AbortController(),
     unloaded: false,

@@ -2618,7 +2618,7 @@ function readDeviceStatusReport(record: Record<string, unknown>): {
 
 const reportedErrorCodes = new Set([
   'applied_main_acknowledgement_failed', 'apply_journal_recovery_required', 'apply_lock_active', 'apply_recovery_required',
-  'blocked_integrity', 'chunk_digest_mismatch', 'chunk_too_large', 'conflict_review_required',
+  'blocked_integrity', 'chunk_digest_mismatch', 'chunk_too_large', 'catchup_local_changes', 'conflict_review_required',
   'connection_not_approved', 'device_blocked', 'device_identity_mismatch', 'device_revoked', 'directory_acknowledgement_missing',
   'directory_baseline_recovery_journal_invalid', 'directory_baseline_recovery_unsafe',
   'directory_delete_failed', 'directory_identity_unavailable',
@@ -2666,7 +2666,7 @@ function safePathCapabilities(value: Record<string, unknown> | null): Record<str
 }
 
 const ACTIVE_STATUS_BASES = 'Checking|Checking changes|Verifying contents|Preparing upload|Uploading|Applying|Merging|Server retrying|Repairing baseline|Finishing update|Waiting for operation';
-const ACTIVE_STATUS_QUALIFIERS = 'planning objects|revalidating|verifying vault|verifying|checking local edits|listing vault files|finishing|requesting changes';
+const ACTIVE_STATUS_QUALIFIERS = 'planning objects|revalidating|verifying vault|verifying|checking local edits|listing vault files|finishing|requesting changes|local files|checking directories|preserving local changes|acknowledging';
 const REPORTED_ACTIVE_STATUS = new RegExp(String.raw`^((?:${ACTIVE_STATUS_BASES})(?: \((?:${ACTIVE_STATUS_QUALIFIERS})\))?)(?: ([0-9]+)\/([0-9]+)| \(~(0|10|20|30|40|50|60|70|80|90|100)%\))?( \(taking longer than expected\))?$`, 'u');
 const NORMALIZED_ACTIVE_STATUS = new RegExp(String.raw`^(?:${ACTIVE_STATUS_BASES})(?: \((?:${ACTIVE_STATUS_QUALIFIERS})\))?(?: \(~(?:0|10|20|30|40|50|60|70|80|90|100)%\))?(?: \(taking longer than expected\))?$`, 'u');
 
@@ -2674,6 +2674,8 @@ function safeReportedStatusLabel(label: string | null, errorCode: string | null)
   if (errorCode) return normalizedLocalDashboardLabel(label, errorCode);
   if (label === 'Unsafe local state' || label === 'Review needed' || label === 'Needs recovery') return 'Out of sync';
   if (label && ['Synced', 'Ahead', 'Behind', 'Offline', 'Out of sync', 'Blocked', 'Server repair required', 'Out of sync — file exceeds upload limit', 'Out of sync — upload limit exceeded', 'Out of sync — local recovery required'].includes(label)) return label;
+  const inventory = label?.match(/^(Applying \(listing vault files\)) [0-9]+ files · [0-9]+ directories( \(taking longer than expected\))?$/u);
+  if (inventory) label = `${inventory[1]}${inventory[2] ?? ''}`;
   const active = label?.match(REPORTED_ACTIVE_STATUS);
   if (active) {
     const completed = Number(active[2]);

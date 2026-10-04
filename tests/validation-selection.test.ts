@@ -156,6 +156,8 @@ describe('validation selection', () => {
     expect(makePlan(['architecture/models/formal/OBTSApplyRecovery.cfg']).formalFamilies).toEqual(['sync']);
     expect(makePlan(['architecture/models/formal/OBTSApplyRecoveryLiveness.cfg']).formalFamilies).toEqual(['sync']);
     expect(makePlan(['architecture/models/formal/OBTSVaultSettings.tla']).formalFamilies).toEqual(['vault-settings']);
+    expect(makePlan(['architecture/models/formal/OBTSManagedHeadlessOwnership.tla']).formalFamilies).toEqual(['headless-ownership']);
+    expect(makePlan(['architecture/models/formal/OBTSManagedHeadlessOwnership.cfg']).formalFamilies).toEqual(['headless-ownership']);
     for (const extension of ['tla', 'cfg']) {
       const plan = makePlan([`architecture/models/formal/OBTSUploadCheckpointRecovery.${extension}`]);
       expect(plan.formalFamilies).toEqual(['client-state']);

@@ -2071,7 +2071,7 @@ components:
       properties:
         point:
           type: string
-          enum: [onboarding_approved, bootstrap_response, multipart_pack, pack_persist_write, pack_persist_read, index_fs_stat, index_fs_read_file, index_fs_read, index_fs_write, index_pack, sync_request, sync_download, onboarding_download, transfer_checkpoint_verification, apply, apply_recovery_prepare, apply_preflight_revalidate, apply_write, apply_verify, apply_local_capture, apply_finalize, local_snapshot, upload_prepare, upload_finalize, recovery, recovery_directory_decision, startup_metadata, startup_git, startup_state, recovery_journal, recovery_target_commit, recovery_target_tree, recovery_file_validation, recovery_bundle, recovery_file_apply, recovery_refs, recovery_state]
+          enum: [onboarding_approved, bootstrap_response, multipart_pack, pack_persist_write, pack_persist_read, index_fs_stat, index_fs_read_file, index_fs_read, index_fs_write, index_pack, sync_request, sync_download, onboarding_download, transfer_checkpoint_verification, apply, apply_recovery_prepare, apply_preflight_revalidate, apply_write, apply_verify, apply_local_capture, apply_finalize, local_snapshot, directory_inventory, file_inventory_check, local_preservation, provenance, upload_prepare, upload_finalize, recovery, recovery_directory_decision, startup_metadata, startup_git, startup_state, recovery_journal, recovery_target_commit, recovery_target_tree, recovery_file_validation, recovery_bundle, recovery_file_apply, recovery_refs, recovery_state]
         outcome:
           type: string
           enum: [started, returned, succeeded, failed]
@@ -2090,7 +2090,7 @@ components:
       properties:
         schema_version:
           type: integer
-          enum: [1, 2]
+          enum: [1, 2, 3]
         event_id:
           type: string
           pattern: "^dgr_[0-9a-f]{32}$"
@@ -2281,10 +2281,45 @@ components:
             context:
               $ref: "#/components/schemas/TroubleshootingDiagnosticContext"
       unevaluatedProperties: false
+    DiagnosticEventV3:
+      allOf:
+        - $ref: "#/components/schemas/DiagnosticEventFields"
+        - type: object
+          required: [phase, phase_id, observation, elapsed_bucket]
+          properties:
+            schema_version:
+              const: 3
+            flow:
+              const: plugin
+            stage:
+              const: plugin_lifecycle
+            failure_code:
+              const: operation_stalled
+            error_class:
+              const: unknown
+            retryable:
+              const: false
+            breadcrumbs:
+              type: array
+              maxItems: 0
+            phase:
+              type: string
+              enum: [onboarding_approved, bootstrap_response, multipart_pack, pack_persist_write, pack_persist_read, index_fs_stat, index_fs_read_file, index_fs_read, index_fs_write, index_pack, sync_request, sync_download, onboarding_download, transfer_checkpoint_verification, apply, apply_recovery_prepare, apply_preflight_revalidate, apply_write, apply_verify, apply_local_capture, apply_finalize, local_snapshot, directory_inventory, file_inventory_check, local_preservation, provenance, upload_prepare, upload_finalize, recovery, recovery_directory_decision, startup_metadata, startup_git, startup_state, recovery_journal, recovery_target_commit, recovery_target_tree, recovery_file_validation, recovery_bundle, recovery_file_apply, recovery_refs, recovery_state]
+            phase_id:
+              type: string
+              pattern: "^dph_[0-9a-f]{32}$"
+            observation:
+              type: string
+              enum: [stalled, completed, abandoned]
+            elapsed_bucket:
+              type: string
+              enum: [under_30s, 30s_to_1m, 1m_to_5m, 5m_to_15m, over_15m]
+      unevaluatedProperties: false
     DiagnosticEvent:
       oneOf:
         - $ref: "#/components/schemas/DiagnosticEventV1"
         - $ref: "#/components/schemas/DiagnosticEventV2"
+        - $ref: "#/components/schemas/DiagnosticEventV3"
     DiagnosticIngestResponse:
       type: object
       additionalProperties: false
@@ -2345,10 +2380,21 @@ components:
               type: string
               format: date-time
       unevaluatedProperties: false
+    DiagnosticEventV3View:
+      allOf:
+        - $ref: "#/components/schemas/DiagnosticEventV3"
+        - type: object
+          required: [received_at]
+          properties:
+            received_at:
+              type: string
+              format: date-time
+      unevaluatedProperties: false
     DiagnosticEventView:
       oneOf:
         - $ref: "#/components/schemas/DiagnosticEventV1View"
         - $ref: "#/components/schemas/DiagnosticEventV2View"
+        - $ref: "#/components/schemas/DiagnosticEventV3View"
     DiagnosticEventsResponse:
       type: object
       additionalProperties: false

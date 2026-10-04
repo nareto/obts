@@ -2,6 +2,9 @@ import { assertRecord, ValidationError } from './validators.js';
 
 export const DIAGNOSTIC_SCHEMA_VERSION = 1 as const;
 export const TROUBLESHOOTING_DIAGNOSTIC_SCHEMA_VERSION = 2 as const;
+export const PHASE_DIAGNOSTIC_SCHEMA_VERSION = 3 as const;
+export const diagnosticElapsedBuckets = ['under_30s', '30s_to_1m', '1m_to_5m', '5m_to_15m', 'over_15m'] as const;
+export const phaseDiagnosticObservations = ['stalled', 'completed', 'abandoned'] as const;
 export const DIAGNOSTIC_MAX_BODY_BYTES = 8 * 1024;
 export const DIAGNOSTIC_MAX_BREADCRUMBS = 16;
 
@@ -69,6 +72,10 @@ export const diagnosticPoints = [
   'apply_local_capture',
   'apply_finalize',
   'local_snapshot',
+  'directory_inventory',
+  'file_inventory_check',
+  'local_preservation',
+  'provenance',
   'upload_prepare',
   'upload_finalize',
   'recovery',
@@ -370,7 +377,23 @@ export type DiagnosticEventV2 = Omit<
   context: TroubleshootingDiagnosticContext;
 };
 
-export type DiagnosticEvent = DiagnosticEventV1 | DiagnosticEventV2;
+export type PhaseDiagnosticObservation = (typeof phaseDiagnosticObservations)[number];
+export type DiagnosticElapsedBucket = (typeof diagnosticElapsedBuckets)[number];
+export type DiagnosticEventV3 = Omit<DiagnosticEventFields<DiagnosticFailureCodeV1>, 'flow' | 'stage' | 'failure_code' | 'error_class' | 'retryable' | 'breadcrumbs'> & {
+  schema_version: typeof PHASE_DIAGNOSTIC_SCHEMA_VERSION;
+  flow: 'plugin';
+  stage: 'plugin_lifecycle';
+  failure_code: 'operation_stalled';
+  error_class: 'unknown';
+  retryable: false;
+  breadcrumbs: [];
+  phase: DiagnosticPoint;
+  phase_id: string;
+  observation: PhaseDiagnosticObservation;
+  elapsed_bucket: DiagnosticElapsedBucket;
+};
+
+export type DiagnosticEvent = DiagnosticEventV1 | DiagnosticEventV2 | DiagnosticEventV3;
 
 const EVENT_KEYS = [
   'schema_version',
@@ -386,6 +409,7 @@ const EVENT_KEYS = [
   'breadcrumbs'
 ] as const;
 const EVENT_V2_KEYS = [...EVENT_KEYS, 'context'] as const;
+const EVENT_V3_KEYS = [...EVENT_KEYS, 'phase', 'phase_id', 'observation', 'elapsed_bucket'] as const;
 const BREADCRUMB_KEYS = ['point', 'outcome', 'value_kind', 'size_bucket', 'error_code'] as const;
 const TROUBLESHOOTING_CONTEXT_KEYS = [
   'attempt_id',
@@ -423,6 +447,7 @@ const CURSOR_RELATION_KEYS = [
 ] as const;
 const EVENT_ID_PATTERN = /^dgr_[0-9a-f]{32}$/u;
 const ATTEMPT_ID_PATTERN = /^(?:none|rca_[0-9a-f]{32})$/u;
+const PHASE_ID_PATTERN = /^dph_[0-9a-f]{32}$/u;
 const LEGACY_VERSION_PATTERN = /^(?:unknown|[0-9]+(?:\.[0-9]+){1,3}(?:[-+][0-9A-Za-z.-]+)?)$/u;
 const TROUBLESHOOTING_VERSION_PATTERN = /^(?:unknown|[0-9]+(?:\.[0-9]+){1,3})$/u;
 
@@ -431,6 +456,24 @@ export function parseDiagnosticEvent(value: unknown): DiagnosticEvent {
   if (value.schema_version === DIAGNOSTIC_SCHEMA_VERSION) {
     assertExactKeys(value, EVENT_KEYS);
     return { schema_version: DIAGNOSTIC_SCHEMA_VERSION, ...parseEventFields(value, diagnosticFailureCodesV1) };
+  }
+  if (value.schema_version === PHASE_DIAGNOSTIC_SCHEMA_VERSION) {
+    assertExactKeys(value, EVENT_V3_KEYS);
+    const fields = parseEventFields(value, diagnosticFailureCodesV1);
+    if (fields.flow !== 'plugin' || fields.stage !== 'plugin_lifecycle' || fields.failure_code !== 'operation_stalled' || fields.error_class !== 'unknown' || fields.retryable || fields.breadcrumbs.length !== 0) {
+      throw new ValidationError('invalid_request', 'Invalid phase diagnostic envelope.');
+    }
+    const phaseId = readBoundedString(value, 'phase_id', 36);
+    if (!PHASE_ID_PATTERN.test(phaseId)) throw new ValidationError('invalid_request', 'Invalid phase diagnostic ID.');
+    return {
+      ...fields,
+      schema_version: PHASE_DIAGNOSTIC_SCHEMA_VERSION,
+      flow: 'plugin', stage: 'plugin_lifecycle', failure_code: 'operation_stalled', error_class: 'unknown', retryable: false, breadcrumbs: [],
+      phase: readEnum(value, 'phase', diagnosticPoints),
+      phase_id: phaseId,
+      observation: readEnum(value, 'observation', phaseDiagnosticObservations),
+      elapsed_bucket: readEnum(value, 'elapsed_bucket', diagnosticElapsedBuckets)
+    };
   }
   if (value.schema_version === TROUBLESHOOTING_DIAGNOSTIC_SCHEMA_VERSION) {
     assertExactKeys(value, EVENT_V2_KEYS);

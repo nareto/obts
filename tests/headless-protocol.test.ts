@@ -99,6 +99,32 @@ describe('headless client protocol', () => {
     }
   });
 
+  it('emits one correlated safe state event after a reported maintenance catch-up failure', async () => {
+    const messages: HeadlessMessage[] = [];
+    const failedState = { ...state, status_label: 'Out of sync', last_error_code: 'catchup_local_changes' };
+    const client = fakeClient({
+      readState: vi.fn(async () => failedState),
+      maintenanceTick: vi.fn(async () => { throw new (await import('../src/client/core.js')).PluginBlockedError('catchup_local_changes', 'safe catch-up failure'); })
+    });
+    const session = new HeadlessSession(client, async message => void messages.push(message));
+    await session.submit({ id: 'maintenance', command: 'maintenance-tick' });
+    expect(messages).toEqual([
+      { type: 'event', event: 'state', state: failedState },
+      { type: 'response', id: 'maintenance', ok: false, error: { code: 'catchup_local_changes', message: 'safe catch-up failure' } }
+    ]);
+  });
+
+  it('does not report an unrelated or unpublished maintenance error as a state event', async () => {
+    const messages: HeadlessMessage[] = [];
+    const client = fakeClient({
+      maintenanceTick: vi.fn(async () => { throw new (await import('../src/client/core.js')).PluginBlockedError('sync_error', 'failure'); })
+    });
+    const session = new HeadlessSession(client, async message => void messages.push(message));
+    await session.submit({ id: 'maintenance', command: 'maintenance-tick' });
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({ type: 'response', id: 'maintenance', ok: false });
+  });
+
   it('emits ordered progress while a long command is active', async () => {
     const messages: HeadlessMessage[] = [];
     let progress: ((status: string, diagnosticPoint: string) => void) | null = null;

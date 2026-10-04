@@ -802,7 +802,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
     expect(JSON.stringify(legacyDashboard.body)).not.toContain('private/path.md');
 
-    for (const code of ['directory_baseline_recovery_unsafe', 'local_ref_recovery_required', 'recovery_bundle_verification_failed']) {
+    for (const code of ['directory_baseline_recovery_unsafe', 'local_ref_recovery_required', 'recovery_bundle_verification_failed', 'catchup_local_changes']) {
       const recoveryReport = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/device-status`, {
         method: 'POST',
         headers: { authorization: `Bearer ${await readDeviceToken(deviceDir)}`, 'content-type': 'application/json' },
@@ -814,9 +814,10 @@ describe('Phase 1 sync without conflict resolution', () => {
       });
       expect(recoveryReport.status).toBe(200);
       const recoveryDashboard = await admin.get<{ devices: Array<{ status_label: string; local_status_label: string; local_error_code: string }> }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+      const expectedLabel = code === 'catchup_local_changes' ? 'Out of sync' : 'Out of sync — local recovery required';
       expect(recoveryDashboard.body.devices.find((device) => device.local_error_code === code)).toMatchObject({
-        status_label: 'Out of sync — local recovery required',
-        local_status_label: 'Out of sync — local recovery required'
+        status_label: expectedLabel,
+        local_status_label: expectedLabel
       });
     }
   });
@@ -2095,7 +2096,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(applyWriter).not.toContain('path.join(this.vaultDir');
 
     const scanner = sourceSection(artifact, 'async scanSyncableFiles', 'async localContentMatchesTree');
-    expect(scanner).toContain('this.listLocalVaultInventory("", policy)');
+    expect(scanner).toContain('this.listLocalVaultInventory("", policy, false, onProgress)');
     expect(scanner).not.toContain('walk(');
     expect(scanner).not.toContain('path.relative');
 
@@ -2307,13 +2308,21 @@ describe('Phase 1 sync without conflict resolution', () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'qualified-progress-status-device');
     await mkdirp(deviceDir);
-    await pairPlugin(admin, deviceDir, 'qualified-progress-device');
+    const plugin = await pairPlugin(admin, deviceDir, 'qualified-progress-device');
     const labels = [
       ['Applying (checking local edits) 3/10', 'Applying (checking local edits) (~30%)'],
       ['Applying (listing vault files)', 'Applying (listing vault files)'],
       ['Applying (finishing)', 'Applying (finishing)'],
       ['Applying (verifying vault) 3/10', 'Applying (verifying vault) (~30%)'],
       ['Checking (requesting changes)', 'Checking (requesting changes)'],
+      ['Checking (local files) 2/10', 'Checking (local files) (~20%)'],
+      ['Verifying contents (local files) 2/10', 'Verifying contents (local files) (~20%)'],
+      ['Applying (listing vault files) 1234 files · 56 directories', 'Applying (listing vault files)'],
+      ['Applying (listing vault files) (taking longer than expected)', 'Applying (listing vault files) (taking longer than expected)'],
+      ['Applying (checking directories) 1/2', 'Applying (checking directories) (~50%)'],
+      ['Applying (acknowledging)', 'Applying (acknowledging)'],
+      ['Finishing update (preserving local changes)', 'Finishing update (preserving local changes)'],
+      ['Finishing update (finishing)', 'Finishing update (finishing)'],
       ['Applying (checking local edits) 9/10 (taking longer than expected)', 'Applying (checking local edits) (~90%) (taking longer than expected)'],
       ['Applying (private/path.md) 3/10', 'Out of sync']
     ];
@@ -2330,6 +2339,32 @@ describe('Phase 1 sync without conflict resolution', () => {
         `/api/v1/vaults/${admin.vaultId}/dashboard`
       );
       expect(dashboard.body.devices.find(device => device.device_name === 'qualified-progress-device')?.status_label).toBe(expected);
+      const report = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/device-status`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await readDeviceToken(deviceDir)}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          plugin_version: RECOMMENDED_PLUGIN_VERSION, local_status_label: reported, local_error_code: null,
+          local_queue_status: 'idle', local_main: null, local_head: null, path_capabilities: null
+        })
+      });
+      expect(report.status).toBe(200);
+      const afterReport = await admin.get<{ devices: Array<{ device_name: string; status_label: string }> }>(
+        `/api/v1/vaults/${admin.vaultId}/dashboard`
+      );
+      expect(afterReport.body.devices.find(device => device.device_name === 'qualified-progress-device')?.status_label).toBe(expected);
+      expect(JSON.stringify(afterReport.body)).not.toContain('1234 files');
+    }
+    for (const slow of [false, true]) {
+      (plugin.client as any).plugin.operationDetails = () => ({
+        availability: 'busy', label: 'Applying (listing vault files) 123456 files · 12345 directories',
+        progressUpdatedAt: Date.now() + 1000, slow
+      });
+      await plugin.reportDeviceStatus();
+      const result = await admin.get<{ devices: Array<{ device_name: string; status_label: string }> }>(
+        `/api/v1/vaults/${admin.vaultId}/dashboard`
+      );
+      expect(result.body.devices.find(device => device.device_name === 'qualified-progress-device')?.status_label)
+        .toBe(`Applying (listing vault files)${slow ? ' (taking longer than expected)' : ''}`);
     }
   });
 
@@ -5620,7 +5655,18 @@ describe('Phase 1 sync without conflict resolution', () => {
         2
       )}\n`
     );
-    await writeFile(join(deviceDir, '.obts', 'apply.lock'), '{"apply_id":"apply_committed"}\n');
+    const lockPath = join(deviceDir, '.obts', 'apply.lock');
+    const journalPath = join(deviceDir, '.obts', 'apply-journal.json');
+    const journalBefore = await readFile(journalPath, 'utf8');
+    const incompleteMarker = '{"apply_id":"apply_committed"}\n';
+    await writeFile(lockPath, incompleteMarker);
+    await expect(plugin.syncOnce()).rejects.toMatchObject({ code: 'apply_lock_active' });
+    expect(await readFile(lockPath, 'utf8')).toBe(incompleteMarker);
+    expect(await readFile(journalPath, 'utf8')).toBe(journalBefore);
+    expect((await plugin.readState()).local_head).toBe(state.local_head);
+    await writeFile(lockPath, JSON.stringify({
+      apply_id: 'apply_committed', created_at: '2026-01-01T00:00:00.000Z'
+    }));
 
     expect((await plugin.syncOnce()).status).toBe('Synced');
     expect(await exists(join(deviceDir, '.obts', 'apply-journal.json'))).toBe(false);
@@ -6030,9 +6076,10 @@ describe('Phase 1 sync without conflict resolution', () => {
 
     expect((await plugin2.syncOnce()).status).toBe('Synced');
     expect(snapshotCount).toBe(3);
-    expect(diagnosticPoints).toContain('local_snapshot');
+    expect(diagnosticPoints).toContain('file_inventory_check');
     expect(diagnosticPoints).toContain('apply_verify');
-    expect(diagnosticPoints).toContain('apply_local_capture');
+    expect(diagnosticPoints).toContain('local_preservation');
+    expect(diagnosticPoints).toContain('directory_inventory');
     expect(diagnosticPoints).toContain('apply_finalize');
     expect(diagnosticPoints).toContain('sync_request');
     expect(progressLabels).toContain('Applying (listing vault files)');
@@ -7500,7 +7547,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('handleStatusClick');
     expect(pluginMain).toContain('addRibbonIcon');
     expect(pluginMain).toContain('scheduleDegradedStatusNotice');
-    expect(pluginMain).toContain('Checking changes');
+    expect(pluginMain).toContain('Checking (local files)');
     expect(pluginMain).toContain('Verifying contents');
     expect(pluginMain).toContain('obts-verify-local-vault');
     expect(pluginMain).toContain('Uploading ${uploadedChunks}/${groups.length}');
