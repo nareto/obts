@@ -74,7 +74,8 @@ describe('FM003 embedding-worker companion gate', () => {
       'node scripts/check-diagnostic-admission-model.mjs',
       'node scripts/check-client-state-model.mjs',
       'node scripts/check-upload-recovery-model.mjs',
-      'node scripts/check-vault-settings-model.mjs'
+      'node scripts/check-vault-settings-model.mjs',
+      'node scripts/check-managed-headless-ownership-model.mjs'
     ]);
     expect(scripts['test:formal:bridge'].split(' && ')).toEqual([
       'node scripts/check-bridge-bounded-model.mjs',

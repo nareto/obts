@@ -26,6 +26,16 @@ function waitForFile(path: string, child: ReturnType<typeof spawn>): Promise<str
 }
 
 describe('managed Linux headless ownership', () => {
+  it.each(['missing .obts directory', 'missing stable ownership lock'])('declines ownership when there is a %s', async (missingState) => {
+    const { createManagedHeadlessOwnership } = await import(modulePath);
+    const root = await mkdtemp(join(tmpdir(), 'obts-managed-missing-state-'));
+    if (missingState === 'missing stable ownership lock') await mkdir(join(root, '.obts'), { mode: 0o700 });
+    try {
+      expect(createManagedHeadlessOwnership(root)).toBeNull();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
   it.each(['write', 'close'])('cleans an unpublished marker after injected %s failure', async (failurePoint) => {
     const { publishManagedApplyMarker } = await import(modulePath);
     const root = await mkdtemp(join(tmpdir(), 'obts-managed-publish-'));

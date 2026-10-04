@@ -53,8 +53,14 @@ export function createManagedHeadlessOwnership(
   const canonicalVault = realpathSync(vaultDir);
   const obtsDir = join(canonicalVault, '.obts');
   const lockPath = join(obtsDir, 'headless-owner.lock');
-  const directory = lstatSync(obtsDir);
-  const lock = lstatSync(lockPath);
+  let directory: ReturnType<typeof lstatSync>;
+  let lock: ReturnType<typeof lstatSync>;
+  try {
+    directory = lstatSync(obtsDir);
+    lock = lstatSync(lockPath);
+  } catch {
+    return null;
+  }
   if (!directory.isDirectory() || directory.isSymbolicLink() || (directory.mode & 0o077) !== 0 ||
       !lock.isFile() || lock.isSymbolicLink() || (lock.mode & 0o077) !== 0 ||
       !trustedFilesystemTypes.has(statfsSync(canonicalVault).type)) return null;
