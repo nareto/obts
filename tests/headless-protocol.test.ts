@@ -114,6 +114,21 @@ describe('headless client protocol', () => {
     ]);
   });
 
+  it('publishes one correlated state event for catch-up evidence failures', async () => {
+    const messages: HeadlessMessage[] = [];
+    const failedState = { ...state, status_label: 'Out of sync — local recovery required', last_error_code: 'catchup_recovery_required' };
+    const client = fakeClient({
+      readState: vi.fn(async () => failedState),
+      maintenanceTick: vi.fn(async () => { throw new (await import('../src/client/core.js')).PluginBlockedError('catchup_recovery_required', 'private recovery detail'); })
+    });
+    const session = new HeadlessSession(client, async message => void messages.push(message));
+    await session.submit({ id: 'maintenance-recovery', command: 'maintenance-tick' });
+    expect(messages).toEqual([
+      { type: 'event', event: 'state', state: failedState },
+      { type: 'response', id: 'maintenance-recovery', ok: false, error: { code: 'catchup_recovery_required', message: 'private recovery detail' } }
+    ]);
+  });
+
   it('does not report an unrelated or unpublished maintenance error as a state event', async () => {
     const messages: HeadlessMessage[] = [];
     const client = fakeClient({

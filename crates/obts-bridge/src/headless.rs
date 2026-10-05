@@ -364,6 +364,10 @@ impl HeadlessClient {
             .map(ToOwned::to_owned)
     }
 
+    pub fn cached_state(&self) -> Value {
+        self.state.read().expect("headless state lock").clone()
+    }
+
     pub fn runtime_status(&self) -> HeadlessProcessStatus {
         let runtime = self.runtime.read().expect("headless runtime lock");
         HeadlessProcessStatus {
@@ -1531,6 +1535,11 @@ pub(crate) mod test_support {
         HeadlessClient::spawn(&config)
             .await
             .expect("spawn scripted headless child")
+    }
+
+    pub(crate) fn set_cached_error(client: &HeadlessClient, code: &str) {
+        client.state.write().expect("headless state lock")["last_error_code"] =
+            Value::String(code.into());
     }
 
     pub(crate) fn pause_circuit(client: &HeadlessClient) {

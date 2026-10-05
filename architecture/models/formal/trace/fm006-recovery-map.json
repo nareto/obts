@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "model": "architecture/models/formal/OBTSOnboardingRecovery.tla",
-  "architectureRevision": 26,
+  "architectureRevision": 45,
   "status": "static seam mapping; no runtime trace conformance claim",
   "contracts": ["OBTS-SYNC-ONB-001", "OBTS-SYNC-ACK-001", "OBTS-SAF-002", "OBTS-SAF-005", "OBTS-SAF-009"],
   "checker": "scripts/check-onboarding-recovery-model.mjs",
@@ -23,6 +23,12 @@
       "implementation": ["obsidian-plugin/src/main.cjs: pull, pullAndApply, queuePreservedLocalChanges, retained catch-up marker and intermediate-ancestry admission, retryPendingAppliedAcknowledgement, settlePreviouslyAppliedPullCheckpoint, completeRegisteredOnboarding"],
       "tests": ["tests/retained-catchup.test.ts: retired-checkpoint catch-up with empty events and blocked intermediate-ancestry upload after restart", "tests/onboarding-mobile-restart.test.ts: checkpoint and pending acknowledgement with advanced main; checkpoint/pending-ack/acknowledged/activated SIGKILL boundaries", "tests/phase1.test.ts: watcher paths during chunk upload including existing-file edits; multipack applied-checkpoint cleanup"],
       "checks": ["safety", "liveness", "drop-checkpoint", "skip-ack", "lost-catchup", "interim-ancestry"]
+    },
+    {
+      "actions": ["CaptureCatchupEdit", "HandoffCatchupEdit", "DropCatchupHandoff", "SkipCatchupCapture", "Crash", "Restart", "AttemptIntermediateUpload"],
+      "implementation": ["Versioned retained-catch-up record validation, exact intermediate-tree identity check, durable edit snapshot/provenance publication, final-canonical stale-proposal handoff"],
+      "tests": ["tests/retained-catchup.test.ts: durable edit recovery, process restart boundaries, base retention and no intermediate upload"],
+      "checks": ["older-path-authoring-base", "catchup-intermediate-upload", "skip-catchup-capture", "wrong-catchup-tree", "drop-catchup-handoff", "crash-after-capture", "crash-at-handoff", "edit-handoff-liveness"]
     }
   ],
   "omissions": ["Physical iPhone suspension and power loss", "Git object, path, checksum and consent validator implementation proof", "Unbounded network faults", "Runtime TLA trace replay"]

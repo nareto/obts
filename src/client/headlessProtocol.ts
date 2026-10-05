@@ -125,10 +125,10 @@ export class HeadlessSession {
         if (shouldStop) this.stopping = true;
       } catch (error) {
         if (request.command === 'maintenance-tick' && error && typeof error === 'object' &&
-            'code' in error && error.code === 'catchup_local_changes') {
+            'code' in error && (error.code === 'catchup_local_changes' || error.code === 'catchup_recovery_required')) {
           try {
             const state = await this.client.readState();
-            if (state.last_error_code === 'catchup_local_changes') {
+            if (state.last_error_code === error.code) {
               await this.emitMessage({ type: 'event', event: 'state', state: projectState(state) });
             }
           } catch {}

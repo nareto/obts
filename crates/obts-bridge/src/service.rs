@@ -56,6 +56,23 @@ pub struct VaultBridgeService {
     vault_file_repair_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
 }
 
+fn maintenance_status(busy: bool, error_code: Option<&str>) -> serde_json::Value {
+    match error_code {
+        Some("catchup_local_changes") => serde_json::json!({
+            "status": "blocked",
+            "category": "preserved_local_edits",
+            "action": "preserve_local_edits_and_review_recovery"
+        }),
+        Some("catchup_recovery_required") => serde_json::json!({
+            "status": "blocked",
+            "category": "catchup_evidence_unverified",
+            "action": "preserve_local_files_and_recovery_evidence"
+        }),
+        _ if busy => serde_json::json!({ "status": "progressing" }),
+        _ => serde_json::json!({ "status": "idle" }),
+    }
+}
+
 impl VaultBridgeService {
     #[cfg(test)]
     pub fn new_for_tests(store: VaultStore) -> Self {
@@ -141,6 +158,13 @@ impl VaultBridgeService {
             "recovering" => Some(2),
             _ => None,
         });
+        let cached_error = self.headless.as_ref().and_then(|client| {
+            client
+                .cached_state()
+                .get("last_error_code")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        });
         serde_json::json!({
             "readiness": status.status,
             "dependencies": status.dependencies,
@@ -148,7 +172,8 @@ impl VaultBridgeService {
                 "status": headless_status,
                 "retryAfterSeconds": retry_after_seconds,
                 "admissionTimeoutSeconds": self.foreground_write_timeout.as_secs()
-            }
+            },
+            "maintenance": maintenance_status(process.busy, cached_error.as_deref())
         })
     }
 
@@ -1318,7 +1343,7 @@ mod obts_tests {
     use chrono::Utc;
     use tempfile::tempdir;
 
-    use super::{ServiceError, VaultBridgeService};
+    use super::{ServiceError, VaultBridgeService, maintenance_status};
     use crate::authorization::{AccessMatcher, AccessPolicy, AccessRule, AuthContext, ContextName};
     use crate::config::AppConfig;
     use crate::filesystem::FilesystemSource;
@@ -1613,8 +1638,34 @@ mod obts_tests {
         let status = service.operational_status().await;
         assert_eq!(status["headless"]["status"], "disabled");
         assert_eq!(status["headless"]["admissionTimeoutSeconds"], 7);
+        assert_eq!(status["maintenance"]["status"], "idle");
         assert!(status.get("context_stats").is_none());
         assert!(status.get("config_path").is_none());
+    }
+
+    #[test]
+    fn maintenance_status_distinguishes_progress_from_safe_catchup_actions() {
+        assert_eq!(
+            maintenance_status(true, None),
+            serde_json::json!({"status":"progressing"})
+        );
+        assert_eq!(
+            maintenance_status(false, Some("catchup_local_changes")),
+            serde_json::json!({
+                "status":"blocked", "category":"preserved_local_edits",
+                "action":"preserve_local_edits_and_review_recovery"
+            })
+        );
+        assert_eq!(
+            maintenance_status(true, Some("catchup_recovery_required")),
+            serde_json::json!({
+                "status":"blocked", "category":"catchup_evidence_unverified",
+                "action":"preserve_local_files_and_recovery_evidence"
+            })
+        );
+        let unknown = maintenance_status(true, Some("secret path /private/vault"));
+        assert_eq!(unknown, serde_json::json!({"status":"progressing"}));
+        assert!(!unknown.to_string().contains("private"));
     }
 
     #[tokio::test]

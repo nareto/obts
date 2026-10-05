@@ -31,7 +31,7 @@ resourceTemplates:
 tools:
   - id: get_status
     name: get_status
-    description: "Report authenticated operational readiness (`ok` or `degraded`), dependency states, and headless status (`healthy`, `busy`, `recovering`, `circuit_paused`, `not_paired`, or `disabled`), including a suggested retry delay and the foreground admission timeout. Available even without content capabilities or during degraded readiness; excludes vault content, paths, counts, and global context/configuration details. Example: `{}`."
+    description: "Report authenticated operational readiness (`ok` or `degraded`), dependency states, and headless status (`healthy`, `busy`, `recovering`, `circuit_paused`, `not_paired`, or `disabled`), including a suggested retry delay and foreground admission timeout. The redacted maintenance projection distinguishes `progressing`, `idle`, and `blocked`; blocked states include only fixed safe categories and actions, such as preserved local edits or unverified catch-up evidence. Available without content capabilities or during degraded readiness; excludes vault content, paths, counts, IDs, and global context/configuration details. Example: `{}`."
     inputSchema:
       type: object
       additionalProperties: false

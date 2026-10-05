@@ -569,6 +569,10 @@ async fn postgres_transport_freshness_and_failclosed_contracts() {
         operational_json["result"]["structuredContent"]["readiness"], "ok",
         "healthy busy sync is not degraded readiness"
     );
+    assert_eq!(
+        operational_json["result"]["structuredContent"]["maintenance"]["status"],
+        "progressing"
+    );
 
     let mcp_resource = app.clone().oneshot(
         Request::post("/mcp")

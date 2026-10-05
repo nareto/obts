@@ -2129,7 +2129,6 @@ mod tests {
             1,
         )
         .await;
-        crate::headless::test_support::quarantine_by_timeout(&headless).await;
         let mut service = VaultBridgeService::new_for_tests(store);
         service.headless = Some(headless.clone());
         let state = McpState::new(
@@ -2146,6 +2145,39 @@ mod tests {
         )
         .unwrap();
         let app = super::app_router(state);
+        crate::headless::test_support::set_cached_error(&headless, "catchup_local_changes");
+        let idle = app.clone().oneshot(Request::post("/mcp").header("content-type", "application/json").header("authorization", "Bearer synthetic-status-token").body(Body::from(r#"{"jsonrpc":"2.0","id":0,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#)).unwrap()).await.unwrap();
+        let idle_body = idle.into_body().collect().await.unwrap().to_bytes();
+        let idle_json: serde_json::Value = serde_json::from_slice(&idle_body).unwrap();
+        assert_eq!(
+            idle_json["result"]["structuredContent"]["headless"]["status"],
+            "healthy"
+        );
+        assert_eq!(
+            idle_json["result"]["structuredContent"]["maintenance"]["status"],
+            "blocked"
+        );
+
+        let busy_client = headless.clone();
+        let busy_request = tokio::spawn(async move {
+            busy_client
+                .request("long-command", serde_json::Value::Null)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let busy = app.clone().oneshot(Request::post("/mcp").header("content-type", "application/json").header("authorization", "Bearer synthetic-status-token").body(Body::from(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#)).unwrap()).await.unwrap();
+        let busy_body = busy.into_body().collect().await.unwrap().to_bytes();
+        let busy_json: serde_json::Value = serde_json::from_slice(&busy_body).unwrap();
+        assert_eq!(
+            busy_json["result"]["structuredContent"]["headless"]["status"],
+            "busy"
+        );
+        assert_eq!(
+            busy_json["result"]["structuredContent"]["maintenance"]["status"],
+            "blocked"
+        );
+        let _ = busy_request.await;
+
         for token in [None, Some("wrong-token"), Some("synthetic-status-token")] {
             let mut request = Request::post("/mcp").header("content-type", "application/json");
             if let Some(token) = token {
@@ -2163,11 +2195,25 @@ mod tests {
             assert_eq!(status["readiness"], "degraded");
             assert_eq!(status["headless"]["status"], "recovering");
             assert_eq!(status["headless"]["retryAfterSeconds"], 2);
-            assert_eq!(status.as_object().unwrap().len(), 3);
+            assert_eq!(status["maintenance"]["status"], "blocked");
+            assert_eq!(status.as_object().unwrap().len(), 4);
             assert!(status.get("context_stats").is_none());
             assert!(status.get("config_reload").is_none());
             assert!(status.get("index").is_none());
         }
+        crate::headless::test_support::set_cached_error(&headless, "catchup_local_changes");
+        let blocked = app.clone().oneshot(Request::post("/mcp").header("content-type", "application/json").header("authorization", "Bearer synthetic-status-token").body(Body::from(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#)).unwrap()).await.unwrap();
+        let blocked_body = blocked.into_body().collect().await.unwrap().to_bytes();
+        let blocked_json: serde_json::Value = serde_json::from_slice(&blocked_body).unwrap();
+        let maintenance = &blocked_json["result"]["structuredContent"]["maintenance"];
+        assert_eq!(
+            maintenance,
+            &serde_json::json!({
+                "status":"blocked", "category":"preserved_local_edits",
+                "action":"preserve_local_edits_and_review_recovery"
+            })
+        );
+        assert!(!maintenance.to_string().contains("path"));
         crate::headless::test_support::pause_circuit(&headless);
         let response = app.oneshot(Request::post("/mcp").header("content-type", "application/json").header("authorization", "Bearer synthetic-status-token").body(Body::from(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#)).unwrap()).await.unwrap();
         let body = response.into_body().collect().await.unwrap().to_bytes();

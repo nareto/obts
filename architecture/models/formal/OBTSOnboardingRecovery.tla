@@ -2,13 +2,15 @@
 EXTENDS Naturals, TLC
 
 (***************************************************************************
-FM006 companion, revision 26: one enrollment, two immutable heads, one crash.
+FM006 companion, revision 45: one enrollment, two immutable heads, one crash.
 Context denotes validated identity, original approval baseline, mode and consent.
 Server acceptance and local receipt publication are separate durable boundaries.
 LegacyContext reproduces the missing-analysis implementation; the other mutants
 isolate admission and ordering defects. Repeated edits during apply and snapshot
-capture remain visible or queued, and never block setup/sync. Durability and byte
-validation are assumed.
+capture remain visible or queued, and never block setup/sync. Catch-up edits bind
+to the pre-apply authoring base and exact intermediate tree, then reach stale
+proposal machinery only after the final canonical target is applied. The model
+assumes validated bytes, ancestry, and durable publication.
 ***************************************************************************)
 CONSTANT Mutation
 VARIABLE s
@@ -24,6 +26,11 @@ Init == s = [phase |-> "approved", durableContext |-> FALSE,
   diverged |-> FALSE, preserved |-> FALSE, blockedByEdit |-> FALSE,
   editCount |-> 0, localVisible |-> FALSE, captureActive |-> FALSE,
   captureVersion |-> 0, queuedVersion |-> 0,
+  authoringBase |-> 1, olderPathBase |-> 0,
+  catchupBase |-> 1, expectedTree |-> 0, captureTree |-> 0,
+  expectedTreeValid |-> FALSE,
+  capturedEdit |-> FALSE, editObligation |-> FALSE,
+  scheduledEdit |-> FALSE, proposalBase |-> 1, intermediateUpload |-> FALSE,
   lastAction |-> "Init"]
 PublishContext ==
   /\ s.running /\ s.phase = "approved"
@@ -96,7 +103,8 @@ Recover ==
 Apply ==
   /\ s.running /\ s.phase = "applying" /\ s.recovered /\ ~s.pendingAck
   /\ s' = [s EXCEPT !.applied = s.target, !.pendingAck = TRUE,
-    !.catchup = TRUE, !.interim = (s.main # s.target),
+    !.catchup = TRUE, !.editObligation = @ \/ s.diverged,
+    !.interim = (s.main # s.target),
     !.journal = FALSE, !.phase = "applied",
     !.preserved = IF Mutation = "discard-divergence" /\ s.diverged THEN FALSE ELSE @ \/ s.diverged,
     !.localVisible = IF Mutation = "discard-divergence" /\ s.diverged THEN FALSE ELSE @,
@@ -106,7 +114,8 @@ CompleteLiveApply ==
   /\ (s.editCount = 0 \/ s.localVisible)
   /\ LET discard == Mutation = "discard-live-edit" /\ s.diverged
      IN s' = [s EXCEPT !.applied = s.target, !.pendingAck = TRUE,
-       !.catchup = TRUE, !.interim = (s.main # s.target),
+       !.catchup = TRUE, !.editObligation = @ \/ (s.diverged /\ ~discard),
+       !.interim = (s.main # s.target),
        !.journal = FALSE, !.phase = "applied",
        !.preserved = IF discard THEN FALSE ELSE @ \/ s.diverged,
        !.localVisible = IF discard THEN FALSE ELSE @,
@@ -126,23 +135,60 @@ CaptureInterim ==
   /\ Mutation = "interim-ancestry" /\ s.running /\ s.resumed /\ s.interim
   /\ s.phase = "acknowledged"
   /\ s' = [s EXCEPT !.unsafeUpload = TRUE, !.lastAction = "CaptureInterim"]
+CaptureCatchupEdit ==
+  /\ s.running /\ s.catchup /\ s.phase = "acknowledged"
+  /\ s.diverged /\ s.editObligation /\ ~s.capturedEdit
+  /\ s' = [s EXCEPT !.capturedEdit = TRUE,
+    !.catchupBase = IF Mutation = "older-obligation" THEN s.olderPathBase ELSE s.authoringBase,
+    !.expectedTree = IF Mutation = "wrong-intermediate-tree" THEN s.main ELSE s.applied,
+    !.captureTree = s.applied, !.expectedTreeValid = TRUE,
+    !.preserved = TRUE, !.lastAction = "CaptureCatchupEdit"]
 CatchUp ==
   /\ s.running /\ s.phase = "acknowledged" /\ s.catchup
+  /\ (~s.editObligation \/ s.capturedEdit)
   /\ s' = IF s.applied = s.main
-    THEN [s EXCEPT !.phase = "complete", !.catchup = FALSE,
+    THEN [s EXCEPT !.phase = IF s.editObligation THEN "handoff" ELSE "complete",
+      !.catchup = IF s.editObligation THEN @ ELSE FALSE,
       !.interim = FALSE, !.lastAction = "CatchUp"]
     ELSE [s EXCEPT !.phase = "transfer", !.target = s.main,
       !.cursor = 0, !.recovered = FALSE, !.lastAction = "CatchUp"]
+HandoffCatchupEdit ==
+  /\ s.running /\ s.phase = "handoff" /\ s.capturedEdit
+  /\ s.editObligation /\ s.expectedTreeValid
+  /\ s.applied = s.main
+  /\ s' = [s EXCEPT !.phase = "complete", !.catchup = FALSE,
+    !.scheduledEdit = TRUE, !.editObligation = FALSE, !.proposalBase = s.catchupBase,
+    !.lastAction = "HandoffCatchupEdit"]
+DropCatchupHandoff ==
+  /\ Mutation = "drop-handoff" /\ s.running /\ s.phase = "handoff"
+  /\ s.capturedEdit /\ s.editObligation
+  /\ s' = [s EXCEPT !.editObligation = FALSE, !.scheduledEdit = FALSE,
+    !.phase = "complete", !.lastAction = "DropCatchupHandoff"]
+SkipCatchupCapture ==
+  /\ Mutation = "skip-capture" /\ s.running /\ s.catchup
+  /\ s.phase = "acknowledged" /\ s.diverged /\ s.editObligation
+  /\ s.applied = s.main /\ ~s.capturedEdit
+  /\ s' = [s EXCEPT !.phase = "complete", !.catchup = FALSE,
+    !.editObligation = FALSE, !.preserved = FALSE,
+    !.lastAction = "SkipCatchupCapture"]
+AttemptIntermediateUpload ==
+  /\ Mutation = "intermediate-upload" /\ s.running /\ s.interim
+  /\ s.capturedEdit
+  /\ s' = [s EXCEPT !.intermediateUpload = TRUE,
+    !.lastAction = "AttemptIntermediateUpload"]
 Terminal == s.phase = "complete" /\ UNCHANGED s
 Next == PublishContext \/ Accept \/ PublishReceipt \/ Crash \/ Restart \/ Chunk \/
   AdvanceMain \/ DropCheckpoint \/ PlanApply \/ OverwriteJournal \/ DivergeEdit \/
   BeginLocalCapture \/ SecondEditDuringCapture \/ FinishLocalCapture \/ BlockApplyForEdit \/
   Recover \/ Apply \/ CompleteLiveApply \/ NewApplyBeforeAck \/ Ack \/ LoseCatchUp \/ CaptureInterim \/
-  CatchUp \/ Terminal
+  CaptureCatchupEdit \/ CatchUp \/ HandoffCatchupEdit \/ DropCatchupHandoff \/
+  SkipCatchupCapture \/ AttemptIntermediateUpload \/ Terminal
 Spec == Init /\ [][Next]_vars
 FairSpec == Spec /\ WF_vars(PublishContext) /\ WF_vars(Accept) /\ WF_vars(PublishReceipt)
   /\ WF_vars(Restart) /\ WF_vars(Chunk) /\ WF_vars(PlanApply) /\ WF_vars(Recover)
+  /\ WF_vars(AdvanceMain)
   /\ WF_vars(Apply) /\ WF_vars(CompleteLiveApply) /\ WF_vars(Ack) /\ WF_vars(CatchUp)
+  /\ WF_vars(CaptureCatchupEdit) /\ WF_vars(HandoffCatchupEdit)
 ResumeHasContext == s.resumed => s.durableContext
 JournalPreserved == ~s.overwritten
 CheckpointPreserved == ~s.dropped
@@ -150,12 +196,21 @@ AckBeforeNewApply == s.pendingAck => s.applied = s.target
 CompleteAfterAck == s.phase = "complete" => s.applied = s.acknowledged
 CatchUpDurable == (s.phase = "acknowledged" /\ s.applied # s.main) => s.catchup
 AcceptedAncestry == ~s.unsafeUpload
+CatchupBaseRetained == s.capturedEdit => s.catchupBase =
+  (IF Mutation = "older-obligation" THEN s.olderPathBase ELSE s.authoringBase)
+CatchupTreeIdentity == s.capturedEdit => s.expectedTreeValid /\ s.expectedTree = s.captureTree
+CatchupHandoffSafe == (s.scheduledEdit => s.proposalBase = s.catchupBase)
+NoUnscheduledCompletion == s.phase = "complete" => ~s.editObligation /\ (s.capturedEdit => s.scheduledEdit)
+EditEventuallyScheduled == s.editObligation ~> s.scheduledEdit
+CrashAfterCaptureWitness == ~(s.resumed /\ s.lastAction = "Restart" /\ s.capturedEdit)
+CrashAtHandoffWitness == ~(s.resumed /\ s.lastAction = "Restart" /\ s.phase = "handoff")
+NoIntermediateCatchupUpload == ~s.intermediateUpload
 DivergencePreserved == (s.diverged /\ s.applied = s.target) => s.preserved
 LocalEditNeverBlocks == ~s.blockedByEdit
 LatestLocalEditRecoverable == s.editCount = 0 \/ s.localVisible \/ s.queuedVersion = s.editCount
 NoSecondEdit == s.editCount < 2
 DivergenceRecovered == ~(s.diverged /\ s.recovered)
-Safety == ResumeHasContext /\ JournalPreserved /\ CheckpointPreserved /\ AckBeforeNewApply /\ CompleteAfterAck /\ CatchUpDurable /\ AcceptedAncestry /\ DivergencePreserved /\ LocalEditNeverBlocks /\ LatestLocalEditRecoverable
+Safety == ResumeHasContext /\ JournalPreserved /\ CheckpointPreserved /\ AckBeforeNewApply /\ CompleteAfterAck /\ CatchUpDurable /\ AcceptedAncestry /\ CatchupBaseRetained /\ CatchupTreeIdentity /\ CatchupHandoffSafe /\ NoUnscheduledCompletion /\ NoIntermediateCatchupUpload /\ DivergencePreserved /\ LocalEditNeverBlocks /\ LatestLocalEditRecoverable
 EventuallyComplete == <> (s.phase = "complete")
 NeverLostResponseRestart == ~(s.resumed /\ s.accepted /\ ~s.credential)
 =============================================================================

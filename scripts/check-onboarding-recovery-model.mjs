@@ -23,6 +23,8 @@ if (sany.status !== 0) throw new Error('SANY failed');
 const checks = [
   ['safety', 'none', 'Safety', null],
   ['liveness', 'none', 'Safety', null],
+  ['edit-handoff-liveness', 'none', 'Safety', null],
+  ['older-path-authoring-base', 'older-obligation', 'CatchupBaseRetained', null],
   ['response-loss-restart', 'none', 'NeverLostResponseRestart', 'Restart'],
   ['legacy-context', 'legacy-context', 'ResumeHasContext', 'Restart'],
   ['overwrite-journal', 'overwrite-journal', 'JournalPreserved', 'OverwriteJournal'],
@@ -30,6 +32,12 @@ const checks = [
   ['skip-ack', 'skip-ack', 'AckBeforeNewApply', 'NewApplyBeforeAck'],
   ['lost-catchup', 'lost-catchup', 'CatchUpDurable', 'LoseCatchUp'],
   ['interim-ancestry', 'interim-ancestry', 'AcceptedAncestry', 'CaptureInterim'],
+  ['catchup-intermediate-upload', 'intermediate-upload', 'NoIntermediateCatchupUpload', 'AttemptIntermediateUpload'],
+  ['skip-catchup-capture', 'skip-capture', 'DivergencePreserved', 'SkipCatchupCapture'],
+  ['wrong-catchup-tree', 'wrong-intermediate-tree', 'CatchupTreeIdentity', 'CaptureCatchupEdit'],
+  ['drop-catchup-handoff', 'drop-handoff', 'NoUnscheduledCompletion', 'DropCatchupHandoff'],
+  ['crash-after-capture', 'none', 'CrashAfterCaptureWitness', 'Restart'],
+  ['crash-at-handoff', 'none', 'CrashAtHandoffWitness', 'Restart'],
   ['divergence-preserved', 'none', 'DivergencePreserved', null],
   ['divergence-reachable', 'none', 'DivergenceRecovered', 'Recover'],
   ['snapshot-capture-race-preserved', 'none', 'LatestLocalEditRecoverable', null],
@@ -40,7 +48,10 @@ const checks = [
 ];
 for (const [id, mutation, invariant, witness] of checks) {
   const cfg = join(run, `${id}.cfg`);
-  writeFileSync(cfg, `CONSTANT Mutation = "${mutation}"\nSPECIFICATION ${id === 'liveness' ? 'FairSpec' : 'Spec'}\nINVARIANT ${invariant}\n${id === 'liveness' ? 'PROPERTY EventuallyComplete\n' : ''}`);
+  const fair = id === 'liveness' || id === 'edit-handoff-liveness';
+  const properties = id === 'liveness' ? 'PROPERTY EventuallyComplete\n' :
+    id === 'edit-handoff-liveness' ? 'PROPERTY EditEventuallyScheduled\n' : '';
+  writeFileSync(cfg, `CONSTANT Mutation = "${mutation}"\nSPECIFICATION ${fair ? 'FairSpec' : 'Spec'}\nINVARIANT ${invariant}\n${properties}`);
   const result = tool('tlc', ['-workers', '1', '-fp', '0', '-config', cfg, '-metadir', join(run, id), 'OBTSOnboardingRecovery'], id);
   const stats = /([\d,]+) states generated, ([\d,]+) distinct states found/.exec(result.output);
   const depth = /depth of the complete state graph search is (\d+)/.exec(result.output);

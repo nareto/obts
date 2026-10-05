@@ -39,11 +39,27 @@ describe('maintenance catch-up failure reporting', () => {
       server_device_ref: state.server_device_ref,
       status_label: 'Out of sync',
       last_error_code: 'catchup_local_changes',
+      apply_validation_reason: null,
       last_error_details: null,
       last_event_seq: 7,
       last_applied_event_seq: 6
     });
     expect(core.writeState).toHaveBeenCalledTimes(1);
+  });
+
+  it('publishes unverified catch-up evidence as a fixed recovery-required status', async () => {
+    const { client, core } = await setup();
+    const error = new PluginBlockedError('catchup_recovery_required', 'unsafe details omitted');
+    core.syncOnce = vi.fn(async () => { throw error; });
+    let published: Record<string, unknown> | null = null;
+    core.writeState = vi.fn(async (next: Record<string, unknown>) => { published = next; });
+    await expect(client.maintenanceTick()).rejects.toBe(error);
+    expect(published).toMatchObject({
+      status_label: 'Out of sync — local recovery required',
+      last_error_code: 'catchup_recovery_required',
+      last_error_details: null
+    });
+    expect(JSON.stringify(published)).not.toContain('unsafe details');
   });
 
   it('keeps the original failure when safe status publication fails', async () => {

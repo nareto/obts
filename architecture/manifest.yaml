@@ -1,7 +1,7 @@
 schema_version: 1
-revision: 44
+revision: 45
 status: current
-updated: 2026-10-03
+updated: 2026-10-05
 authoritative_artifacts:
   - architecture/manifest.yaml
   - architecture/README.md
@@ -92,7 +92,7 @@ formal_models:
     status: accepted
     path: architecture/models/formal/OBTSOnboarding.tla
     companion_path: architecture/models/formal/OBTSOnboardingRecovery.tla
-    companion_architecture_revision: 26
+    companion_architecture_revision: 45
     architecture_revision: 21
     checks: architecture/models/formal/checks-fm006.json
     refines:
@@ -150,7 +150,7 @@ formal_models:
   - id: OBTS-FM-013
     status: focused bounded model
     path: architecture/models/formal/OBTSManagedHeadlessOwnership.tla
-    architecture_revision: 44
+    architecture_revision: 45
     checks: architecture/models/formal/OBTSManagedHeadlessOwnership.cfg
     refines:
       - OBTS-SYNC-ACK-001

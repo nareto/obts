@@ -1,10 +1,10 @@
 ---- MODULE OBTSManagedHeadlessOwnership ----
 EXTENDS Naturals, FiniteSets, TLC
 
-\* OBTS-FM-013, architecture revision 44. Bound: two actors and two launches.
+\* OBTS-FM-013, architecture revision 45. Bound: two actors and two launches.
 \* Descendant process-group membership is bounded by one descendant per actor.
 \* Linux signaling/flock are abstracted; executable launcher tests remain required.
-\* Catch-up reporting preserves authority fields at publication.
+\* Catch-up reporting preserves authority fields and exposes only fixed guidance.
 CONSTANT Mutation
 Actors == {"a", "b"}
 NoOwner == "none"
@@ -189,9 +189,19 @@ NoDuplicateStateEvent == eventCount <= 1
 NeverDetachedChild == children \ supervisors = {}
 NeverReconciled == apply # "recovered"
 NeverRestarted == generation < 2
+maintenanceStatus == IF caughtFailure THEN "blocked" ELSE IF apply = "active" THEN "progressing" ELSE "idle"
+statusCategory == IF caughtFailure THEN "preserved_local_edits" ELSE "none"
+statusAction == IF caughtFailure THEN "preserve_local_edits_and_review_recovery" ELSE "none"
+applyLockActive == apply = "active"
+StatusGuidanceBound == maintenanceStatus = "blocked" =>
+  statusCategory = "preserved_local_edits" /\ statusAction = "preserve_local_edits_and_review_recovery"
+StatusProjectionTruthful == caughtFailure => maintenanceStatus = "blocked"
+StatusProjectionRedacted == statusCategory \in {"none", "preserved_local_edits"} /\
+  statusAction \in {"none", "preserve_local_edits_and_review_recovery"}
 Safety == OneProcessOwner /\ OwnedLockHasLiveChild /\ SurvivingDescendantKeepsLock /\ UnknownMarkerWasNotReclaimed
   /\ MarkerBoundToLaunch /\ LiveMarkerWasNotReclaimed /\ ReplacementWasNotDeleted
-  /\ TruthfulFailureReport /\ NoDuplicateStateEvent
+  /\ TruthfulFailureReport /\ NoDuplicateStateEvent /\ StatusGuidanceBound
+  /\ StatusProjectionTruthful /\ StatusProjectionRedacted /\ (caughtFailure => ~applyLockActive)
 
 Spec == Init /\ [][Next]_vars
 FairSpec == Spec /\ WF_vars(ReportMaintenanceFailure)

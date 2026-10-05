@@ -402,13 +402,16 @@ export class ObtsPluginClient {
         local_head: state.local_head
       };
     } catch (error) {
-      if (error && typeof error === 'object' && 'code' in error && error.code === 'catchup_local_changes') {
+      if (error && typeof error === 'object' && 'code' in error &&
+          (error.code === 'catchup_local_changes' || error.code === 'catchup_recovery_required')) {
         try {
+          const recoveryRequired = error.code === 'catchup_recovery_required';
           const state = await this.client.readState();
           await this.client.writeState({
             ...state,
-            status_label: 'Out of sync',
-            last_error_code: 'catchup_local_changes',
+            status_label: recoveryRequired ? 'Out of sync — local recovery required' : 'Out of sync',
+            last_error_code: error.code,
+            apply_validation_reason: null,
             last_error_details: null,
             updated_at: new Date().toISOString()
           });

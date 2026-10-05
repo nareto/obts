@@ -22314,7 +22314,7 @@ var { createByteBudget, runBoundedWork } = require_work_pool();
 var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.21";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.22";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var STALE_SETTLE_MARGIN_MS = 250;
@@ -26010,25 +26010,119 @@ var ObtsObsidianClient = class {
     const saved = await readRecoveryJsonStrict(this.fsp, this.catchupPath, "catchup_recovery_required", "The saved catch-up state is unreadable. Preserve local files and recovery evidence.");
     if (!saved) return null;
     const state = await this.readState();
-    if (saved.version !== 1 || saved.vault_id !== state.vault_id || saved.device_id !== state.device_id || !isGitObjectId(saved.target_main) || !isGitObjectId(saved.local_head) || saved.accepted_ref !== null && !isGitObjectId(saved.accepted_ref)) {
+    const validV1 = saved.version === 1 && isGitObjectId(saved.local_head);
+    const validV2 = saved.version === 2 && isGitObjectId(saved.authoring_base) && isGitObjectId(saved.expected_head) && isGitObjectId(saved.expected_tree) && Array.isArray(saved.preserved_paths) && saved.preserved_paths.every(isSafeJournalPath) && Array.isArray(saved.recovery_bundles) && saved.recovery_bundles.every((bundle) => bundle && /^rec_[A-Za-z0-9_-]+$/u.test(bundle.bundle_id) && Array.isArray(bundle.paths) && bundle.paths.length > 0 && bundle.paths.every(isSafeJournalPath)) && Array.isArray(saved.capture_pending_paths) && saved.capture_pending_paths.every(isSafeJournalPath);
+    if (!validV1 && !validV2 || saved.vault_id !== state.vault_id || saved.device_id !== state.device_id || !isGitObjectId(saved.target_main) || saved.local_head !== null && !isGitObjectId(saved.local_head) || saved.accepted_ref !== null && !isGitObjectId(saved.accepted_ref)) {
       throw new ObtsBlockedError("catchup_recovery_required", "The saved catch-up identity is invalid. Preserve local files and recovery evidence.");
     }
+    if (validV2 && (!await this.commitExists(saved.authoring_base) || !await this.commitExists(saved.expected_head) || !await this.isAncestor(saved.authoring_base, saved.expected_head))) {
+      throw new ObtsBlockedError("catchup_recovery_required", "Catch-up ancestry evidence is unavailable. Preserve local files and recovery evidence.");
+    }
     return saved;
+  }
+  async preserveCatchupEdits(saved, snapshot, paths) {
+    const distinct = [...new Set(paths)].sort();
+    if (!distinct.length) return saved;
+    const queue = await this.readQueue();
+    if (queue.pending_commit) throw new ObtsBlockedError("catchup_recovery_required", "A proposal overlaps interrupted catch-up. Preserve the queue and recovery evidence before continuing.");
+    let bundleId = null;
+    try {
+      bundleId = await this.createRecoveryBundle("catchup_preserved", saved.target_main, distinct);
+    } catch (error) {
+      if (!(error instanceof LocalSnapshotChangedError)) throw error;
+    }
+    await this.mutateStaleProvenance(async (current) => {
+      for (const filePath of distinct) {
+        const signature = snapshot?.entries instanceof Map ? snapshot.entries.get(filePath)?.entry.oid || "absent" : "uncaptured";
+        let base = saved.authoring_base;
+        const older = async (candidate) => {
+          if (await this.isAncestor(candidate, base)) base = candidate;
+          else if (!await this.isAncestor(base, candidate)) {
+            throw new ObtsBlockedError("catchup_recovery_required", "Catch-up authoring bases do not have proven ancestry. Preserve local files and recovery evidence.");
+          }
+        };
+        for (const [path2, obligation] of Object.entries(current.obligations))
+          if (changedPathsConflict(filePath, path2)) await older(obligation.base);
+        for (const horizon of current.horizons)
+          if (horizon.touched.some((path2) => changedPathsConflict(filePath, path2)))
+            await older(this.staleHorizonBase(horizon, filePath));
+        const old = current.obligations[filePath];
+        if (old) await older(old.base);
+        current.obligations[filePath] = {
+          base,
+          generation: old ? old.generation + (old.signature === signature ? 0 : 1) : 1,
+          signature
+        };
+      }
+    });
+    const updated = Object.assign({}, saved, {
+      preserved_paths: [.../* @__PURE__ */ new Set([...saved.preserved_paths, ...distinct])].sort(),
+      recovery_bundles: bundleId ? [...saved.recovery_bundles.filter((bundle) => bundle.bundle_id !== bundleId), { bundle_id: bundleId, paths: distinct }] : saved.recovery_bundles,
+      capture_pending_paths: bundleId ? (saved.capture_pending_paths || []).filter((p) => !distinct.some((q) => changedPathsConflict(p, q))) : [.../* @__PURE__ */ new Set([...saved.capture_pending_paths || [], ...distinct])].sort()
+    });
+    await writeJson(this.fsp, this.catchupPath, updated);
+    return updated;
   }
   async resumeDurableCatchup() {
     const saved = await this.readDurableCatchup();
     if (!saved) return false;
     await this.flushEditorBuffersToDisk();
-    const files = await this.scanSyncableFiles((await this.readRootIgnorePolicy()).policy);
-    if (await this.resolveRef("refs/heads/local") !== saved.local_head || !await this.commitExists(saved.local_head) || !await this.localContentMatchesTree(files, saved.local_head) || (await this.readDirectoryState()).pending_intents.length > 0) {
-      throw new ObtsBlockedError("catchup_local_changes", "Catch-up paused to preserve local edits. Make a copy of the edited files outside this vault, restore those files to their contents immediately after the interrupted apply using local history or recovery copies, then resume sync and reapply your edits. Keep the catch-up journal and recovery evidence.");
-    }
     const queue = await this.readQueue();
     if (queue.pending_commit) throw new ObtsBlockedError("catchup_recovery_required", "A proposal overlaps interrupted catch-up. Preserve the queue and recovery evidence before continuing.");
+    const localHead = await this.resolveRef("refs/heads/local");
+    if (saved.version === 1) {
+      const files = await this.scanSyncableFiles((await this.readRootIgnorePolicy()).policy);
+      if (localHead !== saved.local_head || !await this.commitExists(saved.local_head) || !await this.localContentMatchesTree(files, saved.local_head) || (await this.readDirectoryState()).pending_intents.length > 0) {
+        throw new ObtsBlockedError("catchup_local_changes", "Catch-up is paused because local edits lack proven authoring provenance. Copy the edited files outside the vault, restore each affected path to its post-apply contents from local history or the recovery bundle, resume sync, then reapply the copied edits after catch-up completes. Keep the catch-up journal and recovery evidence until the proposal is safely queued.");
+      }
+      await this.clearQueuedHintIfUnchanged(queue.change_seq || 0);
+      return await this.pullAndApply(true);
+    }
+    const expectedCommit = await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: saved.expected_head });
+    if (localHead !== saved.expected_head || expectedCommit.commit.tree !== saved.expected_tree) {
+      throw new ObtsBlockedError("catchup_recovery_required", "The saved catch-up tree identity does not match local history. Preserve local files and recovery evidence.");
+    }
+    for (const bundle of saved.recovery_bundles) await this.verifyCatchupRecoveryBundle(bundle, saved);
+    const expectedEntries = await this.listTreeBlobOids(saved.expected_head);
+    const captured = await this.captureStableLocalChanges(expectedEntries);
+    let resumed = saved;
+    if (captured.stable) {
+      if (captured.paths.length) resumed = await this.preserveCatchupEdits(saved, captured.snapshot, captured.paths);
+      const oldPending = resumed.capture_pending_paths || [];
+      const pending = oldPending.filter((p) => captured.paths.some((q) => changedPathsConflict(p, q)));
+      if (pending.length !== oldPending.length) {
+        resumed = Object.assign({}, resumed, { capture_pending_paths: pending });
+        await writeJson(this.fsp, this.catchupPath, resumed);
+      }
+    } else if (captured.changedPath) {
+      resumed = await this.preserveCatchupEdits(saved, null, [captured.changedPath]);
+    }
     await this.clearQueuedHintIfUnchanged(queue.change_seq || 0);
-    return await this.pullAndApply(true);
+    return await this.pullAndApply(true, 0, resumed.preserved_paths, resumed.expected_head);
   }
-  async pullAndApply(allowDestructive, catchupPass = 0) {
+  async verifyCatchupRecoveryBundle(bundle, saved) {
+    const bundleId = bundle.bundle_id;
+    const root = path.join(this.obtsDir, "recovery", bundleId);
+    let manifest;
+    let complete;
+    let checksums;
+    let observed;
+    try {
+      [manifest, complete, checksums] = await Promise.all([
+        readJson(this.fsp, path.join(root, "manifest.json"), null),
+        readJson(this.fsp, path.join(root, "complete.json"), null),
+        this.fsp.readFileBounded(path.join(root, "checksums.sha256"), this.fileBufferBudgetBytes, "utf8")
+      ]);
+      observed = `${(await bundleChecksums(this.fsp, root, this.fileBufferBudgetBytes)).join("\n")}
+`;
+    } catch {
+      throw new ObtsBlockedError("catchup_recovery_required", "Catch-up recovery evidence is missing or corrupt. Preserve it and the visible local files.");
+    }
+    if (!manifest || !complete || manifest.bundle_id !== bundleId || complete.bundle_id !== bundleId || manifest.vault_id !== saved.vault_id || manifest.device_id !== saved.device_id || manifest.operation_type !== "catchup_preserved" || manifest.target_main !== saved.target_main || !Array.isArray(manifest.affected_paths) || stableJson([...manifest.affected_paths].sort()) !== stableJson(bundle.paths) || bundle.paths.some((p) => !saved.preserved_paths.includes(p)) || checksums !== observed) {
+      throw new ObtsBlockedError("catchup_recovery_required", "Catch-up recovery evidence is missing or corrupt. Preserve it and the visible local files.");
+    }
+  }
+  async pullAndApply(allowDestructive, catchupPass = 0, catchupPaths = [], catchupExpectedHead = null) {
     let state = await this.readState();
     if (!state.vault_id || !state.device_id) {
       return false;
@@ -26064,15 +26158,30 @@ var ObtsObsidianClient = class {
     let catchup = await this.readDurableCatchup();
     if (!catchup && retainedCheckpoint) {
       const acceptedRef = state.server_device_ref && state.local_head === state.server_device_ref && await this.commitExists(state.server_device_ref) && await this.isAncestor(pulled.manifest.target_main, state.server_device_ref) ? state.server_device_ref : null;
+      const expectedHead = state.local_head || pulled.manifest.target_main;
+      const expectedCommit = await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: expectedHead });
+      const authoringBase = await this.preApplyAuthoringBase(state, pulled.manifest.target_main);
+      if (!isGitObjectId(authoringBase) || !await this.commitExists(authoringBase) || !await this.isAncestor(authoringBase, pulled.manifest.target_main)) {
+        throw new ObtsBlockedError("catchup_recovery_required", "The original catch-up authoring base or its target ancestry cannot be proven. Preserve local files and recovery evidence.");
+      }
       catchup = {
-        version: 1,
+        version: 2,
         vault_id: state.vault_id,
         device_id: state.device_id,
         target_main: pulled.manifest.target_main,
-        local_head: state.local_head || pulled.manifest.target_main,
-        accepted_ref: acceptedRef
+        local_head: expectedHead,
+        accepted_ref: acceptedRef,
+        authoring_base: authoringBase,
+        expected_head: expectedHead,
+        expected_tree: expectedCommit.commit.tree,
+        preserved_paths: [],
+        recovery_bundles: [],
+        capture_pending_paths: []
       };
       await writeJson(this.fsp, this.catchupPath, catchup);
+    }
+    if (catchup?.version === 2 && !await this.isAncestor(catchup.authoring_base, pulled.manifest.target_main)) {
+      throw new ObtsBlockedError("catchup_recovery_required", "The canonical target does not contain the original catch-up authoring base. Preserve local files and recovery evidence.");
     }
     if (catchup?.accepted_ref && pulled.manifest.target_main !== catchup.target_main && !await this.isAncestor(catchup.accepted_ref, pulled.manifest.target_main)) {
       throw new ObtsBlockedError("catchup_recovery_required", "The catch-up target does not include accepted device history. Preserve local files and recovery evidence.");
@@ -26088,7 +26197,14 @@ var ObtsObsidianClient = class {
       pulled.manifest.event_seq,
       false,
       null,
-      pulled.manifest.target_file_sizes || {}
+      pulled.manifest.target_file_sizes || {},
+      null,
+      false,
+      null,
+      false,
+      catchup?.version === 2 ? await this.listTreeBlobOids(catchupExpectedHead || catchup.expected_head) : catchup?.version === 1 ? await this.listTreeBlobOids(catchup.local_head) : null,
+      catchup?.version === 2 ? [.../* @__PURE__ */ new Set([...catchup.preserved_paths, ...catchupPaths])] : [],
+      catchup?.version === 1
     );
     if (!applied) return false;
     await this.acknowledgeAppliedMain(pulled.manifest.target_main);
@@ -26097,17 +26213,62 @@ var ObtsObsidianClient = class {
     await this.settleAppliedQueue();
     const appliedState = await this.readState();
     const appliedQueue = await this.readQueue();
-    if (catchup && !appliedQueue.pending_commit && appliedQueue.status !== "queued_local" && !(appliedQueue.changed_paths || []).length) {
+    if (catchup && appliedQueue.pending_commit) {
+      throw new ObtsBlockedError("catchup_recovery_required", "A proposal appeared before catch-up handoff. Preserve the queue and recovery evidence.");
+    }
+    if (catchup) {
       const self = await this.getDeviceSelf(token);
       if (self.vault_id !== appliedState.vault_id || self.device_id !== appliedState.device_id) {
         throw new ObtsBlockedError("device_identity_mismatch", "Server device identity does not match local sync state.");
       }
       if (self.current_main !== appliedState.local_main) {
         if (catchupPass >= 4) return false;
-        return await this.pullAndApply(allowDestructive, catchupPass + 1);
+        return await this.pullAndApply(
+          allowDestructive,
+          catchupPass + 1,
+          catchup?.version === 2 ? catchup.preserved_paths : catchupPaths,
+          null
+        );
       }
       if (catchup.accepted_ref && !await this.isAncestor(catchup.accepted_ref, appliedState.local_head)) {
         throw new ObtsBlockedError("catchup_recovery_required", "Accepted device history is not restored. Preserve the catch-up journal and local recovery evidence.");
+      }
+      if (catchup.version === 2 && !await this.isAncestor(catchup.authoring_base, appliedState.local_main)) {
+        throw new ObtsBlockedError("catchup_recovery_required", "The final canonical parent does not contain the original authoring base. Preserve local files and recovery evidence.");
+      }
+      const completedCatchup = await this.readDurableCatchup();
+      if (completedCatchup?.version === 1) {
+        const finalTree = await this.listTreeBlobOids(appliedState.local_main);
+        const finalCapture = await this.captureStableLocalChanges(finalTree);
+        if (!finalCapture.stable || finalCapture.paths.length) {
+          throw new ObtsBlockedError("catchup_local_changes", "Legacy catch-up has local edits without proven provenance. Preserve the local files and recovery evidence before retrying.");
+        }
+      }
+      if (completedCatchup?.version === 2) {
+        const finalTree = await this.listTreeBlobOids(appliedState.local_main);
+        const finalCapture = await this.captureStableLocalChanges(finalTree);
+        const finalProvenance = await this.readStaleProvenance();
+        const alreadyAuthored = (filePath) => completedCatchup.preserved_paths.some((p) => changedPathsConflict(filePath, p)) || Object.keys(finalProvenance.obligations).some((p) => changedPathsConflict(filePath, p)) || finalProvenance.horizons.some((h) => h.touched.some((p) => changedPathsConflict(filePath, p)));
+        if (finalCapture.stable) {
+          const authoredPaths = finalCapture.paths.filter(alreadyAuthored);
+          if (authoredPaths.length) await this.preserveCatchupEdits(completedCatchup, finalCapture.snapshot, authoredPaths);
+          const latestCatchup = await this.readDurableCatchup();
+          const oldPending = latestCatchup?.capture_pending_paths || [];
+          const pending = oldPending.filter((p) => finalCapture.paths.some((q) => changedPathsConflict(p, q)));
+          if (pending.length !== oldPending.length && latestCatchup) {
+            await writeJson(
+              this.fsp,
+              this.catchupPath,
+              Object.assign({}, latestCatchup, { capture_pending_paths: pending })
+            );
+          }
+        } else if (finalCapture.changedPath && alreadyAuthored(finalCapture.changedPath)) {
+          await this.preserveCatchupEdits(completedCatchup, null, [finalCapture.changedPath]);
+        }
+      }
+      const handoff = await this.readDurableCatchup();
+      if (handoff?.version === 2 && handoff.capture_pending_paths.length) {
+        throw new ObtsBlockedError("catchup_local_changes", "Catch-up is waiting to durably capture preserved edits. Keep the visible files and recovery evidence, then retry sync.");
       }
       await this.fsp.rm(this.catchupPath, { force: true });
       const retiredState = await this.readState();
@@ -26387,7 +26548,7 @@ var ObtsObsidianClient = class {
     }
     return p;
   }
-  async applyTargetMain(targetMain, changedPaths, allowDestructive, extraAffectedPaths = [], requireCleanVisibleState = false, directoryIntents = [], explicitDirectories = [], eventSeq = void 0, cleanVisibleStateVerified = false, confirmedDirectoryRecovery = null, targetFileSizes = {}, consentBaselineBundleId = null, preserveConsentLocalPaths = false, consentBaselineContext = null, rebuild = false) {
+  async applyTargetMain(targetMain, changedPaths, allowDestructive, extraAffectedPaths = [], requireCleanVisibleState = false, directoryIntents = [], explicitDirectories = [], eventSeq = void 0, cleanVisibleStateVerified = false, confirmedDirectoryRecovery = null, targetFileSizes = {}, consentBaselineBundleId = null, preserveConsentLocalPaths = false, consentBaselineContext = null, rebuild = false, catchupExpectedTree = null, catchupPreservedPaths = [], catchupLegacyStrict = false) {
     await this.admitApplyRecovery();
     const pendingAck = await this.readPendingAppliedAcknowledgement();
     if (pendingAck) {
@@ -26425,7 +26586,7 @@ var ObtsObsidianClient = class {
       this.reportOperationProgress("Applying", "apply_recovery_prepare");
       const journal = {
         journal_version: 7,
-        authoring_base: await this.preApplyAuthoringBase(state, targetMain),
+        authoring_base: catchupExpectedTree ? (await this.readDurableCatchup())?.authoring_base || await this.preApplyAuthoringBase(state, targetMain) : await this.preApplyAuthoringBase(state, targetMain),
         touched_paths: [],
         target_root_ignore_oid: targetPolicy.oid,
         local_only_paths: [],
@@ -26517,6 +26678,9 @@ var ObtsObsidianClient = class {
       }
       let affectedPaths = Array.from(affected).filter((filePath) => isRecoverableApplyPath(filePath)).sort();
       journal.affected_paths = affectedPaths;
+      if (catchupExpectedTree) {
+        journal.deferred_local_paths = this.expandDeferredApplyPaths(journal, /* @__PURE__ */ new Set(), catchupPreservedPaths);
+      }
       const directoryPreflightPaths = Array.from(/* @__PURE__ */ new Set([
         ...compactedDirectoryIntents.filter((intent) => intent.op === "delete" ? preApplyDirectories.has(intent.path) : !preApplyDirectories.has(intent.path)).map((intent) => intent.path),
         ...explicitDirectorySet
@@ -26547,6 +26711,17 @@ var ObtsObsidianClient = class {
           journal.preflight_sha256[result.filePath] = result.fingerprint.kind === "file" ? result.fingerprint.sha256 : null;
           journal.preflight_fingerprints[result.filePath] = result.fingerprint;
         }
+        if (catchupExpectedTree && stagedRecovery) {
+          const racedPaths = stagedRecovery.results.filter(
+            (result) => !this.fingerprintMatchesTreePath(result.fingerprint, result.filePath, catchupExpectedTree)
+          ).map((result) => result.filePath);
+          if (racedPaths.length && catchupLegacyStrict) {
+            throw new ObtsBlockedError("catchup_local_changes", "Legacy catch-up changed after its provenance check. Preserve the local files and recovery evidence before retrying.");
+          }
+          if (racedPaths.length) {
+            journal.deferred_local_paths = this.expandDeferredApplyPaths(journal, /* @__PURE__ */ new Set(), racedPaths);
+          }
+        }
         if (consentBaselineFingerprints.size > 0 && stagedRecovery) {
           const locallyChangedPaths = stagedRecovery.results.filter((result) => {
             const expected = consentBaselineFingerprints.get(result.filePath) || { kind: "missing", sha256: null };
@@ -26572,6 +26747,7 @@ var ObtsObsidianClient = class {
       const alreadyMaterialized = new Set(journal.affected_paths.filter((p) => this.fingerprintMatchesTarget(journal.preflight_fingerprints[p], targetEntries.get(p))));
       journal.touched_paths = [.../* @__PURE__ */ new Set([
         ...journal.affected_paths.filter((p) => !alreadyMaterialized.has(p)),
+        ...catchupExpectedTree ? journal.deferred_local_paths : [],
         ...compactedDirectoryIntents.map((intent) => intent.path),
         ...[...targetMaterializedDirectories].filter((dir) => !preApplyDirectories.has(dir))
       ])].sort();
@@ -29798,13 +29974,17 @@ var ObtsObsidianClient = class {
   async clearApplyState() {
     const journal = await readApplyJournalStrict(this.fsp, this.applyJournalPath);
     await this.finishApplyProvenance(journal);
-    let catchup = null;
-    try {
-      catchup = await this.readDurableCatchup();
-    } catch {
-      catchup = null;
+    const catchup = await this.readDurableCatchup();
+    if (catchup) {
+      const localHead = await this.resolveRef("refs/heads/local");
+      const next = Object.assign({}, catchup, { local_head: localHead });
+      if (catchup.version === 2 && localHead && await this.commitExists(localHead)) {
+        const commit2 = await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: localHead });
+        next.expected_head = localHead;
+        next.expected_tree = commit2.commit.tree;
+      }
+      await writeJson(this.fsp, this.catchupPath, next);
     }
-    if (catchup) await writeJson(this.fsp, this.catchupPath, Object.assign({}, catchup, { local_head: await this.resolveRef("refs/heads/local") }));
     if (journal && isApplyId(journal.apply_id)) {
       const displacedRoot = path.join(this.obtsDir, "apply-displaced", journal.apply_id);
       if (await this.adapterExists(displacedRoot)) {
