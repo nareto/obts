@@ -1818,6 +1818,211 @@ var require_buffer = __commonJS({
   }
 });
 
+// obsidian-plugin/src/git-object-cache.cjs
+var require_git_object_cache = __commonJS({
+  "obsidian-plugin/src/git-object-cache.cjs"(exports2, module2) {
+    "use strict";
+    var CACHED_COMMANDS = [
+      "readCommit",
+      "readTree",
+      "readBlob",
+      "readObject",
+      "readTag",
+      "isDescendent",
+      "findMergeBase",
+      "packObjects",
+      "walk",
+      "log"
+    ];
+    var PENDING = /* @__PURE__ */ Symbol("pending");
+    function settledValue(promise) {
+      return Promise.race([promise, Promise.resolve(PENDING)]);
+    }
+    function packfileCacheOf(cache) {
+      for (const symbol of Object.getOwnPropertySymbols(cache)) {
+        if (symbol.description === "PackfileCache" && cache[symbol] instanceof Map) return cache[symbol];
+      }
+      return null;
+    }
+    function clearOffsetCache(index2) {
+      for (const _ in index2.offsetCache) {
+        index2.offsetCache = {};
+        return;
+      }
+    }
+    function baseName(filePath) {
+      const value = String(filePath);
+      return value.slice(value.lastIndexOf("/") + 1);
+    }
+    function createGitObjectCache2(options = {}) {
+      const retainBytes = Number.isFinite(options.maxRetainedPackBytes) ? Math.max(0, options.maxRetainedPackBytes) : 0;
+      const busyBytes = Number.isFinite(options.maxBusyPackBytes) ? Math.max(retainBytes, options.maxBusyPackBytes) : Math.max(2 * retainBytes, 16 * 1024 * 1024);
+      const packSizes = /* @__PURE__ */ new WeakMap();
+      let current = newEpoch();
+      let epochs = 0;
+      let maintenance = null;
+      let maintenanceRequested = false;
+      function newEpoch() {
+        return { cache: {}, inFlight: 0, known: /* @__PURE__ */ new Map(), retained: [] };
+      }
+      function rotate() {
+        current = newEpoch();
+        epochs += 1;
+      }
+      async function refreshKnown(epoch, packMap) {
+        for (const [key, entry] of [...packMap]) {
+          const known = epoch.known.get(key);
+          if (known && known.entry === entry) continue;
+          let index2;
+          try {
+            index2 = await settledValue(entry);
+          } catch {
+            index2 = null;
+          }
+          if (index2 === PENDING || packMap.get(key) !== entry) continue;
+          if (!index2 || typeof index2 !== "object" || !(index2.offsets instanceof Map)) {
+            packMap.delete(key);
+            epoch.known.delete(key);
+            continue;
+          }
+          epoch.known.set(key, { entry, index: index2 });
+        }
+        for (const key of [...epoch.known.keys()]) if (!packMap.has(key)) epoch.known.delete(key);
+      }
+      async function loadedPacks(epoch) {
+        const loaded = [];
+        for (const { index: index2 } of epoch.known.values()) {
+          const pack = index2.pack;
+          if (!pack) continue;
+          if (typeof pack !== "object" && typeof pack !== "function") {
+            loaded.push({ index: index2, pack, bytes: Number.POSITIVE_INFINITY });
+            continue;
+          }
+          if (!packSizes.has(pack)) {
+            let value;
+            try {
+              value = await settledValue(pack);
+            } catch {
+              value = null;
+            }
+            if (value === PENDING) continue;
+            packSizes.set(pack, value && typeof value.byteLength === "number" ? value.byteLength : Number.POSITIVE_INFINITY);
+          }
+          loaded.push({ index: index2, pack, bytes: packSizes.get(pack) });
+        }
+        return loaded;
+      }
+      async function maintain() {
+        const epoch = current;
+        const packMap = packfileCacheOf(epoch.cache);
+        if (!packMap) {
+          if (Object.getOwnPropertySymbols(epoch.cache).length > 0 && epoch.inFlight === 0) rotate();
+          return;
+        }
+        await refreshKnown(epoch, packMap);
+        const loaded = await loadedPacks(epoch);
+        if (epoch !== current) return;
+        for (const { index: index2 } of epoch.known.values()) clearOffsetCache(index2);
+        const live = loaded.filter((entry) => entry.index.pack === entry.pack);
+        if (epoch.inFlight > 0) {
+          if (live.reduce((total2, entry) => total2 + entry.bytes, 0) > busyBytes) rotate();
+          return;
+        }
+        const byIndex = new Map(live.map((entry) => [entry.index, entry]));
+        const previous = new Set(epoch.retained);
+        const ordered = [
+          ...live.filter((entry) => !previous.has(entry.index)),
+          ...epoch.retained.map((index2) => byIndex.get(index2)).filter(Boolean)
+        ];
+        let total = 0;
+        const keep = [];
+        for (const entry of ordered) {
+          if (total + entry.bytes <= retainBytes) {
+            total += entry.bytes;
+            keep.push(entry.index);
+          } else {
+            entry.index.pack = null;
+            entry.index._checksumVerified = false;
+          }
+        }
+        epoch.retained = keep;
+      }
+      function requestMaintenance() {
+        maintenanceRequested = true;
+        if (maintenance) return maintenance;
+        maintenance = (async () => {
+          while (maintenanceRequested) {
+            maintenanceRequested = false;
+            try {
+              await maintain();
+            } catch {
+              rotate();
+            }
+          }
+        })().finally(() => {
+          maintenance = null;
+          if (maintenanceRequested) requestMaintenance();
+        });
+        return maintenance;
+      }
+      return {
+        async run(command, args) {
+          const epoch = current;
+          epoch.inFlight += 1;
+          let failure = null;
+          try {
+            return await command({ ...args, cache: epoch.cache });
+          } catch (error) {
+            failure = error;
+            throw error;
+          } finally {
+            epoch.inFlight -= 1;
+            if (failure && failure.code !== "NotFoundError" && epoch === current) rotate();
+            await requestMaintenance();
+          }
+        },
+        reset() {
+          rotate();
+        },
+        forget(filePath) {
+          const packMap = packfileCacheOf(current.cache);
+          if (!packMap) return;
+          const name = baseName(filePath).replace(/\.pack$/u, ".idx");
+          for (const key of [...packMap.keys()]) {
+            if (baseName(key) === name) {
+              packMap.delete(key);
+              current.known.delete(key);
+            }
+          }
+        },
+        stats() {
+          const packMap = packfileCacheOf(current.cache);
+          let retainedPacks = 0;
+          let cachedObjects = 0;
+          for (const { index: index2 } of current.known.values()) {
+            if (index2.pack) retainedPacks += 1;
+            cachedObjects += Object.keys(index2.offsetCache || {}).length;
+          }
+          return { epoch: epochs, indexes: packMap ? packMap.size : 0, retainedPacks, cachedObjects, inFlight: current.inFlight };
+        }
+      };
+    }
+    function withGitObjectCaches2(git2, cacheForFs) {
+      const wrapped = {};
+      for (const key of Object.keys(git2)) wrapped[key] = git2[key];
+      for (const command of CACHED_COMMANDS) {
+        if (typeof git2[command] !== "function") continue;
+        wrapped[command] = (args) => {
+          const objectCache = args && !args.cache && args.fs ? cacheForFs(args.fs) : null;
+          return objectCache ? objectCache.run(git2[command], args) : git2[command](args);
+        };
+      }
+      return wrapped;
+    }
+    module2.exports = { createGitObjectCache: createGitObjectCache2, withGitObjectCaches: withGitObjectCaches2, CACHED_COMMANDS };
+  }
+});
+
 // node_modules/async-lock/lib/index.js
 var require_lib = __commonJS({
   "node_modules/async-lock/lib/index.js"(exports2, module2) {
@@ -22305,7 +22510,9 @@ var obtsRuntime = globalThis.__OBTS_CLIENT_RUNTIME__ || require("obsidian");
 var { Plugin, PluginSettingTab, Setting, Notice, Modal, Platform, requestUrl, apiVersion } = obtsRuntime;
 var { Buffer: Buffer2 } = require_buffer();
 if (typeof globalThis.Buffer === "undefined") globalThis.Buffer = Buffer2;
-var git = (init_isomorphic_git(), __toCommonJS(isomorphic_git_exports));
+var { createGitObjectCache, withGitObjectCaches } = require_git_object_cache();
+var gitObjectCaches = /* @__PURE__ */ new WeakMap();
+var git = withGitObjectCaches((init_isomorphic_git(), __toCommonJS(isomorphic_git_exports)), (fs) => gitObjectCaches.get(fs) || null);
 var path = require_path_browserify();
 var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
@@ -22314,7 +22521,7 @@ var { createByteBudget, runBoundedWork } = require_work_pool();
 var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.23";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.24";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var STALE_SETTLE_MARGIN_MS = 250;
@@ -22328,6 +22535,7 @@ var STATUS_LAG_NOTICE_DELAY_MS = 30 * 1e3;
 var STATUS_NOTICE_DURATION_MS = 15 * 1e3;
 var INITIALIZATION_STALL_DIAGNOSTIC_MS = 30 * 1e3;
 var MOBILE_PACK_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+var DESKTOP_GIT_PACK_CACHE_BYTES = 64 * 1024 * 1024;
 var DESKTOP_FILE_WORK_CONCURRENCY = 4;
 var MOBILE_FILE_WORK_CONCURRENCY = 2;
 var DESKTOP_FILE_BUFFER_BUDGET_BYTES = 64 * 1024 * 1024;
@@ -23578,6 +23786,10 @@ var ObtsObsidianClient = class {
       readAttempts: mobile ? MOBILE_PACK_READ_ATTEMPTS : 1,
       retryDelayMs: mobile ? MOBILE_PACK_READ_RETRY_MS : 0
     });
+    this.gitObjectCache = createGitObjectCache({
+      maxRetainedPackBytes: mobile ? MOBILE_PACK_CACHE_MAX_BYTES : DESKTOP_GIT_PACK_CACHE_BYTES
+    });
+    gitObjectCaches.set(this.fs, this.gitObjectCache);
     this.fsp = this.adapterFs.promises;
     this.fileWorkConcurrency = mobile ? MOBILE_FILE_WORK_CONCURRENCY : DESKTOP_FILE_WORK_CONCURRENCY;
     this.fileBufferBudgetBytes = mobile ? MOBILE_FILE_BUFFER_BUDGET_BYTES : DESKTOP_FILE_BUFFER_BUDGET_BYTES;
@@ -24598,6 +24810,7 @@ var ObtsObsidianClient = class {
     });
   }
   async syncOnce(options = {}) {
+    this.gitObjectCache.reset();
     await this.initialize();
     await this.restorePendingRenameHints();
     if (!this.onboardingOperation && await this.readPendingOnboarding()) {
@@ -29338,6 +29551,8 @@ var ObtsObsidianClient = class {
         breadcrumbs
       });
       throw wrapped;
+    } finally {
+      this.gitObjectCache.forget(packPath);
     }
   }
   async waitForPersistedBinary(filePath, expected = null) {

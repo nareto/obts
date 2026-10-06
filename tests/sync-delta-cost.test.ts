@@ -30,8 +30,15 @@ describe('sync cost is proportional to the change', () => {
       stat: cost.byMethod.stat ?? 0,
       read: (cost.byMethod.readBinary ?? 0) + (cost.byMethod.read ?? 0),
       write: (cost.byMethod.writeBinary ?? 0) + (cost.byMethod.write ?? 0) + (cost.byMethod.writeBinaryExclusive ?? 0),
+      vault: cost.byArea.vault ?? 0,
+      packs: (cost.byArea.idx ?? 0) + (cost.byArea.pack ?? 0) + (cost.byArea.packdir ?? 0),
+      loose: cost.byArea.loose ?? 0,
+      meta: (cost.byArea.gitmeta ?? 0) + (cost.byArea.obts ?? 0),
       statuses: cost.statuses
     }])));
+    if (process.env.OBTS_COST_TRACE) {
+      console.log([...fixture.meter.traces].sort((a, b) => b[1] - a[1]).slice(0, 25).map(([key, count]) => `${count}\t${key}`).join('\n'));
+    }
     await fixture?.close();
   });
 

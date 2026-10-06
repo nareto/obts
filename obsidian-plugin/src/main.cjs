@@ -2,7 +2,9 @@ const obtsRuntime = globalThis.__OBTS_CLIENT_RUNTIME__ || require("obsidian");
 const { Plugin, PluginSettingTab, Setting, Notice, Modal, Platform, requestUrl, apiVersion } = obtsRuntime;
 const { Buffer } = require("buffer");
 if (typeof globalThis.Buffer === "undefined") globalThis.Buffer = Buffer;
-const git = require("isomorphic-git");
+const { createGitObjectCache, withGitObjectCaches } = require("./git-object-cache.cjs");
+const gitObjectCaches = new WeakMap();
+const git = withGitObjectCaches(require("isomorphic-git"), (fs) => gitObjectCaches.get(fs) || null);
 const path = require("path-browserify");
 const createSha = require("sha.js");
 const { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require("./data-adapter-fs.cjs");
@@ -26,6 +28,7 @@ const STATUS_LAG_NOTICE_DELAY_MS = 30 * 1000;
 const STATUS_NOTICE_DURATION_MS = 15 * 1000;
 const INITIALIZATION_STALL_DIAGNOSTIC_MS = 30 * 1000;
 const MOBILE_PACK_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+const DESKTOP_GIT_PACK_CACHE_BYTES = 64 * 1024 * 1024;
 const DESKTOP_FILE_WORK_CONCURRENCY = 4;
 const MOBILE_FILE_WORK_CONCURRENCY = 2;
 const DESKTOP_FILE_BUFFER_BUDGET_BYTES = 64 * 1024 * 1024;
@@ -1415,6 +1418,10 @@ class ObtsObsidianClient {
       readAttempts: mobile ? MOBILE_PACK_READ_ATTEMPTS : 1,
       retryDelayMs: mobile ? MOBILE_PACK_READ_RETRY_MS : 0
     });
+    this.gitObjectCache = createGitObjectCache({
+      maxRetainedPackBytes: mobile ? MOBILE_PACK_CACHE_MAX_BYTES : DESKTOP_GIT_PACK_CACHE_BYTES
+    });
+    gitObjectCaches.set(this.fs, this.gitObjectCache);
     this.fsp = this.adapterFs.promises;
     this.fileWorkConcurrency = mobile ? MOBILE_FILE_WORK_CONCURRENCY : DESKTOP_FILE_WORK_CONCURRENCY;
     this.fileBufferBudgetBytes = mobile ? MOBILE_FILE_BUFFER_BUDGET_BYTES : DESKTOP_FILE_BUFFER_BUDGET_BYTES;
@@ -2504,6 +2511,7 @@ class ObtsObsidianClient {
   }
 
   async syncOnce(options = {}) {
+    this.gitObjectCache.reset();
     await this.initialize();
     await this.restorePendingRenameHints();
     if (!this.onboardingOperation && await this.readPendingOnboarding()) {
@@ -7665,6 +7673,8 @@ class ObtsObsidianClient {
         breadcrumbs
       });
       throw wrapped;
+    } finally {
+      this.gitObjectCache.forget(packPath);
     }
   }
 

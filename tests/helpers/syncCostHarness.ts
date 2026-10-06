@@ -18,17 +18,30 @@ export type AdapterCost = {
   calls: number;
   readBytes: number;
   byMethod: Record<string, number>;
+  byArea: Record<string, number>;
   ms: number;
 };
 
+function areaOf(adapterPath: unknown): string {
+  const value = typeof adapterPath === 'string' ? adapterPath.replace(/^\/+/u, '') : '';
+  if (value.startsWith('.obts/git/objects/pack/')) return value.endsWith('.idx') ? 'idx' : value.endsWith('.pack') ? 'pack' : 'packdir';
+  if (value === '.obts/git/objects/pack') return 'packdir';
+  if (value.startsWith('.obts/git/objects')) return 'loose';
+  if (value.startsWith('.obts/git')) return 'gitmeta';
+  if (value.startsWith('.obts')) return 'obts';
+  return 'vault';
+}
+
 class AdapterMeter {
-  private active: { calls: number; readBytes: number; byMethod: Record<string, number> } | null = null;
+  private active: { calls: number; readBytes: number; byMethod: Record<string, number>; byArea: Record<string, number> } | null = null;
   private readonly originals = new Map<string, (...args: unknown[]) => unknown>();
+  readonly traces = new Map<string, number>();
 
   install(): void {
     const proto = NodeDataAdapter.prototype as unknown as Record<string, (...args: unknown[]) => unknown>;
     for (const method of COUNTED_METHODS) {
       const original = proto[method];
+      if (!original) throw new Error(`NodeDataAdapter.${method} is missing.`);
       this.originals.set(method, original);
       const meter = this;
       proto[method] = async function counted(this: unknown, ...args: unknown[]) {
@@ -37,6 +50,15 @@ class AdapterMeter {
         if (active) {
           active.calls += 1;
           active.byMethod[method] = (active.byMethod[method] ?? 0) + 1;
+          const area = areaOf(args[0]);
+          active.byArea[area] = (active.byArea[area] ?? 0) + 1;
+          if (process.env.OBTS_COST_TRACE === area) {
+            const frames = (new Error().stack ?? '').split('\n')
+              .filter((line) => /(obsidian-plugin\/src\/(?!data-adapter-fs)|isomorphic-git)/u.test(line)).slice(0, 3)
+              .map((line) => line.trim().replace(/^at /u, '').replace(/\(.*\/(src|node_modules)\//u, '(').replace(/:\d+\)$/u, ')'));
+            const key = frames.join(' < ') || 'unknown';
+            meter.traces.set(key, (meter.traces.get(key) ?? 0) + 1);
+          }
           if (value instanceof ArrayBuffer) active.readBytes += value.byteLength;
           else if (typeof value === 'string') active.readBytes += value.length;
         }
@@ -52,7 +74,7 @@ class AdapterMeter {
   }
 
   async measure<T>(operation: () => Promise<T>): Promise<{ value: T; cost: AdapterCost }> {
-    this.active = { calls: 0, readBytes: 0, byMethod: {} };
+    this.active = { calls: 0, readBytes: 0, byMethod: {}, byArea: {} };
     const started = performance.now();
     try {
       const value = await operation();
