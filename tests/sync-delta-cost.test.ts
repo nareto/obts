@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import {
   addSyntheticPacks,
+  countLocalPacks,
   createSyncCostFixture,
   syncUntilSettled,
   writeNote,
@@ -11,7 +12,7 @@ import {
 
 const fileCount = Number(process.env.OBTS_COST_FILES ?? 300);
 const packCount = Number(process.env.OBTS_COST_PACKS ?? 100);
-const report: Record<string, AdapterCost & { statuses: string }> = {};
+const report: Record<string, AdapterCost & { statuses: string; localPacks: number }> = {};
 
 describe('sync cost is proportional to the change', () => {
   let fixture: SyncCostFixture;
@@ -34,6 +35,7 @@ describe('sync cost is proportional to the change', () => {
       packs: (cost.byArea.idx ?? 0) + (cost.byArea.pack ?? 0) + (cost.byArea.packdir ?? 0),
       loose: cost.byArea.loose ?? 0,
       meta: (cost.byArea.gitmeta ?? 0) + (cost.byArea.obts ?? 0),
+      localPacks: cost.localPacks,
       statuses: cost.statuses
     }])));
     if (process.env.OBTS_COST_TRACE) {
@@ -44,7 +46,7 @@ describe('sync cost is proportional to the change', () => {
 
   async function measureReader(name: string): Promise<AdapterCost> {
     const { value, cost } = await fixture.meter.measure(() => syncUntilSettled(fixture.reader));
-    report[name] = { ...cost, statuses: value.join(' > ') };
+    report[name] = { ...cost, statuses: value.join(' > '), localPacks: await countLocalPacks(fixture.readerDir) };
     expect(value.at(-1)).toBe('Synced');
     return cost;
   }
@@ -77,5 +79,26 @@ describe('sync cost is proportional to the change', () => {
     await writeNote(fixture.writerDir, 11, 'remote edit with many packs\n');
     expect((await syncUntilSettled(fixture.writer)).at(-1)).toBe('Synced');
     await measureReader(`remote 1 file, +${packCount} packs`);
+    expect(report[`remote 1 file, +${packCount} packs`]!.localPacks).toBeLessThanOrEqual(24);
+  }, 300_000);
+
+  it('measures a one-file remote change after local packs were consolidated', async () => {
+    await writeNote(fixture.writerDir, 13, 'remote edit after consolidation\n');
+    expect((await syncUntilSettled(fixture.writer)).at(-1)).toBe('Synced');
+    await measureReader('remote 1 file, consolidated');
+  }, 300_000);
+
+  it('keeps syncing when local pack maintenance fails', async () => {
+    const core = (fixture.reader as unknown as { client: any }).client;
+    const consolidator = core.packConsolidator;
+    core.packConsolidator = { run: async () => { throw Object.assign(new Error('simulated maintenance failure'), { code: 'EIO' }); } };
+    try {
+      await writeNote(fixture.writerDir, 14, 'remote edit while maintenance fails\n');
+      expect((await syncUntilSettled(fixture.writer)).at(-1)).toBe('Synced');
+      expect((await syncUntilSettled(fixture.reader)).at(-1)).toBe('Synced');
+      expect(core.lastPackMaintenance).toEqual({ status: 'failed', reason: 'EIO' });
+    } finally {
+      core.packConsolidator = consolidator;
+    }
   }, 300_000);
 });

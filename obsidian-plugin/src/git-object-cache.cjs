@@ -10,6 +10,10 @@
 // - if concurrent commands keep the cache busy past a ceiling, or a command
 //   fails for a reason other than a missing object, later commands start a
 //   fresh cache and the old one is released once its commands finish.
+//
+// Pack maintenance announces itself with beginPackChange(). A read command
+// that fails while a change overlapped it waits for the change to finish and
+// retries against a fresh cache, as git re-scans packs when one disappears.
 
 const CACHED_COMMANDS = [
   "readCommit",
@@ -25,6 +29,7 @@ const CACHED_COMMANDS = [
 ];
 
 const PENDING = Symbol("pending");
+const PACK_CHANGE_RETRIES = 2;
 
 function settledValue(promise) {
   return Promise.race([promise, Promise.resolve(PENDING)]);
@@ -59,6 +64,7 @@ function createGitObjectCache(options = {}) {
   let epochs = 0;
   let maintenance = null;
   let maintenanceRequested = false;
+  const packChanges = { depth: 0, generation: 0, idle: Promise.resolve(), settle: null };
 
   function newEpoch() {
     return { cache: {}, inFlight: 0, known: new Map(), retained: [] };
@@ -171,19 +177,39 @@ function createGitObjectCache(options = {}) {
 
   return {
     async run(command, args) {
-      const epoch = current;
-      epoch.inFlight += 1;
-      let failure = null;
-      try {
-        return await command({ ...args, cache: epoch.cache });
-      } catch (error) {
-        failure = error;
-        throw error;
-      } finally {
-        epoch.inFlight -= 1;
-        if (failure && failure.code !== "NotFoundError" && epoch === current) rotate();
-        await requestMaintenance();
+      for (let attempt = 0; ; attempt += 1) {
+        const generation = packChanges.generation;
+        const epoch = current;
+        epoch.inFlight += 1;
+        let failure = null;
+        try {
+          return await command({ ...args, cache: epoch.cache });
+        } catch (error) {
+          failure = error;
+          const overlapped = packChanges.depth > 0 || packChanges.generation !== generation;
+          if (!overlapped || attempt >= PACK_CHANGE_RETRIES || (args && args.write)) throw error;
+        } finally {
+          epoch.inFlight -= 1;
+          if (failure && failure.code !== "NotFoundError" && epoch === current) rotate();
+          await requestMaintenance();
+        }
+        await packChanges.idle;
       }
+    },
+    beginPackChange() {
+      if (packChanges.depth === 0) packChanges.idle = new Promise((resolve) => { packChanges.settle = resolve; });
+      packChanges.depth += 1;
+      packChanges.generation += 1;
+      let ended = false;
+      return () => {
+        if (ended) return;
+        ended = true;
+        packChanges.depth -= 1;
+        packChanges.generation += 1;
+        if (packChanges.depth > 0) return;
+        rotate();
+        packChanges.settle();
+      };
     },
     reset() {
       rotate();

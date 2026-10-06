@@ -5,6 +5,7 @@ if (typeof globalThis.Buffer === "undefined") globalThis.Buffer = Buffer;
 const { createGitObjectCache, withGitObjectCaches } = require("./git-object-cache.cjs");
 const gitObjectCaches = new WeakMap();
 const git = withGitObjectCaches(require("isomorphic-git"), (fs) => gitObjectCaches.get(fs) || null);
+const { createPackConsolidator } = require("./git-pack-consolidation.cjs");
 const path = require("path-browserify");
 const createSha = require("sha.js");
 const { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require("./data-adapter-fs.cjs");
@@ -29,6 +30,8 @@ const STATUS_NOTICE_DURATION_MS = 15 * 1000;
 const INITIALIZATION_STALL_DIAGNOSTIC_MS = 30 * 1000;
 const MOBILE_PACK_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 const DESKTOP_GIT_PACK_CACHE_BYTES = 64 * 1024 * 1024;
+const MOBILE_PACK_CONSOLIDATION_MAX_BYTES = 8 * 1024 * 1024;
+const DESKTOP_PACK_CONSOLIDATION_MAX_BYTES = 32 * 1024 * 1024;
 const DESKTOP_FILE_WORK_CONCURRENCY = 4;
 const MOBILE_FILE_WORK_CONCURRENCY = 2;
 const DESKTOP_FILE_BUFFER_BUDGET_BYTES = 64 * 1024 * 1024;
@@ -1434,6 +1437,15 @@ class ObtsObsidianClient {
     this.directoryStatePath = path.join(this.obtsDir, "directory-state.json");
     this.applyJournalPath = path.join(this.obtsDir, "apply-journal.json");
     this.staleProvenancePath = path.join(this.obtsDir, "stale-provenance.json");
+    this.packConsolidator = createPackConsolidator({
+      fsp: this.fsp,
+      gitdir: this.gitdir,
+      journalPath: path.join(this.gitdir, "obts-pack-consolidation.json"),
+      policy: { maxPackBytes: mobile ? MOBILE_PACK_CONSOLIDATION_MAX_BYTES : DESKTOP_PACK_CONSOLIDATION_MAX_BYTES },
+      beginPackChange: () => this.gitObjectCache.beginPackChange(),
+      onPackRemoved: (packPath) => this.fs.deleteReadOverlay(packPath)
+    });
+    this.lastPackMaintenance = null;
     this.staleMutation = Promise.resolve();
     this.applyLockPath = path.join(this.obtsDir, "apply.lock");
     this.managedHeadlessOwner = plugin.managedHeadlessOwner ?? null;
@@ -2510,9 +2522,23 @@ class ObtsObsidianClient {
     });
   }
 
+  // Keeps the pack count logarithmic so each object read scans few indexes.
+  // It only ever adds a pack holding every object of the packs it removes, so
+  // a failure here leaves Git readable and must not fail the sync around it.
+  async maintainGitPacks() {
+    try {
+      this.lastPackMaintenance = await this.packConsolidator.run();
+    } catch (error) {
+      const code = error && typeof error.code === "string" && /^[A-Za-z0-9_]{1,64}$/u.test(error.code) ? error.code : "unknown";
+      this.lastPackMaintenance = { status: "failed", reason: code };
+    }
+    return this.lastPackMaintenance;
+  }
+
   async syncOnce(options = {}) {
     this.gitObjectCache.reset();
     await this.initialize();
+    await this.maintainGitPacks();
     await this.restorePendingRenameHints();
     if (!this.onboardingOperation && await this.readPendingOnboarding()) {
       throw new ObtsBlockedError("onboarding_incomplete", "Finish or cancel browser onboarding before normal sync.");
@@ -4447,6 +4473,7 @@ class ObtsObsidianClient {
     if (!state.vault_id || !state.device_id) {
       return { applied: false, status: "Not paired" };
     }
+    await this.maintainGitPacks();
     const wasConflictBlocked = state.last_error_code === "conflict_review_required";
     if (!wasConflictBlocked) {
       this.throwIfSyncBlocked(state);

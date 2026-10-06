@@ -24,7 +24,9 @@ export const pluginTests = [
   'tests/managed-headless-ownership.test.ts',
   'tests/managed-headless-reporting.test.ts',
   'tests/client-state-authority.test.ts',
-  'tests/applied-ack-barrier.test.ts'
+  'tests/applied-ack-barrier.test.ts',
+  'tests/git-object-cache.test.ts',
+  'tests/git-pack-consolidation.test.ts'
 ];
 
 export const dashboardTests = ['tests/vault-deletion.test.ts'];

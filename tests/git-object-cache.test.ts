@@ -12,6 +12,7 @@ type ObjectCache = {
   run(command: unknown, args: unknown): Promise<unknown>;
   reset(): void;
   forget(filePath: string): void;
+  beginPackChange(): () => void;
   stats(): CacheStats;
 };
 
@@ -208,3 +209,86 @@ describe('shared git object cache', () => {
   });
 });
 
+describe('pack change window', () => {
+  const vanished = () => Object.assign(new Error('pack vanished'), { code: 'InternalError' });
+
+  it('retries a read that failed during a pack change once the change ends, with a fresh cache', async () => {
+    const objectCache = createGitObjectCache({ maxRetainedPackBytes: 0 });
+    const caches: unknown[] = [];
+    let end = () => undefined as void;
+    const result = objectCache.run(async ({ cache }: { cache: unknown }) => {
+      caches.push(cache);
+      if (caches.length === 1) {
+        end = objectCache.beginPackChange();
+        throw vanished();
+      }
+      return 'read';
+    }, {});
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(caches).toHaveLength(1);
+    end();
+    await expect(result).resolves.toBe('read');
+    expect(caches).toHaveLength(2);
+    expect(caches[1]).not.toBe(caches[0]);
+  });
+
+  it('retries a read that started during a change and failed after it ended', async () => {
+    const objectCache = createGitObjectCache({ maxRetainedPackBytes: 0 });
+    const end = objectCache.beginPackChange();
+    let attempts = 0;
+    const result = objectCache.run(async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        end();
+        throw vanished();
+      }
+      return 'read';
+    }, {});
+    await expect(result).resolves.toBe('read');
+    expect(attempts).toBe(2);
+  });
+
+  it('does not retry failures without an overlapping change, writes, or beyond the retry bound', async () => {
+    const objectCache = createGitObjectCache({ maxRetainedPackBytes: 0 });
+    let attempts = 0;
+    await expect(objectCache.run(async () => {
+      attempts += 1;
+      throw vanished();
+    }, {})).rejects.toThrow('pack vanished');
+    expect(attempts).toBe(1);
+
+    attempts = 0;
+    await expect(objectCache.run(async () => {
+      attempts += 1;
+      objectCache.beginPackChange()();
+      throw vanished();
+    }, { write: true })).rejects.toThrow('pack vanished');
+    expect(attempts).toBe(1);
+
+    attempts = 0;
+    await expect(objectCache.run(async () => {
+      attempts += 1;
+      objectCache.beginPackChange()();
+      throw vanished();
+    }, {})).rejects.toThrow('pack vanished');
+    expect(attempts).toBe(3);
+  });
+
+  it('waits for nested changes and ignores repeated end calls', async () => {
+    const objectCache = createGitObjectCache({ maxRetainedPackBytes: 0 });
+    const outer = objectCache.beginPackChange();
+    const inner = objectCache.beginPackChange();
+    let attempts = 0;
+    const result = objectCache.run(async () => {
+      attempts += 1;
+      if (attempts === 1) throw vanished();
+      return 'read';
+    }, {});
+    inner();
+    inner();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(attempts).toBe(1);
+    outer();
+    await expect(result).resolves.toBe('read');
+  });
+});

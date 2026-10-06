@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -195,6 +195,11 @@ export async function syncUntilSettled(plugin: ObtsPluginClient, maxCycles = 6):
     if (result.status === 'Synced') break;
   }
   return statuses;
+}
+
+export async function countLocalPacks(vaultDir: string): Promise<number> {
+  const names = await readdir(join(vaultDir, '.obts', 'git', 'objects', 'pack')).catch(() => [] as string[]);
+  return names.filter((name) => name.endsWith('.pack')).length;
 }
 
 export async function addSyntheticPacks(plugin: ObtsPluginClient, count: number): Promise<void> {

@@ -1835,6 +1835,7 @@ var require_git_object_cache = __commonJS({
       "log"
     ];
     var PENDING = /* @__PURE__ */ Symbol("pending");
+    var PACK_CHANGE_RETRIES = 2;
     function settledValue(promise) {
       return Promise.race([promise, Promise.resolve(PENDING)]);
     }
@@ -1862,6 +1863,7 @@ var require_git_object_cache = __commonJS({
       let epochs = 0;
       let maintenance = null;
       let maintenanceRequested = false;
+      const packChanges = { depth: 0, generation: 0, idle: Promise.resolve(), settle: null };
       function newEpoch() {
         return { cache: {}, inFlight: 0, known: /* @__PURE__ */ new Map(), retained: [] };
       }
@@ -1967,19 +1969,41 @@ var require_git_object_cache = __commonJS({
       }
       return {
         async run(command, args) {
-          const epoch = current;
-          epoch.inFlight += 1;
-          let failure = null;
-          try {
-            return await command({ ...args, cache: epoch.cache });
-          } catch (error) {
-            failure = error;
-            throw error;
-          } finally {
-            epoch.inFlight -= 1;
-            if (failure && failure.code !== "NotFoundError" && epoch === current) rotate();
-            await requestMaintenance();
+          for (let attempt = 0; ; attempt += 1) {
+            const generation = packChanges.generation;
+            const epoch = current;
+            epoch.inFlight += 1;
+            let failure = null;
+            try {
+              return await command({ ...args, cache: epoch.cache });
+            } catch (error) {
+              failure = error;
+              const overlapped = packChanges.depth > 0 || packChanges.generation !== generation;
+              if (!overlapped || attempt >= PACK_CHANGE_RETRIES || args && args.write) throw error;
+            } finally {
+              epoch.inFlight -= 1;
+              if (failure && failure.code !== "NotFoundError" && epoch === current) rotate();
+              await requestMaintenance();
+            }
+            await packChanges.idle;
           }
+        },
+        beginPackChange() {
+          if (packChanges.depth === 0) packChanges.idle = new Promise((resolve) => {
+            packChanges.settle = resolve;
+          });
+          packChanges.depth += 1;
+          packChanges.generation += 1;
+          let ended = false;
+          return () => {
+            if (ended) return;
+            ended = true;
+            packChanges.depth -= 1;
+            packChanges.generation += 1;
+            if (packChanges.depth > 0) return;
+            rotate();
+            packChanges.settle();
+          };
         },
         reset() {
           rotate();
@@ -21565,6 +21589,468 @@ var require_sha2 = __commonJS({
   }
 });
 
+// obsidian-plugin/src/git-pack-consolidation.cjs
+var require_git_pack_consolidation = __commonJS({
+  "obsidian-plugin/src/git-pack-consolidation.cjs"(exports2, module2) {
+    "use strict";
+    var { Buffer: Buffer3 } = require_buffer();
+    var path2 = require_path_browserify();
+    var createSha2 = require_sha2();
+    var PACK_SIGNATURE = Buffer3.from("PACK");
+    var IDX_SIGNATURE = Buffer3.from([255, 116, 79, 99]);
+    var CONSOLIDATED_PREFIX = "obts-pack-";
+    var JOURNAL_VERSION = 1;
+    var DEFAULT_POLICY = Object.freeze({
+      triggerPackCount: 24,
+      maxPackBytes: 8 * 1024 * 1024,
+      maxSources: 256,
+      factor: 2
+    });
+    var PackVerificationError = class extends Error {
+      constructor(code) {
+        super(`Git pack verification failed: ${code}.`);
+        this.name = "PackVerificationError";
+        this.code = code;
+      }
+    };
+    var CRC_TABLE = (() => {
+      const table = new Int32Array(256);
+      for (let index2 = 0; index2 < 256; index2 += 1) {
+        let value = index2;
+        for (let bit = 0; bit < 8; bit += 1) value = value & 1 ? 3988292384 ^ value >>> 1 : value >>> 1;
+        table[index2] = value;
+      }
+      return table;
+    })();
+    function crc322(bytes) {
+      let crc = -1;
+      for (let index2 = 0; index2 < bytes.length; index2 += 1) crc = CRC_TABLE[(crc ^ bytes[index2]) & 255] ^ crc >>> 8;
+      return (crc ^ -1) >>> 0;
+    }
+    function sha1(bytes) {
+      return createSha2("sha1").update(bytes).digest();
+    }
+    function asBuffer(value) {
+      return Buffer3.isBuffer(value) ? value : Buffer3.from(value);
+    }
+    function parsePackIndex(value) {
+      const idx = asBuffer(value);
+      if (idx.length < 8 + 1024 + 40 || !idx.subarray(0, 4).equals(IDX_SIGNATURE) || idx.readUInt32BE(4) !== 2) {
+        throw new PackVerificationError("idx_header");
+      }
+      const count = idx.readUInt32BE(8 + 255 * 4);
+      const oidStart = 8 + 1024;
+      const crcStart = oidStart + count * 20;
+      const offsetStart = crcStart + count * 4;
+      const trailerStart = offsetStart + count * 4;
+      if (idx.length !== trailerStart + 40) throw new PackVerificationError("idx_length");
+      if (!sha1(idx.subarray(0, idx.length - 20)).equals(idx.subarray(idx.length - 20))) {
+        throw new PackVerificationError("idx_checksum");
+      }
+      const entries = new Array(count);
+      for (let index2 = 0; index2 < count; index2 += 1) {
+        const oid = idx.subarray(oidStart + index2 * 20, oidStart + index2 * 20 + 20);
+        if (index2 > 0 && Buffer3.compare(entries[index2 - 1].oid, oid) > 0) throw new PackVerificationError("idx_order");
+        const offset = idx.readUInt32BE(offsetStart + index2 * 4);
+        if (offset & 2147483648) throw new PackVerificationError("idx_large_offset");
+        entries[index2] = { oid, crc: idx.readUInt32BE(crcStart + index2 * 4), offset };
+      }
+      let cursor = 0;
+      for (let byte = 0; byte < 256; byte += 1) {
+        while (cursor < count && entries[cursor].oid[0] <= byte) cursor += 1;
+        if (idx.readUInt32BE(8 + byte * 4) !== cursor) throw new PackVerificationError("idx_fanout");
+      }
+      return { entries, packChecksum: idx.subarray(trailerStart, trailerStart + 20) };
+    }
+    function verifyPack(packValue, index2) {
+      const pack = asBuffer(packValue);
+      if (pack.length < 32 || !pack.subarray(0, 4).equals(PACK_SIGNATURE)) throw new PackVerificationError("pack_header");
+      const version2 = pack.readUInt32BE(4);
+      if (version2 !== 2 && version2 !== 3) throw new PackVerificationError("pack_version");
+      if (pack.readUInt32BE(8) !== index2.entries.length) throw new PackVerificationError("pack_object_count");
+      const trailer = pack.subarray(pack.length - 20);
+      if (!trailer.equals(index2.packChecksum) || !sha1(pack.subarray(0, pack.length - 20)).equals(trailer)) {
+        throw new PackVerificationError("pack_checksum");
+      }
+      const byOffset = index2.entries.slice().sort((left, right) => left.offset - right.offset);
+      const oidAtOffset = new Map(byOffset.map((entry) => [entry.offset, entry.oid]));
+      const contained = new Set(byOffset.map((entry) => entry.oid.toString("hex")));
+      const objects = new Array(byOffset.length);
+      for (let position = 0; position < byOffset.length; position += 1) {
+        const start = byOffset[position].offset;
+        const end = position + 1 < byOffset.length ? byOffset[position + 1].offset : pack.length - 20;
+        if (start < 12 || end <= start || end > pack.length - 20 || position === 0 && start !== 12) {
+          throw new PackVerificationError("pack_object_bounds");
+        }
+        if (crc322(pack.subarray(start, end)) !== byOffset[position].crc) throw new PackVerificationError("pack_object_crc");
+        const header = readEntryHeader(pack, start, end);
+        let baseOid = null;
+        if (header.type === OFS_DELTA) {
+          baseOid = oidAtOffset.get(header.baseOffset);
+          if (!baseOid) throw new PackVerificationError("pack_delta_base");
+        } else if (header.type === REF_DELTA) {
+          baseOid = pack.subarray(header.payloadStart - 20, header.payloadStart);
+          if (!contained.has(baseOid.toString("hex"))) throw new PackVerificationError("pack_thin");
+        }
+        objects[position] = { oid: byOffset[position].oid, crc: byOffset[position].crc, start, end, header, baseOid };
+      }
+      return { pack, objects };
+    }
+    var OFS_DELTA = 6;
+    var REF_DELTA = 7;
+    function readEntryHeader(pack, start, end) {
+      let cursor = start;
+      let byte = pack[cursor++];
+      const type = byte >> 4 & 7;
+      if (type === 0 || type === 5) throw new PackVerificationError("pack_object_type");
+      for (let continuation = 0; byte & 128; continuation += 1) {
+        if (cursor >= end || continuation >= 9) throw new PackVerificationError("pack_object_header");
+        byte = pack[cursor++];
+      }
+      const sizeEnd = cursor;
+      let baseOffset = null;
+      if (type === OFS_DELTA) {
+        if (cursor >= end) throw new PackVerificationError("pack_object_header");
+        byte = pack[cursor++];
+        let distance = byte & 127;
+        while (byte & 128) {
+          if (cursor >= end || distance > 16777215) throw new PackVerificationError("pack_object_header");
+          byte = pack[cursor++];
+          distance = (distance + 1) * 128 + (byte & 127);
+        }
+        if (distance <= 0 || distance > start - 12) throw new PackVerificationError("pack_delta_base");
+        baseOffset = start - distance;
+      } else if (type === REF_DELTA) {
+        cursor += 20;
+      }
+      if (cursor >= end) throw new PackVerificationError("pack_object_header");
+      return { type, sizeEnd, payloadStart: cursor, baseOffset };
+    }
+    function buildPackIndex(entries, packChecksum) {
+      const count = entries.length;
+      const idx = Buffer3.alloc(8 + 1024 + count * 28 + 40);
+      IDX_SIGNATURE.copy(idx, 0);
+      idx.writeUInt32BE(2, 4);
+      const fanout = new Uint32Array(256);
+      for (const entry of entries) fanout[entry.oid[0]] += 1;
+      let running = 0;
+      for (let byte = 0; byte < 256; byte += 1) {
+        running += fanout[byte];
+        idx.writeUInt32BE(running, 8 + byte * 4);
+      }
+      const oidStart = 8 + 1024;
+      const crcStart = oidStart + count * 20;
+      const offsetStart = crcStart + count * 4;
+      entries.forEach((entry, index2) => {
+        entry.oid.copy(idx, oidStart + index2 * 20);
+        idx.writeUInt32BE(entry.crc, crcStart + index2 * 4);
+        idx.writeUInt32BE(entry.offset, offsetStart + index2 * 4);
+      });
+      packChecksum.copy(idx, offsetStart + count * 4);
+      sha1(idx.subarray(0, idx.length - 20)).copy(idx, idx.length - 20);
+      return idx;
+    }
+    function buildConsolidatedPack(sources) {
+      const header = Buffer3.alloc(12);
+      PACK_SIGNATURE.copy(header, 0);
+      header.writeUInt32BE(2, 4);
+      const parts = [header];
+      const entries = [];
+      const emitted = /* @__PURE__ */ new Set();
+      let position = 12;
+      for (const source of sources) {
+        for (const object of source.verified.objects) {
+          const key = object.oid.toString("hex");
+          if (emitted.has(key)) continue;
+          emitted.add(key);
+          let bytes = source.verified.pack.subarray(object.start, object.end);
+          let crc = object.crc;
+          if (object.header.type === OFS_DELTA) {
+            const typeAndSize = Buffer3.from(bytes.subarray(0, object.header.sizeEnd - object.start));
+            typeAndSize[0] = typeAndSize[0] & 143 | REF_DELTA << 4;
+            bytes = Buffer3.concat([typeAndSize, object.baseOid, bytes.subarray(object.header.payloadStart - object.start)]);
+            crc = crc322(bytes);
+          }
+          entries.push({ oid: object.oid, crc, offset: position });
+          parts.push(bytes);
+          position += bytes.length;
+          if (position > 2147483647) throw new PackVerificationError("consolidated_too_large");
+        }
+      }
+      header.writeUInt32BE(entries.length, 8);
+      const withoutTrailer = Buffer3.concat(parts);
+      const checksum = sha1(withoutTrailer);
+      const pack = Buffer3.concat([withoutTrailer, checksum]);
+      entries.sort((left, right) => Buffer3.compare(left.oid, right.oid));
+      const idx = buildPackIndex(entries, checksum);
+      return { name: `${CONSOLIDATED_PREFIX}${checksum.toString("hex")}`, pack, idx };
+    }
+    function selectConsolidationSources(packs, policy) {
+      const sorted = packs.filter((pack) => pack.size <= policy.maxPackBytes).sort((left, right) => left.size - right.size || left.name.localeCompare(right.name));
+      if (sorted.length < 2) return [];
+      let split = sorted.length - 1;
+      for (; split > 0; split -= 1) {
+        if (sorted[split].size < policy.factor * sorted[split - 1].size) break;
+      }
+      if (split > 0) split += 1;
+      let total = 0;
+      for (let index2 = 0; index2 < split; index2 += 1) total += sorted[index2].size;
+      while (split < sorted.length && sorted[split].size < policy.factor * total) {
+        total += sorted[split].size;
+        split += 1;
+      }
+      const selected = [];
+      let selectedBytes = 0;
+      for (const pack of sorted.slice(0, split)) {
+        if (selected.length >= policy.maxSources || selectedBytes + pack.size > policy.maxPackBytes) break;
+        selected.push(pack);
+        selectedBytes += pack.size;
+      }
+      return selected.length >= 2 ? selected : [];
+    }
+    function isNotFound(error) {
+      return Boolean(error && (error.code === "ENOENT" || error.code === "NotFoundError"));
+    }
+    function createPackConsolidator2(options) {
+      const { fsp, gitdir, journalPath } = options;
+      const policy = Object.assign({}, DEFAULT_POLICY, options.policy || {});
+      const beginPackChange = typeof options.beginPackChange === "function" ? options.beginPackChange : () => () => void 0;
+      const onPackRemoved = typeof options.onPackRemoved === "function" ? options.onPackRemoved : () => void 0;
+      const packDir = path2.join(gitdir, "objects", "pack");
+      const packPath = (name) => path2.join(packDir, `${name}.pack`);
+      const idxPath = (name) => path2.join(packDir, `${name}.idx`);
+      let settledPackSet = null;
+      let scannedForOrphans = false;
+      async function readOptional(filePath) {
+        try {
+          return asBuffer(await fsp.readFile(filePath));
+        } catch (error) {
+          if (isNotFound(error)) return null;
+          throw error;
+        }
+      }
+      async function removeIfPresent(filePath) {
+        try {
+          await fsp.unlink(filePath);
+          return true;
+        } catch (error) {
+          if (isNotFound(error)) return false;
+          throw error;
+        }
+      }
+      async function writeVerified(filePath, bytes) {
+        await fsp.writeFile(filePath, bytes, { mode: 384 });
+        if (typeof fsp.syncFile === "function") await fsp.syncFile(filePath);
+        const persisted = await readOptional(filePath);
+        if (!persisted || !persisted.equals(bytes)) throw new PackVerificationError("persisted_bytes_mismatch");
+      }
+      async function writeAtomicVerified(filePath, bytes) {
+        const temporaryPath = `${filePath}.tmp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+        try {
+          await writeVerified(temporaryPath, bytes);
+          await fsp.rename(temporaryPath, filePath);
+        } catch (error) {
+          await removeIfPresent(temporaryPath).catch(() => void 0);
+          throw error;
+        }
+        if (typeof fsp.syncDirectory === "function") await fsp.syncDirectory(path2.dirname(filePath));
+        const persisted = await readOptional(filePath);
+        if (!persisted || !persisted.equals(bytes)) throw new PackVerificationError("persisted_bytes_mismatch");
+      }
+      async function readJournal() {
+        const bytes = await readOptional(journalPath);
+        if (!bytes) return null;
+        try {
+          const journal = JSON.parse(bytes.toString("utf8"));
+          const validName = (name) => typeof name === "string" && /^[A-Za-z0-9._-]+$/u.test(name) && !name.includes("..");
+          if (journal && journal.version === JOURNAL_VERSION && validName(journal.pack) && journal.pack.startsWith(CONSOLIDATED_PREFIX) && Array.isArray(journal.sources) && journal.sources.every(validName) && !journal.sources.includes(journal.pack)) {
+            return journal;
+          }
+        } catch {
+        }
+        return { invalid: true };
+      }
+      async function removeSources(sources, published = null) {
+        const end = beginPackChange();
+        const removed = [];
+        try {
+          for (const source of sources) {
+            const sourceIdx = published ? await readOptional(idxPath(source)) : null;
+            if (sourceIdx) {
+              let contained = false;
+              try {
+                const sourceOids = parsePackIndex(sourceIdx).entries;
+                contained = sourceOids.every((entry) => published.has(entry.oid.toString("hex")));
+              } catch (error) {
+                if (!(error instanceof PackVerificationError)) throw error;
+              }
+              if (!contained) continue;
+            }
+            await removeIfPresent(idxPath(source));
+            await removeIfPresent(packPath(source));
+            removed.push(source);
+            onPackRemoved(packPath(source));
+          }
+        } finally {
+          end();
+        }
+        if (removed.length && typeof fsp.syncDirectory === "function") await fsp.syncDirectory(packDir);
+        return removed;
+      }
+      async function publishedOids(name) {
+        const idx = await readOptional(idxPath(name));
+        if (!idx) return null;
+        const pack = await readOptional(packPath(name));
+        if (!pack) return null;
+        const index2 = parsePackIndex(idx);
+        verifyPack(pack, index2);
+        return new Set(index2.entries.map((entry) => entry.oid.toString("hex")));
+      }
+      async function allSourcesPresent(sources) {
+        for (const source of sources) {
+          if (!await readOptional(idxPath(source)) || !await readOptional(packPath(source))) return false;
+        }
+        return true;
+      }
+      async function recover() {
+        const journal = await readJournal();
+        if (journal && !journal.invalid) {
+          let published = null;
+          try {
+            published = await publishedOids(journal.pack);
+          } catch (error) {
+            if (!(error instanceof PackVerificationError)) throw error;
+          }
+          if (published) {
+            await removeSources(journal.sources, published);
+          } else if (await allSourcesPresent(journal.sources)) {
+            await removeIfPresent(idxPath(journal.pack));
+            await removeIfPresent(packPath(journal.pack));
+          } else {
+            throw new PackVerificationError("recovery_blocked");
+          }
+        }
+        if (journal) await removeIfPresent(journalPath);
+        if (!journal && scannedForOrphans) return;
+        scannedForOrphans = true;
+        const journalTemporaryPrefix = `${path2.basename(journalPath)}.tmp-`;
+        let journalSiblings = [];
+        try {
+          journalSiblings = await fsp.readdir(path2.dirname(journalPath));
+        } catch (error) {
+          if (!isNotFound(error)) throw error;
+        }
+        for (const name of journalSiblings) {
+          if (name.startsWith(journalTemporaryPrefix)) await removeIfPresent(path2.join(path2.dirname(journalPath), name));
+        }
+        let names;
+        try {
+          names = await fsp.readdir(packDir);
+        } catch (error) {
+          if (isNotFound(error)) return;
+          throw error;
+        }
+        const indexed = new Set(names.filter((name) => name.endsWith(".idx")).map((name) => name.slice(0, -4)));
+        for (const name of names) {
+          if (!name.startsWith(CONSOLIDATED_PREFIX)) continue;
+          const orphanPack = name.endsWith(".pack") && !indexed.has(name.slice(0, -5));
+          if (orphanPack || name.includes(".tmp-")) await removeIfPresent(path2.join(packDir, name));
+        }
+      }
+      let inFlight = null;
+      function serialized(operation) {
+        const current = (inFlight || Promise.resolve()).catch(() => void 0).then(operation);
+        inFlight = current;
+        return current.finally(() => {
+          if (inFlight === current) inFlight = null;
+        });
+      }
+      async function consolidate() {
+        await recover();
+        let names;
+        try {
+          names = (await fsp.readdir(packDir)).filter((name) => name.endsWith(".idx")).map((name) => name.slice(0, -4)).sort();
+        } catch (error) {
+          if (isNotFound(error)) return { status: "skipped", reason: "no_packs" };
+          throw error;
+        }
+        if (names.length <= policy.triggerPackCount) return { status: "skipped", reason: "below_trigger" };
+        const packSetKey = names.join("\n");
+        if (settledPackSet === packSetKey) return { status: "skipped", reason: "settled" };
+        const packs = [];
+        for (const name of names) {
+          try {
+            packs.push({ name, size: (await fsp.stat(packPath(name))).size });
+          } catch (error) {
+            if (!isNotFound(error)) throw error;
+          }
+        }
+        const sources = [];
+        const rejected = [];
+        for (const candidate of selectConsolidationSources(packs, policy)) {
+          const [idx, pack] = [await readOptional(idxPath(candidate.name)), await readOptional(packPath(candidate.name))];
+          try {
+            if (!idx || !pack) throw new PackVerificationError("missing_pack_file");
+            sources.push({ name: candidate.name, verified: verifyPack(pack, parsePackIndex(idx)) });
+          } catch (error) {
+            if (!(error instanceof PackVerificationError)) throw error;
+            rejected.push(error.code);
+          }
+        }
+        if (sources.length < 2) {
+          settledPackSet = packSetKey;
+          return { status: "skipped", reason: "no_candidates", rejected };
+        }
+        const consolidated = buildConsolidatedPack(sources);
+        const consolidatedIndex = parsePackIndex(consolidated.idx);
+        verifyPack(consolidated.pack, consolidatedIndex);
+        const contained = new Set(consolidatedIndex.entries.map((entry) => entry.oid.toString("hex")));
+        if (contained.size !== consolidatedIndex.entries.length) throw new PackVerificationError("consolidated_duplicate_object");
+        for (const source of sources) {
+          for (const object of source.verified.objects) {
+            if (!contained.has(object.oid.toString("hex"))) throw new PackVerificationError("consolidated_missing_object");
+          }
+        }
+        const sourceNames = sources.map((source) => source.name);
+        sources.length = 0;
+        if (sourceNames.includes(consolidated.name)) {
+          settledPackSet = packSetKey;
+          return { status: "skipped", reason: "no_candidates", rejected };
+        }
+        await writeAtomicVerified(journalPath, Buffer3.from(`${JSON.stringify({ version: JOURNAL_VERSION, pack: consolidated.name, sources: sourceNames }, null, 2)}
+`));
+        await writeVerified(packPath(consolidated.name), consolidated.pack);
+        await writeAtomicVerified(idxPath(consolidated.name), consolidated.idx);
+        const removed = await removeSources(sourceNames);
+        await removeIfPresent(journalPath);
+        settledPackSet = null;
+        return {
+          status: "consolidated",
+          sources: sourceNames.length,
+          removed: removed.length,
+          objects: consolidatedIndex.entries.length,
+          bytes: consolidated.pack.length,
+          rejected
+        };
+      }
+      return {
+        run: () => serialized(consolidate),
+        recover: () => serialized(recover)
+      };
+    }
+    module2.exports = {
+      DEFAULT_PACK_CONSOLIDATION_POLICY: DEFAULT_POLICY,
+      PackVerificationError,
+      buildConsolidatedPack,
+      createPackConsolidator: createPackConsolidator2,
+      crc32: crc322,
+      parsePackIndex,
+      selectConsolidationSources,
+      verifyPack
+    };
+  }
+});
+
 // obsidian-plugin/src/data-adapter-fs.cjs
 var require_data_adapter_fs = __commonJS({
   "obsidian-plugin/src/data-adapter-fs.cjs"(exports2, module2) {
@@ -22513,6 +22999,7 @@ if (typeof globalThis.Buffer === "undefined") globalThis.Buffer = Buffer2;
 var { createGitObjectCache, withGitObjectCaches } = require_git_object_cache();
 var gitObjectCaches = /* @__PURE__ */ new WeakMap();
 var git = withGitObjectCaches((init_isomorphic_git(), __toCommonJS(isomorphic_git_exports)), (fs) => gitObjectCaches.get(fs) || null);
+var { createPackConsolidator } = require_git_pack_consolidation();
 var path = require_path_browserify();
 var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
@@ -22521,7 +23008,7 @@ var { createByteBudget, runBoundedWork } = require_work_pool();
 var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.24";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.25";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var STALE_SETTLE_MARGIN_MS = 250;
@@ -22536,6 +23023,8 @@ var STATUS_NOTICE_DURATION_MS = 15 * 1e3;
 var INITIALIZATION_STALL_DIAGNOSTIC_MS = 30 * 1e3;
 var MOBILE_PACK_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 var DESKTOP_GIT_PACK_CACHE_BYTES = 64 * 1024 * 1024;
+var MOBILE_PACK_CONSOLIDATION_MAX_BYTES = 8 * 1024 * 1024;
+var DESKTOP_PACK_CONSOLIDATION_MAX_BYTES = 32 * 1024 * 1024;
 var DESKTOP_FILE_WORK_CONCURRENCY = 4;
 var MOBILE_FILE_WORK_CONCURRENCY = 2;
 var DESKTOP_FILE_BUFFER_BUDGET_BYTES = 64 * 1024 * 1024;
@@ -23802,6 +24291,15 @@ var ObtsObsidianClient = class {
     this.directoryStatePath = path.join(this.obtsDir, "directory-state.json");
     this.applyJournalPath = path.join(this.obtsDir, "apply-journal.json");
     this.staleProvenancePath = path.join(this.obtsDir, "stale-provenance.json");
+    this.packConsolidator = createPackConsolidator({
+      fsp: this.fsp,
+      gitdir: this.gitdir,
+      journalPath: path.join(this.gitdir, "obts-pack-consolidation.json"),
+      policy: { maxPackBytes: mobile ? MOBILE_PACK_CONSOLIDATION_MAX_BYTES : DESKTOP_PACK_CONSOLIDATION_MAX_BYTES },
+      beginPackChange: () => this.gitObjectCache.beginPackChange(),
+      onPackRemoved: (packPath) => this.fs.deleteReadOverlay(packPath)
+    });
+    this.lastPackMaintenance = null;
     this.staleMutation = Promise.resolve();
     this.applyLockPath = path.join(this.obtsDir, "apply.lock");
     this.managedHeadlessOwner = plugin.managedHeadlessOwner ?? null;
@@ -24809,9 +25307,22 @@ var ObtsObsidianClient = class {
       updated_at: nowIso()
     });
   }
+  // Keeps the pack count logarithmic so each object read scans few indexes.
+  // It only ever adds a pack holding every object of the packs it removes, so
+  // a failure here leaves Git readable and must not fail the sync around it.
+  async maintainGitPacks() {
+    try {
+      this.lastPackMaintenance = await this.packConsolidator.run();
+    } catch (error) {
+      const code = error && typeof error.code === "string" && /^[A-Za-z0-9_]{1,64}$/u.test(error.code) ? error.code : "unknown";
+      this.lastPackMaintenance = { status: "failed", reason: code };
+    }
+    return this.lastPackMaintenance;
+  }
   async syncOnce(options = {}) {
     this.gitObjectCache.reset();
     await this.initialize();
+    await this.maintainGitPacks();
     await this.restorePendingRenameHints();
     if (!this.onboardingOperation && await this.readPendingOnboarding()) {
       throw new ObtsBlockedError("onboarding_incomplete", "Finish or cancel browser onboarding before normal sync.");
@@ -26633,6 +27144,7 @@ var ObtsObsidianClient = class {
     if (!state.vault_id || !state.device_id) {
       return { applied: false, status: "Not paired" };
     }
+    await this.maintainGitPacks();
     const wasConflictBlocked = state.last_error_code === "conflict_review_required";
     if (!wasConflictBlocked) {
       this.throwIfSyncBlocked(state);
