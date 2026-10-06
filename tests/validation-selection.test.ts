@@ -260,6 +260,16 @@ describe('validation selection', () => {
     expect(cargoIndex).toBeGreaterThan(installIndex);
   });
 
+  it('routes every selectable formal family through a complete CI entrypoint', () => {
+    const scripts = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).scripts;
+    const workflow = parse(readFileSync(join(root, '.github/workflows/formal-model.yml'), 'utf8'));
+    const dispatch = workflow.jobs.formal.steps.find((step: { name?: string }) => step.name === 'Run complete formal family').run;
+    for (const family of formalFamilies) {
+      expect(scripts[`test:formal:${family}`], family).toBeDefined();
+      expect(dispatch, family).toContain(`${family}) npm run test:formal:${family} ;;`);
+    }
+  });
+
   it('keeps single-coordinator publication behind selected gates and correct artifact paths', () => {
     const scripts = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).scripts;
     expect(scripts.test).toContain('test:executable:built');
