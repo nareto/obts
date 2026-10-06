@@ -9,6 +9,7 @@ import { assertSyncableTreePaths, PathPolicyViolation } from '../shared/pathPoli
 import { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } from '../shared/rootIgnore.cjs';
 import { mergeLatestTimestampFrontmatter, type MetadataConflictRule } from './frontmatterTimestampMerge.js';
 import type { ServerConfig } from './config.js';
+import type { RenamePair } from '../shared/types.js';
 import { fsyncDurableDirectory, fsyncDurableTree, type DurableFilePersistence } from './durableFile.js';
 
 const ZERO_OID = '0000000000000000000000000000000000000000';
@@ -53,6 +54,7 @@ export type GitObjectReader = {
   validateTreePathPolicy(vaultId: string, commit: string, maxBlobBytes?: number): Promise<void>;
   validateTreeRootIgnorePolicy(vaultId: string, commit: string, maxBlobBytes?: number): Promise<string | null>;
   isAncestor(vaultId: string, ancestor: string, descendant: string): Promise<boolean>;
+  mergeBase(vaultId: string, left: string, right: string): Promise<string | null>;
   changedPaths(vaultId: string, base: string, commit: string): Promise<GitDiffEntry[]>;
   listTreePaths(vaultId: string, commit: string): Promise<string[]>;
 };
@@ -442,6 +444,16 @@ export class GitService {
       validateTreeRootIgnorePolicy: async (_vaultId, commit, maxBlobBytes) =>
         await this.validateTreeRootIgnorePolicyInRepo(repo, commit, maxBlobBytes, alternateObjectStore),
       isAncestor: async (_vaultId, ancestor, descendant) => await this.isAncestorInRepo(repo, ancestor, descendant, alternateObjectStore),
+      mergeBase: async (_vaultId, left, right) => {
+        try {
+          return asText((await this.exec(repo, ['merge-base', left, right], undefined, undefined, {
+            allowedAlternateObjectStore: alternateObjectStore
+          })).stdout).trim();
+        } catch (error) {
+          if (error instanceof GitDurabilityError) throw error;
+          return null;
+        }
+      },
       changedPaths: async (_vaultId, base, commit) => await this.changedPathsInRepo(repo, base, commit, alternateObjectStore),
       listTreePaths: async (_vaultId, commit) => await this.listTreePathsInRepo(repo, commit, alternateObjectStore)
     };
@@ -563,6 +575,16 @@ export class GitService {
           await this.validateTreeRootIgnorePolicyInRepo(quarantineRepo, commit, maxBlobBytes, join(durableRepo, 'objects')),
         isAncestor: async (_vaultId, ancestor, descendant) =>
           await this.isAncestorInRepo(quarantineRepo, ancestor, descendant, join(durableRepo, 'objects')),
+        mergeBase: async (_vaultId, left, right) => {
+          try {
+            return asText((await this.exec(quarantineRepo, ['merge-base', left, right], undefined, undefined, {
+              allowedAlternateObjectStore: join(durableRepo, 'objects')
+            })).stdout).trim();
+          } catch (error) {
+            if (error instanceof GitDurabilityError) throw error;
+            return null;
+          }
+        },
         changedPaths: async (_vaultId, base, commit) => await this.changedPathsInRepo(quarantineRepo, base, commit, join(durableRepo, 'objects')),
         listTreePaths: async (_vaultId, commit) => await this.listTreePathsInRepo(quarantineRepo, commit, join(durableRepo, 'objects'))
       });
@@ -833,7 +855,8 @@ export class GitService {
     mergedTextPaths: string[],
     authoredBase = base,
     mainRenames: GitMergeRename[] = [],
-    metadataRules: MetadataConflictRule[] = []
+    metadataRules: MetadataConflictRule[] = [],
+    renamePairs: RenamePair[] = []
   ): Promise<MergeTreeResult | null> {
     const repo = this.repoPath(vaultId);
     let tree: string;
@@ -845,6 +868,22 @@ export class GitService {
       mergeDevice = asText((await this.exec(repo, [
         'commit-tree', proposalTree, '-p', base, '-m', 'obts: projected proposal ancestor'
       ], undefined, serverGitEnv('obts-merge'))).stdout).trim();
+    }
+    if (renamePairs.length > 0) {
+      const [mappedBaseTree, mappedMainTree, mappedDeviceTree] = await Promise.all([
+        this.createMovedTree(vaultId, base, renamePairs),
+        this.createMovedTree(vaultId, currentMain, renamePairs),
+        this.createMovedTree(vaultId, mergeDevice, renamePairs)
+      ]);
+      const mappedBase = await this.createSyntheticCommit(vaultId, mappedBaseTree, base);
+      const mappedMain = await this.createSyntheticCommit(vaultId, mappedMainTree, mappedBase);
+      const mappedDevice = await this.createSyntheticCommit(vaultId, mappedDeviceTree, mappedBase);
+      base = mappedBase;
+      currentMain = mappedMain;
+      mergeDevice = mappedDevice;
+      deviceCommit = mappedDevice;
+      deviceChanges = await this.changedPaths(vaultId, base, deviceCommit);
+      mergedTextPaths = mergedTextPaths.map((path) => renamePairs.find((pair) => pair.source_path === path)?.destination_path ?? path);
     }
     try {
       const { stdout } = await this.exec(repo, [
@@ -873,7 +912,7 @@ export class GitService {
         tree,
         base,
         currentMain,
-        deviceCommit,
+        deviceCommit: renamePairs.length > 0 ? mergeDevice : deviceCommit,
         paths: mergedTextPaths,
         metadataRules
       });
@@ -926,6 +965,44 @@ export class GitService {
         ...(validation.timestampFields.length > 0 ? { metadata_timestamp_fields: validation.timestampFields } : {})
       }
     };
+  }
+
+  private async createSyntheticCommit(vaultId: string, tree: string, parent: string): Promise<string> {
+    const repo = this.repoPath(vaultId);
+    return asText((await this.exec(repo, ['commit-tree', tree, '-p', parent, '-m', 'obts: mapped rename proposal'],
+      undefined, serverGitEnv('obts-merge'))).stdout).trim();
+  }
+
+  private async createMovedTree(vaultId: string, commit: string, pairs: RenamePair[]): Promise<string> {
+    const repo = this.repoPath(vaultId);
+    const entries = await this.listTreeEntries(vaultId, commit, true);
+    const byPath = new Map(entries.map((entry) => [entry.path, entry]));
+    const sourceDeletions: string[] = [];
+    const moved: Array<{ mode: string; oid: string; path: string }> = [];
+    for (const pair of pairs) {
+      const source = byPath.get(pair.source_path);
+      if (!source) continue;
+      if (byPath.has(pair.destination_path)) throw new GitCommandError('Rename destination is occupied.', '');
+      sourceDeletions.push(pair.source_path);
+      moved.push({ mode: source.mode, oid: source.oid, path: pair.destination_path });
+    }
+    if (sourceDeletions.length === 0) return await this.treeHash(vaultId, commit);
+    const tempRoot = join(this.config.tempDir, `rename-tree-${vaultId}-${randomBytes(8).toString('hex')}`);
+    const indexFile = join(tempRoot, 'index');
+    const env = { GIT_INDEX_FILE: indexFile };
+    await mkdir(tempRoot, { recursive: true, mode: 0o700 });
+    await writeFile(join(tempRoot, '.obts-owner.json'), `${JSON.stringify({ vault_id: vaultId })}\n`, { mode: 0o600 });
+    try {
+      await this.exec(repo, ['read-tree', commit], undefined, env);
+      const updates = [
+        ...sourceDeletions.map((path) => `0 ${ZERO_OID}\t${path}\0`),
+        ...moved.map((entry) => `${entry.mode} ${entry.oid}\t${entry.path}\0`)
+      ];
+      await this.exec(repo, ['update-index', '-z', '--index-info'], Buffer.from(updates.join(''), 'utf8'), env);
+      return asText((await this.exec(repo, ['write-tree'], undefined, env)).stdout).trim();
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
   }
 
   async createDisjointMergeTree(

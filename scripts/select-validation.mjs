@@ -18,7 +18,8 @@ const formalPaths = new Map([
   ['diagnostics', /^(?:architecture\/models\/formal\/OBTSDiagnosticAdmission\.tla)$/],
   ['client-state', /^(?:architecture\/models\/formal\/(?:OBTSClientStateRecovery\.tla|OBTSUploadCheckpointRecovery\.(?:tla|cfg)))$/],
   ['vault-settings', /^(?:architecture\/models\/formal\/(?:OBTSVaultSettings(?:\.tla|\.cfg)?|VaultSettings(?:AutoMerge|ConflictFallback|DeleteLocal|RecomputeMerge|StaleSave)\.cfg|negative\/VaultSettings.*\.cfg))$/],
-  ['headless-ownership', /^(?:architecture\/models\/formal\/OBTSManagedHeadlessOwnership\.(?:tla|cfg))$/]
+  ['headless-ownership', /^(?:architecture\/models\/formal\/OBTSManagedHeadlessOwnership\.(?:tla|cfg))$/],
+  ['atomic-rename', /^(?:architecture\/models\/formal\/(?:OBTSAtomicRename\.(?:tla|cfg)|configs\/fm014-atomic-rename\.cfg))$/]
 ]);
 function git(args, cwd) {
   return spawnSync('git', args, { cwd, encoding: 'buffer', maxBuffer: 16 * 1024 * 1024 });

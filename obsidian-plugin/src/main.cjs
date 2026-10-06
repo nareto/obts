@@ -66,6 +66,8 @@ module.exports = class ObtsPlugin extends Plugin {
     this.staleSettleTimer = null;
     this.staleSettleAt = null;
     this.pendingWatcherPaths = new Set();
+    this.pendingWatcherRenames = [];
+    this.watcherFlush = Promise.resolve();
     this.retiredOperationTimer = null;
     this.observedRetiredLease = null;
     this.retiredOperationNoticeShown = false;
@@ -266,7 +268,7 @@ module.exports = class ObtsPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("create", (file) => this.queueSyncFromWatcher(file && file.path)));
     this.registerEvent(this.app.vault.on("modify", (file) => this.queueSyncFromWatcher(file && file.path)));
     this.registerEvent(this.app.vault.on("delete", (file) => this.queueSyncFromWatcher(file && file.path)));
-    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.queueSyncFromWatcher([file && file.path, oldPath])));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => queueRenameWatcherEvent(this, file, oldPath)));
     if (this.operationAvailability() === "available") {
       void this.initializeClient().catch((error) => this.handleClientInitializationFailure(error));
     } else {
@@ -858,8 +860,9 @@ module.exports = class ObtsPlugin extends Plugin {
     if (typeof settings.openTabById === "function") settings.openTabById(this.manifest && this.manifest.id ? this.manifest.id : "obts");
   }
 
-  queueSyncFromWatcher(paths) {
+  queueSyncFromWatcher(paths, renamePair = null) {
     this.syncQueued = true;
+    if (renamePair) this.pendingWatcherRenames.push(renamePair);
     for (const candidate of Array.isArray(paths) ? paths : [paths]) {
       if (typeof candidate === "string" && candidate.length > 0) this.pendingWatcherPaths.add(candidate);
     }
@@ -871,15 +874,27 @@ module.exports = class ObtsPlugin extends Plugin {
   }
 
   async flushWatcherHints() {
-    if (this.pendingWatcherPaths.size === 0) return;
-    const paths = [...this.pendingWatcherPaths];
-    this.pendingWatcherPaths.clear();
-    try {
-      await this.client.recordLocalChangeHint(paths);
-    } catch (error) {
-      for (const filePath of paths) this.pendingWatcherPaths.add(filePath);
-      throw error;
-    }
+    const run = this.watcherFlush.then(async () => {
+      if (this.pendingWatcherPaths.size === 0 && this.pendingWatcherRenames.length === 0) return;
+      const paths = [...this.pendingWatcherPaths];
+      const renames = [...this.pendingWatcherRenames];
+      this.pendingWatcherPaths.clear();
+      this.pendingWatcherRenames = [];
+      let completedRenames = 0;
+      try {
+        for (const pair of renames) {
+          await this.client.recordLocalRenameHint(pair.source_path, pair.destination_path);
+          completedRenames += 1;
+        }
+        if (paths.length) await this.client.recordLocalChangeHint(paths);
+      } catch (error) {
+        for (const filePath of paths) this.pendingWatcherPaths.add(filePath);
+        this.pendingWatcherRenames.unshift(...renames.slice(completedRenames));
+        throw error;
+      }
+    });
+    this.watcherFlush = run.then(() => undefined, () => undefined);
+    return await run;
   }
 
   async syncOnceOrPollResolvedConflict(options) {
@@ -2490,6 +2505,7 @@ class ObtsObsidianClient {
 
   async syncOnce(options = {}) {
     await this.initialize();
+    await this.restorePendingRenameHints();
     if (!this.onboardingOperation && await this.readPendingOnboarding()) {
       throw new ObtsBlockedError("onboarding_incomplete", "Finish or cancel browser onboarding before normal sync.");
     }
@@ -2947,7 +2963,118 @@ class ObtsObsidianClient {
     }));
   }
 
+  async restorePendingRenameHints() {
+    const pairs = (await this.readStaleProvenance()).rename_pairs;
+    if (pairs.length) await this.recordLocalChangeHint([...new Set(pairs.flatMap((pair) => [pair.source_path, pair.destination_path]))]);
+  }
+
+  async recordLocalRenameHint(sourcePath, destinationPath) {
+    const source = normalizePath(sourcePath);
+    const destination = normalizePath(destinationPath);
+    const blockRename = async (message) => {
+      const details = { source_path: source, destination_path: destination };
+      await this.markBlocked("rename_preservation_required", details);
+      throw new ObtsBlockedError("rename_preservation_required", message, details);
+    };
+    const internalPath = (path) => path === ".git" || path.startsWith(".git/") || path === ".obts" || path.startsWith(".obts/");
+    if (internalPath(source) && internalPath(destination)) return;
+    if (!isSyncableVaultPath(source) || !isSyncableVaultPath(destination) || source === destination || source.toLowerCase() === destination.toLowerCase()) {
+      return await blockRename("This rename cannot be represented safely; preserve both paths and resolve it manually.");
+    }
+    const state = await this.readState();
+    const initialSaved = await this.readStaleProvenance();
+    const policy = await this.readRootIgnorePolicy();
+    const destinationStat = await this.adapter.stat(destination);
+    if (policy.policy.ignores(destination) || destinationStat?.type === "folder") {
+      return await blockRename("The rename destination is ignored or is a directory; preserve both paths and resolve it manually.");
+    }
+    const eventSeen = [...initialSaved.rename_pairs, ...(initialSaved.intent?.rename_pairs || [])].some((pair) =>
+      pair.events?.some((event) => event.source_path === source && event.destination_path === destination) ||
+      pair.source_path === source && pair.destination_path === destination);
+    if (eventSeen) {
+      await this.recordLocalChangeHint([source, destination]);
+      return;
+    }
+    const frozen = initialSaved.intent;
+    const frozenSuccessor = frozen?.outcome === null && frozen.rename_pairs?.some((pair) => pair.destination_path === source);
+    const conflictedSuccessor = frozen?.outcome === "conflicted" && frozen.rename_pairs?.some((pair) => pair.destination_path === source);
+    const pendingPredecessor = initialSaved.rename_pairs.find((pair) => pair.destination_path === source);
+    let base = (frozenSuccessor || conflictedSuccessor) && frozen.commit ? frozen.commit : pendingPredecessor?.base || state.local_main;
+    if (!base || !await this.commitExists(base)) return await blockRename("No durable source base is available for this rename.");
+    if (!frozenSuccessor && !conflictedSuccessor) {
+      const candidates = [
+        ...Object.entries(initialSaved.obligations).filter(([p]) => changedPathsConflict(p, source) || changedPathsConflict(p, destination)).map(([, value]) => value.base),
+        ...initialSaved.horizons.flatMap((h) => h.touched.some((p) => changedPathsConflict(p, source) || changedPathsConflict(p, destination))
+          ? [this.staleHorizonBase(h, source)] : [])
+      ];
+      for (const candidate of candidates) if (await this.isAncestor(candidate, base)) base = candidate;
+    }
+    const baseTree = await this.listTreeBlobOids(base);
+    const hasTrackedPath = (tree, path) => [...tree.keys()].some((candidate) => changedPathsConflict(candidate, path));
+    const provenChainSource = Boolean(pendingPredecessor && baseTree.has(pendingPredecessor.source_path) &&
+      !hasTrackedPath(baseTree, pendingPredecessor.destination_path));
+    if (!baseTree.has(source) && !provenChainSource) {
+      const queue = await this.readQueue();
+      const pendingCommits = [state.local_main, state.server_device_ref, state.local_head, queue.pending_commit, queue.pending_upload_base, base, frozen?.commit].filter(Boolean);
+      const pendingTrees = await Promise.all(pendingCommits.map((commit) => this.listTreeBlobOids(commit)));
+      const hasOutstandingSource = pendingTrees.some((tree) => hasTrackedPath(tree, source));
+      const hasSourceObligation = Object.keys(initialSaved.obligations).some((path) => changedPathsConflict(path, source)) ||
+        initialSaved.horizons.some((horizon) => horizon.touched.some((path) => changedPathsConflict(path, source)));
+      const unresolvedLineage = frozen?.outcome === null || (frozen?.rename_pairs || []).some((pair) =>
+        [pair.source_path, pair.destination_path].some((path) => changedPathsConflict(path, source))) ||
+        initialSaved.rename_pairs.some((pair) => [pair.source_path, pair.destination_path].some((path) => changedPathsConflict(path, source)));
+      if (!hasOutstandingSource && !hasSourceObligation && !unresolvedLineage && destinationStat?.type === "file") {
+        await this.recordLocalChangeHint([destination]);
+        return;
+      }
+      return await blockRename("The rename source and destination do not match a tracked file in the protected base.");
+    }
+    if (hasTrackedPath(baseTree, destination)) return await blockRename("The rename destination already exists in the protected base.");
+    try {
+      await this.mutateStaleProvenance(async (saved) => {
+      const pairs = saved.rename_pairs;
+      const identical = pairs.find((pair) => pair.source_path === source && pair.destination_path === destination);
+      if (identical) return;
+      const frozenPairs = saved.intent?.outcome === null ? saved.intent.rename_pairs || [] : [];
+      const frozenPredecessor = frozenPairs.find((pair) => pair.destination_path === source);
+      const frozenOverlap = frozenPairs.some((pair) => pair !== frozenPredecessor &&
+        [pair.source_path, pair.destination_path].some((path) => changedPathsConflict(path, source) || changedPathsConflict(path, destination))) ||
+        frozenPredecessor && changedPathsConflict(frozenPredecessor.source_path, destination);
+      const predecessor = pairs.find((pair) => pair.destination_path === source);
+      const conflicting = pairs.find((pair) => pair !== predecessor &&
+        [pair.source_path, pair.destination_path].some((path) => changedPathsConflict(path, source) || changedPathsConflict(path, destination)));
+      if (frozenOverlap || conflicting || predecessor && changedPathsConflict(predecessor.source_path, destination)) {
+        throw new ObtsBlockedError("rename_preservation_required", "Overlapping rename history is ambiguous; preserve the affected files and resolve it manually.");
+      }
+      if (predecessor) {
+        predecessor.events ||= [{ source_path: predecessor.source_path, destination_path: predecessor.destination_path }];
+        predecessor.events.push({ source_path: source, destination_path: destination });
+        predecessor.destination_path = destination;
+        predecessor.generation += 1;
+      } else {
+        pairs.push({ source_path: source, destination_path: destination, generation: 0, base,
+          ...(conflictedSuccessor ? { blocked_commit: frozen.commit } : {}),
+          events: [{ source_path: source, destination_path: destination }] });
+      }
+      pairs.sort((a, b) => a.source_path < b.source_path ? -1 : a.source_path > b.source_path ? 1 : a.destination_path < b.destination_path ? -1 : 1);
+      });
+    } catch (error) {
+      if (error?.code === "rename_preservation_required") return await blockRename(error.message);
+      throw error;
+    }
+    await this.recordLocalChangeHint([source, destination]);
+  }
+
   async uploadQueuedCommit(queue) {
+    const staleRecord = await this.readStaleProvenance();
+    const staleIntent = staleRecord.intent?.commit === queue.pending_commit ? staleRecord.intent : null;
+    const intentRenamePairs = (staleIntent?.rename_pairs || []).map(({ source_path, destination_path }) => ({ source_path, destination_path }));
+    const queuedRenamePairs = queue.pending_rename_pairs || [];
+    if (stableJson(intentRenamePairs) !== stableJson(queuedRenamePairs) ||
+        (intentRenamePairs.length || queuedRenamePairs.length) && (!staleIntent || !queue.pending_proposal_base ||
+          staleIntent.base !== queue.pending_proposal_base || staleIntent.capture_id !== queue.pending_capture_id || !queue.pending_capture_id)) {
+      throw new ObtsBlockedError("stale_intent_mismatch", "The queued rename identity does not match its frozen capture and explicit authoring base.");
+    }
     const recovered = await this.recoverUploadCheckpointIfNeeded(queue);
     if (recovered) return recovered;
     let state = await this.readState();
@@ -2960,11 +3087,15 @@ class ObtsObsidianClient {
     this.plugin.setStatus("Preparing upload");
     await this.reportDeviceStatus().catch(() => undefined);
     const allDirectoryIntents = (await this.readDirectoryState()).pending_intents;
-    const staleIntent = queue.pending_proposal_base ? (await this.readStaleProvenance()).intent : null;
     const pendingDirectoryIntents = queue.pending_proposal_base
       ? allDirectoryIntents.filter((intent) => Object.keys(staleIntent?.captures || {}).some((p) => changedPathsConflict(p, intent.path)))
       : allDirectoryIntents;
     const uploadCheckpoint = await this.readUploadCheckpoint();
+    if (uploadCheckpoint && uploadCheckpoint.target_commit === queue.pending_commit &&
+        (stableJson(uploadCheckpoint.rename_pairs || []) !== stableJson(queuedRenamePairs) ||
+         (uploadCheckpoint.capture_id || null) !== (queue.pending_capture_id || null))) {
+      throw new ObtsBlockedError("upload_checkpoint_mismatch", "The saved upload checkpoint does not match its queued rename capture.");
+    }
     let directoryProposal = isUploadTransferCheckpoint(uploadCheckpoint) && uploadCheckpoint.target_commit === queue.pending_commit
       ? uploadCheckpoint.directory_proposal || null
       : null;
@@ -2995,6 +3126,9 @@ class ObtsObsidianClient {
       let capabilities = null;
       if (!result && uploadCheckpoint) {
         capabilities = await this.syncCapabilities();
+        if (queuedRenamePairs.length && !capabilities.capabilities.includes("rename-pairs-v1")) {
+          throw new ObtsBlockedError("server_update_required", "The server must be updated before this rename can sync safely.");
+        }
         result = await this.pushInChunks(state, queue, token, directoryProposal, capabilities,
           uploadCheckpoint.transfer_request.root_ignore_oid);
       }
@@ -3021,6 +3155,9 @@ class ObtsObsidianClient {
             : null;
         }
       }
+      if (!result && queuedRenamePairs.length && !(capabilities && capabilities.capabilities.includes("rename-pairs-v1"))) {
+        throw new ObtsBlockedError("server_update_required", "The server must be updated before this rename can sync safely.");
+      }
       if (!result && directoryProposal && !(capabilities && capabilities.capabilities.includes("directory-proposals-v2"))) {
         throw new ObtsBlockedError("server_update_required", "The server must be updated before directory changes can sync safely.");
       }
@@ -3042,6 +3179,7 @@ class ObtsObsidianClient {
           packfile_bytes: packfile.byteLength,
           client_known_main: state.local_main,
           ...(this.proposalBase(queue, state) ? { base_commit: this.proposalBase(queue, state) } : {}),
+          ...(queuedRenamePairs.length ? { rename_pairs: queuedRenamePairs } : {}),
           ...(directoryProposal ? { directory_proposal: directoryProposal } : {}),
           attempt_id: `sync_${Date.now()}_${randomHex(8)}`
         };
@@ -3375,6 +3513,11 @@ class ObtsObsidianClient {
     );
     if (!parentIsAccepted) return null;
     const policy = await this.readRootIgnorePolicy();
+    for (const pair of queue.pending_rename_pairs || []) {
+      if (policy.policy.ignores(pair.source_path) || policy.policy.ignores(pair.destination_path)) {
+        throw new ObtsBlockedError("rename_preservation_required", "A root policy change excludes a frozen rename endpoint; preserve both paths and resolve the move manually.");
+      }
+    }
     const entries = await this.flattenTree(commit);
     const nextEntries = new Map();
     for (const [filePath, entry] of entries) {
@@ -3546,6 +3689,8 @@ class ObtsObsidianClient {
       expected_device_ref: queue.expected_device_ref,
       client_known_main: state.local_main,
       directory_proposal: directoryProposal,
+      rename_pairs: queue.pending_rename_pairs || [],
+      capture_id: queue.pending_capture_id || null,
       target_chunk_bytes: capabilities.target_chunk_bytes,
       max_chunk_bytes: capabilities.max_chunk_bytes
     })));
@@ -3555,6 +3700,8 @@ class ObtsObsidianClient {
     let attemptId;
     if (
       isModernUploadCheckpoint(checkpoint) && checkpoint.target_commit === queue.pending_commit &&
+      stableJson(checkpoint.rename_pairs || []) === stableJson(queue.pending_rename_pairs || []) &&
+      (checkpoint.capture_id || null) === (queue.pending_capture_id || null) &&
       checkpoint.transfer_request.vault_id === state.vault_id && checkpoint.transfer_request.device_id === state.device_id &&
       checkpoint.transfer_request.root_ignore_oid === rootIgnoreOid
     ) {
@@ -3584,6 +3731,7 @@ class ObtsObsidianClient {
         root_ignore_oid: rootIgnoreOid,
         client_known_main: state.local_main,
         ...(proposalBase ? { base_commit: proposalBase } : {}),
+        ...((queue.pending_rename_pairs || []).length ? { rename_pairs: queue.pending_rename_pairs } : {}),
         ...(directoryProposal ? { directory_proposal: directoryProposal } : {}),
         chunk_count: groups.length,
         plan_sha256: sha256(Buffer.from(JSON.stringify(groups)))
@@ -3594,6 +3742,8 @@ class ObtsObsidianClient {
         identity: transferIdentity,
         target_commit: queue.pending_commit,
         directory_proposal: directoryProposal,
+        rename_pairs: queue.pending_rename_pairs || [],
+        capture_id: queue.pending_capture_id || null,
         groups,
         transfer_request: transferRequest,
         attempt_id: attemptId,
@@ -4554,9 +4704,21 @@ class ObtsObsidianClient {
       if (!parent) return state.local_main;
       const prior = await this.listTreeBlobOids(parent);
       const tree = await this.listTreeBlobOids(p);
+      const targetTree = await this.listTreeBlobOids(targetMain);
       const cohort = [...new Set([...prior.keys(), ...tree.keys()])].filter((q) => prior.get(q) !== tree.get(q));
+      const acceptedPairs = queue.pending_commit === p ? queue.pending_rename_pairs || [] :
+        saved.intent?.commit === p ? saved.intent.rename_pairs || [] : [];
+      const installedPairs = acceptedPairs.filter((pair) =>
+        !tree.has(pair.source_path) && tree.has(pair.destination_path) &&
+        !targetTree.has(pair.source_path) && targetTree.has(pair.destination_path));
       await this.mutateStaleProvenance(async (current) => {
         for (const q of cohort) {
+          const installedDestination = installedPairs.some((pair) => pair.destination_path === q);
+          if (installedDestination) {
+            current.obligations[q] = { base: p, generation: current.obligations[q]?.generation || 0,
+              signature: current.obligations[q]?.signature || "uncaptured" };
+            continue;
+          }
           if (!current.obligations[q]) current.obligations[q] = { base: accepted.base, generation: 0, signature: "uncaptured" };
           else if (await this.isAncestor(accepted.base, current.obligations[q].base)) current.obligations[q].base = accepted.base;
         }
@@ -5541,15 +5703,19 @@ class ObtsObsidianClient {
   async readStaleProvenance() {
     const saved = await readRecoveryJsonStrict(this.fsp, this.staleProvenancePath,
       "stale_provenance_corrupt", "Stale authoring evidence needs explicit recovery.");
-    if (!saved) return { version: 3, horizons: [], obligations: {}, intent: null, accepted_proposal: null, held_proposals: [], queued_replacement: null };
+    if (!saved) return { version: 4, horizons: [], obligations: {}, intent: null, accepted_proposal: null, held_proposals: [], queued_replacement: null, rename_pairs: [] };
     const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
     const oid = (value) => typeof value === "string" && /^[0-9a-f]{40}$/u.test(value);
     const paths = (value) => Array.isArray(value) && value.every((p) => typeof p === "string" && isSafeJournalPath(p));
     const nullableOid = (value) => value === null || oid(value);
+    const validRenamePairs = (value) => isValidStoredRenamePairs(value) && value.every((pair) =>
+      isGitObjectId(pair.base) && Number.isSafeInteger(pair.generation) && pair.generation >= 0 && pair.events.length > 0 && pair.events.every((event) =>
+        object(event) && isSafeJournalPath(event.source_path) && isSafeJournalPath(event.destination_path) &&
+        event.source_path !== event.destination_path));
     const intent = saved.intent;
     const replacement = (r) => object(r) && oid(r.old_commit) && oid(r.old_tree) && oid(r.new_commit) && oid(r.new_tree) &&
       oid(r.local_ref) && nullableOid(r.base);
-    if (!object(saved) || ![1, 2, 3].includes(saved.version) || !Array.isArray(saved.horizons) || saved.horizons.some((h) =>
+    if (!object(saved) || ![1, 2, 3, 4].includes(saved.version) || !Array.isArray(saved.horizons) || saved.horizons.some((h) =>
       !object(h) || !isApplyId(h.apply_id) || !oid(h.base) || !paths(h.touched) || !Number.isFinite(h.expiry) ||
       !(h.held_bases === undefined || object(h.held_bases) && Object.entries(h.held_bases).every(([p, b]) => isSafeJournalPath(p) && oid(b)))) ||
       !object(saved.obligations) || Object.entries(saved.obligations).some(([p, o]) =>
@@ -5563,7 +5729,11 @@ class ObtsObsidianClient {
         (intent.replacement === undefined || object(intent.replacement) &&
           oid(intent.replacement.old_commit) && oid(intent.replacement.old_tree) &&
           oid(intent.replacement.new_commit) && oid(intent.replacement.new_tree) &&
-          intent.replacement.new_commit === intent.commit && intent.replacement.new_tree === intent.tree)) ||
+          intent.replacement.new_commit === intent.commit && intent.replacement.new_tree === intent.tree) &&
+        (intent.rename_pairs === undefined || validRenamePairs(intent.rename_pairs) &&
+          (!intent.rename_pairs.length || intent.rename_pairs.every((pair) => pair.base === intent.base) &&
+            typeof intent.capture_id === "string" && /^[a-f0-9]{16}$/u.test(intent.capture_id))) &&
+        (intent.capture_id === undefined || typeof intent.capture_id === "string" && /^[a-f0-9]{16}$/u.test(intent.capture_id))) ||
       !(saved.accepted_proposal === undefined && saved.version === 1 || saved.accepted_proposal === null ||
         object(saved.accepted_proposal) && oid(saved.accepted_proposal.commit) && nullableOid(saved.accepted_proposal.base)) ||
       !(saved.version < 3 && saved.held_proposals === undefined || Array.isArray(saved.held_proposals) && saved.held_proposals.every((h) =>
@@ -5575,13 +5745,15 @@ class ObtsObsidianClient {
         (h.replacement === undefined || object(h.replacement) && oid(h.replacement.old_commit) && oid(h.replacement.old_tree) &&
           oid(h.replacement.new_commit) && oid(h.replacement.new_tree) && h.replacement.new_commit === h.commit &&
           nullableOid(h.replacement.base) && oid(h.replacement.local_ref)))) ||
-      !(saved.version < 3 && saved.queued_replacement === undefined || saved.queued_replacement === null || replacement(saved.queued_replacement))) {
+      !(saved.version < 3 && saved.queued_replacement === undefined || saved.queued_replacement === null || replacement(saved.queued_replacement)) ||
+      !(saved.version < 4 && saved.rename_pairs === undefined || validRenamePairs(saved.rename_pairs))) {
       throw new ObtsBlockedError("stale_provenance_corrupt", "Stale authoring evidence needs explicit recovery.");
     }
-    saved.version = 3;
+    saved.version = 4;
     saved.accepted_proposal ??= null;
     saved.held_proposals ??= [];
     saved.queued_replacement ??= null;
+    saved.rename_pairs ??= [];
     return saved;
   }
 
@@ -5593,7 +5765,7 @@ class ObtsObsidianClient {
       const bases = new Set([...saved.horizons.map((h) => h.base),
         ...saved.horizons.flatMap((h) => Object.values(h.held_bases || {})),
         ...saved.held_proposals.flatMap((h) => [h.commit, ...Object.values(h.fallbacks)]),
-        ...Object.values(saved.obligations).map((o) => o.base), saved.queued_replacement?.old_commit, saved.queued_replacement?.new_commit, saved.queued_replacement?.base, saved.intent?.base, saved.accepted_proposal?.base].filter(Boolean));
+        ...Object.values(saved.obligations).map((o) => o.base), ...saved.rename_pairs.map((pair) => pair.base), saved.queued_replacement?.old_commit, saved.queued_replacement?.new_commit, saved.queued_replacement?.base, saved.intent?.base, saved.accepted_proposal?.base].filter(Boolean));
       for (const base of bases) {
         if (!(await this.commitExists(base))) throw new ObtsBlockedError("stale_base_missing", "The protected authoring base is unavailable.");
         await git.writeRef({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir,
@@ -5762,10 +5934,18 @@ class ObtsObsidianClient {
         .filter((p) => differences.overlap(p).length)])];
       for (const p of changed) {
         let obligation = current.obligations[p];
-        const relevantHorizons = horizons.overlap(p);
-        const sticky = obligations.overlap(p).map((o) => o.base);
-        let base = obligation?.base || sticky[0] || (relevantHorizons[0] && this.staleHorizonBase(relevantHorizons[0], p));
-        for (const candidate of [...sticky, ...relevantHorizons.map((h) => this.staleHorizonBase(h, p))])
+        const relatedPaths = [p, ...current.rename_pairs.flatMap((pair) =>
+          pair.source_path === p ? [pair.destination_path] : pair.destination_path === p ? [pair.source_path] : [])];
+        const relevantHorizons = [...new Set(relatedPaths.flatMap((path) => horizons.overlap(path)))];
+        const sticky = relatedPaths.flatMap((path) => obligations.overlap(path).map((o) => o.base));
+        const relatedPair = current.rename_pairs.find((pair) => relatedPaths.some((path) =>
+          path === pair.source_path || path === pair.destination_path));
+        const pairBase = relatedPair?.base;
+        let base = relatedPair?.lineage_confirmed ? pairBase :
+          obligation?.base || sticky[0] || pairBase || (relevantHorizons[0] && this.staleHorizonBase(relevantHorizons[0], p));
+        if (!base && current.rename_pairs.some((pair) => relatedPaths.some((path) =>
+          changedPathsConflict(path, pair.source_path) || changedPathsConflict(path, pair.destination_path)))) base = targetMain;
+        if (!relatedPair?.lineage_confirmed) for (const candidate of [...sticky, ...relevantHorizons.map((h) => this.staleHorizonBase(h, p))])
           if (base && await older(candidate, base)) base = candidate;
         if (!base) continue;
         const descendants = inventory.descendants(p).map(([q, v]) => [q, v.entry.oid]);
@@ -5815,8 +5995,50 @@ class ObtsObsidianClient {
         return true;
       }
     }
-    const saved = await this.readStaleProvenance();
-    if (!saved.horizons.length && !Object.keys(saved.obligations).length) return false;
+    let saved = await this.readStaleProvenance();
+    if (saved.intent && !saved.intent.outcome) {
+      const existingQueue = await this.readQueue();
+      if (!saved.intent.commit || existingQueue.pending_commit !== saved.intent.commit) {
+        const actual = await this.resolveRef("refs/heads/local");
+        const state = await this.readState();
+        if (actual !== state.local_head) throw new ObtsBlockedError("local_ref_changed", "Local Git history moved while stale authoring evidence was being recovered.",
+          { ref: "refs/heads/local", expected: state.local_head, actual });
+      }
+    }
+    if (saved.rename_pairs.some((pair) => pair.blocked_commit) && saved.intent?.outcome === "conflicted") {
+      const proposalTree = await this.listTreeBlobOids(saved.intent.commit);
+      const targetTree = await this.listTreeBlobOids(targetMain);
+      const installedSuccessors = saved.rename_pairs.filter((successor) => {
+        if (successor.blocked_commit !== saved.intent.commit) return false;
+        const predecessor = (saved.intent.rename_pairs || []).find((pair) => pair.destination_path === successor.source_path);
+        return Boolean(predecessor && !proposalTree.has(predecessor.source_path) && proposalTree.has(predecessor.destination_path) &&
+          !targetTree.has(predecessor.source_path) && targetTree.has(predecessor.destination_path) &&
+          targetTree.get(predecessor.destination_path) === proposalTree.get(predecessor.destination_path));
+      });
+      if (installedSuccessors.length) {
+        await this.mutateStaleProvenance(async (current) => {
+          for (const successor of current.rename_pairs) if (installedSuccessors.some((candidate) =>
+            candidate.source_path === successor.source_path && candidate.destination_path === successor.destination_path)) {
+            delete successor.blocked_commit;
+            successor.base = saved.intent.commit;
+            successor.lineage_confirmed = true;
+            for (const path of [successor.source_path, successor.destination_path]) {
+              const obligation = current.obligations[path];
+              if (obligation && await this.isAncestor(obligation.base, saved.intent.commit)) obligation.base = saved.intent.commit;
+              for (const horizon of current.horizons.filter((h) => h.touched.some((touched) => changedPathsConflict(touched, path)))) {
+                horizon.held_bases ||= {};
+                horizon.held_bases[path] = saved.intent.commit;
+              }
+            }
+          }
+        });
+        saved = await this.readStaleProvenance();
+      }
+    }
+    if (saved.rename_pairs.some((pair) => pair.blocked_commit)) {
+      throw new ObtsBlockedError("rename_lineage_ambiguous", "A predecessor rename is unresolved; keep both files and resolve the predecessor before syncing the successor move.");
+    }
+    if (!saved.horizons.length && !Object.keys(saved.obligations).length && !saved.rename_pairs.length) return false;
     if (!snapshot) snapshot = (await this.localChangedPathsFromTree(await this.listTreeBlobOids(targetMain), true)).snapshot;
     const stale = await this.classifyStaleSnapshot(targetMain, snapshot);
     if (!stale.length) return false;
@@ -5826,15 +6048,29 @@ class ObtsObsidianClient {
     const cohort = stale.filter((p) => current.obligations[p].base === base &&
       !current.held_proposals.some((h) => Object.keys(h.fallbacks).some((q) => changedPathsConflict(p, q))));
     if (!cohort.length) return false;
-    const captures = Object.fromEntries(cohort.map((p) => [p, current.obligations[p].generation]));
+    const renamePairs = current.rename_pairs.filter((pair) => cohort.includes(pair.source_path) || cohort.includes(pair.destination_path));
     const target = await this.listTreeBlobOids(targetMain);
+    const baseTree = await this.listTreeBlobOids(base);
+    for (const pair of renamePairs) {
+      if (!cohort.includes(pair.source_path) || !cohort.includes(pair.destination_path) ||
+          current.obligations[pair.source_path]?.base !== base || current.obligations[pair.destination_path]?.base !== base) {
+        throw new ObtsBlockedError("rename_preservation_required", "Both rename paths need one coherent authoring base; preserve the files and resolve the move manually.");
+      }
+      if (!baseTree.has(pair.source_path) || baseTree.has(pair.destination_path) ||
+          snapshot.entries.has(pair.source_path) || !snapshot.entries.has(pair.destination_path)) {
+        throw new ObtsBlockedError("rename_preservation_required", `The captured rename ${pair.source_path} -> ${pair.destination_path} is incomplete, recreated, ignored, or a directory move (base source=${baseTree.has(pair.source_path)}, base destination=${baseTree.has(pair.destination_path)}, captured source=${snapshot.entries.has(pair.source_path)}, captured destination=${snapshot.entries.has(pair.destination_path)}); preserve the affected files and resolve it manually.`);
+      }
+    }
+    const captures = Object.fromEntries(cohort.map((p) => [p, current.obligations[p].generation]));
     const held = [...new Set([...target.keys(), ...snapshot.entries.keys()])]
       .filter((p) => !cohort.includes(p) && target.get(p) !== snapshot.entries.get(p)?.entry.oid);
-    const commit = await this.createStaleCohortCommit(targetMain, snapshot, cohort, base, captures);
+    const captureId = randomHex(8);
+    const commit = await this.createStaleCohortCommit(targetMain, snapshot, cohort, base, captures, renamePairs, captureId);
     if (!commit) return false;
     await this.plugin.flushWatcherHints?.();
     await this.updateQueue(async (q) => Object.assign({}, q, {
-      pending_commit: commit, pending_proposal_base: base, expected_device_ref: expectedDeviceRef,
+      pending_commit: commit, pending_proposal_base: base, pending_rename_pairs: renamePairs.map(({ source_path, destination_path }) => ({ source_path, destination_path })),
+      pending_capture_id: captureId, expected_device_ref: expectedDeviceRef,
       changed_paths: [...new Set([...q.changed_paths, ...held])].sort(),
       status: "queued_local", attempts: 0, updated_at: nowIso()
     }));
@@ -5844,7 +6080,7 @@ class ObtsObsidianClient {
     return true;
   }
 
-  async createStaleCohortCommit(parent, snapshot, paths, base, captures) {
+  async createStaleCohortCommit(parent, snapshot, paths, base, captures, renamePairs = [], captureId = randomHex(8)) {
     await this.verifyLocalPolicySnapshot(snapshot);
     const entries = await this.flattenTree(parent);
     // Partial overlay with structural closure. Do not copy unrelated fresh bytes.
@@ -5860,7 +6096,10 @@ class ObtsObsidianClient {
     // Durable intent precedes advancing local ref. Tree+parent identifies a
     // stranded commit even if its identity was not published before the crash.
     await this.mutateStaleProvenance(async (saved) => {
-      saved.intent = { parent, tree, base, captures, commit: null, outcome: null, main: null };
+      if (saved.intent && !saved.intent.outcome) throw new ObtsBlockedError("stale_intent_mismatch", "A frozen proposal still owns stale authoring evidence.");
+      saved.intent = { parent, tree, base, captures, rename_pairs: renamePairs, capture_id: captureId, commit: null, outcome: null, main: null };
+      saved.rename_pairs = saved.rename_pairs.filter((pair) => !renamePairs.some((captured) =>
+        captured.source_path === pair.source_path && captured.destination_path === pair.destination_path));
     });
     const commit = await this.commitTree(tree, parent, "obts: stale authoring cohort");
     await this.mutateStaleProvenance(async (saved) => { saved.intent.commit = commit; });
@@ -5908,6 +6147,8 @@ class ObtsObsidianClient {
     const state = await this.readState();
     await this.updateQueue(async (q) => Object.assign({}, q, {
       pending_commit: commit, pending_proposal_base: saved.intent.base,
+      pending_rename_pairs: (saved.intent.rename_pairs || []).map(({ source_path, destination_path }) => ({ source_path, destination_path })),
+      pending_capture_id: saved.intent.capture_id || null,
       expected_device_ref: q.pending_commit ? q.expected_device_ref : state.server_device_ref,
       status: q.pending_commit ? q.status : "queued_local", updated_at: nowIso()
     }));
@@ -5930,6 +6171,14 @@ class ObtsObsidianClient {
 
   async recordStaleProposalResult(queue, result, detachedRecovery = false) {
     await this.mutateStaleProvenance(async (saved) => {
+      const matchingIntent = saved.intent?.commit === queue.pending_commit ? saved.intent : null;
+      const intentPairs = matchingIntent?.rename_pairs || [];
+      const intentPairIdentity = intentPairs.map(({ source_path, destination_path }) => ({ source_path, destination_path }));
+      if (!detachedRecovery && (stableJson(intentPairIdentity) !== stableJson(queue.pending_rename_pairs || []) ||
+          (intentPairs.length || (queue.pending_rename_pairs || []).length) && (!matchingIntent ||
+            matchingIntent.capture_id !== queue.pending_capture_id || !queue.pending_capture_id || !queue.pending_proposal_base))) {
+        throw new ObtsBlockedError("stale_intent_mismatch", "The upload result does not match its frozen rename capture.");
+      }
       if (["merged", "noop"].includes(result.status)) saved.accepted_proposal = {
         commit: queue.pending_commit, base: queue.pending_proposal_base || null
       };
@@ -5946,6 +6195,11 @@ class ObtsObsidianClient {
       saved.intent.outcome = result.status;
       saved.intent.main = result.main || null;
       if (result.status === "conflicted") {
+        for (const predecessor of saved.intent.rename_pairs || []) for (const successor of saved.rename_pairs) {
+          if (successor.source_path !== predecessor.destination_path) continue;
+          successor.blocked_commit = queue.pending_commit;
+          successor.base = queue.pending_commit;
+        }
         for (const p of Object.keys(saved.intent.captures)) this.retireStaleObligation(saved, p);
         // Keep the terminal identity through a crash before queue handover.
         // Existing pending-conflict protocol now owns the bytes/commit/base.
@@ -5963,13 +6217,54 @@ class ObtsObsidianClient {
       saved.held_proposals = saved.held_proposals.filter((h) => !h.outcome);
       if (saved.accepted_proposal && await this.isAncestor(saved.accepted_proposal.commit, journal.target_main))
         saved.accepted_proposal = null;
-      if (intent?.outcome === "conflicted" && (await this.readQueue()).status !== "conflicted") {
-        saved.intent = null;
+      if (intent?.outcome === "conflicted") {
+        const proposalTree = await this.listTreeBlobOids(intent.commit);
+        for (const successor of saved.rename_pairs.filter((pair) => pair.blocked_commit === intent.commit)) {
+          const predecessor = (intent.rename_pairs || []).find((pair) => pair.destination_path === successor.source_path);
+          if (!predecessor || proposalTree.has(predecessor.source_path) || !proposalTree.has(predecessor.destination_path) ||
+              target.has(predecessor.source_path) || !target.has(predecessor.destination_path) ||
+              target.get(predecessor.destination_path) !== proposalTree.get(predecessor.destination_path)) continue;
+          delete successor.blocked_commit;
+          successor.base = intent.commit;
+          successor.lineage_confirmed = true;
+        }
+        if ((await this.readQueue()).status !== "conflicted") saved.intent = null;
         return;
       }
       if (!intent || !["merged", "noop"].includes(intent.outcome) ||
           !intent.main || !(await this.isAncestor(intent.main, journal.target_main))) return;
+      const acceptedTree = await this.listTreeBlobOids(intent.commit);
+      const pairedPaths = new Set((intent.rename_pairs || []).flatMap((pair) => [pair.source_path, pair.destination_path]));
+      for (const pair of intent.rename_pairs || []) {
+        const sourceGeneration = intent.captures[pair.source_path];
+        const destinationGeneration = intent.captures[pair.destination_path];
+        const source = saved.obligations[pair.source_path];
+        const destination = saved.obligations[pair.destination_path];
+        const deferred = (journal.deferred_local_paths || []).some((p) =>
+          changedPathsConflict(p, pair.source_path) || changedPathsConflict(p, pair.destination_path));
+        const installed = !acceptedTree.has(pair.source_path) && acceptedTree.has(pair.destination_path) &&
+          !target.has(pair.source_path) && target.has(pair.destination_path);
+        if (!installed) continue;
+        if (!deferred && source?.generation === sourceGeneration && destination?.generation === destinationGeneration &&
+            this.fingerprintMatchesTreePath((await this.readRecoveryFileSnapshot(pair.source_path)).fingerprint, pair.source_path, target, targetDirectories) &&
+            this.fingerprintMatchesTreePath((await this.readRecoveryFileSnapshot(pair.destination_path)).fingerprint, pair.destination_path, target, targetDirectories)) {
+          this.retireStaleObligation(saved, pair.source_path, journal.apply_id);
+          this.retireStaleObligation(saved, pair.destination_path, journal.apply_id);
+          saved.rename_pairs = saved.rename_pairs.filter((pending) =>
+            pending.source_path !== pair.source_path || pending.destination_path !== pair.destination_path);
+        }
+        // New work at the moved destination is authored from the accepted P tree.
+        for (const horizon of saved.horizons.filter((h) => h.touched.some((p) =>
+          changedPathsConflict(p, pair.destination_path)))) {
+          horizon.held_bases ||= {};
+          horizon.held_bases[pair.destination_path] = intent.commit;
+        }
+        if (destination && await this.isAncestor(destination.base, intent.commit)) destination.base = intent.commit;
+        for (const successor of saved.rename_pairs.filter((pending) => pending.source_path === pair.destination_path))
+          successor.base = intent.commit;
+      }
       for (const [p, generation] of Object.entries(intent.captures)) {
+        if (pairedPaths.has(p)) continue;
         const obligation = saved.obligations[p];
         if (!obligation || obligation.generation !== generation ||
             (journal.deferred_local_paths || []).some((q) => changedPathsConflict(p, q))) continue;
@@ -6034,6 +6329,7 @@ class ObtsObsidianClient {
     const provenanceJournal = await readApplyJournalStrict(this.fsp, this.applyJournalPath);
     await this.retainApplyProvenance(provenanceJournal);
     await this.finishApplyProvenance(provenanceJournal);
+    if ((await this.readStaleProvenance()).rename_pairs.some((pair) => pair.blocked_commit)) return;
     if (await this.queueStaleCohort(targetMain, expectedDeviceRef, snapshot)) return;
     if (snapshot) {
       const [targetPolicy, targetEntries, directoryState] = await Promise.all([
@@ -8950,6 +9246,11 @@ class ObtsObsidianClient {
       change_seq: 0,
       updated_at: nowIso()
     });
+    if (queue.pending_rename_pairs !== undefined && !isValidWireRenamePairs(queue.pending_rename_pairs) ||
+        queue.pending_capture_id !== undefined && queue.pending_capture_id !== null && !/^[a-f0-9]{16}$/u.test(queue.pending_capture_id) ||
+        (queue.pending_rename_pairs || []).length > 0 && (!queue.pending_commit || !isGitObjectId(queue.pending_proposal_base) || !/^[a-f0-9]{16}$/u.test(queue.pending_capture_id || ""))) {
+      throw new ObtsBlockedError("upload_checkpoint_mismatch", "The queued rename identity is invalid.");
+    }
     return Object.assign({}, queue, {
       change_seq: Number.isSafeInteger(queue.change_seq) && queue.change_seq >= 0 ? queue.change_seq : 0,
       changed_paths: Array.from(new Set((Array.isArray(queue.changed_paths) ? queue.changed_paths : [])
@@ -8970,6 +9271,12 @@ class ObtsObsidianClient {
     const normalized = Object.assign({}, queue, {
       pending_proposal_base: queue.pending_commit
         ? (queue.pending_proposal_base || (existing?.pending_commit === queue.pending_commit ? existing.pending_proposal_base : null) || null)
+        : null,
+      pending_rename_pairs: queue.pending_commit
+        ? (queue.pending_rename_pairs || (existing?.pending_commit === queue.pending_commit ? existing.pending_rename_pairs : null) || [])
+        : [],
+      pending_capture_id: queue.pending_commit
+        ? (queue.pending_capture_id || (existing?.pending_commit === queue.pending_commit ? existing.pending_capture_id : null) || null)
         : null,
       ...(queue.pending_commit && !Object.hasOwn(queue, "pending_upload_base") && existing?.pending_commit === queue.pending_commit && Object.hasOwn(existing, "pending_upload_base")
         ? { pending_upload_base: existing.pending_upload_base } : {}),
@@ -9102,6 +9409,7 @@ class ObtsObsidianClient {
     const oldQueue = Object.assign({}, previousQueue, {
       pending_commit: checkpoint.target_commit, expected_device_ref: request.expected_device_ref,
       pending_proposal_base: previousQueue.pending_commit === checkpoint.target_commit && previousQueue.pending_proposal_base === originalBase ? originalBase : null,
+      pending_rename_pairs: checkpoint.rename_pairs || [], pending_capture_id: checkpoint.capture_id || null,
       pending_upload_base: originalBase, status: "queued_local"
     });
     await this.protectUploadRecoveryCommits([checkpoint.target_commit, originalBase, request.expected_device_ref,
@@ -10675,6 +10983,9 @@ class ObtsObsidianClient {
   }
 
   throwIfSyncBlocked(state) {
+    if (state.last_error_code === "rename_preservation_required") {
+      throw new ObtsBlockedError("rename_preservation_required", "A rename needs manual preservation before sync can continue.", state.last_error_details || undefined);
+    }
     if (state.last_error_code === "conflict_review_required") {
       throw new ObtsBlockedError("conflict_review_required", "A server conflict requires review before normal sync can continue.");
     }
@@ -12309,12 +12620,51 @@ function isCompletePullCheckpoint(value) {
   );
 }
 
+function isValidStoredRenamePairs(value) {
+  return isValidRenamePairs(value) && value.every((pair) =>
+    isGitObjectId(pair.base) && Number.isSafeInteger(pair.generation) && pair.generation >= 0 &&
+    Array.isArray(pair.events) && pair.events.length > 0);
+}
+
+function isValidRenamePairs(value) {
+  if (!Array.isArray(value) || value.length > 5000) return false;
+  const endpoints = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const pair = value[index];
+    if (!pair || typeof pair !== "object" || Array.isArray(pair) ||
+        !isSafeJournalPath(pair.source_path) || !isSafeJournalPath(pair.destination_path) ||
+        pair.source_path === pair.destination_path || pair.source_path.toLowerCase() === pair.destination_path.toLowerCase() ||
+        pair.generation !== undefined && (!Number.isSafeInteger(pair.generation) || pair.generation < 0) ||
+        pair.base !== undefined && !isGitObjectId(pair.base) ||
+        pair.blocked_commit !== undefined && !isGitObjectId(pair.blocked_commit) ||
+        pair.lineage_confirmed !== undefined && typeof pair.lineage_confirmed !== "boolean" ||
+        pair.events !== undefined && (!Array.isArray(pair.events) || pair.events.some((event) =>
+          !event || typeof event !== "object" || !isSafeJournalPath(event.source_path) || !isSafeJournalPath(event.destination_path) ||
+          event.source_path === event.destination_path)) ||
+        index > 0 && (value[index - 1].source_path > pair.source_path ||
+          value[index - 1].source_path === pair.source_path && value[index - 1].destination_path >= pair.destination_path)) return false;
+    endpoints.push(pair.source_path, pair.destination_path);
+  }
+  for (let i = 0; i < endpoints.length; i += 1) for (let j = i + 1; j < endpoints.length; j += 1) {
+    if (changedPathsConflict(endpoints[i], endpoints[j])) return false;
+  }
+  return true;
+}
+
+function isValidWireRenamePairs(value) {
+  return isValidRenamePairs(value) && value.every((pair) =>
+    Object.keys(pair).sort().join(",") === "destination_path,source_path");
+}
+
 function isUploadRecoveryQueue(value) {
   const nullableOid = (oid) => oid === null || isGitObjectId(oid);
   return Boolean(value && typeof value === "object" && !Array.isArray(value) &&
     nullableOid(value.pending_commit) && nullableOid(value.expected_device_ref) &&
     (value.pending_proposal_base === undefined || nullableOid(value.pending_proposal_base)) &&
     (value.pending_upload_base === undefined || nullableOid(value.pending_upload_base)) &&
+    (value.pending_rename_pairs === undefined || isValidWireRenamePairs(value.pending_rename_pairs)) &&
+    (value.pending_capture_id === undefined || value.pending_capture_id === null || typeof value.pending_capture_id === "string" && /^[a-f0-9]{16}$/u.test(value.pending_capture_id)) &&
+    (!(value.pending_rename_pairs || []).length || value.pending_commit !== null && isGitObjectId(value.pending_proposal_base) && /^[a-f0-9]{16}$/u.test(value.pending_capture_id || "")) &&
     ["idle", "queued_local", "uploading", "uploaded", "merged", "conflicted", "blocked_recovery"].includes(value.status) &&
     Number.isSafeInteger(value.attempts) && value.attempts >= 0 &&
     Number.isSafeInteger(value.change_seq) && value.change_seq >= 0 &&
@@ -12344,6 +12694,8 @@ function isUploadCheckpointHandoff(value) {
       isUploadRecoveryQueue(value.old_queue) && value.old_queue.pending_commit === value.old_commit &&
       value.old_queue.expected_device_ref === value.checkpoint.transfer_request.expected_device_ref &&
       value.old_queue.pending_upload_base === value.original_base &&
+      stableJson(value.old_queue.pending_rename_pairs || []) === stableJson(value.checkpoint.rename_pairs || []) &&
+      (value.old_queue.pending_capture_id || null) === (value.checkpoint.capture_id || null) &&
       (!value.old_queue.pending_proposal_base || value.old_queue.pending_proposal_base === value.original_base) &&
       isUploadRecoveryQueue(value.successor_queue) && value.successor_queue.pending_commit === value.successor_commit &&
       ((value.phase === "prepared" && value.result === null) || (value.phase === "result" && isUploadRecoveryResult(value.result) &&
@@ -12363,6 +12715,8 @@ function isUploadRecoveryReplay(value, original) {
     value.transfer_request.expected_device_ref === original.transfer_request.expected_device_ref &&
     value.transfer_request.client_known_main === original.transfer_request.client_known_main &&
     (value.transfer_request.base_commit || null) === (original.transfer_request.base_commit || null) &&
+    stableJson(value.rename_pairs || []) === stableJson(original.rename_pairs || []) &&
+    (value.capture_id || null) === (original.capture_id || null) &&
     stableJson(value.directory_proposal) === stableJson(original.directory_proposal);
 }
 
@@ -12386,7 +12740,11 @@ function isUploadTransferCheckpoint(value) {
     value.transfer_request.plan_sha256 !== sha256(Buffer.from(JSON.stringify(value.groups))) ||
     typeof value.attempt_id !== "string" || !/^[A-Za-z0-9_-]{8,128}$/u.test(value.attempt_id) ||
     value.attempt_id !== `xfer_${sha256(Buffer.from(stableJson(value.transfer_request))).slice(0, 32)}` ||
-    !(value.transfer_id === null || typeof value.transfer_id === "string" && /^trn_[A-Za-z0-9]+$/u.test(value.transfer_id))
+    !(value.transfer_id === null || typeof value.transfer_id === "string" && /^trn_[A-Za-z0-9]+$/u.test(value.transfer_id)) ||
+    !(value.rename_pairs === undefined || isValidWireRenamePairs(value.rename_pairs)) ||
+    !(value.capture_id === undefined || value.capture_id === null || typeof value.capture_id === "string" && /^[a-f0-9]{16}$/u.test(value.capture_id)) ||
+    (value.rename_pairs || []).length > 0 && (!isGitObjectId(value.transfer_request.base_commit) || !/^[a-f0-9]{16}$/u.test(value.capture_id || "")) ||
+    stableJson(value.rename_pairs || []) !== stableJson(value.transfer_request.rename_pairs || [])
   ) return false;
   return value.directory_proposal === null || typeof value.directory_proposal === "object" && !Array.isArray(value.directory_proposal);
 }
@@ -13703,6 +14061,13 @@ function createMultipartBody(parts) {
   return { contentType: `multipart/form-data; boundary=${boundary}`, body: toArrayBuffer(Buffer.concat(chunks)) };
 }
 
+function queueRenameWatcherEvent(plugin, file, oldPath) {
+  const destination = file && typeof file.path === "string" ? file.path : null;
+  const pair = typeof oldPath === "string" && destination
+    ? { source_path: oldPath, destination_path: destination } : null;
+  plugin.queueSyncFromWatcher([destination, oldPath], pair);
+}
+
 function normalizeRequestBody(body) {
   if (typeof body === "string" || body instanceof ArrayBuffer) return body;
   if (ArrayBuffer.isView(body)) return body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength);
@@ -13719,6 +14084,7 @@ function nowIso() {
 }
 
 module.exports.createRootIgnorePolicy = createRootIgnorePolicy;
+module.exports.queueRenameWatcherEvent = queueRenameWatcherEvent;
 module.exports.ObtsClientCore = ObtsObsidianClient;
 module.exports.PluginBlockedError = ObtsBlockedError;
 module.exports.TransportError = ObtsTransportError;

@@ -158,6 +158,9 @@ describe('validation selection', () => {
     expect(makePlan(['architecture/models/formal/OBTSVaultSettings.tla']).formalFamilies).toEqual(['vault-settings']);
     expect(makePlan(['architecture/models/formal/OBTSManagedHeadlessOwnership.tla']).formalFamilies).toEqual(['headless-ownership']);
     expect(makePlan(['architecture/models/formal/OBTSManagedHeadlessOwnership.cfg']).formalFamilies).toEqual(['headless-ownership']);
+    expect(makePlan(['architecture/models/formal/OBTSAtomicRename.tla']).formalFamilies).toEqual(['atomic-rename']);
+    expect(makePlan(['architecture/models/formal/OBTSAtomicRename.cfg']).formalFamilies).toEqual(['atomic-rename']);
+    expect(makePlan(['architecture/models/formal/configs/fm014-atomic-rename.cfg']).formalFamilies).toEqual(['atomic-rename']);
     for (const extension of ['tla', 'cfg']) {
       const plan = makePlan([`architecture/models/formal/OBTSUploadCheckpointRecovery.${extension}`]);
       expect(plan.formalFamilies).toEqual(['client-state']);

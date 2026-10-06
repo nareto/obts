@@ -2499,6 +2499,16 @@ components:
       dependentRequired:
         root_ignore_capability: [root_ignore_oid]
         root_ignore_oid: [root_ignore_capability]
+        rename_pairs: [base_commit]
+      allOf:
+        - if:
+            properties:
+              rename_pairs: { type: array, minItems: 1 }
+            required: [rename_pairs]
+          then:
+            properties:
+              base_commit: { type: string, pattern: '^[0-9a-f]{40}$' }
+            required: [base_commit]
       required:
         - api_version
         - vault_id
@@ -2546,11 +2556,18 @@ components:
             - type: string
               pattern: "^[0-9a-f]{40}$"
         base_commit:
-          description: Trusted vault commit used as the proposal merge base; it never transfers device identity.
+          description: Trusted vault commit used as the proposal merge base for all explicit rename pairs; other authored paths retain OBTS-SYNC-BASE-001 ownership semantics and this never transfers device identity.
           oneOf:
             - type: "null"
             - type: string
               pattern: "^[0-9a-f]{40}$"
+        rename_pairs:
+          description: Optional explicit source-to-destination relations, sorted lexicographically by source_path then destination_path. Endpoints must be distinct, non-overlapping and valid in base_commit and target_commit; retries bind this array immutably.
+          type: array
+          minItems: 1
+          maxItems: 5000
+          items:
+            $ref: "#/components/schemas/RenamePair"
         attempt_id:
           type: string
         directory_intents:
@@ -2634,15 +2651,29 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/DirectoryIntentAcknowledgement"
+    RenamePair:
+      type: object
+      additionalProperties: false
+      required: [source_path, destination_path]
+      properties:
+        source_path:
+          type: string
+          minLength: 1
+          description: Canonical sync path present in the selected proposal base and absent in the target.
+        destination_path:
+          type: string
+          minLength: 1
+          description: Canonical sync path absent in the selected proposal base and present in the target.
     SyncCapabilities:
       type: object
       required: [capabilities, max_chunk_bytes, target_chunk_bytes, max_transfer_bytes, max_transfer_chunks]
       properties:
         capabilities:
+          description: Supported transfer/proposal features; rename-pairs-v1 is advertised only when explicit atomic rename admission is available.
           type: array
           items:
-            enum: [git-object-pack-chunks-v1, async-push-finalize-v1, directory-proposals-v2]
-          minItems: 3
+            enum: [git-object-pack-chunks-v1, async-push-finalize-v1, directory-proposals-v2, rename-pairs-v1]
+          minItems: 4
           uniqueItems: true
         max_chunk_bytes:
           type: integer
@@ -2659,6 +2690,16 @@ components:
       dependentRequired:
         root_ignore_capability: [root_ignore_oid]
         root_ignore_oid: [root_ignore_capability]
+        rename_pairs: [base_commit]
+      allOf:
+        - if:
+            properties:
+              rename_pairs: { type: array, minItems: 1 }
+            required: [rename_pairs]
+          then:
+            properties:
+              base_commit: { type: string, pattern: '^[0-9a-f]{40}$' }
+            required: [base_commit]
       required: [api_version, vault_id, device_id, expected_device_ref, target_commit, client_known_main, attempt_id, chunk_count, plan_sha256]
       properties:
         api_version:
@@ -2690,10 +2731,18 @@ components:
             - type: string
               pattern: "^[0-9a-f]{40}$"
         base_commit:
+          description: Trusted vault commit used as the proposal merge base for all explicit rename pairs; other authored paths retain OBTS-SYNC-BASE-001 ownership semantics.
           oneOf:
             - type: "null"
             - type: string
               pattern: "^[0-9a-f]{40}$"
+        rename_pairs:
+          description: Optional explicit source-to-destination relations, sorted lexicographically by source_path then destination_path. Endpoints must be distinct, non-overlapping and valid in base_commit and target_commit; retries bind this array immutably.
+          type: array
+          minItems: 1
+          maxItems: 5000
+          items:
+            $ref: "#/components/schemas/RenamePair"
         directory_intents:
           description: Legacy directory side channel accepted conservatively during rolling upgrades.
           type: array

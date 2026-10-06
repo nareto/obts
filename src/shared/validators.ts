@@ -8,7 +8,8 @@ import {
   type DevicePushManifest,
   type DirectoryIntent,
   type DirectoryProposal,
-  type DirectoryProposalIntent
+  type DirectoryProposalIntent,
+  type RenamePair
 } from './types.js';
 
 const COMMIT_ID_PATTERN = /^[0-9a-f]{40}$/u;
@@ -165,6 +166,10 @@ export function parseDevicePushManifest(value: unknown): DevicePushManifest {
     : undefined;
   const attemptId = readOptionalString(value, 'attempt_id');
   const rootIgnoreAttestation = readRootIgnoreAttestation(value);
+  const renamePairs = readOptionalRenamePairs(value);
+  if (renamePairs !== undefined && !baseCommit) {
+    throw new ValidationError('invalid_request', 'Rename pairs require an explicit base_commit.', { field: 'base_commit' });
+  }
   const directoryIntents = readOptionalDirectoryIntents(value, 'directory_intents');
   const directoryProposal = readOptionalDirectoryProposal(value, 'directory_proposal');
   if (directoryIntents !== undefined && directoryProposal !== undefined) {
@@ -174,6 +179,7 @@ export function parseDevicePushManifest(value: unknown): DevicePushManifest {
     ...manifest,
     ...(pluginVersion === undefined ? {} : { plugin_version: pluginVersion }),
     ...(baseCommit === undefined ? {} : { base_commit: baseCommit }),
+    ...(renamePairs === undefined ? {} : { rename_pairs: renamePairs }),
     ...(attemptId === undefined ? {} : { attempt_id: attemptId }),
     ...rootIgnoreAttestation,
     ...(directoryIntents === undefined ? {} : { directory_intents: directoryIntents }),
@@ -201,6 +207,54 @@ function readRootIgnoreAttestation(record: Record<string, unknown>): Pick<Device
     throw new ValidationError('invalid_request', 'Root ignore capability and identity must be supplied together.');
   }
   return capability === undefined ? {} : { root_ignore_capability: 'root-ignore-v1', root_ignore_oid: oid! };
+}
+
+export function parseRenamePairs(value: unknown): RenamePair[] {
+  const parsed = readOptionalRenamePairs({ rename_pairs: value });
+  if (parsed === undefined) throw new ValidationError('invalid_request', 'Rename pairs are required.', { field: 'rename_pairs' });
+  return parsed;
+}
+
+function readOptionalRenamePairs(record: Record<string, unknown>): RenamePair[] | undefined {
+  const value = record.rename_pairs;
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0 || value.length > 5000) {
+    throw new ValidationError('invalid_request', 'Invalid rename pairs.', { field: 'rename_pairs' });
+  }
+  const pairs: RenamePair[] = [];
+  const endpoints = new Set<string>();
+  let previous = '';
+  for (const item of value) {
+    assertRecord(item);
+    if (Object.keys(item).sort().join(',') !== 'destination_path,source_path') {
+      throw new ValidationError('invalid_request', 'Rename pair has unsupported fields.', { field: 'rename_pairs' });
+    }
+    const sourcePath = readCanonicalSyncPath(item, 'source_path');
+    const destinationPath = readCanonicalSyncPath(item, 'destination_path');
+    if (sourcePath === destinationPath) throw new ValidationError('invalid_request', 'Rename endpoints must differ.', { field: 'rename_pairs' });
+    const key = `${sourcePath}\0${destinationPath}`;
+    if (previous && key <= previous) throw new ValidationError('invalid_request', 'Rename pairs must be uniquely sorted.', { field: 'rename_pairs' });
+    previous = key;
+    for (const path of [sourcePath, destinationPath]) {
+      for (const existing of endpoints) {
+        if (path === existing || path.startsWith(`${existing}/`) || existing.startsWith(`${path}/`)) {
+          throw new ValidationError('invalid_request', 'Rename pair footprints overlap.', { field: 'rename_pairs' });
+        }
+      }
+      endpoints.add(path);
+    }
+    pairs.push({ source_path: sourcePath, destination_path: destinationPath });
+  }
+  return pairs;
+}
+
+function readCanonicalSyncPath(record: Record<string, unknown>, field: string): string {
+  const input = readString(record, field);
+  const normalized = normalizeVaultPath(input);
+  if (!normalized.ok || normalized.path !== input || !isSyncableVaultPath(input)) {
+    throw new ValidationError('invalid_request', 'Rename endpoint must be a canonical sync path.', { field });
+  }
+  return input;
 }
 
 function readOptionalDirectoryProposal(record: Record<string, unknown>, field: string): DirectoryProposal | undefined {
@@ -356,9 +410,13 @@ export function parseChunkPushCreateRequest(value: unknown): ChunkPushCreateRequ
   const baseCommit = Object.prototype.hasOwnProperty.call(value, 'base_commit')
     ? readNullableCommitId(value, 'base_commit')
     : undefined;
+  const renamePairs = readOptionalRenamePairs(value);
   const directoryIntents = readOptionalDirectoryIntents(value, 'directory_intents');
   const directoryProposal = readOptionalDirectoryProposal(value, 'directory_proposal');
   const rootIgnoreAttestation = readRootIgnoreAttestation(value);
+  if (renamePairs !== undefined && !baseCommit) {
+    throw new ValidationError('invalid_request', 'Rename pairs require an explicit base_commit.', { field: 'base_commit' });
+  }
   if (directoryIntents !== undefined && directoryProposal !== undefined) {
     throw new ValidationError('invalid_request', 'Use either legacy directory intents or a directory proposal, not both.');
   }
@@ -371,6 +429,7 @@ export function parseChunkPushCreateRequest(value: unknown): ChunkPushCreateRequ
     target_commit: readCommitId(value, 'target_commit'),
     client_known_main: readNullableCommitId(value, 'client_known_main'),
     ...(baseCommit === undefined ? {} : { base_commit: baseCommit }),
+    ...(renamePairs === undefined ? {} : { rename_pairs: renamePairs }),
     ...rootIgnoreAttestation,
     ...(directoryIntents === undefined ? {} : { directory_intents: directoryIntents }),
     ...(directoryProposal === undefined ? {} : { directory_proposal: directoryProposal }),

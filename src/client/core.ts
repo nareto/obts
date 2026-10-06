@@ -94,6 +94,8 @@ export type OnboardingJournal = {
 export type QueueState = {
   pending_commit: string | null;
   pending_proposal_base?: string | null;
+  pending_rename_pairs?: Array<{ source_path: string; destination_path: string }>;
+  pending_capture_id?: string | null;
   expected_device_ref: string | null;
   status: 'idle' | 'queued_local' | 'uploading' | 'uploaded' | 'merged' | 'conflicted' | 'blocked_recovery';
   attempts: number;
@@ -150,6 +152,7 @@ type SharedClientCore = {
   ): Promise<SyncResult>;
   cancelOnboarding(): Promise<void>;
   recordLocalChangeHint(paths: string[]): Promise<void>;
+  recordLocalRenameHint(sourcePath: string, destinationPath: string): Promise<void>;
   syncOnce(options?: { confirmInitialImport?: boolean; fullAudit?: boolean }): Promise<SyncResult>;
   pullAndApply(allowDestructive: boolean): Promise<boolean>;
   reconcileDeviceBlocked(fromCaughtError?: boolean, triggeringErrorCode?: string | null): Promise<{ applied: boolean; status: string }>;
@@ -299,6 +302,10 @@ export class ObtsPluginClient {
 
   recordLocalChangeHint(paths: string[]): Promise<void> {
     return this.client.recordLocalChangeHint(paths);
+  }
+
+  recordLocalRenameHint(sourcePath: string, destinationPath: string): Promise<void> {
+    return this.client.recordLocalRenameHint(sourcePath, destinationPath);
   }
 
   syncOnce(options?: { confirmInitialImport?: boolean; fullAudit?: boolean }): Promise<SyncResult> {

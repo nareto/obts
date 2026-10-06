@@ -1,5 +1,5 @@
 schema_version: 1
-revision: 45
+revision: 46
 status: current
 updated: 2026-10-05
 authoritative_artifacts:
@@ -155,4 +155,12 @@ formal_models:
     refines:
       - OBTS-SYNC-ACK-001
       - OBTS-SYNC-STALE-001
+  - id: OBTS-FM-014
+    status: focused bounded model
+    path: architecture/models/formal/OBTSAtomicRename.tla
+    architecture_revision: 46
+    checks: architecture/models/formal/configs/fm014-atomic-rename.cfg
+    refines:
+      - OBTS-SYNC-RENAME-001
+      - OBTS-PER-RENAME-001
 

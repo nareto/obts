@@ -80,6 +80,8 @@ implementation protects revealing a selected body with recent password
 authentication; architecture revision 1 replaces that UX with explicit target
 confirmation, tracked in Forgejo issue 18.
 
+The Obsidian client stores watcher rename relations and frozen rename capture identity in `.obts/stale-provenance.json` and `.obts/queue.json`. Stale provenance schema version 4 adds validated `rename_pairs`; existing versions migrate with an empty relation list and never infer renames from similarity. A queue capture binds its pair array and capture ID to the immutable multipart request or chunk checkpoint. Downgrading to a client without this support cannot safely upload an outstanding paired proposal; preserve the vault's `.obts` state and update the server/client before retrying.
+
 Git maintenance verifies object integrity before and after repacking and prunes
 only unreachable objects. Commits reachable from `main`, device refs,
 unresolved-conflict refs, and recovery refs are retained. Phase 3 has no history

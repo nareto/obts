@@ -1,4 +1,5 @@
 import { fork } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -16,6 +17,7 @@ const MERGED = REMOTE.replace('last', 'local');
 const roots: string[] = [];
 const servers: ObtsServer[] = [];
 const nativeWrite = NodeDataAdapter.prototype.writeBinary;
+const pluginMain = createRequire(import.meta.url)('../obsidian-plugin/src/main.cjs') as any;
 const stableJson = (value: any): string => JSON.stringify(value, (_key, item) =>
   item && typeof item === 'object' && !Array.isArray(item)
     ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b)))
@@ -2124,5 +2126,550 @@ describe('local ref after an applied stale-cohort conflict resolution', () => {
     expect(await f.canonical()).toBe(resolution);
     expect((await f.provenance()).obligations['note.md']).toBeDefined();
     expect((await f.server.store.snapshot()).conflicts.filter((r) => r.status === 'open')).toEqual([]);
+  });
+});
+
+describe('split rename after stale conflict resolution', () => {
+  const REMOTE_EDIT = BASE.replace('last', 'remote last');
+  const DEVICE_EDIT = BASE.replace('last', 'device last');
+
+  it.each([
+    { choice: 'keep_server' as const, restart: false },
+    { choice: 'keep_server' as const, restart: true },
+    { choice: 'use_device' as const, restart: false },
+    { choice: 'use_device' as const, restart: true }
+  ])('characterizes $choice after the split rename (restart=$restart)', async ({ choice, restart }) => {
+    const f = await fixture();
+    await f.remote(REMOTE_EDIT);
+    const stage = f.core.stageRecoveryBundleFiles.bind(f.core);
+    let injected = false;
+    f.core.stageRecoveryBundleFiles = async (...args: any[]) => {
+      if (!injected) {
+        injected = true;
+        await f.core.adapter.write('note.md', DEVICE_EDIT);
+      }
+      return stage(...args);
+    };
+    await f.core.pullAndApply(true);
+    expect((await f.plugin.syncOnce()).status).toBe('Conflict resolution needed');
+    const first = (await f.server.store.snapshot()).conflicts.find((r) => r.status === 'open')!;
+    expect(first.base_commit).toBe(f.m0);
+    const firstReview = await f.server.app.inject({ method: 'GET', headers: f.headers,
+      url: `/api/v1/vaults/${f.vaultId}/conflicts/${first.conflict_id}` });
+    expect((await f.server.app.inject({ method: 'POST', headers: f.headers,
+      url: `/api/v1/vaults/${f.vaultId}/conflicts/${first.conflict_id}/resolve`,
+      payload: { expected_main: firstReview.json().conflict.expected_main, resolution_kind: 'use_device' }
+    })).statusCode).toBe(200);
+    await f.plugin.pollRemoteEventsAndApply();
+    const resolved = await f.canonical();
+    expect(resolved).toBe(DEVICE_EDIT);
+    expect(await readFile(join(f.dir, 'note.md'), 'utf8')).toBe(DEVICE_EDIT);
+
+    await f.core.adapter.rename('note.md', 'renamed.md');
+    await f.core.recordLocalChangeHint(['note.md', 'renamed.md']);
+    expect(await readdir(f.dir)).toContain('renamed.md');
+    expect(await readdir(f.dir)).not.toContain('note.md');
+    expect(await readFile(join(f.dir, 'renamed.md'), 'utf8')).toBe(resolved);
+    expect((await f.provenance()).obligations['note.md']).toMatchObject({ base: f.m0 });
+
+    const secondResult = await f.plugin.syncOnce();
+    expect(secondResult.status).toBe('Conflict resolution needed');
+    const q = await f.plugin.readQueue();
+    expect(q.changed_paths).toContain('note.md');
+    expect(q.changed_paths).toContain('renamed.md');
+    const d = await git.readCommit({ fs: f.core.fs, dir: f.core.vaultDir, gitdir: f.core.gitdir, oid: q.pending_commit! });
+    expect(d.commit.parent).toEqual([await f.server.git.getRef(f.vaultId, 'refs/heads/main')]);
+    expect(q.pending_proposal_base).toBe(f.m0);
+    expect((await f.core.listTreeBlobOids(q.pending_commit!)).has('note.md')).toBe(false);
+    expect((await f.core.listTreeBlobOids(q.pending_commit!)).has('renamed.md')).toBe(false);
+    const second = (await f.server.store.snapshot()).conflicts.filter((r) => r.status === 'open');
+    expect(second).toHaveLength(1);
+    expect(second[0]!.base_commit).toBe(f.m0);
+    expect(second[0]!.conflict_kind).toBe('content');
+    expect(await readdir(f.dir)).not.toContain('note.md');
+    expect(await readdir(f.dir)).toContain('renamed.md');
+    expect(await f.canonical()).toBe(DEVICE_EDIT);
+    const beforeResolutionMain = await f.server.git.getRef(f.vaultId, 'refs/heads/main');
+    expect(beforeResolutionMain).not.toBeNull();
+    const beforeResolutionPaths = await f.server.git.listTreePaths(f.vaultId, beforeResolutionMain!);
+    expect(beforeResolutionPaths).toContain('note.md');
+    expect(beforeResolutionPaths).not.toContain('renamed.md');
+
+    let active = f.plugin;
+    if (restart) active = (await f.restart()).plugin;
+    const review = await f.server.app.inject({ method: 'GET', headers: f.headers,
+      url: `/api/v1/vaults/${f.vaultId}/conflicts/${second[0]!.conflict_id}` });
+    expect(review.json().path_conflicts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'delete_edit', base_path: 'note.md', server_path: 'note.md', device_path: null })
+    ]));
+    expect((await f.server.app.inject({ method: 'POST', headers: f.headers,
+      url: `/api/v1/vaults/${f.vaultId}/conflicts/${second[0]!.conflict_id}/resolve`,
+      payload: { expected_main: review.json().conflict.expected_main, resolution_kind: choice }
+    })).statusCode).toBe(200);
+    const resolvedServerMain = await f.server.git.getRef(f.vaultId, 'refs/heads/main');
+    expect(resolvedServerMain).not.toBeNull();
+    const immediatelyResolvedPaths = await f.server.git.listTreePaths(f.vaultId, resolvedServerMain!);
+    expect(immediatelyResolvedPaths.includes('note.md')).toBe(choice === 'keep_server');
+    expect(immediatelyResolvedPaths).not.toContain('renamed.md');
+    await active.pollRemoteEventsAndApply();
+    const afterApply = {
+      old: await readFile(join(f.dir, 'note.md'), 'utf8').catch(() => null),
+      renamed: await readFile(join(f.dir, 'renamed.md'), 'utf8').catch(() => null),
+      entries: (await readdir(f.dir)).filter((name) => name === 'note.md' || name === 'renamed.md').sort()
+    };
+    const afterDrain = await active.syncOnce();
+    expect(afterDrain.status).toBe('Synced');
+    const finalFiles = {
+      old: await readFile(join(f.dir, 'note.md'), 'utf8').catch(() => null),
+      renamed: await readFile(join(f.dir, 'renamed.md'), 'utf8').catch(() => null),
+      entries: (await readdir(f.dir)).filter((name) => name === 'note.md' || name === 'renamed.md').sort()
+    };
+    const expectedOld = choice === 'keep_server' ? resolved : null;
+    expect(afterApply).toEqual({
+      old: expectedOld,
+      renamed: resolved,
+      entries: choice === 'keep_server' ? ['note.md', 'renamed.md'] : ['renamed.md']
+    });
+    expect(finalFiles).toEqual(afterApply);
+    const finalMain = await f.server.git.getRef(f.vaultId, 'refs/heads/main');
+    expect(finalMain).not.toBeNull();
+    const finalPaths = await f.server.git.listTreePaths(f.vaultId, finalMain!);
+    expect(finalPaths.includes('note.md')).toBe(choice === 'keep_server');
+    expect(finalPaths).toContain('renamed.md');
+    if (choice === 'keep_server') expect(await f.canonical()).toBe(resolved);
+    expect(await f.canonical('renamed.md')).toBe(resolved);
+    expect((await f.server.store.snapshot()).conflicts.filter((r) => r.status === 'open')).toEqual([]);
+    expect((await active.readState()).last_error_code).toBeNull();
+  });
+});
+
+describe('durable atomic rename proposals after stale conflict resolution', () => {
+  it.each(['base', 'generation', 'events'] as const)('fails closed when durable v4 rename evidence omits %s', async (field) => {
+    const f = await fixture();
+    await f.core.adapter.rename('note.md', 'renamed.md');
+    await f.plugin.client.recordLocalRenameHint('note.md', 'renamed.md');
+    const path = join(f.dir, '.obts', 'stale-provenance.json');
+    const saved = JSON.parse(await readFile(path, 'utf8'));
+    delete saved.rename_pairs[0][field];
+    await writeFile(path, JSON.stringify(saved));
+    await expect(f.core.readStaleProvenance()).rejects.toMatchObject({ code: 'stale_provenance_corrupt' });
+  });
+
+  it.each(['omitted pairs', 'empty pairs', 'different base'] as const)('blocks a paired frozen intent with %s in its queue', async (corruption) => {
+    const f = await fixture();
+    await f.core.adapter.rename('note.md', 'renamed.md');
+    await f.plugin.client.recordLocalRenameHint('note.md', 'renamed.md');
+    const state = await f.plugin.readState();
+    expect(await f.core.queueStaleCohort(state.local_main, state.server_device_ref)).toBe(true);
+    const queue = await f.plugin.readQueue();
+    const push = vi.spyOn(f.server.sync, 'pushDeviceCommit');
+    const invalidQueue = corruption === 'different base'
+      ? { ...queue, pending_proposal_base: queue.pending_commit }
+      : { ...queue, pending_rename_pairs: corruption === 'empty pairs' ? [] : undefined };
+    await expect(f.core.uploadQueuedCommit(invalidQueue)).rejects.toMatchObject({ code: 'stale_intent_mismatch' });
+    expect(push).not.toHaveBeenCalled();
+  });
+
+  it('flushes the registered rename watcher serially and retries after durable provenance failure', async () => {
+    const f = await fixture();
+    await f.core.adapter.rename('note.md', 'renamed.md');
+    const callbacks = new Map<string, (file: any, oldPath?: string) => void>();
+    const watcher = Object.create(pluginMain.prototype);
+    Object.assign(watcher, {
+      app: { vault: { on: (name: string, callback: (file: any, oldPath?: string) => void) => {
+        callbacks.set(name, callback); return { name };
+      } } },
+      client: f.core, clientReady: false, unloaded: false, layoutStarted: false,
+      pendingWatcherPaths: new Set(), pendingWatcherRenames: [], watcherFlush: Promise.resolve(),
+      registerEvent: () => undefined, operationAvailability: () => 'unavailable', observeRetiredOperation: () => undefined,
+      reportDeviceError: () => undefined
+    });
+    watcher.startAfterLayoutReady();
+    const mutate = f.core.mutateStaleProvenance.bind(f.core);
+    let attempts = 0;
+    f.core.mutateStaleProvenance = async (...args: any[]) => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('durable write interrupted');
+      return await mutate(args[0]);
+    };
+    callbacks.get('rename')!({ path: 'renamed.md' }, 'note.md');
+    await watcher.flushWatcherHints();
+    expect(attempts).toBe(2);
+    expect((await f.provenance()).rename_pairs).toMatchObject([
+      { source_path: 'note.md', destination_path: 'renamed.md', base: f.m0 }
+    ]);
+    expect(watcher.pendingWatcherRenames).toEqual([]);
+  });
+
+  it('durably blocks a tracked directory rename across restart', async () => {
+    const f = await fixture();
+    await f.core.adapter.mkdir('folder');
+    await f.core.adapter.write('folder/note.md', 'tracked child\n');
+    expect((await f.plugin.syncOnce()).status).toBe('Synced');
+    await f.core.adapter.rename('folder', 'renamed');
+    await expect(f.plugin.client.recordLocalRenameHint('folder', 'renamed'))
+      .rejects.toMatchObject({ code: 'rename_preservation_required' });
+    expect((await f.plugin.readState()).last_error_code).toBe('rename_preservation_required');
+    const restarted = await f.restart();
+    await expect(restarted.plugin.syncOnce()).rejects.toMatchObject({ code: 'rename_preservation_required' });
+    expect(await f.canonical('folder/note.md')).toBe('tracked child\n');
+    await expect(f.canonical('renamed/note.md')).rejects.toThrow();
+  });
+
+  it('persists overlapping rename rejection before reporting it', async () => {
+    const f = await fixture();
+    await f.core.adapter.rename('note.md', 'renamed.md');
+    await f.plugin.client.recordLocalRenameHint('note.md', 'renamed.md');
+    await f.core.adapter.rename('renamed.md', 'final.md');
+    await expect(f.plugin.client.recordLocalRenameHint('note.md', 'final.md'))
+      .rejects.toMatchObject({ code: 'rename_preservation_required' });
+    expect((await f.plugin.readState()).last_error_code).toBe('rename_preservation_required');
+    const restarted = await f.restart();
+    await expect(restarted.plugin.syncOnce()).rejects.toMatchObject({ code: 'rename_preservation_required' });
+  });
+
+  it('normalizes an untracked note rename into an ordinary add', async () => {
+    const f = await fixture();
+    await f.core.adapter.write('Untitled.md', 'new note\n');
+    await f.core.adapter.rename('Untitled.md', 'Title.md');
+    await f.plugin.client.recordLocalRenameHint('Untitled.md', 'Title.md');
+    expect((await f.provenance()).rename_pairs).toEqual([]);
+    expect((await f.plugin.readQueue()).pending_commit).toBeNull();
+    expect((await f.plugin.syncOnce()).status).toBe('Synced');
+    expect(await f.canonical('Title.md')).toBe('new note\n');
+    await expect(f.canonical('Untitled.md')).rejects.toThrow();
+  });
+
+  it('collapses a pre-freeze chain and replays the final watcher event idempotently', async () => {
+    const f = await fixture();
+    await f.core.adapter.rename('note.md', 'middle.md');
+    await f.plugin.client.recordLocalRenameHint('note.md', 'middle.md');
+    await f.core.adapter.rename('middle.md', 'final.md');
+    await f.plugin.client.recordLocalRenameHint('middle.md', 'final.md');
+    await f.plugin.client.recordLocalRenameHint('middle.md', 'final.md');
+    expect((await f.provenance()).rename_pairs).toEqual([
+      { source_path: 'note.md', destination_path: 'final.md', generation: 1, base: f.m0,
+        events: [{ source_path: 'note.md', destination_path: 'middle.md' }, { source_path: 'middle.md', destination_path: 'final.md' }] }
+    ]);
+  });
+
+  const REMOTE_EDIT = BASE.replace('last', 'remote last');
+  const DEVICE_EDIT = BASE.replace('last', 'device last');
+
+  it.each(['edit', 'rename'] as const)('retains a destination %s after pair freeze and syncs from the accepted proposal base', async (successorKind) => {
+    const f = await fixture();
+    await f.remote(REMOTE_EDIT);
+    const stage = f.core.stageRecoveryBundleFiles.bind(f.core);
+    let injected = false;
+    f.core.stageRecoveryBundleFiles = async (...args: any[]) => {
+      if (!injected) { injected = true; await f.core.adapter.write('note.md', DEVICE_EDIT); }
+      return stage(...args);
+    };
+    await f.core.pullAndApply(true);
+    await f.plugin.syncOnce();
+    const conflict = (await f.server.store.snapshot()).conflicts.find((r) => r.status === 'open')!;
+    const review = await f.server.app.inject({ method: 'GET', headers: f.headers,
+      url: `/api/v1/vaults/${f.vaultId}/conflicts/${conflict.conflict_id}` });
+    await f.server.app.inject({ method: 'POST', headers: f.headers,
+      url: `/api/v1/vaults/${f.vaultId}/conflicts/${conflict.conflict_id}/resolve`,
+      payload: { expected_main: review.json().conflict.expected_main, resolution_kind: 'use_device' } });
+    await f.plugin.pollRemoteEventsAndApply();
+    await f.core.adapter.rename('note.md', 'renamed.md');
+    await f.plugin.client.recordLocalRenameHint('note.md', 'renamed.md');
+    const originalPush = f.server.sync.pushDeviceCommit.bind(f.server.sync);
+    let changedAfterFreeze = false;
+    let pairedTarget: string | null = null;
+    f.server.sync.pushDeviceCommit = async (...args: any[]) => {
+      if (!changedAfterFreeze) {
+        changedAfterFreeze = true;
+        pairedTarget = args[1].target_commit;
+        if (successorKind === 'edit') {
+          await f.core.adapter.write('renamed.md', 'successor edit\n');
+          await f.plugin.client.recordLocalChangeHint(['renamed.md']);
+        } else {
+          await f.core.adapter.rename('renamed.md', 'final.md');
+          await f.plugin.client.recordLocalRenameHint('renamed.md', 'final.md');
+        }
+      }
+      return await (originalPush as (...values: any[]) => Promise<any>)(...args);
+    };
+    let result = await f.plugin.syncOnce();
+    for (let attempt = 0; result.status !== 'Synced' && attempt < 3; attempt += 1) result = await f.plugin.syncOnce();
+    expect(result.status).toBe('Synced');
+    const finalPath = successorKind === 'edit' ? 'renamed.md' : 'final.md';
+    expect(await f.canonical(finalPath)).toBe(successorKind === 'edit' ? 'successor edit\n' : DEVICE_EDIT);
+    expect(await readFile(join(f.dir, finalPath), 'utf8')).toBe(successorKind === 'edit' ? 'successor edit\n' : DEVICE_EDIT);
+    if (successorKind === 'rename') {
+      await expect(f.canonical('renamed.md')).rejects.toThrow();
+      await expect(readFile(join(f.dir, 'renamed.md'))).rejects.toMatchObject({ code: 'ENOENT' });
+    }
+    const state = await f.plugin.readState();
+    const deviceCommit = await f.server.git.getRef(f.vaultId, state.device_ref!);
+    const operations = (await f.server.store.snapshot()).sync_operations.filter((row) =>
+      row.operation_type === 'device_push' && row.target_commit === deviceCommit);
+    expect(operations.at(-1)?.proposal_base).toBe(pairedTarget);
+  });
+
+  it('retains and unblocks a successor rename only after use_device installs its predecessor', async () => {
+    const f = await fixture();
+    await f.core.adapter.write('note.md', DEVICE_EDIT);
+    await f.plugin.client.recordLocalChangeHint(['note.md']);
+    expect((await f.plugin.syncOnce()).status).toBe('Synced');
+    await f.core.adapter.rename('note.md', 'renamed.md');
+    await f.plugin.client.recordLocalRenameHint('note.md', 'renamed.md');
+    const beforeCapture = await f.plugin.readState();
+    expect(await f.core.queueStaleCohort(beforeCapture.local_main, beforeCapture.server_device_ref)).toBe(true);
+    const pairedQueue = await f.plugin.readQueue();
+    const pairedCommit = pairedQueue.pending_commit!;
+    await f.remote(REMOTE_EDIT, { 'renamed.md': 'competing destination\n' });
+    expect((await f.core.uploadQueuedCommit(pairedQueue)).status).toBe('conflicted');
+    const predecessor = (await f.server.store.snapshot()).conflicts.find((row) => row.status === 'open')!;
+    expect(predecessor).toBeDefined();
+    await f.core.adapter.rename('renamed.md', 'final.md');
+    await f.plugin.client.recordLocalRenameHint('renamed.md', 'final.md');
+    expect((await f.provenance()).rename_pairs[0]).toMatchObject({ blocked_commit: expect.any(String) });
+    await expect(f.plugin.syncOnce()).rejects.toMatchObject({ code: 'conflict_review_required' });
+    const review = await f.server.app.inject({ method: 'GET', headers: f.headers,
+      url: `/api/v1/vaults/${f.vaultId}/conflicts/${predecessor.conflict_id}` });
+    await f.server.app.inject({ method: 'POST', headers: f.headers,
+      url: `/api/v1/vaults/${f.vaultId}/conflicts/${predecessor.conflict_id}/resolve`,
+      payload: { expected_main: review.json().conflict.expected_main, resolution_kind: 'use_device' } });
+    await f.plugin.pollRemoteEventsAndApply();
+    let result = await f.plugin.syncOnce();
+    for (let attempt = 0; result.status !== 'Synced' && attempt < 3; attempt += 1) result = await f.plugin.syncOnce();
+    expect(result.status).toBe('Synced');
+    expect(await f.canonical('final.md')).toBe(DEVICE_EDIT);
+    await expect(f.canonical('note.md')).rejects.toThrow();
+    await expect(f.canonical('renamed.md')).rejects.toThrow();
+    expect((await f.server.store.snapshot()).conflicts.filter((row) => row.status === 'open')).toEqual([]);
+    expect(predecessor.device_commit).toBe(pairedCommit);
+  });
+
+  it('blocks a successor created during a conflicted push until predecessor installation is proven', async () => {
+    const f = await fixture();
+    await f.core.adapter.write('note.md', DEVICE_EDIT);
+    await f.plugin.client.recordLocalChangeHint(['note.md']);
+    expect((await f.plugin.syncOnce()).status).toBe('Synced');
+    await f.core.adapter.rename('note.md', 'renamed.md');
+    await f.plugin.client.recordLocalRenameHint('note.md', 'renamed.md');
+    const beforeCapture = await f.plugin.readState();
+    expect(await f.core.queueStaleCohort(beforeCapture.local_main, beforeCapture.server_device_ref)).toBe(true);
+    const queue = await f.plugin.readQueue();
+    await f.remote(REMOTE_EDIT, { 'renamed.md': 'competing destination\n' });
+    const originalPush = f.server.sync.pushDeviceCommit.bind(f.server.sync);
+    let createdSuccessor = false;
+    f.server.sync.pushDeviceCommit = async (...args: any[]) => {
+      const result = await (originalPush as (...values: any[]) => Promise<any>)(...args);
+      if (!createdSuccessor) {
+        createdSuccessor = true;
+        await f.core.adapter.rename('renamed.md', 'final.md');
+        await f.plugin.client.recordLocalRenameHint('renamed.md', 'final.md');
+      }
+      return result;
+    };
+    expect((await f.core.uploadQueuedCommit(queue)).status).toBe('conflicted');
+    expect((await f.provenance()).rename_pairs[0]).toMatchObject({
+      source_path: 'renamed.md', destination_path: 'final.md', blocked_commit: queue.pending_commit
+    });
+    const predecessor = (await f.server.store.snapshot()).conflicts.find((row) => row.status === 'open')!;
+    const review = await f.server.app.inject({ method: 'GET', headers: f.headers,
+      url: `/api/v1/vaults/${f.vaultId}/conflicts/${predecessor.conflict_id}` });
+    await f.server.app.inject({ method: 'POST', headers: f.headers,
+      url: `/api/v1/vaults/${f.vaultId}/conflicts/${predecessor.conflict_id}/resolve`,
+      payload: { expected_main: review.json().conflict.expected_main, resolution_kind: 'keep_server' } });
+    await f.plugin.pollRemoteEventsAndApply();
+    const canonicalMain = await f.server.git.getRef(f.vaultId, 'refs/heads/main');
+    const canonicalDestination = await f.canonical('renamed.md');
+    const pushesBeforeRetry = (await f.server.store.snapshot()).sync_operations.filter((row) => row.operation_type === 'device_push').length;
+    await expect(f.plugin.syncOnce()).rejects.toMatchObject({ code: 'rename_lineage_ambiguous' });
+    expect(await readFile(join(f.dir, 'final.md'), 'utf8')).toBe(DEVICE_EDIT);
+    expect(await f.server.git.getRef(f.vaultId, 'refs/heads/main')).toBe(canonicalMain);
+    expect(await f.canonical('renamed.md')).toBe(canonicalDestination);
+    expect((await f.server.store.snapshot()).sync_operations.filter((row) => row.operation_type === 'device_push')).toHaveLength(pushesBeforeRetry);
+  });
+
+  it('blocks a recreated source before producing a deletion-only proposal', async () => {
+    const f = await fixture();
+    await f.core.adapter.rename('note.md', 'renamed.md');
+    await f.plugin.client.recordLocalRenameHint('note.md', 'renamed.md');
+    await f.core.adapter.write('note.md', 'recreated source\n');
+    await f.plugin.client.recordLocalChangeHint(['note.md']);
+    const pushesBefore = (await f.server.store.snapshot()).sync_operations.filter((row) => row.operation_type === 'device_push').length;
+    await expect(f.plugin.syncOnce()).rejects.toMatchObject({ code: 'rename_preservation_required' });
+    expect(await readFile(join(f.dir, 'note.md'), 'utf8')).toBe('recreated source\n');
+    expect(await readFile(join(f.dir, 'renamed.md'), 'utf8')).toBe(BASE);
+    expect((await f.server.store.snapshot()).sync_operations.filter((row) => row.operation_type === 'device_push')).toHaveLength(pushesBefore);
+  });
+
+  it('blocks a root-policy replacement that would exclude a frozen rename endpoint', async () => {
+    const f = await fixture();
+    await f.core.adapter.rename('note.md', 'renamed.md');
+    await f.plugin.client.recordLocalRenameHint('note.md', 'renamed.md');
+    const state = await f.plugin.readState();
+    expect(await f.core.queueStaleCohort(state.local_main, state.server_device_ref)).toBe(true);
+    const queue = await f.plugin.readQueue();
+    await f.core.adapter.write('.gitignore', 'renamed.md\n');
+    expect((await f.core.readRootIgnorePolicy()).policy.ignores('renamed.md')).toBe(true);
+    expect(await f.core.queuedCommitRootPolicyIsStale(queue.pending_commit)).toBe(true);
+    await expect(f.core.rebuildQueuedCommitForRootPolicy(queue.pending_commit, await f.plugin.readState(), queue))
+      .rejects.toMatchObject({ code: 'rename_preservation_required' });
+    expect(await f.plugin.readQueue()).toMatchObject({
+      pending_commit: queue.pending_commit,
+      pending_rename_pairs: [{ source_path: 'note.md', destination_path: 'renamed.md' }],
+      pending_capture_id: queue.pending_capture_id
+    });
+  });
+
+  it('recovers a stranded paired commit before queue publication and strips internal metadata from the wire pair', async () => {
+    const f = await fixture();
+    await f.core.adapter.rename('note.md', 'renamed.md');
+    await f.plugin.client.recordLocalRenameHint('note.md', 'renamed.md');
+    const state = await f.plugin.readState();
+    const updateQueue = f.core.updateQueue.bind(f.core);
+    f.core.updateQueue = async (...args: any[]) => {
+      if ((await f.core.readStaleProvenance()).intent?.rename_pairs?.length) throw new Error('queue publication interrupted');
+      return await updateQueue(...args);
+    };
+    await expect(f.core.queueStaleCohort(state.local_main, state.server_device_ref)).rejects.toThrow('queue publication interrupted');
+    const stranded = await f.provenance();
+    expect(stranded.intent.commit).toMatch(/^[0-9a-f]{40}$/u);
+    expect(stranded.rename_pairs).toEqual([]);
+    const restarted = await f.restart();
+    const queue = await restarted.plugin.readQueue();
+    expect(queue.pending_rename_pairs).toEqual([{ source_path: 'note.md', destination_path: 'renamed.md' }]);
+    expect(Object.keys(queue.pending_rename_pairs![0]!).sort()).toEqual(['destination_path', 'source_path']);
+    expect(queue.pending_capture_id).toBe(stranded.intent.capture_id);
+    let result = await restarted.plugin.syncOnce();
+    for (let attempt = 0; result.status !== 'Synced' && attempt < 3; attempt += 1) result = await restarted.plugin.syncOnce();
+    expect(result.status).toBe('Synced');
+    expect(await f.canonical('renamed.md')).toBe(BASE);
+    await expect(f.canonical('note.md')).rejects.toThrow();
+  });
+
+  it('recovers a paired terminal chunk result after checkpoint-retirement failure and restart', async () => {
+    const f = await fixture();
+    await f.core.adapter.rename('note.md', 'renamed.md');
+    await f.plugin.client.recordLocalRenameHint('note.md', 'renamed.md');
+    const state = await f.plugin.readState();
+    expect(await f.core.queueStaleCohort(state.local_main, state.server_device_ref)).toBe(true);
+    const queue = await f.plugin.readQueue();
+    const remove = f.core.fsp.rm.bind(f.core.fsp);
+    let failed = false;
+    f.core.fsp.rm = async (path: string, ...args: any[]) => {
+      if (path === f.core.uploadTransferPath && !failed) { failed = true; throw new Error('paired terminal retirement failure'); }
+      return remove(path, ...args);
+    };
+    await expect(f.core.uploadQueuedCommit(queue)).rejects.toThrow('paired terminal retirement failure');
+    f.core.fsp.rm = remove;
+    const checkpoint = await f.core.readUploadCheckpoint();
+    expect(checkpoint.rename_pairs).toEqual([{ source_path: 'note.md', destination_path: 'renamed.md' }]);
+    expect(checkpoint.capture_id).toBe(queue.pending_capture_id);
+    const checkpointPath = f.core.uploadTransferPath;
+    const originalCheckpoint = await f.core.fsp.readFile(checkpointPath);
+    const altered = JSON.parse(originalCheckpoint.toString('utf8'));
+    altered.rename_pairs = [{ source_path: 'note.md', destination_path: 'other.md' }];
+    altered.transfer_request.rename_pairs = altered.rename_pairs;
+    altered.attempt_id = `xfer_${createHash('sha256').update(Buffer.from(stableJson(altered.transfer_request))).digest('hex').slice(0, 32)}`;
+    await f.core.fsp.writeFile(checkpointPath, JSON.stringify(altered));
+    await expect(f.core.uploadQueuedCommit(queue)).rejects.toMatchObject({ code: 'upload_checkpoint_recovery_required' });
+    await f.core.fsp.writeFile(checkpointPath, originalCheckpoint);
+    const restarted = await f.restart();
+    let result = await restarted.plugin.syncOnce();
+    for (let attempt = 0; result.status !== 'Synced' && attempt < 3; attempt += 1) result = await restarted.plugin.syncOnce();
+    expect(result.status).toBe('Synced');
+    expect(await f.canonical('renamed.md')).toBe(BASE);
+    await expect(f.canonical('note.md')).rejects.toThrow();
+    expect((await f.server.store.snapshot()).conflicts.filter((row) => row.status === 'open')).toEqual([]);
+  });
+
+  it('blocks an explicit rename before upload when the server lacks the capability', async () => {
+    const f = await fixture();
+    await f.core.adapter.rename('note.md', 'renamed.md');
+    await f.plugin.client.recordLocalRenameHint('note.md', 'renamed.md');
+    const capabilities = f.core.syncCapabilities.bind(f.core);
+    f.core.syncCapabilities = async () => {
+      const current = await capabilities();
+      return { ...current, capabilities: current.capabilities.filter((item: string) => item !== 'rename-pairs-v1') };
+    };
+    const push = vi.spyOn(f.server.sync, 'pushDeviceCommit');
+    await expect(f.plugin.syncOnce()).rejects.toMatchObject({ code: 'server_update_required' });
+    expect(push).not.toHaveBeenCalled();
+    expect(await readFile(join(f.dir, 'renamed.md'), 'utf8')).toBe(BASE);
+    await expect(readFile(join(f.dir, 'note.md'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((await f.plugin.readQueue()).pending_rename_pairs).toEqual([
+      { source_path: 'note.md', destination_path: 'renamed.md' }
+    ]);
+    expect((await f.provenance()).intent.rename_pairs).toHaveLength(1);
+  });
+
+  it.each([
+    { transport: 'multipart' as const, restart: false },
+    { transport: 'chunks' as const, restart: true }
+  ])('uploads one explicit paired proposal over $transport (restart=$restart)', async ({ transport, restart }) => {
+    const f = await fixture();
+    await f.remote(REMOTE_EDIT);
+    const stage = f.core.stageRecoveryBundleFiles.bind(f.core);
+    let injected = false;
+    f.core.stageRecoveryBundleFiles = async (...args: any[]) => {
+      if (!injected) {
+        injected = true;
+        await f.core.adapter.write('note.md', DEVICE_EDIT);
+      }
+      return stage(...args);
+    };
+    await f.core.pullAndApply(true);
+    expect((await f.plugin.syncOnce()).status).toBe('Conflict resolution needed');
+    const conflict = (await f.server.store.snapshot()).conflicts.find((r) => r.status === 'open')!;
+    const review = await f.server.app.inject({ method: 'GET', headers: f.headers,
+      url: `/api/v1/vaults/${f.vaultId}/conflicts/${conflict.conflict_id}` });
+    expect((await f.server.app.inject({ method: 'POST', headers: f.headers,
+      url: `/api/v1/vaults/${f.vaultId}/conflicts/${conflict.conflict_id}/resolve`,
+      payload: { expected_main: review.json().conflict.expected_main, resolution_kind: 'use_device' }
+    })).statusCode).toBe(200);
+    await f.plugin.pollRemoteEventsAndApply();
+    const resolved = await f.canonical();
+    expect(resolved).toBe(DEVICE_EDIT);
+
+    await f.core.adapter.rename('note.md', 'renamed.md');
+    let watcherPair: any;
+    pluginMain.queueRenameWatcherEvent({ queueSyncFromWatcher: (_paths: string[], pair: unknown) => { watcherPair = pair; } },
+      { path: 'renamed.md' }, 'note.md');
+    expect(watcherPair).toEqual({ source_path: 'note.md', destination_path: 'renamed.md' });
+    await f.plugin.client.recordLocalRenameHint(watcherPair.source_path, watcherPair.destination_path);
+    const saved = await f.provenance();
+    expect(saved.rename_pairs).toEqual([{
+      source_path: 'note.md', destination_path: 'renamed.md', generation: 0, base: f.m0,
+      events: [{ source_path: 'note.md', destination_path: 'renamed.md' }]
+    }]);
+    let active = f.plugin;
+    if (restart) active = (await f.restart()).plugin;
+    const activeCore = active.client as any;
+    if (transport === 'multipart') {
+      const capabilities = activeCore.syncCapabilities.bind(activeCore);
+      activeCore.syncCapabilities = async () => {
+        const current = await capabilities();
+        return { ...current, capabilities: current.capabilities.filter((item: string) => item !== 'git-object-pack-chunks-v1') };
+      };
+    }
+    let syncResult = await active.syncOnce();
+    for (let attempt = 0; syncResult.status !== 'Synced' && attempt < 3; attempt += 1) {
+      syncResult = await active.syncOnce();
+    }
+    expect(syncResult.status).toBe('Synced');
+    const queue = await active.readQueue();
+    expect(queue.pending_rename_pairs || []).toEqual([]);
+    await expect(f.canonical('note.md')).rejects.toThrow();
+    expect(await f.canonical('renamed.md')).toBe(DEVICE_EDIT);
+    const state = await active.readState();
+    const deviceCommit = await f.server.git.getRef(f.vaultId, state.device_ref!);
+    const operation = (await f.server.store.snapshot()).sync_operations.find((row) =>
+      row.operation_type === 'device_push' && row.target_commit === deviceCommit)!;
+    expect(operation.prepared_manifest?.proposal_base).toBe(f.m0);
+    expect(operation.prepared_manifest?.rename_pairs).toEqual([{ source_path: 'note.md', destination_path: 'renamed.md' }]);
+    const proposedPaths = await f.server.git.listTreePaths(f.vaultId, deviceCommit!);
+    expect(proposedPaths).not.toContain('note.md');
+    expect(proposedPaths).toContain('renamed.md');
+    expect((await f.server.store.snapshot()).conflicts.filter((row) => row.status === 'open')).toEqual([]);
+    expect((await f.plugin.readState()).last_error_code).toBeNull();
   });
 });

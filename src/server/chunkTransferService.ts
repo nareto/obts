@@ -8,6 +8,7 @@ import {
   ASYNC_PUSH_FINALIZE_CAPABILITY,
   CHUNK_TRANSFER_CAPABILITY,
   DIRECTORY_PROPOSAL_CAPABILITY,
+  RENAME_PAIRS_CAPABILITY,
   type ChunkPushCreateRequest,
   type ChunkPushDescriptor,
   type ChunkPushReceipt,
@@ -349,7 +350,7 @@ export class ChunkTransferService {
 
   capabilities() {
     return {
-      capabilities: [CHUNK_TRANSFER_CAPABILITY, ASYNC_PUSH_FINALIZE_CAPABILITY, DIRECTORY_PROPOSAL_CAPABILITY],
+      capabilities: [CHUNK_TRANSFER_CAPABILITY, ASYNC_PUSH_FINALIZE_CAPABILITY, DIRECTORY_PROPOSAL_CAPABILITY, RENAME_PAIRS_CAPABILITY],
       max_chunk_bytes: this.config.transferChunkBytes,
       target_chunk_bytes: Math.max(1_048_576, Math.floor(this.config.transferChunkBytes * 0.85)),
       max_transfer_bytes: this.config.maxTransferBytes,
@@ -413,6 +414,7 @@ export class ChunkTransferService {
         client_known_main: request.client_known_main,
         ...(request.root_ignore_capability === undefined ? {} : { root_ignore_capability: request.root_ignore_capability, root_ignore_oid: request.root_ignore_oid }),
         ...(request.base_commit === undefined ? {} : { base_commit: request.base_commit }),
+        ...(request.rename_pairs === undefined ? {} : { rename_pairs: request.rename_pairs }),
         ...(request.directory_intents === undefined ? {} : { directory_intents: request.directory_intents }),
         ...(request.directory_proposal === undefined ? {} : { directory_proposal: request.directory_proposal }),
         attempt_id: request.attempt_id

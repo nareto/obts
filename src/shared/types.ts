@@ -236,6 +236,8 @@ export type DirectoryProposalAcknowledgement = {
   acknowledged_intents: DirectoryIntentAcknowledgement[];
 };
 
+export type RenamePair = { source_path: string; destination_path: string };
+
 export type DevicePushManifest = {
   api_version: typeof API_VERSION;
   plugin_version?: string;
@@ -249,6 +251,7 @@ export type DevicePushManifest = {
   root_ignore_capability?: 'root-ignore-v1';
   root_ignore_oid?: string | null;
   base_commit?: string | null;
+  rename_pairs?: RenamePair[];
   attempt_id?: string;
   directory_intents?: DirectoryIntent[];
   directory_proposal?: DirectoryProposal;
@@ -313,12 +316,14 @@ export type DevicePullManifest = {
 export const CHUNK_TRANSFER_CAPABILITY = 'git-object-pack-chunks-v1' as const;
 export const ASYNC_PUSH_FINALIZE_CAPABILITY = 'async-push-finalize-v1' as const;
 export const DIRECTORY_PROPOSAL_CAPABILITY = 'directory-proposals-v2' as const;
+export const RENAME_PAIRS_CAPABILITY = 'rename-pairs-v1' as const;
 
 export type SyncCapabilities = {
   capabilities: Array<
     | typeof CHUNK_TRANSFER_CAPABILITY
     | typeof ASYNC_PUSH_FINALIZE_CAPABILITY
     | typeof DIRECTORY_PROPOSAL_CAPABILITY
+    | typeof RENAME_PAIRS_CAPABILITY
   >;
   max_chunk_bytes: number;
   target_chunk_bytes: number;
@@ -337,6 +342,7 @@ export type ChunkPushCreateRequest = {
   root_ignore_capability?: 'root-ignore-v1';
   root_ignore_oid?: string | null;
   base_commit?: string | null;
+  rename_pairs?: RenamePair[];
   directory_intents?: DirectoryIntent[];
   directory_proposal?: DirectoryProposal;
   attempt_id: string;
@@ -424,6 +430,7 @@ export type ConflictRecord = {
   merge_sequence: number;
   merge_policy_version: string;
   conflict_kind: 'content' | 'directory' | 'mixed';
+  rename_pairs?: RenamePair[];
   directory_context?: DirectoryConflictContext;
   validator_results: Record<string, unknown>;
   validator_summary: Record<string, unknown>;

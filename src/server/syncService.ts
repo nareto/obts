@@ -27,6 +27,7 @@ import type {
 } from '../shared/types.js';
 import { AuthError, type AuthenticatedDevice } from './authService.js';
 import { GitCommandError, GitDurabilityError, GitMalformedPackError, GitMergeOwnershipError, GitService, sha256Hex, type GitDiffEntry, type GitMergeRename, type GitObjectReader, type MergeTreeResult } from './gitService.js';
+import { parseRenamePairs } from '../shared/validators.js';
 import { hasDurableDeletionRecord } from './metadataStore.js';
 import type { VaultLifecycleCoordinator } from './vaultLifecycleCoordinator.js';
 import type {
@@ -48,8 +49,7 @@ const SIMILAR_RENAME_MAX_BYTES = 256 * 1024;
 const MAX_INTERACTIVE_REVIEW_BYTES = 512 * 1024;
 const REVIEW_TEXT_DECODER = new TextDecoder('utf-8', { fatal: true });
 
-type RenameConfidence = 'git' | 'exact_blob' | 'similar_content';
-
+type RenameConfidence = 'git' | 'exact_blob' | 'similar_content' | 'explicit';
 type StructuralActionKind = 'add' | 'edit' | 'delete' | 'rename';
 
 type StructuralAction = {
@@ -349,6 +349,8 @@ export class SyncService {
         if (!main || (await this.git.isAncestor(vault.vault_id, operation.target_commit!, main))) {
           return;
         }
+        const storedPairs = operation.prepared_manifest?.rename_pairs;
+        const renamePairs = storedPairs === undefined || storedPairs === null ? undefined : storedRenamePairs(storedPairs);
         await this.mergeDeviceCommit(
           vault.vault_id,
           device.device_id,
@@ -358,8 +360,14 @@ export class SyncService {
           false,
           storedDirectoryProposal(operation.prepared_manifest?.directory_proposal),
           operation.prepared_manifest?.root_ignore_capability === 'root-ignore-v1'
-            ? { root_ignore_capability: 'root-ignore-v1', root_ignore_oid: operation.prepared_manifest.root_ignore_oid as string | null }
-            : null
+            ? {
+                root_ignore_capability: 'root-ignore-v1',
+                root_ignore_oid: operation.prepared_manifest.root_ignore_oid as string | null,
+                ...(renamePairs ? { rename_pairs: renamePairs } : {})
+              }
+            : renamePairs
+              ? { rename_pairs: renamePairs }
+              : null
         );
       });
     }
@@ -412,6 +420,9 @@ export class SyncService {
               (admitted.prepared_manifest?.requested_base_commit ?? admitted.proposal_base) !== (manifest.base_commit ?? null)) {
             throw new AuthError(409, 'proposal_base_mismatch', 'Proposal base does not match its original admission.');
           }
+          if (admitted && stableJson(admitted.prepared_manifest?.rename_pairs ?? null) !== stableJson(manifest.rename_pairs ?? null)) {
+            throw new AuthError(409, 'rename_pairs_mismatch', 'Rename pairs do not match their original admission.');
+          }
           const started = this.store.startOperation(db, {
             vault_id: auth.vault.vault_id,
             device_id: device.device_id,
@@ -431,12 +442,16 @@ export class SyncService {
             started.prepared_manifest = {
               ...(started.prepared_manifest ?? {}),
               proposal_base: started.proposal_base,
-              requested_base_commit: manifest.base_commit ?? null
+              requested_base_commit: manifest.base_commit ?? null,
+              rename_pairs: admitted.prepared_manifest?.rename_pairs ?? null
             };
           }
           return started;
         });
         operationId = operation.operation_id;
+        const admittedPairs = operation.prepared_manifest?.rename_pairs;
+        const hasAdmittedPairs = Array.isArray(admittedPairs);
+        if (hasAdmittedPairs) manifest = { ...manifest, rename_pairs: storedRenamePairs(admittedPairs) };
         if (!staged) {
           if (manifest.packfile_bytes !== packfile.byteLength || packfile.byteLength > this.maxUploadBytes ||
               sha256Hex(packfile) !== manifest.packfile_sha256) {
@@ -460,6 +475,13 @@ export class SyncService {
           return await this.rejectDevicePush(auth, operation.operation_id, deviceBlock.code, deviceBlock.message);
         }
         if (currentDeviceRef === manifest.target_commit) {
+          if (manifest.rename_pairs?.length && !hasAdmittedPairs) {
+            const rejection = await this.validateRenamePairEvidence(
+              auth.vault.vault_id, manifest.target_commit, manifest.base_commit ?? null, manifest.rename_pairs,
+              this.git.readerForRepo(this.git.repoPath(auth.vault.vault_id))
+            );
+            if (rejection) return await this.rejectDevicePush(auth, operation.operation_id, rejection, 'Rename pair evidence does not match the proposal trees.');
+          }
           return await this.finishExistingDeviceCommit(auth, operation, manifest.target_commit, directoryProposal, manifest);
         }
         if (deviceBlock) {
@@ -504,6 +526,7 @@ export class SyncService {
             operation_type: 'device_push',
             proposal_base: op.proposal_base,
             requested_base_commit: manifest.base_commit ?? null,
+            rename_pairs: manifest.rename_pairs ?? null,
             expected_device_ref: currentDeviceRef,
             target_commit: manifest.target_commit,
             validation: {
@@ -529,7 +552,8 @@ export class SyncService {
             currentDeviceRef,
             currentMain,
             manifest.target_commit,
-            directoryProposal
+            directoryProposal,
+            manifest.rename_pairs ?? []
           );
         }
         await this.store.mutate((db) => {
@@ -1266,6 +1290,7 @@ export class SyncService {
         ...(op.prepared_manifest ?? {}),
         proposal_base: op.proposal_base,
         requested_base_commit: manifest.base_commit ?? null,
+        rename_pairs: op.prepared_manifest?.rename_pairs ?? manifest.rename_pairs ?? null,
         root_ignore_capability: manifest.root_ignore_capability ?? null,
         root_ignore_oid: manifest.root_ignore_oid ?? null,
         directory_proposal: directoryProposal
@@ -1372,6 +1397,39 @@ export class SyncService {
     }
   }
 
+  private async validateRenamePairEvidence(
+    vaultId: string,
+    targetCommit: string,
+    baseCommit: string | null,
+    pairs: NonNullable<DevicePushManifest['rename_pairs']>,
+    reader: GitObjectReader
+  ): Promise<string | null> {
+    if (!baseCommit) return 'rename_base_required';
+    if (!(await reader.commitExists(vaultId, baseCommit)) || !(await reader.commitExists(vaultId, targetCommit))) return 'invalid_rename_pair';
+    if (!(await reader.isAncestor(vaultId, baseCommit, targetCommit))) return 'invalid_rename_pair';
+    const main = await this.git.getRef(vaultId, 'refs/heads/main');
+    if (!main || !(await reader.isAncestor(vaultId, baseCommit, main))) return 'untrusted_base_commit';
+    const [basePaths, targetPaths, naturalBase] = await Promise.all([
+      reader.listTreePaths(vaultId, baseCommit), reader.listTreePaths(vaultId, targetCommit),
+      reader.mergeBase(vaultId, main, targetCommit)
+    ]);
+    if (!naturalBase) return 'no_merge_base';
+    const [naturalBasePaths, naturalChanges] = await Promise.all([
+      reader.listTreePaths(vaultId, naturalBase), reader.changedPaths(vaultId, naturalBase, targetCommit)
+    ]);
+    const naturalStart = new Set(naturalBasePaths);
+    const naturalPaths = new Set(changedPathSet(naturalChanges));
+    const base = new Set(basePaths);
+    const target = new Set(targetPaths);
+    for (const pair of pairs) {
+      if (!base.has(pair.source_path) || base.has(pair.destination_path) ||
+          target.has(pair.source_path) || !target.has(pair.destination_path) ||
+          !naturalStart.has(pair.source_path) || naturalStart.has(pair.destination_path) ||
+          !naturalPaths.has(pair.source_path) || !naturalPaths.has(pair.destination_path)) return 'invalid_rename_pair';
+    }
+    return null;
+  }
+
   private async validateUploadReader(
     auth: AuthenticatedDevice,
     operation: SyncOperationRow,
@@ -1442,6 +1500,17 @@ export class SyncService {
           };
         }
       }
+      if (manifest.rename_pairs?.length) {
+        const reason = await this.validateRenamePairEvidence(
+          auth.vault.vault_id, manifest.target_commit, manifest.base_commit ?? null, manifest.rename_pairs, reader
+        );
+        if (reason) {
+          return {
+            rejection: await this.rejectDevicePush(auth, operation.operation_id, reason, 'Rename pair evidence does not match the proposal trees.'),
+            deviceRelation: 'divergent'
+          };
+        }
+      }
       if (manifest.base_commit) {
         if (!(await reader.commitExists(auth.vault.vault_id, manifest.base_commit))) {
           return {
@@ -1487,8 +1556,9 @@ export class SyncService {
     proposalBase: string | null = null,
     detachedProposal = false,
     directoryProposal: DirectoryProposal | null = null,
-    attestation: Pick<DevicePushManifest, 'root_ignore_capability' | 'root_ignore_oid'> | null = null
+    attestation: Pick<DevicePushManifest, 'root_ignore_capability' | 'root_ignore_oid' | 'rename_pairs'> | null = null
   ): Promise<PushResult> {
+    const renamePairs = attestation?.rename_pairs ?? [];
     const main = await this.git.getRef(vaultId, 'refs/heads/main');
     if (!main) {
       return { status: 'rejected', code: 'missing_main', message: 'Server main is missing.' };
@@ -1501,7 +1571,7 @@ export class SyncService {
       if (directoryProposal && !proposalResult) {
         if (!(await this.hasRootIgnoreAdmission(vaultId, deviceCommit, main, attestation))) {
           return await this.createConflict(vaultId, deviceId, main, main, deviceCommit,
-            ['.gitignore'], 'root_ignore_capability_required');
+            ['.gitignore'], 'root_ignore_capability_required', null, deviceCommit, renamePairs);
         }
         const directoryPlan = await this.classifyDirectoryProposal(vaultId, deviceId, directoryProposal);
         if (directoryPlan.affectedRoots.length > 0) {
@@ -1513,7 +1583,9 @@ export class SyncService {
             deviceCommit,
             directoryPlan.affectedRoots,
             'directory_overlap',
-            directoryPlan
+            directoryPlan,
+            undefined,
+            renamePairs
           );
         }
         const acceptedEventSeq = await this.store.mutate((db) => {
@@ -1567,7 +1639,7 @@ export class SyncService {
 
     if (!(await this.hasRootIgnoreAdmission(vaultId, deviceCommit, main, attestation))) {
       return await this.createConflict(vaultId, deviceId, main, main, deviceCommit,
-        ['.gitignore'], 'root_ignore_capability_required');
+        ['.gitignore'], 'root_ignore_capability_required', null, deviceCommit, renamePairs);
     }
 
     const naturalBase = await this.git.mergeBase(vaultId, main, deviceCommit);
@@ -1578,13 +1650,13 @@ export class SyncService {
         (await this.git.isAncestor(vaultId, base, main)) &&
         (await this.git.isAncestor(vaultId, base, deviceCommit));
       if (!baseIsValid) {
-        return await this.createConflict(vaultId, deviceId, '', main, deviceCommit, [], 'invalid_proposal_base');
+        return await this.createConflict(vaultId, deviceId, '', main, deviceCommit, [], 'invalid_proposal_base', null, deviceCommit, renamePairs);
       }
     } else {
       base = naturalBase;
     }
     if (!base || !naturalBase) {
-      return await this.createConflict(vaultId, deviceId, '', main, deviceCommit, [], 'no_merge_base');
+      return await this.createConflict(vaultId, deviceId, '', main, deviceCommit, [], 'no_merge_base', null, deviceCommit, renamePairs);
     }
 
     const directoryPlan = directoryProposal
@@ -1598,6 +1670,32 @@ export class SyncService {
     ]);
     const mainValues = new Map(mainEntries.map((entry) => [entry.path, entry]));
     const deviceValues = new Map(deviceEntries.map((entry) => [entry.path, entry]));
+    for (const pair of renamePairs) {
+      const source = mainValues.has(pair.source_path);
+      const destination = mainValues.has(pair.destination_path);
+      if (source === destination) {
+        const competingPath = mainChanges.find((entry) => entry.oldPath === pair.source_path)?.path;
+        return await this.createConflict(vaultId, deviceId, base, main, deviceCommit,
+          [...new Set([pair.source_path, pair.destination_path, ...(competingPath ? [competingPath] : [])])].sort(),
+          source ? 'rename_destination_occupied' : 'competing_rename', directoryPlan, undefined, renamePairs);
+      }
+      if (!source && destination) {
+        const [baseBlobs, currentBlobs] = await Promise.all([
+          this.blobOidMap(vaultId, base), this.blobOidMap(vaultId, main)
+        ]);
+        const currentSummary = await summarizeStructuralChanges({
+          baseCommit: base, targetCommit: main, changes: mainChanges, baseBlobs, targetBlobs: currentBlobs,
+          readBlob: async (commit, path) => await this.readOptionalBlob(vaultId, commit, path)
+        });
+        const lineage = currentSummary.renameCandidatesByBasePath.get(pair.source_path) ?? new Set<string>();
+        const samePairLineage = lineage.size === 1 && lineage.has(pair.destination_path) &&
+          mainValues.get(pair.destination_path)?.type === 'blob';
+        if (!samePairLineage) {
+          return await this.createConflict(vaultId, deviceId, base, main, deviceCommit,
+            [...new Set([pair.source_path, pair.destination_path, ...lineage])].sort(), 'competing_rename', directoryPlan, undefined, renamePairs);
+        }
+      }
+    }
     const identicalPaths = new Set([...changedPathSet(deviceChanges)].filter((path) => {
       const left = mainValues.get(path);
       const right = deviceValues.get(path);
@@ -1614,16 +1712,23 @@ export class SyncService {
         deviceCommit,
         destructiveChangedPaths(deviceChanges),
         'detached_proposal_deletes',
-        directoryPlan
+        directoryPlan,
+        undefined,
+        renamePairs
       );
     }
+    const explicitRenameEndpoints = new Set(renamePairs.flatMap((pair) => [pair.source_path, pair.destination_path]));
+    const structuralMainChanges = explicitRenameEndpoints.size === 0 ? mainChanges : mainChanges.filter((entry) =>
+      !explicitRenameEndpoints.has(entry.path) && !(entry.oldPath && explicitRenameEndpoints.has(entry.oldPath)));
+    const structuralDeviceChanges = explicitRenameEndpoints.size === 0 ? deviceChanges : deviceChanges.filter((entry) =>
+      !explicitRenameEndpoints.has(entry.path) && !(entry.oldPath && explicitRenameEndpoints.has(entry.oldPath)));
     const { conflict: structuralConflict, mainRenames } = await this.classifyStructuralMergeConflict(
       vaultId,
       base,
       main,
       deviceCommit,
-      mainChanges,
-      deviceChanges,
+      structuralMainChanges,
+      structuralDeviceChanges,
       naturalBase,
       identicalPaths
     );
@@ -1639,7 +1744,9 @@ export class SyncService {
         deviceCommit,
         affectedPaths,
         directoryPlan && directoryPlan.affectedRoots.length > 0 ? 'mixed_directory_overlap' : structuralConflict.reason,
-        directoryPlan
+        directoryPlan,
+        undefined,
+        renamePairs
       );
     }
     const overlapping = intersectChangedPaths(divergentMainChanges, divergentDeviceChanges);
@@ -1653,12 +1760,14 @@ export class SyncService {
         deviceCommit,
         [...new Set([...fileAffected, ...directoryPlan.affectedRoots])].sort(),
         fileAffected.length > 0 ? 'mixed_directory_overlap' : 'directory_overlap',
-        directoryPlan
+        directoryPlan,
+        undefined,
+        renamePairs
       );
     }
     const identicalOverlaps = intersectChangedPaths(mainChanges, deviceChanges).filter((path) => identicalPaths.has(path));
     if (overlapping.length === 0 && identicalOverlaps.length > 0) {
-      const identityMerge = await this.tryIdentityOverlappingMerge(
+      const identityMerge = renamePairs.length === 0 ? await this.tryIdentityOverlappingMerge(
         vaultId,
         deviceId,
         base,
@@ -1667,7 +1776,7 @@ export class SyncService {
         deviceChanges,
         identicalOverlaps,
         directoryPlan
-      );
+      ) : null;
       if (identityMerge) {
         return identityMerge;
       }
@@ -1684,12 +1793,14 @@ export class SyncService {
         directoryPlan,
         naturalBase,
         mainRenames,
-        metadataRules
+        metadataRules,
+        attestation?.rename_pairs ?? []
       );
       if (cleanMerge) {
         return cleanMerge;
       }
-      return await this.createConflict(vaultId, deviceId, base, main, deviceCommit, overlapping, 'overlapping_paths', directoryPlan);
+      const conflictPaths = [...new Set([...overlapping, ...explicitRenameEndpoints])].sort();
+      return await this.createConflict(vaultId, deviceId, base, main, deviceCommit, conflictPaths, 'overlapping_paths', directoryPlan, undefined, renamePairs);
     }
 
     const mergePreparation = await this.store.mutate((db) => {
@@ -1752,7 +1863,7 @@ export class SyncService {
         await this.abortOperation(mergePreparation.operationId, 'merge_git_error');
         if (error instanceof PathPolicyViolation || error instanceof RootIgnorePolicyError) {
           return await this.createConflict(vaultId, deviceId, base, main, deviceCommit,
-            policyConflictPaths(error), 'root_ignore_merge_policy', directoryPlan);
+            policyConflictPaths(error), 'root_ignore_merge_policy', directoryPlan, undefined, renamePairs);
         }
         throw error;
       }
@@ -1859,6 +1970,7 @@ export class SyncService {
       targetBlobs: deviceBlobs,
       readBlob
     });
+    applyExplicitRenamePairsToSummary(deviceSummary, conflict.rename_pairs ?? [], baseBlobs, deviceBlobs);
     return buildConflictReviewPaths({
       reason: typeof conflict.validator_results.reason === 'string' ? conflict.validator_results.reason : 'overlapping_paths',
       affectedPaths: conflict.affected_paths,
@@ -2357,7 +2469,8 @@ export class SyncService {
     directoryPlan: DirectoryMergePlan | null = null,
     authoredBase = base,
     mainRenames: GitMergeRename[] = [],
-    metadataRules: MetadataConflictRule[] = []
+    metadataRules: MetadataConflictRule[] = [],
+    renamePairs: NonNullable<DevicePushManifest['rename_pairs']> = []
   ): Promise<PushResult | null> {
     if (!overlapping.every(isNativeTextMergePath)) {
       return null;
@@ -2365,11 +2478,11 @@ export class SyncService {
 
     let mergeTree: MergeTreeResult | null;
     try {
-      mergeTree = await this.git.tryPolicyMergeTree(vaultId, base, currentMain, deviceCommit, deviceChanges, overlapping, authoredBase, mainRenames, metadataRules);
+      mergeTree = await this.git.tryPolicyMergeTree(vaultId, base, currentMain, deviceCommit, deviceChanges, overlapping, authoredBase, mainRenames, metadataRules, renamePairs);
     } catch (error) {
       if (!(error instanceof GitMergeOwnershipError)) throw error;
       return await this.createConflict(vaultId, deviceId, base, currentMain, deviceCommit,
-        error.affectedPaths, 'unexplained_native_merge_paths', directoryPlan);
+        error.affectedPaths, 'unexplained_native_merge_paths', directoryPlan, undefined, renamePairs);
     }
     if (!mergeTree) {
       return null;
@@ -2511,7 +2624,8 @@ export class SyncService {
     currentDeviceRef: string,
     currentMain: string,
     deviceCommit: string,
-    directoryProposal: DirectoryProposal | null
+    directoryProposal: DirectoryProposal | null,
+    renamePairs: NonNullable<DevicePushManifest['rename_pairs']> = []
   ): Promise<PushResult> {
     const sharedBase = await this.git.mergeBase(auth.vault.vault_id, currentDeviceRef, deviceCommit) ??
       await this.git.mergeBase(auth.vault.vault_id, currentMain, deviceCommit);
@@ -2519,6 +2633,10 @@ export class SyncService {
     const changedPaths = sharedBase
       ? changedPathSet(await this.git.changedPaths(auth.vault.vault_id, sharedBase, deviceCommit))
       : new Set(await this.git.listTreePaths(auth.vault.vault_id, deviceCommit));
+    for (const pair of renamePairs) {
+      changedPaths.add(pair.source_path);
+      changedPaths.add(pair.destination_path);
+    }
     const directoryPlan = directoryProposal
       ? await this.classifyDirectoryProposal(auth.vault.vault_id, auth.device.device_id, directoryProposal)
       : null;
@@ -2532,7 +2650,8 @@ export class SyncService {
       [...changedPaths].sort(),
       'same_device_history_divergence',
       directoryPlan,
-      currentDeviceRef
+      currentDeviceRef,
+      renamePairs
     );
     await this.store.mutate((db) => {
       const operation = requireOperation(db, operationId);
@@ -2552,8 +2671,10 @@ export class SyncService {
     affectedPaths: string[],
     reason: string,
     directoryPlan: DirectoryMergePlan | null = null,
-    resultDeviceRef: string = deviceCommit
+    resultDeviceRef: string = deviceCommit,
+    renamePairs: NonNullable<DevicePushManifest['rename_pairs']> = []
   ): Promise<PushResult> {
+    affectedPaths = [...new Set([...affectedPaths, ...renamePairs.flatMap((pair) => [pair.source_path, pair.destination_path])])].sort();
     const conflictId = newId('conf');
     const mergeSequence = await this.store.mutate((db) => this.store.nextMergeSequence(db, vaultId));
     const directoryContext = directoryPlan ? directoryConflictContext(directoryPlan) : undefined;
@@ -2583,6 +2704,7 @@ export class SyncService {
         current_main: currentMain,
         device_commit: deviceCommit,
         decision: 'conflict',
+        ...(renamePairs.length > 0 ? { rename_pairs: renamePairs } : {}),
         validator_results: {
           reason,
           affected_paths: affectedPaths,
@@ -2609,6 +2731,7 @@ export class SyncService {
         merge_sequence: mergeSequence,
         merge_policy_version: MERGE_POLICY_VERSION,
         conflict_kind: conflictKind,
+        ...(renamePairs.length > 0 ? { rename_pairs: renamePairs } : {}),
         ...(directoryContext ? { directory_context: directoryContext } : {}),
         validator_results: {
           reason,
@@ -3298,6 +3421,29 @@ function singleSamePath(left: Set<string>, right: Set<string>): boolean {
   return left.values().next().value === right.values().next().value;
 }
 
+function applyExplicitRenamePairsToSummary(
+  summary: StructuralSummary,
+  pairs: NonNullable<ConflictRecord['rename_pairs']>,
+  baseBlobs: Map<string, string>,
+  targetBlobs: Map<string, string>
+): void {
+  for (const pair of pairs) {
+    if (!baseBlobs.has(pair.source_path) || !targetBlobs.has(pair.destination_path)) continue;
+    summary.actions = summary.actions.filter((action) =>
+      action.basePath !== pair.source_path && action.targetPath !== pair.destination_path);
+    summary.actions.push({
+      kind: 'rename', basePath: pair.source_path, targetPath: pair.destination_path,
+      baseOid: baseBlobs.get(pair.source_path)!, targetOid: targetBlobs.get(pair.destination_path)!,
+      renameConfidence: 'explicit'
+    });
+    summary.renameCandidatesByBasePath.set(pair.source_path, new Set([pair.destination_path]));
+  }
+  summary.actions.sort((left, right) => (left.basePath ?? left.targetPath ?? '').localeCompare(right.basePath ?? right.targetPath ?? ''));
+  summary.byBasePath = new Map(summary.actions.filter((action) => action.basePath !== null).map((action) => [action.basePath!, action]));
+  summary.addsByPath = new Map(summary.actions.filter((action) => action.kind === 'add' && action.targetPath !== null)
+    .map((action) => [action.targetPath!, action]));
+}
+
 function buildConflictReviewPaths(input: {
   reason: string;
   affectedPaths: string[];
@@ -3576,6 +3722,14 @@ function proposalAcknowledgement(
     status,
     acknowledged_intents: proposalIntentAcknowledgements(proposal)
   };
+}
+
+function storedRenamePairs(value: unknown): NonNullable<DevicePushManifest['rename_pairs']> {
+  try {
+    return parseRenamePairs(value);
+  } catch {
+    throw new Error('Prepared rename pair identity is invalid.');
+  }
 }
 
 function storedDirectoryProposal(value: unknown): DirectoryProposal | null {

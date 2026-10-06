@@ -9,6 +9,41 @@ import { diagnosticPoints } from '../src/shared/diagnostics.js';
 import { parseChunkPushCreateRequest, parseDevicePushManifest } from '../src/shared/validators.js';
 
 describe('OpenAPI Phase 3 contract', () => {
+  it('declares explicit rename pairs for direct and chunked proposals', async () => {
+    const contract = parse(await readFile(join(process.cwd(), 'openapi', 'openapi.yaml'), 'utf8')) as {
+      components: { schemas: Record<string, { properties: Record<string, unknown>; required?: string[]; items?: { enum?: string[] } }> };
+    };
+    for (const name of ['DevicePushManifest', 'ChunkPushCreateRequest']) {
+      expect(contract.components.schemas[name]!.properties.rename_pairs).toMatchObject({
+        type: 'array', minItems: 1, maxItems: 5000, items: { $ref: '#/components/schemas/RenamePair' }
+      });
+    }
+    expect(contract.components.schemas.RenamePair).toMatchObject({
+      required: ['source_path', 'destination_path'],
+      properties: { source_path: { type: 'string' }, destination_path: { type: 'string' } }
+    });
+    expect(contract.components.schemas.SyncCapabilities!.properties.capabilities).toMatchObject({
+      items: { enum: expect.arrayContaining(['rename-pairs-v1']) }
+    });
+    const request = {
+      api_version: API_VERSION, vault_id: 'vault', device_id: 'device', expected_device_ref: null,
+      target_commit: 'a'.repeat(40), packfile_sha256: 'b'.repeat(64), packfile_bytes: 0, client_known_main: null,
+      base_commit: 'c'.repeat(40), rename_pairs: [{ source_path: 'a.md', destination_path: 'b.md' }]
+    };
+    expect(parseDevicePushManifest(request).rename_pairs).toEqual(request.rename_pairs);
+    const chunkRequest = { ...request, attempt_id: 'rename-attempt-1', chunk_count: 0, plan_sha256: 'd'.repeat(64) };
+    expect(parseChunkPushCreateRequest(chunkRequest).rename_pairs).toEqual(request.rename_pairs);
+    expect(() => parseChunkPushCreateRequest({ ...chunkRequest, base_commit: undefined })).toThrow();
+    expect(() => parseDevicePushManifest({ ...request, base_commit: undefined })).toThrow();
+    expect(() => parseDevicePushManifest({ ...request, rename_pairs: [{ source_path: '../a.md', destination_path: 'b.md' }] })).toThrow();
+    expect(() => parseDevicePushManifest({ ...request, rename_pairs: [
+      { source_path: 'a.md', destination_path: 'b.md' }, { source_path: 'c.md', destination_path: 'b.md' }
+    ] })).toThrow();
+    expect(() => parseDevicePushManifest({ ...request, rename_pairs: [
+      { source_path: 'a.md', destination_path: 'b.md', confidence: 'similarity' }
+    ] })).toThrow();
+  });
+
   it('matches optional operation-bound root-ignore attestation on direct and chunked pushes', async () => {
     const contract = parse(await readFile(join(process.cwd(), 'openapi', 'openapi.yaml'), 'utf8')) as {
       components: { schemas: Record<string, { properties: Record<string, unknown>; dependentRequired: Record<string, string[]> }> };
@@ -21,7 +56,7 @@ describe('OpenAPI Phase 3 contract', () => {
         { type: 'null' }, { type: 'string', pattern: '^[0-9a-f]{40}$' }
       ] });
       expect(schema.dependentRequired).toEqual({
-        root_ignore_capability: ['root_ignore_oid'], root_ignore_oid: ['root_ignore_capability']
+        root_ignore_capability: ['root_ignore_oid'], root_ignore_oid: ['root_ignore_capability'], rename_pairs: ['base_commit']
       });
     }
     const base = {

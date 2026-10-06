@@ -93,14 +93,15 @@ async function fixture(initial: Writes = { 'note.md': BASE, 'image.png': Buffer.
   return f;
 }
 
-async function manifest(f: Fixture, target: string, base: string | undefined = f.m0, attempt?: string): Promise<{ manifest: DevicePushManifest; pack: Buffer }> {
+async function manifest(f: Fixture, target: string, base: string | undefined = f.m0, attempt?: string, renamePairs?: DevicePushManifest['rename_pairs']): Promise<{ manifest: DevicePushManifest; pack: Buffer }> {
   const pack = await f.server.git.exportPack(f.auth.vault.vault_id, target, f.m0);
   return { pack, manifest: {
     api_version: API_VERSION, plugin_version: '0.5.13', vault_id: f.auth.vault.vault_id, device_id: f.auth.device.device_id,
     expected_device_ref: f.m0, target_commit: target,
     client_known_main: await f.server.git.getRef(f.auth.vault.vault_id, 'refs/heads/main'),
     packfile_sha256: sha256Hex(pack), packfile_bytes: pack.length,
-    ...(base === undefined ? {} : { base_commit: base }), ...(attempt ? { attempt_id: attempt } : {})
+    ...(base === undefined ? {} : { base_commit: base }), ...(attempt ? { attempt_id: attempt } : {}),
+    ...(renamePairs === undefined ? {} : { rename_pairs: renamePairs })
   } };
 }
 
@@ -832,6 +833,246 @@ describe('stale proposals composed with vault settings and timestamp rules', () 
     expect(evidence.metadata_timestamp_fields).toContainEqual({ path: 'note.md', field: 'updated', winner: 'device' });
     const operation = (await f.server.store.snapshot()).sync_operations.find((op) => op.operation_type === 'server_merge' && op.target_commit === result.main)!;
     expect(operation.prepared_manifest?.base_commit).toBe(mode === 'explicit' ? f.m0 : k);
+  });
+});
+
+describe('explicit rename pair proposals', () => {
+  const pair = [{ source_path: 'source.md', destination_path: 'moved.md' }];
+
+  it('merges a low-similarity move with a compatible source edit and retains unrelated main changes', async () => {
+    const original = Array.from({ length: 100 }, (_, index) => `line ${index}`).join('\n') + '\n';
+    const f = await fixture({ 'source.md': original, 'unrelated.md': 'base\n' });
+    const remote = await commit(f, f.m0, { 'source.md': `${original}remote addition\n`, 'unrelated.md': 'canonical\n' });
+    await setMain(f, remote);
+    const movedContent = `local addition\n${Array.from({ length: 100 }, (_, index) => `line ${index}`).slice(40).join('\n')}\n`;
+    const target = await commit(f, remote, { 'source.md': null, 'moved.md': movedContent });
+    const request = await manifest(f, target, f.m0, undefined, pair);
+    const response = await multipart(f, request);
+    const result = response.result;
+    expect(response.status).toBe(200);
+    expect(result.status).toBe('merged');
+    if (result.status !== 'merged') throw new Error('rename merge missing');
+    expect(await f.server.git.readBlobAtPathIfPresent(f.auth.vault.vault_id, result.main, 'source.md')).toBeNull();
+    expect(await blob(f, result.main, 'moved.md')).toBe(`${movedContent}remote addition\n`);
+    expect(await blob(f, result.main, 'unrelated.md')).toBe('canonical\n');
+  });
+
+  it('merges a zero-similarity Canvas move through the existing semantic policy', async () => {
+    const nodes = Array.from({ length: 100 }, (_, index) => ({
+      id: `node-${index}`, type: 'text', x: index * 10, y: index * 5, width: 200, height: 100, text: `payload-${index}`
+    }));
+    const original = JSON.stringify({ nodes, edges: [] }) + '\n';
+    const canvasPair = [{ source_path: 'source.canvas', destination_path: 'moved.canvas' }];
+    const f = await fixture({ 'source.canvas': original });
+    const remoteNodes = nodes.map((node) => node.id === 'node-0' ? { ...node, color: '2' } : node);
+    const remote = await commit(f, f.m0, { 'source.canvas': JSON.stringify({ nodes: remoteNodes, edges: [] }) + '\n' });
+    await setMain(f, remote);
+    const movedNodes = [nodes[0]!, {
+      id: 'local-node', type: 'text', x: 1200, y: 0, width: 200, height: 100, text: 'local payload'
+    }];
+    const moved = JSON.stringify({ nodes: movedNodes, edges: [] }) + '\n';
+    const target = await commit(f, remote, { 'source.canvas': null, 'moved.canvas': moved });
+    const naturalChanges = await f.server.git.changedPaths(f.auth.vault.vault_id, remote, target);
+    expect(naturalChanges.some((entry) => entry.oldPath === 'source.canvas')).toBe(false);
+    expect(naturalChanges.map((entry) => entry.path)).toEqual(expect.arrayContaining(['source.canvas', 'moved.canvas']));
+    const request = await manifest(f, target, f.m0, undefined, canvasPair);
+    const result = await f.server.sync.pushDeviceCommit(f.auth, request.manifest, request.pack);
+    expect(result.status).toBe('merged');
+    if (result.status !== 'merged') throw new Error('Canvas rename merge missing');
+    expect(await f.server.git.readBlobAtPathIfPresent(f.auth.vault.vault_id, result.main, 'source.canvas')).toBeNull();
+    const merged = JSON.parse(await blob(f, result.main, 'moved.canvas')) as { nodes: Array<{ id: string; color?: string }> };
+    expect(merged.nodes).toContainEqual(expect.objectContaining({ id: 'node-0', color: '2' }));
+    expect(merged.nodes).toContainEqual(expect.objectContaining({ id: 'local-node' }));
+  });
+
+  it.each(['keep_server', 'use_device'] as const)('reviews a low-similarity explicit move and resolves both endpoints with %s', async (resolutionKind) => {
+    const original = Array.from({ length: 100 }, (_, index) => `line ${index}`).join('\n') + '\n';
+    const f = await fixture({ 'source.md': original });
+    const remote = await commit(f, f.m0, { 'source.md': original.replace('line 50', 'REMOTE line 50') });
+    await setMain(f, remote);
+    const deviceContent = `local addition\n${original.replace('line 50', 'DEVICE line 50').split('\n').slice(40).join('\n')}`;
+    const target = await commit(f, remote, { 'source.md': null, 'moved.md': deviceContent });
+    const request = await manifest(f, target, f.m0, undefined, pair);
+    const result = await f.server.sync.pushDeviceCommit(f.auth, request.manifest, request.pack);
+    expect(result.status).toBe('conflicted');
+    if (result.status !== 'conflicted') throw new Error('expected rename conflict');
+    const review = await f.server.sync.getConflictReviewPackage(f.auth.vault.vault_id, result.conflict_id);
+    expect(review.path_conflicts).toContainEqual(expect.objectContaining({
+      base_path: 'source.md', server_path: 'source.md', device_path: 'moved.md',
+      affected_paths: expect.arrayContaining(['source.md', 'moved.md'])
+    }));
+    const resolved = await f.server.sync.resolveConflict({ actorUserId: f.auth.user.user_id, vaultId: f.auth.vault.vault_id,
+      conflictId: result.conflict_id, expectedMain: remote, resolutionKind });
+    expect(resolved.status).toBe('resolved');
+    if (resolutionKind === 'keep_server') {
+      expect(await blob(f, resolved.main, 'source.md')).toBe(original.replace('line 50', 'REMOTE line 50'));
+      expect(await f.server.git.readBlobAtPathIfPresent(f.auth.vault.vault_id, resolved.main, 'moved.md')).toBeNull();
+    } else {
+      expect(await f.server.git.readBlobAtPathIfPresent(f.auth.vault.vault_id, resolved.main, 'source.md')).toBeNull();
+      expect(await blob(f, resolved.main, 'moved.md')).toBe(deviceContent);
+    }
+  });
+
+  it('roundtrips rename identity in chunk sessions and merges binary moves without content merging', async () => {
+    const bytes = Buffer.from([0, 255, 1, 128]);
+    const f = await fixture({ 'source.md': bytes, 'unrelated.md': 'base\n' });
+    const remote = await commit(f, f.m0, { 'unrelated.md': 'canonical\n' });
+    await setMain(f, remote);
+    const target = await commit(f, remote, { 'source.md': null, 'moved.md': bytes });
+    const request = await manifest(f, target, f.m0, 'rename-chunk-attempt', pair);
+    expect(f.server.chunkTransfers.capabilities().capabilities).toContain('rename-pairs-v1');
+    const transfer = await f.server.chunkTransfers.createPush(f.auth, {
+      ...request.manifest, attempt_id: 'rename-chunk-attempt', chunk_count: 1, plan_sha256: sha256Hex('rename-plan')
+    });
+    const session = JSON.parse(await readFile(join(f.server.config.transferDir, transfer.descriptor.transfer_id, 'session.json'), 'utf8')) as {
+      manifest: DevicePushManifest;
+    };
+    expect(session.manifest.rename_pairs).toEqual(pair);
+    await f.server.chunkTransfers.putChunk(f.auth, transfer.descriptor.transfer_id, 0, request.pack, sha256Hex(request.pack));
+    const result = await f.server.chunkTransfers.finalizePush(f.auth, transfer.descriptor.transfer_id);
+    expect(result.status).toBe('merged');
+    if (result.status !== 'merged') throw new Error('binary rename merge missing');
+    expect(await f.server.git.readBlobAtPathIfPresent(f.auth.vault.vault_id, result.main, 'source.md')).toBeNull();
+    expect(await f.server.git.readBlobAtPath(f.auth.vault.vault_id, result.main, 'moved.md')).toEqual(bytes);
+    expect(await blob(f, result.main, 'unrelated.md')).toBe('canonical\n');
+  });
+
+  it('requires explicit base identity and rejects malformed pairs before device ref movement', async () => {
+    const f = await fixture({ 'source.md': BASE });
+    const target = await commit(f, f.m0, { 'source.md': null, 'moved.md': BASE });
+    const request = await manifest(f, target, f.m0, undefined, pair);
+    delete request.manifest.base_commit;
+    const result = await multipart(f, request);
+    expect(result.status).toBe(400);
+    expect(await f.server.git.getRef(f.auth.vault.vault_id, f.auth.device.device_ref)).toBe(f.m0);
+    const bad = await manifest(f, target);
+    bad.manifest.rename_pairs = [{ source_path: '../source.md', destination_path: 'moved.md' }];
+    const malformed = await multipart(f, bad);
+    expect(malformed.status).toBe(400);
+    const halfPairTarget = await commit(f, f.m0, { 'source.md': null });
+    const halfPair = await manifest(f, halfPairTarget, f.m0, undefined, pair);
+    expect((await multipart(f, halfPair)).result).toMatchObject({ error: { code: 'invalid_rename_pair' } });
+    expect(await f.server.git.getRef(f.auth.vault.vault_id, f.auth.device.device_ref)).toBe(f.m0);
+  });
+
+  it('rejects retry metadata changes, including omission and a new attempt ID', async () => {
+    const f = await fixture({ 'source.md': BASE });
+    const target = await commit(f, f.m0, { 'source.md': null, 'moved.md': BASE });
+    const original = await manifest(f, target, f.m0, 'rename-attempt-original', pair);
+    await expect(f.server.sync.pushDeviceCommit(f.auth, original.manifest, original.pack)).resolves.toMatchObject({ status: 'merged' });
+    const exactReplay = await manifest(f, target, f.m0, 'rename-attempt-exact-replay', pair);
+    await expect(f.server.sync.pushDeviceCommit(f.auth, exactReplay.manifest, exactReplay.pack)).resolves.toMatchObject({ status: 'noop' });
+    const changedPairs: DevicePushManifest['rename_pairs'] = [{ source_path: 'source.md', destination_path: 'other.md' }];
+    for (const [attempt, pairs] of [['rename-attempt-omitted', undefined], ['rename-attempt-changed', changedPairs]] as Array<[string, DevicePushManifest['rename_pairs']]>) {
+      const retry = await manifest(f, target, f.m0, attempt, pairs);
+      await expect(f.server.sync.pushDeviceCommit(f.auth, retry.manifest, retry.pack)).rejects.toMatchObject({ code: 'rename_pairs_mismatch' });
+    }
+  });
+
+  it.each(['absent', 'null'] as const)('resumes an ordinary modern push with %s optional rename metadata', async (optionalMetadata) => {
+    const f = await fixture();
+    const target = await commit(f, f.m0, { 'note.md': LOCAL });
+    const request = await manifest(f, target, f.m0, 'modern-unpaired-recovery');
+    Object.assign(request.manifest, { root_ignore_capability: 'root-ignore-v1', root_ignore_oid: null });
+    vi.spyOn(f.server.sync as unknown as { mergeDeviceCommit: () => Promise<PushResult> }, 'mergeDeviceCommit')
+      .mockRejectedValueOnce(new Error('simulated interruption after device ref'));
+    await expect(f.server.sync.pushDeviceCommit(f.auth, request.manifest, request.pack)).rejects.toThrow('simulated interruption');
+    await f.server.store.mutate((db) => {
+      const operation = db.sync_operations.find((row) => row.target_commit === target)!;
+      expect(operation.prepared_manifest?.rename_pairs).toBeNull();
+      if (optionalMetadata === 'absent') delete operation.prepared_manifest!.rename_pairs;
+    });
+    vi.restoreAllMocks();
+    const merge = vi.spyOn(f.server.sync as unknown as { mergeDeviceCommit: (...args: unknown[]) => Promise<PushResult> }, 'mergeDeviceCommit');
+    await f.server.sync.resumePendingMerges();
+    expect(merge.mock.calls[0]?.[7]).toMatchObject({ root_ignore_capability: 'root-ignore-v1', root_ignore_oid: null });
+    const main = await f.server.git.getRef(f.auth.vault.vault_id, 'refs/heads/main');
+    expect(await blob(f, main!, 'note.md')).toBe(LOCAL);
+  });
+
+  it.each([false, true])('resumes a device-ref-advanced rename using its admitted pair; modern=%s', async (modern) => {
+    const original = Array.from({ length: 100 }, (_, index) => `line ${index}`).join('\n') + '\n';
+    const f = await fixture({ 'source.md': original });
+    const main = await commit(f, f.m0, { 'source.md': `${original}remote addition\n` });
+    await setMain(f, main);
+    const target = await commit(f, main, { 'source.md': null, 'moved.md': `local addition\n${original.split('\n').slice(40).join('\n')}` });
+    const request = await manifest(f, target, f.m0, 'rename-recovery-attempt', pair);
+    if (modern) Object.assign(request.manifest, { root_ignore_capability: 'root-ignore-v1', root_ignore_oid: null });
+    vi.spyOn(f.server.sync as unknown as { mergeDeviceCommit: () => Promise<PushResult> }, 'mergeDeviceCommit')
+      .mockRejectedValueOnce(new Error('simulated interruption after device ref'));
+    await expect(f.server.sync.pushDeviceCommit(f.auth, request.manifest, request.pack)).rejects.toThrow('simulated interruption');
+    expect(await f.server.git.getRef(f.auth.vault.vault_id, f.auth.device.device_ref)).toBe(target);
+    const operation = (await f.server.store.snapshot()).sync_operations.find((row) => row.target_commit === target)!;
+    expect(operation.prepared_manifest?.rename_pairs).toEqual(pair);
+    vi.restoreAllMocks();
+    await f.server.sync.resumePendingMerges();
+    const resumedMain = await f.server.git.getRef(f.auth.vault.vault_id, 'refs/heads/main');
+    expect(resumedMain).not.toBe(main);
+    expect(await f.server.git.readBlobAtPathIfPresent(f.auth.vault.vault_id, resumedMain!, 'source.md')).toBeNull();
+    expect(await blob(f, resumedMain!, 'moved.md')).toContain('remote addition');
+  });
+
+  it.each([
+    [{ source_path: 'source.md', destination_path: 'moved.md', confidence: 'inferred' }], false, 0, ''
+  ].map((corruptPairs) => ({ corruptPairs })))('fails closed when durable rename-pair evidence is corrupted before resume: $corruptPairs', async ({ corruptPairs }) => {
+    const f = await fixture({ 'source.md': BASE });
+    const target = await commit(f, f.m0, { 'source.md': null, 'moved.md': BASE });
+    const request = await manifest(f, target, f.m0, 'rename-corrupt-resume', pair);
+    vi.spyOn(f.server.sync as unknown as { mergeDeviceCommit: () => Promise<PushResult> }, 'mergeDeviceCommit')
+      .mockRejectedValueOnce(new Error('simulated interruption after device ref'));
+    await expect(f.server.sync.pushDeviceCommit(f.auth, request.manifest, request.pack)).rejects.toThrow('simulated interruption');
+    const operation = (await f.server.store.snapshot()).sync_operations.find((row) => row.target_commit === target)!;
+    await f.server.store.mutate((db) => {
+      const row = db.sync_operations.find((candidate) => candidate.operation_id === operation.operation_id)!;
+      row.prepared_manifest!.rename_pairs = corruptPairs;
+    });
+    vi.restoreAllMocks();
+    await expect(f.server.sync.resumePendingMerges()).rejects.toThrow('Prepared rename pair identity is invalid.');
+    expect(await f.server.git.getRef(f.auth.vault.vault_id, 'refs/heads/main')).toBe(f.m0);
+    expect(await f.server.git.getRef(f.auth.vault.vault_id, f.auth.device.device_ref)).toBe(target);
+    const preserved = (await f.server.store.snapshot()).sync_operations.find((row) => row.operation_id === operation.operation_id)!;
+    expect(preserved.prepared_manifest?.rename_pairs).toEqual(corruptPairs);
+  });
+
+  it('protects both endpoints for overlapping edits and occupied destinations', async () => {
+    const f = await fixture({ 'source.md': BASE });
+    const main = await commit(f, f.m0, { 'source.md': BASE.replace('first', 'remote') });
+    await setMain(f, main);
+    const target = await commit(f, main, { 'source.md': null, 'moved.md': BASE.replace('first', 'device') });
+    const request = await manifest(f, target, f.m0, undefined, pair);
+    const result = await f.server.sync.pushDeviceCommit(f.auth, request.manifest, request.pack);
+    await expectConflict(f, result, main);
+    const conflict = (await f.server.store.snapshot()).conflicts.at(-1)!;
+    expect(conflict.affected_paths).toEqual(['moved.md', 'source.md']);
+    expect(await blob(f, main, 'source.md')).toBe(BASE.replace('first', 'remote'));
+    const resolved = await f.server.sync.resolveConflict({ actorUserId: f.auth.user.user_id, vaultId: f.auth.vault.vault_id,
+      conflictId: conflict.conflict_id, expectedMain: main, resolutionKind: 'use_device' });
+    expect(resolved.status).toBe('resolved');
+    expect(await f.server.git.readBlobAtPathIfPresent(f.auth.vault.vault_id, resolved.main, 'source.md')).toBeNull();
+    expect(await blob(f, resolved.main, 'moved.md')).toBe(BASE.replace('first', 'device'));
+
+    const occupied = await fixture({ 'source.md': BASE });
+    const collisionMain = await commit(occupied, occupied.m0, { 'moved.md': 'canonical occupant\n' });
+    await setMain(occupied, collisionMain);
+    const collisionTarget = await commit(occupied, occupied.m0, { 'source.md': null, 'moved.md': BASE });
+    const collisionRequest = await manifest(occupied, collisionTarget, occupied.m0, undefined, pair);
+    const collision = await occupied.server.sync.pushDeviceCommit(occupied.auth, collisionRequest.manifest, collisionRequest.pack);
+    await expectConflict(occupied, collision, collisionMain);
+    expect((await occupied.server.store.snapshot()).conflicts.at(-1)?.affected_paths).toEqual(['moved.md', 'source.md']);
+
+    const competing = await fixture({ 'source.md': BASE });
+    const competingMain = await commit(competing, competing.m0, {
+      'source.md': null, 'other.md': BASE, 'moved.md': 'independent destination content\n'
+    });
+    await setMain(competing, competingMain);
+    const competingTarget = await commit(competing, competing.m0, {
+      'source.md': null, 'moved.md': 'device destination content\n'
+    });
+    const competingRequest = await manifest(competing, competingTarget, competing.m0, undefined, pair);
+    const competingResult = await competing.server.sync.pushDeviceCommit(competing.auth, competingRequest.manifest, competingRequest.pack);
+    expect(competingResult.status, JSON.stringify(competingResult)).toBe('conflicted');
+    await expectConflict(competing, competingResult, competingMain);
+    expect((await competing.server.store.snapshot()).conflicts.at(-1)?.affected_paths).toEqual(['moved.md', 'other.md', 'source.md']);
   });
 });
 
