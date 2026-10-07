@@ -19,7 +19,8 @@
     "modules/OBTSDomain",
     "modules/OBTSApplyRefinement",
     "modules/OBTSSafety",
-    "OBTSStaleProposal"
+    "OBTSStaleProposal",
+    "OBTSDeltaApply"
   ],
   "checks": [
     {
@@ -2820,6 +2821,207 @@
         "depth": 4,
         "minGenerated": 11,
         "minDistinct": 7,
+        "minDepth": 2
+      }
+    },
+    {
+      "id": "fm002-delta-safety",
+      "model": "OBTSDeltaApply",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "config": "configs/delta-safety.cfg",
+      "kind": "positive-safety",
+      "baseline": {
+        "generated": 35692,
+        "distinct": 12015,
+        "depth": 12,
+        "minGenerated": 17846,
+        "minDistinct": 6007,
+        "minDepth": 6
+      }
+    },
+    {
+      "id": "fm002-delta-safety-wide",
+      "model": "OBTSDeltaApply",
+      "timeoutMs": 300000,
+      "heapMb": 2048,
+      "maximumDistinctStates": 2000000,
+      "maximumDepth": 100,
+      "config": "configs/delta-safety-wide.cfg",
+      "kind": "positive-safety",
+      "baseline": {
+        "generated": 3426554,
+        "distinct": 1042881,
+        "depth": 17,
+        "minGenerated": 1713277,
+        "minDistinct": 521440,
+        "minDepth": 8
+      }
+    },
+    {
+      "id": "fm002-delta-liveness",
+      "model": "OBTSDeltaApply",
+      "timeoutMs": 180000,
+      "heapMb": 2048,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "config": "configs/delta-liveness.cfg",
+      "kind": "positive-liveness",
+      "baseline": {
+        "generated": 35692,
+        "distinct": 12015,
+        "depth": 12,
+        "minGenerated": 17846,
+        "minDistinct": 6007,
+        "minDepth": 6
+      }
+    },
+    {
+      "id": "fm002-delta-reach-ref-only",
+      "model": "OBTSDeltaApply",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "config": "configs/delta-reach-ref-only.cfg",
+      "kind": "reachability",
+      "expectedInvariant": "NoRefOnlyApply",
+      "requiredWitness": "ApplyRefOnly",
+      "minimumTraceDepth": 5,
+      "baseline": {
+        "generated": 496,
+        "distinct": 342,
+        "depth": 5,
+        "minGenerated": 248,
+        "minDistinct": 171,
+        "minDepth": 2
+      }
+    },
+    {
+      "id": "fm002-delta-reach-deferred",
+      "model": "OBTSDeltaApply",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "config": "configs/delta-reach-deferred.cfg",
+      "kind": "reachability",
+      "expectedInvariant": "NoDeferredFootprintPath",
+      "requiredWitness": "ApplyFootprint",
+      "minimumTraceDepth": 4,
+      "baseline": {
+        "generated": 111,
+        "distinct": 87,
+        "depth": 4,
+        "minGenerated": 55,
+        "minDistinct": 43,
+        "minDepth": 2
+      }
+    },
+    {
+      "id": "fm002-delta-reach-untouched",
+      "model": "OBTSDeltaApply",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "config": "configs/delta-reach-untouched.cfg",
+      "kind": "reachability",
+      "expectedInvariant": "NoUntouchedEditAcrossApply",
+      "requiredWitness": "ApplyFootprint",
+      "minimumTraceDepth": 4,
+      "baseline": {
+        "generated": 217,
+        "distinct": 161,
+        "depth": 4,
+        "minGenerated": 108,
+        "minDistinct": 80,
+        "minDepth": 2
+      }
+    },
+    {
+      "id": "fm002-delta-reach-inventory-rescue",
+      "model": "OBTSDeltaApply",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "config": "configs/delta-reach-inventory-rescue.cfg",
+      "kind": "reachability",
+      "expectedInvariant": "NoMissedEditRescued",
+      "requiredWitness": "Inventory",
+      "minimumTraceDepth": 3,
+      "baseline": {
+        "generated": 32,
+        "distinct": 28,
+        "depth": 3,
+        "minGenerated": 16,
+        "minDistinct": 14,
+        "minDepth": 1
+      }
+    },
+    {
+      "id": "fm002-delta-negative-ref-only-tree",
+      "model": "OBTSDeltaApply",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "config": "configs/delta-negative-ref-only-tree.cfg",
+      "kind": "negative-control",
+      "expectedInvariant": "NoPhantomEdit",
+      "requiredWitness": "ApplyRefOnly",
+      "minimumTraceDepth": 3,
+      "baseline": {
+        "generated": 58,
+        "distinct": 48,
+        "depth": 3,
+        "minGenerated": 29,
+        "minDistinct": 24,
+        "minDepth": 1
+      }
+    },
+    {
+      "id": "fm002-delta-negative-trust-hints",
+      "model": "OBTSDeltaApply",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "config": "configs/delta-negative-trust-hints.cfg",
+      "kind": "negative-control",
+      "expectedInvariant": "NoLocalEditLost",
+      "requiredWitness": "ApplyFootprint",
+      "minimumTraceDepth": 4,
+      "baseline": {
+        "generated": 210,
+        "distinct": 157,
+        "depth": 4,
+        "minGenerated": 105,
+        "minDistinct": 78,
+        "minDepth": 2
+      }
+    },
+    {
+      "id": "fm002-delta-negative-skip-inventory",
+      "model": "OBTSDeltaApply",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 100,
+      "config": "configs/delta-negative-skip-inventory.cfg",
+      "kind": "negative-control",
+      "expectedInvariant": "MissedEditBoundedDelay",
+      "requiredWitness": "Tick",
+      "minimumTraceDepth": 5,
+      "baseline": {
+        "generated": 661,
+        "distinct": 481,
+        "depth": 5,
+        "minGenerated": 330,
+        "minDistinct": 240,
         "minDepth": 2
       }
     }

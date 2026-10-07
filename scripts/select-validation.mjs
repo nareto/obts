@@ -9,7 +9,7 @@ const dashboardStyles = /^frontend\/dashboard\/src\/.*\.(?:css|scss)$/;
 const pluginOnly = /^(?:obsidian-plugin\/main\.js|obsidian-plugin\/styles\.css)$/;
 const releaseMetadataPaths = new Set(['src/shared/pluginCompatibility.ts', 'obsidian-plugin/src/version.ts', 'obsidian-plugin/manifest.json']);
 const formalPaths = new Map([
-  ['sync', /^(?:architecture\/models\/formal\/(?:OBTSApplyRecovery(?:\.tla)?|OBTSDistributedSync(?:\.tla)?|checks\.json|configs\/(?!fm00[3456]-)|negative\/|trace\/transition-map\.json|modules\/OBTS(?:ApplyRefinement|Domain|Safety)|OBTSApplyRecovery(?:Liveness)?\.cfg))$/],
+  ['sync', /^(?:architecture\/models\/formal\/(?:OBTSApplyRecovery(?:\.tla)?|OBTSDeltaApply\.tla|OBTSDistributedSync(?:\.tla)?|checks\.json|configs\/(?!fm00[3456]-)|negative\/|trace\/transition-map\.json|modules\/OBTS(?:ApplyRefinement|Domain|Safety)|OBTSApplyRecovery(?:Liveness)?\.cfg))$/],
   ['bridge-body', /^(?:architecture\/models\/formal\/(?:OBTSBridge(?:BoundedBody|ReadAvailability)(?:\.tla)?|checks-fm(?:003|010)\.json|fm(?:003|010)-.*|configs\/fm003-.*|trace\/fm003-trace-map\.json))$/],
   ['workers', /^(?:architecture\/models\/formal\/(?:OBTSBridgeEmbeddingWorker(?:\.tla)?|checks-fm003-workers\.json|worker-configs\/.*|trace\/fm003-worker.*))$/],
   ['deletion', /^(?:architecture\/models\/formal\/(?:OBTSVaultDeletion(?:\.tla)?|checks-fm004\.json|configs\/fm004-.*))$/],

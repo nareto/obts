@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "modelId": "OBTS-FM-002",
-  "architectureRevision": 36,
+  "architectureRevision": 47,
   "rootModule": "OBTSDistributedSync.tla",
   "traceSchema": "trace/trace-schema.json",
   "instrumentationStatus": "static-map-only; runtime emission and replay are omitted and no implementation conformance is claimed",
@@ -3093,6 +3093,142 @@
             "obsidian-plugin/src/main.cjs:4123-4535"
           ],
           "tests": [
+            "tests/plugin-stale-proposal.test.ts"
+          ]
+        }
+      }
+    },
+    "OBTSDeltaApply": {
+      "rootModule": "OBTSDeltaApply.tla",
+      "implementationStatus": "contract and model only at revision 47; the current full-vault scan and apply are a valid superset refinement. Ref-only apply, footprint-scoped apply and hint-scoped capture are pending implementation under issue #44",
+      "actions": {
+        "UserEditHinted": {
+          "contracts": [
+            "OBTS-SYNC-DELTA-001",
+            "OBTS-SAF-002"
+          ],
+          "code": [
+            "obsidian-plugin/src/main.cjs:871-883"
+          ],
+          "tests": [
+            "tests/sync-delta-cost.test.ts",
+            "tests/plugin-root-ignore-scan.test.ts"
+          ]
+        },
+        "UserEditMissedHint": {
+          "contracts": [
+            "OBTS-SYNC-DELTA-001",
+            "OBTS-SAF-002"
+          ],
+          "code": [
+            "obsidian-plugin/src/main.cjs:871-883",
+            "obsidian-plugin/src/main.cjs:6752-6787"
+          ],
+          "tests": [
+            "tests/sync-delta-cost.test.ts",
+            "tests/plugin-root-ignore-scan.test.ts"
+          ]
+        },
+        "HintCapture": {
+          "contracts": [
+            "OBTS-SYNC-DELTA-001",
+            "OBTS-SAF-002",
+            "OBTS-SYNC-IMM-001"
+          ],
+          "code": [
+            "obsidian-plugin/src/main.cjs:2543-2625",
+            "obsidian-plugin/src/main.cjs:6926-6974"
+          ],
+          "tests": [
+            "tests/sync-delta-cost.test.ts",
+            "tests/plugin-root-ignore-scan.test.ts",
+            "tests/phase2.test.ts"
+          ]
+        },
+        "Inventory": {
+          "contracts": [
+            "OBTS-SYNC-DELTA-001",
+            "OBTS-SAF-002"
+          ],
+          "code": [
+            "obsidian-plugin/src/main.cjs:6752-6787",
+            "obsidian-plugin/src/main.cjs:10834-10867"
+          ],
+          "tests": [
+            "tests/sync-delta-cost.test.ts",
+            "tests/plugin-root-ignore-scan.test.ts"
+          ]
+        },
+        "Tick": {
+          "contracts": [
+            "OBTS-SYNC-DELTA-001"
+          ],
+          "code": [
+            "obsidian-plugin/src/main.cjs:1004-1037"
+          ],
+          "tests": [
+            "tests/sync-delta-cost.test.ts"
+          ]
+        },
+        "RemoteEdit": {
+          "contracts": [
+            "OBTS-SYNC-DELTA-001",
+            "OBTS-SYNC-IMM-001"
+          ],
+          "code": [
+            "src/server/syncService.ts:376-748"
+          ],
+          "tests": [
+            "tests/phase2.test.ts"
+          ]
+        },
+        "Push": {
+          "contracts": [
+            "OBTS-SYNC-DELTA-001",
+            "OBTS-SYNC-IMM-001",
+            "OBTS-SYNC-BASE-001"
+          ],
+          "code": [
+            "obsidian-plugin/src/main.cjs:3108-3350",
+            "obsidian-plugin/src/main.cjs:3721-3876",
+            "src/server/syncService.ts:376-748"
+          ],
+          "tests": [
+            "tests/sync-delta-cost.test.ts",
+            "tests/phase2.test.ts",
+            "tests/plugin-stale-proposal.test.ts"
+          ]
+        },
+        "ApplyRefOnly": {
+          "contracts": [
+            "OBTS-SYNC-DELTA-001",
+            "OBTS-SYNC-ACK-001",
+            "OBTS-SAF-002"
+          ],
+          "code": [
+            "obsidian-plugin/src/main.cjs:4771-5205",
+            "obsidian-plugin/src/main.cjs:8264-8275"
+          ],
+          "tests": [
+            "tests/sync-delta-cost.test.ts",
+            "tests/applied-ack-barrier.test.ts"
+          ]
+        },
+        "ApplyFootprint": {
+          "contracts": [
+            "OBTS-SYNC-DELTA-001",
+            "OBTS-SYNC-ACK-001",
+            "OBTS-SYNC-STALE-001",
+            "OBTS-SAF-002",
+            "OBTS-SAF-005"
+          ],
+          "code": [
+            "obsidian-plugin/src/main.cjs:4771-5205",
+            "obsidian-plugin/src/main.cjs:6660-6751"
+          ],
+          "tests": [
+            "tests/sync-delta-cost.test.ts",
+            "tests/plugin-in-place-apply.test.ts",
             "tests/plugin-stale-proposal.test.ts"
           ]
         }

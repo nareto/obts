@@ -221,8 +221,9 @@ The runner requires nontrivial state/depth counts and each negative control's ex
 | Architecture revision | 32 |
 | Refined contracts | `OBTS-SAF-001` through `OBTS-SAF-006`, `OBTS-SAF-010`, `OBTS-SYNC-IMM-001`, `OBTS-SYNC-IGN-001`, `OBTS-SYNC-ACK-001`, `OBTS-PER-OP-001`, `OBTS-PER-CLIENT-001`, `OBTS-BRG-PROJ-001` |
 | Root specification | `OBTSDistributedSync.tla` |
-| Check matrix | `checks.json` (revision-36 matrix retains all 115 previous checks and adds bounded gate/provenance checks; exact required IDs and measured baselines are machine-readable) |
+| Check matrix | `checks.json` (revision-36 matrix retains all 115 previous checks and adds bounded gate/provenance checks; revision 47 adds ten delta-companion checks; exact required IDs and measured baselines are machine-readable) |
 | Static transition map / future trace schema | `trace/transition-map.json`, `trace/trace-schema.json` |
+| Delta companion / revision | `OBTSDeltaApply.tla`, revision 47; change-proportional apply and capture (`OBTS-SYNC-DELTA-001`) |
 | Executable check | `npm run test:formal` |
 
 `OBTSDistributedSync.tla` is the sole composed `Init`, `CoreNext`/`Next`, safety, and liveness authority. Every positive scenario uses the same composed transition relation; scenario constants and guards bound edits, messages, faults, and their meaningful causal seams without state constraints or scenario-specific action whitelists. The composition always contains Plugin1, Plugin2, Bridge Node, Rust Bridge write/projection, server proposal/classification/CAS/conflict/recovery, client apply/ack, directory, and bounded request/reply bag actions. Focused reachability configurations prove claimed triggers rather than relying on one explosive scenario to establish all coverage.
@@ -310,6 +311,29 @@ All original twenty reachability checks produced their required witness. All fou
 `trace/transition-map.json` maps every root action and the required production families to existing, range-validated code/test evidence. It cites `obsidian-plugin/src/main.cjs` only within its current 9,652 lines. The schema/map are static design artifacts only: runtime transition instrumentation and replay do not exist, so no runtime trace conformance or implementation proof is claimed.
 
 FM-002 remains bounded and does not prove byte/checksum correctness, Git ancestry implementation, Git-ignore matching semantics, semantic merge formats, filesystem/power-loss durability, editor-buffer flushing, authorization, onboarding, restore, event-pruning recovery, transfer expiry, rename graphs, garbage collection, backup/restore, or real process supervision. Transfer expiry and event-cursor expiry appear in the static production-family map but are not modeled transitions. Audit retention is omitted. The contract-required integrated server/Rust/Node/PostgreSQL deployment fault test remains outstanding.
+
+### Change-proportional apply and capture companion (revision 47)
+
+`OBTSDeltaApply.tla` refines `OBTS-SYNC-DELTA-001` without widening the composed state space. `OBTSDistributedSync.tla` keeps cumulative per-path version sets and abstracts commit and tree identity, so it cannot express whether a target tree equals the authoring base; the companion uses exact symbolic values instead. It has one client, a symbolic server and two paths. `head` is the local commit tree, which is the authoring base M0 once every capture is pushed. A push integrates atomically: an unchanged canonical path takes the local version, otherwise canonical bytes stay and the local version is preserved. Every push advances the canonical commit even when the tree is unchanged, matching the server's merge commit.
+
+User edits deliver a durable hint or lose it. Hint capture reads only hinted paths; inventory reads every path and may run at any time, and a background tick cannot pass `InventoryPeriod` without one. Apply admits T only when no captured change awaits upload. The footprint is every path where T and M0 differ; each footprint path is re-read in the gate, and a locally changed one is deferred with M0 (or an older sticky base) as its proposal base and stays visible. Paths outside the footprint are neither read nor written. Ref-only apply is the empty-footprint case with no sticky obligation. Journal, recovery publication, acknowledgement durability, crash and restart stay FM-001/FM-002 obligations; directory intents, policy changes and held work are abstracted because the contract widens the footprint for them. Byte-identical edits that a metadata inventory cannot detect belong to the full audit and are not modeled.
+
+`NoLocalEditLost` requires the latest user version to stay visible, captured or server-preserved. `NoPhantomEdit` requires visible bytes outside the dirty set to equal the local commit, so moving refs never turns unchanged bytes into an apparent revert. `StaleBaseRetained` keeps a deferred path's older base until its edit settles, and `MissedEditBoundedDelay` bounds how many background cycles a lost event can delay capture. Liveness `EditsEventuallyCaptured` and `EventuallyConverged` assume weak fairness of hint capture, inventory, push and footprint apply.
+
+| Check | Kind | Generated | Distinct | Depth |
+| --- | --- | ---: | ---: | ---: |
+| `fm002-delta-safety` (2 user, 1 remote edit) | positive safety | 35,692 | 12,015 | 12 |
+| `fm002-delta-safety-wide` (3 user, 2 remote edits) | positive safety | 3,426,554 | 1,042,881 | 17 |
+| `fm002-delta-liveness` | positive liveness | 35,692 | 12,015 | 12 |
+| `fm002-delta-reach-ref-only` | witness `ApplyRefOnly` | 496 | 342 | 5 |
+| `fm002-delta-reach-deferred` | witness `ApplyFootprint` | 111 | 87 | 4 |
+| `fm002-delta-reach-untouched` | witness `ApplyFootprint` | 217 | 161 | 4 |
+| `fm002-delta-reach-inventory-rescue` | witness `Inventory` | 32 | 28 | 3 |
+| `fm002-delta-negative-ref-only-tree` | fails `NoPhantomEdit` | 58 | 48 | 3 |
+| `fm002-delta-negative-trust-hints` | fails `NoLocalEditLost` | 210 | 157 | 4 |
+| `fm002-delta-negative-skip-inventory` | fails `MissedEditBoundedDelay` | 661 | 481 | 5 |
+
+The three mutants are the shortcuts this contract forbids: moving refs without comparing trees, treating unhinted footprint paths as clean instead of re-reading them, and relying on hints alone. Skipping the inventory also fails `EditsEventuallyCaptured` under the liveness configuration. The transition map cites current full-vault code as a superset refinement until the ref-only, footprint and hint-scoped implementation lands.
 
 ## OBTS-FM-003: Focused Bridge Bounded-Body Projection
 

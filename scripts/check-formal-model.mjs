@@ -108,7 +108,11 @@ const requiredChecks = new Map([
     'conflict-without-protection', 'cas-uncertain-abort', 'cursor-ack-conflation', 'projection-cursor-early', 'ack-evidence-loss']
     .map((id) => [`fm002-negative-${id}`, 'negative-control']),
   ...['directory-baseline-strict', 'directory-baseline-mutant-intent', 'directory-baseline-mutant-history', 'directory-baseline-mutant-historical']
-    .map((id) => [`fm002-negative-${id}`, 'negative-control'])
+    .map((id) => [`fm002-negative-${id}`, 'negative-control']),
+  ...['safety', 'safety-wide'].map((id) => [`fm002-delta-${id}`, 'positive-safety']),
+  ['fm002-delta-liveness', 'positive-liveness'],
+  ...['ref-only', 'deferred', 'untouched', 'inventory-rescue'].map((id) => [`fm002-delta-reach-${id}`, 'reachability']),
+  ...['ref-only-tree', 'trust-hints', 'skip-inventory'].map((id) => [`fm002-delta-negative-${id}`, 'negative-control'])
 ]);
 
 try {
@@ -285,8 +289,8 @@ function validateTransitionMap(path) {
     if (unknownContracts.length) throw new Error(`transition ${action} maps unknown contract IDs: ${unknownContracts.join(', ')}.`);
     for (const ref of [...entry.code, ...entry.tests]) validateSourceReference(ref, `transition ${action}`);
   }
-  if (!testMode && ['OBTSApplyInPlace', 'OBTSStaleProposal'].some((name) => !map.companionModels?.[name])) {
-    throw new Error('Required gate/provenance companion transition map removed.');
+  if (!testMode && ['OBTSApplyInPlace', 'OBTSStaleProposal', 'OBTSDeltaApply'].some((name) => !map.companionModels?.[name])) {
+    throw new Error('Required gate/provenance/delta companion transition map removed.');
   }
   for (const [name, companion] of Object.entries(map.companionModels ?? {})) {
     const path = safeRelative(companion.rootModule, `companion ${name} module`);

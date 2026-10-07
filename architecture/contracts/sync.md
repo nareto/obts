@@ -32,7 +32,7 @@ The visible local vault is the device source of truth; coordination metadata is 
 
 - Watcher-invalidated paths are durable and drive normal reconciliation.
 - Immutable in-flight upload identity cannot be replaced by later watcher hints or edits.
-- Metadata inventory is a bounded fallback for missed events; complete byte-level audit is separately scheduled and user-invocable.
+- Metadata inventory is a bounded fallback for missed events, run on the triggers and schedule of OBTS-SYNC-DELTA-001; complete byte-level audit is separately scheduled and user-invocable.
 - Cached blob identities are reused only when reliable filesystem identity and the trusted Git base still match.
 - Missing or corrupt `state.json` is repaired from the valid device token and intact local Git journal before destructive work.
 - Local edits are committed or recoverably snapshotted before upload.
@@ -149,6 +149,16 @@ A client pulls required objects and a manifest for canonical `main`, then applie
 - Restart finishes idempotently or blocks with recovery options.
 - A failed maintenance catch-up reports its fixed safe failure category through the ordinary authoritative status/error publication path and one correlated state event at most; best-effort reporting never masks the original failure or changes refs, queues, journal/recovery evidence, or readiness into a claim of global convergence. A stale apply-lock observation is replaced by the truthful maintenance failure only when that authoritative status update succeeds. Authenticated redacted Bridge `get_status` distinguishes progressing maintenance from catch-up blocked on preserved edits, and gives only fixed category/action guidance; it exposes no paths, counts, content, or identifiers and does not wait behind the maintenance mutex. Read availability does not acquire a global synchronization-convergence fence.
 - Semantic ambiguity is never presented as a client-side winner choice.
+
+### OBTS-SYNC-DELTA-001: Change-Proportional Apply And Capture
+
+Steady-state sync work is proportional to what changed since the last applied checkpoint, not to vault size or history length. These rules only narrow which paths are visited; they never weaken OBTS-SAF-001, OBTS-SAF-002, OBTS-SAF-005, OBTS-SYNC-ACK-001 or OBTS-SYNC-STALE-001. Visiting more paths than required, up to the whole vault, is always a valid refinement.
+
+- The apply footprint of target T over pre-apply authoring base M0 is every path whose T and M0 entries differ, their ancestor and descendant hierarchy, deferred, held and sticky-stale paths, and the paths of pending directory intents. A root `.gitignore` change, a missing or unreadable M0, or an M0 that is not the settled visible baseline (unresolved journal, recovery, onboarding or catch-up obligation) widens the footprint to the whole vault.
+- Recovery evidence, preflight, collision checks, writes, verification and post-apply stale capture cover the footprint. Each footprint path is re-read inside the adapter gate before mutation; scan caches and absent watcher hints never prove a footprint path clean. Apply neither reads nor writes paths outside the footprint; local edits there remain ordinary unsynced work for capture.
+- Ref-only apply is the empty-footprint case. It requires equal T and M0 trees, a local head equal to M0, no directory work, no deferred, held or sticky-stale obligation carried from earlier work, and a settled pending acknowledgement; the accepted proposal's own provenance settles exactly as in a full apply. It still admits recovery, holds the apply lock, publishes a committed journal with an empty footprint, moves local refs to T and records the pending acknowledgement before clearing the journal. It publishes no recovery bundle and performs no inventory or file mutation. The tree comparison is mandatory: moving refs over differing trees would make unchanged visible bytes look like local edits that revert canonical content.
+- Ordinary background capture reads only paths with durable watcher hints. A whole-vault metadata inventory runs at startup, on resume from background, when scan state is missing or invalid, after a root policy change, for directory or folder-rename hints, on explicit request, and at least once per bounded inventory interval, so a lost watcher event delays capture by at most that interval. Scan state carried across an apply is refreshed for every path the apply touched; untouched entries stay valid.
+- Client Git maintenance consolidates pulled packs so object lookup does not grow with the number of pulls. Consolidation retains every object of every source pack, verifies its output before removing any source, and never deletes the only verified copy of an object.
 
 ## Conflict Review
 

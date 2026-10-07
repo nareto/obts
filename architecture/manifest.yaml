@@ -1,7 +1,7 @@
 schema_version: 1
-revision: 46
+revision: 47
 status: current
-updated: 2026-10-05
+updated: 2026-10-07
 authoritative_artifacts:
   - architecture/manifest.yaml
   - architecture/README.md
@@ -37,6 +37,8 @@ formal_models:
     status: accepted
     path: architecture/models/formal/OBTSDistributedSync.tla
     architecture_revision: 32
+    companion_path: architecture/models/formal/OBTSDeltaApply.tla
+    companion_architecture_revision: 47
     checks: architecture/models/formal/checks.json
     transition_map: architecture/models/formal/trace/transition-map.json
     trace_schema: architecture/models/formal/trace/trace-schema.json
@@ -51,6 +53,8 @@ formal_models:
       - OBTS-SYNC-IMM-001
       - OBTS-SYNC-IGN-001
       - OBTS-SYNC-ACK-001
+      - OBTS-SYNC-STALE-001
+      - OBTS-SYNC-DELTA-001
       - OBTS-PER-OP-001
       - OBTS-BRG-PROJ-001
   - id: OBTS-FM-003
