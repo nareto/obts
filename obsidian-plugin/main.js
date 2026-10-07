@@ -2031,6 +2031,55 @@ var require_git_object_cache = __commonJS({
         }
       };
     }
+    function createImmutableObjectMemo2(options = {}) {
+      const maxWeight = Number.isFinite(options.maxWeight) ? Math.max(0, options.maxWeight) : 0;
+      const values = /* @__PURE__ */ new Map();
+      let weight = 0;
+      let hits = 0;
+      let misses = 0;
+      function evict() {
+        for (const [key, entry] of values) {
+          if (weight <= maxWeight) return;
+          values.delete(key);
+          weight -= entry.weight;
+        }
+      }
+      return {
+        async get(key, load, weigh = () => 1) {
+          const cached = values.get(key);
+          if (cached) {
+            hits += 1;
+            values.delete(key);
+            values.set(key, cached);
+            return cached.value;
+          }
+          misses += 1;
+          const value = deepFreeze(await load());
+          const entryWeight = Math.max(1, weigh(value));
+          if (entryWeight > maxWeight) return value;
+          const previous = values.get(key);
+          if (previous) weight -= previous.weight;
+          values.set(key, { value, weight: entryWeight });
+          weight += entryWeight;
+          evict();
+          return value;
+        },
+        clear() {
+          values.clear();
+          weight = 0;
+        },
+        stats() {
+          return { values: values.size, weight, hits, misses };
+        }
+      };
+    }
+    function deepFreeze(value) {
+      if (value && typeof value === "object" && !Object.isFrozen(value)) {
+        Object.freeze(value);
+        for (const child of Object.values(value)) deepFreeze(child);
+      }
+      return value;
+    }
     function withGitObjectCaches2(git2, cacheForFs) {
       const wrapped = {};
       for (const key of Object.keys(git2)) wrapped[key] = git2[key];
@@ -2043,7 +2092,7 @@ var require_git_object_cache = __commonJS({
       }
       return wrapped;
     }
-    module2.exports = { createGitObjectCache: createGitObjectCache2, withGitObjectCaches: withGitObjectCaches2, CACHED_COMMANDS };
+    module2.exports = { createGitObjectCache: createGitObjectCache2, createImmutableObjectMemo: createImmutableObjectMemo2, withGitObjectCaches: withGitObjectCaches2, CACHED_COMMANDS };
   }
 });
 
@@ -22996,7 +23045,7 @@ var obtsRuntime = globalThis.__OBTS_CLIENT_RUNTIME__ || require("obsidian");
 var { Plugin, PluginSettingTab, Setting, Notice, Modal, Platform, requestUrl, apiVersion } = obtsRuntime;
 var { Buffer: Buffer2 } = require_buffer();
 if (typeof globalThis.Buffer === "undefined") globalThis.Buffer = Buffer2;
-var { createGitObjectCache, withGitObjectCaches } = require_git_object_cache();
+var { createGitObjectCache, createImmutableObjectMemo, withGitObjectCaches } = require_git_object_cache();
 var gitObjectCaches = /* @__PURE__ */ new WeakMap();
 var git = withGitObjectCaches((init_isomorphic_git(), __toCommonJS(isomorphic_git_exports)), (fs) => gitObjectCaches.get(fs) || null);
 var { createPackConsolidator } = require_git_pack_consolidation();
@@ -23008,7 +23057,7 @@ var { createByteBudget, runBoundedWork } = require_work_pool();
 var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.25";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.26";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var STALE_SETTLE_MARGIN_MS = 250;
@@ -23023,6 +23072,8 @@ var STATUS_NOTICE_DURATION_MS = 15 * 1e3;
 var INITIALIZATION_STALL_DIAGNOSTIC_MS = 30 * 1e3;
 var MOBILE_PACK_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 var DESKTOP_GIT_PACK_CACHE_BYTES = 64 * 1024 * 1024;
+var MOBILE_GIT_OBJECT_MEMO_ENTRIES = 5e4;
+var DESKTOP_GIT_OBJECT_MEMO_ENTRIES = 25e4;
 var MOBILE_PACK_CONSOLIDATION_MAX_BYTES = 8 * 1024 * 1024;
 var DESKTOP_PACK_CONSOLIDATION_MAX_BYTES = 32 * 1024 * 1024;
 var DESKTOP_FILE_WORK_CONCURRENCY = 4;
@@ -24279,6 +24330,9 @@ var ObtsObsidianClient = class {
       maxRetainedPackBytes: mobile ? MOBILE_PACK_CACHE_MAX_BYTES : DESKTOP_GIT_PACK_CACHE_BYTES
     });
     gitObjectCaches.set(this.fs, this.gitObjectCache);
+    this.gitObjectMemo = createImmutableObjectMemo({
+      maxWeight: mobile ? MOBILE_GIT_OBJECT_MEMO_ENTRIES : DESKTOP_GIT_OBJECT_MEMO_ENTRIES
+    });
     this.fsp = this.adapterFs.promises;
     this.fileWorkConcurrency = mobile ? MOBILE_FILE_WORK_CONCURRENCY : DESKTOP_FILE_WORK_CONCURRENCY;
     this.fileBufferBudgetBytes = mobile ? MOBILE_FILE_BUFFER_BUDGET_BYTES : DESKTOP_FILE_BUFFER_BUDGET_BYTES;
@@ -25321,6 +25375,7 @@ var ObtsObsidianClient = class {
   }
   async syncOnce(options = {}) {
     this.gitObjectCache.reset();
+    this.gitObjectMemo.clear();
     await this.initialize();
     await this.maintainGitPacks();
     await this.restorePendingRenameHints();
@@ -29929,10 +29984,10 @@ var ObtsObsidianClient = class {
   async collectChangedTreeObjects(treeOid, baseTreeOid, objects) {
     if (treeOid === baseTreeOid) return;
     objects.add(treeOid);
-    const { tree } = await git.readTree({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: treeOid });
+    const tree = await this.readTreeEntries(treeOid);
     let baseEntries = /* @__PURE__ */ new Map();
     if (baseTreeOid) {
-      const { tree: baseTree } = await git.readTree({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: baseTreeOid });
+      const baseTree = await this.readTreeEntries(baseTreeOid);
       baseEntries = new Map(baseTree.map((entry) => [entry.path, entry]));
     }
     for (const entry of tree) {
@@ -30166,7 +30221,7 @@ var ObtsObsidianClient = class {
   async collectTreeObjects(treeOid, seen) {
     if (seen.has(treeOid)) return;
     seen.add(treeOid);
-    const { tree } = await git.readTree({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: treeOid });
+    const tree = await this.readTreeEntries(treeOid);
     for (const entry of tree) {
       if (entry.type === "tree") await this.collectTreeObjects(entry.oid, seen);
       else seen.add(entry.oid);
@@ -30206,16 +30261,29 @@ var ObtsObsidianClient = class {
     tree.sort((left, right) => left.path.localeCompare(right.path));
     return await git.writeTree({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, tree });
   }
+  async readTreeEntries(oid) {
+    return await this.gitObjectMemo.get(
+      `tree:${oid}`,
+      async () => (await git.readTree({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid })).tree,
+      (tree) => tree.length + 1
+    );
+  }
+  async readCommitTreeOid(oid) {
+    return await this.gitObjectMemo.get(
+      `commit-tree:${oid}`,
+      async () => (await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid })).commit.tree
+    );
+  }
   async walkTree(treeish, prefix, visit) {
     let treeOid = treeish;
     if (prefix === "") {
       try {
-        treeOid = (await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: treeish })).commit.tree;
+        treeOid = await this.readCommitTreeOid(treeish);
       } catch {
         treeOid = treeish;
       }
     }
-    const { tree } = await git.readTree({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: treeOid });
+    const tree = await this.readTreeEntries(treeOid);
     for (const entry of tree) {
       const entryPath = prefix ? `${prefix}/${entry.path}` : entry.path;
       await visit(entryPath, entry);

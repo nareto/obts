@@ -17,8 +17,14 @@ type ObjectCache = {
 };
 
 const require = createRequire(import.meta.url);
-const { createGitObjectCache, withGitObjectCaches } = require('../obsidian-plugin/src/git-object-cache.cjs') as {
+type ObjectMemo = {
+  get<T>(key: string, load: () => Promise<T>, weigh?: (value: T) => number): Promise<T>;
+  clear(): void;
+  stats(): { values: number; weight: number; hits: number; misses: number };
+};
+const { createGitObjectCache, createImmutableObjectMemo, withGitObjectCaches } = require('../obsidian-plugin/src/git-object-cache.cjs') as {
   createGitObjectCache(options: { maxRetainedPackBytes: number; maxBusyPackBytes?: number }): ObjectCache;
+  createImmutableObjectMemo(options: { maxWeight: number }): ObjectMemo;
   withGitObjectCaches(git: typeof rawGit, lookup: (fs: unknown) => unknown): typeof rawGit;
 };
 
@@ -290,5 +296,62 @@ describe('pack change window', () => {
     expect(attempts).toBe(1);
     outer();
     await expect(result).resolves.toBe('read');
+  });
+});
+
+describe('immutable object memo', () => {
+  it('loads each key once and shares a frozen value', async () => {
+    const memo = createImmutableObjectMemo({ maxWeight: 10 });
+    let loads = 0;
+    const load = async () => {
+      loads += 1;
+      return [{ path: 'a.md', oid: 'x' }];
+    };
+    const first = await memo.get('tree:x', load);
+    const second = await memo.get('tree:x', load);
+    expect(second).toBe(first);
+    expect(loads).toBe(1);
+    expect(Object.isFrozen(first) && Object.isFrozen(first[0])).toBe(true);
+    expect(memo.stats()).toMatchObject({ values: 1, hits: 1, misses: 1 });
+  });
+
+  it('evicts least recently used values beyond the weight bound', async () => {
+    const memo = createImmutableObjectMemo({ maxWeight: 5 });
+    const loads: string[] = [];
+    const get = (key: string, size: number) => memo.get(key, async () => {
+      loads.push(key);
+      return Array.from({ length: size }, (_, index) => index);
+    }, (value) => value.length);
+    await get('a', 2);
+    await get('b', 2);
+    await get('a', 2);
+    await get('c', 2);
+    await get('a', 2);
+    await get('b', 2);
+    expect(loads).toEqual(['a', 'b', 'c', 'b']);
+    expect(memo.stats().weight).toBeLessThanOrEqual(5);
+    await get('huge', 6);
+    await get('huge', 6);
+    expect(loads.filter((key) => key === 'huge')).toHaveLength(2);
+  });
+
+  it('does not remember failed loads and forgets everything on clear', async () => {
+    const memo = createImmutableObjectMemo({ maxWeight: 10 });
+    let loads = 0;
+    await expect(memo.get('k', async () => {
+      loads += 1;
+      throw Object.assign(new Error('missing'), { code: 'NotFoundError' });
+    })).rejects.toThrow('missing');
+    await memo.get('k', async () => {
+      loads += 1;
+      return 'v';
+    });
+    memo.clear();
+    await memo.get('k', async () => {
+      loads += 1;
+      return 'v';
+    });
+    expect(loads).toBe(3);
+    expect(memo.stats()).toMatchObject({ values: 1, weight: 1 });
   });
 });

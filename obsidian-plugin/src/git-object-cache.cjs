@@ -238,6 +238,62 @@ function createGitObjectCache(options = {}) {
   };
 }
 
+// Git objects are immutable by id, so a parsed value derived from one object
+// can be shared by every reader. Values are frozen because they are shared, and
+// the memo evicts least recently used values beyond maxWeight.
+function createImmutableObjectMemo(options = {}) {
+  const maxWeight = Number.isFinite(options.maxWeight) ? Math.max(0, options.maxWeight) : 0;
+  const values = new Map();
+  let weight = 0;
+  let hits = 0;
+  let misses = 0;
+
+  function evict() {
+    for (const [key, entry] of values) {
+      if (weight <= maxWeight) return;
+      values.delete(key);
+      weight -= entry.weight;
+    }
+  }
+
+  return {
+    async get(key, load, weigh = () => 1) {
+      const cached = values.get(key);
+      if (cached) {
+        hits += 1;
+        values.delete(key);
+        values.set(key, cached);
+        return cached.value;
+      }
+      misses += 1;
+      const value = deepFreeze(await load());
+      const entryWeight = Math.max(1, weigh(value));
+      if (entryWeight > maxWeight) return value;
+      const previous = values.get(key);
+      if (previous) weight -= previous.weight;
+      values.set(key, { value, weight: entryWeight });
+      weight += entryWeight;
+      evict();
+      return value;
+    },
+    clear() {
+      values.clear();
+      weight = 0;
+    },
+    stats() {
+      return { values: values.size, weight, hits, misses };
+    }
+  };
+}
+
+function deepFreeze(value) {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) deepFreeze(child);
+  }
+  return value;
+}
+
 function withGitObjectCaches(git, cacheForFs) {
   const wrapped = {};
   for (const key of Object.keys(git)) wrapped[key] = git[key];
@@ -251,4 +307,4 @@ function withGitObjectCaches(git, cacheForFs) {
   return wrapped;
 }
 
-module.exports = { createGitObjectCache, withGitObjectCaches, CACHED_COMMANDS };
+module.exports = { createGitObjectCache, createImmutableObjectMemo, withGitObjectCaches, CACHED_COMMANDS };

@@ -2,7 +2,7 @@ const obtsRuntime = globalThis.__OBTS_CLIENT_RUNTIME__ || require("obsidian");
 const { Plugin, PluginSettingTab, Setting, Notice, Modal, Platform, requestUrl, apiVersion } = obtsRuntime;
 const { Buffer } = require("buffer");
 if (typeof globalThis.Buffer === "undefined") globalThis.Buffer = Buffer;
-const { createGitObjectCache, withGitObjectCaches } = require("./git-object-cache.cjs");
+const { createGitObjectCache, createImmutableObjectMemo, withGitObjectCaches } = require("./git-object-cache.cjs");
 const gitObjectCaches = new WeakMap();
 const git = withGitObjectCaches(require("isomorphic-git"), (fs) => gitObjectCaches.get(fs) || null);
 const { createPackConsolidator } = require("./git-pack-consolidation.cjs");
@@ -30,6 +30,8 @@ const STATUS_NOTICE_DURATION_MS = 15 * 1000;
 const INITIALIZATION_STALL_DIAGNOSTIC_MS = 30 * 1000;
 const MOBILE_PACK_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 const DESKTOP_GIT_PACK_CACHE_BYTES = 64 * 1024 * 1024;
+const MOBILE_GIT_OBJECT_MEMO_ENTRIES = 50000;
+const DESKTOP_GIT_OBJECT_MEMO_ENTRIES = 250000;
 const MOBILE_PACK_CONSOLIDATION_MAX_BYTES = 8 * 1024 * 1024;
 const DESKTOP_PACK_CONSOLIDATION_MAX_BYTES = 32 * 1024 * 1024;
 const DESKTOP_FILE_WORK_CONCURRENCY = 4;
@@ -1425,6 +1427,9 @@ class ObtsObsidianClient {
       maxRetainedPackBytes: mobile ? MOBILE_PACK_CACHE_MAX_BYTES : DESKTOP_GIT_PACK_CACHE_BYTES
     });
     gitObjectCaches.set(this.fs, this.gitObjectCache);
+    this.gitObjectMemo = createImmutableObjectMemo({
+      maxWeight: mobile ? MOBILE_GIT_OBJECT_MEMO_ENTRIES : DESKTOP_GIT_OBJECT_MEMO_ENTRIES
+    });
     this.fsp = this.adapterFs.promises;
     this.fileWorkConcurrency = mobile ? MOBILE_FILE_WORK_CONCURRENCY : DESKTOP_FILE_WORK_CONCURRENCY;
     this.fileBufferBudgetBytes = mobile ? MOBILE_FILE_BUFFER_BUDGET_BYTES : DESKTOP_FILE_BUFFER_BUDGET_BYTES;
@@ -2537,6 +2542,7 @@ class ObtsObsidianClient {
 
   async syncOnce(options = {}) {
     this.gitObjectCache.reset();
+    this.gitObjectMemo.clear();
     await this.initialize();
     await this.maintainGitPacks();
     await this.restorePendingRenameHints();
@@ -7554,10 +7560,10 @@ class ObtsObsidianClient {
   async collectChangedTreeObjects(treeOid, baseTreeOid, objects) {
     if (treeOid === baseTreeOid) return;
     objects.add(treeOid);
-    const { tree } = await git.readTree({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: treeOid });
+    const tree = await this.readTreeEntries(treeOid);
     let baseEntries = new Map();
     if (baseTreeOid) {
-      const { tree: baseTree } = await git.readTree({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: baseTreeOid });
+      const baseTree = await this.readTreeEntries(baseTreeOid);
       baseEntries = new Map(baseTree.map((entry) => [entry.path, entry]));
     }
     for (const entry of tree) {
@@ -7814,7 +7820,7 @@ class ObtsObsidianClient {
   async collectTreeObjects(treeOid, seen) {
     if (seen.has(treeOid)) return;
     seen.add(treeOid);
-    const { tree } = await git.readTree({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: treeOid });
+    const tree = await this.readTreeEntries(treeOid);
     for (const entry of tree) {
       if (entry.type === "tree") await this.collectTreeObjects(entry.oid, seen);
       else seen.add(entry.oid);
@@ -7858,16 +7864,31 @@ class ObtsObsidianClient {
     return await git.writeTree({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, tree });
   }
 
+  async readTreeEntries(oid) {
+    return await this.gitObjectMemo.get(
+      `tree:${oid}`,
+      async () => (await git.readTree({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid })).tree,
+      (tree) => tree.length + 1
+    );
+  }
+
+  async readCommitTreeOid(oid) {
+    return await this.gitObjectMemo.get(
+      `commit-tree:${oid}`,
+      async () => (await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid })).commit.tree
+    );
+  }
+
   async walkTree(treeish, prefix, visit) {
     let treeOid = treeish;
     if (prefix === "") {
       try {
-        treeOid = (await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: treeish })).commit.tree;
+        treeOid = await this.readCommitTreeOid(treeish);
       } catch {
         treeOid = treeish;
       }
     }
-    const { tree } = await git.readTree({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: treeOid });
+    const tree = await this.readTreeEntries(treeOid);
     for (const entry of tree) {
       const entryPath = prefix ? `${prefix}/${entry.path}` : entry.path;
       await visit(entryPath, entry);
