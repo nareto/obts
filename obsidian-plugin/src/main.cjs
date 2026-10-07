@@ -1044,7 +1044,7 @@ module.exports = class ObtsPlugin extends Plugin {
     if (!this.beginSync("Checking server")) return;
     let completed = false;
     try {
-      await this.client.pollRemoteEventsAndApply();
+      await this.client.pollRemoteEventsAndApply({ deltaApply: true });
       this.clearTransientSyncFailures();
       this.setStatus((await this.client.readState()).status_label);
       await this.client.reportDeviceStatus().catch(() => undefined);
@@ -2701,10 +2701,11 @@ class ObtsObsidianClient {
     const postUploadState = await this.readState();
     if (postUploadState.last_error_code !== "conflict_review_required") {
       try {
+        const applyOptions = { deltaApply: Boolean(options.hintedCapture && !options.fullAudit) };
         if (uploaded) {
-          await this.pullAndApply(true);
+          await this.pullAndApply(true, 0, [], null, applyOptions);
         } else {
-          await this.pollRemoteEventsAndApply();
+          await this.pollRemoteEventsAndApply(applyOptions);
         }
       } catch (error) {
         if (!(uploaded && error instanceof ObtsTransportError && error.code === "device_blocked")) throw error;
@@ -3710,12 +3711,18 @@ class ObtsObsidianClient {
     return { oid, policy: createRootIgnorePolicy(bytes), entries: targetEntries };
   }
 
-  async validateApplyJournalPolicy(journal) {
+  async validateApplyJournalPolicy(journal, scope = null) {
     let target;
     try {
       target = await this.targetApplyPolicy(journal.target_main);
       if (journal.journal_version < 5) return target.oid === null;
       if (journal.target_root_ignore_oid !== target.oid) return false;
+      // Live scoped applies admitted only ordinary files under an unchanged
+      // policy. Per-path revalidation still catches file/directory races.
+      // Recovery uses the ordinary full validator, never this transient scope.
+      if (scope) return (await this.readRootIgnorePolicy()).oid === target.oid &&
+        journal.local_only_paths.length === 0 && journal.directory_intents.length === 0 &&
+        journal.affected_paths.every((p) => scope.paths.includes(p));
       const previous = journal.expected_prior_local_main
         ? await this.listTreeFiles(journal.expected_prior_local_main) : [];
       const physical = await this.listLocalVaultInventory("");
@@ -4356,7 +4363,7 @@ class ObtsObsidianClient {
     }
   }
 
-  async pullAndApply(allowDestructive, catchupPass = 0, catchupPaths = [], catchupExpectedHead = null) {
+  async pullAndApply(allowDestructive, catchupPass = 0, catchupPaths = [], catchupExpectedHead = null, options = {}) {
     let state = await this.readState();
     if (!state.vault_id || !state.device_id) {
       return false;
@@ -4387,7 +4394,7 @@ class ObtsObsidianClient {
       state.last_applied_event_seq || 0
     );
     await this.importPack(pulled.packfile);
-    await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
+    await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || [], options.deltaApply);
     state = await this.readState();
     const targetPolicy = await this.targetApplyPolicy(pulled.manifest.target_main);
     if (!(await this.ensureNoQueuedLocalChangesBeforeApply(state, targetPolicy))) {
@@ -4437,11 +4444,12 @@ class ObtsObsidianClient {
       catchup?.version === 2 ? await this.listTreeBlobOids(catchupExpectedHead || catchup.expected_head) :
         catchup?.version === 1 ? await this.listTreeBlobOids(catchup.local_head) : null,
       catchup?.version === 2 ? [...new Set([...catchup.preserved_paths, ...catchupPaths])] : [],
-      catchup?.version === 1
+      catchup?.version === 1,
+      options
     );
     if (!applied) return false;
     await this.acknowledgeAppliedMain(pulled.manifest.target_main);
-    await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
+    await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || [], options.deltaApply);
     await this.clearResolvedConflictQueue();
     await this.settleAppliedQueue();
     const appliedState = await this.readState();
@@ -4514,7 +4522,7 @@ class ObtsObsidianClient {
     return true;
   }
 
-  async pollRemoteEventsAndApply() {
+  async pollRemoteEventsAndApply(options = {}) {
     const state = await this.readState();
     if (!state.vault_id || !state.device_id) {
       return { applied: false, status: "Not paired" };
@@ -4544,7 +4552,7 @@ class ObtsObsidianClient {
           await this.writeState(Object.assign({}, nextState, { last_event_seq: currentEventSeq, updated_at: nowIso() }));
         }
         try {
-          const applied = await this.pullAndApply(true);
+          const applied = await this.pullAndApply(true, 0, [], null, options);
           const refreshed = await this.uploadAutoPreservedChanges(applied);
           return { applied, status: refreshed.status_label };
         } catch (pullError) {
@@ -4615,7 +4623,7 @@ class ObtsObsidianClient {
         last_error_code: null,
         updated_at: nowIso()
       }));
-      const applied = await this.pullAndApply(true);
+      const applied = await this.pullAndApply(true, 0, [], null, options);
       const finalState = await this.uploadAutoPreservedChanges(applied);
       return { applied, status: finalState.status_label };
     }
@@ -4626,7 +4634,7 @@ class ObtsObsidianClient {
         updated_at: nowIso()
       }));
     }
-    const applied = await this.pullAndApply(true);
+    const applied = await this.pullAndApply(true, 0, [], null, options);
     const finalState = await this.uploadAutoPreservedChanges(applied);
     return { applied, status: finalState.status_label };
   }
@@ -4828,6 +4836,46 @@ class ObtsObsidianClient {
     await this.advanceScanStateHead(state.local_head, journal.target_main);
   }
 
+  // Conservative file-only footprint: directory creation/removal and complex
+  // provenance still use full apply. Recovery consumes the same v7 journal.
+  async deltaApplyScope(state, targetMain, authoringBase, targetPolicy, explicitDirectories) {
+    if (!this.fullInventoryCurrent() || !authoringBase || state.local_head !== authoringBase ||
+        state.local_main !== authoringBase || await this.readDurableCatchup()) return null;
+    const queue = await this.readQueue();
+    if (queue.pending_commit) return null;
+    const saved = await this.readStaleProvenance();
+    if (Object.keys(saved.obligations).length || saved.held_proposals.length || saved.rename_pairs.length ||
+        saved.queued_replacement || saved.intent && !["merged", "noop"].includes(saved.intent.outcome)) return null;
+    if (!(await exists(this.fsp, this.directoryStatePath))) return null;
+    const directories = await this.readDirectoryState();
+    if (directories.pending_intents.length || directories.explicit_empty_dirs.some((p) => !explicitDirectories.includes(p))) return null;
+    if ((await this.readTreePathOid(authoringBase, ".gitignore") ?? null) !== targetPolicy.oid ||
+        (await this.readRootIgnorePolicy()).oid !== targetPolicy.oid) return null;
+    const paths = await this.changedTreePaths(authoringBase, targetMain);
+    if (!paths.length || paths.length > HINTED_CAPTURE_MAX_PATHS || paths.includes(".gitignore") ||
+        new Set(paths.map((p) => p.toLowerCase())).size !== paths.length) return null;
+    const ancestors = [...new Set(paths.flatMap(directoryPrefixes))].sort();
+    const files = [];
+    for (const filePath of paths) {
+      if (!isRecoverableApplyPath(filePath) || targetPolicy.policy.ignores(filePath)) return null;
+      const before = await this.readTreePathEntry(authoringBase, filePath);
+      const after = await this.readTreePathEntry(targetMain, filePath);
+      if (!before.ancestorsAreTrees || !after.ancestorsAreTrees || before.caseVariant || after.caseVariant ||
+          before.entry?.type === "tree" || after.entry?.type === "tree") return null;
+      const stat = await this.adapter.stat(filePath);
+      if (stat && stat.type !== "file") return null;
+      if (stat) files.push(filePath);
+    }
+    for (const dirPath of ancestors) {
+      if (!isSyncableVaultPath(dirPath) || targetPolicy.policy.ignores(dirPath, true) ||
+          directories.explicit_empty_dirs.includes(dirPath)) return null;
+      const target = await this.readTreePathEntry(targetMain, dirPath);
+      if (target.caseVariant || target.entry?.type !== "tree" ||
+          (await this.adapter.stat(dirPath))?.type !== "folder") return null;
+    }
+    return { paths, files, directories: ancestors };
+  }
+
   async preApplyAuthoringBase(state, targetMain) {
     const queue = await this.readQueue();
     const saved = await this.readStaleProvenance();
@@ -4890,7 +4938,8 @@ class ObtsObsidianClient {
     rebuild = false,
     catchupExpectedTree = null,
     catchupPreservedPaths = [],
-    catchupLegacyStrict = false
+    catchupLegacyStrict = false,
+    options = {}
   ) {
     await this.admitApplyRecovery();
     const pendingAck = await this.readPendingAppliedAcknowledgement();
@@ -4971,6 +5020,10 @@ class ObtsObsidianClient {
         await this.applyRefOnly(state, journal, eventSeq);
         return true;
       }
+      const scope = options.deltaApply && requireCleanVisibleState && !rebuild && !catchupExpectedTree &&
+        !consentBaselineBundleId && !preserveConsentLocalPaths && !confirmedDirectoryRecovery &&
+        extraAffectedPaths.length === 0 && compactedDirectoryIntents.length === 0 && !hasDirectoryWork
+        ? await this.deltaApplyScope(state, targetMain, authoringBase, targetPolicy, explicitDirectorySet) : null;
       const targetEntries = targetPolicy.entries;
       let consentBaselineFingerprints = new Map();
       if (consentBaselineBundleId) {
@@ -4982,8 +5035,8 @@ class ObtsObsidianClient {
       }
       const targetFiles = new Set(targetEntries.keys());
       const previousFiles = journal.authoring_base ? await this.listTreeFiles(journal.authoring_base) : [];
-      const localVaultInventory = await this.listLocalVaultInventory("");
-      journal.local_only_paths = this.localOnlyApplyPaths(targetPolicy, previousFiles, localVaultInventory);
+      const localVaultInventory = scope || await this.listLocalVaultInventory("");
+      journal.local_only_paths = scope ? [] : this.localOnlyApplyPaths(targetPolicy, previousFiles, localVaultInventory);
       journal.local_only_presence = Object.fromEntries(journal.local_only_paths.map((filePath) => [
         filePath, localVaultInventory.files.includes(filePath) || localVaultInventory.directories.includes(filePath)
       ]));
@@ -5114,12 +5167,12 @@ class ObtsObsidianClient {
         ...journal.affected_paths.filter((p) => !alreadyMaterialized.has(p)),
         ...(catchupExpectedTree ? journal.deferred_local_paths : []),
         ...compactedDirectoryIntents.map((intent) => intent.path),
-        ...[...targetMaterializedDirectories].filter((dir) => !preApplyDirectories.has(dir))
+        ...[...(scope ? scope.directories : targetMaterializedDirectories)].filter((dir) => !preApplyDirectories.has(dir))
       ])].sort();
       await writeJson(this.fsp, this.applyJournalPath, journal);
       await this.retainApplyProvenance(journal);
 
-      if (!(await this.validateApplyJournalPolicy(journal))) {
+      if (!(await this.validateApplyJournalPolicy(journal, scope))) {
         await this.block("target_policy_changed", "The pinned target policy or retained local-only paths changed before apply.");
       }
       if (affectedPaths.length > 0) {
@@ -5204,19 +5257,19 @@ class ObtsObsidianClient {
           return false;
         }
       }
-      if (!(await this.validateApplyJournalPolicy(journal))) {
+      if (!(await this.validateApplyJournalPolicy(journal, scope))) {
         await this.block("target_policy_changed", "The pinned target policy or retained local-only paths changed before writing.");
       }
       journal.phase = "writing_files";
       await writeJson(this.fsp, this.applyJournalPath, journal);
-      await this.writeTargetFilesFromJournal(journal, targetEntries, alreadyMaterialized);
+      await this.writeTargetFilesFromJournal(journal, targetEntries, alreadyMaterialized, journal.target_file_sizes, scope);
       const confirmedDirectoryCtimes = confirmedDirectoryRecovery
         ? Object.fromEntries(confirmedDirectoryRecovery.inventory.directories.map((entry) => [entry.path, entry.creation_time]))
         : journal.pre_apply_directory_ctimes;
       const removableDirectories = confirmedDirectoryRecovery
         ? new Set(confirmedDirectoryRecovery.inventory.directories.map((entry) => entry.path))
         : preApplyDirectories;
-      const residualTombstoneDirectories = await this.applyDirectoryChanges(
+      const residualTombstoneDirectories = scope ? new Set() : await this.applyDirectoryChanges(
         compactedDirectoryIntents,
         explicitDirectorySet,
         preApplyDirectories,
@@ -5243,7 +5296,11 @@ class ObtsObsidianClient {
       await this.flushEditorBuffersToDisk();
       const capturedChangeSeq = (await this.readQueue()).change_seq || 0;
       let localScanPending = false;
-      const shouldCapturePreservedChanges = requireCleanVisibleState || journal.deferred_local_paths.length > 0;
+      // Recheck after flushing editor buffers. Any changed/deferred path uses
+      // the existing full preservation path with its complete snapshot.
+      const scopedClean = scope && journal.deferred_local_paths.length === 0 &&
+        (await this.affectedApplyPathsNotMatchingTarget(journal, targetEntries)).length === 0;
+      const shouldCapturePreservedChanges = !scopedClean && (requireCleanVisibleState || journal.deferred_local_paths.length > 0);
       const preserved = shouldCapturePreservedChanges
         ? await this.captureStableLocalChanges(targetEntries)
         : { paths: [], snapshot: null, stable: true, changedPath: null };
@@ -5268,7 +5325,7 @@ class ObtsObsidianClient {
           localScanPending = true;
         }
       }
-      if (requireCleanVisibleState) {
+      if (requireCleanVisibleState && !scopedClean) {
         preservedDirectoryIntents = await this.preserveDirectoryChangesFromTarget(
           targetEntries,
           explicitDirectorySet,
@@ -5279,7 +5336,7 @@ class ObtsObsidianClient {
       const queueAfterCapture = await this.readQueue();
       localScanPending = localScanPending || queueAfterCapture.change_seq !== capturedChangeSeq ||
         queueAfterCapture.changed_paths.length > 0;
-      if (!(await this.validateApplyJournalPolicy(journal))) {
+      if (!(await this.validateApplyJournalPolicy(journal, scope))) {
         await this.block("target_policy_changed", "Retained local-only content changed during apply.");
       }
       await this.updateRef("refs/heads/main", targetMain, null, true);
@@ -5311,6 +5368,7 @@ class ObtsObsidianClient {
       }
       await this.writePendingAppliedAcknowledgement(targetMain, eventSeq || 0);
       await this.clearApplyState();
+      if (scopedClean) await this.advanceScanStateHead(state.local_head, targetMain, journal.affected_paths);
       return true;
     } finally {
       this.plugin.isApplying = false;
@@ -6654,8 +6712,8 @@ class ObtsObsidianClient {
     return { matches: divergedPaths.length === 0, targetMatchedPaths, divergedPaths };
   }
 
-  async writeTargetFilesFromJournal(journal, targetEntries, targetMatchedPaths, targetFileSizes = journal.target_file_sizes || {}) {
-    if (journal.journal_version >= 5 && !(await this.validateApplyJournalPolicy(journal))) {
+  async writeTargetFilesFromJournal(journal, targetEntries, targetMatchedPaths, targetFileSizes = journal.target_file_sizes || {}, scope = null) {
+    if (journal.journal_version >= 5 && !(await this.validateApplyJournalPolicy(journal, scope))) {
       throw new ObtsBlockedError("target_policy_changed", "The pinned target policy or retained local-only paths changed.");
     }
     const activePathMutations = [];
@@ -6878,6 +6936,7 @@ class ObtsObsidianClient {
       return { required: true, mode: "full" };
     }
     await this.retireElapsedEmptyHorizons();
+    await this.retireElapsedCleanFileHorizons();
     const lastInventoryAt = Date.parse(scanState.last_inventory_completed_at || "");
     const nextFullAuditAt = Date.parse(scanState.next_full_audit_at || "");
     const lastFullAuditAt = Date.parse(scanState.last_full_audit_completed_at || "");
@@ -6899,9 +6958,8 @@ class ObtsObsidianClient {
     return { required: false, mode: "none" };
   }
 
-  // Horizons end, and settled obligations retire, only inside a scan. An idle
-  // device must run that scan once a horizon elapses; otherwise the next edit
-  // still sees the old horizon and is proposed against its superseded base.
+  // Unsettled horizons still require classification after expiry. Clean,
+  // file-only horizons can retire through the same drain barrier below.
   async hasElapsedStaleHorizon() {
     let saved;
     try { saved = await this.readStaleProvenance(); } catch { return false; }
@@ -6911,7 +6969,7 @@ class ObtsObsidianClient {
 
   // A horizon that touched no path guards no capture, so ending it needs no
   // drain and no inventory; scanning the whole vault for it would make every
-  // own push cost O(vault). Horizons with paths still end inside a scan.
+  // own push cost O(vault). Nonempty horizons need a post-expiry drain.
   async retireElapsedEmptyHorizons() {
     // Any failure leaves the horizon, so the decision falls back to the
     // ordinary scan, which reports the underlying problem.
@@ -6927,6 +6985,61 @@ class ObtsObsidianClient {
       });
     } catch {
       return;
+    }
+  }
+
+  // Same elapsed-time/drain barrier as classifyStaleSnapshot. File-only
+  // horizons with canonical bytes need no stale proposal; all other cases
+  // retain their evidence for the ordinary classification scan.
+  async retireElapsedCleanFileHorizons() {
+    if (!this.fullInventoryCurrent()) return;
+    try {
+      const saved = await this.readStaleProvenance();
+      const now = Date.now();
+      const expiring = saved.horizons.filter((h) => h.expiry <= now && h.touched.length > 0);
+      const settled = (p) => !Object.keys(p.obligations).length && !p.rename_pairs.length &&
+        !p.held_proposals.length && !p.queued_replacement && (!p.intent || ["merged", "noop"].includes(p.intent.outcome));
+      if (!expiring.length || !settled(saved)) return;
+      const paths = [...new Set(expiring.flatMap((h) => h.touched))];
+      if (paths.length > HINTED_CAPTURE_MAX_PATHS || paths.includes(".gitignore") ||
+          await readApplyJournalStrict(this.fsp, this.applyJournalPath)) return;
+      const state = await this.readState();
+      const directoryState = await this.readDirectoryState();
+      if (!state.local_main || state.local_head !== state.local_main || state.last_error_code ||
+          (await this.readQueue()).pending_commit || directoryState.pending_intents.length) return;
+      const ancestors = [...new Set(paths.flatMap(directoryPrefixes))];
+      await this.flushEditorBuffersToDisk();
+      await this.pathMutationGate.withExclusive([...paths, ...ancestors], async (raw) => {
+        await Promise.resolve(this.adapter.promise);
+        for (const filePath of paths) {
+          const target = await this.readTreePathEntry(state.local_main, filePath);
+          if (!target.ancestorsAreTrees || target.caseVariant || target.entry?.type === "tree") return;
+          if (!target.entry) {
+            const covering = expiring.filter((h) => h.touched.includes(filePath));
+            for (const h of covering) {
+              if ((await this.readTreePathEntry(h.base, filePath)).entry?.type !== "blob") return;
+            }
+          }
+          const { fingerprint } = await this.readRecoveryFileSnapshot(filePath, undefined, raw);
+          if (!this.fingerprintMatchesTarget(fingerprint, target.entry?.oid)) return;
+        }
+        // A recreated folder may still contain canonical files but needs a
+        // stale directory intent. Let reconciliation classify that case.
+        for (const dirPath of ancestors) {
+          const expected = directoryState.observed_directory_ctimes[dirPath];
+          if (!(expected > 0) || await this.adapterDirectoryCreationTime(dirPath, raw) !== expected) return;
+        }
+        if ((await this.readState()).local_head !== state.local_head ||
+            (await this.readDirectoryState()).pending_intents.length) return;
+        await this.mutateStaleProvenance(async (current) => {
+          if (!settled(current)) return;
+          current.horizons = current.horizons.filter((h) => !expiring.some((e) =>
+            e.apply_id === h.apply_id && e.base === h.base && e.expiry === h.expiry &&
+            sameStringArray(e.touched, h.touched)));
+        });
+      });
+    } catch {
+      // Failed inspection never retires evidence; ordinary scanning reports it.
     }
   }
 
@@ -7017,10 +7130,10 @@ class ObtsObsidianClient {
     this.lastSnapshotWasFullAudit = false;
   }
 
-  // A hinted capture or a ref-only apply moves local_head without changing any
-  // visible path outside its own footprint, so the last inventory still
-  // describes the vault. Only the exact head that inventory recorded advances.
-  async advanceScanStateHead(fromHead, toHead) {
+  // Only advance the head recorded by the last inventory. Invalidate entries
+  // changed by apply before publishing the head, including possible oid/mtime
+  // ABA matches; untouched entries and the inventory deadline stay valid.
+  async advanceScanStateHead(fromHead, toHead, touchedPaths = []) {
     const [state, directoryState, scanState] = await Promise.all([
       this.readState(),
       this.readDirectoryState(),
@@ -7032,14 +7145,21 @@ class ObtsObsidianClient {
       scanState.local_head !== fromHead || scanState.directory_generation !== directoryState.next_generation ||
       state.local_head !== toHead
     ) return;
+    if (touchedPaths.length) {
+      const cache = await readJson(this.fsp, this.scanCachePath, null);
+      if (cache?.entries) {
+        for (const filePath of touchedPaths) delete cache.entries[filePath];
+        await writeJson(this.fsp, this.scanCachePath, cache);
+      }
+    }
     await writeJson(this.fsp, this.scanStatePath, Object.assign({}, scanState, { local_head: toHead }));
   }
 
   // OBTS-SYNC-DELTA-001 ordinary capture: read only the durable watcher hints.
   // Returns null whenever the hints alone cannot show what a whole-vault
   // inventory would capture; the caller then runs that inventory instead.
-  // Deletions, folders, new directories, renames, policy changes and any
-  // pending stale or directory evidence all take the inventory path.
+  // Local deletions, folders, new directories, renames, policy changes and
+  // pending stale or directory obligations all take the inventory path.
   async captureHintedLocalChanges(queue, flushedPaths = []) {
     const hints = [...new Set([...(queue.changed_paths || []),
       ...(Array.isArray(flushedPaths) ? flushedPaths : []).map((filePath) => normalizePath(filePath))])].sort();
@@ -7058,8 +7178,9 @@ class ObtsObsidianClient {
       return null;
     }
     const saved = await this.readStaleProvenance();
-    // Horizons that touched no path cannot claim a captured file.
-    if (saved.horizons.some((h) => h.touched.length > 0) || Object.keys(saved.obligations).length > 0 || saved.rename_pairs.length > 0 ||
+    // A live horizon can only claim a differing path. Matching apply-generated
+    // watcher hints are no-ops; differing overlaps use full stale classification.
+    if (Object.keys(saved.obligations).length > 0 || saved.rename_pairs.length > 0 ||
         saved.held_proposals.length > 0 || saved.queued_replacement ||
         (saved.intent && !["merged", "noop"].includes(saved.intent.outcome))) return null;
     const directoryState = await this.readDirectoryState();
@@ -7072,7 +7193,7 @@ class ObtsObsidianClient {
     for (const filePath of hints) {
       // The inventory never descends into unsyncable folders and records
       // explicit empty folders separately; leave those cases to it.
-      if (!isSyncableVaultPath(filePath) || directoryPrefixes(filePath).some((dirPath) =>
+      if (!isSyncableVaultPath(filePath) || explicitEmptyDirs.has(filePath) || directoryPrefixes(filePath).some((dirPath) =>
         !isSyncableVaultPath(dirPath) || explicitEmptyDirs.has(dirPath))) return null;
       const located = await this.readTreePathEntry(base, filePath);
       // A case variant may be the same file on a case-insensitive disk.
@@ -7086,6 +7207,12 @@ class ObtsObsidianClient {
         stat = await this.adapter.stat(filePath);
       } catch {
         return null;
+      }
+      if (!stat && !located.entry) {
+        // A remote file deletion can echo through the watcher. Only a proven
+        // old file (never a directory) is an empty capture here.
+        const horizon = saved.horizons.find((h) => h.touched.includes(filePath));
+        if (horizon && (await this.readTreePathEntry(horizon.base, filePath)).entry?.type === "blob") continue;
       }
       if (!stat || stat.type !== "file") return null;
       if (located.entry) baseEntries.set(filePath, { mode: located.entry.mode, path: filePath, oid: located.entry.oid, type: "blob" });
@@ -7108,6 +7235,10 @@ class ObtsObsidianClient {
     if ((await this.readRootIgnorePolicy()).oid !== rootPolicy.oid) {
       this.plugin.syncQueued = true;
       throw new ObtsBlockedError("local_snapshot_changed", "Root .gitignore changed during capture. Sync will retry.");
+    }
+    for (const [filePath, value] of snapshot.entries) {
+      if (value.entry.oid !== baseEntries.get(filePath)?.oid && saved.horizons.some((h) =>
+        h.touched.some((p) => changedPathsConflict(p, filePath)))) return null;
     }
     const baseTree = await this.readCommitTreeOid(base);
     const tree = await this.writeTreeWithChanges(baseTree,
@@ -10501,7 +10632,7 @@ class ObtsObsidianClient {
     await this.refreshDirectoryStateFromDisk([]);
   }
 
-  async clearAcknowledgedDirectoryIntents(acknowledgedIntents) {
+  async clearAcknowledgedDirectoryIntents(acknowledgedIntents, deferReconcile = false) {
     const acknowledgedKeys = new Set((Array.isArray(acknowledgedIntents) ? acknowledgedIntents : [])
       .filter((intent) => intent && typeof intent.intent_id === "string" && Number.isSafeInteger(intent.generation))
       .map(directoryIntentGenerationKey));
@@ -10509,8 +10640,10 @@ class ObtsObsidianClient {
     // records folder changes before a later apply refreshes directory state.
     // While this session's inventory is current, any such change has left a
     // watcher hint, durable or still in memory; without one the walk is a no-op.
-    if (acknowledgedKeys.size === 0 && this.fullInventoryCurrent() && !this.plugin.syncQueued &&
-        (await this.readQueue()).changed_paths.length === 0) return;
+    // Background apply leaves outside-footprint work for the next capture,
+    // including folder hints. With no acknowledgement, nothing needs clearing.
+    if (acknowledgedKeys.size === 0 && this.fullInventoryCurrent() && (deferReconcile ||
+        !this.plugin.syncQueued && (await this.readQueue()).changed_paths.length === 0)) return;
     await this.reconcileDirectoryState();
     const directoryState = await this.readDirectoryState();
     const remaining = directoryState.pending_intents.filter((intent) => !acknowledgedKeys.has(directoryIntentGenerationKey(intent)));

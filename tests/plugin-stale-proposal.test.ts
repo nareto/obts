@@ -1424,6 +1424,9 @@ describe('idle settlement of elapsed stale provenance', () => {
     await f.core.pullAndApply(true);
     await f.core.recordScanCompleted(false);
     expect(await f.core.backgroundScanDecision()).toEqual({ required: false, mode: 'none' });
+    // Clean file horizons now settle without a scan. Leave a stale save that
+    // requires classification so this still checks conflict-review admission.
+    await f.core.adapter.write('note.md', BASE.replace('first', 'stale buffer first'));
     await markHorizonsExpired(f.core);
     expect(await f.core.backgroundScanDecision()).toEqual({ required: true, mode: 'incremental' });
     await f.core.writeState({ ...(await f.plugin.readState()), last_error_code: 'conflict_review_required' });

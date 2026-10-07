@@ -42,9 +42,9 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 ));
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
-// ../../node_modules/base64-js/index.js
+// node_modules/base64-js/index.js
 var require_base64_js = __commonJS({
-  "../../node_modules/base64-js/index.js"(exports2) {
+  "node_modules/base64-js/index.js"(exports2) {
     "use strict";
     exports2.byteLength = byteLength;
     exports2.toByteArray = toByteArray;
@@ -143,9 +143,9 @@ var require_base64_js = __commonJS({
   }
 });
 
-// ../../node_modules/ieee754/index.js
+// node_modules/ieee754/index.js
 var require_ieee754 = __commonJS({
-  "../../node_modules/ieee754/index.js"(exports2) {
+  "node_modules/ieee754/index.js"(exports2) {
     exports2.read = function(buffer, offset, isLE, mLen, nBytes) {
       var e, m;
       var eLen = nBytes * 8 - mLen - 1;
@@ -226,9 +226,9 @@ var require_ieee754 = __commonJS({
   }
 });
 
-// ../../node_modules/buffer/index.js
+// node_modules/buffer/index.js
 var require_buffer = __commonJS({
-  "../../node_modules/buffer/index.js"(exports2) {
+  "node_modules/buffer/index.js"(exports2) {
     "use strict";
     var base64 = require_base64_js();
     var ieee754 = require_ieee754();
@@ -2096,9 +2096,9 @@ var require_git_object_cache = __commonJS({
   }
 });
 
-// ../../node_modules/async-lock/lib/index.js
+// node_modules/async-lock/lib/index.js
 var require_lib = __commonJS({
-  "../../node_modules/async-lock/lib/index.js"(exports2, module2) {
+  "node_modules/async-lock/lib/index.js"(exports2, module2) {
     "use strict";
     var AsyncLock2 = function(opts) {
       opts = opts || {};
@@ -2321,17 +2321,17 @@ var require_lib = __commonJS({
   }
 });
 
-// ../../node_modules/async-lock/index.js
+// node_modules/async-lock/index.js
 var require_async_lock = __commonJS({
-  "../../node_modules/async-lock/index.js"(exports2, module2) {
+  "node_modules/async-lock/index.js"(exports2, module2) {
     "use strict";
     module2.exports = require_lib();
   }
 });
 
-// ../../node_modules/inherits/inherits_browser.js
+// node_modules/inherits/inherits_browser.js
 var require_inherits_browser = __commonJS({
-  "../../node_modules/inherits/inherits_browser.js"(exports2, module2) {
+  "node_modules/inherits/inherits_browser.js"(exports2, module2) {
     if (typeof Object.create === "function") {
       module2.exports = function inherits(ctor, superCtor) {
         if (superCtor) {
@@ -2361,9 +2361,9 @@ var require_inherits_browser = __commonJS({
   }
 });
 
-// ../../node_modules/safe-buffer/index.js
+// node_modules/safe-buffer/index.js
 var require_safe_buffer = __commonJS({
-  "../../node_modules/safe-buffer/index.js"(exports2, module2) {
+  "node_modules/safe-buffer/index.js"(exports2, module2) {
     var buffer = require_buffer();
     var Buffer3 = buffer.Buffer;
     function copyProps(src, dst) {
@@ -2419,9 +2419,9 @@ var require_safe_buffer = __commonJS({
   }
 });
 
-// ../../node_modules/isarray/index.js
+// node_modules/isarray/index.js
 var require_isarray = __commonJS({
-  "../../node_modules/isarray/index.js"(exports2, module2) {
+  "node_modules/isarray/index.js"(exports2, module2) {
     var toString = {}.toString;
     module2.exports = Array.isArray || function(arr) {
       return toString.call(arr) == "[object Array]";
@@ -2429,121 +2429,121 @@ var require_isarray = __commonJS({
   }
 });
 
-// ../../node_modules/es-errors/type.js
+// node_modules/es-errors/type.js
 var require_type = __commonJS({
-  "../../node_modules/es-errors/type.js"(exports2, module2) {
+  "node_modules/es-errors/type.js"(exports2, module2) {
     "use strict";
     module2.exports = TypeError;
   }
 });
 
-// ../../node_modules/es-object-atoms/index.js
+// node_modules/es-object-atoms/index.js
 var require_es_object_atoms = __commonJS({
-  "../../node_modules/es-object-atoms/index.js"(exports2, module2) {
+  "node_modules/es-object-atoms/index.js"(exports2, module2) {
     "use strict";
     module2.exports = Object;
   }
 });
 
-// ../../node_modules/es-errors/index.js
+// node_modules/es-errors/index.js
 var require_es_errors = __commonJS({
-  "../../node_modules/es-errors/index.js"(exports2, module2) {
+  "node_modules/es-errors/index.js"(exports2, module2) {
     "use strict";
     module2.exports = Error;
   }
 });
 
-// ../../node_modules/es-errors/eval.js
+// node_modules/es-errors/eval.js
 var require_eval = __commonJS({
-  "../../node_modules/es-errors/eval.js"(exports2, module2) {
+  "node_modules/es-errors/eval.js"(exports2, module2) {
     "use strict";
     module2.exports = EvalError;
   }
 });
 
-// ../../node_modules/es-errors/range.js
+// node_modules/es-errors/range.js
 var require_range = __commonJS({
-  "../../node_modules/es-errors/range.js"(exports2, module2) {
+  "node_modules/es-errors/range.js"(exports2, module2) {
     "use strict";
     module2.exports = RangeError;
   }
 });
 
-// ../../node_modules/es-errors/ref.js
+// node_modules/es-errors/ref.js
 var require_ref = __commonJS({
-  "../../node_modules/es-errors/ref.js"(exports2, module2) {
+  "node_modules/es-errors/ref.js"(exports2, module2) {
     "use strict";
     module2.exports = ReferenceError;
   }
 });
 
-// ../../node_modules/es-errors/syntax.js
+// node_modules/es-errors/syntax.js
 var require_syntax = __commonJS({
-  "../../node_modules/es-errors/syntax.js"(exports2, module2) {
+  "node_modules/es-errors/syntax.js"(exports2, module2) {
     "use strict";
     module2.exports = SyntaxError;
   }
 });
 
-// ../../node_modules/es-errors/uri.js
+// node_modules/es-errors/uri.js
 var require_uri = __commonJS({
-  "../../node_modules/es-errors/uri.js"(exports2, module2) {
+  "node_modules/es-errors/uri.js"(exports2, module2) {
     "use strict";
     module2.exports = URIError;
   }
 });
 
-// ../../node_modules/math-intrinsics/abs.js
+// node_modules/math-intrinsics/abs.js
 var require_abs = __commonJS({
-  "../../node_modules/math-intrinsics/abs.js"(exports2, module2) {
+  "node_modules/math-intrinsics/abs.js"(exports2, module2) {
     "use strict";
     module2.exports = Math.abs;
   }
 });
 
-// ../../node_modules/math-intrinsics/floor.js
+// node_modules/math-intrinsics/floor.js
 var require_floor = __commonJS({
-  "../../node_modules/math-intrinsics/floor.js"(exports2, module2) {
+  "node_modules/math-intrinsics/floor.js"(exports2, module2) {
     "use strict";
     module2.exports = Math.floor;
   }
 });
 
-// ../../node_modules/math-intrinsics/max.js
+// node_modules/math-intrinsics/max.js
 var require_max = __commonJS({
-  "../../node_modules/math-intrinsics/max.js"(exports2, module2) {
+  "node_modules/math-intrinsics/max.js"(exports2, module2) {
     "use strict";
     module2.exports = Math.max;
   }
 });
 
-// ../../node_modules/math-intrinsics/min.js
+// node_modules/math-intrinsics/min.js
 var require_min = __commonJS({
-  "../../node_modules/math-intrinsics/min.js"(exports2, module2) {
+  "node_modules/math-intrinsics/min.js"(exports2, module2) {
     "use strict";
     module2.exports = Math.min;
   }
 });
 
-// ../../node_modules/math-intrinsics/pow.js
+// node_modules/math-intrinsics/pow.js
 var require_pow = __commonJS({
-  "../../node_modules/math-intrinsics/pow.js"(exports2, module2) {
+  "node_modules/math-intrinsics/pow.js"(exports2, module2) {
     "use strict";
     module2.exports = Math.pow;
   }
 });
 
-// ../../node_modules/math-intrinsics/round.js
+// node_modules/math-intrinsics/round.js
 var require_round = __commonJS({
-  "../../node_modules/math-intrinsics/round.js"(exports2, module2) {
+  "node_modules/math-intrinsics/round.js"(exports2, module2) {
     "use strict";
     module2.exports = Math.round;
   }
 });
 
-// ../../node_modules/math-intrinsics/isNaN.js
+// node_modules/math-intrinsics/isNaN.js
 var require_isNaN = __commonJS({
-  "../../node_modules/math-intrinsics/isNaN.js"(exports2, module2) {
+  "node_modules/math-intrinsics/isNaN.js"(exports2, module2) {
     "use strict";
     module2.exports = Number.isNaN || function isNaN2(a) {
       return a !== a;
@@ -2551,9 +2551,9 @@ var require_isNaN = __commonJS({
   }
 });
 
-// ../../node_modules/math-intrinsics/sign.js
+// node_modules/math-intrinsics/sign.js
 var require_sign = __commonJS({
-  "../../node_modules/math-intrinsics/sign.js"(exports2, module2) {
+  "node_modules/math-intrinsics/sign.js"(exports2, module2) {
     "use strict";
     var $isNaN = require_isNaN();
     module2.exports = function sign(number) {
@@ -2565,17 +2565,17 @@ var require_sign = __commonJS({
   }
 });
 
-// ../../node_modules/gopd/gOPD.js
+// node_modules/gopd/gOPD.js
 var require_gOPD = __commonJS({
-  "../../node_modules/gopd/gOPD.js"(exports2, module2) {
+  "node_modules/gopd/gOPD.js"(exports2, module2) {
     "use strict";
     module2.exports = Object.getOwnPropertyDescriptor;
   }
 });
 
-// ../../node_modules/gopd/index.js
+// node_modules/gopd/index.js
 var require_gopd = __commonJS({
-  "../../node_modules/gopd/index.js"(exports2, module2) {
+  "node_modules/gopd/index.js"(exports2, module2) {
     "use strict";
     var $gOPD = require_gOPD();
     if ($gOPD) {
@@ -2589,9 +2589,9 @@ var require_gopd = __commonJS({
   }
 });
 
-// ../../node_modules/es-define-property/index.js
+// node_modules/es-define-property/index.js
 var require_es_define_property = __commonJS({
-  "../../node_modules/es-define-property/index.js"(exports2, module2) {
+  "node_modules/es-define-property/index.js"(exports2, module2) {
     "use strict";
     var $defineProperty = Object.defineProperty || false;
     if ($defineProperty) {
@@ -2605,9 +2605,9 @@ var require_es_define_property = __commonJS({
   }
 });
 
-// ../../node_modules/has-symbols/shams.js
+// node_modules/has-symbols/shams.js
 var require_shams = __commonJS({
-  "../../node_modules/has-symbols/shams.js"(exports2, module2) {
+  "node_modules/has-symbols/shams.js"(exports2, module2) {
     "use strict";
     module2.exports = function hasSymbols() {
       if (typeof Symbol !== "function" || typeof Object.getOwnPropertySymbols !== "function") {
@@ -2660,9 +2660,9 @@ var require_shams = __commonJS({
   }
 });
 
-// ../../node_modules/has-symbols/index.js
+// node_modules/has-symbols/index.js
 var require_has_symbols = __commonJS({
-  "../../node_modules/has-symbols/index.js"(exports2, module2) {
+  "node_modules/has-symbols/index.js"(exports2, module2) {
     "use strict";
     var origSymbol = typeof Symbol !== "undefined" && Symbol;
     var hasSymbolSham = require_shams();
@@ -2684,26 +2684,26 @@ var require_has_symbols = __commonJS({
   }
 });
 
-// ../../node_modules/get-proto/Reflect.getPrototypeOf.js
+// node_modules/get-proto/Reflect.getPrototypeOf.js
 var require_Reflect_getPrototypeOf = __commonJS({
-  "../../node_modules/get-proto/Reflect.getPrototypeOf.js"(exports2, module2) {
+  "node_modules/get-proto/Reflect.getPrototypeOf.js"(exports2, module2) {
     "use strict";
     module2.exports = typeof Reflect !== "undefined" && Reflect.getPrototypeOf || null;
   }
 });
 
-// ../../node_modules/get-proto/Object.getPrototypeOf.js
+// node_modules/get-proto/Object.getPrototypeOf.js
 var require_Object_getPrototypeOf = __commonJS({
-  "../../node_modules/get-proto/Object.getPrototypeOf.js"(exports2, module2) {
+  "node_modules/get-proto/Object.getPrototypeOf.js"(exports2, module2) {
     "use strict";
     var $Object = require_es_object_atoms();
     module2.exports = $Object.getPrototypeOf || null;
   }
 });
 
-// ../../node_modules/function-bind/implementation.js
+// node_modules/function-bind/implementation.js
 var require_implementation = __commonJS({
-  "../../node_modules/function-bind/implementation.js"(exports2, module2) {
+  "node_modules/function-bind/implementation.js"(exports2, module2) {
     "use strict";
     var ERROR_MESSAGE = "Function.prototype.bind called on incompatible ";
     var toStr = Object.prototype.toString;
@@ -2777,42 +2777,42 @@ var require_implementation = __commonJS({
   }
 });
 
-// ../../node_modules/function-bind/index.js
+// node_modules/function-bind/index.js
 var require_function_bind = __commonJS({
-  "../../node_modules/function-bind/index.js"(exports2, module2) {
+  "node_modules/function-bind/index.js"(exports2, module2) {
     "use strict";
     var implementation = require_implementation();
     module2.exports = Function.prototype.bind || implementation;
   }
 });
 
-// ../../node_modules/call-bind-apply-helpers/functionCall.js
+// node_modules/call-bind-apply-helpers/functionCall.js
 var require_functionCall = __commonJS({
-  "../../node_modules/call-bind-apply-helpers/functionCall.js"(exports2, module2) {
+  "node_modules/call-bind-apply-helpers/functionCall.js"(exports2, module2) {
     "use strict";
     module2.exports = Function.prototype.call;
   }
 });
 
-// ../../node_modules/call-bind-apply-helpers/functionApply.js
+// node_modules/call-bind-apply-helpers/functionApply.js
 var require_functionApply = __commonJS({
-  "../../node_modules/call-bind-apply-helpers/functionApply.js"(exports2, module2) {
+  "node_modules/call-bind-apply-helpers/functionApply.js"(exports2, module2) {
     "use strict";
     module2.exports = Function.prototype.apply;
   }
 });
 
-// ../../node_modules/call-bind-apply-helpers/reflectApply.js
+// node_modules/call-bind-apply-helpers/reflectApply.js
 var require_reflectApply = __commonJS({
-  "../../node_modules/call-bind-apply-helpers/reflectApply.js"(exports2, module2) {
+  "node_modules/call-bind-apply-helpers/reflectApply.js"(exports2, module2) {
     "use strict";
     module2.exports = typeof Reflect !== "undefined" && Reflect && Reflect.apply;
   }
 });
 
-// ../../node_modules/call-bind-apply-helpers/actualApply.js
+// node_modules/call-bind-apply-helpers/actualApply.js
 var require_actualApply = __commonJS({
-  "../../node_modules/call-bind-apply-helpers/actualApply.js"(exports2, module2) {
+  "node_modules/call-bind-apply-helpers/actualApply.js"(exports2, module2) {
     "use strict";
     var bind = require_function_bind();
     var $apply = require_functionApply();
@@ -2822,9 +2822,9 @@ var require_actualApply = __commonJS({
   }
 });
 
-// ../../node_modules/call-bind-apply-helpers/index.js
+// node_modules/call-bind-apply-helpers/index.js
 var require_call_bind_apply_helpers = __commonJS({
-  "../../node_modules/call-bind-apply-helpers/index.js"(exports2, module2) {
+  "node_modules/call-bind-apply-helpers/index.js"(exports2, module2) {
     "use strict";
     var bind = require_function_bind();
     var $TypeError = require_type();
@@ -2839,9 +2839,9 @@ var require_call_bind_apply_helpers = __commonJS({
   }
 });
 
-// ../../node_modules/dunder-proto/get.js
+// node_modules/dunder-proto/get.js
 var require_get = __commonJS({
-  "../../node_modules/dunder-proto/get.js"(exports2, module2) {
+  "node_modules/dunder-proto/get.js"(exports2, module2) {
     "use strict";
     var callBind = require_call_bind_apply_helpers();
     var gOPD = require_gopd();
@@ -2870,9 +2870,9 @@ var require_get = __commonJS({
   }
 });
 
-// ../../node_modules/get-proto/index.js
+// node_modules/get-proto/index.js
 var require_get_proto = __commonJS({
-  "../../node_modules/get-proto/index.js"(exports2, module2) {
+  "node_modules/get-proto/index.js"(exports2, module2) {
     "use strict";
     var reflectGetProto = require_Reflect_getPrototypeOf();
     var originalGetProto = require_Object_getPrototypeOf();
@@ -2890,9 +2890,9 @@ var require_get_proto = __commonJS({
   }
 });
 
-// ../../node_modules/hasown/index.js
+// node_modules/hasown/index.js
 var require_hasown = __commonJS({
-  "../../node_modules/hasown/index.js"(exports2, module2) {
+  "node_modules/hasown/index.js"(exports2, module2) {
     "use strict";
     var call = Function.prototype.call;
     var $hasOwn = Object.prototype.hasOwnProperty;
@@ -2901,9 +2901,9 @@ var require_hasown = __commonJS({
   }
 });
 
-// ../../node_modules/get-intrinsic/index.js
+// node_modules/get-intrinsic/index.js
 var require_get_intrinsic = __commonJS({
-  "../../node_modules/get-intrinsic/index.js"(exports2, module2) {
+  "node_modules/get-intrinsic/index.js"(exports2, module2) {
     "use strict";
     var undefined2;
     var $Object = require_es_object_atoms();
@@ -3232,9 +3232,9 @@ var require_get_intrinsic = __commonJS({
   }
 });
 
-// ../../node_modules/call-bound/index.js
+// node_modules/call-bound/index.js
 var require_call_bound = __commonJS({
-  "../../node_modules/call-bound/index.js"(exports2, module2) {
+  "node_modules/call-bound/index.js"(exports2, module2) {
     "use strict";
     var GetIntrinsic = require_get_intrinsic();
     var callBindBasic = require_call_bind_apply_helpers();
@@ -3255,9 +3255,9 @@ var require_call_bound = __commonJS({
   }
 });
 
-// ../../node_modules/is-callable/index.js
+// node_modules/is-callable/index.js
 var require_is_callable = __commonJS({
-  "../../node_modules/is-callable/index.js"(exports2, module2) {
+  "node_modules/is-callable/index.js"(exports2, module2) {
     "use strict";
     var fnToStr = Function.prototype.toString;
     var reflectApply = typeof Reflect === "object" && Reflect !== null && Reflect.apply;
@@ -3373,9 +3373,9 @@ var require_is_callable = __commonJS({
   }
 });
 
-// ../../node_modules/for-each/index.js
+// node_modules/for-each/index.js
 var require_for_each = __commonJS({
-  "../../node_modules/for-each/index.js"(exports2, module2) {
+  "node_modules/for-each/index.js"(exports2, module2) {
     "use strict";
     var isCallable = require_is_callable();
     var toStr = Object.prototype.toString;
@@ -3433,9 +3433,9 @@ var require_for_each = __commonJS({
   }
 });
 
-// ../../node_modules/possible-typed-array-names/index.js
+// node_modules/possible-typed-array-names/index.js
 var require_possible_typed_array_names = __commonJS({
-  "../../node_modules/possible-typed-array-names/index.js"(exports2, module2) {
+  "node_modules/possible-typed-array-names/index.js"(exports2, module2) {
     "use strict";
     module2.exports = [
       "Float16Array",
@@ -3454,9 +3454,9 @@ var require_possible_typed_array_names = __commonJS({
   }
 });
 
-// ../../node_modules/available-typed-arrays/index.js
+// node_modules/available-typed-arrays/index.js
 var require_available_typed_arrays = __commonJS({
-  "../../node_modules/available-typed-arrays/index.js"(exports2, module2) {
+  "node_modules/available-typed-arrays/index.js"(exports2, module2) {
     "use strict";
     var possibleNames = require_possible_typed_array_names();
     var g = typeof globalThis === "undefined" ? global : globalThis;
@@ -3472,9 +3472,9 @@ var require_available_typed_arrays = __commonJS({
   }
 });
 
-// ../../node_modules/define-data-property/index.js
+// node_modules/define-data-property/index.js
 var require_define_data_property = __commonJS({
-  "../../node_modules/define-data-property/index.js"(exports2, module2) {
+  "node_modules/define-data-property/index.js"(exports2, module2) {
     "use strict";
     var $defineProperty = require_es_define_property();
     var $SyntaxError = require_syntax();
@@ -3520,9 +3520,9 @@ var require_define_data_property = __commonJS({
   }
 });
 
-// ../../node_modules/has-property-descriptors/index.js
+// node_modules/has-property-descriptors/index.js
 var require_has_property_descriptors = __commonJS({
-  "../../node_modules/has-property-descriptors/index.js"(exports2, module2) {
+  "node_modules/has-property-descriptors/index.js"(exports2, module2) {
     "use strict";
     var $defineProperty = require_es_define_property();
     var hasPropertyDescriptors = function hasPropertyDescriptors2() {
@@ -3542,9 +3542,9 @@ var require_has_property_descriptors = __commonJS({
   }
 });
 
-// ../../node_modules/set-function-length/index.js
+// node_modules/set-function-length/index.js
 var require_set_function_length = __commonJS({
-  "../../node_modules/set-function-length/index.js"(exports2, module2) {
+  "node_modules/set-function-length/index.js"(exports2, module2) {
     "use strict";
     var GetIntrinsic = require_get_intrinsic();
     var define2 = require_define_data_property();
@@ -3595,9 +3595,9 @@ var require_set_function_length = __commonJS({
   }
 });
 
-// ../../node_modules/call-bind-apply-helpers/applyBind.js
+// node_modules/call-bind-apply-helpers/applyBind.js
 var require_applyBind = __commonJS({
-  "../../node_modules/call-bind-apply-helpers/applyBind.js"(exports2, module2) {
+  "node_modules/call-bind-apply-helpers/applyBind.js"(exports2, module2) {
     "use strict";
     var bind = require_function_bind();
     var $apply = require_functionApply();
@@ -3608,9 +3608,9 @@ var require_applyBind = __commonJS({
   }
 });
 
-// ../../node_modules/call-bind/index.js
+// node_modules/call-bind/index.js
 var require_call_bind = __commonJS({
-  "../../node_modules/call-bind/index.js"(exports2, module2) {
+  "node_modules/call-bind/index.js"(exports2, module2) {
     "use strict";
     var setFunctionLength = require_set_function_length();
     var $defineProperty = require_es_define_property();
@@ -3633,9 +3633,9 @@ var require_call_bind = __commonJS({
   }
 });
 
-// ../../node_modules/has-tostringtag/shams.js
+// node_modules/has-tostringtag/shams.js
 var require_shams2 = __commonJS({
-  "../../node_modules/has-tostringtag/shams.js"(exports2, module2) {
+  "node_modules/has-tostringtag/shams.js"(exports2, module2) {
     "use strict";
     var hasSymbols = require_shams();
     module2.exports = function hasToStringTagShams() {
@@ -3644,9 +3644,9 @@ var require_shams2 = __commonJS({
   }
 });
 
-// ../../node_modules/which-typed-array/index.js
+// node_modules/which-typed-array/index.js
 var require_which_typed_array = __commonJS({
-  "../../node_modules/which-typed-array/index.js"(exports2, module2) {
+  "node_modules/which-typed-array/index.js"(exports2, module2) {
     "use strict";
     var forEach = require_for_each();
     var availableTypedArrays = require_available_typed_arrays();
@@ -3768,9 +3768,9 @@ var require_which_typed_array = __commonJS({
   }
 });
 
-// ../../node_modules/is-typed-array/index.js
+// node_modules/is-typed-array/index.js
 var require_is_typed_array = __commonJS({
-  "../../node_modules/is-typed-array/index.js"(exports2, module2) {
+  "node_modules/is-typed-array/index.js"(exports2, module2) {
     "use strict";
     var whichTypedArray = require_which_typed_array();
     module2.exports = function isTypedArray(value) {
@@ -3779,9 +3779,9 @@ var require_is_typed_array = __commonJS({
   }
 });
 
-// ../../node_modules/typed-array-buffer/index.js
+// node_modules/typed-array-buffer/index.js
 var require_typed_array_buffer = __commonJS({
-  "../../node_modules/typed-array-buffer/index.js"(exports2, module2) {
+  "node_modules/typed-array-buffer/index.js"(exports2, module2) {
     "use strict";
     var $TypeError = require_type();
     var callBound = require_call_bound();
@@ -3796,9 +3796,9 @@ var require_typed_array_buffer = __commonJS({
   }
 });
 
-// ../../node_modules/to-buffer/index.js
+// node_modules/to-buffer/index.js
 var require_to_buffer = __commonJS({
-  "../../node_modules/to-buffer/index.js"(exports2, module2) {
+  "node_modules/to-buffer/index.js"(exports2, module2) {
     "use strict";
     var Buffer3 = require_safe_buffer().Buffer;
     var isArray = require_isarray();
@@ -3860,9 +3860,9 @@ var require_to_buffer = __commonJS({
   }
 });
 
-// ../../node_modules/sha.js/hash.js
+// node_modules/sha.js/hash.js
 var require_hash = __commonJS({
-  "../../node_modules/sha.js/hash.js"(exports2, module2) {
+  "node_modules/sha.js/hash.js"(exports2, module2) {
     "use strict";
     var Buffer3 = require_safe_buffer().Buffer;
     var toBuffer = require_to_buffer();
@@ -3921,9 +3921,9 @@ var require_hash = __commonJS({
   }
 });
 
-// ../../node_modules/sha.js/sha1.js
+// node_modules/sha.js/sha1.js
 var require_sha1 = __commonJS({
-  "../../node_modules/sha.js/sha1.js"(exports2, module2) {
+  "node_modules/sha.js/sha1.js"(exports2, module2) {
     "use strict";
     var inherits = require_inherits_browser();
     var Hash2 = require_hash();
@@ -4008,9 +4008,9 @@ var require_sha1 = __commonJS({
   }
 });
 
-// ../../node_modules/crc-32/crc32.js
+// node_modules/crc-32/crc32.js
 var require_crc32 = __commonJS({
-  "../../node_modules/crc-32/crc32.js"(exports2) {
+  "node_modules/crc-32/crc32.js"(exports2) {
     var CRC32;
     (function(factory) {
       if (typeof DO_NOT_EXPORT_CRC === "undefined") {
@@ -4106,9 +4106,9 @@ var require_crc32 = __commonJS({
   }
 });
 
-// ../../node_modules/pako/lib/utils/common.js
+// node_modules/pako/lib/utils/common.js
 var require_common = __commonJS({
-  "../../node_modules/pako/lib/utils/common.js"(exports2) {
+  "node_modules/pako/lib/utils/common.js"(exports2) {
     "use strict";
     var TYPED_OK = typeof Uint8Array !== "undefined" && typeof Uint16Array !== "undefined" && typeof Int32Array !== "undefined";
     function _has(obj, key) {
@@ -4197,9 +4197,9 @@ var require_common = __commonJS({
   }
 });
 
-// ../../node_modules/pako/lib/zlib/trees.js
+// node_modules/pako/lib/zlib/trees.js
 var require_trees = __commonJS({
-  "../../node_modules/pako/lib/zlib/trees.js"(exports2) {
+  "node_modules/pako/lib/zlib/trees.js"(exports2) {
     "use strict";
     var utils = require_common();
     var Z_FIXED = 4;
@@ -4839,9 +4839,9 @@ var require_trees = __commonJS({
   }
 });
 
-// ../../node_modules/pako/lib/zlib/adler32.js
+// node_modules/pako/lib/zlib/adler32.js
 var require_adler32 = __commonJS({
-  "../../node_modules/pako/lib/zlib/adler32.js"(exports2, module2) {
+  "node_modules/pako/lib/zlib/adler32.js"(exports2, module2) {
     "use strict";
     function adler32(adler, buf, len, pos) {
       var s1 = adler & 65535 | 0, s2 = adler >>> 16 & 65535 | 0, n = 0;
@@ -4861,9 +4861,9 @@ var require_adler32 = __commonJS({
   }
 });
 
-// ../../node_modules/pako/lib/zlib/crc32.js
+// node_modules/pako/lib/zlib/crc32.js
 var require_crc322 = __commonJS({
-  "../../node_modules/pako/lib/zlib/crc32.js"(exports2, module2) {
+  "node_modules/pako/lib/zlib/crc32.js"(exports2, module2) {
     "use strict";
     function makeTable() {
       var c, table = [];
@@ -4889,9 +4889,9 @@ var require_crc322 = __commonJS({
   }
 });
 
-// ../../node_modules/pako/lib/zlib/messages.js
+// node_modules/pako/lib/zlib/messages.js
 var require_messages = __commonJS({
-  "../../node_modules/pako/lib/zlib/messages.js"(exports2, module2) {
+  "node_modules/pako/lib/zlib/messages.js"(exports2, module2) {
     "use strict";
     module2.exports = {
       2: "need dictionary",
@@ -4916,9 +4916,9 @@ var require_messages = __commonJS({
   }
 });
 
-// ../../node_modules/pako/lib/zlib/deflate.js
+// node_modules/pako/lib/zlib/deflate.js
 var require_deflate = __commonJS({
-  "../../node_modules/pako/lib/zlib/deflate.js"(exports2) {
+  "node_modules/pako/lib/zlib/deflate.js"(exports2) {
     "use strict";
     var utils = require_common();
     var trees = require_trees();
@@ -5965,9 +5965,9 @@ var require_deflate = __commonJS({
   }
 });
 
-// ../../node_modules/pako/lib/utils/strings.js
+// node_modules/pako/lib/utils/strings.js
 var require_strings = __commonJS({
-  "../../node_modules/pako/lib/utils/strings.js"(exports2) {
+  "node_modules/pako/lib/utils/strings.js"(exports2) {
     "use strict";
     var utils = require_common();
     var STR_APPLY_OK = true;
@@ -6107,9 +6107,9 @@ var require_strings = __commonJS({
   }
 });
 
-// ../../node_modules/pako/lib/zlib/zstream.js
+// node_modules/pako/lib/zlib/zstream.js
 var require_zstream = __commonJS({
-  "../../node_modules/pako/lib/zlib/zstream.js"(exports2, module2) {
+  "node_modules/pako/lib/zlib/zstream.js"(exports2, module2) {
     "use strict";
     function ZStream() {
       this.input = null;
@@ -6129,9 +6129,9 @@ var require_zstream = __commonJS({
   }
 });
 
-// ../../node_modules/pako/lib/deflate.js
+// node_modules/pako/lib/deflate.js
 var require_deflate2 = __commonJS({
-  "../../node_modules/pako/lib/deflate.js"(exports2) {
+  "node_modules/pako/lib/deflate.js"(exports2) {
     "use strict";
     var zlib_deflate = require_deflate();
     var utils = require_common();
@@ -6290,9 +6290,9 @@ var require_deflate2 = __commonJS({
   }
 });
 
-// ../../node_modules/pako/lib/zlib/inffast.js
+// node_modules/pako/lib/zlib/inffast.js
 var require_inffast = __commonJS({
-  "../../node_modules/pako/lib/zlib/inffast.js"(exports2, module2) {
+  "node_modules/pako/lib/zlib/inffast.js"(exports2, module2) {
     "use strict";
     var BAD = 30;
     var TYPE = 12;
@@ -6519,9 +6519,9 @@ var require_inffast = __commonJS({
   }
 });
 
-// ../../node_modules/pako/lib/zlib/inftrees.js
+// node_modules/pako/lib/zlib/inftrees.js
 var require_inftrees = __commonJS({
-  "../../node_modules/pako/lib/zlib/inftrees.js"(exports2, module2) {
+  "node_modules/pako/lib/zlib/inftrees.js"(exports2, module2) {
     "use strict";
     var utils = require_common();
     var MAXBITS = 15;
@@ -6835,9 +6835,9 @@ var require_inftrees = __commonJS({
   }
 });
 
-// ../../node_modules/pako/lib/zlib/inflate.js
+// node_modules/pako/lib/zlib/inflate.js
 var require_inflate = __commonJS({
-  "../../node_modules/pako/lib/zlib/inflate.js"(exports2) {
+  "node_modules/pako/lib/zlib/inflate.js"(exports2) {
     "use strict";
     var utils = require_common();
     var adler32 = require_adler32();
@@ -8074,9 +8074,9 @@ var require_inflate = __commonJS({
   }
 });
 
-// ../../node_modules/pako/lib/zlib/constants.js
+// node_modules/pako/lib/zlib/constants.js
 var require_constants = __commonJS({
-  "../../node_modules/pako/lib/zlib/constants.js"(exports2, module2) {
+  "node_modules/pako/lib/zlib/constants.js"(exports2, module2) {
     "use strict";
     module2.exports = {
       /* Allowed flush values; see deflate() and inflate() below for details */
@@ -8121,9 +8121,9 @@ var require_constants = __commonJS({
   }
 });
 
-// ../../node_modules/pako/lib/zlib/gzheader.js
+// node_modules/pako/lib/zlib/gzheader.js
 var require_gzheader = __commonJS({
-  "../../node_modules/pako/lib/zlib/gzheader.js"(exports2, module2) {
+  "node_modules/pako/lib/zlib/gzheader.js"(exports2, module2) {
     "use strict";
     function GZheader() {
       this.text = 0;
@@ -8141,9 +8141,9 @@ var require_gzheader = __commonJS({
   }
 });
 
-// ../../node_modules/pako/lib/inflate.js
+// node_modules/pako/lib/inflate.js
 var require_inflate2 = __commonJS({
-  "../../node_modules/pako/lib/inflate.js"(exports2) {
+  "node_modules/pako/lib/inflate.js"(exports2) {
     "use strict";
     var zlib_inflate = require_inflate();
     var utils = require_common();
@@ -8315,9 +8315,9 @@ var require_inflate2 = __commonJS({
   }
 });
 
-// ../../node_modules/pako/index.js
+// node_modules/pako/index.js
 var require_pako = __commonJS({
-  "../../node_modules/pako/index.js"(exports2, module2) {
+  "node_modules/pako/index.js"(exports2, module2) {
     "use strict";
     var assign = require_common().assign;
     var deflate2 = require_deflate2();
@@ -8329,9 +8329,9 @@ var require_pako = __commonJS({
   }
 });
 
-// ../../node_modules/pify/index.js
+// node_modules/pify/index.js
 var require_pify = __commonJS({
-  "../../node_modules/pify/index.js"(exports2, module2) {
+  "node_modules/pify/index.js"(exports2, module2) {
     "use strict";
     var processFn = (fn, options) => function(...args) {
       const P = options.promiseModule;
@@ -8394,9 +8394,9 @@ var require_pify = __commonJS({
   }
 });
 
-// ../../node_modules/ignore/index.js
+// node_modules/ignore/index.js
 var require_ignore = __commonJS({
-  "../../node_modules/ignore/index.js"(exports2, module2) {
+  "node_modules/ignore/index.js"(exports2, module2) {
     function makeArray(subject) {
       return Array.isArray(subject) ? subject : [subject];
     }
@@ -8781,9 +8781,9 @@ var require_ignore = __commonJS({
   }
 });
 
-// ../../node_modules/clean-git-ref/lib/index.js
+// node_modules/clean-git-ref/lib/index.js
 var require_lib2 = __commonJS({
-  "../../node_modules/clean-git-ref/lib/index.js"(exports2, module2) {
+  "node_modules/clean-git-ref/lib/index.js"(exports2, module2) {
     "use strict";
     function escapeRegExp(string) {
       return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -8814,9 +8814,9 @@ var require_lib2 = __commonJS({
   }
 });
 
-// ../../node_modules/diff3/onp.js
+// node_modules/diff3/onp.js
 var require_onp = __commonJS({
-  "../../node_modules/diff3/onp.js"(exports2, module2) {
+  "node_modules/diff3/onp.js"(exports2, module2) {
     module2.exports = function(a_, b_) {
       var a = a_, b = b_, m = a.length, n = b.length, reverse = false, ed = null, offset = m + 1, path2 = [], pathposi = [], ses = [], lcs = "", SES_DELETE = -1, SES_COMMON = 0, SES_ADD = 1;
       var tmp1, tmp2;
@@ -8943,9 +8943,9 @@ var require_onp = __commonJS({
   }
 });
 
-// ../../node_modules/diff3/diff3.js
+// node_modules/diff3/diff3.js
 var require_diff3 = __commonJS({
-  "../../node_modules/diff3/diff3.js"(exports2, module2) {
+  "node_modules/diff3/diff3.js"(exports2, module2) {
     var onp = require_onp();
     function longestCommonSubsequence(file1, file2) {
       var diff = new onp(file1, file2);
@@ -9145,7 +9145,7 @@ var require_diff3 = __commonJS({
   }
 });
 
-// ../../node_modules/isomorphic-git/index.js
+// node_modules/isomorphic-git/index.js
 var isomorphic_git_exports = {};
 __export(isomorphic_git_exports, {
   Errors: () => Errors,
@@ -16804,7 +16804,7 @@ async function writeTree({ fs, dir, gitdir = join(dir, ".git"), tree }) {
 }
 var import_async_lock, import_sha1, import_crc_32, import_pako, import_pify, import_ignore, import_clean_git_ref, import_diff3, BaseError, UnmergedPathsError, InternalError, UnsafeFilepathError, BufferCursor, MAX_UINT32, supportsSubtleSHA1, GitIndex, lock, IndexCache, GitIndexManager, GitWalkerIndex, GitWalkSymbol, NotFoundError, ObjectTypeError, InvalidOidError, NoRefspecError, GitPackedRefs, GitRefSpec, GitRefSpecSet, num, bool, schema, SECTION_LINE_REGEX, SECTION_REGEX, VARIABLE_LINE_REGEX, VARIABLE_NAME_REGEX, VARIABLE_VALUE_COMMENT_REGEX, extractSectionLine, extractVariableLine, removeComments, hasOddNumberOfQuotes, removeQuotes, lower, getPath, normalizePath, findLastIndex, GitConfig, GitConfigManager, refpaths, GIT_FILES, lock$1, GitRefManager, GitTree, GitObject, StreamReader, supportsDecompressionStream, GitPackIndex, PackfileCache, AlreadyExistsError, AmbiguousError, CheckoutConflictError, CherryPickMergeCommitError, CherryPickRootCommitError, CommitNotFetchedError, EmptyServerResponseError, FastForwardError, GitPushError, HttpError, InvalidFilepathError, InvalidRefNameError, MaxDepthError, MergeNotSupportedError, MergeConflictError, MissingNameError, MissingParameterError, MultipleGitError, ParseError, PushRejectedError, RemoteCapabilityError, SmartHttpError, UnknownTransportError, UrlParseError, UserCanceledError, IndexResetError, NoCommitError, Errors, GitAnnotatedTag, GitCommit, GitWalkerRepo, GitWalkerFs, flat, RunningMinimum, commands, FileSystem, GitIgnoreManager, supportsCompressionStream, bad, worthWalking, LINEBREAKS, _TreeMap, lock$2, abbreviateRx, GitPktLine, corsProxify, updateHeaders, stringifyBody, GitRemoteHTTP, GitRemoteManager, lock$3, GitShallowManager, pkg, FIFO, GitSideBand, EMPTY_OID, types, GitRefStash, GitStashManager, index, isomorphic_git_default;
 var init_isomorphic_git = __esm({
-  "../../node_modules/isomorphic-git/index.js"() {
+  "node_modules/isomorphic-git/index.js"() {
     import_async_lock = __toESM(require_async_lock(), 1);
     import_sha1 = __toESM(require_sha1(), 1);
     import_crc_32 = __toESM(require_crc32(), 1);
@@ -20528,9 +20528,9 @@ ${obj.gpgsig ? obj.gpgsig : ""}`;
   }
 });
 
-// ../../node_modules/path-browserify/index.js
+// node_modules/path-browserify/index.js
 var require_path_browserify = __commonJS({
-  "../../node_modules/path-browserify/index.js"(exports2, module2) {
+  "node_modules/path-browserify/index.js"(exports2, module2) {
     "use strict";
     function assertPath(path2) {
       if (typeof path2 !== "string") {
@@ -20935,9 +20935,9 @@ var require_path_browserify = __commonJS({
   }
 });
 
-// ../../node_modules/sha.js/sha.js
+// node_modules/sha.js/sha.js
 var require_sha = __commonJS({
-  "../../node_modules/sha.js/sha.js"(exports2, module2) {
+  "node_modules/sha.js/sha.js"(exports2, module2) {
     "use strict";
     var inherits = require_inherits_browser();
     var Hash2 = require_hash();
@@ -21019,9 +21019,9 @@ var require_sha = __commonJS({
   }
 });
 
-// ../../node_modules/sha.js/sha256.js
+// node_modules/sha.js/sha256.js
 var require_sha256 = __commonJS({
-  "../../node_modules/sha.js/sha256.js"(exports2, module2) {
+  "node_modules/sha.js/sha256.js"(exports2, module2) {
     "use strict";
     var inherits = require_inherits_browser();
     var Hash2 = require_hash();
@@ -21181,9 +21181,9 @@ var require_sha256 = __commonJS({
   }
 });
 
-// ../../node_modules/sha.js/sha224.js
+// node_modules/sha.js/sha224.js
 var require_sha224 = __commonJS({
-  "../../node_modules/sha.js/sha224.js"(exports2, module2) {
+  "node_modules/sha.js/sha224.js"(exports2, module2) {
     "use strict";
     var inherits = require_inherits_browser();
     var Sha256 = require_sha256();
@@ -21222,9 +21222,9 @@ var require_sha224 = __commonJS({
   }
 });
 
-// ../../node_modules/sha.js/sha512.js
+// node_modules/sha.js/sha512.js
 var require_sha512 = __commonJS({
-  "../../node_modules/sha.js/sha512.js"(exports2, module2) {
+  "node_modules/sha.js/sha512.js"(exports2, module2) {
     "use strict";
     var inherits = require_inherits_browser();
     var Hash2 = require_hash();
@@ -21565,9 +21565,9 @@ var require_sha512 = __commonJS({
   }
 });
 
-// ../../node_modules/sha.js/sha384.js
+// node_modules/sha.js/sha384.js
 var require_sha384 = __commonJS({
-  "../../node_modules/sha.js/sha384.js"(exports2, module2) {
+  "node_modules/sha.js/sha384.js"(exports2, module2) {
     "use strict";
     var inherits = require_inherits_browser();
     var SHA512 = require_sha512();
@@ -21617,9 +21617,9 @@ var require_sha384 = __commonJS({
   }
 });
 
-// ../../node_modules/sha.js/index.js
+// node_modules/sha.js/index.js
 var require_sha2 = __commonJS({
-  "../../node_modules/sha.js/index.js"(exports2, module2) {
+  "node_modules/sha.js/index.js"(exports2, module2) {
     "use strict";
     module2.exports = function SHA(algorithm) {
       var alg = algorithm.toLowerCase();
@@ -23057,7 +23057,7 @@ var { createByteBudget, runBoundedWork } = require_work_pool();
 var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.28";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.5.29";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var STALE_SETTLE_MARGIN_MS = 250;
@@ -23972,7 +23972,7 @@ module.exports = class ObtsPlugin extends Plugin {
     if (!this.beginSync("Checking server")) return;
     let completed = false;
     try {
-      await this.client.pollRemoteEventsAndApply();
+      await this.client.pollRemoteEventsAndApply({ deltaApply: true });
       this.clearTransientSyncFailures();
       this.setStatus((await this.client.readState()).status_label);
       await this.client.reportDeviceStatus().catch(() => void 0);
@@ -25512,10 +25512,11 @@ var ObtsObsidianClient = class {
     const postUploadState = await this.readState();
     if (postUploadState.last_error_code !== "conflict_review_required") {
       try {
+        const applyOptions = { deltaApply: Boolean(options.hintedCapture && !options.fullAudit) };
         if (uploaded) {
-          await this.pullAndApply(true);
+          await this.pullAndApply(true, 0, [], null, applyOptions);
         } else {
-          await this.pollRemoteEventsAndApply();
+          await this.pollRemoteEventsAndApply(applyOptions);
         }
       } catch (error) {
         if (!(uploaded && error instanceof ObtsTransportError && error.code === "device_blocked")) throw error;
@@ -26494,12 +26495,13 @@ var ObtsObsidianClient = class {
     }
     return { oid, policy: createRootIgnorePolicy(bytes), entries: targetEntries };
   }
-  async validateApplyJournalPolicy(journal) {
+  async validateApplyJournalPolicy(journal, scope = null) {
     let target;
     try {
       target = await this.targetApplyPolicy(journal.target_main);
       if (journal.journal_version < 5) return target.oid === null;
       if (journal.target_root_ignore_oid !== target.oid) return false;
+      if (scope) return (await this.readRootIgnorePolicy()).oid === target.oid && journal.local_only_paths.length === 0 && journal.directory_intents.length === 0 && journal.affected_paths.every((p) => scope.paths.includes(p));
       const previous = journal.expected_prior_local_main ? await this.listTreeFiles(journal.expected_prior_local_main) : [];
       const physical = await this.listLocalVaultInventory("");
       const expected = this.localOnlyApplyPaths(target, previous, physical);
@@ -27067,7 +27069,7 @@ var ObtsObsidianClient = class {
       throw new ObtsBlockedError("catchup_recovery_required", "Catch-up recovery evidence is missing or corrupt. Preserve it and the visible local files.");
     }
   }
-  async pullAndApply(allowDestructive, catchupPass = 0, catchupPaths = [], catchupExpectedHead = null) {
+  async pullAndApply(allowDestructive, catchupPass = 0, catchupPaths = [], catchupExpectedHead = null, options = {}) {
     let state = await this.readState();
     if (!state.vault_id || !state.device_id) {
       return false;
@@ -27094,7 +27096,7 @@ var ObtsObsidianClient = class {
       state.last_applied_event_seq || 0
     );
     await this.importPack(pulled.packfile);
-    await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
+    await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || [], options.deltaApply);
     state = await this.readState();
     const targetPolicy = await this.targetApplyPolicy(pulled.manifest.target_main);
     if (!await this.ensureNoQueuedLocalChangesBeforeApply(state, targetPolicy)) {
@@ -27149,11 +27151,12 @@ var ObtsObsidianClient = class {
       false,
       catchup?.version === 2 ? await this.listTreeBlobOids(catchupExpectedHead || catchup.expected_head) : catchup?.version === 1 ? await this.listTreeBlobOids(catchup.local_head) : null,
       catchup?.version === 2 ? [.../* @__PURE__ */ new Set([...catchup.preserved_paths, ...catchupPaths])] : [],
-      catchup?.version === 1
+      catchup?.version === 1,
+      options
     );
     if (!applied) return false;
     await this.acknowledgeAppliedMain(pulled.manifest.target_main);
-    await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || []);
+    await this.clearAcknowledgedDirectoryIntents(pulled.manifest.directory_acknowledgements || [], options.deltaApply);
     await this.clearResolvedConflictQueue();
     await this.settleAppliedQueue();
     const appliedState = await this.readState();
@@ -27223,7 +27226,7 @@ var ObtsObsidianClient = class {
     }
     return true;
   }
-  async pollRemoteEventsAndApply() {
+  async pollRemoteEventsAndApply(options = {}) {
     const state = await this.readState();
     if (!state.vault_id || !state.device_id) {
       return { applied: false, status: "Not paired" };
@@ -27253,7 +27256,7 @@ var ObtsObsidianClient = class {
           await this.writeState(Object.assign({}, nextState, { last_event_seq: currentEventSeq, updated_at: nowIso() }));
         }
         try {
-          const applied2 = await this.pullAndApply(true);
+          const applied2 = await this.pullAndApply(true, 0, [], null, options);
           const refreshed = await this.uploadAutoPreservedChanges(applied2);
           return { applied: applied2, status: refreshed.status_label };
         } catch (pullError) {
@@ -27322,7 +27325,7 @@ var ObtsObsidianClient = class {
         last_error_code: null,
         updated_at: nowIso()
       }));
-      const applied2 = await this.pullAndApply(true);
+      const applied2 = await this.pullAndApply(true, 0, [], null, options);
       const finalState2 = await this.uploadAutoPreservedChanges(applied2);
       return { applied: applied2, status: finalState2.status_label };
     }
@@ -27333,7 +27336,7 @@ var ObtsObsidianClient = class {
         updated_at: nowIso()
       }));
     }
-    const applied = await this.pullAndApply(true);
+    const applied = await this.pullAndApply(true, 0, [], null, options);
     const finalState = await this.uploadAutoPreservedChanges(applied);
     return { applied, status: finalState.status_label };
   }
@@ -27522,6 +27525,38 @@ var ObtsObsidianClient = class {
     await this.clearApplyState();
     await this.advanceScanStateHead(state.local_head, journal.target_main);
   }
+  // Conservative file-only footprint: directory creation/removal and complex
+  // provenance still use full apply. Recovery consumes the same v7 journal.
+  async deltaApplyScope(state, targetMain, authoringBase, targetPolicy, explicitDirectories) {
+    if (!this.fullInventoryCurrent() || !authoringBase || state.local_head !== authoringBase || state.local_main !== authoringBase || await this.readDurableCatchup()) return null;
+    const queue = await this.readQueue();
+    if (queue.pending_commit) return null;
+    const saved = await this.readStaleProvenance();
+    if (Object.keys(saved.obligations).length || saved.held_proposals.length || saved.rename_pairs.length || saved.queued_replacement || saved.intent && !["merged", "noop"].includes(saved.intent.outcome)) return null;
+    if (!await exists(this.fsp, this.directoryStatePath)) return null;
+    const directories = await this.readDirectoryState();
+    if (directories.pending_intents.length || directories.explicit_empty_dirs.some((p) => !explicitDirectories.includes(p))) return null;
+    if ((await this.readTreePathOid(authoringBase, ".gitignore") ?? null) !== targetPolicy.oid || (await this.readRootIgnorePolicy()).oid !== targetPolicy.oid) return null;
+    const paths = await this.changedTreePaths(authoringBase, targetMain);
+    if (!paths.length || paths.length > HINTED_CAPTURE_MAX_PATHS || paths.includes(".gitignore") || new Set(paths.map((p) => p.toLowerCase())).size !== paths.length) return null;
+    const ancestors = [...new Set(paths.flatMap(directoryPrefixes))].sort();
+    const files = [];
+    for (const filePath of paths) {
+      if (!isRecoverableApplyPath(filePath) || targetPolicy.policy.ignores(filePath)) return null;
+      const before = await this.readTreePathEntry(authoringBase, filePath);
+      const after = await this.readTreePathEntry(targetMain, filePath);
+      if (!before.ancestorsAreTrees || !after.ancestorsAreTrees || before.caseVariant || after.caseVariant || before.entry?.type === "tree" || after.entry?.type === "tree") return null;
+      const stat = await this.adapter.stat(filePath);
+      if (stat && stat.type !== "file") return null;
+      if (stat) files.push(filePath);
+    }
+    for (const dirPath of ancestors) {
+      if (!isSyncableVaultPath(dirPath) || targetPolicy.policy.ignores(dirPath, true) || directories.explicit_empty_dirs.includes(dirPath)) return null;
+      const target = await this.readTreePathEntry(targetMain, dirPath);
+      if (target.caseVariant || target.entry?.type !== "tree" || (await this.adapter.stat(dirPath))?.type !== "folder") return null;
+    }
+    return { paths, files, directories: ancestors };
+  }
   async preApplyAuthoringBase(state, targetMain) {
     const queue = await this.readQueue();
     const saved = await this.readStaleProvenance();
@@ -27561,7 +27596,7 @@ var ObtsObsidianClient = class {
     }
     return p;
   }
-  async applyTargetMain(targetMain, changedPaths, allowDestructive, extraAffectedPaths = [], requireCleanVisibleState = false, directoryIntents = [], explicitDirectories = [], eventSeq = void 0, cleanVisibleStateVerified = false, confirmedDirectoryRecovery = null, targetFileSizes = {}, consentBaselineBundleId = null, preserveConsentLocalPaths = false, consentBaselineContext = null, rebuild = false, catchupExpectedTree = null, catchupPreservedPaths = [], catchupLegacyStrict = false) {
+  async applyTargetMain(targetMain, changedPaths, allowDestructive, extraAffectedPaths = [], requireCleanVisibleState = false, directoryIntents = [], explicitDirectories = [], eventSeq = void 0, cleanVisibleStateVerified = false, confirmedDirectoryRecovery = null, targetFileSizes = {}, consentBaselineBundleId = null, preserveConsentLocalPaths = false, consentBaselineContext = null, rebuild = false, catchupExpectedTree = null, catchupPreservedPaths = [], catchupLegacyStrict = false, options = {}) {
     await this.admitApplyRecovery();
     const pendingAck = await this.readPendingAppliedAcknowledgement();
     if (pendingAck) {
@@ -27634,6 +27669,7 @@ var ObtsObsidianClient = class {
         await this.applyRefOnly(state, journal, eventSeq);
         return true;
       }
+      const scope = options.deltaApply && requireCleanVisibleState && !rebuild && !catchupExpectedTree && !consentBaselineBundleId && !preserveConsentLocalPaths && !confirmedDirectoryRecovery && extraAffectedPaths.length === 0 && compactedDirectoryIntents.length === 0 && !hasDirectoryWork ? await this.deltaApplyScope(state, targetMain, authoringBase, targetPolicy, explicitDirectorySet) : null;
       const targetEntries = targetPolicy.entries;
       let consentBaselineFingerprints = /* @__PURE__ */ new Map();
       if (consentBaselineBundleId) {
@@ -27645,8 +27681,8 @@ var ObtsObsidianClient = class {
       }
       const targetFiles = new Set(targetEntries.keys());
       const previousFiles = journal.authoring_base ? await this.listTreeFiles(journal.authoring_base) : [];
-      const localVaultInventory = await this.listLocalVaultInventory("");
-      journal.local_only_paths = this.localOnlyApplyPaths(targetPolicy, previousFiles, localVaultInventory);
+      const localVaultInventory = scope || await this.listLocalVaultInventory("");
+      journal.local_only_paths = scope ? [] : this.localOnlyApplyPaths(targetPolicy, previousFiles, localVaultInventory);
       journal.local_only_presence = Object.fromEntries(journal.local_only_paths.map((filePath) => [
         filePath,
         localVaultInventory.files.includes(filePath) || localVaultInventory.directories.includes(filePath)
@@ -27769,11 +27805,11 @@ var ObtsObsidianClient = class {
         ...journal.affected_paths.filter((p) => !alreadyMaterialized.has(p)),
         ...catchupExpectedTree ? journal.deferred_local_paths : [],
         ...compactedDirectoryIntents.map((intent) => intent.path),
-        ...[...targetMaterializedDirectories].filter((dir) => !preApplyDirectories.has(dir))
+        ...[...scope ? scope.directories : targetMaterializedDirectories].filter((dir) => !preApplyDirectories.has(dir))
       ])].sort();
       await writeJson(this.fsp, this.applyJournalPath, journal);
       await this.retainApplyProvenance(journal);
-      if (!await this.validateApplyJournalPolicy(journal)) {
+      if (!await this.validateApplyJournalPolicy(journal, scope)) {
         await this.block("target_policy_changed", "The pinned target policy or retained local-only paths changed before apply.");
       }
       if (affectedPaths.length > 0) {
@@ -27857,15 +27893,15 @@ var ObtsObsidianClient = class {
           return false;
         }
       }
-      if (!await this.validateApplyJournalPolicy(journal)) {
+      if (!await this.validateApplyJournalPolicy(journal, scope)) {
         await this.block("target_policy_changed", "The pinned target policy or retained local-only paths changed before writing.");
       }
       journal.phase = "writing_files";
       await writeJson(this.fsp, this.applyJournalPath, journal);
-      await this.writeTargetFilesFromJournal(journal, targetEntries, alreadyMaterialized);
+      await this.writeTargetFilesFromJournal(journal, targetEntries, alreadyMaterialized, journal.target_file_sizes, scope);
       const confirmedDirectoryCtimes = confirmedDirectoryRecovery ? Object.fromEntries(confirmedDirectoryRecovery.inventory.directories.map((entry) => [entry.path, entry.creation_time])) : journal.pre_apply_directory_ctimes;
       const removableDirectories = confirmedDirectoryRecovery ? new Set(confirmedDirectoryRecovery.inventory.directories.map((entry) => entry.path)) : preApplyDirectories;
-      const residualTombstoneDirectories = await this.applyDirectoryChanges(
+      const residualTombstoneDirectories = scope ? /* @__PURE__ */ new Set() : await this.applyDirectoryChanges(
         compactedDirectoryIntents,
         explicitDirectorySet,
         preApplyDirectories,
@@ -27894,7 +27930,8 @@ var ObtsObsidianClient = class {
       await this.flushEditorBuffersToDisk();
       const capturedChangeSeq = (await this.readQueue()).change_seq || 0;
       let localScanPending = false;
-      const shouldCapturePreservedChanges = requireCleanVisibleState || journal.deferred_local_paths.length > 0;
+      const scopedClean = scope && journal.deferred_local_paths.length === 0 && (await this.affectedApplyPathsNotMatchingTarget(journal, targetEntries)).length === 0;
+      const shouldCapturePreservedChanges = !scopedClean && (requireCleanVisibleState || journal.deferred_local_paths.length > 0);
       const preserved = shouldCapturePreservedChanges ? await this.captureStableLocalChanges(targetEntries) : { paths: [], snapshot: null, stable: true, changedPath: null };
       this.reportOperationProgress("Applying (finishing)", "apply_finalize");
       let preservedLocalChangePaths = preserved.stable ? preserved.paths : [];
@@ -27917,7 +27954,7 @@ var ObtsObsidianClient = class {
           localScanPending = true;
         }
       }
-      if (requireCleanVisibleState) {
+      if (requireCleanVisibleState && !scopedClean) {
         preservedDirectoryIntents = await this.preserveDirectoryChangesFromTarget(
           targetEntries,
           explicitDirectorySet,
@@ -27927,7 +27964,7 @@ var ObtsObsidianClient = class {
       this.reportOperationProgress("Applying (finishing)", "apply_finalize");
       const queueAfterCapture = await this.readQueue();
       localScanPending = localScanPending || queueAfterCapture.change_seq !== capturedChangeSeq || queueAfterCapture.changed_paths.length > 0;
-      if (!await this.validateApplyJournalPolicy(journal)) {
+      if (!await this.validateApplyJournalPolicy(journal, scope)) {
         await this.block("target_policy_changed", "Retained local-only content changed during apply.");
       }
       await this.updateRef("refs/heads/main", targetMain, null, true);
@@ -27958,6 +27995,7 @@ var ObtsObsidianClient = class {
       }
       await this.writePendingAppliedAcknowledgement(targetMain, eventSeq || 0);
       await this.clearApplyState();
+      if (scopedClean) await this.advanceScanStateHead(state.local_head, targetMain, journal.affected_paths);
       return true;
     } finally {
       this.plugin.isApplying = false;
@@ -29161,8 +29199,8 @@ var ObtsObsidianClient = class {
     }
     return { matches: divergedPaths.length === 0, targetMatchedPaths, divergedPaths };
   }
-  async writeTargetFilesFromJournal(journal, targetEntries, targetMatchedPaths, targetFileSizes = journal.target_file_sizes || {}) {
-    if (journal.journal_version >= 5 && !await this.validateApplyJournalPolicy(journal)) {
+  async writeTargetFilesFromJournal(journal, targetEntries, targetMatchedPaths, targetFileSizes = journal.target_file_sizes || {}, scope = null) {
+    if (journal.journal_version >= 5 && !await this.validateApplyJournalPolicy(journal, scope)) {
       throw new ObtsBlockedError("target_policy_changed", "The pinned target policy or retained local-only paths changed.");
     }
     const activePathMutations = [];
@@ -29376,6 +29414,7 @@ var ObtsObsidianClient = class {
       return { required: true, mode: "full" };
     }
     await this.retireElapsedEmptyHorizons();
+    await this.retireElapsedCleanFileHorizons();
     const lastInventoryAt = Date.parse(scanState.last_inventory_completed_at || "");
     const nextFullAuditAt = Date.parse(scanState.next_full_audit_at || "");
     const lastFullAuditAt = Date.parse(scanState.last_full_audit_completed_at || "");
@@ -29387,9 +29426,8 @@ var ObtsObsidianClient = class {
     }
     return { required: false, mode: "none" };
   }
-  // Horizons end, and settled obligations retire, only inside a scan. An idle
-  // device must run that scan once a horizon elapses; otherwise the next edit
-  // still sees the old horizon and is proposed against its superseded base.
+  // Unsettled horizons still require classification after expiry. Clean,
+  // file-only horizons can retire through the same drain barrier below.
   async hasElapsedStaleHorizon() {
     let saved;
     try {
@@ -29402,7 +29440,7 @@ var ObtsObsidianClient = class {
   }
   // A horizon that touched no path guards no capture, so ending it needs no
   // drain and no inventory; scanning the whole vault for it would make every
-  // own push cost O(vault). Horizons with paths still end inside a scan.
+  // own push cost O(vault). Nonempty horizons need a post-expiry drain.
   async retireElapsedEmptyHorizons() {
     try {
       const saved = await this.readStaleProvenance();
@@ -29416,6 +29454,51 @@ var ObtsObsidianClient = class {
       });
     } catch {
       return;
+    }
+  }
+  // Same elapsed-time/drain barrier as classifyStaleSnapshot. File-only
+  // horizons with canonical bytes need no stale proposal; all other cases
+  // retain their evidence for the ordinary classification scan.
+  async retireElapsedCleanFileHorizons() {
+    if (!this.fullInventoryCurrent()) return;
+    try {
+      const saved = await this.readStaleProvenance();
+      const now = Date.now();
+      const expiring = saved.horizons.filter((h) => h.expiry <= now && h.touched.length > 0);
+      const settled = (p) => !Object.keys(p.obligations).length && !p.rename_pairs.length && !p.held_proposals.length && !p.queued_replacement && (!p.intent || ["merged", "noop"].includes(p.intent.outcome));
+      if (!expiring.length || !settled(saved)) return;
+      const paths = [...new Set(expiring.flatMap((h) => h.touched))];
+      if (paths.length > HINTED_CAPTURE_MAX_PATHS || paths.includes(".gitignore") || await readApplyJournalStrict(this.fsp, this.applyJournalPath)) return;
+      const state = await this.readState();
+      const directoryState = await this.readDirectoryState();
+      if (!state.local_main || state.local_head !== state.local_main || state.last_error_code || (await this.readQueue()).pending_commit || directoryState.pending_intents.length) return;
+      const ancestors = [...new Set(paths.flatMap(directoryPrefixes))];
+      await this.flushEditorBuffersToDisk();
+      await this.pathMutationGate.withExclusive([...paths, ...ancestors], async (raw) => {
+        await Promise.resolve(this.adapter.promise);
+        for (const filePath of paths) {
+          const target = await this.readTreePathEntry(state.local_main, filePath);
+          if (!target.ancestorsAreTrees || target.caseVariant || target.entry?.type === "tree") return;
+          if (!target.entry) {
+            const covering = expiring.filter((h) => h.touched.includes(filePath));
+            for (const h of covering) {
+              if ((await this.readTreePathEntry(h.base, filePath)).entry?.type !== "blob") return;
+            }
+          }
+          const { fingerprint } = await this.readRecoveryFileSnapshot(filePath, void 0, raw);
+          if (!this.fingerprintMatchesTarget(fingerprint, target.entry?.oid)) return;
+        }
+        for (const dirPath of ancestors) {
+          const expected = directoryState.observed_directory_ctimes[dirPath];
+          if (!(expected > 0) || await this.adapterDirectoryCreationTime(dirPath, raw) !== expected) return;
+        }
+        if ((await this.readState()).local_head !== state.local_head || (await this.readDirectoryState()).pending_intents.length) return;
+        await this.mutateStaleProvenance(async (current) => {
+          if (!settled(current)) return;
+          current.horizons = current.horizons.filter((h) => !expiring.some((e) => e.apply_id === h.apply_id && e.base === h.base && e.expiry === h.expiry && sameStringArray(e.touched, h.touched)));
+        });
+      });
+    } catch {
     }
   }
   // Earliest future horizon expiry, so the host can wake its background check
@@ -29495,23 +29578,30 @@ var ObtsObsidianClient = class {
     });
     this.lastSnapshotWasFullAudit = false;
   }
-  // A hinted capture or a ref-only apply moves local_head without changing any
-  // visible path outside its own footprint, so the last inventory still
-  // describes the vault. Only the exact head that inventory recorded advances.
-  async advanceScanStateHead(fromHead, toHead) {
+  // Only advance the head recorded by the last inventory. Invalidate entries
+  // changed by apply before publishing the head, including possible oid/mtime
+  // ABA matches; untouched entries and the inventory deadline stay valid.
+  async advanceScanStateHead(fromHead, toHead, touchedPaths = []) {
     const [state, directoryState, scanState] = await Promise.all([
       this.readState(),
       this.readDirectoryState(),
       readJson(this.fsp, this.scanStatePath, null)
     ]);
     if (!scanState || scanState.version !== 1 || scanState.scanner_schema !== SCANNER_SCHEMA_VERSION || scanState.vault_id !== state.vault_id || scanState.device_id !== state.device_id || scanState.local_head !== fromHead || scanState.directory_generation !== directoryState.next_generation || state.local_head !== toHead) return;
+    if (touchedPaths.length) {
+      const cache = await readJson(this.fsp, this.scanCachePath, null);
+      if (cache?.entries) {
+        for (const filePath of touchedPaths) delete cache.entries[filePath];
+        await writeJson(this.fsp, this.scanCachePath, cache);
+      }
+    }
     await writeJson(this.fsp, this.scanStatePath, Object.assign({}, scanState, { local_head: toHead }));
   }
   // OBTS-SYNC-DELTA-001 ordinary capture: read only the durable watcher hints.
   // Returns null whenever the hints alone cannot show what a whole-vault
   // inventory would capture; the caller then runs that inventory instead.
-  // Deletions, folders, new directories, renames, policy changes and any
-  // pending stale or directory evidence all take the inventory path.
+  // Local deletions, folders, new directories, renames, policy changes and
+  // pending stale or directory obligations all take the inventory path.
   async captureHintedLocalChanges(queue, flushedPaths = []) {
     const hints = [.../* @__PURE__ */ new Set([
       ...queue.changed_paths || [],
@@ -29529,7 +29619,7 @@ var ObtsObsidianClient = class {
       return null;
     }
     const saved = await this.readStaleProvenance();
-    if (saved.horizons.some((h) => h.touched.length > 0) || Object.keys(saved.obligations).length > 0 || saved.rename_pairs.length > 0 || saved.held_proposals.length > 0 || saved.queued_replacement || saved.intent && !["merged", "noop"].includes(saved.intent.outcome)) return null;
+    if (Object.keys(saved.obligations).length > 0 || saved.rename_pairs.length > 0 || saved.held_proposals.length > 0 || saved.queued_replacement || saved.intent && !["merged", "noop"].includes(saved.intent.outcome)) return null;
     const directoryState = await this.readDirectoryState();
     if (directoryState.pending_intents.length > 0) return null;
     const explicitEmptyDirs = new Set(directoryState.explicit_empty_dirs);
@@ -29538,7 +29628,7 @@ var ObtsObsidianClient = class {
     const files = [];
     const baseEntries = /* @__PURE__ */ new Map();
     for (const filePath of hints) {
-      if (!isSyncableVaultPath(filePath) || directoryPrefixes(filePath).some((dirPath) => !isSyncableVaultPath(dirPath) || explicitEmptyDirs.has(dirPath))) return null;
+      if (!isSyncableVaultPath(filePath) || explicitEmptyDirs.has(filePath) || directoryPrefixes(filePath).some((dirPath) => !isSyncableVaultPath(dirPath) || explicitEmptyDirs.has(dirPath))) return null;
       const located = await this.readTreePathEntry(base, filePath);
       if (!located.ancestorsAreTrees || located.caseVariant || located.entry?.type === "tree") return null;
       if (rootPolicy.policy.ignores(filePath)) {
@@ -29550,6 +29640,10 @@ var ObtsObsidianClient = class {
         stat = await this.adapter.stat(filePath);
       } catch {
         return null;
+      }
+      if (!stat && !located.entry) {
+        const horizon = saved.horizons.find((h) => h.touched.includes(filePath));
+        if (horizon && (await this.readTreePathEntry(horizon.base, filePath)).entry?.type === "blob") continue;
       }
       if (!stat || stat.type !== "file") return null;
       if (located.entry) baseEntries.set(filePath, { mode: located.entry.mode, path: filePath, oid: located.entry.oid, type: "blob" });
@@ -29572,6 +29666,9 @@ var ObtsObsidianClient = class {
     if ((await this.readRootIgnorePolicy()).oid !== rootPolicy.oid) {
       this.plugin.syncQueued = true;
       throw new ObtsBlockedError("local_snapshot_changed", "Root .gitignore changed during capture. Sync will retry.");
+    }
+    for (const [filePath, value] of snapshot.entries) {
+      if (value.entry.oid !== baseEntries.get(filePath)?.oid && saved.horizons.some((h) => h.touched.some((p) => changedPathsConflict(p, filePath)))) return null;
     }
     const baseTree = await this.readCommitTreeOid(base);
     const tree = await this.writeTreeWithChanges(
@@ -32534,9 +32631,9 @@ var ObtsObsidianClient = class {
   async clearPendingDirectoryIntents() {
     await this.refreshDirectoryStateFromDisk([]);
   }
-  async clearAcknowledgedDirectoryIntents(acknowledgedIntents) {
+  async clearAcknowledgedDirectoryIntents(acknowledgedIntents, deferReconcile = false) {
     const acknowledgedKeys = new Set((Array.isArray(acknowledgedIntents) ? acknowledgedIntents : []).filter((intent) => intent && typeof intent.intent_id === "string" && Number.isSafeInteger(intent.generation)).map(directoryIntentGenerationKey));
-    if (acknowledgedKeys.size === 0 && this.fullInventoryCurrent() && !this.plugin.syncQueued && (await this.readQueue()).changed_paths.length === 0) return;
+    if (acknowledgedKeys.size === 0 && this.fullInventoryCurrent() && (deferReconcile || !this.plugin.syncQueued && (await this.readQueue()).changed_paths.length === 0)) return;
     await this.reconcileDirectoryState();
     const directoryState = await this.readDirectoryState();
     const remaining = directoryState.pending_intents.filter((intent) => !acknowledgedKeys.has(directoryIntentGenerationKey(intent)));

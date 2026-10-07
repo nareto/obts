@@ -156,7 +156,7 @@ type SharedClientCore = {
   syncOnce(options?: { confirmInitialImport?: boolean; fullAudit?: boolean; hintedCapture?: boolean }): Promise<SyncResult>;
   pullAndApply(allowDestructive: boolean): Promise<boolean>;
   reconcileDeviceBlocked(fromCaughtError?: boolean, triggeringErrorCode?: string | null): Promise<{ applied: boolean; status: string }>;
-  pollRemoteEventsAndApply(): Promise<{ applied: boolean; status: string }>;
+  pollRemoteEventsAndApply(options?: { deltaApply?: boolean }): Promise<{ applied: boolean; status: string }>;
   replaceLocalWithServer(): Promise<{ status: string; main: string }>;
   rebuildFromServerMain(): Promise<RebuildResult>;
   renameCurrentDevice(deviceName: string): Promise<string>;
@@ -401,7 +401,7 @@ export class ObtsPluginClient {
         ? await this.client.syncOnce(decision.required
           ? { fullAudit: decision.mode === 'full' }
           : { fullAudit: false, hintedCapture: true })
-        : await this.client.pollRemoteEventsAndApply();
+        : await this.client.pollRemoteEventsAndApply({ deltaApply: true });
       const state = await this.client.readState();
       return {
         applied: !syncPerformed && Boolean((result as { applied?: boolean }).applied),

@@ -250,7 +250,7 @@ describe('hinted capture (OBTS-SYNC-DELTA-001)', () => {
     expect((await value.core.backgroundScanDecision()).required).toBe(false);
     expect((await value.core.readStaleProvenance()).horizons).toEqual([]);
 
-    // A horizon over applied paths still ends only inside a scan.
+    // A clean file-only horizon can end after draining and verifying its paths.
     await writeFile(join(value.writerDir, 'b.md'), 'b1 remote\n');
     expect((await settle(value.writer)).at(-1)).toBe('Synced');
     expect((await settle(value.plugin, { hintedCapture: true })).at(-1)).toBe('Synced');
@@ -258,8 +258,8 @@ describe('hinted capture (OBTS-SYNC-DELTA-001)', () => {
     await value.core.mutateStaleProvenance(async (saved: any) => { for (const horizon of saved.horizons) horizon.expiry = Date.now() - 1; });
     const remote = (await value.core.readStaleProvenance()).horizons;
     expect(remote.some((horizon: { touched: string[] }) => horizon.touched.includes('b.md'))).toBe(true);
-    expect((await value.core.backgroundScanDecision())).toMatchObject({ required: true, mode: 'incremental' });
-    expect((await value.core.readStaleProvenance()).horizons).toEqual(remote);
+    expect((await value.core.backgroundScanDecision())).toMatchObject({ required: false, mode: 'none' });
+    expect((await value.core.readStaleProvenance()).horizons).toEqual([]);
   });
 
   it('skips the directory reconcile only when nothing could have changed a folder', async () => {
@@ -276,5 +276,160 @@ describe('hinted capture (OBTS-SYNC-DELTA-001)', () => {
     value.core.requestFullInventory();
     await value.core.clearAcknowledgedDirectoryIntents([]);
     expect(reconciles).toHaveLength(2);
+  });
+});
+
+describe('file footprint apply (OBTS-SYNC-DELTA-001)', () => {
+  async function remoteEdit(value: Awaited<ReturnType<typeof fixture>>, filePath = 'notes/c.md') {
+    await writeFile(join(value.writerDir, filePath), 'remote new bytes\n');
+    expect((await settle(value.writer)).at(-1)).toBe('Synced');
+  }
+
+  it('applies a remote file, records recovery, advances scan state and settles without inventory', async () => {
+    const value = await fixture();
+    await remoteEdit(value);
+    const inventories = spy(value.core, 'listLocalVaultInventory');
+    const captures = spy(value.core, 'captureStableLocalChanges');
+    const scope = spy(value.core, 'deltaApplyScope');
+    const recovery = spy(value.core, 'stageApplyRecoveryFiles');
+    expect(await value.core.pollRemoteEventsAndApply({ deltaApply: true })).toMatchObject({ applied: true, status: 'Synced' });
+    expect(scope[0]?.result).toMatchObject({ paths: ['notes/c.md'], directories: ['notes'] });
+    expect(recovery).toHaveLength(1);
+    expect(inventories).toHaveLength(0);
+    expect(captures).toHaveLength(0);
+    expect(await readFile(join(value.vaultDir, 'notes/c.md'), 'utf8')).toBe('remote new bytes\n');
+    const scan = JSON.parse(await readFile(join(value.vaultDir, '.obts/scan-state.json'), 'utf8'));
+    expect(scan.local_head).toBe((await value.core.readState()).local_head);
+    const cache = JSON.parse(await readFile(join(value.vaultDir, '.obts/scan-cache.json'), 'utf8'));
+    expect(cache.entries['notes/c.md']).toBeUndefined();
+    await value.core.mutateStaleProvenance(async (saved: any) => { for (const h of saved.horizons) h.expiry = 0; });
+    expect(await value.core.backgroundScanDecision()).toEqual({ required: false, mode: 'none' });
+    expect((await value.core.readStaleProvenance()).horizons).toEqual([]);
+    expect(inventories).toHaveLength(0);
+  });
+
+  it('accepts apply-generated watcher hints while retaining unrelated local edits for capture', async () => {
+    const value = await fixture();
+    await remoteEdit(value);
+    const write = value.core.writeTargetFilesFromJournal.bind(value.core);
+    value.core.writeTargetFilesFromJournal = async (...args: unknown[]) => {
+      await write(...args);
+      await writeFile(join(value.vaultDir, 'b.md'), 'unrelated local edit\n');
+      await value.plugin.recordLocalChangeHint(['notes/c.md', 'b.md']);
+    };
+    const inventories = spy(value.core, 'listLocalVaultInventory');
+    const hinted = spy(value.core, 'captureHintedLocalChanges');
+    expect(await value.core.pollRemoteEventsAndApply({ deltaApply: true })).toMatchObject({ applied: true, status: 'Checking' });
+    expect(await readFile(join(value.vaultDir, 'b.md'), 'utf8')).toBe('unrelated local edit\n');
+    expect((await settle(value.plugin, { hintedCapture: true })).at(-1)).toBe('Synced');
+    expect(hinted[0]?.result).toMatchObject({ commit: expect.any(String) });
+    expect(inventories).toHaveLength(0);
+    expect(await serverFile(value.core, await currentMain(value.server), 'b.md')).toBe('unrelated local edit\n');
+  });
+
+  it('uses full preservation for a concurrent edit inside the footprint', async () => {
+    const value = await fixture();
+    await remoteEdit(value);
+    const original = value.core.stageApplyRecoveryFiles.bind(value.core);
+    value.core.stageApplyRecoveryFiles = async (...args: unknown[]) => {
+      await writeFile(join(value.vaultDir, 'notes/c.md'), 'local concurrent bytes\n');
+      return original(...args);
+    };
+    const captures = spy(value.core, 'captureStableLocalChanges');
+    await value.core.pollRemoteEventsAndApply({ deltaApply: true });
+    expect(captures.length).toBeGreaterThan(0);
+    expect(await readFile(join(value.vaultDir, 'notes/c.md'), 'utf8')).toBe('local concurrent bytes\n');
+  });
+
+  it('retains differing elapsed horizons and falls back for stale hinted bytes', async () => {
+    const value = await fixture();
+    await remoteEdit(value);
+    await value.core.pollRemoteEventsAndApply({ deltaApply: true });
+    await value.core.mutateStaleProvenance(async (saved: any) => { for (const h of saved.horizons) h.expiry = Date.now() + 60_000; });
+    await writeFile(join(value.vaultDir, 'notes/c.md'), 'c0\n');
+    await value.plugin.recordLocalChangeHint(['notes/c.md']);
+    expect(await value.core.captureHintedLocalChanges(await value.core.readQueue())).toBeNull();
+    await value.core.mutateStaleProvenance(async (saved: any) => { for (const h of saved.horizons) h.expiry = 0; });
+    expect(await value.core.backgroundScanDecision()).toEqual({ required: true, mode: 'incremental' });
+    expect((await value.core.readStaleProvenance()).horizons.length).toBeGreaterThan(0);
+  });
+
+  it('waits for an already admitted writer before retiring an elapsed horizon', async () => {
+    const value = await fixture();
+    await remoteEdit(value);
+    await value.core.pollRemoteEventsAndApply({ deltaApply: true });
+    await value.core.mutateStaleProvenance(async (saved: any) => { for (const h of saved.horizons) h.expiry = 0; });
+    let release!: () => void;
+    let entered!: () => void;
+    let queued!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const retirementQueued = new Promise<void>((resolve) => { queued = resolve; });
+    const gate = value.core.pathMutationGate.withExclusive.bind(value.core.pathMutationGate);
+    const writer = gate(['notes/c.md'], async (raw: any) => {
+      entered();
+      await hold;
+      await raw.writeBinary('notes/c.md', new TextEncoder().encode('late stale save\n').buffer);
+    });
+    await started;
+    value.core.pathMutationGate.withExclusive = (...args: unknown[]) => { queued(); return gate(...args); };
+    const retiring = value.core.backgroundScanDecision();
+    await retirementQueued;
+    release();
+    await writer;
+    expect(await retiring).toEqual({ required: true, mode: 'incremental' });
+    expect((await value.core.readStaleProvenance()).horizons.length).toBeGreaterThan(0);
+    expect(await readFile(join(value.vaultDir, 'notes/c.md'), 'utf8')).toBe('late stale save\n');
+  });
+
+  it('keeps a horizon when its parent folder was recreated with canonical bytes', async () => {
+    const value = await fixture();
+    await remoteEdit(value);
+    await value.core.pollRemoteEventsAndApply({ deltaApply: true });
+    await rm(join(value.vaultDir, 'notes'), { recursive: true });
+    await mkdir(join(value.vaultDir, 'notes'));
+    await writeFile(join(value.vaultDir, 'notes/c.md'), 'remote new bytes\n');
+    await value.core.mutateStaleProvenance(async (saved: any) => { for (const h of saved.horizons) h.expiry = 0; });
+    expect(await value.core.backgroundScanDecision()).toEqual({ required: true, mode: 'incremental' });
+    expect((await value.core.readStaleProvenance()).horizons.length).toBeGreaterThan(0);
+  });
+
+  it('treats the watcher echo of an applied file deletion as a no-op', async () => {
+    const value = await fixture();
+    await rm(join(value.writerDir, 'b.md'));
+    expect((await settle(value.writer)).at(-1)).toBe('Synced');
+    await value.core.pollRemoteEventsAndApply({ deltaApply: true });
+    await value.plugin.recordLocalChangeHint(['b.md']);
+    expect(await value.core.captureHintedLocalChanges(await value.core.readQueue())).toMatchObject({ commit: null });
+  });
+
+  it.each(['create', 'remove'] as const)('uses full apply when directories %s', async (operation) => {
+    const value = await fixture();
+    if (operation === 'create') {
+      await mkdir(join(value.writerDir, 'new'));
+      await writeFile(join(value.writerDir, 'new/d.md'), 'new folder file\n');
+    } else await rm(join(value.writerDir, 'notes'), { recursive: true });
+    expect((await settle(value.writer)).at(-1)).toBe('Synced');
+    const captures = spy(value.core, 'captureStableLocalChanges');
+    await value.core.pollRemoteEventsAndApply({ deltaApply: true });
+    expect(captures.length).toBeGreaterThan(0);
+  });
+
+  it('recovers an interrupted scoped apply using the ordinary v7 journal', async () => {
+    const value = await fixture();
+    await remoteEdit(value);
+    const update = value.core.updateRef.bind(value.core);
+    value.core.updateRef = async (...args: unknown[]) => {
+      if (args[0] === 'refs/heads/main') throw new Error('interrupted before main ref');
+      return update(...args);
+    };
+    await expect(value.core.pollRemoteEventsAndApply({ deltaApply: true })).rejects.toThrow('interrupted before main ref');
+    const journal = JSON.parse(await readFile(join(value.vaultDir, '.obts/apply-journal.json'), 'utf8'));
+    expect(journal).toMatchObject({ journal_version: 7, phase: 'verifying', affected_paths: ['notes/c.md'], pre_apply_directories: ['notes'] });
+    const restarted = new ObtsPluginClient(value.vaultDir, { serverUrl: value.baseUrl, deviceName: 'hinted-device' });
+    await restarted.initialize();
+    expect((await settle(restarted)).at(-1)).toBe('Synced');
+    expect(await readFile(join(value.vaultDir, 'notes/c.md'), 'utf8')).toBe('remote new bytes\n');
+    expect((await coreOf(restarted).readState()).local_main).toBe(await currentMain(value.server));
   });
 });
