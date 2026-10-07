@@ -3,7 +3,7 @@ EXTENDS Naturals, FiniteSets, TLC
 
 (***************************************************************************
 OBTS-FM-002 change-proportional apply and capture companion, architecture
-revision 47. Refines OBTS-SYNC-DELTA-001 with OBTS-SYNC-ACK-001,
+revision 48. Refines OBTS-SYNC-DELTA-001 with OBTS-SYNC-ACK-001,
 OBTS-SYNC-STALE-001 and OBTS-SAF-002 for one client and a symbolic server.
 
 Values are fresh symbolic file versions per path (0 is the initial version).
@@ -11,8 +11,9 @@ Values are fresh symbolic file versions per path (0 is the initial version).
 the pre-apply authoring base M0 of OBTS-SYNC-STALE-001. A push is one atomic
 server integration: an unchanged canonical path accepts the local version,
 otherwise canonical bytes stay and the local version is preserved (conflict
-copy). Every push advances the canonical commit even when the tree does not
-change, as the server's merge commit does.
+copy). Every push advances canonical identity even when the tree does not
+change. OBTSMainAdvance checks whether that target reuses the admitted device
+commit or is a server merge; this model abstracts that identity choice.
 
 Apply admits target T = canonical main only when no captured change awaits
 upload. Its footprint is {p : T[p] # M0[p]}; directory intents, policy

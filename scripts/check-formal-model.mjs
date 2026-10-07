@@ -109,6 +109,10 @@ const requiredChecks = new Map([
     .map((id) => [`fm002-negative-${id}`, 'negative-control']),
   ...['directory-baseline-strict', 'directory-baseline-mutant-intent', 'directory-baseline-mutant-history', 'directory-baseline-mutant-historical']
     .map((id) => [`fm002-negative-${id}`, 'negative-control']),
+  ['fm002-main-advance-safety', 'positive-safety'],
+  ['fm002-main-advance-liveness', 'positive-liveness'],
+  ...['fast-forward', 'merge', 'recovery'].map((id) => [`fm002-main-advance-reach-${id}`, 'reachability']),
+  ...['parent', 'tree'].map((id) => [`fm002-main-advance-negative-${id}`, 'negative-control']),
   ...['safety', 'safety-wide'].map((id) => [`fm002-delta-${id}`, 'positive-safety']),
   ['fm002-delta-liveness', 'positive-liveness'],
   ...['ref-only', 'deferred', 'untouched', 'inventory-rescue'].map((id) => [`fm002-delta-reach-${id}`, 'reachability']),
@@ -289,7 +293,7 @@ function validateTransitionMap(path) {
     if (unknownContracts.length) throw new Error(`transition ${action} maps unknown contract IDs: ${unknownContracts.join(', ')}.`);
     for (const ref of [...entry.code, ...entry.tests]) validateSourceReference(ref, `transition ${action}`);
   }
-  if (!testMode && ['OBTSApplyInPlace', 'OBTSStaleProposal', 'OBTSDeltaApply'].some((name) => !map.companionModels?.[name])) {
+  if (!testMode && ['OBTSApplyInPlace', 'OBTSStaleProposal', 'OBTSDeltaApply', 'OBTSMainAdvance'].some((name) => !map.companionModels?.[name])) {
     throw new Error('Required gate/provenance/delta companion transition map removed.');
   }
   for (const [name, companion] of Object.entries(map.companionModels ?? {})) {

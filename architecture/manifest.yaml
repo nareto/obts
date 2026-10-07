@@ -1,5 +1,5 @@
 schema_version: 1
-revision: 47
+revision: 48
 status: current
 updated: 2026-10-07
 authoritative_artifacts:
@@ -36,9 +36,11 @@ formal_models:
   - id: OBTS-FM-002
     status: accepted
     path: architecture/models/formal/OBTSDistributedSync.tla
-    architecture_revision: 32
+    architecture_revision: 48
     companion_path: architecture/models/formal/OBTSDeltaApply.tla
-    companion_architecture_revision: 47
+    companion_architecture_revision: 48
+    main_advance_path: architecture/models/formal/OBTSMainAdvance.tla
+    main_advance_architecture_revision: 48
     checks: architecture/models/formal/checks.json
     transition_map: architecture/models/formal/trace/transition-map.json
     trace_schema: architecture/models/formal/trace/trace-schema.json

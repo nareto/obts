@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createObtsServer, type ObtsServer } from '../src/server/app.js';
 import { hashToken, type AuthenticatedDevice } from '../src/server/authService.js';
-import { sha256Hex } from '../src/server/gitService.js';
+import { GitDurabilityError, sha256Hex } from '../src/server/gitService.js';
 import { API_VERSION, type DevicePushManifest, type PushResult } from '../src/shared/types.js';
 
 const BASE = 'first\n\nunchanged middle\n\nlast\n';
@@ -1085,4 +1085,81 @@ it('retains the existing default-settings protected conflict for a pre-K destina
   expect((await f.server.store.snapshot()).conflicts.at(-1)?.validator_results.reason).toBe('rename_path_collision');
   expect(await blob(f, k, 'renamed.md')).toBe(BASE);
   expect(await blob(f, d, 'renamed.md')).toBe(LOCAL);
+});
+
+describe('canonical integration fast-forward', () => {
+  it.each([true, false])('reuses a linear proposal, including an unchanged tree (changed=%s)', async (changed) => {
+    const f = await fixture();
+    const target = await commit(f, f.m0, changed ? { 'note.md': LOCAL } : {});
+    const request = await manifest(f, target, f.m0, `ff-${changed}`);
+    const result = await f.server.sync.pushDeviceCommit(f.auth, request.manifest, request.pack);
+    expect(result).toMatchObject({ status: 'merged', main: target, merge_commit: target, device_ref: target });
+    expect(await f.server.git.getRef(f.auth.vault.vault_id, 'refs/heads/main')).toBe(target);
+    const operation = (await f.server.store.snapshot()).sync_operations.find((op) => op.operation_type === 'server_merge');
+    expect(operation).toMatchObject({ status: 'committed', target_commit: target, expected_refs: { 'refs/heads/main': f.m0 } });
+    const replay = await f.server.sync.pushDeviceCommit(f.auth, request.manifest, request.pack);
+    expect(replay).toMatchObject({ main: target });
+    expect(await f.server.git.getRef(f.auth.vault.vault_id, f.auth.device.device_ref)).toBe(target);
+  });
+
+  it.each([true, false])('creates a merge for an older parent even when the integrated tree matches (remoteChanged=%s)', async (remoteChanged) => {
+    const f = await fixture();
+    const remote = await commit(f, f.m0, remoteChanged ? { 'inherited.md': 'remote\n' } : {});
+    await setMain(f, remote);
+    const target = await commit(f, f.m0, { 'note.md': LOCAL });
+    const result = await push(f, target);
+    if (result.status !== 'merged') throw new Error(`Unexpected integration result: ${result.status}`);
+    expect(result.main).not.toBe(target);
+    const parents = (await f.server.git.exec(f.server.git.repoPath(f.auth.vault.vault_id), ['show', '-s', '--format=%P', result.main])).stdout.toString().trim().split(' ');
+    expect(parents).toEqual([remote, target]);
+    expect(await blob(f, result.main, 'inherited.md')).toBe(remoteChanged ? 'remote\n' : 'base\n');
+  });
+
+  it('requires exactly one parent even when one parent is current main', async () => {
+    const f = await fixture();
+    const other = await commit(f, f.m0, {});
+    const tree = await f.server.git.createTreeFromCommitWithChanges({ vaultId: f.auth.vault.vault_id, sourceCommit: f.m0, writes: new Map([['note.md', Buffer.from(LOCAL)]]) });
+    const target = (await f.server.git.exec(f.server.git.repoPath(f.auth.vault.vault_id),
+      ['commit-tree', tree, '-p', f.m0, '-p', other, '-m', 'multi-parent proposal'], undefined,
+      { GIT_AUTHOR_NAME: 'test', GIT_AUTHOR_EMAIL: 'test@example.invalid', GIT_COMMITTER_NAME: 'test', GIT_COMMITTER_EMAIL: 'test@example.invalid' })).stdout.toString().trim();
+    const result = await push(f, target);
+    if (result.status !== 'merged') throw new Error(`Unexpected integration result: ${result.status}`);
+    expect(result.main).not.toBe(target);
+  });
+
+  it('requires the computed policy tree to equal the proposal tree', async () => {
+    const f = await fixture();
+    const target = await commit(f, f.m0, { 'note.md': LOCAL });
+    const integrationTree = await f.server.git.createTreeFromCommitWithChanges({ vaultId: f.auth.vault.vault_id, sourceCommit: f.m0, writes: new Map([['note.md', Buffer.from(MERGED)]]) });
+    const result = await f.server.git.createMergeCommitObjectFromTree({ vaultId: f.auth.vault.vault_id, tree: integrationTree,
+      base: f.m0, currentMain: f.m0, deviceCommit: target, mergeSequence: 1, strategy: 'semantic_clean' });
+    expect(result).not.toBe(target);
+    expect(await blob(f, result, 'note.md')).toBe(MERGED);
+  });
+
+  it('recovers the prepared device target after main moved but result publication failed', async () => {
+    const f = await fixture();
+    const target = await commit(f, f.m0, { 'note.md': LOCAL });
+    const request = await manifest(f, target, f.m0, 'ff-ref-recovery');
+    const update = f.server.git.updateRef.bind(f.server.git);
+    vi.spyOn(f.server.git, 'updateRef').mockImplementation(async (...args) => {
+      await update(...args);
+      if (args[1] === 'refs/heads/main') throw new GitDurabilityError('simulated interruption after main ref');
+    });
+    await expect(f.server.sync.pushDeviceCommit(f.auth, request.manifest, request.pack)).rejects.toMatchObject({ code: 'transfer_unavailable' });
+    expect(await f.server.git.getRef(f.auth.vault.vault_id, 'refs/heads/main')).toBe(target);
+    const prepared = (await f.server.store.snapshot()).sync_operations.find((op) => op.operation_type === 'server_merge');
+    expect(prepared).toMatchObject({ status: 'prepared', target_commit: target });
+    vi.restoreAllMocks();
+    await f.server.app.close();
+    const restarted = await createObtsServer({ dataDir: f.server.config.dataDir, sessionSecret: 'stale-proposal-test-secret' });
+    servers.push(restarted);
+    const db = await restarted.store.snapshot();
+    expect(db.vaults[0]?.current_main).toBe(target);
+    expect(db.sync_operations.find((op) => op.operation_id === prepared!.operation_id)).toMatchObject({
+      status: 'committed', result: { decision: 'merged', merge_commit: target, reconciled_after_startup: true }
+    });
+    const auth = await restarted.auth.authenticateDevice(`Bearer ${f.token}`, f.auth.vault.vault_id);
+    expect(await restarted.sync.pushDeviceCommit(auth, request.manifest, request.pack)).toMatchObject({ main: target });
+  });
 });

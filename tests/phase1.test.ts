@@ -5429,7 +5429,7 @@ describe('Phase 1 sync without conflict resolution', () => {
         operation.operation_type === 'server_merge' &&
         operation.status === 'committed' &&
         operation.expected_refs['refs/heads/main'] === previousMain &&
-        operation.target_commit !== originalMerge!.target_commit
+        operation.operation_id !== originalMerge!.operation_id
     );
     expect(resumedMerge?.target_commit).toMatch(/^[0-9a-f]{40}$/u);
     expect(reconciledDb.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(
@@ -7532,7 +7532,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).not.toContain('SYNC_STALE_MS');
     expect(pluginMain).toContain('ensureNoQueuedLocalChangesBeforeApply');
     expect(pluginMain).toContain('fetchWithTimeout');
-    const eventPoll = sourceSection(pluginMain, 'async pollRemoteEventsAndApply()', 'async unpairCurrentDevice()');
+    const eventPoll = sourceSection(pluginMain, 'async pollRemoteEventsAndApply(options = {})', 'async unpairCurrentDevice()');
     expect(eventPoll).toContain('wasConflictBlocked');
     expect(eventPoll).toContain('if (!wasConflictBlocked)');
     expect(eventPoll).toContain('event.event_type === "conflict_resolved"');

@@ -779,6 +779,7 @@ export class GitService {
   ): Promise<string> {
     const repo = this.repoPath(vaultId);
     const tree = await this.createOverlayTree(vaultId, currentMain, deviceCommit, deviceChanges, new Map());
+    if (await this.canReuseDeviceCommit(vaultId, currentMain, deviceCommit, tree)) return deviceCommit;
     return asText(
       await this.exec(
         repo,
@@ -1081,6 +1082,7 @@ export class GitService {
     strategy: 'disjoint_overlay' | 'native_clean' | 'semantic_clean';
   }): Promise<string> {
     const repo = this.repoPath(input.vaultId);
+    if (await this.canReuseDeviceCommit(input.vaultId, input.currentMain, input.deviceCommit, input.tree)) return input.deviceCommit;
     return asText(
       await this.exec(
         repo,
@@ -1098,6 +1100,14 @@ export class GitService {
         serverGitEnv('obts-merge')
       ).then((result) => result.stdout)
     ).trim();
+  }
+
+  private async canReuseDeviceCommit(vaultId: string, currentMain: string, deviceCommit: string, integratedTree: string): Promise<boolean> {
+    // Selection happens after policy integration computes its tree. The caller
+    // still validates the target and journals it before the ordinary main CAS.
+    const { stdout } = await this.exec(this.repoPath(vaultId), ['show', '-s', '--format=%T%n%P', deviceCommit]);
+    const [tree, parents] = asText(stdout).trim().split('\n');
+    return tree === integratedTree && parents === currentMain;
   }
 
   async createTreeFromCommitWithChanges(input: {

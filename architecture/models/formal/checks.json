@@ -20,9 +20,74 @@
     "modules/OBTSApplyRefinement",
     "modules/OBTSSafety",
     "OBTSStaleProposal",
-    "OBTSDeltaApply"
+    "OBTSDeltaApply",
+    "OBTSMainAdvance"
   ],
   "checks": [
+    {
+      "id": "fm002-main-advance-safety",
+      "model": "OBTSMainAdvance",
+      "config": "configs/main-advance-safety.cfg",
+      "kind": "positive-safety",
+      "maximumDepth": 20
+    },
+    {
+      "id": "fm002-main-advance-liveness",
+      "model": "OBTSMainAdvance",
+      "config": "configs/main-advance-liveness.cfg",
+      "kind": "positive-liveness",
+      "maximumDepth": 20
+    },
+    {
+      "id": "fm002-main-advance-reach-fast-forward",
+      "model": "OBTSMainAdvance",
+      "config": "configs/main-advance-reach-fast-forward.cfg",
+      "kind": "reachability",
+      "maximumDepth": 20,
+      "expectedInvariant": "NoFastForward",
+      "requiredWitness": "Advance",
+      "minimumTraceDepth": 3
+    },
+    {
+      "id": "fm002-main-advance-reach-merge",
+      "model": "OBTSMainAdvance",
+      "config": "configs/main-advance-reach-merge.cfg",
+      "kind": "reachability",
+      "maximumDepth": 20,
+      "expectedInvariant": "NoMergeFallback",
+      "requiredWitness": "Advance",
+      "minimumTraceDepth": 3
+    },
+    {
+      "id": "fm002-main-advance-reach-recovery",
+      "model": "OBTSMainAdvance",
+      "config": "configs/main-advance-reach-recovery.cfg",
+      "kind": "reachability",
+      "maximumDepth": 20,
+      "expectedInvariant": "NoRecoveredPublication",
+      "requiredWitness": "Publish",
+      "minimumTraceDepth": 6
+    },
+    {
+      "id": "fm002-main-advance-negative-parent",
+      "model": "OBTSMainAdvance",
+      "config": "configs/main-advance-negative-parent.cfg",
+      "kind": "negative-control",
+      "maximumDepth": 20,
+      "expectedInvariant": "ParentGuard",
+      "requiredWitness": "Advance",
+      "minimumTraceDepth": 3
+    },
+    {
+      "id": "fm002-main-advance-negative-tree",
+      "model": "OBTSMainAdvance",
+      "config": "configs/main-advance-negative-tree.cfg",
+      "kind": "negative-control",
+      "maximumDepth": 20,
+      "expectedInvariant": "TreeGuard",
+      "requiredWitness": "Advance",
+      "minimumTraceDepth": 3
+    },
     {
       "id": "fm001-safety",
       "model": "OBTSApplyRecovery",

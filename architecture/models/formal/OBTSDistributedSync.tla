@@ -8,6 +8,10 @@ OBTS-FM-002, architecture revision 32. This is a bounded refinement of the
 architecture contracts, not a definition of product behavior. Persist/commit
 steps assume their named durable facts survive restart. Git ancestry, bytes,
 flush semantics, process kill, and runtime trace conformance remain external.
+Revision 48 reviews canonical identity selection: CommitPreparedMerge and
+recovery preserve their version/operation semantics whether the target is an
+eligible device commit or a server merge. OBTSMainAdvance checks the exact
+parent/tree guard and durable target reuse as a focused companion.
 ***************************************************************************)
 
 CONSTANTS Plugin1, Plugin2, BridgeNode, PathA, PathB,
