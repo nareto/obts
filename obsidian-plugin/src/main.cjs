@@ -9407,7 +9407,10 @@ class ObtsObsidianClient {
   async isAncestor(ancestor, descendant) {
     if (ancestor === descendant) return true;
     try {
-      return await git.isDescendent({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: descendant, ancestor, depth: -1 });
+      // Keep exact, unbounded ancestry. Only a successful walk (including a
+      // proven negative) is memoized; missing objects and I/O failures retry.
+      return await this.gitObjectMemo.get(`ancestor:${ancestor}:${descendant}`, () =>
+        git.isDescendent({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: descendant, ancestor, depth: -1 }));
     } catch {
       return false;
     }

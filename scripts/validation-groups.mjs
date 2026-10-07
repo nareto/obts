@@ -15,6 +15,7 @@ export const pluginTests = [
   'tests/plugin-in-place-apply.test.ts',
   'tests/plugin-ref-only-apply.test.ts',
   'tests/plugin-hinted-capture.test.ts',
+  'tests/plugin-ancestry-memo.test.ts',
   'tests/plugin-apply-progress.test.ts',
   'tests/plugin-adapter-write-gate.test.ts',
   'tests/plugin-stale-proposal.test.ts',
