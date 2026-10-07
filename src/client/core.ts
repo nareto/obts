@@ -153,7 +153,7 @@ type SharedClientCore = {
   cancelOnboarding(): Promise<void>;
   recordLocalChangeHint(paths: string[]): Promise<void>;
   recordLocalRenameHint(sourcePath: string, destinationPath: string): Promise<void>;
-  syncOnce(options?: { confirmInitialImport?: boolean; fullAudit?: boolean }): Promise<SyncResult>;
+  syncOnce(options?: { confirmInitialImport?: boolean; fullAudit?: boolean; hintedCapture?: boolean }): Promise<SyncResult>;
   pullAndApply(allowDestructive: boolean): Promise<boolean>;
   reconcileDeviceBlocked(fromCaughtError?: boolean, triggeringErrorCode?: string | null): Promise<{ applied: boolean; status: string }>;
   pollRemoteEventsAndApply(): Promise<{ applied: boolean; status: string }>;
@@ -308,7 +308,7 @@ export class ObtsPluginClient {
     return this.client.recordLocalRenameHint(sourcePath, destinationPath);
   }
 
-  syncOnce(options?: { confirmInitialImport?: boolean; fullAudit?: boolean }): Promise<SyncResult> {
+  syncOnce(options?: { confirmInitialImport?: boolean; fullAudit?: boolean; hintedCapture?: boolean }): Promise<SyncResult> {
     return this.client.syncOnce(options);
   }
 
@@ -398,7 +398,9 @@ export class ObtsPluginClient {
         queue.pending_commit || queue.status === 'queued_local' || decision.required
       );
       const result = syncPerformed
-        ? await this.client.syncOnce({ fullAudit: decision.mode === 'full' })
+        ? await this.client.syncOnce(decision.required
+          ? { fullAudit: decision.mode === 'full' }
+          : { fullAudit: false, hintedCapture: true })
         : await this.client.pollRemoteEventsAndApply();
       const state = await this.client.readState();
       return {

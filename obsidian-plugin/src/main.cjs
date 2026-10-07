@@ -23,6 +23,8 @@ const PERIODIC_INVENTORY_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const PERIODIC_FULL_AUDIT_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
 const MIGRATED_FULL_AUDIT_DELAY_MS = 24 * 60 * 60 * 1000;
 const SCANNER_SCHEMA_VERSION = 1;
+// Above this many hinted paths a cached whole-vault inventory costs about the same.
+const HINTED_CAPTURE_MAX_PATHS = 256;
 const AUTOMATIC_RETRY_MAX_MS = 5 * 60 * 1000;
 const OPERATION_STATUS_HEARTBEAT_MS = 30 * 1000;
 const STATUS_LAG_NOTICE_DELAY_MS = 30 * 1000;
@@ -259,7 +261,10 @@ module.exports = class ObtsPlugin extends Plugin {
       );
       if (typeof this.registerDomEvent === "function" && typeof document !== "undefined") {
         this.registerDomEvent(document, "visibilitychange", () => {
-          if (!document.hidden) void this.runBackgroundSync();
+          if (document.hidden) return;
+          // Files may have changed while backgrounded without watcher events.
+          if (this.client && typeof this.client.requestFullInventory === "function") this.client.requestFullInventory();
+          void this.runBackgroundSync();
         });
       }
     } catch (error) {
@@ -1074,7 +1079,11 @@ module.exports = class ObtsPlugin extends Plugin {
         await this.client.reportDeviceStatus().catch(() => undefined);
         return;
       }
-      await this.syncOnceOrPollResolvedConflict({ confirmInitialImport: false, fullAudit: Boolean(options.fullAudit) });
+      await this.syncOnceOrPollResolvedConflict({
+        confirmInitialImport: false,
+        fullAudit: Boolean(options.fullAudit),
+        hintedCapture: !options.fullAudit
+      });
       this.clearTransientSyncFailures();
       this.setStatus((await this.client.readState()).status_label);
       await this.client.reportDeviceStatus().catch(() => undefined);
@@ -1473,6 +1482,18 @@ class ObtsObsidianClient {
     this.lastSnapshotWasFullAudit = false;
     this.activeReconciliation = null;
     this.lastCursorGuardDiagnostic = "not_observed";
+    // Hinted capture trusts watcher hints only after a whole-vault inventory
+    // has run since the last startup, resume or explicit inventory request.
+    this.inventoryRequestedSeq = 1;
+    this.inventoryCompletedSeq = 0;
+  }
+
+  requestFullInventory() {
+    this.inventoryRequestedSeq += 1;
+  }
+
+  fullInventoryCurrent() {
+    return this.inventoryCompletedSeq >= this.inventoryRequestedSeq;
   }
 
   async collectTroubleshootingContext(details = {}) {
@@ -2567,7 +2588,8 @@ class ObtsObsidianClient {
     if (await this.readDurableCatchup()) throw new ObtsBlockedError("catchup_local_changes", "Catch-up is still pending. Make a copy of local edits outside this vault and preserve recovery evidence before resuming.");
     await this.recoverUnacknowledgedServerApply();
     state = await this.readState();
-    await this.flushEditorBuffersToDisk();
+    // Their watcher events may land after this sync reads its hints.
+    const flushedPaths = await this.flushEditorBuffersToDisk();
     const heldEvidence = await this.readStaleProvenance();
     const heldQueue = await this.readQueue();
     if (heldEvidence.held_proposals.some((h) => h.commit !== heldQueue.pending_commit && h.commit !== heldEvidence.accepted_proposal?.commit)) {
@@ -2605,24 +2627,37 @@ class ObtsObsidianClient {
         await this.reportDeviceStatus().catch(() => undefined);
       }
 
-      const localInventory = await this.listLocalVaultInventory("", (await this.readRootIgnorePolicy()).policy);
-      const localFiles = assertNoCaseCollisions(localInventory.files.filter((filePath) => isSyncableVaultPath(filePath)).sort());
-      const pendingDirectoryIntents = await this.reconcileDirectoryState(localFiles, localInventory.directories);
-      if (localFiles.length > 0 && !state.initial_import_confirmed && state.server_device_ref === null) {
-        await this.createRecoveryBundle("initial_import", state.local_main, localFiles);
-        if (!options.confirmInitialImport) {
-          await this.block("initial_import_confirmation_required", "Initial import requires owner confirmation. Run the confirm initial import command after reviewing the recovery bundle.");
+      const hinted = options.hintedCapture && !options.fullAudit
+        ? await this.captureHintedLocalChanges(queueBeforeScan, flushedPaths)
+        : null;
+      let staleQueued = false;
+      let pendingDirectoryIntents = [];
+      let commit = null;
+      if (hinted) {
+        commit = hinted.commit;
+      } else {
+        const inventorySeq = this.inventoryRequestedSeq;
+        const localInventory = await this.listLocalVaultInventory("", (await this.readRootIgnorePolicy()).policy);
+        const localFiles = assertNoCaseCollisions(localInventory.files.filter((filePath) => isSyncableVaultPath(filePath)).sort());
+        pendingDirectoryIntents = await this.reconcileDirectoryState(localFiles, localInventory.directories);
+        if (localFiles.length > 0 && !state.initial_import_confirmed && state.server_device_ref === null) {
+          await this.createRecoveryBundle("initial_import", state.local_main, localFiles);
+          if (!options.confirmInitialImport) {
+            await this.block("initial_import_confirmation_required", "Initial import requires owner confirmation. Run the confirm initial import command after reviewing the recovery bundle.");
+          }
+          await this.writeState(Object.assign({}, state, { initial_import_confirmed: true, status_label: "Ahead", updated_at: nowIso() }));
         }
-        await this.writeState(Object.assign({}, state, { initial_import_confirmed: true, status_label: "Ahead", updated_at: nowIso() }));
-      }
 
-      const staleQueued = await this.queueStaleCohort(state.local_main, state.server_device_ref);
-      let commit = staleQueued ? null : await this.createLocalCommit("obts: local vault changes", localFiles, {
-        forcePaths: queueBeforeScan.changed_paths,
-        fullAudit: Boolean(options.fullAudit)
-      });
-      if (!staleQueued && !commit && pendingDirectoryIntents.length > 0) {
-        commit = await this.createMetadataCommit("obts: local directory changes");
+        staleQueued = await this.queueStaleCohort(state.local_main, state.server_device_ref);
+        commit = staleQueued ? null : await this.createLocalCommit("obts: local vault changes", localFiles, {
+          forcePaths: queueBeforeScan.changed_paths,
+          fullAudit: Boolean(options.fullAudit)
+        });
+        if (!staleQueued && !commit && pendingDirectoryIntents.length > 0) {
+          commit = await this.createMetadataCommit("obts: local directory changes");
+        }
+        // A queued stale cohort skipped capture, so this inventory proved nothing.
+        if (!staleQueued) this.inventoryCompletedSeq = Math.max(this.inventoryCompletedSeq, inventorySeq);
       }
       if (commit) {
         const currentState = await this.readState();
@@ -2636,6 +2671,7 @@ class ObtsObsidianClient {
           updated_at: nowIso()
         }));
         await this.writeState(Object.assign({}, currentState, { local_head: commit, status_label: "Ahead", last_error_code: null, updated_at: nowIso() }));
+        if (hinted) await this.advanceScanStateHead(hinted.base, commit);
       } else if (!staleQueued && pendingDirectoryIntents.length === 0 && !this.plugin.syncQueued) {
         await this.clearQueuedHintIfUnchanged(queueBeforeScan.change_seq || 0);
         const [reconciledState, reconciledQueue] = await Promise.all([this.readState(), this.readQueue()]);
@@ -2651,8 +2687,10 @@ class ObtsObsidianClient {
         }
       }
 
-      performedScan = true;
-      await this.recordScanCompleted(Boolean(options.fullAudit));
+      if (!hinted) {
+        performedScan = true;
+        await this.recordScanCompleted(Boolean(options.fullAudit));
+      }
       const queue = await this.readQueue();
       if (queue.pending_commit) {
         uploadResult = await this.uploadQueuedCommit(queue);
@@ -2974,6 +3012,8 @@ class ObtsObsidianClient {
       return;
     }
     let changedPaths = [];
+    // A change without paths can be anywhere: only an inventory can find it.
+    if (paths === undefined) this.requestFullInventory();
     if (paths !== undefined) {
       changedPaths = (Array.isArray(paths) ? paths : [paths])
         .filter((filePath) => typeof filePath === "string" && filePath.length > 0)
@@ -4784,6 +4824,8 @@ class ObtsObsidianClient {
     }));
     await this.writePendingAppliedAcknowledgement(journal.target_main, eventSeq || 0);
     await this.clearApplyState();
+    // No visible path changed, so the last inventory still holds at T.
+    await this.advanceScanStateHead(state.local_head, journal.target_main);
   }
 
   async preApplyAuthoringBase(state, targetMain) {
@@ -5773,6 +5815,7 @@ class ObtsObsidianClient {
       ...targetEntries.keys(),
       ...localFiles
     ])].filter((filePath) => isSyncableVaultPath(filePath)).sort();
+    this.requestFullInventory();
     await this.recordLocalChangeHint(paths);
     this.plugin.syncQueued = true;
   }
@@ -6834,6 +6877,7 @@ class ObtsObsidianClient {
       if (await this.bootstrapScanCacheFromConvergedState(state, directoryState)) return { required: false, mode: "none" };
       return { required: true, mode: "full" };
     }
+    await this.retireElapsedEmptyHorizons();
     const lastInventoryAt = Date.parse(scanState.last_inventory_completed_at || "");
     const nextFullAuditAt = Date.parse(scanState.next_full_audit_at || "");
     const lastFullAuditAt = Date.parse(scanState.last_full_audit_completed_at || "");
@@ -6863,6 +6907,27 @@ class ObtsObsidianClient {
     try { saved = await this.readStaleProvenance(); } catch { return false; }
     const now = Date.now();
     return saved.horizons.some((h) => h.expiry <= now);
+  }
+
+  // A horizon that touched no path guards no capture, so ending it needs no
+  // drain and no inventory; scanning the whole vault for it would make every
+  // own push cost O(vault). Horizons with paths still end inside a scan.
+  async retireElapsedEmptyHorizons() {
+    // Any failure leaves the horizon, so the decision falls back to the
+    // ordinary scan, which reports the underlying problem.
+    try {
+      const saved = await this.readStaleProvenance();
+      const journal = await readApplyJournalStrict(this.fsp, this.applyJournalPath);
+      const now = Date.now();
+      const elapsed = (h) => h.touched.length === 0 && h.expiry <= now && h.apply_id !== journal?.apply_id;
+      if (!saved.horizons.some(elapsed) || Object.keys(saved.obligations).length || saved.rename_pairs.length) return;
+      await this.mutateStaleProvenance(async (current) => {
+        if (Object.keys(current.obligations).length || current.rename_pairs.length) return;
+        current.horizons = current.horizons.filter((h) => !elapsed(h));
+      });
+    } catch {
+      return;
+    }
   }
 
   // Earliest future horizon expiry, so the host can wake its background check
@@ -6950,6 +7015,105 @@ class ObtsObsidianClient {
       bootstrap_basis: completedFullAudit ? null : previous && previous.bootstrap_basis || null
     });
     this.lastSnapshotWasFullAudit = false;
+  }
+
+  // A hinted capture or a ref-only apply moves local_head without changing any
+  // visible path outside its own footprint, so the last inventory still
+  // describes the vault. Only the exact head that inventory recorded advances.
+  async advanceScanStateHead(fromHead, toHead) {
+    const [state, directoryState, scanState] = await Promise.all([
+      this.readState(),
+      this.readDirectoryState(),
+      readJson(this.fsp, this.scanStatePath, null)
+    ]);
+    if (
+      !scanState || scanState.version !== 1 || scanState.scanner_schema !== SCANNER_SCHEMA_VERSION ||
+      scanState.vault_id !== state.vault_id || scanState.device_id !== state.device_id ||
+      scanState.local_head !== fromHead || scanState.directory_generation !== directoryState.next_generation ||
+      state.local_head !== toHead
+    ) return;
+    await writeJson(this.fsp, this.scanStatePath, Object.assign({}, scanState, { local_head: toHead }));
+  }
+
+  // OBTS-SYNC-DELTA-001 ordinary capture: read only the durable watcher hints.
+  // Returns null whenever the hints alone cannot show what a whole-vault
+  // inventory would capture; the caller then runs that inventory instead.
+  // Deletions, folders, new directories, renames, policy changes and any
+  // pending stale or directory evidence all take the inventory path.
+  async captureHintedLocalChanges(queue, flushedPaths = []) {
+    const hints = [...new Set([...(queue.changed_paths || []),
+      ...(Array.isArray(flushedPaths) ? flushedPaths : []).map((filePath) => normalizePath(filePath))])].sort();
+    // No hints is a valid empty capture: a queued sync often finds that the
+    // previous one already committed its paths.
+    if (!this.fullInventoryCurrent() || hints.length > HINTED_CAPTURE_MAX_PATHS ||
+        hints.includes(".gitignore") || new Set(hints.map((filePath) => filePath.toLowerCase())).size !== hints.length) return null;
+    const state = await this.readState();
+    const base = state.local_head;
+    if (!base || base !== state.local_main || !state.initial_import_confirmed && state.server_device_ref === null) return null;
+    if (await this.resolveRef("refs/heads/local") !== base) return null;
+    if ((await this.backgroundScanDecision()).required) return null;
+    try {
+      if (await readApplyJournalStrict(this.fsp, this.applyJournalPath)) return null;
+    } catch {
+      return null;
+    }
+    const saved = await this.readStaleProvenance();
+    // Horizons that touched no path cannot claim a captured file.
+    if (saved.horizons.some((h) => h.touched.length > 0) || Object.keys(saved.obligations).length > 0 || saved.rename_pairs.length > 0 ||
+        saved.held_proposals.length > 0 || saved.queued_replacement ||
+        (saved.intent && !["merged", "noop"].includes(saved.intent.outcome))) return null;
+    const directoryState = await this.readDirectoryState();
+    if (directoryState.pending_intents.length > 0) return null;
+    const explicitEmptyDirs = new Set(directoryState.explicit_empty_dirs);
+    const rootPolicy = await this.readRootIgnorePolicy();
+    if ((rootPolicy.oid ?? undefined) !== await this.readTreePathOid(base, ".gitignore")) return null;
+    const files = [];
+    const baseEntries = new Map();
+    for (const filePath of hints) {
+      // The inventory never descends into unsyncable folders and records
+      // explicit empty folders separately; leave those cases to it.
+      if (!isSyncableVaultPath(filePath) || directoryPrefixes(filePath).some((dirPath) =>
+        !isSyncableVaultPath(dirPath) || explicitEmptyDirs.has(dirPath))) return null;
+      const located = await this.readTreePathEntry(base, filePath);
+      // A case variant may be the same file on a case-insensitive disk.
+      if (!located.ancestorsAreTrees || located.caseVariant || located.entry?.type === "tree") return null;
+      if (rootPolicy.policy.ignores(filePath)) {
+        if (located.entry) return null;
+        continue;
+      }
+      let stat;
+      try {
+        stat = await this.adapter.stat(filePath);
+      } catch {
+        return null;
+      }
+      if (!stat || stat.type !== "file") return null;
+      if (located.entry) baseEntries.set(filePath, { mode: located.entry.mode, path: filePath, oid: located.entry.oid, type: "blob" });
+      files.push(filePath);
+    }
+    if (files.length === 0) return { base, commit: null };
+    let snapshot;
+    try {
+      snapshot = await this.captureLocalFileSnapshot(files, baseEntries, {
+        persistChangedBlobs: true,
+        forcePaths: files,
+        hinted: true,
+        rootPolicy
+      });
+    } catch (error) {
+      if (!(error instanceof LocalSnapshotChangedError)) throw error;
+      this.plugin.syncQueued = true;
+      throw new ObtsBlockedError("local_snapshot_changed", "Local files changed while obts was checking them. Sync will retry.");
+    }
+    if ((await this.readRootIgnorePolicy()).oid !== rootPolicy.oid) {
+      this.plugin.syncQueued = true;
+      throw new ObtsBlockedError("local_snapshot_changed", "Root .gitignore changed during capture. Sync will retry.");
+    }
+    const baseTree = await this.readCommitTreeOid(base);
+    const tree = await this.writeTreeWithChanges(baseTree,
+      new Map([...snapshot.entries].map(([filePath, value]) => [filePath, value.entry])));
+    if (tree === baseTree) return { base, commit: null };
+    return { base, commit: await this.commitTree(tree, base, "obts: local vault changes") };
   }
 
   async readScanCache() {
@@ -7051,7 +7215,7 @@ class ObtsObsidianClient {
     const forcedPaths = Array.from(new Set([".gitignore", ...(Array.isArray(options.forcePaths) ? options.forcePaths : [])]
       .filter((filePath) => typeof filePath === "string" && isSyncableVaultPath(filePath))
       .map((filePath) => normalizePath(filePath))));
-    const scanCache = options.fullAudit ? new Map() : await this.readScanCache();
+    const scanCache = options.fullAudit || options.hinted ? new Map() : await this.readScanCache();
     if (options.persistScanCache) this.lastSnapshotWasFullAudit = Boolean(options.fullAudit || scanCache.size === 0);
     if (options.reportProgress) this.reportCheckingProgress(0, files.length, Boolean(options.fullAudit));
     const values = await runBoundedWork(files, {
@@ -7966,16 +8130,58 @@ class ObtsObsidianClient {
   }
 
   async readTreePathOid(commit, filePath) {
+    const { entry } = await this.readTreePathEntry(commit, filePath);
+    return entry?.type === "blob" ? entry.oid : undefined;
+  }
+
+  // The entry at filePath, whether every ancestor is a directory there, and
+  // whether a sibling differs from the final name only by case.
+  async readTreePathEntry(commit, filePath) {
     let treeOid = await this.readCommitTreeOid(commit);
     const segments = filePath.split("/");
     for (const [index, segment] of segments.entries()) {
-      const entry = (await this.readTreeEntries(treeOid)).find((candidate) => candidate.path === segment);
-      if (!entry) return undefined;
-      if (index === segments.length - 1) return entry.type === "blob" ? entry.oid : undefined;
-      if (entry.type !== "tree") return undefined;
+      const entries = await this.readTreeEntries(treeOid);
+      const entry = entries.find((candidate) => candidate.path === segment) || null;
+      if (index === segments.length - 1) {
+        const folded = segment.toLowerCase();
+        const caseVariant = entries.some((candidate) => candidate.path !== segment && candidate.path.toLowerCase() === folded);
+        return { ancestorsAreTrees: true, entry, caseVariant };
+      }
+      if (!entry || entry.type !== "tree") return { ancestorsAreTrees: false, entry: null, caseVariant: false };
       treeOid = entry.oid;
     }
-    return undefined;
+    return { ancestorsAreTrees: false, entry: null, caseVariant: false };
+  }
+
+  // The base tree with blob entries upserted. Only trees on the changed paths
+  // are rewritten, so cost is depth times changes, not vault size; the result
+  // equals writeTreeFromEntries over the merged entries.
+  async writeTreeWithChanges(baseTreeOid, changes) {
+    const root = { blobs: new Map(), trees: new Map() };
+    for (const [entryPath, entry] of changes) {
+      const segments = entryPath.split("/");
+      let node = root;
+      for (const segment of segments.slice(0, -1)) {
+        if (!node.trees.has(segment)) node.trees.set(segment, { blobs: new Map(), trees: new Map() });
+        node = node.trees.get(segment);
+      }
+      node.blobs.set(segments.at(-1), entry);
+    }
+    const write = async (treeOid, node) => {
+      const entries = new Map((treeOid ? await this.readTreeEntries(treeOid) : []).map((entry) => [entry.path, entry]));
+      for (const [name, child] of node.trees) {
+        const existing = entries.get(name);
+        if (existing && existing.type !== "tree") throw new Error("A changed path crosses a file in the base tree.");
+        entries.set(name, { mode: "040000", path: name, oid: await write(existing ? existing.oid : null, child), type: "tree" });
+      }
+      for (const [name, entry] of node.blobs) {
+        if (entries.get(name)?.type === "tree") throw new Error("A changed file replaces a directory in the base tree.");
+        entries.set(name, { mode: entry.mode, path: name, oid: entry.oid, type: "blob" });
+      }
+      return await git.writeTree({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir,
+        tree: [...entries.values()].map((entry) => Object.assign({}, entry)) });
+    };
+    return await write(baseTreeOid, root);
   }
 
   async readCommitTreeOid(oid) {
@@ -10296,11 +10502,17 @@ class ObtsObsidianClient {
   }
 
   async clearAcknowledgedDirectoryIntents(acknowledgedIntents) {
-    await this.reconcileDirectoryState();
-    const directoryState = await this.readDirectoryState();
     const acknowledgedKeys = new Set((Array.isArray(acknowledgedIntents) ? acknowledgedIntents : [])
       .filter((intent) => intent && typeof intent.intent_id === "string" && Number.isSafeInteger(intent.generation))
       .map(directoryIntentGenerationKey));
+    // OBTS-SYNC-DELTA-001: with nothing to acknowledge the reconcile only
+    // records folder changes before a later apply refreshes directory state.
+    // While this session's inventory is current, any such change has left a
+    // watcher hint, durable or still in memory; without one the walk is a no-op.
+    if (acknowledgedKeys.size === 0 && this.fullInventoryCurrent() && !this.plugin.syncQueued &&
+        (await this.readQueue()).changed_paths.length === 0) return;
+    await this.reconcileDirectoryState();
+    const directoryState = await this.readDirectoryState();
     const remaining = directoryState.pending_intents.filter((intent) => !acknowledgedKeys.has(directoryIntentGenerationKey(intent)));
     await this.writeDirectoryState(Object.assign({}, directoryState, {
       pending_intents: remaining,

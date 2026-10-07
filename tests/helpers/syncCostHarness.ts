@@ -54,8 +54,9 @@ class AdapterMeter {
           active.byArea[area] = (active.byArea[area] ?? 0) + 1;
           if (process.env.OBTS_COST_TRACE === area) {
             const frames = (new Error().stack ?? '').split('\n')
-              .filter((line) => /(obsidian-plugin\/src\/(?!data-adapter-fs)|isomorphic-git)/u.test(line)).slice(0, 3)
-              .map((line) => line.trim().replace(/^at /u, '').replace(/\(.*\/(src|node_modules)\//u, '(').replace(/:\d+\)$/u, ')'));
+              .filter((line) => /(obsidian-plugin\/src\/(?!data-adapter-fs|work-pool)|isomorphic-git)/u.test(line))
+              .slice(0, Number(process.env.OBTS_COST_TRACE_DEPTH ?? 3))
+              .map((line) => line.trim().replace(/^at /u, '').replace(/\(?\/.*\/(src|node_modules)\//u, '(').replace(/:\d+\)?$/u, ')'));
             const key = frames.join(' < ') || 'unknown';
             meter.traces.set(key, (meter.traces.get(key) ?? 0) + 1);
           }
@@ -183,8 +184,31 @@ export async function createSyncCostFixture(fileCount: number): Promise<SyncCost
   };
 }
 
-export async function writeNote(vaultDir: string, index: number, body: string): Promise<void> {
+export async function writeNote(vaultDir: string, index: number, body: string): Promise<string> {
   await writeFile(join(vaultDir, notePath(index)), body);
+  return notePath(index);
+}
+
+// Stands in for the few seconds after an apply in which stale-authoring
+// horizons are still open; the next background check settles them.
+export async function expireStaleHorizons(plugin: ObtsPluginClient): Promise<void> {
+  const core = (plugin as unknown as { client: any }).client;
+  await core.mutateStaleProvenance(async (saved: any) => { for (const horizon of saved.horizons) horizon.expiry = Date.now() - 1; });
+}
+
+// The background path: durable watcher hints, then headless maintenance ticks
+// until the device is converged with nothing left to capture.
+export async function tickUntilSettled(plugin: ObtsPluginClient, hints: string[] = [], maxTicks = 6): Promise<string[]> {
+  const core = (plugin as unknown as { client: any }).client;
+  if (hints.length > 0) await plugin.recordLocalChangeHint(hints);
+  const statuses: string[] = [];
+  for (let tick = 0; tick < maxTicks; tick += 1) {
+    const result = await plugin.maintenanceTick();
+    statuses.push(`${result.scan_mode}:${result.status}`);
+    const queue = await core.readQueue();
+    if (result.status === 'Synced' && queue.status === 'idle' && !queue.pending_commit && queue.changed_paths.length === 0) break;
+  }
+  return statuses;
 }
 
 export async function syncUntilSettled(plugin: ObtsPluginClient, maxCycles = 6): Promise<string[]> {

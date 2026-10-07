@@ -4,7 +4,9 @@ import {
   addSyntheticPacks,
   countLocalPacks,
   createSyncCostFixture,
+  expireStaleHorizons,
   syncUntilSettled,
+  tickUntilSettled,
   writeNote,
   type AdapterCost,
   type SyncCostFixture
@@ -51,6 +53,13 @@ describe('sync cost is proportional to the change', () => {
     return cost;
   }
 
+  async function measureBackground(name: string, hints: string[] = []): Promise<AdapterCost> {
+    const { value, cost } = await fixture.meter.measure(() => tickUntilSettled(fixture.reader, hints));
+    report[name] = { ...cost, statuses: value.join(' > '), localPacks: await countLocalPacks(fixture.readerDir) };
+    expect(value.at(-1)).toMatch(/:Synced$/u);
+    return cost;
+  }
+
   it('measures an idle cycle', async () => {
     await measureReader('idle');
   }, 300_000);
@@ -86,6 +95,21 @@ describe('sync cost is proportional to the change', () => {
     await writeNote(fixture.writerDir, 13, 'remote edit after consolidation\n');
     expect((await syncUntilSettled(fixture.writer)).at(-1)).toBe('Synced');
     await measureReader('remote 1 file, consolidated');
+  }, 300_000);
+
+  // Background ticks after this session's inventory: ordinary edits are
+  // captured from their watcher hints, so cost does not grow with the vault.
+  it('measures background maintenance from watcher hints', async () => {
+    // Settle what the foreground rows above left behind.
+    await expireStaleHorizons(fixture.reader);
+    expect((await tickUntilSettled(fixture.reader)).at(-1)).toMatch(/:Synced$/u);
+    const idle = await measureBackground('bg idle');
+    const ownPush = await measureBackground('bg own push 1 file', [await writeNote(fixture.readerDir, 31, 'hinted local edit\n')]);
+    const again = await measureBackground('bg own push again', [await writeNote(fixture.readerDir, 32, 'second hinted edit\n')]);
+    for (const cost of [idle, ownPush, again]) expect(cost.byArea.vault ?? 0).toBeLessThanOrEqual(40);
+    await writeNote(fixture.writerDir, 33, 'remote edit seen by ticks\n');
+    expect((await syncUntilSettled(fixture.writer)).at(-1)).toBe('Synced');
+    await measureBackground('bg remote 1 file');
   }, 300_000);
 
   it('keeps syncing when local pack maintenance fails', async () => {
