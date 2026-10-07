@@ -4724,6 +4724,68 @@ class ObtsObsidianClient {
     }
   }
 
+  // OBTS-SYNC-DELTA-001 ref-only apply: the target tree equals the authoring
+  // base and every footprint path is already visible as the target, so a full
+  // apply would write and capture nothing. Equal trees alone are not enough:
+  // after a rebuild reset local_head can hold content not yet materialized.
+  // Provenance carried from earlier work disqualifies it; the accepted
+  // proposal's own cohort obligations are re-read here and settle later.
+  async refOnlyApplyEligible(state, targetMain, authoringBase, prior, explicitDirectories = []) {
+    if (!authoringBase || state.local_head !== authoringBase || !state.local_main) return false;
+    if (Object.keys(prior.obligations).length > 0 || prior.held_proposals.length > 0 || prior.rename_pairs.length > 0 ||
+        prior.queued_replacement || (prior.intent && !["merged", "noop"].includes(prior.intent.outcome))) return false;
+    if (await this.readDurableCatchup()) return false;
+    // A full apply also captures hinted local edits on top of the target.
+    if ((await this.readQueue()).changed_paths.length > 0) return false;
+    // A full apply turns local empty folders the target lacks into intents.
+    // Without recorded directory state, or with a recorded empty folder the
+    // target does not list, only that path can preserve them.
+    if (!(await exists(this.fsp, this.directoryStatePath))) return false;
+    const directoryState = await this.readDirectoryState();
+    if (directoryState.pending_intents.length > 0 ||
+        directoryState.explicit_empty_dirs.some((dirPath) => !explicitDirectories.includes(dirPath))) return false;
+    if (!(await this.commitExists(authoringBase)) || !(await this.commitExists(state.local_main))) return false;
+    if (await this.readCommitTreeOid(authoringBase) !== await this.readCommitTreeOid(targetMain)) return false;
+    const footprint = new Set([
+      ...await this.changedTreePaths(state.local_main, targetMain),
+      ...Object.keys((await this.readStaleProvenance()).obligations)
+    ]);
+    if (footprint.has(".gitignore")) return false;
+    try {
+      for (const filePath of [...footprint].sort()) {
+        const { fingerprint } = await this.readRecoveryFileSnapshot(filePath);
+        if (!this.fingerprintMatchesTarget(fingerprint, await this.readTreePathOid(targetMain, filePath))) return false;
+      }
+    } catch (error) {
+      if (error instanceof LocalSnapshotChangedError) return false;
+      throw error;
+    }
+    return true;
+  }
+
+  // Same durable order as the committed tail of a full apply. The committed
+  // journal comes first so startup recovery can roll the refs forward.
+  async applyRefOnly(state, journal, eventSeq) {
+    this.reportOperationProgress("Applying (finishing)", "apply_finalize");
+    journal.phase = "committed";
+    await writeJson(this.fsp, this.applyJournalPath, journal);
+    await this.retainApplyProvenance(journal);
+    await this.updateRef("refs/heads/main", journal.target_main, null, true);
+    await this.updateRef("refs/heads/local", journal.target_main, null, true);
+    const queue = await this.readQueue();
+    await this.writeState(Object.assign({}, state, {
+      local_main: journal.target_main,
+      local_head: journal.target_main,
+      status_label: (queue.changed_paths || []).length > 0 ? "Checking" : "Synced",
+      last_error_code: null,
+      last_event_seq: Math.max(state.last_event_seq || 0, eventSeq || 0),
+      last_applied_event_seq: Math.max(state.last_applied_event_seq || 0, eventSeq || 0),
+      updated_at: nowIso()
+    }));
+    await this.writePendingAppliedAcknowledgement(journal.target_main, eventSeq || 0);
+    await this.clearApplyState();
+  }
+
   async preApplyAuthoringBase(state, targetMain) {
     const queue = await this.readQueue();
     const saved = await this.readStaleProvenance();
@@ -4825,10 +4887,17 @@ class ObtsObsidianClient {
       updated_at: nowIso()
     }));
       this.reportOperationProgress("Applying", "apply_recovery_prepare");
+      const priorProvenance = await this.readStaleProvenance();
+      const authoringBase = catchupExpectedTree
+        ? (await this.readDurableCatchup())?.authoring_base || await this.preApplyAuthoringBase(state, targetMain)
+        : await this.preApplyAuthoringBase(state, targetMain);
+      const refOnly = requireCleanVisibleState && !rebuild && !catchupExpectedTree && !consentBaselineBundleId &&
+        !preserveConsentLocalPaths && !confirmedDirectoryRecovery && extraAffectedPaths.length === 0 &&
+        compactedDirectoryIntents.length === 0 && !hasDirectoryWork &&
+        await this.refOnlyApplyEligible(state, targetMain, authoringBase, priorProvenance, explicitDirectorySet);
       const journal = {
       journal_version: 7,
-        authoring_base: catchupExpectedTree ? (await this.readDurableCatchup())?.authoring_base || await this.preApplyAuthoringBase(state, targetMain)
-          : await this.preApplyAuthoringBase(state, targetMain),
+        authoring_base: authoringBase,
       touched_paths: [],
       target_root_ignore_oid: targetPolicy.oid,
       local_only_paths: [],
@@ -4856,6 +4925,10 @@ class ObtsObsidianClient {
       last_completed_step: null,
       redacted_error_category: null
     };
+      if (refOnly) {
+        await this.applyRefOnly(state, journal, eventSeq);
+        return true;
+      }
       const targetEntries = targetPolicy.entries;
       let consentBaselineFingerprints = new Map();
       if (consentBaselineBundleId) {
@@ -7870,6 +7943,39 @@ class ObtsObsidianClient {
       async () => (await git.readTree({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid })).tree,
       (tree) => tree.length + 1
     );
+  }
+
+  // Blob paths that differ between two commits; equal subtrees are skipped.
+  async changedTreePaths(leftCommit, rightCommit) {
+    const changed = [];
+    const visit = async (leftOid, rightOid, prefix) => {
+      if (leftOid === rightOid) return;
+      const left = new Map(leftOid ? (await this.readTreeEntries(leftOid)).map((entry) => [entry.path, entry]) : []);
+      const right = new Map(rightOid ? (await this.readTreeEntries(rightOid)).map((entry) => [entry.path, entry]) : []);
+      for (const name of new Set([...left.keys(), ...right.keys()])) {
+        const before = left.get(name);
+        const after = right.get(name);
+        if (before?.oid === after?.oid && before?.type === after?.type) continue;
+        const entryPath = prefix ? `${prefix}/${name}` : name;
+        await visit(before?.type === "tree" ? before.oid : null, after?.type === "tree" ? after.oid : null, entryPath);
+        if (before?.type === "blob" || after?.type === "blob") changed.push(entryPath);
+      }
+    };
+    await visit(await this.readCommitTreeOid(leftCommit), await this.readCommitTreeOid(rightCommit), "");
+    return changed.filter((filePath) => isSyncableVaultPath(filePath)).sort();
+  }
+
+  async readTreePathOid(commit, filePath) {
+    let treeOid = await this.readCommitTreeOid(commit);
+    const segments = filePath.split("/");
+    for (const [index, segment] of segments.entries()) {
+      const entry = (await this.readTreeEntries(treeOid)).find((candidate) => candidate.path === segment);
+      if (!entry) return undefined;
+      if (index === segments.length - 1) return entry.type === "blob" ? entry.oid : undefined;
+      if (entry.type !== "tree") return undefined;
+      treeOid = entry.oid;
+    }
+    return undefined;
   }
 
   async readCommitTreeOid(oid) {
