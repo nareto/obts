@@ -509,7 +509,7 @@ export class MetadataStore {
   }
 
   private async persistUnmeasured(db: MetadataDb): Promise<void> {
-    const serialized = `${JSON.stringify(db, null, 2)}\n`;
+    const serialized = `${JSON.stringify(db)}\n`;
     const tempFile = `${this.filePath}.${process.pid}.${Date.now()}.${randomBytes(8).toString('hex')}.tmp`;
     try {
       await mkdir(dirname(this.filePath), { recursive: true, mode: 0o700 });
