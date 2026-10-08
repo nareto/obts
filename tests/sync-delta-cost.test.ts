@@ -107,17 +107,17 @@ describe('sync cost is proportional to the change', () => {
     const ownPush = await measureBackground('bg own push 1 file', [await writeNote(fixture.readerDir, 31, 'hinted local edit\n')]);
     const again = await measureBackground('bg own push again', [await writeNote(fixture.readerDir, 32, 'second hinted edit\n')]);
     for (const cost of [idle, ownPush, again]) expect(cost.byArea.vault ?? 0).toBeLessThanOrEqual(40);
-    expect(idle.calls).toBeLessThanOrEqual(50);
-    for (const cost of [ownPush, again]) expect(cost.calls).toBeLessThanOrEqual(1400);
+    expect(idle.calls).toBeLessThanOrEqual(45);
+    for (const cost of [ownPush, again]) expect(cost.calls).toBeLessThanOrEqual(1200);
     await writeNote(fixture.writerDir, 33, 'remote edit seen by ticks\n');
     expect((await syncUntilSettled(fixture.writer)).at(-1)).toBe('Synced');
     const remote = await measureBackground('bg remote 1 file');
     expect(remote.byArea.vault ?? 0).toBeLessThanOrEqual(75);
-    expect(remote.calls).toBeLessThanOrEqual(1100);
+    expect(remote.calls).toBeLessThanOrEqual(950);
     await expireStaleHorizons(fixture.reader);
     const settled = await measureBackground('bg remote horizon settle');
     expect(settled.byArea.vault ?? 0).toBeLessThanOrEqual(10);
-    expect(settled.calls).toBeLessThanOrEqual(200);
+    expect(settled.calls).toBeLessThanOrEqual(125);
   }, 300_000);
 
   it('keeps syncing when local pack maintenance fails', async () => {

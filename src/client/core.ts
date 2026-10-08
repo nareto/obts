@@ -163,6 +163,8 @@ type SharedClientCore = {
   unpairCurrentDevice(): Promise<{ status: 'Not paired' }>;
   resetLocalPairingState(): Promise<{ status: 'Not paired'; recoveryBundleId: string | null }>;
   reportDeviceStatus(): Promise<void>;
+  reportDeviceStatusIfDue(): Promise<void>;
+  flushDeviceStatusReports(): Promise<void>;
   markBlocked(code: string, details?: Record<string, unknown>): Promise<void>;
   backgroundScanDecision(): Promise<{ required: boolean; mode: 'none' | 'incremental' | 'full' }>;
 };
@@ -402,6 +404,10 @@ export class ObtsPluginClient {
           ? { fullAudit: decision.mode === 'full' }
           : { fullAudit: false, hintedCapture: true })
         : await this.client.pollRemoteEventsAndApply({ deltaApply: true });
+      if (!syncPerformed) {
+        if ((result as { applied?: boolean }).applied) await this.client.reportDeviceStatus().catch(() => undefined);
+        else await this.client.reportDeviceStatusIfDue().catch(() => undefined);
+      }
       const state = await this.client.readState();
       return {
         applied: !syncPerformed && Boolean((result as { applied?: boolean }).applied),

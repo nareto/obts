@@ -521,6 +521,7 @@ it('protects an already captured stale cohort when new vault settings exclude it
   await f.core.queueStaleCohort(c, f.m0);
   const queue = await assertProposal(f, c);
   await f.core.reportDeviceStatus();
+  await f.core.flushDeviceStatusReports();
   expect((await f.server.store.snapshot()).devices.find((device) => device.vault_id === f.vaultId)!.path_capabilities)
     .toMatchObject({ root_ignore: true });
   const actorUserId = (await f.server.store.snapshot()).users[0]!.user_id;

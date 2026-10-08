@@ -22100,6 +22100,61 @@ var require_git_pack_consolidation = __commonJS({
   }
 });
 
+// obsidian-plugin/src/device-status-reporter.cjs
+var require_device_status_reporter = __commonJS({
+  "obsidian-plugin/src/device-status-reporter.cjs"(exports2, module2) {
+    "use strict";
+    var DEVICE_STATUS_HEARTBEAT_MS = 2 * 60 * 1e3;
+    var DEVICE_STATUS_RETRY_MS = 30 * 1e3;
+    function createDeviceStatusReporter2({ send, now = () => Date.now() }) {
+      let pending = null;
+      let running = null;
+      let acceptedSignature = null;
+      let acceptedAt = 0;
+      let retryAt = 0;
+      let failures = 0;
+      async function run() {
+        while (pending) {
+          const snapshot = pending;
+          pending = null;
+          if (snapshot.signature === acceptedSignature && now() - acceptedAt < DEVICE_STATUS_HEARTBEAT_MS) continue;
+          if (now() < retryAt) continue;
+          try {
+            await send(snapshot);
+            acceptedSignature = snapshot.signature;
+            acceptedAt = now();
+            retryAt = 0;
+            failures = 0;
+          } catch {
+            failures = Math.min(failures + 1, 3);
+            retryAt = now() + Math.min(DEVICE_STATUS_HEARTBEAT_MS, DEVICE_STATUS_RETRY_MS * 2 ** (failures - 1));
+          }
+        }
+      }
+      function start() {
+        if (running) return;
+        running = Promise.resolve().then(run).finally(() => {
+          running = null;
+          if (pending) start();
+        });
+      }
+      return {
+        request(snapshot) {
+          pending = snapshot;
+          start();
+        },
+        heartbeatDue() {
+          return acceptedSignature === null || now() - acceptedAt >= DEVICE_STATUS_HEARTBEAT_MS;
+        },
+        async flush() {
+          while (running) await running;
+        }
+      };
+    }
+    module2.exports = { createDeviceStatusReporter: createDeviceStatusReporter2, DEVICE_STATUS_HEARTBEAT_MS };
+  }
+});
+
 // obsidian-plugin/src/data-adapter-fs.cjs
 var require_data_adapter_fs = __commonJS({
   "obsidian-plugin/src/data-adapter-fs.cjs"(exports2, module2) {
@@ -23049,6 +23104,7 @@ var { createGitObjectCache, createImmutableObjectMemo, withGitObjectCaches } = r
 var gitObjectCaches = /* @__PURE__ */ new WeakMap();
 var git = withGitObjectCaches((init_isomorphic_git(), __toCommonJS(isomorphic_git_exports)), (fs) => gitObjectCaches.get(fs) || null);
 var { createPackConsolidator } = require_git_pack_consolidation();
+var { createDeviceStatusReporter } = require_device_status_reporter();
 var path = require_path_browserify();
 var createSha = require_sha2();
 var { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require_data_adapter_fs();
@@ -23057,7 +23113,7 @@ var { createByteBudget, runBoundedWork } = require_work_pool();
 var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.6.0";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.6.1";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var STALE_SETTLE_MARGIN_MS = 250;
@@ -24385,6 +24441,13 @@ var ObtsObsidianClient = class {
     this.lastCursorGuardDiagnostic = "not_observed";
     this.inventoryRequestedSeq = 1;
     this.inventoryCompletedSeq = 0;
+    this.deviceStatusSequence = 0;
+    this.deviceStatusGeneration = 0;
+    this.lastAppliedDeviceStatusSequence = 0;
+    this.pendingDeviceStatusResponse = null;
+    this.applyingDeviceStatusResponse = false;
+    this.latestDeviceStatusIdentity = null;
+    this.deviceStatusReporter = createDeviceStatusReporter({ send: (snapshot) => this.sendDeviceStatus(snapshot) });
   }
   requestFullInventory() {
     this.inventoryRequestedSeq += 1;
@@ -27357,6 +27420,7 @@ var ObtsObsidianClient = class {
     const token = await this.readDeviceToken();
     await this.unpairDevice(state.vault_id, token);
     const baselineMain = state.local_main || await this.resolveRef("refs/heads/main");
+    this.deviceStatusGeneration += 1;
     await this.fsp.rm(this.authPath, { force: true });
     await this.writeQueue({
       pending_commit: null,
@@ -27389,6 +27453,7 @@ var ObtsObsidianClient = class {
     const state = await this.readState();
     const localFiles = await this.scanSyncableFiles();
     const recoveryBundleId = localFiles.length > 0 ? await this.createRecoveryBundle("rebuild_from_server", state.local_main, localFiles) : null;
+    this.deviceStatusGeneration += 1;
     await this.fsp.rm(this.authPath, { force: true });
     await this.fsp.rm(this.pendingAppliedAckPath, { force: true });
     await this.fsp.rm(this.catchupPath, { force: true });
@@ -30668,9 +30733,9 @@ var ObtsObsidianClient = class {
     }
     return await response.json();
   }
-  async reconcileServerVaultStatus(vaultStatus, throwIfBlocked = false) {
+  async reconcileServerVaultStatus(vaultStatus, throwIfBlocked = false, observedState = null) {
     if (vaultStatus !== "active" && vaultStatus !== "blocked_integrity") return true;
-    const state = await this.readState();
+    const state = observedState || await this.readState();
     if (vaultStatus === "blocked_integrity") {
       if (state.last_error_code !== "blocked_integrity") {
         await this.markBlocked("blocked_integrity");
@@ -30923,7 +30988,9 @@ var ObtsObsidianClient = class {
     return await response.json();
   }
   async reportDeviceStatus() {
-    const state = await this.readState();
+    if (this.plugin.unloaded) return;
+    const sequence = ++this.deviceStatusSequence;
+    let state = await this.readState();
     if (!state.vault_id || !state.device_id) {
       return;
     }
@@ -30933,47 +31000,89 @@ var ObtsObsidianClient = class {
     } catch {
       return;
     }
+    const feedbackChangedState = await this.consumeDeviceStatusResponse({ state, token });
+    if (feedbackChangedState) state = await this.readState();
     const queue = await this.readQueue();
     const operation = typeof this.plugin.operationDetails === "function" ? this.plugin.operationDetails() : null;
     const stateUpdatedAt = Date.parse(state.updated_at || "");
     const operationIsNewer = operation && (!Number.isFinite(stateUpdatedAt) || operation.progressUpdatedAt > stateUpdatedAt);
     const activeStatusLabel = operation && operation.availability === "busy" && operation.label && operationIsNewer && isReportableOperationStatus(operation.label) ? `${operation.label.replace(/^(Applying \(listing vault files\)) [0-9]+ files · [0-9]+ directories$/u, "$1")}${operation.slow ? " (taking longer than expected)" : ""}`.slice(0, 80) : normalizePersistedStatusLabel(state.status_label, state.last_error_code, state.last_error_details);
     const nameRevision = this.plugin.deviceNameRevision;
-    const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${state.vault_id}/sync/device-status`), {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${token}`,
-        "content-type": "application/json"
-      },
-      body: JSON.stringify({
-        plugin_version: PLUGIN_VERSION,
-        local_status_label: activeStatusLabel,
-        local_error_code: state.last_error_code,
-        local_queue_status: queue.status,
-        local_main: state.local_main,
-        local_head: state.local_head,
-        path_capabilities: {
-          adapter: "obsidian-data-adapter",
-          platform: runtimePlatform(),
-          root_ignore: true
-        }
-      })
+    const url = this.url(`/api/v1/vaults/${state.vault_id}/sync/device-status`);
+    const body = JSON.stringify({
+      plugin_version: PLUGIN_VERSION,
+      local_status_label: activeStatusLabel,
+      local_error_code: state.last_error_code,
+      local_queue_status: queue.status,
+      local_main: state.local_main,
+      local_head: state.local_head,
+      path_capabilities: { adapter: "obsidian-data-adapter", platform: runtimePlatform(), root_ignore: true }
     });
-    if (!response.ok) {
-      await throwResponseError(response);
-    }
+    if (sequence !== this.deviceStatusSequence || this.plugin.unloaded) return;
+    const identity = JSON.stringify([url, state.vault_id, state.device_id, token, this.deviceStatusGeneration, nameRevision]);
+    this.latestDeviceStatusIdentity = identity;
+    this.deviceStatusReporter.request({
+      sequence,
+      identity,
+      signature: JSON.stringify([identity, body]),
+      url,
+      body,
+      token,
+      vaultId: state.vault_id,
+      deviceId: state.device_id,
+      generation: this.deviceStatusGeneration,
+      nameRevision,
+      reportedErrorCode: state.last_error_code
+    });
+  }
+  async sendDeviceStatus(snapshot) {
+    if (this.plugin.unloaded || snapshot.identity !== this.latestDeviceStatusIdentity || snapshot.generation !== this.deviceStatusGeneration || snapshot.nameRevision !== this.plugin.deviceNameRevision || this.url(`/api/v1/vaults/${snapshot.vaultId}/sync/device-status`) !== snapshot.url) return;
+    const response = await fetchWithTimeout(snapshot.url, {
+      method: "POST",
+      headers: { authorization: `Bearer ${snapshot.token}`, "content-type": "application/json" },
+      body: snapshot.body
+    });
+    if (!response.ok) await throwResponseError(response);
     const result = await response.json();
-    if (nameRevision === this.plugin.deviceNameRevision) {
-      await this.applyServerDeviceName(result.device_name, false);
-      const latestState = await this.readState();
-      const normalizedName = normalizeDisplayName(result.device_name);
-      if (latestState.device_name !== normalizedName) {
-        await this.writeState(Object.assign({}, latestState, { device_name: normalizedName, updated_at: nowIso() }));
-      }
+    if (!this.pendingDeviceStatusResponse || snapshot.sequence > this.pendingDeviceStatusResponse.snapshot.sequence) {
+      this.pendingDeviceStatusResponse = { snapshot, result };
     }
-    await this.reconcileServerVaultStatus(result.vault_status);
-    this.plugin.handlePluginCompatibility(result.plugin);
-    return result;
+  }
+  async consumeDeviceStatusResponse(observed = null) {
+    if (this.applyingDeviceStatusResponse || this.plugin.unloaded) return;
+    const pending = this.pendingDeviceStatusResponse;
+    if (!pending) return;
+    this.pendingDeviceStatusResponse = null;
+    const { snapshot, result } = pending;
+    if (snapshot.sequence <= this.lastAppliedDeviceStatusSequence || snapshot.generation !== this.deviceStatusGeneration || snapshot.nameRevision !== this.plugin.deviceNameRevision) return;
+    this.applyingDeviceStatusResponse = true;
+    try {
+      let state = observed?.state || await this.readState();
+      const token = observed?.token || await this.readDeviceToken();
+      if (state.vault_id !== snapshot.vaultId || state.device_id !== snapshot.deviceId || this.url(`/api/v1/vaults/${state.vault_id}/sync/device-status`) !== snapshot.url || token !== snapshot.token || snapshot.generation !== this.deviceStatusGeneration || snapshot.nameRevision !== this.plugin.deviceNameRevision) return;
+      this.lastAppliedDeviceStatusSequence = snapshot.sequence;
+      await this.applyServerDeviceName(result.device_name, false);
+      const normalizedName = normalizeDisplayName(result.device_name);
+      const nameChanged = state.device_name !== normalizedName;
+      if (nameChanged) {
+        const latestState = await this.readState();
+        await this.writeState(Object.assign({}, latestState, { device_name: normalizedName, updated_at: nowIso() }));
+        state = await this.readState();
+      }
+      const staleActive = result.vault_status === "active" && snapshot.reportedErrorCode !== state.last_error_code;
+      if (!staleActive) await this.reconcileServerVaultStatus(result.vault_status, false, state);
+      this.plugin.handlePluginCompatibility(result.plugin);
+      return nameChanged || !staleActive && (result.vault_status === "blocked_integrity" && state.last_error_code !== "blocked_integrity" || result.vault_status === "active" && state.last_error_code === "blocked_integrity");
+    } finally {
+      this.applyingDeviceStatusResponse = false;
+    }
+  }
+  async reportDeviceStatusIfDue() {
+    if (this.pendingDeviceStatusResponse || this.deviceStatusReporter.heartbeatDue()) await this.reportDeviceStatus();
+  }
+  async flushDeviceStatusReports() {
+    await this.deviceStatusReporter.flush();
+    await this.consumeDeviceStatusResponse();
   }
   async pollEvents(vaultId, token, after) {
     if (!Number.isSafeInteger(after) || after < 0) {

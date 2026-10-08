@@ -1337,6 +1337,7 @@ describe('mobile plugin artifact', () => {
     expect((plugin as any).beginSync('Sync now')).toBe(true);
     (plugin as any).setOperationProgress('Applying 12/6028', 'apply_write');
     await (plugin as any).client.reportDeviceStatus();
+    await (plugin as any).client.flushDeviceStatusReports();
     expect(JSON.parse(String(requests.at(-1)?.body))).toMatchObject({
       local_status_label: 'Applying 12/6028'
     });
@@ -1347,6 +1348,7 @@ describe('mobile plugin artifact', () => {
       updated_at: new Date(Date.now() + 1000).toISOString()
     });
     await (plugin as any).client.reportDeviceStatus();
+    await (plugin as any).client.flushDeviceStatusReports();
     expect(JSON.parse(String(requests.at(-1)?.body))).toMatchObject({
       local_status_label: 'Synced'
     });

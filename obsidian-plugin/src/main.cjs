@@ -6,6 +6,7 @@ const { createGitObjectCache, createImmutableObjectMemo, withGitObjectCaches } =
 const gitObjectCaches = new WeakMap();
 const git = withGitObjectCaches(require("isomorphic-git"), (fs) => gitObjectCaches.get(fs) || null);
 const { createPackConsolidator } = require("./git-pack-consolidation.cjs");
+const { createDeviceStatusReporter } = require("./device-status-reporter.cjs");
 const path = require("path-browserify");
 const createSha = require("sha.js");
 const { createDataAdapterFs, createPackIndexFs, createReadOverlayFs } = require("./data-adapter-fs.cjs");
@@ -1486,6 +1487,13 @@ class ObtsObsidianClient {
     // has run since the last startup, resume or explicit inventory request.
     this.inventoryRequestedSeq = 1;
     this.inventoryCompletedSeq = 0;
+    this.deviceStatusSequence = 0;
+    this.deviceStatusGeneration = 0;
+    this.lastAppliedDeviceStatusSequence = 0;
+    this.pendingDeviceStatusResponse = null;
+    this.applyingDeviceStatusResponse = false;
+    this.latestDeviceStatusIdentity = null;
+    this.deviceStatusReporter = createDeviceStatusReporter({ send: (snapshot) => this.sendDeviceStatus(snapshot) });
   }
 
   requestFullInventory() {
@@ -4657,6 +4665,7 @@ class ObtsObsidianClient {
     const token = await this.readDeviceToken();
     await this.unpairDevice(state.vault_id, token);
     const baselineMain = state.local_main || await this.resolveRef("refs/heads/main");
+    this.deviceStatusGeneration += 1;
     await this.fsp.rm(this.authPath, { force: true });
     await this.writeQueue({
       pending_commit: null,
@@ -4690,6 +4699,7 @@ class ObtsObsidianClient {
     const state = await this.readState();
     const localFiles = await this.scanSyncableFiles();
     const recoveryBundleId = localFiles.length > 0 ? await this.createRecoveryBundle("rebuild_from_server", state.local_main, localFiles) : null;
+    this.deviceStatusGeneration += 1;
     await this.fsp.rm(this.authPath, { force: true });
     await this.fsp.rm(this.pendingAppliedAckPath, { force: true });
     await this.fsp.rm(this.catchupPath, { force: true });
@@ -8349,9 +8359,9 @@ class ObtsObsidianClient {
     return await response.json();
   }
 
-  async reconcileServerVaultStatus(vaultStatus, throwIfBlocked = false) {
+  async reconcileServerVaultStatus(vaultStatus, throwIfBlocked = false, observedState = null) {
     if (vaultStatus !== "active" && vaultStatus !== "blocked_integrity") return true;
-    const state = await this.readState();
+    const state = observedState || await this.readState();
     if (vaultStatus === "blocked_integrity") {
       if (state.last_error_code !== "blocked_integrity") {
         await this.markBlocked("blocked_integrity");
@@ -8622,7 +8632,9 @@ class ObtsObsidianClient {
   }
 
   async reportDeviceStatus() {
-    const state = await this.readState();
+    if (this.plugin.unloaded) return;
+    const sequence = ++this.deviceStatusSequence;
+    let state = await this.readState();
     if (!state.vault_id || !state.device_id) {
       return;
     }
@@ -8632,6 +8644,8 @@ class ObtsObsidianClient {
     } catch {
       return;
     }
+    const feedbackChangedState = await this.consumeDeviceStatusResponse({ state, token });
+    if (feedbackChangedState) state = await this.readState();
     const queue = await this.readQueue();
     const operation = typeof this.plugin.operationDetails === "function" ? this.plugin.operationDetails() : null;
     const stateUpdatedAt = Date.parse(state.updated_at || "");
@@ -8643,41 +8657,83 @@ class ObtsObsidianClient {
       ? `${operation.label.replace(/^(Applying \(listing vault files\)) [0-9]+ files · [0-9]+ directories$/u, "$1")}${operation.slow ? " (taking longer than expected)" : ""}`.slice(0, 80)
       : normalizePersistedStatusLabel(state.status_label, state.last_error_code, state.last_error_details);
     const nameRevision = this.plugin.deviceNameRevision;
-    const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${state.vault_id}/sync/device-status`), {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${token}`,
-        "content-type": "application/json"
-      },
-      body: JSON.stringify({
-        plugin_version: PLUGIN_VERSION,
-        local_status_label: activeStatusLabel,
-        local_error_code: state.last_error_code,
-        local_queue_status: queue.status,
-        local_main: state.local_main,
-        local_head: state.local_head,
-        path_capabilities: {
-          adapter: "obsidian-data-adapter",
-          platform: runtimePlatform(),
-          root_ignore: true
-        }
-      })
+    const url = this.url(`/api/v1/vaults/${state.vault_id}/sync/device-status`);
+    const body = JSON.stringify({
+      plugin_version: PLUGIN_VERSION,
+      local_status_label: activeStatusLabel,
+      local_error_code: state.last_error_code,
+      local_queue_status: queue.status,
+      local_main: state.local_main,
+      local_head: state.local_head,
+      path_capabilities: { adapter: "obsidian-data-adapter", platform: runtimePlatform(), root_ignore: true }
     });
-    if (!response.ok) {
-      await throwResponseError(response);
-    }
+    if (sequence !== this.deviceStatusSequence || this.plugin.unloaded) return;
+    const identity = JSON.stringify([url, state.vault_id, state.device_id, token, this.deviceStatusGeneration, nameRevision]);
+    this.latestDeviceStatusIdentity = identity;
+    this.deviceStatusReporter.request({ sequence, identity, signature: JSON.stringify([identity, body]), url, body, token,
+      vaultId: state.vault_id, deviceId: state.device_id, generation: this.deviceStatusGeneration, nameRevision,
+      reportedErrorCode: state.last_error_code });
+  }
+
+  async sendDeviceStatus(snapshot) {
+    if (this.plugin.unloaded || snapshot.identity !== this.latestDeviceStatusIdentity ||
+        snapshot.generation !== this.deviceStatusGeneration || snapshot.nameRevision !== this.plugin.deviceNameRevision ||
+        this.url(`/api/v1/vaults/${snapshot.vaultId}/sync/device-status`) !== snapshot.url) return;
+    const response = await fetchWithTimeout(snapshot.url, {
+      method: "POST",
+      headers: { authorization: `Bearer ${snapshot.token}`, "content-type": "application/json" },
+      body: snapshot.body
+    });
+    if (!response.ok) await throwResponseError(response);
     const result = await response.json();
-    if (nameRevision === this.plugin.deviceNameRevision) {
-      await this.applyServerDeviceName(result.device_name, false);
-      const latestState = await this.readState();
-      const normalizedName = normalizeDisplayName(result.device_name);
-      if (latestState.device_name !== normalizedName) {
-        await this.writeState(Object.assign({}, latestState, { device_name: normalizedName, updated_at: nowIso() }));
-      }
+    if (!this.pendingDeviceStatusResponse || snapshot.sequence > this.pendingDeviceStatusResponse.snapshot.sequence) {
+      this.pendingDeviceStatusResponse = { snapshot, result };
     }
-    await this.reconcileServerVaultStatus(result.vault_status);
-    this.plugin.handlePluginCompatibility(result.plugin);
-    return result;
+  }
+
+  async consumeDeviceStatusResponse(observed = null) {
+    if (this.applyingDeviceStatusResponse || this.plugin.unloaded) return;
+    const pending = this.pendingDeviceStatusResponse;
+    if (!pending) return;
+    this.pendingDeviceStatusResponse = null;
+    const { snapshot, result } = pending;
+    if (snapshot.sequence <= this.lastAppliedDeviceStatusSequence || snapshot.generation !== this.deviceStatusGeneration ||
+        snapshot.nameRevision !== this.plugin.deviceNameRevision) return;
+    this.applyingDeviceStatusResponse = true;
+    try {
+      let state = observed?.state || await this.readState();
+      const token = observed?.token || await this.readDeviceToken();
+      if (state.vault_id !== snapshot.vaultId || state.device_id !== snapshot.deviceId ||
+          this.url(`/api/v1/vaults/${state.vault_id}/sync/device-status`) !== snapshot.url || token !== snapshot.token ||
+          snapshot.generation !== this.deviceStatusGeneration || snapshot.nameRevision !== this.plugin.deviceNameRevision) return;
+      this.lastAppliedDeviceStatusSequence = snapshot.sequence;
+      await this.applyServerDeviceName(result.device_name, false);
+      const normalizedName = normalizeDisplayName(result.device_name);
+      const nameChanged = state.device_name !== normalizedName;
+      if (nameChanged) {
+        const latestState = await this.readState();
+        await this.writeState(Object.assign({}, latestState, { device_name: normalizedName, updated_at: nowIso() }));
+        state = await this.readState();
+      }
+      const staleActive = result.vault_status === "active" && snapshot.reportedErrorCode !== state.last_error_code;
+      if (!staleActive) await this.reconcileServerVaultStatus(result.vault_status, false, state);
+      this.plugin.handlePluginCompatibility(result.plugin);
+      return nameChanged || !staleActive && (
+        result.vault_status === "blocked_integrity" && state.last_error_code !== "blocked_integrity" ||
+        result.vault_status === "active" && state.last_error_code === "blocked_integrity"
+      );
+    } finally {
+      this.applyingDeviceStatusResponse = false;
+    }
+  }
+
+  async reportDeviceStatusIfDue() {
+    if (this.pendingDeviceStatusResponse || this.deviceStatusReporter.heartbeatDue()) await this.reportDeviceStatus();
+  }
+
+  async flushDeviceStatusReports() {
+    await this.deviceStatusReporter.flush();
+    await this.consumeDeviceStatusResponse();
   }
 
   async pollEvents(vaultId, token, after) {
