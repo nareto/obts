@@ -6,10 +6,16 @@ import { newId, newSecretToken, nowIso } from './shared/ids.js';
 import { ownedVaultOrThrow, hashPassword, hashToken } from './server/authService.js';
 import { createObtsServer, repairVaultIntegrity, type ObtsServer } from './server/app.js';
 import type { ServerConfig } from './server/config.js';
+import { OperationalLog, operationalStdout, parseLogLevel } from './server/operationalLog.js';
 
 type CliIo = {
   stdout: (text: string) => void;
   stderr: (text: string) => void;
+};
+
+const DEFAULT_IO: CliIo = {
+  stdout: (text) => process.stdout.write(text),
+  stderr: (text) => process.stderr.write(text)
 };
 
 type CliEnv = Record<string, string | undefined>;
@@ -49,6 +55,7 @@ Environment:
                             Accept opted-in plugin error reports. Defaults to false.
   OBTS_DIAGNOSTIC_RETENTION_DAYS
                             Error report retention in days (1-90). Defaults to 14.
+  OBTS_LOG_LEVEL            Serve JSON-lines level: error|warn|info|debug|silent. Defaults to info.
   OBTS_HOST                 Serve host. Defaults to 0.0.0.0.
   OBTS_PORT                 Serve port. Defaults to 3000.
 `;
@@ -56,10 +63,7 @@ Environment:
 export async function runCli(
   argv = process.argv.slice(2),
   env: CliEnv = process.env,
-  io: CliIo = {
-    stdout: (text) => process.stdout.write(text),
-    stderr: (text) => process.stderr.write(text)
-  }
+  io: CliIo = DEFAULT_IO
 ): Promise<number> {
   const parsed = parseArgs(argv);
   const [command, subcommand, action] = parsed.positionals;
@@ -70,12 +74,14 @@ export async function runCli(
 
   let server: ObtsServer | null = null;
   try {
-    server = await createObtsServer(configFromEnv(env));
+    const log = command === 'serve' ? new OperationalLog(parseLogLevel(env.OBTS_LOG_LEVEL), io === DEFAULT_IO ? operationalStdout : io.stdout) : undefined;
+    server = await createObtsServer(configFromEnv(env), log ? { operationalLog: log } : {});
     if (command === 'serve') {
       const host = stringOption(parsed, 'host') ?? env.OBTS_HOST ?? '0.0.0.0';
       const port = integerOption(parsed, 'port') ?? integerEnv(env.OBTS_PORT, 'OBTS_PORT') ?? 3000;
-      const address = await server.app.listen({ host, port });
-      io.stdout(`obts server listening on ${address}\n`);
+      await server.app.listen({ host, port });
+      const address = server.app.server.address();
+      log!.emit('info', 'server_listening', { host, port: typeof address === 'object' && address !== null ? address.port : port, log_level: log!.level });
       await waitForShutdown(server);
       return 0;
     }

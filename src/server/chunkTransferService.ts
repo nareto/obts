@@ -31,6 +31,7 @@ import {
 } from './deletionRoot.js';
 import { fsyncDurableDirectory, fsyncDurableFile, writeDurableFile, type DurableFilePersistence } from './durableFile.js';
 import type { VaultLifecycleCoordinator } from './vaultLifecycleCoordinator.js';
+import { type OperationalFields, type OperationalLog, silentOperationalLog } from './operationalLog.js';
 
 const SESSION_VERSION = 1;
 const MAX_OPEN_TRANSFERS_PER_DEVICE = 2;
@@ -99,7 +100,8 @@ export class ChunkTransferService {
     private readonly git: GitService,
     private readonly sync: SyncService,
     private readonly lifecycle?: VaultLifecycleCoordinator,
-    private readonly persistence: Partial<DurableFilePersistence> = {}
+    private readonly persistence: Partial<DurableFilePersistence> = {},
+    private readonly log: OperationalLog = silentOperationalLog
   ) {}
 
   isReady(): boolean {
@@ -588,10 +590,11 @@ export class ChunkTransferService {
     }
   }
 
-  async finalizePush(auth: AuthenticatedDevice, transferId: string): Promise<PushResult> {
+  async finalizePush(auth: AuthenticatedDevice, transferId: string, observe?: (fields: OperationalFields) => void): Promise<PushResult> {
     const operation = async () => await this.withLock(transferId, async () => {
       this.assertTransferAllowed(auth);
       const session = await this.requireSession(auth, transferId);
+      try { observe?.({ chunk_count: session.chunk_count, attempt_id: session.attempt_id }); } catch {}
       if (session.status === 'completed' || session.status === 'rejected' || session.status === 'aborted') {
         if (!session.result) throw new AuthError(409, 'transfer_closed', 'Transfer is no longer open.');
         return session.result;
@@ -619,10 +622,11 @@ export class ChunkTransferService {
     }
   }
 
-  async beginFinalizePush(auth: AuthenticatedDevice, transferId: string): Promise<ChunkPushDescriptor> {
+  async beginFinalizePush(auth: AuthenticatedDevice, transferId: string, observe?: (fields: OperationalFields) => void): Promise<ChunkPushDescriptor> {
     const operation = async () => await this.withLock(transferId, async () => {
       this.assertTransferAllowed(auth);
       const current = await this.requireSession(auth, transferId);
+      try { observe?.({ chunk_count: current.chunk_count, attempt_id: current.attempt_id }); } catch {}
       if (current.status === 'completed' || current.status === 'rejected' || current.status === 'aborted') return current;
       if (current.receipts.length !== current.chunk_count) {
         throw new AuthError(409, 'transfer_incomplete', 'Transfer is missing one or more chunks.');
@@ -685,7 +689,7 @@ export class ChunkTransferService {
   private startProcessing(auth: AuthenticatedDevice, transferId: string): void {
     if (this.closed || this.processors.has(transferId)) return;
     const processing = this.processPendingPush(auth, transferId)
-      .catch(() => undefined)
+      .catch((error) => this.log.backgroundFailure('transfer_processing', error))
       .finally(() => this.processors.delete(transferId));
     this.processors.set(transferId, processing);
   }
@@ -718,6 +722,7 @@ export class ChunkTransferService {
         });
         return;
       } catch (error) {
+        this.log.backgroundFailure('transfer_processing', error);
         if (error instanceof GitDurabilityError) {
           this.suspendTransferStorage();
           return;
@@ -777,6 +782,7 @@ export class ChunkTransferService {
       const canonicalRepoPath = (this.git as unknown as { repoPath?: (vaultId: string) => string }).repoPath?.call(this.git, session.vault_id);
       return await this.sync.pushDeviceCommit(auth, session.manifest, Buffer.alloc(0), {
         reader: this.git.readerForRepo(this.repoDir(transferId), canonicalRepoPath === undefined ? undefined : join(canonicalRepoPath, 'objects')),
+        transferId,
         promote: async () => await this.git.promoteTransferObjects(auth.vault.vault_id, this.repoDir(transferId))
       });
     } finally {

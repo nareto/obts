@@ -1,6 +1,8 @@
 import { lstat, readFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 
+import { type OperationalLog, silentOperationalLog } from './operationalLog.js';
+
 import { AuthError } from './authService.js';
 import type { ServerConfig } from './config.js';
 import type { GitService } from './gitService.js';
@@ -64,7 +66,8 @@ export class VaultLifecycleCoordinator {
   constructor(
     private readonly store: MetadataStore,
     private readonly git: GitService,
-    private readonly config: ServerConfig
+    private readonly config: ServerConfig,
+    private readonly log: OperationalLog = silentOperationalLog
   ) {}
 
   attachTransferLifecycle(transfer: TransferLifecycle): void {
@@ -146,7 +149,7 @@ export class VaultLifecycleCoordinator {
   startReceiptExpiryMaintenance(): void {
     if (this.receiptExpiryTimer !== null) return;
     this.receiptExpiryTimer = setInterval(() => {
-      void this.expireReceipts().catch(() => undefined);
+      void this.expireReceipts().catch((error) => this.log.backgroundFailure('receipt_expiry', error));
     }, 60 * 60 * 1000);
     this.receiptExpiryTimer.unref();
   }
@@ -392,7 +395,8 @@ export class VaultLifecycleCoordinator {
       let db: MetadataDb;
       try {
         db = await this.store.snapshot();
-      } catch {
+      } catch (error) {
+        this.log.backgroundFailure('pending_deletion', error);
         barrier.closing = true;
         barrier.closed = false;
         await this.sleep(RETRY_DELAY_MS);
@@ -405,7 +409,8 @@ export class VaultLifecycleCoordinator {
           try {
             await this.reconcileDeletingVaultRows(vaultId);
             continue;
-          } catch {
+          } catch (error) {
+            this.log.backgroundFailure('pending_deletion', error);
             barrier.closing = true;
             barrier.closed = false;
             await this.sleep(RETRY_DELAY_MS);
@@ -440,8 +445,9 @@ export class VaultLifecycleCoordinator {
         barrier.closing = true;
         return;
       } catch (error) {
+        this.log.backgroundFailure('pending_deletion', error);
         const code: DeletionErrorCode = error instanceof DeletionFailure ? error.code : 'storage_unavailable';
-        await this.recordRetry(vaultId, code).catch(() => undefined);
+        await this.recordRetry(vaultId, code).catch((error) => this.log.backgroundFailure('deletion_retry_record', error));
         await this.sleep(RETRY_DELAY_MS);
       }
     }

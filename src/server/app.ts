@@ -62,6 +62,7 @@ import {
   type SyncOperationRow
 } from './metadataStore.js';
 import { VaultLifecycleCoordinator } from './vaultLifecycleCoordinator.js';
+import { OperationalLog, type OperationalFields, RequestLogContext, pushLogFields, safeErrorFields, safeReportedPluginVersion, silentOperationalLog } from './operationalLog.js';
 import {
   commitRecoveredDirectoryState,
   recoveredDirectoryEventPayload,
@@ -98,29 +99,34 @@ async function syncableTargetFileSizes(
   return sizes;
 }
 
-export async function createObtsServer(overrides: Partial<ServerConfig> & { dataDir: string }): Promise<ObtsServer> {
+export async function createObtsServer(
+  overrides: Partial<ServerConfig> & { dataDir: string },
+  options: { operationalLog?: OperationalLog } = {}
+): Promise<ObtsServer> {
+  const log = options.operationalLog ?? silentOperationalLog;
+  const requestLog = new RequestLogContext(log);
   const config = createServerConfig(overrides);
   await ensureServerDirectories(config);
   const store = new MetadataStore(config.dataDir);
-  await store.initialize();
+  await log.startup('metadata_initialized', async () => await store.initialize());
   const git = new GitService(config);
-  const lifecycle = new VaultLifecycleCoordinator(store, git, config);
+  const lifecycle = new VaultLifecycleCoordinator(store, git, config, log);
   lifecycle.restoreDurableBarriers(await store.snapshot());
-  await lifecycle.reconcileDeletingVaultRows();
+  await log.startup('deletions_reconciled', async () => await lifecycle.reconcileDeletingVaultRows());
   lifecycle.restoreDurableBarriers(await store.snapshot());
-  await lifecycle.expireReceipts();
-  await populateVaultRootCommits(store, git);
-  await reconcileStartupOperations(store, git);
-  await ensureProtectedConflictRefs(store, git);
-  await markInconsistentVaults(store, git);
+  await log.startup('receipts_expired', async () => await lifecycle.expireReceipts());
+  await log.startup('root_commits_populated', async () => await populateVaultRootCommits(store, git));
+  await log.startup('operations_reconciled', async () => await reconcileStartupOperations(store, git, log));
+  await log.startup('conflict_refs_protected', async () => await ensureProtectedConflictRefs(store, git, undefined, log));
+  await log.startup('integrity_scanned', async () => await markInconsistentVaults(store, git, log));
   const auth = new AuthService(store);
   const connections = new ConnectionService(store, git, config.publicBaseUrl, lifecycle);
   const diagnostics = new DiagnosticService(store, config);
-  await diagnostics.initialize();
-  const sync = new SyncService(store, git, config.maxUploadBytes, lifecycle);
-  const chunkTransfers = new ChunkTransferService(config, git, sync, lifecycle);
+  await log.startup('diagnostics_initialized', async () => await diagnostics.initialize());
+  const sync = new SyncService(store, git, config.maxUploadBytes, lifecycle, log);
+  const chunkTransfers = new ChunkTransferService(config, git, sync, lifecycle, {}, log);
   lifecycle.attachTransferLifecycle(chunkTransfers);
-  await chunkTransfers.initialize(async (session) => {
+  await log.startup('transfers_initialized', async () => await chunkTransfers.initialize(async (session) => {
     const db = await store.snapshot();
     const vault = db.vaults.find((candidate) => candidate.vault_id === session.vault_id);
     const device = db.devices.find((candidate) => candidate.device_id === session.device_id);
@@ -135,10 +141,11 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       !token || token.user_id !== user.user_id || token.vault_id !== vault.vault_id
     ) return null;
     return { user, vault, device, token };
-  });
-  await lifecycle.startPendingJobs();
+  }));
+  await log.startup('pending_jobs_started', async () => await lifecycle.startPendingJobs());
   const app = Fastify({
     logger: false,
+    disableRequestLogging: true,
     genReqId: () => newId('req')
   });
   app.addContentTypeParser(
@@ -154,7 +161,36 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       fields: 2
     }
   });
-  await sync.resumePendingMerges();
+  await log.startup('pending_merges_resumed', async () => await sync.resumePendingMerges());
+
+  async function authenticateSession(request: FastifyRequest) {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    requestLog.annotate(request, { user_id: session.user.user_id });
+    return session;
+  }
+
+  async function authenticateDevice(request: FastifyRequest, vaultId?: string) {
+    const device = vaultId === undefined
+      ? await auth.authenticateDeviceAnyVault(request.headers.authorization)
+      : await auth.authenticateDevice(request.headers.authorization, vaultId);
+    requestLog.annotate(request, {
+      vault_id: device.vault.vault_id, device_id: device.device.device_id, user_id: device.user.user_id,
+      plugin_version: safeReportedPluginVersion(device.device.plugin_version ?? 'unknown')
+    });
+    return device;
+  }
+
+  app.addHook('onRequest', async (request, reply) => {
+    requestLog.annotate(request, {});
+    reply.raw.once('close', () => {
+      if (!reply.raw.writableFinished) requestLog.completed(request);
+    });
+  });
+  app.addHook('onSend', async (request, reply, payload) => {
+    requestLog.observeErrorPayload(request, reply, payload);
+    return payload;
+  });
+  app.addHook('onRequestAbort', async (request) => requestLog.completed(request));
 
   const activeAdmissions = new WeakMap<FastifyRequest, { release(): void }>();
   app.addHook('onRequest', async (request, reply) => {
@@ -168,15 +204,16 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const sessionCookie = request.cookies[config.sessionCookieName];
     const authorization = request.headers.authorization;
     if (sessionCookie) {
-      const session = await auth.authenticateSession(sessionCookie);
+      const session = await authenticateSession(request);
       const db = await store.snapshot();
       const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId && candidate.owner_user_id === session.user.user_id);
       if (!vault) throw new AuthError(404, 'not_found', 'Resource not found.');
+      requestLog.annotate(request, { vault_id: vault.vault_id });
       activeAdmissions.set(request, await lifecycle.acquireAdmission(vaultId));
       return;
     }
     if (authorization) {
-      const device = await auth.authenticateDevice(authorization, vaultId);
+      const device = await authenticateDevice(request, vaultId);
       activeAdmissions.set(request, await lifecycle.acquireAdmission(device.vault.vault_id));
     }
   });
@@ -188,6 +225,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     activeAdmissions.get(request)?.release();
     activeAdmissions.delete(request);
   });
+  app.addHook('onResponse', async (request, reply) => requestLog.completed(request, reply));
   lifecycle.startReceiptExpiryMaintenance();
   app.addHook('onClose', async () => {
     await chunkTransfers.close();
@@ -199,6 +237,12 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const deletionMetadataFailure = isVaultDeletionMutation(request) &&
       (normalized instanceof MetadataCleanupError || normalized instanceof MetadataPublicationError);
     const transferDurabilityFailure = isTransferDurabilityRoute(request) && normalized instanceof GitDurabilityError;
+    if (!deletionMetadataFailure && !transferDurabilityFailure &&
+        !(normalized instanceof AuthError || normalized instanceof ValidationError ||
+          normalized instanceof PathPolicyViolation || normalized instanceof RootIgnorePolicyError ||
+          isMultipartInvalidJsonError(normalized) || isMultipartLimitError(normalized))) {
+      requestLog.annotate(request, safeErrorFields(normalized));
+    }
     void sendError(
       deletionMetadataFailure
         ? new AuthError(503, 'deletion_unavailable', 'Deletion lifecycle metadata is unavailable.')
@@ -216,9 +260,10 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
 
   app.get('/health/live', async () => ({ status: 'ok' }));
 
-  app.get('/health/ready', async (_request, reply) => {
-    const readiness = await buildReadinessSummary(config, store, git, lifecycle, chunkTransfers);
+  app.get('/health/ready', async (request, reply) => {
+    const readiness = await buildReadinessSummary(config, store, git, lifecycle, chunkTransfers, log);
     if (readiness.status !== 'ready') {
+      requestLog.annotate(request, { error_code: 'not_ready', failed_checks: Object.entries(readiness.checks).filter(([, ok]) => !ok).map(([name]) => name).join(',') });
       return reply.status(503).send({
         status: readiness.status,
         checks: readiness.checks,
@@ -242,6 +287,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const result = await auth.setupInitialAdmin(
       typeof body.display_name === 'string' ? { ...setupInput, displayName: body.display_name } : setupInput
     );
+    requestLog.annotate(request, { user_id: result.user.user_id });
     setSessionCookie(reply, config, result.sessionId);
     return reply.status(201).send({
       user_id: result.user.user_id,
@@ -257,6 +303,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       password: readString(body, 'password'),
       sourceIp: request.ip
     });
+    requestLog.annotate(request, { user_id: result.user.user_id });
     setSessionCookie(reply, config, result.sessionId);
     return {
       user_id: result.user.user_id,
@@ -266,7 +313,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.post('/api/v1/auth/reauthenticate', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     const body = requestBody(request);
     const result = await auth.reauthenticateSession({
@@ -283,7 +330,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.get('/api/v1/auth/session', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     return {
       user_id: session.user.user_id,
       csrf_token: session.session.csrf_token,
@@ -307,7 +354,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.post('/api/v1/admin/users', async (request, reply) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     auth.requireRecentAuth(session.session);
     const body = requestBody(request);
@@ -333,14 +380,14 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.get('/api/v1/admin/users', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     return {
       users: await auth.listUsers(session.user.user_id)
     };
   });
 
   app.post('/api/v1/admin/users/:userId/disable', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     auth.requireRecentAuth(session.session);
     const { userId } = userPathParams(request);
@@ -352,7 +399,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.post('/api/v1/admin/users/:userId/enable', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     auth.requireRecentAuth(session.session);
     const { userId } = userPathParams(request);
@@ -364,7 +411,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.post('/api/v1/admin/users/:userId/grant-admin', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     auth.requireRecentAuth(session.session);
     const { userId } = userPathParams(request);
@@ -376,7 +423,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.post('/api/v1/admin/users/:userId/revoke-admin', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     auth.requireRecentAuth(session.session);
     const { userId } = userPathParams(request);
@@ -388,7 +435,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.post('/api/v1/admin/users/:userId/password-reset-tokens', async (request, reply) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     auth.requireRecentAuth(session.session);
     const { userId } = userPathParams(request);
@@ -403,7 +450,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.get('/api/v1/vaults', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     const db = await store.snapshot();
     return {
       vaults: db.vaults
@@ -421,7 +468,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.get('/api/v1/diagnostic-events', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     const query = request.query as Record<string, unknown>;
     const cursor = typeof query.cursor === 'string' && query.cursor.length > 0 ? query.cursor : null;
     const requestedLimit = typeof query.limit === 'string' ? Number(query.limit) : 50;
@@ -432,25 +479,27 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.delete('/api/v1/diagnostic-events', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     auth.requireRecentAuth(session.session);
     return { status: 'ok', deleted_count: await diagnostics.deleteOwnerEvents(session.user.user_id) };
   });
 
   app.get('/api/v1/vault-deletions', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     return await lifecycle.listDeletions(session.user.user_id);
   });
 
   app.get('/api/v1/vault-deletions/:vaultId', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     const { vaultId } = pathParams(request);
-    return await lifecycle.getDeletion(session.user.user_id, vaultId);
+    const result = await lifecycle.getDeletion(session.user.user_id, vaultId);
+    requestLog.annotate(request, { vault_id: vaultId });
+    return result;
   });
 
   app.delete('/api/v1/vaults/:vaultId', async (request, reply) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     const { vaultId } = pathParams(request);
     const body = requestBody(request);
@@ -460,11 +509,12 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       vaultId,
       ...(confirmation === undefined ? {} : { confirmation })
     });
+    requestLog.annotate(request, { vault_id: vaultId });
     return reply.status(result.status === 'deleting' ? 202 : 200).send(result);
   });
 
   app.post('/api/v1/vaults', async (request, reply) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     const body = requestBody(request);
     const displayName = readDisplayName(body, 'display_name');
@@ -502,11 +552,12 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       });
       return row;
     });
+    requestLog.annotate(request, { vault_id: vault.vault_id });
     return reply.status(201).send(vault);
   });
 
   app.patch('/api/v1/vaults/:vaultId', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     const { vaultId } = pathParams(request);
     const vault = await auth.renameVault({
@@ -518,13 +569,13 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.get('/api/v1/vaults/:vaultId/sync-settings', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     const { vaultId } = pathParams(request);
     return await sync.getVaultSyncSettings(vaultId, session.user.user_id);
   });
 
   app.post('/api/v1/vaults/:vaultId/sync-settings/preview', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     const { vaultId } = pathParams(request);
     const body = requestBody(request);
@@ -536,7 +587,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.put('/api/v1/vaults/:vaultId/sync-settings', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     const { vaultId } = pathParams(request);
     const body = requestBody(request);
@@ -549,7 +600,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.get('/api/v1/vaults/:vaultId/main', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     const { vaultId } = pathParams(request);
     const db = await store.snapshot();
     const vault = ownedVaultOrThrow(db, session.user.user_id, vaultId);
@@ -561,7 +612,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.get('/api/v1/vaults/:vaultId/dashboard', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     const { vaultId } = pathParams(request);
     const db = await store.snapshot();
     const vault = ownedVaultOrThrow(db, session.user.user_id, vaultId);
@@ -627,7 +678,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     );
     const allConflicts = db.conflicts.filter((conflict) => conflict.vault_id === vault.vault_id);
     const conflicts = allConflicts.filter((conflict) => conflict.status === 'open');
-    const health = await buildReadinessSummary(config, store, git, lifecycle, chunkTransfers);
+    const health = await buildReadinessSummary(config, store, git, lifecycle, chunkTransfers, log);
     return {
       vault: {
         vault_id: vault.vault_id,
@@ -663,18 +714,23 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       },
       request.ip
     );
+    requestLog.annotate(request, { connection_id: result.connection_id });
     return reply.status(201).send(result);
   });
 
   app.get('/api/v1/connections/:connectionId', async (request) => {
     const { connectionId } = connectionPathParams(request);
-    return await connections.status(connectionId, readBearerToken(request.headers.authorization), request.ip);
+    const result = await connections.status(connectionId, readBearerToken(request.headers.authorization), request.ip);
+    requestLog.annotate(request, { connection_id: connectionId });
+    return result;
   });
 
   app.get('/api/v1/connections/:connectionId/review', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     const { connectionId } = connectionPathParams(request);
-    const renderReview = (connection: Awaited<ReturnType<typeof connections.review>>, db: MetadataDb) => ({
+    const renderReview = (connection: Awaited<ReturnType<typeof connections.review>>, db: MetadataDb) => {
+      requestLog.annotate(request, { connection_id: connection.connection_id });
+      return ({
       connection_id: connection.connection_id,
       verification_code: connection.verification_code,
       status: connection.status,
@@ -690,7 +746,8 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
           current_main: vault.current_main,
           status: vault.status
         }))
-    });
+      });
+    };
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const initial = await store.snapshot();
       const initialConnection = initial.connections.find((candidate) => candidate.connection_id === connectionId);
@@ -730,7 +787,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.post('/api/v1/connections/:connectionId/approve', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     auth.requireRecentAuth(session.session);
     const { connectionId } = connectionPathParams(request);
@@ -745,20 +802,23 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       selection,
       ...(selection === 'existing_vault' ? { vaultId: readString(body, 'vault_id') } : { displayName: readDisplayName(body, 'display_name') })
     });
+    requestLog.annotate(request, { connection_id: connectionId });
     return { status: 'approved' };
   });
 
   app.post('/api/v1/connections/:connectionId/deny', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     const { connectionId } = connectionPathParams(request);
     await connections.deny(connectionId, session.user);
+    requestLog.annotate(request, { connection_id: connectionId });
     return { status: 'denied' };
   });
 
   app.post('/api/v1/connections/:connectionId/bootstrap', async (request, reply) => {
     const { connectionId } = connectionPathParams(request);
     const result = await connections.bootstrap(connectionId, readBearerToken(request.headers.authorization));
+    requestLog.annotate(request, { connection_id: connectionId, vault_id: result.vaultId });
     const capability = request.body && typeof request.body === 'object'
       ? readRootIgnoreCapability(requestBody(request)) : undefined;
     const rootIgnoreOid = await requireRootIgnoreCapability(git, result.vaultId, result.targetMain, capability);
@@ -791,7 +851,9 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const { connectionId } = connectionPathParams(request);
     const chunkRequest = parseChunkBootstrapRequest(requestBody(request));
     requireCompatiblePlugin(chunkRequest.plugin_version, null);
+    if (chunkRequest.plugin_version !== undefined) requestLog.annotate(request, { plugin_version: safeReportedPluginVersion(chunkRequest.plugin_version) });
     const metadata = await connections.bootstrapMetadata(connectionId, readBearerToken(request.headers.authorization));
+    requestLog.annotate(request, { connection_id: connectionId, vault_id: metadata.vaultId });
     const buildChunk = async () => {
       const requestedTarget = chunkRequest.requested_target === 'latest' ? metadata.targetMain : chunkRequest.requested_target;
       if (!(await git.commitExists(metadata.vaultId, requestedTarget)) || !(await git.isAncestor(metadata.vaultId, requestedTarget, metadata.targetMain))) {
@@ -824,6 +886,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         chunk_sha256: sha256Hex(chunk.packfile),
         chunk_bytes: chunk.packfile.byteLength
       };
+      requestLog.annotate(request, { chunk_index: chunkRequest.cursor, complete: chunk.complete, target: chunkRequest.requested_target === 'latest' ? 'latest' : 'explicit' });
       return await sendMultipart(reply, { manifest, packfile: chunk.packfile });
     };
     return metadata.connection.approved_user_id
@@ -837,6 +900,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       connectionId,
       readBearerToken(request.headers.authorization)
     );
+    requestLog.annotate(request, { connection_id: connectionId });
     const ingest = async () => await diagnostics.ingestConnection(connectionAuth, request.body, request.ip);
     const result = connectionAuth.connection.selected_vault_id && connectionAuth.connection.approved_user_id
       ? await lifecycle.withOwnerVault(connectionAuth.connection.approved_user_id, connectionAuth.connection.selected_vault_id, ingest)
@@ -867,11 +931,12 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       proposal_base: readOptionalNullableString(body, 'proposal_base'),
       ...(readRootIgnoreCapability(body) === undefined ? {} : { root_ignore_capability: 'root-ignore-v1' })
     });
+    requestLog.annotate(request, { connection_id: connectionId, vault_id: result.vault_id, device_id: result.device_id, user_id: result.user_id });
     return reply.status(201).send(result);
   });
 
   app.patch('/api/v1/vaults/:vaultId/devices/:deviceId', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     const { vaultId, deviceId } = vaultDevicePathParams(request);
     const device = await auth.renameDevice({
@@ -884,7 +949,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.post('/api/v1/vaults/:vaultId/devices/:deviceId/revoke', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     auth.requireRecentAuth(session.session);
     const { vaultId, deviceId } = vaultDevicePathParams(request);
@@ -897,7 +962,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.get('/api/v1/device/self', async (request) => {
-    const deviceAuth = await auth.authenticateDeviceAnyVault(request.headers.authorization);
+    const deviceAuth = await authenticateDevice(request);
     return await lifecycle.withDeviceAdmission(
       deviceAuth.vault.vault_id,
       deviceAuth.user.user_id,
@@ -928,7 +993,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.patch('/api/v1/device/self', async (request) => {
-    const deviceAuth = await auth.authenticateDeviceAnyVault(request.headers.authorization);
+    const deviceAuth = await authenticateDevice(request);
     const device = await lifecycle.withDeviceAdmission(
       deviceAuth.vault.vault_id,
       deviceAuth.user.user_id,
@@ -946,7 +1011,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.post('/api/v1/device/diagnostic-events', { bodyLimit: DIAGNOSTIC_MAX_BODY_BYTES }, async (request, reply) => {
-    const deviceAuth = await auth.authenticateDeviceAnyVault(request.headers.authorization);
+    const deviceAuth = await authenticateDevice(request);
     const result = await lifecycle.withDeviceAdmission(
       deviceAuth.vault.vault_id,
       deviceAuth.user.user_id,
@@ -959,18 +1024,22 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
 
   app.post('/api/v1/vaults/:vaultId/sync/push-transfers', async (request, reply) => {
     const { vaultId } = pathParams(request);
-    const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+    const deviceAuth = await authenticateDevice(request, vaultId);
     const body = parseChunkPushCreateRequest(requestBody(request));
     requireCompatiblePlugin(body.plugin_version, deviceAuth.device.plugin_version);
+    if (body.plugin_version !== undefined) requestLog.annotate(request, { plugin_version: safeReportedPluginVersion(body.plugin_version) });
     const result = await chunkTransfers.createPush(deviceAuth, body);
+    requestLog.annotate(request, { transfer_id: result.descriptor.transfer_id, attempt_id: body.attempt_id, chunk_count: body.chunk_count });
     return reply.status(result.created ? 201 : 200).send(result.descriptor);
   });
 
   app.get('/api/v1/vaults/:vaultId/sync/push-transfers/:transferId', async (request) => {
     const { vaultId } = pathParams(request);
     const transferId = (request.params as { transferId?: string }).transferId ?? '';
-    const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
-    return await chunkTransfers.getPush(deviceAuth, transferId);
+    const deviceAuth = await authenticateDevice(request, vaultId);
+    const result = await chunkTransfers.getPush(deviceAuth, transferId);
+    requestLog.annotate(request, { transfer_id: result.transfer_id, chunk_count: result.chunk_count });
+    return result;
   });
 
   app.put('/api/v1/vaults/:vaultId/sync/push-transfers/:transferId/chunks/:chunkIndex', {
@@ -978,25 +1047,31 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   }, async (request) => {
     const { vaultId } = pathParams(request);
     const params = request.params as { transferId?: string; chunkIndex?: string };
-    const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+    const deviceAuth = await authenticateDevice(request, vaultId);
     const digest = typeof request.headers['x-obts-chunk-sha256'] === 'string' ? request.headers['x-obts-chunk-sha256'] : '';
     if (!/^[0-9a-f]{64}$/u.test(digest)) throw new ValidationError('invalid_request', 'Invalid chunk digest.');
     const index = Number(params.chunkIndex);
     if (!Number.isSafeInteger(index)) throw new ValidationError('invalid_request', 'Invalid chunk index.');
     if (!Buffer.isBuffer(request.body)) throw new ValidationError('invalid_request', 'Expected Git pack chunk bytes.');
-    return await chunkTransfers.putChunk(deviceAuth, params.transferId ?? '', index, request.body, digest);
+    const result = await chunkTransfers.putChunk(deviceAuth, params.transferId ?? '', index, request.body, digest);
+    requestLog.annotate(request, { transfer_id: result.transfer_id, chunk_index: index });
+    return result;
   });
 
   app.post('/api/v1/vaults/:vaultId/sync/push-transfers/:transferId/finalize', async (request, reply) => {
     const { vaultId } = pathParams(request);
     const transferId = (request.params as { transferId?: string }).transferId ?? '';
-    const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+    const deviceAuth = await authenticateDevice(request, vaultId);
     const prefer = Array.isArray(request.headers.prefer) ? request.headers.prefer.join(',') : request.headers.prefer ?? '';
     if (prefer.split(',').some((value) => value.trim() === 'respond-async')) {
-      const descriptor = await chunkTransfers.beginFinalizePush(deviceAuth, transferId);
+      const descriptor = await chunkTransfers.beginFinalizePush(deviceAuth, transferId, (fields) => requestLog.annotate(request, fields));
+      requestLog.annotate(request, { transfer_id: descriptor.transfer_id, chunk_count: descriptor.chunk_count,
+        ...(descriptor.status === 'processing' ? { push_status: 'processing' } : {}),
+        ...(descriptor.result ? pushLogFields(descriptor.result) : {}) });
       return reply.status(descriptor.status === 'processing' ? 202 : 200).send(descriptor);
     }
-    const result = await chunkTransfers.finalizePush(deviceAuth, transferId);
+    const result = await chunkTransfers.finalizePush(deviceAuth, transferId, (fields) => requestLog.annotate(request, fields));
+    requestLog.annotate(request, { transfer_id: transferId, ...pushLogFields(result) });
     if (result.status === 'rejected') {
       const status = result.code === 'not_found' ? 404 : result.code === 'malformed_packfile' ? 400 : 409;
       return reply.status(status).send({ error: { code: result.code, message: result.message, request_id: request.id, details: {} } });
@@ -1007,17 +1082,20 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   app.delete('/api/v1/vaults/:vaultId/sync/push-transfers/:transferId', async (request, reply) => {
     const { vaultId } = pathParams(request);
     const transferId = (request.params as { transferId?: string }).transferId ?? '';
-    const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+    const deviceAuth = await authenticateDevice(request, vaultId);
     await chunkTransfers.deletePush(deviceAuth, transferId);
     return reply.status(204).send();
   });
 
   app.post('/api/v1/vaults/:vaultId/sync/push', async (request, reply) => {
     const { vaultId } = pathParams(request);
-    const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+    const deviceAuth = await authenticateDevice(request, vaultId);
     const { manifest, packfile } = await readPushMultipart(request);
     requireCompatiblePlugin(manifest.plugin_version, deviceAuth.device.plugin_version);
+    if (manifest.plugin_version !== undefined) requestLog.annotate(request, { plugin_version: safeReportedPluginVersion(manifest.plugin_version) });
+    if (manifest.attempt_id !== undefined) requestLog.annotate(request, { attempt_id: manifest.attempt_id });
     const result = await sync.pushDeviceCommit(deviceAuth, manifest, packfile);
+    requestLog.annotate(request, pushLogFields(result));
     if (result.status === 'rejected') {
       const status = result.code === 'not_found' ? 404 : result.code === 'malformed_packfile' ? 400 : 409;
       return reply.status(status).send({
@@ -1034,13 +1112,14 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
 
   app.post('/api/v1/vaults/:vaultId/sync/pull-chunk', async (request, reply) => {
     const { vaultId } = pathParams(request);
-    const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+    const deviceAuth = await authenticateDevice(request, vaultId);
     if (deviceAuth.vault.status === 'blocked_integrity') throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
     if (deviceAuth.device.status === 'review_needed' || deviceAuth.device.status === 'blocked_recovery') {
       throw new AuthError(409, 'device_blocked', 'Device requires review or recovery before pulling server state.');
     }
     const pullRequest = parseChunkPullRequest(requestBody(request));
     requireCompatiblePlugin(pullRequest.plugin_version, deviceAuth.device.plugin_version);
+    if (pullRequest.plugin_version !== undefined) requestLog.annotate(request, { plugin_version: safeReportedPluginVersion(pullRequest.plugin_version) });
     if (pullRequest.vault_id !== vaultId || pullRequest.device_id !== deviceAuth.device.device_id) {
       throw new AuthError(404, 'not_found', 'Resource not found.');
     }
@@ -1122,12 +1201,13 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         }
       });
     }
+    requestLog.annotate(request, { event_seq: eventSnapshot.eventSeq, chunk_index: pullRequest.cursor, complete: chunk.complete, target: pullRequest.requested_target === 'latest' ? 'latest' : 'explicit' });
     return sendMultipart(reply, { manifest, packfile: chunk.packfile });
   });
 
   app.post('/api/v1/vaults/:vaultId/sync/pull', async (request, reply) => {
     const { vaultId } = pathParams(request);
-    const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+    const deviceAuth = await authenticateDevice(request, vaultId);
     if (deviceAuth.vault.status === 'blocked_integrity') {
       throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
     }
@@ -1136,6 +1216,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     }
     const pullRequest = await readPullMultipart(request);
     requireCompatiblePlugin(pullRequest.plugin_version, deviceAuth.device.plugin_version);
+    if (pullRequest.plugin_version !== undefined) requestLog.annotate(request, { plugin_version: safeReportedPluginVersion(pullRequest.plugin_version) });
     if (pullRequest.vault_id !== vaultId || pullRequest.device_id !== deviceAuth.device.device_id) {
       throw new AuthError(404, 'not_found', 'Resource not found.');
     }
@@ -1217,6 +1298,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         }
       });
     }
+    requestLog.annotate(request, { event_seq: eventSnapshot.eventSeq, complete: true, target: pullRequest.requested_target === 'latest' ? 'latest' : 'explicit' });
     return sendMultipart(reply, {
       manifest,
       packfile
@@ -1225,13 +1307,13 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
 
   app.get('/api/v1/vaults/:vaultId/sync/events', async (request, reply) => {
     const { vaultId } = pathParams(request);
-    const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+    const deviceAuth = await authenticateDevice(request, vaultId);
     return sendEventPage(reply, request.id, await store.snapshot(), deviceAuth.vault.vault_id, readEventCursor(request));
   });
 
   app.post('/api/v1/vaults/:vaultId/sync/device-status', async (request) => {
     const { vaultId } = pathParams(request);
-    const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+    const deviceAuth = await authenticateDevice(request, vaultId);
     const report = readDeviceStatusReport(requestBody(request));
     await store.mutate((db) => {
       const device = db.devices.find((candidate) => candidate.device_id === deviceAuth.device.device_id);
@@ -1247,6 +1329,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       device.path_capabilities = report.pathCapabilities;
       device.last_status_report_at = nowIso();
     });
+    requestLog.annotate(request, { plugin_version: report.pluginVersion, event_seq: deviceAuth.device.last_applied_event_seq, reported_status: safeReportedQueueStatus(report.localQueueStatus) });
     return {
       status: 'ok',
       device_name: deviceAuth.device.device_name,
@@ -1258,7 +1341,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   app.post('/api/v1/vaults/:vaultId/sync/applied', async (request) => {
     const { vaultId } = pathParams(request);
     return await sync.runWithVaultLock(vaultId, async () => {
-      const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+      const deviceAuth = await authenticateDevice(request, vaultId);
       const appliedBody = requestBody(request);
       const appliedMain = readCommitId(appliedBody, 'applied_main');
       await requireRootIgnoreCapability(git, vaultId, deviceAuth.vault.current_main, readRootIgnoreCapability(appliedBody));
@@ -1322,6 +1405,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
         store.pruneDirectoryProposalResults(db, vaultId);
         return snapshot;
       });
+      requestLog.annotate(request, { event_seq: acknowledged.eventSeq });
       return {
         status: 'ok',
         applied_main: appliedMain,
@@ -1333,7 +1417,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   app.post('/api/v1/vaults/:vaultId/onboarding/complete', async (request) => {
     const { vaultId } = pathParams(request);
     return await sync.runWithVaultLock(vaultId, async () => {
-      const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+      const deviceAuth = await authenticateDevice(request, vaultId);
       const body = requestBody(request);
       const appliedMain = readCommitId(body, 'applied_main');
       await requireRootIgnoreCapability(git, vaultId, deviceAuth.vault.current_main, readRootIgnoreCapability(body));
@@ -1362,7 +1446,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
 
   app.post('/api/v1/vaults/:vaultId/sync/unpair', async (request) => {
     const { vaultId } = pathParams(request);
-    const deviceAuth = await auth.authenticateDevice(request.headers.authorization, vaultId);
+    const deviceAuth = await authenticateDevice(request, vaultId);
     await auth.revokeDevice({
       actorUserId: deviceAuth.user.user_id,
       vaultId: deviceAuth.vault.vault_id,
@@ -1372,7 +1456,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.get('/api/v1/vaults/:vaultId/conflicts', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     const { vaultId } = pathParams(request);
     const query = request.query as { status?: string };
     const db = await store.snapshot();
@@ -1392,7 +1476,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.get('/api/v1/vaults/:vaultId/conflicts/:conflictId', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     const { vaultId, conflictId } = vaultConflictPathParams(request);
     const db = await store.snapshot();
     ownedVaultOrThrow(db, session.user.user_id, vaultId);
@@ -1400,7 +1484,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.post('/api/v1/vaults/:vaultId/conflicts/:conflictId/refresh', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     const { vaultId, conflictId } = vaultConflictPathParams(request);
     const db = await store.snapshot();
@@ -1413,7 +1497,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.post('/api/v1/vaults/:vaultId/conflicts/:conflictId/preview', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     const { vaultId, conflictId } = vaultConflictPathParams(request);
     const db = await store.snapshot();
@@ -1433,7 +1517,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.post('/api/v1/vaults/:vaultId/conflicts/:conflictId/resolve', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     const { vaultId, conflictId } = vaultConflictPathParams(request);
     const db = await store.snapshot();
@@ -1443,6 +1527,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
     const manualFiles = readManualResolutionFiles(body);
     const manualFilePlan = readManualFilePlan(body);
     const expectedTree = readOptionalCommitId(body, 'expected_tree');
+    requestLog.annotate(request, { vault_id: vaultId, conflict_id: conflictId, resolution: resolutionKind });
     return await sync.resolveConflict({
       actorUserId: session.user.user_id,
       vaultId,
@@ -1456,7 +1541,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.post('/api/v1/vaults/:vaultId/history/query', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     const { vaultId } = pathParams(request);
     const db = await store.snapshot();
     const vault = ownedVaultOrThrow(db, session.user.user_id, vaultId);
@@ -1490,7 +1575,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.post('/api/v1/vaults/:vaultId/history/version', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     const { vaultId } = pathParams(request);
     const db = await store.snapshot();
     const vault = ownedVaultOrThrow(db, session.user.user_id, vaultId);
@@ -1543,11 +1628,11 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.get('/api/v1/vaults/:vaultId/diagnostics/export', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     const { vaultId } = pathParams(request);
     const db = await store.snapshot();
     const vault = ownedVaultOrThrow(db, session.user.user_id, vaultId);
-    const health = await buildReadinessSummary(config, store, git, lifecycle, chunkTransfers);
+    const health = await buildReadinessSummary(config, store, git, lifecycle, chunkTransfers, log);
     return buildRedactedDiagnostics(db, vault.vault_id, health, {
       git_integrity: git.integrityMetricsSnapshot(),
       transfer_phases: chunkTransfers.transferMetricsSnapshot().phases
@@ -1555,7 +1640,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.post('/api/v1/vaults/:vaultId/history/restore', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     auth.requireRecentAuth(session.session);
     const { vaultId } = pathParams(request);
@@ -1696,7 +1781,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.post('/api/v1/vaults/:vaultId/maintenance/git-gc/start', async (request) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
     auth.requireRecentAuth(session.session);
     const { vaultId } = pathParams(request);
@@ -1706,7 +1791,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
       if (vault.status === 'blocked_integrity') {
         throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
       }
-      await ensureProtectedConflictRefs(store, git, vault.vault_id);
+      await ensureProtectedConflictRefs(store, git, vault.vault_id, log);
       const protectedState = await store.snapshot();
       const protectedVault = ownedVaultOrThrow(protectedState, session.user.user_id, vaultId);
       if (protectedVault.status === 'blocked_integrity') {
@@ -1825,7 +1910,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   });
 
   app.get('/api/v1/vaults/:vaultId/events', async (request, reply) => {
-    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName]);
+    const session = await authenticateSession(request);
     const { vaultId } = pathParams(request);
     const db = await store.snapshot();
     const vault = ownedVaultOrThrow(db, session.user.user_id, vaultId);
@@ -1839,7 +1924,7 @@ export async function createObtsServer(overrides: Partial<ServerConfig> & { data
   app.get('/assets/*', async (request, reply) => sendDashboardStatic(request, reply));
 
   const diagnosticPruneTimer = setInterval(() => {
-    void diagnostics.prune().catch(() => undefined);
+    void diagnostics.prune().catch((error) => log.backgroundFailure('diagnostic_prune', error));
   }, 24 * 60 * 60 * 1000);
   diagnosticPruneTimer.unref();
   app.addHook('onClose', async () => clearInterval(diagnosticPruneTimer));
@@ -2642,18 +2727,14 @@ const reportedErrorCodes = new Set([
   'transfer_incomplete', 'transfer_too_large', 'unsafe_local_state', 'upload_interrupted'
 ]);
 
-function safeReportedPluginVersion(version: string): string {
-  return /^(?:0|[1-9]\d{0,2})\.(?:0|[1-9]\d{0,2})\.(?:0|[1-9]\d{0,2})$/u.test(version) ? version : 'unknown';
-}
-
 function safeReportedErrorCode(code: string | null): string | null {
   if (code === null) return null;
   return reportedErrorCodes.has(code) ? code : 'sync_error';
 }
 
-function safeReportedQueueStatus(status: string | null): string | null {
+function safeReportedQueueStatus(status: string | null): 'idle' | 'queued_local' | 'uploading' | 'merged' | 'conflicted' | 'blocked_recovery' | 'unknown' | null {
   if (status === null) return null;
-  return ['idle', 'queued_local', 'uploading', 'merged', 'conflicted', 'blocked_recovery'].includes(status) ? status : 'unknown';
+  return (['idle', 'queued_local', 'uploading', 'merged', 'conflicted', 'blocked_recovery'] as const).find((value) => value === status) ?? 'unknown';
 }
 
 function safePathCapabilities(value: Record<string, unknown> | null): Record<string, unknown> | null {
@@ -3290,7 +3371,8 @@ async function buildReadinessSummary(
   store: MetadataStore,
   git: GitService,
   lifecycle?: VaultLifecycleCoordinator,
-  transfer?: ChunkTransferService
+  transfer?: ChunkTransferService,
+  log: OperationalLog = silentOperationalLog
 ): Promise<ReadinessSummary> {
   if (!store.isReady() || lifecycle && !lifecycle.isReady()) {
     return {
@@ -3325,6 +3407,7 @@ async function buildReadinessSummary(
   let persistentState = transferCheck.ok
     ? await checkPersistentState(db, git)
     : { ok: false as const, error: transferCheck.error };
+  let blockedVaultId: string | null = null;
   if (!persistentState.ok && persistentState.vaultId) {
     // Hold metadata mutation while rechecking so a newly prepared ref transition cannot race the durable block.
     persistentState = await store.mutate(async (mutableDb) => {
@@ -3332,6 +3415,7 @@ async function buildReadinessSummary(
       if (!result.ok && result.vaultId) {
         const vault = mutableDb.vaults.find((candidate) => candidate.vault_id === result.vaultId);
         if (vault && vault.status !== 'blocked_integrity') {
+          blockedVaultId = vault.vault_id;
           vault.status = 'blocked_integrity';
           vault.updated_at = nowIso();
         }
@@ -3339,6 +3423,7 @@ async function buildReadinessSummary(
       return result;
     });
   }
+  if (blockedVaultId) log.emit('warn', 'vault_integrity_blocked', { vault_id: blockedVaultId, source: 'request' });
   const eventDelivery = checkEventDelivery(db);
   const filesystemPermissions = dataDirectoryReady.ok && metadataStoreReady && gitStoreReady.ok && tempWorkspaceReady.ok;
   const checks = {
@@ -3623,7 +3708,7 @@ export async function repairVaultIntegrity(store: MetadataStore, git: GitService
   });
 }
 
-async function markInconsistentVaults(store: MetadataStore, git: GitService): Promise<void> {
+async function markInconsistentVaults(store: MetadataStore, git: GitService, log: OperationalLog): Promise<void> {
   if (!(await git.checkReady()).ok) {
     return;
   }
@@ -3631,19 +3716,22 @@ async function markInconsistentVaults(store: MetadataStore, git: GitService): Pr
   for (const vault of db.vaults.filter((candidate) => candidate.status === 'active' && !hasDurableDeletionRecord(db, candidate.vault_id))) {
     const result = await checkVaultPersistentState(db, vault.vault_id, git);
     if (!result.ok) {
-      await blockVaultForIntegrity(store, vault.vault_id);
+      await blockVaultForIntegrity(store, vault.vault_id, log, 'startup');
     }
   }
 }
 
-async function blockVaultForIntegrity(store: MetadataStore, vaultId: string): Promise<void> {
-  await store.mutate((db) => {
+async function blockVaultForIntegrity(store: MetadataStore, vaultId: string, log: OperationalLog, source: 'startup' | 'request'): Promise<void> {
+  const blocked = await store.mutate((db) => {
     const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
     if (vault && vault.status !== 'blocked_integrity') {
       vault.status = 'blocked_integrity';
       vault.updated_at = nowIso();
+      return true;
     }
+    return false;
   });
+  if (blocked) log.emit('warn', 'vault_integrity_blocked', { vault_id: vaultId, source });
 }
 
 function conflictRef(conflictId: string, kind: string): string {
@@ -3658,7 +3746,7 @@ function conflictProtectedRefs(conflict: MetadataDb['conflicts'][number]): Array
   ];
 }
 
-async function ensureProtectedConflictRefs(store: MetadataStore, git: GitService, onlyVaultId?: string): Promise<void> {
+async function ensureProtectedConflictRefs(store: MetadataStore, git: GitService, onlyVaultId?: string, log: OperationalLog = silentOperationalLog): Promise<void> {
   const db = await store.snapshot();
   for (const conflict of db.conflicts.filter(
     (candidate) => candidate.status === 'open' && (onlyVaultId === undefined || candidate.vault_id === onlyVaultId) &&
@@ -3672,13 +3760,17 @@ async function ensureProtectedConflictRefs(store: MetadataStore, git: GitService
         await git.ensureRef(conflict.vault_id, conflictRef(conflict.conflict_id, kind), commit);
       }
     } catch {
-      await store.mutate((mutableDb) => {
+      const blocked = await store.mutate((mutableDb) => {
         const vault = mutableDb.vaults.find((candidate) => candidate.vault_id === conflict.vault_id);
         if (vault) {
+          const changed = vault.status !== 'blocked_integrity';
           vault.status = 'blocked_integrity';
           vault.updated_at = nowIso();
+          return changed;
         }
+        return false;
       });
+      if (blocked) log.emit('warn', 'vault_integrity_blocked', { vault_id: conflict.vault_id, source: onlyVaultId === undefined ? 'startup' : 'request' });
     }
   }
 }
@@ -3705,7 +3797,7 @@ async function populateVaultRootCommits(store: MetadataStore, git: GitService): 
   });
 }
 
-async function reconcileStartupOperations(store: MetadataStore, git: GitService): Promise<void> {
+async function reconcileStartupOperations(store: MetadataStore, git: GitService, log: OperationalLog): Promise<void> {
   const db = await store.snapshot();
   for (const operation of db.sync_operations) {
     if (hasDurableDeletionRecord(db, operation.vault_id)) continue;
@@ -3723,7 +3815,7 @@ async function reconcileStartupOperations(store: MetadataStore, git: GitService)
       if (await expectedRefsStillCurrent(git, operation)) {
         await abortStartupOperation(store, operation.operation_id, 'startup_prepared_ref_not_moved');
       } else {
-        await blockVaultIntegrity(store, operation, 'prepared operation does not contain a recoverable target ref');
+        await blockVaultIntegrity(store, operation, 'prepared operation does not contain a recoverable target ref', log);
       }
       continue;
     }
@@ -3735,7 +3827,7 @@ async function reconcileStartupOperations(store: MetadataStore, git: GitService)
 
     const allTargetsAlreadyMoved = targetRefs.every(([ref, target]) => actualRefs.get(ref) === target);
     if (allTargetsAlreadyMoved) {
-      await rollForwardPreparedOperation(store, git, operation.operation_id);
+      await rollForwardPreparedOperation(store, git, operation.operation_id, log);
       continue;
     }
 
@@ -3748,7 +3840,7 @@ async function reconcileStartupOperations(store: MetadataStore, git: GitService)
       continue;
     }
 
-    await blockVaultIntegrity(store, operation, 'prepared operation target refs cannot be reconciled');
+    await blockVaultIntegrity(store, operation, 'prepared operation target refs cannot be reconciled', log);
   }
 }
 
@@ -3811,8 +3903,8 @@ async function abortStartupOperation(store: MetadataStore, operationId: string, 
   });
 }
 
-async function blockVaultIntegrity(store: MetadataStore, operation: SyncOperationRow, reason: string): Promise<void> {
-  await store.mutate((db) => {
+async function blockVaultIntegrity(store: MetadataStore, operation: SyncOperationRow, reason: string, log: OperationalLog): Promise<void> {
+  const blocked = await store.mutate((db) => {
     const latestOperation = db.sync_operations.find((candidate) => candidate.operation_id === operation.operation_id);
     if (latestOperation && latestOperation.status !== 'committed') {
       latestOperation.result = { reason };
@@ -3820,13 +3912,17 @@ async function blockVaultIntegrity(store: MetadataStore, operation: SyncOperatio
     }
     const vault = db.vaults.find((candidate) => candidate.vault_id === operation.vault_id);
     if (vault) {
+      const changed = vault.status !== 'blocked_integrity';
       vault.status = 'blocked_integrity';
       vault.updated_at = nowIso();
+      return changed;
     }
+    return false;
   });
+  if (blocked) log.emit('warn', 'vault_integrity_blocked', { vault_id: operation.vault_id, source: 'startup' });
 }
 
-async function rollForwardPreparedOperation(store: MetadataStore, git: GitService, operationId: string): Promise<void> {
+async function rollForwardPreparedOperation(store: MetadataStore, git: GitService, operationId: string, log: OperationalLog): Promise<void> {
   const snapshot = await store.snapshot();
   const pending = snapshot.sync_operations.find((candidate) => candidate.operation_id === operationId);
   if (pending?.operation_type === 'server_merge' &&
@@ -3840,7 +3936,7 @@ async function rollForwardPreparedOperation(store: MetadataStore, git: GitServic
         throw new Error('prepared merge evidence is incomplete');
       }
     } catch {
-      await blockVaultIntegrity(store, pending, 'prepared merge evidence cannot be verified');
+      await blockVaultIntegrity(store, pending, 'prepared merge evidence cannot be verified', log);
       return;
     }
   }
@@ -3854,10 +3950,14 @@ async function rollForwardPreparedOperation(store: MetadataStore, git: GitServic
         throw new Error('prepared settings root policy does not match target main');
       }
     } catch {
-      await blockVaultIntegrity(store, pending, 'prepared vault settings root policy cannot be verified');
+      await blockVaultIntegrity(store, pending, 'prepared vault settings root policy cannot be verified', log);
       return;
     }
   }
+  let blockedVaultId: string | null = null;
+  let recoveredPush: OperationalFields | null = null;
+  let resolvedConflict: OperationalFields | null = null;
+  const started = Date.now();
   await store.mutate((db) => {
     const operation = db.sync_operations.find((candidate) => candidate.operation_id === operationId);
     if (!operation || operation.status !== 'prepared') {
@@ -3881,7 +3981,11 @@ async function rollForwardPreparedOperation(store: MetadataStore, git: GitServic
           operation.target_refs['refs/heads/main'] !== targetMain || operation.target_commit !== targetMain) {
         operation.result = { reason: 'vault_settings_reconciliation_failed' };
         operation.updated_at = nowIso();
-        if (vault) { vault.status = 'blocked_integrity'; vault.updated_at = nowIso(); }
+        if (vault) {
+          if (vault.status !== 'blocked_integrity') blockedVaultId = vault.vault_id;
+          vault.status = 'blocked_integrity';
+          vault.updated_at = nowIso();
+        }
         return;
       }
       const intents = removedDirectories.map((path) => ({ op: 'delete' as const, path }));
@@ -3957,6 +4061,7 @@ async function rollForwardPreparedOperation(store: MetadataStore, git: GitServic
         operation.result = { reason: 'conflict_refresh_reconciliation_failed' };
         operation.updated_at = nowIso();
         if (vault) {
+          if (vault.status !== 'blocked_integrity') blockedVaultId = vault.vault_id;
           vault.status = 'blocked_integrity';
           vault.updated_at = nowIso();
         }
@@ -4033,6 +4138,7 @@ async function rollForwardPreparedOperation(store: MetadataStore, git: GitServic
         operation.updated_at = nowIso();
         const vault = db.vaults.find((candidate) => candidate.vault_id === operation.vault_id);
         if (vault) {
+          if (vault.status !== 'blocked_integrity') blockedVaultId = vault.vault_id;
           vault.status = 'blocked_integrity';
           vault.updated_at = nowIso();
         }
@@ -4074,6 +4180,7 @@ async function rollForwardPreparedOperation(store: MetadataStore, git: GitServic
         operation.result = { reason: 'server_merge_reconciliation_failed' };
         operation.updated_at = nowIso();
         if (vault) {
+          if (vault.status !== 'blocked_integrity') blockedVaultId = vault.vault_id;
           vault.status = 'blocked_integrity';
           vault.updated_at = nowIso();
         }
@@ -4104,6 +4211,7 @@ async function rollForwardPreparedOperation(store: MetadataStore, git: GitServic
       ) {
         operation.result = { reason: 'conflict_resolution_reconciliation_failed' };
         operation.updated_at = nowIso();
+        if (vault.status !== 'blocked_integrity') blockedVaultId = vault.vault_id;
         vault.status = 'blocked_integrity';
         vault.updated_at = nowIso();
         return;
@@ -4192,7 +4300,11 @@ async function rollForwardPreparedOperation(store: MetadataStore, git: GitServic
         }
       });
       commitRecoveredDirectoryState(db, operation, recoveredEvent.event_seq);
+      if (operation.operation_type === 'server_merge' && device) {
+        recoveredPush = { vault_id: operation.vault_id, device_id: device.device_id, push_status: 'merged', event_seq: recoveredEvent.event_seq };
+      }
       if (operation.operation_type === 'conflict_resolve' && conflictId && resolutionKind) {
+        resolvedConflict = { vault_id: operation.vault_id, conflict_id: conflictId, resolution: resolutionKind, ...(actorUserId ? { user_id: actorUserId } : {}) };
         const conflict = db.conflicts.find(
           (candidate) => candidate.vault_id === operation.vault_id && candidate.conflict_id === conflictId
         );
@@ -4261,6 +4373,9 @@ async function rollForwardPreparedOperation(store: MetadataStore, git: GitServic
     operation.result = { reason: 'startup_prepared_operation_without_ref_mutation' };
     operation.updated_at = nowIso();
   });
+  if (recoveredPush) log.emit('info', 'push_integrated', { ...recoveredPush as OperationalFields, duration_ms: Date.now() - started });
+  if (resolvedConflict) log.emit('info', 'conflict_resolved', resolvedConflict);
+  if (blockedVaultId) log.emit('warn', 'vault_integrity_blocked', { vault_id: blockedVaultId, source: 'startup' });
 }
 
 function stringValue(value: unknown): string | null {

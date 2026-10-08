@@ -30,6 +30,7 @@ import { GitCommandError, GitDurabilityError, GitMalformedPackError, GitMergeOwn
 import { parseRenamePairs } from '../shared/validators.js';
 import { hasDurableDeletionRecord } from './metadataStore.js';
 import type { VaultLifecycleCoordinator } from './vaultLifecycleCoordinator.js';
+import { type OperationalLog, pushLogFields, silentOperationalLog } from './operationalLog.js';
 import type {
   DeviceRow,
   DirectoryProposalResultRow,
@@ -110,7 +111,8 @@ export class SyncService {
     private readonly store: MetadataStore,
     private readonly git: GitService,
     private readonly maxUploadBytes: number,
-    private readonly lifecycle?: VaultLifecycleCoordinator
+    private readonly lifecycle?: VaultLifecycleCoordinator,
+    private readonly log: OperationalLog = silentOperationalLog
   ) {}
 
   async runWithVaultLock<T>(vaultId: string, fn: () => Promise<T>): Promise<T> {
@@ -351,7 +353,8 @@ export class SyncService {
         }
         const storedPairs = operation.prepared_manifest?.rename_pairs;
         const renamePairs = storedPairs === undefined || storedPairs === null ? undefined : storedRenamePairs(storedPairs);
-        await this.mergeDeviceCommit(
+        const started = Date.now();
+        const result = await this.mergeDeviceCommit(
           vault.vault_id,
           device.device_id,
           operation.target_commit!,
@@ -369,11 +372,30 @@ export class SyncService {
               ? { rename_pairs: renamePairs }
               : null
         );
+        this.log.emit('info', 'push_integrated', {
+          vault_id: vault.vault_id, device_id: device.device_id, ...pushLogFields(result), duration_ms: Date.now() - started
+        });
       });
     }
   }
 
   async pushDeviceCommit(
+    auth: AuthenticatedDevice,
+    manifest: DevicePushManifest,
+    packfile: Buffer,
+    staged?: { reader: GitObjectReader; promote: () => Promise<void>; transferId?: string }
+  ): Promise<PushResult> {
+    const started = Date.now();
+    const result = await this.integrateDeviceCommit(auth, manifest, packfile, staged);
+    this.log.emit('info', 'push_integrated', {
+      vault_id: auth.vault.vault_id, device_id: auth.device.device_id,
+      ...(staged?.transferId ? { transfer_id: staged.transferId } : {}),
+      ...pushLogFields(result), duration_ms: Date.now() - started
+    });
+    return result;
+  }
+
+  private async integrateDeviceCommit(
     auth: AuthenticatedDevice,
     manifest: DevicePushManifest,
     packfile: Buffer,
@@ -1247,6 +1269,9 @@ export class SyncService {
         return mainEvent.event_seq;
       });
 
+      this.log.emit('info', 'conflict_resolved', {
+        vault_id: input.vaultId, conflict_id: input.conflictId, resolution: input.resolutionKind, user_id: input.actorUserId
+      });
       return {
         status: 'resolved',
         conflict_id: input.conflictId,
@@ -2799,16 +2824,20 @@ export class SyncService {
       });
       return event.event_seq;
     });
+    this.log.emit('info', 'conflict_created', { vault_id: vaultId, device_id: deviceId, conflict_id: conflictId, event_seq: eventSeq });
     try {
       await this.git.ensureRef(vaultId, `refs/obts/conflicts/${conflictId}/base`, base);
       await this.git.ensureRef(vaultId, `refs/obts/conflicts/${conflictId}/current`, currentMain);
       await this.git.ensureRef(vaultId, `refs/obts/conflicts/${conflictId}/device`, deviceCommit);
     } catch (error) {
-      await this.store.mutate((db) => {
+      const blocked = await this.store.mutate((db) => {
         const vault = requireVault(db, vaultId);
+        const changed = vault.status !== 'blocked_integrity';
         vault.status = 'blocked_integrity';
         vault.updated_at = nowIso();
+        return changed;
       });
+      if (blocked) this.log.emit('warn', 'vault_integrity_blocked', { vault_id: vaultId, source: 'request' });
       throw error;
     }
     return {
@@ -2872,14 +2901,17 @@ export class SyncService {
   }
 
   private async blockPreparedOperationForIntegrity(operationId: string, reason: string): Promise<void> {
-    await this.store.mutate((db) => {
+    const blockedVaultId = await this.store.mutate((db) => {
       const operation = requireOperation(db, operationId);
       operation.result = { reason };
       operation.updated_at = nowIso();
       const vault = requireVault(db, operation.vault_id);
+      const changed = vault.status !== 'blocked_integrity';
       vault.status = 'blocked_integrity';
       vault.updated_at = nowIso();
+      return changed ? vault.vault_id : null;
     });
+    if (blockedVaultId) this.log.emit('warn', 'vault_integrity_blocked', { vault_id: blockedVaultId, source: 'request' });
   }
 
   private async prepareMergeRefUpdate(operationId: string, mergeCommit: string): Promise<void> {
