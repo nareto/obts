@@ -731,6 +731,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     }, null, 2)}\n`);
 
     await plugin.reportDeviceStatus();
+    await plugin.client.flushDeviceStatusReports();
     const dashboard = await admin.get<{
       devices: Array<{ device_name: string; status_label: string; local_error_code: string | null; blocked: boolean }>;
     }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
@@ -748,6 +749,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       updated_at: new Date().toISOString()
     }, null, 2)}\n`);
     await plugin.reportDeviceStatus();
+    await plugin.client.flushDeviceStatusReports();
     const sizeDashboard = await admin.get<{ devices: Array<{ status_label: string; local_error_code: string | null }> }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
     expect(sizeDashboard.body.devices.find((device) => device.local_error_code === 'object_too_large_for_chunk')).toMatchObject({
       status_label: 'Out of sync — file exceeds upload limit'
@@ -2360,6 +2362,7 @@ describe('Phase 1 sync without conflict resolution', () => {
         progressUpdatedAt: Date.now() + 1000, slow
       });
       await plugin.reportDeviceStatus();
+      await plugin.client.flushDeviceStatusReports();
       const result = await admin.get<{ devices: Array<{ device_name: string; status_label: string }> }>(
         `/api/v1/vaults/${admin.vaultId}/dashboard`
       );
@@ -2422,6 +2425,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
 
     expect((await plugin2.syncOnce()).status).toBe('Synced');
+    await plugin2.client.flushDeviceStatusReports();
     const afterApply = await admin.get<{
       devices: Array<{ device_name: string; status_label: string; behind_main: boolean }>;
     }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
@@ -2477,6 +2481,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
 
     expect((await plugin2.syncOnce()).status).toBe('Synced');
+    await plugin2.client.flushDeviceStatusReports();
     const afterApply = await admin.get<{
       devices: Array<{ device_name: string; status_label: string; behind_main: boolean; last_applied_main: string | null }>;
     }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
@@ -2827,7 +2832,11 @@ describe('Phase 1 sync without conflict resolution', () => {
     );
     expect(ownerRename).toMatchObject({ status: 200, body: { device_id: originalState.device_id, device_name: 'Desk phone' } });
 
-    await plugin.reportDeviceStatus();
+    const heartbeatClock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 2 * 60 * 1000 + 1);
+    try {
+      await plugin.reportDeviceStatus();
+      await plugin.client.flushDeviceStatusReports();
+    } finally { heartbeatClock.mockRestore(); }
     expect(await plugin.readState()).toMatchObject({ device_name: 'Desk phone' });
     expect(await plugin.renameCurrentDevice('  Travel phone  ')).toBe('Travel phone');
     expect(await plugin.readState()).toMatchObject({ device_name: 'Travel phone' });
@@ -5162,6 +5171,7 @@ describe('Phase 1 sync without conflict resolution', () => {
 
     await repairVaultIntegrity(server.store, server.git, admin.vaultId);
     await internal.reportDeviceStatus();
+    await internal.flushDeviceStatusReports();
     expect(await plugin.readState()).toMatchObject({ status_label: 'Ahead', last_error_code: null });
     expect(internal.plugin.syncQueued).toBe(true);
     internal.plugin.syncQueued = false;
@@ -8092,6 +8102,7 @@ async function pairPlugin(admin: BrowserSession & { vaultId: string }, vaultDir:
     deviceName
   });
   await onboardExistingVault(admin, plugin, admin.vaultId);
+  await plugin.client.flushDeviceStatusReports();
   return plugin;
 }
 

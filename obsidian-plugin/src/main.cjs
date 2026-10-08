@@ -8672,7 +8672,7 @@ class ObtsObsidianClient {
     this.latestDeviceStatusIdentity = identity;
     this.deviceStatusReporter.request({ sequence, identity, signature: JSON.stringify([identity, body]), url, body, token,
       vaultId: state.vault_id, deviceId: state.device_id, generation: this.deviceStatusGeneration, nameRevision,
-      reportedErrorCode: state.last_error_code });
+      reportedErrorCode: state.last_error_code, requiresServerFeedback: state.last_error_code === "blocked_integrity" });
   }
 
   async sendDeviceStatus(snapshot) {

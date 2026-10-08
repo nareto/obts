@@ -58,6 +58,23 @@ describe('single-flight latest-wins device status transport', () => {
     expect(send).toHaveBeenCalledTimes(2);
   });
 
+  it('does not dedupe states awaiting server feedback, but still dedupes healthy status', async () => {
+    const send = vi.fn(async () => undefined);
+    const reporter = createDeviceStatusReporter({ send, now: () => 0 });
+    for (let boundary = 0; boundary < 3; boundary += 1) {
+      reporter.request({ signature: 'blocked', requiresServerFeedback: true });
+      await reporter.flush();
+      expect(reporter.heartbeatDue()).toBe(true);
+    }
+    expect(send).toHaveBeenCalledTimes(3);
+    reporter.request({ signature: 'Synced' });
+    await reporter.flush();
+    reporter.request({ signature: 'Synced' });
+    await reporter.flush();
+    expect(send).toHaveBeenCalledTimes(4);
+    expect(reporter.heartbeatDue()).toBe(false);
+  });
+
   it('backs off failures across changing payloads without rejecting callers', async () => {
     let now = 0;
     const send = vi.fn(async () => { throw new Error('synthetic transport failure'); });
@@ -117,6 +134,31 @@ describe('status feedback at local ownership boundaries', () => {
     await f.core.reportDeviceStatus();
     expect(f.state().last_error_code).toBe('blocked_integrity');
     await f.core.flushDeviceStatusReports();
+  });
+
+  it('keeps integrity feedback polling at idle boundaries and resumes at the next local boundary', async () => {
+    const f = await clientFixture();
+    f.change({ status_label: 'Server repair required', last_error_code: 'blocked_integrity' });
+    let vaultStatus = 'blocked_integrity';
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ device_name: 'Synthetic', vault_status: vaultStatus, plugin: {} }), { status: 200 })));
+    await f.core.reportDeviceStatus();
+    await f.core.flushDeviceStatusReports();
+    await f.core.reportDeviceStatusIfDue();
+    await f.core.flushDeviceStatusReports();
+    expect(fetch).toHaveBeenCalledTimes(2);
+    vaultStatus = 'active';
+    await f.core.reportDeviceStatusIfDue();
+    await f.core.deviceStatusReporter.flush();
+    expect(f.state().last_error_code).toBe('blocked_integrity');
+    f.core.recordLocalChangeHint = vi.fn(async () => undefined);
+    await f.core.reportDeviceStatusIfDue();
+    await f.core.flushDeviceStatusReports();
+    expect(f.state().last_error_code).toBeNull();
+    expect(f.core.plugin.syncQueued).toBe(true);
+    const accepted = vi.mocked(fetch).mock.calls.length;
+    await f.core.reportDeviceStatus();
+    await f.core.flushDeviceStatusReports();
+    expect(fetch).toHaveBeenCalledTimes(accepted);
   });
 
   it('does not apply a response older than the last applied request', async () => {

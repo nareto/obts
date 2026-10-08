@@ -8,12 +8,13 @@ function createDeviceStatusReporter({ send, now = () => Date.now() }) {
   let acceptedAt = 0;
   let retryAt = 0;
   let failures = 0;
+  let requiresServerFeedback = false;
 
   async function run() {
     while (pending) {
       const snapshot = pending;
       pending = null;
-      if (snapshot.signature === acceptedSignature && now() - acceptedAt < DEVICE_STATUS_HEARTBEAT_MS) continue;
+      if (!snapshot.requiresServerFeedback && snapshot.signature === acceptedSignature && now() - acceptedAt < DEVICE_STATUS_HEARTBEAT_MS) continue;
       if (now() < retryAt) continue;
       try {
         await send(snapshot);
@@ -38,11 +39,12 @@ function createDeviceStatusReporter({ send, now = () => Date.now() }) {
 
   return {
     request(snapshot) {
+      requiresServerFeedback = Boolean(snapshot.requiresServerFeedback);
       pending = snapshot;
       start();
     },
     heartbeatDue() {
-      return acceptedSignature === null || now() - acceptedAt >= DEVICE_STATUS_HEARTBEAT_MS;
+      return requiresServerFeedback || acceptedSignature === null || now() - acceptedAt >= DEVICE_STATUS_HEARTBEAT_MS;
     },
     async flush() {
       while (running) await running;

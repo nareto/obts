@@ -22113,11 +22113,12 @@ var require_device_status_reporter = __commonJS({
       let acceptedAt = 0;
       let retryAt = 0;
       let failures = 0;
+      let requiresServerFeedback = false;
       async function run() {
         while (pending) {
           const snapshot = pending;
           pending = null;
-          if (snapshot.signature === acceptedSignature && now() - acceptedAt < DEVICE_STATUS_HEARTBEAT_MS) continue;
+          if (!snapshot.requiresServerFeedback && snapshot.signature === acceptedSignature && now() - acceptedAt < DEVICE_STATUS_HEARTBEAT_MS) continue;
           if (now() < retryAt) continue;
           try {
             await send(snapshot);
@@ -22140,11 +22141,12 @@ var require_device_status_reporter = __commonJS({
       }
       return {
         request(snapshot) {
+          requiresServerFeedback = Boolean(snapshot.requiresServerFeedback);
           pending = snapshot;
           start();
         },
         heartbeatDue() {
-          return acceptedSignature === null || now() - acceptedAt >= DEVICE_STATUS_HEARTBEAT_MS;
+          return requiresServerFeedback || acceptedSignature === null || now() - acceptedAt >= DEVICE_STATUS_HEARTBEAT_MS;
         },
         async flush() {
           while (running) await running;
@@ -31032,7 +31034,8 @@ var ObtsObsidianClient = class {
       deviceId: state.device_id,
       generation: this.deviceStatusGeneration,
       nameRevision,
-      reportedErrorCode: state.last_error_code
+      reportedErrorCode: state.last_error_code,
+      requiresServerFeedback: state.last_error_code === "blocked_integrity"
     });
   }
   async sendDeviceStatus(snapshot) {
