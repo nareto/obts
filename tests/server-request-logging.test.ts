@@ -17,6 +17,7 @@ import {
   safeErrorFields, STARTUP_PHASES, type LogLevel, type OperationalFields
 } from '../src/server/operationalLog.js';
 import { API_VERSION, type DevicePushManifest } from '../src/shared/types.js';
+import packageJson from '../package.json' with { type: 'json' };
 
 const roots: string[] = [];
 const servers: ObtsServer[] = [];
@@ -240,6 +241,20 @@ describe('stdout operational buffering', () => {
 });
 
 describe('closed-schema operational logger', () => {
+  it('accepts only finite nonnegative latency fields and integer persist counts', () => {
+    const lines: string[] = [];
+    const log = new OperationalLog('debug', (line) => lines.push(line));
+    log.emit('info', 'push_integrated', { persist_count: 7, persist_ms: 12, git_ms: 34 });
+    expect(JSON.parse(lines[0]!)).toMatchObject({ persist_count: 7, persist_ms: 12, git_ms: 34 });
+    for (const invalid of [-1, Infinity, NaN, 'private-canary', {}]) {
+      log.emit('info', 'push_integrated', { persist_count: invalid, persist_ms: invalid, git_ms: invalid } as OperationalFields);
+      const row = JSON.parse(lines.at(-1)!);
+      for (const field of ['persist_count', 'persist_ms', 'git_ms']) expect(row).not.toHaveProperty(field);
+    }
+    log.emit('info', 'push_integrated', { persist_count: 1.5 });
+    expect(JSON.parse(lines.at(-1)!)).not.toHaveProperty('persist_count');
+  });
+
   it('drops unknown keys, unsafe strings, non-finite values, objects and OIDs at runtime', () => {
     const lines: string[] = [];
     const log = new OperationalLog('debug', (line) => lines.push(line));
@@ -377,7 +392,7 @@ describe('server request and lifecycle observations', () => {
       const row = JSON.parse(line);
       expect(Object.keys(row).every((key) => LOG_FIELD_ALLOWLIST.includes(key))).toBe(true);
       expect(row.ts).toMatch(/^\d{4}-\d{2}-\d{2}T.*Z$/u);
-      expect(row).toMatchObject({ service: 'obts-server', version: '0.3.46' });
+      expect(row).toMatchObject({ service: 'obts-server', version: packageJson.version });
       expect(Buffer.byteLength(line)).toBeLessThanOrEqual(MAX_LOG_LINE_BYTES);
     }
   });
@@ -475,7 +490,8 @@ describe('server request and lifecycle observations', () => {
       expect(f.rows().filter((row) => row.event === 'push_integrated')).toEqual([]);
       release();
       await vi.waitFor(() => expect(f.rows().find((row) => row.event === 'push_integrated')).toMatchObject({
-        vault_id: f.vaultId, device_id: f.deviceId, transfer_id: transferId, push_status: 'merged', event_seq: expect.any(Number)
+        vault_id: f.vaultId, device_id: f.deviceId, transfer_id: transferId, push_status: 'merged', event_seq: expect.any(Number),
+        persist_count: 7, persist_ms: expect.any(Number), git_ms: expect.any(Number)
       }), { timeout: 5000 });
       const auth = await f.server.auth.authenticateDevice(`Bearer ${f.token}`, f.vaultId);
       await vi.waitFor(async () => expect((await f.server.chunkTransfers.getPush(auth, transferId)).status).toBe('completed'));

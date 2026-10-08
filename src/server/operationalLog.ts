@@ -33,6 +33,9 @@ export type OperationalFields = {
   route?: string | null;
   status?: number | null;
   duration_ms?: number;
+  persist_count?: number;
+  persist_ms?: number;
+  git_ms?: number;
   outcome?: 'ok' | 'client_error' | 'server_error' | 'aborted';
   vault_id?: string;
   device_id?: string;
@@ -147,6 +150,7 @@ const id = (prefix: string): Validator => (value) => typeof value === 'string' &
 const FIELD_VALIDATORS: Record<keyof OperationalFields, Validator> = {
   request_id: id('req'), method: enumeration(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'TRACE', 'CONNECT']),
   route: nullable(enumeration(LOG_ROUTES)), status: nullable(number), duration_ms: number,
+  persist_count: (value) => number(value) && Number.isSafeInteger(value), persist_ms: number, git_ms: number,
   outcome: enumeration(['ok', 'client_error', 'server_error', 'aborted']),
   vault_id: id('vlt'), device_id: id('dev'), user_id: id('usr'), connection_id: id('con'),
   transfer_id: id('trn'), conflict_id: id('conf'), plugin_version: (value) => value === 'unknown' || pattern(VERSION)(value),

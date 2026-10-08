@@ -59,6 +59,7 @@ import {
   MetadataPublicationError,
   MetadataStore,
   type MetadataDb,
+  type MetadataPersistenceAdapter,
   type SyncOperationRow
 } from './metadataStore.js';
 import { VaultLifecycleCoordinator } from './vaultLifecycleCoordinator.js';
@@ -101,13 +102,13 @@ async function syncableTargetFileSizes(
 
 export async function createObtsServer(
   overrides: Partial<ServerConfig> & { dataDir: string },
-  options: { operationalLog?: OperationalLog; onRoute?: (route: RouteOptions) => void } = {}
+  options: { operationalLog?: OperationalLog; onRoute?: (route: RouteOptions) => void; metadataPersistence?: Partial<MetadataPersistenceAdapter> } = {}
 ): Promise<ObtsServer> {
   const log = options.operationalLog ?? silentOperationalLog;
   const requestLog = new RequestLogContext(log);
   const config = createServerConfig(overrides);
   await ensureServerDirectories(config);
-  const store = new MetadataStore(config.dataDir);
+  const store = new MetadataStore(config.dataDir, options.metadataPersistence);
   await log.startup('metadata_initialized', async () => await store.initialize());
   const git = new GitService(config);
   const lifecycle = new VaultLifecycleCoordinator(store, git, config, log);

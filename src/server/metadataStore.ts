@@ -3,6 +3,7 @@ import { lstat, mkdir, open, readFile, readdir, rename, rm, writeFile } from 'no
 import { basename, dirname, join, resolve } from 'node:path';
 
 import { assertNoSymlinkComponents } from './deletionRoot.js';
+import { observeMetadataPersist } from './syncLatency.js';
 
 import { newId, nowIso } from '../shared/ids.js';
 import { DISPLAY_NAME_MAX_LENGTH, normalizeDisplayName } from '../shared/validators.js';
@@ -471,6 +472,10 @@ export class MetadataStore {
   }
 
   private async persist(db = this.requireDb()): Promise<void> {
+    await observeMetadataPersist(async () => await this.persistUnmeasured(db));
+  }
+
+  private async persistUnmeasured(db: MetadataDb): Promise<void> {
     const serialized = `${JSON.stringify(db, null, 2)}\n`;
     const tempFile = `${this.filePath}.${process.pid}.${Date.now()}.${randomBytes(8).toString('hex')}.tmp`;
     try {

@@ -31,6 +31,7 @@ import { parseRenamePairs } from '../shared/validators.js';
 import { hasDurableDeletionRecord } from './metadataStore.js';
 import type { VaultLifecycleCoordinator } from './vaultLifecycleCoordinator.js';
 import { type OperationalLog, pushLogFields, silentOperationalLog } from './operationalLog.js';
+import { observeSyncLatency } from './syncLatency.js';
 import type {
   DeviceRow,
   DirectoryProposalResultRow,
@@ -354,7 +355,7 @@ export class SyncService {
         const storedPairs = operation.prepared_manifest?.rename_pairs;
         const renamePairs = storedPairs === undefined || storedPairs === null ? undefined : storedRenamePairs(storedPairs);
         const started = Date.now();
-        const result = await this.mergeDeviceCommit(
+        const { result, latency } = await observeSyncLatency(async () => await this.mergeDeviceCommit(
           vault.vault_id,
           device.device_id,
           operation.target_commit!,
@@ -371,9 +372,9 @@ export class SyncService {
             : renamePairs
               ? { rename_pairs: renamePairs }
               : null
-        );
+        ));
         this.log.emit('info', 'push_integrated', {
-          vault_id: vault.vault_id, device_id: device.device_id, ...pushLogFields(result), duration_ms: Date.now() - started
+          vault_id: vault.vault_id, device_id: device.device_id, ...pushLogFields(result), ...latency, duration_ms: Date.now() - started
         });
       });
     }
@@ -386,11 +387,11 @@ export class SyncService {
     staged?: { reader: GitObjectReader; promote: () => Promise<void>; transferId?: string }
   ): Promise<PushResult> {
     const started = Date.now();
-    const result = await this.integrateDeviceCommit(auth, manifest, packfile, staged);
+    const { result, latency } = await observeSyncLatency(async () => await this.integrateDeviceCommit(auth, manifest, packfile, staged));
     this.log.emit('info', 'push_integrated', {
       vault_id: auth.vault.vault_id, device_id: auth.device.device_id,
       ...(staged?.transferId ? { transfer_id: staged.transferId } : {}),
-      ...pushLogFields(result), duration_ms: Date.now() - started
+      ...pushLogFields(result), ...latency, duration_ms: Date.now() - started
     });
     return result;
   }

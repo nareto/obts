@@ -3,6 +3,8 @@ import { constants, copyFile, chmod, lstat, mkdir, readFile, readdir, realpath, 
 import { dirname, join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 
+import { observeGitCommand } from './syncLatency.js';
+
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 
 import { assertSyncableTreePaths, PathPolicyViolation } from '../shared/pathPolicy.js';
@@ -1456,7 +1458,7 @@ export class GitService {
   ): Promise<{ stdout: string | Buffer; stderr: string | Buffer }> {
     if (!allowWhenDurabilityUncertain) this.assertDurabilityAvailable();
     const maxBuffer = options.maxBuffer ?? 64 * 1024 * 1024;
-    return await new Promise((resolve, reject) => {
+    return await observeGitCommand(async () => await new Promise<{ stdout: string | Buffer; stderr: string | Buffer }>((resolve, reject) => {
       const child = spawn(this.config.gitBinary, args, {
         env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
         stdio: ['pipe', 'pipe', 'pipe']
@@ -1515,7 +1517,7 @@ export class GitService {
       } else {
         child.stdin.end();
       }
-    });
+    }));
   }
 
   private async validateMergedTextPaths(
