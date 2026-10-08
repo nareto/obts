@@ -75,6 +75,56 @@ describe('single-flight latest-wins device status transport', () => {
     expect(reporter.heartbeatDue()).toBe(false);
   });
 
+  it('bypasses accepted healthy dedupe once for a forced snapshot without changing heartbeat cadence', async () => {
+    const send = vi.fn(async () => undefined);
+    const reporter = createDeviceStatusReporter({ send, now: () => 0 });
+    reporter.request({ signature: 'Synced' });
+    await reporter.flush();
+    reporter.request({ signature: 'Synced', force: true });
+    await reporter.flush();
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(reporter.heartbeatDue()).toBe(false);
+    reporter.request({ signature: 'Synced' });
+    await reporter.flush();
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps a pending force when a newer identical snapshot supersedes it', async () => {
+    const gate = deferred();
+    const sent: any[] = [];
+    const reporter = createDeviceStatusReporter({ now: () => 0, send: async (snapshot: any) => {
+      sent.push(snapshot);
+      if (sent.length === 2) await gate.promise;
+    } });
+    reporter.request({ signature: 'Synced', sequence: 1 });
+    await reporter.flush();
+    reporter.request({ signature: 'Synced', sequence: 2, force: true });
+    await Promise.resolve();
+    try {
+      reporter.request({ signature: 'Synced', sequence: 3, force: true });
+      reporter.request({ signature: 'Synced', sequence: 4 });
+    } finally { gate.resolve(); }
+    await reporter.flush();
+    expect(sent.map((snapshot) => snapshot.sequence)).toEqual([1, 2, 4]);
+    expect(sent[2].force).toBe(true);
+  });
+
+  it('does not bypass existing transport backoff for a forced snapshot', async () => {
+    let now = 0;
+    const send = vi.fn(async () => { throw new Error('synthetic transport failure'); });
+    const reporter = createDeviceStatusReporter({ send, now: () => now });
+    reporter.request({ signature: 'Synced' });
+    await reporter.flush();
+    now = 10_000;
+    reporter.request({ signature: 'Synced', force: true });
+    await reporter.flush();
+    expect(send).toHaveBeenCalledTimes(1);
+    now = 30_000;
+    reporter.request({ signature: 'Synced', force: true });
+    await reporter.flush();
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
   it('backs off failures across changing payloads without rejecting callers', async () => {
     let now = 0;
     const send = vi.fn(async () => { throw new Error('synthetic transport failure'); });

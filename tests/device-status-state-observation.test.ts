@@ -263,6 +263,77 @@ describe('durable client state integrity observations', () => {
     expect(core.statePublicationsInFlight).toBe(0);
   });
 
+  it.each([false, true])('refreshes deferred feedback after a known non-crossing write, fails: %s', async (fails) => {
+    const core = await durableFixture();
+    await core.reportDeviceStatus();
+    await core.deviceStatusReporter.flush();
+    const originalBody = vi.mocked(fetch).mock.calls[0]?.[1]?.body;
+    const sequence = core.pendingDeviceStatusResponse.snapshot.sequence;
+    const state = await core.readState();
+    const before = core.vaultStatusObservation;
+    const entered = deferred();
+    const gate = deferred();
+    const syncDirectory = core.fsp.syncDirectory.bind(core.fsp);
+    let hold = true;
+    const sync = vi.spyOn(core.fsp, 'syncDirectory').mockImplementation(async (...args: any[]) => {
+      if (hold) {
+        hold = false;
+        entered.resolve();
+        await gate.promise;
+        if (fails) throw new Error('synthetic non-crossing sync failure');
+      }
+      await syncDirectory(...args);
+    });
+    const write = core.writeState(state);
+    const settlement = fails ? expect(write).rejects.toThrow('synthetic non-crossing sync failure') : write;
+    await entered.promise;
+    const reconcile = vi.spyOn(core, 'reconcileServerVaultStatus');
+    const compatibility = vi.spyOn(core.plugin, 'handlePluginCompatibility');
+    try {
+      expect(core.statePublicationsInFlight).toBe(1);
+      expect(core.stateIntegrityBlocked).toBe(false);
+      expect(core.stateIntegrityUncertain).toBe(false);
+      expect(core.vaultStatusObservation).toBe(before);
+      await core.consumeDeviceStatusResponse();
+      expect(reconcile).not.toHaveBeenCalled();
+      expect(compatibility).toHaveBeenCalledWith({});
+      expect((await core.readState()).last_error_code).toBeNull();
+      expect(core.pendingDeviceStatusResponse).toBeNull();
+      expect(core.lastAppliedDeviceStatusSequence).toBe(sequence);
+      expect(core.forceDeviceStatusReport).toBe(true);
+    } finally { gate.resolve(); await settlement; }
+    expect(core.statePublicationsInFlight).toBe(0);
+    sync.mockRestore();
+    if (fails) {
+      expect(core.stateIntegrityUncertain).toBe(true);
+      await core.writeState({ ...await core.readState(), status_label: 'Synced' });
+    }
+    expect(core.stateIntegrityUncertain).toBe(false);
+    await core.reportDeviceStatusIfDue();
+    await core.deviceStatusReporter.flush();
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(fetch).mock.calls[1]?.[1]?.body).toBe(originalBody);
+    expect(core.forceDeviceStatusReport).toBe(false);
+    expect(core.pendingDeviceStatusResponse.snapshot.sequence).toBeGreaterThan(sequence);
+    expect((await core.readState()).last_error_code).toBeNull();
+    await core.reportDeviceStatusIfDue();
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect((await core.readState()).last_error_code).toBe('blocked_integrity');
+  });
+
+  it('still deduplicates healthy steady state without an in-flight publication', async () => {
+    const core = await durableFixture();
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ device_name: 'Synthetic', vault_status: 'active', plugin: {} }), { status: 200 })));
+    for (let boundary = 0; boundary < 4; boundary += 1) {
+      await core.reportDeviceStatus();
+      await core.deviceStatusReporter.flush();
+    }
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(core.statePublicationsInFlight).toBe(0);
+    expect(core.forceDeviceStatusReport).toBe(false);
+    expect((await core.readState()).last_error_code).toBeNull();
+  });
+
   it('does not lose a clear when a read sees it before publication finishes', async () => {
     const core = await durableFixture();
     await core.writeState({ ...await core.readState(), last_error_code: 'blocked_integrity' });

@@ -14,7 +14,7 @@ function createDeviceStatusReporter({ send, now = () => Date.now() }) {
     while (pending) {
       const snapshot = pending;
       pending = null;
-      if (!snapshot.requiresServerFeedback && snapshot.signature === acceptedSignature && now() - acceptedAt < DEVICE_STATUS_HEARTBEAT_MS) continue;
+      if (!snapshot.force && !snapshot.requiresServerFeedback && snapshot.signature === acceptedSignature && now() - acceptedAt < DEVICE_STATUS_HEARTBEAT_MS) continue;
       if (now() < retryAt) continue;
       try {
         await send(snapshot);
@@ -40,7 +40,7 @@ function createDeviceStatusReporter({ send, now = () => Date.now() }) {
   return {
     request(snapshot) {
       requiresServerFeedback = Boolean(snapshot.requiresServerFeedback);
-      pending = snapshot;
+      pending = pending?.force ? Object.assign({}, snapshot, { force: true }) : snapshot;
       start();
     },
     heartbeatDue() {

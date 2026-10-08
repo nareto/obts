@@ -22118,7 +22118,7 @@ var require_device_status_reporter = __commonJS({
         while (pending) {
           const snapshot = pending;
           pending = null;
-          if (!snapshot.requiresServerFeedback && snapshot.signature === acceptedSignature && now() - acceptedAt < DEVICE_STATUS_HEARTBEAT_MS) continue;
+          if (!snapshot.force && !snapshot.requiresServerFeedback && snapshot.signature === acceptedSignature && now() - acceptedAt < DEVICE_STATUS_HEARTBEAT_MS) continue;
           if (now() < retryAt) continue;
           try {
             await send(snapshot);
@@ -22142,7 +22142,7 @@ var require_device_status_reporter = __commonJS({
       return {
         request(snapshot) {
           requiresServerFeedback = Boolean(snapshot.requiresServerFeedback);
-          pending = snapshot;
+          pending = pending?.force ? Object.assign({}, snapshot, { force: true }) : snapshot;
           start();
         },
         heartbeatDue() {
@@ -24449,6 +24449,7 @@ var ObtsObsidianClient = class {
     this.stateIntegrityBlocked = null;
     this.stateIntegrityUncertain = false;
     this.statePublicationsInFlight = 0;
+    this.forceDeviceStatusReport = false;
     this.lastAppliedDeviceStatusSequence = 0;
     this.pendingDeviceStatusResponse = null;
     this.applyingDeviceStatusResponse = false;
@@ -31042,8 +31043,10 @@ var ObtsObsidianClient = class {
       nameRevision,
       reportedErrorCode: state.last_error_code,
       vaultStatusObservation,
-      requiresServerFeedback: state.last_error_code === "blocked_integrity"
+      requiresServerFeedback: state.last_error_code === "blocked_integrity",
+      force: this.forceDeviceStatusReport
     });
+    this.forceDeviceStatusReport = false;
   }
   async sendDeviceStatus(snapshot) {
     if (this.plugin.unloaded || snapshot.identity !== this.latestDeviceStatusIdentity || snapshot.generation !== this.deviceStatusGeneration || snapshot.nameRevision !== this.plugin.deviceNameRevision || this.url(`/api/v1/vaults/${snapshot.vaultId}/sync/device-status`) !== snapshot.url) return;
@@ -31079,7 +31082,9 @@ var ObtsObsidianClient = class {
         await this.writeState(Object.assign({}, latestState, { device_name: normalizedName, updated_at: nowIso() }));
         state = await this.readState();
       }
-      const staleVaultStatus = this.stateIntegrityUncertain || snapshot.vaultStatusObservation !== this.vaultStatusObservation || result.vault_status === "active" && snapshot.reportedErrorCode !== state.last_error_code;
+      const publicationInFlight = this.statePublicationsInFlight > 0;
+      if (publicationInFlight) this.forceDeviceStatusReport = true;
+      const staleVaultStatus = publicationInFlight || this.stateIntegrityUncertain || snapshot.vaultStatusObservation !== this.vaultStatusObservation || result.vault_status === "active" && snapshot.reportedErrorCode !== state.last_error_code;
       if (!staleVaultStatus) await this.reconcileServerVaultStatus(result.vault_status, false, state);
       this.plugin.handlePluginCompatibility(result.plugin);
       return nameChanged || !staleVaultStatus && (result.vault_status === "blocked_integrity" && state.last_error_code !== "blocked_integrity" || result.vault_status === "active" && state.last_error_code === "blocked_integrity");
@@ -31088,7 +31093,7 @@ var ObtsObsidianClient = class {
     }
   }
   async reportDeviceStatusIfDue() {
-    if (this.pendingDeviceStatusResponse || this.deviceStatusReporter.heartbeatDue()) await this.reportDeviceStatus();
+    if (this.pendingDeviceStatusResponse || this.forceDeviceStatusReport || this.deviceStatusReporter.heartbeatDue()) await this.reportDeviceStatus();
   }
   async flushDeviceStatusReports() {
     await this.deviceStatusReporter.flush();

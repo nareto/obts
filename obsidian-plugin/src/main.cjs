@@ -1493,6 +1493,7 @@ class ObtsObsidianClient {
     this.stateIntegrityBlocked = null;
     this.stateIntegrityUncertain = false;
     this.statePublicationsInFlight = 0;
+    this.forceDeviceStatusReport = false;
     this.lastAppliedDeviceStatusSequence = 0;
     this.pendingDeviceStatusResponse = null;
     this.applyingDeviceStatusResponse = false;
@@ -8678,7 +8679,9 @@ class ObtsObsidianClient {
     this.latestDeviceStatusIdentity = identity;
     this.deviceStatusReporter.request({ sequence, identity, signature: JSON.stringify([identity, body]), url, body, token,
       vaultId: state.vault_id, deviceId: state.device_id, generation: this.deviceStatusGeneration, nameRevision,
-      reportedErrorCode: state.last_error_code, vaultStatusObservation, requiresServerFeedback: state.last_error_code === "blocked_integrity" });
+      reportedErrorCode: state.last_error_code, vaultStatusObservation, requiresServerFeedback: state.last_error_code === "blocked_integrity",
+      force: this.forceDeviceStatusReport });
+    this.forceDeviceStatusReport = false;
   }
 
   async sendDeviceStatus(snapshot) {
@@ -8721,8 +8724,11 @@ class ObtsObsidianClient {
         await this.writeState(Object.assign({}, latestState, { device_name: normalizedName, updated_at: nowIso() }));
         state = await this.readState();
       }
-      // Vault feedback requires no integrity publication since its snapshot and none still unsettled.
-      const staleVaultStatus = this.stateIntegrityUncertain || snapshot.vaultStatusObservation !== this.vaultStatusObservation ||
+      // Vault feedback needs no newer integrity publication, none unsettled, and no publication in flight.
+      // Deferred feedback is discarded and replaced by a forced fresh report.
+      const publicationInFlight = this.statePublicationsInFlight > 0;
+      if (publicationInFlight) this.forceDeviceStatusReport = true;
+      const staleVaultStatus = publicationInFlight || this.stateIntegrityUncertain || snapshot.vaultStatusObservation !== this.vaultStatusObservation ||
         result.vault_status === "active" && snapshot.reportedErrorCode !== state.last_error_code;
       if (!staleVaultStatus) await this.reconcileServerVaultStatus(result.vault_status, false, state);
       this.plugin.handlePluginCompatibility(result.plugin);
@@ -8736,7 +8742,7 @@ class ObtsObsidianClient {
   }
 
   async reportDeviceStatusIfDue() {
-    if (this.pendingDeviceStatusResponse || this.deviceStatusReporter.heartbeatDue()) await this.reportDeviceStatus();
+    if (this.pendingDeviceStatusResponse || this.forceDeviceStatusReport || this.deviceStatusReporter.heartbeatDue()) await this.reportDeviceStatus();
   }
 
   async flushDeviceStatusReports() {
