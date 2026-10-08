@@ -23,6 +23,20 @@ function deferred() {
   return { promise, resolve };
 }
 
+function holdStatePublications(core: any, beforeRename = false) {
+  const createHold = () => ({ entered: deferred(), release: deferred() });
+  const holds = [createHold(), createHold()] as const;
+  const rename = core.fsp.rename.bind(core.fsp);
+  let ordinal = 0;
+  vi.spyOn(core.fsp, 'rename').mockImplementation(async (...args: any[]) => {
+    const hold = args[1] === core.statePath ? holds[ordinal++] : undefined;
+    if (!beforeRename) await rename(...args);
+    if (hold) { hold.entered.resolve(); await hold.release.promise; }
+    if (beforeRename) await rename(...args);
+  });
+  return holds;
+}
+
 async function durableFixture() {
   const root = await mkdtemp(join(tmpdir(), 'obts-status-state-'));
   roots.push(root);
@@ -47,7 +61,7 @@ describe('durable client state integrity observations', () => {
       const state = await core.readState();
       const before = core.vaultStatusObservation;
       await core.writeState({ ...state, last_error_code: code });
-      expect(core.vaultStatusObservation).toBe(before + Number(changed));
+      expect(core.vaultStatusObservation).toBe(before + 2 * Number(changed));
       expect((await core.readState()).last_error_code).toBe(code);
     }
     const state = await core.readState();
@@ -74,14 +88,179 @@ describe('durable client state integrity observations', () => {
       exists: 0, read: 0, write: 0 });
   });
 
-  it('does not record an unpublished failed state transition', async () => {
+  it('invalidates feedback and preserves uncertainty after a rename failure and subsequent reads', async () => {
     const core = await durableFixture();
     const state = await core.readState();
     const before = core.vaultStatusObservation;
-    vi.spyOn(core.fsp, 'rename').mockRejectedValue(new Error('synthetic publication failure'));
+    const rename = vi.spyOn(core.fsp, 'rename').mockRejectedValue(new Error('synthetic publication failure'));
     await expect(core.writeState({ ...state, last_error_code: 'blocked_integrity' })).rejects.toThrow('synthetic publication failure');
-    expect(core.vaultStatusObservation).toBe(before);
+    expect(core.vaultStatusObservation).toBe(before + 2);
+    expect(core.stateIntegrityBlocked).toBeNull();
+    expect(core.stateIntegrityUncertain).toBe(true);
+    expect(core.statePublicationsInFlight).toBe(0);
     expect((await core.readState()).last_error_code).toBeNull();
+    expect((await core.readPrimaryState()).last_error_code).toBeNull();
+    expect(core.stateIntegrityBlocked).toBeNull();
+    expect(core.stateIntegrityUncertain).toBe(true);
+    expect(core.vaultStatusObservation).toBe(before + 2);
+    rename.mockRestore();
+    await core.writeState(state);
+    expect(core.vaultStatusObservation).toBe(before + 4);
+    expect(core.stateIntegrityBlocked).toBe(false);
+    expect(core.stateIntegrityUncertain).toBe(false);
+  });
+
+  it('invalidates feedback even when a failed write intended no integrity transition', async () => {
+    const core = await durableFixture();
+    const state = await core.readState();
+    const before = core.vaultStatusObservation;
+    vi.spyOn(core.fsp, 'writeFile').mockRejectedValue(new Error('synthetic staging failure'));
+    await expect(core.writeState({ ...state, device_name: 'Renamed' })).rejects.toThrow('synthetic staging failure');
+    expect(core.vaultStatusObservation).toBe(before + 1);
+    expect(core.stateIntegrityBlocked).toBeNull();
+    expect(core.stateIntegrityUncertain).toBe(true);
+    expect(core.statePublicationsInFlight).toBe(0);
+  });
+
+  it('rejects pending blocked feedback after rename succeeds but directory sync fails', async () => {
+    const core = await durableFixture();
+    await core.writeState({ ...await core.readState(), last_error_code: 'blocked_integrity' });
+    await core.reportDeviceStatus();
+    await core.deviceStatusReporter.flush();
+    const state = await core.readState();
+    const before = core.vaultStatusObservation;
+    const rename = vi.spyOn(core.fsp, 'rename');
+    const entered = deferred();
+    const gate = deferred();
+    const sync = vi.spyOn(core.fsp, 'syncDirectory').mockImplementation(async () => {
+      entered.resolve();
+      await gate.promise;
+      throw new Error('synthetic directory sync failure');
+    });
+    const write = core.writeState({ ...state, last_error_code: null });
+    const rejected = expect(write).rejects.toThrow('synthetic directory sync failure');
+    await entered.promise;
+    try {
+      await core.reportDeviceStatus();
+      await core.deviceStatusReporter.flush();
+      expect(core.pendingDeviceStatusResponse.result.vault_status).toBe('blocked_integrity');
+      expect(core.pendingDeviceStatusResponse.snapshot.vaultStatusObservation).toBe(before + 1);
+    } finally { gate.resolve(); await rejected; }
+    expect(rename).toHaveBeenCalledWith(expect.any(String), core.statePath);
+    expect(core.vaultStatusObservation).toBe(before + 2);
+    expect(core.stateIntegrityBlocked).toBeNull();
+    expect(core.stateIntegrityUncertain).toBe(true);
+    const reconcile = vi.spyOn(core, 'reconcileServerVaultStatus');
+    await core.consumeDeviceStatusResponse();
+    expect(reconcile).not.toHaveBeenCalled();
+    expect((await core.readState()).last_error_code).toBeNull();
+    expect(core.stateIntegrityBlocked).toBeNull();
+    expect(core.stateIntegrityUncertain).toBe(true);
+    sync.mockRestore();
+    await core.writeState({ ...await core.readState(), status_label: 'Checking' });
+    expect(core.vaultStatusObservation).toBe(before + 4);
+    expect(core.stateIntegrityUncertain).toBe(false);
+  });
+
+  it.each([false, true])('rejects feedback consumed during a crossing, captured during publication: %s', async (captureDuring) => {
+    const core = await durableFixture();
+    await core.writeState({ ...await core.readState(), last_error_code: 'blocked_integrity' });
+    const state = await core.readState();
+    if (!captureDuring) {
+      await core.reportDeviceStatus();
+      await core.deviceStatusReporter.flush();
+    }
+    const before = core.vaultStatusObservation;
+    const [hold] = holdStatePublications(core, true);
+    const write = core.writeState({ ...state, last_error_code: null });
+    await hold.entered.promise;
+    try {
+      if (captureDuring) {
+        await core.reportDeviceStatus();
+        await core.deviceStatusReporter.flush();
+        expect(core.pendingDeviceStatusResponse.snapshot.vaultStatusObservation).toBe(core.vaultStatusObservation);
+      }
+      const reconcile = vi.spyOn(core, 'reconcileServerVaultStatus');
+      await core.consumeDeviceStatusResponse();
+      expect(reconcile).not.toHaveBeenCalled();
+      expect(core.vaultStatusObservation).toBe(before + 1);
+      expect(core.stateIntegrityBlocked).toBeNull();
+      expect(core.stateIntegrityUncertain).toBe(true);
+    } finally { hold.release.resolve(); await write; }
+    expect((await core.readState()).last_error_code).toBeNull();
+    expect(core.vaultStatusObservation).toBe(before + 2);
+  });
+
+  it('rejects a snapshot captured during a crossing after successful settlement', async () => {
+    const core = await durableFixture();
+    await core.writeState({ ...await core.readState(), last_error_code: 'blocked_integrity' });
+    const state = await core.readState();
+    const [hold] = holdStatePublications(core);
+    const write = core.writeState({ ...state, last_error_code: null });
+    await hold.entered.promise;
+    let during;
+    try {
+      await core.reportDeviceStatus();
+      await core.deviceStatusReporter.flush();
+      during = core.pendingDeviceStatusResponse.snapshot.vaultStatusObservation;
+      expect(core.stateIntegrityBlocked).toBeNull();
+      expect(core.stateIntegrityUncertain).toBe(true);
+    } finally { hold.release.resolve(); await write; }
+    expect(core.vaultStatusObservation).toBe(during + 1);
+    expect(core.stateIntegrityUncertain).toBe(false);
+    const reconcile = vi.spyOn(core, 'reconcileServerVaultStatus');
+    await core.consumeDeviceStatusResponse();
+    expect(reconcile).not.toHaveBeenCalled();
+    expect((await core.readState()).last_error_code).toBeNull();
+  });
+
+  it.each([false, true])('retains uncertainty until opposite-order overlapping publications settle, initially blocked: %s', async (initiallyBlocked) => {
+    const core = await durableFixture();
+    if (initiallyBlocked) await core.writeState({ ...await core.readState(), last_error_code: 'blocked_integrity' });
+    const state = await core.readState();
+    const [first, second] = holdStatePublications(core);
+    const firstWrite = core.writeState({ ...state, last_error_code: null });
+    await first.entered.promise;
+    const secondWrite = core.writeState({ ...state, last_error_code: 'blocked_integrity' });
+    await second.entered.promise;
+    try {
+      expect(core.statePublicationsInFlight).toBe(2);
+      expect(core.stateIntegrityBlocked).toBeNull();
+      expect(core.stateIntegrityUncertain).toBe(true);
+      second.release.resolve();
+      await secondWrite;
+      expect(core.statePublicationsInFlight).toBe(1);
+      expect((await core.readState()).last_error_code).toBe('blocked_integrity');
+      expect(core.stateIntegrityBlocked).toBeNull();
+      expect(core.stateIntegrityUncertain).toBe(true);
+    } finally { first.release.resolve(); second.release.resolve(); await Promise.all([firstWrite, secondWrite]); }
+    expect(core.statePublicationsInFlight).toBe(0);
+    expect(core.stateIntegrityUncertain).toBe(false);
+    expect(core.stateIntegrityBlocked).toBe(false);
+    const before = core.vaultStatusObservation;
+    await core.writeState({ ...state, last_error_code: null });
+    expect(core.vaultStatusObservation).toBeGreaterThan(before);
+    expect((await core.readState()).last_error_code).toBeNull();
+  });
+
+  it('keeps overlapping known healthy publications from advancing the epoch', async () => {
+    const core = await durableFixture();
+    const state = await core.readState();
+    const before = core.vaultStatusObservation;
+    const [first, second] = holdStatePublications(core);
+    const firstWrite = core.writeState({ ...state, device_name: 'First' });
+    await first.entered.promise;
+    const secondWrite = core.writeState({ ...state, device_name: 'Second' });
+    await second.entered.promise;
+    try {
+      second.release.resolve();
+      await secondWrite;
+      expect(core.stateIntegrityBlocked).toBe(false);
+      expect(core.stateIntegrityUncertain).toBe(false);
+      expect(core.vaultStatusObservation).toBe(before);
+    } finally { first.release.resolve(); second.release.resolve(); await Promise.all([firstWrite, secondWrite]); }
+    expect(core.vaultStatusObservation).toBe(before);
+    expect(core.statePublicationsInFlight).toBe(0);
   });
 
   it('does not lose a clear when a read sees it before publication finishes', async () => {

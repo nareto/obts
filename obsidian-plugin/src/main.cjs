@@ -1491,6 +1491,8 @@ class ObtsObsidianClient {
     this.deviceStatusGeneration = 0;
     this.vaultStatusObservation = 0;
     this.stateIntegrityBlocked = null;
+    this.stateIntegrityUncertain = false;
+    this.statePublicationsInFlight = 0;
     this.lastAppliedDeviceStatusSequence = 0;
     this.pendingDeviceStatusResponse = null;
     this.applyingDeviceStatusResponse = false;
@@ -8719,7 +8721,8 @@ class ObtsObsidianClient {
         await this.writeState(Object.assign({}, latestState, { device_name: normalizedName, updated_at: nowIso() }));
         state = await this.readState();
       }
-      const staleVaultStatus = snapshot.vaultStatusObservation !== this.vaultStatusObservation ||
+      // Vault feedback requires no integrity publication since its snapshot and none still unsettled.
+      const staleVaultStatus = this.stateIntegrityUncertain || snapshot.vaultStatusObservation !== this.vaultStatusObservation ||
         result.vault_status === "active" && snapshot.reportedErrorCode !== state.last_error_code;
       if (!staleVaultStatus) await this.reconcileServerVaultStatus(result.vault_status, false, state);
       this.plugin.handlePluginCompatibility(result.plugin);
@@ -9514,7 +9517,7 @@ class ObtsObsidianClient {
   }
 
   rememberStateIntegrity(state, observation) {
-    if (observation === this.vaultStatusObservation) {
+    if (observation === this.vaultStatusObservation && !this.stateIntegrityUncertain && this.statePublicationsInFlight === 0) {
       const blocked = Boolean(state && state.last_error_code === "blocked_integrity");
       if (this.stateIntegrityBlocked !== null && this.stateIntegrityBlocked !== blocked) this.vaultStatusObservation += 1;
       this.stateIntegrityBlocked = blocked;
@@ -9540,10 +9543,27 @@ class ObtsObsidianClient {
 
   async publishState(state) {
     const blocked = state.last_error_code === "blocked_integrity";
-    const integrityTransition = this.stateIntegrityBlocked !== blocked;
-    await writeJson(this.fsp, this.statePath, state);
-    if (integrityTransition || this.stateIntegrityBlocked !== blocked) this.vaultStatusObservation += 1;
-    this.stateIntegrityBlocked = blocked;
+    this.statePublicationsInFlight += 1;
+    if (this.stateIntegrityUncertain || this.stateIntegrityBlocked !== blocked) {
+      this.vaultStatusObservation += 1;
+      this.stateIntegrityBlocked = null;
+      this.stateIntegrityUncertain = true;
+    }
+    try {
+      await writeJson(this.fsp, this.statePath, state);
+      if (this.stateIntegrityBlocked !== blocked) this.vaultStatusObservation += 1;
+      if (this.statePublicationsInFlight === 1) {
+        this.stateIntegrityBlocked = blocked;
+        this.stateIntegrityUncertain = false;
+      }
+    } catch (error) {
+      this.vaultStatusObservation += 1;
+      this.stateIntegrityBlocked = null;
+      this.stateIntegrityUncertain = true;
+      throw error;
+    } finally {
+      this.statePublicationsInFlight -= 1;
+    }
   }
 
   async guardStateCursorRegression(nextState) {
