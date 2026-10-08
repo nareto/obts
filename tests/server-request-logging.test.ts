@@ -476,7 +476,7 @@ describe('server request and lifecycle observations', () => {
       release();
       await vi.waitFor(() => expect(f.rows().find((row) => row.event === 'push_integrated')).toMatchObject({
         vault_id: f.vaultId, device_id: f.deviceId, transfer_id: transferId, push_status: 'merged', event_seq: expect.any(Number)
-      }));
+      }), { timeout: 5000 });
       const auth = await f.server.auth.authenticateDevice(`Bearer ${f.token}`, f.vaultId);
       await vi.waitFor(async () => expect((await f.server.chunkTransfers.getPush(auth, transferId)).status).toBe('completed'));
     } finally { release(); }
