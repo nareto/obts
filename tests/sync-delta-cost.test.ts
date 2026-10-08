@@ -1,10 +1,10 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   addSyntheticPacks,
   countLocalPacks,
   createSyncCostFixture,
-  expireStaleHorizons,
+  advancePastStaleHorizons,
   syncUntilSettled,
   tickUntilSettled,
   writeNote,
@@ -20,7 +20,13 @@ describe('sync cost is proportional to the change', () => {
   let fixture: SyncCostFixture;
 
   beforeAll(async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
     fixture = await createSyncCostFixture(fileCount);
+  }, 300_000);
+
+  beforeEach(async ({ task }) => {
+    await advancePastStaleHorizons(fixture.reader);
+    await measureBackground(`settle before ${task.name}`);
   }, 300_000);
 
   afterAll(async () => {
@@ -43,7 +49,7 @@ describe('sync cost is proportional to the change', () => {
     if (process.env.OBTS_COST_TRACE) {
       console.log([...fixture.meter.traces].sort((a, b) => b[1] - a[1]).slice(0, 25).map(([key, count]) => `${count}\t${key}`).join('\n'));
     }
-    await fixture?.close();
+    try { await fixture?.close(); } finally { vi.useRealTimers(); }
   });
 
   async function measureReader(name: string): Promise<AdapterCost> {
@@ -100,24 +106,43 @@ describe('sync cost is proportional to the change', () => {
   // Background ticks after this session's inventory: ordinary edits are
   // captured from their watcher hints, so cost does not grow with the vault.
   it('measures background maintenance from watcher hints', async () => {
-    // Settle what the foreground rows above left behind.
-    await expireStaleHorizons(fixture.reader);
-    expect((await tickUntilSettled(fixture.reader)).at(-1)).toMatch(/:Synced$/u);
+    const settle = async (name: string) => {
+      await advancePastStaleHorizons(fixture.reader);
+      return await measureBackground(name);
+    };
+    await settle('bg initial horizon settle');
     const idle = await measureBackground('bg idle');
     const ownPush = await measureBackground('bg own push 1 file', [await writeNote(fixture.readerDir, 31, 'hinted local edit\n')]);
+    await settle('bg own horizon settle');
     const again = await measureBackground('bg own push again', [await writeNote(fixture.readerDir, 32, 'second hinted edit\n')]);
-    for (const cost of [idle, ownPush, again]) expect(cost.byArea.vault ?? 0).toBeLessThanOrEqual(40);
+    await settle('bg second own horizon settle');
+    expect(idle.byArea.vault ?? 0).toBe(0);
     expect(idle.calls).toBeLessThanOrEqual(45);
-    for (const cost of [ownPush, again]) expect(cost.calls).toBeLessThanOrEqual(1200);
+    for (const cost of [ownPush, again]) {
+      expect(cost.byArea.vault ?? 0).toBe(27);
+      expect(cost.calls).toBeLessThanOrEqual(1150);
+    }
     await writeNote(fixture.writerDir, 33, 'remote edit seen by ticks\n');
     expect((await syncUntilSettled(fixture.writer)).at(-1)).toBe('Synced');
     const remote = await measureBackground('bg remote 1 file');
-    expect(remote.byArea.vault ?? 0).toBeLessThanOrEqual(75);
-    expect(remote.calls).toBeLessThanOrEqual(950);
-    await expireStaleHorizons(fixture.reader);
-    const settled = await measureBackground('bg remote horizon settle');
-    expect(settled.byArea.vault ?? 0).toBeLessThanOrEqual(10);
-    expect(settled.calls).toBeLessThanOrEqual(125);
+    expect(remote.byArea.vault ?? 0).toBe(66);
+    expect(remote.calls).toBeLessThanOrEqual(900);
+    const settled = await settle('bg remote horizon settle');
+    expect(settled.byArea.vault ?? 0).toBe(4);
+    expect(settled.calls).toBeLessThanOrEqual(110);
+
+    const overlapFirst = await measureBackground('bg overlap own push', [await writeNote(fixture.readerDir, 34, 'overlapping hinted edit\n')]);
+    const overlapSecond = await measureBackground('bg overlap own push again', [await writeNote(fixture.readerDir, 35, 'second overlapping hinted edit\n')]);
+    for (const cost of [overlapFirst, overlapSecond]) {
+      expect(cost.byArea.vault ?? 0).toBe(27);
+      expect(cost.calls).toBeLessThanOrEqual(1150);
+    }
+    const active = await measureBackground('bg active own horizon cycle');
+    expect(active.byArea.vault ?? 0).toBe(0);
+    expect(active.calls).toBeLessThanOrEqual(50);
+    const overlapSettled = await settle('bg overlap horizon settle');
+    expect(overlapSettled.byArea.vault ?? 0).toBe(0);
+    expect(overlapSettled.calls).toBeLessThanOrEqual(110);
   }, 300_000);
 
   it('keeps syncing when local pack maintenance fails', async () => {

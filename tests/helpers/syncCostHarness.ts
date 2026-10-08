@@ -3,6 +3,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 
+import { vi } from 'vitest';
+
 import { ObtsPluginClient } from '../../src/client/core.js';
 import { NodeDataAdapter } from '../../src/client/nodeDataAdapter.js';
 import { createObtsServer, type ObtsServer } from '../../src/server/app.js';
@@ -189,11 +191,10 @@ export async function writeNote(vaultDir: string, index: number, body: string): 
   return notePath(index);
 }
 
-// Stands in for the few seconds after an apply in which stale-authoring
-// horizons are still open; the next background check settles them.
-export async function expireStaleHorizons(plugin: ObtsPluginClient): Promise<void> {
+export async function advancePastStaleHorizons(plugin: ObtsPluginClient): Promise<void> {
   const core = (plugin as unknown as { client: any }).client;
-  await core.mutateStaleProvenance(async (saved: any) => { for (const horizon of saved.horizons) horizon.expiry = Date.now() - 1; });
+  const saved = await core.readStaleProvenance();
+  vi.setSystemTime(Math.max(Date.now(), ...saved.horizons.map((horizon: { expiry: number }) => horizon.expiry)) + 1);
 }
 
 // The background path: durable watcher hints, then headless maintenance ticks
