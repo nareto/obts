@@ -24446,6 +24446,7 @@ var ObtsObsidianClient = class {
     this.deviceStatusSequence = 0;
     this.deviceStatusGeneration = 0;
     this.vaultStatusObservation = 0;
+    this.stateIntegrityBlocked = null;
     this.lastAppliedDeviceStatusSequence = 0;
     this.pendingDeviceStatusResponse = null;
     this.applyingDeviceStatusResponse = false;
@@ -31724,6 +31725,7 @@ var ObtsObsidianClient = class {
     }
   }
   async readState() {
+    const observation = this.vaultStatusObservation;
     let state;
     try {
       state = JSON.parse(await this.fsp.readFile(this.statePath, "utf8"));
@@ -31731,9 +31733,9 @@ var ObtsObsidianClient = class {
     } catch {
       if (await exists(this.fsp, this.authPath)) {
         const backupState = await this.readBackupState();
-        return backupState || this.localStateIncomplete(null);
+        return this.rememberStateIntegrity(backupState || this.localStateIncomplete(null), observation);
       }
-      return {
+      return this.rememberStateIntegrity({
         user_id: null,
         vault_id: null,
         device_id: null,
@@ -31750,12 +31752,20 @@ var ObtsObsidianClient = class {
         unpaired_baseline_vault_id: null,
         unpaired_baseline_main: null,
         updated_at: nowIso()
-      };
+      }, observation);
     }
     if (await this.hasActiveTokenWithoutIdentity(state)) {
-      return this.normalizeStateEventCursors(await this.readBackupState() || this.localStateIncomplete(state));
+      return this.rememberStateIntegrity(this.normalizeStateEventCursors(await this.readBackupState() || this.localStateIncomplete(state)), observation);
     }
-    return this.normalizeStateEventCursors(await this.preferRecoverableBackupState(state));
+    return this.rememberStateIntegrity(this.normalizeStateEventCursors(await this.preferRecoverableBackupState(state)), observation);
+  }
+  rememberStateIntegrity(state, observation) {
+    if (observation === this.vaultStatusObservation) {
+      const blocked = Boolean(state && state.last_error_code === "blocked_integrity");
+      if (this.stateIntegrityBlocked !== null && this.stateIntegrityBlocked !== blocked) this.vaultStatusObservation += 1;
+      this.stateIntegrityBlocked = blocked;
+    }
+    return state;
   }
   normalizeStateEventCursors(state) {
     return Object.assign({}, state, {
@@ -31767,7 +31777,14 @@ var ObtsObsidianClient = class {
   async writeState(state) {
     const guardedState = await this.guardStateCursorRegression(this.normalizeStateEventCursors(state));
     await this.backupExistingState();
-    await writeJson(this.fsp, this.statePath, guardedState);
+    await this.publishState(guardedState);
+  }
+  async publishState(state) {
+    const blocked = state.last_error_code === "blocked_integrity";
+    const integrityTransition = this.stateIntegrityBlocked !== blocked;
+    await writeJson(this.fsp, this.statePath, state);
+    if (integrityTransition || this.stateIntegrityBlocked !== blocked) this.vaultStatusObservation += 1;
+    this.stateIntegrityBlocked = blocked;
   }
   async guardStateCursorRegression(nextState) {
     const currentState = await this.readPrimaryState();
@@ -31863,7 +31880,7 @@ var ObtsObsidianClient = class {
       recovered.last_error_code = null;
       recovered.last_error_details = null;
     }
-    await writeJson(this.fsp, this.statePath, recovered);
+    await this.publishState(recovered);
     return recovered;
   }
   async backupStateCursorsDescend(primaryState, backupState) {
@@ -31897,10 +31914,11 @@ var ObtsObsidianClient = class {
     return await this.isAncestor(olderCursor, newerCursor);
   }
   async readPrimaryState() {
+    const observation = this.vaultStatusObservation;
     try {
-      return JSON.parse(await this.fsp.readFile(this.statePath, "utf8"));
+      return this.rememberStateIntegrity(JSON.parse(await this.fsp.readFile(this.statePath, "utf8")), observation);
     } catch {
-      return null;
+      return this.rememberStateIntegrity(null, observation);
     }
   }
   async repairLocalStateIfNeeded(state) {
