@@ -161,6 +161,103 @@ describe('status feedback at local ownership boundaries', () => {
     expect(fetch).toHaveBeenCalledTimes(accepted);
   });
 
+  it('ignores delayed blocked feedback after a fresh repair without dropping name or compatibility feedback', async () => {
+    const f = await clientFixture();
+    f.change({ status_label: 'Server repair required', last_error_code: 'blocked_integrity' });
+    f.core.recordLocalChangeHint = vi.fn(async () => undefined);
+    const gate = deferred();
+    const compatibility = { update_available: false };
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      await gate.promise;
+      return new Response(JSON.stringify({ device_name: 'Renamed', vault_status: 'blocked_integrity', plugin: compatibility }), { status: 200 });
+    }));
+    const compatibilityFeedback = vi.spyOn(f.core.plugin, 'handlePluginCompatibility');
+    const markBlocked = vi.spyOn(f.core, 'markBlocked');
+    await f.core.reportDeviceStatus();
+    await f.core.reconcileServerVaultStatus('active', true);
+    expect(f.state().last_error_code).toBeNull();
+    gate.resolve();
+    await f.core.deviceStatusReporter.flush();
+    await f.core.consumeDeviceStatusResponse();
+    expect(f.state()).toMatchObject({ last_error_code: null, device_name: 'Renamed' });
+    expect(markBlocked).not.toHaveBeenCalled();
+    expect(compatibilityFeedback).toHaveBeenCalledWith(compatibility);
+    expect(f.core.plugin.syncQueued).toBe(true);
+  });
+
+  it.each([
+    { initialError: null, response: 'blocked_integrity', facts: ['blocked_integrity', 'active'] },
+    { initialError: 'blocked_integrity', response: 'active', facts: ['active', 'blocked_integrity'] }
+  ])('rejects ABA vault feedback ending at $initialError', async ({ initialError, response, facts }) => {
+    const f = await clientFixture();
+    f.change({ last_error_code: initialError });
+    f.core.recordLocalChangeHint = vi.fn(async () => undefined);
+    const gate = deferred();
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      await gate.promise;
+      return new Response(JSON.stringify({ device_name: 'Synthetic', vault_status: response, plugin: {} }), { status: 200 });
+    }));
+    await f.core.reportDeviceStatus();
+    const report = vi.spyOn(f.core, 'reportDeviceStatus').mockResolvedValue(undefined);
+    for (const fact of facts) await f.core.reconcileServerVaultStatus(fact);
+    report.mockRestore();
+    expect(f.state().last_error_code).toBe(initialError);
+    gate.resolve();
+    await f.core.deviceStatusReporter.flush();
+    expect(f.core.pendingDeviceStatusResponse.snapshot.reportedErrorCode).toBe(initialError);
+    const writes = f.core.writeState.mock.calls.length;
+    await f.core.consumeDeviceStatusResponse();
+    expect(f.state().last_error_code).toBe(initialError);
+    expect(f.core.writeState).toHaveBeenCalledTimes(writes);
+  });
+
+  it.each([
+    { initialError: null, response: 'blocked_integrity', fact: 'active' },
+    { initialError: 'blocked_integrity', response: 'active', fact: 'blocked_integrity' }
+  ])('records a fresh $fact observation even without a local error transition', async ({ initialError, response, fact }) => {
+    const f = await clientFixture();
+    f.change({ last_error_code: initialError });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ device_name: 'Synthetic', vault_status: response, plugin: {} }), { status: 200 })));
+    await f.core.reportDeviceStatus();
+    await f.core.deviceStatusReporter.flush();
+    await f.core.reconcileServerVaultStatus(fact);
+    await f.core.consumeDeviceStatusResponse();
+    expect(f.state().last_error_code).toBe(initialError);
+    expect(f.core.writeState).not.toHaveBeenCalled();
+  });
+
+  it('records repeated direct integrity blocks as newer facts', async () => {
+    const f = await clientFixture();
+    f.change({ last_error_code: 'blocked_integrity' });
+    f.core.recordLocalChangeHint = vi.fn(async () => undefined);
+    await f.core.reportDeviceStatus();
+    await f.core.deviceStatusReporter.flush();
+    const report = vi.spyOn(f.core, 'reportDeviceStatus').mockResolvedValue(undefined);
+    await f.core.markBlocked('blocked_integrity');
+    report.mockRestore();
+    const writes = f.core.writeState.mock.calls.length;
+    await f.core.consumeDeviceStatusResponse();
+    expect(f.state().last_error_code).toBe('blocked_integrity');
+    expect(f.core.writeState).toHaveBeenCalledTimes(writes);
+  });
+
+  it('checks vault freshness after awaiting name feedback', async () => {
+    const f = await clientFixture();
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ device_name: 'Synthetic', vault_status: 'blocked_integrity', plugin: {} }), { status: 200 })));
+    await f.core.reportDeviceStatus();
+    await f.core.deviceStatusReporter.flush();
+    const entered = deferred();
+    const gate = deferred();
+    vi.spyOn(f.core, 'applyServerDeviceName').mockImplementation(async () => { entered.resolve(); await gate.promise; });
+    const consume = f.core.consumeDeviceStatusResponse();
+    await entered.promise;
+    await f.core.reconcileServerVaultStatus('active', true);
+    gate.resolve();
+    await consume;
+    expect(f.state().last_error_code).toBeNull();
+    expect(f.core.writeState).not.toHaveBeenCalled();
+  });
+
   it('does not apply a response older than the last applied request', async () => {
     const f = await clientFixture();
     await f.core.reportDeviceStatus();

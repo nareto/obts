@@ -24445,6 +24445,7 @@ var ObtsObsidianClient = class {
     this.inventoryCompletedSeq = 0;
     this.deviceStatusSequence = 0;
     this.deviceStatusGeneration = 0;
+    this.vaultStatusObservation = 0;
     this.lastAppliedDeviceStatusSequence = 0;
     this.pendingDeviceStatusResponse = null;
     this.applyingDeviceStatusResponse = false;
@@ -30737,6 +30738,7 @@ var ObtsObsidianClient = class {
   }
   async reconcileServerVaultStatus(vaultStatus, throwIfBlocked = false, observedState = null) {
     if (vaultStatus !== "active" && vaultStatus !== "blocked_integrity") return true;
+    this.vaultStatusObservation += 1;
     const state = observedState || await this.readState();
     if (vaultStatus === "blocked_integrity") {
       if (state.last_error_code !== "blocked_integrity") {
@@ -31003,6 +31005,7 @@ var ObtsObsidianClient = class {
       return;
     }
     const feedbackChangedState = await this.consumeDeviceStatusResponse({ state, token });
+    const vaultStatusObservation = this.vaultStatusObservation;
     if (feedbackChangedState) state = await this.readState();
     const queue = await this.readQueue();
     const operation = typeof this.plugin.operationDetails === "function" ? this.plugin.operationDetails() : null;
@@ -31035,6 +31038,7 @@ var ObtsObsidianClient = class {
       generation: this.deviceStatusGeneration,
       nameRevision,
       reportedErrorCode: state.last_error_code,
+      vaultStatusObservation,
       requiresServerFeedback: state.last_error_code === "blocked_integrity"
     });
   }
@@ -31072,10 +31076,10 @@ var ObtsObsidianClient = class {
         await this.writeState(Object.assign({}, latestState, { device_name: normalizedName, updated_at: nowIso() }));
         state = await this.readState();
       }
-      const staleActive = result.vault_status === "active" && snapshot.reportedErrorCode !== state.last_error_code;
-      if (!staleActive) await this.reconcileServerVaultStatus(result.vault_status, false, state);
+      const staleVaultStatus = snapshot.vaultStatusObservation !== this.vaultStatusObservation || result.vault_status === "active" && snapshot.reportedErrorCode !== state.last_error_code;
+      if (!staleVaultStatus) await this.reconcileServerVaultStatus(result.vault_status, false, state);
       this.plugin.handlePluginCompatibility(result.plugin);
-      return nameChanged || !staleActive && (result.vault_status === "blocked_integrity" && state.last_error_code !== "blocked_integrity" || result.vault_status === "active" && state.last_error_code === "blocked_integrity");
+      return nameChanged || !staleVaultStatus && (result.vault_status === "blocked_integrity" && state.last_error_code !== "blocked_integrity" || result.vault_status === "active" && state.last_error_code === "blocked_integrity");
     } finally {
       this.applyingDeviceStatusResponse = false;
     }
@@ -33534,6 +33538,7 @@ var ObtsObsidianClient = class {
     throw new ObtsBlockedError(code, message, details);
   }
   async markBlocked(code, details = void 0) {
+    if (code === "blocked_integrity") this.vaultStatusObservation += 1;
     await this.writeState(Object.assign({}, await this.readState(), {
       status_label: blockStatusLabel(code, details),
       last_error_code: code,
