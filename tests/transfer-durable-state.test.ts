@@ -167,6 +167,7 @@ describe('transfer durable state publication', () => {
     const events: string[] = [];
     const persistence = tracedPersistence(events);
     const finalize = deferred<PushResult>();
+    const processingEntered = deferred<void>();
     const git = {
       getRef: async () => null,
       commitExists: async () => false,
@@ -176,7 +177,7 @@ describe('transfer durable state publication', () => {
       readerForRepo: () => ({}) as never,
       promoteTransferObjects: async () => undefined
     };
-    const sync = { pushDeviceCommit: async () => await finalize.promise };
+    const sync = { pushDeviceCommit: async () => { processingEntered.resolve(); return await finalize.promise; } };
     const service = new ChunkTransferService(config, git as never, sync as never, undefined, persistence);
     const auth = syntheticAuth();
     const request: ChunkPushCreateRequest = {
@@ -203,6 +204,18 @@ describe('transfer durable state publication', () => {
     const processing = await service.beginFinalizePush(auth, transferId);
     expect(processing).toBeDefined();
     expect(processing.status).toBe('processing');
+    expect(processing.poll_after_ms).toBe(250);
+    await processingEntered.promise;
+    const sessionPath = join(config.transferDir, transferId, 'session.json');
+    const processingSession = JSON.parse(await readFile(sessionPath, 'utf8'));
+    await writeFile(sessionPath, JSON.stringify({ ...processingSession, processing_error_code: 'server_processing_error',
+      retry_at: new Date(Date.now() + 120_000).toISOString() }));
+    expect((await service.getPush(auth, transferId)).poll_after_ms).toBe(5_000);
+    await writeFile(sessionPath, JSON.stringify({ ...processingSession, processing_error_code: 'server_processing_error',
+      retry_at: new Date(Date.now() - 1_000).toISOString() }));
+    expect((await service.getPush(auth, transferId)).poll_after_ms).toBe(1_000);
+    await writeFile(sessionPath, JSON.stringify(processingSession));
+    expect((await service.getPush(auth, transferId)).poll_after_ms).toBe(250);
     await new Promise<void>((resolve) => setImmediate(resolve));
     finalize.resolve({ status: 'noop', device_ref: 'refs/obts/devices/dev_test', main: 'd'.repeat(40), event_seq: 1 });
     await new Promise((resolve) => setTimeout(resolve, 20));

@@ -35,6 +35,7 @@ import { type OperationalFields, type OperationalLog, silentOperationalLog } fro
 
 const SESSION_VERSION = 1;
 const MAX_OPEN_TRANSFERS_PER_DEVICE = 2;
+const HEALTHY_PUSH_POLL_MS = 250;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/u;
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9_:-]{1,256}$/u;
@@ -815,7 +816,9 @@ export class ChunkTransferService {
       expires_at: session.expires_at,
       ...(session.status === 'processing'
         ? {
-            poll_after_ms: Math.max(1_000, Math.min(5_000, Date.parse(session.retry_at ?? '') - Date.now() || 1_000)),
+            poll_after_ms: session.processing_error_code || session.retry_at
+              ? Math.max(1_000, Math.min(5_000, Date.parse(session.retry_at ?? '') - Date.now() || 1_000))
+              : HEALTHY_PUSH_POLL_MS,
             ...(session.processing_error_code ? { processing_error_code: session.processing_error_code } : {}),
             processing_attempts: session.processing_attempts ?? 0
           }
