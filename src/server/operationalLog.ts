@@ -8,6 +8,8 @@ export type LogLevel = typeof LOG_LEVELS[number];
 type EmittedLevel = Exclude<LogLevel, 'silent'>;
 export type LogSink = (line: string) => void;
 export const MAX_LOG_LINE_BYTES = 4096;
+export const MAX_STDOUT_BUFFER_BYTES = 4 * 1024 * 1024;
+const MAX_STACK_CHARS = 8 * 90 + 7;
 
 export const STARTUP_PHASES = [
   'metadata_initialized', 'deletions_reconciled', 'receipts_expired', 'root_commits_populated',
@@ -21,7 +23,7 @@ export const BACKGROUND_TASKS = [
 type BackgroundTask = typeof BACKGROUND_TASKS[number];
 export const LOG_EVENTS = [
   'http_request', 'server_listening', 'startup_phase', 'vault_integrity_blocked',
-  'push_integrated', 'conflict_created', 'conflict_resolved', 'background_task_failed'
+  'push_integrated', 'conflict_created', 'conflict_resolved', 'background_task_failed', 'log_lines_dropped'
 ] as const;
 type LogEvent = typeof LOG_EVENTS[number];
 
@@ -45,7 +47,7 @@ export type OperationalFields = {
   push_status?: PushResult['status'] | 'processing';
   event_seq?: number;
   directory_ack?: 'accepted' | 'conflicted' | 'duplicate';
-  attempt_id?: string;
+  dropped_lines?: number;
   chunk_count?: number;
   chunk_index?: number;
   complete?: boolean;
@@ -135,6 +137,7 @@ const CODE = /^[a-z][a-z0-9_]{0,63}$/u;
 const OPAQUE_ID = /^[a-z]+_[A-Za-z0-9_-]{1,64}$/u;
 const VERSION = /^(?:0|[1-9]\d{0,2})\.(?:0|[1-9]\d{0,2})\.(?:0|[1-9]\d{0,2})$/u;
 const OID = /[0-9a-f]{40}/iu;
+const MODULE_BASENAME = /^[A-Za-z0-9_.-]{1,64}\.(?:c|m)?js$/u;
 type Validator = (value: unknown) => boolean;
 const enumeration = (values: readonly string[]): Validator => (value) => typeof value === 'string' && values.includes(value);
 const pattern = (regex: RegExp): Validator => (value) => typeof value === 'string' && regex.test(value);
@@ -148,9 +151,9 @@ const FIELD_VALIDATORS: Record<keyof OperationalFields, Validator> = {
   vault_id: id('vlt'), device_id: id('dev'), user_id: id('usr'), connection_id: id('con'),
   transfer_id: id('trn'), conflict_id: id('conf'), plugin_version: (value) => value === 'unknown' || pattern(VERSION)(value),
   error_code: pattern(CODE), error_class: pattern(/^[A-Za-z][A-Za-z0-9_]{0,63}$/u),
-  stack: pattern(/^frame:\d{1,7}:\d{1,7}(?:,frame:\d{1,7}:\d{1,7}){0,7}$/u),
+  stack: pattern(/^frame:(?:[A-Za-z0-9_.-]{1,64}\.(?:c|m)?js|node|\?):\d{1,7}:\d{1,7}(?:,frame:(?:[A-Za-z0-9_.-]{1,64}\.(?:c|m)?js|node|\?):\d{1,7}:\d{1,7}){0,7}$/u),
   push_status: enumeration(['noop', 'merged', 'conflicted', 'rejected', 'processing']), event_seq: number,
-  directory_ack: enumeration(['accepted', 'conflicted', 'duplicate']), attempt_id: pattern(OPAQUE_ID),
+  directory_ack: enumeration(['accepted', 'conflicted', 'duplicate']), dropped_lines: number,
   chunk_count: number, chunk_index: number, complete: (value) => typeof value === 'boolean',
   target: enumeration(['latest', 'explicit']),
   reported_status: nullable(enumeration(['idle', 'queued_local', 'uploading', 'merged', 'conflicted', 'blocked_recovery', 'unknown'])),
@@ -165,21 +168,22 @@ function sanitize(fields: OperationalFields): OperationalFields {
   const result: Record<string, unknown> = {};
   for (const [key, validator] of Object.entries(FIELD_VALIDATORS)) {
     const value = fields[key as keyof OperationalFields];
-    if (typeof value === 'string' && (value.length > 256 || OID.test(value))) continue;
+    if (typeof value === 'string' && (value.length > (key === 'stack' ? MAX_STACK_CHARS : 256) || OID.test(value))) continue;
     if (validator(value)) result[key] = value;
   }
   return result as OperationalFields;
 }
 
-let stdoutObserved = false;
+function serializeLine(level: EmittedLevel, event: LogEvent, fields: OperationalFields): string {
+  return `${JSON.stringify({
+    ts: new Date().toISOString(), level, event, service: 'obts-server', version: packageJson.version,
+    ...sanitize(fields)
+  })}\n`;
+}
+
+let stdoutSink: LogSink | undefined;
 export function operationalStdout(line: string): void {
-  try {
-    if (!stdoutObserved) {
-      process.stdout.on('error', () => undefined);
-      stdoutObserved = true;
-    }
-    if (!process.stdout.destroyed && !process.stdout.writableNeedDrain) process.stdout.write(line);
-  } catch {}
+  try { (stdoutSink ??= createOperationalStdout(process.stdout))(line); } catch {}
 }
 
 export function parseLogLevel(value: string | undefined): LogLevel {
@@ -195,10 +199,7 @@ export class OperationalLog {
     try {
       if (this.level === 'silent' || LOG_LEVELS.indexOf(level) > LOG_LEVELS.indexOf(this.level) ||
           !LOG_EVENTS.includes(event) || !LOG_LEVELS.includes(level)) return;
-      const line = `${JSON.stringify({
-        ts: new Date().toISOString(), level, event, service: 'obts-server', version: packageJson.version,
-        ...sanitize(fields)
-      })}\n`;
+      const line = serializeLine(level, event, fields);
       if (Buffer.byteLength(line, 'utf8') <= MAX_LOG_LINE_BYTES) {
         const result: unknown = this.sink(line);
         if (result instanceof Promise) void result.catch(() => undefined);
@@ -218,6 +219,42 @@ export class OperationalLog {
   }
 }
 
+type OperationalStream = {
+  destroyed: boolean;
+  writableLength: number;
+  write(line: string): unknown;
+  on(event: 'drain' | 'error', listener: () => void): unknown;
+};
+
+export function createOperationalStdout(stream: OperationalStream): LogSink {
+  let droppedLines = 0;
+  const reportDrops = () => {
+    try {
+      if (droppedLines === 0 || stream.destroyed || stream.writableLength >= MAX_STDOUT_BUFFER_BYTES) return;
+      const count = droppedLines;
+      droppedLines = 0;
+      try { stream.write(serializeLine('warn', 'log_lines_dropped', { dropped_lines: count })); }
+      catch { droppedLines += count; }
+    } catch {}
+  };
+  try {
+    stream.on('error', () => undefined);
+    stream.on('drain', reportDrops);
+  } catch {}
+  return (line) => {
+    try {
+      if (stream.destroyed) return;
+      if (stream.writableLength >= MAX_STDOUT_BUFFER_BYTES) {
+        droppedLines++;
+        return;
+      }
+      reportDrops();
+      if (stream.writableLength >= MAX_STDOUT_BUFFER_BYTES) droppedLines++;
+      else stream.write(line);
+    } catch {}
+  };
+}
+
 export const silentOperationalLog = new OperationalLog();
 
 export function safeReportedPluginVersion(version: string): string {
@@ -228,10 +265,14 @@ export function safeErrorFields(error: unknown): Pick<OperationalFields, 'error_
   try {
     if (!(error instanceof Error)) return {};
     const errorClass = error.constructor.name;
-    // Retain frame positions only: V8 frame text also carries filenames and can contain error messages.
     const frames = (error.stack ?? '').slice(0, 16_384).split('\n').slice(1, 33).filter((line) => /^\s+at /u.test(line))
-      .map((line) => line.match(/:(\d{1,7}):(\d{1,7})\)?$/u))
-      .filter((match) => match !== null).slice(0, 8).map((match) => `frame:${match[1]}:${match[2]}`);
+      .map((line) => line.trim().slice(3).match(/^(.*):(\d{1,7}):(\d{1,7})\)?$/u))
+      .filter((match) => match !== null).slice(0, 8).map((match) => {
+        const source = match[1]!.slice(match[1]!.lastIndexOf('(') + 1);
+        const basename = source.split(/[\\/]/u).at(-1)!;
+        const module = source.startsWith('node:') ? 'node' : MODULE_BASENAME.test(basename) ? basename : '?';
+        return `frame:${module}:${match[2]}:${match[3]}`;
+      });
     return {
       ...(FIELD_VALIDATORS.error_class(errorClass) && !OID.test(errorClass) ? { error_class: errorClass } : {}),
       ...(frames.length ? { stack: frames.join(',') } : {})

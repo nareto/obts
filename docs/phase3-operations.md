@@ -92,7 +92,7 @@ event, not a plaintext URL.
 
 Events are `http_request`, `server_listening`, `startup_phase`,
 `vault_integrity_blocked`, `push_integrated`, `conflict_created`,
-`conflict_resolved`, and `background_task_failed`. Each completed or aborted
+`conflict_resolved`, `background_task_failed`, and `log_lines_dropped`. Each completed or aborted
 request has one request event. Integration events also cover asynchronous
 finalization and startup resumption, so a processing response is distinguishable
 from an actual merge outcome. Lifecycle events follow successful durable
@@ -102,9 +102,10 @@ mutations; integrity-block events report only actual status transitions.
 | --- | --- |
 | `ts`, `level`, `event`, `service`, `version` | UTC timestamp, severity, event category, fixed `obts-server` service and server version |
 | `request_id`, `method`, `route`, `status`, `duration_ms`, `outcome` | Request correlation, HTTP method, allowlisted route template (null for unmatched), status (null for aborted), rounded duration and `ok|client_error|server_error|aborted` |
-| `vault_id`, `device_id`, `user_id`, `connection_id`, `transfer_id`, `conflict_id`, `plugin_version` | Known opaque identities and sanitized plugin version; connection ID is never the connection secret |
-| `error_code`, `error_class`, `stack`, `failed_checks` | Safe error code/class, bounded stack frame positions only, and comma-separated failed readiness check names (never detail text) |
-| `push_status`, `event_seq`, `directory_ack`, `attempt_id`, `chunk_count`, `chunk_index`, `complete`, `target`, `reported_status`, `resolution` | Validated domain observations; attempt IDs must match a bounded opaque-ID pattern, target is `latest|explicit`, reported status uses the safe queue-status vocabulary |
+| `vault_id`, `device_id`, `user_id`, `connection_id`, `transfer_id`, `conflict_id`, `plugin_version` | Known server-generated opaque identities and sanitized plugin version; connection ID is never the connection secret |
+| `error_code`, `error_class`, `stack`, `failed_checks` | Safe error code/class, bounded `frame:<module>:<line>:<col>` observations, and comma-separated failed readiness check names (never detail text); module is a validated JS basename, `node` for internals or `?` for other sources |
+| `push_status`, `event_seq`, `directory_ack`, `chunk_count`, `chunk_index`, `complete`, `target`, `reported_status`, `resolution` | Validated domain observations; target is `latest|explicit`, reported status uses the safe queue-status vocabulary |
+| `dropped_lines` | Number of overflowed stdout observations since the previous drop report |
 | `host`, `port`, `log_level`, `phase`, `source`, `task` | Listener configuration and closed startup, integrity-source and background-task categories |
 
 | Request class | Level |
@@ -118,9 +119,19 @@ mutations; integrity-block events report only actual status transitions.
 Every line is capped at 4 KiB; unknown fields and invalid values are dropped.
 Logs never include raw paths/URLs/queries, bodies, headers, client IPs,
 credentials, content, display names, Git object IDs or error message text.
+Client-selected correlation strings are not logged. Stack observations contain
+only validated module basenames and positions, never directory components.
 Logging failures are swallowed and logging never changes responses, mutation
-ordering, durability or recovery. A failing or backpressured stdout sink may
-lose observations; logs are not persistence or recovery authority.
+ordering, durability or recovery.
+
+The stdout sink keeps writing through ordinary backpressure while Node's buffered
+byte count is below 4 MiB. At or above that cap it drops new lines and counts them,
+without waiting or building another queue. A final accepted line can exceed the
+cap by at most one 4 KiB line. Once space returns, on `drain` or the next accepted
+write, it emits one `warn` `log_lines_dropped` event with `dropped_lines`, then
+resets the count. This sink warning is independent of the normal event-level
+filter. A failing sink can still lose observations; logs are not persistence or
+recovery authority.
 
 For example, inspect integration outcomes and their progression without Git IDs:
 

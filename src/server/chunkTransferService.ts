@@ -594,7 +594,7 @@ export class ChunkTransferService {
     const operation = async () => await this.withLock(transferId, async () => {
       this.assertTransferAllowed(auth);
       const session = await this.requireSession(auth, transferId);
-      try { observe?.({ chunk_count: session.chunk_count, attempt_id: session.attempt_id }); } catch {}
+      try { observe?.({ chunk_count: session.chunk_count }); } catch {}
       if (session.status === 'completed' || session.status === 'rejected' || session.status === 'aborted') {
         if (!session.result) throw new AuthError(409, 'transfer_closed', 'Transfer is no longer open.');
         return session.result;
@@ -626,7 +626,7 @@ export class ChunkTransferService {
     const operation = async () => await this.withLock(transferId, async () => {
       this.assertTransferAllowed(auth);
       const current = await this.requireSession(auth, transferId);
-      try { observe?.({ chunk_count: current.chunk_count, attempt_id: current.attempt_id }); } catch {}
+      try { observe?.({ chunk_count: current.chunk_count }); } catch {}
       if (current.status === 'completed' || current.status === 'rejected' || current.status === 'aborted') return current;
       if (current.receipts.length !== current.chunk_count) {
         throw new AuthError(409, 'transfer_incomplete', 'Transfer is missing one or more chunks.');

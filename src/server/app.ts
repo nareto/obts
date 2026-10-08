@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 import cookie from '@fastify/cookie';
 import multipart from '@fastify/multipart';
-import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest, type RouteOptions } from 'fastify';
 
 import { DIAGNOSTIC_MAX_BODY_BYTES } from '../shared/diagnostics.js';
 import { newId, nowIso } from '../shared/ids.js';
@@ -101,7 +101,7 @@ async function syncableTargetFileSizes(
 
 export async function createObtsServer(
   overrides: Partial<ServerConfig> & { dataDir: string },
-  options: { operationalLog?: OperationalLog } = {}
+  options: { operationalLog?: OperationalLog; onRoute?: (route: RouteOptions) => void } = {}
 ): Promise<ObtsServer> {
   const log = options.operationalLog ?? silentOperationalLog;
   const requestLog = new RequestLogContext(log);
@@ -148,6 +148,7 @@ export async function createObtsServer(
     disableRequestLogging: true,
     genReqId: () => newId('req')
   });
+  if (options.onRoute) app.addHook('onRoute', options.onRoute);
   app.addContentTypeParser(
     'application/x-git-packed-objects',
     { parseAs: 'buffer', bodyLimit: config.transferChunkBytes },
@@ -1029,7 +1030,7 @@ export async function createObtsServer(
     requireCompatiblePlugin(body.plugin_version, deviceAuth.device.plugin_version);
     if (body.plugin_version !== undefined) requestLog.annotate(request, { plugin_version: safeReportedPluginVersion(body.plugin_version) });
     const result = await chunkTransfers.createPush(deviceAuth, body);
-    requestLog.annotate(request, { transfer_id: result.descriptor.transfer_id, attempt_id: body.attempt_id, chunk_count: body.chunk_count });
+    requestLog.annotate(request, { transfer_id: result.descriptor.transfer_id, chunk_count: body.chunk_count });
     return reply.status(result.created ? 201 : 200).send(result.descriptor);
   });
 
@@ -1093,7 +1094,6 @@ export async function createObtsServer(
     const { manifest, packfile } = await readPushMultipart(request);
     requireCompatiblePlugin(manifest.plugin_version, deviceAuth.device.plugin_version);
     if (manifest.plugin_version !== undefined) requestLog.annotate(request, { plugin_version: safeReportedPluginVersion(manifest.plugin_version) });
-    if (manifest.attempt_id !== undefined) requestLog.annotate(request, { attempt_id: manifest.attempt_id });
     const result = await sync.pushDeviceCommit(deviceAuth, manifest, packfile);
     requestLog.annotate(request, pushLogFields(result));
     if (result.status === 'rejected') {
@@ -1527,8 +1527,8 @@ export async function createObtsServer(
     const manualFiles = readManualResolutionFiles(body);
     const manualFilePlan = readManualFilePlan(body);
     const expectedTree = readOptionalCommitId(body, 'expected_tree');
-    requestLog.annotate(request, { vault_id: vaultId, conflict_id: conflictId, resolution: resolutionKind });
-    return await sync.resolveConflict({
+    requestLog.annotate(request, { resolution: resolutionKind });
+    const result = await sync.resolveConflict({
       actorUserId: session.user.user_id,
       vaultId,
       conflictId,
@@ -1538,6 +1538,8 @@ export async function createObtsServer(
       ...(manualFiles === undefined ? {} : { manualFiles }),
       ...(manualFilePlan === undefined ? {} : { manualFilePlan })
     });
+    requestLog.annotate(request, { vault_id: vaultId, conflict_id: result.conflict_id });
+    return result;
   });
 
   app.post('/api/v1/vaults/:vaultId/history/query', async (request) => {

@@ -2,6 +2,8 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { connect, createServer } from 'node:net';
+import { Script } from 'node:vm';
+import { EventEmitter } from 'node:events';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -10,7 +12,8 @@ import { createObtsServer, type ObtsServer } from '../src/server/app.js';
 import { AuthError } from '../src/server/authService.js';
 import { sha256Hex } from '../src/server/gitService.js';
 import {
-  LOG_FIELD_ALLOWLIST, LOG_LEVELS, MAX_LOG_LINE_BYTES, OperationalLog, parseLogLevel,
+  createOperationalStdout, LOG_FIELD_ALLOWLIST, LOG_LEVELS, LOG_ROUTES, MAX_LOG_LINE_BYTES, MAX_STDOUT_BUFFER_BYTES,
+  OperationalLog, parseLogLevel,
   safeErrorFields, STARTUP_PHASES, type LogLevel, type OperationalFields
 } from '../src/server/operationalLog.js';
 import { API_VERSION, type DevicePushManifest } from '../src/shared/types.js';
@@ -34,12 +37,12 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true })));
 });
 
-async function create(level: LogLevel = 'debug', sink?: (line: string) => void) {
+async function create(level: LogLevel = 'debug', sink?: (line: string) => void, onRoute?: NonNullable<Parameters<typeof createObtsServer>[1]>['onRoute']) {
   const root = await mkdtemp(join(tmpdir(), 'obts-request-log-'));
   roots.push(root);
   const lines: string[] = [];
   const log = new OperationalLog(level, sink ?? ((line) => lines.push(line)));
-  const server = await createObtsServer({ dataDir: join(root, 'data'), sessionSecret: 'request-log-fixture-signing-key' }, { operationalLog: log });
+  const server = await createObtsServer({ dataDir: join(root, 'data'), sessionSecret: 'request-log-fixture-signing-key' }, { operationalLog: log, ...(onRoute ? { onRoute } : {}) });
   servers.push(server);
   const rows = () => lines.map((line) => JSON.parse(line) as LogRow);
   const requests = () => rows().filter((row) => row.event === 'http_request');
@@ -132,13 +135,13 @@ async function push(f: Fixture, target: string, overrides: Partial<DevicePushMan
   });
 }
 
-async function transfer(f: Fixture, target: string) {
+async function transfer(f: Fixture, target: string, attemptId = 'xfer_logging_fixture') {
   const pack = await f.server.git.exportPack(f.vaultId, target, f.m0);
   const created = await f.server.app.inject({
     method: 'POST', url: `/api/v1/vaults/${f.vaultId}/sync/push-transfers`, headers: f.deviceHeaders,
     payload: {
       api_version: API_VERSION, plugin_version: '0.5.14', vault_id: f.vaultId, device_id: f.deviceId,
-      expected_device_ref: null, target_commit: target, client_known_main: f.m0, attempt_id: 'xfer_logging_fixture',
+      expected_device_ref: null, target_commit: target, client_known_main: f.m0, attempt_id: attemptId,
       chunk_count: 1, plan_sha256: sha256Hex(Buffer.from('logging fixture plan'))
     }
   });
@@ -152,6 +155,90 @@ async function transfer(f: Fixture, target: string) {
   return transferId;
 }
 
+class FakeOutput extends EventEmitter {
+  destroyed = false;
+  writableLength = 0;
+  writableNeedDrain = true;
+  lines: string[] = [];
+
+  write(line: string): boolean {
+    this.lines.push(line);
+    this.writableLength += Buffer.byteLength(line);
+    return false;
+  }
+}
+
+describe('stdout operational buffering', () => {
+  it('accepts a burst below the byte cap even while the stream needs drain', () => {
+    const stream = new FakeOutput();
+    const log = new OperationalLog('info', createOperationalStdout(stream));
+    for (let index = 0; index < 20_000; index++) log.emit('info', 'http_request');
+    expect(stream.writableNeedDrain).toBe(true);
+    expect(stream.writableLength).toBeLessThan(MAX_STDOUT_BUFFER_BYTES);
+    expect(stream.lines).toHaveLength(20_000);
+    stream.writableLength = 0;
+    stream.emit('drain');
+    expect(stream.lines).toHaveLength(20_000);
+  });
+
+  it.each(['drain', 'write'])('reports overflow exactly once on %s and resets the counter', (resume) => {
+    const stream = new FakeOutput();
+    const log = new OperationalLog('info', createOperationalStdout(stream));
+    stream.writableLength = MAX_STDOUT_BUFFER_BYTES;
+    for (let index = 0; index < 3; index++) log.emit('info', 'http_request');
+    expect(stream.lines).toEqual([]);
+    stream.writableLength = 0;
+    if (resume === 'drain') stream.emit('drain');
+    else log.emit('info', 'http_request');
+    const reports = () => stream.lines.map((line) => JSON.parse(line)).filter((row) => row.event === 'log_lines_dropped');
+    expect(reports()).toEqual([expect.objectContaining({ level: 'warn', dropped_lines: 3, service: 'obts-server' })]);
+    stream.emit('drain');
+    expect(reports()).toHaveLength(1);
+    stream.writableLength = MAX_STDOUT_BUFFER_BYTES + 1;
+    for (let index = 0; index < 2; index++) log.emit('info', 'http_request');
+    stream.writableLength = 0;
+    log.emit('info', 'http_request');
+    stream.emit('drain');
+    expect(reports().map((row) => row.dropped_lines)).toEqual([3, 2]);
+    for (const line of stream.lines) {
+      expect(Object.keys(JSON.parse(line)).every((key) => LOG_FIELD_ALLOWLIST.includes(key))).toBe(true);
+      expect(Buffer.byteLength(line)).toBeLessThanOrEqual(MAX_LOG_LINE_BYTES);
+    }
+  });
+
+  it('rechecks the byte cap after reporting drops before accepting another line', () => {
+    const stream = new FakeOutput();
+    const log = new OperationalLog('info', createOperationalStdout(stream));
+    stream.writableLength = MAX_STDOUT_BUFFER_BYTES;
+    log.emit('info', 'http_request');
+    stream.writableLength--;
+    log.emit('info', 'http_request');
+    expect(stream.lines).toHaveLength(1);
+    expect(JSON.parse(stream.lines[0]!)).toMatchObject({ event: 'log_lines_dropped', dropped_lines: 1 });
+    expect(stream.writableLength).toBeLessThan(MAX_STDOUT_BUFFER_BYTES + MAX_LOG_LINE_BYTES);
+    stream.writableLength = 0;
+    stream.emit('drain');
+    expect(stream.lines.map((line) => JSON.parse(line).dropped_lines)).toEqual([1, 1]);
+  });
+
+  it('swallows stream errors and retries a failed overflow report without losing its count', () => {
+    const stream = new FakeOutput();
+    const log = new OperationalLog('info', createOperationalStdout(stream));
+    stream.writableLength = MAX_STDOUT_BUFFER_BYTES;
+    log.emit('info', 'http_request');
+    stream.writableLength = 0;
+    const fault = vi.spyOn(stream, 'write').mockImplementation(() => { throw new Error('sink failure'); });
+    expect(() => stream.emit('error', new Error('pipe failure'))).not.toThrow();
+    expect(() => stream.emit('drain')).not.toThrow();
+    fault.mockRestore();
+    log.emit('info', 'http_request');
+    expect(JSON.parse(stream.lines[0]!)).toMatchObject({ event: 'log_lines_dropped', dropped_lines: 1 });
+    stream.destroyed = true;
+    expect(() => log.emit('info', 'http_request')).not.toThrow();
+    expect(stream.lines).toHaveLength(2);
+  });
+});
+
 describe('closed-schema operational logger', () => {
   it('drops unknown keys, unsafe strings, non-finite values, objects and OIDs at runtime', () => {
     const lines: string[] = [];
@@ -159,7 +246,7 @@ describe('closed-schema operational logger', () => {
     log.emit('info', 'http_request', {
       request_id: 'req_safe', route: '/api/v1/vaults/:vaultId/main', status: 200, duration_ms: 1,
       vault_id: 'vlt_safe', plugin_version: '0.6.0', raw_url: '/secret', authorization: 'Bearer secret',
-      body: { password: PASSWORD }, error_code: 'has/secret', attempt_id: 'a'.repeat(40),
+      body: { password: PASSWORD }, error_code: 'has/secret', attempt_id: 'tok_client-selected-unit-canary',
       host: 'x'.repeat(300), event_seq: Infinity, chunk_index: NaN, complete: 'not-a-boolean',
       ts: PASSWORD, service: PASSWORD, version: PASSWORD
     } as unknown as OperationalFields);
@@ -170,6 +257,7 @@ describe('closed-schema operational logger', () => {
     expect(row).not.toHaveProperty('event_seq');
     expect(Object.keys(row).every((key) => LOG_FIELD_ALLOWLIST.includes(key))).toBe(true);
     expect(lines.join('')).not.toContain(PASSWORD);
+    expect(lines.join('')).not.toContain('client-selected-unit-canary');
     expect(Buffer.byteLength(lines[0]!)).toBeLessThanOrEqual(MAX_LOG_LINE_BYTES);
     expect(() => log.emit('info', 'http_request', new Proxy({}, { get() { throw new Error('serialization failed'); } }))).not.toThrow();
   });
@@ -182,17 +270,96 @@ describe('closed-schema operational logger', () => {
     expect(lines.map((line) => JSON.parse(line).level)).toEqual(expected);
   });
 
-  it('rejects invalid levels and strips messages and filenames from stack observations', () => {
+  it('rejects invalid levels and retains only validated module basenames and stack positions', () => {
     expect(parseLogLevel(undefined)).toBe('info');
     expect(() => parseLogLevel('verbose')).toThrow('OBTS_LOG_LEVEL');
     expect(() => parseLogLevel('')).toThrow('OBTS_LOG_LEVEL');
     const error = new TypeError(PASSWORD);
-    error.stack = `TypeError: ${PASSWORD}\n    at handler (/private/${PATH_MARKER}.ts:12:7)\n    at ${CONTENT_MARKER} (file:///private/source.ts:19:3)`;
-    expect(safeErrorFields(error)).toEqual({ error_class: 'TypeError', stack: 'frame:12:7,frame:19:3' });
+    error.stack = `TypeError: ${PASSWORD}\n    at handler (/private/${PATH_MARKER}.ts:12:7)\n    at ${CONTENT_MARKER} (file:///private/source.mjs:19:3)\n    at node:internal/process/task_queues:95:5\n    at loader (C:\\private\\module.cjs:2:4)\n    at invalid (/private/not+safe.js:3:6)\n    at handler (/private/(deep folder)/module.js:4:8)\n    at invalid (/private/module(unsafe).js:5:9)`;
+    expect(safeErrorFields(error)).toEqual({ error_class: 'TypeError', stack: 'frame:?:12:7,frame:source.mjs:19:3,frame:node:95:5,frame:module.cjs:2:4,frame:?:3:6,frame:module.js:4:8,frame:?:5:9' });
+  });
+
+  it('accepts eight bounded basename frames but rejects directory, URL and oversized stack modules', () => {
+    const lines: string[] = [];
+    const log = new OperationalLog('debug', (line) => lines.push(line));
+    const module = `${'x'.repeat(64)}.mjs`;
+    const stack = Array.from({ length: 8 }, () => `frame:${module}:9999999:9999999`).join(',');
+    log.emit('error', 'http_request', { stack });
+    expect(JSON.parse(lines[0]!).stack).toBe(stack);
+    for (const invalid of ['frame:/directory/source.js:1:2', 'frame:file:///source.js:1:2',
+      'frame:https://example.invalid/source.js:1:2', `frame:${'x'.repeat(65)}.js:1:2`, 'frame:source.ts:1:2']) {
+      log.emit('error', 'http_request', { stack: invalid });
+      expect(JSON.parse(lines.at(-1)!)).not.toHaveProperty('stack');
+    }
+    expect(lines.every((line) => Buffer.byteLength(line) <= MAX_LOG_LINE_BYTES)).toBe(true);
+  });
+
+  it('logs an error thrown from a deep path without directory names, separators or message text', () => {
+    const lines: string[] = [];
+    const log = new OperationalLog('debug', (line) => lines.push(line));
+    try {
+      new Script(`(() => { throw new TypeError('${PASSWORD}'); })()`, {
+        filename: '/directory-canary-53710/deep/nested/diagnostic.cjs'
+      }).runInThisContext();
+    } catch (error) {
+      log.backgroundFailure('diagnostic_prune', error);
+    }
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0]!).stack).toContain('frame:diagnostic.cjs:1:');
+    for (const marker of ['/', '\\', 'directory-canary-53710', 'deep', 'nested', PASSWORD]) {
+      expect(lines[0]).not.toContain(marker);
+    }
   });
 });
 
 describe('server request and lifecycle observations', () => {
+  it('matches the complete registered route set with no missing or stale allowlist entries', async () => {
+    const registered = new Set<string>();
+    const f = await create('silent', undefined, (route) => { registered.add(route.url); });
+    await f.server.app.ready();
+    expect([...registered].sort()).toEqual([...LOG_ROUTES].sort());
+    expect(new Set(LOG_ROUTES).size).toBe(LOG_ROUTES.length);
+  });
+
+  it('never logs client attempt IDs from direct push or transfer creation and finalize', async () => {
+    const f = await fixture();
+    const marker = 'client-attempt-secret-canary-724901';
+    const attemptId = `tok_${marker}`;
+    const target = await commit(f, f.m0);
+    const transferId = await transfer(f, target, `${attemptId}_transfer`);
+    const response = await f.server.app.inject({
+      method: 'POST', url: `/api/v1/vaults/${f.vaultId}/sync/push-transfers/${transferId}/finalize`, headers: f.deviceHeaders
+    });
+    expect(response.statusCode).toBe(200);
+    expect((await push(f, target, { attempt_id: `${attemptId}_direct` })).statusCode).toBe(200);
+    expect(f.lines.join('')).not.toContain(marker);
+    expect(f.rows().every((row) => !Object.hasOwn(row, 'attempt_id'))).toBe(true);
+  });
+
+  it('never logs unvalidated resource IDs from request paths', async () => {
+    const f = await fixture();
+    const marker = 'client-resource-secret-canary-861405';
+    const conflict = await f.server.app.inject({
+      method: 'POST', url: `/api/v1/vaults/${f.vaultId}/conflicts/conf_${marker}/resolve`, headers: f.sessionHeaders,
+      payload: { expected_main: f.m0, resolution_kind: 'keep_server' }
+    });
+    expect(conflict.statusCode).toBe(404);
+    const finalize = await f.server.app.inject({
+      method: 'POST', url: `/api/v1/vaults/${f.vaultId}/sync/push-transfers/trn_${marker}/finalize`, headers: f.deviceHeaders
+    });
+    expect(finalize.statusCode).toBe(404);
+    for (const url of [`/api/v1/vaults/vlt_${marker}/main`, `/api/v1/vault-deletions/vlt_${marker}`,
+      `/api/v1/connections/con_${marker}/review`]) {
+      expect((await f.server.app.inject({ method: 'GET', url, headers: f.sessionHeaders })).statusCode).toBe(404);
+    }
+    expect((await f.server.app.inject({
+      method: 'GET', url: '/api/v1/device/self',
+      headers: { ...f.deviceHeaders, 'request-id': `req_${marker}`, 'x-request-id': `req_${marker}` }
+    })).statusCode).toBe(200);
+    expect(f.requests().at(-1)?.request_id).toMatch(/^req_[0-9A-HJKMNP-TV-Z]{20}$/u);
+    expect(f.lines.join('')).not.toContain(marker);
+  });
+
   it('emits every startup phase once, and exactly one JSON line per completed request with template routes', async () => {
     const f = await fixture();
     expect(f.rows().filter((row) => row.event === 'startup_phase').map((row) => row.phase)).toEqual(STARTUP_PHASES);
@@ -240,14 +407,13 @@ describe('server request and lifecycle observations', () => {
     const merged = await push(f, target, { attempt_id: 'xfer_direct_fixture' });
     expect(merged.statusCode).toBe(200);
     expect(f.requests().at(-1)).toMatchObject({ vault_id: f.vaultId, device_id: f.deviceId, user_id: f.userId,
-      plugin_version: '0.5.14', push_status: 'merged', event_seq: merged.json().event_seq, attempt_id: 'xfer_direct_fixture' });
+      plugin_version: '0.5.14', push_status: 'merged', event_seq: merged.json().event_seq });
     const noop = await push(f, target);
     expect(noop.json().status).toBe('noop');
     expect(f.requests().at(-1)).toMatchObject({ push_status: 'noop', event_seq: noop.json().event_seq });
     const rejected = await push(f, target, { packfile_sha256: '0'.repeat(64), attempt_id: 'invalid/attempt' });
     expect(rejected.statusCode).toBe(409);
     expect(f.requests().at(-1)).toMatchObject({ push_status: 'rejected', error_code: 'invalid_packfile', outcome: 'client_error', level: 'info' });
-    expect(f.requests().at(-1)).not.toHaveProperty('attempt_id');
     expect(f.rows().filter((row) => row.event === 'push_integrated').map((row) => row.push_status)).toEqual(['merged', 'noop', 'rejected']);
   });
 
@@ -305,7 +471,7 @@ describe('server request and lifecycle observations', () => {
         headers: { ...f.deviceHeaders, prefer: 'respond-async' }
       });
       expect(finalized.statusCode).toBe(202);
-      expect(f.requests().at(-1)).toMatchObject({ push_status: 'processing', chunk_count: 1, transfer_id: transferId, attempt_id: 'xfer_logging_fixture' });
+      expect(f.requests().at(-1)).toMatchObject({ push_status: 'processing', chunk_count: 1, transfer_id: transferId });
       expect(f.rows().filter((row) => row.event === 'push_integrated')).toEqual([]);
       release();
       await vi.waitFor(() => expect(f.rows().find((row) => row.event === 'push_integrated')).toMatchObject({
