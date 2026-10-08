@@ -698,10 +698,10 @@ describe('vault deletion hardening', () => {
     let authReturned!: () => void;
     const authGate = new Promise<void>((resolve) => { releaseAuth = resolve; });
     const authDone = new Promise<void>((resolve) => { authReturned = resolve; });
-    const originalMutate = server.store.mutate.bind(server.store);
+    const originalAuth = server.auth.authenticateDeviceAnyVault.bind(server.auth);
     let holdNextAuth = true;
-    const mutateSpy = vi.spyOn(server.store, 'mutate').mockImplementation(async (fn) => {
-      const result = await originalMutate(fn);
+    const mutateSpy = vi.spyOn(server.auth, 'authenticateDeviceAnyVault').mockImplementation(async (header) => {
+      const result = await originalAuth(header);
       if (holdNextAuth) {
         holdNextAuth = false;
         authReturned();

@@ -39,6 +39,8 @@ Metadata conflict rules are explicit per-vault frontmatter field names and the s
 
 Overview summarizes synchronization, unresolved conflicts, paired devices, readiness, attention items, recent activity, maintenance, and backup contract state. Its four summaries are a compact adaptive status strip, followed by independently sized Devices/Attention and Activity/Maintenance columns; informational content remains available without stretched empty panels. Devices are shown in a concise operational table with name/status as the primary explanation, plugin version versus server recommendation, human relative times with exact accessible timestamps, ahead/behind state, and touch-sized actions. Expandable technical details retain identifiers, cursors, local detail, and exact report timestamps. A compact Overview table variant may omit secondary columns, while the Devices page keeps the full operational view. Status always combines readable text and icon; plugin mismatch is understandable without color alone.
 
+Device last-seen is a coalesced liveness observation with up to 60-second granularity, not a per-request log; this precision does not replace fresh server/client reports as the authority for convergence.
+
 Device revocation is a danger action with explicit confirmation. Rename changes server display metadata only and does not rename a physical vault folder.
 
 ## Conflict Workbench

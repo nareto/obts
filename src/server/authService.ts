@@ -6,6 +6,7 @@ import { Algorithm, hash as argonHash, verify as argonVerify, Version } from '@n
 import { newId, newSecretToken, nowIso } from '../shared/ids.js';
 import type {
   DeviceRow,
+  DeepReadonly,
   LegacyPasswordHash,
   MetadataDb,
   MetadataStore,
@@ -17,6 +18,7 @@ import type {
 } from './metadataStore.js';
 
 const scrypt = promisify(scryptCallback);
+const DEVICE_LAST_SEEN_INTERVAL_MS = 60_000;
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_IDLE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const RECENT_AUTH_MS = 15 * 60 * 1000;
@@ -577,7 +579,7 @@ export class AuthService {
   ): Promise<AuthenticatedDevice> {
     const token = parseBearer(authorizationHeader);
     const tokenHash = hashToken(token);
-    return await this.store.mutate((db) => {
+    const select = (db: DeepReadonly<MetadataDb>): DeepReadonly<AuthenticatedDevice> => {
       const row = db.tokens.find(
         (candidate) =>
           candidate.kind === 'device' &&
@@ -604,8 +606,15 @@ export class AuthService {
       ) {
         throw new AuthError(404, 'not_found', 'Resource not found.');
       }
-      device.last_seen_at = nowIso();
       return { user, vault, device, token: row };
+    };
+    return await this.store.readOrMutate(select, ({ device }) => {
+      const lastSeen = Date.parse(device.last_seen_at ?? '');
+      return !Number.isFinite(lastSeen) || Date.now() - lastSeen >= DEVICE_LAST_SEEN_INTERVAL_MS;
+    }, (db) => {
+      const authenticated = select(db);
+      db.devices.find((device) => device.device_id === authenticated.device.device_id)!.last_seen_at = nowIso();
+      return authenticated;
     });
   }
 

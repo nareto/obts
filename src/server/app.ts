@@ -969,8 +969,7 @@ export async function createObtsServer(
       deviceAuth.vault.vault_id,
       deviceAuth.user.user_id,
       deviceAuth.device.device_id,
-      async () => {
-        const db = await store.snapshot();
+      async () => await store.read((db) => {
         const vault = db.vaults.find((candidate) => candidate.vault_id === deviceAuth.vault.vault_id);
         const device = db.devices.find((candidate) => candidate.device_id === deviceAuth.device.device_id);
         const user = db.users.find((candidate) => candidate.user_id === deviceAuth.user.user_id);
@@ -989,7 +988,7 @@ export async function createObtsServer(
           last_applied_event_seq: device.last_applied_event_seq,
           event_seq: db.event_seq_by_vault[vault.vault_id] ?? 0
         };
-      },
+      }),
       deviceAuth.token.token_id
     );
   });

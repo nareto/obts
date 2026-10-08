@@ -328,6 +328,21 @@ describe('closed-schema operational logger', () => {
 });
 
 describe('server request and lifecycle observations', () => {
+  it('serves device self and denies revoked or closed admission without a full metadata snapshot', async () => {
+    const f = await fixture();
+    vi.spyOn(f.server.store, 'snapshot').mockRejectedValue(new Error('Full snapshot is not allowed on this route.'));
+    expect((await f.server.app.inject({ method: 'GET', url: '/api/v1/device/self', headers: f.deviceHeaders })).statusCode).toBe(200);
+    await f.server.store.mutate((db) => { db.tokens.find((token) => token.device_id === f.deviceId)!.revoked_at = new Date().toISOString(); });
+    expect((await f.server.app.inject({ method: 'GET', url: '/api/v1/device/self', headers: f.deviceHeaders })).statusCode).toBe(404);
+    await f.server.store.mutate((db) => {
+      db.tokens.find((token) => token.device_id === f.deviceId)!.revoked_at = null;
+      db.deletion_jobs.push({ vault_id: f.vaultId, owner_user_id: f.userId, requested_at: new Date().toISOString(),
+        phase: 'intent', retry_at: null, error_code: null });
+    });
+    expect((await f.server.app.inject({ method: 'GET', url: '/api/v1/device/self', headers: f.deviceHeaders })).statusCode).toBe(409);
+    expect(f.server.store.snapshot).not.toHaveBeenCalled();
+  });
+
   it('matches the complete registered route set with no missing or stale allowlist entries', async () => {
     const registered = new Set<string>();
     const f = await create('silent', undefined, (route) => { registered.add(route.url); });

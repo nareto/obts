@@ -269,6 +269,9 @@ export type MetadataDb = {
   deletion_receipts: DeletionReceipt[];
 };
 
+export type DeepReadonly<T> = T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T;
+type Detached<T> = T extends object ? { -readonly [K in keyof T]: Detached<T[K]> } : T;
+
 export type MetadataPersistenceAdapter = {
   readDirectory(path: string): Promise<string[]>;
   writeFile(path: string, data: string): Promise<void>;
@@ -383,6 +386,36 @@ export class MetadataStore {
       }
       this.db = candidate;
       return result;
+    });
+  }
+
+  async read<T>(select: (db: DeepReadonly<MetadataDb>) => T): Promise<Detached<T>> {
+    await this.pending;
+    await this.ensureLoaded();
+    this.assertOperational();
+    return clone(select(this.requireDb())) as Detached<T>;
+  }
+
+  async readOrMutate<T>(
+    select: (db: DeepReadonly<MetadataDb>) => T,
+    shouldMutate: (selected: T) => boolean,
+    update: (db: MetadataDb) => T
+  ): Promise<Detached<T>> {
+    return await this.enqueue(async () => {
+      await this.ensureLoaded();
+      this.assertOperational();
+      const selected = select(this.requireDb());
+      if (!shouldMutate(selected)) return clone(selected) as Detached<T>;
+      const candidate = clone(this.requireDb());
+      const result = update(candidate);
+      try {
+        await this.persist(candidate);
+      } catch (error) {
+        if (error instanceof MetadataPublicationError) this.durabilityUncertain = true;
+        throw error;
+      }
+      this.db = candidate;
+      return clone(result) as Detached<T>;
     });
   }
 
@@ -868,7 +901,7 @@ function isMissing(error: unknown): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT';
 }
 
-export function hasDurableDeletionRecord(db: MetadataDb, vaultId: string): boolean {
+export function hasDurableDeletionRecord(db: DeepReadonly<MetadataDb>, vaultId: string): boolean {
   return db.vaults.some((vault) => vault.vault_id === vaultId && vault.status === 'deleting') ||
     db.deletion_jobs.some((job) => job.vault_id === vaultId) ||
     db.deletion_receipts.some((receipt) => receipt.vault_id === vaultId);

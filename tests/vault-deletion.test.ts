@@ -280,15 +280,15 @@ describe('server-owned vault deletion lifecycle', () => {
     let signalSnapshot!: () => void;
     const snapshotEntered = new Promise<void>((resolve) => { signalSnapshot = resolve; });
     const snapshotGate = new Promise<void>((resolve) => { releaseSnapshot = resolve; });
-    const originalSnapshot = server.store.snapshot.bind(server.store);
+    const originalRead = server.store.read.bind(server.store);
     let firstSnapshot = true;
-    const snapshotSpy = vi.spyOn(server.store, 'snapshot').mockImplementation(async () => {
+    const snapshotSpy = vi.spyOn(server.store, 'read').mockImplementation(async (select) => {
       if (firstSnapshot) {
         firstSnapshot = false;
         signalSnapshot();
         await snapshotGate;
       }
-      return await originalSnapshot();
+      return await originalRead(select);
     });
     const acquiring = server.lifecycle.acquireAdmission(vaultId);
     await snapshotEntered;

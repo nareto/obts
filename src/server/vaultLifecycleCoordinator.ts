@@ -215,21 +215,23 @@ export class VaultLifecycleCoordinator {
 
   async withDeviceAdmission<T>(vaultId: string, userId: string, deviceId: string, fn: () => Promise<T>, tokenId?: string): Promise<T> {
     return await this.withAdmission(vaultId, async () => {
-      const db = await this.store.snapshot();
-      const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
-      const device = db.devices.find((candidate) => candidate.device_id === deviceId);
-      const user = db.users.find((candidate) => candidate.user_id === userId);
-      const token = tokenId === undefined ? null : db.tokens.find((candidate) => candidate.token_id === tokenId);
-      if (
-        (tokenId !== undefined && (!token || token.kind !== 'device' || token.user_id !== userId || token.vault_id !== vaultId || token.device_id !== deviceId || token.revoked_at !== null || token.consumed_at !== null ||
-          (token.expires_at !== null && (!Number.isFinite(Date.parse(token.expires_at)) || Date.parse(token.expires_at) <= Date.now())))) ||
-        !vault || !device || !user || user.disabled || vault.owner_user_id !== userId ||
-        (vault.status !== 'active' && vault.status !== 'blocked_integrity') || device.vault_id !== vaultId ||
-        device.user_id !== userId || device.status === 'revoked' || device.revoked_at !== null ||
-        hasDurableDeletionRecord(db, vaultId)
-      ) {
-        throw new AuthError(404, 'not_found', 'Resource not found.');
-      }
+      await this.store.read((db) => {
+        const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
+        const device = db.devices.find((candidate) => candidate.device_id === deviceId);
+        const user = db.users.find((candidate) => candidate.user_id === userId);
+        const token = tokenId === undefined ? null : db.tokens.find((candidate) => candidate.token_id === tokenId);
+        if (
+          (tokenId !== undefined && (!token || token.kind !== 'device' || token.user_id !== userId || token.vault_id !== vaultId || token.device_id !== deviceId || token.revoked_at !== null || token.consumed_at !== null ||
+            (token.expires_at !== null && (!Number.isFinite(Date.parse(token.expires_at)) || Date.parse(token.expires_at) <= Date.now())))) ||
+          !vault || !device || !user || user.disabled || vault.owner_user_id !== userId ||
+          (vault.status !== 'active' && vault.status !== 'blocked_integrity') || device.vault_id !== vaultId ||
+          device.user_id !== userId || device.status === 'revoked' || device.revoked_at !== null ||
+          hasDurableDeletionRecord(db, vaultId)
+        ) {
+          throw new AuthError(404, 'not_found', 'Resource not found.');
+        }
+        return null;
+      });
       return await fn();
     });
   }
@@ -660,8 +662,7 @@ export class VaultLifecycleCoordinator {
   }
 
   private async isDurablyClosed(vaultId: string): Promise<boolean> {
-    const db = await this.store.snapshot();
-    return hasDurableDeletionRecord(db, vaultId);
+    return await this.store.read((db) => hasDurableDeletionRecord(db, vaultId));
   }
 
   private async waitForDrain(barrier: Barrier): Promise<void> {
