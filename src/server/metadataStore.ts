@@ -307,6 +307,7 @@ const defaultPersistenceAdapter: MetadataPersistenceAdapter = {
 export class MetadataStore {
   private db: MetadataDb | null = null;
   private pending: Promise<void> = Promise.resolve();
+  private closed = false;
   private durabilityUncertain = false;
   private cleanupFailed = false;
   private cleanupDirectorySyncRequired = false;
@@ -317,7 +318,12 @@ export class MetadataStore {
   }
 
   isReady(): boolean {
-    return !this.durabilityUncertain && !this.cleanupFailed;
+    return !this.closed && !this.durabilityUncertain && !this.cleanupFailed;
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+    await this.pending;
   }
 
   isDurabilityUncertain(): boolean {
@@ -325,6 +331,10 @@ export class MetadataStore {
   }
 
   async initialize(): Promise<void> {
+    await this.enqueue(async () => await this.initializeUnqueued());
+  }
+
+  private async initializeUnqueued(): Promise<void> {
     await assertNoSymlinkComponents(resolve(dirname(this.filePath)));
     await mkdir(dirname(this.filePath), { recursive: true, mode: 0o700 });
     const metadataDirectory = await lstat(dirname(this.filePath));
@@ -350,7 +360,7 @@ export class MetadataStore {
 
   async snapshot(): Promise<MetadataDb> {
     await this.pending;
-    await this.ensureLoaded();
+    if (this.db === null) await this.initialize();
     this.assertOperational();
     return clone(this.requireDb());
   }
@@ -391,7 +401,7 @@ export class MetadataStore {
 
   async read<T>(select: (db: DeepReadonly<MetadataDb>) => T): Promise<Detached<T>> {
     await this.pending;
-    await this.ensureLoaded();
+    if (this.db === null) await this.initialize();
     this.assertOperational();
     return clone(select(this.requireDb())) as Detached<T>;
   }
@@ -428,6 +438,7 @@ export class MetadataStore {
   }
 
   private async enqueue<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.closed) throw new Error('Metadata store is closed.');
     const previous = this.pending;
     let release!: () => void;
     this.pending = new Promise((resolve) => {
@@ -500,7 +511,7 @@ export class MetadataStore {
 
   private async ensureLoaded(): Promise<void> {
     if (this.db === null) {
-      await this.initialize();
+      await this.initializeUnqueued();
     }
   }
 

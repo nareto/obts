@@ -232,6 +232,7 @@ export async function createObtsServer(
   app.addHook('onClose', async () => {
     await chunkTransfers.close();
     await lifecycle.close();
+    await store.close();
   });
 
   app.setErrorHandler((error, request, reply) => {
