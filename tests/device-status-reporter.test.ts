@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ObtsPluginClient } from '../src/client/core.js';
+import { HeadlessSession } from '../src/client/headlessProtocol.js';
 import { createSyncCostFixture, tickUntilSettled, writeNote } from './helpers/syncCostHarness.js';
 
 const { createDeviceStatusReporter, DEVICE_STATUS_HEARTBEAT_MS } = createRequire(import.meta.url)('../obsidian-plugin/src/device-status-reporter.cjs') as any;
@@ -23,6 +24,29 @@ function deferred() {
 }
 
 describe('single-flight latest-wins device status transport', () => {
+  it.each([false, true])('closes idempotently, dropping pending work without waiting for transport (failure=%s)', async (fail) => {
+    const entered = deferred();
+    const gate = deferred();
+    const send = vi.fn(async () => {
+      entered.resolve();
+      await gate.promise;
+      if (fail) throw new Error('synthetic closed transport failure');
+    });
+    const reporter = createDeviceStatusReporter({ send });
+    reporter.request({ signature: 'Checking' });
+    await entered.promise;
+    reporter.request({ signature: 'Synced', force: true });
+    reporter.close();
+    reporter.close();
+    reporter.request({ signature: 'Uploading', force: true });
+    expect(reporter.closed).toBe(true);
+    expect(reporter.heartbeatDue()).toBe(false);
+    gate.resolve();
+    await reporter.flush();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(reporter.heartbeatDue()).toBe(false);
+  });
+
   it('sends one in-flight request then only the latest pending status', async () => {
     const gate = deferred();
     const labels: string[] = [];
@@ -347,6 +371,157 @@ describe('status feedback at local ownership boundaries', () => {
     await f.core.consumeDeviceStatusResponse();
     expect(f.state().last_error_code).toBe('blocked_integrity');
     expect(f.core.writeState).not.toHaveBeenCalled();
+  });
+
+  it('drops a transport response arriving after unload without depositing feedback', async () => {
+    const f = await clientFixture();
+    const entered = deferred();
+    const gate = deferred();
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      entered.resolve();
+      await gate.promise;
+      return new Response(JSON.stringify({ device_name: 'Renamed', vault_status: 'blocked_integrity', plugin: {} }), { status: 200 });
+    }));
+    await f.core.reportDeviceStatus();
+    await entered.promise;
+    f.plugin.unloaded = true;
+    gate.resolve();
+    await f.core.deviceStatusReporter.flush();
+    expect(f.core.pendingDeviceStatusResponse).toBeNull();
+    expect(f.core.writeState).not.toHaveBeenCalled();
+  });
+
+  it('logically closes headless status before a gated send settles, with no later effects', async () => {
+    const f = await clientFixture();
+    const entered = deferred();
+    const gate = deferred();
+    let transportSettled = false;
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      entered.resolve();
+      await gate.promise;
+      transportSettled = true;
+      return new Response(JSON.stringify({ device_name: 'Renamed', vault_status: 'blocked_integrity', plugin: {} }), { status: 200 });
+    }));
+    const name = vi.spyOn(f.core, 'applyServerDeviceName');
+    const compatibility = vi.spyOn(f.core.plugin, 'handlePluginCompatibility');
+    const session = new HeadlessSession(f.plugin, async () => undefined);
+    await f.core.reportDeviceStatus();
+    await entered.promise;
+    await session.stop('test');
+    expect(transportSettled).toBe(false);
+    expect(f.core.deviceStatusReporter.closed).toBe(true);
+    gate.resolve();
+    await f.core.flushDeviceStatusReports();
+    expect(f.core.pendingDeviceStatusResponse).toBeNull();
+    expect(f.core.writeState).not.toHaveBeenCalled();
+    expect(name).not.toHaveBeenCalled();
+    expect(compatibility).not.toHaveBeenCalled();
+  });
+
+  it('closes status synchronously before waiting for the headless command tail without changing its result', async () => {
+    const f = await clientFixture();
+    const transportEntered = deferred();
+    const transportGate = deferred();
+    const tailEntered = deferred();
+    const tailGate = deferred();
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      transportEntered.resolve();
+      await transportGate.promise;
+      return new Response(JSON.stringify({ device_name: 'Renamed', vault_status: 'blocked_integrity', plugin: {} }), { status: 200 });
+    }));
+    const name = vi.spyOn(f.core, 'applyServerDeviceName');
+    const compatibility = vi.spyOn(f.core.plugin, 'handlePluginCompatibility');
+    const sync = vi.spyOn(f.plugin, 'syncOnce').mockImplementation(async () => {
+      tailEntered.resolve();
+      await tailGate.promise;
+      await f.core.reportDeviceStatus();
+      await f.core.consumeDeviceStatusResponse();
+      expect(f.plugin.unloaded).toBe(false);
+      return { status: 'Synced' };
+    });
+    const messages: any[] = [];
+    const session = new HeadlessSession(f.plugin, async (message) => { messages.push(message); });
+    const command = session.submit({ id: 'tail', command: 'sync-once' });
+    await tailEntered.promise;
+    await f.core.reportDeviceStatus();
+    await transportEntered.promise;
+    let stopped = false;
+    const stopping = session.stop('test').then(() => { stopped = true; });
+    try {
+      expect(f.core.deviceStatusReporter.closed).toBe(true);
+      expect(stopped).toBe(false);
+      transportGate.resolve();
+      await f.core.deviceStatusReporter.flush();
+      expect(f.core.pendingDeviceStatusResponse).toBeNull();
+    } finally {
+      transportGate.resolve();
+      tailGate.resolve();
+      await Promise.all([command, stopping]);
+    }
+    expect(stopped).toBe(true);
+    expect(sync).toHaveBeenCalledOnce();
+    expect(messages).toContainEqual({ type: 'response', id: 'tail', ok: true, result: { status: 'Synced' } });
+    expect(name).not.toHaveBeenCalled();
+    expect(compatibility).not.toHaveBeenCalled();
+    expect(f.core.writeState).not.toHaveBeenCalled();
+  });
+
+  it('lets an owned name step settle after close without starting later status steps', async () => {
+    const f = await clientFixture();
+    await f.core.reportDeviceStatus();
+    await f.core.deviceStatusReporter.flush();
+    f.core.pendingDeviceStatusResponse.result.device_name = 'Renamed';
+    const entered = deferred();
+    const gate = deferred();
+    let nameStepSettled = false;
+    vi.spyOn(f.core, 'applyServerDeviceName').mockImplementation(async () => {
+      entered.resolve();
+      await gate.promise;
+      nameStepSettled = true;
+    });
+    const reconcile = vi.spyOn(f.core, 'reconcileServerVaultStatus');
+    const compatibility = vi.spyOn(f.core.plugin, 'handlePluginCompatibility');
+    const consuming = f.core.consumeDeviceStatusResponse();
+    await entered.promise;
+    f.core.stopDeviceStatusReports();
+    expect(nameStepSettled).toBe(false);
+    gate.resolve();
+    await consuming;
+    expect(nameStepSettled).toBe(true);
+    expect(f.core.writeState).not.toHaveBeenCalled();
+    expect(reconcile).not.toHaveBeenCalled();
+    expect(compatibility).not.toHaveBeenCalled();
+    expect(f.core.pendingDeviceStatusResponse).toBeNull();
+  });
+
+  it('drops already queued feedback on close and stops a consumer crossing close during a read', async () => {
+    const f = await clientFixture();
+    await f.core.reportDeviceStatus();
+    await f.core.deviceStatusReporter.flush();
+    const entered = deferred();
+    const gate = deferred();
+    const readState = f.core.readState;
+    f.core.readState = async () => {
+      entered.resolve();
+      await gate.promise;
+      return await readState();
+    };
+    const name = vi.spyOn(f.core, 'applyServerDeviceName');
+    const compatibility = vi.spyOn(f.core.plugin, 'handlePluginCompatibility');
+    const consuming = f.core.consumeDeviceStatusResponse();
+    await entered.promise;
+    f.core.stopDeviceStatusReports();
+    f.core.stopDeviceStatusReports();
+    gate.resolve();
+    await consuming;
+    expect(f.core.pendingDeviceStatusResponse).toBeNull();
+    expect(f.core.writeState).not.toHaveBeenCalled();
+    expect(name).not.toHaveBeenCalled();
+    expect(compatibility).not.toHaveBeenCalled();
+    const stateReads = vi.spyOn(f.core, 'readState');
+    await f.core.reportDeviceStatus();
+    await f.core.flushDeviceStatusReports();
+    expect(stateReads).not.toHaveBeenCalled();
   });
 
   it('drops pending telemetry on unload without applying delayed feedback', async () => {

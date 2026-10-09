@@ -25,6 +25,7 @@ function fakeClient(overrides: Partial<HeadlessClient> = {}): HeadlessClient {
   return {
     initialize: vi.fn(async () => undefined),
     setProgressListener: vi.fn(() => undefined),
+    stopDeviceStatusReports: vi.fn(() => undefined),
     readState: vi.fn(async () => state),
     readQueue: vi.fn(async () => ({ pending_commit: null, expected_device_ref: null, status: 'idle', attempts: 0, updated_at: state.updated_at })),
     readPendingOnboarding: vi.fn(async () => null),
@@ -173,6 +174,7 @@ describe('headless client protocol', () => {
       status: 'Downloaded 1 sync chunk',
       diagnosticPoint: 'sync_download'
     });
+    expect(client.stopDeviceStatusReports).toHaveBeenCalledTimes(1);
     expect(client.setProgressListener).toHaveBeenLastCalledWith(null);
   });
 

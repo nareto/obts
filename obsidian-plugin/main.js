@@ -22114,19 +22114,22 @@ var require_device_status_reporter = __commonJS({
       let retryAt = 0;
       let failures = 0;
       let requiresServerFeedback = false;
+      let closed = false;
       async function run() {
-        while (pending) {
+        while (pending && !closed) {
           const snapshot = pending;
           pending = null;
           if (!snapshot.force && !snapshot.requiresServerFeedback && snapshot.signature === acceptedSignature && now() - acceptedAt < DEVICE_STATUS_HEARTBEAT_MS) continue;
           if (now() < retryAt) continue;
           try {
             await send(snapshot);
+            if (closed) return;
             acceptedSignature = snapshot.signature;
             acceptedAt = now();
             retryAt = 0;
             failures = 0;
           } catch {
+            if (closed) return;
             failures = Math.min(failures + 1, 3);
             retryAt = now() + Math.min(DEVICE_STATUS_HEARTBEAT_MS, DEVICE_STATUS_RETRY_MS * 2 ** (failures - 1));
           }
@@ -22140,13 +22143,22 @@ var require_device_status_reporter = __commonJS({
         });
       }
       return {
+        get closed() {
+          return closed;
+        },
+        close() {
+          closed = true;
+          pending = null;
+          requiresServerFeedback = false;
+        },
         request(snapshot) {
+          if (closed) return;
           requiresServerFeedback = Boolean(snapshot.requiresServerFeedback);
           pending = pending?.force ? Object.assign({}, snapshot, { force: true }) : snapshot;
           start();
         },
         heartbeatDue() {
-          return requiresServerFeedback || acceptedSignature === null || now() - acceptedAt >= DEVICE_STATUS_HEARTBEAT_MS;
+          return !closed && (requiresServerFeedback || acceptedSignature === null || now() - acceptedAt >= DEVICE_STATUS_HEARTBEAT_MS);
         },
         async flush() {
           while (running) await running;
@@ -23115,7 +23127,7 @@ var { createByteBudget, runBoundedWork } = require_work_pool();
 var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.6.1";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.6.2";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var STALE_SETTLE_MARGIN_MS = 250;
@@ -23383,6 +23395,7 @@ module.exports = class ObtsPlugin extends Plugin {
   }
   onunload() {
     this.unloaded = true;
+    this.client?.stopDeviceStatusReports();
     this.lifecycleAbortController?.abort();
     this.retirePathMutationGate();
     if (this.queuedSyncTimer !== null) {
@@ -30995,8 +31008,12 @@ var ObtsObsidianClient = class {
     }
     return await response.json();
   }
+  stopDeviceStatusReports() {
+    this.deviceStatusReporter.close();
+    this.pendingDeviceStatusResponse = null;
+  }
   async reportDeviceStatus() {
-    if (this.plugin.unloaded) return;
+    if (this.plugin.unloaded || this.deviceStatusReporter.closed) return;
     const sequence = ++this.deviceStatusSequence;
     let state = await this.readState();
     if (!state.vault_id || !state.device_id) {
@@ -31027,7 +31044,7 @@ var ObtsObsidianClient = class {
       local_head: state.local_head,
       path_capabilities: { adapter: "obsidian-data-adapter", platform: runtimePlatform(), root_ignore: true }
     });
-    if (sequence !== this.deviceStatusSequence || this.plugin.unloaded) return;
+    if (sequence !== this.deviceStatusSequence || this.plugin.unloaded || this.deviceStatusReporter.closed) return;
     const identity = JSON.stringify([url, state.vault_id, state.device_id, token, this.deviceStatusGeneration, nameRevision]);
     this.latestDeviceStatusIdentity = identity;
     this.deviceStatusReporter.request({
@@ -31049,7 +31066,7 @@ var ObtsObsidianClient = class {
     this.forceDeviceStatusReport = false;
   }
   async sendDeviceStatus(snapshot) {
-    if (this.plugin.unloaded || snapshot.identity !== this.latestDeviceStatusIdentity || snapshot.generation !== this.deviceStatusGeneration || snapshot.nameRevision !== this.plugin.deviceNameRevision || this.url(`/api/v1/vaults/${snapshot.vaultId}/sync/device-status`) !== snapshot.url) return;
+    if (this.plugin.unloaded || this.deviceStatusReporter.closed || snapshot.identity !== this.latestDeviceStatusIdentity || snapshot.generation !== this.deviceStatusGeneration || snapshot.nameRevision !== this.plugin.deviceNameRevision || this.url(`/api/v1/vaults/${snapshot.vaultId}/sync/device-status`) !== snapshot.url) return;
     const response = await fetchWithTimeout(snapshot.url, {
       method: "POST",
       headers: { authorization: `Bearer ${snapshot.token}`, "content-type": "application/json" },
@@ -31057,12 +31074,13 @@ var ObtsObsidianClient = class {
     });
     if (!response.ok) await throwResponseError(response);
     const result = await response.json();
+    if (this.plugin.unloaded || this.deviceStatusReporter.closed) return;
     if (!this.pendingDeviceStatusResponse || snapshot.sequence > this.pendingDeviceStatusResponse.snapshot.sequence) {
       this.pendingDeviceStatusResponse = { snapshot, result };
     }
   }
   async consumeDeviceStatusResponse(observed = null) {
-    if (this.applyingDeviceStatusResponse || this.plugin.unloaded) return;
+    if (this.applyingDeviceStatusResponse || this.plugin.unloaded || this.deviceStatusReporter.closed) return;
     const pending = this.pendingDeviceStatusResponse;
     if (!pending) return;
     this.pendingDeviceStatusResponse = null;
@@ -31072,20 +31090,24 @@ var ObtsObsidianClient = class {
     try {
       let state = observed?.state || await this.readState();
       const token = observed?.token || await this.readDeviceToken();
-      if (state.vault_id !== snapshot.vaultId || state.device_id !== snapshot.deviceId || this.url(`/api/v1/vaults/${state.vault_id}/sync/device-status`) !== snapshot.url || token !== snapshot.token || snapshot.generation !== this.deviceStatusGeneration || snapshot.nameRevision !== this.plugin.deviceNameRevision) return;
+      if (this.plugin.unloaded || this.deviceStatusReporter.closed || state.vault_id !== snapshot.vaultId || state.device_id !== snapshot.deviceId || this.url(`/api/v1/vaults/${state.vault_id}/sync/device-status`) !== snapshot.url || token !== snapshot.token || snapshot.generation !== this.deviceStatusGeneration || snapshot.nameRevision !== this.plugin.deviceNameRevision) return;
       this.lastAppliedDeviceStatusSequence = snapshot.sequence;
       await this.applyServerDeviceName(result.device_name, false);
+      if (this.plugin.unloaded || this.deviceStatusReporter.closed) return;
       const normalizedName = normalizeDisplayName(result.device_name);
       const nameChanged = state.device_name !== normalizedName;
       if (nameChanged) {
         const latestState = await this.readState();
+        if (this.plugin.unloaded || this.deviceStatusReporter.closed) return;
         await this.writeState(Object.assign({}, latestState, { device_name: normalizedName, updated_at: nowIso() }));
         state = await this.readState();
+        if (this.plugin.unloaded || this.deviceStatusReporter.closed) return;
       }
       const publicationInFlight = this.statePublicationsInFlight > 0;
       if (publicationInFlight) this.forceDeviceStatusReport = true;
       const staleVaultStatus = publicationInFlight || this.stateIntegrityUncertain || snapshot.vaultStatusObservation !== this.vaultStatusObservation || result.vault_status === "active" && snapshot.reportedErrorCode !== state.last_error_code;
       if (!staleVaultStatus) await this.reconcileServerVaultStatus(result.vault_status, false, state);
+      if (this.plugin.unloaded || this.deviceStatusReporter.closed) return;
       this.plugin.handlePluginCompatibility(result.plugin);
       return nameChanged || !staleVaultStatus && (result.vault_status === "blocked_integrity" && state.last_error_code !== "blocked_integrity" || result.vault_status === "active" && state.last_error_code === "blocked_integrity");
     } finally {

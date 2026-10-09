@@ -304,6 +304,7 @@ module.exports = class ObtsPlugin extends Plugin {
 
   onunload() {
     this.unloaded = true;
+    this.client?.stopDeviceStatusReports();
     this.lifecycleAbortController?.abort();
     this.retirePathMutationGate();
     if (this.queuedSyncTimer !== null) {
@@ -8637,8 +8638,13 @@ class ObtsObsidianClient {
     return await response.json();
   }
 
+  stopDeviceStatusReports() {
+    this.deviceStatusReporter.close();
+    this.pendingDeviceStatusResponse = null;
+  }
+
   async reportDeviceStatus() {
-    if (this.plugin.unloaded) return;
+    if (this.plugin.unloaded || this.deviceStatusReporter.closed) return;
     const sequence = ++this.deviceStatusSequence;
     let state = await this.readState();
     if (!state.vault_id || !state.device_id) {
@@ -8674,7 +8680,7 @@ class ObtsObsidianClient {
       local_head: state.local_head,
       path_capabilities: { adapter: "obsidian-data-adapter", platform: runtimePlatform(), root_ignore: true }
     });
-    if (sequence !== this.deviceStatusSequence || this.plugin.unloaded) return;
+    if (sequence !== this.deviceStatusSequence || this.plugin.unloaded || this.deviceStatusReporter.closed) return;
     const identity = JSON.stringify([url, state.vault_id, state.device_id, token, this.deviceStatusGeneration, nameRevision]);
     this.latestDeviceStatusIdentity = identity;
     this.deviceStatusReporter.request({ sequence, identity, signature: JSON.stringify([identity, body]), url, body, token,
@@ -8685,7 +8691,7 @@ class ObtsObsidianClient {
   }
 
   async sendDeviceStatus(snapshot) {
-    if (this.plugin.unloaded || snapshot.identity !== this.latestDeviceStatusIdentity ||
+    if (this.plugin.unloaded || this.deviceStatusReporter.closed || snapshot.identity !== this.latestDeviceStatusIdentity ||
         snapshot.generation !== this.deviceStatusGeneration || snapshot.nameRevision !== this.plugin.deviceNameRevision ||
         this.url(`/api/v1/vaults/${snapshot.vaultId}/sync/device-status`) !== snapshot.url) return;
     const response = await fetchWithTimeout(snapshot.url, {
@@ -8695,13 +8701,14 @@ class ObtsObsidianClient {
     });
     if (!response.ok) await throwResponseError(response);
     const result = await response.json();
+    if (this.plugin.unloaded || this.deviceStatusReporter.closed) return;
     if (!this.pendingDeviceStatusResponse || snapshot.sequence > this.pendingDeviceStatusResponse.snapshot.sequence) {
       this.pendingDeviceStatusResponse = { snapshot, result };
     }
   }
 
   async consumeDeviceStatusResponse(observed = null) {
-    if (this.applyingDeviceStatusResponse || this.plugin.unloaded) return;
+    if (this.applyingDeviceStatusResponse || this.plugin.unloaded || this.deviceStatusReporter.closed) return;
     const pending = this.pendingDeviceStatusResponse;
     if (!pending) return;
     this.pendingDeviceStatusResponse = null;
@@ -8712,17 +8719,22 @@ class ObtsObsidianClient {
     try {
       let state = observed?.state || await this.readState();
       const token = observed?.token || await this.readDeviceToken();
-      if (state.vault_id !== snapshot.vaultId || state.device_id !== snapshot.deviceId ||
+      if (this.plugin.unloaded || this.deviceStatusReporter.closed ||
+          state.vault_id !== snapshot.vaultId || state.device_id !== snapshot.deviceId ||
           this.url(`/api/v1/vaults/${state.vault_id}/sync/device-status`) !== snapshot.url || token !== snapshot.token ||
           snapshot.generation !== this.deviceStatusGeneration || snapshot.nameRevision !== this.plugin.deviceNameRevision) return;
       this.lastAppliedDeviceStatusSequence = snapshot.sequence;
+      // A started step belongs to the awaited sync boundary; close stops only later status steps.
       await this.applyServerDeviceName(result.device_name, false);
+      if (this.plugin.unloaded || this.deviceStatusReporter.closed) return;
       const normalizedName = normalizeDisplayName(result.device_name);
       const nameChanged = state.device_name !== normalizedName;
       if (nameChanged) {
         const latestState = await this.readState();
+        if (this.plugin.unloaded || this.deviceStatusReporter.closed) return;
         await this.writeState(Object.assign({}, latestState, { device_name: normalizedName, updated_at: nowIso() }));
         state = await this.readState();
+        if (this.plugin.unloaded || this.deviceStatusReporter.closed) return;
       }
       // Vault feedback needs no newer integrity publication, none unsettled, and no publication in flight.
       // Deferred feedback is discarded and replaced by a forced fresh report.
@@ -8731,6 +8743,7 @@ class ObtsObsidianClient {
       const staleVaultStatus = publicationInFlight || this.stateIntegrityUncertain || snapshot.vaultStatusObservation !== this.vaultStatusObservation ||
         result.vault_status === "active" && snapshot.reportedErrorCode !== state.last_error_code;
       if (!staleVaultStatus) await this.reconcileServerVaultStatus(result.vault_status, false, state);
+      if (this.plugin.unloaded || this.deviceStatusReporter.closed) return;
       this.plugin.handlePluginCompatibility(result.plugin);
       return nameChanged || !staleVaultStatus && (
         result.vault_status === "blocked_integrity" && state.last_error_code !== "blocked_integrity" ||

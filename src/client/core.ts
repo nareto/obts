@@ -165,6 +165,7 @@ type SharedClientCore = {
   reportDeviceStatus(): Promise<void>;
   reportDeviceStatusIfDue(): Promise<void>;
   flushDeviceStatusReports(): Promise<void>;
+  stopDeviceStatusReports(): void;
   markBlocked(code: string, details?: Record<string, unknown>): Promise<void>;
   backgroundScanDecision(): Promise<{ required: boolean; mode: 'none' | 'incremental' | 'full' }>;
 };
@@ -230,6 +231,10 @@ export class ObtsPluginClient {
     this.transport = exposeMutableMethods(this.client, ['pullChunk', 'putPushChunk', 'completeConnection']);
     exposeCompatiblePull(this.transport, this.client);
     exposeDirectMutableMethod(this, this.client, 'writeTargetFilesFromJournal');
+  }
+
+  stopDeviceStatusReports(): void {
+    this.client.stopDeviceStatusReports();
   }
 
   get unloaded(): boolean {

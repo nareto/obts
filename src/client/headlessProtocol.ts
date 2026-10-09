@@ -53,6 +53,7 @@ export type HeadlessClient = Pick<
   ObtsPluginClient,
   | 'initialize'
   | 'setProgressListener'
+  | 'stopDeviceStatusReports'
   | 'readState'
   | 'readQueue'
   | 'readPendingOnboarding'
@@ -142,6 +143,7 @@ export class HeadlessSession {
 
   async stop(reason: string): Promise<void> {
     this.stopping = true;
+    this.client.stopDeviceStatusReports();
     await this.tail;
     this.client.setProgressListener(null);
     await this.emitMessage({ type: 'event', event: 'stopping', reason });

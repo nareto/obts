@@ -41,6 +41,15 @@ async function lifecycleFixture() {
 }
 
 describe('plugin gate loading lifecycle', () => {
+  it('initiates status reporter close synchronously without blocking unload', async () => {
+    const { plugin } = await lifecycleFixture();
+    const stop = vi.fn(() => new Promise<void>(() => {}));
+    plugin.client = { stopDeviceStatusReports: stop };
+    expect(() => plugin.onunload()).not.toThrow();
+    expect(plugin.unloaded).toBe(true);
+    expect(stop).toHaveBeenCalledOnce();
+  });
+
   it('restores original descriptors when settings loading fails', async () => {
     const { plugin, adapter, descriptors } = await lifecycleFixture();
     const error = new Error('settings read failed');
