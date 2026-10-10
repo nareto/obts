@@ -160,6 +160,7 @@ describe('validation selection', () => {
     expect(makePlan(['architecture/models/formal/OBTSManagedHeadlessOwnership.tla']).formalFamilies).toEqual(['headless-ownership']);
     expect(makePlan(['architecture/models/formal/OBTSManagedHeadlessOwnership.cfg']).formalFamilies).toEqual(['headless-ownership']);
     expect(makePlan(['architecture/models/formal/OBTSAtomicRename.tla']).formalFamilies).toEqual(['atomic-rename']);
+    expect(makePlan(['architecture/models/formal/OBTSRenameAuthoring.tla']).formalFamilies).toEqual(['atomic-rename']);
     expect(makePlan(['architecture/models/formal/OBTSAtomicRename.cfg']).formalFamilies).toEqual(['atomic-rename']);
     expect(makePlan(['architecture/models/formal/configs/fm014-atomic-rename.cfg']).formalFamilies).toEqual(['atomic-rename']);
     for (const extension of ['tla', 'cfg']) {

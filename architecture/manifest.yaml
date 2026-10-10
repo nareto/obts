@@ -1,7 +1,7 @@
 schema_version: 1
-revision: 51
+revision: 52
 status: current
-updated: 2026-10-08
+updated: 2026-10-10
 authoritative_artifacts:
   - architecture/manifest.yaml
   - architecture/README.md
@@ -166,6 +166,8 @@ formal_models:
     path: architecture/models/formal/OBTSAtomicRename.tla
     architecture_revision: 46
     checks: architecture/models/formal/configs/fm014-atomic-rename.cfg
+    companion_path: architecture/models/formal/OBTSRenameAuthoring.tla
+    companion_architecture_revision: 52
     refines:
       - OBTS-SYNC-RENAME-001
       - OBTS-PER-RENAME-001

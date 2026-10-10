@@ -23127,7 +23127,7 @@ var { createByteBudget, runBoundedWork } = require_work_pool();
 var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.6.2";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.6.3";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var STALE_SETTLE_MARGIN_MS = 250;
@@ -27653,6 +27653,28 @@ var ObtsObsidianClient = class {
     });
     if (!p || state.local_head !== p || !await this.isAncestor(p, targetMain) || state.local_main && await this.isAncestor(p, state.local_main)) return state.local_main;
     if (saved.intent?.commit === p && accepted.base !== saved.intent.base) return state.local_main;
+    if (!accepted.base && targetMain === p && state.local_main) {
+      for (const pair of saved.rename_pairs.filter((candidate) => candidate.base === state.local_main && !candidate.blocked_commit && !candidate.lineage_confirmed)) {
+        const endpoints = [pair.source_path, pair.destination_path];
+        const overlaps = (path2) => endpoints.some((endpoint) => changedPathsConflict(endpoint, path2));
+        const hasIndependentEvidence = (current) => Object.keys(current.obligations).some(overlaps) || current.horizons.some((horizon) => horizon.touched.some(overlaps)) || current.held_proposals.some((heldProposal) => Object.keys(heldProposal.fallbacks).some(overlaps)) || current.intent && (Object.keys(current.intent.captures).some(overlaps) || (current.intent.rename_pairs || []).some((other) => [other.source_path, other.destination_path].some(overlaps))) || current.rename_pairs.some((other) => !(other.source_path === pair.source_path && other.destination_path === pair.destination_path) && [other.source_path, other.destination_path].some(overlaps));
+        if (hasIndependentEvidence(await this.readStaleProvenance())) continue;
+        const source = await this.readTreePathEntry(p, pair.source_path);
+        const destination = await this.readTreePathEntry(p, pair.destination_path);
+        if (source.entry?.type !== "blob" || !/^100(?:644|755)$/u.test(source.entry.mode) || !source.ancestorsAreTrees || source.caseVariant || destination.entry || !destination.ancestorsAreTrees || destination.caseVariant) continue;
+        await this.mutateStaleProvenance(async (current) => {
+          const latestQueue = await this.readQueue();
+          const latestState = await this.readState();
+          const latestAccepted = latestQueue.pending_commit ? { commit: latestQueue.pending_commit, base: latestQueue.pending_proposal_base } : current.accepted_proposal;
+          const latestPair = current.rename_pairs.find((candidate) => candidate.source_path === pair.source_path && candidate.destination_path === pair.destination_path);
+          if (latestAccepted?.commit !== p || latestAccepted.base !== null || current.intent?.commit === p && latestAccepted.base !== current.intent.base || latestState.local_head !== p || latestState.local_main !== state.local_main || latestState.local_main !== pair.base || latestPair?.base !== pair.base || latestPair.blocked_commit || latestPair.lineage_confirmed || !await this.isAncestor(p, targetMain) || await this.isAncestor(p, latestState.local_main) || hasIndependentEvidence(current)) return;
+          const currentSource = await this.readTreePathEntry(p, pair.source_path);
+          const currentDestination = await this.readTreePathEntry(p, pair.destination_path);
+          if (currentSource.entry?.type !== "blob" || !/^100(?:644|755)$/u.test(currentSource.entry.mode) || !currentSource.ancestorsAreTrees || currentSource.caseVariant || currentDestination.entry || !currentDestination.ancestorsAreTrees || currentDestination.caseVariant) return;
+          latestPair.base = p;
+        });
+      }
+    }
     if (accepted.base) {
       const parsed = (await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: p })).commit;
       const parent = parsed.parent[0];
