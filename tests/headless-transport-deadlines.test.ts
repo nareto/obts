@@ -375,6 +375,56 @@ describe('headless session stop and in-flight sync', () => {
     expect(server.sockets.size).toBe(0);
   });
 
+  it.each(['headers', 'body'] as const)('aborts a detached device-status request stalled at %s after its sync command finishes', async (stall) => {
+    let statusSocket: Socket | undefined;
+    let statusSignal: AbortSignal | null | undefined;
+    const originalFetch = globalThis.fetch;
+    const fetchSpy = vi.fn<typeof fetch>((input, init) => {
+      if (String(input).endsWith('/sync/device-status')) statusSignal = init?.signal;
+      return originalFetch(input, init);
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+    const server = await startServer((req, res) => {
+      if (req.method === 'POST' && req.url === '/api/v1/vaults/vault_1/sync/device-status') {
+        statusSocket = req.socket;
+        if (stall === 'body') stallMidBody(req, res);
+        return;
+      }
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: 'test_failure', message: 'End the foreground sync.' } }));
+    });
+    const client = await pairedClient(server.url);
+    const { session, messages } = sessionFor(client);
+
+    try {
+      await session.submit({ id: 'sync', command: 'sync-once' });
+      expect(messages).toContainEqual(expect.objectContaining({ type: 'response', id: 'sync', ok: false }));
+      expect(server.seen).toContain('GET /api/v1/vaults/vault_1/sync/events?after=0');
+      await vi.waitFor(() => expect(statusSocket).toBeDefined());
+      expect(statusSignal).toBeInstanceOf(AbortSignal);
+      expect(statusSignal?.aborted).toBe(false);
+      expect(statusSocket?.destroyed).toBe(false);
+
+      // Queue a follow-up while the detached send still owns the reporter.
+      await client.runInRequestScope(() => client.reportDeviceStatus());
+      const requestsBeforeStop = fetchSpy.mock.calls.length;
+      expect(server.seen.filter((request) => request.endsWith('/sync/device-status'))).toHaveLength(1);
+      await session.stop('test');
+
+      expect(statusSignal?.aborted).toBe(true);
+      expect(statusSignal?.reason).toMatchObject({ name: 'AbortError' });
+      await vi.waitFor(() => expect(statusSocket?.destroyed).toBe(true), { timeout: 5_000 });
+      await client.client.flushDeviceStatusReports();
+      await client.reportDeviceStatus();
+      expect(fetchSpy).toHaveBeenCalledTimes(requestsBeforeStop);
+      expect(server.seen.filter((request) => request.endsWith('/sync/device-status'))).toHaveLength(1);
+      expect(messages.at(-1)).toMatchObject({ type: 'event', event: 'stopping', reason: 'test' });
+    } finally {
+      client.stopDeviceStatusReports();
+      client.abortRequests();
+    }
+  });
+
   it('stops promptly by aborting a command stalled in connect', async () => {
     const server = await startServer(hangForever);
     const { client } = await makeClient(server.url);
