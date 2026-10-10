@@ -11,6 +11,7 @@ import { runCli } from '../src/cli.js';
 import { createObtsServer, type ObtsServer } from '../src/server/app.js';
 import { AuthError } from '../src/server/authService.js';
 import { sha256Hex } from '../src/server/gitService.js';
+import type { MetadataDb, MetadataPersistenceAdapter } from '../src/server/metadataStore.js';
 import {
   createOperationalStdout, LOG_FIELD_ALLOWLIST, LOG_LEVELS, LOG_ROUTES, MAX_LOG_LINE_BYTES, MAX_STDOUT_BUFFER_BYTES,
   OperationalLog, parseLogLevel,
@@ -491,6 +492,13 @@ describe('server request and lifecycle observations', () => {
   it('emits integration after async finalize completes, not when its processing response is sent', async () => {
     const f = await fixture();
     const transferId = await transfer(f, await commit(f, f.m0));
+    const persistence = (f.server.store as unknown as { persistence: MetadataPersistenceAdapter }).persistence;
+    const write = persistence.writeFile.bind(persistence);
+    const publications: MetadataDb[] = [];
+    vi.spyOn(persistence, 'writeFile').mockImplementation(async (path, data) => {
+      await write(path, data);
+      publications.push(JSON.parse(data) as MetadataDb);
+    });
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const original = f.server.sync.pushDeviceCommit.bind(f.server.sync);
@@ -506,8 +514,20 @@ describe('server request and lifecycle observations', () => {
       release();
       await vi.waitFor(() => expect(f.rows().find((row) => row.event === 'push_integrated')).toMatchObject({
         vault_id: f.vaultId, device_id: f.deviceId, transfer_id: transferId, push_status: 'merged', event_seq: expect.any(Number),
-        persist_count: 7, persist_ms: expect.any(Number), git_ms: expect.any(Number)
+        persist_count: 9, persist_ms: expect.any(Number), git_ms: expect.any(Number)
       }), { timeout: 5000 });
+      expect(f.rows().filter((row) => row.event === 'push_integrated')).toHaveLength(1);
+      expect(publications).toHaveLength(9);
+      const descriptor = publications.at(-2)!;
+      const state = descriptor.operation_history_by_vault![f.vaultId]!;
+      const batch = state.pending_batch!;
+      expect(batch.rows.length).toBeGreaterThan(0);
+      expect(publications.slice(0, -2).every((db) => db.operation_history_by_vault![f.vaultId]!.pending_batch === null)).toBe(true);
+      const acknowledged = structuredClone(descriptor);
+      acknowledged.sync_operations = acknowledged.sync_operations.filter((row) => !batch.rows.some((entry) => entry.operation_id === row.operation_id));
+      acknowledged.operation_history_by_vault![f.vaultId] = { ...state, generation: batch.target_generation, pending_batch: null };
+      expect(publications.at(-1)).toEqual(acknowledged);
+      for (const marker of [CONTENT_MARKER, PATH_MARKER, f.token, f.connectionSecret, PASSWORD]) expect(f.lines.join('')).not.toContain(marker);
       const auth = await f.server.auth.authenticateDevice(`Bearer ${f.token}`, f.vaultId);
       await vi.waitFor(async () => expect((await f.server.chunkTransfers.getPush(auth, transferId)).status).toBe('completed'));
     } finally { release(); }

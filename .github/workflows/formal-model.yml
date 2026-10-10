@@ -55,5 +55,6 @@ jobs:
             vault-settings) npm run test:formal:vault-settings ;;
             headless-ownership) npm run test:formal:headless-ownership ;;
             atomic-rename) npm run test:formal:atomic-rename ;;
+            operation-history) npm run test:formal:operation-history ;;
             *) echo "Unknown formal family: $FAMILY" >&2; exit 1 ;;
           esac

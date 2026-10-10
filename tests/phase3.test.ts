@@ -1,17 +1,24 @@
 import { chmod, cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { runCli } from '../src/cli.js';
-import { createObtsServer } from '../src/server/app.js';
+import { createObtsServer, repairVaultIntegrity, type ObtsServer } from '../src/server/app.js';
+import { historyCheckpointFixture, commit, directoryProposal, manifest, multipart, refInventory } from './helpers/historyCheckpointFixture.js';
+import { hashToken } from '../src/server/authService.js';
+import { OperationHistoryStore } from '../src/server/operationHistoryStore.js';
 import { MetadataStore } from '../src/server/metadataStore.js';
 
 describe('Phase 3 deployable history state', () => {
   const roots: string[] = [];
+  const checkpointServers: ObtsServer[] = [];
 
   afterEach(async () => {
+    vi.restoreAllMocks();
+    await Promise.all(checkpointServers.splice(0).map(async (server) => await server.app.close()));
     await Promise.all(roots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true })));
   });
 
@@ -49,14 +56,14 @@ describe('Phase 3 deployable history state', () => {
     const store = new MetadataStore(root);
     await store.initialize();
     const upgraded = await store.snapshot();
-    expect(upgraded.schema_version).toBe(7);
+    expect(upgraded.schema_version).toBe(8);
     expect(upgraded.derived_history_by_vault).toEqual({});
     expect(upgraded.diagnostic_events).toEqual([]);
     expect(upgraded.deletion_jobs).toEqual([]);
     expect(upgraded.deletion_receipts).toEqual([]);
 
     expect(JSON.parse(await readFile(join(metadataDir, 'phase1.json'), 'utf8'))).toMatchObject({
-      schema_version: 7,
+      schema_version: 8,
       connections: [],
       diagnostic_events: [],
       derived_history_by_vault: {}
@@ -65,7 +72,7 @@ describe('Phase 3 deployable history state', () => {
     const reloaded = new MetadataStore(root);
     await reloaded.initialize();
     expect(await reloaded.snapshot()).toMatchObject({
-      schema_version: 7,
+      schema_version: 8,
       connections: [],
       diagnostic_events: [],
       derived_history_by_vault: {}
@@ -339,6 +346,204 @@ describe('Phase 3 deployable history state', () => {
     } finally {
       await chmod(metadataFile, 0o600);
       await restored.app.close();
+    }
+  });
+
+  it('preserves the primary sync error when post-COMMIT history cleanup also fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'obts-primary-history-error-'));
+    roots.push(root);
+    const f = await historyCheckpointFixture(root);
+    checkpointServers.push(f.server);
+    const vaultId = f.auth.vault.vault_id;
+    const target = await commit(f, f.m0, { 'shared.md': 'new bytes\n' });
+    const request = await manifest(f, target, f.m0, 'primary-sync-error');
+    await f.server.store.mutate((db) => {
+      const row = f.server.store.startOperation(db, {
+        vault_id: vaultId, device_id: f.auth.device.device_id, operation_type: 'device_push',
+        expected_refs: {}, target_refs: {}, target_commit: f.m0
+      });
+      row.status = 'aborted';
+      row.result = { reason: 'prior_failed_attempt' };
+    });
+    const primary = new Error('injected primary sync failure');
+    const history = (f.server.store as unknown as { histories: Map<string, OperationHistoryStore> }).histories.get(vaultId)!;
+    const cleanup = vi.spyOn(history as unknown as { syncFile(): void }, 'syncFile').mockImplementationOnce(() => {
+      throw new Error('injected post-COMMIT archive sync failure');
+    });
+    vi.spyOn(f.server.git, 'getRef').mockRejectedValueOnce(primary);
+    try {
+      await expect(f.server.sync.pushDeviceCommit(f.auth, request.manifest, request.pack)).rejects.toBe(primary);
+      expect(cleanup).toHaveBeenCalledTimes(1);
+      expect(f.server.store.isReady()).toBe(false);
+    } finally {
+      vi.restoreAllMocks();
+      await f.server.app.close();
+    }
+    const persisted = JSON.parse(await readFile(join(root, 'metadata', 'phase1.json'), 'utf8'));
+    expect(persisted.sync_operations).toHaveLength(2);
+    expect(persisted.sync_operations.every((row: { status: string }) => row.status === 'aborted')).toBe(true);
+    expect(persisted.operation_history_by_vault[vaultId].pending_batch.rows).toHaveLength(2);
+    for (let restart = 0; restart < 2; restart++) {
+      f.server = await createObtsServer({ dataDir: root, sessionSecret: 'checkpoint-test-secret' });
+      checkpointServers.push(f.server);
+      try {
+        expect((await f.server.app.inject({ method: 'GET', url: '/health/ready' })).statusCode).toBe(200);
+        expect(await f.server.store.exportOperationHistory(vaultId)).toEqual(persisted.sync_operations);
+        expect(await f.server.store.operationHistoryCounts(vaultId)).toEqual({ 'device_push:aborted': 2 });
+        expect((await f.server.store.snapshot()).sync_operations).toEqual([]);
+        expect(await f.server.git.getRef(vaultId, 'refs/heads/main')).toBe(f.m0);
+        expect(await f.server.git.getRef(vaultId, f.auth.device.device_ref)).toBe(f.m0);
+      } finally { await f.server.app.close(); }
+    }
+  });
+
+  it('populated complete checkpoints restore while ledger-only and Git-only mixtures fail closed', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'obts-populated-checkpoints-'));
+    roots.push(root);
+    const dataDir = join(root, 'data');
+    const f = await historyCheckpointFixture(dataDir);
+    checkpointServers.push(f.server);
+    const vaultId = f.auth.vault.vault_id;
+    const rename = await commit(f, f.m0, { 'old.md': null, 'new.md': 'rename payload\n' });
+    const renamed = await manifest(f, rename, f.m0, 'checkpoint-rename', [{ source_path: 'old.md', destination_path: 'new.md' }]);
+    renamed.manifest.directory_proposal = await directoryProposal(f, rename);
+    expect((await multipart(f, renamed)).result.status).toBe('merged');
+    expect((await f.server.store.findArchivedAttempt(vaultId, f.auth.device.device_id, 'checkpoint-rename'))?.row.prepared_manifest).toMatchObject({
+      rename_pairs: renamed.manifest.rename_pairs, directory_proposal: renamed.manifest.directory_proposal
+    });
+    const mainAfterRename = (await f.server.git.getRef(vaultId, 'refs/heads/main'))!;
+    const token = 'checkpoint-second-device-token';
+    const tokenHash = hashToken(token);
+    await f.server.store.mutate((db) => {
+      db.devices.push({ ...structuredClone(db.devices[0]!), device_id: 'dev_checkpoint_remote',
+        device_ref: 'refs/obts/devices/dev_checkpoint_remote', device_ref_head: mainAfterRename,
+        last_applied_main: mainAfterRename, last_applied_event_seq: db.event_seq_by_vault[vaultId]!, last_applied_explicit_dirs: ['Empty'] });
+      db.tokens.push({ ...structuredClone(db.tokens.find((row) => row.kind === 'device')!), token_id: 'tok_checkpoint_remote',
+        device_id: 'dev_checkpoint_remote', lookup_prefix: tokenHash.lookupPrefix, token_hash: tokenHash.hash });
+    });
+    await f.server.git.updateRef(vaultId, 'refs/obts/devices/dev_checkpoint_remote', mainAfterRename, null);
+    const remote = { ...f, token, m0: mainAfterRename, auth: await f.server.auth.authenticateDevice(`Bearer ${token}`, vaultId) };
+    const remoteCommit = await commit(remote, remote.m0, { 'shared.md': 'server version\n' });
+    const remoteRequest = await manifest(remote, remoteCommit, remote.m0, 'checkpoint-remote');
+    expect((await multipart(remote, remoteRequest)).result.status).toBe('merged');
+    const conflictCommit = await commit(f, rename, { 'shared.md': 'device version\n' });
+    const conflictRequest = await manifest(f, conflictCommit, mainAfterRename, 'checkpoint-conflict');
+    conflictRequest.manifest.expected_device_ref = rename;
+    const conflictResult = await multipart(f, conflictRequest);
+    expect(conflictResult.result.status).toBe('conflicted');
+    const capture = async (name: string) => {
+      const retry = await multipart(f, conflictRequest);
+      expect(retry.status).toBe(200);
+      expect(retry.result.status).toBe('conflicted');
+      const db = await f.server.store.snapshot();
+      const rows = await f.server.store.exportOperationHistory(vaultId);
+      const counts = await f.server.store.operationHistoryCounts(vaultId);
+      for (const attempt of ['checkpoint-rename', 'checkpoint-conflict']) {
+        expect(db.sync_operations.some((row) => row.prepared_manifest?.attempt_id === attempt)).toBe(false);
+        expect(await f.server.store.findArchivedAttempt(vaultId, f.auth.device.device_id, attempt)).not.toBeNull();
+      }
+      const refs = await Promise.all([
+        'refs/heads/main', f.auth.device.device_ref, remote.auth.device.device_ref,
+        ...db.conflicts.flatMap((conflict) => ['base', 'current', 'device'].map((suffix) => `refs/obts/conflicts/${conflict.conflict_id}/${suffix}`))
+      ].map(async (ref) => [ref, await f.server.git.getRef(vaultId, ref)] as const));
+      expect(db.conflicts.some((row) => row.status === 'open')).toBe(true);
+      expect(db.directory_state_by_vault[vaultId]?.explicit_dirs).toEqual(['Empty']);
+      expect(db.operation_history_by_vault![vaultId]!.generation).toBeGreaterThan(0);
+      const allRefs = await refInventory(f);
+      await f.server.app.close();
+      const path = join(root, name);
+      await cp(dataDir, path, { recursive: true });
+      return { path, db, rows, counts, refs, allRefs, retry };
+    };
+    const a = await capture('A');
+    f.server = await createObtsServer({ dataDir, sessionSecret: 'checkpoint-test-secret' });
+    checkpointServers.push(f.server);
+    remote.server = f.server;
+    const bCommit = await commit(remote, remoteCommit, { 'later.md': 'checkpoint B\n' });
+    const bRequest = await manifest(remote, bCommit, remote.m0, 'checkpoint-B');
+    bRequest.manifest.expected_device_ref = remoteCommit;
+    expect((await multipart(remote, bRequest)).result.status).toBe('merged');
+    const b = await capture('B');
+    expect(b.db.vaults[0]!.current_main).not.toBe(a.db.vaults[0]!.current_main);
+    expect(b.db.operation_history_by_vault![vaultId]!.generation).toBeGreaterThan(a.db.operation_history_by_vault![vaultId]!.generation);
+    for (const [checkpoint, other, mixed] of [
+      [a, b, null], [b, a, null], [a, b, 'ledger'], [b, a, 'ledger'], [a, b, 'git'], [b, a, 'git']
+    ] as const) {
+      await rm(dataDir, { recursive: true });
+      await cp(checkpoint.path, dataDir, { recursive: true });
+      const historyDir = join(dataDir, 'metadata', 'operation-history', vaultId);
+      if (mixed === 'ledger') {
+        await rm(historyDir, { recursive: true });
+        await cp(join(other.path, 'metadata', 'operation-history', vaultId), historyDir, { recursive: true });
+        const otherState = other.db.operation_history_by_vault![vaultId]!;
+        OperationHistoryStore.verifyOnDisk(historyDir, vaultId, otherState.ledger_id, otherState.generation, otherState.next_sequence);
+      }
+      if (mixed === 'git') {
+        await rm(join(dataDir, 'git'), { recursive: true });
+        await cp(join(other.path, 'git'), join(dataDir, 'git'), { recursive: true });
+      }
+      const ledgerBefore = createHash('sha256').update(await readFile(join(historyDir, 'history.sqlite'))).digest('hex');
+      if (mixed === 'ledger') {
+        await expect(createObtsServer({ dataDir, sessionSecret: 'checkpoint-test-secret' })).rejects.toThrow('Operation history generation or sequence mismatch.');
+        const persisted = JSON.parse(await readFile(join(dataDir, 'metadata', 'phase1.json'), 'utf8'));
+        expect(persisted).toEqual(checkpoint.db);
+        expect(createHash('sha256').update(await readFile(join(historyDir, 'history.sqlite'))).digest('hex')).toBe(ledgerBefore);
+        for (const [ref, target] of checkpoint.refs) expect(await f.server.git.getRef(vaultId, ref)).toBe(target);
+        expect(await refInventory(f)).toBe(checkpoint.allRefs);
+        continue;
+      }
+      f.server = await createObtsServer({ dataDir, sessionSecret: 'checkpoint-test-secret' });
+      checkpointServers.push(f.server);
+      try {
+        const ready = await f.server.app.inject({ method: 'GET', url: '/health/ready' });
+        expect(ready.statusCode, `checkpoint ${checkpoint === a ? 'A' : 'B'} with ${mixed ?? 'complete'} restore`).toBe(mixed ? 503 : 200);
+        const persisted = JSON.parse(await readFile(join(dataDir, 'metadata', 'phase1.json'), 'utf8'));
+        expect(persisted.events).toEqual(checkpoint.db.events);
+        expect(persisted.conflicts).toEqual(checkpoint.db.conflicts);
+        expect(persisted.sync_operations).toEqual(checkpoint.db.sync_operations);
+        const expectedRefs = mixed === 'git' ? other.refs : checkpoint.refs;
+        for (const [ref, target] of expectedRefs) expect(await f.server.git.getRef(vaultId, ref)).toBe(target);
+        expect(await refInventory(f)).toBe(mixed === 'git' ? other.allRefs : checkpoint.allRefs);
+        expect(createHash('sha256').update(await readFile(join(historyDir, 'history.sqlite'))).digest('hex')).toBe(ledgerBefore);
+        if (mixed === 'git') {
+          expect(persisted.vaults.find((vault: { vault_id: string }) => vault.vault_id === vaultId)).toMatchObject({
+            status: 'blocked_integrity', current_main: checkpoint.db.vaults[0]!.current_main
+          });
+          const readiness = ready.json() as { detail: string; checks: Record<string, boolean> };
+          expect(readiness.detail).toBe('vault persistent state is blocked by an integrity failure');
+          expect(readiness.checks.persistent_state).toBe(false);
+          for (const [check, passed] of Object.entries(readiness.checks)) {
+            if (check !== 'persistent_state') expect(passed, check).toBe(true);
+          }
+          const metadataBeforeRepair = await readFile(join(dataDir, 'metadata', 'phase1.json'));
+          const snapshotBeforeRepair = await f.server.store.snapshot();
+          await expect(repairVaultIntegrity(f.server.store, f.server.git, vaultId))
+            .rejects.toThrow('Vault integrity remains inconsistent: vault main ref is inconsistent with metadata');
+          expect(await readFile(join(dataDir, 'metadata', 'phase1.json'))).toEqual(metadataBeforeRepair);
+          expect(await f.server.store.snapshot()).toEqual(snapshotBeforeRepair);
+          expect(await refInventory(f)).toBe(other.allRefs);
+          expect(createHash('sha256').update(await readFile(join(historyDir, 'history.sqlite'))).digest('hex')).toBe(ledgerBefore);
+        }
+        if (!mixed) {
+          expect(await f.server.store.exportOperationHistory(vaultId)).toEqual(checkpoint.rows);
+          expect(await f.server.store.operationHistoryCounts(vaultId)).toEqual(checkpoint.counts);
+          const restored = await f.server.store.snapshot();
+          expect(restored.directory_state_by_vault).toEqual(checkpoint.db.directory_state_by_vault);
+          expect(restored.directory_proposal_results).toEqual(checkpoint.db.directory_proposal_results);
+          const main = checkpoint.db.vaults[0]!.current_main;
+          expect((await f.server.git.readBlobAtPath(vaultId, main, 'shared.md')).toString()).toBe('server version\n');
+          if (checkpoint === b) expect((await f.server.git.readBlobAtPath(vaultId, main, 'later.md')).toString()).toBe('checkpoint B\n');
+          expect((await f.server.git.readBlobAtPath(vaultId, main, 'new.md')).toString()).toBe('rename payload\n');
+          expect((await f.server.git.readBlobAtPath(vaultId, conflictCommit, 'shared.md')).toString()).toBe('device version\n');
+          expect(await multipart(f, conflictRequest)).toEqual(checkpoint.retry);
+          expect((await f.server.store.snapshot()).events).toEqual(checkpoint.db.events);
+          const mismatched = structuredClone(renamed);
+          mismatched.manifest.base_commit = mainAfterRename;
+          const rejected = await multipart(f, mismatched);
+          expect(rejected.status).toBe(409);
+          expect(rejected.result).toMatchObject({ error: { code: 'attempt_mismatch' } });
+        }
+      } finally { await f.server.app.close(); }
     }
   });
 

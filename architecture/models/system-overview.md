@@ -25,7 +25,7 @@ Config.yaml/runtime auth is the sole ACL-policy authority; PostgreSQL stores not
 - **Visible device vault:** local user or agent content; the immediate device source of truth.
 - **Device `.obts/`:** local Git, credentials, journals, queues, scan/directory state, and recovery evidence.
 - **Server Git store:** canonical, device, conflict, and recovery history.
-- **Server metadata store:** users, sessions, vault/device state, operation manifests, directory outcomes, conflicts, events, audits, diagnostics, and derived history metadata.
+- **Server metadata store:** hot JSON for users, sessions, vault/device state, live operation manifests and pending handoff descriptors, directory outcomes, conflicts, events, audits, diagnostics, and derived history metadata; per-vault SQLite ledgers are authoritative for acknowledged historical operation payloads, indexed admission evidence, and transactional counts.
 - **Transfer quarantine:** resumable chunks, staged objects, processing state, and terminal outcomes.
 - **Semantic workspace:** transaction-scoped materialization only for overlapping content requiring semantic validation.
 - **Bridge PostgreSQL:** mixed state: rebuildable content-derived metadata/full-text/vector/graph/revision/projection rows plus non-reconstructable retained access/audit history.

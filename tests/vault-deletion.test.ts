@@ -109,6 +109,7 @@ describe('server-owned vault deletion lifecycle', () => {
     expect(repeated.statusCode).toBe(200);
     expect((await server.store.snapshot()).vaults.some((vault) => vault.vault_id === vaultId)).toBe(false);
     expect((await server.store.snapshot()).vaults.some((vault) => vault.vault_id === otherVaultId)).toBe(true);
+    await expect(access(join(root!, 'server-data', 'metadata', 'operation-history', vaultId))).rejects.toMatchObject({ code: 'ENOENT' });
     await access(join(root!, 'server-data', 'git', `${otherVaultId}.git`));
   });
 
@@ -158,6 +159,7 @@ describe('server-owned vault deletion lifecycle', () => {
     }
     expect(completed).toBe(true);
     await expect(access(join(root, 'server-data', 'git', `${vaultId}.git`))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(access(join(root, 'server-data', 'metadata', 'operation-history', vaultId))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('resumes after Git erasure when later cleanup publication fails', async () => {

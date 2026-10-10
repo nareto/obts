@@ -125,6 +125,14 @@ export async function createObtsServer(
   const diagnostics = new DiagnosticService(store, config);
   await log.startup('diagnostics_initialized', async () => await diagnostics.initialize());
   const sync = new SyncService(store, git, config.maxUploadBytes, lifecycle, log);
+  await log.startup('operation_history_compacted', async () => {
+    const recovered = await store.snapshot();
+    for (const vault of recovered.vaults) {
+      if (vault.status === 'active' && !hasDurableDeletionRecord(recovered, vault.vault_id)) {
+        await sync.archiveStartupHistory(vault.vault_id);
+      }
+    }
+  });
   const chunkTransfers = new ChunkTransferService(config, git, sync, lifecycle, {}, log);
   lifecycle.attachTransferLifecycle(chunkTransfers);
   await log.startup('transfers_initialized', async () => await chunkTransfers.initialize(async (session) => {
@@ -1639,7 +1647,7 @@ export async function createObtsServer(
     return buildRedactedDiagnostics(db, vault.vault_id, health, {
       git_integrity: git.integrityMetricsSnapshot(),
       transfer_phases: chunkTransfers.transferMetricsSnapshot().phases
-    });
+    }, await store.operationHistoryCounts(vault.vault_id));
   });
 
   app.post('/api/v1/vaults/:vaultId/history/restore', async (request) => {
@@ -2110,7 +2118,8 @@ function buildRedactedDiagnostics(
   observability: {
     git_integrity: ReturnType<GitService['integrityMetricsSnapshot']>;
     transfer_phases: ReturnType<ChunkTransferService['transferMetricsSnapshot']>['phases'];
-  }
+  },
+  operationHistoryCounts: Record<string, number>
 ): {
   generated_at: string;
   vault: { vault_id: string; status: 'active' | 'blocked_integrity' | 'deleting'; current_main: string };
@@ -2130,12 +2139,7 @@ function buildRedactedDiagnostics(
   if (!vault) {
     throw new AuthError(404, 'not_found', 'Resource not found.');
   }
-  const operations = db.sync_operations.filter((operation) => operation.vault_id === vaultId);
-  const operationCounts: Record<string, number> = {};
-  for (const operation of operations) {
-    const key = `${operation.operation_type}:${operation.status}`;
-    operationCounts[key] = (operationCounts[key] ?? 0) + 1;
-  }
+  const operationCounts = operationHistoryCounts;
   return {
     generated_at: nowIso(),
     vault: { vault_id: vault.vault_id, status: vault.status, current_main: vault.current_main },
@@ -3434,7 +3438,7 @@ async function buildReadinessSummary(
     metadata_store: metadataStoreReady,
     git: gitReady.ok,
     setup_complete: db.setup_complete,
-    migrations: db.schema_version === 7,
+    migrations: db.schema_version === 8,
     git_store: gitStoreReady.ok,
     temp_workspace: tempWorkspaceReady.ok,
     filesystem_permissions: filesystemPermissions,
@@ -3491,7 +3495,7 @@ function checkEventDelivery(db: MetadataDb): { ok: true } | { ok: false; error: 
 type PersistentStateCheck = { ok: true } | { ok: false; error: string; vaultId?: string };
 
 async function checkPersistentState(db: MetadataDb, git: GitService): Promise<PersistentStateCheck> {
-  if (db.schema_version !== 7) {
+  if (db.schema_version !== 8) {
     return { ok: false, error: 'metadata schema version is unsupported' };
   }
   try {
@@ -3804,7 +3808,7 @@ async function reconcileStartupOperations(store: MetadataStore, git: GitService,
   const db = await store.snapshot();
   for (const operation of db.sync_operations) {
     if (hasDurableDeletionRecord(db, operation.vault_id)) continue;
-    if (operation.status === 'started' && operation.prepared_manifest === null) {
+    if (operation.status === 'started') {
       await abortStartupOperation(store, operation.operation_id, 'startup_unprepared_operation');
     }
   }

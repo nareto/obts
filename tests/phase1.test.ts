@@ -1,11 +1,12 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { cp, mkdtemp, readFile, readdir, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import git from 'isomorphic-git';
 import { publishRecoveryFixture } from './helpers/publishRecoveryFixture.js';
+import { commit, historyCheckpointFixture, manifest, multipart, refInventory } from './helpers/historyCheckpointFixture.js';
 
 import { NodeDataAdapter } from '../src/client/nodeDataAdapter.js';
 import { ObtsPluginClient, PluginBlockedError } from '../obsidian-plugin/src/core/client.js';
@@ -346,8 +347,8 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(dashboard.body.unresolved_conflict_count).toBe(0);
     expect(dashboard.body.devices).toHaveLength(2);
 
-    const db = await server.store.snapshot();
-    const mergeOperations = db.sync_operations.filter((operation) => operation.operation_type === 'server_merge');
+    const mergeOperations = (await server.store.exportOperationHistory(admin.vaultId))
+      .filter((operation) => operation.operation_type === 'server_merge');
     expect(mergeOperations.length).toBeGreaterThanOrEqual(2);
     expect(mergeOperations.at(-1)?.status).toBe('committed');
     expect(mergeOperations.at(-1)?.prepared_manifest).toMatchObject({
@@ -3303,7 +3304,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     const db = await server.store.snapshot();
     const device = db.devices.find((candidate) => candidate.device_id === state.device_id);
     expect(device?.device_ref_head).toBeNull();
-    expect(db.sync_operations).toEqual([]);
+    expect(await server.store.exportOperationHistory(admin.vaultId)).toEqual([]);
   });
 
   it('scopes browser connection authorization and removes legacy pairing endpoints', async () => {
@@ -4030,8 +4031,7 @@ describe('Phase 1 sync without conflict resolution', () => {
         affected_path_count: 1
       }
     });
-    const db = await server.store.snapshot();
-    const operation = db.sync_operations.find(
+    const operation = (await server.store.exportOperationHistory(admin.vaultId)).find(
       (candidate) =>
         candidate.operation_type === 'conflict_create' &&
         candidate.result?.conflict_id === result.conflictId
@@ -4334,7 +4334,12 @@ describe('Phase 1 sync without conflict resolution', () => {
 
     const db = await server.store.snapshot();
     expect(db.conflicts).toHaveLength(0);
-    expect(db.sync_operations.at(-1)?.prepared_manifest).toMatchObject({
+    const accepted = await plugin2.readState();
+    const merge = (await server.store.exportOperationHistory(admin.vaultId)).findLast((operation) =>
+      operation.operation_type === 'server_merge' && operation.device_id === accepted.device_id &&
+      operation.prepared_manifest?.device_commit === accepted.server_device_ref);
+    expect(merge?.status).toBe('committed');
+    expect(merge?.prepared_manifest).toMatchObject({
       decision: 'merge',
       validator_results: {
         native_git_merge: 'clean',
@@ -4436,7 +4441,12 @@ describe('Phase 1 sync without conflict resolution', () => {
 
     const db = await server.store.snapshot();
     expect(db.conflicts).toHaveLength(0);
-    expect(db.sync_operations.at(-1)?.prepared_manifest).toMatchObject({
+    const accepted = await plugin2.readState();
+    const merge = (await server.store.exportOperationHistory(admin.vaultId)).findLast((operation) =>
+      operation.operation_type === 'server_merge' && operation.device_id === accepted.device_id &&
+      operation.prepared_manifest?.device_commit === accepted.server_device_ref);
+    expect(merge?.status).toBe('committed');
+    expect(merge?.prepared_manifest).toMatchObject({
       decision: 'merge',
       validator_results: {
         native_git_merge: 'clean',
@@ -4525,7 +4535,12 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(merged.nodes[0]).toMatchObject({ text: 'desktop', color: '2' });
     const db = await server.store.snapshot();
     expect(db.conflicts).toHaveLength(0);
-    expect(db.sync_operations.at(-1)?.prepared_manifest).toMatchObject({
+    const accepted = await plugin2.readState();
+    const merge = (await server.store.exportOperationHistory(admin.vaultId)).findLast((operation) =>
+      operation.operation_type === 'server_merge' && operation.device_id === accepted.device_id &&
+      operation.prepared_manifest?.device_commit === accepted.server_device_ref);
+    expect(merge?.status).toBe('committed');
+    expect(merge?.prepared_manifest).toMatchObject({
       decision: 'merge',
       validator_results: {
         native_git_merge: 'conflicted',
@@ -4592,7 +4607,12 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(merged).toContain('score: rating * 3');
     const db = await server.store.snapshot();
     expect(db.conflicts).toHaveLength(0);
-    expect(db.sync_operations.at(-1)?.prepared_manifest).toMatchObject({
+    const accepted = await plugin2.readState();
+    const merge = (await server.store.exportOperationHistory(admin.vaultId)).findLast((operation) =>
+      operation.operation_type === 'server_merge' && operation.device_id === accepted.device_id &&
+      operation.prepared_manifest?.device_commit === accepted.server_device_ref);
+    expect(merge?.status).toBe('committed');
+    expect(merge?.prepared_manifest).toMatchObject({
       decision: 'merge',
       validator_results: {
         native_git_merge: 'conflicted',
@@ -4660,9 +4680,13 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await readFile(join(device1Dir, 'tablet.md'), 'utf8')).toBe('device-specific note\n');
     const db = await server.store.snapshot();
     expect(db.conflicts).toHaveLength(0);
-    const identityMerge = db.sync_operations.findLast(
-      (operation) => operation.operation_type === 'server_merge' && operation.prepared_manifest?.validator_results !== undefined
+    const accepted = await plugin2.readState();
+    const identityMerge = (await server.store.exportOperationHistory(admin.vaultId)).findLast(
+      (operation) => operation.operation_type === 'server_merge' && operation.device_id === accepted.device_id &&
+        operation.prepared_manifest?.device_commit === accepted.server_device_ref &&
+        operation.prepared_manifest?.validator_results !== undefined
     );
+    expect(identityMerge?.status).toBe('committed');
     expect(identityMerge?.prepared_manifest).toMatchObject({
       decision: 'merge',
       validator_results: {
@@ -5178,274 +5202,241 @@ describe('Phase 1 sync without conflict resolution', () => {
     await expect(plugin.syncOnce()).resolves.toMatchObject({ status: 'Synced' });
   });
 
-  it('rolls forward a prepared merge operation when startup finds main already advanced', async () => {
-    const admin = await setupAdminAndVault(baseUrl);
-    const deviceDir = join(root, 'reconcile-merge-device');
-    await mkdirp(deviceDir);
-    await writeFile(join(deviceDir, 'reconcile.md'), 'prepared merge target\n');
-    const plugin = await pairPlugin(admin, deviceDir, 'desktop');
-    await plugin.syncOnce({ confirmInitialImport: true });
-
-    const committedDb = await server.store.snapshot();
-    const mergeOperation = committedDb.sync_operations.findLast(
-      (operation) => operation.operation_type === 'server_merge' && operation.status === 'committed'
-    );
-    expect(mergeOperation?.target_commit).toMatch(/^[0-9a-f]{40}$/u);
-    expect(mergeOperation?.target_refs).toMatchObject({
-      'refs/heads/main': mergeOperation?.target_commit
-    });
-    const targetMain = mergeOperation!.target_commit!;
-    const previousMain = mergeOperation!.expected_refs['refs/heads/main'];
-    expect(previousMain).toMatch(/^[0-9a-f]{40}$/u);
-
-    await server.store.mutate((db) => {
-      const operation = db.sync_operations.find((candidate) => candidate.operation_id === mergeOperation!.operation_id);
-      expect(operation).toBeDefined();
-      operation!.status = 'prepared';
-      operation!.result = null;
-      const vault = db.vaults.find((candidate) => candidate.vault_id === admin.vaultId);
-      expect(vault).toBeDefined();
-      vault!.current_main = previousMain!;
-      const device = db.devices.find((candidate) => candidate.device_id === mergeOperation!.device_id);
-      expect(device).toBeDefined();
-      device!.status = 'ahead';
-      device!.last_successful_sync_at = null;
-    });
-
+  async function preparedCrashFixture(seam: 'main-moved' | 'no-target' | 'device-moved') {
+    const dataDir = join(root, 'server-data');
     await server.app.close();
-    server = await createObtsServer({
-      dataDir: join(root, 'server-data'),
-      publicBaseUrl: 'http://127.0.0.1:0',
-      sessionSecret: 'test-session-secret-with-enough-entropy'
+    const f = await historyCheckpointFixture(dataDir);
+    server = f.server;
+    const vaultId = f.auth.vault.vault_id;
+    const deviceId = f.auth.device.device_id;
+    const deviceRef = f.auth.device.device_ref;
+    const seed = await commit(f, f.m0, { 'prior.md': 'previous accepted proposal\n' });
+    const accepted = await multipart(f, await manifest(f, seed));
+    expect(accepted).toMatchObject({ status: 200, result: { status: 'merged' } });
+    const seeded = await server.store.snapshot();
+    const prior = await server.store.exportOperationHistory(vaultId);
+    expect(prior.filter((row) => row.operation_type === 'device_push' && row.target_commit === seed))
+      .toEqual([expect.objectContaining({ status: 'committed' })]);
+    expect(prior.some((row) => row.operation_type === 'server_merge' && row.status === 'committed')).toBe(true);
+    expect(seeded.operation_history_by_vault![vaultId]!.generation).toBeGreaterThan(0);
+    expect(seeded.sync_operations).toHaveLength(0);
+    const previousMain = seeded.vaults.find((vault) => vault.vault_id === vaultId)!.current_main;
+    f.m0 = seed;
+    f.auth = await server.auth.authenticateDevice(`Bearer ${f.token}`, vaultId);
+    const target = await commit(f, previousMain, { 'recovered.md': 'pending merge after restart\n' });
+    const request = await manifest(f, target, previousMain, 'prepared-checkpoint-attempt');
+    const image = join(root, 'prepared-crash-image');
+    let captured: Awaited<ReturnType<typeof server.store.snapshot>> | undefined;
+    let capturedRefs = '';
+    const capture = async () => {
+      expect(captured).toBeUndefined();
+      captured = await server.store.snapshot();
+      capturedRefs = await refInventory(f);
+      expect(await server.store.exportOperationHistory(vaultId)).toEqual(expect.arrayContaining(prior));
+      await cp(dataDir, image, { recursive: true });
+    };
+    const updateRef = server.git.updateRef.bind(server.git);
+    const createTree = server.git.createDisjointMergeTree.bind(server.git);
+    if (seam === 'no-target') {
+      server.git.createDisjointMergeTree = async (...args) => {
+        if (args[0] === vaultId && args[3] === target) await capture();
+        return await createTree(...args);
+      };
+    } else {
+      server.git.updateRef = async (...args) => {
+        await updateRef(...args);
+        if (args[0] === vaultId && args[1] === (seam === 'main-moved' ? 'refs/heads/main' : deviceRef)) {
+          await capture();
+        }
+      };
+    }
+    try {
+      expect(await multipart(f, request)).toMatchObject({ status: 200, result: { status: 'merged' } });
+    } finally {
+      server.git.updateRef = updateRef;
+      server.git.createDisjointMergeTree = createTree;
+    }
+    expect(captured).toBeDefined();
+    const checkpoint = captured!;
+    const prepared = checkpoint.sync_operations.find((row) => row.status === 'prepared')!;
+    expect(prepared).toMatchObject({
+      vault_id: vaultId, device_id: deviceId,
+      operation_type: seam === 'device-moved' ? 'device_push' : 'server_merge', status: 'prepared', result: null
     });
-    baseUrl = await server.app.listen({ port: 0, host: '127.0.0.1' });
-
-    const ready = await fetch(`${baseUrl}/health/ready`);
-    expect(ready.status).toBe(200);
-    const reconciledDb = await server.store.snapshot();
-    expect(reconciledDb.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(targetMain);
-    const reconciledOperation = reconciledDb.sync_operations.find(
-      (operation) => operation.operation_id === mergeOperation!.operation_id
-    );
-    expect(reconciledOperation).toMatchObject({
-      status: 'committed',
-      result: {
-        decision: 'merged',
-        merge_commit: targetMain,
-        reconciled_after_startup: true
+    expect(checkpoint.operation_history_by_vault![vaultId]).toEqual({
+      ...seeded.operation_history_by_vault![vaultId],
+      next_sequence: seeded.operation_history_by_vault![vaultId]!.next_sequence + (seam === 'device-moved' ? 1 : 2)
+    });
+    expect(checkpoint.vaults.find((vault) => vault.vault_id === vaultId)?.current_main).toBe(previousMain);
+    expect(capturedRefs).toContain(`${deviceRef} ${target}\n`);
+    const push = checkpoint.sync_operations.find((row) => row.operation_type === 'device_push')!;
+    expect(push).toMatchObject({ target_commit: target, proposal_base: previousMain,
+      prepared_manifest: { attempt_id: request.manifest.attempt_id } });
+    if (seam === 'device-moved') {
+      expect(checkpoint.devices.find((device) => device.device_id === deviceId)?.device_ref_head).toBe(seed);
+      expect(checkpoint.sync_operations.filter((row) => row.operation_type === 'server_merge')).toEqual([]);
+      expect(prior.some((row) => row.prepared_manifest?.device_commit === target)).toBe(false);
+      expect(capturedRefs).toContain(`refs/heads/main ${previousMain}\n`);
+    } else {
+      expect(push.status).toBe('committed');
+      expect(prepared.expected_refs).toEqual({ 'refs/heads/main': previousMain, [deviceRef]: target });
+      if (seam === 'no-target') {
+        expect(prepared.target_commit).toBeNull();
+        expect(prepared.target_refs).toEqual({ 'refs/heads/main': null });
+        expect(prepared.prepared_manifest).not.toHaveProperty('target_refs');
+        expect(capturedRefs).toContain(`refs/heads/main ${previousMain}\n`);
+      } else {
+        expect(prepared.target_commit).toMatch(/^[0-9a-f]{40}$/u);
+        expect(prepared.target_refs).toEqual({ 'refs/heads/main': prepared.target_commit });
+        expect(capturedRefs).toContain(`refs/heads/main ${prepared.target_commit}\n`);
       }
+    }
+    return { f, dataDir, image, checkpoint, prepared, capturedRefs, prior, previousMain, target, vaultId, deviceId, deviceRef };
+  }
+
+  async function restartPreparedCrash(fixture: Awaited<ReturnType<typeof preparedCrashFixture>>, restore = false, corruptMain = false) {
+    await server.app.close();
+    if (restore) {
+      await rm(fixture.dataDir, { recursive: true });
+      await cp(fixture.image, fixture.dataDir, { recursive: true });
+      expect(await refInventory(fixture.f)).toBe(fixture.capturedRefs);
+      if (corruptMain) {
+        // Deliberate foreign CAS, not a naturally emitted crash state: metadata and ledger stay untouched.
+        expect(fixture.target).not.toBe(fixture.previousMain);
+        await server.git.updateRef(fixture.vaultId, 'refs/heads/main', fixture.target, fixture.previousMain);
+      }
+      const metadataFiles = await readdir(join(fixture.image, 'metadata'), { recursive: true });
+      expect((await readdir(join(fixture.dataDir, 'metadata'), { recursive: true })).sort()).toEqual(metadataFiles.sort());
+      for (const file of metadataFiles) {
+        const original = join(fixture.image, 'metadata', file);
+        if ((await stat(original)).isFile()) {
+          expect(await readFile(join(fixture.dataDir, 'metadata', file))).toEqual(await readFile(original));
+        }
+      }
+    }
+    server = await createObtsServer({ dataDir: fixture.dataDir, sessionSecret: 'checkpoint-test-secret' });
+    fixture.f.server = server;
+    baseUrl = await server.app.listen({ port: 0, host: '127.0.0.1' });
+    const history = await server.store.exportOperationHistory(fixture.vaultId);
+    for (const row of fixture.prior) {
+      expect(JSON.stringify(history.find((candidate) => candidate.operation_id === row.operation_id))).toBe(JSON.stringify(row));
+    }
+    const recovered = history.find((row) => row.operation_id === fixture.prepared.operation_id)!;
+    expect(recovered).toBeDefined();
+    expect(recovered).toEqual({ ...fixture.prepared,
+      status: recovered.status, result: recovered.result, updated_at: recovered.updated_at });
+    return history;
+  }
+
+  async function assertStablePreparedRestart(fixture: Awaited<ReturnType<typeof preparedCrashFixture>>, readyStatus = 200) {
+    const history = await server.store.exportOperationHistory(fixture.vaultId);
+    const before = await server.store.snapshot();
+    const refs = await refInventory(fixture.f);
+    await restartPreparedCrash(fixture);
+    expect((await fetch(`${baseUrl}/health/ready`)).status).toBe(readyStatus);
+    const afterHistory = await server.store.exportOperationHistory(fixture.vaultId);
+    if (readyStatus === 503) {
+      const blocked = afterHistory.find((row) => row.operation_id === fixture.prepared.operation_id)!;
+      expect(Date.parse(blocked.updated_at)).toBeGreaterThanOrEqual(Date.parse(
+        history.find((row) => row.operation_id === fixture.prepared.operation_id)!.updated_at));
+      expect(afterHistory).toEqual(history.map((row) => row.operation_id === fixture.prepared.operation_id
+        ? { ...row, updated_at: blocked.updated_at } : row));
+    } else {
+      expect(afterHistory).toEqual(history);
+    }
+    expect((await server.store.snapshot()).events).toEqual(before.events);
+    expect((await server.store.snapshot()).audit_log).toEqual(before.audit_log);
+    expect((await server.store.snapshot()).operation_history_by_vault).toEqual(before.operation_history_by_vault);
+    expect(await refInventory(fixture.f)).toBe(refs);
+    expect((await server.store.snapshot()).vaults.map(({ current_main, status }) => ({ current_main, status })))
+      .toEqual(before.vaults.map(({ current_main, status }) => ({ current_main, status })));
+  }
+
+  async function assertRecoveredProposal(fixture: Awaited<ReturnType<typeof preparedCrashFixture>>, main: string) {
+    const db = await server.store.snapshot();
+    expect((await fetch(`${baseUrl}/health/ready`)).status).toBe(200);
+    expect(db.vaults.find((vault) => vault.vault_id === fixture.vaultId)).toMatchObject({ status: 'active', current_main: main });
+    expect(await server.git.getRef(fixture.vaultId, 'refs/heads/main')).toBe(main);
+    expect(await server.git.getRef(fixture.vaultId, fixture.deviceRef)).toBe(fixture.target);
+    expect(await refInventory(fixture.f)).toBe(fixture.capturedRefs.replace(/^refs\/heads\/main [0-9a-f]{40}$/mu,
+      `refs/heads/main ${main}`));
+    expect((await server.git.readBlobAtPath(fixture.vaultId, main, 'recovered.md')).toString()).toBe('pending merge after restart\n');
+    expect((await server.git.readBlobAtPath(fixture.vaultId, main, 'prior.md')).toString()).toBe('previous accepted proposal\n');
+    expect(db.events.filter((event) => event.event_type === 'main_advanced' && event.commit_cursors.main === main)).toHaveLength(1);
+  }
+
+  it('rolls forward a prepared merge operation when startup finds main already advanced', async () => {
+    const fixture = await preparedCrashFixture('main-moved');
+    const history = await restartPreparedCrash(fixture, true);
+    const recovered = history.find((row) => row.operation_id === fixture.prepared.operation_id);
+    expect(recovered).toMatchObject({
+      status: 'committed', prepared_manifest: fixture.prepared.prepared_manifest,
+      result: { decision: 'merged', merge_commit: fixture.prepared.target_commit, reconciled_after_startup: true }
     });
-    expect(
-      reconciledDb.events.find((event) => event.event_type === 'main_advanced' && event.payload.reconciled_after_startup === true)
-    ).toBeDefined();
+    await assertRecoveredProposal(fixture, fixture.prepared.target_commit!);
+    const db = await server.store.snapshot();
+    expect(db.events.filter((event) => event.event_type === 'main_advanced' &&
+      event.commit_cursors.main === fixture.prepared.target_commit && event.payload.reconciled_after_startup === true)).toHaveLength(1);
+    await assertStablePreparedRestart(fixture);
   });
 
   it('aborts a prepared merge operation on startup when no target ref was recorded and refs did not move', async () => {
-    const admin = await setupAdminAndVault(baseUrl);
-    const deviceDir = join(root, 'abort-prepared-merge-device');
-    await mkdirp(deviceDir);
-    await writeFile(join(deviceDir, 'pre-target.md'), 'prepared before target ref\n');
-    const plugin = await pairPlugin(admin, deviceDir, 'desktop');
-    await plugin.syncOnce({ confirmInitialImport: true });
-
-    const committedDb = await server.store.snapshot();
-    const mergeOperation = committedDb.sync_operations.findLast(
-      (operation) => operation.operation_type === 'server_merge' && operation.status === 'committed'
-    );
-    const devicePush = committedDb.sync_operations.find(
-      (operation) => operation.operation_type === 'device_push' && operation.status === 'committed'
-    );
-    expect(mergeOperation?.target_commit).toMatch(/^[0-9a-f]{40}$/u);
-    expect(devicePush?.target_commit).toMatch(/^[0-9a-f]{40}$/u);
-    const previousMain = mergeOperation!.expected_refs['refs/heads/main'];
-    expect(previousMain).toMatch(/^[0-9a-f]{40}$/u);
-
-    await server.git.updateRef(admin.vaultId, 'refs/heads/main', previousMain!, mergeOperation!.target_commit);
-    await server.store.mutate((db) => {
-      const operation = db.sync_operations.find((candidate) => candidate.operation_id === mergeOperation!.operation_id);
-      expect(operation).toBeDefined();
-      operation!.status = 'prepared';
-      operation!.target_refs = { 'refs/heads/main': null };
-      operation!.target_commit = null;
-      operation!.result = null;
-      operation!.prepared_manifest = {
-        merge_sequence: operation!.prepared_manifest?.merge_sequence,
-        merge_policy_version: operation!.prepared_manifest?.merge_policy_version,
-        base_commit: operation!.prepared_manifest?.base_commit,
-        current_main: operation!.prepared_manifest?.current_main,
-        device_commit: operation!.prepared_manifest?.device_commit,
-        decision: 'merge',
-        validator_results: operation!.prepared_manifest?.validator_results
-      };
-      const vault = db.vaults.find((candidate) => candidate.vault_id === admin.vaultId);
-      expect(vault).toBeDefined();
-      vault!.current_main = previousMain!;
-      vault!.status = 'active';
-      const device = db.devices.find((candidate) => candidate.device_id === mergeOperation!.device_id);
-      expect(device).toBeDefined();
-      device!.status = 'ahead';
+    const fixture = await preparedCrashFixture('no-target');
+    const history = await restartPreparedCrash(fixture, true);
+    expect(history.find((row) => row.operation_id === fixture.prepared.operation_id)).toMatchObject({
+      status: 'aborted', prepared_manifest: fixture.prepared.prepared_manifest, result: { reason: 'startup_prepared_ref_not_moved' }
     });
-
-    await server.app.close();
-    server = await createObtsServer({
-      dataDir: join(root, 'server-data'),
-      publicBaseUrl: 'http://127.0.0.1:0',
-      sessionSecret: 'test-session-secret-with-enough-entropy'
-    });
-    baseUrl = await server.app.listen({ port: 0, host: '127.0.0.1' });
-
-    const ready = await fetch(`${baseUrl}/health/ready`);
-    expect(ready.status).toBe(200);
-    const reconciledDb = await server.store.snapshot();
-    const originalOperation = reconciledDb.sync_operations.find(
-      (operation) => operation.operation_id === mergeOperation!.operation_id
-    );
-    expect(originalOperation).toMatchObject({
-      status: 'aborted',
-      result: {
-        reason: 'startup_prepared_ref_not_moved'
-      }
-    });
-    expect(reconciledDb.vaults.find((vault) => vault.vault_id === admin.vaultId)?.status).toBe('active');
-    expect(reconciledDb.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toMatch(
-      /^[0-9a-f]{40}$/u
-    );
+    const followOn = history.filter((row) => row.operation_type === 'server_merge' && row.status === 'committed' &&
+      row.device_id === fixture.deviceId && row.prepared_manifest?.device_commit === fixture.target);
+    expect(followOn).toHaveLength(1);
+    expect(followOn[0]!.operation_id).not.toBe(fixture.prepared.operation_id);
+    expect(followOn[0]!.expected_refs['refs/heads/main']).toBe(fixture.previousMain);
+    expect(followOn[0]!.result).toMatchObject({ decision: 'merged', merge_commit: followOn[0]!.target_commit });
+    await assertRecoveredProposal(fixture, followOn[0]!.target_commit!);
+    await assertStablePreparedRestart(fixture);
   });
 
   it('fails readiness closed when a prepared operation has no target ref and refs already moved', async () => {
-    const admin = await setupAdminAndVault(baseUrl);
-    const deviceDir = join(root, 'unknown-prepared-merge-device');
-    await mkdirp(deviceDir);
-    await writeFile(join(deviceDir, 'unknown-target.md'), 'prepared unknown target ref\n');
-    const plugin = await pairPlugin(admin, deviceDir, 'desktop');
-    await plugin.syncOnce({ confirmInitialImport: true });
-
-    const committedDb = await server.store.snapshot();
-    const mergeOperation = committedDb.sync_operations.findLast(
-      (operation) => operation.operation_type === 'server_merge' && operation.status === 'committed'
-    );
-    expect(mergeOperation?.target_commit).toMatch(/^[0-9a-f]{40}$/u);
-    const previousMain = mergeOperation!.expected_refs['refs/heads/main'];
-    expect(previousMain).toMatch(/^[0-9a-f]{40}$/u);
-
-    await server.store.mutate((db) => {
-      const operation = db.sync_operations.find((candidate) => candidate.operation_id === mergeOperation!.operation_id);
-      expect(operation).toBeDefined();
-      operation!.status = 'prepared';
-      operation!.target_refs = { 'refs/heads/main': null };
-      operation!.target_commit = null;
-      operation!.result = null;
-      operation!.prepared_manifest = {
-        merge_sequence: operation!.prepared_manifest?.merge_sequence,
-        merge_policy_version: operation!.prepared_manifest?.merge_policy_version,
-        base_commit: operation!.prepared_manifest?.base_commit,
-        current_main: operation!.prepared_manifest?.current_main,
-        device_commit: operation!.prepared_manifest?.device_commit,
-        decision: 'merge',
-        validator_results: operation!.prepared_manifest?.validator_results
-      };
-      const vault = db.vaults.find((candidate) => candidate.vault_id === admin.vaultId);
-      expect(vault).toBeDefined();
-      vault!.current_main = previousMain!;
-      vault!.status = 'active';
-    });
-
-    await server.app.close();
-    server = await createObtsServer({
-      dataDir: join(root, 'server-data'),
-      publicBaseUrl: 'http://127.0.0.1:0',
-      sessionSecret: 'test-session-secret-with-enough-entropy'
-    });
-    baseUrl = await server.app.listen({ port: 0, host: '127.0.0.1' });
-
+    const fixture = await preparedCrashFixture('no-target');
+    await restartPreparedCrash(fixture, true, true);
     const ready = await fetch(`${baseUrl}/health/ready`);
     expect(ready.status).toBe(503);
-    const body = (await ready.json()) as { detail: string; checks: { persistent_state: boolean } };
-    expect(body.detail).toBe('vault persistent state is blocked by an integrity failure');
-    expect(body.checks.persistent_state).toBe(false);
-    const reconciledDb = await server.store.snapshot();
-    expect(reconciledDb.vaults.find((vault) => vault.vault_id === admin.vaultId)?.status).toBe('blocked_integrity');
-    expect(
-      reconciledDb.sync_operations.find((operation) => operation.operation_id === mergeOperation!.operation_id)?.result
-    ).toMatchObject({
-      reason: 'prepared operation does not contain a recoverable target ref'
+    expect(await ready.json()).toMatchObject({
+      detail: 'vault persistent state is blocked by an integrity failure', checks: { persistent_state: false }
     });
+    const db = await server.store.snapshot();
+    expect(db.vaults.find((vault) => vault.vault_id === fixture.vaultId))
+      .toMatchObject({ status: 'blocked_integrity', current_main: fixture.previousMain });
+    expect(await server.git.getRef(fixture.vaultId, 'refs/heads/main')).toBe(fixture.target);
+    expect(await server.git.getRef(fixture.vaultId, fixture.deviceRef)).toBe(fixture.target);
+    expect(await refInventory(fixture.f)).toBe(fixture.capturedRefs.replace(
+      `refs/heads/main ${fixture.previousMain}\n`, `refs/heads/main ${fixture.target}\n`));
+    expect(db.sync_operations.find((row) => row.operation_id === fixture.prepared.operation_id)).toEqual({
+      ...fixture.prepared,
+      updated_at: expect.any(String),
+      result: { reason: 'prepared operation does not contain a recoverable target ref' }
+    });
+    expect(db.operation_history_by_vault).toEqual(fixture.checkpoint.operation_history_by_vault);
+    await assertStablePreparedRestart(fixture, 503);
   });
 
   it('resumes a reconciled device ref update and merges it on startup', async () => {
-    const admin = await setupAdminAndVault(baseUrl);
-    const deviceDir = join(root, 'reconcile-device-push-device');
-    await mkdirp(deviceDir);
-    await writeFile(join(deviceDir, 'pending-device-ref.md'), 'pending merge after restart\n');
-    const plugin = await pairPlugin(admin, deviceDir, 'desktop');
-    await plugin.syncOnce({ confirmInitialImport: true });
-
-    const committedDb = await server.store.snapshot();
-    const devicePush = committedDb.sync_operations.find(
-      (operation) => operation.operation_type === 'device_push' && operation.status === 'committed'
-    );
-    const originalMerge = committedDb.sync_operations.find(
-      (operation) => operation.operation_type === 'server_merge' && operation.status === 'committed'
-    );
-    expect(devicePush?.target_commit).toMatch(/^[0-9a-f]{40}$/u);
-    expect(originalMerge?.target_commit).toMatch(/^[0-9a-f]{40}$/u);
-    const previousMain = originalMerge!.expected_refs['refs/heads/main'];
-    expect(previousMain).toMatch(/^[0-9a-f]{40}$/u);
-
-    await server.git.updateRef(admin.vaultId, 'refs/heads/main', previousMain!, originalMerge!.target_commit);
-    await server.store.mutate((db) => {
-      const operation = db.sync_operations.find((candidate) => candidate.operation_id === devicePush!.operation_id);
-      expect(operation).toBeDefined();
-      operation!.status = 'prepared';
-      operation!.result = null;
-      const oldMerge = db.sync_operations.find((candidate) => candidate.operation_id === originalMerge!.operation_id);
-      expect(oldMerge).toBeDefined();
-      oldMerge!.status = 'aborted';
-      oldMerge!.result = { reason: 'test_rewind_to_pre_merge_crash_window' };
-      const vault = db.vaults.find((candidate) => candidate.vault_id === admin.vaultId);
-      expect(vault).toBeDefined();
-      vault!.current_main = previousMain!;
-      vault!.updated_at = new Date().toISOString();
-      const device = db.devices.find((candidate) => candidate.device_id === devicePush!.device_id);
-      expect(device).toBeDefined();
-      device!.device_ref_head = null;
-      device!.status = 'paired';
-      device!.last_successful_sync_at = null;
+    const fixture = await preparedCrashFixture('device-moved');
+    const history = await restartPreparedCrash(fixture, true);
+    expect(history.find((row) => row.operation_id === fixture.prepared.operation_id)).toMatchObject({
+      status: 'committed', proposal_base: fixture.previousMain, prepared_manifest: fixture.prepared.prepared_manifest,
+      result: { device_ref: fixture.target, reconciled_after_startup: true }
     });
-
-    await server.app.close();
-    server = await createObtsServer({
-      dataDir: join(root, 'server-data'),
-      publicBaseUrl: 'http://127.0.0.1:0',
-      sessionSecret: 'test-session-secret-with-enough-entropy'
-    });
-    baseUrl = await server.app.listen({ port: 0, host: '127.0.0.1' });
-
-    const ready = await fetch(`${baseUrl}/health/ready`);
-    expect(ready.status).toBe(200);
-    const reconciledDb = await server.store.snapshot();
-    const reconciledPush = reconciledDb.sync_operations.find(
-      (operation) => operation.operation_id === devicePush!.operation_id
-    );
-    expect(reconciledPush).toMatchObject({
-      status: 'committed',
-      result: {
-        device_ref: devicePush!.target_commit,
-        reconciled_after_startup: true
-      }
-    });
-    const resumedMerge = reconciledDb.sync_operations.find(
-      (operation) =>
-        operation.operation_type === 'server_merge' &&
-        operation.status === 'committed' &&
-        operation.expected_refs['refs/heads/main'] === previousMain &&
-        operation.operation_id !== originalMerge!.operation_id
-    );
-    expect(resumedMerge?.target_commit).toMatch(/^[0-9a-f]{40}$/u);
-    expect(reconciledDb.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(
-      resumedMerge!.target_commit
-    );
-    expect(await server.git.getRef(admin.vaultId, 'refs/heads/main')).toBe(resumedMerge!.target_commit);
+    const resumedMerge = history.filter((row) => row.operation_type === 'server_merge' && row.status === 'committed' &&
+      row.device_id === fixture.deviceId && row.prepared_manifest?.device_commit === fixture.target);
+    expect(resumedMerge).toHaveLength(1);
+    expect(resumedMerge[0]!.expected_refs['refs/heads/main']).toBe(fixture.previousMain);
+    expect(fixture.checkpoint.sync_operations.some((row) => row.operation_id === resumedMerge[0]!.operation_id)).toBe(false);
+    expect(resumedMerge[0]!.result).toMatchObject({ decision: 'merged', merge_commit: resumedMerge[0]!.target_commit });
+    await assertRecoveredProposal(fixture, resumedMerge[0]!.target_commit!);
+    expect((await server.store.snapshot()).events.filter((event) => event.event_type === 'device_ref_updated' &&
+      event.commit_cursors.device_ref === fixture.target && event.payload.reconciled_after_startup === true)).toHaveLength(1);
+    await assertStablePreparedRestart(fixture);
   });
 
   it('returns 410 when an event cursor has fallen behind retained event history', async () => {
@@ -6752,7 +6743,9 @@ describe('Phase 1 sync without conflict resolution', () => {
         const acceptedDevice = acceptedState.devices.find((device) => device.device_id === baseState.device_id);
         expect(acceptedDevice).toBeDefined();
         expect(await server.git.getRef(baseState.vault_id, acceptedDevice!.device_ref)).toBe(pending);
-        expect(acceptedState.sync_operations.find((operation) => operation.target_commit === pending)?.status).toBe('committed');
+        expect((await server.store.exportOperationHistory(baseState.vault_id)).find((operation) =>
+          operation.operation_type === 'device_push' && operation.device_id === baseState.device_id &&
+          operation.target_commit === pending && operation.prepared_manifest?.attempt_id === attemptId)?.status).toBe('committed');
       }
       await expect(phone.syncOnce()).rejects.toMatchObject({ code: 'legacy_directory_advance_unsafe' });
       core.fsp.rename = rename;
@@ -6773,7 +6766,9 @@ describe('Phase 1 sync without conflict resolution', () => {
         const settledDevice = settledState.devices.find((device) => device.device_id === baseState.device_id);
         expect(settledDevice).toBeDefined();
         expect(await server.git.getRef(baseState.vault_id, settledDevice!.device_ref)).toBe(pending);
-        expect(settledState.sync_operations.find((operation) => operation.target_commit === pending)?.status).toBe('committed');
+        expect((await server.store.exportOperationHistory(baseState.vault_id)).find((operation) =>
+          operation.operation_type === 'device_push' && operation.device_id === baseState.device_id &&
+          operation.target_commit === pending && operation.prepared_manifest?.attempt_id === attemptId)?.status).toBe('committed');
       }
       return;
     }
@@ -6781,6 +6776,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     for (let attempt = 0; attempt < 3 && settled.status !== 'Synced'; attempt++) settled = await phone.syncOnce();
     expect(settled.status).toBe('Synced');
     await mkdirp(join(phoneDir, 'new-local-empty'));
+    const beforeDirectorySync = (await server.store.exportOperationHistory(admin.vaultId)).at(-1)!.operation_sequence!;
     expect(await phone.syncOnce()).toMatchObject({ status: 'Synced' });
     core.fsp.rename = rename;
     expect(checkedArchiveBeforeAuthorization).toBe(true);
@@ -6793,9 +6789,12 @@ describe('Phase 1 sync without conflict resolution', () => {
     const archiveFiles = await readdir(join(phoneDir, '.obts', 'recovery'));
     expect(archiveFiles.some((name) => name.startsWith('legacy-baseline-'))).toBe(true);
     const stored = await server.store.snapshot();
-    const oldAttempt = stored.sync_operations.find((operation) => operation.target_commit === pending);
+    const history = await server.store.exportOperationHistory(admin.vaultId);
+    const oldAttempt = history.find((operation) => operation.target_commit === pending);
     expect(oldAttempt).toBeUndefined();
-    const uploaded = stored.sync_operations.find((operation) => operation.device_id === baseState.device_id &&
+    const uploaded = history.find((operation) => operation.operation_type === 'device_push' &&
+      operation.device_id === baseState.device_id && operation.operation_sequence! > beforeDirectorySync &&
+      operation.target_commit === (stored.devices.find((device) => device.device_id === baseState.device_id)?.device_ref_head) &&
       operation.target_commit !== pending && operation.status === 'committed' &&
       operation.prepared_manifest?.directory_proposal != null);
     expect(uploaded).toBeDefined();
@@ -6886,8 +6885,9 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(rejectedCheckpoint.target_commit).toBe(queuedCommit);
     const rejectedQueue = await phone.readQueue();
     expect(rejectedQueue.pending_commit).toBe(queuedCommit);
-    const rejectedOperation = (await server.store.snapshot()).sync_operations
-      .find((candidate) => candidate.target_commit === queuedCommit && candidate.operation_type === 'device_push');
+    const rejectedOperation = (await server.store.exportOperationHistory(admin.vaultId))
+      .find((candidate) => candidate.target_commit === queuedCommit && candidate.operation_type === 'device_push' &&
+        candidate.device_id === appliedState.device_id);
     expect(rejectedOperation).toMatchObject({
       status: 'aborted',
       result: { reason: 'stale_directory_proposal_base' }

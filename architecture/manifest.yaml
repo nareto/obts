@@ -1,5 +1,5 @@
 schema_version: 1
-revision: 53
+revision: 54
 status: current
 updated: 2026-10-10
 authoritative_artifacts:
@@ -171,4 +171,14 @@ formal_models:
     refines:
       - OBTS-SYNC-RENAME-001
       - OBTS-PER-RENAME-001
+  - id: OBTS-FM-015
+    status: focused bounded model
+    path: architecture/models/formal/OBTSOperationHistory.tla
+    architecture_revision: 54
+    checks: architecture/models/formal/OBTSOperationHistory.cfg
+    refines:
+      - OBTS-PER-HIST-001
+      - OBTS-PER-OP-001
+      - OBTS-SYNC-IMM-001
+      - OBTS-PER-DEL-001
 

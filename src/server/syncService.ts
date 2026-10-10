@@ -117,7 +117,7 @@ export class SyncService {
   ) {}
 
   async runWithVaultLock<T>(vaultId: string, fn: () => Promise<T>): Promise<T> {
-    return await this.withVaultLock(vaultId, fn);
+    return await this.withVaultLock(vaultId, fn, true);
   }
 
   async getVaultSyncSettings(vaultId: string, actorUserId: string): Promise<Record<string, unknown>> {
@@ -268,7 +268,7 @@ export class SyncService {
       await this.commitVaultSettingsOperation(operationId);
       return { vault_id: vault.vault_id, current_main: targetMain, root_ignore: input.rootIgnore,
         metadata_conflict_rules: rules, root_ignore_oid: preview.root_ignore_oid };
-    });
+    }, true);
   }
 
   private async commitVaultSettingsOperation(operationId: string): Promise<void> {
@@ -314,15 +314,24 @@ export class SyncService {
     return validateMetadataConflictRules(vault.metadata_conflict_rules ?? []);
   }
 
+  async archiveStartupHistory(vaultId: string): Promise<void> {
+    await this.store.archiveStartupHistory(vaultId, async (row, db) => await this.isPendingMergeRow(vaultId, row, db));
+  }
+
   async resumePendingMerges(): Promise<void> {
     const db = await this.store.snapshot();
+    const devices = new Map(db.devices.map((device) => [device.device_id, device]));
+    const vaults = new Map(db.vaults.map((vault) => [vault.vault_id, vault]));
     const candidates = db.sync_operations
       .filter((operation) => {
+        const device = operation.device_id ? devices.get(operation.device_id) : undefined;
+        const vault = vaults.get(operation.vault_id);
         return (
-          operation.operation_type === 'device_push' &&
-          operation.status === 'committed' &&
-          operation.device_id !== null &&
-          typeof operation.target_commit === 'string'
+          operation.operation_type === 'device_push' && operation.status === 'committed' &&
+          operation.device_id !== null && typeof operation.target_commit === 'string' &&
+          device?.device_ref_head === operation.target_commit && device.status !== 'revoked' &&
+          device.status !== 'review_needed' && device.status !== 'blocked_recovery' &&
+          vault?.status === 'active' && !hasDurableDeletionRecord(db, operation.vault_id)
         );
       })
       .sort((left, right) => left.created_at.localeCompare(right.created_at) || left.operation_id.localeCompare(right.operation_id));
@@ -376,7 +385,7 @@ export class SyncService {
         this.log.emit('info', 'push_integrated', {
           vault_id: vault.vault_id, device_id: device.device_id, ...pushLogFields(result), ...latency, duration_ms: Date.now() - started
         });
-      });
+      }, true);
     }
   }
 
@@ -417,28 +426,37 @@ export class SyncService {
     }
     return await this.withVaultLock(auth.vault.vault_id, async () => {
       let operationId: string | null = null;
+      let primaryFailure: unknown;
       try {
         const attemptHash = manifest.attempt_id
           ? sha256Hex(Buffer.from(stableJson({ manifest, transport: staged ? 'chunk' : 'direct' })))
           : null;
-        const operation = await this.store.mutate((db) => {
+        const operation = await this.store.mutate(async (db) => {
           const device = requireDevice(db, auth.device.device_id);
           if (attemptHash) {
-            const prior = db.sync_operations.find((candidate) =>
-              candidate.vault_id === auth.vault.vault_id && candidate.device_id === device.device_id &&
-              candidate.operation_type === 'device_push' && candidate.prepared_manifest?.attempt_id === manifest.attempt_id
-            );
+            const archivedAttempt = await this.store.findArchivedAttempt(auth.vault.vault_id, device.device_id, manifest.attempt_id!);
+            const hotAttempt = db.sync_operations
+              .filter((candidate) => candidate.vault_id === auth.vault.vault_id && candidate.device_id === device.device_id &&
+                candidate.operation_type === 'device_push' && candidate.prepared_manifest?.attempt_id === manifest.attempt_id)
+              .map((row) => ({ row, sequence: row.operation_sequence ?? Number.MAX_SAFE_INTEGER }));
+            const attemptsById = new Map([...hotAttempt, ...(archivedAttempt ? [archivedAttempt] : [])]
+              .map((item) => [item.row.operation_id, item]));
+            const prior = [...attemptsById.values()]
+              .sort((left, right) => left.sequence - right.sequence || left.row.operation_id.localeCompare(right.row.operation_id))[0]?.row;
             if (prior && prior.prepared_manifest?.attempt_hash !== attemptHash) {
               throw new AuthError(409, 'attempt_mismatch', 'Upload attempt does not match its original request.');
             }
           }
-          const priorAdmissions = db.sync_operations.filter((candidate) =>
-            candidate.vault_id === auth.vault.vault_id && candidate.device_id === device.device_id &&
-            candidate.operation_type === 'device_push' && candidate.target_commit === manifest.target_commit
-          );
-          // Once a legacy admission is retried, prefer its newly bound operation.
-          const admitted = priorAdmissions.find((candidate) => candidate.proposal_base !== undefined) ??
-            priorAdmissions.find((candidate) => candidate.status === 'prepared' || candidate.status === 'committed');
+          const hotAdmissions = db.sync_operations
+            .filter((candidate) => candidate.vault_id === auth.vault.vault_id && candidate.device_id === device.device_id &&
+              candidate.operation_type === 'device_push' && candidate.target_commit === manifest.target_commit)
+            .map((row) => ({ row, sequence: row.operation_sequence ?? Number.MAX_SAFE_INTEGER }));
+          const archivedAdmissions = await this.store.findArchivedTargetCandidates(auth.vault.vault_id, device.device_id, manifest.target_commit);
+          const admissionsById = new Map([...hotAdmissions, ...archivedAdmissions].map((item) => [item.row.operation_id, item]));
+          const priorAdmissions = [...admissionsById.values()].sort((left, right) =>
+            left.sequence - right.sequence || left.row.operation_id.localeCompare(right.row.operation_id));
+          const admitted = priorAdmissions.find((candidate) => candidate.row.proposal_base !== undefined)?.row ??
+            priorAdmissions.find((candidate) => candidate.row.status === 'prepared' || candidate.row.status === 'committed')?.row;
           if (admitted?.proposal_base !== undefined &&
               (admitted.prepared_manifest?.requested_base_commit ?? admitted.proposal_base) !== (manifest.base_commit ?? null)) {
             throw new AuthError(409, 'proposal_base_mismatch', 'Proposal base does not match its original admission.');
@@ -635,11 +653,18 @@ export class SyncService {
         const mappedError = error instanceof GitDurabilityError
           ? new AuthError(503, 'transfer_unavailable', 'Transfer storage is unavailable.')
           : error;
+        primaryFailure = mappedError;
         if (operationId) {
           const reason = mappedError instanceof AuthError ? mappedError.code : mappedError instanceof GitCommandError ? 'server_git_error' : 'unexpected_error';
           await this.abortOperation(operationId, reason);
         }
         throw mappedError;
+      } finally {
+        try {
+          await this.store.archiveCompletedHistory(auth.vault.vault_id, async (row, db) => await this.isPendingMergeRow(auth.vault.vault_id, row, db));
+        } catch (archiveError) {
+          if (primaryFailure === undefined) throw archiveError;
+        }
       }
     });
   }
@@ -1007,7 +1032,7 @@ export class SyncService {
         };
         operation.updated_at = nowIso();
       });
-    });
+    }, true);
     return await this.getConflictReviewPackage(input.vaultId, input.conflictId);
   }
 
@@ -1281,7 +1306,7 @@ export class SyncService {
         event_seq: eventSeq,
         idempotent: false
       };
-    });
+    }, true);
   }
 
   private async finishExistingDeviceCommit(
@@ -2989,12 +3014,22 @@ export class SyncService {
     return { status: 'rejected', code, message };
   }
 
+  private async isPendingMergeRow(vaultId: string, row: SyncOperationRow, db: MetadataDb): Promise<boolean> {
+    if (row.operation_type !== 'device_push' || row.status !== 'committed' || !row.device_id || !row.target_commit) return false;
+    const device = db.devices.find((candidate) => candidate.vault_id === vaultId && candidate.device_id === row.device_id);
+    if (!device || device.device_ref_head !== row.target_commit || device.status === 'revoked' ||
+        device.status === 'review_needed' || device.status === 'blocked_recovery') return false;
+    const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
+    if (!vault) return false;
+    return !(await this.git.isAncestor(vaultId, row.target_commit, vault.current_main));
+  }
+
   private isGitDurabilityUnavailable(): boolean {
     const checker = (this.git as unknown as { isDurabilityUnavailable?: () => boolean }).isDurabilityUnavailable;
     return checker?.call(this.git) ?? false;
   }
 
-  private async withVaultLock<T>(vaultId: string, fn: () => Promise<T>): Promise<T> {
+  private async withVaultLock<T>(vaultId: string, fn: () => Promise<T>, archiveAfter = false): Promise<T> {
     const previous = this.locks.get(vaultId) ?? Promise.resolve();
     let release!: () => void;
     const next = new Promise<void>((resolve) => {
@@ -3003,8 +3038,25 @@ export class SyncService {
     const chained = previous.then(() => next);
     this.locks.set(vaultId, chained);
     await previous;
+    let primaryFailure: unknown;
+    const operation = async () => {
+      try {
+        return await fn();
+      } catch (error) {
+        primaryFailure = error;
+        throw error;
+      } finally {
+        if (archiveAfter) {
+          try {
+            await this.store.archiveCompletedHistory(vaultId, async (row, db) => await this.isPendingMergeRow(vaultId, row, db));
+          } catch (error) {
+            if (primaryFailure === undefined) throw error;
+          }
+        }
+      }
+    };
     try {
-      return await (this.lifecycle ? this.lifecycle.withAdmission(vaultId, fn) : fn());
+      return await (this.lifecycle ? this.lifecycle.withAdmission(vaultId, operation) : operation());
     } finally {
       release();
       if (this.locks.get(vaultId) === chained) {

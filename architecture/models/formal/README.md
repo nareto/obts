@@ -186,6 +186,20 @@ The pilot does not cover directories, multiple paths, write concurrency, editor-
 
 The bounded companion uses two competing actors and at most two launches. It covers process-lock ownership surviving supervisor death, descendants retaining ownership after leader exit, explicit owned-process-group termination before lock release/relaunch, generation-bound stale-marker reconciliation after a replacement launch, same-generation contention, unknown-marker preservation, delayed old-owner cleanup against a replacement marker, and truthful catch-up reporting. Its status projection distinguishes progressing work from blocked preserved edits, constrains guidance to fixed redacted category/action values, and requires no active apply lock after the maintenance failure is published. The model deliberately does not claim preservation of general ref/queue/evidence publication histories; that remains an executable-test obligation. Mandatory mutants challenge duplicate owners, same-generation reclamation, deleting a replacement marker, unknown-marker reclamation, supervisor-death release, leader reaping while a descendant remains, report mutation, and duplicate events. It abstracts Linux group signaling and flock implementation; executable process tests must establish containment, lock release, and descriptor/inode behavior. Supported managed commands must not daemonize or escape their process group. No cross-host/network-filesystem or external-writer guarantees are modeled.
 
+## OBTS-FM-015: Durable Operation-History Handoff
+
+| Field | Value |
+| --- | --- |
+| Status | Focused bounded model |
+| Architecture revision | 52 |
+| Refined contracts | `OBTS-PER-HIST-001`, `OBTS-PER-OP-001`, `OBTS-SYNC-IMM-001`, `OBTS-PER-DEL-001` |
+| Specification / configuration | `OBTSOperationHistory.tla`, `OBTSOperationHistory.cfg`, nine negative-control and nine reachability configs |
+| Executable check | `npm run test:formal:operation-history` |
+
+The two-row bounded model carries complete symbolic operation payloads: distinct attempt hashes, absent versus explicit-null bases, rename and directory evidence, outcome/status, and stable sequence. It checks earliest attempt binding across hot/cold placement, bound-base preference, descriptor-first transfer, parent/target generation recovery, pending-merge hot ownership until settlement, schema initialization with all rows hot, missing/foreign/ahead/behind/source-mismatched restore behavior, verified-only lookup/archive admission, and deletion erasure. Nine required controls violate exact evidence preservation, earliest binding, restore/source fail-closed behavior, no-resurrection, or verified admission/lookup. Nine reachability checks cover initialization, both interrupted-handoff recovery branches, foreign/missing/ahead/behind restore blocks, and deletion.
+
+Latest bounded TLC evidence (TLC 2.19, one worker): positive 283 generated / 178 distinct / depth 13; every negative control produced its required counterexample; all nine reachability witnesses were reached. This is design evidence only. It does not prove SQLite/fsync/canonical-JSON correctness, owner lifetime, filesystem barriers, backup behavior, or implementation conformance; these remain executable fault-injection and integration obligations.
+
 ## OBTS-FM-012: Bridge Write Admission
 
 | Field | Value |

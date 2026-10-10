@@ -25,6 +25,8 @@ type ParsedArgs = {
   options: Record<string, string | boolean>;
 };
 
+const HISTORY_EXPORT_UNAVAILABLE = 'obts: history export unavailable; verify complete persistent state and storage access with the server stopped.\n';
+
 const HELP = `obts CLI
 
 Usage:
@@ -34,6 +36,7 @@ Usage:
   obts vault create --username USER (--password PASSWORD | --password-env ENV) --display-name NAME [--json]
   obts devices list --username USER (--password PASSWORD | --password-env ENV) --vault-id ID [--json]
   obts conflicts list --username USER (--password PASSWORD | --password-env ENV) --vault-id ID [--status open|resolved|all] [--json]
+  obts history export --vault-id ID
   obts integrity repair --vault-id ID [--json]
   obts admin-recovery create-reset-token --username USER [--enable-user] [--json]
   obts admin-recovery create-admin --username USER (--password PASSWORD | --password-env ENV) [--display-name NAME] [--json]
@@ -72,8 +75,15 @@ export async function runCli(
     return 0;
   }
 
+  const historyExport = command === 'history' && subcommand === 'export';
   let server: ObtsServer | null = null;
   try {
+    if (historyExport) {
+      if (parsed.positionals.length !== 2 || Object.keys(parsed.options).some((name) => name !== 'vault-id')) {
+        throw new CliUsageError('history export accepts only --vault-id ID.');
+      }
+      requiredString(parsed, 'vault-id');
+    }
     const log = command === 'serve' ? new OperationalLog(parseLogLevel(env.OBTS_LOG_LEVEL), io === DEFAULT_IO ? operationalStdout : io.stdout) : undefined;
     server = await createObtsServer(configFromEnv(env), log ? { operationalLog: log } : {});
     if (command === 'serve') {
@@ -206,6 +216,14 @@ export async function runCli(
       return 0;
     }
 
+    if (command === 'history' && subcommand === 'export') {
+      const vaultId = requiredString(parsed, 'vault-id');
+      const db = await server.store.snapshot();
+      if (!db.vaults.some((vault) => vault.vault_id === vaultId)) throw new CliUsageError('vault does not exist.');
+      io.stdout(`${JSON.stringify({ vault_id: vaultId, operations: await server.store.exportOperationHistory(vaultId) }, null, 2)}\n`);
+      return 0;
+    }
+
     if (command === 'integrity' && subcommand === 'repair') {
       const vaultId = requiredString(parsed, 'vault-id');
       await repairVaultIntegrity(server.store, server.git, vaultId);
@@ -329,6 +347,10 @@ export async function runCli(
       io.stderr(`${error.message}\n\n${HELP}`);
       return 2;
     }
+    if (historyExport) {
+      io.stderr(HISTORY_EXPORT_UNAVAILABLE);
+      return 1;
+    }
     const message = error instanceof Error ? error.message : 'Unknown error';
     io.stderr(`obts: ${message}\n`);
     const cause = error instanceof Error ? error.cause : undefined;
@@ -338,7 +360,13 @@ export async function runCli(
     return 1;
   } finally {
     if (server && command !== 'serve') {
-      await server.app.close();
+      try {
+        await server.app.close();
+      } catch (error) {
+        if (!historyExport) throw error;
+        io.stderr(HISTORY_EXPORT_UNAVAILABLE);
+        return 1;
+      }
     }
   }
 }

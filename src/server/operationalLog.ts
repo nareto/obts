@@ -14,7 +14,7 @@ const MAX_STACK_CHARS = 8 * 90 + 7;
 export const STARTUP_PHASES = [
   'metadata_initialized', 'deletions_reconciled', 'receipts_expired', 'root_commits_populated',
   'operations_reconciled', 'conflict_refs_protected', 'integrity_scanned', 'diagnostics_initialized',
-  'transfers_initialized', 'pending_jobs_started', 'pending_merges_resumed'
+  'operation_history_compacted', 'transfers_initialized', 'pending_jobs_started', 'pending_merges_resumed'
 ] as const;
 export type StartupPhase = typeof STARTUP_PHASES[number];
 export const BACKGROUND_TASKS = [

@@ -41,7 +41,7 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
         chunkTransferService = component "Chunk transfer service" "Persists bounded Git chunks and transfer descriptors, returns prompt asynchronous acceptance, and retries internal processing failures with durable bounded backoff across restarts." "TypeScript"
         syncService = component "Sync service" "Validates proposals and serializes each vault's integration. Ref movement changes merge classification rather than acceptance of valid uploaded bytes." "TypeScript"
         gitService = component "Git service" "Uses batched tree inspection and object-level merge operations for refs, validation, merge, history, and conflict retention." "Native Git"
-        metadataStoreService = component "Metadata store" "Atomically persists users, vaults, devices, operations, transfer-independent proposal outcomes, events, and conflicts." "TypeScript"
+        metadataStoreService = component "Metadata store" "Atomically persists hot JSON metadata and coordinates lossless, generation-acknowledged handoffs to authoritative indexed operation-history ledgers." "TypeScript, node:sqlite"
         diagnosticService = component "Diagnostic service" "Accepts and retains opt-in redacted client diagnostics." "TypeScript"
         deletionCoordinator = component "Vault deletion coordinator" "Closes per-vault admissions, durably publishes deletion intent and revocation, drains detached work, erases attributable server material, and retries completion/receipt publication." "TypeScript"
         dashboardHost = component "Dashboard host" "Serves the built SPA and dashboard APIs, including owner-scoped sync settings preview and save." "Fastify"
@@ -53,7 +53,7 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
       bridgeProjection = container "Bridge PostgreSQL state" "Paginated metadata, ACL/search/graph/Base/revision/OID projection rows and bounded worker cursors, plus retained non-reconstructable access and audit history; never the raw-body source of truth." "PostgreSQL, pgvector" "Database"
       localVault = container "Visible vault" "User-controlled Obsidian files. The filesystem is the device source of truth." "Obsidian Vault API, filesystem" "File System"
       localStore = container ".obts local store" "Local Git journal, immutable upload journal, durable watcher paths, scan cache/watermark, causal directory and baseline-repair state, apply journal, credentials, and recovery bundles. Excluded from synchronization." "Filesystem" "File System"
-      metadataStore = container "Metadata store" "Durable JSON metadata for accounts, devices, operations, events, conflicts, and directory proposal outcomes." "JSON file adapter" "Database"
+      metadataStore = container "Metadata store" "Hot JSON for accounts, devices, live operations, handoff descriptors, events, conflicts, and directory outcomes; per-vault SQLite ledgers own acknowledged historical operation payloads, indexes, and aggregates." "Atomic JSON files, SQLite rollback-journal ledgers" "Database"
       gitStore = container "Vault Git stores" "Bare repositories containing canonical main, protected device refs, conflict refs, and immutable Git objects." "Native Git bare repositories" "File System"
       transferStore = container "Transfer quarantine" "Durable resumable transfer sessions and validated staged Git objects, including processing and terminal outcomes." "Filesystem, temporary bare Git repositories" "File System"
       mergeWorkspace = container "Semantic merge workspace" "Transaction-scoped plaintext materialization used only for overlapping content requiring semantic validation." "Temporary filesystem" "File System"
@@ -155,11 +155,11 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
         "write-surface" ".obts/"
       }
     }
-    obts.server -> obts.metadataStore "Reads and atomically replaces application metadata" "Filesystem" {
+    obts.server -> obts.metadataStore "Atomically publishes hot metadata and transactionally archives acknowledged operation history" "Filesystem, SQLite" {
       properties {
         "ops" "read,write"
         "protocol" "filesystem"
-        "data" "accounts, devices, operations, events, conflicts, directory state"
+        "data" "accounts, devices, live operations, handoff proofs, historical operations, events, conflicts, directory state"
       }
     }
     obts.server -> obts.gitStore "Validates objects and maintains canonical, device, and conflict refs" "Git object and ref operations" {
@@ -323,7 +323,7 @@ workspace "Obsidian True Sync (obts)" "Implementation-derived architecture for t
         "protocol" "filesystem"
       }
     }
-    obts.server.metadataStoreService -> obts.metadataStore "Atomically reads and replaces durable metadata" "Filesystem" {
+    obts.server.metadataStoreService -> obts.metadataStore "Coordinates atomic JSON publication, durable indexed history transactions, and generation recovery" "Filesystem, SQLite" {
       properties {
         "ops" "read,write"
         "protocol" "filesystem"

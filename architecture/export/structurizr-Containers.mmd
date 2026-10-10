@@ -18,7 +18,7 @@ graph LR
       38[("Bridge PostgreSQL state [Container: PostgreSQL, pgvector]")]
       39["Visible vault [Container: Obsidian Vault API, filesystem]"]
       40[".obts local store [Container: Filesystem]"]
-      41[("Metadata store [Container: JSON file adapter]")]
+      41[("Metadata store [Container: Atomic JSON files, SQLite rollback-journal ledgers]")]
       42["Vault Git stores [Container: Native Git bare repositories]"]
       43["Transfer quarantine [Container: Filesystem, temporary bare Git repositories]"]
       44["Semantic merge workspace [Container: Temporary filesystem]"]
@@ -40,7 +40,7 @@ graph LR
     36-. "Pairs and synchronizes as a normal protected OBTS device [HTTPS]" .->25
     7-. "Scans and safely applies visible vault content [Obsidian Vault API]" .->39
     7-. "Persists local journal, immutable upload identity, credentials, cursors, and recovery evidence [Filesystem]" .->40
-    25-. "Reads and atomically replaces application metadata [Filesystem]" .->41
+    25-. "Atomically publishes hot metadata and transactionally archives acknowledged operation history [Filesystem, SQLite]" .->41
     25-. "Validates objects and maintains canonical, device, and conflict refs [Git object and ref operations]" .->42
     25-. "Persists resumable chunks, staged objects, and asynchronous terminal results [Filesystem]" .->43
     25-. "Materializes only overlapping candidates requiring semantic validation [Filesystem]" .->44

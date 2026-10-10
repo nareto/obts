@@ -1,72 +1,110 @@
-import { fork } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createObtsServer, type ObtsServer } from '../src/server/app.js';
 import { ObtsPluginClient } from '../src/client/core.js';
-import { mobileHarness, click, waitUntil } from './helpers/mobileOnboardingHarness.js';
+import { mobileHarness as createMobileHarness, click, waitUntil } from './helpers/mobileOnboardingHarness.js';
+import { MobileRestartLifecycle } from './helpers/mobileRestartLifecycle.js';
 
-type Harness = Awaited<ReturnType<typeof mobileHarness>>;
-let root: string, url: string, server: ObtsServer, vaultId: string, cookie: string, csrf: string;
-const harnesses: Harness[] = [];
-async function post(path: string, body: unknown, authenticated = true) {
-  const response = await fetch(`${url}${path}`, { method: 'POST', headers: { 'content-type': 'application/json', ...(authenticated ? { cookie, 'x-obts-csrf': csrf } : {}) }, body: JSON.stringify(body) });
-  const json: any = await response.json();
-  if (!response.ok) throw new Error(`Test request ${path}: ${response.status}`);
-  if (!authenticated) { cookie = response.headers.getSetCookie().map(value => value.split(';')[0]).join('; '); csrf = json.csrf_token; }
-  return json;
-}
-async function seed() {
-  const desktopRoot = join(root, 'desktop');
-  const desktop = new ObtsPluginClient(desktopRoot, { serverUrl: url, deviceName: 'desktop' });
-  const connection = await desktop.startOnboarding('Desktop');
-  await post(`/api/v1/connections/${connection.connection_id}/approve`, { selection: 'existing_vault', vault_id: vaultId });
-  const analysis = await desktop.analyzeOnboarding(connection.connection_id, connection.connection_secret);
-  await desktop.finishOnboarding({ connectionId: connection.connection_id, secret: connection.connection_secret, analysis, mode: 'use_server' });
-  await writeFile(join(desktopRoot, 'note.md'), 'server bytes\n');
-  await mkdir(join(desktopRoot, 'empty'));
-  await desktop.syncOnce();
-  return { desktop, desktopRoot };
-}
-async function prepared() {
-  const phoneRoot = join(root, 'phone');
-  await mkdir(phoneRoot);
-  await writeFile(join(phoneRoot, 'note.md'), 'local recovery bytes\n');
-  const h = await mobileHarness(phoneRoot, url); harnesses.push(h);
-  const connection = await h.plugin.runExclusiveAction(() => h.core.startOnboarding('Phone', 'use_server'));
-  await post(`/api/v1/connections/${connection.connection_id}/approve`, { selection: 'existing_vault', vault_id: vaultId });
-  await h.plugin.runExclusiveAction(() => h.core.prepareReplacementOnboarding(connection.connection_id, connection.connection_secret));
-  return { h, phoneRoot, connection };
-}
-beforeEach(async () => {
-  await mkdir('tmp/mobile-restart', { recursive: true });
-  root = await mkdtemp(join(process.cwd(), 'tmp/mobile-restart/run-'));
-  server = await createObtsServer({ dataDir: join(root, 'server'), publicBaseUrl: 'http://127.0.0.1:0', sessionSecret: 'synthetic-session-secret-for-restart-tests' });
-  url = await server.app.listen({ port: 0, host: '127.0.0.1' });
-  await post('/api/v1/setup', { username: 'owner', password: 'synthetic-test-password-1234', display_name: 'Owner' }, false);
-  vaultId = (await post('/api/v1/vaults', { display_name: 'Recovery vault' })).vault_id;
-});
-afterEach(async () => {
-  for (const h of harnesses.splice(0)) h.dispose();
-  await server.app.close();
-  await rm(root, { recursive: true, force: true });
-});
-
-async function child(root: string, boundary: string) {
-  const processChild = fork('tests/fixtures/onboarding-crash-child.mjs', [root, url, boundary], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
-  let stderr = '';
-  processChild.stderr?.on('data', data => { stderr += String(data).slice(0, 4096); });
-  const exit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(resolve => processChild.once('exit', (code, signal) => resolve({ code, signal })));
-  const message = await new Promise<any>((resolve, reject) => {
-    const timer = setTimeout(() => { processChild.kill('SIGKILL'); reject(new Error('Child boundary timeout')); }, 25000);
-    processChild.once('message', message => { clearTimeout(timer); resolve(message); });
-    processChild.once('exit', code => { clearTimeout(timer); if (code !== null && code !== 0) reject(new Error(`Child failed: ${stderr}`)); });
+type Harness = Awaited<ReturnType<typeof createMobileHarness>>;
+class MobileFixture {
+  readonly lifecycle = new MobileRestartLifecycle();
+  root!: string;
+  url!: string;
+  server!: ObtsServer;
+  vaultId!: string;
+  cookie = '';
+  csrf = '';
+  readonly harnesses: Harness[] = [];
+  post = async (path: string, body: unknown, authenticated = true) => {
+    this.lifecycle.assertOpen();
+    const { url, cookie, csrf } = this;
+    const response = await fetch(`${url}${path}`, { method: 'POST', headers: { 'content-type': 'application/json', ...(authenticated ? { cookie, 'x-obts-csrf': csrf } : {}) }, body: JSON.stringify(body) });
+    const json: any = await response.json();
+    if (!response.ok) throw new Error(`Test request ${path}: ${response.status}`);
+    if (!authenticated) { this.cookie = response.headers.getSetCookie().map(value => value.split(';')[0]).join('; '); this.csrf = json.csrf_token; }
+    return json;
+  }
+  seed = async () => {
+    this.lifecycle.mark('desktop preparation');
+    const { root, url, post, vaultId } = this;
+    const desktopRoot = join(root, 'desktop');
+    const desktop = new ObtsPluginClient(desktopRoot, { serverUrl: url, deviceName: 'desktop' });
+    const connection = await desktop.startOnboarding('Desktop');
+    await post(`/api/v1/connections/${connection.connection_id}/approve`, { selection: 'existing_vault', vault_id: vaultId });
+    const analysis = await desktop.analyzeOnboarding(connection.connection_id, connection.connection_secret);
+    await desktop.finishOnboarding({ connectionId: connection.connection_id, secret: connection.connection_secret, analysis, mode: 'use_server' });
+    await writeFile(join(desktopRoot, 'note.md'), 'server bytes\n');
+    await mkdir(join(desktopRoot, 'empty'));
+    await desktop.syncOnce();
+    return { desktop, desktopRoot };
+  }
+  prepared = async () => {
+    this.lifecycle.mark('phone preparation');
+    const { root, url, mobileHarness, post, vaultId } = this;
+    const phoneRoot = join(root, 'phone');
+    await mkdir(phoneRoot);
+    await writeFile(join(phoneRoot, 'note.md'), 'local recovery bytes\n');
+    const h = await mobileHarness(phoneRoot, url);
+    const connection = await h.plugin.runExclusiveAction(() => h.core.startOnboarding('Phone', 'use_server'));
+    await post(`/api/v1/connections/${connection.connection_id}/approve`, { selection: 'existing_vault', vault_id: vaultId });
+    await h.plugin.runExclusiveAction(() => h.core.prepareReplacementOnboarding(connection.connection_id, connection.connection_secret));
+    return { h, phoneRoot, connection };
+  }
+  mobileHarness = async (root: string, url: string) => this.lifecycle.run('harness creation', async () => {
+    const h = await createMobileHarness(root, url, {
+      request: (_request, send) => this.lifecycle.run('harness request', send)
+    });
+    this.harnesses.push(h);
+    if (this.lifecycle.closing) { h.dispose(); this.lifecycle.assertOpen(); }
+    this.lifecycle.ownMethods(h.plugin, ['runExclusiveAction'], 'plugin');
+    this.lifecycle.ownMethods(h.core.fsp, Object.keys(h.core.fsp).filter(name => typeof h.core.fsp[name] === 'function'), 'filesystem');
+    const open = h.open.bind(h);
+    h.open = () => this.lifecycle.run('modal open', async () => {
+      const modal = await open();
+      this.lifecycle.ownMethods(modal, ['runOnboardingCompletion'], 'modal', { detached: true });
+      return modal;
+    });
+    return h;
   });
-  if (message.boundary) processChild.kill('SIGKILL');
-  const result = await exit;
-  if (message.failed) throw new Error(`Child failed: ${message.failed}`);
-  return { message, ...result };
+  setup = async () => {
+    await mkdir('tmp/mobile-restart', { recursive: true });
+    this.root = await mkdtemp(join(process.cwd(), 'tmp/mobile-restart/run-'));
+    this.server = await createObtsServer({ dataDir: join(this.root, 'server'), publicBaseUrl: 'http://127.0.0.1:0', sessionSecret: 'synthetic-session-secret-for-restart-tests' });
+    this.url = await this.server.app.listen({ port: 0, host: '127.0.0.1' });
+    await this.post('/api/v1/setup', { username: 'owner', password: 'synthetic-test-password-1234', display_name: 'Owner' }, false);
+    this.vaultId = (await this.post('/api/v1/vaults', { display_name: 'Recovery vault' })).vault_id;
+  };
+  child = async (root: string, boundary: string) => {
+    this.lifecycle.mark(`child:${boundary}`);
+    const result = await this.lifecycle.child('tests/fixtures/onboarding-crash-child.mjs', [root, this.url, boundary]);
+    this.lifecycle.mark(`verify:${boundary}`);
+    return result;
+  };
+}
+let active: MobileFixture;
+beforeEach(async () => {
+  const fixture = active = new MobileFixture();
+  await fixture.lifecycle.run('setup', fixture.setup);
+});
+afterEach(async ({ task }) => {
+  const fixture = active;
+  if (task.result?.state === 'fail') console.error(`Mobile phase diagnostics: ${fixture.lifecycle.diagnostics()}`);
+  await fixture.lifecycle.close({
+    stop: () => { for (const h of fixture.harnesses) h.dispose(); },
+    finish: async () => {
+      for (const h of fixture.harnesses) h.dispose();
+      await fixture.server?.app.close();
+    },
+    remove: async () => { if (fixture.root) await rm(fixture.root, { recursive: true, force: true }); }
+  }).catch(error => { console.error(`Preserved mobile fixture: ${fixture.root}`); throw error; });
+});
+function owned<T extends unknown[]>(body: (fixture: MobileFixture, ...args: T) => Promise<void>) {
+  return (...args: T) => {
+    const fixture = active;
+    return fixture.lifecycle.run('test continuation', () => body(fixture, ...args));
+  };
 }
 async function verifyRecovery(phoneRoot: string) {
   const recoveryRoot = join(phoneRoot, '.obts/recovery');
@@ -86,21 +124,21 @@ async function verifyRecovery(phoneRoot: string) {
 }
 
 describe('packaged mobile onboarding recovery', () => {
-  it('keeps a missing credential blocked in the cold modal without starting another enrollment', async () => {
+  it('keeps a missing credential blocked in the cold modal without starting another enrollment', owned(async ({ url, prepared, mobileHarness }) => {
     const { h, phoneRoot } = await prepared();
     h.dispose();
     const journal = await readFile(join(phoneRoot, '.obts/onboarding.json'), 'utf8');
     await h.core.fsp.rm(h.core.pendingConnectionPath);
-    const restarted = await mobileHarness(phoneRoot, url); harnesses.push(restarted);
+    const restarted = await mobileHarness(phoneRoot, url);
     const modal = await restarted.open();
     expect(modal.contentEl.allText).toContain('credential');
     expect(modal.contentEl.allText).toContain('Preserve');
     expect(modal.contentEl.buttons.map((button: any) => button.text)).toEqual(['Close']);
     expect(restarted.requests.filter(path => path === '/api/v1/connections' || path.endsWith('/complete'))).toHaveLength(0);
     expect(await readFile(join(phoneRoot, '.obts/onboarding.json'), 'utf8')).toBe(journal);
-  });
+  }));
 
-  it.each(['approved', 'consumed'])('completes same enrollment while preserving later local edits: %s', async status => {
+  it.each(['approved', 'consumed'])('completes same enrollment while preserving later local edits: %s', owned(async ({ url, server, seed, prepared, mobileHarness }, status: string) => {
     await seed();
     const { h, phoneRoot, connection } = await prepared();
     const saved = await h.core.readPendingOnboarding();
@@ -108,7 +146,7 @@ describe('packaged mobile onboarding recovery', () => {
     await h.core.writeOnboardingJournal({ ...saved.journal, stage: 'blocked', selected_mode: 'use_server' });
     await writeFile(join(phoneRoot, 'note.md'), 'later local edit\n');
     h.dispose();
-    const restarted = await mobileHarness(phoneRoot, url); harnesses.push(restarted);
+    const restarted = await mobileHarness(phoneRoot, url);
     const modal = await restarted.open();
     await click(modal, 'Resume setup');
     await waitUntil(() => !modal.onboardingRunning);
@@ -119,9 +157,9 @@ describe('packaged mobile onboarding recovery', () => {
     expect(await restarted.core.readQueue()).toMatchObject({ status: 'queued_local', pending_commit: expect.any(String) });
     expect((await restarted.core.syncOnce()).status).toBe('Synced');
     expect(await readFile(join(phoneRoot, 'note.md'), 'utf8')).toBe('later local edit\n');
-  });
+  }));
 
-  it('completes setup and queues edits when the local snapshot keeps changing during baseline capture', async () => {
+  it('completes setup and queues edits when the local snapshot keeps changing during baseline capture', owned(async ({ seed, prepared }) => {
     await seed();
     const { h, phoneRoot } = await prepared();
     const originalReadFile = h.core.fsp.readFile.bind(h.core.fsp);
@@ -163,9 +201,9 @@ describe('packaged mobile onboarding recovery', () => {
     await h.plugin.runExclusiveAction(() => h.core.syncOnce());
     expect(await readFile(join(phoneRoot, 'note.md'), 'utf8')).toBe('edit 3 during baseline xxx\n');
     expect((await h.core.readState()).status_label).toBe('Synced');
-  });
+  }));
 
-  it.each(['apply', 'credential', 'proposal', 'identity'])('does not refresh initial consent after local publication: %s', async boundary => {
+  it.each(['apply', 'credential', 'proposal', 'identity'])('does not refresh initial consent after local publication: %s', owned(async ({ prepared }, boundary: string) => {
     const { h } = await prepared();
     const pending = await h.core.readPendingOnboarding();
     await h.core.writeOnboardingJournal({ ...pending.journal, selected_mode: 'use_server', ...(boundary === 'proposal' ? { proposal_commit: 'a'.repeat(40) } : {}) });
@@ -175,9 +213,9 @@ describe('packaged mobile onboarding recovery', () => {
     const original = await h.core.fsp.readFile(h.core.onboardingJournalPath, 'utf8');
     await expect(h.core.reviewOnboardingConsent()).rejects.toMatchObject({ code: 'onboarding_context_required' });
     expect(await h.core.fsp.readFile(h.core.onboardingJournalPath, 'utf8')).toBe(original);
-  });
+  }));
 
-  it('replays a completed merge receipt after activation expires proposal authorization', async () => {
+  it('replays a completed merge receipt after activation expires proposal authorization', owned(async ({ root, url, server, vaultId, post, seed }) => {
     await seed();
     const phoneRoot = join(root, 'phone'); await mkdir(phoneRoot);
     await writeFile(join(phoneRoot, 'extra.md'), 'merge local bytes\n');
@@ -200,8 +238,8 @@ describe('packaged mobile onboarding recovery', () => {
     expect((await complete({ ...request, expected_main: 'f'.repeat(40) })).status).toBe(409);
     expect((await server.store.snapshot()).events.length).toBe(db.events.length);
     expect((await server.store.snapshot()).devices).toHaveLength(2);
-  });
-  it('accepts N-1 enrollment payloads and binds consumed receipts and replay to the original mode and credential', async () => {
+  }));
+  it('accepts N-1 enrollment payloads and binds consumed receipts and replay to the original mode and credential', owned(async ({ url, server, vaultId, post }) => {
     const created = await fetch(`${url}/api/v1/connections`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
       plugin_version: '0.5.1', device_name: 'N-1 device', local_vault_name: 'N-1 vault', local_summary: { has_content: false, syncable_file_count: 0, syncable_bytes: 0, has_detached_baseline: false }
     }) });
@@ -224,14 +262,14 @@ describe('packaged mobile onboarding recovery', () => {
     expect((await fetch(`${url}/api/v1/connections/${connection.connection_id}`, { headers: { authorization: `Bearer ${connection.connection_secret}` } })).status).toBe(409);
     expect((await complete(request)).status).toBe(409);
     expect((await server.store.snapshot()).devices).toHaveLength(1);
-  });
+  }));
 
-  it('reopens the real modal after response loss with no retained analysis', async () => {
+  it('reopens the real modal after response loss with no retained analysis', owned(async ({ root, url, server, vaultId, post, seed, mobileHarness }) => {
     await seed();
     const phoneRoot = join(root, 'phone');
     await mkdir(phoneRoot);
     await writeFile(join(phoneRoot, 'note.md'), 'local recovery bytes\n');
-    const h = await mobileHarness(phoneRoot, url); harnesses.push(h);
+    const h = await mobileHarness(phoneRoot, url);
     const complete = h.core.completeConnection.bind(h.core);
     h.core.completeConnection = async (...args: any[]) => { await complete(...args); throw new h.plugin.constructor.TransportError(0, 'network_error', 'Synthetic lost response'); };
     const modal = await h.open();
@@ -248,7 +286,7 @@ describe('packaged mobile onboarding recovery', () => {
     await click(modal, 'Replace local contents');
     await waitUntil(() => modal.onboardingPaused);
     h.dispose();
-    const restarted = await mobileHarness(phoneRoot, url); harnesses.push(restarted);
+    const restarted = await mobileHarness(phoneRoot, url);
     const reopened = await restarted.open();
     expect(reopened.contentEl.buttons.some((button: any) => button.text === 'Resume setup')).toBe(true);
     await click(reopened, 'Resume setup');
@@ -257,16 +295,16 @@ describe('packaged mobile onboarding recovery', () => {
     expect((await server.store.snapshot()).devices).toHaveLength(2);
     expect(await readFile(join(phoneRoot, 'note.md'), 'utf8')).toBe('server bytes\n');
     await verifyRecovery(phoneRoot);
-  });
+  }));
 
-  it.each(['approved', 'consumed'])('migrates a historical null-analysis early-replacement journal: %s', async status => {
+  it.each(['approved', 'consumed'])('migrates a historical null-analysis early-replacement journal: %s', owned(async ({ url, server, seed, prepared, mobileHarness }, status: string) => {
     await seed();
     const { h, phoneRoot, connection } = await prepared();
     const saved = await h.core.readPendingOnboarding();
     if (status === 'consumed') await h.core.completeConnection(connection.connection_id, connection.connection_secret, { mode: 'use_server', expected_main: saved.journal.analysis.expectedMain });
     await h.core.writeOnboardingJournal({ ...saved.journal, analysis: null, selected_mode: 'use_server', stage: 'blocked', last_error_code: 'onboarding_failed' });
     h.dispose();
-    const restarted = await mobileHarness(phoneRoot, url); harnesses.push(restarted);
+    const restarted = await mobileHarness(phoneRoot, url);
     const modal = await restarted.open();
     await click(modal, 'Resume setup');
     await waitUntil(() => !modal.onboardingRunning);
@@ -274,9 +312,9 @@ describe('packaged mobile onboarding recovery', () => {
     expect((await server.store.snapshot()).devices).toHaveLength(2);
     expect(await readFile(join(phoneRoot, 'note.md'), 'utf8')).toBe('server bytes\n');
     await verifyRecovery(phoneRoot);
-  });
+  }));
 
-  it.each(['missing-consent', 'mode', 'vault', 'revoked'])('preserves historical state when migration is unsafe: %s', async fault => {
+  it.each(['missing-consent', 'mode', 'vault', 'revoked'])('preserves historical state when migration is unsafe: %s', owned(async ({ url, server, seed, prepared, mobileHarness }, fault: string) => {
     await seed();
     const { h, phoneRoot, connection } = await prepared();
     const saved = await h.core.readPendingOnboarding();
@@ -291,7 +329,7 @@ describe('packaged mobile onboarding recovery', () => {
     if (fault === 'vault') await h.core.writeState({ ...await h.core.readState(), vault_id: 'other-vault', device_id: 'other-device' });
     await h.core.writeOnboardingJournal({ ...saved.journal, analysis: null, selected_mode: 'use_server', stage: 'blocked', ...(fault === 'missing-consent' ? { pending_summary: null } : {}) });
     h.dispose();
-    const restarted = await mobileHarness(phoneRoot, url); harnesses.push(restarted);
+    const restarted = await mobileHarness(phoneRoot, url);
     const modal = await restarted.open();
     await click(modal, 'Resume setup');
     await waitUntil(() => !modal.onboardingRunning);
@@ -299,16 +337,16 @@ describe('packaged mobile onboarding recovery', () => {
     expect(await readFile(join(phoneRoot, 'note.md'), 'utf8')).toBe('local recovery bytes\n');
     expect(await restarted.core.readPendingOnboarding()).not.toBeNull();
     expect(restarted.requests.filter(path => path.endsWith('/sync/pull-chunk'))).toHaveLength(0);
-  });
+  }));
 
-  it('completes a historical replacement resume and queues edits made after saved consent', async () => {
+  it('completes a historical replacement resume and queues edits made after saved consent', owned(async ({ url, server, seed, prepared, mobileHarness }) => {
     await seed();
     const { h, phoneRoot } = await prepared();
     const saved = await h.core.readPendingOnboarding();
     await writeFile(join(phoneRoot, 'note.md'), 'later local edit\n');
     await h.core.writeOnboardingJournal({ ...saved.journal, analysis: null, selected_mode: 'use_server', stage: 'blocked', last_error_code: 'onboarding_failed' });
     h.dispose();
-    const restarted = await mobileHarness(phoneRoot, url); harnesses.push(restarted);
+    const restarted = await mobileHarness(phoneRoot, url);
     const modal = await restarted.open();
     await click(modal, 'Resume setup');
     await waitUntil(() => !modal.onboardingRunning);
@@ -317,9 +355,9 @@ describe('packaged mobile onboarding recovery', () => {
     expect(await restarted.core.readQueue()).toMatchObject({ status: 'queued_local', pending_commit: expect.any(String) });
     expect(await restarted.core.readPendingOnboarding()).toBeNull();
     expect((await server.store.snapshot()).devices).toHaveLength(2);
-  });
+  }));
 
-  it.each(['checkpoint', 'pending-ack'])('settles %s before catching up to an advanced main', async boundary => {
+  it.each(['checkpoint', 'pending-ack'])('settles %s before catching up to an advanced main', owned(async ({ url, server, seed, prepared, mobileHarness }, boundary: string) => {
     const { desktop, desktopRoot } = await seed();
     const { h, phoneRoot } = await prepared();
     if (boundary === 'checkpoint') {
@@ -337,7 +375,7 @@ describe('packaged mobile onboarding recovery', () => {
     h.dispose();
     await writeFile(join(desktopRoot, 'note.md'), 'advanced server bytes\n');
     await desktop.syncOnce();
-    const restarted = await mobileHarness(phoneRoot, url); harnesses.push(restarted);
+    const restarted = await mobileHarness(phoneRoot, url);
     const targets: string[] = [];
     const summaries: any[] = [];
     const apply = restarted.core.applyTargetMain.bind(restarted.core);
@@ -357,9 +395,9 @@ describe('packaged mobile onboarding recovery', () => {
     expect(ackIndex).toBeLessThan(pullIndex);
     expect(restarted.requests.filter(path => path.endsWith('/sync/pull-chunk'))).toHaveLength(1);
     expect(await readFile(join(phoneRoot, 'note.md'), 'utf8')).toBe('advanced server bytes\n');
-  });
+  }));
 
-  it('keeps lease ownership while unloading an active modal operation', async () => {
+  it('keeps lease ownership while unloading an active modal operation', owned(async ({ url, server, seed, prepared, mobileHarness }) => {
     await seed();
     const { h, phoneRoot } = await prepared();
     let entered = false;
@@ -379,14 +417,14 @@ describe('packaged mobile onboarding recovery', () => {
     expect(h.plugin.operationAvailability()).toBe('available');
     expect(modal.contentEl.allText).not.toContain('Sync is ready');
     h.dispose();
-    const restarted = await mobileHarness(phoneRoot, url); harnesses.push(restarted);
+    const restarted = await mobileHarness(phoneRoot, url);
     expect(await restarted.core.readPendingOnboarding()).toBeNull();
     await restarted.plugin.runExclusiveAction(() => restarted.core.syncOnce());
     expect((await restarted.core.readState()).status_label).toBe('Synced');
     expect((await server.store.snapshot()).devices).toHaveLength(2);
-  });
+  }));
 
-  it.each(['foreground-first', 'rejection-first'])('serializes manual and automatic retry: %s', async order => {
+  it.each(['foreground-first', 'rejection-first'])('serializes manual and automatic retry: %s', owned(async ({ prepared }, order: string) => {
     const { h } = await prepared();
     let reject!: (error: Error) => void;
     let calls = 0;
@@ -411,13 +449,13 @@ describe('packaged mobile onboarding recovery', () => {
     modal.close(); h.foreground();
     await new Promise(resolve => setTimeout(resolve, 1300));
     expect(calls).toBe(2);
-  });
+  }));
 
-  it.each(['proposal-ref', 'proposal'])('publishes only one initialization proposal after cold restart at %s', async boundary => {
+  it.each(['proposal-ref', 'proposal'])('publishes only one initialization proposal after cold restart at %s', owned(async ({ root, url, server, post, child, mobileHarness }, boundary: string) => {
     const phoneRoot = join(root, 'new-vault-phone');
     await mkdir(phoneRoot);
     await writeFile(join(phoneRoot, 'note.md'), 'local recovery bytes\n');
-    const h = await mobileHarness(phoneRoot, url); harnesses.push(h);
+    const h = await mobileHarness(phoneRoot, url);
     const connection = await h.plugin.runExclusiveAction(() => h.core.startOnboarding('New vault'));
     await post(`/api/v1/connections/${connection.connection_id}/approve`, { selection: 'new_vault', display_name: 'New recovery vault' });
     await h.plugin.runExclusiveAction(() => h.core.analyzeOnboarding(connection.connection_id, connection.connection_secret));
@@ -428,11 +466,12 @@ describe('packaged mobile onboarding recovery', () => {
     expect(db.devices).toHaveLength(1);
     expect(db.events.filter(event => event.event_type === 'device_ref_updated')).toHaveLength(1);
     expect(await readFile(join(phoneRoot, 'note.md'), 'utf8')).toBe('local recovery bytes\n');
-  });
+  }));
 
-  it.each(['enrollment', 'accepted', 'credential', 'identity', 'registered', 'chunk', 'checkpoint', 'recovery', 'apply-recovery', 'displaced', 'files', 'committed', 'pending-ack', 'acknowledged', 'activated'])('SIGKILL and cold restart at %s', async boundary => {
+  it.each(['enrollment', 'accepted', 'credential', 'identity', 'registered', 'chunk', 'checkpoint', 'recovery', 'apply-recovery', 'displaced', 'files', 'committed', 'pending-ack', 'acknowledged', 'activated'])('SIGKILL and cold restart at %s', owned(async ({ lifecycle, server, vaultId, seed, prepared, child }, boundary: string) => {
     const { desktop, desktopRoot } = await seed();
     if (boundary === 'chunk') {
+      lifecycle.mark('chunk binary preparation');
       server.config.transferChunkBytes = 1_048_576;
       await writeFile(join(desktopRoot, 'first.bin'), randomBytes(700_000));
       await writeFile(join(desktopRoot, 'second.bin'), randomBytes(700_000));
@@ -474,5 +513,5 @@ describe('packaged mobile onboarding recovery', () => {
     expect(device.last_applied_main).toBe((await server.store.snapshot()).vaults.find(vault => vault.vault_id === vaultId)!.current_main);
     expect(await readFile(join(phoneRoot, '.obts/apply-journal.json')).catch(() => null)).toBeNull();
     await verifyRecovery(phoneRoot);
-  });
+  }));
 });

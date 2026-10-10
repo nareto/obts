@@ -314,7 +314,9 @@ describe('client stale authoring cohorts with the real server', () => {
     expect(transport === 'chunked' ? ['merged', 'noop'] : ['merged'])
       .toContain((await next.core.uploadQueuedCommit(await next.plugin.readQueue())).status);
     expect(await f.canonical()).toBe(MERGED);
-    const operation = (await f.server.store.snapshot()).sync_operations.find((o) => o.operation_type === 'device_push' && o.target_commit === queue.pending_commit)!;
+    const state = await next.plugin.readState();
+    const operation = (await f.server.store.exportOperationHistory(f.vaultId)).find((o) =>
+      o.operation_type === 'device_push' && o.device_id === state.device_id && o.target_commit === queue.pending_commit)!;
     expect(operation.proposal_base).toBe(f.m0);
   });
 
@@ -2652,8 +2654,8 @@ describe('durable atomic rename proposals after stale conflict resolution', () =
     }
     const state = await f.plugin.readState();
     const deviceCommit = await f.server.git.getRef(f.vaultId, state.device_ref!);
-    const operations = (await f.server.store.snapshot()).sync_operations.filter((row) =>
-      row.operation_type === 'device_push' && row.target_commit === deviceCommit);
+    const operations = (await f.server.store.exportOperationHistory(f.vaultId)).filter((row) =>
+      row.operation_type === 'device_push' && row.device_id === state.device_id && row.target_commit === deviceCommit);
     expect(operations.at(-1)?.proposal_base).toBe(pairedTarget);
   });
 
@@ -2727,12 +2729,12 @@ describe('durable atomic rename proposals after stale conflict resolution', () =
     await f.plugin.pollRemoteEventsAndApply();
     const canonicalMain = await f.server.git.getRef(f.vaultId, 'refs/heads/main');
     const canonicalDestination = await f.canonical('renamed.md');
-    const pushesBeforeRetry = (await f.server.store.snapshot()).sync_operations.filter((row) => row.operation_type === 'device_push').length;
+    const pushesBeforeRetry = (await f.server.store.exportOperationHistory(f.vaultId)).filter((row) => row.operation_type === 'device_push').length;
     await expect(f.plugin.syncOnce()).rejects.toMatchObject({ code: 'rename_lineage_ambiguous' });
     expect(await readFile(join(f.dir, 'final.md'), 'utf8')).toBe(DEVICE_EDIT);
     expect(await f.server.git.getRef(f.vaultId, 'refs/heads/main')).toBe(canonicalMain);
     expect(await f.canonical('renamed.md')).toBe(canonicalDestination);
-    expect((await f.server.store.snapshot()).sync_operations.filter((row) => row.operation_type === 'device_push')).toHaveLength(pushesBeforeRetry);
+    expect((await f.server.store.exportOperationHistory(f.vaultId)).filter((row) => row.operation_type === 'device_push')).toHaveLength(pushesBeforeRetry);
   });
 
   it('blocks a recreated source before producing a deletion-only proposal', async () => {
@@ -2741,11 +2743,11 @@ describe('durable atomic rename proposals after stale conflict resolution', () =
     await f.plugin.client.recordLocalRenameHint('note.md', 'renamed.md');
     await f.core.adapter.write('note.md', 'recreated source\n');
     await f.plugin.client.recordLocalChangeHint(['note.md']);
-    const pushesBefore = (await f.server.store.snapshot()).sync_operations.filter((row) => row.operation_type === 'device_push').length;
+    const pushesBefore = (await f.server.store.exportOperationHistory(f.vaultId)).filter((row) => row.operation_type === 'device_push').length;
     await expect(f.plugin.syncOnce()).rejects.toMatchObject({ code: 'rename_preservation_required' });
     expect(await readFile(join(f.dir, 'note.md'), 'utf8')).toBe('recreated source\n');
     expect(await readFile(join(f.dir, 'renamed.md'), 'utf8')).toBe(BASE);
-    expect((await f.server.store.snapshot()).sync_operations.filter((row) => row.operation_type === 'device_push')).toHaveLength(pushesBefore);
+    expect((await f.server.store.exportOperationHistory(f.vaultId)).filter((row) => row.operation_type === 'device_push')).toHaveLength(pushesBefore);
   });
 
   it('blocks a root-policy replacement that would exclude a frozen rename endpoint', async () => {
@@ -2909,8 +2911,8 @@ describe('durable atomic rename proposals after stale conflict resolution', () =
     expect(await f.canonical('renamed.md')).toBe(DEVICE_EDIT);
     const state = await active.readState();
     const deviceCommit = await f.server.git.getRef(f.vaultId, state.device_ref!);
-    const operation = (await f.server.store.snapshot()).sync_operations.find((row) =>
-      row.operation_type === 'device_push' && row.target_commit === deviceCommit)!;
+    const operation = (await f.server.store.exportOperationHistory(f.vaultId)).find((row) =>
+      row.operation_type === 'device_push' && row.device_id === state.device_id && row.target_commit === deviceCommit)!;
     expect(operation.prepared_manifest?.proposal_base).toBe(f.m0);
     expect(operation.prepared_manifest?.rename_pairs).toEqual([{ source_path: 'note.md', destination_path: 'renamed.md' }]);
     const proposedPaths = await f.server.git.listTreePaths(f.vaultId, deviceCommit!);

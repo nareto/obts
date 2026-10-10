@@ -1,8 +1,8 @@
-import { mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { publishRecoveryFixture } from './helpers/publishRecoveryFixture.js';
 
 import { ObtsPluginClient, TransportError } from '../obsidian-plugin/src/core/client.js';
@@ -11,6 +11,10 @@ import { createObtsServer, repairVaultIntegrity, type ObtsServer } from '../src/
 import type { MetadataDb } from '../src/server/metadataStore.js';
 
 type Json = Record<string, unknown>;
+
+async function operationHistory(server: ObtsServer, vaultId: string) {
+  return await server.store.exportOperationHistory(vaultId);
+}
 
 class BrowserSession {
   cookie = '';
@@ -320,7 +324,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
       sessionSecret: 'test-session-secret-with-enough-entropy'
     });
     const recoveredDb = await server.store.snapshot();
-    const recoveredOperation = recoveredDb.sync_operations.find((operation) => operation.operation_id === prepared?.operation_id);
+    const recoveredOperation = (await operationHistory(server, admin.vaultId)).find((operation) => operation.operation_id === prepared?.operation_id);
     expect(recoveredDb.vaults.find((item) => item.vault_id === admin.vaultId)?.current_main).toBe(movedMain);
     expect(recoveredOperation).toMatchObject({
       status: 'committed',
@@ -516,6 +520,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     const expectedMainTree = await server.git.treeHash(admin.vaultId, review.body.conflict.expected_main);
 
     const beforePreview = await server.store.snapshot();
+    const beforePreviewOperations = await operationHistory(server, admin.vaultId);
     const serverPreview = await admin.post<{
       resolution_kind: string;
       expected_main: string;
@@ -547,7 +552,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
       review.body.conflict.expected_main
     );
     expect(afterPreview.events.length).toBe(beforePreview.events.length);
-    expect(afterPreview.sync_operations.length).toBe(beforePreview.sync_operations.length);
+    expect(await operationHistory(server, admin.vaultId)).toEqual(beforePreviewOperations);
     expect(afterPreview.audit_log.length).toBe(beforePreview.audit_log.length);
     expect(await server.git.getRef(admin.vaultId, 'refs/heads/main')).toBe(review.body.conflict.expected_main);
 
@@ -1370,7 +1375,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(await server.git.getRef(admin.vaultId, `refs/obts/conflicts/${result.conflictId}/current`)).toBe(
       refreshed.body.current_main
     );
-    expect((await server.store.snapshot()).sync_operations.findLast(
+    expect((await operationHistory(server, admin.vaultId)).findLast(
       (operation) => operation.operation_type === 'conflict_refresh'
     )).toMatchObject({
       status: 'committed',
@@ -1441,7 +1446,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     const beforeRef = await server.git.getRef(fixture.admin.vaultId, protectedRef);
     const beforeDb = await server.store.snapshot();
     const beforeConflict = beforeDb.conflicts.find((conflict) => conflict.conflict_id === fixture.conflictId);
-    const beforeOperationCount = beforeDb.sync_operations.length;
+    const beforeOperations = await operationHistory(server, fixture.admin.vaultId);
     await server.store.mutate((db) => {
       const vault = db.vaults.find((candidate) => candidate.vault_id === fixture.admin.vaultId);
       expect(vault).toBeDefined();
@@ -1462,7 +1467,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(resolve.body.error.code).toBe('blocked_integrity');
 
     const afterDb = await server.store.snapshot();
-    expect(afterDb.sync_operations).toHaveLength(beforeOperationCount);
+    expect(await operationHistory(server, fixture.admin.vaultId)).toEqual(beforeOperations);
     expect(afterDb.vaults.find((vault) => vault.vault_id === fixture.admin.vaultId)?.current_main).toBe(fixture.refreshedMain);
     expect(afterDb.conflicts.find((conflict) => conflict.conflict_id === fixture.conflictId)).toMatchObject({
       status: beforeConflict?.status,
@@ -1470,6 +1475,218 @@ describe('Phase 2 dashboard conflict resolution', () => {
       expected_main: beforeConflict?.expected_main
     });
     expect(await server.git.getRef(fixture.admin.vaultId, protectedRef)).toBe(beforeRef);
+  });
+
+  function captureRefCrashImage(image: string, selectedRef: string, seam: 'before' | 'after') {
+    const original = server.git.updateRef.bind(server.git);
+    let captured = false;
+    server.git.updateRef = async (vaultId, ref, target, expected) => {
+      if (ref !== selectedRef || captured) return await original(vaultId, ref, target, expected);
+      captured = true;
+      if (seam === 'after') await original(vaultId, ref, target, expected);
+      await server.store.snapshot();
+      await cp(join(root, 'server-data'), image, { recursive: true });
+      if (seam === 'before') await original(vaultId, ref, target, expected);
+    };
+    return () => {
+      server.git.updateRef = original;
+      expect(captured).toBe(true);
+    };
+  }
+
+  async function restartCrashImage(image?: string) {
+    await server.app.close();
+    if (image) {
+      await rm(join(root, 'server-data'), { recursive: true });
+      await cp(image, join(root, 'server-data'), { recursive: true });
+    }
+    server = await createObtsServer({
+      dataDir: join(root, 'server-data'),
+      publicBaseUrl: 'http://127.0.0.1:0',
+      sessionSecret: 'test-session-secret-with-enough-entropy'
+    });
+    baseUrl = await server.app.listen({ port: 0, host: '127.0.0.1' });
+  }
+
+  it('history boundary rolls forward every prepared conflict-resolution effect from a real crash image', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'recover-conflict-resolution-desktop');
+    const tabletDir = join(root, 'recover-conflict-resolution-tablet');
+    await mkdir(desktopDir, { recursive: true });
+    await mkdir(tabletDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, 'recover-conflict-resolution-desktop');
+    await writeFile(join(desktopDir, 'shared.md'), 'base\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const tablet = await pairPlugin(admin, tabletDir, 'recover-conflict-resolution-tablet');
+    await writeFile(join(desktopDir, 'shared.md'), 'server version\n');
+    await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const conflicted = await tablet.syncOnce();
+    expect(conflicted.status).toBe('Conflict resolution needed');
+
+    const review = await admin.get<{ conflict: { expected_main: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}`
+    );
+    expect(review.status).toBe(200);
+    const image = join(root, 'resolution-crash-image');
+    const stopCapture = captureRefCrashImage(image, 'refs/heads/main', 'after');
+    const resolved = await admin.post<{ resolution_commit: string }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}/resolve`,
+      { expected_main: review.body.conflict.expected_main, resolution_kind: 'keep_server' }
+    );
+    expect(resolved.status).toBe(200);
+
+    const committedDb = await server.store.snapshot();
+    const resolutionOperation = (await operationHistory(server, admin.vaultId)).findLast(
+      (operation) => operation.operation_type === 'conflict_resolve'
+    );
+    const committedConflict = committedDb.conflicts.find(
+      (conflict) => conflict.conflict_id === conflicted.conflictId
+    );
+    expect(resolutionOperation).toMatchObject({
+      status: 'committed',
+      prepared_manifest: { actor_user_id: expect.any(String) }
+    });
+    expect(committedConflict).toMatchObject({
+      status: 'resolved',
+      resolved_by_user_id: expect.any(String)
+    });
+    const actorUserId = committedConflict!.resolved_by_user_id;
+    const deviceId = committedConflict!.device_id;
+
+    stopCapture();
+    const captured = JSON.parse(await readFile(join(image, 'metadata', 'phase1.json'), 'utf8')) as MetadataDb;
+    expect(captured.sync_operations.find((row) => row.operation_id === resolutionOperation!.operation_id)?.status).toBe('prepared');
+    expect(captured.operation_history_by_vault![admin.vaultId]!.generation).toBeGreaterThan(0);
+
+    await restartCrashImage(image);
+
+    expect((await fetch(`${baseUrl}/health/ready`)).status).toBe(200);
+    const recoveredDb = await server.store.snapshot();
+    expect(recoveredDb.vaults.find((vault) => vault.vault_id === admin.vaultId)).toMatchObject({
+      status: 'active',
+      current_main: resolved.body.resolution_commit
+    });
+    expect(recoveredDb.conflicts.find((conflict) => conflict.conflict_id === conflicted.conflictId)).toMatchObject({
+      status: 'resolved',
+      resolved_by_user_id: actorUserId,
+      resolution_kind: 'keep_server',
+      resolution_commit: resolved.body.resolution_commit,
+      resolution_request_hash: expect.any(String)
+    });
+    expect(recoveredDb.devices.find((device) => device.device_id === deviceId)).toMatchObject({
+      status: 'synced',
+      last_successful_sync_at: expect.any(String)
+    });
+    expect((await operationHistory(server, admin.vaultId)).find(
+      (operation) => operation.operation_id === resolutionOperation!.operation_id
+    )).toMatchObject({
+      status: 'committed',
+      result: {
+        decision: 'resolved',
+        conflict_id: conflicted.conflictId,
+        resolution_kind: 'keep_server',
+        resolution_commit: resolved.body.resolution_commit,
+        reconciled_after_startup: true
+      }
+    });
+    const recoveredEvents = recoveredDb.events.filter(
+      (event) => event.resource_ids.conflict_id === conflicted.conflictId && event.payload.reconciled_after_startup === true
+    );
+    expect(recoveredEvents).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        event_type: 'main_advanced',
+        payload: expect.objectContaining({
+          conflict_id: conflicted.conflictId,
+          resolution_kind: 'keep_server'
+        })
+      }),
+      expect.objectContaining({
+        event_type: 'conflict_resolved',
+        payload: expect.objectContaining({ resolution_kind: 'keep_server' })
+      })
+    ]));
+    expect(recoveredDb.audit_log).toContainEqual(expect.objectContaining({
+      actor_user_id: actorUserId,
+      actor_device_id: null,
+      vault_id: admin.vaultId,
+      action: 'conflict_resolved',
+      resource_class: 'conflict',
+      resource_id: conflicted.conflictId
+    }));
+    expect(recoveredDb.sync_operations.some((row) => row.operation_id === resolutionOperation!.operation_id)).toBe(false);
+    expect(await server.git.getRef(admin.vaultId, 'refs/heads/main')).toBe(resolved.body.resolution_commit);
+    const rows = await operationHistory(server, admin.vaultId);
+    const counts = await server.store.operationHistoryCounts(admin.vaultId);
+    await restartCrashImage();
+    const twice = await server.store.snapshot();
+    expect(twice.events).toEqual(recoveredDb.events);
+    expect(twice.audit_log).toEqual(recoveredDb.audit_log);
+    expect(twice.conflicts).toEqual(recoveredDb.conflicts);
+    expect(twice.devices).toEqual(recoveredDb.devices);
+    expect(await operationHistory(server, admin.vaultId)).toEqual(rows);
+    expect(await server.store.operationHistoryCounts(admin.vaultId)).toEqual(counts);
+  });
+
+  it.each(['moved', 'unmoved', 'foreign'] as const)('history boundary refresh recovery from a real %s crash image', async (mode) => {
+    const fixture = await createStaleConflictFixture(`history-refresh-${mode}`);
+    const vaultId = fixture.admin.vaultId;
+    const protectedRef = `refs/obts/conflicts/${fixture.conflictId}/current`;
+    const before = await server.store.snapshot();
+    const previousRows = await operationHistory(server, vaultId);
+    expect(previousRows.some((row) => !before.sync_operations.some((hot) => hot.operation_id === row.operation_id))).toBe(true);
+    const image = join(root, 'refresh-crash-image');
+    const stopCapture = captureRefCrashImage(image, protectedRef, mode === 'moved' ? 'after' : 'before');
+    const refreshed = await fixture.admin.post<Json>(`/api/v1/vaults/${vaultId}/conflicts/${fixture.conflictId}/refresh`, {});
+    expect(refreshed.status).toBe(200);
+    stopCapture();
+    const captured = JSON.parse(await readFile(join(image, 'metadata', 'phase1.json'), 'utf8')) as MetadataDb;
+    const operation = captured.sync_operations.findLast((row) => row.operation_type === 'conflict_refresh')!;
+    expect(operation.status).toBe('prepared');
+    expect(captured.events).toEqual(before.events);
+    expect(captured.conflicts).toEqual(before.conflicts);
+    if (mode === 'foreign') {
+      const { GitService } = await import('../src/server/gitService.js');
+      const copiedGit = new GitService({ ...server.config, gitStoreDir: join(image, 'git') });
+      await copiedGit.updateRef(vaultId, protectedRef, fixture.deviceCommit, fixture.previousMain);
+    }
+    await restartCrashImage(image);
+    const recovered = await server.store.snapshot();
+    const rows = await operationHistory(server, vaultId);
+    const currentMain = mode === 'moved' ? fixture.refreshedMain : fixture.previousMain;
+    expect((await fetch(`${baseUrl}/health/ready`)).status).toBe(mode === 'foreign' ? 503 : 200);
+    expect(recovered.vaults.find((vault) => vault.vault_id === vaultId)).toMatchObject({
+      status: mode === 'foreign' ? 'blocked_integrity' : 'active', current_main: fixture.refreshedMain
+    });
+    expect(recovered.conflicts.find((conflict) => conflict.conflict_id === fixture.conflictId)).toMatchObject({
+      status: 'open', current_main: currentMain, expected_main: currentMain
+    });
+    expect(rows.find((row) => row.operation_id === operation.operation_id)).toMatchObject(mode === 'moved' ? {
+      status: 'committed', result: { decision: 'refreshed', refreshed_main: fixture.refreshedMain, reconciled_after_startup: true }
+    } : mode === 'unmoved' ? {
+      status: 'aborted', result: { reason: 'startup_prepared_ref_not_moved' }
+    } : {
+      status: 'prepared', result: { reason: 'prepared operation target refs cannot be reconciled' }
+    });
+    expect(recovered.sync_operations.some((row) => row.operation_id === operation.operation_id)).toBe(mode === 'foreign');
+    expect(await server.git.getRef(vaultId, protectedRef)).toBe(mode === 'foreign' ? fixture.deviceCommit : currentMain);
+    expect(await server.git.getRef(vaultId, 'refs/heads/main')).toBe(fixture.refreshedMain);
+    expect(recovered.events.filter((event) => event.event_type === 'conflict_review_refreshed' && event.payload.reconciled_after_startup === true)).toHaveLength(mode === 'moved' ? 1 : 0);
+    for (const row of previousRows) expect(rows).toContainEqual(row);
+    const counts = await server.store.operationHistoryCounts(vaultId);
+    await restartCrashImage();
+    const twice = await server.store.snapshot();
+    expect((await fetch(`${baseUrl}/health/ready`)).status).toBe(mode === 'foreign' ? 503 : 200);
+    expect(twice.events).toEqual(recovered.events);
+    expect(twice.audit_log).toEqual(recovered.audit_log);
+    expect(twice.conflicts).toEqual(recovered.conflicts);
+    const stable = (items: typeof rows) => items.map((row) => {
+      if (mode !== 'foreign' || row.operation_id !== operation.operation_id) return row;
+      const { updated_at: _updated, ...evidence } = row;
+      return evidence;
+    });
+    expect(stable(await operationHistory(server, vaultId))).toEqual(stable(rows));
+    expect(await server.store.operationHistoryCounts(vaultId)).toEqual(counts);
   });
 
   it('rolls forward every prepared conflict-resolution effect after main moves', async () => {
@@ -1493,6 +1710,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     );
     expect(review.status).toBe(200);
     const beforeResolution = await server.store.snapshot();
+    const archiveHistory = vi.spyOn(server.store, 'archiveCompletedHistory').mockResolvedValue();
     const resolved = await admin.post<{ resolution_commit: string }>(
       `/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}/resolve`,
       { expected_main: review.body.conflict.expected_main, resolution_kind: 'keep_server' }
@@ -1500,7 +1718,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(resolved.status).toBe(200);
 
     const committedDb = await server.store.snapshot();
-    const resolutionOperation = committedDb.sync_operations.findLast(
+    const resolutionOperation = (await operationHistory(server, admin.vaultId)).findLast(
       (operation) => operation.operation_type === 'conflict_resolve'
     );
     const committedConflict = committedDb.conflicts.find(
@@ -1543,6 +1761,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
       db.audit_log = structuredClone(beforeResolution.audit_log);
       db.event_seq_by_vault = structuredClone(beforeResolution.event_seq_by_vault);
     });
+    archiveHistory.mockRestore();
 
     await server.app.close();
     server = await createObtsServer({
@@ -1569,7 +1788,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
       status: 'synced',
       last_successful_sync_at: expect.any(String)
     });
-    expect(recoveredDb.sync_operations.find(
+    expect((await operationHistory(server, admin.vaultId)).find(
       (operation) => operation.operation_id === resolutionOperation!.operation_id
     )).toMatchObject({
       status: 'committed',
@@ -1611,6 +1830,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     const fixture = await createStaleConflictFixture('recover-conflict-refresh');
     const protectedRef = `refs/obts/conflicts/${fixture.conflictId}/current`;
     const beforeRefresh = await server.store.snapshot();
+    const archiveHistory = vi.spyOn(server.store, 'archiveCompletedHistory').mockResolvedValue();
     const refreshed = await fixture.admin.post<{ current_main: string }>(
       `/api/v1/vaults/${fixture.admin.vaultId}/conflicts/${fixture.conflictId}/refresh`,
       {}
@@ -1624,6 +1844,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     await server.store.mutate((db) => {
       rewindConflictRefreshMetadata(db, beforeRefresh, fixture.conflictId, refreshOperation!.operation_id);
     });
+    archiveHistory.mockRestore();
     expect((await fetch(`${baseUrl}/health/ready`)).status).toBe(200);
 
     await server.app.close();
@@ -1641,7 +1862,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
       current_main: fixture.refreshedMain,
       expected_main: fixture.refreshedMain
     });
-    expect(recoveredDb.sync_operations.find((operation) => operation.operation_id === refreshOperation!.operation_id)).toMatchObject({
+    expect((await operationHistory(server, fixture.admin.vaultId)).find((operation) => operation.operation_id === refreshOperation!.operation_id)).toMatchObject({
       status: 'committed',
       result: {
         decision: 'refreshed',
@@ -1659,6 +1880,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     const fixture = await createStaleConflictFixture('abort-conflict-refresh');
     const protectedRef = `refs/obts/conflicts/${fixture.conflictId}/current`;
     const beforeRefresh = await server.store.snapshot();
+    const archiveHistory = vi.spyOn(server.store, 'archiveCompletedHistory').mockResolvedValue();
     const refreshed = await fixture.admin.post<Json>(
       `/api/v1/vaults/${fixture.admin.vaultId}/conflicts/${fixture.conflictId}/refresh`,
       {}
@@ -1673,6 +1895,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     await server.store.mutate((db) => {
       rewindConflictRefreshMetadata(db, beforeRefresh, fixture.conflictId, refreshOperation!.operation_id);
     });
+    archiveHistory.mockRestore();
 
     await server.app.close();
     server = await createObtsServer({
@@ -1689,7 +1912,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
       current_main: fixture.previousMain,
       expected_main: fixture.previousMain
     });
-    expect(recoveredDb.sync_operations.find((operation) => operation.operation_id === refreshOperation!.operation_id)).toMatchObject({
+    expect((await operationHistory(server, fixture.admin.vaultId)).find((operation) => operation.operation_id === refreshOperation!.operation_id)).toMatchObject({
       status: 'aborted',
       result: { reason: 'startup_prepared_ref_not_moved' }
     });
@@ -1718,7 +1941,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
       server.git.updateRef = originalUpdateRef;
 
       const db = await server.store.snapshot();
-      const operation = db.sync_operations.findLast((candidate) => candidate.operation_type === 'conflict_refresh');
+      const operation = (await operationHistory(server, fixture.admin.vaultId)).findLast((candidate) => candidate.operation_type === 'conflict_refresh');
       if (mode === 'before_move') {
         expect(refresh.status).toBe(500);
         expect(operation).toMatchObject({
@@ -1781,6 +2004,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     const fixture = await createStaleConflictFixture('foreign-conflict-refresh-startup');
     const protectedRef = `refs/obts/conflicts/${fixture.conflictId}/current`;
     const beforeRefresh = await server.store.snapshot();
+    const archiveHistory = vi.spyOn(server.store, 'archiveCompletedHistory').mockResolvedValue();
     const refreshed = await fixture.admin.post<Json>(
       `/api/v1/vaults/${fixture.admin.vaultId}/conflicts/${fixture.conflictId}/refresh`,
       {}
@@ -1795,6 +2019,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     await server.store.mutate((db) => {
       rewindConflictRefreshMetadata(db, beforeRefresh, fixture.conflictId, refreshOperation!.operation_id);
     });
+    archiveHistory.mockRestore();
 
     await server.app.close();
     server = await createObtsServer({
@@ -1811,7 +2036,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
       current_main: fixture.previousMain,
       expected_main: fixture.previousMain
     });
-    expect(recoveredDb.sync_operations.find((operation) => operation.operation_id === refreshOperation!.operation_id)).toMatchObject({
+    expect((await operationHistory(server, fixture.admin.vaultId)).find((operation) => operation.operation_id === refreshOperation!.operation_id)).toMatchObject({
       status: 'prepared',
       result: { reason: 'prepared operation target refs cannot be reconciled' }
     });

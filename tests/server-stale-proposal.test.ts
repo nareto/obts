@@ -7,7 +7,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createObtsServer, type ObtsServer } from '../src/server/app.js';
 import { hashToken, type AuthenticatedDevice } from '../src/server/authService.js';
 import { GitDurabilityError, sha256Hex } from '../src/server/gitService.js';
-import { API_VERSION, type DevicePushManifest, type PushResult } from '../src/shared/types.js';
+import { API_VERSION, type DevicePushManifest, type DirectoryProposal, type PushResult } from '../src/shared/types.js';
+import type { SyncOperationRow } from '../src/server/metadataStore.js';
 
 const BASE = 'first\n\nunchanged middle\n\nlast\n';
 const REMOTE = BASE.replace('first', 'remote');
@@ -24,6 +25,76 @@ afterEach(async () => {
 
 type Fixture = { server: ObtsServer; auth: AuthenticatedDevice; token: string; m0: string };
 type Writes = Record<string, string | Buffer | null>;
+
+async function operationHistory(server: ObtsServer, vaultId: string) {
+  return await server.store.exportOperationHistory(vaultId);
+}
+
+async function restart(f: Fixture): Promise<void> {
+  await f.server.app.close();
+  servers.splice(servers.indexOf(f.server), 1);
+  f.server = await createObtsServer(f.server.config);
+  servers.push(f.server);
+  f.auth = await f.server.auth.authenticateDevice(`Bearer ${f.token}`, f.auth.vault.vault_id);
+}
+
+async function coldAdmission(f: Fixture, attemptId: string) {
+  const hot = (await f.server.store.snapshot()).sync_operations;
+  expect(hot.filter((row) => row.prepared_manifest?.attempt_id === attemptId)).toEqual([]);
+  const archived = await f.server.store.findArchivedAttempt(f.auth.vault.vault_id, f.auth.device.device_id, attemptId);
+  expect(archived).not.toBeNull();
+  return archived!.row;
+}
+
+async function canonicalEffects(f: Fixture) {
+  const db = await f.server.store.snapshot();
+  const main = await f.server.git.getRef(f.auth.vault.vault_id, 'refs/heads/main');
+  return {
+    main, deviceRef: await f.server.git.getRef(f.auth.vault.vault_id, f.auth.device.device_ref),
+    tree: await f.server.git.listTreeEntries(f.auth.vault.vault_id, main!),
+    directories: db.directory_state_by_vault, results: db.directory_proposal_results,
+    conflicts: db.conflicts, events: db.events, audit: db.audit_log
+  };
+}
+
+function stableRequestJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableRequestJson).join(',')}]`;
+  if (value && typeof value === 'object') return `{${Object.entries(value).sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, item]) => `${JSON.stringify(key)}:${stableRequestJson(item)}`).join(',')}}`;
+  return JSON.stringify(value) ?? 'null';
+}
+
+async function seedAdmission(f: Fixture, request: Awaited<ReturnType<typeof manifest>>, overrides: Partial<SyncOperationRow> = {}) {
+  return await f.server.store.mutate((db) => {
+    const row = f.server.store.startOperation(db, {
+      vault_id: f.auth.vault.vault_id, device_id: f.auth.device.device_id, operation_type: 'device_push',
+      expected_refs: { [f.auth.device.device_ref]: request.manifest.expected_device_ref },
+      target_refs: { [f.auth.device.device_ref]: request.manifest.target_commit }, target_commit: request.manifest.target_commit
+    });
+    Object.assign(row, {
+      status: 'committed', proposal_base: request.manifest.base_commit ?? null,
+      prepared_manifest: {
+        attempt_id: request.manifest.attempt_id,
+        attempt_hash: sha256Hex(stableRequestJson({ manifest: request.manifest, transport: 'direct' })),
+        requested_base_commit: request.manifest.base_commit ?? null,
+        rename_pairs: request.manifest.rename_pairs ?? null,
+        directory_proposal: request.manifest.directory_proposal ?? null
+      }, result: { idempotent: true, target_commit: request.manifest.target_commit }, ...overrides
+    });
+    return row;
+  });
+}
+
+async function directoryProposal(f: Fixture, target: string, op: 'create' | 'delete' = 'create', path = 'Empty'): Promise<DirectoryProposal> {
+  const device = (await f.server.store.snapshot()).devices.find((row) => row.device_id === f.auth.device.device_id)!;
+  const body = {
+    schema_version: 2 as const, base_main: device.last_applied_main, base_event_seq: device.last_applied_event_seq,
+    intents: [{ op, path, intent_id: 'dir_1_0_012345abcdef', generation: 0, provenance: 'local_v2' as const,
+      base_main: device.last_applied_main, base_event_seq: device.last_applied_event_seq,
+      replaces_intent_id: null, recreated_after_delete: false, created_at: null }]
+  };
+  return { ...body, proposal_id: `dirprop_${sha256Hex(JSON.stringify([device.device_id, target, body]))}` };
+}
 
 async function commit(f: Fixture, parent: string, writes: Writes): Promise<string> {
   const tree = await f.server.git.createTreeFromCommitWithChanges({
@@ -535,6 +606,283 @@ describe('K-relative rename ownership adversarial cases', () => {
   });
 });
 
+describe('archived admission replay outcomes', () => {
+  it.each(['earliest-cold', 'earliest-hot'] as const)('archived_admission_union_selects_original_binding: %s with out-of-order completion', async (location) => {
+    const f = await fixture({ 'source.md': BASE });
+    const pair = [{ source_path: 'source.md', destination_path: 'moved.md' }];
+    const target = await commit(f, f.m0, { 'source.md': null, 'moved.md': BASE });
+    const request = await manifest(f, target, f.m0, 'ordered-attempt');
+    request.manifest.rename_pairs = pair;
+    await setMain(f, target);
+    await f.server.git.updateRef(f.auth.vault.vault_id, f.auth.device.device_ref, target, f.m0);
+    await f.server.store.mutate((db) => { db.devices.find((row) => row.device_id === f.auth.device.device_id)!.device_ref_head = target; });
+    const first = await seedAdmission(f, request, { status: location === 'earliest-hot' ? 'prepared' : 'committed' });
+    if (location === 'earliest-cold') await f.server.sync.archiveStartupHistory(f.auth.vault.vault_id);
+    const second = await seedAdmission(f, request, { status: 'aborted', proposal_base: target,
+      created_at: first.created_at, updated_at: first.created_at,
+      prepared_manifest: { attempt_id: request.manifest.attempt_id, attempt_hash: 'later-conflicting-hash',
+        requested_base_commit: target, rename_pairs: null } });
+    expect(first.operation_sequence!).toBeLessThan(second.operation_sequence!);
+    if (location === 'earliest-hot') {
+      await f.server.sync.archiveStartupHistory(f.auth.vault.vault_id);
+      expect((await f.server.store.snapshot()).sync_operations.map((row) => row.operation_id)).toContain(first.operation_id);
+      expect((await f.server.store.findArchivedAttempt(f.auth.vault.vault_id, f.auth.device.device_id, 'ordered-attempt'))!.row).toEqual(second);
+      await f.server.store.mutate((db) => {
+        const hot = db.sync_operations.find((row) => row.operation_id === first.operation_id)!;
+        hot.status = 'committed';
+        hot.updated_at = new Date(Date.parse(second.updated_at) + 1_000).toISOString();
+      });
+    } else {
+      expect((await f.server.store.snapshot()).sync_operations.map((row) => row.operation_id)).toContain(second.operation_id);
+      expect((await f.server.store.findArchivedAttempt(f.auth.vault.vault_id, f.auth.device.device_id, 'ordered-attempt'))!.row).toEqual(first);
+    }
+    const before = await canonicalEffects(f);
+    expect(await multipart(f, request)).toMatchObject({ status: 200, result: { status: 'noop', main: target, device_ref: target } });
+    for (const reboot of [false, true]) {
+      if (reboot) await restart(f);
+      expect((await multipart(f, { ...request, manifest: { ...request.manifest, attempt_id: 'fresh-allowed' } })).result.status).toBe('noop');
+      for (const [change, code] of [
+        [{ plugin_version: '0.5.14' }, 'attempt_mismatch'],
+        [{ attempt_id: 'fresh-base', base_commit: target }, 'proposal_base_mismatch'],
+        [{ attempt_id: 'fresh-pairs', rename_pairs: [{ source_path: 'source.md', destination_path: 'other.md' }] }, 'rename_pairs_mismatch'],
+        [{ attempt_id: 'fresh-omitted', rename_pairs: undefined }, 'rename_pairs_mismatch']
+      ] as Array<[Partial<DevicePushManifest>, string]>) {
+        expect(await multipart(f, { ...request, manifest: { ...request.manifest, ...change } }))
+          .toMatchObject({ status: 409, result: { error: { code } } });
+      }
+      expect(await canonicalEffects(f)).toEqual(before);
+      expect(await blob(f, target, 'moved.md')).toBe(BASE);
+      expect((await coldAdmission(f, 'ordered-attempt')).operation_id).toBe(first.operation_id);
+    }
+  });
+
+  it.each(['legacy-before-null', 'null-before-explicit', 'legacy-prepared', 'legacy-committed'] as const)(
+    'archived_admission_union_selects_original_binding: %s', async (mode) => {
+      const f = await fixture();
+      const request = await manifest(f, f.m0, f.m0, 'base-preference');
+      delete request.manifest.base_commit;
+      const legacy = (status: SyncOperationRow['status']): Partial<SyncOperationRow> => ({ status,
+        prepared_manifest: { rename_pairs: null }, result: { idempotent: true, target_commit: f.m0 } });
+      const seedLegacy = async (status: SyncOperationRow['status'], pairs: unknown = null) => {
+        const row = await seedAdmission(f, request, legacy(status));
+        await f.server.store.mutate((db) => {
+          const hot = db.sync_operations.find((candidate) => candidate.operation_id === row.operation_id)!;
+          delete hot.proposal_base;
+          hot.prepared_manifest!.rename_pairs = pairs;
+        });
+        return row.operation_id;
+      };
+      const absentId = await seedLegacy('aborted', [{ source_path: 'old.md', destination_path: 'new.md' }]);
+      if (mode === 'legacy-before-null') {
+        await seedLegacy('committed');
+        await f.server.sync.archiveStartupHistory(f.auth.vault.vault_id);
+      }
+      const selected = mode.startsWith('legacy-') && mode !== 'legacy-before-null'
+        ? await seedLegacy(mode === 'legacy-prepared' ? 'prepared' : 'committed')
+        : (await seedAdmission(f, request)).operation_id;
+      if (mode !== 'legacy-before-null') await f.server.sync.archiveStartupHistory(f.auth.vault.vault_id);
+      if (mode === 'null-before-explicit') await seedAdmission(f, request, { status: 'aborted', proposal_base: f.m0,
+        prepared_manifest: { requested_base_commit: f.m0, rename_pairs: null } });
+      const rows = await operationHistory(f.server, f.auth.vault.vault_id);
+      expect(Object.hasOwn(rows.find((row) => row.operation_id === absentId)!, 'proposal_base')).toBe(false);
+      const bound = mode === 'legacy-before-null' || mode === 'null-before-explicit';
+      expect(Object.hasOwn(rows.find((row) => row.operation_id === selected)!, 'proposal_base')).toBe(bound);
+      if (bound) expect(rows.find((row) => row.operation_id === selected)!.proposal_base).toBeNull();
+      if (mode === 'legacy-prepared' || mode === 'legacy-before-null') expect((await f.server.store.snapshot()).sync_operations.map((row) => row.operation_id)).toContain(selected);
+      else expect((await f.server.store.snapshot()).sync_operations.map((row) => row.operation_id)).not.toContain(selected);
+      const before = await canonicalEffects(f);
+      if (mode === 'legacy-before-null' || mode === 'null-before-explicit') {
+        expect(await multipart(f, { ...request, manifest: { ...request.manifest, attempt_id: 'before-replay-explicit-base', base_commit: f.m0 } }))
+          .toMatchObject({ status: 409, result: { error: { code: 'proposal_base_mismatch' } } });
+      }
+      expect(await multipart(f, request)).toMatchObject({ status: 200, result: { status: 'noop', main: f.m0 } });
+      if (mode === 'legacy-prepared') await f.server.store.mutate((db) => {
+        db.sync_operations.find((row) => row.operation_id === selected)!.status = 'committed';
+      });
+      await restart(f);
+      expect(await multipart(f, { ...request, manifest: { ...request.manifest, attempt_id: 'explicit-null', base_commit: null } }))
+        .toMatchObject({ status: 200, result: { status: 'noop' } });
+      expect(await multipart(f, { ...request, manifest: { ...request.manifest, attempt_id: 'explicit-base', base_commit: f.m0 } }))
+        .toMatchObject({ status: 409, result: { error: { code: 'proposal_base_mismatch' } } });
+      expect(await canonicalEffects(f)).toEqual(before);
+      const restartedRows = await operationHistory(f.server, f.auth.vault.vault_id);
+      expect(Object.hasOwn(restartedRows.find((row) => row.operation_id === absentId)!, 'proposal_base')).toBe(false);
+      if (bound) expect(restartedRows.find((row) => row.operation_id === selected)!.proposal_base).toBeNull();
+    }
+  );
+
+  it('archived_admission_union_selects_original_binding: valid hot row-forgetting sensitivity control', async () => {
+    const outcomes: number[] = [];
+    for (const retain of [true, false]) {
+      const f = await fixture();
+      const request = await manifest(f, f.m0, f.m0, 'forgotten-base');
+      delete request.manifest.base_commit;
+      if (retain) await seedAdmission(f, request);
+      expect(await f.server.store.findArchivedTargetCandidates(f.auth.vault.vault_id, f.auth.device.device_id, f.m0)).toEqual([]);
+      const before = await canonicalEffects(f);
+      const result = await multipart(f, { ...request, manifest: { ...request.manifest, attempt_id: 'changed-base', base_commit: f.m0 } });
+      outcomes.push(result.status);
+      expect(result).toMatchObject(retain
+        ? { status: 409, result: { error: { code: 'proposal_base_mismatch' } } }
+        : { status: 200, result: { status: 'noop', main: f.m0 } });
+      expect(await canonicalEffects(f)).toEqual(before);
+    }
+    expect(outcomes).toEqual([409, 200]);
+  });
+
+  it.each((['clean', 'root-ignore', 'overlap'] as const).flatMap((branch) =>
+    (['hot', 'cold'] as const).map((location) => ({ branch, location }))))(
+    'pruned_directory_result_retry_keeps_rename_evidence: $branch/$location', async ({ branch, location }) => {
+    const f = await fixture({ 'source.md': BASE });
+    const pair = [{ source_path: 'source.md', destination_path: 'moved.md' }];
+    const target = await commit(f, f.m0, { 'source.md': null, 'moved.md': BASE });
+    const request = await manifest(f, target, f.m0, 'directory-rename-original', pair);
+    request.manifest.directory_proposal = await directoryProposal(f, target, 'delete');
+    const proposal = request.manifest.directory_proposal;
+    const ack = { proposal_id: proposal.proposal_id, acknowledged_intents: [{ intent_id: proposal.intents[0]!.intent_id, generation: 0 }] };
+    if (location === 'cold') {
+      expect(await multipart(f, request)).toMatchObject({ status: 200, result: { status: 'merged', directory_ack: { ...ack, status: 'accepted' } } });
+    } else {
+      // Seed the already-admitted device ref, then use the real merge to build the hot control's canonical effects.
+      await f.server.git.updateRef(f.auth.vault.vault_id, f.auth.device.device_ref, target, f.m0);
+      await f.server.store.mutate((db) => {
+        const device = db.devices.find((row) => row.device_id === f.auth.device.device_id)!;
+        device.device_ref_head = target;
+        device.status = 'ahead';
+      });
+      const merge = f.server.sync as unknown as { mergeDeviceCommit: (...args: unknown[]) => Promise<PushResult> };
+      expect(await merge.mergeDeviceCommit(f.auth.vault.vault_id, f.auth.device.device_id, target, 0, f.m0, false, proposal, request.manifest))
+        .toMatchObject({ status: 'merged', directory_ack: { ...ack, status: 'accepted' } });
+    }
+    if (branch === 'root-ignore') {
+      await f.server.store.mutate((db) => { db.devices.find((row) => row.device_id === f.auth.device.device_id)!.path_capabilities = { root_ignore: true }; });
+      await saveSettings(f, 'ignored/\n');
+    }
+    if (branch === 'overlap') {
+      const main = (await canonicalEffects(f)).main!;
+      const device = { ...structuredClone(f.auth.device), device_id: 'dev_directory_other', device_ref: 'refs/obts/devices/dev_directory_other',
+        device_ref_head: main, last_applied_main: main,
+        last_applied_event_seq: (await f.server.store.snapshot()).event_seq_by_vault[f.auth.vault.vault_id]!, last_applied_explicit_dirs: [] };
+      await f.server.store.mutate((db) => { db.devices.push(device); });
+      await f.server.git.updateRef(f.auth.vault.vault_id, device.device_ref, main, null);
+      const other = { ...f, auth: { ...f.auth, device } };
+      const opposing = await manifest(other, main, main, 'opposing-directory');
+      opposing.manifest.expected_device_ref = main;
+      opposing.manifest.directory_proposal = await directoryProposal(other, main, 'create', 'Empty/Child');
+      expect(await f.server.sync.pushDeviceCommit(other.auth, opposing.manifest, opposing.pack)).toMatchObject({ status: 'noop', directory_ack: { status: 'accepted' } });
+    }
+    const admitted = location === 'cold' ? await coldAdmission(f, 'directory-rename-original') : await seedAdmission(f, request);
+    const acknowledged = (await f.server.store.snapshot()).devices.find((row) => row.device_id === f.auth.device.device_id)!;
+    expect((await f.server.store.snapshot()).directory_proposal_results.some((row) => row.proposal_id === proposal.proposal_id)).toBe(true);
+    await f.server.store.mutate((db) => {
+      db.directory_proposal_results = db.directory_proposal_results.filter((row) => row.proposal_id !== proposal.proposal_id);
+    });
+    const before = await canonicalEffects(f);
+    if (location === 'cold') {
+      await restart(f);
+      expect(await coldAdmission(f, 'directory-rename-original')).toEqual(admitted);
+    } else {
+      expect((await f.server.store.snapshot()).sync_operations).toContainEqual(admitted);
+      expect(await f.server.store.findArchivedAttempt(f.auth.vault.vault_id, f.auth.device.device_id, 'directory-rename-original')).toBeNull();
+    }
+    const finish = vi.spyOn(f.server.sync as unknown as { finishExistingDeviceCommit: (...args: unknown[]) => Promise<PushResult> }, 'finishExistingDeviceCommit');
+    const merge = vi.spyOn(f.server.sync as unknown as { mergeDeviceCommit: (...args: unknown[]) => Promise<PushResult> }, 'mergeDeviceCommit');
+    const replay = await multipart(f, request);
+    expect(finish).toHaveBeenCalledTimes(1);
+    expect(merge).toHaveBeenCalledTimes(branch === 'root-ignore' ? 0 : 1);
+    expect(await f.server.git.isAncestor(f.auth.vault.vault_id, target, before.main!)).toBe(true);
+    const after = await canonicalEffects(f);
+    expect(after.main).toBe(before.main);
+    expect(after.deviceRef).toBe(target);
+    expect(after.tree).toEqual(before.tree);
+    expect(await blob(f, before.main!, 'moved.md')).toBe(BASE);
+    expect(await f.server.git.readBlobAtPathIfPresent(f.auth.vault.vault_id, before.main!, 'source.md')).toBeNull();
+    expect(await coldAdmission(f, 'directory-rename-original')).toEqual(admitted);
+    const deviceAfter = (await f.server.store.snapshot()).devices.find((row) => row.device_id === f.auth.device.device_id)!;
+    expect([deviceAfter.last_applied_main, deviceAfter.last_applied_event_seq, deviceAfter.last_applied_explicit_dirs])
+      .toEqual([acknowledged.last_applied_main, acknowledged.last_applied_event_seq, acknowledged.last_applied_explicit_dirs]);
+    if (branch === 'root-ignore') {
+      expect(replay).toMatchObject({ status: 409, result: { error: { code: 'root_ignore_capability_required' } } });
+      expect(after).toEqual({ ...before, events: after.events });
+      expect(after.events.slice(0, -1)).toEqual(before.events);
+      expect(after.events.at(-1)).toMatchObject({ event_type: 'device_sync_rejected', payload: { reason: 'root_ignore_capability_required' } });
+    } else if (branch === 'clean') {
+      expect(replay).toEqual({ status: 200, result: { status: 'noop', main: before.main, device_ref: target,
+        event_seq: before.events.at(-1)!.event_seq + 1, directory_ack: { ...ack, status: 'accepted' } } });
+      expect(after.directories[f.auth.vault.vault_id]?.explicit_dirs).toEqual([]);
+      expect(after.events.slice(0, -1)).toEqual(before.events);
+      expect(after.events.at(-1)).toMatchObject({ event_type: 'main_advanced', payload: {
+        decision: 'directory_metadata_merged', directory_intents: [{ op: 'delete', path: 'Empty' }]
+      } });
+      expect(after.conflicts).toEqual(before.conflicts);
+    } else {
+      expect(replay).toMatchObject({ status: 200, result: { status: 'conflicted', directory_ack: { ...ack, status: 'conflicted' } } });
+      if (replay.result.status !== 'conflicted') throw new Error('directory conflict missing');
+      const conflict = after.conflicts.at(-1)!;
+      expect(conflict).toMatchObject({ conflict_id: replay.result.conflict_id, validator_results: { reason: 'directory_overlap' },
+        affected_paths: ['Empty', 'moved.md', 'source.md'], rename_pairs: pair });
+      expect(conflict.directory_context).toMatchObject({ proposal, affected_roots: ['Empty'], conflicting_intent_ids: [proposal.intents[0]!.intent_id] });
+      expect(after.directories).toEqual(before.directories);
+      const review = await f.server.sync.getConflictReviewPackage(f.auth.vault.vault_id, conflict.conflict_id);
+      expect(review.conflict.affected_paths).toEqual(['Empty', 'moved.md', 'source.md']);
+      expect(after.events.slice(0, -1)).toEqual(before.events);
+      expect(after.events.at(-1)).toMatchObject({ event_type: 'conflict_created', payload: { reason: 'directory_overlap' } });
+      expect(replay.result).toEqual({ status: 'conflicted', main: before.main, device_ref: target,
+        conflict_id: conflict.conflict_id, event_seq: before.events.at(-1)!.event_seq + 1,
+        directory_ack: { ...ack, status: 'conflicted' } });
+      for (const [suffix, oid] of [['base', f.m0], ['current', before.main], ['device', target]]) {
+        expect(await f.server.git.getRef(f.auth.vault.vault_id, `refs/obts/conflicts/${conflict.conflict_id}/${suffix}`)).toBe(oid);
+      }
+    }
+    const settled = await canonicalEffects(f);
+    await restart(f);
+    const duplicate = await multipart(f, request);
+    if (branch === 'root-ignore') expect(duplicate).toMatchObject({ status: 409, result: { error: { code: 'root_ignore_capability_required' } } });
+    else {
+      expect(duplicate).toEqual({ status: 200, result: { ...replay.result,
+        directory_ack: { ...ack, status: branch === 'clean' ? 'duplicate' : 'conflicted' } } });
+      expect(await canonicalEffects(f)).toEqual(settled);
+    }
+    expect(await coldAdmission(f, 'directory-rename-original')).toEqual(admitted);
+  });
+
+  it.each(['proposal', 'legacy'] as const)('plain_attempt_cannot_acquire_directory_payload_after_archive: hot control %s', async (variant) => {
+    const f = await fixture();
+    const request = await manifest(f, f.m0, f.m0, 'plain-hot-attempt');
+    const admitted = await seedAdmission(f, request);
+    expect((await f.server.store.snapshot()).sync_operations).toContainEqual(admitted);
+    expect(await f.server.store.findArchivedAttempt(f.auth.vault.vault_id, f.auth.device.device_id, 'plain-hot-attempt')).toBeNull();
+    const before = await canonicalEffects(f);
+    const payload = variant === 'proposal'
+      ? { directory_proposal: await directoryProposal(f, f.m0) }
+      : { directory_intents: [{ op: 'create' as const, path: 'Empty' }] };
+    expect(await multipart(f, { ...request, manifest: { ...request.manifest, ...payload } }))
+      .toMatchObject({ status: 409, result: { error: { code: 'attempt_mismatch' } } });
+    expect((await multipart(f, request)).result.status).toBe('noop');
+    expect(await canonicalEffects(f)).toEqual(before);
+    expect(await coldAdmission(f, 'plain-hot-attempt')).toEqual(admitted);
+  });
+
+  it.each(['proposal', 'legacy'] as const)('plain_attempt_cannot_acquire_directory_payload_after_archive: %s', async (variant) => {
+    const f = await fixture();
+    const target = await commit(f, f.m0, { 'note.md': LOCAL });
+    const request = await manifest(f, target, f.m0, 'plain-admitted-attempt');
+    expect((await multipart(f, request)).result.status).toBe('merged');
+    const admitted = await coldAdmission(f, 'plain-admitted-attempt');
+    const before = await canonicalEffects(f);
+    expect((await multipart(f, request)).result.status).toBe('noop');
+    await restart(f);
+    const payload = variant === 'proposal'
+      ? { directory_proposal: await directoryProposal(f, target) }
+      : { directory_intents: [{ op: 'create' as const, path: 'Empty' }] };
+    const changed = { ...request, manifest: { ...request.manifest, ...payload } };
+    expect(await multipart(f, changed)).toMatchObject({ status: 409, result: { error: { code: 'attempt_mismatch' } } });
+    expect(await canonicalEffects(f)).toEqual(before);
+    expect(await coldAdmission(f, 'plain-admitted-attempt')).toEqual(admitted);
+    expect(await blob(f, before.main!, 'note.md')).toBe(LOCAL);
+  });
+});
+
 describe('immutable admitted base across re-entry', () => {
   it.each(['multipart', 'chunked', 'replacement-chunked'] as const)('reuses M0 after ref movement and rejects a different base (%s)', async (transport) => {
     const f = await fixture();
@@ -596,7 +944,7 @@ describe('immutable admitted base across re-entry', () => {
     if (result.status !== 'merged') throw new Error('merge missing');
     expect(await blob(f, result.main, 'note.md')).toBe(MERGED);
     expect(await blob(f, result.main, 'inherited.md')).toBe('main advanced during retry\n');
-    const merges = (await f.server.store.snapshot()).sync_operations.filter((op) => op.operation_type === 'server_merge');
+    const merges = (await operationHistory(f.server, f.auth.vault.vault_id)).filter((op) => op.operation_type === 'server_merge');
     expect(merges.at(-1)?.prepared_manifest?.base_commit).toBe(f.m0);
   });
 
@@ -623,6 +971,32 @@ describe('immutable admitted base across re-entry', () => {
     await expect(f.server.sync.pushDeviceCommit(f.auth, bad.manifest, bad.pack))
       .rejects.toMatchObject({ statusCode: 409, code: 'proposal_base_mismatch' });
     expect(await f.server.git.getRef(f.auth.vault.vault_id, 'refs/heads/main')).toBe(result.main);
+  });
+
+  it('startup aborts stale started admission rows without losing their attempt binding', async () => {
+    const f = await fixture();
+    const target = await commit(f, f.m0, { 'note.md': LOCAL });
+    const operation = await f.server.store.mutate((db) => {
+      const row = f.server.store.startOperation(db, {
+        vault_id: f.auth.vault.vault_id, device_id: f.auth.device.device_id, operation_type: 'device_push',
+        expected_refs: { [f.auth.device.device_ref]: f.m0 }, target_refs: { [f.auth.device.device_ref]: target },
+        target_commit: target
+      });
+      row.prepared_manifest = {
+        attempt_id: 'stale-started-attempt', attempt_hash: 'stale-started-hash',
+        rename_pairs: [{ source_path: 'old.md', destination_path: 'new.md' }]
+      };
+      return row;
+    });
+    await f.server.app.close();
+    servers.splice(servers.indexOf(f.server), 1);
+    const restarted = await createObtsServer(f.server.config);
+    servers.push(restarted);
+    const recovered = (await operationHistory(restarted, f.auth.vault.vault_id)).find((row) => row.operation_id === operation.operation_id);
+    expect(recovered).toMatchObject({
+      status: 'aborted', prepared_manifest: operation.prepared_manifest,
+      result: { reason: 'startup_unprepared_operation' }
+    });
   });
 
   it.each(['bound', 'legacy'] as const)('startup resumes persisted %s admission with its migration semantics', async (mode) => {
@@ -667,7 +1041,7 @@ async function saveSettings(f: Fixture, rootIgnore: string | null = null, rules 
   return String(saved.current_main);
 }
 async function mergeEvidence(f: Fixture, main: string) {
-  const operation = (await f.server.store.snapshot()).sync_operations.find((op) => op.operation_type === 'server_merge' && op.target_commit === main)!;
+  const operation = (await operationHistory(f.server, f.auth.vault.vault_id)).find((op) => op.operation_type === 'server_merge' && op.target_commit === main)!;
   expect(operation.status).toBe('committed');
   expect(operation.prepared_manifest?.metadata_conflict_rules).toEqual(TIMESTAMP_RULES);
   expect(operation.prepared_manifest?.metadata_conflict_rules_sha256).toBe(sha256Hex(JSON.stringify(TIMESTAMP_RULES)));
@@ -831,7 +1205,7 @@ describe('stale proposals composed with vault settings and timestamp rules', () 
     expect(await blob(f, result.main, 'note.md')).toBe(timestampNote(4));
     const evidence = await mergeEvidence(f, result.main);
     expect(evidence.metadata_timestamp_fields).toContainEqual({ path: 'note.md', field: 'updated', winner: 'device' });
-    const operation = (await f.server.store.snapshot()).sync_operations.find((op) => op.operation_type === 'server_merge' && op.target_commit === result.main)!;
+    const operation = (await operationHistory(f.server, f.auth.vault.vault_id)).find((op) => op.operation_type === 'server_merge' && op.target_commit === result.main)!;
     expect(operation.prepared_manifest?.base_commit).toBe(mode === 'explicit' ? f.m0 : k);
   });
 });
@@ -885,17 +1259,36 @@ describe('explicit rename pair proposals', () => {
     expect(merged.nodes).toContainEqual(expect.objectContaining({ id: 'local-node' }));
   });
 
-  it.each(['keep_server', 'use_device'] as const)('reviews a low-similarity explicit move and resolves both endpoints with %s', async (resolutionKind) => {
+  it.each(['keep_server', 'use_device'] as const)('archived_conflict_and_expired_transfer_replay: reviews and resolves a low-similarity move with %s', async (resolutionKind) => {
     const original = Array.from({ length: 100 }, (_, index) => `line ${index}`).join('\n') + '\n';
     const f = await fixture({ 'source.md': original });
     const remote = await commit(f, f.m0, { 'source.md': original.replace('line 50', 'REMOTE line 50') });
     await setMain(f, remote);
     const deviceContent = `local addition\n${original.replace('line 50', 'DEVICE line 50').split('\n').slice(40).join('\n')}`;
     const target = await commit(f, remote, { 'source.md': null, 'moved.md': deviceContent });
-    const request = await manifest(f, target, f.m0, undefined, pair);
+    const request = await manifest(f, target, f.m0, 'rename-open-conflict', pair);
+    request.manifest.directory_proposal = await directoryProposal(f, target);
     const result = await f.server.sync.pushDeviceCommit(f.auth, request.manifest, request.pack);
     expect(result.status).toBe('conflicted');
     if (result.status !== 'conflicted') throw new Error('expected rename conflict');
+    expect(result.directory_ack).toMatchObject({ proposal_id: request.manifest.directory_proposal.proposal_id, status: 'conflicted',
+      acknowledged_intents: [{ intent_id: request.manifest.directory_proposal.intents[0]!.intent_id, generation: 0 }] });
+    const admitted = await coldAdmission(f, 'rename-open-conflict');
+    const before = await canonicalEffects(f);
+    const originalReview = await f.server.sync.getConflictReviewPackage(f.auth.vault.vault_id, result.conflict_id);
+    for (const reboot of [false, true]) {
+      if (reboot) await restart(f);
+      expect(await multipart(f, request)).toEqual({ status: 200, result });
+      expect(await coldAdmission(f, 'rename-open-conflict')).toEqual(admitted);
+      expect(await canonicalEffects(f)).toEqual(before);
+      expect(await f.server.sync.getConflictReviewPackage(f.auth.vault.vault_id, result.conflict_id)).toEqual(originalReview);
+      for (const [suffix, oid] of [['base', f.m0], ['current', remote], ['device', target]]) {
+        expect(await f.server.git.getRef(f.auth.vault.vault_id, `refs/obts/conflicts/${result.conflict_id}/${suffix}`)).toBe(oid);
+      }
+      expect(await blob(f, f.m0, 'source.md')).toBe(original);
+      expect(await blob(f, remote, 'source.md')).toBe(original.replace('line 50', 'REMOTE line 50'));
+      expect(await blob(f, target, 'moved.md')).toBe(deviceContent);
+    }
     const review = await f.server.sync.getConflictReviewPackage(f.auth.vault.vault_id, result.conflict_id);
     expect(review.path_conflicts).toContainEqual(expect.objectContaining({
       base_path: 'source.md', server_path: 'source.md', device_path: 'moved.md',
@@ -913,13 +1306,14 @@ describe('explicit rename pair proposals', () => {
     }
   });
 
-  it('roundtrips rename identity in chunk sessions and merges binary moves without content merging', async () => {
+  it('archived_conflict_and_expired_transfer_replay: expires a completed binary rename upload and replays after restart', async () => {
     const bytes = Buffer.from([0, 255, 1, 128]);
     const f = await fixture({ 'source.md': bytes, 'unrelated.md': 'base\n' });
     const remote = await commit(f, f.m0, { 'unrelated.md': 'canonical\n' });
     await setMain(f, remote);
     const target = await commit(f, remote, { 'source.md': null, 'moved.md': bytes });
     const request = await manifest(f, target, f.m0, 'rename-chunk-attempt', pair);
+    request.manifest.directory_proposal = await directoryProposal(f, target);
     expect(f.server.chunkTransfers.capabilities().capabilities).toContain('rename-pairs-v1');
     const transfer = await f.server.chunkTransfers.createPush(f.auth, {
       ...request.manifest, attempt_id: 'rename-chunk-attempt', chunk_count: 1, plan_sha256: sha256Hex('rename-plan')
@@ -935,6 +1329,51 @@ describe('explicit rename pair proposals', () => {
     expect(await f.server.git.readBlobAtPathIfPresent(f.auth.vault.vault_id, result.main, 'source.md')).toBeNull();
     expect(await f.server.git.readBlobAtPath(f.auth.vault.vault_id, result.main, 'moved.md')).toEqual(bytes);
     expect(await blob(f, result.main, 'unrelated.md')).toBe('canonical\n');
+    expect(result.directory_ack).toMatchObject({ status: 'accepted', proposal_id: request.manifest.directory_proposal.proposal_id });
+    const admitted = await coldAdmission(f, 'rename-chunk-attempt');
+    expect(admitted.proposal_base).toBe(f.m0);
+    expect(admitted.prepared_manifest?.rename_pairs).toEqual(pair);
+    const before = await canonicalEffects(f);
+    const sessionPath = join(f.server.config.transferDir, transfer.descriptor.transfer_id, 'session.json');
+    const completed = JSON.parse(await readFile(sessionPath, 'utf8'));
+    completed.expires_at = new Date(Date.now() - 1_000).toISOString();
+    await writeFile(sessionPath, JSON.stringify(completed));
+    await expect(f.server.chunkTransfers.getPush(f.auth, transfer.descriptor.transfer_id))
+      .rejects.toMatchObject({ statusCode: 410, code: 'transfer_expired' });
+    await restart(f);
+    expect(await coldAdmission(f, 'rename-chunk-attempt')).toEqual(admitted);
+    const replacement = await f.server.chunkTransfers.createPush(f.auth, {
+      ...request.manifest, attempt_id: 'rename-replacement', chunk_count: 1, plan_sha256: sha256Hex('rename-plan')
+    });
+    await f.server.chunkTransfers.putChunk(f.auth, replacement.descriptor.transfer_id, 0, request.pack, sha256Hex(request.pack));
+    const replay = await f.server.chunkTransfers.finalizePush(f.auth, replacement.descriptor.transfer_id);
+    expect(replay).toEqual({ status: 'noop', main: result.main, device_ref: target, event_seq: result.event_seq,
+      directory_ack: { ...result.directory_ack, status: 'duplicate' } });
+    expect(await canonicalEffects(f)).toEqual(before);
+    const replacementAdmission = await coldAdmission(f, 'rename-replacement');
+    expect(replacementAdmission.proposal_base).toBe(f.m0);
+    expect(replacementAdmission.prepared_manifest).toMatchObject({ rename_pairs: pair, directory_proposal: request.manifest.directory_proposal });
+    expect((await operationHistory(f.server, f.auth.vault.vault_id)).find((row) => row.operation_type === 'server_merge' && row.target_commit === result.main)
+      ?.prepared_manifest?.base_commit).toBe(f.m0);
+    await restart(f);
+    expect(await f.server.chunkTransfers.finalizePush(f.auth, replacement.descriptor.transfer_id)).toEqual(replay);
+    expect(await coldAdmission(f, 'rename-chunk-attempt')).toEqual(admitted);
+    for (const [change, code] of [
+      [{ base_commit: remote }, 'proposal_base_mismatch'],
+      [{ rename_pairs: undefined }, 'rename_pairs_mismatch'],
+      [{ rename_pairs: [{ source_path: 'source.md', destination_path: 'other.md' }] }, 'rename_pairs_mismatch']
+    ] as Array<[Partial<DevicePushManifest>, string]>) {
+      const bad = await f.server.chunkTransfers.createPush(f.auth, {
+        ...request.manifest, ...change, attempt_id: `bad-rename-${code}-${JSON.stringify(change).length}`,
+        chunk_count: 1, plan_sha256: sha256Hex('rename-plan')
+      });
+      await f.server.chunkTransfers.putChunk(f.auth, bad.descriptor.transfer_id, 0, request.pack, sha256Hex(request.pack));
+      await expect(f.server.chunkTransfers.finalizePush(f.auth, bad.descriptor.transfer_id)).rejects.toMatchObject({ statusCode: 409, code });
+    }
+    expect(await canonicalEffects(f)).toEqual(before);
+    expect(await f.server.git.readBlobAtPath(f.auth.vault.vault_id, result.main, 'moved.md')).toEqual(bytes);
+    expect(await blob(f, result.main, 'unrelated.md')).toBe('canonical\n');
+    expect(await f.server.git.readBlobAtPathIfPresent(f.auth.vault.vault_id, result.main, 'source.md')).toBeNull();
   });
 
   it('requires explicit base identity and rejects malformed pairs before device ref movement', async () => {
@@ -955,17 +1394,54 @@ describe('explicit rename pair proposals', () => {
     expect(await f.server.git.getRef(f.auth.vault.vault_id, f.auth.device.device_ref)).toBe(f.m0);
   });
 
-  it('rejects retry metadata changes, including omission and a new attempt ID', async () => {
+  it('archived_rename_retry_equal_and_superseded: preserves the exact request through restart', async () => {
     const f = await fixture({ 'source.md': BASE });
     const target = await commit(f, f.m0, { 'source.md': null, 'moved.md': BASE });
     const original = await manifest(f, target, f.m0, 'rename-attempt-original', pair);
-    await expect(f.server.sync.pushDeviceCommit(f.auth, original.manifest, original.pack)).resolves.toMatchObject({ status: 'merged' });
+    const savedManifest = JSON.stringify(original.manifest);
+    const savedPack = Buffer.from(original.pack);
+    expect((await multipart(f, original)).result.status).toBe('merged');
+    const admitted = await coldAdmission(f, 'rename-attempt-original');
+    expect(admitted.prepared_manifest?.rename_pairs).toEqual(pair);
+    const before = await canonicalEffects(f);
+    for (const reboot of [false, true]) {
+      if (reboot) await restart(f);
+      expect(await coldAdmission(f, 'rename-attempt-original')).toEqual(admitted);
+      const replay = await multipart(f, original);
+      expect(replay.status).toBe(200);
+      expect(replay.result).toMatchObject({ status: 'noop', main: before.main, device_ref: target });
+      expect(await canonicalEffects(f)).toEqual(before);
+      expect(await blob(f, target, 'moved.md')).toBe(BASE);
+      expect(await f.server.git.readBlobAtPathIfPresent(f.auth.vault.vault_id, target, 'source.md')).toBeNull();
+    }
+    expect(JSON.stringify(original.manifest)).toBe(savedManifest);
+    expect(original.pack).toEqual(savedPack);
     const exactReplay = await manifest(f, target, f.m0, 'rename-attempt-exact-replay', pair);
     await expect(f.server.sync.pushDeviceCommit(f.auth, exactReplay.manifest, exactReplay.pack)).resolves.toMatchObject({ status: 'noop' });
     const changedPairs: DevicePushManifest['rename_pairs'] = [{ source_path: 'source.md', destination_path: 'other.md' }];
     for (const [attempt, pairs] of [['rename-attempt-omitted', undefined], ['rename-attempt-changed', changedPairs]] as Array<[string, DevicePushManifest['rename_pairs']]>) {
       const retry = await manifest(f, target, f.m0, attempt, pairs);
       await expect(f.server.sync.pushDeviceCommit(f.auth, retry.manifest, retry.pack)).rejects.toMatchObject({ code: 'rename_pairs_mismatch' });
+    }
+    const descendant = await commit(f, target, { 'moved.md': LOCAL });
+    const successor = await manifest(f, descendant, target, 'rename-successor');
+    successor.manifest.expected_device_ref = target;
+    expect((await multipart(f, successor)).result.status).toBe('merged');
+    const superseded = await canonicalEffects(f);
+    for (const reboot of [false, true]) {
+      if (reboot) await restart(f);
+      const priorEvents = (await canonicalEffects(f)).events;
+      const replay = await multipart(f, original);
+      expect(replay).toMatchObject({ status: 409, result: { error: { code: 'invalid_rename_pair' } } });
+      const after = await canonicalEffects(f);
+      expect(after).toEqual({ ...superseded, events: after.events });
+      expect(after.events.slice(0, -1)).toEqual(priorEvents);
+      expect(after.events.at(-1)).toMatchObject({ event_type: 'device_sync_rejected', payload: { reason: 'invalid_rename_pair' } });
+      expect(await coldAdmission(f, 'rename-attempt-original')).toEqual(admitted);
+      expect(await blob(f, superseded.main!, 'moved.md')).toBe(LOCAL);
+      expect(await blob(f, target, 'moved.md')).toBe(BASE);
+      expect(JSON.stringify(original.manifest)).toBe(savedManifest);
+      expect(original.pack).toEqual(savedPack);
     }
   });
 
@@ -1095,7 +1571,7 @@ describe('canonical integration fast-forward', () => {
     const result = await f.server.sync.pushDeviceCommit(f.auth, request.manifest, request.pack);
     expect(result).toMatchObject({ status: 'merged', main: target, merge_commit: target, device_ref: target });
     expect(await f.server.git.getRef(f.auth.vault.vault_id, 'refs/heads/main')).toBe(target);
-    const operation = (await f.server.store.snapshot()).sync_operations.find((op) => op.operation_type === 'server_merge');
+    const operation = (await operationHistory(f.server, f.auth.vault.vault_id)).find((op) => op.operation_type === 'server_merge');
     expect(operation).toMatchObject({ status: 'committed', target_commit: target, expected_refs: { 'refs/heads/main': f.m0 } });
     const replay = await f.server.sync.pushDeviceCommit(f.auth, request.manifest, request.pack);
     expect(replay).toMatchObject({ main: target });
@@ -1156,7 +1632,7 @@ describe('canonical integration fast-forward', () => {
     servers.push(restarted);
     const db = await restarted.store.snapshot();
     expect(db.vaults[0]?.current_main).toBe(target);
-    expect(db.sync_operations.find((op) => op.operation_id === prepared!.operation_id)).toMatchObject({
+    expect((await restarted.store.exportOperationHistory(f.auth.vault.vault_id)).find((op) => op.operation_id === prepared!.operation_id)).toMatchObject({
       status: 'committed', result: { decision: 'merged', merge_commit: target, reconciled_after_startup: true }
     });
     const auth = await restarted.auth.authenticateDevice(`Bearer ${f.token}`, f.auth.vault.vault_id);

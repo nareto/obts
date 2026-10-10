@@ -442,6 +442,7 @@ export class VaultLifecycleCoordinator {
         await this.eraseGitAndTemp(vaultId);
         await this.store.cleanupPersistenceTemps();
         await this.setPhase(vaultId, 'finalizing', null);
+        await this.store.eraseOperationHistory(vaultId);
         await this.store.mutateDurably((mutableDb) => this.finalizeDb(mutableDb, vaultId));
         barrier.closed = true;
         barrier.closing = true;
@@ -605,6 +606,7 @@ export class VaultLifecycleCoordinator {
     delete db.merge_sequence_by_vault[vaultId];
     delete db.directory_state_by_vault[vaultId];
     delete db.derived_history_by_vault[vaultId];
+    if (db.operation_history_by_vault) delete db.operation_history_by_vault[vaultId];
     db.directory_proposal_results = db.directory_proposal_results.filter((result) => result.vault_id !== vaultId);
     db.deletion_jobs = db.deletion_jobs.filter((candidate) => candidate.vault_id !== vaultId);
     const receipt: DeletionReceipt = {

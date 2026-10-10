@@ -4,6 +4,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 
 import { assertNoSymlinkComponents } from './deletionRoot.js';
 import { observeMetadataPersist } from './syncLatency.js';
+import { OperationHistoryStore, type HistoryBatch } from './operationHistoryStore.js';
 
 import { newId, nowIso } from '../shared/ids.js';
 import { DISPLAY_NAME_MAX_LENGTH, normalizeDisplayName } from '../shared/validators.js';
@@ -18,6 +19,7 @@ import type {
 
 const EVENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const EVENT_RETENTION_LIMIT = 100_000;
+const MAX_OPEN_OPERATION_HISTORY_LEDGERS = 16;
 
 // Metadata temp residue is only removed when its name matches a naming scheme this
 // project has actually written: `<pid>.<epoch-ms>.<random-hex>.tmp` for the current
@@ -164,6 +166,7 @@ export type LoginAttemptRow = {
 
 export type SyncOperationRow = {
   operation_id: string;
+  operation_sequence?: number;
   vault_id: string;
   device_id: string | null;
   operation_type: 'device_push' | 'server_merge' | 'conflict_create' | 'conflict_refresh' | 'conflict_resolve' | 'note_restore' | 'git_maintenance' | 'vault_settings';
@@ -245,8 +248,17 @@ export type DeletionReceipt = {
   status: 'deleted';
 };
 
+export type OperationHistoryMetadata = {
+  ledger_id: string;
+  generation: number;
+  next_sequence: number;
+  init_pending: boolean;
+  pending_batch: HistoryBatch | null;
+};
+
 export type MetadataDb = {
-  schema_version: 7;
+  schema_version: 8;
+  operation_history_by_vault?: Record<string, OperationHistoryMetadata>;
   setup_complete: boolean;
   users: UserRow[];
   sessions: SessionRow[];
@@ -312,18 +324,36 @@ export class MetadataStore {
   private cleanupFailed = false;
   private cleanupDirectorySyncRequired = false;
   private readonly persistence: MetadataPersistenceAdapter;
+  private readonly histories = new Map<string, OperationHistoryStore>();
 
   constructor(private readonly dataDir: string, persistence?: Partial<MetadataPersistenceAdapter>) {
     this.persistence = { ...defaultPersistenceAdapter, ...persistence };
   }
 
   isReady(): boolean {
-    return !this.closed && !this.durabilityUncertain && !this.cleanupFailed;
+    if (this.closed || this.durabilityUncertain || this.cleanupFailed || !this.db) return false;
+    try {
+      for (const vault of this.db.vaults) {
+        if (vault.status === 'deleting' || this.db.deletion_jobs.some((job) => job.vault_id === vault.vault_id)) continue;
+        const state = this.db.operation_history_by_vault?.[vault.vault_id];
+        const history = this.histories.get(vault.vault_id);
+        if (!state || state.init_pending || state.pending_batch) return false;
+        const directory = join(this.dataDir, 'metadata', 'operation-history', vault.vault_id);
+        if (history) history.verifyAvailable(state.generation, state.next_sequence);
+        else OperationHistoryStore.verifyOnDisk(directory, vault.vault_id, state.ledger_id, state.generation, state.next_sequence);
+      }
+      return true;
+    } catch {
+      this.durabilityUncertain = true;
+      return false;
+    }
   }
 
   async close(): Promise<void> {
     this.closed = true;
     await this.pending;
+    for (const history of this.histories.values()) history.close();
+    this.histories.clear();
   }
 
   isDurabilityUncertain(): boolean {
@@ -356,6 +386,338 @@ export class MetadataStore {
       await this.persist();
     }
     await this.removeStalePersistenceTemps();
+    try {
+      await this.initializeOperationHistory();
+    } catch (error) {
+      this.durabilityUncertain = true;
+      throw error;
+    }
+  }
+
+  private async initializeOperationHistory(): Promise<void> {
+    const current = this.requireDb();
+    let candidate = clone(current);
+    let initialized = false;
+    candidate.operation_history_by_vault ??= {};
+    const vaultIds = new Set(candidate.vaults.map((vault) => vault.vault_id));
+    if (candidate.sync_operations.some((operation) => !vaultIds.has(operation.vault_id)) ||
+        Object.keys(candidate.operation_history_by_vault).some((vaultId) => !vaultIds.has(vaultId))) {
+      throw new Error('Operation history references an unknown vault.');
+    }
+    for (const vault of candidate.vaults) {
+      const rows = candidate.sync_operations.filter((operation) => operation.vault_id === vault.vault_id);
+      const state = candidate.operation_history_by_vault[vault.vault_id];
+      if (!state) {
+        if (rows.some((operation) => operation.operation_sequence !== undefined)) throw new Error('Unacknowledged operation history sequence state is inconsistent.');
+        rows.forEach((operation, index) => { operation.operation_sequence = index + 1; });
+        candidate.operation_history_by_vault[vault.vault_id] = {
+          ledger_id: newId('hist'), generation: 0,
+          next_sequence: rows.length + 1, init_pending: true, pending_batch: null
+        };
+        initialized = true;
+        continue;
+      }
+      let previousSequence = 0;
+      for (const operation of rows) {
+        if (!Number.isSafeInteger(operation.operation_sequence) || operation.operation_sequence! <= previousSequence) {
+          throw new Error('Operation history hot-row ordering is inconsistent.');
+        }
+        previousSequence = operation.operation_sequence!;
+      }
+      if (!Number.isSafeInteger(state.next_sequence) || state.next_sequence <= previousSequence ||
+          typeof state.ledger_id !== 'string' || state.ledger_id.length === 0 ||
+          !Number.isSafeInteger(state.generation) || state.generation < 0 ||
+          typeof state.init_pending !== 'boolean' || !Object.hasOwn(state, 'pending_batch')) {
+        throw new Error('Operation history metadata is inconsistent.');
+      }
+    }
+    if (initialized || candidate.sync_operations.some((operation, index) => operation.operation_sequence !== current.sync_operations[index]?.operation_sequence)) {
+      await this.persist(candidate);
+      this.db = candidate;
+      candidate = clone(candidate);
+    }
+    for (const vault of candidate.vaults) {
+      const state = candidate.operation_history_by_vault![vault.vault_id];
+      if (!state) throw new Error('Operation history initialization state is missing.');
+      if (vault.status === 'deleting' || candidate.deletion_jobs.some((job) => job.vault_id === vault.vault_id)) continue;
+      if (state.init_pending && (state.generation !== 0 || state.pending_batch !== null)) throw new Error('Operation history initialization state is inconsistent.');
+      if (state.pending_batch) this.validateHistoryBatch(candidate, vault.vault_id);
+      const history = await OperationHistoryStore.open(join(this.dataDir, 'metadata', 'operation-history', vault.vault_id), vault.vault_id, state.ledger_id, state.init_pending, this.persistence, true,
+        { generation: state.generation, nextSequence: state.next_sequence, pendingBatch: state.pending_batch });
+      this.cacheHistory(vault.vault_id, history);
+      if (state.pending_batch) await this.recoverHistoryBatch(candidate, vault.vault_id, history);
+      else if (history.generation !== state.generation || history.maxSequence >= state.next_sequence) throw new Error('Operation history generation or sequence mismatch.');
+      if (state.init_pending) {
+        const initialized = clone(this.requireDb());
+        initialized.operation_history_by_vault![vault.vault_id]!.init_pending = false;
+        await this.persist(initialized);
+        this.db = initialized;
+        candidate = initialized;
+      }
+    }
+  }
+
+  private validateHistoryBatch(db: MetadataDb, vaultId: string): HistoryBatch {
+    const state = db.operation_history_by_vault![vaultId];
+    if (!state) throw new Error('Operation history metadata is missing.');
+    const batch = state.pending_batch!;
+    if (batch.vault_id !== vaultId || batch.ledger_id !== state.ledger_id || batch.parent_generation !== state.generation ||
+        batch.target_generation !== state.generation + 1 || batch.rows.length === 0 || batch.rows.length > 256) {
+      throw new Error('Operation history handoff descriptor is inconsistent.');
+    }
+    const selected = new Map(db.sync_operations.filter((row) => row.vault_id === vaultId).map((row) => [row.operation_id, row]));
+    const identities = new Set<string>();
+    let previousSequence = 0;
+    for (const entry of batch.rows) {
+      const row = selected.get(entry.operation_id);
+      const canonical = row ? OperationHistoryStore.canonical(row) : null;
+      if (!row || row.status !== 'committed' && row.status !== 'aborted' || row.operation_sequence !== entry.sequence ||
+          entry.sequence <= previousSequence || identities.has(entry.operation_id) || canonical?.text !== entry.canonical || canonical.sha256 !== entry.sha256) {
+        throw new Error('Operation history source row does not match its handoff descriptor.');
+      }
+      identities.add(entry.operation_id);
+      previousSequence = entry.sequence;
+    }
+    return batch;
+  }
+
+  private async recoverHistoryBatch(db: MetadataDb, vaultId: string, history: OperationHistoryStore): Promise<void> {
+    const batch = this.validateHistoryBatch(db, vaultId);
+    if (history.generation === batch.parent_generation) history.commitBatch(batch);
+    else if (history.generation === batch.target_generation) history.commitBatch(batch);
+    else throw new Error('Operation history archive proof is missing.');
+    await this.finishHistoryBatch(db, vaultId, batch);
+  }
+
+  private async archiveEligibleUnqueued(vaultId: string, isPendingMerge?: (row: SyncOperationRow, db: MetadataDb) => Promise<boolean>): Promise<number> {
+    const db = this.requireDb();
+    const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
+    if (!vault || vault.status !== 'active' || db.deletion_jobs.some((job) => job.vault_id === vaultId)) return 0;
+    const history = await this.ensureHistory(vaultId);
+    const state = db.operation_history_by_vault![vaultId];
+    if (!state) throw new Error('Operation history metadata is missing.');
+    if (state.pending_batch) throw new Error('Operation history handoff requires recovery.');
+    if (history.generation !== state.generation || history.maxSequence >= state.next_sequence) throw new Error('Operation history generation or sequence mismatch.');
+    const vaultRows = db.sync_operations.filter((row) => row.vault_id === vaultId);
+    const currentDeviceHeads = new Map(db.devices.filter((device) => device.vault_id === vaultId).map((device) => [device.device_id, device.device_ref_head]));
+    const eligible: SyncOperationRow[] = [];
+    for (const row of vaultRows) {
+      if (row.status !== 'committed' && row.status !== 'aborted') continue;
+      if (row.operation_type === 'device_push' && row.status === 'committed' && row.device_id &&
+          row.target_commit === currentDeviceHeads.get(row.device_id) && (isPendingMerge ? await isPendingMerge(row, db) : true)) continue;
+      eligible.push(row);
+    }
+    eligible.sort((left, right) => (left.operation_sequence ?? 0) - (right.operation_sequence ?? 0));
+    eligible.splice(256);
+    if (eligible.length === 0) return 0;
+    await this.publishHistoryBatch(vaultId, eligible);
+    return eligible.length;
+  }
+
+  private async publishHistoryBatch(vaultId: string, rows: SyncOperationRow[]): Promise<void> {
+    const db = clone(this.requireDb());
+    const state = db.operation_history_by_vault![vaultId];
+    if (!state) throw new Error('Operation history metadata is missing.');
+    const history = await this.ensureHistory(vaultId);
+    if (state.pending_batch || state.generation !== history.generation) throw new Error('Operation history handoff is unavailable.');
+    const batch: HistoryBatch = {
+      vault_id: vaultId, ledger_id: state.ledger_id, batch_id: newId('batch'), parent_generation: state.generation,
+      target_generation: state.generation + 1,
+      rows: rows.map((row) => {
+        const canonical = OperationHistoryStore.canonical(row);
+        if (row.operation_sequence === undefined) throw new Error('Operation history sequence is missing.');
+        return { operation_id: row.operation_id, sequence: row.operation_sequence, canonical: canonical.text, sha256: canonical.sha256 };
+      })
+    };
+    state.pending_batch = batch;
+    await this.persist(db);
+    this.db = db;
+    try {
+      history.commitBatch(batch);
+      await this.finishHistoryBatch(db, vaultId, batch);
+    } catch (error) {
+      this.durabilityUncertain = true;
+      throw error;
+    }
+  }
+
+  private async finishHistoryBatch(db: MetadataDb, vaultId: string, batch: HistoryBatch): Promise<void> {
+    const candidate = clone(db);
+    candidate.sync_operations = candidate.sync_operations.filter((row) =>
+      row.vault_id !== vaultId || !batch.rows.some((entry) => entry.operation_id === row.operation_id));
+    const state = candidate.operation_history_by_vault![vaultId];
+    if (!state) throw new Error('Operation history metadata is missing.');
+    state.generation = batch.target_generation;
+    state.pending_batch = null;
+    await this.persist(candidate);
+    this.db = candidate;
+  }
+
+  async findArchivedAttempt(vaultId: string, deviceId: string, attemptId: string): Promise<{ row: SyncOperationRow; sequence: number } | null> {
+    return await this.readHistory(vaultId, (history) => history.findAttempt(deviceId, attemptId));
+  }
+
+  async findArchivedTargetCandidates(vaultId: string, deviceId: string, targetCommit: string): Promise<Array<{ row: SyncOperationRow; sequence: number }>> {
+    return await this.readHistory(vaultId, (history) => history.findTargetCandidates(deviceId, targetCommit));
+  }
+
+  async exportOperationHistory(vaultId: string): Promise<SyncOperationRow[]> {
+    return await this.enqueue(async () => {
+      await this.ensureLoaded();
+      this.assertOperational();
+      const db = this.requireDb();
+      return await this.readHistory(vaultId, (history) => {
+        const rows = new Map<string, SyncOperationRow>();
+        for (const row of [...history.exportRows(), ...db.sync_operations.filter((candidate) => candidate.vault_id === vaultId)]) {
+          const previous = rows.get(row.operation_id);
+          if (previous && OperationHistoryStore.canonical(previous).sha256 !== OperationHistoryStore.canonical(row).sha256) {
+            throw new Error('Operation history contains conflicting copies.');
+          }
+          rows.set(row.operation_id, row);
+        }
+        return [...rows.values()].sort((left, right) => (left.operation_sequence ?? 0) - (right.operation_sequence ?? 0));
+      });
+    });
+  }
+
+  async operationHistoryCounts(vaultId: string): Promise<Record<string, number>> {
+    return await this.enqueue(async () => {
+      await this.ensureLoaded();
+      this.assertOperational();
+      const db = this.requireDb();
+      const hot = db.sync_operations.filter((row) => row.vault_id === vaultId);
+      const pendingIds = db.operation_history_by_vault?.[vaultId]?.pending_batch?.rows.map((row) => row.operation_id) ?? [];
+      const counts: Record<string, number> = {};
+      for (const row of hot) {
+        const key = `${row.operation_type}:${row.status}`;
+        counts[key] = (counts[key] ?? 0) + 1;
+      }
+      const historicalCounts = await this.readHistory(vaultId, (history) => history.countByTypeStatus(pendingIds));
+      for (const item of historicalCounts) {
+        const key = `${item.operation_type}:${item.status}`;
+        counts[key] = (counts[key] ?? 0) + item.count;
+      }
+      return counts;
+    });
+  }
+
+  async eraseOperationHistory(vaultId: string): Promise<void> {
+    await this.enqueue(async () => {
+      if (this.closed) throw new Error('Metadata store is closed.');
+      this.histories.get(vaultId)?.close();
+      this.histories.delete(vaultId);
+      const state = this.requireDb().operation_history_by_vault?.[vaultId];
+      await OperationHistoryStore.eraseDirectory(join(this.dataDir, 'metadata', 'operation-history', vaultId),
+        state ? { vaultId, ledgerId: state.ledger_id } : undefined);
+    });
+  }
+
+  async archiveCompletedHistory(vaultId: string, isPendingMerge?: (row: SyncOperationRow, db: MetadataDb) => Promise<boolean>): Promise<void> {
+    await this.enqueue(async () => {
+      await this.ensureLoaded();
+      this.assertOperational();
+      try {
+        await this.archiveEligibleUnqueued(vaultId, isPendingMerge);
+      } catch (error) {
+        this.durabilityUncertain = true;
+        throw error;
+      }
+    });
+  }
+
+  async archiveStartupHistory(vaultId: string, isPendingMerge?: (row: SyncOperationRow, db: MetadataDb) => Promise<boolean>): Promise<void> {
+    await this.enqueue(async () => {
+      await this.ensureLoaded();
+      this.assertOperational();
+      try {
+        while (await this.archiveEligibleUnqueued(vaultId, isPendingMerge) > 0) {}
+      } catch (error) {
+        this.durabilityUncertain = true;
+        throw error;
+      }
+    });
+  }
+
+  private prepareOperationHistoryMetadata(db: MetadataDb): void {
+    db.operation_history_by_vault ??= {};
+    for (const vault of db.vaults) {
+      if (!db.operation_history_by_vault[vault.vault_id]) {
+        db.operation_history_by_vault[vault.vault_id] = {
+          ledger_id: newId('hist'), generation: 0,
+          next_sequence: db.sync_operations.filter((row) => row.vault_id === vault.vault_id).length + 1,
+          init_pending: true, pending_batch: null
+        };
+      }
+    }
+  }
+
+  private cacheHistory(vaultId: string, history: OperationHistoryStore): void {
+    const existing = this.histories.get(vaultId);
+    if (existing && existing !== history) existing.close();
+    this.histories.delete(vaultId);
+    this.histories.set(vaultId, history);
+    while (this.histories.size > MAX_OPEN_OPERATION_HISTORY_LEDGERS) {
+      const oldest = this.histories.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.histories.get(oldest)?.close();
+      this.histories.delete(oldest);
+    }
+  }
+
+  private async readHistory<T>(vaultId: string, read: (history: OperationHistoryStore) => T): Promise<T> {
+    const history = await this.ensureHistory(vaultId);
+    try { return read(history); }
+    catch (error) {
+      this.durabilityUncertain = true;
+      throw error;
+    }
+  }
+
+  private async ensureHistory(vaultId: string): Promise<OperationHistoryStore> {
+    if (this.durabilityUncertain) throw new MetadataPublicationError();
+    try {
+      const state = this.requireDb().operation_history_by_vault?.[vaultId];
+      if (!state) throw new Error('Operation history metadata is missing.');
+      const existing = this.histories.get(vaultId);
+      if (existing) {
+        existing.verifyAvailable(state.generation, state.next_sequence);
+        this.histories.delete(vaultId);
+        this.histories.set(vaultId, existing);
+        return existing;
+      }
+      // Startup validates all rows; eviction must not turn indexed admission into a history scan.
+      const history = await OperationHistoryStore.open(
+        join(this.dataDir, 'metadata', 'operation-history', vaultId), vaultId, state.ledger_id, state.init_pending, this.persistence, false,
+        { generation: state.generation, nextSequence: state.next_sequence, pendingBatch: state.pending_batch }
+      );
+      try {
+        history.verifyAvailable(state.generation, state.next_sequence);
+      } catch (error) {
+        history.close();
+        throw error;
+      }
+      this.cacheHistory(vaultId, history);
+      return history;
+    } catch (error) {
+      this.durabilityUncertain = true;
+      throw error;
+    }
+  }
+
+  private async initializePendingHistories(): Promise<void> {
+    const db = this.requireDb();
+    this.prepareOperationHistoryMetadata(db);
+    for (const vault of db.vaults) {
+      if (vault.status === 'deleting' || db.deletion_jobs.some((job) => job.vault_id === vault.vault_id)) continue;
+      const state = db.operation_history_by_vault![vault.vault_id]!;
+      if (!state.init_pending) continue;
+      const history = await this.ensureHistory(vault.vault_id);
+      if (history.generation !== state.generation || history.maxSequence >= state.next_sequence) throw new Error('Operation history generation or sequence mismatch.');
+      const initialized = clone(this.requireDb());
+      initialized.operation_history_by_vault![vault.vault_id]!.init_pending = false;
+      await this.persist(initialized);
+      this.db = initialized;
+    }
   }
 
   async snapshot(): Promise<MetadataDb> {
@@ -371,6 +733,7 @@ export class MetadataStore {
       this.assertOperational();
       const candidate = clone(this.requireDb());
       const result = await fn(candidate);
+      this.prepareOperationHistoryMetadata(candidate);
       try {
         await this.persist(candidate);
       } catch (error) {
@@ -378,6 +741,7 @@ export class MetadataStore {
         throw error;
       }
       this.db = candidate;
+      await this.initializePendingHistories();
       return result;
     });
   }
@@ -388,6 +752,7 @@ export class MetadataStore {
       this.assertOperational();
       const candidate = clone(this.requireDb());
       const result = await fn(candidate);
+      this.prepareOperationHistoryMetadata(candidate);
       try {
         await this.persist(candidate);
       } catch (error) {
@@ -395,6 +760,7 @@ export class MetadataStore {
         throw error;
       }
       this.db = candidate;
+      await this.initializePendingHistories();
       return result;
     });
   }
@@ -418,6 +784,7 @@ export class MetadataStore {
       if (!shouldMutate(selected)) return clone(selected) as Detached<T>;
       const candidate = clone(this.requireDb());
       const result = update(candidate);
+      this.prepareOperationHistoryMetadata(candidate);
       try {
         await this.persist(candidate);
       } catch (error) {
@@ -425,6 +792,7 @@ export class MetadataStore {
         throw error;
       }
       this.db = candidate;
+      await this.initializePendingHistories();
       return clone(result) as Detached<T>;
     });
   }
@@ -462,6 +830,26 @@ export class MetadataStore {
   private assertOperational(): void {
     if (this.durabilityUncertain) throw new MetadataPublicationError();
     if (this.cleanupFailed) throw new MetadataCleanupError();
+    const db = this.db;
+    if (!db) return;
+    try {
+      for (const vault of db.vaults) {
+        if (vault.status === 'deleting' || db.deletion_jobs.some((job) => job.vault_id === vault.vault_id)) continue;
+        const state = db.operation_history_by_vault?.[vault.vault_id];
+        const history = this.histories.get(vault.vault_id);
+        if (!state || state.init_pending || state.pending_batch) throw new MetadataPublicationError();
+        if (history) {
+          history.verifyAvailable(state.generation, state.next_sequence);
+        } else {
+          OperationHistoryStore.verifyOnDisk(join(this.dataDir, 'metadata', 'operation-history', vault.vault_id),
+            vault.vault_id, state.ledger_id, state.generation, state.next_sequence);
+        }
+      }
+    } catch (error) {
+      this.durabilityUncertain = true;
+      if (error instanceof MetadataPublicationError) throw error;
+      throw new MetadataPublicationError(error);
+    }
   }
 
   nextMergeSequence(db: MetadataDb, vaultId: string): number {
@@ -492,8 +880,15 @@ export class MetadataStore {
     input: Omit<SyncOperationRow, 'operation_id' | 'status' | 'prepared_manifest' | 'result' | 'created_at' | 'updated_at'>
   ): SyncOperationRow {
     const timestamp = nowIso();
+    db.operation_history_by_vault ??= {};
+    const state = db.operation_history_by_vault[input.vault_id] ??= {
+      ledger_id: newId('hist'), generation: 0,
+      next_sequence: db.sync_operations.filter((row) => row.vault_id === input.vault_id).length + 1,
+      init_pending: true, pending_batch: null
+    };
     const operation: SyncOperationRow = {
       operation_id: newId('op'),
+      operation_sequence: state.next_sequence++,
       status: 'started',
       prepared_manifest: null,
       result: null,
@@ -602,8 +997,8 @@ export class MetadataStore {
   }
 
   private normalizeLoadedDb(db: MetadataDb): boolean {
-    const legacyDb = db as MetadataDb & {
-      schema_version: 1 | 2 | 3 | 4 | 5 | 6 | 7;
+    const legacyDb = db as Omit<MetadataDb, 'schema_version'> & {
+      schema_version: number;
       deletion_jobs?: DeletionJob[];
       deletion_receipts?: DeletionReceipt[];
       connections?: ConnectionRequestRow[];
@@ -667,8 +1062,8 @@ export class MetadataStore {
       changed = true;
     }
     const schema = legacyDb as unknown as { schema_version: number };
-    if (schema.schema_version < 7) {
-      schema.schema_version = 7;
+    if (schema.schema_version < 8) {
+      schema.schema_version = 8;
       changed = true;
     }
     for (const vault of db.vaults) {
@@ -868,7 +1263,7 @@ function migrateDisplayName(value: unknown, fallback: string): string {
 
 function createEmptyDb(): MetadataDb {
   return {
-    schema_version: 7,
+    schema_version: 8,
     setup_complete: false,
     users: [],
     sessions: [],

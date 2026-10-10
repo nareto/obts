@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { lstat, open, realpath, readdir, rm } from 'node:fs/promises';
+import { lstat, open, realpath, readdir, rm, rmdir, unlink } from 'node:fs/promises';
 import { dirname, join, resolve, sep } from 'node:path';
 import type { Dirent } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
@@ -25,7 +25,7 @@ export async function openDeletionRoot(configuredPath: string): Promise<Deletion
   }
   const absolutePath = resolve(configuredPath);
   await assertNoSymlinkComponents(absolutePath);
-  const initial = await lstat(absolutePath);
+  const initial = await lstat(absolutePath, { bigint: true });
   if (!initial.isDirectory() || initial.isSymbolicLink()) {
     throw new DeletionRootError('Configured deletion root is not a real directory.');
   }
@@ -34,7 +34,8 @@ export async function openDeletionRoot(configuredPath: string): Promise<Deletion
     const identity = await handle.stat({ bigint: true });
     const resolvedPath = await realpath(absolutePath);
     const resolvedInfo = await lstat(resolvedPath, { bigint: true });
-    if (!resolvedInfo.isDirectory() || resolvedInfo.dev !== identity.dev || resolvedInfo.ino !== identity.ino) {
+    if (!resolvedInfo.isDirectory() || initial.dev !== identity.dev || initial.ino !== identity.ino ||
+        resolvedInfo.dev !== identity.dev || resolvedInfo.ino !== identity.ino) {
       throw new DeletionRootError('Configured deletion root identity changed.');
     }
     return {
@@ -109,6 +110,43 @@ export async function removeDeletionRootDirectoryChild(root: DeletionRoot, name:
     throw new DeletionRootError('Deletion candidate is not a real directory.');
   }
   await rm(child, { recursive: true, force: true });
+  await assertDeletionRootUnchanged(root);
+}
+
+export async function removeDeletionRootFileChild(root: DeletionRoot, name: string, expected: { dev: bigint; ino: bigint }): Promise<void> {
+  if (!name || name.includes(sep) || name === '.' || name === '..') {
+    throw new DeletionRootError('Deletion candidate is not a direct child.');
+  }
+  await assertDeletionRootUnchanged(root);
+  const child = join(root.fdPath, name);
+  const handle = await open(child, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const opened = await handle.stat({ bigint: true });
+    const current = await lstat(child, { bigint: true });
+    if (!opened.isFile() || !current.isFile() || current.isSymbolicLink() ||
+        opened.dev !== expected.dev || opened.ino !== expected.ino || current.dev !== expected.dev || current.ino !== expected.ino) {
+      throw new DeletionRootError('Deletion file identity changed.');
+    }
+    await assertDeletionRootUnchanged(root);
+    await unlink(child);
+    await assertDeletionRootUnchanged(root);
+  } finally {
+    await handle.close();
+  }
+}
+
+export async function removeEmptyDeletionRootDirectoryChild(root: DeletionRoot, name: string, childRoot: DeletionRoot): Promise<void> {
+  if (!name || name.includes(sep) || name === '.' || name === '..') {
+    throw new DeletionRootError('Deletion candidate is not a direct child.');
+  }
+  await assertDeletionRootUnchanged(root);
+  await assertDeletionRootUnchanged(childRoot);
+  const child = join(root.fdPath, name);
+  const current = await lstat(child, { bigint: true });
+  if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== childRoot.device || current.ino !== childRoot.inode) {
+    throw new DeletionRootError('Deletion directory identity changed.');
+  }
+  await rmdir(child);
   await assertDeletionRootUnchanged(root);
 }
 

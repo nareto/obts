@@ -25,7 +25,7 @@ graph LR
       38[("Bridge PostgreSQL state [Container: PostgreSQL, pgvector]")]
       39["Visible vault [Container: Obsidian Vault API, filesystem]"]
       40[".obts local store [Container: Filesystem]"]
-      41[("Metadata store [Container: JSON file adapter]")]
+      41[("Metadata store [Container: Atomic JSON files, SQLite rollback-journal ledgers]")]
       42["Vault Git stores [Container: Native Git bare repositories]"]
       43["Transfer quarantine [Container: Filesystem, temporary bare Git repositories]"]
       44["Semantic merge workspace [Container: Temporary filesystem]"]
@@ -47,7 +47,7 @@ graph LR
     36-. "Pairs and synchronizes as a normal protected OBTS device [HTTPS]" .->25
     7-. "Scans and safely applies visible vault content [Obsidian Vault API]" .->39
     7-. "Persists local journal, immutable upload identity, credentials, cursors, and recovery evidence [Filesystem]" .->40
-    25-. "Reads and atomically replaces application metadata [Filesystem]" .->41
+    25-. "Atomically publishes hot metadata and transactionally archives acknowledged operation history [Filesystem, SQLite]" .->41
     25-. "Validates objects and maintains canonical, device, and conflict refs [Git object and ref operations]" .->42
     25-. "Persists resumable chunks, staged objects, and asynchronous terminal results [Filesystem]" .->43
     25-. "Materializes only overlapping candidates requiring semantic validation [Filesystem]" .->44
@@ -145,14 +145,14 @@ graph LR
         28["Chunk transfer service [Component: TypeScript]"]
         29["Sync service [Component: TypeScript]"]
         30["Git service [Component: Native Git]"]
-        31["Metadata store [Component: TypeScript]"]
+        31["Metadata store [Component: TypeScript, node:sqlite]"]
         32["Diagnostic service [Component: TypeScript]"]
         33["Vault deletion coordinator [Component: TypeScript]"]
         34["Dashboard host [Component: Fastify]"]
       end
 
       17["Dashboard SPA [Container: Svelte, TypeScript, Vite]"]
-      41[("Metadata store [Container: JSON file adapter]")]
+      41[("Metadata store [Container: Atomic JSON files, SQLite rollback-journal ledgers]")]
       42["Vault Git stores [Container: Native Git bare repositories]"]
       43["Transfer quarantine [Container: Filesystem, temporary bare Git repositories]"]
       44["Semantic merge workspace [Container: Temporary filesystem]"]
@@ -170,7 +170,7 @@ graph LR
     30-. "Runs batched tree inspection, object promotion, temporary-index read-tree/write-tree merges, commit-tree, and ref CAS [Native Git]" .->42
     30-. "Reads validated staged objects and promotes them after policy checks [Git alternates and filesystem]" .->43
     30-. "Materializes semantic overlap candidates only [Filesystem]" .->44
-    31-. "Atomically reads and replaces durable metadata [Filesystem]" .->41
+    31-. "Coordinates atomic JSON publication, durable indexed history transactions, and generation recovery [Filesystem, SQLite]" .->41
     33-. "Closes new per-vault sync admission and rejects target work after durable revocation [In-process calls]" .->29
     33-. "Stops or drains target transfer processors and detached callbacks without reusing released request leases [In-process calls]" .->28
     33-. "Revokes target devices/connections and closes new approval/completion admission [In-process calls]" .->27

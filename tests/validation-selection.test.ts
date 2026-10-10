@@ -174,6 +174,35 @@ describe('validation selection', () => {
     expect(makePlan(['architecture/models/formal/checks-fm004.json', 'README.md']).executableGroup).toBe('all');
   });
 
+  it('selects operation-history for every model and companion config', () => {
+    const configs = readdirSync(join(root, 'architecture/models/formal/configs'))
+      .filter((name) => name.startsWith('fm015-') && name.endsWith('.cfg'));
+    expect(configs.length).toBeGreaterThan(0);
+    const paths = [
+      'architecture/models/formal/OBTSOperationHistory.tla',
+      'architecture/models/formal/OBTSOperationHistory.cfg',
+      ...configs.map((name) => `architecture/models/formal/configs/${name}`)
+    ];
+    for (const changedPaths of [...paths.map((path) => [path]), paths]) {
+      expect(makePlan(changedPaths)).toMatchObject({
+        executableGroup: 'fast',
+        formalFamilies: ['operation-history'],
+        rustUnitTestsRequired: false
+      });
+    }
+  });
+
+  it('includes operation-history in full and conservative validation', () => {
+    for (const plan of [
+      makePlan([], { full: true }),
+      makePlan(['src/server/metadataStore.ts']),
+      makePlan(['scripts/check-operation-history-model.mjs'])
+    ]) {
+      expect(plan.executableGroup).toBe('all');
+      expect(plan.formalFamilies).toContain('operation-history');
+    }
+  });
+
   it('defines fast, scoped, checker, and integration partitions with safe unknown-test fallback', () => {
     const testFiles = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
       const path = join(dir, entry.name);
