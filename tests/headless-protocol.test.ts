@@ -26,6 +26,8 @@ function fakeClient(overrides: Partial<HeadlessClient> = {}): HeadlessClient {
     initialize: vi.fn(async () => undefined),
     setProgressListener: vi.fn(() => undefined),
     stopDeviceStatusReports: vi.fn(() => undefined),
+    runInRequestScope: vi.fn(async (fn: () => Promise<unknown>) => await fn()) as HeadlessClient['runInRequestScope'],
+    abortRequests: vi.fn(() => undefined),
     readState: vi.fn(async () => state),
     readQueue: vi.fn(async () => ({ pending_commit: null, expected_device_ref: null, status: 'idle', attempts: 0, updated_at: state.updated_at })),
     readPendingOnboarding: vi.fn(async () => null),

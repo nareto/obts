@@ -2,6 +2,7 @@ export const fastTests = [
   'tests/conflict-diff.test.ts',
   'tests/dashboard-presentation.test.ts',
   'tests/headless-protocol.test.ts',
+  'tests/headless-transport-deadlines.test.ts',
   'tests/plugin-mobile-fs.test.ts',
   'tests/work-pool.test.ts',
   'tests/path-mutation-gate.test.ts',

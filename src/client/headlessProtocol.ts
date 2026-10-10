@@ -54,6 +54,8 @@ export type HeadlessClient = Pick<
   | 'initialize'
   | 'setProgressListener'
   | 'stopDeviceStatusReports'
+  | 'runInRequestScope'
+  | 'abortRequests'
   | 'readState'
   | 'readQueue'
   | 'readPendingOnboarding'
@@ -95,55 +97,61 @@ export class HeadlessSession {
     this.client.setProgressListener((status, diagnosticPoint) => {
       void this.emitMessage({ type: 'event', event: 'progress', status, diagnosticPoint });
     });
-    await this.client.initialize();
-    await this.emitMessage({ type: 'event', event: 'ready', state: projectState(await this.client.readState()) });
+    const state = await this.client.runInRequestScope(async () => {
+      await this.client.initialize();
+      return await this.client.readState();
+    });
+    await this.emitMessage({ type: 'event', event: 'ready', state: projectState(state) });
   }
 
   submit(value: unknown): Promise<void> {
-    const operation = this.tail.then(async () => {
-      let request: HeadlessRequest;
-      try {
-        request = parseRequest(value);
-      } catch (error) {
-        await this.emitMessage({ type: 'response', id: requestId(value), ok: false, error: protocolError(error) });
-        return;
-      }
-      if (this.stopping && request.command !== 'shutdown') {
-        await this.emitMessage({
-          type: 'response',
-          id: request.id,
-          ok: false,
-          error: { code: 'shutting_down', message: 'The headless client is shutting down.' }
-        });
-        return;
-      }
-      try {
-        const { result, stateChanged, shouldStop } = await this.dispatch(request);
-        if (stateChanged) {
-          await this.emitMessage({ type: 'event', event: 'state', state: projectState(await this.client.readState()) });
-        }
-        await this.emitMessage({ type: 'response', id: request.id, ok: true, result });
-        if (shouldStop) this.stopping = true;
-      } catch (error) {
-        if (request.command === 'maintenance-tick' && error && typeof error === 'object' &&
-            'code' in error && (error.code === 'catchup_local_changes' || error.code === 'catchup_recovery_required')) {
-          try {
-            const state = await this.client.readState();
-            if (state.last_error_code === error.code) {
-              await this.emitMessage({ type: 'event', event: 'state', state: projectState(state) });
-            }
-          } catch {}
-        }
-        await this.emitMessage({ type: 'response', id: request.id, ok: false, error: protocolError(error) });
-      }
-    });
+    const operation = this.tail.then(() => this.client.runInRequestScope(() => this.execute(value)));
     this.tail = operation.catch(() => undefined);
     return operation;
+  }
+
+  private async execute(value: unknown): Promise<void> {
+    let request: HeadlessRequest;
+    try {
+      request = parseRequest(value);
+    } catch (error) {
+      await this.emitMessage({ type: 'response', id: requestId(value), ok: false, error: protocolError(error) });
+      return;
+    }
+    if (this.stopping && request.command !== 'shutdown') {
+      await this.emitMessage({
+        type: 'response',
+        id: request.id,
+        ok: false,
+        error: { code: 'shutting_down', message: 'The headless client is shutting down.' }
+      });
+      return;
+    }
+    try {
+      const { result, stateChanged, shouldStop } = await this.dispatch(request);
+      if (stateChanged) {
+        await this.emitMessage({ type: 'event', event: 'state', state: projectState(await this.client.readState()) });
+      }
+      await this.emitMessage({ type: 'response', id: request.id, ok: true, result });
+      if (shouldStop) this.stopping = true;
+    } catch (error) {
+      if (request.command === 'maintenance-tick' && error && typeof error === 'object' &&
+          'code' in error && (error.code === 'catchup_local_changes' || error.code === 'catchup_recovery_required')) {
+        try {
+          const state = await this.client.readState();
+          if (state.last_error_code === error.code) {
+            await this.emitMessage({ type: 'event', event: 'state', state: projectState(state) });
+          }
+        } catch {}
+      }
+      await this.emitMessage({ type: 'response', id: request.id, ok: false, error: protocolError(error) });
+    }
   }
 
   async stop(reason: string): Promise<void> {
     this.stopping = true;
     this.client.stopDeviceStatusReports();
+    this.client.abortRequests();
     await this.tail;
     this.client.setProgressListener(null);
     await this.emitMessage({ type: 'event', event: 'stopping', reason });

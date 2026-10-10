@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { Buffer } from 'node:buffer';
 import { createRequire } from 'node:module';
 
@@ -204,6 +205,49 @@ type SharedModule = {
 
 type NodePluginHost = ReturnType<typeof createNodePluginHost>;
 
+export const HEADLESS_REQUEST_DEADLINES_MS = { control: 60_000, transfer: 180_000 } as const;
+
+export type HeadlessRequestClass = keyof typeof HEADLESS_REQUEST_DEADLINES_MS;
+
+export type HeadlessClientOptions = {
+  requestDeadlinesMs?: Partial<Record<HeadlessRequestClass, number>>;
+};
+
+type RequestScopeState = {
+  signal: AbortSignal;
+  deadlinesMs: Record<HeadlessRequestClass, number>;
+};
+
+const requestScope = new AsyncLocalStorage<RequestScopeState>();
+
+const TRANSFER_PATHNAMES = [
+  /^(?:\/.*)?\/api\/v1\/connections\/[^/]+\/bootstrap(?:-chunk)?$/u,
+  /^(?:\/.*)?\/api\/v1\/vaults\/[^/]+\/sync\/(?:pull|pull-chunk|push)$/u,
+  /^(?:\/.*)?\/api\/v1\/vaults\/[^/]+\/sync\/push-transfers(?:\/.*)?$/u
+];
+
+export function classifyHeadlessRequest(_method: string, url: string): HeadlessRequestClass {
+  let pathname: string;
+  try {
+    pathname = new URL(url).pathname;
+  } catch {
+    return 'control';
+  }
+  return TRANSFER_PATHNAMES.some((pattern) => pattern.test(pathname)) ? 'transfer' : 'control';
+}
+
+function requestTimeoutError(requestClass: HeadlessRequestClass, deadlineMs: number): Error {
+  return Object.assign(new Error(`The ${requestClass} request exceeded its ${deadlineMs} ms deadline.`), {
+    name: 'TimeoutError',
+    requestClass,
+    deadlineMs
+  });
+}
+
+function requestAbortError(): Error {
+  return Object.assign(new Error('The request was aborted because the headless client is stopping.'), { name: 'AbortError' });
+}
+
 const shared = loadSharedModule();
 export const PluginBlockedError = shared.PluginBlockedError;
 export const TransportError = shared.TransportError;
@@ -215,9 +259,22 @@ export class ObtsPluginClient {
   readonly git: Record<string, MutableMethod>;
   readonly recovery: Record<string, MutableMethod>;
   readonly transport: Record<string, MutableMethod>;
+  private readonly requestAbortController = new AbortController();
+  private readonly requestScopeState: RequestScopeState;
 
-  constructor(vaultDir: string, settings: ObtsPluginSettings, managedHeadlessOwner?: ManagedHeadlessOwnership | null) {
+  constructor(
+    vaultDir: string,
+    settings: ObtsPluginSettings,
+    managedHeadlessOwner?: ManagedHeadlessOwnership | null,
+    options?: HeadlessClientOptions
+  ) {
     this.settings = settings;
+    const deadlinesMs = { ...HEADLESS_REQUEST_DEADLINES_MS } as Record<HeadlessRequestClass, number>;
+    for (const requestClass of Object.keys(deadlinesMs) as HeadlessRequestClass[]) {
+      const override = options?.requestDeadlinesMs?.[requestClass];
+      if (typeof override === 'number' && Number.isFinite(override) && override > 0) deadlinesMs[requestClass] = override;
+    }
+    this.requestScopeState = { signal: this.requestAbortController.signal, deadlinesMs };
     this.host = createNodePluginHost(vaultDir, settings);
     this.host.managedHeadlessOwner = managedHeadlessOwner ?? null;
     this.host.pathMutationGate = shared.installPathMutationGate(this.host.app.vault.adapter, this.host);
@@ -235,6 +292,14 @@ export class ObtsPluginClient {
 
   stopDeviceStatusReports(): void {
     this.client.stopDeviceStatusReports();
+  }
+
+  runInRequestScope<T>(fn: () => Promise<T>): Promise<T> {
+    return requestScope.run(this.requestScopeState, fn);
+  }
+
+  abortRequests(): void {
+    if (!this.requestAbortController.signal.aborted) this.requestAbortController.abort(requestAbortError());
   }
 
   get unloaded(): boolean {
@@ -611,25 +676,43 @@ async function nodeRequestUrl(options: {
   json?: unknown;
   arrayBuffer: ArrayBuffer;
 }> {
-  const request: RequestInit = {
-    method: options.method ?? 'GET',
-    ...(options.headers === undefined ? {} : { headers: options.headers }),
-    ...(options.body === undefined ? {} : { body: options.body })
-  };
-  const response = await fetch(options.url, request);
-  const arrayBuffer = await response.arrayBuffer();
-  const text = Buffer.from(arrayBuffer).toString('utf8');
-  let json: unknown;
+  const method = options.method ?? 'GET';
+  const scope = requestScope.getStore();
+  if (scope?.signal.aborted) throw requestAbortError();
+  const requestClass = classifyHeadlessRequest(method, options.url);
+  const deadlineMs = (scope?.deadlinesMs ?? HEADLESS_REQUEST_DEADLINES_MS)[requestClass];
+  const controller = new AbortController();
+  const onScopeAbort = (): void => controller.abort(requestAbortError());
+  scope?.signal.addEventListener('abort', onScopeAbort, { once: true });
+  const timer = setTimeout(() => controller.abort(requestTimeoutError(requestClass, deadlineMs)), deadlineMs);
   try {
-    json = text ? JSON.parse(text) : undefined;
-  } catch {
-    json = undefined;
+    const request: RequestInit = {
+      method,
+      signal: controller.signal,
+      ...(options.headers === undefined ? {} : { headers: options.headers }),
+      ...(options.body === undefined ? {} : { body: options.body })
+    };
+    const response = await fetch(options.url, request);
+    const arrayBuffer = await response.arrayBuffer();
+    const text = Buffer.from(arrayBuffer).toString('utf8');
+    let json: unknown;
+    try {
+      json = text ? JSON.parse(text) : undefined;
+    } catch {
+      json = undefined;
+    }
+    return {
+      status: response.status,
+      headers: Object.fromEntries(response.headers.entries()),
+      text,
+      json,
+      arrayBuffer
+    };
+  } catch (error) {
+    if (controller.signal.aborted) throw controller.signal.reason;
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    scope?.signal.removeEventListener('abort', onScopeAbort);
   }
-  return {
-    status: response.status,
-    headers: Object.fromEntries(response.headers.entries()),
-    text,
-    json,
-    arrayBuffer
-  };
 }
