@@ -1,12 +1,29 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount, tick } from 'svelte';
   import { ApiError, DashboardApi } from './api/client';
+  import {
+    currentHistoryIndex,
+    currentLocationHref,
+    currentRoute,
+    initHistoryIndex,
+    navigate,
+    routeHref,
+    shouldInterceptClick,
+    subscribe,
+    undoNavigation,
+    vaultRoute,
+    type NavigationSource,
+    type Route,
+    type Section
+  } from './router';
   import type { AttentionItem } from './components/Attention.svelte';
   import AuthScreen from './components/AuthScreen.svelte';
   import ConflictQueue from './components/ConflictQueue.svelte';
   import ConflictWorkbench from './components/ConflictWorkbench.svelte';
   import ConnectionScreen from './components/ConnectionScreen.svelte';
-  import DeviceTable from './components/DeviceTable.svelte';
+  import DeviceRemovalModal from './components/DeviceRemovalModal.svelte';
+  import type { DiscardReason, RemovalMode } from './components/DeviceRemovalModal.svelte';
+  import DevicesPage from './components/DevicesPage.svelte';
   import HistoryPage from './components/HistoryPage.svelte';
   import MaintenancePage from './components/MaintenancePage.svelte';
   import Overview from './components/Overview.svelte';
@@ -15,6 +32,9 @@
   import Shell from './components/Shell.svelte';
   import Status from './components/Status.svelte';
   import VaultDeletionModal from './components/VaultDeletionModal.svelte';
+  import { LiveUpdates, type LiveRefreshRequest, type LiveState } from './liveUpdates';
+  import { isDeviceRevoked, liveAnnouncement, liveIndicator, removalFailureText } from './presentation';
+  import { RefreshScheduler, type RefreshScope } from './refreshScheduler';
   import type {
     DashboardConflict,
     ConnectionReview,
@@ -37,16 +57,44 @@
   } from './api/types';
 
   const api = new DashboardApi();
+  const scheduler = new RefreshScheduler({
+    run: runScheduledRefresh,
+    onRunError: (error) => {
+      dashboardStatusCurrent = false;
+      reportAsyncError(error, 'Unable to refresh dashboard status.');
+    }
+  });
+  /** Fallback polling while the live stream is not connected. */
   const DASHBOARD_REFRESH_INTERVAL_MS = 15 * 1000;
+  /** While live, status is re-read this often so clock-dependent labels keep aging. */
+  const DASHBOARD_LIVE_AGING_INTERVAL_MS = 60 * 1000;
+  const DIAGNOSTICS_STALE_MS = 60 * 1000;
   const nav = ['Overview', 'Devices', 'Conflicts', 'History', 'Maintenance', 'Settings'] as const;
   type Page = (typeof nav)[number];
+  const sectionByPage: Record<Page, Section> = {
+    Overview: 'overview', Devices: 'devices', Conflicts: 'conflicts', History: 'history', Maintenance: 'maintenance', Settings: 'settings'
+  };
+  const pageBySection: Record<Section, Page> = {
+    overview: 'Overview', devices: 'Devices', conflicts: 'Conflicts', history: 'History', maintenance: 'Maintenance', settings: 'Settings'
+  };
 
   let session: Session | null = null;
   let setupComplete = true;
   let username = '';
   let password = '';
   let authError = '';
+  let route: Route = currentRoute();
+  let committedHref = currentLocationHref();
+  let committedIndex = currentHistoryIndex();
+  let focusToken = 0;
+  /** Monotonic count of applied route changes (push, replace, popstate); async completions compare it instead of URLs. */
+  let routeSeq = 0;
   let page: Page = 'Overview';
+  let vaultsLoaded = false;
+  let settingsDraftDirty = false;
+  let resolutionDraftDirty = false;
+  let unloadGuardActive = false;
+  const refreshOnOpen = new Set<string>();
   let vaults: VaultSummary[] = [];
   let deletions: VaultDeletionStatus[] = [];
   let vaultId = '';
@@ -65,6 +113,10 @@
   let diagnostics: DiagnosticEventsResponse | null = null;
   let diagnosticsError = '';
   let diagnosticsLoading = false;
+  /** The user followed `next_cursor` at least once, so an automatic refetch would collapse the loaded pages. */
+  let diagnosticsPaged = false;
+  /** Diagnostics changed while paged: the header offers a manual refresh instead of replacing the list. */
+  let diagnosticsNewActivity = false;
   let conflicts: DashboardConflict[] = [];
   let selectedConflictId = '';
   let conflictListOpen = false;
@@ -79,6 +131,7 @@
   let connectionOperationInFlight = false;
   let connectionRequestGeneration = 0;
   let reauthOpen = false;
+  let reauthTrigger: HTMLElement | null = null;
   let reauthAction: (() => Promise<void>) | null = null;
   let historyPath = '';
   let history: NoteHistoryQueryResponse | null = null;
@@ -90,6 +143,7 @@
   let maintenanceDetailOpen = false;
   let busy = false;
   let notice = '';
+  let noticeLink: { forNotice: string; label: string; route: Route } | null = null;
   let actionError = '';
   let lastRefreshed: string | null = null;
   let nowMs = Date.now();
@@ -97,6 +151,16 @@
   let dashboardRefreshGeneration = 0;
   let dashboardRefreshOwner: { vaultId: string; epoch: number; generation: number } | null = null;
   let dashboardStatusCurrent = true;
+  let live: LiveUpdates | null = null;
+  let liveState: LiveState = 'connecting';
+  let liveReconnectingSince: number | null = null;
+  let liveAnnouncementText = '';
+  let liveKeyPrevious = '';
+  /** A stream (re)connect asked for a full snapshot that has not settled yet; `Live` is not shown before it lands. */
+  let connectRefreshPending = false;
+  /** Bumped per connect request so a run only clears the obligation it actually started after. */
+  let connectRefreshToken = 0;
+  let diagnosticsRefetchWanted = false;
   let stateEpoch = 0;
   let logoutInFlight = false;
   let logoutFailed = false;
@@ -105,6 +169,8 @@
   let previewRequestGeneration = 0;
   let historyRequestGeneration = 0;
   let diagnosticsRequestGeneration = 0;
+  let diagnosticsFetchedAt = 0;
+  let settingsShownPrevious = false;
   let diagnosticsDeleteGeneration = 0;
   let diagnosticsDeleteInFlight = false;
   let deletionModalOpen = false;
@@ -114,6 +180,15 @@
   let deletionRequestInFlight = false;
   let deletionRefreshGeneration = 0;
   let deletionRefreshInFlight = false;
+  type RemovalTarget = { vaultId: string; deviceId: string; deviceName: string; epoch: number; account: number; userId: string; generation: number };
+  let removalTarget: RemovalTarget | null = null;
+  let removalMode: RemovalMode = 'standard';
+  let removalDiscardReason: DiscardReason | null = null;
+  let removalError = '';
+  let removalFailureNote = '';
+  let removalConflictsLink = false;
+  let removalRequestGeneration = 0;
+  let removalRequestInFlight = false;
 
   $: selectedVault = vaults.find((vault) => vault.vault_id === vaultId) ?? null;
   $: if (session && page === 'Settings' && selectedVault && vaultSyncSettingsLoadedFor !== selectedVault.vault_id && !vaultSyncSettingsLoading && !vaultSyncSettingsError) {
@@ -125,14 +200,200 @@
   $: selectedVaultDeleting = selectedVault?.status === 'deleting' || selectedDeletion?.status === 'deleting';
   $: recentAuthValid = session ? Date.parse(session.recent_auth_expires_at) > nowMs : false;
   $: syncSummary = dashboardSyncSummary(dashboard, dashboardStatusCurrent);
+  $: indicator = liveIndicator({ state: liveState, statusCurrent: dashboardStatusCurrent, snapshotPending: connectRefreshPending, reconnectingSince: liveReconnectingSince, now: nowMs });
+  $: syncLive(live, session && !connectionId ? session.user_id : '');
+  $: page = routePage(route);
+  $: routeConflictId = route.kind === 'vault' && route.section === 'conflicts' ? route.conflictId ?? '' : '';
+  $: routeProblem = computeRouteProblem(route, vaults, vaultsLoaded);
+  $: conflictNotFound = !!routeConflictId && !!dashboard && !review && !conflicts.some((conflict) => conflict.conflict_id === routeConflictId);
+  $: navHrefs = Object.fromEntries(nav.map((item) => [item, routeHref(navRoute(item, vaultId, vaults))]));
+  $: firstVaultRoute = vaults[0] ? vaultRoute(vaults[0].vault_id, 'overview') : ({ kind: 'account-settings' } as Route);
+  $: settingsRouteShown = vaultsLoaded && (route.kind === 'account-settings' || (route.kind === 'vault' && route.section === 'settings' && vaultId === route.vaultId));
+  $: if (session && !connectionId && settingsRouteShown && !diagnostics && !diagnosticsLoading && !diagnosticsError) void refreshDiagnostics();
+  $: if (settingsRouteShown !== settingsShownPrevious) onSettingsVisibility(settingsRouteShown);
+  $: removalDevice = removalTarget && dashboard ? dashboard.devices.find((device) => device.device_id === removalTarget?.deviceId) ?? null : null;
+  $: devicesView = route.kind === 'vault' && route.section === 'devices' && route.devicesView === 'revoked' ? 'revoked' as const : 'active' as const;
+  $: draftDirty = settingsDraftDirty || resolutionDraftDirty;
+  $: setUnloadGuard(draftDirty);
+  $: if (!connectionId) document.title = documentTitle(!!session, route, routeProblem, page, selectedVault?.display_name ?? '');
+
+  function routePage(value: Route): Page {
+    if (value.kind === 'vault') return pageBySection[value.section];
+    return value.kind === 'account-settings' ? 'Settings' : 'Overview';
+  }
+
+  function computeRouteProblem(value: Route, list: VaultSummary[], loaded: boolean): 'page' | 'vault' | null {
+    if (value.kind === 'not-found') return 'page';
+    if (!loaded) return null;
+    if (value.kind === 'vault') return list.some((vault) => vault.vault_id === value.vaultId) ? null : 'vault';
+    if (value.kind === 'root' && value.legacyVault) return list.some((vault) => vault.vault_id === value.legacyVault) ? null : 'vault';
+    return null;
+  }
+
+  function documentTitle(signedIn: boolean, value: Route, problem: 'page' | 'vault' | null, current: Page, vaultName: string): string {
+    if (!signedIn) return 'obts dashboard';
+    if (problem) return `${problem === 'vault' ? 'Vault not found' : 'Page not found'} · OBTS`;
+    if (value.kind === 'account-settings') return 'Settings · OBTS';
+    if (value.kind === 'vault' && vaultName) return `${current} · ${vaultName} · OBTS`;
+    return 'OBTS';
+  }
+
+  function navRoute(item: string, activeVaultId: string, list: VaultSummary[]): Route {
+    const section = sectionByPage[item as Page];
+    if (section === 'settings' && !activeVaultId) return { kind: 'account-settings' };
+    const target = activeVaultId || list[0]?.vault_id;
+    return target ? vaultRoute(target, section) : { kind: 'root' };
+  }
+
+  function discardMessage() {
+    return settingsDraftDirty
+      ? 'Discard your unsaved sync rule changes?'
+      : 'Discard your in-progress conflict resolution?';
+  }
+
+  function blockUnload(event: BeforeUnloadEvent) {
+    event.preventDefault();
+    event.returnValue = '';
+  }
+
+  function setUnloadGuard(active: boolean) {
+    if (active === unloadGuardActive) return;
+    unloadGuardActive = active;
+    if (active) window.addEventListener('beforeunload', blockUnload);
+    else window.removeEventListener('beforeunload', blockUnload);
+  }
+
+  const setSettingsDraftDirty = (dirty: boolean) => { settingsDraftDirty = dirty; };
+  const setResolutionDraftDirty = (dirty: boolean) => { resolutionDraftDirty = dirty; };
+
+  /** The only in-app navigation seam: every link, selector and flow goes through the router here. */
+  function go(next: Route, options: { replace?: boolean } = {}): boolean {
+    const target = resolveBareConflicts(next);
+    if (routeHref(target) === currentLocationHref()) return false;
+    if (!options.replace && draftDirty && !window.confirm(discardMessage())) return false;
+    navigate(target, options);
+    if (!options.replace) focusToken += 1;
+    return true;
+  }
+
+  /** A bare conflicts route resolves to the auto-selected conflict before it is pushed, so no duplicate entry is created. */
+  function resolveBareConflicts(next: Route): Route {
+    if (next.kind !== 'vault' || next.section !== 'conflicts' || next.conflictId) return next;
+    if (vaultId !== next.vaultId || !dashboard || selectedVaultDeleting) return next;
+    const first = conflicts.find((conflict) => conflict.status === 'open');
+    return first ? vaultRoute(next.vaultId, 'conflicts', { conflictId: first.conflict_id }) : next;
+  }
+
+  function onRoute(next: Route, source: NavigationSource) {
+    if (source === 'popstate' && draftDirty && currentLocationHref() !== committedHref && !window.confirm(discardMessage())) {
+      committedIndex = undoNavigation(committedHref, committedIndex);
+      return;
+    }
+    committedHref = currentLocationHref();
+    committedIndex = currentHistoryIndex();
+    route = next;
+    routeSeq += 1;
+    resetRemoval();
+    if (source === 'popstate') focusToken += 1;
+    void applyRoute();
+  }
+
+  function handleLinkClick(event: MouseEvent, target: Route) {
+    if (!shouldInterceptClick(event, event.currentTarget as HTMLAnchorElement)) return;
+    event.preventDefault();
+    go(target);
+  }
+
+  function navigateToPage(item: string) {
+    go(navRoute(item, vaultId, vaults));
+  }
+
+  function changeVault(nextVaultId: string) {
+    if (!nextVaultId) return;
+    const section = route.kind === 'vault' ? route.section : 'overview';
+    go(vaultRoute(nextVaultId, section, section === 'devices' && route.kind === 'vault' ? { devicesView: route.devicesView } : {}));
+  }
+
+  /** Reconciles state with the URL; the vault switch reuses selectVault's scope clearing and epoch path. */
+  function applyRoute(): Promise<void> | void {
+    if (!session || connectionId || !vaultsLoaded) return;
+    const current = route;
+    if (current.kind === 'root') {
+      if (current.legacyVault) {
+        if (vaults.some((vault) => vault.vault_id === current.legacyVault)) navigate(vaultRoute(current.legacyVault, 'settings'), { replace: true });
+        else if (vaultId) leaveVault();
+        return;
+      }
+      const first = vaults[0];
+      navigate(first ? vaultRoute(first.vault_id, 'overview') : { kind: 'account-settings' }, { replace: true });
+      return;
+    }
+    if ((current.kind === 'vault' || current.kind === 'account-settings') && routeHref(current) !== currentLocationHref()) {
+      navigate(current, { replace: true });
+      return;
+    }
+    if (current.kind === 'vault' && !vaults.some((vault) => vault.vault_id === current.vaultId) && deletions.some((deletion) => deletion.vault_id === current.vaultId)) {
+      navigate({ kind: 'account-settings' }, { replace: true });
+      return;
+    }
+    const target = current.kind === 'vault' ? vaults.find((vault) => vault.vault_id === current.vaultId) : undefined;
+    if (!target) {
+      if (vaultId) leaveVault();
+      return;
+    }
+    if (vaultId !== target.vault_id) return selectVault(target.vault_id);
+    return syncConflictRoute(false);
+  }
+
+  function leaveVault() {
+    vaultId = '';
+    clearScopedState();
+    busy = false;
+  }
+
+  async function syncConflictRoute(reload: boolean) {
+    if (route.kind !== 'vault' || route.section !== 'conflicts' || !vaultId || route.vaultId !== vaultId || !dashboard || selectedVaultDeleting) return;
+    const conflictId = route.conflictId;
+    const requestedVaultId = vaultId;
+    if (!conflictId) {
+      selectedConflictId = '';
+      review = null;
+      const first = conflicts.find((conflict) => conflict.status === 'open');
+      if (first) navigate(vaultRoute(requestedVaultId, 'conflicts', { conflictId: first.conflict_id }), { replace: true });
+      return;
+    }
+    if (!conflicts.some((conflict) => conflict.conflict_id === conflictId)) {
+      reviewRequestGeneration += 1;
+      selectedConflictId = '';
+      review = null;
+      return;
+    }
+    if (!reload && selectedConflictId === conflictId && review?.conflict.conflict_id === conflictId) return;
+    conflictListOpen = false;
+    if (refreshOnOpen.delete(conflictId)) await refreshConflictReview(conflictId);
+    else await loadReview(conflictId);
+  }
+
+  function openConflict(conflictId: string, refresh = false) {
+    if (!vaultId) return;
+    const next = vaultRoute(vaultId, 'conflicts', { conflictId });
+    if (routeHref(next) === currentLocationHref()) {
+      void (refresh ? refreshConflictReview(conflictId) : loadReview(conflictId));
+      return;
+    }
+    if (refresh) refreshOnOpen.add(conflictId);
+    if (!go(next)) refreshOnOpen.delete(conflictId);
+  }
 
   function clearScopedState(clearAccount = false) {
     stateEpoch += 1;
+    resetScheduler();
+    if (clearAccount) live?.stop();
+    diagnosticsRefetchWanted = false;
     dashboardRefreshGeneration += 1;
     reviewRequestGeneration += 1;
     previewRequestGeneration += 1;
     historyRequestGeneration += 1;
-    diagnosticsRequestGeneration += 1;
     diagnosticsDeleteGeneration += 1;
     deletionRequestGeneration += 1;
     deletionRefreshGeneration += 1;
@@ -145,6 +406,7 @@
     deletionError = '';
     deletionRequestInFlight = false;
     deletionRefreshInFlight = false;
+    resetRemoval();
     dashboardRefreshOwner = null;
     dashboardRefreshInFlight = false;
     dashboard = null;
@@ -156,8 +418,17 @@
     vaultSyncSettingsGeneration += 1;
     if (clearAccount) {
       accountEpoch += 1;
+      diagnosticsRequestGeneration += 1;
+      diagnosticsLoading = false;
       diagnostics = null;
+      diagnosticsPaged = false;
+      diagnosticsNewActivity = false;
+      diagnosticsFetchedAt = 0;
       diagnosticsError = '';
+      vaultsLoaded = false;
+      settingsDraftDirty = false;
+      resolutionDraftDirty = false;
+      refreshOnOpen.clear();
       connectionReview = null;
       connectionApproved = false;
       connectionVaultId = '';
@@ -165,7 +436,6 @@
       vaults = [];
       deletions = [];
       vaultId = '';
-      page = 'Overview';
     }
     createVaultOpen = false;
     renameVaultOpen = false;
@@ -208,11 +478,11 @@
   function clearTargetPresentation(targetVaultId: string) {
     if (vaultId !== targetVaultId) return;
     stateEpoch += 1;
+    resetScheduler();
     dashboardRefreshGeneration += 1;
     reviewRequestGeneration += 1;
     previewRequestGeneration += 1;
     historyRequestGeneration += 1;
-    diagnosticsRequestGeneration += 1;
     deletionRequestGeneration += 1;
     deletionRefreshGeneration += 1;
     dashboardRefreshOwner = null;
@@ -236,7 +506,24 @@
     deletionTarget = null;
     deletionError = '';
     deletionRequestInFlight = false;
+    resetRemoval();
     vaultId = '';
+  }
+
+  function resetRemoval() {
+    removalRequestGeneration += 1;
+    removalTarget = null;
+    removalMode = 'standard';
+    removalDiscardReason = null;
+    removalError = '';
+    removalFailureNote = '';
+    removalConflictsLink = false;
+    removalRequestInFlight = false;
+  }
+
+  function showNotice(text: string, link: { label: string; route: Route } | null = null) {
+    notice = text;
+    noticeLink = link ? { forNotice: text, ...link } : null;
   }
 
   function reportAsyncError(error: unknown, fallback: string, epoch = stateEpoch) {
@@ -244,6 +531,7 @@
     if (error instanceof ApiError && error.status === 401) {
       session = null;
       clearScopedState(true);
+      if (!connectionId) navigate({ kind: 'root' }, { replace: true });
       api.csrfToken = '';
       authError = 'Your session ended. Sign in to continue.';
       busy = false;
@@ -266,37 +554,146 @@
     if (!statusCurrent) return { label: 'Status unknown', role: 'warning' };
     if (value.vault.status === 'deleting') return { label: 'Deleting', role: 'info' };
     if (value.vault.status === 'blocked_integrity') return { label: 'Integrity blocked', role: 'danger' };
-    if (value.devices.length === 0) return { label: 'Status unknown', role: 'warning' };
-    if (value.devices.every((device) => device.status_label === 'Synced')) return { label: 'Synced', role: 'success' };
-    if (value.devices.some((device) => ['Blocked', 'Needs recovery', 'Integrity failure', 'Conflict resolution needed', 'Out of sync — file exceeds upload limit', 'Out of sync — upload limit exceeded', 'Out of sync — local recovery required', 'Server repair required'].includes(device.status_label))) {
+    const activeDevices = value.devices.filter((device) => !isDeviceRevoked(device));
+    if (activeDevices.length === 0) return { label: 'Status unknown', role: 'warning' };
+    if (activeDevices.every((device) => device.status_label === 'Synced')) return { label: 'Synced', role: 'success' };
+    if (activeDevices.some((device) => ['Blocked', 'Needs recovery', 'Integrity failure', 'Conflict resolution needed', 'Out of sync — file exceeds upload limit', 'Out of sync — upload limit exceeded', 'Out of sync — local recovery required', 'Server repair required'].includes(device.status_label))) {
       return { label: 'Attention required', role: 'danger' };
     }
-    if (value.devices.some((device) => isActiveStatusLabel(device.status_label))) {
+    if (activeDevices.some((device) => isActiveStatusLabel(device.status_label))) {
       return { label: 'Sync in progress', role: 'info' };
     }
     return { label: 'Not converged', role: 'warning' };
   }
 
+  onDestroy(() => setUnloadGuard(false));
+
   onMount(() => {
+    initHistoryIndex();
+    committedIndex = currentHistoryIndex();
+    const unsubscribeRoute = subscribe(onRoute);
     void bootstrap();
     const clockInterval = window.setInterval(() => {
       nowMs = Date.now();
     }, 1000);
-    const dashboardInterval = window.setInterval(() => {
-      if (!document.hidden) void refreshDashboardStatus();
-    }, DASHBOARD_REFRESH_INTERVAL_MS);
+    // Coming back to the tab or window refreshes through the same scheduler as stream events and polling. A paused
+    // stream resumes (and refreshes) itself, so it is skipped here to avoid a duplicate request.
     const refreshWhenVisible = () => {
-      if (!document.hidden) void refreshDashboardStatus();
+      if (document.hidden || !session || connectionId || live?.currentState === 'paused') return;
+      scheduler.request('vault');
     };
     document.addEventListener('visibilitychange', refreshWhenVisible);
     window.addEventListener('focus', refreshWhenVisible);
+    const controller = new LiveUpdates({
+      createEventSource: typeof window.EventSource === 'function' ? (url) => new window.EventSource(url) : null,
+      requestRefresh: onLiveRefresh,
+      getSelectedVaultId: () => vaultId,
+      checkSession: verifySession,
+      onStateChange: onLiveStateChange,
+      fallbackIntervalMs: DASHBOARD_REFRESH_INTERVAL_MS,
+      agingIntervalMs: DASHBOARD_LIVE_AGING_INTERVAL_MS,
+      setTimeout: (callback, ms) => window.setTimeout(callback, ms),
+      clearTimeout: (handle) => window.clearTimeout(handle as number),
+      now: () => Date.now(),
+      isHidden: () => document.hidden,
+      onVisibilityChange: (listener) => {
+        document.addEventListener('visibilitychange', listener);
+        return () => document.removeEventListener('visibilitychange', listener);
+      }
+    });
+    live = controller;
     return () => {
+      unsubscribeRoute();
       window.clearInterval(clockInterval);
-      window.clearInterval(dashboardInterval);
       document.removeEventListener('visibilitychange', refreshWhenVisible);
       window.removeEventListener('focus', refreshWhenVisible);
+      controller.stop();
+      live = null;
+      resetScheduler();
     };
   });
+
+  function syncLive(controller: LiveUpdates | null, key: string) {
+    if (!controller) return;
+    if (key === liveKeyPrevious && controller.isStarted === (key !== '')) return;
+    liveKeyPrevious = key;
+    controller.stop();
+    connectRefreshPending = false;
+    if (key) controller.start();
+  }
+
+  /** Every scheduler reset also forgets the connect obligation: the reset drops the pending run that would clear it. */
+  function resetScheduler() {
+    scheduler.reset();
+    connectRefreshPending = false;
+  }
+
+  function onLiveStateChange(next: LiveState, previous: LiveState) {
+    liveState = next;
+    if (next !== 'reconnecting') liveReconnectingSince = null;
+    else if (previous !== 'reconnecting' || liveReconnectingSince === null) liveReconnectingSince = Date.now();
+    liveAnnouncementText = liveAnnouncement(next, previous) ?? (next === 'live' || next === 'reconnecting' ? liveAnnouncementText : '');
+  }
+
+  /** The one entry point for stream events, polling and resume: record the obligation, never fetch directly. */
+  function onLiveRefresh(request: LiveRefreshRequest) {
+    if (!session || connectionId) return;
+    noteDiagnosticsInvalidation(request.source);
+    if (request.source === 'connect') {
+      connectRefreshToken += 1;
+      connectRefreshPending = true;
+    }
+    scheduler.request(request.scope);
+  }
+
+  /** Session check used after stream errors: a 401 runs the normal logged-out handling; other failures are not auth failures. */
+  async function verifySession(): Promise<boolean> {
+    const epoch = stateEpoch;
+    try {
+      await api.session();
+      return true;
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        reportAsyncError(error, 'Your session ended. Sign in to continue.', epoch);
+        return false;
+      }
+      return true;
+    }
+  }
+
+  /**
+   * Settings shows account-level diagnostics. An event (an invalidation for the selected vault or the account) and a
+   * stream connect, which may follow missed events, both make them stale. They are refetched once after the coalesced
+   * refresh, and only while Settings is shown (never from Overview or other pages). A missing cache (the previous load
+   * failed or never ran) does not suppress the refetch.
+   */
+  function noteDiagnosticsInvalidation(source: LiveRefreshRequest['source']) {
+    if (source === 'poll' || source === 'visibility') return;
+    diagnosticsFetchedAt = 0;
+    if (settingsRouteShown) diagnosticsRefetchWanted = true;
+  }
+
+  async function runScheduledRefresh(scope: RefreshScope) {
+    // The run fetches after this point, so it serves every connect request recorded so far; a newer one stays pending.
+    const serves = connectRefreshToken;
+    try {
+      if (!session || connectionId) return;
+      const epoch = stateEpoch;
+      const account = accountEpoch;
+      if (scope === 'full') await refreshAll(false);
+      if (session && stateEpoch === epoch) await refreshDashboardStatus(true);
+      if (connectRefreshToken === serves) connectRefreshPending = false;
+      if (diagnosticsRefetchWanted && session && accountEpoch === account) {
+        diagnosticsRefetchWanted = false;
+        if (settingsRouteShown && !diagnosticsDeleteInFlight) await refreshDiagnostics(true);
+      }
+    } catch (error) {
+      dashboardStatusCurrent = false;
+      throw error;
+    } finally {
+      if (connectRefreshToken === serves) connectRefreshPending = false;
+    }
+  }
 
   async function bootstrap() {
     const epoch = stateEpoch;
@@ -371,7 +768,22 @@
     }
   }
 
-  async function refreshAll() {
+  /** Every refresh registers with the scheduler so background triggers queue behind it instead of superseding it. */
+  async function tracked<T>(work: () => Promise<T>): Promise<T> {
+    const end = scheduler.begin();
+    try {
+      return await work();
+    } finally {
+      end();
+    }
+  }
+
+  /** `reconcileRoute: false` is the quiet account refresh: the route is only re-applied if the selected vault vanished or none is selected. */
+  function refreshAll(reconcileRoute = true) {
+    return tracked(() => refreshAllNow(reconcileRoute));
+  }
+
+  async function refreshAllNow(reconcileRoute: boolean) {
     if (!session) return;
     const epoch = stateEpoch;
     const account = accountEpoch;
@@ -395,19 +807,23 @@
         ? { ...vault, status: 'deleting' as const }
         : vault);
     const previousVaultId = vaultId;
-    if (previousVaultId && !nextVaults.some((vault) => vault.vault_id === previousVaultId)) clearTargetPresentation(previousVaultId);
+    const selectedVanished = !!previousVaultId && !nextVaults.some((vault) => vault.vault_id === previousVaultId);
+    if (selectedVanished) clearTargetPresentation(previousVaultId);
     vaults = nextVaults;
-    const requestedVault = new URLSearchParams(window.location.search).get('vault');
-    if (requestedVault && nextVaults.some((vault) => vault.vault_id === requestedVault)) {
-      vaultId = requestedVault;
-      page = 'Settings';
-    } else if (!vaults.some((vault) => vault.vault_id === vaultId)) vaultId = vaults[0]?.vault_id ?? '';
     deletions = deletionList.deletions;
-    if (vaults.length === 0 && deletions.length > 0) page = 'Settings';
-    await Promise.all([refreshVault(), refreshDiagnostics()]);
+    vaultsLoaded = true;
+    if (reconcileRoute || selectedVanished || !vaultId) await applyRoute();
   }
 
-  async function refreshDiagnostics() {
+  /**
+   * `automatic` refetches (events, connects, ageing) never replace pages the user loaded with "Load more": they only
+   * flag new activity. A manual refresh always reloads the first page.
+   */
+  async function refreshDiagnostics(automatic = false) {
+    if (automatic && diagnosticsPaged && diagnostics) {
+      diagnosticsNewActivity = true;
+      return;
+    }
     const epoch = accountEpoch;
     const userId = session?.user_id ?? '';
     const generation = ++diagnosticsRequestGeneration;
@@ -415,7 +831,12 @@
     diagnosticsLoading = true;
     try {
       const next = await api.diagnosticEvents();
-      if (session && session.user_id === userId && accountEpoch === epoch && generation === diagnosticsRequestGeneration) diagnostics = next;
+      if (session && session.user_id === userId && accountEpoch === epoch && generation === diagnosticsRequestGeneration) {
+        diagnostics = next;
+        diagnosticsPaged = false;
+        diagnosticsNewActivity = false;
+        diagnosticsFetchedAt = Date.now();
+      }
     } catch (error) {
       if (session && session.user_id === userId && accountEpoch === epoch && generation === diagnosticsRequestGeneration) {
         if (error instanceof ApiError && error.status === 401) {
@@ -427,6 +848,13 @@
     } finally {
       if (accountEpoch === epoch && generation === diagnosticsRequestGeneration) diagnosticsLoading = false;
     }
+  }
+
+  /** Entering Settings refreshes cached diagnostics in the background once they are older than the freshness window. */
+  function onSettingsVisibility(shown: boolean) {
+    settingsShownPrevious = shown;
+    if (!shown || !session || connectionId || !diagnostics || diagnosticsLoading) return;
+    if (Date.now() - diagnosticsFetchedAt > DIAGNOSTICS_STALE_MS) void refreshDiagnostics(true);
   }
 
   async function requestRefreshDiagnostics() {
@@ -470,11 +898,8 @@
       return;
     }
     const nextActive = nextVaults.find((vault) => vault.status === 'active');
-    if (nextActive) {
-      vaultId = nextActive.vault_id;
-      await refreshVault();
-    } else {
-      page = 'Settings';
+    if (route.kind === 'vault' && route.vaultId === targetVaultId) {
+      go(nextActive ? vaultRoute(nextActive.vault_id, 'overview') : { kind: 'account-settings' }, { replace: true });
     }
     notice = 'Vault deletion completed. The 30-day receipt remains available in Settings.';
   }
@@ -522,6 +947,7 @@
       const next = await api.diagnosticEvents(cursor);
       if (session && session.user_id === userId && accountEpoch === epoch && generation === diagnosticsRequestGeneration && diagnostics?.next_cursor === cursor) {
         diagnostics = { ...next, events: [...diagnostics.events, ...next.events] };
+        diagnosticsPaged = true;
       }
     } catch (error) {
       if (session && session.user_id === userId && accountEpoch === epoch && generation === diagnosticsRequestGeneration) {
@@ -563,17 +989,6 @@
     });
   }
 
-  function reconcileConflictSelection() {
-    const currentConflictExists = conflicts.some((conflict) => conflict.conflict_id === selectedConflictId);
-    if (!currentConflictExists) {
-      selectedConflictId = '';
-      review = null;
-    }
-    if (!selectedConflictId) {
-      selectedConflictId = conflicts.find((conflict) => conflict.status === 'open')?.conflict_id ?? '';
-    }
-  }
-
   function clearDashboardPresentation() {
     dashboard = null;
     conflicts = [];
@@ -593,15 +1008,12 @@
     const wasSelected = vaultId === targetVaultId;
     vaults = nextVaults.filter((vault) => vault.vault_id !== targetVaultId);
     if (!wasSelected) return;
+    const leavingRoute = route.kind === 'vault' && route.vaultId === targetVaultId;
+    const keepSettings = route.kind === 'vault' && route.section === 'settings';
     clearTargetPresentation(targetVaultId);
     vaults = nextVaults.filter((vault) => vault.vault_id !== targetVaultId);
     const nextActive = vaults.find((vault) => vault.status === 'active');
-    if (nextActive) {
-      vaultId = nextActive.vault_id;
-      await refreshVault();
-    } else {
-      page = 'Settings';
-    }
+    if (leavingRoute) go(nextActive ? vaultRoute(nextActive.vault_id, keepSettings ? 'settings' : 'overview') : { kind: 'account-settings' }, { replace: true });
   }
 
   async function refreshDeletionRecords() {
@@ -615,7 +1027,6 @@
       const result = await api.vaultDeletions();
       if (!session || session.user_id !== userId || stateEpoch !== epoch || accountEpoch !== account || generation !== deletionRefreshGeneration) return;
       deletions = result.deletions;
-      if (vaults.length === 0 && deletions.length > 0) page = 'Settings';
     } catch (error) {
       if (session && session.user_id === userId && stateEpoch === epoch && accountEpoch === account && generation === deletionRefreshGeneration) {
         if (error instanceof ApiError && error.status === 401) reportAsyncError(error, 'Unable to refresh vault deletion status.', epoch);
@@ -627,6 +1038,10 @@
   }
 
   async function refreshDashboardStatus(supersede = false) {
+    return tracked(() => refreshDashboardStatusNow(supersede));
+  }
+
+  async function refreshDashboardStatusNow(supersede: boolean) {
     if (!session || connectionId || (dashboardRefreshInFlight && !supersede)) return;
     if (!vaultId) {
       await refreshDeletionRecords();
@@ -646,10 +1061,7 @@
       const deletionPromise = api.vaultDeletions();
       const dashboardPromise = selectedVaultDeleting
         ? Promise.resolve(null)
-        : Promise.all([
-          api.dashboard(requestedVaultId),
-          api.conflicts(requestedVaultId).then((value) => value.conflicts)
-        ]);
+        : api.dashboard(requestedVaultId);
       const [deletionResult, dashboardResult] = await Promise.allSettled([deletionPromise, dashboardPromise]);
       const owned = !!session && session.user_id === userId && accountEpoch === account && stateEpoch === epoch && vaultId === requestedVaultId && deletionGeneration === deletionRefreshGeneration && currentRequest(requestedVaultId, epoch, requestGeneration);
       if (!owned) return;
@@ -686,8 +1098,8 @@
           return;
         }
         reviewRequestGeneration += 1;
-        dashboard = dashboardResult.value[0];
-        conflicts = sortConflicts(dashboardResult.value[1]);
+        dashboard = dashboardResult.value;
+        conflicts = sortConflicts(dashboardResult.value.conflicts);
         const selected = conflicts.find((conflict) => conflict.conflict_id === selectedConflictId);
         if (review && selectedConflictId && (!selected || selected.status !== 'open' || selected.stale || selected.current_main !== review.expected_main)) {
           review = { ...review, stale: true };
@@ -717,6 +1129,10 @@
   }
 
   async function refreshVault() {
+    return tracked(refreshVaultNow);
+  }
+
+  async function refreshVaultNow() {
     if (!vaultId || !session) return;
     const requestedVaultId = vaultId;
     const epoch = stateEpoch;
@@ -728,9 +1144,8 @@
     dashboardRefreshInFlight = true;
     deletionRefreshInFlight = true;
     try {
-      const [dashboardResult, refreshedConflicts, deletionList] = await Promise.all([
+      const [dashboardResult, deletionList] = await Promise.all([
         api.dashboard(requestedVaultId),
-        api.conflicts(requestedVaultId).then((value) => value.conflicts),
         api.vaultDeletions()
       ]);
       if (!session || session.user_id !== userId || accountEpoch !== account || !currentRequest(requestedVaultId, epoch, requestGeneration) || deletionGeneration !== deletionRefreshGeneration) return;
@@ -748,14 +1163,9 @@
         return;
       }
       dashboard = dashboardResult;
-      conflicts = sortConflicts(refreshedConflicts);
-      reconcileConflictSelection();
+      conflicts = sortConflicts(dashboardResult.conflicts);
       dashboardStatusCurrent = true;
-      if (selectedConflictId) {
-        await loadReview(selectedConflictId);
-      } else {
-        review = null;
-      }
+      await syncConflictRoute(true);
       if (currentRequest(requestedVaultId, epoch, requestGeneration)) lastRefreshed = new Date().toLocaleTimeString();
     } catch (error) {
       if (!currentRequest(requestedVaultId, epoch, requestGeneration) || accountEpoch !== account || session?.user_id !== userId) return;
@@ -908,18 +1318,23 @@
     if (!session || busy || !newVaultName.trim()) return;
     let epoch = stateEpoch;
     const account = accountEpoch;
+    const startSeq = routeSeq;
     busy = true;
     actionError = '';
     try {
       const created = await api.createVault(newVaultName.trim());
       if (!session || stateEpoch !== epoch || accountEpoch !== account) return;
       vaults = [...vaults, created];
-      vaultId = created.vault_id;
-      clearScopedState();
-      epoch = stateEpoch;
       newVaultName = '';
-      notice = 'Vault created.';
-      await refreshVault();
+      const overview = vaultRoute(created.vault_id, 'overview');
+      if (routeSeq === startSeq && !draftDirty) {
+        go(overview);
+        epoch = stateEpoch;
+        showNotice('Vault created.');
+      } else {
+        createVaultOpen = false;
+        showNotice(`Vault ${created.display_name} created.`, { label: 'Open', route: overview });
+      }
     } catch (error) {
       if (accountEpoch === account) reportAsyncError(error, 'Unable to create this vault.', epoch);
     } finally {
@@ -1045,36 +1460,31 @@
     }
   }
 
-  async function openConflictFromList(conflict: DashboardConflict) {
+  function openConflictFromList(conflict: DashboardConflict) {
     conflictListOpen = false;
-    if (conflict.stale) {
-      await refreshConflictReview(conflict.conflict_id);
-      return;
-    }
-    await loadReview(conflict.conflict_id);
+    openConflict(conflict.conflict_id, conflict.stale);
   }
 
-  async function selectConflict(event: Event) {
-    const conflictId = (event.currentTarget as HTMLSelectElement).value;
-    const conflict = conflicts.find((candidate) => candidate.conflict_id === conflictId);
-    if (conflict) await openConflictFromList(conflict);
+  function selectConflict(event: Event) {
+    const select = event.currentTarget as HTMLSelectElement;
+    const conflict = conflicts.find((candidate) => candidate.conflict_id === select.value);
+    if (conflict) openConflictFromList(conflict);
+    void tick().then(() => {
+      if (select.isConnected && select.value !== selectedConflictId) select.value = selectedConflictId;
+    });
   }
 
-  async function handleAttentionAction(item: AttentionItem) {
+  function handleAttentionAction(item: AttentionItem) {
+    if (!vaultId) return;
     if (item.kind === 'maintenance') {
-      page = 'Maintenance';
+      go(vaultRoute(vaultId, 'maintenance'));
       return;
     }
     if (item.kind === 'devices') {
-      page = 'Devices';
+      go(vaultRoute(vaultId, 'devices'));
       return;
     }
-    page = 'Conflicts';
-    if (item.kind === 'stale_conflict') {
-      await refreshConflictReview(item.conflictId);
-      return;
-    }
-    await loadReview(item.conflictId);
+    openConflict(item.conflictId, item.kind === 'stale_conflict');
   }
 
   async function withRecentAuth(action: () => Promise<void>) {
@@ -1092,6 +1502,8 @@
       return;
     }
     authError = '';
+    const trigger = document.activeElement;
+    reauthTrigger = trigger instanceof HTMLElement && trigger !== document.body ? trigger : null;
     reauthAction = run;
     reauthOpen = true;
   }
@@ -1215,9 +1627,174 @@
       if (!confirm(`Revoke ${deviceName}? This stops its sync access. Local vault files are not deleted.`)) return;
       await api.revokeDevice(requestedVaultId, deviceId);
       if (!currentRequest(requestedVaultId, epoch)) return;
-      notice = 'Device revoked.';
+      showNotice(`${deviceName} was revoked.`, { label: 'View revoked devices', route: vaultRoute(requestedVaultId, 'devices', { devicesView: 'revoked' }) });
       await refreshVault();
     });
+  }
+
+  function currentRemovalTarget(target: RemovalTarget, generation = target.generation) {
+    return removalTarget === target && removalTarget.generation === generation && removalRequestGeneration === generation && vaultId === target.vaultId && stateEpoch === target.epoch && accountEpoch === target.account && session?.user_id === target.userId;
+  }
+
+  function openDeviceRemoval(device: DashboardDevice) {
+    if (!session || !vaultId || selectedVaultDeleting || removalRequestInFlight || !isDeviceRevoked(device)) return;
+    const removal = device.removal ?? null;
+    if (removal?.state === 'pending') return;
+    const generation = ++removalRequestGeneration;
+    removalError = '';
+    removalConflictsLink = false;
+    removalMode = 'standard';
+    removalDiscardReason = null;
+    removalFailureNote = removal?.state === 'failed' ? removalFailureText(removal.error_code) : '';
+    removalTarget = {
+      vaultId,
+      deviceId: device.device_id,
+      deviceName: device.device_name,
+      epoch: stateEpoch,
+      account: accountEpoch,
+      userId: session.user_id,
+      generation
+    };
+  }
+
+  function cancelDeviceRemoval() {
+    resetRemoval();
+  }
+
+  function openConflictsFromRemoval() {
+    const target = removalTarget;
+    resetRemoval();
+    if (target) go(vaultRoute(target.vaultId, 'conflicts'));
+  }
+
+  function finishRemoval(target: RemovalTarget, text: string) {
+    resetRemoval();
+    if (dashboard && dashboard.vault.vault_id === target.vaultId) {
+      dashboard = { ...dashboard, devices: dashboard.devices.filter((device) => device.device_id !== target.deviceId) };
+    }
+    showNotice(text);
+    void refreshVault().catch(() => undefined);
+    void tick().then(() => {
+      if (!document.activeElement || document.activeElement === document.body) focusToken += 1;
+    });
+  }
+
+  /** The server finished (or found nothing to remove) for a target the user already left: refresh the list quietly if its vault is still shown. */
+  function refreshAfterAbandonedRemoval(target: RemovalTarget) {
+    if (!session || vaultId !== target.vaultId || stateEpoch !== target.epoch || accountEpoch !== target.account || session.user_id !== target.userId) return;
+    void refreshDashboardStatus(true);
+  }
+
+  async function submitDeviceRemoval(confirmation: string) {
+    const target = removalTarget;
+    if (!target || removalRequestInFlight) return;
+    const discard = removalMode === 'discard';
+    const expected = discard ? `DELETE ${target.deviceId} AND DISCARD UNMERGED WORK` : `DELETE ${target.deviceId}`;
+    if (confirmation !== expected) {
+      removalError = 'Type the exact confirmation phrase shown above.';
+      return;
+    }
+    if (!currentRemovalTarget(target)) {
+      removalError = 'The selected vault changed. Close this dialog and review the current vault.';
+      return;
+    }
+    removalRequestInFlight = true;
+    removalError = '';
+    removalConflictsLink = false;
+    try {
+      await api.removeDevice(target.vaultId, target.deviceId, { confirmation, discard_unmerged: discard });
+      if (!currentRemovalTarget(target)) {
+        refreshAfterAbandonedRemoval(target);
+        return;
+      }
+      finishRemoval(target, `${target.deviceName} permanently removed.`);
+    } catch (error) {
+      if (!currentRemovalTarget(target)) {
+        if (error instanceof ApiError && error.status === 404) refreshAfterAbandonedRemoval(target);
+        return;
+      }
+      removalRequestInFlight = false;
+      await handleRemovalError(error, target);
+    }
+  }
+
+  async function handleRemovalError(error: unknown, target: RemovalTarget) {
+    if (!(error instanceof ApiError)) {
+      removalError = 'Unable to remove this device. Try again.';
+      return;
+    }
+    const details = error.details ?? {};
+    if (error.status === 401) {
+      reportAsyncError(error, 'Unable to remove this device.', target.epoch);
+      return;
+    }
+    if (error.status === 409 && error.code === 'device_has_unmerged_work') {
+      removalMode = 'discard';
+      removalDiscardReason = details.reason === 'staged_transfer' ? 'staged_transfer' : 'device_ref';
+      removalFailureNote = '';
+      return;
+    }
+    if (error.status === 409 && error.code === 'device_ref_inconsistent' && details.resolution === 'discard_phrase') {
+      removalMode = 'discard';
+      removalDiscardReason = 'device_ref_inconsistent';
+      removalFailureNote = '';
+      return;
+    }
+    if (error.status === 409 && error.code === 'device_has_open_work') {
+      if (details.reason === 'open_conflict') {
+        removalError = 'This device still has open conflicts. Resolve them first, then try again.';
+        removalConflictsLink = true;
+      } else if (details.reason === 'unsettled_operation') {
+        removalError = 'This device still has a sync operation in progress. Wait for sync to settle, then try again.';
+      } else {
+        removalError = 'This device still has open work. Wait for it to finish, then try again.';
+      }
+      return;
+    }
+    if (error.status === 409 && error.code === 'device_not_revoked') {
+      removalError = 'Revoke the device first.';
+      void refreshVault().catch(() => undefined);
+      return;
+    }
+    if (error.status === 409 && error.code === 'vault_deleting') {
+      resetRemoval();
+      actionError = 'This vault is being deleted, so devices cannot be removed.';
+      void refreshVault().catch(() => undefined);
+      return;
+    }
+    if (error.status === 409 && details.retryable === false) {
+      removalError = "The server can't safely remove this device from the dashboard: its server-side record is inconsistent. An administrator needs to check the server logs.";
+      return;
+    }
+    if (error.status === 400 && error.code === 'confirmation_mismatch') {
+      removalError = 'The confirmation phrase did not match. Check it and try again.';
+      return;
+    }
+    if (error.status === 404) {
+      removalRequestInFlight = true;
+      try {
+        await refreshVault();
+      } catch {
+        if (currentRemovalTarget(target)) removalError = 'Unable to remove this device. Try again.';
+        return;
+      } finally {
+        if (currentRemovalTarget(target)) removalRequestInFlight = false;
+      }
+      if (!currentRemovalTarget(target)) return;
+      if (!dashboard?.devices.some((device) => device.device_id === target.deviceId)) {
+        finishRemoval(target, `${target.deviceName} was already removed.`);
+      } else {
+        removalError = 'The server could not find this device. The device list was refreshed.';
+      }
+      return;
+    }
+    if (error.status === 503) {
+      removalError = error.retryAfter !== null
+        ? `Temporarily unavailable. Try again in ${error.retryAfter} second${error.retryAfter === 1 ? '' : 's'}.`
+        : 'Temporarily unavailable. Try again.';
+      return;
+    }
+    removalError = 'Unable to remove this device. Try again.';
   }
 
   async function submitResolution(submission: ConflictResolutionSubmission, expectedTree?: string) {
@@ -1227,6 +1804,7 @@
     const conflictId = review.conflict.conflict_id;
     const requestedVaultId = vaultId;
     const epoch = stateEpoch;
+    const startSeq = routeSeq;
     try {
       await api.resolveConflict({
         vaultId: requestedVaultId,
@@ -1235,11 +1813,21 @@
         ...(expectedTree ? { expectedTree } : {}),
         ...submission
       });
-      if (!currentRequest(requestedVaultId, epoch) || selectedConflictId !== conflictId) return;
+      if (!currentRequest(requestedVaultId, epoch)) return;
       notice = 'Conflict resolved.';
-      selectedConflictId = '';
-      review = null;
-      await refreshVault();
+      conflicts = conflicts.map((conflict) => conflict.conflict_id === conflictId ? { ...conflict, status: 'resolved' as const } : conflict);
+      const stillSelected = selectedConflictId === conflictId;
+      if (stillSelected) {
+        selectedConflictId = '';
+        review = null;
+      }
+      const stillOnConflict = stillSelected && routeSeq === startSeq && route.kind === 'vault' && route.vaultId === requestedVaultId && route.section === 'conflicts' && route.conflictId === conflictId;
+      if (stillOnConflict) {
+        go(vaultRoute(requestedVaultId, 'conflicts'), { replace: true });
+        await refreshVault();
+      } else {
+        await refreshDashboardStatus(true);
+      }
     } catch (error) {
       if (!currentRequest(requestedVaultId, epoch) || selectedConflictId !== conflictId) return;
       if (error instanceof ApiError && error.code === 'stale_conflict_review' && review?.conflict.conflict_id === conflictId) {
@@ -1360,8 +1948,11 @@
 
   function handleMaintenanceAction(action: NonNullable<MaintenanceRow['action']>) {
     if (action === 'view_backup_contract') {
-      maintenanceDetailOpen = page !== 'Maintenance' || !maintenanceDetailOpen;
-      page = 'Maintenance';
+      if (page === 'Maintenance') {
+        maintenanceDetailOpen = !maintenanceDetailOpen;
+      } else if (vaultId && go(vaultRoute(vaultId, 'maintenance'))) {
+        maintenanceDetailOpen = true;
+      }
       return;
     }
     if (!vaultId || selectedVaultDeleting) return;
@@ -1385,6 +1976,7 @@
     password = '';
     authError = '';
     logoutFailed = false;
+    if (!connectionId) navigate({ kind: 'root' }, { replace: true });
     try {
       await api.logout();
     } catch (error) {
@@ -1439,8 +2031,9 @@
   />
 {:else}
   <Shell
-    {page}
+    page={routeProblem ? (routeProblem === 'vault' ? 'Vault not found' : 'Page not found') : page}
     {nav}
+    {navHrefs}
     {vaults}
     {vaultId}
     {selectedVault}
@@ -1448,26 +2041,50 @@
     {unresolvedCount}
     {lastRefreshed}
     {dashboardStatusCurrent}
+    liveIndicator={indicator}
+    liveAnnouncement={liveAnnouncementText}
     {busy}
-    modalOpen={reauthOpen || deletionModalOpen}
+    modalOpen={reauthOpen || deletionModalOpen || removalTarget !== null}
+    {focusToken}
     vaultDeleting={selectedVaultDeleting}
     refreshing={dashboardRefreshInFlight || deletionRefreshInFlight}
-    onPageChange={(nextPage) => (page = nextPage as Page)}
-    onVaultChange={selectVault}
+    onNavigate={navigateToPage}
+    onVaultChange={changeVault}
     onRefresh={requestRefreshVault}
     onLogout={logout}
   >
     <svelte:fragment slot="actions">
-      {#if page === 'Overview'}
+      {#if page === 'Overview' && route.kind === 'vault' && !routeProblem}
         <button class="secondary" disabled={busy || !selectedVault || selectedVaultDeleting} on:click={openVaultRename}>Rename vault</button>
         <button class="primary" disabled={busy} on:click={() => { renameVaultOpen = false; createVaultOpen = true; newVaultName = ''; }}>New vault</button>
       {/if}
     </svelte:fragment>
 
-    {#if notice}<p class="notice" role="status">{notice}</p>{/if}
+    {#if notice}
+      <p class="notice" role="status">{notice}{#if noticeLink && noticeLink.forNotice === notice} <a href={routeHref(noticeLink.route)} on:click={(event) => noticeLink && handleLinkClick(event, noticeLink.route)}>{noticeLink.label}</a>{/if}</p>
+    {/if}
       {#if actionError}<p class="action-error" role="alert">{actionError}</p>{/if}
 
-      {#if renameVaultOpen}
+      {#if routeProblem}
+        <main class="page">
+          <section class="panel full route-problem" aria-labelledby="route-problem-title">
+            <span class="eyebrow">{routeProblem === 'vault' ? 'Vault' : 'Dashboard'}</span>
+            <h2 id="route-problem-title">{routeProblem === 'vault' ? 'Vault not found' : 'Page not found'}</h2>
+            <p class="muted">{routeProblem === 'vault' ? 'This vault does not exist or is not available to this account. No other vault was opened.' : 'This dashboard address does not match a page.'}</p>
+            <p>
+              <a class="button-link primary" href={routeHref(firstVaultRoute)} on:click={(event) => handleLinkClick(event, firstVaultRoute)}>{vaults[0] ? `Open ${vaults[0].display_name}` : 'Open account settings'}</a>
+            </p>
+          </section>
+        </main>
+      {:else if route.kind === 'root' || !vaultsLoaded}
+        <main class="page">
+          <section class="panel full loading-state" aria-live="polite">
+            <span class="eyebrow">Dashboard</span>
+            <h2>Loading dashboard</h2>
+            <p class="muted">Checking which vaults this account can open.</p>
+          </section>
+        </main>
+      {:else if renameVaultOpen}
         <main class="page">
           <section class="panel full">
             <h2>Rename vault</h2>
@@ -1486,6 +2103,7 @@
           {diagnostics}
           {diagnosticsError}
           {diagnosticsLoading}
+          {diagnosticsNewActivity}
           {busy}
           onRefreshDiagnostics={requestRefreshDiagnostics}
           onLoadMoreDiagnostics={() => void loadMoreDiagnostics()}
@@ -1504,6 +2122,7 @@
           vaultDeleting={selectedVaultDeleting}
           deletionBusy={deletionRequestInFlight}
           onOpenVaultDeletion={openVaultDeletion}
+          onDirtyChange={setSettingsDraftDirty}
         >
           <svelte:fragment slot="destructive-actions">
             <section class="panel settings-create-panel" aria-labelledby="settings-create-vault-title">
@@ -1549,7 +2168,7 @@
             <h2>Vault deletion in progress</h2>
             <Status label="Deleting" />
             <p class="muted">The server accepted this deletion and is still working. Dashboard, devices, conflicts, history, and other target actions are unavailable until completion is reported.</p>
-            <button class="secondary" on:click={() => (page = 'Settings')}>View deletion status in Settings</button>
+            <button class="secondary" on:click={() => vaultId && go(vaultRoute(vaultId, 'settings'))}>View deletion status in Settings</button>
           </section>
         </main>
       {:else if page === 'Overview' && dashboard}
@@ -1565,13 +2184,18 @@
           onRevoke={revokeDevice}
         />
       {:else if page === 'Devices' && dashboard}
-        <main class="page">
-          <section class="panel full">
-            <h2>Devices</h2>
-            <DeviceTable devices={dashboard.devices} recommendedPluginVersion={dashboard.recommended_plugin_version} statusCurrent={dashboardStatusCurrent} onRename={renameDevice} onRevoke={revokeDevice} />
-          </section>
-        </main>
-      {:else if page === 'Conflicts'}
+        <DevicesPage
+          {vaultId}
+          devices={dashboard.devices}
+          view={devicesView}
+          recommendedPluginVersion={dashboard.recommended_plugin_version}
+          statusCurrent={dashboardStatusCurrent}
+          onNavigate={handleLinkClick}
+          onRename={renameDevice}
+          onRevoke={revokeDevice}
+          onRemove={openDeviceRemoval}
+        />
+      {:else if page === 'Conflicts' && dashboard}
         <main class="conflict-layout">
           <ConflictQueue
             {conflicts}
@@ -1592,7 +2216,14 @@
               onSubmit={submitResolution}
               onPreview={previewResolution}
               onRefresh={refreshReview}
+              onDirtyChange={setResolutionDraftDirty}
             />
+          {:else if conflictNotFound}
+            <section class="panel full route-problem" aria-labelledby="conflict-not-found-title">
+              <h2 id="conflict-not-found-title">Conflict not found</h2>
+              <p class="muted">This conflict is not in the current vault's conflict list. It may have been resolved or removed.</p>
+              <p><a class="button-link" href={routeHref(vaultRoute(vaultId, 'conflicts'))} on:click={(event) => handleLinkClick(event, vaultRoute(vaultId, 'conflicts'))}>View all conflicts</a></p>
+            </section>
           {:else if conflicts.length === 0}
             <section class="panel full"><p class="muted">No conflicts to review.</p></section>
           {/if}
@@ -1634,6 +2265,7 @@
           {diagnostics}
           {diagnosticsError}
           {diagnosticsLoading}
+          {diagnosticsNewActivity}
           {busy}
           onRefreshDiagnostics={requestRefreshDiagnostics}
           onLoadMoreDiagnostics={() => void loadMoreDiagnostics()}
@@ -1652,6 +2284,7 @@
           vaultDeleting={selectedVaultDeleting}
           deletionBusy={deletionRequestInFlight}
           onOpenVaultDeletion={openVaultDeletion}
+          onDirtyChange={setSettingsDraftDirty}
         />
       {/if}
   </Shell>
@@ -1663,8 +2296,25 @@
     bind:password
     {authError}
     {busy}
+    returnFocusTo={reauthTrigger}
     onSubmit={authenticate}
     onCancel={cancelReauth}
+  />
+{/if}
+
+{#if removalTarget}
+  <DeviceRemovalModal
+    deviceName={removalDevice?.device_name ?? removalTarget.deviceName}
+    deviceId={removalTarget.deviceId}
+    mode={removalMode}
+    discardReason={removalDiscardReason}
+    busy={removalRequestInFlight}
+    error={removalError}
+    failureText={removalFailureNote}
+    conflictsHref={removalConflictsLink ? routeHref(vaultRoute(removalTarget.vaultId, 'conflicts')) : null}
+    onSubmit={submitDeviceRemoval}
+    onCancel={cancelDeviceRemoval}
+    onOpenConflicts={openConflictsFromRemoval}
   />
 {/if}
 

@@ -14,15 +14,17 @@ const MAX_STACK_CHARS = 8 * 90 + 7;
 export const STARTUP_PHASES = [
   'metadata_initialized', 'deletions_reconciled', 'receipts_expired', 'root_commits_populated',
   'operations_reconciled', 'conflict_refs_protected', 'integrity_scanned', 'diagnostics_initialized',
-  'operation_history_compacted', 'transfers_initialized', 'pending_jobs_started', 'pending_merges_resumed'
+  'operation_history_compacted', 'transfers_initialized', 'pending_jobs_started', 'device_removals_resumed',
+  'pending_merges_resumed'
 ] as const;
 export type StartupPhase = typeof STARTUP_PHASES[number];
 export const BACKGROUND_TASKS = [
-  'diagnostic_prune', 'receipt_expiry', 'pending_deletion', 'deletion_retry_record', 'transfer_processing'
+  'diagnostic_prune', 'receipt_expiry', 'pending_deletion', 'deletion_retry_record', 'transfer_processing',
+  'readiness_sample', 'device_removal'
 ] as const;
 type BackgroundTask = typeof BACKGROUND_TASKS[number];
 export const LOG_EVENTS = [
-  'http_request', 'server_listening', 'startup_phase', 'vault_integrity_blocked',
+  'http_request', 'server_listening', 'startup_phase', 'vault_integrity_blocked', 'vault_integrity_block_contended',
   'push_integrated', 'conflict_created', 'conflict_resolved', 'background_task_failed', 'log_lines_dropped'
 ] as const;
 type LogEvent = typeof LOG_EVENTS[number];
@@ -62,7 +64,7 @@ export type OperationalFields = {
   port?: number;
   log_level?: LogLevel;
   phase?: StartupPhase;
-  source?: 'startup' | 'request';
+  source?: 'startup' | 'request' | 'sampler';
   task?: BackgroundTask;
 };
 
@@ -93,6 +95,7 @@ export const LOG_ROUTES = [
   '/api/v1/vaults/:vaultId/sync-settings/preview',
   '/api/v1/vaults/:vaultId/main',
   '/api/v1/vaults/:vaultId/dashboard',
+  '/api/v1/dashboard/events',
   '/api/v1/connections',
   '/api/v1/connections/:connectionId',
   '/api/v1/connections/:connectionId/review',
@@ -164,7 +167,7 @@ const FIELD_VALIDATORS: Record<keyof OperationalFields, Validator> = {
   resolution: enumeration(['keep_server', 'use_device', 'keep_both_files', 'insert_both_blocks', 'manual']),
   failed_checks: (value) => typeof value === 'string' && value.split(',').every((name) => CHECK_NAMES.includes(name)),
   host: pattern(/^[A-Za-z0-9.:_-]{1,253}$/u), port: number, log_level: enumeration(LOG_LEVELS),
-  phase: enumeration(STARTUP_PHASES), source: enumeration(['startup', 'request']), task: enumeration(BACKGROUND_TASKS)
+  phase: enumeration(STARTUP_PHASES), source: enumeration(['startup', 'request', 'sampler']), task: enumeration(BACKGROUND_TASKS)
 };
 export const LOG_FIELD_ALLOWLIST = ['ts', 'level', 'event', 'service', 'version', ...Object.keys(FIELD_VALIDATORS)];
 
@@ -298,7 +301,7 @@ const DEBUG_READ_ROUTES = new Set<string>([
   '/health/live', '/health/ready', '/', '/dashboard', '/dashboard/*', '/assets/*', '/connect/:connectionId'
 ]);
 const DEBUG_EVENT_ROUTES = new Set<string>([
-  '/api/v1/vaults/:vaultId/sync/events', '/api/v1/vaults/:vaultId/events'
+  '/api/v1/vaults/:vaultId/sync/events', '/api/v1/vaults/:vaultId/events', '/api/v1/dashboard/events'
 ]);
 type RequestClassification = { method: string; route: string | null; status: number | null };
 export const REQUEST_LEVEL_TABLE: ReadonlyArray<{

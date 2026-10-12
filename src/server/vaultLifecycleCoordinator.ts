@@ -56,8 +56,16 @@ type Barrier = {
 
 export type Admission = { release(): void };
 
+/**
+ * Device-scoped barrier used by permanent device removal. `closing` rejects new leases; `active` counts
+ * admitted and detached device work (request handlers and background transfer processors) that must
+ * finish before a device's ref and identity may be deleted.
+ */
+type DeviceBarrier = { active: number; closing: boolean; idle: Array<() => void> };
+
 export class VaultLifecycleCoordinator {
   private readonly barriers = new Map<string, Barrier>();
+  private readonly deviceBarriers = new Map<string, DeviceBarrier>();
   private transferLifecycle: TransferLifecycle | null = null;
   private stopping = false;
   private receiptExpiryTimer: NodeJS.Timeout | null = null;
@@ -91,6 +99,119 @@ export class VaultLifecycleCoordinator {
       barrier.closing = true;
       barrier.closed = true;
     }
+    for (const job of db.device_removal_jobs) {
+      if (!hasDurableDeletionRecord(db, job.vault_id)) this.closeDeviceBarrier(job.vault_id, job.device_id);
+    }
+  }
+
+  closeDeviceBarrier(vaultId: string, deviceId: string): void {
+    this.deviceBarrier(vaultId, deviceId).closing = true;
+  }
+
+  releaseDeviceBarrier(vaultId: string, deviceId: string): void {
+    const barrier = this.deviceBarriers.get(deviceKey(vaultId, deviceId));
+    if (barrier === undefined) return;
+    barrier.closing = false;
+    if (barrier.active === 0) this.deviceBarriers.delete(deviceKey(vaultId, deviceId));
+  }
+
+  /** Number of unreleased device leases (admitted requests and detached work); for diagnostics and tests. */
+  activeDeviceLeaseCount(vaultId: string, deviceId: string): number {
+    return this.deviceBarriers.get(deviceKey(vaultId, deviceId))?.active ?? 0;
+  }
+
+  /** Number of unreleased vault admissions; for diagnostics and tests. */
+  activeAdmissionCount(vaultId: string): number {
+    return this.barriers.get(vaultId)?.active ?? 0;
+  }
+
+  isDeviceRemoving(vaultId: string, deviceId: string): boolean {
+    return this.deviceBarriers.get(deviceKey(vaultId, deviceId))?.closing === true;
+  }
+
+  /**
+   * Synchronous lease for work that is already authenticated or already owned (for example a detached
+   * transfer processor). Returns null when the device is being removed, so ownership is registered
+   * before any detached work is spawned and never after the barrier closed.
+   */
+  tryAcquireDeviceLease(vaultId: string, deviceId: string): Admission | null {
+    const barrier = this.deviceBarrier(vaultId, deviceId);
+    if (barrier.closing) return null;
+    barrier.active += 1;
+    let released = false;
+    return {
+      release: () => {
+        if (released) return;
+        released = true;
+        barrier.active -= 1;
+        if (barrier.active === 0) {
+          const waiters = barrier.idle.splice(0);
+          for (const wake of waiters) wake();
+          if (!barrier.closing && this.deviceBarriers.get(deviceKey(vaultId, deviceId)) === barrier) {
+            this.deviceBarriers.delete(deviceKey(vaultId, deviceId));
+          }
+        }
+      }
+    };
+  }
+
+  /**
+   * Registers a lease and then re-reads durable state, so a request that authenticated just before the
+   * removal intent committed can never slip past the barrier.
+   */
+  async acquireDeviceLease(vaultId: string, deviceId: string): Promise<Admission> {
+    const lease = this.tryAcquireDeviceLease(vaultId, deviceId);
+    if (lease === null) throw new AuthError(404, 'not_found', 'Resource not found.');
+    try {
+      const allowed = await this.store.read((db) => {
+        const device = db.devices.find((candidate) => candidate.device_id === deviceId && candidate.vault_id === vaultId);
+        return device !== undefined && device.status !== 'revoked' && device.revoked_at === null &&
+          !db.device_removal_jobs.some((job) => job.device_id === deviceId);
+      });
+      if (!allowed) throw new AuthError(404, 'not_found', 'Resource not found.');
+    } catch (error) {
+      lease.release();
+      throw error;
+    }
+    return lease;
+  }
+
+  /** Resolves true once every admitted and detached lease of the device finished, false on timeout. */
+  async drainDeviceLeases(vaultId: string, deviceId: string, timeoutMs: number): Promise<boolean> {
+    const barrier = this.deviceBarriers.get(deviceKey(vaultId, deviceId));
+    if (barrier === undefined || barrier.active === 0) return true;
+    return await new Promise<boolean>((resolveDrain) => {
+      const timer = setTimeout(() => {
+        barrier.idle = barrier.idle.filter((entry) => entry !== wake);
+        resolveDrain(false);
+      }, timeoutMs);
+      timer.unref();
+      const wake = () => {
+        clearTimeout(timer);
+        resolveDrain(true);
+      };
+      barrier.idle.push(wake);
+    });
+  }
+
+  /** Whole-vault deletion supersedes device removal: its barriers no longer apply once journals are dropped. */
+  releaseDeviceBarriersForVault(vaultId: string): void {
+    const prefix = `${vaultId}\u0000`;
+    for (const [key, barrier] of [...this.deviceBarriers]) {
+      if (!key.startsWith(prefix)) continue;
+      barrier.closing = false;
+      if (barrier.active === 0) this.deviceBarriers.delete(key);
+    }
+  }
+
+  private deviceBarrier(vaultId: string, deviceId: string): DeviceBarrier {
+    const key = deviceKey(vaultId, deviceId);
+    let barrier = this.deviceBarriers.get(key);
+    if (barrier === undefined) {
+      barrier = { active: 0, closing: false, idle: [] };
+      this.deviceBarriers.set(key, barrier);
+    }
+    return barrier;
   }
 
   async reconcileDeletingVaultRows(vaultId?: string): Promise<void> {
@@ -107,6 +228,7 @@ export class VaultLifecycleCoordinator {
           if (!current || current.status !== 'deleting') return;
           if (hasDeletionJobOrReceipt(db, current.vault_id)) return;
           const deviceIds = new Set(db.devices.filter((device) => device.vault_id === current.vault_id).map((device) => device.device_id));
+          db.device_removal_jobs = db.device_removal_jobs.filter((job) => job.vault_id !== current.vault_id);
           db.deletion_jobs.push({
             vault_id: current.vault_id,
             owner_user_id: current.owner_user_id,
@@ -137,6 +259,7 @@ export class VaultLifecycleCoordinator {
         barrier.closed = false;
         throw new AuthError(503, 'deletion_unavailable', 'Vault deletion could not be reconciled durably.');
       }
+      this.releaseDeviceBarriersForVault(vault.vault_id);
     }
   }
 
@@ -215,6 +338,17 @@ export class VaultLifecycleCoordinator {
 
   async withDeviceAdmission<T>(vaultId: string, userId: string, deviceId: string, fn: () => Promise<T>, tokenId?: string): Promise<T> {
     return await this.withAdmission(vaultId, async () => {
+      const lease = await this.acquireDeviceLease(vaultId, deviceId);
+      try {
+        return await this.checkedDeviceWork(vaultId, userId, deviceId, fn, tokenId);
+      } finally {
+        lease.release();
+      }
+    });
+  }
+
+  private async checkedDeviceWork<T>(vaultId: string, userId: string, deviceId: string, fn: () => Promise<T>, tokenId?: string): Promise<T> {
+    return await (async () => {
       await this.store.read((db) => {
         const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
         const device = db.devices.find((candidate) => candidate.device_id === deviceId);
@@ -233,7 +367,7 @@ export class VaultLifecycleCoordinator {
         return null;
       });
       return await fn();
-    });
+    })();
   }
 
   async withOwnerVault<T>(userId: string, vaultId: string, fn: () => Promise<T>): Promise<T> {
@@ -300,6 +434,8 @@ export class VaultLifecycleCoordinator {
           }
           current.status = 'deleting';
           current.updated_at = requestedAt;
+          // Whole-vault deletion dominates: any pending device removal journal is superseded.
+          db.device_removal_jobs = db.device_removal_jobs.filter((job) => job.vault_id !== input.vaultId);
           db.deletion_jobs.push({
             vault_id: input.vaultId,
             owner_user_id: input.ownerUserId,
@@ -313,7 +449,7 @@ export class VaultLifecycleCoordinator {
           for (const device of db.devices) {
             if (!deviceIds.has(device.device_id)) continue;
             device.status = 'revoked';
-            device.revoked_at = revokedAt;
+            device.revoked_at = device.revoked_at ?? revokedAt;
           }
           for (const token of db.tokens) {
             if (token.vault_id === input.vaultId || (token.device_id !== null && deviceIds.has(token.device_id))) {
@@ -330,6 +466,7 @@ export class VaultLifecycleCoordinator {
         if (error instanceof AuthError) throw error;
         throw new AuthError(503, 'deletion_unavailable', 'Vault deletion could not be durably accepted.');
       }
+      this.releaseDeviceBarriersForVault(input.vaultId);
       this.startWorker(input.vaultId);
       return {
         vault_id: input.vaultId,
@@ -608,6 +745,7 @@ export class VaultLifecycleCoordinator {
     delete db.derived_history_by_vault[vaultId];
     if (db.operation_history_by_vault) delete db.operation_history_by_vault[vaultId];
     db.directory_proposal_results = db.directory_proposal_results.filter((result) => result.vault_id !== vaultId);
+    db.device_removal_jobs = db.device_removal_jobs.filter((candidate) => candidate.vault_id !== vaultId);
     db.deletion_jobs = db.deletion_jobs.filter((candidate) => candidate.vault_id !== vaultId);
     const receipt: DeletionReceipt = {
       vault_id: vaultId,
@@ -749,6 +887,10 @@ function receiptExpiryTimestamp(completedAtValue: string): number | null {
   if (!Number.isFinite(completedAt) || completedAt > maxDate - RECEIPT_RETENTION_MS) return null;
   const expiry = completedAt + RECEIPT_RETENTION_MS;
   return expiry < -maxDate ? null : expiry;
+}
+
+function deviceKey(vaultId: string, deviceId: string): string {
+  return `${vaultId}\u0000${deviceId}`;
 }
 
 function hasDeletionJobOrReceipt(db: MetadataDb, vaultId: string): boolean {

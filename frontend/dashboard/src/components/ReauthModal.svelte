@@ -7,6 +7,7 @@
   export let busy = false;
   export let onSubmit: () => void | Promise<void> = () => {};
   export let onCancel: () => void | Promise<void> = () => {};
+  export let returnFocusTo: HTMLElement | null = null;
 
   let dialog: HTMLElement | null = null;
   let usernameInput: HTMLInputElement | null = null;
@@ -54,7 +55,8 @@
   }
 
   onMount(() => {
-    previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const active = document.activeElement;
+    previousFocus = returnFocusTo ?? (active instanceof HTMLElement && active !== document.body ? active : null);
     void tick().then(() => usernameInput?.focus());
     document.addEventListener('keydown', handleKeydown);
   });

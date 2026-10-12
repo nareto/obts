@@ -12,22 +12,32 @@ This is not true E2EE or zero knowledge. A compromised live process, malicious d
 - Administrator status does not grant another owner's vault-content access.
 - Every vault, device, ref/object, conflict, history, event, diagnostic, connection, and maintenance boundary enforces user/vault/device scope.
 - Cross-owner vault-resource requests return `404` without useful existence leakage.
-- Disabling a user revokes sessions, pending/approved connections, device tokens, and event streams.
+- Disabling a user revokes sessions, pending/approved connections, device tokens, and event streams. Every send on an owner dashboard stream rechecks current session/account authority; it cannot serve a stale private snapshot after disablement, revocation, logout, expiry, or metadata/dependency unavailability.
 - Revoking administrator status must not remove the final enabled administrator.
 - User creation/disable/enable, administrator grant/revoke, reset-token creation, login, connection approval/completion, failed authentication, token rotation, and revocation write redacted audit records.
-- Revoking a device or rotating its token takes effect server-side immediately; local credential deletion is best-effort cleanup.
+- Revoking a device or rotating its token takes effect server-side immediately; local credential deletion is best-effort cleanup. Revocation is sticky: a device with `revoked_at` set always has status `revoked`, enforced at the metadata commit boundary, so sync completions authenticated before the revoke cannot un-revoke it.
 
 ## Dashboard Sessions
 
 Dashboard authentication uses server-side sessions with at least 128 bits of entropy. Cookies are `HttpOnly`, `SameSite=Strict`, `Path=/`, have no `Domain` attribute, and use the hardened `__Host-`/`Secure` form when served over HTTPS. Sessions have a 30-day absolute lifetime and a seven-day idle lifetime refreshed by authenticated dashboard use; logout or account disable invalidates them immediately.
 
+### OBTS-SEC-SESSION-001: Authoritative Session Liveness
+
+Every request revalidates session existence, revocation/disabled state, absolute and idle expiry, and current user authority from authoritative metadata; no cached positive authorization is permitted. `last_seen_at` persistence may coalesce for up to 60 seconds per active session and cannot extend absolute expiry. Stream heartbeats do not update liveness. This bounded write frequency does not extend the authorization grace period: expiration and revocation remain checked on every request.
+
 Cookie-authenticated mutations require a session-bound CSRF token. The active authenticated user is not asked to re-enter username or password for dashboard operations. Consequential actions instead use explicit target-specific typed confirmation or ordinary confirmation according to the product contract. Server authorization and state preconditions remain mandatory regardless of frontend confirmation.
 
 Passwords are at least 12 characters and use Argon2id with minimum parameters `m=19456`, `t=2`, `p=1`. Five failed logins for one account/source within ten minutes trigger exponential backoff starting at one minute and capped at one hour. Connection creation/review/polling is rate-limited by source and connection identity. Local account recovery uses audited one-time reset credentials; v1 does not depend on email recovery.
 
+### OBTS-SEC-STREAM-001: Owner-Scoped Dashboard Invalidation Stream
+
+The owner dashboard stream is a same-origin cookie-authenticated, one-way invalidation channel. It accepts no query-string credentials and no permissive credentialed cross-origin access. Unauthorized requests fail before opening a stream. Each send rechecks current session/account authority; logout, revoke, disable, expiry, or dependency failure terminates the stream. Each reconnect sends a fixed refresh instruction, not replay from a separate durable event log. Live notifications are bounded closed-schema projections of committed owner-visible changes and reveal only owned vault IDs. Backpressure, subscriber limits, heartbeats, close/abort/shutdown cleanup, and fail-closed behavior are mandatory.
+
 ### OBTS-SEC-DEL-001: Owner-Scoped Destructive Deletion
 
 A vault deletion request requires the ordinary authenticated owner session, a valid session-bound CSRF token, and an explicit typed target phrase bound to the captured full vault ID. It does not require recent-auth or password re-entry. Authorization is checked against the target before confirmation errors; unknown and cross-owner resources remain indistinguishable `404` responses. A request cannot change target when selection or account context changes.
+
+Permanent device removal likewise requires an owner session, valid CSRF, and exact captured vault/device target, but accepts only a device that is already revoked. Unknown and cross-owner vault/device targets return indistinguishable `404` before eligibility or confirmation details. Typed confirmation is `DELETE <device_id>`; an explicit discard request additionally requires `DELETE <device_id> AND DISCARD UNMERGED WORK`. Confirmation is intent evidence, never authorization: server-side lifecycle, conflict, prepared-operation, ref-ownership, and drain gates remain mandatory. No recent-password step is required.
 
 The deletion coordinator rechecks owner scope and lifecycle state at its durable acceptance boundary. All pending, active, and completed deletion status is owner-scoped and redacted to opaque IDs, timestamps, status, and fixed safe error categories. No receipt or pending record retains names, paths, commits, content, manifests, tokens, connection secrets, device names, or diagnostics. Revocation and the deletion barrier prevent new device, transfer, connection, diagnostic, sync, history, or mutation admissions for the target while another vault remains independently accessible.
 

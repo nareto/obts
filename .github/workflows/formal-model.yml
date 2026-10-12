@@ -56,5 +56,6 @@ jobs:
             headless-ownership) npm run test:formal:headless-ownership ;;
             atomic-rename) npm run test:formal:atomic-rename ;;
             operation-history) npm run test:formal:operation-history ;;
+            dashboard-protocols) npm run test:formal:dashboard-protocols ;;
             *) echo "Unknown formal family: $FAMILY" >&2; exit 1 ;;
           esac

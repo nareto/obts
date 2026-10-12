@@ -1,6 +1,9 @@
 export const fastTests = [
   'tests/conflict-diff.test.ts',
   'tests/dashboard-presentation.test.ts',
+  'tests/dashboard-router.test.ts',
+  'tests/dashboard-live-updates.test.ts',
+  'tests/dashboard-refresh-scheduler.test.ts',
   'tests/headless-protocol.test.ts',
   'tests/headless-transport-deadlines.test.ts',
   'tests/plugin-mobile-fs.test.ts',
@@ -40,10 +43,11 @@ export const checkerTests = [
   'tests/formal-bounded-body.test.ts',
   'tests/formal-embedding-worker.test.ts',
   'tests/formal-deletion-checker.test.ts',
+  'tests/formal-dashboard-protocols.test.ts',
   'tests/formal-external-protocol-tooling.test.ts',
   'tests/validation-selection.test.ts'
 ];
 
 export const formalFamilies = [
-  'sync', 'bridge-body', 'workers', 'deletion', 'bridge-protocol', 'onboarding', 'diagnostics', 'client-state', 'vault-settings', 'headless-ownership', 'atomic-rename', 'operation-history'
+  'sync', 'bridge-body', 'workers', 'deletion', 'bridge-protocol', 'onboarding', 'diagnostics', 'client-state', 'vault-settings', 'headless-ownership', 'atomic-rename', 'operation-history', 'dashboard-protocols'
 ];

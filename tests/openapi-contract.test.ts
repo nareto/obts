@@ -225,6 +225,42 @@ describe('OpenAPI Phase 3 contract', () => {
       properties: { result: { $ref: '#/components/schemas/PushResult' } }
     });
     expect(document.paths['/vaults/{vault_id}/devices/{device_id}']?.patch).toBeDefined();
+    const deviceRemoval = document.paths['/vaults/{vault_id}/devices/{device_id}']?.delete;
+    expect(deviceRemoval).toBeDefined();
+    expect(Object.keys(deviceRemoval?.responses ?? {}).sort()).toEqual(['200', '400', '401', '403', '404', '409', '503']);
+    expect(document.components.schemas).toMatchObject({
+      DeviceRemovalRequest: {
+        additionalProperties: false,
+        required: ['confirmation'],
+        properties: { confirmation: { type: 'string' }, discard_unmerged: { type: 'boolean', default: false } }
+      },
+      DeviceRemovalResponse: {
+        additionalProperties: false,
+        required: ['status', 'device_id'],
+        properties: { status: { enum: ['removed'] } }
+      },
+      DeviceRemovalState: {
+        required: ['state', 'retryable', 'error_code'],
+        properties: {
+          state: { enum: ['pending', 'failed'] },
+          retryable: { type: 'boolean' },
+          error_code: { oneOf: [{ type: 'null' }, { type: 'string' }] }
+        }
+      }
+    });
+    for (const code of [
+      'device_not_revoked', 'confirmation_mismatch', 'device_has_open_work', 'device_has_unmerged_work',
+      'device_removal_unavailable', 'device_removal_incomplete', 'device_ref_inconsistent'
+    ]) {
+      expect(contract).toContain(code);
+    }
+    const dashboardDevice = (document.components.schemas.DashboardSummary as {
+      properties: { devices: { items: { required: string[]; properties: Record<string, unknown> } } };
+    }).properties.devices.items;
+    expect(dashboardDevice.required).toEqual(expect.arrayContaining(['revoked_at', 'removal']));
+    expect(dashboardDevice.properties.removal).toMatchObject({
+      oneOf: [{ type: 'null' }, { $ref: '#/components/schemas/DeviceRemovalState' }]
+    });
     expect(document.paths['/device/self']?.patch?.security).toEqual([{ deviceBearer: [] }]);
     expect(document.components.schemas).toHaveProperty('ConnectionReviewResponse');
     expect(document.components.schemas).toHaveProperty('ConnectionBootstrapManifest');
@@ -336,5 +372,34 @@ describe('OpenAPI Phase 3 contract', () => {
     );
     expect(deviceUnpairSection).toContain('deviceBearer');
     expect(deviceUnpairSection).toContain('StatusResponse');
+  });
+
+  it('commits the dashboard invalidation stream and the observation-only health projection', async () => {
+    const document = parse(await readFile(join(process.cwd(), 'openapi', 'openapi.yaml'), 'utf8')) as {
+      paths: Record<string, { get?: { security?: unknown; responses: Record<string, any> } }>;
+      components: { schemas: Record<string, any> };
+    };
+    const events = document.paths['/dashboard/events']?.get;
+    expect(events).toBeDefined();
+    expect(events?.security).toBeUndefined();
+    expect(Object.keys(events!.responses).sort()).toEqual(['200', '401', '403', '429', '503']);
+    expect(events!.responses['200'].headers['Cache-Control'].schema.const).toBe('no-store, no-transform');
+    expect(events!.responses['200'].content['text/event-stream']['x-obts-events']).toEqual({
+      refresh: { $ref: '#/components/schemas/DashboardRefreshEvent' },
+      invalidate: { $ref: '#/components/schemas/DashboardInvalidation' }
+    });
+    expect(document.components.schemas.DashboardInvalidation).toMatchObject({
+      required: ['account', 'vault_ids'],
+      additionalProperties: false,
+      properties: { account: { type: 'boolean' }, vault_ids: { type: 'array', maxItems: 32, items: { pattern: '^vlt_' } } }
+    });
+    expect(document.components.schemas.DashboardSummary.properties.health).toEqual({ $ref: '#/components/schemas/DashboardHealth' });
+    const health = document.components.schemas.DashboardHealth;
+    expect(health.allOf[0]).toEqual({ $ref: '#/components/schemas/ReadinessSummary' });
+    expect(health.allOf[1].required).toEqual(['checked_at', 'checking', 'stale', 'state']);
+    expect(health.allOf[1].properties.state.enum).toEqual(['verified', 'not_ready', 'stale', 'pending', 'failed']);
+    expect(document.components.schemas.MaintenanceRow.properties.last_checked_at.oneOf).toEqual(
+      expect.arrayContaining([{ type: 'null' }])
+    );
   });
 });

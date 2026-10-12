@@ -162,6 +162,10 @@ describe('validation selection', () => {
     expect(makePlan(['architecture/models/formal/OBTSAtomicRename.tla']).formalFamilies).toEqual(['atomic-rename']);
     expect(makePlan(['architecture/models/formal/OBTSRenameAuthoring.tla']).formalFamilies).toEqual(['atomic-rename']);
     expect(makePlan(['architecture/models/formal/OBTSAtomicRename.cfg']).formalFamilies).toEqual(['atomic-rename']);
+    expect(makePlan(['architecture/models/formal/OBTSDashboardProtocols.tla']).formalFamilies).toEqual(['dashboard-protocols']);
+    expect(makePlan(['architecture/models/formal/OBTSDeviceRemoval.tla']).formalFamilies).toEqual(['dashboard-protocols']);
+    expect(makePlan(['architecture/models/formal/configs/dashboard-positive.cfg']).formalFamilies).toEqual(['dashboard-protocols']);
+    expect(makePlan(['architecture/models/formal/configs/device-removal-positive.cfg']).formalFamilies).toEqual(['dashboard-protocols']);
     expect(makePlan(['architecture/models/formal/configs/fm014-atomic-rename.cfg']).formalFamilies).toEqual(['atomic-rename']);
     for (const extension of ['tla', 'cfg']) {
       const plan = makePlan([`architecture/models/formal/OBTSUploadCheckpointRecovery.${extension}`]);
@@ -218,6 +222,14 @@ describe('validation selection', () => {
     expect([...files].filter((path) => !fastTests.includes(path)).length + fastTests.length).toBe(files.size);
     expect(makePlan(['tests/new-unknown.test.ts']).executableGroup).toBe('all');
     expect(readFileSync(join(root, 'vitest.config.ts'), 'utf8')).toContain("group === 'integration' ? fastTests");
+  });
+
+  it('runs the live-update controller and refresh scheduler tests in the fast group and never treats their sources as style-only', () => {
+    expect(fastTests).toContain('tests/dashboard-live-updates.test.ts');
+    expect(fastTests).toContain('tests/dashboard-refresh-scheduler.test.ts');
+    for (const source of ['frontend/dashboard/src/liveUpdates.ts', 'frontend/dashboard/src/refreshScheduler.ts']) {
+      expect(makePlan([source]).executableGroup).toBe('all');
+    }
   });
 
   it('rejects artifact source SHA and byte mismatches', () => {

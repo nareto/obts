@@ -13,7 +13,16 @@ describe('dashboard live device status', () => {
     ]);
 
     expect(app).toContain('DASHBOARD_REFRESH_INTERVAL_MS = 15 * 1000');
-    expect(app).toContain('refreshDashboardStatus()');
+    // The interval/focus/visibility triggers no longer call refreshDashboardStatus() directly: every trigger goes
+    // through the coalescing scheduler, whose runs use the quiet superseding path.
+    expect(app).not.toContain('refreshDashboardStatus();');
+    expect(app).toContain("scheduler.request('vault')");
+    expect(app).toContain('scheduler.request(request.scope)');
+    expect(app).toContain('await refreshDashboardStatus(true)');
+    expect(app).toContain('DASHBOARD_LIVE_AGING_INTERVAL_MS = 60 * 1000');
+    expect(app).toContain('fallbackIntervalMs: DASHBOARD_REFRESH_INTERVAL_MS');
+    expect(app).toContain('agingIntervalMs: DASHBOARD_LIVE_AGING_INTERVAL_MS');
+    expect(app).not.toContain('window.setInterval(() => {\n      if (!document.hidden) void refreshDashboardStatus');
     expect(app).toContain("document.addEventListener('visibilitychange', refreshWhenVisible)");
     expect(app).toContain("window.addEventListener('focus', refreshWhenVisible)");
     expect(app).toContain('dashboardRefreshGeneration');
@@ -41,6 +50,9 @@ describe('dashboard live device status', () => {
     expect(status).toContain('value.startsWith(`${base} `)');
     expect(deviceTable).not.toContain('nowMs');
     expect(deviceTable).not.toContain('Date.parse(device.last_status_report_at)');
+    expect(shell).not.toContain('Auto-refresh');
+    expect(shell).toContain('aria-live="polite"');
+    expect(shell).toContain('liveIndicator.label');
     expect(shell).toContain('drawer-backdrop');
     expect(shell).toContain("event.key === 'Escape'");
     expect(shell).toContain("document.body.style.overflow = 'hidden'");

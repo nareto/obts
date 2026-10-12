@@ -1,7 +1,7 @@
 schema_version: 1
-revision: 54
+revision: 55
 status: current
-updated: 2026-10-10
+updated: 2026-10-12
 authoritative_artifacts:
   - architecture/manifest.yaml
   - architecture/README.md
@@ -181,4 +181,15 @@ formal_models:
       - OBTS-PER-OP-001
       - OBTS-SYNC-IMM-001
       - OBTS-PER-DEL-001
+  - id: OBTS-FM-016
+    status: focused bounded model
+    path: architecture/models/formal/OBTSDashboardProtocols.tla
+    companion_path: architecture/models/formal/OBTSDeviceRemoval.tla
+    architecture_revision: 55
+    refines:
+      - OBTS-DASH-HEALTH-001
+      - OBTS-DASH-STREAM-001
+      - OBTS-SEC-SESSION-001
+      - OBTS-SEC-STREAM-001
+      - OBTS-PER-DEV-DEL-001
 

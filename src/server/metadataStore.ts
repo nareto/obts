@@ -256,6 +256,27 @@ export type OperationHistoryMetadata = {
   pending_batch: HistoryBatch | null;
 };
 
+/**
+ * Durable intent for permanent removal of one already-revoked device. The record is committed before
+ * any ref or identity deletion and is the only authority that makes an intentionally missing device ref
+ * legitimate. `expected_ref_oid` is immutable for one `generation`; if the ref moves, a new generation
+ * is committed with the newly verified OID before another compare-and-swap is attempted.
+ */
+export type DeviceRemovalJob = {
+  device_id: string;
+  vault_id: string;
+  owner_user_id: string;
+  requested_at: string;
+  updated_at: string;
+  phase: 'intent' | 'ref_deleting' | 'cleanup';
+  generation: number;
+  expected_ref_oid: string | null;
+  discard_unmerged: boolean;
+  state: 'pending' | 'failed';
+  error_code: string | null;
+  retryable: boolean;
+};
+
 export type MetadataDb = {
   schema_version: 8;
   operation_history_by_vault?: Record<string, OperationHistoryMetadata>;
@@ -279,7 +300,36 @@ export type MetadataDb = {
   derived_history_by_vault: Record<string, DerivedHistoryIndexRow[]>;
   deletion_jobs: DeletionJob[];
   deletion_receipts: DeletionReceipt[];
+  device_removal_jobs: DeviceRemovalJob[];
 };
+
+export type MetadataCommit = { readonly previous: DeepReadonly<MetadataDb>; readonly current: DeepReadonly<MetadataDb> };
+/**
+ * A device is revoked when `revoked_at` is set OR its status is 'revoked'. The status-only form exists in
+ * legacy rows (no timestamp was ever recorded; none is invented at load), which must stay removable and
+ * look revoked everywhere. The store only enforces the other direction (see `enforceRevocationInvariant`).
+ */
+export function isDeviceRevoked(device: Pick<DeviceRow, 'revoked_at'> & Partial<Pick<DeviceRow, 'status'>>): boolean {
+  return (device.revoked_at !== null && device.revoked_at !== undefined) || device.status === 'revoked';
+}
+
+/**
+ * Revocation is sticky: a device with `revoked_at` set always has status 'revoked'. Enforced at the
+ * commit boundary (before persistence and publication) so no sync completion that was authenticated
+ * before a revoke can make the device look un-revoked. Returns whether anything was repaired.
+ */
+function enforceRevocationInvariant(db: MetadataDb): boolean {
+  let repaired = false;
+  for (const device of db.devices) {
+    if (device.revoked_at !== null && device.revoked_at !== undefined && device.status !== 'revoked') {
+      device.status = 'revoked';
+      repaired = true;
+    }
+  }
+  return repaired;
+}
+
+export type MetadataCommitListener = (commit: MetadataCommit) => void;
 
 export type DeepReadonly<T> = T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T;
 type Detached<T> = T extends object ? { -readonly [K in keyof T]: Detached<T[K]> } : T;
@@ -323,6 +373,9 @@ export class MetadataStore {
   private durabilityUncertain = false;
   private cleanupFailed = false;
   private cleanupDirectorySyncRequired = false;
+  private readonly commitListeners = new Set<MetadataCommitListener>();
+  private commits = 0;
+  private pendingCommit: { previous: MetadataDb; current: MetadataDb } | null = null;
   private readonly persistence: MetadataPersistenceAdapter;
   private readonly histories = new Map<string, OperationHistoryStore>();
 
@@ -358,6 +411,65 @@ export class MetadataStore {
 
   isDurabilityUncertain(): boolean {
     return this.durabilityUncertain;
+  }
+
+  /**
+   * Observes committed metadata states. Listeners run detached (after the committing transaction has
+   * resolved its own continuation), receive readonly previous/current states and can neither delay
+   * nor fail a commit. They are only invoked after durable publication succeeded; a failed or
+   * uncertain publication never reaches them.
+   */
+  subscribeCommits(listener: MetadataCommitListener): () => void {
+    this.commitListeners.add(listener);
+    return () => {
+      this.commitListeners.delete(listener);
+    };
+  }
+
+  /**
+   * Monotonic count of durably published commits in this process. Callers that verify state outside the
+   * metadata queue use it to detect that a commit landed in between, instead of holding the queue.
+   */
+  commitVersion(): number {
+    return this.commits;
+  }
+
+  async snapshotVersioned(): Promise<{ db: MetadataDb; version: number }> {
+    await this.pending;
+    if (this.db === null) await this.initialize();
+    this.assertOperational();
+    return { db: clone(this.requireDb()), version: this.commits };
+  }
+
+  /**
+   * Commits that land before the detached drain runs are coalesced into one transition (earliest
+   * previous -> latest current), so at most two retained states exist however large a burst is. Each
+   * listener therefore sees one combined transition per drain.
+   */
+  private publishCommit(previous: MetadataDb | null, current: MetadataDb): void {
+    this.commits += 1;
+    if (previous === null) return;
+    if (this.pendingCommit !== null) {
+      this.pendingCommit.current = current;
+      return;
+    }
+    if (this.commitListeners.size === 0) return;
+    this.pendingCommit = { previous, current };
+    setImmediate(() => this.drainCommits());
+  }
+
+  private drainCommits(): void {
+    const pending = this.pendingCommit;
+    this.pendingCommit = null;
+    if (pending === null) return;
+    for (const listener of [...this.commitListeners]) {
+      if (!this.commitListeners.has(listener)) continue;
+      try {
+        listener({ previous: pending.previous, current: pending.current });
+      } catch {
+        // A subscriber failure must never affect the already committed transaction.
+      }
+    }
   }
 
   async initialize(): Promise<void> {
@@ -733,6 +845,7 @@ export class MetadataStore {
       this.assertOperational();
       const candidate = clone(this.requireDb());
       const result = await fn(candidate);
+      enforceRevocationInvariant(candidate);
       this.prepareOperationHistoryMetadata(candidate);
       try {
         await this.persist(candidate);
@@ -740,7 +853,9 @@ export class MetadataStore {
         if (error instanceof MetadataPublicationError) this.durabilityUncertain = true;
         throw error;
       }
+      const previous = this.db;
       this.db = candidate;
+      this.publishCommit(previous, candidate);
       await this.initializePendingHistories();
       return result;
     });
@@ -752,6 +867,7 @@ export class MetadataStore {
       this.assertOperational();
       const candidate = clone(this.requireDb());
       const result = await fn(candidate);
+      enforceRevocationInvariant(candidate);
       this.prepareOperationHistoryMetadata(candidate);
       try {
         await this.persist(candidate);
@@ -759,7 +875,9 @@ export class MetadataStore {
         if (error instanceof MetadataPublicationError) this.durabilityUncertain = true;
         throw error;
       }
+      const previous = this.db;
       this.db = candidate;
+      this.publishCommit(previous, candidate);
       await this.initializePendingHistories();
       return result;
     });
@@ -784,6 +902,7 @@ export class MetadataStore {
       if (!shouldMutate(selected)) return clone(selected) as Detached<T>;
       const candidate = clone(this.requireDb());
       const result = update(candidate);
+      enforceRevocationInvariant(candidate);
       this.prepareOperationHistoryMetadata(candidate);
       try {
         await this.persist(candidate);
@@ -791,7 +910,9 @@ export class MetadataStore {
         if (error instanceof MetadataPublicationError) this.durabilityUncertain = true;
         throw error;
       }
+      const previous = this.db;
       this.db = candidate;
+      this.publishCommit(previous, candidate);
       await this.initializePendingHistories();
       return clone(result) as Detached<T>;
     });
@@ -1001,6 +1122,7 @@ export class MetadataStore {
       schema_version: number;
       deletion_jobs?: DeletionJob[];
       deletion_receipts?: DeletionReceipt[];
+      device_removal_jobs?: DeviceRemovalJob[];
       connections?: ConnectionRequestRow[];
       login_attempts?: LoginAttemptRow[];
       diagnostic_events?: DiagnosticEventRow[];
@@ -1061,6 +1183,10 @@ export class MetadataStore {
       legacyDb.deletion_receipts = [];
       changed = true;
     }
+    if (!Array.isArray(legacyDb.device_removal_jobs)) {
+      legacyDb.device_removal_jobs = [];
+      changed = true;
+    }
     const schema = legacyDb as unknown as { schema_version: number };
     if (schema.schema_version < 8) {
       schema.schema_version = 8;
@@ -1077,6 +1203,7 @@ export class MetadataStore {
         changed = true;
       }
     }
+    if (enforceRevocationInvariant(db)) changed = true;
     for (const device of db.devices) {
       const deviceName = migrateDisplayName(device.device_name, 'Unnamed device');
       if (device.device_name !== deviceName) {
@@ -1283,7 +1410,8 @@ function createEmptyDb(): MetadataDb {
     directory_proposal_results: [],
     derived_history_by_vault: {},
     deletion_jobs: [],
-    deletion_receipts: []
+    deletion_receipts: [],
+    device_removal_jobs: []
   };
 }
 

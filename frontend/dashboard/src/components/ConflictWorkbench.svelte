@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import Status from './Status.svelte';
   import {
     buildConflictDiff,
@@ -32,6 +33,7 @@
     throw new Error('Resolution preview is unavailable.');
   };
   export let onRefresh: () => Promise<void> = async () => {};
+  export let onDirtyChange: (dirty: boolean) => void = () => {};
 
   type PreviewState =
     | { kind: 'idle' }
@@ -56,6 +58,7 @@
   let candidateRevision = 0;
   let currentSubmission: ConflictResolutionSubmission | null = null;
   let currentCandidateKey = '';
+  let draftTouched = false;
   const fileNodes = new Map<string, HTMLElement>();
   let fileObserver: IntersectionObserver | null = null;
 
@@ -110,11 +113,16 @@
     previewState = { kind: 'idle' };
     previewGeneration += 1;
     candidateChanged();
+    draftTouched = false;
   }
 
   function candidateChanged() {
     candidateRevision += 1;
+    draftTouched = true;
   }
+
+  $: onDirtyChange(draftTouched && !reviewResolved);
+  onDestroy(() => onDirtyChange(false));
 
   function trackFile(node: HTMLElement, path: string) {
     fileNodes.set(path, node);

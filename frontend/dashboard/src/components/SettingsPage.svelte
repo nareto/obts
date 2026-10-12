@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import type { DiagnosticEventsResponse, MetadataConflictRule, Session, VaultDeletionStatus, VaultSummary, VaultSyncSettings, VaultSyncSettingsPreview } from '../api/types';
   import Diagnostics from './Diagnostics.svelte';
   import Status from './Status.svelte';
@@ -8,6 +9,8 @@
   export let diagnostics: DiagnosticEventsResponse | null = null;
   export let diagnosticsError = '';
   export let diagnosticsLoading = false;
+  /** True when diagnostics changed on the server but loaded pages were kept; the notice runs the manual refresh. */
+  export let diagnosticsNewActivity = false;
   export let busy = false;
   export let onRefreshDiagnostics: () => void | Promise<void> = () => {};
   export let onLoadMoreDiagnostics: () => void | Promise<void> = () => {};
@@ -26,6 +29,7 @@
   export let onLoadSyncSettings: () => boolean | void | Promise<boolean | void> = () => {};
   export let onPreviewSyncSettings: (rootIgnore: string | null, rules: MetadataConflictRule[]) => Promise<VaultSyncSettingsPreview> = async () => { throw new Error('Settings preview is unavailable.'); };
   export let onSaveSyncSettings: (rootIgnore: string | null, rules: MetadataConflictRule[], preview: VaultSyncSettingsPreview) => void | Promise<void> = () => {};
+  export let onDirtyChange: (dirty: boolean) => void = () => {};
 
   let settingsKey = '';
   let draftOwnerKey = '';
@@ -59,6 +63,12 @@
     settingsPreview = null;
     settingsMessage = '';
   }
+
+  $: draftDirty = !!syncSettings && settingsKey !== '' && (hasRootIgnore !== (syncSettings.root_ignore !== null) ||
+    rootIgnoreDraft !== (syncSettings.root_ignore ?? '') ||
+    conflictFieldsDraft !== syncSettings.metadata_conflict_rules.map((rule) => rule.field).join('\n'));
+  $: onDirtyChange(draftDirty);
+  onDestroy(() => onDirtyChange(false));
 
   function invalidateSettingsPreview() {
     settingsRequestGeneration += 1;
@@ -149,7 +159,12 @@
     <section class="panel diagnostics-settings" aria-labelledby="diagnostics-title">
       <div class="section-heading">
         <div><p class="eyebrow">Consent and redaction</p><h2 id="diagnostics-title">Troubleshooting diagnostics</h2></div>
-        <button class="secondary" disabled={busy || diagnosticsLoading} on:click={() => onRefreshDiagnostics()}>Refresh</button>
+        <div class="diagnostics-heading-actions">
+          {#if diagnosticsNewActivity}
+            <button class="secondary diagnostics-new-activity" disabled={busy || diagnosticsLoading} on:click={() => onRefreshDiagnostics()}>New activity — Refresh diagnostics</button>
+          {/if}
+          <button class="secondary" disabled={busy || diagnosticsLoading} on:click={() => onRefreshDiagnostics()}>Refresh</button>
+        </div>
       </div>
       {#if diagnosticsError}
         <div class="inline-error" role="alert"><strong>Diagnostics unavailable</strong><p>{diagnosticsError}</p><button class="secondary" disabled={busy || diagnosticsLoading} on:click={() => onRefreshDiagnostics()}>Try again</button></div>

@@ -20,7 +20,8 @@ const formalPaths = new Map([
   ['vault-settings', /^(?:architecture\/models\/formal\/(?:OBTSVaultSettings(?:\.tla|\.cfg)?|VaultSettings(?:AutoMerge|ConflictFallback|DeleteLocal|RecomputeMerge|StaleSave)\.cfg|negative\/VaultSettings.*\.cfg))$/],
   ['headless-ownership', /^(?:architecture\/models\/formal\/OBTSManagedHeadlessOwnership\.(?:tla|cfg))$/],
   ['atomic-rename', /^(?:architecture\/models\/formal\/(?:OBTS(?:AtomicRename|RenameAuthoring)\.(?:tla|cfg)|configs\/fm014-atomic-rename\.cfg))$/],
-  ['operation-history', /^(?:architecture\/models\/formal\/(?:OBTSOperationHistory\.(?:tla|cfg)|configs\/fm015-[^/]+\.cfg))$/]
+  ['operation-history', /^(?:architecture\/models\/formal\/(?:OBTSOperationHistory\.(?:tla|cfg)|configs\/fm015-[^/]+\.cfg))$/],
+  ['dashboard-protocols', /^(?:architecture\/models\/formal\/(?:OBTS(?:DashboardProtocols|DeviceRemoval)\.tla|configs\/(?:dashboard|device-removal)-.*\.cfg))$/]
 ]);
 function git(args, cwd) {
   return spawnSync('git', args, { cwd, encoding: 'buffer', maxBuffer: 16 * 1024 * 1024 });

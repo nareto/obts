@@ -91,7 +91,7 @@ fails startup. Library use and other CLI commands remain silent, including
 event, not a plaintext URL.
 
 Events are `http_request`, `server_listening`, `startup_phase`,
-`vault_integrity_blocked`, `push_integrated`, `conflict_created`,
+`vault_integrity_blocked`, `vault_integrity_block_contended`, `push_integrated`, `conflict_created`,
 `conflict_resolved`, `background_task_failed`, and `log_lines_dropped`. Each completed or aborted
 request has one request event. Integration events also cover asynchronous
 finalization and startup resumption, so a processing response is distinguishable

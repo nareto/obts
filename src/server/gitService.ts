@@ -71,12 +71,18 @@ type GitTreeEntry = {
 
 export class GitCommandError extends Error {
   readonly stderr: string;
+  readonly exitCode: number | null;
 
-  constructor(message: string, stderr: string) {
+  constructor(message: string, stderr: string, exitCode: number | null = null) {
     super(message);
     this.stderr = stderr;
+    this.exitCode = exitCode;
   }
 }
+
+export type AncestryVerdict = 'ancestor' | 'not_ancestor' | 'unknown';
+
+const ANCESTRY_CACHE_LIMIT = 4096;
 
 export class GitMalformedPackError extends Error {
   constructor() {
@@ -92,6 +98,9 @@ export class GitDurabilityError extends Error {
 
 export class GitService {
   private durabilityUncertain = false;
+  // Definitive ancestry answers between two commit ids never change, so they are safe to reuse.
+  // Transient or ambiguous failures are deliberately never stored.
+  private readonly ancestryCache = new Map<string, boolean>();
   // Process-wide counters since server start. They make validation regressions (for example a
   // scoped quarantine check silently becoming a full-store walk) visible in redacted diagnostics
   // instead of requiring per-request log archaeology.
@@ -331,6 +340,52 @@ export class GitService {
     }
   }
 
+  /**
+   * Strict ref lookup for lifecycle decisions. Unlike `getRef`, only a definitive "no such ref" answer
+   * is `null`; every other failure (unreadable repository, unexpected output, durability loss) throws, so
+   * it can never be mistaken for an absent ref.
+   */
+  async readRefStrict(vaultId: string, ref: string): Promise<string | null> {
+    if (!/^refs\/[A-Za-z0-9_./-]+$/u.test(ref) || ref.includes('..') || ref.endsWith('/') || ref.endsWith('.lock')) {
+      throw new GitCommandError('Git ref name is not acceptable.', '');
+    }
+    const { stdout } = await this.exec(this.repoPath(vaultId), ['for-each-ref', '--format=%(refname) %(objectname)', ref]);
+    let found: string | null = null;
+    for (const line of asText(stdout).split('\n')) {
+      if (line.length === 0) continue;
+      const separator = line.lastIndexOf(' ');
+      const name = line.slice(0, separator);
+      const oid = line.slice(separator + 1);
+      if (name !== ref) continue;
+      if (!/^[0-9a-f]{40}$/u.test(oid) || found !== null) {
+        throw new GitCommandError('Git ref lookup returned an unexpected answer.', '');
+      }
+      found = oid;
+    }
+    return found;
+  }
+
+  /**
+   * Deletes exactly one ref with an expected-OID compare-and-swap and syncs the repository. The result
+   * is `moved` only when a strict re-read proves the ref holds a different OID, and `absent` only when a
+   * strict re-read proves it does not exist; any other failure is rethrown.
+   */
+  async deleteRefCas(vaultId: string, ref: string, expected: string): Promise<'deleted' | 'moved' | 'absent'> {
+    if (!/^[0-9a-f]{40}$/u.test(expected)) throw new GitCommandError('Expected ref OID is not acceptable.', '');
+    const repo = this.repoPath(vaultId);
+    try {
+      await this.exec(repo, ['update-ref', '-d', ref, expected]);
+    } catch (error) {
+      if (error instanceof GitDurabilityError) throw error;
+      const current = await this.readRefStrict(vaultId, ref);
+      if (current === null) return 'absent';
+      if (current !== expected) return 'moved';
+      throw error;
+    }
+    await this.fsyncTree(repo);
+    return 'deleted';
+  }
+
   async updateRef(vaultId: string, ref: string, target: string, expected: string | null): Promise<void> {
     const repo = this.repoPath(vaultId);
     const oldValue = expected ?? ZERO_OID;
@@ -367,6 +422,40 @@ export class GitService {
 
   async isAncestor(vaultId: string, ancestor: string, descendant: string): Promise<boolean> {
     return await this.isAncestorInRepo(this.repoPath(vaultId), ancestor, descendant);
+  }
+
+  /**
+   * Observation-only ancestry answer for read paths. `not_ancestor` is reported only when Git exits
+   * with its documented "no" status and no diagnostics; any other failure is `unknown` and is never
+   * cached. Durability failures still propagate.
+   */
+  async ancestryVerdict(vaultId: string, ancestor: string, descendant: string): Promise<AncestryVerdict> {
+    if (ancestor === descendant) return 'ancestor';
+    const key = `${vaultId}\0${ancestor}\0${descendant}`;
+    const cached = this.ancestryCache.get(key);
+    if (cached !== undefined) {
+      this.ancestryCache.delete(key);
+      this.ancestryCache.set(key, cached);
+      return cached ? 'ancestor' : 'not_ancestor';
+    }
+    let verdict: AncestryVerdict;
+    try {
+      await this.exec(this.repoPath(vaultId), ['merge-base', '--is-ancestor', ancestor, descendant]);
+      verdict = 'ancestor';
+    } catch (error) {
+      if (error instanceof GitDurabilityError) throw error;
+      verdict = error instanceof GitCommandError && error.exitCode === 1 && error.stderr.trim() === ''
+        ? 'not_ancestor'
+        : 'unknown';
+    }
+    if (verdict !== 'unknown') {
+      this.ancestryCache.set(key, verdict === 'ancestor');
+      if (this.ancestryCache.size > ANCESTRY_CACHE_LIMIT) {
+        const oldest = this.ancestryCache.keys().next();
+        if (!oldest.done) this.ancestryCache.delete(oldest.value);
+      }
+    }
+    return verdict;
   }
 
   private async isAncestorInRepo(repo: string, ancestor: string, descendant: string, alternateObjectStore?: string): Promise<boolean> {
@@ -1501,7 +1590,7 @@ export class GitService {
         const stdout = Buffer.concat(stdoutChunks);
         const stderr = Buffer.concat(stderrChunks);
         if (code !== 0) {
-          reject(new GitCommandError(`git ${args.join(' ')} failed`, stderr.toString('utf8')));
+          reject(new GitCommandError(`git ${args.join(' ')} failed`, stderr.toString('utf8'), code));
           return;
         }
         if (options.encoding === 'buffer') {

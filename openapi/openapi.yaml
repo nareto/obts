@@ -348,6 +348,66 @@ paths:
           description: Current main.
         "404":
           $ref: "#/components/responses/Error"
+  /dashboard/events:
+    get:
+      summary: Stream owner-scoped dashboard invalidations over Server-Sent Events.
+      description: >-
+        One-way invalidation channel over authoritative metadata, not a second
+        state authority. Authenticated with the same-origin dashboard session
+        cookie only (never a query string or bearer token); requests with a
+        cross-origin `Origin` or a `Sec-Fetch-Site` other than `same-origin` or
+        `none` are rejected before the stream opens. The response is
+        `text/event-stream` with `Cache-Control: no-store, no-transform` and
+        `X-Accel-Buffering: no`. The first frame of every connection or
+        reconnection is `retry: <ms>` plus a fixed `refresh` event: fetch the
+        current authorized account and vault state. Nothing is replayed, so
+        invalidations missed while disconnected are recovered only by that
+        snapshot. Later `invalidate` events are published after a durable
+        metadata commit, coalesced, and carry only identifiers owned by the
+        stream's own account. A change of the server-wide readiness verdict is
+        pushed to every open stream as `{account: true, vault_ids: []}`. Lines starting with `:` are keep-alive comments
+        and never require a refetch. Opening or heartbeating a stream does not
+        update session liveness (`last_seen_at`) and so cannot keep an idle
+        session alive; the server closes the stream when the session is
+        revoked, expired, or its account is disabled or removed, when metadata
+        becomes unavailable, when the reader stalls, and on shutdown. The
+        stream holds no vault admission. Session-liveness touches, unchanged
+        device heartbeats and status reports, and other accounts' changes never
+        produce an event. Per session, per account and per process stream
+        counts are bounded; excess opens receive `429 stream_limit`.
+      responses:
+        "200":
+          description: Open event stream.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: no-store, no-transform
+            X-Accel-Buffering:
+              schema:
+                type: string
+                const: "no"
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: >-
+                  SSE frames. `event: refresh` with `data: {}`, or
+                  `event: invalidate` with a DashboardInvalidation JSON object
+                  as `data`.
+              x-obts-events:
+                refresh:
+                  $ref: "#/components/schemas/DashboardRefreshEvent"
+                invalidate:
+                  $ref: "#/components/schemas/DashboardInvalidation"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "429":
+          $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/Error"
   /vaults/{vault_id}/dashboard:
     get:
       summary: Return deployable dashboard state for devices, conflicts, activity, and health.
@@ -696,6 +756,77 @@ paths:
           $ref: "#/components/responses/Error"
         "404":
           $ref: "#/components/responses/Error"
+    delete:
+      summary: Permanently remove a revoked device after exact owner confirmation.
+      description: >-
+        Requires the owner dashboard session and a valid CSRF header. Checks run in this order:
+        authentication; owner scope (a vault or device that is not the caller's, unknown, or in
+        another vault is an indistinguishable `not_found`; an already removed device is also
+        `not_found`); the device must already be revoked (`device_not_revoked`); the exact
+        confirmation phrase (`confirmation_mismatch`); open conflicts attributed to the device or
+        unsettled operations (`device_has_open_work`, no automatic resolution; `details.reason` is
+        `open_conflict` or `unsettled_operation`); and finally unmerged work (`device_has_unmerged_work`
+        unless `discard_unmerged` is true), where `details.reason` is `device_ref` (the device ref is
+        not covered by canonical main) or `staged_transfer` (the device owns a staged, unfinalized
+        chunk transfer, including one aborted by an earlier removal drain, whose target commit is
+        not a verified ancestor of canonical main; cleanup would erase it). Ancestry that cannot be
+        verified, or a transfer record that cannot be read, fails closed with a retryable 503
+        `device_removal_unavailable`. `discard_unmerged` is evaluated per request and persisted on
+        the journal on every attempt, so a later plain-phrase request never reuses an earlier grant.
+
+        Removal is a synchronous bounded operation backed by a durable journal. The intent is
+        committed before any ref or credential deletion; new device work is rejected, in-flight and
+        detached device work is drained, the device ref is deleted with a compare-and-swap on the
+        verified object ID, and credentials, connection replay records, transfer residue and
+        diagnostics bookkeeping are removed before the device row and journal are removed in one
+        commit. Main, other devices, conflict protection and audit provenance are preserved. A
+        failure after intent returns a retryable 503 `device_removal_incomplete` (or a 409 for open
+        work or unmerged work found after intent) and keeps the journal, which the dashboard device
+        list reports as `removal`; repeating the request resumes idempotently. A 409
+        `device_ref_inconsistent` is not retryable; with `details.reason` `ref_missing` the device
+        ref recorded for the device is absent (confirmed by a strict read, never inferred from an
+        unreadable ref) and `details.resolution` `discard_phrase` tells the owner that repeating the
+        request with the discard phrase accepts "nothing to delete" and proceeds to cleanup.
+        Whole-vault deletion supersedes a pending removal. Revoked tokens and connection replays of the removed device stay denied.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - $ref: "#/components/parameters/DeviceId"
+        - $ref: "#/components/parameters/CsrfHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceRemovalRequest"
+      responses:
+        "200":
+          description: Device permanently removed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceRemovalResponse"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "503":
+          description: >-
+            Retryable. Codes `device_removal_unavailable` (nothing was changed) and
+            `device_removal_incomplete` (journal kept; repeat the request to resume).
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
   /vaults/{vault_id}/devices/{device_id}/revoke:
     post:
       summary: Revoke a paired device and its device tokens after recent dashboard auth.
@@ -1703,6 +1834,49 @@ components:
         updated_at:
           type: string
           format: date-time
+    DeviceRemovalRequest:
+      type: object
+      additionalProperties: false
+      required: [confirmation]
+      properties:
+        confirmation:
+          type: string
+          description: >-
+            Exactly `DELETE <device_id>`, or `DELETE <device_id> AND DISCARD UNMERGED WORK` when
+            `discard_unmerged` is true.
+          maxLength: 256
+        discard_unmerged:
+          type: boolean
+          default: false
+    DeviceRemovalResponse:
+      type: object
+      additionalProperties: false
+      required: [status, device_id]
+      properties:
+        status:
+          type: string
+          enum: [removed]
+        device_id:
+          type: string
+    DeviceRemovalState:
+      description: Present only while a durable removal journal exists for the device.
+      type: object
+      additionalProperties: false
+      required: [state, retryable, error_code]
+      properties:
+        state:
+          type: string
+          enum: [pending, failed]
+        retryable:
+          type: boolean
+        error_code:
+          description: >-
+            Public-safe code of the last failed removal attempt (for example `device_has_unmerged_work`,
+            `device_ref_inconsistent`, `device_removal_incomplete`); never a message. Null while the
+            removal is pending.
+          oneOf:
+            - type: "null"
+            - type: string
     VaultDeletionRequest:
       type: object
       additionalProperties: false
@@ -3254,6 +3428,8 @@ components:
               - device_name
               - status
               - status_label
+              - revoked_at
+              - removal
               - last_seen_at
               - device_ref_head
               - last_applied_main
@@ -3282,6 +3458,15 @@ components:
                 enum: [paired, synced, ahead, review_needed, blocked_recovery, revoked]
               status_label:
                 type: string
+              revoked_at:
+                oneOf:
+                  - type: "null"
+                  - type: string
+                    format: date-time
+              removal:
+                oneOf:
+                  - type: "null"
+                  - $ref: "#/components/schemas/DeviceRemovalState"
               last_seen_at:
                 oneOf:
                   - type: "null"
@@ -3368,7 +3553,69 @@ components:
           items:
             $ref: "#/components/schemas/MaintenanceRow"
         health:
-          $ref: "#/components/schemas/ReadinessSummary"
+          $ref: "#/components/schemas/DashboardHealth"
+    DashboardRefreshEvent:
+      type: object
+      description: Payload of the fixed `refresh` event; always empty.
+      additionalProperties: false
+      maxProperties: 0
+    DashboardInvalidation:
+      type: object
+      description: >-
+        Payload of an `invalidate` event. `account: true` means refetch the
+        whole account-scoped state and every shown vault (it is also sent when
+        a bounded set of vault ids overflowed, in which case `vault_ids` is
+        empty). Otherwise only the listed owned vaults changed. Contains
+        identifiers only, never content.
+      required: [account, vault_ids]
+      additionalProperties: false
+      properties:
+        account:
+          type: boolean
+        vault_ids:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          items:
+            type: string
+            pattern: "^vlt_"
+    DashboardHealth:
+      description: >-
+        Observation of the newest completed deep readiness sample plus live
+        authoritative state. It is never authorization to sync. `status` is
+        `ready` only for a completed, non-stale sample that reported ready with
+        no current failure; every other state reports `not_ready` with every
+        unverified check false.
+      allOf:
+        - $ref: "#/components/schemas/ReadinessSummary"
+        - type: object
+          required: [checked_at, checking, stale, state]
+          properties:
+            checked_at:
+              description: >-
+                When the newest sample completed (or failed); null before the
+                first sample completes.
+              oneOf:
+                - type: "null"
+                - type: string
+                  format: date-time
+            checking:
+              type: boolean
+              description: A sample is currently running; the other fields describe the previous one.
+            stale:
+              type: boolean
+              description: >-
+                No sample, or the newest one completed more than twice the sampling
+                interval (ten minutes) ago. While `checking`, the previous verdict is
+                kept for the interval plus a slack window (fifteen minutes) first.
+            state:
+              type: string
+              enum: [verified, not_ready, stale, pending, failed]
+              description: >-
+                verified - current sample reported ready; not_ready - a current
+                sample or live state reports a failure; stale - newest sample
+                is older than ten minutes; pending - no sample has completed
+                yet; failed - the newest sample could not complete.
     DashboardConflict:
       allOf:
         - $ref: "#/components/schemas/ConflictRecord"
@@ -3417,8 +3664,11 @@ components:
         status_label:
           type: string
         last_checked_at:
-          type: string
-          format: date-time
+          description: When the underlying sample completed; null before the first sample completes.
+          oneOf:
+            - type: "null"
+            - type: string
+              format: date-time
         detail:
           type: string
         action:

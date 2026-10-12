@@ -7,7 +7,7 @@
   import Summary from './Summary.svelte';
   import Status from './Status.svelte';
   import type { DashboardDevice } from '../api/types';
-  import { exactTime, relativeTime } from '../presentation';
+  import { describeHealth, exactTime, isDeviceRevoked, relativeTime } from '../presentation';
 
   export let dashboard: DashboardSummary;
   export let conflicts: DashboardConflict[];
@@ -22,24 +22,27 @@
   export let onRename: (device: DashboardDevice, deviceName: string) => void | Promise<void>;
   export let onRevoke: (device: DashboardDevice) => void | Promise<void>;
 
-  $: checksPassed = dashboard.health.status === 'ready' && dashboard.maintenance.every((row) => row.status_label === 'Synced');
+  $: activeDevices = dashboard.devices.filter((device) => !isDeviceRevoked(device));
+  $: healthView = describeHealth(dashboard.health);
+  $: readinessDetail = [healthView.state === 'verified' ? healthView.checked : healthView.detail ?? healthView.checked, healthView.state === 'verified' ? dashboard.health.git_version : null, healthView.checking ? 'Checking\u2026' : null].filter(Boolean).join(' \u00b7 ');
+  $: checksPassed = healthView.healthy && dashboard.maintenance.every((row) => row.status_label === 'Synced');
 </script>
 
 <main class="overview-page">
   <section class="summary-strip" aria-label="Vault summary">
     <Summary title="Sync status" value={syncSummary.label} role={syncSummary.role} detail={dashboard.vault.current_main} technical />
     <Summary title="Unresolved conflicts" value={String(unresolvedCount)} role={unresolvedCount ? 'warning' : 'success'} detail="Review queue" />
-    <Summary title="Paired devices" value={String(dashboard.devices.length)} role="neutral" detail="Registered devices" />
-    <Summary title="Server readiness" value={dashboard.health.status === 'ready' ? 'Ready' : 'Integrity failure'} role={dashboard.health.status === 'ready' ? 'success' : 'danger'} detail={dashboard.health.detail ?? dashboard.health.git_version} />
+    <Summary title="Paired devices" value={String(activeDevices.length)} role="neutral" detail="Registered devices" />
+    <Summary title="Server readiness" value={healthView.cardSummary} role={healthView.tone} detail={readinessDetail} />
   </section>
 
   <div class="overview-columns overview-primary-columns">
     <section class="panel overview-section devices-overview">
       <div class="section-heading">
         <h2>Devices</h2>
-        <span class="section-count">{dashboard.devices.length} paired</span>
+        <span class="section-count">{activeDevices.length} paired</span>
       </div>
-      <DeviceTable compact={true} devices={dashboard.devices} recommendedPluginVersion={dashboard.recommended_plugin_version} statusCurrent={statusCurrent} onRename={onRename} onRevoke={onRevoke} />
+      <DeviceTable compact={true} devices={activeDevices} recommendedPluginVersion={dashboard.recommended_plugin_version} statusCurrent={statusCurrent} onRename={onRename} onRevoke={onRevoke} />
     </section>
 
     <section class="panel overview-section attention-overview">

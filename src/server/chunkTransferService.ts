@@ -177,7 +177,7 @@ export class ChunkTransferService {
           !auth.user.disabled
         ) {
           this.startProcessing(auth, session.transfer_id);
-        } else if (!deletionBlocked) {
+        } else if (!deletionBlocked && !(this.lifecycle?.isDeviceRemoving(session.vault_id, session.device_id) ?? false)) {
           // A processing session whose device no longer resolves cannot be resumed. That leaves one
           // unfinished transfer behind; it must not disable transfers for every other device.
           this.recordTransferAnomaly('transfer_processing_session_unresolved', session.transfer_id);
@@ -226,6 +226,118 @@ export class ChunkTransferService {
     await Promise.allSettled([...this.processors.entries()]
       .filter(([transferId]) => sessions.some((session) => session.transferId === transferId && session.value?.vault_id === vaultId))
       .map(([, processor]) => processor));
+  }
+
+  /**
+   * Aborts every unfinished transfer of one device, wakes retry waiters, and waits for the device's
+   * detached processors to settle. Callers close the device barrier first so no new processor can start,
+   * and must not hold the metadata queue, a vault lock or any transfer lock while awaiting this.
+   */
+  async drainDevice(vaultId: string, deviceId: string): Promise<void> {
+    const sessions = await this.listSessionsIncludingMalformed();
+    const owned = sessions.filter((session) => session.value?.vault_id === vaultId && session.value.device_id === deviceId);
+    for (const session of owned) {
+      await this.withLock(session.transferId, async () => {
+        const current = await this.readSession(session.transferId);
+        if (!current || current.vault_id !== vaultId || current.device_id !== deviceId) return;
+        if (current.status === 'processing' || current.status === 'open') {
+          current.status = 'aborted';
+          current.result = null;
+          current.processing_error_code = null;
+          current.retry_at = null;
+          current.updated_at = nowIso();
+          await this.withStorageLock(async () => await this.writeSession(current, session.transferId));
+        }
+      });
+    }
+    for (const wake of [...this.retryWaiters]) wake();
+    await Promise.allSettled(owned.flatMap((session) => {
+      const processor = this.processors.get(session.transferId);
+      return processor === undefined ? [] : [processor];
+    }));
+  }
+
+  /**
+   * Removes the transfer sessions that are provably this device's: a valid session record in this vault
+   * for this device whose owner marker names the same vault. Sessions that cannot be attributed to a
+   * device (malformed or marker-only residue) are left to whole-vault deletion and expiry pruning.
+   */
+  async eraseDeviceResidue(vaultId: string, deviceId: string): Promise<void> {
+    await this.withStorageLock(async () => {
+      let root: DeletionRoot;
+      try {
+        root = await openDeletionRoot(this.config.transferDir);
+      } catch (error) {
+        if (isMissing(error)) return;
+        throw error;
+      }
+      try {
+        const targets: string[] = [];
+        for (const entry of await readDeletionRootEntries(root)) {
+          if (!/^trn_[A-Za-z0-9]+$/u.test(entry.name) || !entry.isDirectory() || entry.isSymbolicLink()) continue;
+          if ((await this.inspectDeviceOwnedSession(root, entry.name, vaultId, deviceId)).kind === 'owned') targets.push(entry.name);
+        }
+        await assertDeletionRootUnchanged(root);
+        for (const name of targets) await removeDeletionRootDirectoryChild(root, name);
+        if (targets.length > 0) {
+          await syncDeletionRoot(root);
+          this.storedBytes = null;
+        }
+      } finally {
+        await closeDeletionRoot(root);
+      }
+    });
+  }
+
+  /**
+   * The single ownership predicate of device removal, shared by the eraser and the staged-work gate so they
+   * agree exactly: a valid session record for this vault and device AND a valid owner marker naming the same
+   * vault. Anything else is `not_owned` (neither counted nor erased; left for expiry or vault deletion).
+   */
+  private async inspectDeviceOwnedSession(root: DeletionRoot, transferId: string, vaultId: string, deviceId: string): Promise<
+    { kind: 'owned'; session: PushSession } | { kind: 'not_owned' } | { kind: 'unreadable' }
+  > {
+    const inspection = await this.inspectSessionAt(root, transferId);
+    if (inspection.kind === 'unreadable') return { kind: 'unreadable' };
+    if (inspection.kind !== 'valid') return { kind: 'not_owned' };
+    const session = inspection.value;
+    if (session.vault_id !== vaultId || session.device_id !== deviceId) return { kind: 'not_owned' };
+    const marker = await this.inspectOwnerMarkerAt(root, transferId);
+    return marker.kind === 'valid' && marker.vaultId === session.vault_id ? { kind: 'owned', session } : { kind: 'not_owned' };
+  }
+
+  /**
+   * Target commits of the device's staged, unfinalized transfers: every session `eraseDeviceResidue` would
+   * delete (same predicate, `inspectDeviceOwnedSession`) that is not `completed`/`rejected`. `aborted` counts as staged because it is only ever written by
+   * the vault/device drains, which leave the uploaded chunks on disk. Each session records its target commit
+   * in the validated manifest, so no commit is guessed. An unreadable record or directory fails closed (it
+   * throws); malformed or marker-only residue cannot be attributed to a device and is never erased, so it
+   * is not reported here either.
+   */
+  async stagedTargetCommits(vaultId: string, deviceId: string): Promise<string[]> {
+    let root: DeletionRoot;
+    try {
+      root = await openDeletionRoot(this.config.transferDir);
+    } catch (error) {
+      if (isMissing(error)) return [];
+      throw error;
+    }
+    try {
+      const commits = new Set<string>();
+      for (const entry of await readDeletionRootEntries(root)) {
+        if (!/^trn_[A-Za-z0-9]+$/u.test(entry.name) || !entry.isDirectory() || entry.isSymbolicLink()) continue;
+        const owned = await this.inspectDeviceOwnedSession(root, entry.name, vaultId, deviceId);
+        if (owned.kind === 'unreadable') throw new TransferStorageError('A transfer session could not be read.');
+        if (owned.kind !== 'owned') continue;
+        const session = owned.session;
+        if (session.status === 'completed' || session.status === 'rejected') continue;
+        commits.add(session.manifest.target_commit);
+      }
+      await assertDeletionRootUnchanged(root);
+      return [...commits];
+    } finally {
+      await closeDeletionRoot(root);
+    }
   }
 
   async inventoryVaultResidue(vaultId: string): Promise<{ attributable: string[]; unattributed: boolean }> {
@@ -689,19 +801,27 @@ export class ChunkTransferService {
 
   private startProcessing(auth: AuthenticatedDevice, transferId: string): void {
     if (this.closed || this.processors.has(transferId)) return;
+    // Ownership is registered before the detached work is spawned. A device that is being removed gets
+    // no new processor; its unfinished sessions are aborted by the removal drain instead.
+    const lease = this.lifecycle?.tryAcquireDeviceLease(auth.vault.vault_id, auth.device.device_id) ?? null;
+    if (this.lifecycle !== undefined && lease === null) return;
     const processing = this.processPendingPush(auth, transferId)
       .catch((error) => this.log.backgroundFailure('transfer_processing', error))
-      .finally(() => this.processors.delete(transferId));
+      .finally(() => {
+        this.processors.delete(transferId);
+        lease?.release();
+      });
     this.processors.set(transferId, processing);
   }
 
   private async processPendingPush(auth: AuthenticatedDevice, transferId: string): Promise<void> {
     while (!this.closed) {
+      if (this.lifecycle?.isDeviceRemoving(auth.vault.vault_id, auth.device.device_id)) return;
       let session = await this.requireSession(auth, transferId);
       if (session.status !== 'processing') return;
       const retryDelay = Math.max(0, Date.parse(session.retry_at ?? '') - Date.now());
       if (retryDelay > 0) await this.waitForRetry(retryDelay);
-      if (this.closed) return;
+      if (this.closed || this.lifecycle?.isDeviceRemoving(auth.vault.vault_id, auth.device.device_id)) return;
       session = await this.requireSession(auth, transferId);
       if (session.status !== 'processing') return;
       try {

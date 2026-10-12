@@ -2,11 +2,14 @@
   import type { DashboardSummary, MaintenanceRow } from '../api/types';
   import Checklist from './Checklist.svelte';
   import Status from './Status.svelte';
+  import { describeHealth } from '../presentation';
 
   export let health: DashboardSummary['health'];
   export let rows: MaintenanceRow[] = [];
   export let detailOpen = false;
   export let onAction: (action: NonNullable<MaintenanceRow['action']>) => void | Promise<void> = () => {};
+
+  $: view = describeHealth(health);
 </script>
 
 <main class="page maintenance-page">
@@ -17,7 +20,9 @@
       <p class="muted">Review server health and run only the maintenance actions provided by this vault.</p>
     </div>
     <div class="maintenance-health">
-      <Status label={health.status === 'ready' ? 'Synced' : 'Integrity failure'} />
+      <Status label={view.statusLabel} />
+      <span class="health-checked" title={view.checkedTitle}>{view.checked}</span>
+      {#if view.checking}<span class="health-checking">Checking…</span>{/if}
       <span>{health.git_version}</span>
     </div>
   </section>
@@ -27,7 +32,7 @@
       <div><h2 id="maintenance-checks-title">Readiness checks</h2><p class="muted">A passing check does not prove backup freshness.</p></div>
       <span class="section-count">{rows.length} checks</span>
     </div>
-    {#if health.detail}<p class="maintenance-health-detail" role="alert">{health.detail}</p>{/if}
+    {#if view.detail}<p class="maintenance-health-detail" class:soft={view.state !== 'not_ready'} role={view.state === 'not_ready' ? 'alert' : undefined}>{view.detail}</p>{/if}
     <Checklist {health} rows={rows} onAction={onAction} />
   </section>
 

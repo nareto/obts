@@ -87,10 +87,19 @@ export type ConnectionReview = {
   vaults: Array<Pick<VaultSummary, 'vault_id' | 'display_name' | 'current_main' | 'status'>>;
 };
 
+export type DeviceRemovalState = {
+  state: 'pending' | 'failed';
+  retryable: boolean;
+  /** Public-safe code of the last failed attempt; null while pending. */
+  error_code: string | null;
+};
+
 export type DashboardDevice = {
   device_id: string;
   device_name: string;
   status: string;
+  revoked_at: string | null;
+  removal: DeviceRemovalState | null;
   status_label: StatusLabel;
   last_seen_at: string | null;
   device_ref_head: string | null;
@@ -134,7 +143,8 @@ export type MaintenanceRow = {
   key: string;
   label: string;
   status_label: StatusLabel;
-  last_checked_at: string;
+  /** `null` until the first server-side readiness sample completes. */
+  last_checked_at: string | null;
   detail: string;
   action?: 'start_git_maintenance' | 'view_backup_contract';
 };
@@ -208,6 +218,22 @@ export type DiagnosticEventsResponse = {
   next_cursor: string | null;
 };
 
+export type DashboardHealthState = 'verified' | 'not_ready' | 'stale' | 'pending' | 'failed';
+
+/** Cached readiness verdict. Only `state: 'verified'` means the last completed check passed and is recent. */
+export type DashboardHealth = {
+  status: 'ready' | 'not_ready';
+  checks: Record<string, boolean>;
+  detail: string | null;
+  git_version: string;
+  /** Completion time of the newest sample (also set for failed ones); `null` before the first sample. */
+  checked_at: string | null;
+  /** A sample is running; the other fields still describe the previous one. */
+  checking: boolean;
+  stale: boolean;
+  state: DashboardHealthState;
+};
+
 export type DashboardSummary = {
   vault: Pick<VaultSummary, 'vault_id' | 'display_name' | 'current_main' | 'status'>;
   devices: DashboardDevice[];
@@ -216,12 +242,7 @@ export type DashboardSummary = {
   conflicts: DashboardConflict[];
   recent_activity: DashboardActivity[];
   maintenance: MaintenanceRow[];
-  health: {
-    status: 'ready' | 'not_ready';
-    checks: Record<string, boolean>;
-    detail: string | null;
-    git_version: string;
-  };
+  health: DashboardHealth;
 };
 
 export type ConflictResolutionKind =

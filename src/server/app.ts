@@ -51,6 +51,8 @@ import { AuthError, AuthService, ownedVaultOrThrow } from './authService.js';
 import { ChunkTransferService } from './chunkTransferService.js';
 import { ConnectionService } from './connectionService.js';
 import { createServerConfig, ensureServerDirectories, type ServerConfig } from './config.js';
+import { DashboardEventHub, type DashboardEventOptions } from './dashboardEvents.js';
+import { DeviceRemovalService, type DeviceRemovalOptions } from './deviceRemovalService.js';
 import { DiagnosticService } from './diagnosticService.js';
 import { GitCommandError, GitDurabilityError, GitService, sha256Hex } from './gitService.js';
 import {
@@ -58,11 +60,22 @@ import {
   MetadataCleanupError,
   MetadataPublicationError,
   MetadataStore,
+  isDeviceRevoked,
+  type DeviceRemovalJob,
   type MetadataDb,
   type MetadataPersistenceAdapter,
   type SyncOperationRow
 } from './metadataStore.js';
-import { VaultLifecycleCoordinator } from './vaultLifecycleCoordinator.js';
+import {
+  applyReadinessOverride,
+  projectDashboardHealth,
+  ReadinessSampler,
+  type CurrentReadinessOverride,
+  type DashboardHealth,
+  type ReadinessSource,
+  type ReadinessSummary
+} from './readinessSampler.js';
+import { type Admission, VaultLifecycleCoordinator } from './vaultLifecycleCoordinator.js';
 import { OperationalLog, type OperationalFields, RequestLogContext, pushLogFields, safeErrorFields, safeReportedPluginVersion, silentOperationalLog } from './operationalLog.js';
 import {
   commitRecoveredDirectoryState,
@@ -81,6 +94,8 @@ export type ObtsServer = {
   sync: SyncService;
   chunkTransfers: ChunkTransferService;
   lifecycle: VaultLifecycleCoordinator;
+  readiness: ReadinessSampler;
+  dashboardEvents: DashboardEventHub;
 };
 
 let dashboardRootPromise: Promise<string> | null = null;
@@ -100,9 +115,21 @@ async function syncableTargetFileSizes(
   return sizes;
 }
 
+export type CreateObtsServerOptions = {
+  operationalLog?: OperationalLog;
+  onRoute?: (route: RouteOptions) => void;
+  metadataPersistence?: Partial<MetadataPersistenceAdapter>;
+  /** Deep readiness sampler tuning. Defaults: start on ready, sample every five minutes. */
+  readiness?: { intervalMs?: number; now?: () => number; autoStart?: boolean };
+  /** Dashboard event stream tuning (heartbeat, caps, backpressure). Defaults are production values. */
+  dashboardEvents?: DashboardEventOptions;
+  /** Permanent device removal tuning (drain timeout) and failure-injection checkpoints for tests. */
+  deviceRemoval?: DeviceRemovalOptions;
+};
+
 export async function createObtsServer(
   overrides: Partial<ServerConfig> & { dataDir: string },
-  options: { operationalLog?: OperationalLog; onRoute?: (route: RouteOptions) => void; metadataPersistence?: Partial<MetadataPersistenceAdapter> } = {}
+  options: CreateObtsServerOptions = {}
 ): Promise<ObtsServer> {
   const log = options.operationalLog ?? silentOperationalLog;
   const requestLog = new RequestLogContext(log);
@@ -152,6 +179,54 @@ export async function createObtsServer(
     return { user, vault, device, token };
   }));
   await log.startup('pending_jobs_started', async () => await lifecycle.startPendingJobs());
+  const deviceRemovals = new DeviceRemovalService(store, git, lifecycle, sync, chunkTransfers, options.deviceRemoval, log);
+  await log.startup('device_removals_resumed', async () => await deviceRemovals.resumePending());
+  const readinessNow = options.readiness?.now ?? Date.now;
+  const readiness = new ReadinessSampler({
+    run: async (source) => await buildReadinessSummary(config, store, git, lifecycle, chunkTransfers, log, source),
+    now: readinessNow,
+    // Health is server-wide, so a verdict change is pushed to every open stream as an account invalidation.
+    onVerdictChange: () => dashboardEvents.broadcastAccountInvalidation(),
+    ...(options.readiness?.intervalMs === undefined ? {} : { intervalMs: options.readiness.intervalMs }),
+    onFailure: (error) => log.backgroundFailure('readiness_sample', error)
+  });
+  const currentReadinessOverride = (): CurrentReadinessOverride | null => {
+    if (!store.isReady() || !lifecycle.isReady()) {
+      return { detail: 'metadata lifecycle durability is unavailable', failedChecks: 'all' };
+    }
+    if (git.isDurabilityUnavailable()) {
+      return { detail: 'Git repository durability is uncertain', failedChecks: ['git', 'persistent_state'] };
+    }
+    if (!chunkTransfers.isReady()) {
+      return { detail: 'transfer storage is unavailable', failedChecks: ['persistent_state'] };
+    }
+    return null;
+  };
+  // Observation-only projection of the newest completed sample. It never starts or awaits a deep
+  // check; current authoritative failures and the selected vault's own state override a cached result.
+  async function dashboardHealth(vault: { vault_id: string; status: string; current_main: string }): Promise<DashboardHealth> {
+    let override = currentReadinessOverride();
+    if (override === null && vault.status === 'blocked_integrity') {
+      override = { detail: 'vault persistent state is blocked by an integrity failure', failedChecks: ['persistent_state'] };
+    }
+    if (override === null && vault.status === 'active') {
+      try {
+        if ((await git.getRef(vault.vault_id, 'refs/heads/main')) !== vault.current_main) {
+          const db = await store.snapshot();
+          const result = await checkVaultMainRef(db, vault.vault_id, git);
+          if (!result.ok) override = { detail: result.error, failedChecks: ['persistent_state'] };
+        }
+      } catch {
+        override = { detail: 'server Git store cannot be read', failedChecks: ['persistent_state'] };
+      }
+    }
+    return projectDashboardHealth({ view: readiness.view(), nowMs: readinessNow(), override });
+  }
+  const dashboardEvents = new DashboardEventHub(
+    store,
+    async (sessionId) => await auth.authenticateSession(sessionId, { touch: false }),
+    options.dashboardEvents
+  );
   const app = Fastify({
     logger: false,
     disableRequestLogging: true,
@@ -179,10 +254,126 @@ export async function createObtsServer(
     return session;
   }
 
+  // Every authenticated device request holds a device lease, and every vault-scoped request a vault
+  // admission, so permanent device removal and whole-vault deletion can drain exactly the work that may
+  // still touch the device ref, identity or vault. Fastify does not run onResponse/onError when a client
+  // aborts mid-request (only onRequestAbort), and an aborted request's handler keeps running and may still
+  // write. Resources are therefore released exactly once, when the request lifecycle ended (response sent,
+  // errored, aborted or the socket closed) AND the route handler is not running. The invariant is that a
+  // handler body only ever executes while its fence is held: a request aborted before its handler starts
+  // releases immediately and the wrapper below then refuses to run the handler, whereas an aborted request
+  // whose handler is already running keeps the fence until that handler settles.
+  type RequestFence = {
+    lease: Admission | null;
+    admission: Admission | null;
+    ended: boolean;
+    aborted: boolean;
+    handler: 'pending' | 'running' | 'done';
+    pipelineClosed: boolean;
+    released: boolean;
+    hijacked: boolean;
+  };
+  const requestFences = new WeakMap<FastifyRequest, RequestFence>();
+  function fenceOf(request: FastifyRequest): RequestFence {
+    let fence = requestFences.get(request);
+    if (fence === undefined) {
+      fence = {
+        lease: null, admission: null, ended: false, aborted: false, handler: 'pending',
+        pipelineClosed: false, released: false, hijacked: false
+      };
+      requestFences.set(request, fence);
+    }
+    return fence;
+  }
+  function releaseFenceIfSettled(request: FastifyRequest): void {
+    const fence = requestFences.get(request);
+    if (fence === undefined || fence.released || !fence.ended) return;
+    if (fence.handler === 'running' || (fence.handler === 'pending' && !fence.pipelineClosed && !fence.aborted)) return;
+    fence.released = true;
+    const { admission, lease } = fence;
+    fence.admission = null;
+    fence.lease = null;
+    admission?.release();
+    lease?.release();
+  }
+  function holdForRequest(request: FastifyRequest, kind: 'lease' | 'admission', held: Admission): void {
+    const fence = fenceOf(request);
+    if (fence.hijacked) {
+      held.release();
+      throw new Error(`A hijacked (streaming) request must not acquire a device ${kind}.`);
+    }
+    if (fence.released || fence[kind] !== null) {
+      held.release();
+      return;
+    }
+    fence[kind] = held;
+  }
+  function endRequestLifecycle(request: FastifyRequest, cause: { pipelineClosed?: boolean; aborted?: boolean }): void {
+    const fence = fenceOf(request);
+    fence.ended = true;
+    if (cause.pipelineClosed === true) fence.pipelineClosed = true;
+    if (cause.aborted === true) fence.aborted = true;
+    releaseFenceIfSettled(request);
+  }
+  /** Fastify's own thenable test (wrap-thenable), so non-native thenables are tracked like promises. */
+  function isThenable(value: unknown): value is PromiseLike<unknown> {
+    return value !== null && value !== undefined && typeof (value as { then?: unknown }).then === 'function';
+  }
+  /**
+   * A handler that never started because its request was aborted: nothing to send and nobody to send it to.
+   * If the connection is somehow still usable the client must not hang, so that case is an explicit error.
+   */
+  function skippedHandlerResult(request: FastifyRequest, reply: FastifyReply): Promise<undefined> {
+    if (reply.sent || request.raw.aborted || reply.raw.destroyed || request.raw.socket?.destroyed === true) {
+      return Promise.resolve(undefined);
+    }
+    return Promise.reject(new AuthError(503, 'request_cancelled', 'The request was cancelled before it started.'));
+  }
+  app.addHook('onRoute', (routeOptions) => {
+    const handler = routeOptions.handler;
+    routeOptions.handler = function fencedHandler(this: unknown, request: FastifyRequest, reply: FastifyReply) {
+      const fence = fenceOf(request);
+      if (request.raw.aborted === true) endRequestLifecycle(request, { aborted: true });
+      const settle = () => {
+        fence.handler = 'done';
+        releaseFenceIfSettled(request);
+      };
+      // Never run a handler body unfenced: its lease/admission was already released (or the request died).
+      if (fence.released || fence.aborted) {
+        settle();
+        return skippedHandlerResult(request, reply);
+      }
+      fence.handler = 'running';
+      // A hijacked reply only ends at raw socket close, so a streaming route must hold no lease or admission.
+      const hijack = reply.hijack.bind(reply);
+      reply.hijack = () => {
+        if (fence.lease !== null || fence.admission !== null) {
+          throw new Error('A route that hijacks its reply must not hold a device lease or vault admission.');
+        }
+        fence.hijacked = true;
+        return hijack();
+      };
+      let result: unknown;
+      try {
+        result = (handler as (this: unknown, request: FastifyRequest, reply: FastifyReply) => unknown).call(this, request, reply);
+      } catch (error) {
+        settle();
+        throw error;
+      }
+      if (isThenable(result)) {
+        return Promise.resolve(result).then((value) => { settle(); return value; }, (error: unknown) => { settle(); throw error; });
+      }
+      settle();
+      return result;
+    } as typeof routeOptions.handler;
+  });
   async function authenticateDevice(request: FastifyRequest, vaultId?: string) {
     const device = vaultId === undefined
       ? await auth.authenticateDeviceAnyVault(request.headers.authorization)
       : await auth.authenticateDevice(request.headers.authorization, vaultId);
+    if (fenceOf(request).lease === null) {
+      holdForRequest(request, 'lease', await lifecycle.acquireDeviceLease(device.vault.vault_id, device.device.device_id));
+    }
     requestLog.annotate(request, {
       vault_id: device.vault.vault_id, device_id: device.device.device_id, user_id: device.user.user_id,
       plugin_version: safeReportedPluginVersion(device.device.plugin_version ?? 'unknown')
@@ -194,15 +385,18 @@ export async function createObtsServer(
     requestLog.annotate(request, {});
     reply.raw.once('close', () => {
       if (!reply.raw.writableFinished) requestLog.completed(request);
+      endRequestLifecycle(request, { aborted: !reply.raw.writableFinished });
     });
   });
   app.addHook('onSend', async (request, reply, payload) => {
     requestLog.observeErrorPayload(request, reply, payload);
     return payload;
   });
-  app.addHook('onRequestAbort', async (request) => requestLog.completed(request));
+  app.addHook('onRequestAbort', async (request) => {
+    requestLog.completed(request);
+    endRequestLifecycle(request, { aborted: true });
+  });
 
-  const activeAdmissions = new WeakMap<FastifyRequest, { release(): void }>();
   app.addHook('onRequest', async (request, reply) => {
     setApiCorsHeaders(request, reply);
     const params = request.params as { vaultId?: string };
@@ -210,34 +404,42 @@ export async function createObtsServer(
     const path = request.url.split('?')[0] ?? request.url;
     if (!vaultId || path.startsWith('/api/v1/vault-deletions/') ||
       (request.method === 'DELETE' && /^\/api\/v1\/vaults\/[^/]+$/u.test(path)) ||
+      // Device removal drains device work itself and takes vault admission only for short steps, so it
+      // must not hold an admission that a concurrent whole-vault deletion would have to wait for.
+      (request.method === 'DELETE' && /^\/api\/v1\/vaults\/[^/]+\/devices\/[^/]+$/u.test(path)) ||
       isSyncLifecycleLockingRoute(request.method, path)) return;
     const sessionCookie = request.cookies[config.sessionCookieName];
     const authorization = request.headers.authorization;
     if (sessionCookie) {
       const session = await authenticateSession(request);
-      const db = await store.snapshot();
-      const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId && candidate.owner_user_id === session.user.user_id);
-      if (!vault) throw new AuthError(404, 'not_found', 'Resource not found.');
-      requestLog.annotate(request, { vault_id: vault.vault_id });
-      activeAdmissions.set(request, await lifecycle.acquireAdmission(vaultId));
+      const owned = await store.read((db) =>
+        db.vaults.some((candidate) => candidate.vault_id === vaultId && candidate.owner_user_id === session.user.user_id));
+      if (!owned) throw new AuthError(404, 'not_found', 'Resource not found.');
+      requestLog.annotate(request, { vault_id: vaultId });
+      holdForRequest(request, 'admission', await lifecycle.acquireAdmission(vaultId));
       return;
     }
     if (authorization) {
       const device = await authenticateDevice(request, vaultId);
-      activeAdmissions.set(request, await lifecycle.acquireAdmission(device.vault.vault_id));
+      holdForRequest(request, 'admission', await lifecycle.acquireAdmission(device.vault.vault_id));
     }
   });
-  app.addHook('onError', async (request) => {
-    activeAdmissions.get(request)?.release();
-    activeAdmissions.delete(request);
-  });
-  app.addHook('onResponse', async (request) => {
-    activeAdmissions.get(request)?.release();
-    activeAdmissions.delete(request);
-  });
+  app.addHook('onError', async (request) => endRequestLifecycle(request, { pipelineClosed: true }));
+  app.addHook('onResponse', async (request) => endRequestLifecycle(request, { pipelineClosed: true }));
   app.addHook('onResponse', async (request, reply) => requestLog.completed(request, reply));
   lifecycle.startReceiptExpiryMaintenance();
+  app.addHook('onReady', async () => {
+    if (options.readiness?.autoStart !== false) readiness.start();
+  });
+  // Streams are long-lived connections that would otherwise keep the HTTP server from closing, and
+  // Fastify runs preClose before server.close(), so they are terminated here and not in onClose.
+  app.addHook('preClose', async () => {
+    dashboardEvents.close();
+  });
   app.addHook('onClose', async () => {
+    dashboardEvents.close();
+    // Drain the owned sampler before any dependency it reads (metadata, Git, transfers) closes.
+    await readiness.close();
     await chunkTransfers.close();
     await lifecycle.close();
     await store.close();
@@ -272,16 +474,17 @@ export async function createObtsServer(
   app.get('/health/live', async () => ({ status: 'ok' }));
 
   app.get('/health/ready', async (request, reply) => {
-    const readiness = await buildReadinessSummary(config, store, git, lifecycle, chunkTransfers, log);
-    if (readiness.status !== 'ready') {
-      requestLog.annotate(request, { error_code: 'not_ready', failed_checks: Object.entries(readiness.checks).filter(([, ok]) => !ok).map(([name]) => name).join(',') });
+    // Explicit probes want a fresh deep check; concurrent probes and the periodic sample share one run.
+    const sampled = applyReadinessOverride(await readiness.sample(), currentReadinessOverride());
+    if (sampled.status !== 'ready') {
+      requestLog.annotate(request, { error_code: 'not_ready', failed_checks: Object.entries(sampled.checks).filter(([, ok]) => !ok).map(([name]) => name).join(',') });
       return reply.status(503).send({
-        status: readiness.status,
-        checks: readiness.checks,
-        detail: readiness.detail
+        status: sampled.status,
+        checks: sampled.checks,
+        detail: sampled.detail
       });
     }
-    return { status: readiness.status, checks: readiness.checks, git_version: readiness.git_version };
+    return { status: sampled.status, checks: sampled.checks, git_version: sampled.git_version };
   });
 
   app.get('/api/v1/setup/status', async () => {
@@ -622,18 +825,51 @@ export async function createObtsServer(
     };
   });
 
+  // One-way invalidation stream. Authentication never touches session liveness, the stream holds no
+  // vault admission, and every publication re-reads current authorization (see DashboardEventHub).
+  app.get('/api/v1/dashboard/events', async (request, reply) => {
+    const session = await auth.authenticateSession(request.cookies[config.sessionCookieName], { touch: false });
+    requestLog.annotate(request, { user_id: session.user.user_id });
+    dashboardEvents.admit(
+      request,
+      reply,
+      { userId: session.user.user_id, sessionId: session.session.session_id },
+      () => requestLog.completed(request, reply)
+    );
+    return reply;
+  });
+
   app.get('/api/v1/vaults/:vaultId/dashboard', async (request) => {
     const session = await authenticateSession(request);
     const { vaultId } = pathParams(request);
-    const db = await store.snapshot();
-    const vault = ownedVaultOrThrow(db, session.user.user_id, vaultId);
+    // Only this owner's vault is projected out of the metadata; the whole database is never cloned.
+    const scoped = await store.read((db) => {
+      const found = db.vaults.find((candidate) => candidate.vault_id === vaultId && candidate.owner_user_id === session.user.user_id);
+      if (!found) return null;
+      const directory = db.directory_state_by_vault[found.vault_id];
+      return {
+        vault: found,
+        devices: db.devices.filter((device) => device.vault_id === found.vault_id),
+        device_removal_jobs: db.device_removal_jobs.filter((job) => job.vault_id === found.vault_id),
+        conflicts: db.conflicts.filter((conflict) => conflict.vault_id === found.vault_id),
+        directory_state_by_vault: directory ? { [found.vault_id]: directory } : {},
+        events: db.events
+          .filter((event) => event.vault_id === found.vault_id)
+          .sort((left, right) => right.event_seq - left.event_seq)
+          .slice(0, 12)
+      };
+    });
+    if (scoped === null) throw new AuthError(404, 'not_found', 'Resource not found.');
+    const { vault } = scoped;
     const devices = await Promise.all(
-      db.devices
-        .filter((device) => device.vault_id === vault.vault_id && device.user_id === session.user.user_id)
+      scoped.devices
+        .filter((device) => device.user_id === session.user.user_id)
         .map(async (device) => {
           const aheadOfMain =
-            device.device_ref_head !== null && !(await git.isAncestor(vault.vault_id, device.device_ref_head, vault.current_main));
-          const behindMain = device.status === 'synced' && device.last_applied_main !== vault.current_main;
+            device.device_ref_head !== null &&
+            (await git.ancestryVerdict(vault.vault_id, device.device_ref_head, vault.current_main)) !== 'ancestor';
+          const dashboardStatus = isDeviceRevoked(device) ? 'revoked' : device.status;
+          const behindMain = dashboardStatus === 'synced' && device.last_applied_main !== vault.current_main;
           const offline = device.last_seen_at !== null && Date.now() - Date.parse(device.last_seen_at) > 24 * 60 * 60 * 1000;
           const localStatusFresh = isFreshDeviceStatus(device.last_status_report_at);
           const staleDeviceBlockReport = localStatusFresh && device.local_error_code === 'device_blocked';
@@ -654,8 +890,8 @@ export async function createObtsServer(
           return {
             device_id: device.device_id,
             device_name: device.device_name,
-            status: device.status,
-            status_label: dashboardDeviceStatusLabel(device.status, {
+            status: dashboardStatus,
+            status_label: dashboardDeviceStatusLabel(dashboardStatus, {
               behindMain,
               offline,
               localStatusFresh,
@@ -664,6 +900,9 @@ export async function createObtsServer(
               pendingLocal,
               convergenceProven
             }),
+            // Legacy status-only revoked rows have no timestamp; the contract allows null.
+            revoked_at: device.revoked_at ?? null,
+            removal: removalSummary(scoped.device_removal_jobs.find((job) => job.device_id === device.device_id)),
             last_seen_at: device.last_seen_at,
             device_ref_head: device.device_ref_head,
             last_applied_main: device.last_applied_main,
@@ -687,9 +926,9 @@ export async function createObtsServer(
           };
         })
     );
-    const allConflicts = db.conflicts.filter((conflict) => conflict.vault_id === vault.vault_id);
+    const allConflicts = scoped.conflicts;
     const conflicts = allConflicts.filter((conflict) => conflict.status === 'open');
-    const health = await buildReadinessSummary(config, store, git, lifecycle, chunkTransfers, log);
+    const health = await dashboardHealth(vault);
     return {
       vault: {
         vault_id: vault.vault_id,
@@ -700,8 +939,8 @@ export async function createObtsServer(
       devices,
       recommended_plugin_version: RECOMMENDED_PLUGIN_VERSION,
       unresolved_conflict_count: conflicts.length,
-      conflicts: buildDashboardConflicts(db, vault.vault_id, vault.current_main, allConflicts),
-      recent_activity: buildRecentActivity(db, vault.vault_id),
+      conflicts: buildDashboardConflicts(scoped, vault.vault_id, vault.current_main, allConflicts),
+      recent_activity: buildRecentActivity(scoped, vault.vault_id),
       maintenance: buildMaintenanceRows(health),
       health
     };
@@ -957,6 +1196,30 @@ export async function createObtsServer(
       deviceName: readDisplayName(requestBody(request), 'device_name')
     });
     return { device_id: device.device_id, device_name: device.device_name };
+  });
+
+  app.delete('/api/v1/vaults/:vaultId/devices/:deviceId', async (request, reply) => {
+    const session = await authenticateSession(request);
+    auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
+    const { vaultId, deviceId } = vaultDevicePathParams(request);
+    const body = requestBody(request);
+    if (body.discard_unmerged !== undefined && typeof body.discard_unmerged !== 'boolean') {
+      throw new ValidationError('invalid_request', 'discard_unmerged must be a boolean.');
+    }
+    try {
+      await deviceRemovals.remove({
+        ownerUserId: session.user.user_id,
+        vaultId,
+        deviceId,
+        confirmation: typeof body.confirmation === 'string' ? body.confirmation : undefined,
+        discardUnmerged: body.discard_unmerged === true
+      });
+    } catch (error) {
+      if (error instanceof AuthError && error.statusCode === 503) reply.header('retry-after', '2');
+      throw error;
+    }
+    requestLog.annotate(request, { vault_id: vaultId, device_id: deviceId });
+    return { status: 'removed', device_id: deviceId };
   });
 
   app.post('/api/v1/vaults/:vaultId/devices/:deviceId/revoke', async (request) => {
@@ -1643,7 +1906,7 @@ export async function createObtsServer(
     const { vaultId } = pathParams(request);
     const db = await store.snapshot();
     const vault = ownedVaultOrThrow(db, session.user.user_id, vaultId);
-    const health = await buildReadinessSummary(config, store, git, lifecycle, chunkTransfers, log);
+    const health = applyReadinessOverride(await readiness.sample(), currentReadinessOverride());
     return buildRedactedDiagnostics(db, vault.vault_id, health, {
       git_integrity: git.integrityMetricsSnapshot(),
       transfer_phases: chunkTransfers.transferMetricsSnapshot().phases
@@ -1940,11 +2203,15 @@ export async function createObtsServer(
   diagnosticPruneTimer.unref();
   app.addHook('onClose', async () => clearInterval(diagnosticPruneTimer));
 
-  return { app, config, store, git, auth, connections, diagnostics, sync, chunkTransfers, lifecycle };
+  return { app, config, store, git, auth, connections, diagnostics, sync, chunkTransfers, lifecycle, readiness, dashboardEvents };
+}
+
+function removalSummary(job: Pick<DeviceRemovalJob, 'state' | 'retryable' | 'error_code'> | undefined): { state: 'pending' | 'failed'; retryable: boolean; error_code: string | null } | null {
+  return job === undefined ? null : { state: job.state, retryable: job.retryable, error_code: job.error_code };
 }
 
 function buildDashboardConflicts(
-  db: MetadataDb,
+  db: Pick<MetadataDb, 'devices' | 'directory_state_by_vault'>,
   vaultId: string,
   currentMain: string,
   conflicts: MetadataDb['conflicts']
@@ -1993,7 +2260,7 @@ function conflictType(conflict: MetadataDb['conflicts'][number]): string {
   return 'Path overlap';
 }
 
-function buildRecentActivity(db: MetadataDb, vaultId: string): Array<{
+function buildRecentActivity(db: Pick<MetadataDb, 'events'>, vaultId: string): Array<{
   event_id: string;
   event_seq: number;
   event_type: string;
@@ -2046,15 +2313,17 @@ function activityLabel(eventType: string): string {
   }
 }
 
-function buildMaintenanceRows(health: Awaited<ReturnType<typeof buildReadinessSummary>>): Array<{
+function buildMaintenanceRows(health: DashboardHealth): Array<{
   key: string;
   label: string;
   status_label: string;
-  last_checked_at: string;
+  last_checked_at: string | null;
   detail: string;
   action?: string;
 }> {
-  const checkedAt = nowIso();
+  // Only a completed, current sample (or a current authoritative failure) says anything per check;
+  // otherwise the rows admit that nothing is verified instead of claiming health.
+  const observed = health.state === 'verified' || health.state === 'not_ready';
   const rows = [
     ['metadata_store', 'Postgres', 'Metadata store is writable.'],
     ['git_store', 'Server Git store', 'Server Git store is writable.'],
@@ -2068,9 +2337,9 @@ function buildMaintenanceRows(health: Awaited<ReturnType<typeof buildReadinessSu
   return rows.map(([key, label, okDetail]) => ({
     key,
     label,
-    status_label: health.checks[key] ? 'Synced' : 'Integrity failure',
-    last_checked_at: checkedAt,
-    detail: health.checks[key] ? okDetail : health.detail ?? 'Check failed.',
+    status_label: !observed ? (health.checking ? 'Checking' : 'Status unknown') : health.checks[key] ? 'Synced' : 'Integrity failure',
+    last_checked_at: health.checked_at,
+    detail: !observed ? health.detail ?? 'Readiness is not verified.' : health.checks[key] ? okDetail : health.detail ?? 'Check failed.',
     ...(label === 'Server Git store' ? { action: 'start_git_maintenance' } : {}),
     ...(label === 'Persistent-state backup contract' ? { action: 'view_backup_contract' } : {})
   }));
@@ -2114,7 +2383,7 @@ function redactedPathId(path: string): string {
 function buildRedactedDiagnostics(
   db: MetadataDb,
   vaultId: string,
-  health: Awaited<ReturnType<typeof buildReadinessSummary>>,
+  health: ReadinessSummary,
   observability: {
     git_integrity: ReturnType<GitService['integrityMetricsSnapshot']>;
     transfer_phases: ReturnType<ChunkTransferService['transferMetricsSnapshot']>['phases'];
@@ -3273,7 +3542,7 @@ async function sendError(error: Error, request: FastifyRequest, reply: FastifyRe
         code: error.code,
         message: error.message,
         request_id: request.id,
-        details: {}
+        details: error.details
       }
     });
     return;
@@ -3355,31 +3624,14 @@ async function checkRestrictedFile(path: string): Promise<{ ok: true } | { ok: f
   }
 }
 
-type ReadinessSummary = {
-  status: 'ready' | 'not_ready';
-  checks: {
-    metadata: boolean;
-    metadata_store: boolean;
-    git: boolean;
-    setup_complete: boolean;
-    migrations: boolean;
-    git_store: boolean;
-    temp_workspace: boolean;
-    filesystem_permissions: boolean;
-    event_delivery: boolean;
-    persistent_state: boolean;
-  };
-  detail: string | null;
-  git_version: string;
-};
-
 async function buildReadinessSummary(
   config: ServerConfig,
   store: MetadataStore,
   git: GitService,
   lifecycle?: VaultLifecycleCoordinator,
   transfer?: ChunkTransferService,
-  log: OperationalLog = silentOperationalLog
+  log: OperationalLog = silentOperationalLog,
+  source: ReadinessSource = 'request'
 ): Promise<ReadinessSummary> {
   if (!store.isReady() || lifecycle && !lifecycle.isReady()) {
     return {
@@ -3401,7 +3653,7 @@ async function buildReadinessSummary(
     };
   }
   const gitReady = await git.checkReady();
-  const db = await store.snapshot();
+  const { db } = await store.snapshotVersioned();
   const dataDirectoryReady = await checkWritableDirectory(config.dataDir);
   const metadataDirectoryReady = await checkWritableDirectory(join(config.dataDir, 'metadata'));
   const metadataFileReady = await checkRestrictedFile(join(config.dataDir, 'metadata', 'phase1.json'));
@@ -3414,23 +3666,9 @@ async function buildReadinessSummary(
   let persistentState = transferCheck.ok
     ? await checkPersistentState(db, git)
     : { ok: false as const, error: transferCheck.error };
-  let blockedVaultId: string | null = null;
   if (!persistentState.ok && persistentState.vaultId) {
-    // Hold metadata mutation while rechecking so a newly prepared ref transition cannot race the durable block.
-    persistentState = await store.mutate(async (mutableDb) => {
-      const result = await checkPersistentState(mutableDb, git);
-      if (!result.ok && result.vaultId) {
-        const vault = mutableDb.vaults.find((candidate) => candidate.vault_id === result.vaultId);
-        if (vault && vault.status !== 'blocked_integrity') {
-          blockedVaultId = vault.vault_id;
-          vault.status = 'blocked_integrity';
-          vault.updated_at = nowIso();
-        }
-      }
-      return result;
-    });
+    persistentState = await confirmPersistentStateFailure(store, git, log, source);
   }
-  if (blockedVaultId) log.emit('warn', 'vault_integrity_blocked', { vault_id: blockedVaultId, source: 'request' });
   const eventDelivery = checkEventDelivery(db);
   const filesystemPermissions = dataDirectoryReady.ok && metadataStoreReady && gitStoreReady.ok && tempWorkspaceReady.ok;
   const checks = {
@@ -3521,6 +3759,82 @@ async function checkPersistentState(db: MetadataDb, git: GitService): Promise<Pe
   return { ok: true };
 }
 
+const PERSISTENT_STATE_CONFIRM_ATTEMPTS = 10;
+
+/**
+ * Authoritative recheck of a vault failure before it is durably blocked. The recheck reads a versioned
+ * snapshot and runs Git outside the metadata queue (it can be slow), then only enters the queue for a
+ * cheap compare-and-block: if any metadata commit landed since the snapshot (for example a newly
+ * prepared ref transition), the block is not applied and the check is repeated against fresh state.
+ *
+ * The repetition is bounded. When unrelated commits keep racing every attempt, the failure is not
+ * silently dropped: the vault is blocked under the queue anyway (fail closed), after a synchronous,
+ * Git-free revalidation against the facts the last failing check was computed from (the vault still
+ * exists, is not being deleted, and its main/root commits are unchanged). Nothing in the queue awaits
+ * Git or a vault lock, so the established lock order is kept.
+ */
+async function confirmPersistentStateFailure(
+  store: MetadataStore,
+  git: GitService,
+  log: OperationalLog,
+  source: ReadinessSource
+): Promise<PersistentStateCheck> {
+  const block = (mutableDb: MetadataDb, vaultId: string): 'blocked' => {
+    const vault = mutableDb.vaults.find((candidate) => candidate.vault_id === vaultId);
+    if (vault) {
+      vault.status = 'blocked_integrity';
+      vault.updated_at = nowIso();
+    }
+    return 'blocked' as const;
+  };
+  let result: PersistentStateCheck = { ok: false, error: 'persistent state could not be confirmed' };
+  let facts: { currentMain: string; rootCommit: string | null | undefined } | null = null;
+  for (let attempt = 0; attempt < PERSISTENT_STATE_CONFIRM_ATTEMPTS; attempt += 1) {
+    const { db, version } = await store.snapshotVersioned();
+    result = await checkPersistentState(db, git);
+    if (result.ok || !result.vaultId) return result;
+    const vaultId = result.vaultId;
+    const checked = db.vaults.find((vault) => vault.vault_id === vaultId);
+    facts = checked ? { currentMain: checked.current_main, rootCommit: checked.root_commit } : null;
+    const outcome = await store.readOrMutate(
+      (current): 'changed' | 'noop' | 'block' | 'blocked' => {
+        if (store.commitVersion() !== version) return 'changed';
+        return current.vaults.some((vault) => vault.vault_id === vaultId && vault.status !== 'blocked_integrity') ? 'block' : 'noop';
+      },
+      (selected) => selected === 'block',
+      (mutableDb) => block(mutableDb, vaultId)
+    );
+    if (outcome === 'blocked') log.emit('warn', 'vault_integrity_blocked', { vault_id: vaultId, source });
+    if (outcome !== 'changed') return result;
+  }
+  if (result.ok || !result.vaultId || facts === null) return result;
+  const vaultId = result.vaultId;
+  const expected = facts;
+  log.emit('warn', 'vault_integrity_block_contended', { vault_id: vaultId, source });
+  const outcome = await store.readOrMutate(
+    (current): 'noop' | 'block' | 'blocked' => {
+      const vault = current.vaults.find((candidate) => candidate.vault_id === vaultId);
+      if (!vault || vault.status === 'blocked_integrity' || hasDurableDeletionRecord(current, vaultId)) return 'noop';
+      return vault.current_main === expected.currentMain && vault.root_commit === expected.rootCommit ? 'block' : 'noop';
+    },
+    (selected) => selected === 'block',
+    (mutableDb) => block(mutableDb, vaultId)
+  );
+  if (outcome === 'blocked') log.emit('warn', 'vault_integrity_blocked', { vault_id: vaultId, source });
+  return result;
+}
+
+/** Cheap main-ref consistency check for a single vault; never runs fsck. */
+async function checkVaultMainRef(db: MetadataDb, vaultId: string, git: GitService): Promise<PersistentStateCheck> {
+  const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
+  if (!vault) return { ok: false, error: 'vault metadata is missing' };
+  if (hasDurableDeletionRecord(db, vaultId)) return { ok: true };
+  const mainRef = await git.getRef(vaultId, 'refs/heads/main');
+  if (mainRef === vault.current_main) return { ok: true };
+  const allowed = await preparedRefTransitionAllows(db, vaultId, 'refs/heads/main', vault.current_main, mainRef, git);
+  return allowed ? { ok: true } : { ok: false, error: 'vault main ref is inconsistent with metadata', vaultId };
+}
+
 async function checkVaultPersistentState(
   db: MetadataDb,
   vaultId: string,
@@ -3568,7 +3882,9 @@ async function checkVaultPersistentState(
     return { ...integrity, vaultId };
   }
   for (const device of db.devices.filter((candidate) => candidate.vault_id === vaultId)) {
-    const deviceRef = await git.getRef(vaultId, device.device_ref);
+    // A durable removal journal is the only authority that makes a missing device ref legitimate.
+    const removing = db.device_removal_jobs.some((job) => job.device_id === device.device_id);
+    const deviceRef = removing ? (device.device_ref_head ?? null) : await git.getRef(vaultId, device.device_ref);
     if (
       (device.device_ref_head ?? null) !== deviceRef &&
       !(

@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { DashboardConflict, DashboardSummary } from '../api/types';
+  import { describeHealth, isDeviceRevoked } from '../presentation';
   import Status from './Status.svelte';
 
   export let dashboard: DashboardSummary;
@@ -12,11 +13,17 @@
     | { kind: 'conflict'; label: string; action: string; conflictId: string }
     | { kind: 'stale_conflict'; label: string; action: string; conflictId: string };
 
+  $: activeDevices = dashboard.devices.filter((device) => !isDeviceRevoked(device));
+  $: healthView = describeHealth(dashboard.health);
+  $: healthItems =
+    ['stale', 'pending', 'failed'].includes(healthView.state)
+      ? [{ kind: 'maintenance', label: healthView.summary, action: 'Open maintenance' } satisfies AttentionItem]
+      : dashboard.health.checks.persistent_state
+        ? []
+        : [{ kind: 'maintenance', label: 'Integrity failure', action: 'Open maintenance' } satisfies AttentionItem];
   $: items = [
-    ...(dashboard.health.checks.persistent_state
-      ? []
-      : [{ kind: 'maintenance', label: 'Integrity failure', action: 'Open maintenance' } satisfies AttentionItem]),
-    ...dashboard.devices
+    ...healthItems,
+    ...activeDevices
       .filter((device) => device.blocked)
       .map((device) => ({ kind: 'devices', label: `Blocked device: ${device.device_name}`, action: 'Open devices' }) satisfies AttentionItem),
     ...conflicts
@@ -41,7 +48,7 @@
             conflictId: conflict.conflict_id
           }) satisfies AttentionItem
       ),
-    ...dashboard.devices
+    ...activeDevices
       .filter((device) => device.offline)
       .map((device) => ({ kind: 'devices', label: `Offline device: ${device.device_name}`, action: 'Open devices' }) satisfies AttentionItem)
   ] satisfies AttentionItem[];

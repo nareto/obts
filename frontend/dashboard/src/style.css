@@ -92,12 +92,23 @@ button {
 }
 
 summary:focus-visible,
+a:focus-visible,
 button:focus-visible,
 select:focus-visible,
 input:focus-visible,
 textarea:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
+}
+
+h1[tabindex="-1"]:focus:not(:focus-visible) {
+  outline: none;
+}
+
+h1[tabindex="-1"]:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 4px;
+  border-radius: 4px;
 }
 
 button:disabled {
@@ -117,6 +128,32 @@ button:disabled {
 }
 
 .primary:not(:disabled):hover {
+  background: var(--primary-strong);
+  border-color: var(--primary-strong);
+}
+
+a.button-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  padding: 0 12px;
+  color: var(--text);
+  text-decoration: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+a.button-link.primary {
+  color: var(--primary-text);
+  background: var(--primary);
+  border-color: var(--primary);
+  font-weight: 600;
+}
+
+a.button-link.primary:hover {
   background: var(--primary-strong);
   border-color: var(--primary-strong);
 }
@@ -310,11 +347,16 @@ textarea {
   align-items: center;
   gap: 10px;
   width: 100%;
+  min-height: 36px;
   padding: 0 10px;
   color: var(--muted);
   text-align: left;
+  text-decoration: none;
+  cursor: pointer;
   background: transparent;
-  border-color: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
 }
 
 .nav-item:hover {
@@ -357,10 +399,15 @@ textarea {
 }
 
 .sidebar-status span {
+  flex: 0 0 auto;
   width: 7px;
   height: 7px;
-  background: var(--success);
+  background: var(--muted);
   border-radius: 50%;
+}
+
+.sidebar-status span.live {
+  background: var(--success);
 }
 
 .sidebar-status span.offline {
@@ -476,7 +523,8 @@ textarea {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .shell button {
+  .shell button,
+  .shell .nav-item {
     transition: none;
   }
 
@@ -756,6 +804,11 @@ pre {
   color: var(--success);
 }
 
+.notice a {
+  color: inherit;
+  font-weight: 600;
+}
+
 .action-error {
   margin: 12px 24px 0;
   color: var(--danger);
@@ -994,6 +1047,197 @@ pre {
 
 .device-revoked {
   background: color-mix(in srgb, var(--danger) 3%, var(--surface));
+}
+
+.view-switch {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 2px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.view-switch a {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 32px;
+  padding: 0 12px;
+  color: var(--muted);
+  font-weight: 600;
+  text-decoration: none;
+  border-radius: 8px;
+}
+
+.view-switch a.selected {
+  color: var(--text);
+  background: var(--surface);
+  box-shadow: 0 1px 2px rgb(24 42 50 / 12%);
+}
+
+.view-switch .view-count {
+  font-weight: 400;
+}
+
+.devices-page .section-heading {
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.revoked-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.revoked-device {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 12px 14px;
+  background: color-mix(in srgb, var(--danger) 3%, var(--surface));
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.revoked-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.revoked-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  min-width: 0;
+}
+
+.revoked-title strong {
+  min-width: 0;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.revoked-id {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.revoked-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 24px;
+  margin: 0;
+}
+
+.revoked-facts dt {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.revoked-facts dd {
+  margin: 2px 0 0;
+}
+
+.revoked-removal {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+}
+
+.revoked-removal small {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.revoked-empty {
+  display: grid;
+  gap: 4px;
+  max-width: 560px;
+  padding: 16px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+}
+
+.revoked-empty p {
+  margin: 0;
+}
+
+.device-removal-dialog .deletion-scope {
+  margin-top: 12px;
+}
+
+.device-removal-dialog .phrase {
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.device-removal-dialog .discard-warning {
+  margin: 12px 0 0;
+}
+
+.device-removal-dialog .removal-failure {
+  margin: 12px 0 0;
+  padding-left: 10px;
+  border-left: 3px solid var(--warning);
+}
+
+.device-removal-dialog .removal-status {
+  margin: 8px 0 0;
+}
+
+.device-removal-dialog .removal-status:empty {
+  margin: 0;
+}
+
+.device-removal-dialog .discard-warning p {
+  margin: 4px 0 0;
+}
+
+.device-removal-dialog form > .checkbox-label {
+  align-items: flex-start;
+  margin-bottom: 12px;
+}
+
+.device-removal-dialog .checkbox-label input {
+  flex: 0 0 auto;
+  margin-top: 3px;
+}
+
+@media (max-width: 480px) {
+  .view-switch {
+    width: 100%;
+  }
+
+  .view-switch a {
+    flex: 1 1 0;
+    justify-content: center;
+  }
+
+  .revoked-removal button {
+    width: 100%;
+    min-height: 44px;
+  }
+
+  .device-removal-dialog .actions {
+    flex-direction: column-reverse;
+  }
+
+  .device-removal-dialog .actions button {
+    min-height: 44px;
+  }
 }
 
 .device-details-row > td {
@@ -1876,6 +2120,13 @@ pre {
   margin-bottom: 0;
 }
 
+.diagnostics-heading-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .diagnostics-settings > .diagnostics-panel {
   margin: -4px 0 0;
   padding: 0;
@@ -1987,6 +2238,8 @@ pre {
 }
 
 .maintenance-page {
+  display: grid;
+  gap: 16px;
   width: min(1100px, 100%);
   margin: 0 auto;
 }
@@ -2008,6 +2261,17 @@ pre {
   background: color-mix(in srgb, var(--danger) 8%, var(--surface));
   border: 1px solid color-mix(in srgb, var(--danger) 42%, var(--border));
   border-radius: 8px;
+}
+
+.maintenance-health-detail.soft {
+  color: var(--text);
+  background: color-mix(in srgb, var(--warning) 8%, var(--surface));
+  border-color: color-mix(in srgb, var(--warning) 42%, var(--border));
+}
+
+.health-checking {
+  color: var(--muted);
+  font-style: italic;
 }
 
 .backup-panel .section-heading {
@@ -2148,7 +2412,9 @@ pre {
 }
 
 @media (max-width: 1099px) {
-  button {
+  button,
+  a.button-link,
+  a.nav-item {
     min-height: 44px;
   }
 

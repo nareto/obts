@@ -22,10 +22,17 @@ export class ApiError extends Error {
   constructor(
     readonly status: number,
     readonly code: string,
-    message: string
+    message: string,
+    readonly details: Record<string, unknown> | null = null,
+    readonly retryAfter: number | null = null
   ) {
     super(message);
   }
+}
+
+function parseRetryAfter(value: string | null): number | null {
+  if (!value || !/^\d{1,6}$/u.test(value.trim())) return null;
+  return Number(value.trim());
 }
 
 export class DashboardApi {
@@ -223,6 +230,14 @@ export class DashboardApi {
     });
   }
 
+  async removeDevice(vaultId: string, deviceId: string, input: { confirmation: string; discard_unmerged: boolean }): Promise<{ status: 'removed'; device_id: string }> {
+    return await this.request(`/vaults/${encodeURIComponent(vaultId)}/devices/${encodeURIComponent(deviceId)}`, {
+      method: 'DELETE',
+      csrf: true,
+      body: input
+    });
+  }
+
   async resolveConflict(input: {
     vaultId: string;
     conflictId: string;
@@ -306,10 +321,19 @@ export class DashboardApi {
       body: options.body === undefined ? undefined : JSON.stringify(options.body)
     });
     const data = (await response.json().catch(() => ({}))) as {
-      error?: { code: string; message: string };
+      error?: { code: string; message: string; details?: unknown };
     };
     if (!response.ok) {
-      throw new ApiError(response.status, data.error?.code ?? 'request_failed', data.error?.message ?? 'Request failed.');
+      const details = data.error?.details && typeof data.error.details === 'object' && !Array.isArray(data.error.details)
+        ? (data.error.details as Record<string, unknown>)
+        : null;
+      throw new ApiError(
+        response.status,
+        data.error?.code ?? 'request_failed',
+        data.error?.message ?? 'Request failed.',
+        details,
+        parseRetryAfter(response.headers.get('retry-after'))
+      );
     }
     return data as T;
   }

@@ -21,6 +21,7 @@ const scrypt = promisify(scryptCallback);
 const DEVICE_LAST_SEEN_INTERVAL_MS = 60_000;
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_IDLE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const SESSION_TOUCH_INTERVAL_MS = 60_000;
 const RECENT_AUTH_MS = 15 * 60 * 1000;
 const PASSWORD_RESET_TTL_MS = 30 * 60 * 1000;
 const LOGIN_FAILURE_WINDOW_MS = 10 * 60 * 1000;
@@ -34,11 +35,13 @@ const ARGON2ID_PARALLELISM = 1;
 export class AuthError extends Error {
   readonly statusCode: number;
   readonly code: string;
+  readonly details: Record<string, string | number | boolean>;
 
-  constructor(statusCode: number, code: string, message: string) {
+  constructor(statusCode: number, code: string, message: string, details: Record<string, string | number | boolean> = {}) {
     super(message);
     this.statusCode = statusCode;
     this.code = code;
+    this.details = details;
   }
 }
 
@@ -171,12 +174,7 @@ export class AuthService {
       enforceLoginBackoff(db, input.username, sourceIp);
       const session = db.sessions.find((candidate) => candidate.session_id === input.sessionId);
       const now = Date.now();
-      if (
-        !session ||
-        session.revoked_at ||
-        Date.parse(session.expires_at) <= now ||
-        Date.parse(session.idle_expires_at) <= now
-      ) {
+      if (!session || !isSessionLive(session, now)) {
         throw new AuthError(401, 'unauthenticated', 'Authentication required.');
       }
       const user = db.users.find((candidate) => candidate.user_id === session.user_id);
@@ -484,7 +482,7 @@ export class AuthService {
       }
       const timestamp = nowIso();
       device.status = 'revoked';
-      device.revoked_at = timestamp;
+      device.revoked_at = device.revoked_at ?? timestamp;
       for (const token of db.tokens) {
         if (token.kind === 'device' && token.device_id === device.device_id && !token.revoked_at) {
           token.revoked_at = timestamp;
@@ -515,28 +513,46 @@ export class AuthService {
     });
   }
 
-  async authenticateSession(sessionId: string | undefined): Promise<AuthenticatedSession> {
+  /**
+   * Authoritative on every call: the session row, its revocation, absolute and idle expiry and the
+   * owning user's disabled flag are re-read from current metadata and no decision is cached.
+   * Only the liveness write (last_seen_at / idle_expires_at) is coalesced: it is persisted at most
+   * once per SESSION_TOUCH_INTERVAL_MS per session, so idle expiry is accurate to that granularity.
+   * The absolute expiry is never extended. `touch: false` never writes (used by streams, whose
+   * heartbeats must not keep an otherwise idle session alive).
+   */
+  async authenticateSession(
+    sessionId: string | undefined,
+    options: { touch?: boolean } = {}
+  ): Promise<AuthenticatedSession> {
     if (!sessionId) {
       throw new AuthError(401, 'unauthenticated', 'Authentication required.');
     }
-    return await this.store.mutate((db) => {
+    const select = (db: DeepReadonly<MetadataDb>): DeepReadonly<AuthenticatedSession> => {
       const session = db.sessions.find((candidate) => candidate.session_id === sessionId);
-      const now = Date.now();
-      if (
-        !session ||
-        session.revoked_at ||
-        Date.parse(session.expires_at) <= now ||
-        Date.parse(session.idle_expires_at) <= now
-      ) {
+      if (!session || !isSessionLive(session, Date.now())) {
         throw new AuthError(401, 'unauthenticated', 'Authentication required.');
       }
       const user = db.users.find((candidate) => candidate.user_id === session.user_id);
       if (!user || user.disabled) {
         throw new AuthError(401, 'unauthenticated', 'Authentication required.');
       }
-      session.last_seen_at = nowIso();
-      session.idle_expires_at = new Date(now + SESSION_IDLE_TTL_MS).toISOString();
       return { user, session };
+    };
+    if (options.touch === false) {
+      return await this.store.read(select);
+    }
+    return await this.store.readOrMutate(select, ({ session }) => {
+      const lastSeen = Date.parse(session.last_seen_at);
+      const elapsed = Date.now() - lastSeen;
+      return !Number.isFinite(lastSeen) || elapsed >= SESSION_TOUCH_INTERVAL_MS || elapsed < 0;
+    }, (db) => {
+      const authenticated = select(db);
+      const now = Date.now();
+      const session = db.sessions.find((candidate) => candidate.session_id === authenticated.session.session_id)!;
+      session.last_seen_at = new Date(now).toISOString();
+      session.idle_expires_at = new Date(now + SESSION_IDLE_TTL_MS).toISOString();
+      return { user: db.users.find((candidate) => candidate.user_id === session.user_id)!, session };
     });
   }
 
@@ -625,6 +641,13 @@ export class AuthService {
     }
     return actor;
   }
+}
+
+function isSessionLive(session: DeepReadonly<SessionRow>, now: number): boolean {
+  if (session.revoked_at) return false;
+  const expiresAt = Date.parse(session.expires_at);
+  const idleExpiresAt = Date.parse(session.idle_expires_at);
+  return Number.isFinite(expiresAt) && Number.isFinite(idleExpiresAt) && expiresAt > now && idleExpiresAt > now;
 }
 
 export function ownedVaultOrThrow(db: MetadataDb, userId: string, vaultId: string): VaultRow {
