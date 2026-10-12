@@ -61,6 +61,7 @@ import {
   MetadataPublicationError,
   MetadataStore,
   isDeviceRevoked,
+  type DeepReadonly,
   type DeviceRemovalJob,
   type MetadataDb,
   type MetadataPersistenceAdapter,
@@ -733,41 +734,46 @@ export async function createObtsServer(
     const body = requestBody(request);
     const displayName = readDisplayName(body, 'display_name');
     const vaultId = newId('vlt');
-    const rootCommit = await git.initializeVault(vaultId);
-    const vault = await store.mutate((db) => {
-      const timestamp = nowIso();
-      const row = {
-        vault_id: vaultId,
-        owner_user_id: session.user.user_id,
-        display_name: displayName,
-        status: 'active' as const,
-        root_commit: rootCommit,
-        current_main: rootCommit,
-        created_at: timestamp,
-        updated_at: timestamp
-      };
-      db.vaults.push(row);
-      db.audit_log.push({
-        audit_id: newId('aud'),
-        actor_user_id: session.user.user_id,
-        actor_device_id: null,
-        vault_id: vaultId,
-        action: 'vault_created',
-        resource_class: 'vault',
-        resource_id: vaultId,
-        created_at: timestamp
+    const creation = git.reserveVaultCreation(vaultId);
+    try {
+      const rootCommit = await git.initializeVault(vaultId);
+      const vault = await store.mutate((db) => {
+        const timestamp = nowIso();
+        const row = {
+          vault_id: vaultId,
+          owner_user_id: session.user.user_id,
+          display_name: displayName,
+          status: 'active' as const,
+          root_commit: rootCommit,
+          current_main: rootCommit,
+          created_at: timestamp,
+          updated_at: timestamp
+        };
+        db.vaults.push(row);
+        db.audit_log.push({
+          audit_id: newId('aud'),
+          actor_user_id: session.user.user_id,
+          actor_device_id: null,
+          vault_id: vaultId,
+          action: 'vault_created',
+          resource_class: 'vault',
+          resource_id: vaultId,
+          created_at: timestamp
+        });
+        store.appendEvent(db, {
+          event_type: 'main_advanced',
+          vault_id: vaultId,
+          resource_ids: { vault_id: vaultId },
+          commit_cursors: { main: rootCommit, previous_main: null },
+          payload: { reason: 'empty_root' }
+        });
+        return row;
       });
-      store.appendEvent(db, {
-        event_type: 'main_advanced',
-        vault_id: vaultId,
-        resource_ids: { vault_id: vaultId },
-        commit_cursors: { main: rootCommit, previous_main: null },
-        payload: { reason: 'empty_root' }
-      });
-      return row;
-    });
-    requestLog.annotate(request, { vault_id: vault.vault_id });
-    return reply.status(201).send(vault);
+      requestLog.annotate(request, { vault_id: vault.vault_id });
+      return reply.status(201).send(vault);
+    } finally {
+      creation.release();
+    }
   });
 
   app.patch('/api/v1/vaults/:vaultId', async (request) => {
@@ -3664,7 +3670,7 @@ async function buildReadinessSummary(
     ? { ok: true as const }
     : await transfer.checkReady();
   let persistentState = transferCheck.ok
-    ? await checkPersistentState(db, git)
+    ? await checkPersistentState(db, store, git)
     : { ok: false as const, error: transferCheck.error };
   if (!persistentState.ok && persistentState.vaultId) {
     persistentState = await confirmPersistentStateFailure(store, git, log, source);
@@ -3732,22 +3738,38 @@ function checkEventDelivery(db: MetadataDb): { ok: true } | { ok: false; error: 
 
 type PersistentStateCheck = { ok: true } | { ok: false; error: string; vaultId?: string };
 
-async function checkPersistentState(db: MetadataDb, git: GitService): Promise<PersistentStateCheck> {
+function metadataVaultIds(db: DeepReadonly<MetadataDb>): string[] {
+  return [
+    ...db.vaults.map((vault) => vault.vault_id),
+    ...db.deletion_jobs.map((job) => job.vault_id),
+    ...db.deletion_receipts.map((receipt) => receipt.vault_id)
+  ];
+}
+
+async function checkPersistentState(db: MetadataDb, store: MetadataStore, git: GitService): Promise<PersistentStateCheck> {
   if (db.schema_version !== 8) {
     return { ok: false, error: 'metadata schema version is unsupported' };
   }
+  let repositoryIds: string[];
   try {
-    const metadataVaultIds = new Set([
-      ...db.vaults.map((vault) => vault.vault_id),
-      ...db.deletion_jobs.map((job) => job.vault_id),
-      ...db.deletion_receipts.map((receipt) => receipt.vault_id)
-    ]);
-    const orphanRepository = (await git.listVaultRepositoryIds()).find((vaultId) => !metadataVaultIds.has(vaultId));
-    if (orphanRepository) {
-      return { ok: false, error: 'server Git store contains a vault repository missing from metadata' };
-    }
+    repositoryIds = await git.listVaultRepositoryIds();
   } catch {
     return { ok: false, error: 'server Git store cannot be enumerated' };
+  }
+  const snapshotVaultIds = new Set(metadataVaultIds(db));
+  const unknownRepositoryIds = repositoryIds.filter((vaultId) => !snapshotVaultIds.has(vaultId));
+  if (unknownRepositoryIds.length > 0) {
+    // OBTS-PER-READY-001: a creation releases its reservation only after its metadata commit, so a
+    // repository created while this check ran is visible to metadata read after the enumeration.
+    let currentVaultIds: Set<string>;
+    try {
+      currentVaultIds = new Set(await store.read(metadataVaultIds));
+    } catch {
+      return { ok: false, error: 'metadata is unavailable to reconcile the server Git store' };
+    }
+    if (unknownRepositoryIds.some((vaultId) => !currentVaultIds.has(vaultId))) {
+      return { ok: false, error: 'server Git store contains a vault repository missing from metadata' };
+    }
   }
   for (const vault of db.vaults) {
     if (hasDurableDeletionRecord(db, vault.vault_id)) continue;
@@ -3791,7 +3813,7 @@ async function confirmPersistentStateFailure(
   let facts: { currentMain: string; rootCommit: string | null | undefined } | null = null;
   for (let attempt = 0; attempt < PERSISTENT_STATE_CONFIRM_ATTEMPTS; attempt += 1) {
     const { db, version } = await store.snapshotVersioned();
-    result = await checkPersistentState(db, git);
+    result = await checkPersistentState(db, store, git);
     if (result.ok || !result.vaultId) return result;
     const vaultId = result.vaultId;
     const checked = db.vaults.find((vault) => vault.vault_id === vaultId);

@@ -31,7 +31,17 @@ const checks = [
   { id: 'device-removal-negative-wrong-cas', model: 'OBTSDeviceRemoval', mutation: 'wrong-cas', invariants: ['CASUsesExpectedOID'], action: 'RemoveRef' },
   { id: 'device-removal-negative-premature-completion', model: 'OBTSDeviceRemoval', mutation: 'premature-completion', invariants: ['CompletionAfterCleanup'], action: 'PublishCompletion' },
   { id: 'device-removal-negative-preservation', model: 'OBTSDeviceRemoval', mutation: 'damage-preserved-state', invariants: ['CanonicalAndOtherDevicePreserved'], action: 'RemoveRef' },
-  { id: 'device-removal-negative-owner-isolation', model: 'OBTSDeviceRemoval', mutation: 'owner-bypass', invariants: ['OwnerIsolation'], action: 'RemoveRef' }
+  { id: 'device-removal-negative-owner-isolation', model: 'OBTSDeviceRemoval', mutation: 'owner-bypass', invariants: ['OwnerIsolation'], action: 'RemoveRef' },
+  { id: 'vault-creation-positive', model: 'OBTSVaultCreationReadiness', invariants: ['TypeOK', 'NoFalseOrphan', 'FailClosedOnOrphan'], pass: true },
+  { id: 'vault-creation-reach-skipped', model: 'OBTSVaultCreationReadiness', invariants: ['ReachSkippedCreation'], action: 'Conclude', reach: true, requiredActions: ['Reserve', 'List'] },
+  { id: 'vault-creation-reach-recheck', model: 'OBTSVaultCreationReadiness', invariants: ['ReachRecheckRescue'], action: 'Conclude', reach: true, requiredActions: ['Commit', 'Release'] },
+  { id: 'vault-creation-reach-orphan', model: 'OBTSVaultCreationReadiness', invariants: ['ReachOrphanDetected'], action: 'Conclude', reach: true, requiredActions: ['Fail'] },
+  { id: 'vault-creation-negative-no-reservation', model: 'OBTSVaultCreationReadiness', mutation: 'no-reservation', invariants: ['NoFalseOrphan'], action: 'Conclude', requiredActions: ['InitPartial'] },
+  { id: 'vault-creation-negative-no-skip', model: 'OBTSVaultCreationReadiness', mutation: 'no-skip', invariants: ['NoFalseOrphan'], action: 'Conclude', requiredActions: ['InitPartial'] },
+  { id: 'vault-creation-negative-no-recheck', model: 'OBTSVaultCreationReadiness', mutation: 'no-recheck', invariants: ['NoFalseOrphan'], action: 'Conclude', requiredActions: ['Commit', 'Release'] },
+  { id: 'vault-creation-negative-early-release', model: 'OBTSVaultCreationReadiness', mutation: 'early-release', invariants: ['NoFalseOrphan'], action: 'Conclude', requiredActions: ['ReleaseEarly'] },
+  { id: 'vault-creation-negative-leaked-reservation', model: 'OBTSVaultCreationReadiness', mutation: 'leak-reservation', invariants: ['FailClosedOnOrphan'], action: 'Conclude', requiredActions: ['Fail'] },
+  { id: 'vault-creation-negative-ignore-unknown', model: 'OBTSVaultCreationReadiness', mutation: 'ignore-unknown', invariants: ['FailClosedOnOrphan'], action: 'Conclude', requiredActions: ['Fail'] }
 ];
 
 function run(tool, args, cwd) {
@@ -46,9 +56,11 @@ function run(tool, args, cwd) {
 function configFor(check) {
   if (check.config) return resolve(modelDir, check.config);
   const values = check.model === 'OBTSDashboardProtocols'
-    ? '  MaxAge = 1\n  Minute = 1\n  AccountA = "owner-a"\n  AccountB = "owner-b"'
-    : `  OwnerA = "owner-a"\n  OwnerB = "owner-b"\n  ExpectedOID = "device-commit"\n  CanonicalOID = "main-commit"\n  OtherOID = "other-device-ref"\n  WorkMode = "${check.mode ?? 'covered'}"`;
-  const text = `CONSTANTS\n${values}\n  Mutation = "${check.mutation ?? 'none'}"\nSPECIFICATION Spec\n${check.invariants.map(name => `INVARIANT ${name}`).join('\n')}\n`;
+    ? '  MaxAge = 1\n  Minute = 1\n  AccountA = "owner-a"\n  AccountB = "owner-b"\n'
+    : check.model === 'OBTSDeviceRemoval'
+      ? `  OwnerA = "owner-a"\n  OwnerB = "owner-b"\n  ExpectedOID = "device-commit"\n  CanonicalOID = "main-commit"\n  OtherOID = "other-device-ref"\n  WorkMode = "${check.mode ?? 'covered'}"\n`
+      : '';
+  const text = `CONSTANTS\n${values}  Mutation = "${check.mutation ?? 'none'}"\nSPECIFICATION Spec\n${check.invariants.map(name => `INVARIANT ${name}`).join('\n')}\n`;
   const path = join(runDir, `${check.id}.cfg`);
   writeFileSync(path, text);
   return path;
@@ -57,7 +69,7 @@ function configFor(check) {
 try {
   rmSync(runDir, { recursive: true, force: true });
   mkdirSync(runDir, { recursive: true });
-  for (const model of ['OBTSDashboardProtocols', 'OBTSDeviceRemoval']) {
+  for (const model of ['OBTSDashboardProtocols', 'OBTSDeviceRemoval', 'OBTSVaultCreationReadiness']) {
     const sany = run('sany', [`${model}.tla`], modelDir);
     if (sany.status !== 0) throw new Error(`SANY failed for ${model}:\n${sany.output}`);
   }

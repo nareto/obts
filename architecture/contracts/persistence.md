@@ -168,6 +168,10 @@ Readiness verifies storage access, migrations, native Git, repository/object int
 
 Operator repair validates and clears a block only after the underlying state has been restored or reconciled deliberately. It never invents missing objects, selects among mismatched refs, reconstructs uncertain device work, or discards metadata to make readiness pass.
 
+### OBTS-PER-READY-001: In-Flight Vault Creation Is Not An Orphan Repository
+
+Readiness fails closed on a server Git repository that has no vault, deletion-job or deletion-receipt metadata. Vault creation (owner request, new-vault onboarding or CLI) initializes the bare repository before it commits the vault row, so readiness must not mistake an in-flight creation for such an orphan. Before the repository path can exist, creation takes an in-process reservation for the new vault ID; it releases the reservation only after the vault metadata commit has completed or the creation has failed. Repository enumeration skips a reserved ID before inspecting its possibly partial shape. A listed repository absent from the readiness snapshot is an orphan only if it is also absent from metadata read after the enumeration: a reservation is released only after its commit, so a creation that completes while the check runs is visible to that later read. Releasing a reservation without a committed vault row does not make the repository authoritative; it is an orphan again and keeps failing readiness closed. Readiness never deletes, adopts or waits for a reserved repository.
+
 ### OBTS-PER-DEV-DEL-001: Durable Device Removal Lifecycle
 
 Permanent removal of an already-revoked device is a distinct durable lifecycle, not a consequence of credential revocation and not whole-vault deletion. Persist the per-device removal intent before deleting its Git ref or any identity. The intent installs an admission barrier that excludes new device work, including callbacks already authenticated before revocation; drain admitted and detached work to completion while retaining the barrier. Never wait for drain while holding metadata serialization or an inner transfer/processing lock required by drained work.

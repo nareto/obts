@@ -1,5 +1,5 @@
 schema_version: 1
-revision: 56
+revision: 57
 status: current
 updated: 2026-10-12
 authoritative_artifacts:
@@ -188,10 +188,13 @@ formal_models:
     path: architecture/models/formal/OBTSDashboardProtocols.tla
     companion_path: architecture/models/formal/OBTSDeviceRemoval.tla
     architecture_revision: 55
+    readiness_companion_path: architecture/models/formal/OBTSVaultCreationReadiness.tla
+    readiness_companion_architecture_revision: 57
     refines:
       - OBTS-DASH-HEALTH-001
       - OBTS-DASH-STREAM-001
       - OBTS-SEC-SESSION-001
       - OBTS-SEC-STREAM-001
       - OBTS-PER-DEV-DEL-001
+      - OBTS-PER-READY-001
 

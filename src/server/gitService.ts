@@ -101,6 +101,8 @@ export class GitService {
   // Definitive ancestry answers between two commit ids never change, so they are safe to reuse.
   // Transient or ambiguous failures are deliberately never stored.
   private readonly ancestryCache = new Map<string, boolean>();
+  // OBTS-PER-READY-001: vault IDs whose repository may exist before the vault metadata commit.
+  private readonly vaultCreationReservations = new Set<string>();
   // Process-wide counters since server start. They make validation regressions (for example a
   // scoped quarantine check silently becoming a full-store walk) visible in redacted diagnostics
   // instead of requiring per-request log archaeology.
@@ -170,12 +172,38 @@ export class GitService {
     }
   }
 
+  /**
+   * Reserves a new vault ID before its repository path can exist. The caller releases the reservation
+   * only after the vault metadata commit has completed or the creation has failed, so readiness never
+   * reports an in-flight creation as an orphan repository (OBTS-PER-READY-001).
+   */
+  reserveVaultCreation(vaultId: string): { release(): void } {
+    if (this.vaultCreationReservations.has(vaultId)) {
+      throw new GitCommandError('Vault creation is already reserved.', '');
+    }
+    this.vaultCreationReservations.add(vaultId);
+    let released = false;
+    return {
+      release: () => {
+        if (released) return;
+        released = true;
+        this.vaultCreationReservations.delete(vaultId);
+      }
+    };
+  }
+
+  /**
+   * Lists vault repositories that must be accounted for by metadata. A repository reserved for an
+   * in-flight creation is skipped before its possibly partial shape is inspected; the reservation is
+   * read after the directory listing, and it always precedes the repository path's existence.
+   */
   async listVaultRepositoryIds(): Promise<string[]> {
     this.assertDurabilityAvailable();
     const entries = await readdir(this.config.gitStoreDir, { withFileTypes: true });
     const repositories: string[] = [];
     for (const entry of entries) {
       if (!/^[A-Za-z0-9_]+\.git$/u.test(entry.name)) continue;
+      if (this.vaultCreationReservations.has(entry.name.slice(0, -'.git'.length))) continue;
       if (entry.isSymbolicLink() || !entry.isDirectory()) {
         throw new GitCommandError('Server Git store contains a non-directory vault repository.', '');
       }

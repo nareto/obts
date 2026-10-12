@@ -37,7 +37,17 @@ describe('dashboard protocol formal checker', () => {
       'device-removal-negative-wrong-cas: REJECTED',
       'device-removal-negative-premature-completion: REJECTED',
       'device-removal-negative-preservation: REJECTED',
-      'device-removal-negative-owner-isolation: REJECTED'
+      'device-removal-negative-owner-isolation: REJECTED',
+      'vault-creation-positive: PASS',
+      'vault-creation-reach-skipped: REACHED',
+      'vault-creation-reach-recheck: REACHED',
+      'vault-creation-reach-orphan: REACHED',
+      'vault-creation-negative-no-reservation: REJECTED',
+      'vault-creation-negative-no-skip: REJECTED',
+      'vault-creation-negative-no-recheck: REJECTED',
+      'vault-creation-negative-early-release: REJECTED',
+      'vault-creation-negative-leaked-reservation: REJECTED',
+      'vault-creation-negative-ignore-unknown: REJECTED'
     ]) expect(output).toContain(check);
   }, 180_000);
 });

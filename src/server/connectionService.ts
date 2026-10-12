@@ -389,6 +389,7 @@ export class ConnectionService {
     let vaultId = connection.selected_vault_id;
     let rootCommit: string;
     let targetAdmission: { release(): void } | null = null;
+    let creation: { release(): void } | null = null;
     try {
       if (connection.selection === 'new_vault') {
         if (request.mode !== 'initialize' && request.mode !== 'use_server') {
@@ -397,6 +398,7 @@ export class ConnectionService {
         const materializedVaultId = newId('vlt');
         vaultId = materializedVaultId;
         if (this.lifecycle) targetAdmission = await this.lifecycle.acquireAdmission(materializedVaultId);
+        creation = this.git.reserveVaultCreation(materializedVaultId);
         rootCommit = await this.git.initializeVault(materializedVaultId);
       } else {
         const vault = ownedVaultOrThrow(snapshot, connection.approved_user_id, vaultId ?? '');
@@ -546,6 +548,7 @@ export class ConnectionService {
     }
     return responseFor(authoritativeVault, authoritativeDevice, deviceToken, request.mode);
     } finally {
+      creation?.release();
       targetAdmission?.release();
     }
   }

@@ -133,41 +133,46 @@ export async function runCli(
       const user = await loginForCli(server, parsed, env);
       const displayName = requiredString(parsed, 'display-name');
       const vaultId = newId('vlt');
-      const rootCommit = await server.git.initializeVault(vaultId);
-      const vault = await server.store.mutate((db) => {
-        const timestamp = nowIso();
-        const row = {
-          vault_id: vaultId,
-          owner_user_id: user.user_id,
-          display_name: displayName,
-          status: 'active' as const,
-          root_commit: rootCommit,
-          current_main: rootCommit,
-          created_at: timestamp,
-          updated_at: timestamp
-        };
-        db.vaults.push(row);
-        db.audit_log.push({
-          audit_id: newId('aud'),
-          actor_user_id: user.user_id,
-          actor_device_id: null,
-          vault_id: vaultId,
-          action: 'vault_created',
-          resource_class: 'vault',
-          resource_id: vaultId,
-          created_at: timestamp
+      const creation = server.git.reserveVaultCreation(vaultId);
+      try {
+        const rootCommit = await server.git.initializeVault(vaultId);
+        const vault = await server.store.mutate((db) => {
+          const timestamp = nowIso();
+          const row = {
+            vault_id: vaultId,
+            owner_user_id: user.user_id,
+            display_name: displayName,
+            status: 'active' as const,
+            root_commit: rootCommit,
+            current_main: rootCommit,
+            created_at: timestamp,
+            updated_at: timestamp
+          };
+          db.vaults.push(row);
+          db.audit_log.push({
+            audit_id: newId('aud'),
+            actor_user_id: user.user_id,
+            actor_device_id: null,
+            vault_id: vaultId,
+            action: 'vault_created',
+            resource_class: 'vault',
+            resource_id: vaultId,
+            created_at: timestamp
+          });
+          server!.store.appendEvent(db, {
+            event_type: 'main_advanced',
+            vault_id: vaultId,
+            resource_ids: { vault_id: vaultId },
+            commit_cursors: { main: rootCommit, previous_main: null },
+            payload: { reason: 'empty_root' }
+          });
+          return row;
         });
-        server!.store.appendEvent(db, {
-          event_type: 'main_advanced',
-          vault_id: vaultId,
-          resource_ids: { vault_id: vaultId },
-          commit_cursors: { main: rootCommit, previous_main: null },
-          payload: { reason: 'empty_root' }
-        });
-        return row;
-      });
-      writeResult(io, parsed, vault, `created vault ${vault.display_name} (${vault.vault_id}) at ${vault.current_main}\n`);
-      return 0;
+        writeResult(io, parsed, vault, `created vault ${vault.display_name} (${vault.vault_id}) at ${vault.current_main}\n`);
+        return 0;
+      } finally {
+        creation.release();
+      }
     }
 
     if (command === 'devices' && subcommand === 'list') {

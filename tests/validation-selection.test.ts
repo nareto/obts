@@ -165,6 +165,7 @@ describe('validation selection', () => {
     expect(makePlan(['architecture/models/formal/OBTSAtomicRename.cfg']).formalFamilies).toEqual(['atomic-rename']);
     expect(makePlan(['architecture/models/formal/OBTSDashboardProtocols.tla']).formalFamilies).toEqual(['dashboard-protocols']);
     expect(makePlan(['architecture/models/formal/OBTSDeviceRemoval.tla']).formalFamilies).toEqual(['dashboard-protocols']);
+    expect(makePlan(['architecture/models/formal/OBTSVaultCreationReadiness.tla']).formalFamilies).toEqual(['dashboard-protocols']);
     expect(makePlan(['architecture/models/formal/configs/dashboard-positive.cfg']).formalFamilies).toEqual(['dashboard-protocols']);
     expect(makePlan(['architecture/models/formal/configs/device-removal-positive.cfg']).formalFamilies).toEqual(['dashboard-protocols']);
     expect(makePlan(['architecture/models/formal/configs/fm014-atomic-rename.cfg']).formalFamilies).toEqual(['atomic-rename']);
