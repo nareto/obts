@@ -2550,31 +2550,102 @@ describe('durable atomic rename proposals after stale conflict resolution', () =
     expect(watcher.pendingWatcherRenames).toEqual([]);
   });
 
-  it('durably blocks a tracked directory rename across restart', async () => {
+  it('falls back to a full inventory when the watcher keeps failing to record a rename', async () => {
+    const f = await fixture();
+    await f.core.adapter.rename('note.md', 'renamed.md');
+    const watcher = Object.create(pluginMain.prototype);
+    Object.assign(watcher, {
+      client: f.core, pendingWatcherPaths: new Set(), watcherFlush: Promise.resolve(), reportDeviceError: () => undefined,
+      pendingWatcherRenames: [{ source_path: 'note.md', destination_path: 'renamed.md' }]
+    });
+    f.core.recordLocalRenameHint = async () => { throw new Error('durable write interrupted'); };
+    for (let attempt = 1; attempt < 3; attempt += 1) await expect(watcher.flushWatcherHints()).rejects.toThrow('durable write interrupted');
+    const requestedBefore = f.core.inventoryRequestedSeq;
+    await watcher.flushWatcherHints();
+    expect(watcher.pendingWatcherRenames).toEqual([]);
+    expect(f.core.inventoryRequestedSeq).toBeGreaterThan(requestedBefore);
+    expect((await f.plugin.readQueue()).changed_paths).toEqual(expect.arrayContaining(['note.md', 'renamed.md']));
+    expect((await f.plugin.syncOnce()).status).toBe('Synced');
+    expect(await f.canonical('renamed.md')).toBe(BASE);
+    await expect(f.canonical('note.md')).rejects.toThrow();
+  });
+
+  it('syncs a tracked directory rename as delete plus add without latching across restart', async () => {
     const f = await fixture();
     await f.core.adapter.mkdir('folder');
     await f.core.adapter.write('folder/note.md', 'tracked child\n');
     expect((await f.plugin.syncOnce()).status).toBe('Synced');
     await f.core.adapter.rename('folder', 'renamed');
-    await expect(f.plugin.client.recordLocalRenameHint('folder', 'renamed'))
-      .rejects.toMatchObject({ code: 'rename_preservation_required' });
-    expect((await f.plugin.readState()).last_error_code).toBe('rename_preservation_required');
+    await f.plugin.client.recordLocalRenameHint('folder', 'renamed');
+    await f.plugin.client.recordLocalRenameHint('folder/note.md', 'renamed/note.md');
+    expect((await f.plugin.readState()).last_error_code).toBeNull();
     const restarted = await f.restart();
-    await expect(restarted.plugin.syncOnce()).rejects.toMatchObject({ code: 'rename_preservation_required' });
-    expect(await f.canonical('folder/note.md')).toBe('tracked child\n');
-    await expect(f.canonical('renamed/note.md')).rejects.toThrow();
+    let result = await restarted.plugin.syncOnce();
+    for (let attempt = 0; result.status !== 'Synced' && attempt < 3; attempt += 1) result = await restarted.plugin.syncOnce();
+    expect(result.status).toBe('Synced');
+    expect(await f.canonical('renamed/note.md')).toBe('tracked child\n');
+    await expect(f.canonical('folder/note.md')).rejects.toThrow();
+    expect((await restarted.core.readStaleProvenance()).rename_pairs).toEqual([]);
   });
 
-  it('persists overlapping rename rejection before reporting it', async () => {
+  it('degrades overlapping rename history into ordinary changes that sync after restart', async () => {
     const f = await fixture();
     await f.core.adapter.rename('note.md', 'renamed.md');
     await f.plugin.client.recordLocalRenameHint('note.md', 'renamed.md');
     await f.core.adapter.rename('renamed.md', 'final.md');
-    await expect(f.plugin.client.recordLocalRenameHint('note.md', 'final.md'))
-      .rejects.toMatchObject({ code: 'rename_preservation_required' });
-    expect((await f.plugin.readState()).last_error_code).toBe('rename_preservation_required');
+    await f.plugin.client.recordLocalRenameHint('note.md', 'final.md');
+    expect((await f.plugin.readState()).last_error_code).toBeNull();
+    const saved = await f.provenance();
+    expect(saved.rename_pairs).toEqual([]);
+    expect(saved.obligations).toMatchObject({ 'note.md': { base: f.m0 }, 'renamed.md': { base: f.m0 } });
     const restarted = await f.restart();
-    await expect(restarted.plugin.syncOnce()).rejects.toMatchObject({ code: 'rename_preservation_required' });
+    let result = await restarted.plugin.syncOnce();
+    for (let attempt = 0; result.status !== 'Synced' && attempt < 3; attempt += 1) result = await restarted.plugin.syncOnce();
+    expect(result.status).toBe('Synced');
+    expect(await f.canonical('final.md')).toBe(BASE);
+    await expect(f.canonical('note.md')).rejects.toThrow();
+    await expect(f.canonical('renamed.md')).rejects.toThrow();
+  });
+
+  it('settles a rename-back without a pair or a latch', async () => {
+    const f = await fixture();
+    await f.core.adapter.rename('note.md', 'renamed.md');
+    await f.plugin.client.recordLocalRenameHint('note.md', 'renamed.md');
+    await f.core.adapter.rename('renamed.md', 'note.md');
+    await f.plugin.client.recordLocalRenameHint('renamed.md', 'note.md');
+    expect((await f.provenance()).rename_pairs).toEqual([]);
+    expect((await f.plugin.readState()).last_error_code).toBeNull();
+    let result = await f.plugin.syncOnce();
+    for (let attempt = 0; result.status !== 'Synced' && attempt < 3; attempt += 1) result = await f.plugin.syncOnce();
+    expect(result.status).toBe('Synced');
+    expect(await f.canonical('note.md')).toBe(BASE);
+    await expect(f.canonical('renamed.md')).rejects.toThrow();
+  });
+
+  it('clears a rename latch persisted by an older release and syncs the move on restart', async () => {
+    const f = await fixture();
+    await f.core.adapter.rename('note.md', 'renamed.md');
+    await f.core.writeState(Object.assign({}, await f.plugin.readState(), {
+      status_label: 'Out of sync', last_error_code: 'rename_preservation_required',
+      last_error_details: { source_path: 'note.md', destination_path: 'renamed.md' }
+    }));
+    const restarted = await f.restart();
+    expect(await restarted.plugin.readState()).toMatchObject({ last_error_code: null, last_error_details: null });
+    expect((await restarted.plugin.readQueue()).status).toBe('queued_local');
+    let result = await restarted.plugin.syncOnce();
+    for (let attempt = 0; result.status !== 'Synced' && attempt < 3; attempt += 1) result = await restarted.plugin.syncOnce();
+    expect(result.status).toBe('Synced');
+    expect(await f.canonical('renamed.md')).toBe(BASE);
+    await expect(f.canonical('note.md')).rejects.toThrow();
+  });
+
+  it('explains rename codes in plain language without changing other explanations', () => {
+    const explain = pluginMain.localSyncFailureExplanation;
+    expect(explain('rename_preservation_required')).toContain('reload the obts plugin');
+    expect(explain('rename_lineage_ambiguous')).toContain('reload the obts plugin');
+    expect(explain('rename_endpoint_ignored', { source_path: 'a.md', destination_path: 'b.md' }))
+      .toContain('the move a.md -> b.md');
+    expect(explain('unknown_failure_code')).toBe('Sync has not completed (unknown_failure_code). Check connectivity and sync diagnostics; keep local state intact and retry only after the cause is understood.');
   });
 
   it('normalizes an untracked note rename into an ordinary add', async () => {
@@ -2694,7 +2765,7 @@ describe('durable atomic rename proposals after stale conflict resolution', () =
     expect(predecessor.device_commit).toBe(pairedCommit);
   });
 
-  it('blocks a successor created during a conflicted push until predecessor installation is proven', async () => {
+  it('degrades a blocked successor after keep_server resolves its predecessor, without losing the moved bytes', async () => {
     const f = await fixture();
     await f.core.adapter.write('note.md', DEVICE_EDIT);
     await f.plugin.client.recordLocalChangeHint(['note.md']);
@@ -2727,30 +2798,37 @@ describe('durable atomic rename proposals after stale conflict resolution', () =
       url: `/api/v1/vaults/${f.vaultId}/conflicts/${predecessor.conflict_id}/resolve`,
       payload: { expected_main: review.json().conflict.expected_main, resolution_kind: 'keep_server' } });
     await f.plugin.pollRemoteEventsAndApply();
-    const canonicalMain = await f.server.git.getRef(f.vaultId, 'refs/heads/main');
-    const canonicalDestination = await f.canonical('renamed.md');
-    const pushesBeforeRetry = (await f.server.store.exportOperationHistory(f.vaultId)).filter((row) => row.operation_type === 'device_push').length;
-    await expect(f.plugin.syncOnce()).rejects.toMatchObject({ code: 'rename_lineage_ambiguous' });
+    let result = await f.plugin.syncOnce();
+    for (let attempt = 0; result.status !== 'Synced' && attempt < 3; attempt += 1) result = await f.plugin.syncOnce();
+    expect(result.status).toBe('Synced');
+    expect((await f.provenance()).rename_pairs).toEqual([]);
+    expect((await f.plugin.readState()).last_error_code).toBeNull();
+    expect((await f.server.store.snapshot()).conflicts.filter((row) => row.status === 'open')).toEqual([]);
+    // keep_server retained the predecessor source and competing destination; the
+    // successor move still lands as an ordinary add, so no device bytes are lost.
+    expect(await f.canonical('final.md')).toBe(DEVICE_EDIT);
+    expect(await f.canonical('renamed.md')).toBe('competing destination\n');
+    expect(await f.canonical('note.md')).toBe(REMOTE_EDIT);
     expect(await readFile(join(f.dir, 'final.md'), 'utf8')).toBe(DEVICE_EDIT);
-    expect(await f.server.git.getRef(f.vaultId, 'refs/heads/main')).toBe(canonicalMain);
-    expect(await f.canonical('renamed.md')).toBe(canonicalDestination);
-    expect((await f.server.store.exportOperationHistory(f.vaultId)).filter((row) => row.operation_type === 'device_push')).toHaveLength(pushesBeforeRetry);
   });
 
-  it('blocks a recreated source before producing a deletion-only proposal', async () => {
+  it('syncs a recreated rename source as an ordinary edit plus add', async () => {
     const f = await fixture();
     await f.core.adapter.rename('note.md', 'renamed.md');
     await f.plugin.client.recordLocalRenameHint('note.md', 'renamed.md');
     await f.core.adapter.write('note.md', 'recreated source\n');
     await f.plugin.client.recordLocalChangeHint(['note.md']);
-    const pushesBefore = (await f.server.store.exportOperationHistory(f.vaultId)).filter((row) => row.operation_type === 'device_push').length;
-    await expect(f.plugin.syncOnce()).rejects.toMatchObject({ code: 'rename_preservation_required' });
+    let result = await f.plugin.syncOnce();
+    for (let attempt = 0; result.status !== 'Synced' && attempt < 3; attempt += 1) result = await f.plugin.syncOnce();
+    expect(result.status).toBe('Synced');
+    expect(await f.canonical('note.md')).toBe('recreated source\n');
+    expect(await f.canonical('renamed.md')).toBe(BASE);
     expect(await readFile(join(f.dir, 'note.md'), 'utf8')).toBe('recreated source\n');
     expect(await readFile(join(f.dir, 'renamed.md'), 'utf8')).toBe(BASE);
-    expect((await f.server.store.exportOperationHistory(f.vaultId)).filter((row) => row.operation_type === 'device_push')).toHaveLength(pushesBefore);
+    expect((await f.provenance()).rename_pairs).toEqual([]);
   });
 
-  it('blocks a root-policy replacement that would exclude a frozen rename endpoint', async () => {
+  it('retries a frozen rename after a root-policy exclusion is undone', async () => {
     const f = await fixture();
     await f.core.adapter.rename('note.md', 'renamed.md');
     await f.plugin.client.recordLocalRenameHint('note.md', 'renamed.md');
@@ -2761,12 +2839,23 @@ describe('durable atomic rename proposals after stale conflict resolution', () =
     expect((await f.core.readRootIgnorePolicy()).policy.ignores('renamed.md')).toBe(true);
     expect(await f.core.queuedCommitRootPolicyIsStale(queue.pending_commit)).toBe(true);
     await expect(f.core.rebuildQueuedCommitForRootPolicy(queue.pending_commit, await f.plugin.readState(), queue))
-      .rejects.toMatchObject({ code: 'rename_preservation_required' });
+      .rejects.toMatchObject({ code: 'rename_endpoint_ignored' });
     expect(await f.plugin.readQueue()).toMatchObject({
       pending_commit: queue.pending_commit,
       pending_rename_pairs: [{ source_path: 'note.md', destination_path: 'renamed.md' }],
       pending_capture_id: queue.pending_capture_id
     });
+    await expect(f.core.uploadQueuedCommit(queue)).rejects.toMatchObject({ code: 'rename_endpoint_ignored' });
+    expect(await f.plugin.readState()).toMatchObject({
+      last_error_code: 'rename_endpoint_ignored',
+      last_error_details: { source_path: 'note.md', destination_path: 'renamed.md' }
+    });
+    await f.core.adapter.remove('.gitignore');
+    let result = await f.plugin.syncOnce();
+    for (let attempt = 0; result.status !== 'Synced' && attempt < 3; attempt += 1) result = await f.plugin.syncOnce();
+    expect(result.status).toBe('Synced');
+    expect(await f.canonical('renamed.md')).toBe(BASE);
+    await expect(f.canonical('note.md')).rejects.toThrow();
   });
 
   it('recovers a stranded paired commit before queue publication and strips internal metadata from the wire pair', async () => {

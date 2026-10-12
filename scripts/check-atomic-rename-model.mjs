@@ -23,9 +23,11 @@ try {
   const revision = Number(/^revision:\s*(\d+)$/mu.exec(architecture)?.[1]);
   const sanyAuthoring = run('sany', ['OBTSRenameAuthoring.tla']);
   if (sanyAuthoring.status !== 0) throw new Error(`SANY authoring companion failed:\n${sanyAuthoring.output}`);
-  const registration = /- id: OBTS-FM-014\n\s+status: focused bounded model\n\s+path: architecture\/models\/formal\/OBTSAtomicRename\.tla\n\s+architecture_revision: 46\n\s+checks: architecture\/models\/formal\/configs\/fm014-atomic-rename\.cfg\n\s+companion_path: architecture\/models\/formal\/OBTSRenameAuthoring\.tla\n\s+companion_architecture_revision: 52\n\s+refines:\n\s+- OBTS-SYNC-RENAME-001\n\s+- OBTS-PER-RENAME-001/u;
-  if (!registration.test(architecture) || !Number.isInteger(revision) || revision < 52) {
-    throw new Error('architecture/manifest.yaml must register FM014 and its authoring companion against both rename contracts at revision 52 or later.');
+  const sanyFallback = run('sany', ['OBTSRenameFallback.tla']);
+  if (sanyFallback.status !== 0) throw new Error(`SANY fallback companion failed:\n${sanyFallback.output}`);
+  const registration = /- id: OBTS-FM-014\n\s+status: focused bounded model\n\s+path: architecture\/models\/formal\/OBTSAtomicRename\.tla\n\s+architecture_revision: 46\n\s+checks: architecture\/models\/formal\/configs\/fm014-atomic-rename\.cfg\n\s+companion_path: architecture\/models\/formal\/OBTSRenameAuthoring\.tla\n\s+companion_architecture_revision: 52\n\s+fallback_companion_path: architecture\/models\/formal\/OBTSRenameFallback\.tla\n\s+fallback_companion_architecture_revision: 56\n\s+refines:\n\s+- OBTS-SYNC-RENAME-001\n\s+- OBTS-PER-RENAME-001/u;
+  if (!registration.test(architecture) || !Number.isInteger(revision) || revision < 56) {
+    throw new Error('architecture/manifest.yaml must register FM014 and its authoring and fallback companions against both rename contracts at revision 56 or later.');
   }
   const checks = [
     { id: 'rename-safety', mutation: 'none', property: 'AllSafety', minDistinct: 100, minDepth: 12 },
@@ -116,10 +118,28 @@ try {
     { id: 'rename-authoring-mutant-conflict-mutates-canonical', mutation: 'mutant-conflict-mutates-canonical', property: 'CanonicalUnchangedOnConflict', expectation: 'reject', actions: ['RemoteAdvanceOverlap', 'IntegrateProposal'], minDepth: 6 },
     { id: 'rename-authoring-mutant-drops-remote-unrelated', mutation: 'mutant-drop-remote-unrelated', property: 'RemoteUnrelatedSurvivesMerge', expectation: 'reject', actions: ['RemoteAdvanceDisjoint', 'IntegrateProposal'], minDepth: 6 }
   );
+  const fallback = 'OBTSRenameFallback';
+  for (const check of authoringChecks) check.model = companion;
+  authoringChecks.push(
+    { id: 'rename-fallback-safety', mutation: 'none', property: 'AllSafety', expectation: 'pass', minDistinct: 300, minDepth: 8 },
+    { id: 'rename-fallback-degrade-merge', mutation: 'reach-degrade-merge', property: 'WitnessNotReached', expectation: 'reach', actions: ['DegradeToObligations', 'CaptureUnpaired', 'AdmitUnpaired', 'IntegrateUnpaired'], minDepth: 5 },
+    { id: 'rename-fallback-degrade-conflict', mutation: 'reach-degrade-conflict', property: 'WitnessNotReached', expectation: 'reach', actions: ['RemoteEditSource', 'DegradeToObligations', 'IntegrateUnpaired'], minDepth: 6 },
+    { id: 'rename-fallback-degrade-resolved', mutation: 'reach-degrade-resolved', property: 'WitnessNotReached', expectation: 'reach', actions: ['IntegrateUnpaired', 'ResolveInDashboard'], minDepth: 7 },
+    { id: 'rename-fallback-recreated-source', mutation: 'reach-recreated-source-merge', property: 'WitnessNotReached', expectation: 'reach', actions: ['DegradeToObligations', 'IntegrateUnpaired'], minDepth: 5 },
+    { id: 'rename-fallback-predecessor-base', mutation: 'reach-predecessor-fallback', property: 'WitnessNotReached', expectation: 'reach', actions: ['DegradeToObligations', 'AdmitUnpaired', 'IntegrateUnpaired'], minDepth: 5 },
+    { id: 'rename-fallback-legacy-upgrade', mutation: 'reach-legacy-upgrade', property: 'WitnessNotReached', expectation: 'reach', actions: ['Upgrade', 'DegradeToObligations', 'IntegrateUnpaired'], minDepth: 6 },
+    { id: 'rename-fallback-frozen-retry', mutation: 'reach-frozen-retry', property: 'WitnessNotReached', expectation: 'reach', actions: ['FrozenIgnoredRetry', 'RestoreRootPolicy', 'KeepProvenPair'], minDepth: 4 },
+    { id: 'rename-fallback-mutant-latch', mutation: 'mutant-latch', property: 'NeverLatchedAfterUpgrade', expectation: 'reject', actions: ['DegradeToObligations'], minDepth: 2 },
+    { id: 'rename-fallback-mutant-no-migration', mutation: 'mutant-no-migration', property: 'NeverLatchedAfterUpgrade', expectation: 'reject', actions: ['Upgrade'], minDepth: 2 },
+    { id: 'rename-fallback-mutant-newer-base', mutation: 'mutant-newer-base', property: 'NoSilentLoss', expectation: 'reject', actions: ['RemoteEditSource', 'DegradeToObligations', 'IntegrateUnpaired'], minDepth: 6 },
+    { id: 'rename-fallback-mutant-newer-base-bound', mutation: 'mutant-newer-base', property: 'DegradedBaseNotNewer', expectation: 'reject', actions: ['DegradeToObligations'], minDepth: 2 },
+    { id: 'rename-fallback-mutant-no-predecessor-fallback', mutation: 'mutant-no-predecessor-fallback', property: 'ServerAdmitsFallback', expectation: 'reject', actions: ['DegradeToObligations', 'AdmitUnpaired'], minDepth: 4 },
+    { id: 'rename-fallback-mutant-degrade-frozen', mutation: 'mutant-degrade-frozen', property: 'FrozenNeverDegraded', expectation: 'reject', actions: ['DegradeToObligations'], minDepth: 2 }
+  );
   for (const check of authoringChecks) {
     const config = join(runDir, `${check.id}.cfg`);
     writeFileSync(config, `CONSTANTS\n  Mutation = "${check.mutation}"\nSPECIFICATION Spec\nINVARIANT ${check.property}\n`);
-    const result = run('tlc', ['-workers', '1', '-fp', '0', '-config', config, '-metadir', join(runDir, check.id), companion]);
+    const result = run('tlc', ['-workers', '1', '-fp', '0', '-config', config, '-metadir', join(runDir, check.id), check.model || fallback]);
     const stats = /([\d,]+) states generated, ([\d,]+) distinct states found/.exec(result.output);
     const depth = /depth of the complete state graph search is (\d+)/.exec(result.output);
     const distinct = Number(stats?.[2]?.replaceAll(',', ''));

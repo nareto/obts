@@ -161,6 +161,7 @@ describe('validation selection', () => {
     expect(makePlan(['architecture/models/formal/OBTSManagedHeadlessOwnership.cfg']).formalFamilies).toEqual(['headless-ownership']);
     expect(makePlan(['architecture/models/formal/OBTSAtomicRename.tla']).formalFamilies).toEqual(['atomic-rename']);
     expect(makePlan(['architecture/models/formal/OBTSRenameAuthoring.tla']).formalFamilies).toEqual(['atomic-rename']);
+    expect(makePlan(['architecture/models/formal/OBTSRenameFallback.tla']).formalFamilies).toEqual(['atomic-rename']);
     expect(makePlan(['architecture/models/formal/OBTSAtomicRename.cfg']).formalFamilies).toEqual(['atomic-rename']);
     expect(makePlan(['architecture/models/formal/OBTSDashboardProtocols.tla']).formalFamilies).toEqual(['dashboard-protocols']);
     expect(makePlan(['architecture/models/formal/OBTSDeviceRemoval.tla']).formalFamilies).toEqual(['dashboard-protocols']);

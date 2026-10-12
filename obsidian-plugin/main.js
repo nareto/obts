@@ -23127,7 +23127,7 @@ var { createByteBudget, runBoundedWork } = require_work_pool();
 var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.6.4";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.6.5";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var STALE_SETTLE_MARGIN_MS = 250;
@@ -23136,6 +23136,8 @@ var PERIODIC_FULL_AUDIT_INTERVAL_MS = 7 * 24 * 60 * 60 * 1e3;
 var MIGRATED_FULL_AUDIT_DELAY_MS = 24 * 60 * 60 * 1e3;
 var SCANNER_SCHEMA_VERSION = 1;
 var HINTED_CAPTURE_MAX_PATHS = 256;
+var WATCHER_RENAME_ATTEMPTS = 3;
+var LEGACY_RENAME_LATCH_CODES = /* @__PURE__ */ new Set(["rename_preservation_required", "rename_lineage_ambiguous"]);
 var AUTOMATIC_RETRY_MAX_MS = 5 * 60 * 1e3;
 var OPERATION_STATUS_HEARTBEAT_MS = 30 * 1e3;
 var STATUS_LAG_NOTICE_DELAY_MS = 30 * 1e3;
@@ -23909,7 +23911,15 @@ module.exports = class ObtsPlugin extends Plugin {
       let completedRenames = 0;
       try {
         for (const pair of renames) {
-          await this.client.recordLocalRenameHint(pair.source_path, pair.destination_path);
+          try {
+            await this.client.recordLocalRenameHint(pair.source_path, pair.destination_path);
+          } catch (error) {
+            pair.failures = (pair.failures || 0) + 1;
+            if (pair.failures < WATCHER_RENAME_ATTEMPTS) throw error;
+            void this.reportDeviceError(error);
+            this.client.requestFullInventory();
+            paths.push(pair.source_path, pair.destination_path);
+          }
           completedRenames += 1;
         }
         if (paths.length) await this.client.recordLocalChangeHint(paths);
@@ -24581,6 +24591,12 @@ var ObtsObsidianClient = class {
     await this.fsp.writeFile(path.join(this.gitdir, "info", "exclude"), ".obts/\n.git/\n", { mode: 384 });
     this.plugin.setInitializationStage("Reading local sync state", "startup_state");
     let state = await this.readState();
+    if (LEGACY_RENAME_LATCH_CODES.has(state.last_error_code)) {
+      state = Object.assign({}, state, { status_label: "Checking", last_error_code: null, last_error_details: null, updated_at: nowIso() });
+      await this.writeState(state);
+      await this.recordLocalChangeHint();
+      state = await this.readState();
+    }
     this.plugin.setInitializationStage("Checking interrupted apply journal", "recovery_journal");
     let journal;
     try {
@@ -25948,23 +25964,26 @@ var ObtsObsidianClient = class {
   async recordLocalRenameHint(sourcePath, destinationPath) {
     const source = normalizePath2(sourcePath);
     const destination = normalizePath2(destinationPath);
-    const blockRename = async (message) => {
-      const details = { source_path: source, destination_path: destination };
-      await this.markBlocked("rename_preservation_required", details);
-      throw new ObtsBlockedError("rename_preservation_required", message, details);
+    const touches = (pair) => !pair.blocked_commit && [pair.source_path, pair.destination_path].some((path2) => changedPathsConflict(path2, source) || changedPathsConflict(path2, destination));
+    const unpaired = async () => {
+      if ((await this.readStaleProvenance()).rename_pairs.some(touches)) {
+        await this.mutateStaleProvenance(async (saved) => {
+          await this.degradeRenamePairs(saved, saved.rename_pairs.filter(touches));
+        });
+      }
+      this.requestFullInventory();
+      await this.recordLocalChangeHint([source, destination]);
     };
     const internalPath = (path2) => path2 === ".git" || path2.startsWith(".git/") || path2 === ".obts" || path2.startsWith(".obts/");
     if (internalPath(source) && internalPath(destination)) return;
     if (!isSyncableVaultPath(source) || !isSyncableVaultPath(destination) || source === destination || source.toLowerCase() === destination.toLowerCase()) {
-      return await blockRename("This rename cannot be represented safely; preserve both paths and resolve it manually.");
+      return await unpaired();
     }
     const state = await this.readState();
     const initialSaved = await this.readStaleProvenance();
     const policy = await this.readRootIgnorePolicy();
     const destinationStat = await this.adapter.stat(destination);
-    if (policy.policy.ignores(destination) || destinationStat?.type === "folder") {
-      return await blockRename("The rename destination is ignored or is a directory; preserve both paths and resolve it manually.");
-    }
+    if (policy.policy.ignores(destination) || destinationStat?.type === "folder") return await unpaired();
     const eventSeen = [...initialSaved.rename_pairs, ...initialSaved.intent?.rename_pairs || []].some((pair) => pair.events?.some((event) => event.source_path === source && event.destination_path === destination) || pair.source_path === source && pair.destination_path === destination);
     if (eventSeen) {
       await this.recordLocalChangeHint([source, destination]);
@@ -25975,7 +25994,7 @@ var ObtsObsidianClient = class {
     const conflictedSuccessor = frozen?.outcome === "conflicted" && frozen.rename_pairs?.some((pair) => pair.destination_path === source);
     const pendingPredecessor = initialSaved.rename_pairs.find((pair) => pair.destination_path === source);
     let base = (frozenSuccessor || conflictedSuccessor) && frozen.commit ? frozen.commit : pendingPredecessor?.base || state.local_main;
-    if (!base || !await this.commitExists(base)) return await blockRename("No durable source base is available for this rename.");
+    if (!base || !await this.commitExists(base)) return await unpaired();
     if (!frozenSuccessor && !conflictedSuccessor) {
       const candidates = [
         ...Object.entries(initialSaved.obligations).filter(([p]) => changedPathsConflict(p, source) || changedPathsConflict(p, destination)).map(([, value]) => value.base),
@@ -25997,44 +26016,83 @@ var ObtsObsidianClient = class {
         await this.recordLocalChangeHint([destination]);
         return;
       }
-      return await blockRename("The rename source and destination do not match a tracked file in the protected base.");
+      return await unpaired();
     }
-    if (hasTrackedPath(baseTree, destination)) return await blockRename("The rename destination already exists in the protected base.");
-    try {
-      await this.mutateStaleProvenance(async (saved) => {
-        const pairs = saved.rename_pairs;
-        const identical = pairs.find((pair) => pair.source_path === source && pair.destination_path === destination);
-        if (identical) return;
-        const frozenPairs = saved.intent?.outcome === null ? saved.intent.rename_pairs || [] : [];
-        const frozenPredecessor = frozenPairs.find((pair) => pair.destination_path === source);
-        const frozenOverlap = frozenPairs.some((pair) => pair !== frozenPredecessor && [pair.source_path, pair.destination_path].some((path2) => changedPathsConflict(path2, source) || changedPathsConflict(path2, destination))) || frozenPredecessor && changedPathsConflict(frozenPredecessor.source_path, destination);
-        const predecessor = pairs.find((pair) => pair.destination_path === source);
-        const conflicting = pairs.find((pair) => pair !== predecessor && [pair.source_path, pair.destination_path].some((path2) => changedPathsConflict(path2, source) || changedPathsConflict(path2, destination)));
-        if (frozenOverlap || conflicting || predecessor && changedPathsConflict(predecessor.source_path, destination)) {
-          throw new ObtsBlockedError("rename_preservation_required", "Overlapping rename history is ambiguous; preserve the affected files and resolve it manually.");
-        }
-        if (predecessor) {
-          predecessor.events || (predecessor.events = [{ source_path: predecessor.source_path, destination_path: predecessor.destination_path }]);
-          predecessor.events.push({ source_path: source, destination_path: destination });
-          predecessor.destination_path = destination;
-          predecessor.generation += 1;
-        } else {
-          pairs.push({
-            source_path: source,
-            destination_path: destination,
-            generation: 0,
-            base,
-            ...conflictedSuccessor ? { blocked_commit: frozen.commit } : {},
-            events: [{ source_path: source, destination_path: destination }]
-          });
-        }
-        pairs.sort((a, b) => a.source_path < b.source_path ? -1 : a.source_path > b.source_path ? 1 : a.destination_path < b.destination_path ? -1 : 1);
-      });
-    } catch (error) {
-      if (error?.code === "rename_preservation_required") return await blockRename(error.message);
-      throw error;
-    }
+    if (hasTrackedPath(baseTree, destination)) return await unpaired();
+    const overlapping = await this.mutateStaleProvenance(async (saved) => {
+      const pairs = saved.rename_pairs;
+      const identical = pairs.find((pair) => pair.source_path === source && pair.destination_path === destination);
+      if (identical) return;
+      const frozenPairs = saved.intent?.outcome === null ? saved.intent.rename_pairs || [] : [];
+      const frozenPredecessor = frozenPairs.find((pair) => pair.destination_path === source);
+      const frozenOverlap = frozenPairs.some((pair) => pair !== frozenPredecessor && [pair.source_path, pair.destination_path].some((path2) => changedPathsConflict(path2, source) || changedPathsConflict(path2, destination))) || frozenPredecessor && changedPathsConflict(frozenPredecessor.source_path, destination);
+      const predecessor = pairs.find((pair) => pair.destination_path === source);
+      const conflicting = pairs.find((pair) => pair !== predecessor && [pair.source_path, pair.destination_path].some((path2) => changedPathsConflict(path2, source) || changedPathsConflict(path2, destination)));
+      if (frozenOverlap || conflicting || predecessor && changedPathsConflict(predecessor.source_path, destination)) {
+        await this.degradeRenamePairs(saved, pairs.filter(touches));
+        return true;
+      }
+      if (predecessor) {
+        predecessor.events || (predecessor.events = [{ source_path: predecessor.source_path, destination_path: predecessor.destination_path }]);
+        predecessor.events.push({ source_path: source, destination_path: destination });
+        predecessor.destination_path = destination;
+        predecessor.generation += 1;
+      } else {
+        pairs.push({
+          source_path: source,
+          destination_path: destination,
+          generation: 0,
+          base,
+          ...conflictedSuccessor ? { blocked_commit: frozen.commit } : {},
+          events: [{ source_path: source, destination_path: destination }]
+        });
+      }
+      pairs.sort((a, b) => a.source_path < b.source_path ? -1 : a.source_path > b.source_path ? 1 : a.destination_path < b.destination_path ? -1 : 1);
+      return false;
+    });
+    if (overlapping) return await unpaired();
     await this.recordLocalChangeHint([source, destination]);
+  }
+  // Rename lineage is best-effort. Unprovable unfrozen pairs become ordinary
+  // source/destination obligations at a base no newer than the pair base. Call
+  // inside one mutateStaleProvenance callback so new bases are pinned first.
+  async degradeRenamePairs(saved, pairs, baseFor = async (pair) => pair.base) {
+    for (const pair of pairs) {
+      const base = await baseFor(pair);
+      if (base) for (const p of [pair.source_path, pair.destination_path]) {
+        const obligation = saved.obligations[p];
+        if (!obligation) saved.obligations[p] = { base, generation: 0, signature: "uncaptured" };
+        else if (await this.isAncestor(base, obligation.base)) obligation.base = base;
+      }
+      saved.rename_pairs = saved.rename_pairs.filter((pending) => pending.source_path !== pair.source_path || pending.destination_path !== pair.destination_path);
+    }
+  }
+  // A blocked successor was authored on its predecessor proposal P. When P did
+  // not reach main, fall back to P's recorded authoring base so it stays admissible.
+  async blockedRenameFallbackBase(pair, targetMain, intent) {
+    const predecessor = pair.blocked_commit;
+    const parents = predecessor && await this.commitExists(predecessor) ? (await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: predecessor })).commit.parent : [];
+    const candidates = [predecessor, intent?.commit === predecessor ? intent.base : null, parents.length === 1 ? parents[0] : null];
+    for (const candidate of candidates) {
+      if (candidate && targetMain && await this.commitExists(candidate) && await this.isAncestor(candidate, targetMain)) return candidate;
+    }
+    return null;
+  }
+  // A successor waits only while its predecessor conflict is still open; once
+  // that is resolved without installing the predecessor, the successor degrades.
+  async settleBlockedRenamePairs(targetMain) {
+    const queue = await this.readQueue();
+    const open = (pair) => queue.status === "conflicted" && queue.pending_commit === pair.blocked_commit;
+    if ((await this.readStaleProvenance()).rename_pairs.some((pair) => pair.blocked_commit && !open(pair))) {
+      await this.mutateStaleProvenance(async (saved) => {
+        await this.degradeRenamePairs(
+          saved,
+          saved.rename_pairs.filter((pair) => pair.blocked_commit && !open(pair)),
+          (pair) => this.blockedRenameFallbackBase(pair, targetMain, saved.intent)
+        );
+      });
+    }
+    return (await this.readStaleProvenance()).rename_pairs.some((pair) => pair.blocked_commit);
   }
   async uploadQueuedCommit(queue) {
     const staleRecord = await this.readStaleProvenance();
@@ -26175,7 +26233,7 @@ var ObtsObsidianClient = class {
         await this.writeState(Object.assign({}, await this.readState(), {
           status_label: statusLabel,
           last_error_code: errorCode,
-          last_error_details: error instanceof ObtsBlockedError && error.code === "object_too_large_for_chunk" ? error.details : null,
+          last_error_details: error instanceof ObtsBlockedError && ["object_too_large_for_chunk", "rename_endpoint_ignored"].includes(error.code) ? error.details : null,
           updated_at: nowIso()
         }));
         this.plugin.setStatus(statusLabel);
@@ -26459,7 +26517,11 @@ var ObtsObsidianClient = class {
     const policy = await this.readRootIgnorePolicy();
     for (const pair of queue.pending_rename_pairs || []) {
       if (policy.policy.ignores(pair.source_path) || policy.policy.ignores(pair.destination_path)) {
-        throw new ObtsBlockedError("rename_preservation_required", "A root policy change excludes a frozen rename endpoint; preserve both paths and resolve the move manually.");
+        throw new ObtsBlockedError(
+          "rename_endpoint_ignored",
+          "A root .gitignore change excludes a file move that is waiting to upload. Undo that .gitignore change; sync retries automatically.",
+          { source_path: pair.source_path, destination_path: pair.destination_path }
+        );
       }
     }
     const entries = await this.flattenTree(commit2);
@@ -28909,28 +28971,38 @@ var ObtsObsidianClient = class {
         saved = await this.readStaleProvenance();
       }
     }
-    if (saved.rename_pairs.some((pair) => pair.blocked_commit)) {
-      throw new ObtsBlockedError("rename_lineage_ambiguous", "A predecessor rename is unresolved; keep both files and resolve the predecessor before syncing the successor move.");
+    if (await this.settleBlockedRenamePairs(targetMain)) {
+      throw new ObtsBlockedError("conflict_review_required", "A file move waits for an earlier server conflict. Resolve it in the dashboard.");
     }
-    if (!saved.horizons.length && !Object.keys(saved.obligations).length && !saved.rename_pairs.length) return false;
-    if (!snapshot) snapshot = (await this.localChangedPathsFromTree(await this.listTreeBlobOids(targetMain), true)).snapshot;
-    const stale = await this.classifyStaleSnapshot(targetMain, snapshot);
-    if (!stale.length) return false;
-    const current = await this.readStaleProvenance();
-    let base = current.obligations[stale[0]].base;
-    for (const p of stale) if (await this.isAncestor(current.obligations[p].base, base)) base = current.obligations[p].base;
-    const cohort = stale.filter((p) => current.obligations[p].base === base && !current.held_proposals.some((h) => Object.keys(h.fallbacks).some((q) => changedPathsConflict(p, q))));
-    if (!cohort.length) return false;
-    const renamePairs = current.rename_pairs.filter((pair) => cohort.includes(pair.source_path) || cohort.includes(pair.destination_path));
-    const target = await this.listTreeBlobOids(targetMain);
-    const baseTree = await this.listTreeBlobOids(base);
-    for (const pair of renamePairs) {
-      if (!cohort.includes(pair.source_path) || !cohort.includes(pair.destination_path) || current.obligations[pair.source_path]?.base !== base || current.obligations[pair.destination_path]?.base !== base) {
-        throw new ObtsBlockedError("rename_preservation_required", "Both rename paths need one coherent authoring base; preserve the files and resolve the move manually.");
+    let current;
+    let cohort;
+    let base;
+    let renamePairs;
+    let target;
+    let passLimit = null;
+    for (let pass = 0; ; pass += 1) {
+      saved = await this.readStaleProvenance();
+      if (!saved.horizons.length && !Object.keys(saved.obligations).length && !saved.rename_pairs.length) return false;
+      if (!snapshot) snapshot = (await this.localChangedPathsFromTree(await this.listTreeBlobOids(targetMain), true)).snapshot;
+      const stale = await this.classifyStaleSnapshot(targetMain, snapshot);
+      if (!stale.length) return false;
+      current = await this.readStaleProvenance();
+      base = current.obligations[stale[0]].base;
+      for (const p of stale) if (await this.isAncestor(current.obligations[p].base, base)) base = current.obligations[p].base;
+      cohort = stale.filter((p) => current.obligations[p].base === base && !current.held_proposals.some((h) => Object.keys(h.fallbacks).some((q) => changedPathsConflict(p, q))));
+      if (!cohort.length) return false;
+      renamePairs = current.rename_pairs.filter((pair) => cohort.includes(pair.source_path) || cohort.includes(pair.destination_path));
+      target = await this.listTreeBlobOids(targetMain);
+      const baseTree = await this.listTreeBlobOids(base);
+      const unprovable = renamePairs.filter((pair) => !cohort.includes(pair.source_path) || !cohort.includes(pair.destination_path) || current.obligations[pair.source_path]?.base !== base || current.obligations[pair.destination_path]?.base !== base || !baseTree.has(pair.source_path) || baseTree.has(pair.destination_path) || snapshot.entries.has(pair.source_path) || !snapshot.entries.has(pair.destination_path));
+      if (!unprovable.length) break;
+      passLimit ?? (passLimit = current.rename_pairs.length);
+      if (pass >= passLimit) {
+        throw new ObtsBlockedError("local_snapshot_changed", "Local file moves changed while obts was checking them. Sync will retry.");
       }
-      if (!baseTree.has(pair.source_path) || baseTree.has(pair.destination_path) || snapshot.entries.has(pair.source_path) || !snapshot.entries.has(pair.destination_path)) {
-        throw new ObtsBlockedError("rename_preservation_required", `The captured rename ${pair.source_path} -> ${pair.destination_path} is incomplete, recreated, ignored, or a directory move (base source=${baseTree.has(pair.source_path)}, base destination=${baseTree.has(pair.destination_path)}, captured source=${snapshot.entries.has(pair.source_path)}, captured destination=${snapshot.entries.has(pair.destination_path)}); preserve the affected files and resolve it manually.`);
-      }
+      await this.mutateStaleProvenance(async (latest) => {
+        await this.degradeRenamePairs(latest, latest.rename_pairs.filter((pair) => !pair.blocked_commit && unprovable.some((invalid) => invalid.source_path === pair.source_path && invalid.destination_path === pair.destination_path)));
+      });
     }
     const captures = Object.fromEntries(cohort.map((p) => [p, current.obligations[p].generation]));
     const held = [.../* @__PURE__ */ new Set([...target.keys(), ...snapshot.entries.keys()])].filter((p) => !cohort.includes(p) && target.get(p) !== snapshot.entries.get(p)?.entry.oid);
@@ -29096,7 +29168,14 @@ var ObtsObsidianClient = class {
           successor.base = intent.commit;
           successor.lineage_confirmed = true;
         }
-        if ((await this.readQueue()).status !== "conflicted") saved.intent = null;
+        if ((await this.readQueue()).status !== "conflicted") {
+          await this.degradeRenamePairs(
+            saved,
+            saved.rename_pairs.filter((pair) => pair.blocked_commit === intent.commit),
+            (pair) => this.blockedRenameFallbackBase(pair, journal.target_main, intent)
+          );
+          saved.intent = null;
+        }
         return;
       }
       if (!intent || !["merged", "noop"].includes(intent.outcome) || !intent.main || !await this.isAncestor(intent.main, journal.target_main)) return;
@@ -29176,7 +29255,7 @@ var ObtsObsidianClient = class {
     const provenanceJournal = await readApplyJournalStrict(this.fsp, this.applyJournalPath);
     await this.retainApplyProvenance(provenanceJournal);
     await this.finishApplyProvenance(provenanceJournal);
-    if ((await this.readStaleProvenance()).rename_pairs.some((pair) => pair.blocked_commit)) return;
+    if (await this.settleBlockedRenamePairs(targetMain)) return;
     if (await this.queueStaleCohort(targetMain, expectedDeviceRef, snapshot)) return;
     if (snapshot) {
       const [targetPolicy, targetEntries, directoryState] = await Promise.all([
@@ -33597,9 +33676,6 @@ var ObtsObsidianClient = class {
     return `${this.plugin.settings.serverUrl.replace(/\/+$/u, "")}${route}`;
   }
   throwIfSyncBlocked(state) {
-    if (state.last_error_code === "rename_preservation_required") {
-      throw new ObtsBlockedError("rename_preservation_required", "A rename needs manual preservation before sync can continue.", state.last_error_details || void 0);
-    }
     if (state.last_error_code === "conflict_review_required") {
       throw new ObtsBlockedError("conflict_review_required", "A server conflict requires review before normal sync can continue.");
     }
@@ -35140,7 +35216,7 @@ function sameCachedScanFileMetadata(current, cached) {
   return current.size === cached.size && current.mtime !== null && cached.mtime !== null && current.mtime === cached.mtime;
 }
 function isRetryableLocalError(code) {
-  return code === "local_snapshot_changed" || code === "upload_interrupted" || code === "pack_preparation_failed" || code === "git_error" || code === "server_git_error" || code === "server_processing_error" || code === "stale_directory_proposal_base" || code === "directory_acknowledgement_missing" || code === "invalid_path" || code === "path_collision" || code === "excluded_git_path" || code === "excluded_internal_path" || code === "excluded_path" || code === "unsupported_file_mode";
+  return code === "local_snapshot_changed" || code === "upload_interrupted" || code === "pack_preparation_failed" || code === "git_error" || code === "server_git_error" || code === "server_processing_error" || code === "stale_directory_proposal_base" || code === "directory_acknowledgement_missing" || code === "invalid_path" || code === "path_collision" || code === "excluded_git_path" || code === "excluded_internal_path" || code === "excluded_path" || code === "unsupported_file_mode" || code === "rename_endpoint_ignored";
 }
 function isOfflineTransportError(error) {
   return error instanceof ObtsTransportError && error.status === 0;
@@ -35241,6 +35317,12 @@ function localSyncFailureExplanation(code, details) {
     return `${summary}${location} The queued commit remains local; changing the current file or an ignore rule alone may not clear its ancestry. Preserve the journal and use a reviewed fresh baseline or supported large-file transport before retrying.`;
   }
   if (safeCode === "conflict_review_required") return "The server recorded a conflict. Review it in the dashboard; the client cannot choose a winner locally.";
+  if (LEGACY_RENAME_LATCH_CODES.has(safeCode)) return "An older obts version paused sync after a file move it could not track. This version syncs such moves as a delete plus an add: reload the obts plugin (or restart Obsidian) and sync resumes by itself. If another device changed the same file, a conflict appears in the dashboard; click the sync indicator to open it.";
+  if (safeCode === "rename_endpoint_ignored") {
+    const paths = [details?.source_path, details?.destination_path].filter((value) => typeof value === "string" && isValidVaultPath(value));
+    const move = paths.length === 2 ? `the move ${paths[0]} -> ${paths[1]}` : "a file move";
+    return `Your root .gitignore now hides ${move}, which was already waiting to upload. Nothing was lost. Undo that .gitignore change and sync retries by itself; you can re-apply it once this move has uploaded.`;
+  }
   if (safeCode === "apply_journal_recovery_required" || safeCode === "apply_recovery_required") return `Local apply recovery needs review (${safeCode}). Preserve the vault and .obts state; restart Obsidian once, then inspect the recovery journal if this persists.`;
   if (safeCode === "directory_recovery_journal_invalid") return "The local directory recovery journal is invalid. Preserve .obts/directory-recovery.json and the vault; send sanitized diagnostics before assisted recovery.";
   if (safeCode === "apply_lock_active") return "A local apply lock is active. Another operation may still own it; do not remove the lock. If it persists after restarting Obsidian, preserve the vault and .obts state for recovery support.";
@@ -36012,4 +36094,5 @@ module.exports.ObtsClientCore = ObtsObsidianClient;
 module.exports.PluginBlockedError = ObtsBlockedError;
 module.exports.TransportError = ObtsTransportError;
 module.exports.buildTroubleshootingDiagnostic = buildTroubleshootingDiagnostic;
+module.exports.localSyncFailureExplanation = localSyncFailureExplanation;
 module.exports.installPathMutationGate = installPathMutationGate;

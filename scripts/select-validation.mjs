@@ -19,7 +19,7 @@ const formalPaths = new Map([
   ['client-state', /^(?:architecture\/models\/formal\/(?:OBTSClientStateRecovery\.tla|OBTSUploadCheckpointRecovery\.(?:tla|cfg)))$/],
   ['vault-settings', /^(?:architecture\/models\/formal\/(?:OBTSVaultSettings(?:\.tla|\.cfg)?|VaultSettings(?:AutoMerge|ConflictFallback|DeleteLocal|RecomputeMerge|StaleSave)\.cfg|negative\/VaultSettings.*\.cfg))$/],
   ['headless-ownership', /^(?:architecture\/models\/formal\/OBTSManagedHeadlessOwnership\.(?:tla|cfg))$/],
-  ['atomic-rename', /^(?:architecture\/models\/formal\/(?:OBTS(?:AtomicRename|RenameAuthoring)\.(?:tla|cfg)|configs\/fm014-atomic-rename\.cfg))$/],
+  ['atomic-rename', /^(?:architecture\/models\/formal\/(?:OBTS(?:AtomicRename|RenameAuthoring|RenameFallback)\.(?:tla|cfg)|configs\/fm014-atomic-rename\.cfg))$/],
   ['operation-history', /^(?:architecture\/models\/formal\/(?:OBTSOperationHistory\.(?:tla|cfg)|configs\/fm015-[^/]+\.cfg))$/],
   ['dashboard-protocols', /^(?:architecture\/models\/formal\/(?:OBTS(?:DashboardProtocols|DeviceRemoval)\.tla|configs\/(?:dashboard|device-removal)-.*\.cfg))$/]
 ]);
