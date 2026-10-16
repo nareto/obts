@@ -4,6 +4,8 @@ import {
   buildConflictDiff,
   changedRows,
   choicesForAllRows,
+  collapseConflictDiff,
+  formatDiffLineRange,
   hasDivergentFinalPaths,
   isAgreedFileDeletion,
   previewOutcomeLabel,
@@ -57,6 +59,44 @@ describe('conflict diff workbench', () => {
     const choices = choicesForAllRows(diffs, 'device');
     expect(unresolvedLineCount(diffs, choices)).toBe(0);
     expect(resolveConflictFile(first, diffs[first.path]!, choices[first.path]!)).toBe('device\n');
+  });
+
+  it('collapses long unchanged runs into expandable hunks while keeping row ids and line numbers', () => {
+    const lines = (count: number, prefix: string) => Array.from({ length: count }, (_, index) => `${prefix} ${index + 1}\n`).join('');
+    const file = textFile(
+      'long.md',
+      `${lines(20, 'head')}server first\n${lines(30, 'body')}server second\n${lines(10, 'tail')}`,
+      `${lines(20, 'head')}device first\n${lines(30, 'body')}device second\nextra device\n${lines(10, 'tail')}`
+    );
+    const rows = buildConflictDiff(file);
+    const items = collapseConflictDiff(rows);
+    const hunks = items.filter((item) => item.kind === 'hunk');
+    const shown = items.filter((item) => item.kind !== 'hunk');
+
+    expect(hunks).toHaveLength(3);
+    expect(hunks[0]).toMatchObject({ gap: { hidden: 17, server: { start: 1, count: 17 } }, lines: { server: { start: 18, count: 7 }, device: { start: 18, count: 7 } } });
+    expect(hunks[1]).toMatchObject({ gap: { hidden: 24, server: { start: 25, count: 24 }, device: { start: 25, count: 24 } }, lines: { server: { start: 49, count: 7 }, device: { start: 49, count: 8 } } });
+    expect(hunks[2]).toMatchObject({ gap: { hidden: 7, server: { start: 56, count: 7 }, device: { start: 57, count: 7 } }, lines: null });
+    expect(shown.every((row) => rows.includes(row as (typeof rows)[number]))).toBe(true);
+    expect(changedRows(shown as typeof rows)).toEqual(changedRows(rows));
+    expect(shown.find((row) => row.kind === 'context')).toMatchObject({ serverLine: 18, deviceLine: 18, text: 'head 18\n' });
+
+    const expanded = collapseConflictDiff(rows, { [hunks[0]!.gap!.id]: true });
+    expect(expanded.filter((item) => item.kind !== 'hunk')).toHaveLength(shown.length + 17);
+    expect(expanded[0]).toMatchObject({ kind: 'hunk', gap: null, lines: { server: { start: 1, count: 24 } } });
+    expect(collapseConflictDiff(rows, Object.fromEntries(hunks.map((hunk) => [hunk.gap!.id, true]))).filter((item) => item.kind !== 'hunk')).toEqual(rows);
+  });
+
+  it('keeps short unchanged runs inline instead of hiding a handful of lines', () => {
+    const file = textFile('short.md', 'a\nb\nc\nserver\nd\ne\nf\ng\nh\ni\nserver again\nj\n', 'a\nb\nc\ndevice\nd\ne\nf\ng\nh\ni\ndevice again\nj\n');
+    const rows = buildConflictDiff(file);
+    const items = collapseConflictDiff(rows);
+
+    expect(items[0]).toMatchObject({ kind: 'hunk', gap: null, lines: { server: { start: 1, count: 12 } } });
+    expect(items.slice(1)).toEqual(rows);
+    expect(formatDiffLineRange({ start: 4, count: 1 })).toBe('line 4');
+    expect(formatDiffLineRange({ start: 4, count: 0 })).toBe('no lines');
+    expect(formatDiffLineRange({ start: 4, count: 3 })).toBe('lines 4\u20136');
   });
 
   it('distinguishes an absent side from an empty text file', () => {

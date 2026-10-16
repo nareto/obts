@@ -1,10 +1,13 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
+  import Icon from './Icon.svelte';
   import Status from './Status.svelte';
   import {
     buildConflictDiff,
     changedRows,
     choicesForAllRows,
+    collapseConflictDiff,
+    formatDiffLineRange,
     hasDivergentFinalPaths,
     isAgreedFileDeletion,
     previewOutcomeLabel,
@@ -13,7 +16,9 @@
     submissionCandidateKey,
     unresolvedLineCount,
     validateManualPathTargets,
+    type CollapsedDiffGap,
     type ConflictDiffRow,
+    type DiffLineRange,
     type LineResolution
   } from '../conflictDiff';
   import type {
@@ -47,6 +52,7 @@
   let resolutionKind: ConflictResolutionKind = 'keep_server';
   let lineChoices: Record<string, Record<string, LineResolution>> = {};
   let diffs: Record<string, ConflictDiffRow[]> = {};
+  let expandedGaps: Record<string, Record<string, boolean>> = {};
   let manualTextByPath: Record<string, string> = {};
   let manualPathByGroup: Record<string, string> = {};
   let manualContentByGroup: Record<string, string> = {};
@@ -98,6 +104,7 @@
     mode = 'whole';
     resolutionKind = 'keep_server';
     diffs = Object.fromEntries(review.files.map((file) => [file.path, buildConflictDiff(file)]));
+    expandedGaps = {};
     lineChoices = {};
     manualTextByPath = Object.fromEntries(
       review.files.map((file) => [file.path, file.server_content ?? file.device_content ?? ''])
@@ -345,6 +352,18 @@
 
   function resultPolicyLabel(): string {
     return mode === 'lines' ? 'Line-by-line final content' : choiceLabel(resolutionKind);
+  }
+
+  function expandGap(path: string, gapId: string) {
+    expandedGaps = { ...expandedGaps, [path]: { ...(expandedGaps[path] ?? {}), [gapId]: true } };
+  }
+
+  function hunkLabel(server: DiffLineRange, device: DiffLineRange): string {
+    return `Server main ${formatDiffLineRange(server)} \u2194 Device: ${review.device_name} ${formatDiffLineRange(device)}`;
+  }
+
+  function gapLabel(gap: CollapsedDiffGap): string {
+    return `Show ${gap.hidden} unchanged line${gap.hidden === 1 ? '' : 's'} (${hunkLabel(gap.server, gap.device)})`;
   }
 
   function displayLine(value: string): string {
@@ -644,11 +663,20 @@
                   </div>
                 {:else}
                   <div class="github-diff" aria-label={`Server and device changes for ${file.path}`}>
-                    <div class="diff-hunk-header">
-                      <span class="line-number">...</span><span class="line-number">...</span><code>@@ Server main &harr; Device: {review.device_name} @@</code>
-                    </div>
-                    {#each rows as row}
-                      {#if row.kind === 'context'}
+                    {#each collapseConflictDiff(rows, expandedGaps[file.path]) as row (row.id)}
+                      {#if row.kind === 'hunk'}
+                        <div class="diff-hunk-header" class:has-gap={row.gap !== null}>
+                          {#if row.gap}
+                            {@const gap = row.gap}
+                            <button class="diff-expand" title={gapLabel(gap)} aria-label={gapLabel(gap)} on:click={() => expandGap(file.path, gap.id)}>
+                              <Icon name="expand" size={16} />
+                            </button>
+                          {:else}
+                            <span class="line-number">...</span><span class="line-number">...</span>
+                          {/if}
+                          <code>{#if row.lines}<span class="diff-hunk-range">@@ {hunkLabel(row.lines.server, row.lines.device)} @@</span>{/if}{#if row.gap}<span class="diff-gap-note">{row.gap.hidden} unchanged line{row.gap.hidden === 1 ? '' : 's'} hidden</span>{/if}</code>
+                        </div>
+                      {:else if row.kind === 'context'}
                         <div class="diff-code-row context">
                           <span class="line-number">{row.serverLine}</span>
                           <span class="line-number">{row.deviceLine}</span>

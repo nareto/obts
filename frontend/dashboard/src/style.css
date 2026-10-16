@@ -3666,6 +3666,37 @@ pre {
   color: inherit;
 }
 
+.diff-hunk-header.has-gap {
+  border-top: 1px solid color-mix(in srgb, var(--conflict-blue) 20%, var(--conflict-border));
+}
+
+.diff-expand {
+  display: grid;
+  grid-column: span 2;
+  place-items: center;
+  min-height: 28px;
+  padding: 0;
+  color: inherit;
+  background: color-mix(in srgb, var(--conflict-blue) 12%, var(--conflict-blue-soft));
+  border: 0;
+  border-right: 1px solid var(--conflict-border);
+  border-radius: 0;
+}
+
+.diff-expand:hover {
+  color: #ffffff;
+  background: var(--conflict-blue);
+}
+
+.diff-gap-note {
+  color: var(--muted);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+.diff-hunk-range + .diff-gap-note {
+  margin-left: 12px;
+}
+
 .diff-code-row {
   grid-template-columns: 48px 48px 24px minmax(280px, 1fr);
   min-width: max-content;

@@ -487,6 +487,43 @@ try {
     await expect(page.getByRole('button',{name:'Apply resolution',exact:true})).toBeVisible();
   });
 
+  await scenario('long conflict files show GitHub-style hunks with expandable unchanged context',async({page,navigate})=>{
+    const favicon=page.locator('link[rel="icon"]');
+    await expect(favicon).toHaveAttribute('type','image/svg+xml');
+    const faviconResponse=await page.request.get(await favicon.evaluate(link=>link.href));
+    assert.equal(faviconResponse.status(),200,'favicon is served');
+    assert.match(await faviconResponse.text(),/<svg/u);
+    await navigate('Conflicts');
+    const file=page.locator('.conflict-file').first();
+    await expect(file.locator('.diff-code-row')).toHaveCount(17);
+    await expect(file.locator('.diff-hunk-header')).toHaveCount(3);
+    await expect(file.locator('.diff-hunk-header').first()).toContainText('Server main lines 40–46');
+    await expect(file.locator('.diff-hunk-header').first()).toContainText('39 unchanged lines hidden');
+    await expect(file.getByText('Long intro 1:',{exact:false})).toHaveCount(0);
+    await file.getByRole('button',{name:/^Show 39 unchanged lines \(Server main lines 1–39/u}).click();
+    await expect(file.locator('.diff-code-row')).toHaveCount(56);
+    await expect(file.getByText('Long intro 1: unchanged',{exact:false})).toBeVisible();
+    await expect(file.locator('.diff-code-row').first().locator('.line-number').first()).toHaveText('1');
+    await page.getByRole('button',{name:'Line by line',exact:true}).click();
+    await expect(file.locator('.diff-code-row')).toHaveCount(56);
+    await page.getByRole('button',{name:'All device',exact:true}).first().click();
+    const previewRequest=page.waitForRequest(request=>request.url().endsWith('/preview'));
+    await page.getByRole('button',{name:'Review result',exact:true}).click();
+    const first=(await previewRequest).postDataJSON().manual_files['Projects/Weekend plans.md'];
+    assert.ok(first.includes('Long body 30: unchanged'),'hidden context is still part of the assembled file');
+    assert.ok(first.includes('- Plan the trip on Sunday') && first.includes('- Another device idea'));
+    assert.ok(!first.includes('Saturday'));
+  },{prepare:async({fixture})=>{
+    const lines=(count,prefix)=>Array.from({length:count},(_,index)=>`${prefix} ${index+1}: unchanged note text.`);
+    const head=['# Weekly review','',...lines(40,'Long intro')];
+    const middle=lines(60,'Long body');
+    const tail=lines(40,'Long footer');
+    const review=fixture.routes['/vaults/sample-vault/conflicts/sample-conflict'];
+    review.files[0]={...review.files[0],
+      server_content:[...head,'- Plan the trip on Saturday',...middle,'## Ideas','- Server-side idea',...tail].join('\n')+'\n',
+      device_content:[...head,'- Plan the trip on Sunday',...middle,'## Ideas','- Device-side idea','- Another device idea',...tail].join('\n')+'\n'};
+  }});
+
   await scenario('manual refresh owns its request; a focus trigger waits and runs once as the trailing refresh',async({page,fixture})=>{
     const dashboardGets=()=>fixture.requests.filter(request=>request.path.endsWith('/dashboard')).length;
     const before=dashboardGets();

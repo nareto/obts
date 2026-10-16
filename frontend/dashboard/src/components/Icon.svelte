@@ -15,6 +15,7 @@
     | 'info'
     | 'warning'
     | 'danger'
+    | 'expand'
     | 'dot';
 
   export let name: IconName;
@@ -56,6 +57,8 @@
     <path d="m10 2.8 7.2 13H2.8L10 2.8Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" /><path d="M10 7v4M10 13.5v.1" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
   {:else if name === 'danger'}
     <circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.6" /><path d="m7.2 7.2 5.6 5.6M12.8 7.2l-5.6 5.6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+  {:else if name === 'expand'}
+    <path d="M10 2.5v4.75M10 12.75v4.75M7 4.5l3-2.5 3 2.5M7 15.5l3 2.5 3-2.5M3 10h1.5M7.25 10h1.5M11.25 10h1.5M15.5 10H17" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
   {:else}
     <circle cx="10" cy="10" r="3.2" fill="currentColor" />
   {/if}

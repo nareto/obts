@@ -34,6 +34,30 @@ export type ConflictDiffRow =
       deviceTokens: DiffToken[];
     };
 
+export const DIFF_CONTEXT_LINES = 3;
+const MIN_COLLAPSED_LINES = 4;
+
+export type DiffLineRange = {
+  start: number;
+  count: number;
+};
+
+export type CollapsedDiffGap = {
+  id: string;
+  hidden: number;
+  server: DiffLineRange;
+  device: DiffLineRange;
+};
+
+export type ConflictDiffDisplayItem =
+  | ConflictDiffRow
+  | {
+      kind: 'hunk';
+      id: string;
+      gap: CollapsedDiffGap | null;
+      lines: { server: DiffLineRange; device: DiffLineRange } | null;
+    };
+
 export function hasDivergentFinalPaths(group: ConflictReviewPath): boolean {
   return group.server_path !== group.device_path;
 }
@@ -103,6 +127,74 @@ export function buildConflictDiff(file: ConflictReviewFile): ConflictDiffRow[] {
     }
   }
   return rows;
+}
+
+export function collapseConflictDiff(
+  rows: ConflictDiffRow[],
+  expandedGaps: Readonly<Record<string, boolean>> = {},
+  context = DIFF_CONTEXT_LINES
+): ConflictDiffDisplayItem[] {
+  const visible = rows.map((row) => row.kind === 'change');
+  rows.forEach((row, index) => {
+    if (row.kind !== 'change') return;
+    for (let offset = Math.max(0, index - context); offset <= Math.min(rows.length - 1, index + context); offset += 1) {
+      visible[offset] = true;
+    }
+  });
+
+  const gaps = new Map<number, CollapsedDiffGap>();
+  for (let start = 0; start < rows.length; ) {
+    if (visible[start]) {
+      start += 1;
+      continue;
+    }
+    let end = start;
+    while (end + 1 < rows.length && !visible[end + 1]) end += 1;
+    const hidden = rows.slice(start, end + 1);
+    const id = `gap-${rows[start]!.id}`;
+    if (hidden.length < MIN_COLLAPSED_LINES || expandedGaps[id]) {
+      for (let index = start; index <= end; index += 1) visible[index] = true;
+    } else {
+      gaps.set(start, { id, hidden: hidden.length, server: lineRange(hidden, 'serverLine'), device: lineRange(hidden, 'deviceLine') });
+    }
+    start = end + 1;
+  }
+
+  const items: ConflictDiffDisplayItem[] = [];
+  let pendingGap: CollapsedDiffGap | null = null;
+  for (let index = 0; index < rows.length; ) {
+    const gap = gaps.get(index);
+    if (gap) {
+      pendingGap = gap;
+      index += gap.hidden;
+      continue;
+    }
+    let end = index;
+    while (end + 1 < rows.length && !gaps.has(end + 1)) end += 1;
+    const hunkRows = rows.slice(index, end + 1);
+    items.push({
+      kind: 'hunk',
+      id: `hunk-${hunkRows[0]!.id}`,
+      gap: pendingGap,
+      lines: { server: lineRange(hunkRows, 'serverLine'), device: lineRange(hunkRows, 'deviceLine') }
+    });
+    items.push(...hunkRows);
+    pendingGap = null;
+    index = end + 1;
+  }
+  if (pendingGap) items.push({ kind: 'hunk', id: `trailing-${pendingGap.id}`, gap: pendingGap, lines: null });
+  return items;
+}
+
+export function formatDiffLineRange(range: DiffLineRange): string {
+  if (range.count === 0) return 'no lines';
+  if (range.count === 1) return `line ${range.start}`;
+  return `lines ${range.start}\u2013${range.start + range.count - 1}`;
+}
+
+function lineRange(rows: ConflictDiffRow[], side: 'serverLine' | 'deviceLine'): DiffLineRange {
+  const lines = rows.map((row) => row[side]).filter((line): line is number => line !== null);
+  return { start: lines[0] ?? 0, count: lines.length };
 }
 
 export function changedRows(rows: ConflictDiffRow[]): Array<Extract<ConflictDiffRow, { kind: 'change' }>> {
