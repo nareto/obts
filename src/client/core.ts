@@ -183,6 +183,7 @@ type SharedClientInternals = SharedClientCore & {
   pullChunk(input: Record<string, unknown>): Promise<any>;
   putPushChunk(input: Record<string, unknown>): Promise<any>;
   completeConnection(...args: any[]): Promise<any>;
+  getDeviceSelf(token: string): Promise<any>;
   commitExists(commit: string): Promise<boolean>;
   isAncestor(ancestor: string, descendant: string): Promise<boolean>;
   listTreeBlobOids(commit: string): Promise<Map<string, string>>;

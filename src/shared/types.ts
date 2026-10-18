@@ -16,6 +16,7 @@ export type StatusLabel =
   | 'Out of sync — file exceeds upload limit'
   | 'Out of sync — upload limit exceeded'
   | 'Out of sync — local recovery required'
+  | 'Out of sync — file names need repair'
   | 'Stale review'
   | 'Blocked'
   | 'Needs recovery'

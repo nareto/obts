@@ -25,7 +25,7 @@ export class UiElement {
   get allText(): string { return [this.text, ...this.children.map(child => child.allText)].join(' '); }
 }
 
-export async function mobileHarness(root: string, serverUrl: string, options: { request?: (request: any, send: () => Promise<any>) => Promise<any> } = {}) {
+export async function mobileHarness(root: string, serverUrl: string, options: { request?: (request: any, send: () => Promise<any>) => Promise<any>; platform?: 'ios' | 'android' } = {}) {
   const commands = new Map<string, () => Promise<void>>();
   const modals: any[] = [];
   const timers = new Set<any>();
@@ -93,7 +93,7 @@ export async function mobileHarness(root: string, serverUrl: string, options: { 
     Plugin, Modal, Setting,
     PluginSettingTab: class { constructor(public app: any, public plugin: any) {} },
     Notice: class { constructor(message: string) { notices.push(message); } },
-    Platform: { isMobile: true, isIosApp: true }, apiVersion: '1.9.12',
+    Platform: options.platform === 'android' ? { isMobile: true, isAndroidApp: true } : { isMobile: true, isIosApp: true }, apiVersion: '1.9.12',
     requestUrl: async (request: any) => {
       requests.push(new URL(request.url).pathname);
       const send = async () => {

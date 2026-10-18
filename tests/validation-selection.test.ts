@@ -168,6 +168,8 @@ describe('validation selection', () => {
     expect(makePlan(['architecture/models/formal/OBTSVaultCreationReadiness.tla']).formalFamilies).toEqual(['dashboard-protocols']);
     expect(makePlan(['architecture/models/formal/configs/dashboard-positive.cfg']).formalFamilies).toEqual(['dashboard-protocols']);
     expect(makePlan(['architecture/models/formal/configs/device-removal-positive.cfg']).formalFamilies).toEqual(['dashboard-protocols']);
+    expect(makePlan(['architecture/models/formal/OBTSNamePortability.tla']).formalFamilies).toEqual(['name-portability']);
+    expect(makePlan(['architecture/models/formal/configs/name-portability-safety.cfg']).formalFamilies).toEqual(['name-portability']);
     expect(makePlan(['architecture/models/formal/configs/fm014-atomic-rename.cfg']).formalFamilies).toEqual(['atomic-rename']);
     for (const extension of ['tla', 'cfg']) {
       const plan = makePlan([`architecture/models/formal/OBTSUploadCheckpointRecovery.${extension}`]);

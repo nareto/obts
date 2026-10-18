@@ -74,7 +74,7 @@ Every ordinary synchronization, merge, restore, conflict-resolution, and other r
 1. acquire the per-vault mutation lock;
 2. persist an operation identity and expected refs;
 3. validate authorization, objects, ancestry, path policy, limits, and operation invariants in quarantine;
-4. persist a prepared manifest containing every metadata, directory, conflict, audit, event, derived-index, and result effect required after ref movement. Dashboard root-exclusion edits pin the expected main/policy identity, exact candidate tree, directory removals, and associated metadata settings in this manifest; restart applies those effects only for the exact moved target;
+4. persist a prepared manifest containing every metadata, directory, conflict, audit, event, derived-index, and result effect required after ref movement. Dashboard root-exclusion edits pin the expected main/policy identity, exact candidate tree, directory removals, and associated metadata settings in this manifest; restart applies those effects only for the exact moved target. Dashboard name repair likewise pins the expected main, exact candidate tree, rename count, and directory intents;
 5. promote validated objects;
 6. update the target ref with compare-and-swap semantics;
 7. atomically apply the prepared metadata effects and mark the operation committed;

@@ -12,7 +12,8 @@ export const fastTests = [
   'tests/conflict-workbench-ui.test.ts',
   'tests/dashboard-deletion-ui.test.ts',
   'tests/dashboard-live-status.test.ts',
-  'tests/openapi-contract.test.ts'
+  'tests/openapi-contract.test.ts',
+  'tests/name-portability.test.ts'
 ];
 
 export const pluginTests = [
@@ -33,7 +34,8 @@ export const pluginTests = [
   'tests/client-state-authority.test.ts',
   'tests/applied-ack-barrier.test.ts',
   'tests/git-object-cache.test.ts',
-  'tests/git-pack-consolidation.test.ts'
+  'tests/git-pack-consolidation.test.ts',
+  'tests/name-repair-flow.test.ts'
 ];
 
 export const dashboardTests = ['tests/vault-deletion.test.ts'];
@@ -49,5 +51,5 @@ export const checkerTests = [
 ];
 
 export const formalFamilies = [
-  'sync', 'bridge-body', 'workers', 'deletion', 'bridge-protocol', 'onboarding', 'diagnostics', 'client-state', 'vault-settings', 'headless-ownership', 'atomic-rename', 'operation-history', 'dashboard-protocols'
+  'sync', 'bridge-body', 'workers', 'deletion', 'bridge-protocol', 'onboarding', 'diagnostics', 'client-state', 'vault-settings', 'headless-ownership', 'atomic-rename', 'operation-history', 'dashboard-protocols', 'name-portability'
 ];

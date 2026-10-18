@@ -15,6 +15,7 @@ export type StatusLabel =
   | 'Out of sync — file exceeds upload limit'
   | 'Out of sync — upload limit exceeded'
   | 'Out of sync — local recovery required'
+  | 'Out of sync — file names need repair'
   | 'Stale review'
   | 'Blocked'
   | 'Needs recovery'
@@ -243,6 +244,38 @@ export type DashboardSummary = {
   recent_activity: DashboardActivity[];
   maintenance: MaintenanceRow[];
   health: DashboardHealth;
+  name_portability?: NamePortabilitySummary;
+};
+
+export type RestrictedNamePlatform = 'android';
+export type NamePortabilitySummary = {
+  rule_version: number;
+  restricted_platforms: RestrictedNamePlatform[];
+  unportable_path_count: number;
+  restricted_devices: Array<{ device_id: string; device_name: string; platform: RestrictedNamePlatform; blocked: boolean }>;
+};
+export type NameRepairRename = {
+  from: string;
+  to: string;
+  kind: 'file' | 'directory';
+  reasons: Array<'reserved_characters' | 'case_collision'>;
+};
+export type NameRepairPreview = {
+  vault_id: string;
+  rule_version: number;
+  expected_main: string;
+  preview_tree: string;
+  review_fingerprint: string;
+  renames: NameRepairRename[];
+  link_updates: Array<{ path: string; link_count: number }>;
+  changes_main: boolean;
+};
+export type NameRepairResult = {
+  vault_id: string;
+  previous_main: string;
+  current_main: string;
+  renamed_count: number;
+  link_updated_count: number;
 };
 
 export type ConflictResolutionKind =

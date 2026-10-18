@@ -1296,6 +1296,60 @@ export class GitService {
     return Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
   }
 
+  async readBlobsByOid(vaultId: string, oids: string[]): Promise<Map<string, Buffer>> {
+    const unique = [...new Set(oids)];
+    const blobs = new Map<string, Buffer>();
+    if (unique.length === 0) return blobs;
+    const repo = this.repoPath(vaultId);
+    const { stdout } = await this.exec(repo, ['cat-file', '--batch'], Buffer.from(`${unique.join('\n')}\n`, 'utf8'), undefined, {
+      encoding: 'buffer',
+      maxBuffer: 1024 * 1024 * 1024
+    });
+    const data = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
+    let offset = 0;
+    while (offset < data.length) {
+      const newline = data.indexOf(0x0a, offset);
+      if (newline < 0) throw new GitCommandError('Malformed git cat-file output.', '');
+      const match = /^([0-9a-f]+) blob (\d+)$/u.exec(data.subarray(offset, newline).toString('utf8'));
+      if (!match?.[1] || !match[2]) throw new GitCommandError('Expected git blob object.', '');
+      const size = Number.parseInt(match[2], 10);
+      blobs.set(match[1], data.subarray(newline + 1, newline + 1 + size));
+      offset = newline + 1 + size + 1;
+    }
+    return blobs;
+  }
+
+  /** Builds a tree from `sourceCommit` by removing paths and staging exact entries without a worktree. */
+  async createTreeFromIndexEntries(input: {
+    vaultId: string;
+    sourceCommit: string;
+    deletes: string[];
+    entries: Array<{ path: string; mode: string; oid?: string; content?: Buffer }>;
+  }): Promise<string> {
+    const repo = this.repoPath(input.vaultId);
+    const tempRoot = join(this.config.tempDir, `index-tree-${input.vaultId}-${randomBytes(8).toString('hex')}`);
+    const env = { GIT_INDEX_FILE: join(tempRoot, 'index') };
+    await mkdir(tempRoot, { recursive: true, mode: 0o700 });
+    await writeFile(join(tempRoot, '.obts-owner.json'), `${JSON.stringify({ vault_id: input.vaultId })}\n`, { mode: 0o600 });
+    try {
+      await this.exec(repo, ['read-tree', input.sourceCommit], undefined, env);
+      const updates = input.deletes.map((path) => `0 ${ZERO_OID}\t${path}\0`);
+      for (const entry of input.entries) {
+        const oid = entry.content === undefined
+          ? entry.oid
+          : asText((await this.exec(repo, ['hash-object', '-w', '--stdin'], entry.content)).stdout).trim();
+        if (!oid || !/^[0-9a-f]{40}$/u.test(oid)) throw new GitCommandError('Index entry has no object identity.', '');
+        updates.push(`${entry.mode} ${oid}\t${entry.path}\0`);
+      }
+      if (updates.length > 0) {
+        await this.exec(repo, ['update-index', '-z', '--index-info'], Buffer.from(updates.join(''), 'utf8'), env);
+      }
+      return asText((await this.exec(repo, ['write-tree'], undefined, env)).stdout).trim();
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  }
+
   async readBlobAtPathIfPresent(vaultId: string, commit: string, path: string): Promise<Buffer | null> {
     try {
       return await this.readBlobAtPath(vaultId, commit, path);

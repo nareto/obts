@@ -4,6 +4,8 @@ import { createHash } from 'node:crypto';
 import { newId, nowIso } from '../shared/ids.js';
 import { assertSyncableTreePaths, PathPolicyViolation } from '../shared/pathPolicy.js';
 import { createRootIgnorePolicy, RootIgnorePolicyError } from '../shared/rootIgnore.cjs';
+import { findUnportablePaths, NAME_RESTRICTION_RULE_VERSION } from '../shared/namePortability.cjs';
+import { NameRepairError, planNameRepair, rewriteCanvasLinks, rewriteMarkdownLinks, VaultLinkIndex } from './nameRepair.js';
 import { validateMetadataConflictRules, type MetadataConflictRule } from './frontmatterTimestampMerge.js';
 import type {
   ConflictPreviewFile,
@@ -105,8 +107,68 @@ type ResolutionArtifacts = {
   deletes: string[];
 };
 
+export type NameRepairPreviewResult = {
+  vault_id: string;
+  rule_version: number;
+  expected_main: string;
+  preview_tree: string;
+  review_fingerprint: string;
+  renames: Array<{ from: string; to: string; kind: 'file' | 'directory'; reasons: string[] }>;
+  link_updates: Array<{ path: string; link_count: number }>;
+  changes_main: boolean;
+};
+
+const MAX_NAME_REPAIR_LINK_SOURCE_BYTES = 8 * 1024 * 1024;
+const NAME_REPAIR_TEXT_DECODER = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false });
+const UTF8_BOM = Buffer.from([0xef, 0xbb, 0xbf]);
+
+function compareText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+/**
+ * Commits one prepared `name_repair` operation inside a metadata mutation.
+ * Shared by the live path and startup roll-forward; returns false when the
+ * prepared decision no longer matches metadata.
+ */
+export function commitPreparedNameRepair(store: MetadataStore, db: MetadataDb, operationId: string): boolean {
+  const operation = requireOperation(db, operationId);
+  const vault = db.vaults.find((candidate) => candidate.vault_id === operation.vault_id);
+  const manifest = operation.prepared_manifest ?? {};
+  const previousMain = typeof manifest.previous_main === 'string' ? manifest.previous_main : null;
+  const targetMain = typeof manifest.target_main === 'string' ? manifest.target_main : null;
+  const actorUserId = typeof manifest.actor_user_id === 'string' ? manifest.actor_user_id : null;
+  const rawIntents = manifest.directory_intents;
+  const intents = Array.isArray(rawIntents) && rawIntents.every((intent): intent is DirectoryIntent =>
+    Boolean(intent) && typeof intent === 'object' && (intent.op === 'create' || intent.op === 'delete') && typeof intent.path === 'string')
+    ? rawIntents.map((intent) => ({ op: intent.op, path: intent.path })) : null;
+  if (!vault || operation.operation_type !== 'name_repair' || operation.status !== 'prepared' ||
+      !previousMain || !targetMain || !actorUserId || !intents || vault.current_main !== previousMain ||
+      operation.expected_refs['refs/heads/main'] !== previousMain ||
+      operation.target_refs['refs/heads/main'] !== targetMain || operation.target_commit !== targetMain) {
+    return false;
+  }
+  vault.current_main = targetMain;
+  vault.updated_at = nowIso();
+  const event = store.appendEvent(db, {
+    event_type: 'main_advanced', vault_id: operation.vault_id, resource_ids: {},
+    commit_cursors: { previous_main: previousMain, main: targetMain },
+    payload: { name_repair: true, directory_intents: intents }
+  });
+  applyDirectoryIntents(db, operation.vault_id, intents, event.event_seq);
+  db.audit_log.push({
+    audit_id: newId('aud'), actor_user_id: actorUserId, actor_device_id: null, vault_id: operation.vault_id,
+    action: 'vault_name_repair_applied', resource_class: 'vault', resource_id: operation.vault_id, created_at: nowIso()
+  });
+  operation.status = 'committed';
+  operation.result = { target_main: targetMain, event_seq: event.event_seq };
+  operation.updated_at = nowIso();
+  return true;
+}
+
 export class SyncService {
   private readonly locks = new Map<string, Promise<void>>();
+  private readonly unportableCounts = new Map<string, { key: string; count: number }>();
 
   constructor(
     private readonly store: MetadataStore,
@@ -305,6 +367,183 @@ export class SyncService {
       operation.result = { target_main: targetMain, event_seq: event.event_seq };
       operation.updated_at = nowIso();
     });
+  }
+
+  async unportablePathCount(vaultId: string, main: string, explicitDirs: string[]): Promise<number> {
+    const key = `${main}\0${explicitDirs.join('\0')}`;
+    const cached = this.unportableCounts.get(vaultId);
+    if (cached?.key === key) return cached.count;
+    const entries = await this.git.listTreeEntries(vaultId, main);
+    const count = findUnportablePaths(entries.map((entry) => entry.path), explicitDirs).length;
+    this.unportableCounts.set(vaultId, { key, count });
+    return count;
+  }
+
+  private async computeNameRepair(vaultId: string, actorUserId: string): Promise<{
+    preview: NameRepairPreviewResult; intents: DirectoryIntent[]; linkUpdatedCount: number;
+  }> {
+    const db = await this.store.snapshot();
+    const vault = requireVault(db, vaultId);
+    if (vault.owner_user_id !== actorUserId) throw new AuthError(404, 'not_found', 'Resource not found.');
+    if (vault.status !== 'active') throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+    const main = vault.current_main;
+    const entries = (await this.git.listTreeEntries(vaultId, main)).filter((entry) => entry.type === 'blob');
+    const byPath = new Map(entries.map((entry) => [entry.path, entry]));
+    const explicitDirs = [...(db.directory_state_by_vault[vaultId]?.explicit_dirs ?? [])].sort();
+    let plan;
+    try {
+      plan = planNameRepair(entries.map((entry) => entry.path), explicitDirs);
+    } catch (error) {
+      if (error instanceof NameRepairError) throw new AuthError(409, error.code, error.message);
+      throw error;
+    }
+    const rootPolicy = await this.git.readRootIgnoreBlob(vaultId, main);
+    const policy = createRootIgnorePolicy(rootPolicy.bytes);
+    for (const rename of plan.renames) {
+      if (policy.ignores(rename.to, rename.kind === 'directory')) {
+        throw new AuthError(409, 'name_repair_excluded_path', 'A repaired name would be excluded by the vault .gitignore; rename it manually.');
+      }
+    }
+
+    const linkUpdates: Array<{ path: string; link_count: number }> = [];
+    const contentWrites = new Map<string, Buffer>();
+    const fileRenames = plan.renames.filter((rename) => rename.kind === 'file');
+    if (fileRenames.length > 0) {
+      const oldIndex = new VaultLinkIndex(entries.map((entry) => entry.path));
+      const newIndex = new VaultLinkIndex(plan.files);
+      const map = (path: string) => plan.fileMap.get(path) ?? path;
+      const linkSources = entries.filter((entry) => /\.(md|canvas)$/iu.test(entry.path) && entry.mode !== '120000' &&
+        (entry.size ?? 0) <= MAX_NAME_REPAIR_LINK_SOURCE_BYTES);
+      const blobs = await this.git.readBlobsByOid(vaultId, linkSources.map((entry) => entry.oid));
+      for (const entry of linkSources) {
+        const bytes = blobs.get(entry.oid);
+        if (!bytes) continue;
+        let text: string;
+        try {
+          text = NAME_REPAIR_TEXT_DECODER.decode(bytes);
+        } catch {
+          continue;
+        }
+        const rewritten = /\.canvas$/iu.test(entry.path)
+          ? rewriteCanvasLinks(text, plan.fileMap)
+          : rewriteMarkdownLinks(text, { sourceOld: entry.path, sourceNew: map(entry.path), oldIndex, newIndex, map });
+        if (!rewritten) continue;
+        const prefix = bytes.subarray(0, 3).equals(UTF8_BOM) ? UTF8_BOM : Buffer.alloc(0);
+        contentWrites.set(map(entry.path), Buffer.concat([prefix, Buffer.from(rewritten.text, 'utf8')]));
+        linkUpdates.push({ path: map(entry.path), link_count: rewritten.count });
+      }
+      linkUpdates.sort((left, right) => compareText(left.path, right.path));
+    }
+
+    const treeEntries: Array<{ path: string; mode: string; oid?: string; content?: Buffer }> = [];
+    for (const rename of fileRenames) {
+      const source = byPath.get(rename.from)!;
+      const content = contentWrites.get(rename.to);
+      treeEntries.push(content ? { path: rename.to, mode: source.mode, content } : { path: rename.to, mode: source.mode, oid: source.oid });
+    }
+    const renamedTargets = new Set(fileRenames.map((rename) => rename.to));
+    for (const [path, content] of contentWrites) {
+      if (!renamedTargets.has(path)) treeEntries.push({ path, mode: byPath.get(path)!.mode, content });
+    }
+    const currentTree = await this.git.treeHash(vaultId, main);
+    const tree = treeEntries.length === 0 ? currentTree : await this.git.createTreeFromIndexEntries({
+      vaultId, sourceCommit: main, deletes: fileRenames.map((rename) => rename.from), entries: treeEntries
+    });
+
+    const newDirs = new Set(plan.directories);
+    const oldDirs = new Set(explicitDirs);
+    const intents: DirectoryIntent[] = [
+      ...explicitDirs.filter((path) => !newDirs.has(path)).map((path) => ({ op: 'delete' as const, path })),
+      ...plan.directories.filter((path) => !oldDirs.has(path)).map((path) => ({ op: 'create' as const, path }))
+    ];
+    const renames = plan.renames.map((rename) => ({ from: rename.from, to: rename.to, kind: rename.kind, reasons: rename.reasons }));
+    const reviewFingerprint = createHash('sha256').update(JSON.stringify({
+      vault_id: vaultId, rule_version: NAME_RESTRICTION_RULE_VERSION, expected_main: main, preview_tree: tree,
+      renames, link_updates: linkUpdates, directory_intents: intents
+    })).digest('hex');
+    return {
+      preview: {
+        vault_id: vaultId,
+        rule_version: NAME_RESTRICTION_RULE_VERSION,
+        expected_main: main,
+        preview_tree: tree,
+        review_fingerprint: reviewFingerprint,
+        renames,
+        link_updates: linkUpdates,
+        changes_main: tree !== currentTree || intents.length > 0
+      },
+      intents,
+      linkUpdatedCount: linkUpdates.length
+    };
+  }
+
+  async previewNameRepair(vaultId: string, actorUserId: string): Promise<NameRepairPreviewResult> {
+    return (await this.computeNameRepair(vaultId, actorUserId)).preview;
+  }
+
+  async applyNameRepair(input: {
+    vaultId: string; actorUserId: string; expectedMain: string; expectedPreviewTree: string; expectedReviewFingerprint: string;
+  }): Promise<Record<string, unknown>> {
+    return await this.withVaultLock(input.vaultId, async () => {
+      const { preview, intents, linkUpdatedCount } = await this.computeNameRepair(input.vaultId, input.actorUserId);
+      if (preview.expected_main !== input.expectedMain || preview.preview_tree !== input.expectedPreviewTree ||
+          preview.review_fingerprint !== input.expectedReviewFingerprint) {
+        throw new AuthError(409, 'stale_name_repair', 'The vault changed since the preview; review the repair again.');
+      }
+      if (preview.renames.length === 0) {
+        throw new AuthError(409, 'name_repair_not_needed', 'Every file name is already portable.');
+      }
+      const targetTree = preview.preview_tree;
+      const targetMain = await this.git.createMainCommitFromTree({
+        vaultId: input.vaultId, tree: targetTree, parentMain: input.expectedMain,
+        subject: 'obts: repair file names for restricted devices',
+        body: `actor_user_id=${input.actorUserId}\nname_rule_version=${NAME_RESTRICTION_RULE_VERSION}\nrenamed_count=${preview.renames.length}\nlink_updated_count=${linkUpdatedCount}\n`,
+        actor: 'obts-name-repair'
+      });
+      await this.git.validateTreePathPolicy(input.vaultId, targetMain);
+      if (await this.git.validateTreeRootIgnorePolicy(input.vaultId, targetMain) !==
+          (await this.git.readRootIgnoreBlob(input.vaultId, input.expectedMain)).oid) {
+        throw new AuthError(409, 'name_repair_excluded_path', 'The repaired tree does not satisfy the vault .gitignore.');
+      }
+      const operationId = await this.store.mutate((mutableDb) => {
+        const current = requireVault(mutableDb, input.vaultId);
+        if (current.current_main !== input.expectedMain) throw new AuthError(409, 'stale_name_repair', 'The vault changed since the preview; review the repair again.');
+        const operation = this.store.startOperation(mutableDb, {
+          vault_id: input.vaultId, device_id: null, operation_type: 'name_repair',
+          expected_refs: { 'refs/heads/main': input.expectedMain }, target_refs: { 'refs/heads/main': targetMain }, target_commit: targetMain
+        });
+        operation.status = 'prepared';
+        operation.prepared_manifest = {
+          actor_user_id: input.actorUserId, previous_main: input.expectedMain, target_main: targetMain,
+          target_tree: targetTree, rule_version: NAME_RESTRICTION_RULE_VERSION, renamed_count: preview.renames.length,
+          link_updated_count: linkUpdatedCount, directory_intents: intents, target_refs: { 'refs/heads/main': targetMain }
+        };
+        operation.updated_at = nowIso();
+        return operation.operation_id;
+      });
+      try {
+        await this.git.updateRef(input.vaultId, 'refs/heads/main', targetMain, input.expectedMain);
+      } catch (error) {
+        const actual = await this.git.getRef(input.vaultId, 'refs/heads/main');
+        if (actual === input.expectedMain) {
+          await this.abortOperation(operationId, 'name_repair_ref_not_moved');
+          throw error;
+        }
+        if (actual !== targetMain) {
+          await this.blockPreparedOperationForIntegrity(operationId, 'name repair ref cannot be reconciled');
+          throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
+        }
+      }
+      await this.store.mutate((mutableDb) => {
+        if (!commitPreparedNameRepair(this.store, mutableDb, operationId)) {
+          throw new Error('Prepared name repair operation is invalid.');
+        }
+      });
+      return {
+        vault_id: input.vaultId, previous_main: input.expectedMain, current_main: targetMain,
+        renamed_count: preview.renames.length, link_updated_count: linkUpdatedCount
+      };
+    }, true);
   }
 
   async metadataConflictRules(vaultId: string): Promise<MetadataConflictRule[]> {

@@ -52,6 +52,7 @@
     Session,
     VaultSummary,
     MetadataConflictRule,
+    NameRepairPreview,
     VaultSyncSettings,
     VaultSyncSettingsPreview
   } from './api/types';
@@ -557,7 +558,7 @@
     const activeDevices = value.devices.filter((device) => !isDeviceRevoked(device));
     if (activeDevices.length === 0) return { label: 'Status unknown', role: 'warning' };
     if (activeDevices.every((device) => device.status_label === 'Synced')) return { label: 'Synced', role: 'success' };
-    if (activeDevices.some((device) => ['Blocked', 'Needs recovery', 'Integrity failure', 'Conflict resolution needed', 'Out of sync — file exceeds upload limit', 'Out of sync — upload limit exceeded', 'Out of sync — local recovery required', 'Server repair required'].includes(device.status_label))) {
+    if (activeDevices.some((device) => ['Blocked', 'Needs recovery', 'Integrity failure', 'Conflict resolution needed', 'Out of sync — file exceeds upload limit', 'Out of sync — upload limit exceeded', 'Out of sync — local recovery required', 'Out of sync — file names need repair', 'Server repair required'].includes(device.status_label))) {
       return { label: 'Attention required', role: 'danger' };
     }
     if (activeDevices.some((device) => isActiveStatusLabel(device.status_label))) {
@@ -1480,7 +1481,7 @@
       go(vaultRoute(vaultId, 'maintenance'));
       return;
     }
-    if (item.kind === 'devices') {
+    if (item.kind === 'devices' || item.kind === 'name_repair') {
       go(vaultRoute(vaultId, 'devices'));
       return;
     }
@@ -1591,6 +1592,29 @@
       }
     } finally {
       if (connectionOperationGeneration === generation) connectionOperationInFlight = false;
+    }
+  }
+
+  async function previewNameRepair(): Promise<NameRepairPreview> {
+    if (!vaultId || selectedVaultDeleting) throw new Error('Select an active vault before repairing names.');
+    return await api.previewNameRepair(vaultId);
+  }
+
+  async function applyNameRepair(preview: NameRepairPreview) {
+    if (!vaultId || selectedVaultDeleting) return;
+    const requestedVaultId = vaultId;
+    const epoch = stateEpoch;
+    actionError = '';
+    try {
+      const result = await api.applyNameRepair(requestedVaultId, preview);
+      if (!currentRequest(requestedVaultId, epoch)) return;
+      const links = result.link_updated_count ? ` and updated links in ${result.link_updated_count} note${result.link_updated_count === 1 ? '' : 's'}` : '';
+      showNotice(`Renamed ${result.renamed_count} item${result.renamed_count === 1 ? '' : 's'}${links}. Devices pick up the new names on their next sync.`);
+      await refreshVault();
+    } catch (error) {
+      if (!currentRequest(requestedVaultId, epoch)) return;
+      if (error instanceof ApiError && error.status === 401) reportAsyncError(error, 'Unable to repair file names.', epoch);
+      throw error;
     }
   }
 
@@ -2194,6 +2218,11 @@
           onRename={renameDevice}
           onRevoke={revokeDevice}
           onRemove={openDeviceRemoval}
+          namePortability={dashboard.name_portability ?? null}
+          currentMain={dashboard.vault.current_main}
+          busy={busy || selectedVaultDeleting}
+          onPreviewNameRepair={previewNameRepair}
+          onApplyNameRepair={applyNameRepair}
         />
       {:else if page === 'Conflicts' && dashboard}
         <main class="conflict-layout">

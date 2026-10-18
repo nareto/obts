@@ -35,7 +35,23 @@ export function createFixtures() {
   const checks = ['metadata_store','git_store','temp_workspace','migrations','git','filesystem_permissions','event_delivery','persistent_state'];
   const labels = ['Metadata database','Server Git store','Temporary workspace','Migrations','Native Git','Filesystem permissions','Event delivery','Persistent-state backup contract'];
   const summary = {vault,devices,recommended_plugin_version:'0.3.25',unresolved_conflict_count:1,conflicts:[conflict],recent_activity:['Device synchronized','Changes merged into server main','Conflict recorded','Device connected'].map((label,i)=>({event_id:`sample-event-${i}`,event_seq:100-i,event_type:'sample',label,created_at:ago(i*8),device_id:devices[i%3].device_id,main})),maintenance:checks.map((key,i)=>({key,label:labels[i],status_label:'Synced',last_checked_at:now,detail:i===7?'Backup must include metadata and Git stores.':'Check passed',...(i===1?{action:'start_git_maintenance'}:i===7?{action:'view_backup_contract'}:{})})),health:{status:'ready',checks:Object.fromEntries(checks.map(k=>[k,true])),detail:null,git_version:'git version 2.49.0',checked_at:ago(1),checking:false,stale:false,state:'verified'}};
-  const oldSummary = {...summary,vault:oldVault,devices:[],conflicts:[],unresolved_conflict_count:0,recent_activity:[]};
+  summary.name_portability = {rule_version:1,restricted_platforms:['android'],unportable_path_count:0,restricted_devices:[{device_id:devices[2].device_id,device_name:devices[2].device_name,platform:'android',blocked:false}]};
+  const oldSummary = {...summary,vault:oldVault,devices:[],conflicts:[],unresolved_conflict_count:0,recent_activity:[],name_portability:{...summary.name_portability,restricted_devices:[]}};
+  const nameRepair = {staleNext:false,applied:null,preview:{vault_id:vault.vault_id,rule_version:1,expected_main:main,preview_tree:'d'.repeat(40),review_fingerprint:'e'.repeat(64),changes_main:true,
+    renames:[
+      {from:'Inbox/Meeting: Q3 plan.md',to:'Inbox/Meeting - Q3 plan.md',kind:'file',reasons:['reserved_characters']},
+      {from:'Notes/todo.md',to:'Notes/todo (2).md',kind:'file',reasons:['case_collision']},
+      {from:'Projects/Why? Ideas.md',to:'Projects/Why Ideas.md',kind:'file',reasons:['reserved_characters']},
+      {from:'Reading/"Piranesi" notes.md',to:"Reading/'Piranesi' notes.md",kind:'file',reasons:['reserved_characters']},
+      {from:'Recipes/Pasta | quick.md',to:'Recipes/Pasta - quick.md',kind:'file',reasons:['reserved_characters']},
+      {from:'Travel/lisbon',to:'Travel/Lisbon',kind:'directory',reasons:['case_collision']}
+    ],
+    link_updates:[{path:'Daily/2026-10-12.md',link_count:3},{path:'Home.canvas',link_count:1},{path:'Projects/Index.md',link_count:2}]}};
+  function enableNameRepair() {
+    summary.name_portability.unportable_path_count = 6;
+    summary.name_portability.restricted_devices[0].blocked = true;
+    Object.assign(devices[2],{status_label:'Out of sync — file names need repair',local_status_label:'Out of sync — file names need repair',local_error_code:'unportable_target_paths',status_report_fresh:true,status_report_age_seconds:20,last_seen_at:ago(0),last_status_report_at:ago(0),offline:false,blocked:true,plugin_version:'0.3.25'});
+  }
   const syncSettings = {vault_id:vault.vault_id,current_main:main,root_ignore_oid:null,root_ignore:null,metadata_conflict_rules:[]};
   const diagnostic = {event_id:'sample-diagnostic-0',plugin_version:'0.3.25',obsidian_version:'1.8.0',platform_family:'linux',flow:'sync',stage:'upload',failure_code:'sample_failure',error_class:'network',retryable:true,breadcrumbs:[{point:'request',outcome:'failed',value_kind:'none',size_bucket:'small',error_code:'timeout'}],received_at:now};
   const routes = {'/setup/status':{setup_complete:true},'/auth/session':{user_id:'sample-owner',csrf_token:'',recent_auth_expires_at:'2099-01-01T00:00:00Z'},'/vaults':{vaults:[vault,oldVault]},'/vault-deletions':{deletions:[]},'/diagnostic-events':{ingestion_enabled:false,retention_days:30,events:[diagnostic],next_cursor:null},'/vaults/sample-vault/dashboard':summary,'/vaults/old-test-vault/dashboard':oldSummary,'/vaults/sample-vault/sync-settings':syncSettings,'/vaults/old-test-vault/sync-settings':{...syncSettings,vault_id:oldVault.vault_id,current_main:oldVault.current_main},'/vaults/sample-vault/conflicts':{conflicts:[conflict]},'/vaults/old-test-vault/conflicts':{conflicts:[]},'/vaults/sample-vault/conflicts/sample-conflict':review};
@@ -85,6 +101,23 @@ export function createFixtures() {
         if(body.review_fingerprint!=='b'.repeat(64)){await route.fulfill({status:409,json:{error:{code:'stale_settings',message:'Review settings again.'}}});return;}
         Object.assign(syncSettings,{root_ignore:body.root_ignore,metadata_conflict_rules:body.metadata_conflict_rules});
         await route.fulfill({status:200,json:syncSettings});return;
+      }
+      if(method==='POST'&&path==='/vaults/sample-vault/name-repair/preview'){
+        await route.fulfill({status:200,json:{...nameRepair.preview,expected_main:vault.current_main}});return;
+      }
+      if(method==='POST'&&path==='/vaults/sample-vault/name-repair'){
+        const body=request.postDataJSON();
+        if(nameRepair.staleNext||body.expected_main!==vault.current_main||body.review_fingerprint!==nameRepair.preview.review_fingerprint){
+          nameRepair.staleNext=false;
+          await route.fulfill({status:409,json:{error:{code:'stale_name_repair',message:'The vault changed since the preview; review the repair again.'}}});return;
+        }
+        const previous=vault.current_main;
+        vault.current_main='c'.repeat(40);
+        summary.name_portability.unportable_path_count=0;
+        summary.name_portability.restricted_devices[0].blocked=false;
+        Object.assign(devices[2],{status_label:'Synced',local_status_label:'Synced',local_error_code:null,blocked:false,last_applied_main:vault.current_main,local_main:vault.current_main});
+        nameRepair.applied=body;
+        await route.fulfill({status:200,json:{vault_id:vault.vault_id,previous_main:previous,current_main:vault.current_main,renamed_count:nameRepair.preview.renames.length,link_updated_count:nameRepair.preview.link_updates.length}});return;
       }
       if(method==='POST'&&path==='/auth/reauthenticate'){await route.fulfill({status:200,json:routes['/auth/session']});return;}
       if(method==='POST'&&path==='/vaults/sample-vault/history/query'){
@@ -184,5 +217,5 @@ export function createFixtures() {
     holds.push({path,method,gate,markStarted,used:false});
     return {release,started};
   }
-  return {eventRequests,holdNext,vault,oldVault,devices,addRevokedDevices,summary,oldSummary,conflict,review,routes,requests,unexpected,install,setFailure(value){failure=value;},scriptRemovalResponses(responses){removalScript.push(...responses);},removalResponses,setDelay(value){delay=value;},setDeletionStatus(statuses){routes['/vault-deletions']={deletions:statuses};}};
+  return {eventRequests,holdNext,nameRepair,enableNameRepair,vault,oldVault,devices,addRevokedDevices,summary,oldSummary,conflict,review,routes,requests,unexpected,install,setFailure(value){failure=value;},scriptRemovalResponses(responses){removalScript.push(...responses);},removalResponses,setDelay(value){delay=value;},setDeletionStatus(statuses){routes['/vault-deletions']={deletions:statuses};}};
 }

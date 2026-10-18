@@ -2519,6 +2519,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       },
       detail: 'vault main ref is inconsistent with metadata'
     });
+    expect(dashboard.body).not.toHaveProperty('name_portability');
   });
 
   it('keeps an uploading device behind until it acknowledges applying the merge commit', async () => {

@@ -10,11 +10,17 @@
   export type AttentionItem =
     | { kind: 'maintenance'; label: string; action: string }
     | { kind: 'devices'; label: string; action: string }
+    | { kind: 'name_repair'; label: string; action: string }
     | { kind: 'conflict'; label: string; action: string; conflictId: string }
     | { kind: 'stale_conflict'; label: string; action: string; conflictId: string };
 
   $: activeDevices = dashboard.devices.filter((device) => !isDeviceRevoked(device));
   $: healthView = describeHealth(dashboard.health);
+  $: unportableCount = dashboard.name_portability?.unportable_path_count ?? 0;
+  $: namePlatforms = (dashboard.name_portability?.restricted_platforms ?? []).map((platform) => (platform === 'android' ? 'Android' : platform)).join(' and ') || 'Android';
+  $: nameItems = unportableCount > 0
+    ? [{ kind: 'name_repair', label: `${unportableCount} file name${unportableCount === 1 ? '' : 's'} can't sync to ${namePlatforms}`, action: 'Repair names' } satisfies AttentionItem]
+    : [];
   $: healthItems =
     ['stale', 'pending', 'failed'].includes(healthView.state)
       ? [{ kind: 'maintenance', label: healthView.summary, action: 'Open maintenance' } satisfies AttentionItem]
@@ -23,8 +29,9 @@
         : [{ kind: 'maintenance', label: 'Integrity failure', action: 'Open maintenance' } satisfies AttentionItem];
   $: items = [
     ...healthItems,
+    ...nameItems,
     ...activeDevices
-      .filter((device) => device.blocked)
+      .filter((device) => device.blocked && !(unportableCount > 0 && device.local_error_code === 'unportable_target_paths'))
       .map((device) => ({ kind: 'devices', label: `Blocked device: ${device.device_name}`, action: 'Open devices' }) satisfies AttentionItem),
     ...conflicts
       .filter((conflict) => conflict.status === 'open' && !conflict.stale)

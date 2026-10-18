@@ -10,6 +10,7 @@ import { DIAGNOSTIC_MAX_BODY_BYTES } from '../shared/diagnostics.js';
 import { newId, nowIso } from '../shared/ids.js';
 import { isSyncableVaultPath, PathPolicyViolation } from '../shared/pathPolicy.js';
 import { MAX_ROOT_IGNORE_BYTES, RootIgnorePolicyError } from '../shared/rootIgnore.cjs';
+import { isRestrictedNamePlatform, NAME_RESTRICTION_RULE_VERSION, RESTRICTED_NAME_PLATFORMS } from '../shared/namePortability.cjs';
 import { validateMetadataConflictRules } from './frontmatterTimestampMerge.js';
 import {
   describePluginCompatibility,
@@ -63,6 +64,7 @@ import {
   isDeviceRevoked,
   type DeepReadonly,
   type DeviceRemovalJob,
+  type DeviceRow,
   type MetadataDb,
   type MetadataPersistenceAdapter,
   type SyncOperationRow
@@ -79,6 +81,7 @@ import {
 import { type Admission, VaultLifecycleCoordinator } from './vaultLifecycleCoordinator.js';
 import { OperationalLog, type OperationalFields, RequestLogContext, pushLogFields, safeErrorFields, safeReportedPluginVersion, silentOperationalLog } from './operationalLog.js';
 import {
+  commitPreparedNameRepair,
   commitRecoveredDirectoryState,
   recoveredDirectoryEventPayload,
   SyncService
@@ -819,6 +822,25 @@ export async function createObtsServer(
     });
   });
 
+  app.post('/api/v1/vaults/:vaultId/name-repair/preview', async (request) => {
+    const session = await authenticateSession(request);
+    auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
+    const { vaultId } = pathParams(request);
+    return await sync.previewNameRepair(vaultId, session.user.user_id);
+  });
+
+  app.post('/api/v1/vaults/:vaultId/name-repair', async (request) => {
+    const session = await authenticateSession(request);
+    auth.requireCsrf(session.session, request.headers['x-obts-csrf']);
+    const { vaultId } = pathParams(request);
+    const body = requestBody(request);
+    return await sync.applyNameRepair({
+      vaultId, actorUserId: session.user.user_id, expectedMain: readCommitId(body, 'expected_main'),
+      expectedPreviewTree: readCommitId(body, 'preview_tree'),
+      expectedReviewFingerprint: readBoundedString(body, 'review_fingerprint', 64)
+    });
+  });
+
   app.get('/api/v1/vaults/:vaultId/main', async (request) => {
     const session = await authenticateSession(request);
     const { vaultId } = pathParams(request);
@@ -935,6 +957,22 @@ export async function createObtsServer(
     const allConflicts = scoped.conflicts;
     const conflicts = allConflicts.filter((conflict) => conflict.status === 'open');
     const health = await dashboardHealth(vault);
+    const restrictedDevices = scoped.devices
+      .filter((device) => device.user_id === session.user.user_id && !isDeviceRevoked(device) &&
+        isRestrictedNamePlatform(device.path_capabilities?.platform))
+      .map((device) => ({
+        device_id: device.device_id,
+        device_name: device.device_name,
+        platform: String(device.path_capabilities?.platform),
+        blocked: isFreshDeviceStatus(device.last_status_report_at) && device.local_error_code === 'unportable_target_paths'
+      }));
+    const nameDirectories = scoped.directory_state_by_vault[vault.vault_id]?.explicit_dirs ?? [];
+    let unportablePathCount: number | null = null;
+    try {
+      unportablePathCount = await sync.unportablePathCount(vault.vault_id, vault.current_main, nameDirectories);
+    } catch {
+      // An unreadable main is already reported through health; the dashboard stays readable.
+    }
     return {
       vault: {
         vault_id: vault.vault_id,
@@ -948,7 +986,15 @@ export async function createObtsServer(
       conflicts: buildDashboardConflicts(scoped, vault.vault_id, vault.current_main, allConflicts),
       recent_activity: buildRecentActivity(scoped, vault.vault_id),
       maintenance: buildMaintenanceRows(health),
-      health
+      health,
+      ...(unportablePathCount === null ? {} : {
+        name_portability: {
+          rule_version: NAME_RESTRICTION_RULE_VERSION,
+          restricted_platforms: [...RESTRICTED_NAME_PLATFORMS],
+          unportable_path_count: unportablePathCount,
+          restricted_devices: restrictedDevices
+        }
+      })
     };
   });
 
@@ -1264,7 +1310,8 @@ export async function createObtsServer(
           status: device.status,
           last_applied_main: device.last_applied_main,
           last_applied_event_seq: device.last_applied_event_seq,
-          event_seq: db.event_seq_by_vault[vault.vault_id] ?? 0
+          event_seq: db.event_seq_by_vault[vault.vault_id] ?? 0,
+          restricted_name_platforms: restrictedNamePlatforms(db.devices.filter((candidate) => candidate.vault_id === vault.vault_id))
         };
       }),
       deviceAuth.token.token_id
@@ -1593,7 +1640,7 @@ export async function createObtsServer(
     const { vaultId } = pathParams(request);
     const deviceAuth = await authenticateDevice(request, vaultId);
     const report = readDeviceStatusReport(requestBody(request));
-    await store.mutate((db) => {
+    const restrictedPlatforms = await store.mutate((db) => {
       const device = db.devices.find((candidate) => candidate.device_id === deviceAuth.device.device_id);
       if (!device || device.status === 'revoked') {
         throw new AuthError(404, 'not_found', 'Resource not found.');
@@ -1606,13 +1653,15 @@ export async function createObtsServer(
       device.plugin_version = report.pluginVersion;
       device.path_capabilities = report.pathCapabilities;
       device.last_status_report_at = nowIso();
+      return restrictedNamePlatforms(db.devices.filter((candidate) => candidate.vault_id === vaultId));
     });
     requestLog.annotate(request, { plugin_version: report.pluginVersion, event_seq: deviceAuth.device.last_applied_event_seq, reported_status: safeReportedQueueStatus(report.localQueueStatus) });
     return {
       status: 'ok',
       device_name: deviceAuth.device.device_name,
       vault_status: deviceAuth.vault.status,
-      plugin: describePluginCompatibility(report.pluginVersion)
+      plugin: describePluginCompatibility(report.pluginVersion),
+      restricted_name_platforms: restrictedPlatforms
     };
   });
 
@@ -3006,8 +3055,17 @@ const reportedErrorCodes = new Set([
   'server_processing_error', 'server_recovery_required', 'server_update_required', 'stale_device_ref',
   'stale_directory_proposal_base', 'sync_error', 'sync_lease_blocked', 'target_blob_size_mismatch',
   'target_blob_size_unavailable', 'transfer_closed',
-  'transfer_incomplete', 'transfer_too_large', 'unsafe_local_state', 'upload_interrupted'
+  'transfer_incomplete', 'transfer_too_large', 'unportable_target_paths', 'unsafe_local_state', 'upload_interrupted'
 ]);
+
+function restrictedNamePlatforms(devices: ReadonlyArray<DeepReadonly<DeviceRow>>): string[] {
+  const platforms = new Set<string>();
+  for (const device of devices) {
+    const platform = device.path_capabilities?.platform;
+    if (!isDeviceRevoked(device) && isRestrictedNamePlatform(platform)) platforms.add(String(platform));
+  }
+  return [...platforms].sort();
+}
 
 function safeReportedErrorCode(code: string | null): string | null {
   if (code === null) return null;
@@ -3036,7 +3094,7 @@ const NORMALIZED_ACTIVE_STATUS = new RegExp(String.raw`^(?:${ACTIVE_STATUS_BASES
 function safeReportedStatusLabel(label: string | null, errorCode: string | null): string {
   if (errorCode) return normalizedLocalDashboardLabel(label, errorCode);
   if (label === 'Unsafe local state' || label === 'Review needed' || label === 'Needs recovery') return 'Out of sync';
-  if (label && ['Synced', 'Ahead', 'Behind', 'Offline', 'Out of sync', 'Blocked', 'Server repair required', 'Out of sync — file exceeds upload limit', 'Out of sync — upload limit exceeded', 'Out of sync — local recovery required'].includes(label)) return label;
+  if (label && ['Synced', 'Ahead', 'Behind', 'Offline', 'Out of sync', 'Blocked', 'Server repair required', 'Out of sync — file exceeds upload limit', 'Out of sync — upload limit exceeded', 'Out of sync — local recovery required', 'Out of sync — file names need repair'].includes(label)) return label;
   const inventory = label?.match(/^(Applying \(listing vault files\)) [0-9]+ files · [0-9]+ directories( \(taking longer than expected\))?$/u);
   if (inventory) label = `${inventory[1]}${inventory[2] ?? ''}`;
   const active = label?.match(REPORTED_ACTIVE_STATUS);
@@ -4285,6 +4343,22 @@ async function rollForwardPreparedOperation(store: MetadataStore, git: GitServic
       return;
     }
   }
+  if (pending?.operation_type === 'name_repair') {
+    const manifest = pending.prepared_manifest ?? {};
+    const targetMain = stringValue(manifest.target_main);
+    const previousMain = stringValue(manifest.previous_main);
+    try {
+      if (!targetMain || !previousMain || typeof manifest.target_tree !== 'string' ||
+          await git.treeHash(pending.vault_id, targetMain) !== manifest.target_tree ||
+          await git.validateTreeRootIgnorePolicy(pending.vault_id, targetMain) !==
+            (await git.readRootIgnoreBlob(pending.vault_id, previousMain)).oid) {
+        throw new Error('prepared name repair target does not match its decision');
+      }
+    } catch {
+      await blockVaultIntegrity(store, pending, 'prepared name repair cannot be verified', log);
+      return;
+    }
+  }
   if (pending?.operation_type === 'vault_settings') {
     const manifest = pending.prepared_manifest ?? {};
     const expectedOid = manifest.target_root_ignore_oid;
@@ -4306,6 +4380,21 @@ async function rollForwardPreparedOperation(store: MetadataStore, git: GitServic
   await store.mutate((db) => {
     const operation = db.sync_operations.find((candidate) => candidate.operation_id === operationId);
     if (!operation || operation.status !== 'prepared') {
+      return;
+    }
+    if (operation.operation_type === 'name_repair') {
+      if (commitPreparedNameRepair(store, db, operationId)) {
+        operation.result = { ...(operation.result ?? {}), reconciled_after_startup: true };
+        return;
+      }
+      operation.result = { reason: 'name_repair_reconciliation_failed' };
+      operation.updated_at = nowIso();
+      const vault = db.vaults.find((candidate) => candidate.vault_id === operation.vault_id);
+      if (vault) {
+        if (vault.status !== 'blocked_integrity') blockedVaultId = vault.vault_id;
+        vault.status = 'blocked_integrity';
+        vault.updated_at = nowIso();
+      }
       return;
     }
     if (operation.operation_type === 'vault_settings') {
@@ -4794,6 +4883,7 @@ function normalizedLocalDashboardLabel(label: string | null, code: string | null
   if (code === 'object_too_large_for_chunk') return label === 'Out of sync — file exceeds upload limit' ? label : 'Out of sync — upload limit exceeded';
   if (code === 'blocked_integrity') return 'Server repair required';
   if (code === 'initial_import_confirmation_required') return 'Blocked';
+  if (code === 'unportable_target_paths') return 'Out of sync — file names need repair';
   if (code && ['unsafe_local_state', 'apply_journal_recovery_required', 'apply_recovery_required', 'recovery_bundle_failed', 'recovery_bundle_verification_failed', 'recovery_bundle_durability_unavailable', 'directory_baseline_recovery_journal_invalid', 'directory_baseline_recovery_unsafe', 'directory_recovery_journal_invalid', 'directory_recovery_journal_mismatch', 'directory_recovery_decision_required', 'directory_recovery_changed', 'local_ref_recovery_required', 'replace_local_with_server_required', 'server_recovery_required', 'stale_device_ref', 'same_device_non_fast_forward', 'local_state_incomplete'].includes(code)) {
     return 'Out of sync — local recovery required';
   }
@@ -4802,7 +4892,7 @@ function normalizedLocalDashboardLabel(label: string | null, code: string | null
   if (code && ['git_error', 'server_git_error', 'server_processing_error'].includes(code)) return 'Server retrying';
   if (code) return 'Out of sync';
   if (label === 'Review needed' || label === 'Unsafe local state' || label === 'Needs recovery') return 'Out of sync';
-  if (label && ['Out of sync', 'Out of sync — file exceeds upload limit', 'Out of sync — upload limit exceeded', 'Out of sync — local recovery required', 'Blocked', 'Offline', 'Ahead', 'Behind', 'Server repair required'].includes(label)) return label;
+  if (label && ['Out of sync', 'Out of sync — file exceeds upload limit', 'Out of sync — upload limit exceeded', 'Out of sync — local recovery required', 'Out of sync — file names need repair', 'Blocked', 'Offline', 'Ahead', 'Behind', 'Server repair required'].includes(label)) return label;
   if (label && NORMALIZED_ACTIVE_STATUS.test(label)) return label;
   const progressBase = localStatusBaseLabel(label);
   if (progressBase && ['Verifying contents', 'Preparing upload', 'Uploading', 'Applying', 'Checking', 'Merging', 'Server retrying', 'Repairing baseline', 'Finishing update', 'Waiting for operation'].includes(progressBase)) return progressBase;
@@ -4830,6 +4920,7 @@ function isLocalStatusOverride(label: string | null, errorCode: string | null): 
       base === 'Out of sync — file exceeds upload limit' ||
       base === 'Out of sync — upload limit exceeded' ||
       base === 'Out of sync — local recovery required' ||
+      base === 'Out of sync — file names need repair' ||
       base === 'Conflict resolution needed' ||
       base === 'Needs recovery' ||
       base === 'Blocked' ||
@@ -4851,7 +4942,7 @@ function isLocalStatusOverride(label: string | null, errorCode: string | null): 
 }
 
 function isBlockingLocalReport(label: string | null, errorCode: string | null): boolean {
-  return Boolean(errorCode || ['Unsafe local state', 'Needs recovery', 'Blocked', 'Review needed', 'Conflict resolution needed', 'Out of sync — file exceeds upload limit', 'Out of sync — upload limit exceeded', 'Out of sync — local recovery required'].includes(label ?? ''));
+  return Boolean(errorCode || ['Unsafe local state', 'Needs recovery', 'Blocked', 'Review needed', 'Conflict resolution needed', 'Out of sync — file exceeds upload limit', 'Out of sync — upload limit exceeded', 'Out of sync — local recovery required', 'Out of sync — file names need repair'].includes(label ?? ''));
 }
 
 function isMultipartInvalidJsonError(error: Error): boolean {

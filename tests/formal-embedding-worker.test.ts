@@ -78,7 +78,8 @@ describe('FM003 embedding-worker companion gate', () => {
       'node scripts/check-managed-headless-ownership-model.mjs',
       'node scripts/check-atomic-rename-model.mjs',
       'node scripts/check-operation-history-model.mjs',
-      'node scripts/check-dashboard-protocols-model.mjs'
+      'node scripts/check-dashboard-protocols-model.mjs',
+      'node scripts/check-name-portability-model.mjs'
     ]);
     expect(scripts['test:formal:bridge'].split(' && ')).toEqual([
       'node scripts/check-bridge-bounded-model.mjs',
@@ -100,6 +101,7 @@ describe('FM003 embedding-worker companion gate', () => {
     expect(workflow).toContain('bridge-body) npm run test:formal:bridge-body');
     expect(workflow).toContain('workers) npm run test:formal:workers');
     expect(workflow).toContain('vault-settings) npm run test:formal:vault-settings');
+    expect(workflow).toContain('name-portability) npm run test:formal:name-portability');
     expect(workflow).not.toContain('  push:');
     expect(coordinator).toContain('VITEST_GROUP=checker npx vitest run');
     expect(coordinator).toContain('npm run test:formal:metadata');

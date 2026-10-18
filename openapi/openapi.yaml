@@ -485,6 +485,49 @@ paths:
           $ref: "#/components/responses/Error"
         "409":
           $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/name-repair/preview:
+    post:
+      summary: Preview the deterministic repair of canonical paths that restricted platforms cannot store.
+      description: Owner-scoped and read-only. Lists every proposed rename with its reason and every note whose links change; the fingerprint binds the current main, candidate tree, and complete outcome.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "200":
+          description: Exact proposed renames, link updates, and candidate tree identity.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NameRepairPreview"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+  /vaults/{vault_id}/name-repair:
+    post:
+      summary: Apply a reviewed name repair as one server-authored canonical commit.
+      parameters:
+        - $ref: "#/components/parameters/VaultId"
+        - $ref: "#/components/parameters/CsrfHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApplyNameRepairRequest"
+      responses:
+        "200":
+          description: Resulting canonical main and repair counts.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NameRepairResult"
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
   /connections:
     post:
       summary: Start browser-assisted plugin onboarding.
@@ -2238,6 +2281,13 @@ components:
         event_seq:
           type: integer
           minimum: 0
+        restricted_name_platforms:
+          description: Restricted platforms (OBTS-SYNC-NAME-001) among the vault's active paired devices. Absent from older servers; clients treat absence as empty.
+          type: array
+          maxItems: 8
+          items:
+            type: string
+            enum: [android]
     DiagnosticBreadcrumb:
       type: object
       additionalProperties: false
@@ -2652,6 +2702,13 @@ components:
           enum: [active, blocked_integrity, deleting]
         plugin:
           $ref: "#/components/schemas/PluginCompatibility"
+        restricted_name_platforms:
+          description: Restricted platforms (OBTS-SYNC-NAME-001) among the vault's active paired devices. Absent from older servers; clients treat absence as empty.
+          type: array
+          maxItems: 8
+          items:
+            type: string
+            enum: [android]
     PluginCompatibility:
       type: object
       required: [current_version, minimum_version, recommended_version, update_required, update_available, update_url]
@@ -3398,6 +3455,121 @@ components:
             $ref: "#/components/schemas/MetadataConflictRule"
         changes_main:
           type: boolean
+    NamePortabilitySummary:
+      type: object
+      required: [rule_version, restricted_platforms, unportable_path_count, restricted_devices]
+      properties:
+        rule_version:
+          type: integer
+          minimum: 1
+        restricted_platforms:
+          type: array
+          items:
+            type: string
+            enum: [android]
+        unportable_path_count:
+          type: integer
+          minimum: 0
+        restricted_devices:
+          type: array
+          items:
+            type: object
+            required: [device_id, device_name, platform, blocked]
+            properties:
+              device_id:
+                type: string
+              device_name:
+                type: string
+              platform:
+                type: string
+                enum: [android]
+              blocked:
+                type: boolean
+    NameRepairRename:
+      type: object
+      required: [from, to, kind, reasons]
+      properties:
+        from:
+          type: string
+        to:
+          type: string
+        kind:
+          type: string
+          enum: [file, directory]
+        reasons:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            enum: [reserved_characters, case_collision]
+    NameRepairLinkUpdate:
+      type: object
+      required: [path, link_count]
+      properties:
+        path:
+          type: string
+        link_count:
+          type: integer
+          minimum: 1
+    NameRepairPreview:
+      type: object
+      required: [vault_id, rule_version, expected_main, preview_tree, review_fingerprint, renames, link_updates, changes_main]
+      properties:
+        vault_id:
+          type: string
+        rule_version:
+          type: integer
+          minimum: 1
+        expected_main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        preview_tree:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        review_fingerprint:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        renames:
+          type: array
+          items:
+            $ref: "#/components/schemas/NameRepairRename"
+        link_updates:
+          type: array
+          items:
+            $ref: "#/components/schemas/NameRepairLinkUpdate"
+        changes_main:
+          type: boolean
+    ApplyNameRepairRequest:
+      type: object
+      required: [expected_main, preview_tree, review_fingerprint]
+      properties:
+        expected_main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        preview_tree:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        review_fingerprint:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+    NameRepairResult:
+      type: object
+      required: [vault_id, previous_main, current_main, renamed_count, link_updated_count]
+      properties:
+        vault_id:
+          type: string
+        previous_main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        current_main:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        renamed_count:
+          type: integer
+          minimum: 0
+        link_updated_count:
+          type: integer
+          minimum: 0
     DashboardSummary:
       type: object
       required: [vault, devices, recommended_plugin_version, unresolved_conflict_count, conflicts, recent_activity, maintenance, health]
@@ -3554,6 +3726,8 @@ components:
             $ref: "#/components/schemas/MaintenanceRow"
         health:
           $ref: "#/components/schemas/DashboardHealth"
+        name_portability:
+          $ref: "#/components/schemas/NamePortabilitySummary"
     DashboardRefreshEvent:
       type: object
       description: Payload of the fixed `refresh` event; always empty.

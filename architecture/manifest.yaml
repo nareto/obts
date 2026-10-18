@@ -1,7 +1,7 @@
 schema_version: 1
-revision: 57
+revision: 58
 status: current
-updated: 2026-10-12
+updated: 2026-10-18
 authoritative_artifacts:
   - architecture/manifest.yaml
   - architecture/README.md
@@ -197,4 +197,13 @@ formal_models:
       - OBTS-SEC-STREAM-001
       - OBTS-PER-DEV-DEL-001
       - OBTS-PER-READY-001
+  - id: OBTS-FM-017
+    status: focused bounded model
+    path: architecture/models/formal/OBTSNamePortability.tla
+    architecture_revision: 58
+    checks: architecture/models/formal/configs/name-portability-safety.cfg
+    refines:
+      - OBTS-SYNC-NAME-001
+      - OBTS-DASH-NAME-001
+      - OBTS-PER-OP-001
 

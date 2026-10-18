@@ -57,5 +57,6 @@ jobs:
             atomic-rename) npm run test:formal:atomic-rename ;;
             operation-history) npm run test:formal:operation-history ;;
             dashboard-protocols) npm run test:formal:dashboard-protocols ;;
+            name-portability) npm run test:formal:name-portability ;;
             *) echo "Unknown formal family: $FAMILY" >&2; exit 1 ;;
           esac

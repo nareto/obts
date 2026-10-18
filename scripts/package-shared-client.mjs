@@ -22,6 +22,7 @@ export async function packageSharedClient(sourceRoot, destinationRoot) {
   const sharedDestination = new URL('../dist/src/shared/', destinationRoot);
   await mkdir(sharedDestination, { recursive: true });
   await copyFile(new URL('../src/shared/rootIgnore.cjs', sourceRoot), new URL('rootIgnore.cjs', sharedDestination));
+  await copyFile(new URL('../src/shared/namePortability.cjs', sourceRoot), new URL('namePortability.cjs', sharedDestination));
   return [...packaged].sort();
 }
 

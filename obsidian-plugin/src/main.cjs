@@ -14,6 +14,7 @@ const { installPathMutationGate } = require("./path-mutation-gate.cjs");
 const { createByteBudget, runBoundedWork } = require("./work-pool.cjs");
 const { blobSizeFromGit } = require("./blob-size-reader.cjs");
 const { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require("../../src/shared/rootIgnore.cjs");
+const { findUnportablePaths, isRestrictedNamePlatform, segmentHasReservedCharacters } = require("../../src/shared/namePortability.cjs");
 
 const API_VERSION = obtsRuntime.obtsApiVersion || "__OBTS_API_VERSION__";
 const PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "__OBTS_PLUGIN_VERSION__";
@@ -103,6 +104,7 @@ module.exports = class ObtsPlugin extends Plugin {
     this.activeMeasuredPhase = null;
     this.layoutStarted = false;
     this.reportedDiagnosticErrors = new WeakSet();
+    this.portableNameWarnings = new Set();
     this.diagnosticRetryAfter = new Map();
     this.failedTroubleshootingTransitions = new Map();
     this.reportedTroubleshootingTransitions = new Map();
@@ -281,15 +283,50 @@ module.exports = class ObtsPlugin extends Plugin {
   startAfterLayoutReady() {
     if (this.unloaded || this.layoutStarted) return;
     this.layoutStarted = true;
-    this.registerEvent(this.app.vault.on("create", (file) => this.queueSyncFromWatcher(file && file.path)));
+    this.registerEvent(this.app.vault.on("create", (file) => {
+      this.queueSyncFromWatcher(file && file.path);
+      this.guardPortableName(file, null);
+    }));
     this.registerEvent(this.app.vault.on("modify", (file) => this.queueSyncFromWatcher(file && file.path)));
     this.registerEvent(this.app.vault.on("delete", (file) => this.queueSyncFromWatcher(file && file.path)));
-    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => queueRenameWatcherEvent(this, file, oldPath)));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      queueRenameWatcherEvent(this, file, oldPath);
+      this.guardPortableName(file, oldPath);
+    }));
     if (this.operationAvailability() === "available") {
       void this.initializeClient().catch((error) => this.handleClientInitializationFailure(error));
     } else {
       this.observeRetiredOperation();
     }
+  }
+
+  /**
+   * OBTS-SYNC-NAME-001: while the vault has a restricted-platform device, an
+   * interactive rename to a name that device cannot store is undone, and a new
+   * file with such a name raises a warning. Upload is never blocked.
+   */
+  guardPortableName(file, oldPath) {
+    if (this.unloaded || this.isApplying || !file || typeof file.path !== "string") return;
+    const restricted = this.client && Array.isArray(this.client.restrictedNamePlatforms) ? this.client.restrictedNamePlatforms : [];
+    if (restricted.length === 0 || isRestrictedNamePlatform(runtimePlatform())) return;
+    const vault = this.app.vault;
+    const others = typeof vault.getAllLoadedFiles === "function"
+      ? vault.getAllLoadedFiles().map((entry) => entry && entry.path).filter((entryPath) => typeof entryPath === "string" && entryPath !== file.path)
+      : [];
+    const decision = portableNameDecision(file.path, typeof oldPath === "string" ? oldPath : null, others);
+    if (!decision) return;
+    const platforms = restricted.map(restrictedPlatformLabel).join(", ");
+    if (decision.action === "revert" && this.app.fileManager && typeof this.app.fileManager.renameFile === "function") {
+      window.setTimeout(() => {
+        if (this.unloaded || file.path !== decision.path) return;
+        void this.app.fileManager.renameFile(file, decision.restorePath).catch(() => undefined);
+      }, 0);
+      new Notice(`obts kept the name "${decision.restorePath}": "${decision.path}" cannot be stored on your ${platforms} device (${unportableReasonText(decision.reasons)}).`, 10000);
+      return;
+    }
+    if (this.portableNameWarnings.has(decision.path)) return;
+    this.portableNameWarnings.add(decision.path);
+    new Notice(`"${decision.path}" cannot be stored on your ${platforms} device (${unportableReasonText(decision.reasons)}). Rename it, or repair names from the obts dashboard.`, 10000);
   }
 
   retirePathMutationGate() {
@@ -1436,6 +1473,7 @@ module.exports = class ObtsPlugin extends Plugin {
 class ObtsObsidianClient {
   constructor(plugin) {
     this.plugin = plugin;
+    this.restrictedNamePlatforms = [];
     this.adapter = plugin.app.vault.adapter;
     this.pathMutationGate = plugin.pathMutationGate || installPathMutationGate(this.adapter, plugin);
     this.adapterFs = createDataAdapterFs(this.adapter, this.pathMutationGate);
@@ -3786,6 +3824,31 @@ class ObtsObsidianClient {
     }
   }
 
+  /**
+   * OBTS-SYNC-NAME-001 preflight: a restricted-platform device refuses a target
+   * it cannot store before any lock, journal or visible write.
+   */
+  async assertPortableTargetNames(targetMain, targetPolicy, explicitDirectories, directoryIntents) {
+    if (!isRestrictedNamePlatform(runtimePlatform())) return;
+    const files = [...targetPolicy.entries.keys()].filter((filePath) => isSyncableVaultPath(filePath) && !targetPolicy.policy.ignores(filePath, false));
+    const directories = [...new Set([
+      ...explicitDirectories,
+      ...directoryIntents.filter((intent) => intent.op === "create").map((intent) => intent.path)
+    ])];
+    const unportable = findUnportablePaths(files, directories);
+    if (unportable.length === 0) return;
+    const details = {
+      unportable_path_count: unportable.length,
+      sample_paths: unportable.slice(0, 5).map((entry) => entry.path),
+      platform: runtimePlatform(),
+      target_main: targetMain
+    };
+    // Nothing references the rejected snapshot yet; dropping it lets the next
+    // attempt pull the current (possibly repaired) main instead of replaying it.
+    await this.clearAppliedPullCheckpoint(targetMain, await this.readState());
+    await this.block("unportable_target_paths", unportableTargetPathsMessage(details), details);
+  }
+
   async targetApplyPolicy(commit, entries = null) {
     const targetEntries = entries || await this.listTreeBlobOids(commit);
     const oid = await this.validateUploadTargetRootIgnore(commit);
@@ -4656,7 +4719,16 @@ class ObtsObsidianClient {
       throw error;
     }
     const currentState = await this.readState();
-    const shouldPull = page.events.some((event) => {
+    // A target this device already refused for its names is not downloaded
+    // again until main moves (normally by the dashboard name repair).
+    const rejectedTarget = currentState.last_error_code === "unportable_target_paths" && currentState.last_error_details
+      ? currentState.last_error_details.target_main
+      : null;
+    const latestMain = page.events.reduce((latest, event) => {
+      const main = event && event.commit_cursors ? event.commit_cursors.main : null;
+      return typeof main === "string" ? main : latest;
+    }, null);
+    const shouldPull = !(rejectedTarget && latestMain === rejectedTarget) && page.events.some((event) => {
       const main = event && event.commit_cursors ? event.commit_cursors.main : null;
       const hasNewMain = typeof main === "string" && main !== currentState.local_main;
       const hasDirectoryChanges = Array.isArray(event && event.payload && event.payload.directory_intents) &&
@@ -5097,6 +5169,7 @@ class ObtsObsidianClient {
       }));
       return true;
     }
+    await this.assertPortableTargetNames(targetMain, targetPolicy, explicitDirectorySet, compactedDirectoryIntents);
     if (requireCleanVisibleState && !cleanVisibleStateVerified && !(await this.ensureNoLocalChangesBeforeApply(state, targetPolicy))) {
       return false;
     }
@@ -8499,7 +8572,13 @@ class ObtsObsidianClient {
     if (!response.ok) {
       await throwResponseError(response);
     }
-    return await response.json();
+    const self = await response.json();
+    this.recordRestrictedNamePlatforms(self && self.restricted_name_platforms);
+    return self;
+  }
+
+  recordRestrictedNamePlatforms(value) {
+    this.restrictedNamePlatforms = Array.isArray(value) ? [...new Set(value.filter(isRestrictedNamePlatform))].sort() : [];
   }
 
   async reconcileServerVaultStatus(vaultStatus, throwIfBlocked = false, observedState = null) {
@@ -8861,6 +8940,7 @@ class ObtsObsidianClient {
           this.url(`/api/v1/vaults/${state.vault_id}/sync/device-status`) !== snapshot.url || token !== snapshot.token ||
           snapshot.generation !== this.deviceStatusGeneration || snapshot.nameRevision !== this.plugin.deviceNameRevision) return;
       this.lastAppliedDeviceStatusSequence = snapshot.sequence;
+      this.recordRestrictedNamePlatforms(result.restricted_name_platforms);
       // A started step belongs to the awaited sync boundary; close stops only later status steps.
       await this.applyServerDeviceName(result.device_name, false);
       if (this.plugin.unloaded || this.deviceStatusReporter.closed) return;
@@ -13758,7 +13838,7 @@ function sameCachedScanFileMetadata(current, cached) {
 }
 
 function isRetryableLocalError(code) {
-  return code === "local_snapshot_changed" || code === "upload_interrupted" || code === "pack_preparation_failed" || code === "git_error" || code === "server_git_error" || code === "server_processing_error" || code === "stale_directory_proposal_base" || code === "directory_acknowledgement_missing" || code === "invalid_path" || code === "path_collision" || code === "excluded_git_path" || code === "excluded_internal_path" || code === "excluded_path" || code === "unsupported_file_mode" || code === "rename_endpoint_ignored";
+  return code === "local_snapshot_changed" || code === "upload_interrupted" || code === "pack_preparation_failed" || code === "git_error" || code === "server_git_error" || code === "server_processing_error" || code === "stale_directory_proposal_base" || code === "directory_acknowledgement_missing" || code === "invalid_path" || code === "path_collision" || code === "excluded_git_path" || code === "excluded_internal_path" || code === "excluded_path" || code === "unsupported_file_mode" || code === "rename_endpoint_ignored" || code === "unportable_target_paths";
 }
 
 function isOfflineTransportError(error) {
@@ -13789,7 +13869,7 @@ function statusPresentation(label) {
   if (base === "Synced") tone = "success";
   else if (["Checking", "Verifying contents", "Preparing upload", "Uploading", "Applying", "Merging", "Server retrying", "Repairing baseline", "Finishing update", "Waiting for operation"].includes(base)) tone = "active";
   else if (["Ahead", "Behind", "Offline", "Out of sync"].includes(base)) tone = "warning";
-  else if (["Conflict resolution needed", "Out of sync — file exceeds upload limit", "Out of sync — upload limit exceeded", "Out of sync — local recovery required", "Blocked", "Server repair required", "Integrity failure", "Recovery required", "Restart required"].includes(base)) tone = "danger";
+  else if (["Conflict resolution needed", "Out of sync — file exceeds upload limit", "Out of sync — upload limit exceeded", "Out of sync — local recovery required", "Out of sync — file names need repair", "Blocked", "Server repair required", "Integrity failure", "Recovery required", "Restart required"].includes(base)) tone = "danger";
   return {
     label: normalized,
     base,
@@ -13803,13 +13883,14 @@ function statusAttentionMessage(base) {
   if (base === "Conflict resolution needed") return "obts needs attention: Resolve the server conflict in the dashboard. Click the sync indicator to continue.";
   if (base === "Out of sync — file exceeds upload limit" || base === "Out of sync — upload limit exceeded") return "obts cannot upload an oversized Git object. Open obts settings for the size, version, and next step.";
   if (base === "Out of sync — local recovery required") return "obts cannot continue automatically. Open obts settings for the specific recovery reason.";
+  if (base === "Out of sync — file names need repair") return "Some server file names cannot be stored on this device. Repair them from the obts dashboard Devices page.";
   if (base === "Blocked") return "obts sync is blocked. Click the sync indicator to inspect the required action.";
   if (base === "Server repair required") return "obts stopped because the server vault needs an integrity repair. Click the sync indicator for details.";
   return null;
 }
 
 function isPersistentAttentionStatus(base) {
-  return ["Conflict resolution needed", "Out of sync", "Out of sync — file exceeds upload limit", "Out of sync — upload limit exceeded", "Out of sync — local recovery required", "Blocked", "Server repair required", "Integrity failure", "Recovery required", "Restart required"].includes(base);
+  return ["Conflict resolution needed", "Out of sync", "Out of sync — file exceeds upload limit", "Out of sync — upload limit exceeded", "Out of sync — local recovery required", "Out of sync — file names need repair", "Blocked", "Server repair required", "Integrity failure", "Recovery required", "Restart required"].includes(base);
 }
 
 function isActiveTransferStatus(base) {
@@ -13859,7 +13940,54 @@ function blockStatusLabel(code, details = null) {
   if (code === "stale_directory_proposal_base") return "Repairing baseline";
   if (code === "initial_import_confirmation_required") return "Blocked";
   if (code === "blocked_integrity") return "Server repair required";
+  if (code === "unportable_target_paths") return "Out of sync — file names need repair";
   return "Out of sync";
+}
+
+function restrictedPlatformLabel(platform) {
+  return platform === "android" ? "Android" : String(platform);
+}
+
+function unportableReasonText(reasons) {
+  const parts = [];
+  if (reasons.includes("reserved_characters")) parts.push('it contains one of < > : " | ? * \\');
+  if (reasons.includes("case_collision")) parts.push("another name differs only by letter case");
+  return parts.join("; ") || "unsupported name";
+}
+
+function unportableTargetPathsMessage(details) {
+  const count = details && Number.isSafeInteger(details.unportable_path_count) && details.unportable_path_count > 0 ? details.unportable_path_count : null;
+  const samples = details && Array.isArray(details.sample_paths)
+    ? details.sample_paths.filter((value) => typeof value === "string" && isValidVaultPath(value)).slice(0, 5)
+    : [];
+  const platform = restrictedPlatformLabel(details && typeof details.platform === "string" ? details.platform : "android");
+  const subject = count === null ? "Some file names" : count === 1 ? "1 file name" : `${count} file names`;
+  const example = samples.length ? ` For example: ${samples.join(", ")}${count !== null && count > samples.length ? ", …" : ""}.` : "";
+  return `${subject} in this vault cannot be stored on ${platform} (characters like < > : " | ? * or names that differ only by letter case).${example} Nothing on this device was changed. Open the obts dashboard, go to Devices and run "Repair file names"; this device picks up the repaired vault on its next sync attempt.`;
+}
+
+/**
+ * Decides how an unrestricted client reacts to a new or renamed path. Only a
+ * problem in the path's own name counts; one inherited from a parent folder is
+ * reported for that folder. A rename that introduced it is reverted.
+ */
+function portableNameDecision(newPath, oldPath, otherPaths) {
+  if (!isSyncableVaultPath(newPath)) return null;
+  const others = otherPaths.filter((value) => typeof value === "string" && value && value !== "/" && value !== newPath && value !== oldPath);
+  const problemOf = (candidate) => findUnportablePaths([candidate, ...others]).find((entry) => entry.path === candidate) || null;
+  const problem = problemOf(newPath);
+  if (!problem) return null;
+  const slash = newPath.lastIndexOf("/");
+  const parentProblem = slash > 0 ? problemOf(newPath.slice(0, slash)) : null;
+  const ownReserved = segmentHasReservedCharacters(newPath.slice(slash + 1));
+  const ownCollision = problem.reasons.includes("case_collision") && !(parentProblem && parentProblem.reasons.includes("case_collision"));
+  if (!ownReserved && !ownCollision) return null;
+  const reasons = [...(ownReserved ? ["reserved_characters"] : []), ...(ownCollision ? ["case_collision"] : [])];
+  const renamedLeaf = typeof oldPath === "string" && isSyncableVaultPath(oldPath) &&
+    oldPath.slice(oldPath.lastIndexOf("/") + 1) !== newPath.slice(slash + 1);
+  return renamedLeaf && !problemOf(oldPath)
+    ? { action: "revert", path: newPath, restorePath: oldPath, reasons }
+    : { action: "warn", path: newPath, reasons };
 }
 
 function normalizePersistedStatusLabel(label, code, details = null) {
@@ -13892,6 +14020,7 @@ function localSyncFailureExplanation(code, details) {
     const location = paths.length ? ` Current path${paths.length === 1 ? "" : "s"}: ${paths.join(", ")}.` : " No current path is known; the object may exist only in pending history.";
     return `${summary}${location} The queued commit remains local; changing the current file or an ignore rule alone may not clear its ancestry. Preserve the journal and use a reviewed fresh baseline or supported large-file transport before retrying.`;
   }
+  if (safeCode === "unportable_target_paths") return unportableTargetPathsMessage(details);
   if (safeCode === "conflict_review_required") return "The server recorded a conflict. Review it in the dashboard; the client cannot choose a winner locally.";
   if (LEGACY_RENAME_LATCH_CODES.has(safeCode)) return "An older obts version paused sync after a file move it could not track. This version syncs such moves as a delete plus an add: reload the obts plugin (or restart Obsidian) and sync resumes by itself. If another device changed the same file, a conflict appears in the dashboard; click the sync indicator to open it.";
   if (safeCode === "rename_endpoint_ignored") {
@@ -14459,6 +14588,7 @@ function troubleshootingSafeErrorCode(value) {
     "directory_recovery_changed",
     "directory_recovery_journal_invalid",
     "object_too_large_for_chunk",
+    "unportable_target_paths",
     "pack_preparation_failed",
     "network_error",
     "http_error",
@@ -14857,6 +14987,8 @@ function nowIso() {
 
 module.exports.createRootIgnorePolicy = createRootIgnorePolicy;
 module.exports.queueRenameWatcherEvent = queueRenameWatcherEvent;
+module.exports.portableNameDecision = portableNameDecision;
+module.exports.unportableTargetPathsMessage = unportableTargetPathsMessage;
 module.exports.ObtsClientCore = ObtsObsidianClient;
 module.exports.PluginBlockedError = ObtsBlockedError;
 module.exports.TransportError = ObtsTransportError;

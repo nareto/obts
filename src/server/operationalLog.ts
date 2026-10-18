@@ -93,6 +93,8 @@ export const LOG_ROUTES = [
   '/api/v1/vaults/:vaultId',
   '/api/v1/vaults/:vaultId/sync-settings',
   '/api/v1/vaults/:vaultId/sync-settings/preview',
+  '/api/v1/vaults/:vaultId/name-repair/preview',
+  '/api/v1/vaults/:vaultId/name-repair',
   '/api/v1/vaults/:vaultId/main',
   '/api/v1/vaults/:vaultId/dashboard',
   '/api/v1/dashboard/events',

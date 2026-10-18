@@ -2747,6 +2747,71 @@ try {
     await expect(page.locator('.checklist')).not.toContainText(/Invalid Date|1970|1\/1\/70/u);
   }, {prepare: async ({fixture}) => { fixture.summary.maintenance = fixture.summary.maintenance.map(row => ({...row, last_checked_at: null})); }});
 
+  await scenario('name repair: attention opens a reviewed, stale-safe rename for Android devices', async ({page, fixture, navigate, capture}) => {
+    const attention = page.locator('.attention');
+    await expect(attention).toContainText("6 file names can't sync to Android");
+    await expect(attention).not.toContainText('Blocked device: Android phone');
+    await capture('name-repair-overview');
+    await attention.getByRole('button', {name: 'Repair names', exact: true}).click();
+    await expect(page.getByRole('heading', {name: 'Devices', level: 1, exact: true})).toBeVisible();
+    const panel = page.locator('section.name-repair');
+    await expect(panel.getByRole('heading', {name: 'File names need repair'})).toBeVisible();
+    await expect(panel.locator('.name-repair-devices li.blocked')).toContainText('Android phone');
+    await expect(panel.locator('.name-repair-devices li.blocked')).toContainText('Sync paused until the names are repaired');
+    await expect(page.locator('.device-table')).toContainText('Out of sync — file names need repair');
+    const apply = panel.getByRole('button', {name: /^(Apply repair|Rename \d+ items?)$/u});
+    await expect(apply).toBeDisabled();
+    await capture('name-repair-devices');
+    await panel.getByRole('button', {name: 'Preview repair', exact: true}).click();
+    await expect(panel.locator('.name-repair-table tbody tr')).toHaveCount(6);
+    await expect(panel.locator('.name-repair-facts')).toContainText('Renames6');
+    await expect(panel.locator('.name-repair-facts')).toContainText('Links rewritten6');
+    await expect(panel.locator('.name-repair-table')).toContainText('Meeting - Q3 plan.md');
+    await expect(panel.locator('.name-repair-table')).toContainText('Case clash');
+    await expect(apply).toHaveText('Rename 6 items');
+    await panel.locator('.name-repair-links summary').click();
+    await expect(panel.locator('.name-repair-links')).toContainText('Projects/Index.md');
+    await capture('name-repair-preview');
+    await page.setViewportSize({width: 390, height: 900});
+    await expect(panel.locator('.name-repair-table thead')).toBeHidden();
+    const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    assert.ok(overflow <= 0, `name repair panel fits a phone viewport (overflow ${overflow}px)`);
+    await capture('name-repair-preview-mobile');
+    await page.setViewportSize({width: 1440, height: 1000});
+    fixture.nameRepair.staleNext = true;
+    await apply.click();
+    await expect(panel.getByRole('status')).toContainText('The vault changed after this preview');
+    await expect(panel.locator('.name-repair-table')).toHaveCount(0);
+    await expect(apply).toBeDisabled();
+    await panel.getByRole('button', {name: 'Preview repair', exact: true}).click();
+    await expect(apply).toHaveText('Rename 6 items');
+    await apply.click();
+    await expect(page.locator('.notice')).toContainText('Renamed 6 items and updated links in 3 notes. Devices pick up the new names on their next sync.');
+    await expect(panel).toHaveCount(0);
+    const applied = fixture.requests.filter(request => request.method === 'POST' && request.path === '/vaults/sample-vault/name-repair');
+    assert.equal(applied.length, 2, 'stale attempt plus the reviewed apply');
+    assert.deepEqual(fixture.nameRepair.applied, {expected_main: fixture.main ?? 'a14f802ef33a591076d34504551bd5473a71000c', preview_tree: 'd'.repeat(40), review_fingerprint: 'e'.repeat(64)});
+    assert.ok(applied.every(request => request.csrf !== null), 'apply sends the CSRF header');
+    await expect(page.locator('.device-table')).not.toContainText('file names need repair');
+    await navigate('Overview');
+    await expect(page.locator('.attention')).not.toContainText("can't sync to Android");
+    await capture('name-repair-done');
+  }, {prepare: async ({fixture}) => { fixture.enableNameRepair(); }});
+
+  await scenario('name repair: the preview stays legible in dark mode', async ({page, navigate, capture}) => {
+    await navigate('Devices');
+    const panel = page.locator('section.name-repair');
+    await panel.getByRole('button', {name: 'Preview repair', exact: true}).click();
+    await expect(panel.locator('.name-repair-table tbody tr')).toHaveCount(6);
+    await capture('name-repair-preview-dark');
+  }, {colorScheme: 'dark', prepare: async ({fixture}) => { fixture.enableNameRepair(); }});
+
+  await scenario('name repair: the panel stays hidden while every name is portable', async ({page, navigate}) => {
+    await expect(page.locator('.attention')).not.toContainText("can't sync to Android");
+    await navigate('Devices');
+    await expect(page.locator('section.name-repair')).toHaveCount(0);
+  });
+
   console.log(`${count-failures}/${count} dashboard browser scenarios passed.`);
   if(failures) process.exitCode=1;
 } finally {await browser?.close();await server.close();await rm(cache,{recursive:true,force:true});}

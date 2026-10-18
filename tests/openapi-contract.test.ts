@@ -119,6 +119,8 @@ describe('OpenAPI Phase 3 contract', () => {
       '/vaults/{vault_id}/dashboard',
       '/vaults/{vault_id}/sync-settings',
       '/vaults/{vault_id}/sync-settings/preview',
+      '/vaults/{vault_id}/name-repair/preview',
+      '/vaults/{vault_id}/name-repair',
       '/connections',
       '/connections/{connection_id}',
       '/connections/{connection_id}/review',
@@ -171,6 +173,11 @@ describe('OpenAPI Phase 3 contract', () => {
     expect(document.paths['/connections/{connection_id}/diagnostic-events']?.post?.responses).toHaveProperty('409');
     expect(document.paths['/connections/{connection_id}/complete']?.post?.responses).toHaveProperty('409');
     expect(document.components.securitySchemes).toHaveProperty('connectionBearer');
+    for (const path of ['/vaults/{vault_id}/name-repair/preview', '/vaults/{vault_id}/name-repair']) {
+      expect(document.paths[path]?.post?.security).toBeUndefined();
+      expect(document.paths[path]?.post?.responses).toHaveProperty('409');
+    }
+    expect(document.components.schemas).toHaveProperty('NamePortabilitySummary');
     expect(document.components.schemas).toHaveProperty('ConnectionStatusResponse');
     expect(document.components.schemas).toHaveProperty('DisplayName');
     expect(document.components.schemas).toHaveProperty('VaultNameRequest');

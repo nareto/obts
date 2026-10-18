@@ -5,6 +5,8 @@ import type {
   ConflictResolutionKind,
   ManualFilePlanEntry,
   DashboardSummary,
+  NameRepairPreview,
+  NameRepairResult,
   DashboardConflict,
   DiagnosticEventsResponse,
   NoteHistoryQueryResponse,
@@ -137,6 +139,17 @@ export class DashboardApi {
   }): Promise<VaultSyncSettings> {
     return await this.request(`/vaults/${vaultId}/sync-settings`, {
       method: 'PUT', csrf: true, body: input
+    });
+  }
+
+  async previewNameRepair(vaultId: string): Promise<NameRepairPreview> {
+    return await this.request(`/vaults/${vaultId}/name-repair/preview`, { method: 'POST', csrf: true });
+  }
+
+  async applyNameRepair(vaultId: string, preview: Pick<NameRepairPreview, 'expected_main' | 'preview_tree' | 'review_fingerprint'>): Promise<NameRepairResult> {
+    return await this.request(`/vaults/${vaultId}/name-repair`, {
+      method: 'POST', csrf: true,
+      body: { expected_main: preview.expected_main, preview_tree: preview.preview_tree, review_fingerprint: preview.review_fingerprint }
     });
   }
 

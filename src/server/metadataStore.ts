@@ -169,7 +169,7 @@ export type SyncOperationRow = {
   operation_sequence?: number;
   vault_id: string;
   device_id: string | null;
-  operation_type: 'device_push' | 'server_merge' | 'conflict_create' | 'conflict_refresh' | 'conflict_resolve' | 'note_restore' | 'git_maintenance' | 'vault_settings';
+  operation_type: 'device_push' | 'server_merge' | 'conflict_create' | 'conflict_refresh' | 'conflict_resolve' | 'note_restore' | 'git_maintenance' | 'vault_settings' | 'name_repair';
   expected_refs: Record<string, string | null>;
   target_refs: Record<string, string | null>;
   target_commit: string | null;
