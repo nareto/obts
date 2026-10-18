@@ -48,6 +48,8 @@ const FILE_WORK_YIELD_EVERY = 25;
 const FILE_PROGRESS_INTERVAL_MS = 250;
 const MOBILE_PACK_READ_ATTEMPTS = 5;
 const MOBILE_PACK_READ_RETRY_MS = 100;
+const SETUP_SNAPSHOT_ATTEMPTS = 4;
+const SETUP_SNAPSHOT_RETRY_MS = 250;
 const RETIRED_OPERATION_GRACE_MS = 1500;
 const REF_LOCK_STALE_MS = 30 * 1000;
 const PLUGIN_UPDATE_URL = "obsidian://brat?plugin=nareto%2Fobts";
@@ -1867,7 +1869,7 @@ class ObtsObsidianClient {
     if (await this.readPendingOnboarding()) throw new ObtsBlockedError("onboarding_incomplete", "Resume the saved setup or explicitly cancel it before starting another enrollment.");
     await this.assertPairingCanStart();
     await this.flushEditorBuffersToDisk();
-    const summary = await this.localSnapshotSummary();
+    const summary = await this.stableSetupSnapshotSummary();
     const existing = await readJson(this.fsp, this.statePath, null);
     const deviceName = normalizeDisplayName(this.plugin.settings.deviceName || "Obsidian device");
     this.plugin.settings.deviceName = deviceName;
@@ -2015,7 +2017,7 @@ class ObtsObsidianClient {
       throw new ObtsBlockedError("connection_not_approved", "Approve this connection in the browser first.");
     }
     await this.flushEditorBuffersToDisk();
-    const local = await this.localSnapshotSummary();
+    const local = await this.stableSetupSnapshotSummary();
     if (status.selection === "new_vault") {
       const analysis = {
         selection: status.selection,
@@ -7772,6 +7774,24 @@ class ObtsObsidianClient {
       this.plugin.setOperationProgress(label, diagnosticPoint);
     } else {
       this.plugin.setStatus(label);
+    }
+  }
+
+  // Setup scans must not fail on a single racing write: Obsidian rewrites its
+  // own settings files at any time, and some mobile adapters report metadata
+  // that changes on the first read after a write. Each attempt is a complete,
+  // independently verified snapshot, so retrying never weakens consent.
+  async stableSetupSnapshotSummary(attempts = SETUP_SNAPSHOT_ATTEMPTS) {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await this.localSnapshotSummary();
+      } catch (error) {
+        if (!(error instanceof LocalSnapshotChangedError)) throw error;
+        if (attempt >= attempts) {
+          throw new ObtsBlockedError("local_snapshot_changed", "Files in this vault kept changing while obts scanned it. Close Settings and other plugins that write files, wait a moment, then try again.");
+        }
+        await new Promise((resolve) => setTimeout(resolve, SETUP_SNAPSHOT_RETRY_MS * attempt));
+      }
     }
   }
 

@@ -23183,7 +23183,7 @@ var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var { findUnportablePaths, isRestrictedNamePlatform, segmentHasReservedCharacters } = require_namePortability();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.7.0";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.7.1";
 var SYNC_DEBOUNCE_MS = 1500;
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var STALE_SETTLE_MARGIN_MS = 250;
@@ -23213,6 +23213,8 @@ var FILE_WORK_YIELD_EVERY = 25;
 var FILE_PROGRESS_INTERVAL_MS = 250;
 var MOBILE_PACK_READ_ATTEMPTS = 5;
 var MOBILE_PACK_READ_RETRY_MS = 100;
+var SETUP_SNAPSHOT_ATTEMPTS = 4;
+var SETUP_SNAPSHOT_RETRY_MS = 250;
 var RETIRED_OPERATION_GRACE_MS = 1500;
 var REF_LOCK_STALE_MS = 30 * 1e3;
 var PLUGIN_UPDATE_URL = "obsidian://brat?plugin=nareto%2Fobts";
@@ -24874,7 +24876,7 @@ var ObtsObsidianClient = class {
     if (await this.readPendingOnboarding()) throw new ObtsBlockedError("onboarding_incomplete", "Resume the saved setup or explicitly cancel it before starting another enrollment.");
     await this.assertPairingCanStart();
     await this.flushEditorBuffersToDisk();
-    const summary = await this.localSnapshotSummary();
+    const summary = await this.stableSetupSnapshotSummary();
     const existing = await readJson(this.fsp, this.statePath, null);
     const deviceName = normalizeDisplayName(this.plugin.settings.deviceName || "Obsidian device");
     this.plugin.settings.deviceName = deviceName;
@@ -25023,7 +25025,7 @@ var ObtsObsidianClient = class {
       throw new ObtsBlockedError("connection_not_approved", "Approve this connection in the browser first.");
     }
     await this.flushEditorBuffersToDisk();
-    const local = await this.localSnapshotSummary();
+    const local = await this.stableSetupSnapshotSummary();
     if (status2.selection === "new_vault") {
       const analysis2 = {
         selection: status2.selection,
@@ -30239,6 +30241,23 @@ var ObtsObsidianClient = class {
       this.plugin.setOperationProgress(label, diagnosticPoint);
     } else {
       this.plugin.setStatus(label);
+    }
+  }
+  // Setup scans must not fail on a single racing write: Obsidian rewrites its
+  // own settings files at any time, and some mobile adapters report metadata
+  // that changes on the first read after a write. Each attempt is a complete,
+  // independently verified snapshot, so retrying never weakens consent.
+  async stableSetupSnapshotSummary(attempts = SETUP_SNAPSHOT_ATTEMPTS) {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await this.localSnapshotSummary();
+      } catch (error) {
+        if (!(error instanceof LocalSnapshotChangedError)) throw error;
+        if (attempt >= attempts) {
+          throw new ObtsBlockedError("local_snapshot_changed", "Files in this vault kept changing while obts scanned it. Close Settings and other plugins that write files, wait a moment, then try again.");
+        }
+        await new Promise((resolve) => setTimeout(resolve, SETUP_SNAPSHOT_RETRY_MS * attempt));
+      }
     }
   }
   async localSnapshotSummary() {

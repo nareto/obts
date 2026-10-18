@@ -35,7 +35,8 @@ export const pluginTests = [
   'tests/applied-ack-barrier.test.ts',
   'tests/git-object-cache.test.ts',
   'tests/git-pack-consolidation.test.ts',
-  'tests/name-repair-flow.test.ts'
+  'tests/name-repair-flow.test.ts',
+  'tests/onboarding-setup-scan.test.ts'
 ];
 
 export const dashboardTests = ['tests/vault-deletion.test.ts'];
