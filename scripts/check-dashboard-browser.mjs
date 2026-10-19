@@ -2359,6 +2359,65 @@ try {
     assert.equal(getCount(fixture, '/vaults'), vaultsBase, 'a vault-scope event does not refetch the vault list');
   });
 
+  await scenario('live: a conflict review refresh survives the update event it causes and becomes submittable', async ({page, fixture, es, navigate}) => {
+    await goLive(page, es, fixture);
+    const nextMain = 'b'.repeat(40);
+    Object.assign(fixture.conflict, {stale: true, status_label: 'Stale review'});
+    fixture.review.stale = true;
+    await navigate('Conflicts');
+    await expect(page.getByRole('button', {name: 'Refresh review', exact: true})).toBeVisible();
+    const before = dashboardGets(fixture);
+    let dashboardGetsDuringRefresh = -1;
+    await page.route('**/api/v1/vaults/sample-vault/conflicts/sample-conflict/refresh', async route => {
+      fixture.vault.current_main = nextMain;
+      Object.assign(fixture.conflict, {stale: false, status_label: 'Review needed', current_main: nextMain, expected_main: nextMain});
+      Object.assign(fixture.review, {stale: false, expected_main: nextMain, current_main: nextMain});
+      // The server publishes the refresh event before its response reaches the browser.
+      await es.invalidate({account: false, vault_ids: ['sample-vault']});
+      await page.waitForTimeout(300);
+      dashboardGetsDuringRefresh = dashboardGets(fixture);
+      await route.fulfill({status: 200, json: fixture.review});
+    });
+    await page.getByRole('button', {name: 'Refresh review', exact: true}).click();
+    await expect(page.locator('.notice')).toContainText('Conflict review refreshed');
+    assert.equal(dashboardGetsDuringRefresh, before, 'the refresh event waits behind the manual review refresh');
+    await expect.poll(() => dashboardGets(fixture)).toBe(before + 1);
+    await stable(page, () => dashboardGets(fixture));
+    await expect(page.getByRole('button', {name: 'Refresh review', exact: true})).toHaveCount(0);
+    await expect(page.locator('.action-error')).toHaveCount(0);
+    await page.locator('.resolution-policy select').selectOption('use_device');
+    const previewRequest = page.waitForRequest(request => request.url().endsWith('/preview'));
+    await page.getByRole('button', {name: 'Review result', exact: true}).click();
+    assert.equal((await previewRequest).postDataJSON().expected_main, nextMain);
+    await expect(page.getByRole('button', {name: 'Apply resolution', exact: true})).toBeVisible();
+  });
+
+  await scenario('live: a dashboard snapshot requested before a conflict review load cannot discard it', async ({page, fixture, es, navigate}) => {
+    await goLive(page, es, fixture);
+    await navigate('Conflicts');
+    await expect(page.getByRole('button', {name: 'Review result', exact: true})).toBeVisible();
+    const dashboardHold = fixture.holdNext('/vaults/sample-vault/dashboard');
+    const reviewHold = fixture.holdNext('/vaults/sample-vault/conflicts/sample-conflict');
+    try {
+      await es.invalidate({account: false, vault_ids: ['sample-vault']});
+      await dashboardHold.started;
+      await page.getByRole('button', {name: 'Browse queue', exact: true}).click();
+      await page.locator('.conflict-queue-list').getByRole('button', {name: 'Review', exact: true}).click();
+      await reviewHold.started;
+      const dashboardDone = page.waitForResponse('**/api/v1/vaults/sample-vault/dashboard');
+      dashboardHold.release();
+      await dashboardDone;
+      await page.evaluate(() => new Promise(requestAnimationFrame));
+      reviewHold.release();
+      await expect(page.getByRole('button', {name: 'Review result', exact: true})).toBeVisible();
+      await expect(page.getByRole('button', {name: 'Refresh review', exact: true})).toHaveCount(0);
+      await expect(page.locator('.action-error')).toHaveCount(0);
+    } finally {
+      dashboardHold.release();
+      reviewHold.release();
+    }
+  });
+
   await scenario('live: heartbeat comments and unknown frames never refresh', async ({page, fixture, es}) => {
     await goLive(page, es, fixture);
     const base = dashboardGets(fixture);

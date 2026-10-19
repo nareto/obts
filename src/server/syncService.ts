@@ -119,6 +119,8 @@ export type NameRepairPreviewResult = {
 };
 
 const MAX_NAME_REPAIR_LINK_SOURCE_BYTES = 8 * 1024 * 1024;
+const MAX_REVIEW_ADVANCE_VERDICTS = 512;
+const ROOT_IGNORE_PATH = '.gitignore';
 const NAME_REPAIR_TEXT_DECODER = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false });
 const UTF8_BOM = Buffer.from([0xef, 0xbb, 0xbf]);
 
@@ -169,6 +171,7 @@ export function commitPreparedNameRepair(store: MetadataStore, db: MetadataDb, o
 export class SyncService {
   private readonly locks = new Map<string, Promise<void>>();
   private readonly unportableCounts = new Map<string, { key: string; count: number }>();
+  private readonly reviewAdvanceVerdicts = new Map<string, boolean>();
 
   constructor(
     private readonly store: MetadataStore,
@@ -1081,13 +1084,10 @@ export class SyncService {
         rendered_markdown_diff: contentKind === 'text' && path.endsWith('.md') ? buildMarkdownReview(serverContent, deviceContent) : null
       });
     }
-    const directoryContext = conflict.directory_context;
-    const directoryConflicts = buildDirectoryConflictViews(directoryContext);
-    const directoryStale = directoryContext !== undefined &&
-      (db.directory_state_by_vault[vaultId]?.last_event_seq ?? 0) !== directoryContext.expected_event_seq;
+    const directoryConflicts = buildDirectoryConflictViews(conflict.directory_context);
     return {
       conflict,
-      stale: conflict.status === 'open' && (vault.current_main !== conflict.expected_main || directoryStale),
+      stale: await this.isConflictReviewStale(db, vault, conflict),
       expected_main: conflict.expected_main,
       current_main: vault.current_main,
       device_name: device.device_name,
@@ -1275,6 +1275,144 @@ export class SyncService {
     return await this.getConflictReviewPackage(input.vaultId, input.conflictId);
   }
 
+  /**
+   * A review stays current while main advances only outside everything it covers: the affected paths, directory
+   * roots, the device's authored changes, and the root ignore policy. Directory-state changes keep invalidating
+   * directory reviews.
+   */
+  async isConflictReviewStale(
+    db: Pick<MetadataDb, 'directory_state_by_vault'>,
+    vault: { vault_id: string; current_main: string },
+    conflict: ConflictRecord
+  ): Promise<boolean> {
+    if (conflict.status !== 'open') return false;
+    const directoryEventSeq = db.directory_state_by_vault[vault.vault_id]?.last_event_seq ?? 0;
+    if (conflict.directory_context !== undefined && conflict.directory_context.expected_event_seq !== directoryEventSeq) {
+      return true;
+    }
+    return await this.reviewedMainAdvanceOverlaps(conflict, vault.current_main);
+  }
+
+  async staleConflictReviewIds(
+    db: Pick<MetadataDb, 'directory_state_by_vault'>,
+    vault: { vault_id: string; current_main: string },
+    conflicts: ConflictRecord[]
+  ): Promise<Set<string>> {
+    const stale = new Set<string>();
+    for (const conflict of conflicts) {
+      if (conflict.vault_id === vault.vault_id && await this.isConflictReviewStale(db, vault, conflict)) {
+        stale.add(conflict.conflict_id);
+      }
+    }
+    return stale;
+  }
+
+  private async reviewedMainAdvanceOverlaps(conflict: ConflictRecord, currentMain: string): Promise<boolean> {
+    if (conflict.expected_main === currentMain) return false;
+    const key = JSON.stringify([
+      conflict.vault_id,
+      conflict.conflict_id,
+      conflict.expected_main,
+      conflict.device_commit,
+      currentMain,
+      conflict.affected_paths,
+      conflict.directory_context?.affected_roots ?? []
+    ]);
+    const cached = this.reviewAdvanceVerdicts.get(key);
+    if (cached !== undefined) return cached;
+    let overlaps: boolean;
+    try {
+      overlaps = await this.computeReviewedMainAdvanceOverlap(conflict, currentMain);
+    } catch {
+      return true;
+    }
+    if (this.reviewAdvanceVerdicts.size >= MAX_REVIEW_ADVANCE_VERDICTS) this.reviewAdvanceVerdicts.clear();
+    this.reviewAdvanceVerdicts.set(key, overlaps);
+    return overlaps;
+  }
+
+  private async computeReviewedMainAdvanceOverlap(conflict: ConflictRecord, currentMain: string): Promise<boolean> {
+    const vaultId = conflict.vault_id;
+    for (const commit of [conflict.expected_main, currentMain, conflict.device_commit]) {
+      if (!(await this.git.commitExists(vaultId, commit))) return true;
+    }
+    if (!(await this.git.isAncestor(vaultId, conflict.expected_main, currentMain))) return true;
+    const advanced = changedPathSet(await this.git.changedPaths(vaultId, conflict.expected_main, currentMain));
+    if (advanced.size === 0) return false;
+    const authoredBase = await this.git.mergeBase(vaultId, currentMain, conflict.device_commit) ?? conflict.base_commit;
+    const reviewed = [
+      ROOT_IGNORE_PATH,
+      ...conflict.affected_paths,
+      ...(conflict.directory_context?.affected_roots ?? []),
+      ...changedPathSet(await this.git.changedPaths(vaultId, authoredBase, conflict.device_commit))
+    ];
+    return [...advanced].some((path) => reviewed.some((reviewedPath) => changedPathsConflict(path, reviewedPath)));
+  }
+
+  private async loadResolutionTarget(
+    snapshot: MetadataDb,
+    input: { vaultId: string; conflictId: string; expectedMain: string; resolutionKind: ConflictResolutionKind },
+    options: { allowResolved?: boolean } = {}
+  ): Promise<{ conflict: ConflictRecord; effectiveMain: string }> {
+    const conflict = this.loadResolutionConflict(snapshot, input, options);
+    const vault = requireVault(snapshot, input.vaultId);
+    if (conflict.status === 'open' && await this.reviewedMainAdvanceOverlaps(conflict, vault.current_main)) {
+      throw new AuthError(409, 'stale_conflict_review', 'Conflict review is stale; refresh before resolving.');
+    }
+    return { conflict, effectiveMain: vault.current_main };
+  }
+
+  /**
+   * Builds the reviewed candidate on the conflict's recorded main and, when main has since advanced outside the
+   * review, the candidate applied on current main. Both must make exactly the same changes to their main.
+   */
+  private async buildResolutionCandidate(
+    conflict: ConflictRecord,
+    effectiveMain: string,
+    resolutionKind: ConflictResolutionKind,
+    manualFiles: Record<string, string | null> | undefined,
+    manualFilePlan: ManualFilePlanEntry[] | undefined
+  ): Promise<{ reviewed: ResolutionArtifacts; appliedTree: string }> {
+    const reviewed = await this.buildResolutionArtifacts(conflict, resolutionKind, manualFiles, manualFilePlan);
+    if (effectiveMain === conflict.expected_main) return { reviewed, appliedTree: reviewed.tree };
+    const advanced: ConflictRecord = { ...conflict, current_main: effectiveMain, expected_main: effectiveMain };
+    let appliedTree: string;
+    try {
+      appliedTree = (await this.buildResolutionArtifacts(advanced, resolutionKind, manualFiles, manualFilePlan, {
+        serverLabelMain: conflict.expected_main
+      })).tree;
+    } catch (error) {
+      if (error instanceof AuthError && error.code === 'invalid_resolution') {
+        throw new AuthError(409, 'stale_conflict_review', 'Conflict review is stale; refresh before resolving.');
+      }
+      throw error;
+    }
+    if (!(await this.sameTreeChanges(conflict.vault_id, conflict.expected_main, reviewed.tree, effectiveMain, appliedTree))) {
+      throw new AuthError(409, 'stale_conflict_review', 'Conflict review is stale; refresh before resolving.');
+    }
+    return { reviewed, appliedTree };
+  }
+
+  private async sameTreeChanges(
+    vaultId: string,
+    reviewedBase: string,
+    reviewedTree: string,
+    appliedBase: string,
+    appliedTree: string
+  ): Promise<boolean> {
+    const identities = async (treeish: string) => treeEntryIdentities(await this.git.listTreeEntries(vaultId, treeish));
+    const [reviewedBaseEntries, reviewedEntries, appliedBaseEntries, appliedEntries] = await Promise.all([
+      identities(reviewedBase),
+      identities(reviewedTree),
+      identities(appliedBase),
+      identities(appliedTree)
+    ]);
+    const reviewedChanges = treeChanges(reviewedBaseEntries, reviewedEntries);
+    const appliedChanges = treeChanges(appliedBaseEntries, appliedEntries);
+    return reviewedChanges.size === appliedChanges.size &&
+      [...reviewedChanges].every(([path, identity]) => appliedChanges.has(path) && appliedChanges.get(path) === identity);
+  }
+
   private loadResolutionConflict(
     snapshot: MetadataDb,
     input: { vaultId: string; conflictId: string; expectedMain: string; resolutionKind: ConflictResolutionKind },
@@ -1297,7 +1435,6 @@ export class SyncService {
     const currentDirectoryEventSeq = snapshot.directory_state_by_vault[input.vaultId]?.last_event_seq ?? 0;
     if (
       conflict.expected_main !== input.expectedMain ||
-      vault.current_main !== input.expectedMain ||
       (conflict.directory_context !== undefined && conflict.directory_context.expected_event_seq !== currentDirectoryEventSeq)
     ) {
       throw new AuthError(409, 'stale_conflict_review', 'Conflict review is stale; refresh before resolving.');
@@ -1321,14 +1458,20 @@ export class SyncService {
   }): Promise<ConflictResolutionPreview> {
     return await this.withVaultLock(input.vaultId, async () => {
       const snapshot = await this.store.snapshot();
-      const conflict = this.loadResolutionConflict(snapshot, input);
-      const artifacts = await this.buildResolutionArtifacts(conflict, input.resolutionKind, input.manualFiles, input.manualFilePlan);
-      await this.git.validateTreeRootIgnorePolicy(input.vaultId, artifacts.tree, this.maxUploadBytes);
+      const { conflict, effectiveMain } = await this.loadResolutionTarget(snapshot, input);
+      const { reviewed: artifacts, appliedTree } = await this.buildResolutionCandidate(
+        conflict,
+        effectiveMain,
+        input.resolutionKind,
+        input.manualFiles,
+        input.manualFilePlan
+      );
+      await this.git.validateTreeRootIgnorePolicy(input.vaultId, appliedTree, this.maxUploadBytes);
       return {
         conflict_id: conflict.conflict_id,
         resolution_kind: input.resolutionKind,
         expected_main: conflict.expected_main,
-        current_main: conflict.expected_main,
+        current_main: effectiveMain,
         tree: artifacts.tree,
         files: await this.describeResolutionPreview(conflict, input.resolutionKind, artifacts),
         directory_conflicts: buildDirectoryConflictViews(conflict.directory_context).map((view) => ({
@@ -1366,7 +1509,7 @@ export class SyncService {
     const requestHash = resolutionRequestHash(input);
     return await this.withVaultLock(input.vaultId, async () => {
       const snapshot = await this.store.snapshot();
-      const conflict = this.loadResolutionConflict(snapshot, input, { allowResolved: true });
+      const { conflict, effectiveMain } = await this.loadResolutionTarget(snapshot, input, { allowResolved: true });
       if (conflict.status === 'resolved') {
         if (conflict.resolution_request_hash === requestHash && conflict.resolution_commit) {
           return {
@@ -1382,10 +1525,17 @@ export class SyncService {
       }
       const resolvedDirectoryIntents = resolvedConflictDirectoryIntents(conflict, input.resolutionKind);
 
-      const tree = await this.buildResolutionTree(conflict, input.resolutionKind, input.manualFiles, input.manualFilePlan);
-      if (input.expectedTree !== undefined && tree !== input.expectedTree) {
+      const candidate = await this.buildResolutionCandidate(
+        conflict,
+        effectiveMain,
+        input.resolutionKind,
+        input.manualFiles,
+        input.manualFilePlan
+      );
+      if (input.expectedTree !== undefined && candidate.reviewed.tree !== input.expectedTree) {
         throw new AuthError(409, 'stale_conflict_preview', 'The reviewed resolution result changed; review the result again.');
       }
+      const tree = candidate.appliedTree;
       await this.git.validateTreeRootIgnorePolicy(input.vaultId, tree, this.maxUploadBytes);
 
       const preparation = await this.store.mutate((db) => {
@@ -1399,7 +1549,7 @@ export class SyncService {
           device_id: conflict.device_id,
           operation_type: 'conflict_resolve',
           expected_refs: {
-            'refs/heads/main': input.expectedMain,
+            'refs/heads/main': effectiveMain,
             [device.device_ref]: conflict.device_commit
           },
           target_refs: {
@@ -1412,7 +1562,8 @@ export class SyncService {
           merge_sequence: conflict.merge_sequence,
           merge_policy_version: conflict.merge_policy_version,
           base_commit: conflict.base_commit,
-          current_main: input.expectedMain,
+          current_main: effectiveMain,
+          reviewed_main: conflict.expected_main,
           device_commit: conflict.device_commit,
           conflict_id: conflict.conflict_id,
           actor_user_id: input.actorUserId,
@@ -1421,6 +1572,7 @@ export class SyncService {
           resolution_request_hash: requestHash,
           validator_results: {
             accepted_tree: tree,
+            reviewed_tree: candidate.reviewed.tree,
             expected_main_matches: true
           },
           resolved_directory_intents: resolvedDirectoryIntents,
@@ -1435,7 +1587,7 @@ export class SyncService {
         resolutionCommit = await this.git.createResolutionMergeCommitObject({
           vaultId: input.vaultId,
           tree,
-          expectedMain: input.expectedMain,
+          expectedMain: effectiveMain,
           deviceCommit: conflict.device_commit,
           conflictId: conflict.conflict_id,
           resolutionKind: input.resolutionKind,
@@ -1443,7 +1595,7 @@ export class SyncService {
           userId: input.actorUserId
         });
         await this.prepareConflictResolutionRefUpdate(preparation.operationId, resolutionCommit);
-        await this.git.updateRef(input.vaultId, 'refs/heads/main', resolutionCommit, input.expectedMain);
+        await this.git.updateRef(input.vaultId, 'refs/heads/main', resolutionCommit, effectiveMain);
       } catch (error) {
         await this.abortOperation(preparation.operationId, 'resolution_git_error');
         throw error;
@@ -1487,7 +1639,7 @@ export class SyncService {
             device_id: mutableConflict.device_id
           },
           commit_cursors: {
-            previous_main: input.expectedMain,
+            previous_main: effectiveMain,
             main: resolutionCommit,
             device_commit: mutableConflict.device_commit
           },
@@ -1511,7 +1663,7 @@ export class SyncService {
           },
           commit_cursors: {
             main: resolutionCommit,
-            previous_main: input.expectedMain,
+            previous_main: effectiveMain,
             device_commit: mutableConflict.device_commit
           },
           payload: {
@@ -2501,20 +2653,12 @@ export class SyncService {
     return blob === null ? null : blob.toString('utf8');
   }
 
-  private async buildResolutionTree(
-    conflict: ConflictRecord,
-    resolutionKind: ConflictResolutionKind,
-    manualFiles: Record<string, string | null> | undefined,
-    manualFilePlan: ManualFilePlanEntry[] | undefined
-  ): Promise<string> {
-    return (await this.buildResolutionArtifacts(conflict, resolutionKind, manualFiles, manualFilePlan)).tree;
-  }
-
   private async buildResolutionArtifacts(
     conflict: ConflictRecord,
     resolutionKind: ConflictResolutionKind,
     manualFiles: Record<string, string | null> | undefined,
-    manualFilePlan: ManualFilePlanEntry[] | undefined
+    manualFilePlan: ManualFilePlanEntry[] | undefined,
+    options: { serverLabelMain?: string } = {}
   ): Promise<ResolutionArtifacts> {
     const sourceTree = await this.resolutionSourceTree(conflict);
     const fileAffectedPaths = await this.conflictFileAffectedPaths(conflict);
@@ -2581,7 +2725,7 @@ export class SyncService {
           path,
           Buffer.from(
             [
-              `## Server version (${conflict.expected_main.slice(0, 12)})`,
+              `## Server version (${(options.serverLabelMain ?? conflict.expected_main).slice(0, 12)})`,
               '',
               serverText ?? '',
               '',
@@ -3953,6 +4097,20 @@ function intersectChangedPaths(left: GitDiffEntry[], right: GitDiffEntry[]): str
 
 function changedPathsConflict(left: string, right: string): boolean {
   return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
+
+function treeEntryIdentities(entries: Array<{ mode: string; oid: string; path: string }>): Map<string, string> {
+  return new Map(entries.map((entry) => [entry.path, `${entry.mode}:${entry.oid}`]));
+}
+
+function treeChanges(base: Map<string, string>, target: Map<string, string>): Map<string, string> {
+  const changes = new Map<string, string>();
+  for (const path of new Set([...base.keys(), ...target.keys()])) {
+    const before = base.get(path) ?? 'absent';
+    const after = target.get(path) ?? 'absent';
+    if (before !== after) changes.set(path, `${before}->${after}`);
+  }
+  return changes;
 }
 
 export function recoveredDirectoryEventPayload(operation: SyncOperationRow): Record<string, unknown> {

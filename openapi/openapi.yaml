@@ -1458,6 +1458,9 @@ paths:
   /vaults/{vault_id}/conflicts/{conflict_id}/refresh:
     post:
       summary: Refresh a stale conflict review package against the current server main.
+      description: |
+        Rebuilds the package on current main. Only a stale package needs this; a package stays
+        current across main advances that do not touch what it reviewed (see `ConflictReviewPackage.stale`).
       parameters:
         - $ref: "#/components/parameters/VaultId"
         - $ref: "#/components/parameters/ConflictId"
@@ -1482,6 +1485,8 @@ paths:
         the conflict resolved, mutates conflict metadata, or emits resolution events;
         candidate construction may create unreachable internal Git objects. Stale
         reviews and invalid manual input are rejected exactly as for resolution.
+        `tree` is the reviewed candidate built on `expected_main`; when main has advanced
+        without making the review stale, `current_main` is the main the resolution applies to.
       parameters:
         - $ref: "#/components/parameters/VaultId"
         - $ref: "#/components/parameters/ConflictId"
@@ -3802,6 +3807,7 @@ components:
               type: string
             stale:
               type: boolean
+              description: Same meaning as `ConflictReviewPackage.stale`; always false for resolved conflicts.
             status_label:
               type: string
     DashboardActivity:
@@ -3957,6 +3963,11 @@ components:
           $ref: "#/components/schemas/ConflictRecord"
         stale:
           type: boolean
+          description: |
+            True when the package must be refreshed before it can resolve. That is the case when its directory
+            context changed, or when main advanced into what it reviewed: the advance touches an affected path or
+            directory root, the device's authored changes, or the root `.gitignore`, or ancestry cannot be
+            verified. An advance outside the review keeps the package current.
         expected_main:
           type: string
           pattern: "^[0-9a-f]{40}$"

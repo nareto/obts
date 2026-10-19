@@ -66,8 +66,12 @@ The complete-conflict choices are:
 - insert both blocks for text review;
 - manually edit complete final content and paths.
 
-If server `main` advances while a review is open, resolution submission fails
-with `409 stale_conflict_review`; the dashboard marks the review stale so it can
+If server `main` advances while a review is open, the review stays current as
+long as the advance does not touch its affected paths or directories, the
+device's own changes, or the root `.gitignore`. Resolving it then applies the
+reviewed change on top of the new `main`, keeping the advance. An advance that
+touches any of those makes the review stale: submission fails with
+`409 stale_conflict_review`, and the dashboard marks the review stale so it can
 be refreshed before trying again. Duplicate submission of the same accepted
 resolution is idempotent.
 

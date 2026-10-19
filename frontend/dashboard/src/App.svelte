@@ -1054,6 +1054,8 @@
     const userId = session.user_id;
     const requestGeneration = ++dashboardRefreshGeneration;
     const deletionGeneration = ++deletionRefreshGeneration;
+    // Review requests started after this snapshot was requested are newer than it; it must not supersede them.
+    const reviewGenerationAtRequest = reviewRequestGeneration;
     const deletionBefore = deletions;
     dashboardRefreshOwner = { vaultId: requestedVaultId, epoch, generation: requestGeneration };
     dashboardRefreshInFlight = true;
@@ -1098,11 +1100,12 @@
           dashboardStatusCurrent = true;
           return;
         }
-        reviewRequestGeneration += 1;
+        const newerReviewPending = reviewRequestGeneration !== reviewGenerationAtRequest;
+        if (!newerReviewPending) reviewRequestGeneration += 1;
         dashboard = dashboardResult.value;
         conflicts = sortConflicts(dashboardResult.value.conflicts);
         const selected = conflicts.find((conflict) => conflict.conflict_id === selectedConflictId);
-        if (review && selectedConflictId && (!selected || selected.status !== 'open' || selected.stale || selected.current_main !== review.expected_main)) {
+        if (!newerReviewPending && review && selectedConflictId && (!selected || selected.status !== 'open' || selected.stale || selected.expected_main !== review.expected_main)) {
           review = { ...review, stale: true };
           if (selected) selected.status_label = 'Stale review';
           actionError = selected ? 'This conflict changed while it was open. Refresh before submitting.' : 'This conflict is no longer available. Refresh the conflict queue.';
@@ -1440,7 +1443,12 @@
     await refreshConflictReview(review.conflict.conflict_id);
   }
 
-  async function refreshConflictReview(conflictId: string) {
+  /** Registered with the scheduler: live updates it causes (such as its own refresh event) queue behind it. */
+  function refreshConflictReview(conflictId: string) {
+    return tracked(() => refreshConflictReviewNow(conflictId));
+  }
+
+  async function refreshConflictReviewNow(conflictId: string) {
     if (!vaultId || !session) return;
     actionError = '';
     const requestedVaultId = vaultId;

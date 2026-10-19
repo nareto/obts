@@ -1335,8 +1335,17 @@ describe('Phase 2 dashboard conflict resolution', () => {
       expect(session).toBeDefined();
       session!.recent_auth_at = new Date(Date.now() - 16 * 60 * 1000).toISOString();
     });
-    await writeFile(join(desktopDir, 'unrelated.md'), 'accepted while review is open\n');
+    await writeFile(join(desktopDir, 'shared.md'), 'server edit while review is open\n');
     expect((await desktop.syncOnce()).status).toBe('Synced');
+    const staleReview = await admin.get<{ stale: boolean }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`);
+    expect(staleReview.body.stale).toBe(true);
+    const staleList = await admin.get<{ conflicts: Array<{ conflict_id: string; stale: boolean; status_label: string }> }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts`
+    );
+    expect(staleList.body.conflicts.find((conflict) => conflict.conflict_id === result.conflictId)).toMatchObject({
+      stale: true,
+      status_label: 'Stale review'
+    });
     const stale = await admin.post<{ error: { code: string } }>(
       `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
       {
@@ -1369,7 +1378,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(refreshed.body.expected_main).not.toBe(review.body.expected_main);
     expect(refreshed.body.files[0]).toMatchObject({
       path: 'shared.md',
-      server_content: 'server version\n',
+      server_content: 'server edit while review is open\n',
       device_content: 'device version\n'
     });
     expect(await server.git.getRef(admin.vaultId, `refs/obts/conflicts/${result.conflictId}/current`)).toBe(
@@ -1408,9 +1417,8 @@ describe('Phase 2 dashboard conflict resolution', () => {
     );
     expect(resolvedConflictRecord).toBeDefined();
     expect((await server.git.readBlobAtPath(admin.vaultId, review.body.current_main, 'shared.md')).toString('utf8')).toBe('server version\n');
-    expect((await server.git.readBlobAtPath(admin.vaultId, refreshed.body.current_main, 'shared.md')).toString('utf8')).toBe('server version\n');
-    expect((await server.git.readBlobAtPath(admin.vaultId, refreshed.body.current_main, 'unrelated.md')).toString('utf8')).toBe(
-      'accepted while review is open\n'
+    expect((await server.git.readBlobAtPath(admin.vaultId, refreshed.body.current_main, 'shared.md')).toString('utf8')).toBe(
+      'server edit while review is open\n'
     );
     expect((await server.git.readBlobAtPath(admin.vaultId, resolvedConflictRecord!.device_commit, 'shared.md')).toString('utf8')).toBe(
       'device version\n'
@@ -1418,9 +1426,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect((await server.git.readBlobAtPath(admin.vaultId, refreshedResolved.body.resolution_commit, 'shared.md')).toString('utf8')).toBe(
       'device version\n'
     );
-    expect((await server.git.readBlobAtPath(admin.vaultId, refreshedResolved.body.resolution_commit, 'unrelated.md')).toString('utf8')).toBe(
-      'accepted while review is open\n'
-    );
+    expect(await server.git.isAncestor(admin.vaultId, refreshed.body.current_main, refreshedResolved.body.resolution_commit)).toBe(true);
 
     const protectedCurrentRef = `refs/obts/conflicts/${result.conflictId}/current`;
     await server.git.updateRef(admin.vaultId, protectedCurrentRef, review.body.current_main, refreshed.body.current_main);
@@ -1435,8 +1441,8 @@ describe('Phase 2 dashboard conflict resolution', () => {
       current_main: refreshedResolved.body.resolution_commit
     });
     expect((await server.git.readBlobAtPath(admin.vaultId, review.body.current_main, 'shared.md')).toString('utf8')).toBe('server version\n');
-    expect((await server.git.readBlobAtPath(admin.vaultId, refreshed.body.current_main, 'unrelated.md')).toString('utf8')).toBe(
-      'accepted while review is open\n'
+    expect((await server.git.readBlobAtPath(admin.vaultId, refreshed.body.current_main, 'shared.md')).toString('utf8')).toBe(
+      'server edit while review is open\n'
     );
   });
 
@@ -2071,6 +2077,14 @@ describe('Phase 2 dashboard conflict resolution', () => {
 
     await writeFile(join(desktopDir, 'two.md'), 'two server later\n');
     expect((await desktop.syncOnce()).status).toBe('Synced');
+    const stale = await admin.get<{ stale: boolean }>(`/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`);
+    expect(stale.body.stale).toBe(true);
+    const staleResolve = await admin.post<{ error: { code: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
+      { expected_main: review.body.conflict.expected_main, resolution_kind: 'use_device' }
+    );
+    expect(staleResolve.status).toBe(409);
+    expect(staleResolve.body.error.code).toBe('stale_conflict_review');
 
     const refreshed = await admin.post<{
       conflict: { affected_paths: string[]; affected_path_count: number };
@@ -2084,6 +2098,125 @@ describe('Phase 2 dashboard conflict resolution', () => {
       server_content: 'two server later\n',
       device_content: 'two device\n'
     });
+  });
+
+  it('keeps a conflict review current and resolvable when main advances outside it', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'desktop-outside-advance');
+    const tabletDir = join(root, 'tablet-outside-advance');
+    await mkdir(desktopDir, { recursive: true });
+    await mkdir(tabletDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await writeFile(join(desktopDir, 'shared.md'), 'base\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const tablet = await pairPlugin(admin, tabletDir, 'tablet');
+    await writeFile(join(desktopDir, 'shared.md'), 'server version\n');
+    await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
+    await writeFile(join(tabletDir, 'tablet-only.md'), 'device only\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const result = await tablet.syncOnce();
+    expect(result.status).toBe('Conflict resolution needed');
+    const review = await admin.get<{ stale: boolean; expected_main: string; current_main: string }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`
+    );
+    expect(review.body.stale).toBe(false);
+    const reviewedMain = review.body.expected_main;
+
+    await writeFile(join(desktopDir, 'unrelated.md'), 'accepted while review is open\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const advancedMain = (await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main;
+    expect(advancedMain).toMatch(/^[0-9a-f]{40}$/u);
+    expect(advancedMain).not.toBe(reviewedMain);
+
+    const current = await admin.get<{ stale: boolean; expected_main: string; current_main: string }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`
+    );
+    expect(current.body).toMatchObject({ stale: false, expected_main: reviewedMain, current_main: advancedMain });
+    const listed = await admin.get<{ conflicts: Array<{ conflict_id: string; stale: boolean; status_label: string }> }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts`
+    );
+    expect(listed.body.conflicts.find((conflict) => conflict.conflict_id === result.conflictId)).toMatchObject({
+      stale: false,
+      status_label: 'Review needed'
+    });
+    const dashboard = await admin.get<{ conflicts: Array<{ conflict_id: string; stale: boolean }> }>(
+      `/api/v1/vaults/${admin.vaultId}/dashboard`
+    );
+    expect(dashboard.body.conflicts.find((conflict) => conflict.conflict_id === result.conflictId)?.stale).toBe(false);
+
+    const preview = await admin.post<{ tree: string; expected_main: string; current_main: string }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/preview`,
+      { expected_main: reviewedMain, resolution_kind: 'insert_both_blocks' }
+    );
+    expect(preview.status).toBe(200);
+    expect(preview.body).toMatchObject({ expected_main: reviewedMain, current_main: advancedMain });
+
+    const resolved = await admin.post<{ status: string; resolution_commit: string }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
+      { expected_main: reviewedMain, expected_tree: preview.body.tree, resolution_kind: 'insert_both_blocks' }
+    );
+    expect(resolved.status).toBe(200);
+    expect(resolved.body.status).toBe('resolved');
+    const resolutionCommit = resolved.body.resolution_commit;
+    expect(await server.git.isAncestor(admin.vaultId, advancedMain!, resolutionCommit)).toBe(true);
+    const read = async (path: string) => (await server.git.readBlobAtPath(admin.vaultId, resolutionCommit, path)).toString('utf8');
+    expect(await read('unrelated.md')).toBe('accepted while review is open\n');
+    expect(await read('tablet-only.md')).toBe('device only\n');
+    const merged = await read('shared.md');
+    expect(merged).toContain(`## Server version (${reviewedMain.slice(0, 12)})`);
+    expect(merged).toContain('server version\n');
+    expect(merged).toContain('device version\n');
+    expect((await operationHistory(server, admin.vaultId)).findLast(
+      (operation) => operation.operation_type === 'conflict_resolve'
+    )).toMatchObject({
+      status: 'committed',
+      expected_refs: { 'refs/heads/main': advancedMain },
+      target_refs: { 'refs/heads/main': resolutionCommit }
+    });
+    expect((await server.store.snapshot()).vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).toBe(resolutionCommit);
+  });
+
+  it('treats an outside-advance resolution as stale when the advanced candidate would change different paths', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'desktop-outside-collision');
+    const tabletDir = join(root, 'tablet-outside-collision');
+    await mkdir(desktopDir, { recursive: true });
+    await mkdir(tabletDir, { recursive: true });
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop');
+    await writeFile(join(desktopDir, 'shared.md'), 'base\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const tablet = await pairPlugin(admin, tabletDir, 'tablet');
+    await writeFile(join(desktopDir, 'shared.md'), 'server version\n');
+    await writeFile(join(tabletDir, 'shared.md'), 'device version\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const result = await tablet.syncOnce();
+    expect(result.status).toBe('Conflict resolution needed');
+    const review = await admin.get<{ expected_main: string; conflict: { device_id: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`
+    );
+    const reviewedMain = review.body.expected_main;
+    const preview = await admin.post<{ tree: string; files: Array<{ path: string; source_path: string | null }> }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/preview`,
+      { expected_main: reviewedMain, resolution_kind: 'keep_both_files' }
+    );
+    expect(preview.status).toBe(200);
+    const copyPath = preview.body.files.find((file) => file.source_path === 'shared.md')?.path;
+    expect(copyPath).toBeDefined();
+
+    // Main gains the exact copy path the reviewed keep-both result would have created.
+    await mkdir(dirname(join(desktopDir, copyPath!)), { recursive: true });
+    await writeFile(join(desktopDir, copyPath!), 'server file at the copy path\n');
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+
+    const resolve = await admin.post<{ error: { code: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}/resolve`,
+      { expected_main: reviewedMain, expected_tree: preview.body.tree, resolution_kind: 'keep_both_files' }
+    );
+    expect(resolve.status).toBe(409);
+    expect(resolve.body.error.code).toBe('stale_conflict_review');
+    expect((await server.store.snapshot()).conflicts.find((conflict) => conflict.conflict_id === result.conflictId)?.status).toBe('open');
   });
 
   it('supports keep-both, insert-both, and manual conflict resolutions as merge commits', async () => {

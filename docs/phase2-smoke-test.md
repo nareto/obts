@@ -56,11 +56,16 @@ Phase 2 dashboard conflict-resolution workflow without using test harness code.
 11. Verify stale-review protection manually:
 
     - create another conflict and open its review package in the dashboard;
-    - advance server `main` with an unrelated accepted edit from another
-      device;
+    - advance server `main` with an accepted edit from another device to a
+      path outside the conflict;
+    - confirm the review stays current, and that resolving it keeps that edit
+      in the resolved `main`;
+    - create another conflict, open its review, and advance `main` with an
+      accepted edit to one of its conflicting paths;
     - submit the old review package;
     - confirm the dashboard reports a stale review and `main` is unchanged by
-      the stale submission.
+      the stale submission;
+    - choose Refresh review and confirm the refreshed review can be resolved.
 
 12. Stop the server and either keep the Docker volume for restore testing or
     remove it:

@@ -172,7 +172,13 @@ The owner reviews server and named-device provenance, affected paths, rendered/s
 
 A resolution preview returns the candidate tree and complete final outcomes produced by the same resolution computation that application uses; it never advances main, records a resolution, mutates conflict metadata, or emits resolution events. Creating internal unreachable Git objects during candidate construction is not canonical mutation. A submission may carry the reviewed candidate tree and is rejected when the recomputed candidate differs, so the applied result is the reviewed result.
 
-Submission carries conflict ID and expected current main. If main advanced, the package is stale and cannot resolve until refreshed. Accepted resolution creates a two-parent merge commit whose tree exactly represents the accepted final package while preserving non-conflicting device changes. Duplicate submission is idempotent.
+Submission carries conflict ID and the package's reviewed main (`expected_main`). Canonical history is append-only, so a main advance alone does not make a package stale. A package is stale only when the review could have changed:
+
+- its directory context sequence changed;
+- the reviewed main or current main is missing, or current main does not descend from the reviewed main;
+- a path changed between the reviewed main and current main intersects the package's affected paths or directory roots, the device's authored changes, or the root `.gitignore`.
+
+When staleness cannot be determined, the package is stale. A stale package cannot resolve until refreshed. A current package resolves on current main and never rewrites or drops the advance. Resolution computes the reviewed result on the reviewed main and the applied result on current main. It is rejected as stale unless both make identical path changes to their main, so the applied change is the reviewed change. Accepted resolution creates a two-parent merge commit of current main and the device commit. Its tree applies exactly the accepted final package to current main while preserving non-conflicting device changes. Duplicate submission is idempotent.
 
 Conflict resolution uses the valid dashboard session, CSRF protection, stale-review checks, and audit logging. It does not require password re-entry.
 

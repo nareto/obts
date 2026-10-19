@@ -983,7 +983,7 @@ export async function createObtsServer(
       devices,
       recommended_plugin_version: RECOMMENDED_PLUGIN_VERSION,
       unresolved_conflict_count: conflicts.length,
-      conflicts: buildDashboardConflicts(scoped, vault.vault_id, vault.current_main, allConflicts),
+      conflicts: buildDashboardConflicts(scoped, vault.vault_id, await sync.staleConflictReviewIds(scoped, vault, allConflicts), allConflicts),
       recent_activity: buildRecentActivity(scoped, vault.vault_id),
       maintenance: buildMaintenanceRows(health),
       health,
@@ -1788,17 +1788,13 @@ export async function createObtsServer(
     const query = request.query as { status?: string };
     const db = await store.snapshot();
     const vault = ownedVaultOrThrow(db, session.user.user_id, vaultId);
+    const conflicts = db.conflicts.filter(
+      (conflict) =>
+        conflict.vault_id === vault.vault_id &&
+        (query.status === undefined || query.status === 'all' || query.status === conflict.status)
+    );
     return {
-      conflicts: buildDashboardConflicts(
-        db,
-        vault.vault_id,
-        vault.current_main,
-        db.conflicts.filter(
-          (conflict) =>
-            conflict.vault_id === vault.vault_id &&
-            (query.status === undefined || query.status === 'all' || query.status === conflict.status)
-        )
-      )
+      conflicts: buildDashboardConflicts(db, vault.vault_id, await sync.staleConflictReviewIds(db, vault, conflicts), conflicts)
     };
   });
 
@@ -2266,20 +2262,16 @@ function removalSummary(job: Pick<DeviceRemovalJob, 'state' | 'retryable' | 'err
 }
 
 function buildDashboardConflicts(
-  db: Pick<MetadataDb, 'devices' | 'directory_state_by_vault'>,
+  db: Pick<MetadataDb, 'devices'>,
   vaultId: string,
-  currentMain: string,
+  staleConflictIds: ReadonlySet<string>,
   conflicts: MetadataDb['conflicts']
 ): Array<MetadataDb['conflicts'][number] & { device_name: string; conflict_type: string; stale: boolean; status_label: string }> {
   return conflicts
     .filter((conflict) => conflict.vault_id === vaultId)
     .map((conflict) => {
       const device = db.devices.find((candidate) => candidate.device_id === conflict.device_id);
-      const currentDirectoryEventSeq = db.directory_state_by_vault[vaultId]?.last_event_seq ?? 0;
-      const stale = conflict.status === 'open' && (
-        conflict.expected_main !== currentMain ||
-        (conflict.directory_context !== undefined && conflict.directory_context.expected_event_seq !== currentDirectoryEventSeq)
-      );
+      const stale = conflict.status === 'open' && staleConflictIds.has(conflict.conflict_id);
       return {
         ...conflict,
         device_name: device?.device_name ?? 'Unknown device',

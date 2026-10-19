@@ -28,7 +28,7 @@ Server operations persist every post-ref metadata/event/conflict/directory effec
 
 ## Dashboard
 
-The Svelte SPA is an authenticated operational UI for validated vault context, device status, conflict review, history, diagnostics, and maintenance. It is not authoritative for sync state. Server-versus-named-device provenance remains explicit throughout conflict review, and stale expected-main packages cannot resolve.
+The Svelte SPA is an authenticated operational UI for validated vault context, device status, conflict review, history, diagnostics, and maintenance. It is not authoritative for sync state. Server-versus-named-device provenance remains explicit throughout conflict review, and stale packages cannot resolve. A package goes stale only when main advances into what it reviewed, not on every advance.
 
 The dashboard relies on valid session, ownership, CSRF, and operation preconditions. Consequential intent uses an explicit confirmation appropriate to the target; it does not ask an active authenticated user to enter the password again.
 
