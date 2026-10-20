@@ -23183,8 +23183,9 @@ var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var { findUnportablePaths, isRestrictedNamePlatform, segmentHasReservedCharacters } = require_namePortability();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.7.1";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.7.2";
 var SYNC_DEBOUNCE_MS = 1500;
+var EMPTY_JSON_BODY = "{}";
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
 var STALE_SETTLE_MARGIN_MS = 250;
 var PERIODIC_INVENTORY_INTERVAL_MS = 6 * 60 * 60 * 1e3;
@@ -26917,8 +26918,10 @@ var ObtsObsidianClient = class {
           method: "POST",
           headers: {
             authorization: `Bearer ${token}`,
+            "content-type": "application/json",
             ...useAsyncFinalize ? { prefer: "respond-async" } : {}
-          }
+          },
+          body: EMPTY_JSON_BODY
         }
       );
       if (!finalizeResponse.ok) await throwResponseError(finalizeResponse);
@@ -26949,7 +26952,11 @@ var ObtsObsidianClient = class {
       if (descriptor.status === "open") {
         const retry = await fetchWithTimeout(
           this.url(`/api/v1/vaults/${state.vault_id}/sync/push-transfers/${descriptor.transfer_id}/finalize`),
-          { method: "POST", headers: { authorization: `Bearer ${token}`, prefer: "respond-async" } }
+          {
+            method: "POST",
+            headers: { authorization: `Bearer ${token}`, "content-type": "application/json", prefer: "respond-async" },
+            body: EMPTY_JSON_BODY
+          }
         );
         if (!retry.ok) await throwResponseError(retry);
         descriptor = await retry.json();
@@ -31380,7 +31387,8 @@ var ObtsObsidianClient = class {
   async unpairDevice(vaultId, token) {
     const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${vaultId}/sync/unpair`), {
       method: "POST",
-      headers: { authorization: `Bearer ${token}` }
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: EMPTY_JSON_BODY
     });
     if (!response.ok) {
       await throwResponseError(response);

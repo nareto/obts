@@ -19,6 +19,8 @@ const { findUnportablePaths, isRestrictedNamePlatform, segmentHasReservedCharact
 const API_VERSION = obtsRuntime.obtsApiVersion || "__OBTS_API_VERSION__";
 const PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "__OBTS_PLUGIN_VERSION__";
 const SYNC_DEBOUNCE_MS = 1500;
+// Every POST names its body: Android sends an unlabeled POST as form data, which servers up to 0.3.54 reject.
+const EMPTY_JSON_BODY = "{}";
 const BACKGROUND_SYNC_INTERVAL_MS = 10 * 1000;
 const STALE_SETTLE_MARGIN_MS = 250;
 const PERIODIC_INVENTORY_INTERVAL_MS = 6 * 60 * 60 * 1000;
@@ -4044,8 +4046,10 @@ class ObtsObsidianClient {
           method: "POST",
           headers: {
             authorization: `Bearer ${token}`,
+            "content-type": "application/json",
             ...(useAsyncFinalize ? { prefer: "respond-async" } : {})
-          }
+          },
+          body: EMPTY_JSON_BODY
         }
       );
       if (!finalizeResponse.ok) await throwResponseError(finalizeResponse);
@@ -4080,7 +4084,11 @@ class ObtsObsidianClient {
       if (descriptor.status === "open") {
         const retry = await fetchWithTimeout(
           this.url(`/api/v1/vaults/${state.vault_id}/sync/push-transfers/${descriptor.transfer_id}/finalize`),
-          { method: "POST", headers: { authorization: `Bearer ${token}`, prefer: "respond-async" } }
+          {
+            method: "POST",
+            headers: { authorization: `Bearer ${token}`, "content-type": "application/json", prefer: "respond-async" },
+            body: EMPTY_JSON_BODY
+          }
         );
         if (!retry.ok) await throwResponseError(retry);
         descriptor = await retry.json();
@@ -9016,7 +9024,8 @@ class ObtsObsidianClient {
   async unpairDevice(vaultId, token) {
     const response = await fetchWithTimeout(this.url(`/api/v1/vaults/${vaultId}/sync/unpair`), {
       method: "POST",
-      headers: { authorization: `Bearer ${token}` }
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: EMPTY_JSON_BODY
     });
     if (!response.ok) {
       await throwResponseError(response);

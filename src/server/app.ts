@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 import cookie from '@fastify/cookie';
 import multipart from '@fastify/multipart';
-import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest, type RouteOptions } from 'fastify';
+import Fastify, { errorCodes, type FastifyInstance, type FastifyReply, type FastifyRequest, type RouteOptions } from 'fastify';
 
 import { DIAGNOSTIC_MAX_BODY_BYTES } from '../shared/diagnostics.js';
 import { newId, nowIso } from '../shared/ids.js';
@@ -242,6 +242,12 @@ export async function createObtsServer(
     { parseAs: 'buffer', bodyLimit: config.transferChunkBytes },
     (_request, body, done) => done(null, body)
   );
+  // The Android app labels a body-less POST as form data. An empty body carries no media, so treat it
+  // as no body whatever its declared type; any other unregistered type stays unsupported.
+  app.addContentTypeParser('*', (request, _payload, done) => {
+    if (hasEmptyBody(request)) done(null, undefined);
+    else done(new errorCodes.FST_ERR_CTP_INVALID_MEDIA_TYPE(), undefined);
+  });
   await app.register(cookie, { secret: config.sessionSecret });
   await app.register(multipart, {
     limits: {
@@ -457,7 +463,8 @@ export async function createObtsServer(
     if (!deletionMetadataFailure && !transferDurabilityFailure &&
         !(normalized instanceof AuthError || normalized instanceof ValidationError ||
           normalized instanceof PathPolicyViolation || normalized instanceof RootIgnorePolicyError ||
-          isMultipartInvalidJsonError(normalized) || isMultipartLimitError(normalized))) {
+          isMultipartInvalidJsonError(normalized) || isMultipartLimitError(normalized) ||
+          frameworkClientError(normalized) !== null)) {
       requestLog.annotate(request, safeErrorFields(normalized));
     }
     void sendError(
@@ -3592,6 +3599,13 @@ async function sendError(error: Error, request: FastifyRequest, reply: FastifyRe
     });
     return;
   }
+  const framework = frameworkClientError(error);
+  if (framework) {
+    await reply.status(framework.status).send({
+      error: { code: framework.code, message: framework.message, request_id: request.id, details: {} }
+    });
+    return;
+  }
   if (error instanceof AuthError) {
     await reply.status(error.statusCode).send({
       error: {
@@ -4939,6 +4953,30 @@ function isBlockingLocalReport(label: string | null, errorCode: string | null): 
 
 function isMultipartInvalidJsonError(error: Error): boolean {
   return 'code' in error && error.code === 'FST_INVALID_JSON_FIELD_ERROR';
+}
+
+function hasEmptyBody(request: FastifyRequest): boolean {
+  const length = request.headers['content-length'];
+  return request.headers['transfer-encoding'] === undefined && (length === undefined || length === '0');
+}
+
+// Fastify rejects malformed request framing (body type, JSON syntax, size) before any route runs. Those
+// are client errors; answer them with their own status and a fixed message rather than an internal error.
+function frameworkClientError(error: Error): { status: number; code: string; message: string } | null {
+  const { code, statusCode } = error as { code?: unknown; statusCode?: unknown };
+  if (typeof code !== 'string' || !code.startsWith('FST_ERR_')) return null;
+  if (typeof statusCode !== 'number' || statusCode < 400 || statusCode > 499) return null;
+  switch (code) {
+    case 'FST_ERR_CTP_INVALID_MEDIA_TYPE':
+      return { status: 415, code: 'unsupported_media_type', message: 'Unsupported request content type.' };
+    case 'FST_ERR_CTP_EMPTY_JSON_BODY':
+    case 'FST_ERR_CTP_INVALID_JSON_BODY':
+      return { status: 400, code: 'invalid_json', message: 'Expected valid JSON.' };
+    case 'FST_ERR_CTP_BODY_TOO_LARGE':
+      return { status: 413, code: 'request_too_large', message: 'Request body exceeds the configured byte limit.' };
+    default:
+      return { status: statusCode, code: 'invalid_request', message: 'Invalid request.' };
+  }
 }
 
 function isMultipartLimitError(error: Error): boolean {
