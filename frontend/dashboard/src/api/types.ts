@@ -278,12 +278,14 @@ export type NameRepairResult = {
   link_updated_count: number;
 };
 
-export type ConflictResolutionKind =
+export type PerFileResolutionChoice =
   | 'keep_server'
   | 'use_device'
   | 'keep_both_files'
   | 'insert_both_blocks'
   | 'manual';
+
+export type ConflictResolutionKind = PerFileResolutionChoice | 'per_file';
 
 export type DirectoryProposalIntent = {
   intent_id: string;
@@ -399,10 +401,17 @@ export type ManualFilePlanEntry = {
   content: string | null;
 };
 
+export type PerFileResolutionEntry = {
+  paths: string[];
+  choice: PerFileResolutionChoice;
+  manual_file_plan?: ManualFilePlanEntry[];
+};
+
 export type ConflictResolutionSubmission = {
   resolutionKind: ConflictResolutionKind;
   manualFiles?: Record<string, string | null>;
   manualFilePlan?: ManualFilePlanEntry[];
+  perFile?: PerFileResolutionEntry[];
 };
 
 export type NoteHistoryVersion = {

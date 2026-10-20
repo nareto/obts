@@ -67,6 +67,11 @@ try {
     };
   }
 
+  function perFileContent(body, path) {
+    const entry = body.per_file?.find(candidate => candidate.paths.includes(path));
+    return entry?.manual_file_plan?.find(candidate => candidate.path === path)?.content;
+  }
+
   async function scenario(name, run, options = {}) {
     count++;
     const {initialPath = '', prepare, liveMode = 'fake', ...contextOptions} = options;
@@ -411,7 +416,7 @@ try {
 
   await scenario('background refresh preserves a draft but invalidates a removed conflict',async({page,navigate,fixture})=>{
     await navigate('Conflicts');
-    await page.locator('.resolution-policy select').selectOption('manual');
+    await page.locator('.decision-more select').first().selectOption('manual');
     const draft=page.locator('.manual-file-editor textarea').first();
     await draft.fill('Unsubmitted sample draft');
     fixture.routes['/vaults/sample-vault/conflicts']={conflicts:[]};
@@ -430,7 +435,10 @@ try {
     await expect(page.locator('.diff-source-legend')).toContainText('Device: Travel laptop');
     await expect(page.locator('.diff-source-legend')).toContainText('Colors identify versions');
     await expect(page.getByRole('button',{name:'Apply resolution',exact:true})).toHaveCount(0);
-    await page.locator('.resolution-policy select').selectOption('use_device');
+    await expect(page.getByRole('button',{name:'Review result',exact:true})).toBeDisabled();
+    await expect(page.locator('.decision-progress')).toContainText('0 of 2 files decided');
+    await page.getByRole('button', {name: 'Set all files to Device: Travel laptop', exact: true}).click();
+    await expect(page.locator('.decision-progress')).toContainText('2 of 2 files decided');
     const previewRequest=page.waitForRequest(request=>request.url().endsWith('/preview'));
     await page.getByRole('button',{name:'Review result',exact:true}).click();
     const previewBody=(await previewRequest).postDataJSON();
@@ -441,7 +449,7 @@ try {
     await expect(page.locator('.conflict-result')).toContainText('Solaris');
     await expect(page.locator('.conflict-result')).not.toContainText('Piranesi');
     await page.getByRole('button',{name:'Compare',exact:true}).click();
-    await page.locator('.resolution-policy select').selectOption('keep_server');
+    await page.getByRole('button', {name: 'Set all files to Server main', exact: true}).click();
     await expect(page.getByRole('button',{name:'Review result',exact:true})).toBeVisible();
     await expect(page.getByRole('button',{name:'Apply resolution',exact:true})).toHaveCount(0);
     await page.getByRole('button',{name:'Result',exact:true}).click();
@@ -456,9 +464,10 @@ try {
 
   await scenario('failed result review keeps the draft and never enables apply',async({page,navigate,fixture})=>{
     await navigate('Conflicts');
-    await page.locator('.resolution-policy select').selectOption('manual');
+    await page.locator('.decision-more select').first().selectOption('manual');
     const draft=page.locator('.manual-file-editor textarea').first();
     await draft.fill('Draft final content');
+    await page.getByRole('button',{name:'Use Device: Travel laptop for Notes/Reading list.md',exact:true}).click();
     fixture.setFailure({path:'/vaults/sample-vault/conflicts/sample-conflict/preview',status:503});
     await page.getByRole('button',{name:'Review result',exact:true}).click();
     await expect(page.locator('.resolution-banner.warning')).toContainText('temporarily unavailable');
@@ -472,20 +481,74 @@ try {
 
   await scenario('line selections preview the assembled final text with newlines preserved',async({page,navigate})=>{
     await navigate('Conflicts');
-    await page.getByRole('button',{name:'Line by line',exact:true}).click();
-    await page.getByRole('button',{name:'All device',exact:true}).first().click();
+    const files=page.locator('.conflict-file');
+    await page.getByRole('button',{name:'Choose line by line for Projects/Weekend plans.md',exact:true}).click();
+    await files.first().locator('.file-bulk-actions').getByRole('button',{name:'Device',exact:true}).click();
     await page.getByRole('button',{name:/^Use server for /u}).first().click();
+    await page.getByRole('button',{name:'Choose line by line for Notes/Reading list.md',exact:true}).click();
+    await expect(page.getByRole('button',{name:'Review result',exact:true})).toBeDisabled();
+    await expect(page.locator('.decision-progress')).toContainText('1 of 2 files decided');
+    await files.nth(1).locator('.file-bulk-actions').getByRole('button',{name:'Device',exact:true}).click();
     const previewRequest=page.waitForRequest(request=>request.url().endsWith('/preview'));
     await page.getByRole('button',{name:'Review result',exact:true}).click();
     const previewBody=(await previewRequest).postDataJSON();
-    assert.equal(previewBody.resolution_kind,'manual');
-    const first=previewBody.manual_files['Projects/Weekend plans.md'];
+    assert.equal(previewBody.resolution_kind,'per_file');
+    const first=perFileContent(previewBody,'Projects/Weekend plans.md');
     assert.ok(first.includes('Visit the market on Saturday'),'server line choice is preserved');
     assert.ok(!first.includes('Visit the market on Sunday'),'overridden device line is replaced');
     assert.ok(first.endsWith('\n'),'final newline is preserved');
-    assert.ok(previewBody.manual_files['Notes/Reading list.md'].includes('Solaris'));
+    assert.ok(perFileContent(previewBody,'Notes/Reading list.md').includes('Solaris'));
     await expect(page.getByRole('button',{name:'Apply resolution',exact:true})).toBeVisible();
   });
+
+  await scenario('each file keeps its own decision and the bulk action only sets every file',async({page,navigate})=>{
+    await navigate('Conflicts');
+    await page.getByRole('button',{name:'Keep Server main for Projects/Weekend plans.md',exact:true}).click();
+    await expect(page.locator('.decision-progress')).toContainText('1 of 2 files decided');
+    await page.getByRole('button',{name:'Next undecided',exact:true}).click();
+    await expect(page.getByRole('button',{name:'Keep Server main for Notes/Reading list.md',exact:true})).toBeFocused();
+    await page.getByRole('button',{name:'Use Device: Travel laptop for Notes/Reading list.md',exact:true}).click();
+    const previewRequest=page.waitForRequest(request=>request.url().endsWith('/preview'));
+    await page.getByRole('button',{name:'Review result',exact:true}).click();
+    const previewBody=(await previewRequest).postDataJSON();
+    assert.equal(previewBody.resolution_kind,'per_file');
+    assert.deepEqual(previewBody.per_file,[
+      {paths:['Projects/Weekend plans.md'],choice:'keep_server'},
+      {paths:['Notes/Reading list.md'],choice:'use_device'}
+    ]);
+    const result=page.locator('.conflict-result');
+    await expect(result).toContainText('Per-file decisions');
+    await expect(result.locator('.conflict-result-file').filter({hasText:'Projects/Weekend plans.md'})).toContainText('Server main');
+    await expect(result.locator('.conflict-result-file').filter({hasText:'Notes/Reading list.md'})).toContainText('Device: Travel laptop');
+    await page.getByRole('button',{name:'Compare',exact:true}).click();
+    await page.getByRole('button',{name:'Set all files to Server main',exact:true}).click();
+    await expect(page.getByRole('button',{name:'Keep Server main for Notes/Reading list.md',exact:true})).toHaveAttribute('aria-pressed','true');
+    await expect(page.getByRole('button',{name:'Apply resolution',exact:true})).toHaveCount(0);
+    await page.locator('.decision-more select').nth(1).selectOption('keep_both_files');
+    const mixedRequest=page.waitForRequest(request=>request.url().endsWith('/preview'));
+    await page.getByRole('button',{name:'Review result',exact:true}).click();
+    assert.deepEqual((await mixedRequest).postDataJSON().per_file.map(entry=>entry.choice),['keep_server','keep_both_files']);
+  });
+
+  await scenario('a binary file keeps whole-file choices without blocking line choices elsewhere',async({page,navigate})=>{
+    await navigate('Conflicts');
+    await expect(page.getByRole('button',{name:'Choose line by line for Notes/Reading list.md',exact:true})).toBeDisabled();
+    await expect(page.locator('.conflict-file').nth(1)).toContainText('Binary content keeps whole-file choices');
+    await expect(page.locator('.decision-more select').nth(1).locator('option[value="insert_both_blocks"]')).toHaveJSProperty('disabled',true);
+    await expect(page.locator('.decision-more select').nth(1).locator('option[value="keep_both_files"]')).toHaveJSProperty('disabled',false);
+    await page.getByRole('button',{name:'Choose line by line for Projects/Weekend plans.md',exact:true}).click();
+    await page.locator('.conflict-file').first().locator('.file-bulk-actions').getByRole('button',{name:'Device',exact:true}).click();
+    await page.getByRole('button',{name:'Keep Server main for Notes/Reading list.md',exact:true}).click();
+    const previewRequest=page.waitForRequest(request=>request.url().endsWith('/preview'));
+    await page.getByRole('button',{name:'Review result',exact:true}).click();
+    const previewBody=(await previewRequest).postDataJSON();
+    assert.equal(previewBody.resolution_kind,'per_file');
+    assert.deepEqual(previewBody.per_file[1],{paths:['Notes/Reading list.md'],choice:'keep_server'});
+    assert.ok(perFileContent(previewBody,'Projects/Weekend plans.md').includes('Visit the market on Sunday'));
+  },{prepare:async({fixture})=>{
+    const review=fixture.routes['/vaults/sample-vault/conflicts/sample-conflict'];
+    review.files[1]={...review.files[1],content_kind:'binary',base_content:null,server_content:null,device_content:null};
+  }});
 
   await scenario('long conflict files show GitHub-style hunks with expandable unchanged context',async({page,navigate})=>{
     const favicon=page.locator('link[rel="icon"]');
@@ -504,12 +567,13 @@ try {
     await expect(file.locator('.diff-code-row')).toHaveCount(56);
     await expect(file.getByText('Long intro 1: unchanged',{exact:false})).toBeVisible();
     await expect(file.locator('.diff-code-row').first().locator('.line-number').first()).toHaveText('1');
-    await page.getByRole('button',{name:'Line by line',exact:true}).click();
+    await page.getByRole('button',{name:'Choose line by line for Projects/Weekend plans.md',exact:true}).click();
     await expect(file.locator('.diff-code-row')).toHaveCount(56);
-    await page.getByRole('button',{name:'All device',exact:true}).first().click();
+    await file.locator('.file-bulk-actions').getByRole('button',{name:'Device',exact:true}).click();
+    await page.getByRole('button',{name:'Use Device: Travel laptop for Notes/Reading list.md',exact:true}).click();
     const previewRequest=page.waitForRequest(request=>request.url().endsWith('/preview'));
     await page.getByRole('button',{name:'Review result',exact:true}).click();
-    const first=(await previewRequest).postDataJSON().manual_files['Projects/Weekend plans.md'];
+    const first=perFileContent((await previewRequest).postDataJSON(),'Projects/Weekend plans.md');
     assert.ok(first.includes('Long body 30: unchanged'),'hidden context is still part of the assembled file');
     assert.ok(first.includes('- Plan the trip on Sunday') && first.includes('- Another device idea'));
     assert.ok(!first.includes('Saturday'));
@@ -2038,7 +2102,7 @@ try {
     await page.route('**/api/v1/vaults/sample-vault/conflicts/sample-conflict/resolve', async route => { await gate; await route.fallback(); });
     page.on('dialog', dialog => dialog.accept());
     await navigate('Conflicts');
-    await page.locator('.resolution-policy select').selectOption('use_device');
+    await page.getByRole('button', {name: 'Set all files to Device: Travel laptop', exact: true}).click();
     await page.getByRole('button', {name: 'Review result', exact: true}).click();
     const resolved = page.waitForRequest(request => request.url().endsWith('/resolve'));
     await page.getByRole('button', {name: 'Apply resolution', exact: true}).click();
@@ -2055,7 +2119,7 @@ try {
 
   await scenario('R1: a resolve completion on the same conflict still leaves the resolved conflict', async ({page, navigate}) => {
     await navigate('Conflicts');
-    await page.locator('.resolution-policy select').selectOption('use_device');
+    await page.getByRole('button', {name: 'Set all files to Device: Travel laptop', exact: true}).click();
     await page.getByRole('button', {name: 'Review result', exact: true}).click();
     await page.getByRole('button', {name: 'Apply resolution', exact: true}).click();
     await expect(page.locator('.notice')).toContainText('Conflict resolved');
@@ -2385,7 +2449,7 @@ try {
     await stable(page, () => dashboardGets(fixture));
     await expect(page.getByRole('button', {name: 'Refresh review', exact: true})).toHaveCount(0);
     await expect(page.locator('.action-error')).toHaveCount(0);
-    await page.locator('.resolution-policy select').selectOption('use_device');
+    await page.getByRole('button', {name: 'Set all files to Device: Travel laptop', exact: true}).click();
     const previewRequest = page.waitForRequest(request => request.url().endsWith('/preview'));
     await page.getByRole('button', {name: 'Review result', exact: true}).click();
     assert.equal((await previewRequest).postDataJSON().expected_main, nextMain);
@@ -2570,7 +2634,7 @@ try {
 
   await scenario('live: a conflict draft survives an event-driven refresh', async ({page, fixture, navigate, es}) => {
     await navigate('Conflicts');
-    await page.locator('.resolution-policy select').selectOption('manual');
+    await page.locator('.decision-more select').first().selectOption('manual');
     const draft = page.locator('.manual-file-editor textarea').first();
     await draft.fill('Unsubmitted live draft');
     await goLive(page, es, fixture);

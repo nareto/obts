@@ -328,6 +328,13 @@ describe('OpenAPI Phase 3 contract', () => {
     expect(contract).toContain('ResolveConflictResponse');
     expect(contract).toContain('keep_server');
     expect(contract).toContain('insert_both_blocks');
+    expect(contract).toContain('PerFileResolutionEntry');
+    const conflictSchemas = document.components.schemas as Record<string, { enum?: string[]; properties?: Record<string, unknown> }>;
+    expect(conflictSchemas.ConflictResolutionKind?.enum).toContain('per_file');
+    expect(conflictSchemas.PerFileResolutionChoice?.enum).not.toContain('per_file');
+    expect(conflictSchemas.ResolveConflictRequest?.properties?.per_file).toMatchObject({
+      type: 'array', items: { $ref: '#/components/schemas/PerFileResolutionEntry' }
+    });
     expect(contract).toContain('DashboardSummary');
     expect(contract).toContain('NoteHistoryQueryResponse');
     expect(contract).toContain('MaintenanceStartResponse');

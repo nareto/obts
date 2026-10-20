@@ -252,7 +252,8 @@ export function submissionCandidateKey(submission: ConflictResolutionSubmission)
     manual_files: submission.manualFiles
       ? Object.fromEntries(Object.entries(submission.manualFiles).sort(([left], [right]) => left.localeCompare(right)))
       : null,
-    manual_file_plan: submission.manualFilePlan ?? null
+    manual_file_plan: submission.manualFilePlan ?? null,
+    per_file: submission.perFile ?? null
   });
 }
 

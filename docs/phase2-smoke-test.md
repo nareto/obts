@@ -43,8 +43,11 @@ Phase 2 dashboard conflict-resolution workflow without using test harness code.
    metadata, rendered Markdown diff, source diff, current server commit, device
    commit, and resolution choices are visible.
 
-9. Resolve the conflict. Use one of the available choices and submit from the
-   existing dashboard session; verify there is no password re-authentication
+9. Resolve the conflict. With two or more affected files, give them different
+   choices (for example keep the server version for one and the device version
+   for another), choose `Review result`, and verify the result lists each
+   file's own source. Apply from the existing dashboard session; verify there
+   is no password re-authentication
    prompt. Verify the conflict becomes resolved, the activity list includes
    conflict resolution and `main_advanced`, and the current server `main`
    changes.

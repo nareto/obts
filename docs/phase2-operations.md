@@ -56,15 +56,17 @@ From the plugin and dashboard:
 5. Inspect the Overview, Devices, Conflicts, History, and Maintenance pages for vault status, device state, unresolved conflicts, readiness, and activity.
 6. Resolve review-needed conflicts from the Conflicts page. The workbench displays every affected file in one scrollable review, with a file navigator, unified line numbers, and word-level emphasis inside changed lines. Resolution submission uses the authenticated dashboard session without another password prompt and includes the expected current `main` commit from the review package.
 
-The dashboard offers complete-conflict shortcuts as well as explicit per-line choices for ordinary text conflicts. Every changed line must be assigned to the server, device, or both before an individual resolution can be submitted. Rename/path conflicts retain path-aware complete-file editing, while binary conflicts expose sizes and hashes without lossy text rendering and allow only byte-preserving whole-file choices. Text sides larger than 512 KiB also use metadata-only review so rendering cannot freeze the dashboard; their original bytes remain available to whole-conflict actions.
+Each affected file is decided on its own. A file can keep the server version, use the device version, or, for ordinary text, be resolved line by line; every changed line must then be assigned to the server, device, or both. The per-file menu also offers keep both, insert both blocks, and editing the complete final content. Files start undecided, a progress count and `Next undecided` lead to the remaining ones, and `Review result` is enabled only after every file is decided. `Set all files` in the toolbar sets every file to the server or device version in one step; it is a shortcut, not a separate mode.
 
-The complete-conflict choices are:
+Paths that cannot be decided apart are one decision: the paths of a rename or path conflict are decided together, and so are a file and a path beneath it. Rename/path conflicts keep path-aware editing of their final files. Binary files expose sizes and hashes without lossy text rendering and allow only byte-preserving choices (server, device, keep both). Text sides larger than 512 KiB use metadata-only review so rendering cannot freeze the dashboard; their original bytes remain available to whole-file choices. Directory or mixed file/directory conflicts are decided as one package: keep the server version or use the device version.
+
+The dashboard submits a uniform whole-file choice as the plain resolution kind. Any mix is submitted as `resolution_kind: per_file` with one entry per decision, so the server still builds the final tree and binary bytes are preserved. The available choices per file are:
 
 - keep the current server version;
-- use the device version for affected paths;
-- keep both by writing device copies next to the server version;
+- use the device version;
+- keep both by writing a device copy next to the server version;
 - insert both blocks for text review;
-- manually edit complete final content and paths.
+- manually edit complete final content and paths (line-by-line results are sent this way).
 
 If server `main` advances while a review is open, the review stays current as
 long as the advance does not touch its affected paths or directories, the

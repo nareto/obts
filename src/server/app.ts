@@ -29,8 +29,11 @@ import {
   type DirectoryConflictContext,
   type DirectoryIntent,
   type DirectoryIntentAcknowledgement,
+  type ConflictResolutionKind,
   type ManualFilePlanEntry,
-  type NoteHistoryVersion
+  type NoteHistoryVersion,
+  type PerFileResolutionChoice,
+  type PerFileResolutionEntry
 } from '../shared/types.js';
 import {
   assertRecord,
@@ -1836,13 +1839,15 @@ export async function createObtsServer(
     const resolutionKind = readConflictResolutionKind(body);
     const manualFiles = readManualResolutionFiles(body);
     const manualFilePlan = readManualFilePlan(body);
+    const perFile = readPerFileResolution(body);
     return await sync.previewConflictResolution({
       vaultId,
       conflictId,
       expectedMain: readCommitId(body, 'expected_main'),
       resolutionKind,
       ...(manualFiles === undefined ? {} : { manualFiles }),
-      ...(manualFilePlan === undefined ? {} : { manualFilePlan })
+      ...(manualFilePlan === undefined ? {} : { manualFilePlan }),
+      ...(perFile === undefined ? {} : { perFile })
     });
   });
 
@@ -1856,6 +1861,7 @@ export async function createObtsServer(
     const resolutionKind = readConflictResolutionKind(body);
     const manualFiles = readManualResolutionFiles(body);
     const manualFilePlan = readManualFilePlan(body);
+    const perFile = readPerFileResolution(body);
     const expectedTree = readOptionalCommitId(body, 'expected_tree');
     requestLog.annotate(request, { resolution: resolutionKind });
     const result = await sync.resolveConflict({
@@ -1866,7 +1872,8 @@ export async function createObtsServer(
       resolutionKind,
       ...(expectedTree === undefined ? {} : { expectedTree }),
       ...(manualFiles === undefined ? {} : { manualFiles }),
-      ...(manualFilePlan === undefined ? {} : { manualFilePlan })
+      ...(manualFilePlan === undefined ? {} : { manualFilePlan }),
+      ...(perFile === undefined ? {} : { perFile })
     });
     requestLog.annotate(request, { vault_id: vaultId, conflict_id: result.conflict_id });
     return result;
@@ -3273,20 +3280,62 @@ function readOptionalCommitId(record: Record<string, unknown>, field: string): s
   return readCommitId(record, field);
 }
 
-function readConflictResolutionKind(
-  record: Record<string, unknown>
-): 'keep_server' | 'use_device' | 'keep_both_files' | 'insert_both_blocks' | 'manual' {
+function isPerFileResolutionChoice(value: unknown): value is PerFileResolutionChoice {
+  return (
+    value === 'keep_server' ||
+    value === 'use_device' ||
+    value === 'keep_both_files' ||
+    value === 'insert_both_blocks' ||
+    value === 'manual'
+  );
+}
+
+function isConflictResolutionKind(value: unknown): value is ConflictResolutionKind {
+  return isPerFileResolutionChoice(value) || value === 'per_file';
+}
+
+function readConflictResolutionKind(record: Record<string, unknown>): ConflictResolutionKind {
   const value = readString(record, 'resolution_kind');
-  if (
-    value !== 'keep_server' &&
-    value !== 'use_device' &&
-    value !== 'keep_both_files' &&
-    value !== 'insert_both_blocks' &&
-    value !== 'manual'
-  ) {
+  if (!isConflictResolutionKind(value)) {
     throw new ValidationError('invalid_request', 'Invalid conflict resolution kind.', { field: 'resolution_kind' });
   }
   return value;
+}
+
+function readPerFileResolution(record: Record<string, unknown>): PerFileResolutionEntry[] | undefined {
+  const value = record.per_file;
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value)) {
+    throw new ValidationError('invalid_request', 'Per-file resolution must be an array.', { field: 'per_file' });
+  }
+  return value.map((entry, index) => {
+    assertRecord(entry);
+    const paths = entry.paths;
+    if (!Array.isArray(paths) || paths.length === 0) {
+      throw new ValidationError('invalid_request', 'Per-file resolution entries require affected paths.', {
+        field: `per_file.${index}.paths`
+      });
+    }
+    const choice = entry.choice;
+    if (!isPerFileResolutionChoice(choice)) {
+      throw new ValidationError('invalid_request', 'Invalid per-file resolution choice.', { field: `per_file.${index}.choice` });
+    }
+    const manualFilePlan = readManualFilePlan(entry);
+    return {
+      paths: paths.map((path: unknown, pathIndex) => {
+        if (typeof path !== 'string' || !isSyncableVaultPath(path)) {
+          throw new ValidationError('invalid_path', 'Path is not syncable vault content.', {
+            field: `per_file.${index}.paths.${pathIndex}`
+          });
+        }
+        return path;
+      }),
+      choice,
+      ...(manualFilePlan === undefined ? {} : { manual_file_plan: manualFilePlan })
+    };
+  });
 }
 
 function readManualResolutionFiles(record: Record<string, unknown>): Record<string, string | null> | undefined {
@@ -4632,14 +4681,7 @@ async function rollForwardPreparedOperation(store: MetadataStore, git: GitServic
       const manifest = operation.prepared_manifest ?? {};
       const conflictId = stringValue(manifest.conflict_id);
       const actorUserId = stringValue(manifest.actor_user_id);
-      const resolutionKind =
-        manifest.resolution_kind === 'keep_server' ||
-        manifest.resolution_kind === 'use_device' ||
-        manifest.resolution_kind === 'keep_both_files' ||
-        manifest.resolution_kind === 'insert_both_blocks' ||
-        manifest.resolution_kind === 'manual'
-          ? manifest.resolution_kind
-          : undefined;
+      const resolutionKind = isConflictResolutionKind(manifest.resolution_kind) ? manifest.resolution_kind : undefined;
       const resolutionConflict = operation.operation_type === 'conflict_resolve' && conflictId
         ? db.conflicts.find(
             (candidate) => candidate.vault_id === operation.vault_id && candidate.conflict_id === conflictId

@@ -1,5 +1,6 @@
 export const fastTests = [
   'tests/conflict-diff.test.ts',
+  'tests/conflict-decisions.test.ts',
   'tests/dashboard-presentation.test.ts',
   'tests/dashboard-router.test.ts',
   'tests/dashboard-live-updates.test.ts',

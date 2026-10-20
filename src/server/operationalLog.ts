@@ -166,7 +166,7 @@ const FIELD_VALIDATORS: Record<keyof OperationalFields, Validator> = {
   chunk_count: number, chunk_index: number, complete: (value) => typeof value === 'boolean',
   target: enumeration(['latest', 'explicit']),
   reported_status: nullable(enumeration(['idle', 'queued_local', 'uploading', 'merged', 'conflicted', 'blocked_recovery', 'unknown'])),
-  resolution: enumeration(['keep_server', 'use_device', 'keep_both_files', 'insert_both_blocks', 'manual']),
+  resolution: enumeration(['keep_server', 'use_device', 'keep_both_files', 'insert_both_blocks', 'manual', 'per_file']),
   failed_checks: (value) => typeof value === 'string' && value.split(',').every((name) => CHECK_NAMES.includes(name)),
   host: pattern(/^[A-Za-z0-9.:_-]{1,253}$/u), port: number, log_level: enumeration(LOG_LEVELS),
   phase: enumeration(STARTUP_PHASES), source: enumeration(['startup', 'request', 'sampler']), task: enumeration(BACKGROUND_TASKS)

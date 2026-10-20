@@ -443,12 +443,14 @@ export type ConflictRecord = {
   resolution_request_hash?: string;
 };
 
-export type ConflictResolutionKind =
+export type PerFileResolutionChoice =
   | 'keep_server'
   | 'use_device'
   | 'keep_both_files'
   | 'insert_both_blocks'
   | 'manual';
+
+export type ConflictResolutionKind = PerFileResolutionChoice | 'per_file';
 
 export type ConflictPathOperation = 'absent' | 'unchanged' | 'added' | 'modified' | 'deleted' | 'renamed';
 
@@ -528,12 +530,19 @@ export type ManualFilePlanEntry = {
   content: string | null;
 };
 
+export type PerFileResolutionEntry = {
+  paths: string[];
+  choice: PerFileResolutionChoice;
+  manual_file_plan?: ManualFilePlanEntry[];
+};
+
 export type ResolveConflictRequest = {
   expected_main: string;
   expected_tree?: string;
   resolution_kind: ConflictResolutionKind;
   manual_files?: Record<string, string | null>;
   manual_file_plan?: ManualFilePlanEntry[];
+  per_file?: PerFileResolutionEntry[];
 };
 
 export type ResolveConflictResponse = {

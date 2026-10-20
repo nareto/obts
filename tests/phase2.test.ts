@@ -764,6 +764,16 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(
       (await server.git.readBlobAtPathIfPresent(admin.vaultId, review.body.conflict.expected_main, 'Scratch/server.md'))?.toString('utf8')
     ).toBe('server-only\n');
+    const perFile = await admin.post<{ error: { code: string } }>(
+      `/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}/resolve`,
+      {
+        expected_main: review.body.conflict.expected_main,
+        resolution_kind: 'per_file',
+        per_file: [{ paths: ['Scratch'], choice: 'use_device' }]
+      }
+    );
+    expect(perFile.status).toBe(400);
+    expect(perFile.body.error.code).toBe('invalid_resolution');
     const resolved = await admin.post<{ resolution_commit: string }>(
       `/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}/resolve`,
       { expected_main: review.body.conflict.expected_main, resolution_kind: 'use_device' }
@@ -1263,6 +1273,126 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect(await server.git.readBlobAtPath(admin.vaultId, resolved.body.resolution_commit, 'asset.bin')).toEqual(
       Buffer.from([0, 7, 8, 9])
     );
+  });
+
+  it('resolves each file of one conflict package with its own decision', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const desktopDir = join(root, 'desktop-per-file');
+    const tabletDir = join(root, 'tablet-per-file');
+    await mkdir(desktopDir, { recursive: true });
+    await mkdir(tabletDir, { recursive: true });
+    const textPaths = ['Blocks.md', 'Device.md', 'Edited.md', 'Server.md'];
+    const desktop = await pairPlugin(admin, desktopDir, 'desktop-per-file');
+    for (const path of textPaths) await writeFile(join(desktopDir, path), `base ${path}\n`);
+    await writeFile(join(desktopDir, 'Unrelated.md'), 'unrelated\n');
+    await writeFile(join(desktopDir, 'asset.bin'), Buffer.from([0, 1, 2, 3]));
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const tablet = await pairPlugin(admin, tabletDir, 'tablet-per-file');
+    for (const [name, dir] of [['desktop', desktopDir], ['tablet', tabletDir]] as const) {
+      for (const path of textPaths) await writeFile(join(dir, path), `${name} ${path}\n`);
+      await writeFile(join(dir, 'asset.bin'), Buffer.from(name === 'desktop' ? [0, 4, 5, 6] : [0, 7, 8, 9]));
+    }
+    expect((await desktop.syncOnce()).status).toBe('Synced');
+    const result = await tablet.syncOnce();
+    expect(result.status).toBe('Conflict resolution needed');
+
+    const conflictUrl = `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`;
+    const review = await admin.get<{ conflict: { expected_main: string; affected_paths: string[] }; choices: string[] }>(conflictUrl);
+    expect(review.status).toBe(200);
+    expect(review.body.conflict.affected_paths).toEqual([...textPaths, 'asset.bin']);
+    expect(review.body.choices).toContain('per_file');
+    const expectedMain = review.body.conflict.expected_main;
+    const perFile = [
+      { paths: ['Server.md'], choice: 'keep_server' },
+      { paths: ['Device.md'], choice: 'use_device' },
+      { paths: ['asset.bin'], choice: 'use_device' },
+      { paths: ['Blocks.md'], choice: 'insert_both_blocks' },
+      { paths: ['Edited.md'], choice: 'manual', manual_file_plan: [{ path: 'Edited.md', content: 'merged edit\n' }] }
+    ];
+    const withEdited = (manual_file_plan: Array<{ path: string; content: string | null }>) =>
+      perFile.map((entry) => entry.paths[0] === 'Edited.md' ? { ...entry, manual_file_plan } : entry);
+
+    const rejectedBodies: Array<Record<string, unknown>> = [
+      { resolution_kind: 'per_file' },
+      { resolution_kind: 'keep_server', per_file: perFile },
+      { resolution_kind: 'per_file', per_file: perFile.slice(1) },
+      { resolution_kind: 'per_file', per_file: [...perFile, { paths: ['Server.md'], choice: 'use_device' }] },
+      { resolution_kind: 'per_file', per_file: [...perFile, { paths: ['Unrelated.md'], choice: 'use_device' }] },
+      { resolution_kind: 'per_file', per_file: perFile.map((entry) => entry.paths[0] === 'asset.bin' ? { ...entry, choice: 'manual' } : entry) },
+      { resolution_kind: 'per_file', per_file: perFile.map((entry) => entry.paths[0] === 'asset.bin' ? { ...entry, choice: 'insert_both_blocks' } : entry) },
+      { resolution_kind: 'per_file', per_file: withEdited([{ path: 'Edited.md', content: 'x\n' }, { path: 'Server.md', content: 'stolen\n' }]) },
+      { resolution_kind: 'per_file', per_file: withEdited([{ path: 'Edited.md', content: 'x\n' }, { path: 'Unrelated.md', content: 'collision\n' }]) },
+      { resolution_kind: 'per_file', per_file: withEdited([{ path: 'Server.md', content: null }]) }
+    ];
+    for (const body of rejectedBodies) {
+      const rejected = await admin.post<{ error: { code: string } }>(`${conflictUrl}/preview`, { expected_main: expectedMain, ...body });
+      expect(rejected.status, JSON.stringify(body)).toBe(400);
+      expect(rejected.body.error.code).toBe('invalid_resolution');
+    }
+
+    const preview = await admin.post<{
+      tree: string;
+      files: Array<{ path: string; operation: string; provenance: string; content_kind: string; content: string | null }>;
+    }>(`${conflictUrl}/preview`, { expected_main: expectedMain, resolution_kind: 'per_file', per_file: [...perFile].reverse() });
+    expect(preview.status).toBe(200);
+    const previewByPath = new Map(preview.body.files.map((file) => [file.path, file]));
+    expect(previewByPath.get('Server.md')).toMatchObject({ provenance: 'server', operation: 'retained', content: 'desktop Server.md\n' });
+    expect(previewByPath.get('Device.md')).toMatchObject({ provenance: 'device', operation: 'updated', content: 'tablet Device.md\n' });
+    expect(previewByPath.get('asset.bin')).toMatchObject({ provenance: 'device', content_kind: 'binary', content: null });
+    expect(previewByPath.get('Blocks.md')).toMatchObject({ provenance: 'both', operation: 'updated' });
+    expect(previewByPath.get('Edited.md')).toMatchObject({ provenance: 'manual', content: 'merged edit\n' });
+
+    const resolved = await admin.post<{ resolution_commit: string }>(`${conflictUrl}/resolve`, {
+      expected_main: expectedMain,
+      resolution_kind: 'per_file',
+      per_file: perFile,
+      expected_tree: preview.body.tree
+    });
+    expect(resolved.status).toBe(200);
+    const commit = resolved.body.resolution_commit;
+    const read = async (path: string) => (await server.git.readBlobAtPath(admin.vaultId, commit, path))?.toString('utf8');
+    expect(await read('Server.md')).toBe('desktop Server.md\n');
+    expect(await read('Device.md')).toBe('tablet Device.md\n');
+    expect(await read('Edited.md')).toBe('merged edit\n');
+    expect(await read('Unrelated.md')).toBe('unrelated\n');
+    expect(await read('Blocks.md')).toMatch(/desktop Blocks\.md[\s\S]*tablet Blocks\.md/);
+    expect(await server.git.readBlobAtPath(admin.vaultId, commit, 'asset.bin')).toEqual(Buffer.from([0, 7, 8, 9]));
+
+    const repeated = await admin.post<{ resolution_commit: string }>(`${conflictUrl}/resolve`, {
+      expected_main: expectedMain,
+      resolution_kind: 'per_file',
+      per_file: [...perFile].reverse()
+    });
+    expect(repeated.status).toBe(200);
+    expect(repeated.body.resolution_commit).toBe(commit);
+  });
+
+  it('decides the paths of one rename group together in a per-file resolution', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const { result } = await prepareRenameConflict(admin, root, 'per-file-rename');
+    const conflictUrl = `/api/v1/vaults/${admin.vaultId}/conflicts/${result.conflictId}`;
+    const review = await admin.get<{ conflict: { expected_main: string } }>(conflictUrl);
+    expect(review.status).toBe(200);
+    const expectedMain = review.body.conflict.expected_main;
+
+    const split = await admin.post<{ error: { code: string } }>(`${conflictUrl}/preview`, {
+      expected_main: expectedMain,
+      resolution_kind: 'per_file',
+      per_file: [{ paths: ['Old.md'], choice: 'keep_server' }, { paths: ['Title A.md', 'Title B.md'], choice: 'use_device' }]
+    });
+    expect(split.status).toBe(400);
+    expect(split.body.error.code).toBe('invalid_resolution');
+
+    const resolved = await admin.post<{ resolution_commit: string }>(`${conflictUrl}/resolve`, {
+      expected_main: expectedMain,
+      resolution_kind: 'per_file',
+      per_file: [{ paths: ['Title B.md', 'Old.md', 'Title A.md'], choice: 'use_device' }]
+    });
+    expect(resolved.status).toBe(200);
+    expect(await server.git.listTreePaths(admin.vaultId, resolved.body.resolution_commit)).toEqual([
+      'Title B.md',
+      'per-file-rename-tablet-ref.md'
+    ]);
   });
 
   it('rejects stale and cross-user conflict resolution submissions without requiring recent auth', async () => {

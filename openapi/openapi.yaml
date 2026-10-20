@@ -3864,7 +3864,39 @@ components:
             $ref: "#/components/schemas/DashboardConflict"
     ConflictResolutionKind:
       type: string
+      enum: [keep_server, use_device, keep_both_files, insert_both_blocks, manual, per_file]
+      description: Whole-package choice, or per_file to decide each decision unit separately through per_file.
+    PerFileResolutionChoice:
+      type: string
       enum: [keep_server, use_device, keep_both_files, insert_both_blocks, manual]
+    ManualFilePlanEntry:
+      type: object
+      required: [path, content]
+      properties:
+        path:
+          type: string
+        content:
+          oneOf:
+            - type: string
+            - type: "null"
+          description: Complete final text, or null to delete the path.
+    PerFileResolutionEntry:
+      type: object
+      required: [paths, choice]
+      properties:
+        paths:
+          type: array
+          minItems: 1
+          items:
+            type: string
+          description: Affected paths decided together. Paths linked by a structural review group or by overlapping file/directory paths must share one entry.
+        choice:
+          $ref: "#/components/schemas/PerFileResolutionChoice"
+        manual_file_plan:
+          type: array
+          items:
+            $ref: "#/components/schemas/ManualFilePlanEntry"
+          description: Required only for manual. Names every path of the entry, null deleting it, plus optional new final paths that collide with no other path.
     ConflictPathOperation:
       type: string
       enum: [absent, unchanged, added, modified, deleted, renamed]
@@ -4105,15 +4137,12 @@ components:
         manual_file_plan:
           type: array
           items:
-            type: object
-            required: [path, content]
-            properties:
-              path:
-                type: string
-              content:
-                oneOf:
-                  - type: string
-                  - type: "null"
+            $ref: "#/components/schemas/ManualFilePlanEntry"
+        per_file:
+          type: array
+          items:
+            $ref: "#/components/schemas/PerFileResolutionEntry"
+          description: Required only for resolution_kind per_file. Entries partition the affected paths of a content conflict; directory and mixed conflicts reject per_file.
     ResolveConflictResponse:
       type: object
       required: [status, conflict_id, main, resolution_commit, event_seq, idempotent]

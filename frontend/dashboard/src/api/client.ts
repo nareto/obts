@@ -4,6 +4,7 @@ import type {
   ConnectionReview,
   ConflictResolutionKind,
   ManualFilePlanEntry,
+  PerFileResolutionEntry,
   DashboardSummary,
   NameRepairPreview,
   NameRepairResult,
@@ -191,6 +192,7 @@ export class DashboardApi {
     resolutionKind: ConflictResolutionKind;
     manualFiles?: Record<string, string | null>;
     manualFilePlan?: ManualFilePlanEntry[];
+    perFile?: PerFileResolutionEntry[];
   }): Promise<ConflictResolutionPreview> {
     return await this.request(`/vaults/${input.vaultId}/conflicts/${input.conflictId}/preview`, {
       method: 'POST',
@@ -199,7 +201,8 @@ export class DashboardApi {
         expected_main: input.expectedMain,
         resolution_kind: input.resolutionKind,
         ...(input.manualFiles ? { manual_files: input.manualFiles } : {}),
-        ...(input.manualFilePlan ? { manual_file_plan: input.manualFilePlan } : {})
+        ...(input.manualFilePlan ? { manual_file_plan: input.manualFilePlan } : {}),
+        ...(input.perFile ? { per_file: input.perFile } : {})
       }
     });
   }
@@ -259,6 +262,7 @@ export class DashboardApi {
     resolutionKind: ConflictResolutionKind;
     manualFiles?: Record<string, string | null>;
     manualFilePlan?: ManualFilePlanEntry[];
+    perFile?: PerFileResolutionEntry[];
   }): Promise<{ resolution_commit: string; main: string; idempotent: boolean }> {
     return await this.request(`/vaults/${input.vaultId}/conflicts/${input.conflictId}/resolve`, {
       method: 'POST',
@@ -268,7 +272,8 @@ export class DashboardApi {
         resolution_kind: input.resolutionKind,
         ...(input.expectedTree ? { expected_tree: input.expectedTree } : {}),
         ...(input.manualFiles ? { manual_files: input.manualFiles } : {}),
-        ...(input.manualFilePlan ? { manual_file_plan: input.manualFilePlan } : {})
+        ...(input.manualFilePlan ? { manual_file_plan: input.manualFilePlan } : {}),
+        ...(input.perFile ? { per_file: input.perFile } : {})
       }
     });
   }

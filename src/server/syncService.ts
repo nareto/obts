@@ -24,6 +24,8 @@ import type {
   DirectoryProposalAcknowledgement,
   DirectoryProposalIntent,
   ManualFilePlanEntry,
+  PerFileResolutionChoice,
+  PerFileResolutionEntry,
   PushResult,
   ResolveConflictResponse
 } from '../shared/types.js';
@@ -105,6 +107,15 @@ type ResolutionArtifacts = {
   fileAffectedPaths: string[];
   writes: Map<string, Buffer>;
   deletes: string[];
+  copySources?: Map<string, string>;
+  choiceByPath?: Map<string, PerFileResolutionChoice>;
+};
+
+type ResolutionRequest = {
+  resolutionKind: ConflictResolutionKind;
+  manualFiles?: Record<string, string | null> | undefined;
+  manualFilePlan?: ManualFilePlanEntry[] | undefined;
+  perFile?: PerFileResolutionEntry[] | undefined;
 };
 
 export type NameRepairPreviewResult = {
@@ -1096,7 +1107,7 @@ export class SyncService {
       directory_conflicts: directoryConflicts,
       choices: conflict.conflict_kind === 'directory' || conflict.conflict_kind === 'mixed'
         ? ['keep_server', 'use_device']
-        : ['keep_server', 'use_device', 'keep_both_files', 'insert_both_blocks', 'manual']
+        : ['keep_server', 'use_device', 'keep_both_files', 'insert_both_blocks', 'manual', 'per_file']
     };
   }
 
@@ -1369,16 +1380,19 @@ export class SyncService {
   private async buildResolutionCandidate(
     conflict: ConflictRecord,
     effectiveMain: string,
-    resolutionKind: ConflictResolutionKind,
-    manualFiles: Record<string, string | null> | undefined,
-    manualFilePlan: ManualFilePlanEntry[] | undefined
+    request: ResolutionRequest
   ): Promise<{ reviewed: ResolutionArtifacts; appliedTree: string }> {
-    const reviewed = await this.buildResolutionArtifacts(conflict, resolutionKind, manualFiles, manualFilePlan);
+    if (request.resolutionKind === 'per_file') {
+      await this.validatePerFileDecisionUnits(conflict, request.perFile);
+    } else if (request.perFile !== undefined) {
+      throw new AuthError(400, 'invalid_resolution', 'Per-file decisions require the per_file resolution kind.');
+    }
+    const reviewed = await this.buildResolutionArtifacts(conflict, request);
     if (effectiveMain === conflict.expected_main) return { reviewed, appliedTree: reviewed.tree };
     const advanced: ConflictRecord = { ...conflict, current_main: effectiveMain, expected_main: effectiveMain };
     let appliedTree: string;
     try {
-      appliedTree = (await this.buildResolutionArtifacts(advanced, resolutionKind, manualFiles, manualFilePlan, {
+      appliedTree = (await this.buildResolutionArtifacts(advanced, request, {
         serverLabelMain: conflict.expected_main
       })).tree;
     } catch (error) {
@@ -1455,17 +1469,12 @@ export class SyncService {
     resolutionKind: ConflictResolutionKind;
     manualFiles?: Record<string, string | null>;
     manualFilePlan?: ManualFilePlanEntry[];
+    perFile?: PerFileResolutionEntry[];
   }): Promise<ConflictResolutionPreview> {
     return await this.withVaultLock(input.vaultId, async () => {
       const snapshot = await this.store.snapshot();
       const { conflict, effectiveMain } = await this.loadResolutionTarget(snapshot, input);
-      const { reviewed: artifacts, appliedTree } = await this.buildResolutionCandidate(
-        conflict,
-        effectiveMain,
-        input.resolutionKind,
-        input.manualFiles,
-        input.manualFilePlan
-      );
+      const { reviewed: artifacts, appliedTree } = await this.buildResolutionCandidate(conflict, effectiveMain, input);
       await this.git.validateTreeRootIgnorePolicy(input.vaultId, appliedTree, this.maxUploadBytes);
       return {
         conflict_id: conflict.conflict_id,
@@ -1505,6 +1514,7 @@ export class SyncService {
     resolutionKind: ConflictResolutionKind;
     manualFiles?: Record<string, string | null>;
     manualFilePlan?: ManualFilePlanEntry[];
+    perFile?: PerFileResolutionEntry[];
   }): Promise<ResolveConflictResponse> {
     const requestHash = resolutionRequestHash(input);
     return await this.withVaultLock(input.vaultId, async () => {
@@ -1525,13 +1535,7 @@ export class SyncService {
       }
       const resolvedDirectoryIntents = resolvedConflictDirectoryIntents(conflict, input.resolutionKind);
 
-      const candidate = await this.buildResolutionCandidate(
-        conflict,
-        effectiveMain,
-        input.resolutionKind,
-        input.manualFiles,
-        input.manualFilePlan
-      );
+      const candidate = await this.buildResolutionCandidate(conflict, effectiveMain, input);
       if (input.expectedTree !== undefined && candidate.reviewed.tree !== input.expectedTree) {
         throw new AuthError(409, 'stale_conflict_preview', 'The reviewed resolution result changed; review the result again.');
       }
@@ -2655,11 +2659,10 @@ export class SyncService {
 
   private async buildResolutionArtifacts(
     conflict: ConflictRecord,
-    resolutionKind: ConflictResolutionKind,
-    manualFiles: Record<string, string | null> | undefined,
-    manualFilePlan: ManualFilePlanEntry[] | undefined,
+    request: ResolutionRequest,
     options: { serverLabelMain?: string } = {}
   ): Promise<ResolutionArtifacts> {
+    const { resolutionKind, manualFiles, manualFilePlan } = request;
     const sourceTree = await this.resolutionSourceTree(conflict);
     const fileAffectedPaths = await this.conflictFileAffectedPaths(conflict);
     if (resolutionKind === 'keep_server') {
@@ -2668,12 +2671,15 @@ export class SyncService {
 
     const writes = new Map<string, Buffer>();
     const deletes: string[] = [];
-    const artifacts = async (): Promise<ResolutionArtifacts> => ({
+    const copySources = new Map<string, string>();
+    const artifacts = async (choiceByPath?: Map<string, PerFileResolutionChoice>): Promise<ResolutionArtifacts> => ({
       tree: await this.git.createTreeFromTreeWithChanges({ vaultId: conflict.vault_id, sourceTree, writes, deletes }),
       sourceTree,
       fileAffectedPaths,
       writes,
-      deletes
+      deletes,
+      copySources,
+      ...(choiceByPath ? { choiceByPath } : {})
     });
 
     if (resolutionKind === 'use_device') {
@@ -2686,25 +2692,12 @@ export class SyncService {
           deletes
         };
       }
-      for (const path of fileAffectedPaths) {
-        const deviceBlob = await this.readOptionalBlob(conflict.vault_id, conflict.device_commit, path);
-        if (deviceBlob === null) {
-          deletes.push(path);
-        } else {
-          writes.set(path, deviceBlob);
-        }
-      }
+      await this.addDeviceVersionChanges(conflict, fileAffectedPaths, writes, deletes);
       return await artifacts();
     }
 
     if (resolutionKind === 'keep_both_files') {
-      for (const path of conflict.affected_paths) {
-        const deviceBlob = await this.readOptionalBlob(conflict.vault_id, conflict.device_commit, path);
-        if (deviceBlob !== null) {
-          const sourceBlob = await this.readOptionalBlob(conflict.vault_id, sourceTree, path);
-          writes.set(sourceBlob === null ? path : conflictCopyPath(path, conflict.conflict_id, conflict.device_id), deviceBlob);
-        }
-      }
+      await this.addKeepBothChanges(conflict, sourceTree, conflict.affected_paths, writes, copySources);
       assertSyncableTreePaths([...writes.keys()]);
       return await artifacts();
     }
@@ -2714,29 +2707,7 @@ export class SyncService {
     }
 
     if (resolutionKind === 'insert_both_blocks') {
-      for (const path of conflict.affected_paths) {
-        const serverText = await this.readOptionalTextBlob(conflict.vault_id, conflict.expected_main, path);
-        const deviceText = await this.readOptionalTextBlob(conflict.vault_id, conflict.device_commit, path);
-        if (serverText === null && deviceText === null) {
-          deletes.push(path);
-          continue;
-        }
-        writes.set(
-          path,
-          Buffer.from(
-            [
-              `## Server version (${(options.serverLabelMain ?? conflict.expected_main).slice(0, 12)})`,
-              '',
-              serverText ?? '',
-              '',
-              `## Device version (${conflict.device_commit.slice(0, 12)})`,
-              '',
-              deviceText ?? ''
-            ].join('\n'),
-            'utf8'
-          )
-        );
-      }
+      await this.addInsertBothBlocksChanges(conflict, conflict.affected_paths, writes, deletes, options);
       return await artifacts();
     }
 
@@ -2773,7 +2744,168 @@ export class SyncService {
       return await artifacts();
     }
 
+    if (resolutionKind === 'per_file') {
+      if (manualFiles !== undefined || manualFilePlan !== undefined) {
+        throw new AuthError(400, 'invalid_resolution', 'Per-file resolution carries manual content inside its per_file decisions.');
+      }
+      const perFile = request.perFile;
+      if (perFile === undefined || perFile.length === 0) {
+        throw new AuthError(400, 'invalid_resolution', 'Per-file resolution requires a decision for every affected path.');
+      }
+      const choiceByPath = new Map<string, PerFileResolutionChoice>();
+      const writeOwner = new Map<string, number>();
+      const fileAffected = new Set(fileAffectedPaths);
+      for (const [entryIndex, entry] of perFile.entries()) {
+        const entryWrites = new Map<string, Buffer>();
+        const entryDeletes: string[] = [];
+        const entryCopies = new Map<string, string>();
+        switch (entry.choice) {
+          case 'keep_server':
+            break;
+          case 'use_device':
+            await this.addDeviceVersionChanges(conflict, entry.paths.filter((path) => fileAffected.has(path)), entryWrites, entryDeletes);
+            break;
+          case 'keep_both_files':
+            await this.addKeepBothChanges(conflict, sourceTree, entry.paths, entryWrites, entryCopies);
+            break;
+          case 'insert_both_blocks':
+          case 'manual':
+            if (await this.conflictContainsBinary(conflict, entry.paths)) {
+              throw new AuthError(400, 'invalid_resolution', 'Binary files require a whole-file server, device, or keep-both decision.');
+            }
+            if (entry.choice === 'insert_both_blocks') {
+              await this.addInsertBothBlocksChanges(conflict, entry.paths, entryWrites, entryDeletes, options);
+            } else {
+              const plan = await this.buildManualFilePlanChanges(conflict, sourceTree, entry.manual_file_plan ?? [], entry.paths);
+              for (const [path, content] of plan.writes) entryWrites.set(path, content);
+              entryDeletes.push(...plan.deletes);
+            }
+            break;
+        }
+        for (const path of entry.paths) choiceByPath.set(path, entry.choice);
+        for (const [path, content] of entryWrites) {
+          for (const [writtenPath, owner] of writeOwner) {
+            if (owner !== entryIndex && changedPathsConflict(writtenPath, path)) {
+              throw new AuthError(400, 'invalid_resolution', 'Per-file decisions write colliding final paths.');
+            }
+          }
+          writeOwner.set(path, entryIndex);
+          writes.set(path, content);
+          choiceByPath.set(path, entry.choice);
+        }
+        deletes.push(...entryDeletes);
+        for (const [copyPath, path] of entryCopies) copySources.set(copyPath, path);
+      }
+      assertSyncableTreePaths([...writes.keys()]);
+      return await artifacts(choiceByPath);
+    }
+
     throw new AuthError(400, 'invalid_resolution', 'Unsupported conflict resolution kind.');
+  }
+
+  private async addDeviceVersionChanges(
+    conflict: ConflictRecord,
+    paths: string[],
+    writes: Map<string, Buffer>,
+    deletes: string[]
+  ): Promise<void> {
+    for (const path of paths) {
+      const deviceBlob = await this.readOptionalBlob(conflict.vault_id, conflict.device_commit, path);
+      if (deviceBlob === null) {
+        deletes.push(path);
+      } else {
+        writes.set(path, deviceBlob);
+      }
+    }
+  }
+
+  private async addKeepBothChanges(
+    conflict: ConflictRecord,
+    sourceTree: string,
+    paths: string[],
+    writes: Map<string, Buffer>,
+    copySources: Map<string, string>
+  ): Promise<void> {
+    for (const path of paths) {
+      const deviceBlob = await this.readOptionalBlob(conflict.vault_id, conflict.device_commit, path);
+      if (deviceBlob === null) continue;
+      const sourceBlob = await this.readOptionalBlob(conflict.vault_id, sourceTree, path);
+      const target = sourceBlob === null ? path : conflictCopyPath(path, conflict.conflict_id, conflict.device_id);
+      writes.set(target, deviceBlob);
+      if (target !== path) copySources.set(target, path);
+    }
+  }
+
+  private async addInsertBothBlocksChanges(
+    conflict: ConflictRecord,
+    paths: string[],
+    writes: Map<string, Buffer>,
+    deletes: string[],
+    options: { serverLabelMain?: string }
+  ): Promise<void> {
+    for (const path of paths) {
+      const serverText = await this.readOptionalTextBlob(conflict.vault_id, conflict.expected_main, path);
+      const deviceText = await this.readOptionalTextBlob(conflict.vault_id, conflict.device_commit, path);
+      if (serverText === null && deviceText === null) {
+        deletes.push(path);
+        continue;
+      }
+      writes.set(
+        path,
+        Buffer.from(
+          [
+            `## Server version (${(options.serverLabelMain ?? conflict.expected_main).slice(0, 12)})`,
+            '',
+            serverText ?? '',
+            '',
+            `## Device version (${conflict.device_commit.slice(0, 12)})`,
+            '',
+            deviceText ?? ''
+          ].join('\n'),
+          'utf8'
+        )
+      );
+    }
+  }
+
+  /**
+   * A per-file resolution decides each decision unit separately. Paths that one structural review group links, and
+   * file/directory paths that overlap, must be decided together; the submitted units must partition the affected paths.
+   */
+  private async validatePerFileDecisionUnits(conflict: ConflictRecord, perFile: PerFileResolutionEntry[] | undefined): Promise<void> {
+    if (perFile === undefined || perFile.length === 0) {
+      throw new AuthError(400, 'invalid_resolution', 'Per-file resolution requires a decision for every affected path.');
+    }
+    const affected = new Set(conflict.affected_paths);
+    const unitByPath = new Map<string, number>();
+    perFile.forEach((entry, index) => {
+      for (const path of entry.paths) {
+        if (!affected.has(path)) {
+          throw new AuthError(400, 'invalid_resolution', 'Per-file resolution can only decide affected conflict paths.');
+        }
+        if (unitByPath.has(path)) {
+          throw new AuthError(400, 'invalid_resolution', 'Per-file resolution decides a path more than once.');
+        }
+        unitByPath.set(path, index);
+      }
+      if (entry.choice === 'manual' && entry.manual_file_plan === undefined) {
+        throw new AuthError(400, 'invalid_resolution', 'A manual per-file decision requires its final file plan.');
+      }
+      if (entry.choice !== 'manual' && entry.manual_file_plan !== undefined) {
+        throw new AuthError(400, 'invalid_resolution', 'Only a manual per-file decision carries a final file plan.');
+      }
+    });
+    if (conflict.affected_paths.some((path) => !unitByPath.has(path))) {
+      throw new AuthError(400, 'invalid_resolution', 'Per-file resolution requires a decision for every affected path.');
+    }
+    const splitsLinkedPaths = (paths: string[]) => new Set(paths.map((path) => unitByPath.get(path))).size > 1;
+    const overlappingPaths = conflict.affected_paths.flatMap((path) =>
+      ancestorPaths(path).filter((ancestor) => affected.has(ancestor)).map((ancestor) => [ancestor, path])
+    );
+    const groups = await this.conflictReviewPaths(conflict);
+    if (groups.some((group) => splitsLinkedPaths(group.affected_paths)) || overlappingPaths.some(splitsLinkedPaths)) {
+      throw new AuthError(400, 'invalid_resolution', 'Per-file resolution must decide linked paths together.');
+    }
   }
 
   private async describeResolutionPreview(
@@ -2782,13 +2914,7 @@ export class SyncService {
     artifacts: ResolutionArtifacts
   ): Promise<ConflictPreviewFile[]> {
     const deleted = new Set(artifacts.deletes);
-    const copySources = new Map<string, string>();
-    if (resolutionKind === 'keep_both_files') {
-      for (const path of conflict.affected_paths) {
-        const copyPath = conflictCopyPath(path, conflict.conflict_id, conflict.device_id);
-        if (artifacts.writes.has(copyPath)) copySources.set(copyPath, path);
-      }
-    }
+    const copySources = artifacts.copySources ?? new Map<string, string>();
     const paths = [...new Set([...artifacts.fileAffectedPaths, ...artifacts.writes.keys(), ...artifacts.deletes])].sort();
     const files: ConflictPreviewFile[] = [];
     for (const path of paths) {
@@ -2797,10 +2923,11 @@ export class SyncService {
       const text = blob === null ? null : decodeReviewText(blob);
       const contentKind: ConflictPreviewFile['content_kind'] =
         blob !== null && text === null ? 'binary' : blob !== null && blob.byteLength > MAX_INTERACTIVE_REVIEW_BYTES ? 'large_text' : 'text';
+      const choice = resolutionKind === 'per_file' ? artifacts.choiceByPath?.get(path) ?? 'keep_server' : resolutionKind;
       files.push({
         path,
         operation: previewOperation(path, blob, sourceBlob, deleted, copySources),
-        provenance: previewProvenance(resolutionKind, artifacts.writes.has(path), copySources.has(path)),
+        provenance: previewProvenance(choice, artifacts.writes.has(path), copySources.has(path)),
         source_path: copySources.get(path) ?? null,
         content_kind: contentKind,
         content: contentKind === 'text' ? text : null,
@@ -2811,8 +2938,8 @@ export class SyncService {
     return files;
   }
 
-  private async conflictContainsBinary(conflict: ConflictRecord): Promise<boolean> {
-    for (const path of conflict.affected_paths) {
+  private async conflictContainsBinary(conflict: ConflictRecord, paths: string[] = conflict.affected_paths): Promise<boolean> {
+    for (const path of paths) {
       const blobs = await Promise.all([
         this.readOptionalBlob(conflict.vault_id, conflict.base_commit, path),
         this.readOptionalBlob(conflict.vault_id, conflict.expected_main, path),
@@ -2826,13 +2953,20 @@ export class SyncService {
   private async buildManualFilePlanChanges(
     conflict: ConflictRecord,
     sourceTree: string,
-    manualFilePlan: ManualFilePlanEntry[]
+    manualFilePlan: ManualFilePlanEntry[],
+    decidedPaths: string[] = conflict.affected_paths
   ): Promise<{ writes: Map<string, Buffer>; deletes: string[] }> {
     if (manualFilePlan.length === 0) {
       throw new AuthError(400, 'invalid_resolution', 'Manual file plan requires at least one path.');
     }
+    const decided = new Set(decidedPaths);
+    const otherAffectedPaths = conflict.affected_paths.filter((path) => !decided.has(path));
+    const otherAffected = new Set(otherAffectedPaths);
     const affected = new Set(conflict.affected_paths);
-    const unaffectedSourcePaths = (await this.git.listTreePaths(conflict.vault_id, sourceTree)).filter((path) => !affected.has(path));
+    const unrelatedPaths = [
+      ...(await this.git.listTreePaths(conflict.vault_id, sourceTree)).filter((path) => !affected.has(path)),
+      ...otherAffectedPaths
+    ];
     const seen = new Set<string>();
     const writes = new Map<string, Buffer>();
     const deletes: string[] = [];
@@ -2842,18 +2976,21 @@ export class SyncService {
       }
       seen.add(entry.path);
       if (entry.content === null) {
-        if (!affected.has(entry.path)) {
+        if (!decided.has(entry.path)) {
           throw new AuthError(400, 'invalid_resolution', 'Manual file plan can only delete affected conflict paths.');
         }
         deletes.push(entry.path);
         continue;
       }
-      if (unaffectedSourcePaths.some((path) => changedPathsConflict(path, entry.path))) {
+      if (otherAffected.has(entry.path)) {
+        throw new AuthError(400, 'invalid_resolution', 'Manual file plan cannot write a path decided separately.');
+      }
+      if (unrelatedPaths.some((path) => changedPathsConflict(path, entry.path))) {
         throw new AuthError(400, 'invalid_resolution', 'Manual file plan target collides with an unrelated path.');
       }
       writes.set(entry.path, Buffer.from(entry.content, 'utf8'));
     }
-    const missingPaths = conflict.affected_paths.filter((path) => !seen.has(path));
+    const missingPaths = decidedPaths.filter((path) => !seen.has(path));
     if (missingPaths.length > 0) {
       throw new AuthError(400, 'invalid_resolution', 'Manual file plan must include every affected conflict path.');
     }
@@ -4095,6 +4232,11 @@ function intersectChangedPaths(left: GitDiffEntry[], right: GitDiffEntry[]): str
   return [...result].sort();
 }
 
+function ancestorPaths(path: string): string[] {
+  const segments = path.split('/');
+  return segments.slice(1).map((_segment, index) => segments.slice(0, index + 1).join('/'));
+}
+
 function changedPathsConflict(left: string, right: string): boolean {
   return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
 }
@@ -4616,7 +4758,7 @@ function previewOperation(
 }
 
 function previewProvenance(
-  resolutionKind: ConflictResolutionKind,
+  resolutionKind: PerFileResolutionChoice,
   written: boolean,
   copied: boolean
 ): ConflictPreviewFile['provenance'] {
@@ -4711,7 +4853,18 @@ function resolutionRequestHash(input: {
   resolutionKind: ConflictResolutionKind;
   manualFiles?: Record<string, string | null>;
   manualFilePlan?: ManualFilePlanEntry[];
+  perFile?: PerFileResolutionEntry[];
 }): string {
+  const sortPlan = (plan: ManualFilePlanEntry[]) => [...plan].sort((left, right) => left.path.localeCompare(right.path));
+  const perFile = input.perFile === undefined
+    ? undefined
+    : input.perFile
+      .map((entry) => ({
+        paths: [...entry.paths].sort((left, right) => left.localeCompare(right)),
+        choice: entry.choice,
+        manual_file_plan: entry.manual_file_plan === undefined ? null : sortPlan(entry.manual_file_plan)
+      }))
+      .sort((left, right) => left.paths[0]!.localeCompare(right.paths[0]!));
   return sha256Hex(
     JSON.stringify({
       expected_main: input.expectedMain,
@@ -4723,7 +4876,8 @@ function resolutionRequestHash(input: {
       manual_file_plan:
         input.manualFilePlan === undefined
           ? null
-          : [...input.manualFilePlan].sort((left, right) => left.path.localeCompare(right.path))
+          : sortPlan(input.manualFilePlan),
+      ...(perFile === undefined ? {} : { per_file: perFile })
     })
   );
 }

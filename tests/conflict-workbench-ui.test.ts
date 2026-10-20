@@ -63,4 +63,28 @@ describe('conflict workbench UI contract', () => {
     expect(styles).toContain('.diff-source-legend');
     expect(styles).toContain('.conflict-result');
   });
+
+  it('decides every file on its own and keeps the toolbar choice as a bulk action', async () => {
+    const [component, styles] = await Promise.all([
+      readFile('frontend/dashboard/src/components/ConflictWorkbench.svelte', 'utf8'),
+      readFile('frontend/dashboard/src/style.css', 'utf8')
+    ]);
+
+    expect(component).toContain('class="file-decision"');
+    expect(component).toContain('class="decision-segment"');
+    expect(component).toContain('>Line by line</button>');
+    expect(component).toContain('Edit final content');
+    expect(component).toContain("file{review.files.length === 1 ? '' : 's'} decided");
+    expect(component).toContain('Next undecided');
+    expect(component).toContain('Set all files');
+    expect(component).toContain('One choice covers the complete conflict package.');
+    expect(component).toContain('class="file-nav-decision"');
+    expect(component).not.toContain('Whole conflict');
+    expect(component).not.toContain('One decision applies to the complete conflict package.');
+    expect(component).not.toContain('class="resolution-policy"');
+
+    expect(styles).toContain('.file-decision');
+    expect(styles).toContain('.decision-segment button.active');
+    expect(styles).not.toContain('.resolution-policy');
+  });
 });

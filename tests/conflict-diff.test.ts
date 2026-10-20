@@ -182,6 +182,9 @@ describe('conflict diff workbench', () => {
     expect(submissionCandidateKey({ resolutionKind: 'manual', manualFilePlan: [{ path: 'new.md', content: 'x' }] })).not.toBe(
       submissionCandidateKey({ resolutionKind: 'manual', manualFilePlan: [{ path: 'new.md', content: 'y' }] })
     );
+    expect(submissionCandidateKey({ resolutionKind: 'per_file', perFile: [{ paths: ['a.md'], choice: 'keep_server' }] })).not.toBe(
+      submissionCandidateKey({ resolutionKind: 'per_file', perFile: [{ paths: ['a.md'], choice: 'use_device' }] })
+    );
   });
 
   it('labels final outcomes and provenance in text rather than color', () => {

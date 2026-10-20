@@ -5,22 +5,30 @@
   import {
     buildConflictDiff,
     changedRows,
-    choicesForAllRows,
     collapseConflictDiff,
     formatDiffLineRange,
-    hasDivergentFinalPaths,
     isAgreedFileDeletion,
     previewOutcomeLabel,
     previewProvenanceLabel,
     resolveConflictFile,
     submissionCandidateKey,
-    unresolvedLineCount,
     validateManualPathTargets,
     type CollapsedDiffGap,
     type ConflictDiffRow,
     type DiffLineRange,
     type LineResolution
   } from '../conflictDiff';
+  import {
+    buildDecisionUnits,
+    decisionCapabilities,
+    fileChoiceLabel,
+    perFileSubmission,
+    unitStatus,
+    type DecisionCapabilities,
+    type DecisionUnit,
+    type FileChoice,
+    type UnitStatus
+  } from '../conflictDecisions';
   import type {
     ConflictResolutionKind,
     ConflictResolutionPreview,
@@ -28,7 +36,8 @@
     ConflictReviewFile,
     ConflictReviewPackage,
     ConflictReviewPath,
-    ManualFilePlanEntry
+    ManualFilePlanEntry,
+    PerFileResolutionEntry
   } from '../api/types';
 
   export let review: ConflictReviewPackage;
@@ -46,10 +55,14 @@
     | { kind: 'ready'; candidateKey: string; preview: ConflictResolutionPreview; reviewRef: ConflictReviewPackage }
     | { kind: 'error'; candidateKey: string; message: string };
 
+  type DirectoryChoice = 'keep_server' | 'use_device';
+  type ExtraChoice = 'keep_both_files' | 'insert_both_blocks' | 'manual';
+  const DIRECTORY_CHOICES: DirectoryChoice[] = ['keep_server', 'use_device'];
+
   let initializedKey = '';
   let activePath = '';
-  let mode: 'whole' | 'lines' = 'whole';
-  let resolutionKind: ConflictResolutionKind = 'keep_server';
+  let fileChoices: Record<string, FileChoice> = {};
+  let directoryChoice: DirectoryChoice | null = null;
   let lineChoices: Record<string, Record<string, LineResolution>> = {};
   let diffs: Record<string, ConflictDiffRow[]> = {};
   let expandedGaps: Record<string, Record<string, boolean>> = {};
@@ -70,21 +83,23 @@
 
   $: reviewKey = `${review.conflict.conflict_id}:${review.expected_main}:${review.files.map((file) => file.path).join('|')}:${review.directory_conflicts.map((group) => group.root).join('|')}`;
   $: if (reviewKey !== initializedKey) initializeReview();
-  $: structuralGroups = review.path_conflicts.filter(hasStructuralChange);
-  $: titleGroups = review.path_conflicts.filter(hasTitleConflict);
-  $: hasBinary = review.files.some((file) => file.content_kind === 'binary');
-  $: hasLargeText = review.files.some((file) => file.content_kind === 'large_text');
+  $: affectedPaths = new Set(review.conflict.affected_paths);
+  $: allUnits = buildDecisionUnits(review.files, review.path_conflicts, review.conflict.affected_paths);
+  $: units = allUnits.filter((unit) => unit.files.length > 0);
+  $: contentlessPaths = allUnits.filter((unit) => unit.files.length === 0).flatMap((unit) => unit.paths);
+  $: unitByPath = new Map(units.flatMap((unit) => unit.paths.map((path) => [path, unit] as const)));
   $: hasDirectoryConflicts = review.directory_conflicts.length > 0;
-  $: hasNonInteractiveContent = hasBinary || hasLargeText;
-  $: hasUnlineableText = review.files.some(
-    (file) => file.content_kind === 'text' && changedRows(diffs[file.path] ?? []).length === 0 && file.server_content !== file.device_content
-  );
-  $: individualAvailable = !hasDirectoryConflicts && !hasNonInteractiveContent && !hasUnlineableText && titleGroups.length === 0;
-  $: unresolved = unresolvedLineCount(diffs, lineChoices);
+  $: perFileDecisions = !hasDirectoryConflicts && units.length > 0;
+  $: capabilities = Object.fromEntries(units.map((unit) => [unit.id, decisionCapabilities(unit, diffs)])) as Record<string, DecisionCapabilities>;
+  $: statuses = Object.fromEntries(
+    units.map((unit) => [unit.id, unitStatus(unit, fileChoices[unit.id], diffs, lineChoices)])
+  ) as Record<string, UnitStatus>;
+  $: decidedFileCount = review.files.filter((file) => statuses[unitByPath.get(file.path)?.id ?? '']?.decided).length;
+  $: firstUndecided = units.find((unit) => !statuses[unit.id]?.decided) ?? null;
+  $: manualErrors = manualPlanErrors(units, fileChoices, manualPathByGroup, manualDeleteByGroup);
   $: reviewResolved = review.conflict.status === 'resolved';
-  $: manualPlanError = mode === 'whole' && resolutionKind === 'manual' ? validateManualPlan() : '';
   $: statusLabel = reviewResolved ? 'Synced' : review.stale ? 'Stale review' : 'Review needed';
-  $: if (candidateRevision >= 0) {
+  $: if (candidateRevision >= 0 && units && contentlessPaths && statuses && manualErrors) {
     currentSubmission = buildSubmission();
     currentCandidateKey = currentSubmission ? submissionCandidateKey(currentSubmission) : '';
   }
@@ -101,8 +116,8 @@
   function initializeReview() {
     initializedKey = reviewKey;
     activePath = review.files[0]?.path ?? '';
-    mode = 'whole';
-    resolutionKind = 'keep_server';
+    fileChoices = {};
+    directoryChoice = null;
     diffs = Object.fromEntries(review.files.map((file) => [file.path, buildConflictDiff(file)]));
     expandedGaps = {};
     lineChoices = {};
@@ -156,28 +171,40 @@
 
   function scrollToFile(path: string) {
     activePath = path;
-    fileNodes.get(path)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    const reduceMotion = typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    fileNodes.get(path)?.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'start' });
   }
 
   function jumpToSelectedFile(event: Event) {
     scrollToFile((event.currentTarget as HTMLSelectElement).value);
   }
 
+  function jumpToUndecided() {
+    const path = firstUndecided?.files[0]?.path;
+    if (!path) return;
+    scrollToFile(path);
+    fileNodes.get(path)?.querySelector<HTMLElement>('.decision-segment button')?.focus({ preventScroll: true });
+  }
+
   function pathGroup(file: ConflictReviewFile): ConflictReviewPath | null {
     return review.path_conflicts.find((group) => group.affected_paths.includes(file.path)) ?? null;
+  }
+
+  function choiceOffered(choice: ConflictResolutionKind): boolean {
+    return review.choices.includes(choice);
   }
 
   function hasStructuralChange(group: ConflictReviewPath): boolean {
     return group.base_path !== group.server_path || group.base_path !== group.device_path;
   }
 
-  function hasTitleConflict(group: ConflictReviewPath): boolean {
-    return hasDivergentFinalPaths(group);
+  function groupLabel(group: ConflictReviewPath): string {
+    if (group.server_path === group.device_path) return group.base_path ?? group.server_path ?? group.device_path ?? 'Path overlap';
+    return `${group.base_path ?? '(new file)'} -> ${group.server_path ?? '(deleted)'} / ${group.device_path ?? '(deleted)'}`;
   }
 
-  function groupLabel(group: ConflictReviewPath): string {
-    if (!hasTitleConflict(group)) return group.base_path ?? group.server_path ?? group.device_path ?? 'Path overlap';
-    return `${group.base_path ?? '(new file)'} -> ${group.server_path ?? '(deleted)'} / ${group.device_path ?? '(deleted)'}`;
+  function unitLabel(unit: DecisionUnit): string {
+    return unit.titleGroup ? groupLabel(unit.titleGroup) : unit.files.length === 1 ? unit.files[0]!.path : unit.paths.join(', ');
   }
 
   function defaultGroupContent(group: ConflictReviewPath): string {
@@ -186,18 +213,33 @@
     return server ?? device ?? '';
   }
 
-  function belongsToTitleGroup(path: string): boolean {
-    return titleGroups.some((group) => group.affected_paths.includes(path));
+  function belongsToTitleGroup(unit: DecisionUnit, path: string): boolean {
+    return unit.titleGroup?.affected_paths.includes(path) ?? false;
   }
 
-  function setMode(next: 'whole' | 'lines') {
-    if (mode === next) return;
-    mode = next;
+  function isExtraChoice(choice: FileChoice | undefined): choice is ExtraChoice {
+    return choice === 'keep_both_files' || choice === 'insert_both_blocks' || choice === 'manual';
+  }
+
+  function setUnitChoice(unitId: string, choice: FileChoice) {
+    if (fileChoices[unitId] === choice) return;
+    fileChoices = { ...fileChoices, [unitId]: choice };
     candidateChanged();
   }
 
-  function changeResolutionKind(event: Event) {
-    resolutionKind = (event.currentTarget as HTMLSelectElement).value as ConflictResolutionKind;
+  function chooseMore(unitId: string, event: Event) {
+    const value = (event.currentTarget as HTMLSelectElement).value;
+    if (value === 'keep_both_files' || value === 'insert_both_blocks' || value === 'manual') setUnitChoice(unitId, value);
+  }
+
+  function setAllFiles(choice: DirectoryChoice) {
+    fileChoices = Object.fromEntries(units.map((unit) => [unit.id, choice]));
+    candidateChanged();
+  }
+
+  function setDirectoryChoice(choice: DirectoryChoice) {
+    if (directoryChoice === choice) return;
+    directoryChoice = choice;
     candidateChanged();
   }
 
@@ -209,16 +251,12 @@
     candidateChanged();
   }
 
-  function chooseFile(path: string, choice: LineResolution) {
-    lineChoices = {
-      ...lineChoices,
-      [path]: Object.fromEntries(changedRows(diffs[path] ?? []).map((row) => [row.id, choice]))
-    };
-    candidateChanged();
-  }
-
-  function chooseAll(choice: LineResolution) {
-    lineChoices = choicesForAllRows(diffs, choice);
+  function chooseAllLines(unit: DecisionUnit, choice: LineResolution) {
+    const next = { ...lineChoices };
+    for (const file of unit.files) {
+      next[file.path] = Object.fromEntries(changedRows(diffs[file.path] ?? []).map((row) => [row.id, choice]));
+    }
+    lineChoices = next;
     candidateChanged();
   }
 
@@ -242,58 +280,67 @@
     candidateChanged();
   }
 
-  function validateManualPlan(): string {
-    return validateManualPathTargets(
-      review.files.filter((file) => !belongsToTitleGroup(file.path) && !isAgreedFileDeletion(file)).map((file) => file.path),
-      titleGroups.map((group) => ({
-        label: groupLabel(group),
-        path: manualPathByGroup[group.group_id] ?? '',
-        deleted: Boolean(manualDeleteByGroup[group.group_id])
-      }))
-    );
+  function manualPlanErrors(
+    decisionUnits: DecisionUnit[],
+    choices: Record<string, FileChoice>,
+    paths: Record<string, string>,
+    deletes: Record<string, boolean>
+  ): Record<string, string> {
+    const errors: Record<string, string> = {};
+    for (const unit of decisionUnits) {
+      const group = unit.titleGroup;
+      if (choices[unit.id] !== 'manual' || !group) continue;
+      const error = validateManualPathTargets(
+        review.files.filter((file) => !unit.paths.includes(file.path) && !isAgreedFileDeletion(file)).map((file) => file.path),
+        [{ label: groupLabel(group), path: paths[group.group_id] ?? '', deleted: Boolean(deletes[group.group_id]) }]
+      );
+      if (error) errors[unit.id] = error;
+    }
+    return errors;
   }
 
-  function buildManualFilePlan(): ManualFilePlanEntry[] {
-    const error = validateManualPlan();
-    if (error) throw new Error(error);
-    const plan = new Map<string, string | null>(review.conflict.affected_paths.map((path) => [path, null]));
-    for (const file of review.files) {
-      if (!belongsToTitleGroup(file.path) && !isAgreedFileDeletion(file)) plan.set(file.path, manualTextByPath[file.path] ?? '');
+  function decidedPaths(unit: DecisionUnit): string[] {
+    return unit.paths.filter((path) => affectedPaths.has(path));
+  }
+
+  function unitFilePlan(unit: DecisionUnit, choice: 'lines' | 'manual'): ManualFilePlanEntry[] {
+    const plan = new Map<string, string | null>(decidedPaths(unit).map((path) => [path, null]));
+    for (const file of unit.files) {
+      if (choice === 'lines') {
+        plan.set(file.path, resolveConflictFile(file, diffs[file.path] ?? [], lineChoices[file.path] ?? {}));
+      } else {
+        plan.set(file.path, belongsToTitleGroup(unit, file.path) || isAgreedFileDeletion(file) ? null : manualTextByPath[file.path] ?? '');
+      }
     }
-    for (const group of titleGroups) {
-      if (manualDeleteByGroup[group.group_id]) continue;
-      const path = (manualPathByGroup[group.group_id] ?? '').trim();
-      plan.set(path, manualContentByGroup[group.group_id] ?? '');
+    const group = unit.titleGroup;
+    if (choice === 'manual' && group && !manualDeleteByGroup[group.group_id]) {
+      plan.set((manualPathByGroup[group.group_id] ?? '').trim(), manualContentByGroup[group.group_id] ?? '');
     }
     return [...plan.entries()].map(([path, content]) => ({ path, content }));
   }
 
+  function unitEntry(unit: DecisionUnit, choice: FileChoice): PerFileResolutionEntry {
+    if (choice === 'lines' || choice === 'manual') {
+      return { paths: decidedPaths(unit), choice: 'manual', manual_file_plan: unitFilePlan(unit, choice) };
+    }
+    return { paths: decidedPaths(unit), choice };
+  }
+
   function buildSubmission(): ConflictResolutionSubmission | null {
     if (reviewResolved) return null;
-    if (mode === 'lines') {
-      if (!individualAvailable || unresolved > 0) return null;
+    if (hasDirectoryConflicts) return directoryChoice ? { resolutionKind: directoryChoice } : null;
+    if (Object.keys(manualErrors).length > 0) return null;
+    const entries: PerFileResolutionEntry[] = [];
+    for (const unit of units) {
+      const choice = fileChoices[unit.id];
+      if (!choice || !unitStatus(unit, choice, diffs, lineChoices).decided) return null;
       try {
-        const manualFiles = Object.fromEntries(
-          review.files.map((file) => [file.path, resolveConflictFile(file, diffs[file.path] ?? [], lineChoices[file.path] ?? {})])
-        );
-        return { resolutionKind: 'manual', manualFiles };
+        entries.push(unitEntry(unit, choice));
       } catch {
         return null;
       }
     }
-    if (resolutionKind !== 'manual') return { resolutionKind };
-    if (manualPlanError) return null;
-    if (structuralGroups.length > 0) {
-      try {
-        return { resolutionKind: 'manual', manualFilePlan: buildManualFilePlan() };
-      } catch {
-        return null;
-      }
-    }
-    return {
-      resolutionKind: 'manual',
-      manualFiles: Object.fromEntries(review.files.map((file) => [file.path, manualTextByPath[file.path] ?? '']))
-    };
+    return perFileSubmission(entries, contentlessPaths);
   }
 
   async function reviewResult() {
@@ -346,12 +393,37 @@
       case 'use_device': return hasDirectoryConflicts ? 'Use device directory state' : 'Use device version';
       case 'keep_both_files': return 'Keep both notes/files';
       case 'insert_both_blocks': return 'Insert both blocks';
-      case 'manual': return 'Edit complete final files';
+      case 'manual': return 'Edited final files';
+      case 'per_file': return 'Per-file decisions';
     }
   }
 
   function resultPolicyLabel(): string {
-    return mode === 'lines' ? 'Line-by-line final content' : choiceLabel(resolutionKind);
+    if (!currentSubmission) return 'Final result';
+    if (currentSubmission.resolutionKind === 'per_file' || hasDirectoryConflicts) return choiceLabel(currentSubmission.resolutionKind);
+    return `${choiceLabel(currentSubmission.resolutionKind)} for every file`;
+  }
+
+  function decisionSummary(): string {
+    if (hasDirectoryConflicts) return '';
+    const counts = new Map<string, number>();
+    for (const unit of units) {
+      const label = fileChoiceLabel(fileChoices[unit.id] ?? null);
+      counts.set(label, (counts.get(label) ?? 0) + unit.files.length);
+    }
+    return [...counts.entries()].map(([label, count]) => `${count} ${label.toLowerCase()}`).join(' \u00b7 ');
+  }
+
+  function decisionState(status: UnitStatus | undefined): string {
+    if (!status?.choice) return 'undecided';
+    if (status.choice === 'lines' && !status.decided) return 'partial';
+    return status.choice;
+  }
+
+  function decisionStateLabel(status: UnitStatus | undefined): string {
+    if (!status?.choice) return 'Undecided';
+    if (status.choice === 'lines' && !status.decided) return `${status.remainingLines} line${status.remainingLines === 1 ? '' : 's'} left`;
+    return fileChoiceLabel(status.choice);
   }
 
   function expandGap(path: string, gapId: string) {
@@ -387,10 +459,6 @@
 
   function removedLineCount(rows: ConflictDiffRow[]): number {
     return changedRows(rows).filter((row) => row.serverText !== null).length;
-  }
-
-  function isChoiceDisabled(choice: ConflictResolutionKind): boolean {
-    return (choice === 'manual' && hasNonInteractiveContent) || (choice === 'insert_both_blocks' && hasBinary);
   }
 </script>
 
@@ -439,30 +507,36 @@
         <span>{review.conflict.resolved_at ? new Date(review.conflict.resolved_at).toLocaleString() : ''}</span>
         {#if review.conflict.resolution_commit}<code>{review.conflict.resolution_commit.slice(0, 10)}</code>{/if}
       </div>
-    {:else}
-      <div class="resolution-mode" role="group" aria-label="Resolution mode">
-        <button aria-pressed={mode === 'whole'} class:active={mode === 'whole'} on:click={() => setMode('whole')}>Whole conflict</button>
-        <button aria-pressed={mode === 'lines'} class:active={mode === 'lines'} disabled={!individualAvailable} on:click={() => setMode('lines')}>Line by line</button>
+    {:else if !perFileDecisions}
+      <div class="decision-progress">
+        <span><strong>{directoryChoice ? choiceLabel(directoryChoice) : 'Undecided'}</strong></span>
+        <span class="decision-summary">One choice covers the complete conflict package.</span>
       </div>
-
-      {#if mode === 'whole'}
-        <label class="resolution-policy">
-          <span>Resolution</span>
-          <select value={resolutionKind} on:change={changeResolutionKind}>
-            {#each review.choices as choice}
-              <option value={choice} disabled={isChoiceDisabled(choice)}>{choiceLabel(choice)}</option>
-            {/each}
-          </select>
-        </label>
-        <p class="resolution-context">One decision applies to the complete conflict package.</p>
-      {:else}
-        <div class="review-bulk-actions" aria-label="Choose every changed line">
-          <span><strong>{unresolved}</strong> unresolved</span>
-          <button class="secondary" on:click={() => chooseAll('server')}>All server</button>
-          <button class="secondary" on:click={() => chooseAll('device')}>All device</button>
-          <button class="secondary" on:click={() => chooseAll('both')}>Keep all both</button>
-        </div>
-      {/if}
+      <div class="bulk-decision" role="group" aria-label="Outcome for the complete conflict package">
+        <span>Whole package</span>
+        {#each DIRECTORY_CHOICES as choice}
+          <button
+            class="secondary"
+            class:active={directoryChoice === choice}
+            aria-pressed={directoryChoice === choice}
+            on:click={() => setDirectoryChoice(choice)}
+          >{choice === 'keep_server' ? 'Server' : 'Device'}</button>
+        {/each}
+      </div>
+    {:else}
+      <div class="decision-progress" aria-live="polite">
+        <span><strong>{decidedFileCount}</strong> of {review.files.length} file{review.files.length === 1 ? '' : 's'} decided</span>
+        {#if firstUndecided}
+          <button class="link-button" on:click={jumpToUndecided}>Next undecided</button>
+        {:else}
+          <span class="decision-summary">{decisionSummary()}</span>
+        {/if}
+      </div>
+      <div class="bulk-decision" role="group" aria-label="Set every file to one version">
+        <span>Set all files</span>
+        <button class="secondary" aria-label="Set all files to Server main" on:click={() => setAllFiles('keep_server')}>Server</button>
+        <button class="secondary" aria-label={`Set all files to Device: ${review.device_name}`} on:click={() => setAllFiles('use_device')}>Device</button>
+      </div>
     {/if}
 
     {#if review.stale}
@@ -484,7 +558,6 @@
     {/if}
   </section>
 
-  {#if manualPlanError}<p class="warning resolution-banner">{manualPlanError}</p>{/if}
   {#if previewState.kind === 'error' && previewState.candidateKey === currentCandidateKey}<p class="warning resolution-banner" role="alert">{previewState.message}</p>{/if}
 
   {#if hasDirectoryConflicts}
@@ -492,7 +565,7 @@
       <div>
         <p class="eyebrow">Directory state</p>
         <h3>Choose the canonical directory outcome</h3>
-        <p>The server records the decision. Devices only perform non-recursive, empty-directory-safe materialization.</p>
+        <p>One server or device choice covers the complete package, including every file listed below. The server records the decision. Devices only perform non-recursive, empty-directory-safe materialization.</p>
       </div>
       <div class="directory-conflict-list">
         {#each review.directory_conflicts as group}
@@ -510,13 +583,6 @@
     </section>
   {/if}
 
-  {#if !reviewResolved && !individualAvailable && !hasDirectoryConflicts}
-    <p class="resolution-banner">
-      Line-by-line resolution is unavailable for {hasBinary ? 'binary content' : hasLargeText ? 'large text content' : hasUnlineableText ? 'an empty-file add/delete' : 'path or rename conflicts'}.
-      Choose a whole-conflict policy so bytes and paths remain safe.
-    </p>
-  {/if}
-
   {#if review.files.length > 0 || hasDirectoryConflicts}
   <div class="conflict-review-body" class:no-file-navigator={review.files.length === 0}>
     {#if review.files.length > 0}
@@ -530,6 +596,7 @@
             {@const fileRows = diffs[file.path] ?? []}
             {@const added = addedLineCount(fileRows)}
             {@const removed = removedLineCount(fileRows)}
+            {@const navStatus = statuses[unitByPath.get(file.path)?.id ?? '']}
             <button
               class:active={activePath === file.path}
               aria-current={activePath === file.path ? 'location' : undefined}
@@ -547,6 +614,9 @@
                 {:else}
                   <b class="addition">+{added}</b><b class="deletion">-{removed}</b>
                 {/if}
+                {#if perFileDecisions && !reviewResolved}
+                  <b class="file-nav-decision" data-state={decisionState(navStatus)}>{decisionStateLabel(navStatus)}</b>
+                {/if}
               </span>
             </button>
           {/each}
@@ -563,32 +633,6 @@
       {/if}
 
       {#if view === 'compare' || reviewResolved}
-        {#if mode === 'whole' && resolutionKind === 'manual' && titleGroups.length > 0}
-          <section class="structure-editor panel">
-            <h2>Final paths</h2>
-            <p class="muted">Path conflicts require an explicit final path and complete content.</p>
-            {#each titleGroups as group}
-              <div class="structure-group">
-                <strong>{groupLabel(group)}</strong>
-                <label class="checkbox-label">
-                  <input type="checkbox" checked={manualDeleteByGroup[group.group_id] ?? false} on:change={(event) => updateManualDelete(group.group_id, event)} />
-                  Delete this path group in the final result
-                </label>
-                {#if !manualDeleteByGroup[group.group_id]}
-                  <label>
-                    Final path
-                    <input value={manualPathByGroup[group.group_id] ?? ''} on:input={(event) => updateManualPath(group.group_id, event)} />
-                  </label>
-                  <label>
-                    Final content
-                    <textarea value={manualContentByGroup[group.group_id] ?? ''} on:input={(event) => updateManualGroupContent(group.group_id, event)}></textarea>
-                  </label>
-                {/if}
-              </div>
-            {/each}
-          </section>
-        {/if}
-
         {#if review.files.length > 0}
           <div class="diff-source-legend" aria-label="Diff source legend">
             <span class="legend-entry legend-server"><b aria-hidden="true">&minus;</b> Server main</span>
@@ -600,6 +644,13 @@
               {@const group = pathGroup(file)}
               {@const rows = diffs[file.path] ?? []}
               {@const changes = changedRows(rows)}
+              {@const unit = unitByPath.get(file.path)}
+              {@const unitChoice = unit ? fileChoices[unit.id] : undefined}
+              {@const status = unit ? statuses[unit.id] : undefined}
+              {@const caps = unit ? capabilities[unit.id] : undefined}
+              {@const leadsUnit = unit?.files[0]?.path === file.path}
+              {@const showLineChoices = perFileDecisions && !reviewResolved && unitChoice === 'lines'}
+              {@const editing = perFileDecisions && !reviewResolved && unitChoice === 'manual'}
               <article
                 class="conflict-file"
                 id={`conflict-file-${fileIndex}`}
@@ -621,14 +672,86 @@
                       <span class="deletion">-{removedLineCount(rows)}</span>
                     {/if}
                   </div>
-                  {#if mode === 'lines' && file.content_kind === 'text' && changes.length > 0}
-                    <div class="file-bulk-actions" aria-label={`Choose all changes in ${file.path}`}>
-                      <button class="secondary" on:click={() => chooseFile(file.path, 'server')}>All server</button>
-                      <button class="secondary" on:click={() => chooseFile(file.path, 'device')}>All device</button>
-                      <button class="secondary" on:click={() => chooseFile(file.path, 'both')}>Keep both</button>
-                    </div>
-                  {/if}
                 </header>
+
+                {#if perFileDecisions && unit && !reviewResolved}
+                  {#if leadsUnit}
+                    <div class="file-decision" data-state={decisionState(status)} role="group" aria-label={`Decision for ${unitLabel(unit)}`}>
+                      <span class="decision-state" data-state={decisionState(status)}>{decisionStateLabel(status)}</span>
+                      <div class="decision-segment">
+                        <button
+                          class:active={unitChoice === 'keep_server'}
+                          aria-pressed={unitChoice === 'keep_server'}
+                          aria-label={`Keep Server main for ${unitLabel(unit)}`}
+                          on:click={() => setUnitChoice(unit.id, 'keep_server')}
+                        >Server</button>
+                        <button
+                          class:active={unitChoice === 'use_device'}
+                          aria-pressed={unitChoice === 'use_device'}
+                          aria-label={`Use Device: ${review.device_name} for ${unitLabel(unit)}`}
+                          on:click={() => setUnitChoice(unit.id, 'use_device')}
+                        >Device</button>
+                        <button
+                          class:active={unitChoice === 'lines'}
+                          aria-pressed={unitChoice === 'lines'}
+                          aria-label={`Choose line by line for ${unitLabel(unit)}`}
+                          disabled={!caps?.lines || !choiceOffered('manual')}
+                          on:click={() => setUnitChoice(unit.id, 'lines')}
+                        >Line by line</button>
+                      </div>
+                      <label class="decision-more">
+                        <span class="visually-hidden">Other choices for {unitLabel(unit)}</span>
+                        <select class:active={isExtraChoice(unitChoice)} value={isExtraChoice(unitChoice) ? unitChoice : ''} on:change={(event) => chooseMore(unit.id, event)}>
+                          <option value="" disabled>More...</option>
+                          <option value="keep_both_files" disabled={!choiceOffered('keep_both_files')}>Keep both copies</option>
+                          <option value="insert_both_blocks" disabled={!caps?.insertBoth || !choiceOffered('insert_both_blocks')}>Insert both blocks</option>
+                          <option value="manual" disabled={!caps?.edit || !choiceOffered('manual')}>Edit final content</option>
+                        </select>
+                      </label>
+                      {#if unitChoice === 'lines'}
+                        <div class="file-bulk-actions" role="group" aria-label={`Choose every changed line in ${unitLabel(unit)}`}>
+                          <span>All lines</span>
+                          <button class="secondary" on:click={() => chooseAllLines(unit, 'server')}>Server</button>
+                          <button class="secondary" on:click={() => chooseAllLines(unit, 'device')}>Device</button>
+                          <button class="secondary" on:click={() => chooseAllLines(unit, 'both')}>Both</button>
+                        </div>
+                      {/if}
+                      {#if unit.files.length > 1}
+                        <p class="decision-note">
+                          Decided together with {unit.files.slice(1).map((linked) => linked.path).join(', ')}: a rename or overlapping path links them.
+                        </p>
+                      {/if}
+                      {#if caps && !caps.lines && caps.reason}<p class="decision-note">{caps.reason}</p>{/if}
+                    </div>
+                  {:else}
+                    <p class="decision-linked">
+                      Decided with <code>{unit.files[0]?.path}</code>: <strong>{decisionStateLabel(status)}</strong>
+                    </p>
+                  {/if}
+                {/if}
+
+                {#if editing && leadsUnit && unit?.titleGroup}
+                  {@const titleGroup = unit.titleGroup}
+                  <section class="structure-editor">
+                    <strong>Final path for {groupLabel(titleGroup)}</strong>
+                    <p class="muted">Divergent renames require an explicit final path and complete content.</p>
+                    <label class="checkbox-label">
+                      <input type="checkbox" checked={manualDeleteByGroup[titleGroup.group_id] ?? false} on:change={(event) => updateManualDelete(titleGroup.group_id, event)} />
+                      Delete this path group in the final result
+                    </label>
+                    {#if !manualDeleteByGroup[titleGroup.group_id]}
+                      <label>
+                        Final path
+                        <input value={manualPathByGroup[titleGroup.group_id] ?? ''} on:input={(event) => updateManualPath(titleGroup.group_id, event)} />
+                      </label>
+                      <label>
+                        Final content
+                        <textarea value={manualContentByGroup[titleGroup.group_id] ?? ''} on:input={(event) => updateManualGroupContent(titleGroup.group_id, event)}></textarea>
+                      </label>
+                    {/if}
+                    {#if manualErrors[unit.id]}<p class="warning" role="alert">{manualErrors[unit.id]}</p>{/if}
+                  </section>
+                {/if}
 
                 {#if group && hasStructuralChange(group)}
                   <section class:path-warning={hasTitleConflict(group)} class="path-review">
@@ -644,8 +767,8 @@
                     <strong>{file.content_kind === 'binary' ? 'Binary preview unavailable' : 'Large text preview limited'}</strong>
                     <p>
                       {file.content_kind === 'binary'
-                        ? 'Use a whole-conflict server, device, or keep-both resolution. obts will preserve the original bytes.'
-                        : 'This file exceeds the interactive diff limit. Use a whole-conflict action so the dashboard does not freeze or truncate content.'}
+                        ? 'Choose server, device, or keep both copies for this file. obts preserves the original bytes.'
+                        : 'This file exceeds the interactive diff limit. Choose server, device, keep both, or insert both so the dashboard does not freeze or truncate content.'}
                     </p>
                     <dl>
                       <div><dt>Base</dt><dd>{formatBytes(file.base_bytes)}</dd><dd><code title={file.base_sha256 ?? ''}>{formatDigest(file.base_sha256)}</code></dd></div>
@@ -701,7 +824,7 @@
                               <code><span class="visually-hidden">Device {review.device_name}: </span>{#each row.deviceTokens as token}<span class:word-change={token.changed}>{token.text}</span>{/each}</code>
                             </div>
                           {/if}
-                          {#if mode === 'lines'}
+                          {#if showLineChoices}
                             <div class="line-choice" aria-label={`Resolution for changed line ${row.id}`}>
                               <button
                                 class:active={lineChoices[file.path]?.[row.id] === 'server'}
@@ -737,12 +860,13 @@
                     </details>
                   {/if}
 
-                  {#if mode === 'whole' && resolutionKind === 'manual' && !belongsToTitleGroup(file.path) && !isAgreedFileDeletion(file)}
-                    <label class="manual-file-editor">
-                      Complete final content for {file.path}
-                      <textarea value={manualTextByPath[file.path] ?? ''} on:input={(event) => updateManualText(file.path, event)}></textarea>
-                    </label>
-                  {/if}
+                {/if}
+
+                {#if editing && unit && file.content_kind === 'text' && !belongsToTitleGroup(unit, file.path) && !isAgreedFileDeletion(file)}
+                  <label class="manual-file-editor">
+                    Complete final content for {file.path}
+                    <textarea value={manualTextByPath[file.path] ?? ''} on:input={(event) => updateManualText(file.path, event)}></textarea>
+                  </label>
                 {/if}
               </article>
             {/each}
@@ -756,6 +880,7 @@
             <div>
               <p class="eyebrow">Reviewed result</p>
               <h3>{resultPolicyLabel()}</h3>
+              {#if currentSubmission?.resolutionKind === 'per_file'}<p class="result-scope">{decisionSummary()}</p>{/if}
               <p class="muted">Nothing is applied until you choose Apply resolution. This is the complete final state obts would commit.</p>
             </div>
           </header>
