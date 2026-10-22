@@ -2318,6 +2318,8 @@ mod tests {
         let create_vault_file = tool_named("create_vault_file");
         assert!(create_vault_file.description.contains("indexed_as_note"));
         assert!(create_vault_file.description.contains("file_type"));
+        assert!(create_vault_file.description.contains("title_truncated"));
+        assert!(create_vault_file.description.contains("word boundary"));
 
         let get_vault_file = tool_named("get_vault_file");
         assert!(get_vault_file.description.contains("raw"));

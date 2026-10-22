@@ -67,6 +67,8 @@ Every exact note/file read and successful write receipt returns an opaque whole-
 
 Bridge-generated Markdown frontmatter `created` (on creation) and `updated` (on edits) use RFC3339 with whole-second precision and the runtime's local numeric UTC offset, for example `2026-10-03T05:28:26+02:00`. Existing `created` values are preserved on edits; this does not migrate older timestamps or change API/database timestamp serialization or date-based filename generation.
 
+New-file names are generated from the request `title` through `new_note.path_template`. `{title}` is limited by `new_note.max_title_length` (default 200 bytes) and `{slug}` by `new_note.max_title_slug_length` (default 60 bytes). A longer value is cut at a word boundary, or at a character boundary when a single overlong word leaves no usable boundary. Create receipts report the final `title` (the file name without folder or extension) and `title_truncated`, so callers can tell when a title was shortened.
+
 Containers do not automatically inherit the host timezone. Configure the runtime with a named timezone and zoneinfo data (for example `TZ=Europe/Rome`), or mount the host's `/etc/localtime` read-only. Named zones supply daylight-saving transitions rather than a fixed offset. Recreate the container after changing a host timezone bind mount so it picks up the new file.
 
 ## Markdown export

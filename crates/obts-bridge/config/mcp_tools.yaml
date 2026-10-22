@@ -178,14 +178,14 @@ tools:
 
   - id: create_vault_file
     name: create_vault_file
-    description: "Create a new vault file in the configured new-file location. The server generates the path from `title` and `file_type`; `content` is complete raw file content, not a body fragment. For `md` files, include the full Markdown including YAML frontmatter if needed; server policy may add managed frontmatter such as tags/owner/created. For `base` files, provide the full Bases YAML content. Returns `indexed_as_note` indicating whether the file was also indexed as a parsed Markdown note (only `.md` files). Example: `{ \"title\": \"Sync Notes\", \"content\": \"# Sync Notes\\n\\nBody\", \"file_type\": \"md\" }`."
+    description: "Create a new vault file in the configured new-file location. The server generates the path from `title` and `file_type`. Long titles are shortened at a word boundary to the configured limit (by default 200 bytes for title names, 60 for slugs); the response then reports `title_truncated: true` and the final `title`. `content` is complete raw file content, not a body fragment. For `md`, include full Markdown with any frontmatter; policy may add managed tags/owner/created. For `base`, provide the full Bases YAML. Returns `indexed_as_note` (true only for `.md`). Example: `{ \"title\": \"Sync Notes\", \"content\": \"# Sync Notes\\n\\nBody\", \"file_type\": \"md\" }`."
     inputSchema:
       type: object
       additionalProperties: false
       properties:
         title:
           type: string
-          description: "Human-readable title for filename generation. Do not include a folder or extension."
+          description: "Human-readable title for filename generation. Do not include a folder or extension. Shortened at a word boundary if over the configured limit (default 200 bytes; 60 for slug names)."
         content:
           type: string
           description: "Complete raw file content."

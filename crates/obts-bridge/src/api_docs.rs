@@ -462,7 +462,7 @@ pub(crate) fn openapi_spec() -> Value {
                     "properties": {
                         "title": {
                             "type": "string",
-                            "description": "Human-readable title for filename generation. Do not include a folder or extension."
+                            "description": "Human-readable title for filename generation. Do not include a folder or extension. Longer titles are shortened at a word boundary to the configured limit (default 200 bytes for {title} names, 60 for {slug} names); see title_truncated in the response."
                         },
                         "content": {
                             "type": "string",
@@ -481,9 +481,11 @@ pub(crate) fn openapi_spec() -> Value {
                 },
                 "NewNoteResponse": {
                     "type": "object",
-                    "required": ["id", "revision", "status", "file_type", "indexed_as_note", "local_projection", "operation_id"],
+                    "required": ["id", "title", "title_truncated", "revision", "status", "file_type", "indexed_as_note", "local_projection", "operation_id"],
                     "properties": {
                         "id": {"type": "string"},
+                        "title": {"type": "string", "description": "Final note title: the created file name without folder or extension."},
+                        "title_truncated": {"type": "boolean", "description": "True when a configured length limit shortened the title-derived part of the generated path."},
                         "revision": {"type": "string", "pattern": "^v1:sha256:[0-9a-f]{64}$"},
                         "status": {"type": "string", "enum": ["created", "accepted"]},
                         "file_type": {"type": "string", "enum": ["md", "base"]},
@@ -1310,6 +1312,14 @@ mod tests {
             spec["components"]["schemas"]["VaultFile"]["required"]
                 .as_array()
                 .is_some_and(|required| required.contains(&json!("revision")))
+        );
+        assert!(
+            spec["components"]["schemas"]["NewNoteResponse"]["required"]
+                .as_array()
+                .is_some_and(|required| {
+                    required.contains(&json!("title"))
+                        && required.contains(&json!("title_truncated"))
+                })
         );
         assert!(
             spec["paths"]["/api/v1/notes/{id}"]["put"]["responses"]
