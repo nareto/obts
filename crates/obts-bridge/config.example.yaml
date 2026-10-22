@@ -115,6 +115,7 @@ new_note:
   path_template: "{base}/{date}-{slug}.md"
   date_format: "%Y-%m-%d"
   max_title_slug_length: 60
+  max_title_length: 200
 
 audit:
   enabled: true

@@ -17,6 +17,7 @@ use crate::headless::{HeadlessClient, HeadlessError, HeadlessFilesystemGuard};
 use crate::model::{Note, NoteId, VaultFile};
 use crate::new_note::{
     NewNoteFileType, NewNoteRequest, PersistenceFailureKind, UpdateNoteRequest, WriteError,
+    created_file_title,
 };
 use crate::search::{SearchMode, SearchResponse};
 use crate::store::{
@@ -545,6 +546,7 @@ impl VaultBridgeService {
             .validate_new_note_write_at(&request, now)
             .await
             .map_err(ServiceError::Write)?;
+        let title_truncated = self.store.new_note_title_truncated(&request).await;
         let request = self
             .store
             .prepare_create_note_request(auth, request, &path, now)
@@ -586,8 +588,11 @@ impl VaultBridgeService {
             .await;
         let projection = self.finalize_prepared_write(write, &revision).await?;
         drop(headless_guard);
+        let title = created_file_title(response_id.as_str(), file_type);
         Ok(NewNoteResponse {
             id: response_id,
+            title,
+            title_truncated,
             revision: response_revision,
             status: projection.response_status("created"),
             file_type,
@@ -801,6 +806,7 @@ impl VaultBridgeService {
             .validate_new_note_write_at(&request, now)
             .await
             .map_err(ServiceError::Write)?;
+        let title_truncated = self.store.new_note_title_truncated(&request).await;
         let request = self
             .store
             .prepare_create_note_request(auth, request, &path, now)
@@ -842,8 +848,11 @@ impl VaultBridgeService {
             .await;
         let projection = self.finalize_prepared_write(write, &revision).await?;
         drop(headless_guard);
+        let title = created_file_title(response_id.as_str(), file_type);
         Ok(NewNoteResponse {
             id: response_id,
+            title,
+            title_truncated,
             revision: response_revision,
             status: projection.response_status("created"),
             file_type,
@@ -1348,7 +1357,9 @@ mod obts_tests {
     use crate::config::AppConfig;
     use crate::filesystem::FilesystemSource;
     use crate::model::NoteId;
-    use crate::new_note::{NewNoteFileType, NewNoteRequest, UpdateNoteRequest, WriteError};
+    use crate::new_note::{
+        NewNoteFileType, NewNotePathSettings, NewNoteRequest, UpdateNoteRequest, WriteError,
+    };
     use crate::runtime_config::RuntimeConfigState;
     use crate::store::{RecoveredVaultFileState, VaultStore};
 
@@ -1883,5 +1894,78 @@ mod obts_tests {
             service.status().await.dependencies.obts_client,
             "not_paired"
         );
+    }
+
+    #[tokio::test]
+    async fn create_receipts_report_final_title_and_truncation() {
+        let store = VaultStore::new(10);
+        store
+            .set_authorization_config(BTreeMap::from([("admin".into(), AccessPolicy::admin())]))
+            .await;
+        store
+            .set_new_note_path_settings(NewNotePathSettings {
+                base_path: "00New".to_string(),
+                path_template: "{base}/{title}.md".to_string(),
+                date_format: "%Y-%m-%d".to_string(),
+                max_title_slug_length: 60,
+                max_title_length: 60,
+            })
+            .await;
+        let root = tempdir().unwrap();
+        let source = Arc::new(FilesystemSource::new(root.path()).unwrap());
+        let service = VaultBridgeService::new_with_filesystem(store, source, None);
+        let auth = AuthContext::new(ContextName::new("admin"), "test:admin".into());
+        let new_request = |title: &str| NewNoteRequest {
+            title: title.into(),
+            content: "Body".into(),
+            template_id: None,
+            file_type: NewNoteFileType::Md,
+        };
+
+        let long = service
+            .create_vault_file(
+                &auth,
+                new_request(
+                    "Weekly review of reading notes - what I learned about distributed systems",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            long.id.as_str(),
+            "00New/Weekly review of reading notes - what I learned about.md"
+        );
+        assert_eq!(
+            long.title,
+            "Weekly review of reading notes - what I learned about"
+        );
+        assert!(long.title_truncated);
+        assert!(root.path().join(long.id.as_str()).exists());
+
+        let short = service
+            .create_vault_file(&auth, new_request("Short"))
+            .await
+            .unwrap();
+        assert_eq!(short.title, "Short");
+        assert!(!short.title_truncated);
+
+        let note = service
+            .create_note(
+                &auth,
+                new_request(
+                    "Another long title that keeps going well past the configured sixty byte limit",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            note.id.as_str(),
+            "00New/Another long title that keeps going well past the configured.md"
+        );
+        assert_eq!(
+            note.title,
+            "Another long title that keeps going well past the configured"
+        );
+        assert!(note.title_truncated);
     }
 }

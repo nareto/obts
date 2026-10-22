@@ -37,7 +37,7 @@ use crate::markdown::{
 use crate::model::{Note, NoteId, UnscopedNote, VaultFile};
 use crate::new_note::{
     NewNoteFileType, NewNotePathSettings, NewNoteRequest, PersistenceFailureKind,
-    UpdateNoteRequest, WriteError, apply_content_patch, frontmatter_timestamp,
+    UpdateNoteRequest, WriteError, apply_content_patch, created_file_title, frontmatter_timestamp,
 };
 use crate::persistence::{
     BlockSemanticMatch, PersistedAccessLogEntry, PersistedFileAlias, PersistedIngestDelta,
@@ -468,6 +468,8 @@ impl BacklinksResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct NewNoteResponse {
     pub id: NoteId,
+    pub title: String,
+    pub title_truncated: bool,
     pub revision: String,
     pub status: &'static str,
     pub file_type: NewNoteFileType,
@@ -2886,6 +2888,13 @@ impl VaultStore {
         self.create_note_at(request, Utc::now()).await
     }
 
+    /// Whether the configured title limits shorten the title-derived part of
+    /// the path generated for `request`.
+    pub async fn new_note_title_truncated(&self, request: &NewNoteRequest) -> bool {
+        let settings = self.settings.read().await.new_note_path_settings.clone();
+        request.title_truncated_with_settings(&settings)
+    }
+
     pub async fn validate_new_note_write_at(
         &self,
         request: &NewNoteRequest,
@@ -3019,9 +3028,12 @@ impl VaultStore {
         request: NewNoteRequest,
         now: DateTime<Utc>,
     ) -> Result<NewNoteResponse, WriteError> {
+        let title_truncated = self.new_note_title_truncated(&request).await;
         let write = self.prepare_create_vault_write_at(request, now).await?;
         let response = NewNoteResponse {
             id: NoteId::new(write.path.clone()),
+            title: created_file_title(&write.path, write.file_type),
+            title_truncated,
             revision: whole_file_revision(&write.content),
             status: "created",
             file_type: write.file_type,
@@ -3786,9 +3798,12 @@ impl VaultStore {
         request: NewNoteRequest,
         now: DateTime<Utc>,
     ) -> Result<NewNoteResponse, WriteError> {
+        let title_truncated = self.new_note_title_truncated(&request).await;
         let write = self.prepare_create_vault_write_at(request, now).await?;
         let response = NewNoteResponse {
             id: NoteId::new(write.path.clone()),
+            title: created_file_title(&write.path, write.file_type),
+            title_truncated,
             revision: whole_file_revision(&write.content),
             status: "created",
             file_type: write.file_type,

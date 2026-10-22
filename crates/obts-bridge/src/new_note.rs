@@ -13,6 +13,7 @@ pub struct NewNotePathSettings {
     pub path_template: String,
     pub date_format: String,
     pub max_title_slug_length: usize,
+    pub max_title_length: usize,
 }
 
 impl Default for NewNotePathSettings {
@@ -22,6 +23,7 @@ impl Default for NewNotePathSettings {
             path_template: "{base}/{date}-{slug}.md".to_string(),
             date_format: "%Y-%m-%d".to_string(),
             max_title_slug_length: 60,
+            max_title_length: 200,
         }
     }
 }
@@ -33,8 +35,17 @@ impl From<&NewNoteConfig> for NewNotePathSettings {
             path_template: value.path_template.clone(),
             date_format: value.date_format.clone(),
             max_title_slug_length: value.max_title_slug_length,
+            max_title_length: value.max_title_length,
         }
     }
+}
+
+/// A generated create path plus whether a configured length limit shortened
+/// a title-derived placeholder that the path template actually uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedNewNotePath {
+    pub path: String,
+    pub title_truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -172,6 +183,22 @@ impl NewNoteRequest {
         now: DateTime<Utc>,
         settings: &NewNotePathSettings,
     ) -> String {
+        self.generate_path_details_with_settings_at(now, settings)
+            .path
+    }
+
+    /// Whether the configured limits shorten the title-derived part of the
+    /// generated path. The date does not affect truncation.
+    pub fn title_truncated_with_settings(&self, settings: &NewNotePathSettings) -> bool {
+        self.generate_path_details_with_settings_at(Utc::now(), settings)
+            .title_truncated
+    }
+
+    pub fn generate_path_details_with_settings_at(
+        &self,
+        now: DateTime<Utc>,
+        settings: &NewNotePathSettings,
+    ) -> GeneratedNewNotePath {
         let base = normalize_base_path(&settings.base_path);
         let template = normalized_template(&settings.path_template);
         let date_format = if settings.date_format.trim().is_empty() {
@@ -180,8 +207,11 @@ impl NewNoteRequest {
             settings.date_format.as_str()
         };
         let date = now.format(date_format).to_string();
-        let slug = slug_with_limit(&self.title, settings.max_title_slug_length);
-        let title = title_segment_with_limit(&self.title, settings.max_title_slug_length);
+        let (slug, slug_cut) = slug_with_limit(&self.title, settings.max_title_slug_length);
+        let (title, title_cut) = title_segment_with_limit(&self.title, settings.max_title_length);
+        let uses_title = template.contains("{title}");
+        let uses_slug = template.contains("{slug}");
+        let mut title_truncated = (uses_title && title_cut) || (uses_slug && slug_cut);
 
         let mut rendered = template
             .replace("{base}", &base)
@@ -193,8 +223,12 @@ impl NewNoteRequest {
 
         if rendered.is_empty() {
             rendered = format!("{base}/{date}-{slug}");
+            title_truncated = slug_cut;
         }
-        with_file_type_extension(&rendered, self.file_type)
+        GeneratedNewNotePath {
+            path: with_file_type_extension(&rendered, self.file_type),
+            title_truncated,
+        }
     }
 
     pub fn validate_write(&self) -> Result<String, WriteError> {
@@ -464,25 +498,45 @@ fn add_tags_to_frontmatter(frontmatter: &mut Value, tags: &[String]) {
     }
 }
 
-fn slug_with_limit(title: &str, max_len: usize) -> String {
-    let mut slug = slugify(title);
+/// Cuts an over-limit `value` to at most `max_len` bytes, preferring the last
+/// `separator` boundary. Falls back to a UTF-8 character boundary when the
+/// value has no separator or the boundary would discard more than half of the
+/// budget (an overlong single word).
+fn cut_at_word_boundary(value: &str, max_len: usize, separator: char) -> &str {
+    let mut end = max_len.min(value.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let hard = &value[..end];
+    if value[end..].starts_with(separator) {
+        return hard;
+    }
+    match hard.rfind(separator) {
+        Some(pos) if pos >= max_len / 2 => &hard[..pos],
+        _ => hard,
+    }
+}
+
+fn slug_with_limit(title: &str, max_len: usize) -> (String, bool) {
+    let slug = slugify(title);
     if slug.is_empty() {
-        slug = "note".to_string();
+        return ("note".to_string(), false);
     }
 
     let max_len = max_len.max(1);
-    if slug.len() > max_len {
-        slug.truncate(max_len);
-        slug = slug.trim_end_matches('-').to_string();
-        if slug.is_empty() {
-            slug = "note".to_string();
-        }
+    if slug.len() <= max_len {
+        return (slug, false);
     }
 
-    slug
+    let cut = cut_at_word_boundary(&slug, max_len, '-').trim_end_matches('-');
+    if cut.is_empty() {
+        ("note".to_string(), true)
+    } else {
+        (cut.to_string(), true)
+    }
 }
 
-fn title_segment_with_limit(title: &str, max_len: usize) -> String {
+fn title_segment_with_limit(title: &str, max_len: usize) -> (String, bool) {
     let mut segment = String::new();
     let mut previous_was_space = false;
     for ch in title.trim().chars() {
@@ -508,29 +562,36 @@ fn title_segment_with_limit(title: &str, max_len: usize) -> String {
         segment = "Untitled".to_string();
     }
 
-    let segment = truncate_filename_segment(&segment, max_len);
+    let (segment, truncated) = truncate_filename_segment(&segment, max_len);
     if segment.is_empty() || is_reserved_windows_filename(&segment) {
-        truncate_filename_segment("Untitled", max_len)
+        (truncate_filename_segment("Untitled", max_len).0, truncated)
     } else {
-        segment
+        (segment, truncated)
     }
 }
 
-fn truncate_filename_segment(segment: &str, max_len: usize) -> String {
+fn truncate_filename_segment(segment: &str, max_len: usize) -> (String, bool) {
     let max_len = max_len.max(1);
-    let mut truncated = String::new();
-    for ch in segment.chars() {
-        if truncated.len() + ch.len_utf8() > max_len {
-            break;
-        }
-        truncated.push(ch);
+    if segment.len() <= max_len {
+        return (segment.to_string(), false);
     }
-    let truncated = trim_filename_segment(truncated);
-    if truncated.is_empty() {
-        "Untitled".chars().take(max_len).collect()
+
+    let cut = cut_at_word_boundary(segment, max_len, ' ')
+        .trim_end_matches([' ', '.', ',', ';', '-', '\u{2013}', '\u{2014}']);
+    let cut = trim_filename_segment(cut.to_string());
+    if cut.is_empty() {
+        ("Untitled".chars().take(max_len).collect(), true)
     } else {
-        truncated
+        (cut, true)
     }
+}
+
+/// The note title Obsidian shows for a created file: its name without folder
+/// and without the file-type extension.
+pub fn created_file_title(path: &str, file_type: NewNoteFileType) -> String {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let suffix = format!(".{}", file_type.extension());
+    name.strip_suffix(&suffix).unwrap_or(name).to_string()
 }
 
 fn trim_filename_segment(segment: String) -> String {
@@ -626,7 +687,7 @@ mod tests {
 
     use super::{
         ContentPatchOperation, NewNoteFileType, NewNotePathSettings, NewNoteRequest,
-        UpdateNoteRequest, WriteError, frontmatter_timestamp,
+        UpdateNoteRequest, WriteError, created_file_title, frontmatter_timestamp,
     };
     use crate::markdown::parse_frontmatter;
 
@@ -763,6 +824,7 @@ mod tests {
             path_template: "{base}/{date}-{slug}.md".to_string(),
             date_format: "%Y-%m-%d".to_string(),
             max_title_slug_length: 60,
+            max_title_length: 200,
         };
 
         let path = request("Conversational Practical Essay Style Guide")
@@ -782,6 +844,7 @@ mod tests {
             path_template: "{base}/{title}.md".to_string(),
             date_format: "%Y-%m-%d".to_string(),
             max_title_slug_length: 60,
+            max_title_length: 200,
         };
 
         let path = request("Conversational Practical Essay Style Guide")
@@ -798,6 +861,7 @@ mod tests {
             path_template: "{base}/{title}.md".to_string(),
             date_format: "%Y-%m-%d".to_string(),
             max_title_slug_length: 60,
+            max_title_length: 200,
         };
 
         let path = request(r#"C# Notes: "Agent"/Draft? <v1>"#)
@@ -814,6 +878,7 @@ mod tests {
             path_template: "{base}/{title}.md".to_string(),
             date_format: "%Y-%m-%d".to_string(),
             max_title_slug_length: 60,
+            max_title_length: 200,
         };
 
         let mut request = request("Project Dashboard");
@@ -823,6 +888,124 @@ mod tests {
             .expect("valid base path");
 
         assert_eq!(path, "00New/Project Dashboard.base");
+    }
+
+    const LONG_TITLE: &str =
+        "Weekly review of reading notes - what I learned about distributed systems";
+
+    fn title_settings(max_title_length: usize) -> NewNotePathSettings {
+        NewNotePathSettings {
+            base_path: "00New".to_string(),
+            path_template: "{base}/{title}.md".to_string(),
+            date_format: "%Y-%m-%d".to_string(),
+            max_title_slug_length: 60,
+            max_title_length,
+        }
+    }
+
+    fn slug_settings(max_title_slug_length: usize, max_title_length: usize) -> NewNotePathSettings {
+        NewNotePathSettings {
+            path_template: "{base}/{date}-{slug}.md".to_string(),
+            max_title_slug_length,
+            ..title_settings(max_title_length)
+        }
+    }
+
+    #[test]
+    fn title_template_keeps_long_titles_whole_under_default_limit() {
+        let generated = request(LONG_TITLE)
+            .generate_path_details_with_settings_at(fixed_now(), &title_settings(200));
+
+        assert_eq!(
+            generated.path,
+            "00New/Weekly review of reading notes - what I learned about distributed systems.md"
+        );
+        assert!(!generated.title_truncated);
+    }
+
+    #[test]
+    fn title_template_cuts_at_word_boundary_and_reports_truncation() {
+        let generated = request(LONG_TITLE)
+            .generate_path_details_with_settings_at(fixed_now(), &title_settings(60));
+
+        assert_eq!(
+            generated.path,
+            "00New/Weekly review of reading notes - what I learned about.md"
+        );
+        assert!(generated.title_truncated);
+        assert!(request(LONG_TITLE).title_truncated_with_settings(&title_settings(60)));
+    }
+
+    #[test]
+    fn title_cut_trims_trailing_separators() {
+        let generated = request(LONG_TITLE)
+            .generate_path_details_with_settings_at(fixed_now(), &title_settings(33));
+
+        assert_eq!(generated.path, "00New/Weekly review of reading notes.md");
+        assert!(generated.title_truncated);
+    }
+
+    #[test]
+    fn title_cut_falls_back_to_char_boundary_for_overlong_words() {
+        let generated = request("Supercalifragilisticexpialidocious")
+            .generate_path_details_with_settings_at(fixed_now(), &title_settings(10));
+        assert_eq!(generated.path, "00New/Supercalif.md");
+        assert!(generated.title_truncated);
+
+        let generated = request("A Supercalifragilisticexpialidocious")
+            .generate_path_details_with_settings_at(fixed_now(), &title_settings(20));
+        assert_eq!(generated.path, "00New/A Supercalifragilist.md");
+        assert!(generated.title_truncated);
+    }
+
+    #[test]
+    fn title_cut_never_splits_multibyte_characters() {
+        let title = "é".repeat(150);
+        let generated = request(&title)
+            .generate_path_details_with_settings_at(fixed_now(), &title_settings(201));
+
+        assert_eq!(generated.path, format!("00New/{}.md", "é".repeat(100)));
+        assert!(generated.title_truncated);
+    }
+
+    #[test]
+    fn slug_cut_ends_on_hyphen_boundary_and_reports_truncation() {
+        let generated = request(
+            "Weekly review of reading notes about distributed systems and consensus protocols",
+        )
+        .generate_path_details_with_settings_at(fixed_now(), &slug_settings(58, 200));
+
+        assert_eq!(
+            generated.path,
+            "00New/2026-02-26-weekly-review-of-reading-notes-about-distributed-systems.md"
+        );
+        assert!(generated.title_truncated);
+    }
+
+    #[test]
+    fn truncation_flag_only_counts_placeholders_the_template_uses() {
+        // {title} would be cut at 10 bytes, but the slug template does not use it.
+        let generated = request(LONG_TITLE)
+            .generate_path_details_with_settings_at(fixed_now(), &slug_settings(200, 10));
+        assert!(!generated.title_truncated);
+
+        // Sanitization alone is not truncation.
+        let generated = request(r#"C# Notes: "Agent"/Draft? <v1>"#)
+            .generate_path_details_with_settings_at(fixed_now(), &title_settings(200));
+        assert_eq!(generated.path, "00New/C Notes Agent Draft v1.md");
+        assert!(!generated.title_truncated);
+    }
+
+    #[test]
+    fn created_file_title_strips_folder_and_extension() {
+        assert_eq!(
+            created_file_title("00New/A b.md", NewNoteFileType::Md),
+            "A b"
+        );
+        assert_eq!(
+            created_file_title("11New/x.base", NewNoteFileType::Base),
+            "x"
+        );
     }
 
     #[test]
@@ -859,6 +1042,7 @@ mod tests {
             path_template: "{base}/../{title}.md".to_string(),
             date_format: "%Y-%m-%d".to_string(),
             max_title_slug_length: 60,
+            max_title_length: 200,
         };
 
         let error = request("Escaping Note")

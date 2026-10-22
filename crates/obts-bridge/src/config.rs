@@ -660,6 +660,7 @@ pub struct NewNoteConfig {
     pub path_template: String,
     pub date_format: String,
     pub max_title_slug_length: usize,
+    pub max_title_length: usize,
 }
 
 impl Default for NewNoteConfig {
@@ -669,6 +670,7 @@ impl Default for NewNoteConfig {
             path_template: "{base}/{date}-{slug}.md".to_string(),
             date_format: "%Y-%m-%d".to_string(),
             max_title_slug_length: 60,
+            max_title_length: 200,
         }
     }
 }
