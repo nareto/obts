@@ -550,6 +550,31 @@ try {
     review.files[1]={...review.files[1],content_kind:'binary',base_content:null,server_content:null,device_content:null};
   }});
 
+  await scenario('a device rename of an unchanged server file renders its path operation and keeps navigation working',async({page,navigate})=>{
+    await navigate('Conflicts');
+    const operations=page.locator('.path-review.path-warning');
+    await expect(operations).toHaveCount(2);
+    await expect(operations.first()).toContainText('Device / renamed');
+    await expect(operations.first()).toContainText('Notes/Reading list (renamed).md');
+    await expect(page.locator('.conflict-resolution-toolbar')).toBeVisible();
+    await navigate('Overview');
+    await expect(page.locator('main.overview-page')).toBeVisible();
+    await navigate('Conflicts');
+    await expect(page.locator('main.conflict-layout')).toBeVisible();
+    await expect(page.locator('main.overview-page')).toHaveCount(0);
+    await expect(page.locator('.path-review.path-warning')).toHaveCount(2);
+  },{prepare:async({fixture})=>{
+    const review=fixture.routes['/vaults/sample-vault/conflicts/sample-conflict'];
+    const source='Notes/Reading list.md';
+    const destination='Notes/Reading list (renamed).md';
+    const original=review.files[1];
+    review.files=[review.files[0],
+      {...original,path:destination,base_content:null,server_content:null,base_bytes:null,server_bytes:null,base_sha256:null,server_sha256:null},
+      {...original,path:source,server_content:original.base_content,device_content:null,server_bytes:original.base_bytes,device_bytes:null,server_sha256:original.base_sha256,device_sha256:null}];
+    review.path_conflicts=[review.path_conflicts[0],{group_id:'path-rename',kind:'rename_edit',base_path:source,server_path:source,device_path:destination,server_operation:'unchanged',device_operation:'renamed',affected_paths:[destination,source]}];
+    Object.assign(review.conflict,{affected_paths:[review.files[0].path,destination,source],affected_path_count:3,rename_pairs:[{source_path:source,destination_path:destination}]});
+  }});
+
   await scenario('long conflict files show GitHub-style hunks with expandable unchanged context',async({page,navigate})=>{
     const favicon=page.locator('link[rel="icon"]');
     await expect(favicon).toHaveAttribute('type','image/svg+xml');

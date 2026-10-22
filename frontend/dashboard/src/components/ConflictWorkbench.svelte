@@ -7,6 +7,7 @@
     changedRows,
     collapseConflictDiff,
     formatDiffLineRange,
+    hasDivergentFinalPaths,
     isAgreedFileDeletion,
     previewOutcomeLabel,
     previewProvenanceLabel,
@@ -754,7 +755,7 @@
                 {/if}
 
                 {#if group && hasStructuralChange(group)}
-                  <section class:path-warning={hasTitleConflict(group)} class="path-review">
+                  <section class:path-warning={hasDivergentFinalPaths(group)} class="path-review">
                     <div class="path-review-heading"><code>@@ path operation @@</code></div>
                     <div><span>Base</span><code>{group.base_path ?? '(absent)'}</code></div>
                     <div><span>Server / {group.server_operation}</span><code>{group.server_path ?? '(deleted)'}</code></div>
