@@ -2638,11 +2638,11 @@
       "maximumDistinctStates": 100000,
       "maximumDepth": 250,
       "baseline": {
-        "generated": 17,
-        "distinct": 6,
+        "generated": 23,
+        "distinct": 8,
         "depth": 2,
-        "minGenerated": 8,
-        "minDistinct": 3,
+        "minGenerated": 11,
+        "minDistinct": 4,
         "minDepth": 1
       }
     },
@@ -2761,10 +2761,73 @@
       "requiredWitness": "AcknowledgeProposal",
       "minimumTraceDepth": 2,
       "baseline": {
+        "generated": 7,
+        "distinct": 6,
+        "depth": 2,
+        "minGenerated": 3,
+        "minDistinct": 3,
+        "minDepth": 1
+      }
+    },
+    {
+      "id": "fm001-stale-reach-ack-match",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-reach-ack-match.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoMatchingCohortAdvance",
+      "requiredWitness": "AcknowledgeProposal",
+      "minimumTraceDepth": 2,
+      "baseline": {
         "generated": 5,
         "distinct": 4,
         "depth": 2,
         "minGenerated": 2,
+        "minDistinct": 2,
+        "minDepth": 1
+      }
+    },
+    {
+      "id": "fm001-stale-negative-ack-match-old-base",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-negative-ack-match-old-base.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "AckOwnContinuationNoFalseConflict",
+      "requiredWitness": "AcknowledgeProposal",
+      "minimumTraceDepth": 2,
+      "baseline": {
+        "generated": 5,
+        "distinct": 4,
+        "depth": 2,
+        "minGenerated": 2,
+        "minDistinct": 2,
+        "minDepth": 1
+      }
+    },
+    {
+      "id": "fm001-stale-negative-ack-older-evidence",
+      "model": "OBTSStaleProposal",
+      "config": "configs/stale-negative-ack-older-evidence.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "AckOlderEvidenceNotLost",
+      "requiredWitness": "AcknowledgeProposal",
+      "minimumTraceDepth": 2,
+      "baseline": {
+        "generated": 6,
+        "distinct": 5,
+        "depth": 2,
+        "minGenerated": 3,
         "minDistinct": 2,
         "minDepth": 1
       }

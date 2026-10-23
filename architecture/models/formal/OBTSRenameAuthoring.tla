@@ -1,7 +1,10 @@
 ---- MODULE OBTSRenameAuthoring ----
 EXTENDS Naturals, FiniteSets, TLC
 
-\* OBTS-FM-014 companion, architecture revision 52. Symbolic guards, evidence, and three-path trees.
+\* OBTS-FM-014 companion, architecture revisions 52 and 62. Symbolic guards, evidence, and three-path trees.
+\* Revision 62: the accepted proposal may be ordinary or stale, and target C may be P itself
+\* ("verbatim") or a merge/resolution that carries P's endpoints ("stale-merged"); the guard is
+\* endpoint equality between P and C, not C = P with a null recorded base.
 CONSTANT Mutation
 Paths == {"source", "destination", "unrelated"}
 Blockers == {"obligation-source", "obligation-destination", "horizon-source",
@@ -15,14 +18,16 @@ PTree == [KTree EXCEPT !["source"] = "P-source"]
 ProposalTree == [PTree EXCEPT !["source"] = "absent", !["destination"] = "renamed"]
 RemoteDisjointTree == [PTree EXCEPT !["unrelated"] = "remote"]
 RemoteOverlapTree == [PTree EXCEPT !["source"] = "remote-source"]
+StaleMergedTree == [PTree EXCEPT !["unrelated"] = "merged"]
+AcceptedTree(kind) == IF kind = "stale-merged" THEN StaleMergedTree ELSE PTree
 VARIABLES phase, liveQueueIdentity, localHeadP, pAncestor, pNotCanonical,
-  targetIsP, ordinaryBaseNull, intentConsistent, pairBase, frozen, frozenBase,
+  targetEndpointsMatchP, acceptKind, intentConsistent, pairBase, frozen, frozenBase,
   pinnedBases, durableBase, sourceRegular, destinationFree, hierarchyClear,
   endpointBlockers, touchedHorizon, unrelatedEvidence, crashed, restarted,
   canonicalTree, proposalTree, conflictSnapshot, remoteAdvanced, remoteKind,
   integrationResult, acceptedAtEvent
 vars == <<phase, liveQueueIdentity, localHeadP, pAncestor, pNotCanonical,
-  targetIsP, ordinaryBaseNull, intentConsistent, pairBase, frozen, frozenBase,
+  targetEndpointsMatchP, acceptKind, intentConsistent, pairBase, frozen, frozenBase,
   pinnedBases, durableBase, sourceRegular, destinationFree, hierarchyClear,
   endpointBlockers, touchedHorizon, unrelatedEvidence, crashed, restarted,
   canonicalTree, proposalTree, conflictSnapshot, remoteAdvanced, remoteKind,
@@ -31,7 +36,7 @@ vars == <<phase, liveQueueIdentity, localHeadP, pAncestor, pNotCanonical,
 Init ==
   /\ phase = "pending"
   /\ liveQueueIdentity = FALSE /\ localHeadP = FALSE /\ pAncestor = FALSE
-  /\ pNotCanonical = FALSE /\ targetIsP = FALSE /\ ordinaryBaseNull = FALSE
+  /\ pNotCanonical = FALSE /\ targetEndpointsMatchP = FALSE /\ acceptKind = "none"
   /\ intentConsistent = FALSE /\ pairBase = K /\ frozen = FALSE
   /\ frozenBase = NoBase /\ pinnedBases = {K} /\ durableBase = K
   /\ sourceRegular = "unknown" /\ destinationFree = FALSE /\ hierarchyClear = FALSE
@@ -45,10 +50,11 @@ Init ==
 AcceptProposal ==
   /\ phase = "pending" /\ Mutation # "reach-accepted-after-rename"
   /\ liveQueueIdentity' = TRUE /\ localHeadP' = TRUE /\ pAncestor' = TRUE
-  /\ pNotCanonical' = TRUE /\ targetIsP' = TRUE /\ ordinaryBaseNull' = TRUE
+  /\ pNotCanonical' = TRUE /\ targetEndpointsMatchP' = TRUE
+  /\ acceptKind' \in {"verbatim", "stale-merged"}
   /\ intentConsistent' = TRUE /\ sourceRegular' = "regular"
   /\ destinationFree' = TRUE /\ hierarchyClear' = TRUE
-  /\ canonicalTree' = PTree /\ conflictSnapshot' = PTree
+  /\ canonicalTree' = AcceptedTree(acceptKind') /\ conflictSnapshot' = AcceptedTree(acceptKind')
   /\ acceptedAtEvent' = TRUE /\ phase' = "accepted"
   /\ UNCHANGED <<pairBase, frozen, frozenBase, pinnedBases, durableBase,
     endpointBlockers, touchedHorizon, unrelatedEvidence, crashed, restarted,
@@ -59,7 +65,7 @@ RecordRenameBeforeAcceptance ==
   /\ destinationFree' = TRUE /\ hierarchyClear' = TRUE
   /\ phase' = "rename-recorded"
   /\ UNCHANGED <<liveQueueIdentity, localHeadP, pAncestor, pNotCanonical,
-    targetIsP, ordinaryBaseNull, intentConsistent, pairBase, frozen, frozenBase,
+    targetEndpointsMatchP, acceptKind, intentConsistent, pairBase, frozen, frozenBase,
     pinnedBases, durableBase, endpointBlockers, touchedHorizon, unrelatedEvidence,
     crashed, restarted, canonicalTree, proposalTree, conflictSnapshot,
     remoteAdvanced, remoteKind, integrationResult, acceptedAtEvent>>
@@ -67,9 +73,10 @@ RecordRenameBeforeAcceptance ==
 AcceptAfterRename ==
   /\ phase = "rename-recorded"
   /\ liveQueueIdentity' = TRUE /\ localHeadP' = TRUE /\ pAncestor' = TRUE
-  /\ pNotCanonical' = TRUE /\ targetIsP' = TRUE /\ ordinaryBaseNull' = TRUE
-  /\ intentConsistent' = TRUE /\ canonicalTree' = PTree
-  /\ conflictSnapshot' = PTree /\ acceptedAtEvent' = FALSE
+  /\ pNotCanonical' = TRUE /\ targetEndpointsMatchP' = TRUE
+  /\ acceptKind' \in {"verbatim", "stale-merged"}
+  /\ intentConsistent' = TRUE /\ canonicalTree' = AcceptedTree(acceptKind')
+  /\ conflictSnapshot' = AcceptedTree(acceptKind') /\ acceptedAtEvent' = FALSE
   /\ phase' = "accepted-after-rename"
   /\ UNCHANGED <<sourceRegular, destinationFree, hierarchyClear, pairBase,
     frozen, frozenBase, pinnedBases, durableBase, endpointBlockers,
@@ -79,25 +86,26 @@ AcceptAfterRename ==
 InvalidateSelectedGuard ==
   /\ phase = "accepted"
   /\ Mutation \in {"case-live-identity", "case-local-head", "case-not-ancestor",
-    "case-already-canonical", "case-target-not-P", "case-nonnull-base",
+    "case-already-canonical", "case-target-endpoint-differs",
     "case-intent-mismatch", "case-source-missing", "case-source-nonfile",
-    "case-destination-occupied", "case-hierarchy-invalid", "mutant-omit-live-identity"}
+    "case-destination-occupied", "case-hierarchy-invalid", "mutant-omit-live-identity",
+    "mutant-omit-endpoint-equality"}
   /\ liveQueueIdentity' = IF Mutation \in {"case-live-identity", "mutant-omit-live-identity"}
        THEN FALSE ELSE liveQueueIdentity
   /\ localHeadP' = IF Mutation = "case-local-head" THEN FALSE ELSE localHeadP
   /\ pAncestor' = IF Mutation = "case-not-ancestor" THEN FALSE ELSE pAncestor
   /\ pNotCanonical' = IF Mutation = "case-already-canonical" THEN FALSE ELSE pNotCanonical
-  /\ targetIsP' = IF Mutation = "case-target-not-P" THEN FALSE ELSE targetIsP
-  /\ ordinaryBaseNull' = IF Mutation = "case-nonnull-base" THEN FALSE ELSE ordinaryBaseNull
+  /\ targetEndpointsMatchP' = IF Mutation \in {"case-target-endpoint-differs", "mutant-omit-endpoint-equality"}
+       THEN FALSE ELSE targetEndpointsMatchP
   /\ intentConsistent' = IF Mutation = "case-intent-mismatch" THEN FALSE ELSE intentConsistent
   /\ sourceRegular' = CASE Mutation = "case-source-missing" -> "missing"
       [] Mutation = "case-source-nonfile" -> "nonregular"
       [] OTHER -> sourceRegular
   /\ destinationFree' = IF Mutation = "case-destination-occupied" THEN FALSE ELSE destinationFree
   /\ hierarchyClear' = IF Mutation = "case-hierarchy-invalid" THEN FALSE ELSE hierarchyClear
-  /\ phase' = IF Mutation = "mutant-omit-live-identity"
+  /\ phase' = IF Mutation \in {"mutant-omit-live-identity", "mutant-omit-endpoint-equality"}
        THEN "accepted" ELSE "guard-invalid"
-  /\ UNCHANGED <<pairBase, frozen, frozenBase, pinnedBases, durableBase,
+  /\ UNCHANGED <<acceptKind, pairBase, frozen, frozenBase, pinnedBases, durableBase,
     endpointBlockers, touchedHorizon, unrelatedEvidence, crashed, restarted,
     canonicalTree, proposalTree, conflictSnapshot, remoteAdvanced, remoteKind,
     integrationResult, acceptedAtEvent>>
@@ -108,7 +116,7 @@ AddEndpointEvidence ==
   /\ endpointBlockers' = IF Mutation \in Blockers THEN {Mutation} ELSE {"obligation-source"}
   /\ phase' = "evidence-blocked"
   /\ UNCHANGED <<liveQueueIdentity, localHeadP, pAncestor, pNotCanonical,
-    targetIsP, ordinaryBaseNull, intentConsistent, pairBase, frozen, frozenBase,
+    targetEndpointsMatchP, acceptKind, intentConsistent, pairBase, frozen, frozenBase,
     pinnedBases, durableBase, sourceRegular, destinationFree, hierarchyClear,
     touchedHorizon, unrelatedEvidence, crashed, restarted, canonicalTree,
     proposalTree, conflictSnapshot, remoteAdvanced, remoteKind, integrationResult,
@@ -119,14 +127,14 @@ AddTouchedHorizon ==
   /\ touchedHorizon' = {"source", "destination"}
   /\ phase' = "horizon-blocked"
   /\ UNCHANGED <<liveQueueIdentity, localHeadP, pAncestor, pNotCanonical,
-    targetIsP, ordinaryBaseNull, intentConsistent, pairBase, frozen, frozenBase,
+    targetEndpointsMatchP, acceptKind, intentConsistent, pairBase, frozen, frozenBase,
     pinnedBases, durableBase, sourceRegular, destinationFree, hierarchyClear,
     endpointBlockers, unrelatedEvidence, crashed, restarted, canonicalTree,
     proposalTree, conflictSnapshot, remoteAdvanced, remoteKind, integrationResult,
     acceptedAtEvent>>
 
 AuthoringGuard == liveQueueIdentity /\ localHeadP /\ pAncestor /\ pNotCanonical
-  /\ targetIsP /\ ordinaryBaseNull /\ intentConsistent
+  /\ targetEndpointsMatchP /\ intentConsistent
 EndpointTreeValid == sourceRegular = "regular" /\ destinationFree /\ hierarchyClear
 NoEndpointEvidence == endpointBlockers = {} /\ touchedHorizon = {}
 MayRebase == AuthoringGuard /\ EndpointTreeValid /\ NoEndpointEvidence
@@ -136,16 +144,17 @@ PinNewBase ==
   /\ phase \in {"accepted", "accepted-after-rename", "evidence-blocked",
     "horizon-blocked", "guard-invalid", "restarted", "frozen"}
   /\ pairBase = K /\ ~frozen
-  /\ IF Mutation = "mutant-omit-live-identity"
-       THEN localHeadP /\ pAncestor /\ pNotCanonical /\ targetIsP
-         /\ ordinaryBaseNull /\ intentConsistent
-       ELSE AuthoringGuard
+  /\ CASE Mutation = "mutant-omit-live-identity" ->
+         localHeadP /\ pAncestor /\ pNotCanonical /\ targetEndpointsMatchP /\ intentConsistent
+       [] Mutation = "mutant-omit-endpoint-equality" ->
+         liveQueueIdentity /\ localHeadP /\ pAncestor /\ pNotCanonical /\ intentConsistent
+       [] OTHER -> AuthoringGuard
   /\ EndpointTreeValid
   /\ IF Mutation = "mutant-omit-endpoint-evidence" THEN TRUE ELSE NoEndpointEvidence
   /\ pinnedBases' = pinnedBases \cup {P}
   /\ phase' = "base-pinned"
   /\ UNCHANGED <<liveQueueIdentity, localHeadP, pAncestor, pNotCanonical,
-    targetIsP, ordinaryBaseNull, intentConsistent, pairBase, frozen, frozenBase,
+    targetEndpointsMatchP, acceptKind, intentConsistent, pairBase, frozen, frozenBase,
     durableBase, sourceRegular, destinationFree, hierarchyClear, endpointBlockers,
     touchedHorizon, unrelatedEvidence, crashed, restarted, canonicalTree,
     proposalTree, conflictSnapshot, remoteAdvanced, remoteKind, integrationResult,
@@ -154,13 +163,14 @@ PinNewBase ==
 PersistNewBase ==
   /\ phase = "base-pinned" /\ P \in pinnedBases
   /\ (MayRebase \/ Mutation \in {"mutant-omit-live-identity",
-      "mutant-omit-endpoint-evidence", "mutant-drop-unrelated-evidence"})
+      "mutant-omit-endpoint-evidence", "mutant-drop-unrelated-evidence",
+      "mutant-omit-endpoint-equality"})
   /\ pairBase' = P /\ durableBase' = P /\ phase' = "rebased"
   /\ IF Mutation = "mutant-drop-unrelated-evidence"
        THEN unrelatedEvidence' = [unrelatedEvidence EXCEPT !["unrelated"] = NoBase]
        ELSE unrelatedEvidence' = unrelatedEvidence
   /\ UNCHANGED <<liveQueueIdentity, localHeadP, pAncestor, pNotCanonical,
-    targetIsP, ordinaryBaseNull, intentConsistent, frozen, frozenBase, pinnedBases,
+    targetEndpointsMatchP, acceptKind, intentConsistent, frozen, frozenBase, pinnedBases,
     sourceRegular, destinationFree, hierarchyClear, endpointBlockers,
     touchedHorizon, crashed, restarted, canonicalTree, proposalTree,
     conflictSnapshot, remoteAdvanced, remoteKind, integrationResult, acceptedAtEvent>>
@@ -169,7 +179,7 @@ FreezePair ==
   /\ phase \in {"accepted", "accepted-after-rename"}
   /\ ~frozen /\ frozen' = TRUE /\ frozenBase' = pairBase /\ phase' = "frozen"
   /\ UNCHANGED <<liveQueueIdentity, localHeadP, pAncestor, pNotCanonical,
-    targetIsP, ordinaryBaseNull, intentConsistent, pairBase, pinnedBases,
+    targetEndpointsMatchP, acceptKind, intentConsistent, pairBase, pinnedBases,
     durableBase, sourceRegular, destinationFree, hierarchyClear, endpointBlockers,
     touchedHorizon, unrelatedEvidence, crashed, restarted, canonicalTree,
     proposalTree, conflictSnapshot, remoteAdvanced, remoteKind, integrationResult,
@@ -180,7 +190,7 @@ RebindFrozenMutant ==
   /\ pinnedBases' = pinnedBases \cup {P}
   /\ pairBase' = P /\ durableBase' = P /\ phase' = "rebased"
   /\ UNCHANGED <<liveQueueIdentity, localHeadP, pAncestor, pNotCanonical,
-    targetIsP, ordinaryBaseNull, intentConsistent, frozen, frozenBase,
+    targetEndpointsMatchP, acceptKind, intentConsistent, frozen, frozenBase,
     sourceRegular, destinationFree, hierarchyClear, endpointBlockers,
     touchedHorizon, unrelatedEvidence, crashed, restarted, canonicalTree,
     proposalTree, conflictSnapshot, remoteAdvanced, remoteKind, integrationResult,
@@ -190,7 +200,7 @@ Crash ==
   /\ phase \in {"base-pinned", "rebased", "frozen"} /\ ~crashed
   /\ crashed' = TRUE /\ phase' = "crashed"
   /\ UNCHANGED <<liveQueueIdentity, localHeadP, pAncestor, pNotCanonical,
-    targetIsP, ordinaryBaseNull, intentConsistent, pairBase, frozen, frozenBase,
+    targetEndpointsMatchP, acceptKind, intentConsistent, pairBase, frozen, frozenBase,
     pinnedBases, durableBase, sourceRegular, destinationFree, hierarchyClear,
     endpointBlockers, touchedHorizon, unrelatedEvidence, restarted, canonicalTree,
     proposalTree, conflictSnapshot, remoteAdvanced, remoteKind, integrationResult,
@@ -200,7 +210,7 @@ Restart ==
   /\ crashed /\ ~restarted
   /\ restarted' = TRUE /\ pairBase' = durableBase /\ phase' = "restarted"
   /\ UNCHANGED <<liveQueueIdentity, localHeadP, pAncestor, pNotCanonical,
-    targetIsP, ordinaryBaseNull, intentConsistent, frozen, frozenBase,
+    targetEndpointsMatchP, acceptKind, intentConsistent, frozen, frozenBase,
     pinnedBases, durableBase, sourceRegular, destinationFree, hierarchyClear,
     endpointBlockers, touchedHorizon, unrelatedEvidence, crashed, canonicalTree,
     proposalTree, conflictSnapshot, remoteAdvanced, remoteKind, integrationResult,
@@ -217,7 +227,7 @@ RemoteAdvanceDisjoint ==
   /\ canonicalTree' = RemoteDisjointTree /\ conflictSnapshot' = RemoteDisjointTree
   /\ remoteAdvanced' = TRUE /\ remoteKind' = "disjoint" /\ phase' = "remote-advanced"
   /\ UNCHANGED <<liveQueueIdentity, localHeadP, pAncestor, pNotCanonical,
-    targetIsP, ordinaryBaseNull, intentConsistent, pairBase, frozen, frozenBase,
+    targetEndpointsMatchP, acceptKind, intentConsistent, pairBase, frozen, frozenBase,
     pinnedBases, durableBase, sourceRegular, destinationFree, hierarchyClear,
     endpointBlockers, touchedHorizon, unrelatedEvidence, crashed, restarted,
     proposalTree, integrationResult, acceptedAtEvent>>
@@ -227,7 +237,7 @@ RemoteAdvanceOverlap ==
   /\ canonicalTree' = RemoteOverlapTree /\ conflictSnapshot' = RemoteOverlapTree
   /\ remoteAdvanced' = TRUE /\ remoteKind' = "overlap" /\ phase' = "remote-advanced"
   /\ UNCHANGED <<liveQueueIdentity, localHeadP, pAncestor, pNotCanonical,
-    targetIsP, ordinaryBaseNull, intentConsistent, pairBase, frozen, frozenBase,
+    targetEndpointsMatchP, acceptKind, intentConsistent, pairBase, frozen, frozenBase,
     pinnedBases, durableBase, sourceRegular, destinationFree, hierarchyClear,
     endpointBlockers, touchedHorizon, unrelatedEvidence, crashed, restarted,
     proposalTree, integrationResult, acceptedAtEvent>>
@@ -247,7 +257,7 @@ IntegrateProposal ==
                  ELSE [proposalTree EXCEPT !["unrelated"] = canonicalTree["unrelated"]]
             /\ phase' = "integrated"
   /\ UNCHANGED <<liveQueueIdentity, localHeadP, pAncestor, pNotCanonical,
-    targetIsP, ordinaryBaseNull, intentConsistent, pairBase, frozen, frozenBase,
+    targetEndpointsMatchP, acceptKind, intentConsistent, pairBase, frozen, frozenBase,
     pinnedBases, durableBase, sourceRegular, destinationFree, hierarchyClear,
     endpointBlockers, touchedHorizon, unrelatedEvidence, crashed, restarted,
     proposalTree, conflictSnapshot, remoteAdvanced, remoteKind, acceptedAtEvent>>
@@ -285,6 +295,8 @@ WitnessNotReached ==
       ~(integrationResult = "merged" /\ remoteKind = "disjoint")
     [] Mutation = "reach-remote-overlap-conflict" ->
       ~(integrationResult = "conflict" /\ remoteKind = "overlap")
+    [] Mutation = "reach-stale-merged-rebase" ->
+      ~(integrationResult = "merged" /\ acceptKind = "stale-merged" /\ pairBase = P)
     [] Mutation = "reach-unrelated-evidence-retained" ->
       ~(integrationResult = "merged" /\ unrelatedEvidence["unrelated"] = K)
     [] Mutation = "case-live-identity" ->
@@ -297,10 +309,10 @@ WitnessNotReached ==
       ~(phase = "guard-invalid" /\ ~pAncestor /\ pairBase = K)
     [] Mutation = "case-already-canonical" ->
       ~(phase = "guard-invalid" /\ ~pNotCanonical /\ pairBase = K)
-    [] Mutation = "case-target-not-P" ->
-      ~(phase = "guard-invalid" /\ ~targetIsP /\ pairBase = K)
-    [] Mutation = "case-nonnull-base" ->
-      ~(phase = "guard-invalid" /\ ~ordinaryBaseNull /\ pairBase = K)
+    [] Mutation = "case-target-endpoint-differs" ->
+      ~(phase = "guard-invalid" /\ ~targetEndpointsMatchP /\ pairBase = K)
+    [] Mutation = "mutant-omit-endpoint-equality" ->
+      ~(phase = "rebased" /\ ~targetEndpointsMatchP /\ pairBase = P)
     [] Mutation = "case-intent-mismatch" ->
       ~(phase = "guard-invalid" /\ ~intentConsistent /\ pairBase = K)
     [] Mutation = "case-source-missing" ->

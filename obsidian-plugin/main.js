@@ -23183,7 +23183,7 @@ var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var { findUnportablePaths, isRestrictedNamePlatform, segmentHasReservedCharacters } = require_namePortability();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.7.3";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.7.4";
 var SYNC_DEBOUNCE_MS = 1500;
 var EMPTY_JSON_BODY = "{}";
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
@@ -27841,24 +27841,20 @@ var ObtsObsidianClient = class {
     });
     if (!p || state.local_head !== p || !await this.isAncestor(p, targetMain) || state.local_main && await this.isAncestor(p, state.local_main)) return state.local_main;
     if (saved.intent?.commit === p && accepted.base !== saved.intent.base) return state.local_main;
-    if (!accepted.base && targetMain === p && state.local_main) {
+    const acknowledged = Boolean(saved.accepted_proposal && saved.accepted_proposal.commit === p);
+    if (state.local_main && (!accepted.base || acknowledged)) {
       for (const pair of saved.rename_pairs.filter((candidate) => candidate.base === state.local_main && !candidate.blocked_commit && !candidate.lineage_confirmed)) {
         const endpoints = [pair.source_path, pair.destination_path];
         const overlaps = (path2) => endpoints.some((endpoint) => changedPathsConflict(endpoint, path2));
         const hasIndependentEvidence = (current) => Object.keys(current.obligations).some(overlaps) || current.horizons.some((horizon) => horizon.touched.some(overlaps)) || current.held_proposals.some((heldProposal) => Object.keys(heldProposal.fallbacks).some(overlaps)) || current.intent && (Object.keys(current.intent.captures).some(overlaps) || (current.intent.rename_pairs || []).some((other) => [other.source_path, other.destination_path].some(overlaps))) || current.rename_pairs.some((other) => !(other.source_path === pair.source_path && other.destination_path === pair.destination_path) && [other.source_path, other.destination_path].some(overlaps));
         if (hasIndependentEvidence(await this.readStaleProvenance())) continue;
-        const source = await this.readTreePathEntry(p, pair.source_path);
-        const destination = await this.readTreePathEntry(p, pair.destination_path);
-        if (source.entry?.type !== "blob" || !/^100(?:644|755)$/u.test(source.entry.mode) || !source.ancestorsAreTrees || source.caseVariant || destination.entry || !destination.ancestorsAreTrees || destination.caseVariant) continue;
+        if (!await this.acceptedRenamePairCarried(p, targetMain, pair)) continue;
         await this.mutateStaleProvenance(async (current) => {
           const latestQueue = await this.readQueue();
           const latestState = await this.readState();
           const latestAccepted = latestQueue.pending_commit ? { commit: latestQueue.pending_commit, base: latestQueue.pending_proposal_base } : current.accepted_proposal;
           const latestPair = current.rename_pairs.find((candidate) => candidate.source_path === pair.source_path && candidate.destination_path === pair.destination_path);
-          if (latestAccepted?.commit !== p || latestAccepted.base !== null || current.intent?.commit === p && latestAccepted.base !== current.intent.base || latestState.local_head !== p || latestState.local_main !== state.local_main || latestState.local_main !== pair.base || latestPair?.base !== pair.base || latestPair.blocked_commit || latestPair.lineage_confirmed || !await this.isAncestor(p, targetMain) || await this.isAncestor(p, latestState.local_main) || hasIndependentEvidence(current)) return;
-          const currentSource = await this.readTreePathEntry(p, pair.source_path);
-          const currentDestination = await this.readTreePathEntry(p, pair.destination_path);
-          if (currentSource.entry?.type !== "blob" || !/^100(?:644|755)$/u.test(currentSource.entry.mode) || !currentSource.ancestorsAreTrees || currentSource.caseVariant || currentDestination.entry || !currentDestination.ancestorsAreTrees || currentDestination.caseVariant) return;
+          if (latestAccepted?.commit !== p || (latestAccepted.base || null) !== (accepted.base || null) || current.intent?.commit === p && latestAccepted.base !== current.intent.base || latestState.local_head !== p || latestState.local_main !== state.local_main || latestState.local_main !== pair.base || latestPair?.base !== pair.base || latestPair.blocked_commit || latestPair.lineage_confirmed || !await this.isAncestor(p, targetMain) || await this.isAncestor(p, latestState.local_main) || hasIndependentEvidence(current) || !await this.acceptedRenamePairCarried(p, targetMain, pair)) return;
           latestPair.base = p;
         });
       }
@@ -27884,12 +27880,47 @@ var ObtsObsidianClient = class {
             };
             continue;
           }
+          if (acknowledged && tree.get(q) === targetTree.get(q) && !await this.staleCohortPathHasOlderEvidence(current, q, p, accepted.base)) {
+            current.obligations[q] = {
+              base: p,
+              generation: current.obligations[q]?.generation || 0,
+              signature: current.obligations[q]?.signature || "uncaptured"
+            };
+            for (const horizon of current.horizons.filter((h) => h.touched.some((path2) => changedPathsConflict(path2, q)))) {
+              horizon.held_bases || (horizon.held_bases = {});
+              horizon.held_bases[q] = p;
+            }
+            continue;
+          }
           if (!current.obligations[q]) current.obligations[q] = { base: accepted.base, generation: 0, signature: "uncaptured" };
           else if (await this.isAncestor(accepted.base, current.obligations[q].base)) current.obligations[q].base = accepted.base;
         }
       });
     }
     return p;
+  }
+  // P and the acknowledged target both hold the pair's identical regular-file
+  // source and no destination, with every endpoint ancestor a plain tree.
+  async acceptedRenamePairCarried(p, targetMain, pair) {
+    const shape = async (commit2) => {
+      const source = await this.readTreePathEntry(commit2, pair.source_path);
+      const destination = await this.readTreePathEntry(commit2, pair.destination_path);
+      const valid = source.entry?.type === "blob" && /^100(?:644|755)$/u.test(source.entry.mode) && source.ancestorsAreTrees && !source.caseVariant && !destination.entry && destination.ancestorsAreTrees && !destination.caseVariant;
+      return valid ? `${source.entry.mode}:${source.entry.oid}` : null;
+    };
+    const accepted = await shape(p);
+    return Boolean(accepted) && (targetMain === p || accepted === await shape(targetMain));
+  }
+  // Evidence older than P's own cohort keeps the recorded base. P's own
+  // obligation or horizon on exactly this path, between its base and P, does not.
+  async staleCohortPathHasOlderEvidence(saved, filePath, p, recordedBase) {
+    const overlaps = (path2) => changedPathsConflict(path2, filePath);
+    const between = async (base) => await this.isAncestor(recordedBase, base) && await this.isAncestor(base, p);
+    for (const [path2, obligation] of Object.entries(saved.obligations))
+      if (overlaps(path2) && (path2 !== filePath || !await between(obligation.base))) return true;
+    for (const horizon of saved.horizons) for (const path2 of horizon.touched)
+      if (overlaps(path2) && (path2 !== filePath || !await between(this.staleHorizonBase(horizon, filePath)))) return true;
+    return saved.held_proposals.some((held) => Object.keys(held.fallbacks).some(overlaps)) || Boolean(saved.intent && saved.intent.commit !== p && (Object.keys(saved.intent.captures).some(overlaps) || (saved.intent.rename_pairs || []).some((pair) => [pair.source_path, pair.destination_path].some(overlaps)))) || saved.rename_pairs.some((pair) => [pair.source_path, pair.destination_path].some(overlaps));
   }
   async applyTargetMain(targetMain, changedPaths, allowDestructive, extraAffectedPaths = [], requireCleanVisibleState = false, directoryIntents = [], explicitDirectories = [], eventSeq = void 0, cleanVisibleStateVerified = false, confirmedDirectoryRecovery = null, targetFileSizes = {}, consentBaselineBundleId = null, preserveConsentLocalPaths = false, consentBaselineContext = null, rebuild = false, catchupExpectedTree = null, catchupPreservedPaths = [], catchupLegacyStrict = false, options = {}) {
     await this.admitApplyRecovery();

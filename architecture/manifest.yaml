@@ -1,5 +1,5 @@
 schema_version: 1
-revision: 61
+revision: 62
 status: current
 updated: 2026-10-22
 authoritative_artifacts:
@@ -21,7 +21,7 @@ formal_models:
     companion_path: architecture/models/formal/OBTSApplyInPlace.tla
     companion_architecture_revision: 36
     provenance_path: architecture/models/formal/OBTSStaleProposal.tla
-    provenance_architecture_revision: 36
+    provenance_architecture_revision: 62
     checks: architecture/models/formal/checks.json
     transition_map: architecture/models/formal/trace/transition-map.json
     refines:
@@ -167,7 +167,7 @@ formal_models:
     architecture_revision: 46
     checks: architecture/models/formal/configs/fm014-atomic-rename.cfg
     companion_path: architecture/models/formal/OBTSRenameAuthoring.tla
-    companion_architecture_revision: 52
+    companion_architecture_revision: 62
     fallback_companion_path: architecture/models/formal/OBTSRenameFallback.tla
     fallback_companion_architecture_revision: 56
     refines:

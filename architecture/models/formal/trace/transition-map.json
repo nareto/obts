@@ -38,21 +38,21 @@
     "clientRestartApplyAck": [
       "tests/plugin-large-vault.test.ts:300-724",
       "obsidian-plugin/src/main.cjs:1567-1727",
-      "obsidian-plugin/src/main.cjs:5476-5493",
-      "obsidian-plugin/src/main.cjs:5571-5724",
-      "obsidian-plugin/src/main.cjs:8731-8748"
+      "obsidian-plugin/src/main.cjs:5510-5527",
+      "obsidian-plugin/src/main.cjs:5605-5758",
+      "obsidian-plugin/src/main.cjs:8765-8782"
     ],
     "directoryCausality": [
       "src/server/syncService.ts:2392-2620",
       "tests/plugin-large-vault.test.ts:480-650",
-      "obsidian-plugin/src/main.cjs:10582-10633",
-      "obsidian-plugin/src/main.cjs:11010-11053",
-      "obsidian-plugin/src/main.cjs:10638-10658"
+      "obsidian-plugin/src/main.cjs:10616-10667",
+      "obsidian-plugin/src/main.cjs:11044-11087",
+      "obsidian-plugin/src/main.cjs:10672-10692"
     ],
     "legacyDirectoryRetirement": [
       "tests/plugin-legacy-directory-advance.test.ts",
-      "obsidian-plugin/src/main.cjs:9970-9997",
-      "obsidian-plugin/src/main.cjs:9998-10232"
+      "obsidian-plugin/src/main.cjs:10004-10031",
+      "obsidian-plugin/src/main.cjs:10032-10266"
     ],
     "adapterGateAndStaleProvenance": [
       "src/client/core.ts",
@@ -61,12 +61,12 @@
       "tests/path-mutation-gate.test.ts",
       "tests/plugin-adapter-write-gate.test.ts",
       "obsidian-plugin/src/main.cjs:977-1008",
-      "obsidian-plugin/src/main.cjs:6086-6115",
-      "obsidian-plugin/src/main.cjs:6116-6196",
-      "obsidian-plugin/src/main.cjs:6373-6386",
-      "obsidian-plugin/src/main.cjs:6715-6833",
-      "obsidian-plugin/src/main.cjs:11103-11113",
-      "obsidian-plugin/src/main.cjs:11322-11387"
+      "obsidian-plugin/src/main.cjs:6120-6149",
+      "obsidian-plugin/src/main.cjs:6150-6230",
+      "obsidian-plugin/src/main.cjs:6407-6420",
+      "obsidian-plugin/src/main.cjs:6749-6867",
+      "obsidian-plugin/src/main.cjs:11137-11147",
+      "obsidian-plugin/src/main.cjs:11356-11421"
     ],
     "explicitProposalBaseRetry": [
       "src/server/syncService.ts:1261-1344",
@@ -74,7 +74,7 @@
       "tests/phase1.test.ts",
       "src/server/syncService.ts:376-623",
       "tests/server-stale-proposal.test.ts",
-      "obsidian-plugin/src/main.cjs:5912-5917",
+      "obsidian-plugin/src/main.cjs:5946-5951",
       "obsidian-plugin/src/main.cjs:3149-3391",
       "obsidian-plugin/src/main.cjs:3768-3923"
     ]
@@ -133,8 +133,8 @@
         "OBTS-SYNC-IGN-001"
       ],
       "code": [
-        "obsidian-plugin/src/main.cjs:8811-8818",
-        "obsidian-plugin/src/main.cjs:8749-8784"
+        "obsidian-plugin/src/main.cjs:8845-8852",
+        "obsidian-plugin/src/main.cjs:8783-8818"
       ],
       "tests": [
         "tests/phase1.test.ts:5994-6360",
@@ -265,9 +265,9 @@
         "OBTS-SYNC-ACK-001"
       ],
       "code": [
-        "obsidian-plugin/src/main.cjs:6715-6833",
-        "obsidian-plugin/src/main.cjs:11103-11113",
-        "obsidian-plugin/src/main.cjs:11322-11387"
+        "obsidian-plugin/src/main.cjs:6749-6867",
+        "obsidian-plugin/src/main.cjs:11137-11147",
+        "obsidian-plugin/src/main.cjs:11356-11421"
       ],
       "tests": [
         "tests/phase1.test.ts:5994-6360",
@@ -304,8 +304,8 @@
         "OBTS-SYNC-ACK-001"
       ],
       "code": [
-        "obsidian-plugin/src/main.cjs:7294-7342",
-        "obsidian-plugin/src/main.cjs:6298-6323"
+        "obsidian-plugin/src/main.cjs:7328-7376",
+        "obsidian-plugin/src/main.cjs:6332-6357"
       ],
       "tests": [
         "tests/phase1.test.ts:5994-6360",
@@ -324,7 +324,7 @@
       ],
       "code": [
         "obsidian-plugin/src/main.cjs:1567-1727",
-        "obsidian-plugin/src/main.cjs:5476-5493"
+        "obsidian-plugin/src/main.cjs:5510-5527"
       ],
       "tests": [
         "tests/phase1.test.ts:5994-6360",
@@ -379,7 +379,7 @@
         "OBTS-SYNC-ACK-001"
       ],
       "code": [
-        "obsidian-plugin/src/main.cjs:9190-9230"
+        "obsidian-plugin/src/main.cjs:9224-9264"
       ],
       "tests": [
         "tests/phase1.test.ts:5994-6360",
@@ -452,8 +452,8 @@
       ],
       "code": [
         "src/server/syncService.ts:2392-2620",
-        "obsidian-plugin/src/main.cjs:10550-10581",
-        "obsidian-plugin/src/main.cjs:11010-11053"
+        "obsidian-plugin/src/main.cjs:10584-10615",
+        "obsidian-plugin/src/main.cjs:11044-11087"
       ],
       "tests": [
         "tests/plugin-large-vault.test.ts:480-650",
@@ -474,7 +474,7 @@
       ],
       "code": [
         "obsidian-plugin/src/main.cjs:3149-3391",
-        "obsidian-plugin/src/main.cjs:6387-6424"
+        "obsidian-plugin/src/main.cjs:6421-6458"
       ],
       "tests": [
         "tests/phase1.test.ts:5994-6360",
@@ -492,9 +492,9 @@
         "OBTS-SYNC-ACK-001"
       ],
       "code": [
-        "obsidian-plugin/src/main.cjs:5571-5724",
-        "obsidian-plugin/src/main.cjs:9464-9469",
-        "obsidian-plugin/src/main.cjs:9798-9806"
+        "obsidian-plugin/src/main.cjs:5605-5758",
+        "obsidian-plugin/src/main.cjs:9498-9503",
+        "obsidian-plugin/src/main.cjs:9832-9840"
       ],
       "tests": [
         "tests/phase1.test.ts:5994-6360",
@@ -526,7 +526,7 @@
       ],
       "code": [
         "obsidian-plugin/src/main.cjs:3149-3391",
-        "obsidian-plugin/src/main.cjs:6387-6424"
+        "obsidian-plugin/src/main.cjs:6421-6458"
       ],
       "tests": [
         "tests/phase1.test.ts:5994-6360",
@@ -544,8 +544,8 @@
         "OBTS-SYNC-ACK-001"
       ],
       "code": [
-        "obsidian-plugin/src/main.cjs:4923-5378",
-        "obsidian-plugin/src/main.cjs:5571-5724"
+        "obsidian-plugin/src/main.cjs:4923-5412",
+        "obsidian-plugin/src/main.cjs:5605-5758"
       ],
       "tests": [
         "tests/phase1.test.ts:5994-6360",
@@ -629,8 +629,8 @@
       ],
       "code": [
         "src/server/syncService.ts:2392-2620",
-        "obsidian-plugin/src/main.cjs:11054-11076",
-        "obsidian-plugin/src/main.cjs:11187-11223"
+        "obsidian-plugin/src/main.cjs:11088-11110",
+        "obsidian-plugin/src/main.cjs:11221-11257"
       ],
       "tests": [
         "tests/plugin-large-vault.test.ts:480-650",
@@ -915,8 +915,8 @@
         "OBTS-SYNC-IGN-001"
       ],
       "code": [
-        "obsidian-plugin/src/main.cjs:7294-7342",
-        "obsidian-plugin/src/main.cjs:7478-7491"
+        "obsidian-plugin/src/main.cjs:7328-7376",
+        "obsidian-plugin/src/main.cjs:7512-7525"
       ],
       "tests": [
         "tests/phase1.test.ts:5994-6360",
@@ -968,7 +968,7 @@
       ],
       "code": [
         "src/server/syncService.ts:2392-2620",
-        "obsidian-plugin/src/main.cjs:10582-10633"
+        "obsidian-plugin/src/main.cjs:10616-10667"
       ],
       "tests": [
         "tests/plugin-large-vault.test.ts:480-650",
@@ -987,7 +987,7 @@
       ],
       "code": [
         "obsidian-plugin/src/main.cjs:3010-3046",
-        "obsidian-plugin/src/main.cjs:5821-5863"
+        "obsidian-plugin/src/main.cjs:5855-5897"
       ],
       "tests": [
         "tests/phase1.test.ts:5994-6360",
@@ -1005,8 +1005,8 @@
         "OBTS-SYNC-IGN-001"
       ],
       "code": [
-        "obsidian-plugin/src/main.cjs:7515-7525",
-        "obsidian-plugin/src/main.cjs:7343-7437"
+        "obsidian-plugin/src/main.cjs:7549-7559",
+        "obsidian-plugin/src/main.cjs:7377-7471"
       ],
       "tests": [
         "tests/plugin-root-ignore-scan.test.ts:210-277"
@@ -1036,7 +1036,7 @@
         "OBTS-SYNC-ACK-001"
       ],
       "code": [
-        "obsidian-plugin/src/main.cjs:8707-8718"
+        "obsidian-plugin/src/main.cjs:8741-8752"
       ],
       "tests": [
         "tests/phase1.test.ts:5994-6360",
@@ -1093,8 +1093,8 @@
         "OBTS-SYNC-IGN-001"
       ],
       "code": [
-        "obsidian-plugin/src/main.cjs:6298-6323",
-        "obsidian-plugin/src/main.cjs:9798-9806"
+        "obsidian-plugin/src/main.cjs:6332-6357",
+        "obsidian-plugin/src/main.cjs:9832-9840"
       ],
       "tests": [
         "tests/phase1.test.ts:5994-6360",
@@ -1114,7 +1114,7 @@
         "OBTS-SYNC-IGN-001"
       ],
       "code": [
-        "obsidian-plugin/src/main.cjs:4923-5378"
+        "obsidian-plugin/src/main.cjs:4923-5412"
       ],
       "tests": [
         "tests/phase1.test.ts:5994-6360",
@@ -1135,7 +1135,7 @@
       ],
       "code": [
         "obsidian-plugin/src/main.cjs:4525-4641",
-        "obsidian-plugin/src/main.cjs:8683-8695"
+        "obsidian-plugin/src/main.cjs:8717-8729"
       ],
       "tests": [
         "tests/phase1.test.ts:5994-6360",
@@ -1151,8 +1151,8 @@
       ],
       "code": [
         "src/server/syncService.ts:2392-2620",
-        "obsidian-plugin/src/main.cjs:11141-11150",
-        "obsidian-plugin/src/main.cjs:11187-11223"
+        "obsidian-plugin/src/main.cjs:11175-11184",
+        "obsidian-plugin/src/main.cjs:11221-11257"
       ],
       "tests": [
         "tests/plugin-large-vault.test.ts:480-650",
@@ -1205,8 +1205,8 @@
       ],
       "code": [
         "src/server/syncService.ts:2392-2620",
-        "obsidian-plugin/src/main.cjs:10550-10581",
-        "obsidian-plugin/src/main.cjs:10582-10633"
+        "obsidian-plugin/src/main.cjs:10584-10615",
+        "obsidian-plugin/src/main.cjs:10616-10667"
       ],
       "tests": [
         "tests/plugin-large-vault.test.ts:480-650",
@@ -1300,8 +1300,8 @@
         "OBTS-SYNC-ACK-001"
       ],
       "code": [
-        "obsidian-plugin/src/main.cjs:7764-7814",
-        "obsidian-plugin/src/main.cjs:7815-7856"
+        "obsidian-plugin/src/main.cjs:7798-7848",
+        "obsidian-plugin/src/main.cjs:7849-7890"
       ],
       "tests": [
         "tests/phase1.test.ts:5994-6360",
@@ -1395,8 +1395,8 @@
       ],
       "code": [
         "src/server/syncService.ts:2392-2620",
-        "obsidian-plugin/src/main.cjs:11010-11053",
-        "obsidian-plugin/src/main.cjs:11322-11387"
+        "obsidian-plugin/src/main.cjs:11044-11087",
+        "obsidian-plugin/src/main.cjs:11356-11421"
       ],
       "tests": [
         "tests/plugin-large-vault.test.ts:480-650",
@@ -1441,7 +1441,7 @@
       ],
       "code": [
         "obsidian-plugin/src/main.cjs:1567-1727",
-        "obsidian-plugin/src/main.cjs:5476-5493"
+        "obsidian-plugin/src/main.cjs:5510-5527"
       ],
       "tests": [
         "tests/phase1.test.ts:5994-6360",
@@ -1653,7 +1653,7 @@
       ],
       "code": [
         "obsidian-plugin/src/main.cjs:1567-1727",
-        "obsidian-plugin/src/main.cjs:5918-5974"
+        "obsidian-plugin/src/main.cjs:5952-6008"
       ],
       "tests": [
         "tests/phase1.test.ts:5994-6360"
@@ -1671,8 +1671,8 @@
         "OBTS-SYNC-ACK-001"
       ],
       "code": [
-        "obsidian-plugin/src/main.cjs:6665-6714",
-        "obsidian-plugin/src/main.cjs:5571-5724"
+        "obsidian-plugin/src/main.cjs:6699-6748",
+        "obsidian-plugin/src/main.cjs:5605-5758"
       ],
       "tests": [
         "tests/phase1.test.ts:5994-6360",
@@ -1894,7 +1894,7 @@
         "OBTS-PER-CLIENT-001"
       ],
       "code": [
-        "obsidian-plugin/src/main.cjs:9998-10232"
+        "obsidian-plugin/src/main.cjs:10032-10266"
       ],
       "tests": [
         "tests/plugin-legacy-directory-advance.test.ts"
@@ -1907,7 +1907,7 @@
         "OBTS-PER-CLIENT-001"
       ],
       "code": [
-        "obsidian-plugin/src/main.cjs:9998-10232"
+        "obsidian-plugin/src/main.cjs:10032-10266"
       ],
       "tests": [
         "tests/plugin-legacy-directory-advance.test.ts"
@@ -1920,7 +1920,7 @@
         "OBTS-SYNC-ACK-001"
       ],
       "code": [
-        "obsidian-plugin/src/main.cjs:9998-10232"
+        "obsidian-plugin/src/main.cjs:10032-10266"
       ],
       "tests": [
         "tests/plugin-legacy-directory-advance.test.ts"
@@ -1933,7 +1933,7 @@
         "OBTS-PER-CLIENT-001"
       ],
       "code": [
-        "obsidian-plugin/src/main.cjs:9998-10232"
+        "obsidian-plugin/src/main.cjs:10032-10266"
       ],
       "tests": [
         "tests/plugin-legacy-directory-advance.test.ts"
@@ -1946,8 +1946,8 @@
         "OBTS-SYNC-ACK-001"
       ],
       "code": [
-        "obsidian-plugin/src/main.cjs:9998-10232",
-        "obsidian-plugin/src/main.cjs:8785-8798"
+        "obsidian-plugin/src/main.cjs:10032-10266",
+        "obsidian-plugin/src/main.cjs:8819-8832"
       ],
       "tests": [
         "tests/plugin-legacy-directory-advance.test.ts"
@@ -1960,8 +1960,8 @@
         "OBTS-SYNC-ACK-001"
       ],
       "code": [
-        "obsidian-plugin/src/main.cjs:9970-9997",
-        "obsidian-plugin/src/main.cjs:9998-10232"
+        "obsidian-plugin/src/main.cjs:10004-10031",
+        "obsidian-plugin/src/main.cjs:10032-10266"
       ],
       "tests": [
         "tests/plugin-legacy-directory-advance.test.ts"
@@ -1974,7 +1974,7 @@
         "OBTS-SYNC-ACK-001"
       ],
       "code": [
-        "obsidian-plugin/src/main.cjs:9998-10232"
+        "obsidian-plugin/src/main.cjs:10032-10266"
       ],
       "tests": [
         "tests/plugin-legacy-directory-advance.test.ts"
@@ -2117,29 +2117,64 @@
       "architectureRevision": 48,
       "actions": {
         "Prepare": {
-          "contracts": ["OBTS-SYNC-IMM-001", "OBTS-PER-OP-001"],
-          "code": ["src/server/syncService.ts:1806-1854", "src/server/gitService.ts:771-801", "src/server/gitService.ts:1074-1112"],
-          "tests": ["tests/phase1.test.ts:2518-2600"]
+          "contracts": [
+            "OBTS-SYNC-IMM-001",
+            "OBTS-PER-OP-001"
+          ],
+          "code": [
+            "src/server/syncService.ts:1806-1854",
+            "src/server/gitService.ts:771-801",
+            "src/server/gitService.ts:1074-1112"
+          ],
+          "tests": [
+            "tests/phase1.test.ts:2518-2600"
+          ]
         },
         "Advance": {
-          "contracts": ["OBTS-SYNC-IMM-001", "OBTS-PER-OP-001"],
-          "code": ["src/server/syncService.ts:1839-1872"],
-          "tests": ["tests/phase1.test.ts:2518-2600"]
+          "contracts": [
+            "OBTS-SYNC-IMM-001",
+            "OBTS-PER-OP-001"
+          ],
+          "code": [
+            "src/server/syncService.ts:1839-1872"
+          ],
+          "tests": [
+            "tests/phase1.test.ts:2518-2600"
+          ]
         },
         "Publish": {
-          "contracts": ["OBTS-SYNC-IMM-001", "OBTS-PER-OP-001"],
-          "code": ["src/server/syncService.ts:1872-1920"],
-          "tests": ["tests/phase1.test.ts:2518-2600"]
+          "contracts": [
+            "OBTS-SYNC-IMM-001",
+            "OBTS-PER-OP-001"
+          ],
+          "code": [
+            "src/server/syncService.ts:1872-1920"
+          ],
+          "tests": [
+            "tests/phase1.test.ts:2518-2600"
+          ]
         },
         "Crash": {
-          "contracts": ["OBTS-PER-OP-001"],
-          "code": ["src/server/syncService.ts:1855-1872"],
-          "tests": ["tests/phase1.test.ts:5222-5270"]
+          "contracts": [
+            "OBTS-PER-OP-001"
+          ],
+          "code": [
+            "src/server/syncService.ts:1855-1872"
+          ],
+          "tests": [
+            "tests/phase1.test.ts:5222-5270"
+          ]
         },
         "Restart": {
-          "contracts": ["OBTS-PER-OP-001"],
-          "code": ["src/server/syncService.ts"],
-          "tests": ["tests/phase1.test.ts:5222-5270"]
+          "contracts": [
+            "OBTS-PER-OP-001"
+          ],
+          "code": [
+            "src/server/syncService.ts"
+          ],
+          "tests": [
+            "tests/phase1.test.ts:5222-5270"
+          ]
         }
       }
     },
@@ -2154,9 +2189,9 @@
             "OBTS-PER-GATE-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:11388-11399",
-            "obsidian-plugin/src/main.cjs:11400-11418",
-            "obsidian-plugin/src/main.cjs:11322-11387"
+            "obsidian-plugin/src/main.cjs:11422-11433",
+            "obsidian-plugin/src/main.cjs:11434-11452",
+            "obsidian-plugin/src/main.cjs:11356-11421"
           ],
           "tests": [
             "tests/plugin-in-place-apply.test.ts",
@@ -2173,8 +2208,8 @@
           ],
           "code": [
             "obsidian-plugin/src/path-mutation-gate.cjs:1-139",
-            "obsidian-plugin/src/main.cjs:11103-11113",
-            "obsidian-plugin/src/main.cjs:11322-11387"
+            "obsidian-plugin/src/main.cjs:11137-11147",
+            "obsidian-plugin/src/main.cjs:11356-11421"
           ],
           "tests": [
             "tests/plugin-in-place-apply.test.ts",
@@ -2191,8 +2226,8 @@
           ],
           "code": [
             "obsidian-plugin/src/path-mutation-gate.cjs:1-139",
-            "obsidian-plugin/src/main.cjs:11103-11113",
-            "obsidian-plugin/src/main.cjs:6834-6925"
+            "obsidian-plugin/src/main.cjs:11137-11147",
+            "obsidian-plugin/src/main.cjs:6868-6959"
           ],
           "tests": [
             "tests/plugin-in-place-apply.test.ts",
@@ -2209,8 +2244,8 @@
           ],
           "code": [
             "obsidian-plugin/src/path-mutation-gate.cjs:1-139",
-            "obsidian-plugin/src/main.cjs:11322-11387",
-            "obsidian-plugin/src/main.cjs:11134-11140"
+            "obsidian-plugin/src/main.cjs:11356-11421",
+            "obsidian-plugin/src/main.cjs:11168-11174"
           ],
           "tests": [
             "tests/plugin-in-place-apply.test.ts",
@@ -2227,8 +2262,8 @@
           ],
           "code": [
             "obsidian-plugin/src/path-mutation-gate.cjs:1-139",
-            "obsidian-plugin/src/main.cjs:11103-11113",
-            "obsidian-plugin/src/main.cjs:6834-6925"
+            "obsidian-plugin/src/main.cjs:11137-11147",
+            "obsidian-plugin/src/main.cjs:6868-6959"
           ],
           "tests": [
             "tests/plugin-in-place-apply.test.ts",
@@ -2245,8 +2280,8 @@
           ],
           "code": [
             "obsidian-plugin/src/path-mutation-gate.cjs:1-139",
-            "obsidian-plugin/src/main.cjs:6715-6833",
-            "obsidian-plugin/src/main.cjs:11103-11113"
+            "obsidian-plugin/src/main.cjs:6749-6867",
+            "obsidian-plugin/src/main.cjs:11137-11147"
           ],
           "tests": [
             "tests/plugin-in-place-apply.test.ts",
@@ -2263,7 +2298,7 @@
           ],
           "code": [
             "obsidian-plugin/src/path-mutation-gate.cjs:1-139",
-            "obsidian-plugin/src/main.cjs:6715-6833"
+            "obsidian-plugin/src/main.cjs:6749-6867"
           ],
           "tests": [
             "tests/plugin-in-place-apply.test.ts",
@@ -2280,8 +2315,8 @@
           ],
           "code": [
             "obsidian-plugin/src/path-mutation-gate.cjs:1-139",
-            "obsidian-plugin/src/main.cjs:6834-6925",
-            "obsidian-plugin/src/main.cjs:5571-5724"
+            "obsidian-plugin/src/main.cjs:6868-6959",
+            "obsidian-plugin/src/main.cjs:5605-5758"
           ],
           "tests": [
             "tests/plugin-in-place-apply.test.ts",
@@ -2298,8 +2333,8 @@
           ],
           "code": [
             "obsidian-plugin/src/path-mutation-gate.cjs:1-139",
-            "obsidian-plugin/src/main.cjs:5476-5493",
-            "obsidian-plugin/src/main.cjs:5571-5724"
+            "obsidian-plugin/src/main.cjs:5510-5527",
+            "obsidian-plugin/src/main.cjs:5605-5758"
           ],
           "tests": [
             "tests/plugin-in-place-apply.test.ts",
@@ -2316,8 +2351,8 @@
           ],
           "code": [
             "obsidian-plugin/src/path-mutation-gate.cjs:1-139",
-            "obsidian-plugin/src/main.cjs:5476-5493",
-            "obsidian-plugin/src/main.cjs:5571-5724"
+            "obsidian-plugin/src/main.cjs:5510-5527",
+            "obsidian-plugin/src/main.cjs:5605-5758"
           ],
           "tests": [
             "tests/plugin-in-place-apply.test.ts",
@@ -2334,8 +2369,8 @@
           ],
           "code": [
             "obsidian-plugin/src/path-mutation-gate.cjs:1-139",
-            "obsidian-plugin/src/main.cjs:5379-5475",
-            "obsidian-plugin/src/main.cjs:5571-5724"
+            "obsidian-plugin/src/main.cjs:5413-5509",
+            "obsidian-plugin/src/main.cjs:5605-5758"
           ],
           "tests": [
             "tests/plugin-in-place-apply.test.ts",
@@ -2352,9 +2387,9 @@
           ],
           "code": [
             "obsidian-plugin/src/path-mutation-gate.cjs:1-139",
-            "obsidian-plugin/src/main.cjs:5559-5570",
-            "obsidian-plugin/src/main.cjs:6715-6833",
-            "obsidian-plugin/src/main.cjs:11103-11113"
+            "obsidian-plugin/src/main.cjs:5593-5604",
+            "obsidian-plugin/src/main.cjs:6749-6867",
+            "obsidian-plugin/src/main.cjs:11137-11147"
           ],
           "tests": [
             "tests/plugin-in-place-apply.test.ts",
@@ -2371,7 +2406,7 @@
           ],
           "code": [
             "obsidian-plugin/src/path-mutation-gate.cjs:1-139",
-            "obsidian-plugin/src/main.cjs:6715-6833"
+            "obsidian-plugin/src/main.cjs:6749-6867"
           ],
           "tests": [
             "tests/plugin-in-place-apply.test.ts",
@@ -2396,8 +2431,8 @@
             "OBTS-SYNC-IMM-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:5559-5570",
-            "obsidian-plugin/src/main.cjs:6086-6115"
+            "obsidian-plugin/src/main.cjs:5593-5604",
+            "obsidian-plugin/src/main.cjs:6120-6149"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts",
@@ -2415,8 +2450,8 @@
             "OBTS-SYNC-IMM-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:6086-6115",
-            "obsidian-plugin/src/main.cjs:6116-6196"
+            "obsidian-plugin/src/main.cjs:6120-6149",
+            "obsidian-plugin/src/main.cjs:6150-6230"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts",
@@ -2435,8 +2470,8 @@
           ],
           "code": [
             "obsidian-plugin/src/main.cjs:977-1008",
-            "obsidian-plugin/src/main.cjs:8916-8922",
-            "obsidian-plugin/src/main.cjs:6116-6196"
+            "obsidian-plugin/src/main.cjs:8950-8956",
+            "obsidian-plugin/src/main.cjs:6150-6230"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts",
@@ -2454,8 +2489,8 @@
             "OBTS-SYNC-IMM-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:4923-5378",
-            "obsidian-plugin/src/main.cjs:6086-6115"
+            "obsidian-plugin/src/main.cjs:4923-5412",
+            "obsidian-plugin/src/main.cjs:6120-6149"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts",
@@ -2473,7 +2508,7 @@
             "OBTS-SYNC-IMM-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:6116-6196"
+            "obsidian-plugin/src/main.cjs:6150-6230"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts",
@@ -2491,7 +2526,7 @@
             "OBTS-SYNC-IMM-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:6116-6196"
+            "obsidian-plugin/src/main.cjs:6150-6230"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts",
@@ -2509,8 +2544,8 @@
             "OBTS-SYNC-IMM-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:6116-6196",
-            "obsidian-plugin/src/main.cjs:5975-5999"
+            "obsidian-plugin/src/main.cjs:6150-6230",
+            "obsidian-plugin/src/main.cjs:6009-6033"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts",
@@ -2528,7 +2563,7 @@
             "OBTS-SYNC-IMM-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:6116-6196",
+            "obsidian-plugin/src/main.cjs:6150-6230",
             "obsidian-plugin/src/main.cjs:2564-2739"
           ],
           "tests": [
@@ -2547,8 +2582,8 @@
             "OBTS-SYNC-IMM-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:6197-6297",
-            "obsidian-plugin/src/main.cjs:6298-6323"
+            "obsidian-plugin/src/main.cjs:6231-6331",
+            "obsidian-plugin/src/main.cjs:6332-6357"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts",
@@ -2566,8 +2601,8 @@
             "OBTS-SYNC-IMM-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:6116-6196",
-            "obsidian-plugin/src/main.cjs:6086-6115"
+            "obsidian-plugin/src/main.cjs:6150-6230",
+            "obsidian-plugin/src/main.cjs:6120-6149"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts",
@@ -2585,7 +2620,7 @@
             "OBTS-SYNC-IMM-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:6298-6323"
+            "obsidian-plugin/src/main.cjs:6332-6357"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts",
@@ -2603,8 +2638,8 @@
             "OBTS-SYNC-IMM-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:6197-6297",
-            "obsidian-plugin/src/main.cjs:9798-9806"
+            "obsidian-plugin/src/main.cjs:6231-6331",
+            "obsidian-plugin/src/main.cjs:9832-9840"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts",
@@ -2622,8 +2657,8 @@
             "OBTS-SYNC-IMM-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:9190-9230",
-            "obsidian-plugin/src/main.cjs:6425-6493"
+            "obsidian-plugin/src/main.cjs:9224-9264",
+            "obsidian-plugin/src/main.cjs:6459-6527"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts",
@@ -2692,7 +2727,7 @@
             "src/server/syncService.ts:376-623",
             "src/server/syncService.ts:1261-1344",
             "src/server/syncService.ts:314-375",
-            "obsidian-plugin/src/main.cjs:5912-5917",
+            "obsidian-plugin/src/main.cjs:5946-5951",
             "obsidian-plugin/src/main.cjs:3149-3391",
             "obsidian-plugin/src/main.cjs:3768-3923"
           ],
@@ -2747,8 +2782,8 @@
             "OBTS-SYNC-IMM-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:6425-6493",
-            "obsidian-plugin/src/main.cjs:4923-5378"
+            "obsidian-plugin/src/main.cjs:6459-6527",
+            "obsidian-plugin/src/main.cjs:4923-5412"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts",
@@ -2766,8 +2801,8 @@
             "OBTS-SYNC-IMM-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:6387-6424",
-            "obsidian-plugin/src/main.cjs:6373-6386",
+            "obsidian-plugin/src/main.cjs:6421-6458",
+            "obsidian-plugin/src/main.cjs:6407-6420",
             "obsidian-plugin/src/main.cjs:3149-3391"
           ],
           "tests": [
@@ -2786,8 +2821,8 @@
             "OBTS-SYNC-IMM-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:6197-6297",
-            "obsidian-plugin/src/main.cjs:6116-6196"
+            "obsidian-plugin/src/main.cjs:6231-6331",
+            "obsidian-plugin/src/main.cjs:6150-6230"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts",
@@ -2806,7 +2841,7 @@
           ],
           "code": [
             "obsidian-plugin/src/main.cjs:2564-2739",
-            "obsidian-plugin/src/main.cjs:6197-6297"
+            "obsidian-plugin/src/main.cjs:6231-6331"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts",
@@ -2824,8 +2859,8 @@
             "OBTS-SYNC-IMM-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:6425-6493",
-            "obsidian-plugin/src/main.cjs:9190-9230"
+            "obsidian-plugin/src/main.cjs:6459-6527",
+            "obsidian-plugin/src/main.cjs:9224-9264"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts",
@@ -2843,8 +2878,8 @@
             "OBTS-SYNC-IMM-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:6298-6323",
-            "obsidian-plugin/src/main.cjs:5975-5999"
+            "obsidian-plugin/src/main.cjs:6332-6357",
+            "obsidian-plugin/src/main.cjs:6009-6033"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts",
@@ -2864,8 +2899,8 @@
           ],
           "code": [
             "obsidian-plugin/src/main.cjs:1567-1727",
-            "obsidian-plugin/src/main.cjs:6070-6078",
-            "obsidian-plugin/src/main.cjs:6324-6372"
+            "obsidian-plugin/src/main.cjs:6104-6112",
+            "obsidian-plugin/src/main.cjs:6358-6406"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts",
@@ -2885,7 +2920,7 @@
           ],
           "code": [
             "src/server/syncService.ts:376-623",
-            "obsidian-plugin/src/main.cjs:5912-5917",
+            "obsidian-plugin/src/main.cjs:5946-5951",
             "obsidian-plugin/src/main.cjs:3149-3391",
             "obsidian-plugin/src/main.cjs:3768-3923"
           ],
@@ -2936,8 +2971,8 @@
             "OBTS-SYNC-IMM-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:6086-6115",
-            "obsidian-plugin/src/main.cjs:6116-6196"
+            "obsidian-plugin/src/main.cjs:6120-6149",
+            "obsidian-plugin/src/main.cjs:6150-6230"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts",
@@ -2955,8 +2990,8 @@
             "OBTS-SYNC-IMM-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:6425-6493",
-            "obsidian-plugin/src/main.cjs:6373-6386"
+            "obsidian-plugin/src/main.cjs:6459-6527",
+            "obsidian-plugin/src/main.cjs:6407-6420"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts:532"
@@ -2972,8 +3007,8 @@
             "OBTS-SYNC-IMM-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:6116-6196",
-            "obsidian-plugin/src/main.cjs:6373-6386"
+            "obsidian-plugin/src/main.cjs:6150-6230",
+            "obsidian-plugin/src/main.cjs:6407-6420"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts:532"
@@ -2989,8 +3024,8 @@
             "OBTS-SYNC-IMM-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:6116-6196",
-            "obsidian-plugin/src/main.cjs:6373-6386"
+            "obsidian-plugin/src/main.cjs:6150-6230",
+            "obsidian-plugin/src/main.cjs:6407-6420"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts:564"
@@ -3006,9 +3041,10 @@
             "OBTS-SYNC-IMM-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:4879-4922"
+            "obsidian-plugin/src/main.cjs:5048-5176"
           ],
           "tests": [
+            "tests/plugin-stale-proposal.test.ts:1872-1959",
             "tests/plugin-stale-proposal.test.ts:588"
           ]
         },
@@ -3018,7 +3054,7 @@
             "OBTS-PER-STALE-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:6000-6047",
+            "obsidian-plugin/src/main.cjs:6034-6081",
             "obsidian-plugin/src/main.cjs:2779-3009"
           ],
           "tests": [
@@ -3032,7 +3068,7 @@
           ],
           "code": [
             "obsidian-plugin/src/main.cjs:3585-3663",
-            "obsidian-plugin/src/main.cjs:6324-6372"
+            "obsidian-plugin/src/main.cjs:6358-6406"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts"
@@ -3044,8 +3080,8 @@
             "OBTS-PER-STALE-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:6052-6069",
-            "obsidian-plugin/src/main.cjs:6387-6424",
+            "obsidian-plugin/src/main.cjs:6086-6103",
+            "obsidian-plugin/src/main.cjs:6421-6458",
             "obsidian-plugin/src/main.cjs:4879-4922"
           ],
           "tests": [
@@ -3058,8 +3094,8 @@
             "OBTS-PER-STALE-001"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:6197-6297",
-            "obsidian-plugin/src/main.cjs:6116-6196"
+            "obsidian-plugin/src/main.cjs:6231-6331",
+            "obsidian-plugin/src/main.cjs:6150-6230"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts"
@@ -3071,7 +3107,7 @@
           ],
           "code": [
             "obsidian-plugin/src/main.cjs:1567-1727",
-            "obsidian-plugin/src/main.cjs:6070-6078"
+            "obsidian-plugin/src/main.cjs:6104-6112"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts"
@@ -3096,7 +3132,7 @@
           ],
           "code": [
             "obsidian-plugin/src/main.cjs:2779-3009",
-            "obsidian-plugin/src/main.cjs:6000-6047"
+            "obsidian-plugin/src/main.cjs:6034-6081"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts"
@@ -3121,7 +3157,7 @@
           ],
           "code": [
             "obsidian-plugin/src/main.cjs:2779-3009",
-            "obsidian-plugin/src/main.cjs:4923-5378"
+            "obsidian-plugin/src/main.cjs:4923-5412"
           ],
           "tests": [
             "tests/plugin-stale-proposal.test.ts"
@@ -3153,7 +3189,7 @@
           ],
           "code": [
             "obsidian-plugin/src/main.cjs:876-888",
-            "obsidian-plugin/src/main.cjs:6926-6962"
+            "obsidian-plugin/src/main.cjs:6960-6996"
           ],
           "tests": [
             "tests/sync-delta-cost.test.ts",
@@ -3168,8 +3204,8 @@
           ],
           "code": [
             "obsidian-plugin/src/main.cjs:2564-2739",
-            "obsidian-plugin/src/main.cjs:6994-7047",
-            "obsidian-plugin/src/main.cjs:7163-7249"
+            "obsidian-plugin/src/main.cjs:7028-7081",
+            "obsidian-plugin/src/main.cjs:7197-7283"
           ],
           "tests": [
             "tests/sync-delta-cost.test.ts",
@@ -3184,8 +3220,8 @@
             "OBTS-SAF-002"
           ],
           "code": [
-            "obsidian-plugin/src/main.cjs:6926-6962",
-            "obsidian-plugin/src/main.cjs:11288-11321"
+            "obsidian-plugin/src/main.cjs:6960-6996",
+            "obsidian-plugin/src/main.cjs:11322-11355"
           ],
           "tests": [
             "tests/sync-delta-cost.test.ts",
@@ -3240,8 +3276,8 @@
           ],
           "code": [
             "obsidian-plugin/src/main.cjs:4781-4840",
-            "obsidian-plugin/src/main.cjs:4923-5378",
-            "obsidian-plugin/src/main.cjs:8707-8718"
+            "obsidian-plugin/src/main.cjs:4923-5412",
+            "obsidian-plugin/src/main.cjs:8741-8752"
           ],
           "tests": [
             "tests/sync-delta-cost.test.ts",
@@ -3259,8 +3295,8 @@
           ],
           "code": [
             "obsidian-plugin/src/main.cjs:4841-4878",
-            "obsidian-plugin/src/main.cjs:4923-5378",
-            "obsidian-plugin/src/main.cjs:6834-6925"
+            "obsidian-plugin/src/main.cjs:4923-5412",
+            "obsidian-plugin/src/main.cjs:6868-6959"
           ],
           "tests": [
             "tests/sync-delta-cost.test.ts",

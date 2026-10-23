@@ -2,7 +2,7 @@
 EXTENDS Naturals, FiniteSets, TLC
 
 (***************************************************************************
-FM001/FM002 focused provenance companion, architecture revision 36.
+FM001/FM002 focused provenance companion, architecture revisions 36 and 62.
 Refines OBTS-SAF-002, OBTS-SAF-005, OBTS-SYNC-STALE-001,
 OBTS-SYNC-BASE-001, OBTS-SYNC-IMM-001, OBTS-PER-STALE-001. Four paths:
 p touched/stale, q inherited/known fresh revert, u untouched/fresh,
@@ -264,12 +264,23 @@ AckQBase == IF WrongBase THEN {} ELSE RemoteQ
 AckQTarget == RemoteQ \cup {"second-remote-q"}
 AckQConflict == AckQTarget # AckQBase /\ {} # AckQBase /\ AckQTarget # {}
 AckQResult == IF AckQConflict \/ {} = AckQBase THEN AckQTarget ELSE {}
+\* Per-path cohort kinds: "stale" means C's bytes differ from P's on p (merge
+\* or keep_server); "stale-match" means C carries P's p bytes and no older
+\* independent evidence overlaps p; "stale-older" carries P's bytes but an
+\* older horizon/obligation overlaps p. In "ack", OlderBaseDiff keeps M0 on a
+\* matching path and ReplaceOldBase advances a differing or older-evidence path.
+AckStaleKinds == {"stale", "stale-match", "stale-older", "stale-remote-q"}
+AckRetirementBase(kind) ==
+  CASE kind = "stale-match" -> IF OlderBaseDiff THEN M0 ELSE "P"
+    [] kind \in {"stale", "stale-older"} -> IF ReplaceOldBase THEN "P" ELSE M0
+    [] kind = "stale-remote-q" -> M0
+    [] OTHER -> None
 AcknowledgeProposal ==
   /\ r.running /\ Scenario = "ack" /\ r.stage = "plan"
-  /\ \E kind \in {"ordinary", "stale", "stale-remote-q", "missing", "contained"} :
+  /\ \E kind \in {"ordinary", "stale", "stale-match", "stale-older", "stale-remote-q", "missing", "contained"} :
     r' = [r EXCEPT !.stage = "done", !.ackKind = kind,
       !.ackBase = IF kind \in {"missing", "contained"} THEN M0 ELSE "P",
-      !.retirementBase = IF kind \in {"stale", "stale-remote-q"} THEN M0 ELSE None,
+      !.retirementBase = AckRetirementBase(kind),
       !.freshHeld = kind = "stale-remote-q",
       !.mainQ = IF kind = "stale-remote-q" THEN AckQResult ELSE @,
       !.proposalQ = IF kind = "stale-remote-q" THEN {} ELSE @,
@@ -341,7 +352,22 @@ HeldFallbackRecorded == Scenario \in {"held", "held-repair"} /\ r.stage \in {"ap
 RetirementKeepsOldBase == Scenario \in {"handover", "noop"} /\ r.saveKind = "retirement" => r.obligation = M0
 AcknowledgedAuthoringBase == Scenario = "ack" /\ r.stage = "done" =>
   /\ r.ackBase = IF r.ackKind \in {"missing", "contained"} THEN M0 ELSE "P"
-  /\ (r.ackKind \in {"stale", "stale-remote-q"} => r.retirementBase = M0)
+  /\ (r.ackKind \in AckStaleKinds \ {"stale-match"} => r.retirementBase = M0)
+  /\ (r.ackKind = "stale-match" => r.retirementBase = "P")
+\* Continued same-line edit on cohort path p after the acknowledgement. Values:
+\* M0[p]="old", P[p]="typed"; C[p]="server" when C differs from P. Under older
+\* evidence the device bytes may be a late save derived from M0, not from P.
+AckContinuation ==
+  LET base == IF r.retirementBase = "P" THEN "typed" ELSE "old"
+      main == IF r.ackKind = "stale" THEN "server" ELSE "typed"
+      device == IF r.ackKind = "stale-older" THEN "late" ELSE "continued"
+      conflict == main # base /\ device # base /\ main # device
+  IN [conflict |-> conflict,
+      result |-> IF conflict THEN main ELSE IF main = base THEN device ELSE main]
+AckOwnContinuationNoFalseConflict == Scenario = "ack" /\ r.stage = "done" /\ r.ackKind = "stale-match" =>
+  ~AckContinuation.conflict /\ AckContinuation.result = "continued"
+AckOlderEvidenceNotLost == Scenario = "ack" /\ r.stage = "done" /\ r.ackKind = "stale-older" =>
+  AckContinuation.conflict /\ AckContinuation.result = "typed"
 KnownFreshRevertNotLost == Scenario = "ack" /\ r.stage = "done" /\ r.freshHeld =>
   r.pendingConflict \/ r.mainQ = {}
 NoopReleasesPin == Scenario = "noop" /\ r.obligation = None =>
@@ -349,6 +375,7 @@ NoopReleasesPin == Scenario = "noop" /\ r.obligation = None =>
 NoRetirementSave == ~(Scenario = "handover" /\ r.stage = "done")
 NoNoopSettlement == ~(Scenario = "noop" /\ r.stage = "applied")
 NoAcknowledgedProposal == ~(Scenario = "ack" /\ r.stage = "done")
+NoMatchingCohortAdvance == ~(Scenario = "ack" /\ r.stage = "done" /\ r.ackKind = "stale-match" /\ r.retirementBase = "P")
 Next == PreMutationSave \/ GateQueuedSave \/ PostApplyFlush \/ ApplyMutation
   \/ HorizonElapsed \/ DrainAdapterQueue \/ EndHorizon \/ KnownFreshRevert
   \/ UntouchedFreshEdit \/ StickySecondEdit

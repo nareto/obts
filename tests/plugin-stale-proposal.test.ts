@@ -775,6 +775,14 @@ describe('accepted ordinary rename base boundaries', () => {
     expect((await f.provenance()).rename_pairs[0].base).toBe(f.m0);
   });
 
+  it('advances the pair base for a stale proposal whose target carries its endpoints', async () => {
+    const f = await pendingRename();
+    expect((await f.core.uploadQueuedCommit(await f.plugin.readQueue())).status).toBe('merged');
+    await f.core.mutateStaleProvenance(async (saved: any) => { saved.accepted_proposal.base = f.m0; });
+    await f.core.preApplyAuthoringBase(await f.plugin.readState(), f.p);
+    expect((await f.provenance()).rename_pairs[0].base).toBe(f.p);
+  });
+
   it('advances an independent second pair when the first pair has an older obligation', async () => {
     const f = await pendingRename();
     await f.core.adapter.rename('untouched.md', 'second.md');
@@ -790,7 +798,7 @@ describe('accepted ordinary rename base boundaries', () => {
     expect(saved.obligations['note.md'].base).toBe(f.m0);
   });
 
-  it.each(['missing identity', 'different head', 'already canonical', 'different target', 'stale proposal', 'occupied destination'] as const)('retains the original rename base for %s', async (kind) => {
+  it.each(['missing identity', 'different head', 'already canonical', 'different endpoint', 'occupied destination'] as const)('retains the original rename base for %s', async (kind) => {
     const f = await pendingRename();
     expect((await f.core.uploadQueuedCommit(await f.plugin.readQueue())).status).toBe('merged');
     let state = await f.plugin.readState();
@@ -798,12 +806,13 @@ describe('accepted ordinary rename base boundaries', () => {
     if (kind === 'missing identity') await f.core.mutateStaleProvenance(async (saved: any) => { saved.accepted_proposal = null; });
     if (kind === 'different head') state = { ...state, local_head: f.m0 };
     if (kind === 'already canonical') state = { ...state, local_main: f.p };
-    if (kind === 'different target') {
-      target = await f.remote(f.proposalText, { 'untouched.md': 'remote\n' });
+    if (kind === 'different endpoint') {
+      // A target that differs at the pair's own source cannot rebase the pair,
+      // however unrelated its other changes are.
+      target = await f.remote('remote replacement of the rename source\n', { 'untouched.md': 'remote\n' });
       const pulled = await f.core.pull(state.vault_id, state.device_id, await f.core.readDeviceToken(), f.m0, 'latest', 0);
       await f.core.importPack(pulled.packfile);
     }
-    if (kind === 'stale proposal') await f.core.mutateStaleProvenance(async (saved: any) => { saved.accepted_proposal.base = f.m0; });
     if (kind === 'occupied destination') {
       // Exercise the occupied-tree guard without changing an immutable commit.
       const entry = f.core.readTreePathEntry.bind(f.core);
@@ -1859,6 +1868,96 @@ describe('queued proposal-derived rebuild work', () => {
     expect(await readFile(join(f.dir, 'note.md'), 'utf8')).toBe(latest);
   });
 });
+
+describe('continued authoring after an acknowledged proposal', () => {
+  // The acknowledged target settled the device's own bytes there, so a
+  // continuation derives from P, not from P's older recorded proposal base.
+  it('advances a cohort path the target carries exactly as P', async () => {
+    const f = await fixture();
+    await f.core.adapter.write('note.md', LOCAL);
+    await f.core.mutateStaleProvenance(async (saved: any) => {
+      saved.obligations['note.md'] = { base: f.m0, generation: 0, signature: 'uncaptured' };
+    });
+    expect(await f.core.queueStaleCohort(f.m0, f.m0)).toBe(true);
+    const p = (await f.plugin.readQueue()).pending_commit!;
+    expect((await f.core.uploadQueuedCommit(await f.plugin.readQueue())).status).toBe('merged');
+    const target = await f.server.git.getRef(f.vaultId, 'refs/heads/main');
+    await f.core.mutateStaleProvenance(async (saved: any) => {
+      saved.accepted_proposal = { commit: p, base: f.m0 };
+      saved.obligations['note.md'] = { base: f.m0, generation: 0, signature: 'uncaptured' };
+    });
+    await f.core.preApplyAuthoringBase(await f.plugin.readState(), target);
+    const saved = await f.core.readStaleProvenance();
+    expect(saved.obligations['note.md'].base).toBe(p);
+    expect(await f.core.resolveRef(`refs/obts/stale-bases/${p}`)).toBe(p);
+  });
+
+  it('keeps the recorded base when older independent evidence overlaps a cohort path', async () => {
+    const f = await fixture();
+    await f.core.adapter.write('later.md', 'later authoring commit\n');
+    const p = await f.core.createLocalCommit('later authoring commit');
+    expect(p).not.toBeNull();
+    const older = (saved: any) => f.core.staleCohortPathHasOlderEvidence(saved, 'dir/note.md', p, f.m0);
+    const saved = (overrides: any) => ({ obligations: {}, horizons: [], held_proposals: [], rename_pairs: [], intent: null, ...overrides });
+    expect(await older(saved({}))).toBe(false);
+    // P's own obligation or horizon at its recorded base is the cohort path itself.
+    expect(await older(saved({ obligations: { 'dir/note.md': { base: f.m0 } } }))).toBe(false);
+    expect(await older(saved({ horizons: [{ touched: ['dir/note.md'], base: f.m0 }] }))).toBe(false);
+    // An overlapping path, a pending pair, a held fallback, or another commit's
+    // frozen capture each own older authoring history for the same path.
+    expect(await older(saved({ obligations: { dir: { base: f.m0 } } }))).toBe(true);
+    expect(await older(saved({ horizons: [{ touched: ['dir'], base: f.m0 }] }))).toBe(true);
+    expect(await older(saved({ rename_pairs: [{ source_path: 'dir/note.md', destination_path: 'dir/other.md' }] }))).toBe(true);
+    expect(await older(saved({ held_proposals: [{ commit: f.m0, fallbacks: { 'dir/note.md': f.m0 } }] }))).toBe(true);
+    expect(await older(saved({ intent: { commit: f.m0, captures: { 'dir/note.md': 1 }, rename_pairs: [] } }))).toBe(true);
+    expect(await older(saved({ intent: { commit: f.m0, captures: {}, rename_pairs: [{ source_path: 'dir/note.md', destination_path: 'dir/other.md' }] } }))).toBe(true);
+  });
+
+  // A rename recorded while P uploads names the pre-P main. It may rebase onto P
+  // only while both P and the acknowledged target still carry its endpoints.
+  it.each([true, false])('rebases a rename recorded during a stale upload onto P; endpoints-carried=%s', async (carried) => {
+    const f = await fixture();
+    const c = await f.remote(REMOTE, carried ? {} : { 'untouched.md': 'remote replacement\n' });
+    await f.core.pullAndApply(true);
+    await f.core.adapter.write('note.md', LOCAL);
+    await f.core.queueStaleCohort(c, f.m0);
+    const q = await f.plugin.readQueue();
+    const p = q.pending_commit!;
+    const pair = async () => {
+      const saved: any = await f.core.readStaleProvenance();
+      return [...saved.rename_pairs, ...(saved.intent?.rename_pairs || [])]
+        .find((candidate: any) => candidate.source_path === 'untouched.md');
+    };
+    const real = (f.server.sync as any).mergeDeviceCommit.bind(f.server.sync);
+    let renamed = false;
+    vi.spyOn(f.server.sync as any, 'mergeDeviceCommit').mockImplementation(async (...args: any[]) => {
+      if (!renamed) {
+        renamed = true;
+        await f.core.adapter.rename('untouched.md', 'other.md');
+        await f.core.recordLocalRenameHint('untouched.md', 'other.md');
+      }
+      return real(...args);
+    });
+    expect((await f.core.uploadQueuedCommit(q)).status).toBe('merged');
+    const recorded = (await pair()).base;
+    await f.core.pullAndApply(true);
+    expect((await pair()).base).toBe(carried ? p : recorded);
+    if (carried) {
+      expect(recorded).toBe(c);
+      for (let attempt = 0; attempt < 4 && !(await f.plugin.readState()).last_error_code; attempt += 1) {
+        if ((await f.plugin.syncOnce()).status === 'Synced') break;
+      }
+      expect((await f.server.store.snapshot()).conflicts).toEqual([]);
+      expect(await readFile(join(f.dir, 'other.md'), 'utf8')).toBe('unchanged\n');
+      await expect(readFile(join(f.dir, 'untouched.md'))).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(await f.canonical('other.md')).toBe('unchanged\n');
+    } else {
+      // The target's endpoint differs from P, so the rename keeps its own base.
+      expect(await f.canonical('untouched.md')).toBe('remote replacement\n');
+    }
+  });
+});
+
 async function ordinaryHeldFixture() {
   const f = await fixture();
   await expire(f.core);

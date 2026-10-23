@@ -25,9 +25,9 @@ try {
   if (sanyAuthoring.status !== 0) throw new Error(`SANY authoring companion failed:\n${sanyAuthoring.output}`);
   const sanyFallback = run('sany', ['OBTSRenameFallback.tla']);
   if (sanyFallback.status !== 0) throw new Error(`SANY fallback companion failed:\n${sanyFallback.output}`);
-  const registration = /- id: OBTS-FM-014\n\s+status: focused bounded model\n\s+path: architecture\/models\/formal\/OBTSAtomicRename\.tla\n\s+architecture_revision: 46\n\s+checks: architecture\/models\/formal\/configs\/fm014-atomic-rename\.cfg\n\s+companion_path: architecture\/models\/formal\/OBTSRenameAuthoring\.tla\n\s+companion_architecture_revision: 52\n\s+fallback_companion_path: architecture\/models\/formal\/OBTSRenameFallback\.tla\n\s+fallback_companion_architecture_revision: 56\n\s+refines:\n\s+- OBTS-SYNC-RENAME-001\n\s+- OBTS-PER-RENAME-001/u;
-  if (!registration.test(architecture) || !Number.isInteger(revision) || revision < 56) {
-    throw new Error('architecture/manifest.yaml must register FM014 and its authoring and fallback companions against both rename contracts at revision 56 or later.');
+  const registration = /- id: OBTS-FM-014\n\s+status: focused bounded model\n\s+path: architecture\/models\/formal\/OBTSAtomicRename\.tla\n\s+architecture_revision: 46\n\s+checks: architecture\/models\/formal\/configs\/fm014-atomic-rename\.cfg\n\s+companion_path: architecture\/models\/formal\/OBTSRenameAuthoring\.tla\n\s+companion_architecture_revision: 62\n\s+fallback_companion_path: architecture\/models\/formal\/OBTSRenameFallback\.tla\n\s+fallback_companion_architecture_revision: 56\n\s+refines:\n\s+- OBTS-SYNC-RENAME-001\n\s+- OBTS-PER-RENAME-001/u;
+  if (!registration.test(architecture) || !Number.isInteger(revision) || revision < 62) {
+    throw new Error('architecture/manifest.yaml must register FM014 and its authoring and fallback companions against both rename contracts at revision 62 or later.');
   }
   const checks = [
     { id: 'rename-safety', mutation: 'none', property: 'AllSafety', minDistinct: 100, minDepth: 12 },
@@ -79,12 +79,13 @@ try {
     { id: 'rename-authoring-own-only-merge', mutation: 'reach-own-only-merge', property: 'WitnessNotReached', expectation: 'reach', actions: ['IntegrateProposal'], minDepth: 5 },
     { id: 'rename-authoring-remote-disjoint-merge', mutation: 'reach-remote-disjoint-merge', property: 'WitnessNotReached', expectation: 'reach', actions: ['RemoteAdvanceDisjoint', 'IntegrateProposal'], minDepth: 6 },
     { id: 'rename-authoring-remote-overlap-conflict', mutation: 'reach-remote-overlap-conflict', property: 'WitnessNotReached', expectation: 'reach', actions: ['RemoteAdvanceOverlap', 'IntegrateProposal'], minDepth: 6 },
+    { id: 'rename-authoring-stale-merged-rebase', mutation: 'reach-stale-merged-rebase', property: 'WitnessNotReached', expectation: 'reach', actions: ['AcceptProposal', 'PinNewBase', 'PersistNewBase', 'IntegrateProposal'], minDepth: 5 },
     { id: 'rename-authoring-unrelated-evidence-merge', mutation: 'reach-unrelated-evidence-retained', property: 'WitnessNotReached', expectation: 'reach', actions: ['PinNewBase', 'PersistNewBase', 'IntegrateProposal'], minDepth: 5 }
   ];
   const guards = [
     ['case-live-identity', 'InvalidateSelectedGuard'], ['case-local-head', 'InvalidateSelectedGuard'],
     ['case-not-ancestor', 'InvalidateSelectedGuard'], ['case-already-canonical', 'InvalidateSelectedGuard'],
-    ['case-target-not-P', 'InvalidateSelectedGuard'], ['case-nonnull-base', 'InvalidateSelectedGuard'],
+    ['case-target-endpoint-differs', 'InvalidateSelectedGuard'],
     ['case-intent-mismatch', 'InvalidateSelectedGuard'], ['case-source-missing', 'InvalidateSelectedGuard'],
     ['case-source-nonfile', 'InvalidateSelectedGuard'], ['case-destination-occupied', 'InvalidateSelectedGuard'],
     ['case-hierarchy-invalid', 'InvalidateSelectedGuard']
@@ -112,6 +113,7 @@ try {
     { id: 'rename-authoring-reach-frozen-capture', mutation: 'case-frozen-capture', property: 'WitnessNotReached', expectation: 'reach', actions: ['FreezePair'], minDepth: 2 },
     { id: 'rename-authoring-safe-frozen-capture', mutation: 'case-frozen-capture', property: 'AllSafety', expectation: 'pass', minDepth: 3 },
     { id: 'rename-authoring-mutant-live-identity', mutation: 'mutant-omit-live-identity', property: 'NoUnauthorizedBaseAdvance', expectation: 'reject', actions: ['InvalidateSelectedGuard', 'PinNewBase', 'PersistNewBase'], minDepth: 4 },
+    { id: 'rename-authoring-mutant-endpoint-equality', mutation: 'mutant-omit-endpoint-equality', property: 'NoUnauthorizedBaseAdvance', expectation: 'reject', actions: ['InvalidateSelectedGuard', 'PinNewBase', 'PersistNewBase'], minDepth: 4 },
     { id: 'rename-authoring-mutant-endpoint-evidence', mutation: 'mutant-omit-endpoint-evidence', property: 'NoUnauthorizedBaseAdvance', expectation: 'reject', actions: ['AddEndpointEvidence', 'PinNewBase', 'PersistNewBase'], minDepth: 4 },
     { id: 'rename-authoring-mutant-drop-unrelated-base', mutation: 'mutant-drop-unrelated-evidence', property: 'UnrelatedEvidenceBaseRetained', expectation: 'reject', actions: ['PinNewBase', 'PersistNewBase'], minDepth: 4 },
     { id: 'rename-authoring-mutant-frozen-rebind', mutation: 'mutant-rebind-frozen', property: 'FrozenAttemptNeverRebound', expectation: 'reject', actions: ['FreezePair', 'RebindFrozenMutant'], minDepth: 3 },
