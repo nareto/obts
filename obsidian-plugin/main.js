@@ -23183,7 +23183,7 @@ var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var { findUnportablePaths, isRestrictedNamePlatform, segmentHasReservedCharacters } = require_namePortability();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.7.4";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.7.5";
 var SYNC_DEBOUNCE_MS = 1500;
 var EMPTY_JSON_BODY = "{}";
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
@@ -23216,6 +23216,7 @@ var MOBILE_PACK_READ_ATTEMPTS = 5;
 var MOBILE_PACK_READ_RETRY_MS = 100;
 var SETUP_SNAPSHOT_ATTEMPTS = 4;
 var SETUP_SNAPSHOT_RETRY_MS = 250;
+var APPLY_TAIL_SCAN_ATTEMPTS = 3;
 var RETIRED_OPERATION_GRACE_MS = 1500;
 var REF_LOCK_STALE_MS = 30 * 1e3;
 var PLUGIN_UPDATE_URL = "obsidian://brat?plugin=nareto%2Fobts";
@@ -24723,42 +24724,10 @@ var ObtsObsidianClient = class {
         await this.writeState(state);
       }
       if (journal && journal.phase === "committed") {
-        let preservedLocalChangePaths = [];
-        let preservedLocalSnapshot = null;
-        let pendingDirectoryIntents = [];
-        if (journal.preserve_local_changes || journal.expected_prior_local_main) {
-          this.plugin.setInitializationStage("Validating recovered local changes", "recovery_file_validation");
-          const targetEntries = await this.listTreeBlobOids(journal.target_main);
-          const preserved = await this.localChangedPathsFromTree(targetEntries, true, { targetRootIgnoreOid: journal.target_root_ignore_oid });
-          preservedLocalChangePaths = preserved.paths;
-          preservedLocalSnapshot = preserved.snapshot;
-          pendingDirectoryIntents = (await this.readDirectoryState()).pending_intents;
-          if (preservedLocalChangePaths.length > 0) {
-            this.plugin.setInitializationStage("Writing recovered local change bundle", "recovery_bundle");
-            await this.createRecoveryBundle("rebuild_from_server", journal.target_main, preservedLocalChangePaths);
-          }
-        }
-        this.plugin.setInitializationStage("Restoring recovered refs", "recovery_refs");
-        await this.updateRef("refs/heads/main", journal.target_main, null, true);
-        await this.updateRef("refs/heads/local", journal.target_main, null, true);
-        this.plugin.setInitializationStage("Persisting recovered sync state", "recovery_state");
-        await this.writeState(Object.assign({}, state, {
-          local_main: journal.target_main,
-          local_head: journal.target_main,
-          status_label: "Synced",
-          last_error_code: null,
-          last_event_seq: Math.max(state.last_event_seq || 0, journal.event_seq || 0),
-          last_applied_event_seq: Math.max(state.last_applied_event_seq || 0, journal.event_seq || 0),
-          updated_at: nowIso()
-        }));
-        if (!journal.preserve_local_changes) await this.refreshDirectoryStateFromDisk();
-        if (preservedLocalChangePaths.length > 0) {
-          await this.queuePreservedLocalChanges(journal.target_main, state.server_device_ref, preservedLocalSnapshot);
-        } else if (pendingDirectoryIntents.length > 0) {
-          await this.queuePreservedDirectoryChanges(journal.target_main, state.server_device_ref);
-        }
-        await this.writePendingAppliedAcknowledgement(journal.target_main, journal.event_seq || 0);
-        await this.clearApplyState();
+        await this.finishCommittedApply(journal, state, {
+          initialization: true,
+          shouldScan: Boolean(journal.preserve_local_changes || journal.expected_prior_local_main)
+        });
         return;
       }
       if (journal && await this.recoverBlockedApplyWithPreservedLocalChanges(journal, state)) {
@@ -28302,26 +28271,25 @@ var ObtsObsidianClient = class {
       await this.writeState(Object.assign({}, state, {
         local_main: targetMain,
         local_head: targetMain,
-        status_label: preservedLocalChangePaths.length > 0 ? "Ahead" : localScanPending ? "Checking" : "Synced",
+        // The apply journal owns the tail until the pending acknowledgement is
+        // durable. Publishing Synced here would report completion for work that
+        // a suspension can still interrupt.
+        status_label: "Checking",
         last_error_code: null,
         last_event_seq: Math.max(state.last_event_seq || 0, eventSeq || 0),
         last_applied_event_seq: Math.max(state.last_applied_event_seq || 0, eventSeq || 0),
         updated_at: nowIso()
       }));
-      if (!requireCleanVisibleState) await this.refreshDirectoryStateFromDisk();
-      if (preservedLocalChangePaths.length > 0) {
-        try {
-          await this.queuePreservedLocalChanges(targetMain, state.server_device_ref, preservedLocalSnapshot);
-        } catch (error) {
-          if (!(error instanceof LocalSnapshotChangedError) && !(error instanceof ObtsBlockedError && error.code === "local_snapshot_changed")) throw error;
-          await this.recordDeferredApplyPaths(journal, [error.filePath || ".gitignore"]);
-          await this.markLocalApplyScanPending(journal, targetEntries, [error.filePath || ".gitignore"]);
-        }
-      } else if (preservedDirectoryIntents.length > 0) {
-        await this.queuePreservedDirectoryChanges(targetMain, state.server_device_ref);
-      }
-      await this.writePendingAppliedAcknowledgement(targetMain, eventSeq || 0);
-      await this.clearApplyState();
+      await this.finishCommittedApply(journal, state, {
+        eventSeq,
+        targetEntries,
+        preservedPaths: preservedLocalChangePaths,
+        preservedSnapshot: preservedLocalSnapshot,
+        preservedDirectoryIntents,
+        scanDeferred: localScanPending,
+        deferralRecorded: true,
+        bundleWritten: preservedLocalChangePaths.length > 0
+      });
       if (scopedClean) await this.advanceScanStateHead(state.local_head, targetMain, journal.affected_paths);
       return true;
     } finally {
@@ -28331,6 +28299,126 @@ var ObtsObsidianClient = class {
       } catch {
       }
     }
+  }
+  /**
+   * OBTS-SYNC-TAIL-001: a committed apply journal owns one bounded tail
+   * (preserved local changes, recovery evidence, coordinated queue, applied
+   * acknowledgement, cleanup). Every step is idempotent and leaves its own
+   * durable product, so a suspended or restarted device resumes the tail
+   * instead of repeating it from the start.
+   *
+   * The tail under a mutable vault must also terminate: Obsidian rewrites its
+   * own settings files at any time, so an unstable scan retries a few complete
+   * snapshots and then defers the churning path to the ordinary
+   * captured-inventory path. It never loops on the same scan on every launch.
+   */
+  async finishCommittedApply(journal, state, options = {}) {
+    const targetMain = journal.target_main;
+    const eventSeq = Number.isSafeInteger(options.eventSeq) ? options.eventSeq : journal.event_seq || 0;
+    const initialization = Boolean(options.initialization);
+    const report = (label, point) => {
+      if (initialization) this.plugin.setInitializationStage(label, point);
+      else this.reportOperationProgress(label, point);
+    };
+    const readTargetEntries = async () => options.targetEntries || await this.listTreeBlobOids(targetMain);
+    const pendingAck = await this.readPendingAppliedAcknowledgement();
+    if (pendingAck && pendingAck.target_main === targetMain) {
+      report("Finishing recovered apply", "recovery_state");
+      await this.clearApplyState();
+      return;
+    }
+    const step = typeof journal.last_completed_step === "string" ? journal.last_completed_step : null;
+    const tailQueued = step === "preserved_queued" || step === "preserved_deferred";
+    const skipCapture = tailQueued;
+    let preservedPaths = Array.isArray(options.preservedPaths) ? options.preservedPaths : null;
+    let preservedSnapshot = options.preservedSnapshot || null;
+    let scanDeferred = Boolean(options.scanDeferred) || step === "preserved_deferred";
+    let deferralRecorded = Boolean(options.deferralRecorded);
+    let changedPath = null;
+    let queueFailed = false;
+    if (!skipCapture && preservedPaths === null && options.shouldScan !== false) {
+      const captured = await this.captureTailPreservedChanges(journal, await readTargetEntries(), initialization);
+      changedPath = captured.changedPath;
+      if (captured.stable) {
+        preservedPaths = captured.paths;
+        preservedSnapshot = captured.snapshot;
+      } else {
+        preservedPaths = [];
+        scanDeferred = true;
+      }
+    }
+    if (preservedPaths === null) preservedPaths = [];
+    if (!skipCapture) {
+      if (preservedPaths.length > 0 && !options.bundleWritten) {
+        report("Writing recovered local change bundle", "recovery_bundle");
+        await this.createRecoveryBundle("rebuild_from_server", targetMain, preservedPaths);
+      }
+      report("Restoring recovered refs", "recovery_refs");
+      await this.updateRef("refs/heads/main", targetMain, null, true);
+      await this.updateRef("refs/heads/local", targetMain, null, true);
+      const refState = await this.readState();
+      await this.writeState(Object.assign({}, refState, {
+        local_main: targetMain,
+        local_head: targetMain,
+        last_event_seq: Math.max(refState.last_event_seq || 0, eventSeq),
+        last_applied_event_seq: Math.max(refState.last_applied_event_seq || 0, eventSeq),
+        updated_at: nowIso()
+      }));
+      if (!journal.preserve_local_changes) {
+        report("Refreshing local directory state", "recovery_directory_decision");
+        await this.refreshDirectoryStateFromDisk();
+      }
+      try {
+        if (preservedPaths.length > 0) {
+          await this.queuePreservedLocalChanges(targetMain, state.server_device_ref, preservedSnapshot);
+        } else if (Array.isArray(options.preservedDirectoryIntents) && options.preservedDirectoryIntents.length > 0) {
+          await this.queuePreservedDirectoryChanges(targetMain, state.server_device_ref);
+        }
+      } catch (error) {
+        if (!(error instanceof LocalSnapshotChangedError) && !(error instanceof ObtsBlockedError && error.code === "local_snapshot_changed")) throw error;
+        changedPath = error.filePath || changedPath || ".gitignore";
+        scanDeferred = true;
+        queueFailed = true;
+      }
+      if (changedPath !== null && !deferralRecorded) {
+        await this.markLocalApplyScanPending(journal, await readTargetEntries(), [changedPath], initialization);
+        deferralRecorded = true;
+      }
+      journal.last_completed_step = !queueFailed && (!scanDeferred || preservedPaths.length > 0) ? "preserved_queued" : "preserved_deferred";
+      await writeJson(this.fsp, this.applyJournalPath, journal);
+    }
+    const current = await this.readState();
+    const queueAfter = await this.readQueue();
+    const finalLabel = queueAfter.status === "queued_local" && typeof queueAfter.pending_commit === "string" ? "Ahead" : scanDeferred ? "Checking" : current.local_main === targetMain && current.local_head === targetMain ? "Synced" : current.status_label;
+    if (current.status_label !== finalLabel || current.last_error_code) {
+      await this.writeState(Object.assign({}, current, {
+        status_label: finalLabel,
+        last_error_code: null,
+        updated_at: nowIso()
+      }));
+    }
+    report("Recording applied acknowledgement", "recovery_state");
+    await this.writePendingAppliedAcknowledgement(targetMain, eventSeq);
+    await this.clearApplyState();
+  }
+  async captureTailPreservedChanges(journal, targetEntries, initialization = false) {
+    let changedPath = null;
+    for (let attempt = 0; attempt < APPLY_TAIL_SCAN_ATTEMPTS; attempt += 1) {
+      try {
+        const captured = await this.localChangedPathsFromTree(targetEntries, true, {
+          targetRootIgnoreOid: journal.target_root_ignore_oid,
+          reportOperationProgress: true,
+          onListing: this.createInventoryProgress(initialization)
+        });
+        return { stable: true, paths: captured.paths, snapshot: captured.snapshot, changedPath: null };
+      } catch (error) {
+        if (!(error instanceof LocalSnapshotChangedError)) throw error;
+        changedPath = error.filePath || changedPath;
+        this.plugin.finishMeasuredPhase?.("abandoned");
+        await new Promise((resolve) => setTimeout(resolve, SETUP_SNAPSHOT_RETRY_MS * (attempt + 1)));
+      }
+    }
+    return { stable: false, paths: [], snapshot: null, changedPath };
   }
   async recoverBlockedApplyWithPreservedLocalChanges(journal, state) {
     if (journal.phase !== "blocked_recovery") return false;
@@ -36249,18 +36337,40 @@ function diagnosticIoCode(error) {
   }
   return "unknown";
 }
+var CONTROL_REQUEST_DEADLINE_MS = 2 * 60 * 1e3;
+var TRANSFER_REQUEST_DEADLINE_MS = 30 * 60 * 1e3;
+var TRANSFER_REQUEST_PATH = /\/(?:sync\/(?:pull-chunk|push-transfers)|onboarding\/(?:bootstrap|upload))/u;
+function requestDeadlineMs(url) {
+  try {
+    return TRANSFER_REQUEST_PATH.test(new URL(url).pathname) ? TRANSFER_REQUEST_DEADLINE_MS : CONTROL_REQUEST_DEADLINE_MS;
+  } catch {
+    return CONTROL_REQUEST_DEADLINE_MS;
+  }
+}
 async function fetchWithTimeout(url, options = {}) {
   let response;
+  let deadline = null;
   try {
-    response = await requestUrl({
-      url,
-      method: options.method || "GET",
-      headers: options.headers || {},
-      ...options.body === void 0 ? {} : { body: normalizeRequestBody(options.body) },
-      throw: false
-    });
+    const deadlineMs = Number.isFinite(options.deadlineMs) && options.deadlineMs > 0 ? options.deadlineMs : requestDeadlineMs(url);
+    response = await Promise.race([
+      requestUrl({
+        url,
+        method: options.method || "GET",
+        headers: options.headers || {},
+        ...options.body === void 0 ? {} : { body: normalizeRequestBody(options.body) },
+        throw: false
+      }),
+      new Promise((_resolve, reject) => {
+        deadline = setTimeout(() => {
+          reject(new ObtsTransportError(0, "request_timeout", "The obts server did not answer in time."));
+        }, deadlineMs);
+      })
+    ]);
   } catch (error) {
+    if (error instanceof ObtsTransportError) throw error;
     throw new ObtsTransportError(0, "network_error", "Unable to reach the obts server.", void 0, error);
+  } finally {
+    if (deadline !== null) clearTimeout(deadline);
   }
   const headers = Object.fromEntries(Object.entries(response.headers || {}).map(([key, value]) => [key.toLowerCase(), value]));
   return {
