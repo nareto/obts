@@ -5673,19 +5673,25 @@ class ObtsObsidianClient {
         await this.createRecoveryBundle("rebuild_from_server", targetMain, preservedPaths);
       }
       // A journal can be committed before its refs move (the ref-only path
-      // publishes the phase first), so re-assert them idempotently before the
-      // preserved work is queued from the applied base.
-      report("Restoring recovered refs", "recovery_refs");
-      await this.updateRef("refs/heads/main", targetMain, null, true);
-      await this.updateRef("refs/heads/local", targetMain, null, true);
-      const refState = await this.readState();
-      await this.writeState(Object.assign({}, refState, {
-        local_main: targetMain,
-        local_head: targetMain,
-        last_event_seq: Math.max(refState.last_event_seq || 0, eventSeq),
-        last_applied_event_seq: Math.max(refState.last_applied_event_seq || 0, eventSeq),
-        updated_at: nowIso()
-      }));
+      // publishes the phase first), so recovery re-asserts them before the
+      // preserved work is queued from the applied base. The ordinary apply has
+      // already moved both refs and written this state.
+      if (initialization) {
+        report("Restoring recovered refs", "recovery_refs");
+        if (await this.resolveRef("refs/heads/main") !== targetMain) await this.updateRef("refs/heads/main", targetMain, null, true);
+        if (await this.resolveRef("refs/heads/local") !== targetMain) await this.updateRef("refs/heads/local", targetMain, null, true);
+        const refState = await this.readState();
+        if (refState.local_main !== targetMain || refState.local_head !== targetMain ||
+            (refState.last_event_seq || 0) < eventSeq || (refState.last_applied_event_seq || 0) < eventSeq) {
+          await this.writeState(Object.assign({}, refState, {
+            local_main: targetMain,
+            local_head: targetMain,
+            last_event_seq: Math.max(refState.last_event_seq || 0, eventSeq),
+            last_applied_event_seq: Math.max(refState.last_applied_event_seq || 0, eventSeq),
+            updated_at: nowIso()
+          }));
+        }
+      }
       if (!journal.preserve_local_changes) {
         report("Refreshing local directory state", "recovery_directory_decision");
         await this.refreshDirectoryStateFromDisk();

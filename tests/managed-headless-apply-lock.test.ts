@@ -106,14 +106,17 @@ describe('managed apply lock ownership', () => {
     core.clearApplyState = async () => { throw new Error('injected post-commit failure'); };
     await expect(core.applyTargetMain(target, ['target.md'], true)).rejects.toThrow('injected post-commit failure');
     expect(JSON.parse(await readFile(join(root, '.obts', 'apply-journal.json'), 'utf8'))).toMatchObject({ phase: 'committed' });
+    // The acknowledgement is the tail's last durable step, so drop it to leave
+    // the retry with real work to fault on.
+    await rm(join(root, '.obts', 'pending-applied-ack.json'), { force: true });
 
     const restarted = new ObtsPluginClient(root, { serverUrl: 'http://127.0.0.1:1', deviceName: 'apply-owner-retry' });
     const restartedCore = restarted.client as any;
-    const originalUpdateRef = restartedCore.updateRef.bind(restartedCore);
-    restartedCore.updateRef = async () => { throw new Error('injected startup recovery ref failure'); };
-    await expect(restarted.initialize()).rejects.toThrow('injected startup recovery ref failure');
+    const originalWriteAcknowledgement = restartedCore.writePendingAppliedAcknowledgement.bind(restartedCore);
+    restartedCore.writePendingAppliedAcknowledgement = async () => { throw new Error('injected startup recovery acknowledgement failure'); };
+    await expect(restarted.initialize()).rejects.toThrow('injected startup recovery acknowledgement failure');
     await expect(readFile(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
-    restartedCore.updateRef = originalUpdateRef;
+    restartedCore.writePendingAppliedAcknowledgement = originalWriteAcknowledgement;
     await restarted.initialize();
     await expect(readFile(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
   });

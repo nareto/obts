@@ -23183,7 +23183,7 @@ var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var { findUnportablePaths, isRestrictedNamePlatform, segmentHasReservedCharacters } = require_namePortability();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.7.5";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.7.6";
 var SYNC_DEBOUNCE_MS = 1500;
 var EMPTY_JSON_BODY = "{}";
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
@@ -28353,17 +28353,21 @@ var ObtsObsidianClient = class {
         report("Writing recovered local change bundle", "recovery_bundle");
         await this.createRecoveryBundle("rebuild_from_server", targetMain, preservedPaths);
       }
-      report("Restoring recovered refs", "recovery_refs");
-      await this.updateRef("refs/heads/main", targetMain, null, true);
-      await this.updateRef("refs/heads/local", targetMain, null, true);
-      const refState = await this.readState();
-      await this.writeState(Object.assign({}, refState, {
-        local_main: targetMain,
-        local_head: targetMain,
-        last_event_seq: Math.max(refState.last_event_seq || 0, eventSeq),
-        last_applied_event_seq: Math.max(refState.last_applied_event_seq || 0, eventSeq),
-        updated_at: nowIso()
-      }));
+      if (initialization) {
+        report("Restoring recovered refs", "recovery_refs");
+        if (await this.resolveRef("refs/heads/main") !== targetMain) await this.updateRef("refs/heads/main", targetMain, null, true);
+        if (await this.resolveRef("refs/heads/local") !== targetMain) await this.updateRef("refs/heads/local", targetMain, null, true);
+        const refState = await this.readState();
+        if (refState.local_main !== targetMain || refState.local_head !== targetMain || (refState.last_event_seq || 0) < eventSeq || (refState.last_applied_event_seq || 0) < eventSeq) {
+          await this.writeState(Object.assign({}, refState, {
+            local_main: targetMain,
+            local_head: targetMain,
+            last_event_seq: Math.max(refState.last_event_seq || 0, eventSeq),
+            last_applied_event_seq: Math.max(refState.last_applied_event_seq || 0, eventSeq),
+            updated_at: nowIso()
+          }));
+        }
+      }
       if (!journal.preserve_local_changes) {
         report("Refreshing local directory state", "recovery_directory_decision");
         await this.refreshDirectoryStateFromDisk();
