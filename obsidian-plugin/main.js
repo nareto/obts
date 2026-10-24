@@ -23183,7 +23183,7 @@ var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var { findUnportablePaths, isRestrictedNamePlatform, segmentHasReservedCharacters } = require_namePortability();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.7.6";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.7.7";
 var SYNC_DEBOUNCE_MS = 1500;
 var EMPTY_JSON_BODY = "{}";
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
@@ -29173,13 +29173,11 @@ var ObtsObsidianClient = class {
   async queueStaleCohort(targetMain, expectedDeviceRef, snapshot = null) {
     if (!targetMain || await this.readDurableCatchup()) return false;
     const queue = await this.readQueue();
-    if (queue.pending_commit) {
+    if (queue.pending_commit && !await this.isAncestor(queue.pending_commit, targetMain)) {
       if (!queue.pending_proposal_base) return false;
-      if (!await this.isAncestor(queue.pending_commit, targetMain)) {
-        await this.updateRef("refs/heads/local", queue.pending_commit, null, true);
-        await this.writeState(Object.assign({}, await this.readState(), { local_head: queue.pending_commit, updated_at: nowIso() }));
-        return true;
-      }
+      await this.updateRef("refs/heads/local", queue.pending_commit, null, true);
+      await this.writeState(Object.assign({}, await this.readState(), { local_head: queue.pending_commit, updated_at: nowIso() }));
+      return true;
     }
     let saved = await this.readStaleProvenance();
     if (saved.intent && !saved.intent.outcome) {

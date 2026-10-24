@@ -2477,6 +2477,57 @@ describe('local ref after an applied stale-cohort conflict resolution', () => {
   });
 });
 
+// Issue #59: an ordinary (unbased) proposal P conflicts, the user keeps typing
+// on the conflicted note, and the conflict resolves keep_server. The typing is
+// P-derived, so it stays P-based: it merges or conflicts, never replaces C's lines.
+describe('continued typing behind an ordinary conflicted proposal resolved keep_server', () => {
+  const SERVER_LINES = '- other one\n- other two\n';
+  const TYPED = '- typed during review\n';
+  it.each([
+    // Separate hunks against P: the typing merges on top of the kept lines.
+    { shape: 'a separate hunk', path: 'note.md', other: BASE.replace('last', `last\n${SERVER_LINES}`),
+      device: BASE.replace('last', 'last\n- device draft\n'), merged: `${BASE.replace('last', `last\n${SERVER_LINES}`)}${TYPED}` },
+    // Same insertion point against P (the reported daily-note loss): review.
+    { shape: 'the same insertion point', path: 'day.md', other: `# Day\n${SERVER_LINES}`, device: '# Day\n', merged: null }
+  ])('proposes held typing on P, never as a C-based replacement, for $shape', async ({ path, other, device, merged }) => {
+    const f = await fixture();
+    if (path === 'note.md') await f.remote(other);
+    else await f.remote(BASE, { [path]: other });
+    await f.core.adapter.write(path, device);
+    let result: any = await f.plugin.syncOnce();
+    for (let attempt = 0; result.status !== 'Conflict resolution needed' && attempt < 2; attempt += 1) result = await f.plugin.syncOnce();
+    expect(result.status).toBe('Conflict resolution needed');
+    const p = (await f.plugin.readQueue()).pending_commit;
+    expect((await f.plugin.readQueue()).pending_proposal_base).toBeNull();
+    const held = `${device}${TYPED}`;
+    await f.core.adapter.write(path, held);
+    const conflict = (await f.server.store.snapshot()).conflicts.find((r) => r.status === 'open')!;
+    expect(conflict.device_commit).toBe(p);
+    const review = await f.server.app.inject({ method: 'GET', headers: f.headers,
+      url: `/api/v1/vaults/${f.vaultId}/conflicts/${conflict.conflict_id}` });
+    expect((await f.server.app.inject({ method: 'POST', headers: f.headers,
+      url: `/api/v1/vaults/${f.vaultId}/conflicts/${conflict.conflict_id}/resolve`,
+      payload: { expected_main: review.json().conflict.expected_main, resolution_kind: 'keep_server' } })).statusCode).toBe(200);
+    expect(await f.canonical(path)).toBe(other);
+    await f.plugin.pollRemoteEventsAndApply();
+    const open = () => f.server.store.snapshot().then((s) => s.conflicts.filter((r) => r.status === 'open'));
+    if (merged) {
+      expect((await f.plugin.syncOnce()).status).toBe('Synced');
+      expect(await f.canonical(path)).toBe(merged);
+      expect(await readFile(join(f.dir, path), 'utf8')).toBe(merged);
+      expect(await open()).toEqual([]);
+      return;
+    }
+    await expect(f.plugin.syncOnce()).rejects.toMatchObject({ code: 'conflict_review_required' });
+    expect(await readFile(join(f.dir, path), 'utf8')).toBe(held);
+    expect(await f.canonical(path)).toBe(other);
+    const [review2] = await open();
+    expect(await open()).toHaveLength(1);
+    expect(review2!.base_commit).toBe(p);
+    expect((await f.server.git.readBlobAtPath(f.vaultId, review2!.device_commit, path)).toString()).toBe(held);
+  });
+});
+
 describe('split rename after stale conflict resolution', () => {
   const REMOTE_EDIT = BASE.replace('last', 'remote last');
   const DEVICE_EDIT = BASE.replace('last', 'device last');

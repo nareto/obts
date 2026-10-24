@@ -6586,18 +6586,20 @@ class ObtsObsidianClient {
   async queueStaleCohort(targetMain, expectedDeviceRef, snapshot = null) {
     if (!targetMain || await this.readDurableCatchup()) return false;
     const queue = await this.readQueue();
-    if (queue.pending_commit) {
+    // A queued proposal that C already contains, ordinary or stale, was settled
+    // by C (for a conflict, by its resolution) and owns nothing: its remaining
+    // obligations form a new cohort on C below. Letting an ordinary one fall
+    // through to a whole-snapshot commit would propose sticky bytes as fresh
+    // C-based work and silently replace a keep_server resolution.
+    if (queue.pending_commit && !(await this.isAncestor(queue.pending_commit, targetMain))) {
+      // A live ordinary proposal keeps its legacy natural-base ownership.
       if (!queue.pending_proposal_base) return false;
       // Committed-journal recovery may have just restored C. The already queued
-      // immutable cohort still owns local_head, including its original base.
-      // A conflicted proposal that C already contains was settled by C's
-      // resolution and owns nothing: restoring it would rewind the ref behind
-      // local_head. Its remaining obligations form a new cohort on C below.
-      if (!(await this.isAncestor(queue.pending_commit, targetMain))) {
-        await this.updateRef("refs/heads/local", queue.pending_commit, null, true);
-        await this.writeState(Object.assign({}, await this.readState(), { local_head: queue.pending_commit, updated_at: nowIso() }));
-        return true;
-      }
+      // immutable cohort still owns local_head, including its original base;
+      // restoring a settled one would rewind the ref behind local_head.
+      await this.updateRef("refs/heads/local", queue.pending_commit, null, true);
+      await this.writeState(Object.assign({}, await this.readState(), { local_head: queue.pending_commit, updated_at: nowIso() }));
+      return true;
     }
     let saved = await this.readStaleProvenance();
     if (saved.intent && !saved.intent.outcome) {
