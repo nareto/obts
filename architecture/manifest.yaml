@@ -1,7 +1,7 @@
 schema_version: 1
-revision: 62
+revision: 63
 status: current
-updated: 2026-10-22
+updated: 2026-10-26
 authoritative_artifacts:
   - architecture/manifest.yaml
   - architecture/README.md
@@ -41,6 +41,8 @@ formal_models:
     companion_architecture_revision: 48
     main_advance_path: architecture/models/formal/OBTSMainAdvance.tla
     main_advance_architecture_revision: 48
+    directory_checkpoint_path: architecture/models/formal/OBTSDirectoryCheckpoint.tla
+    directory_checkpoint_architecture_revision: 63
     checks: architecture/models/formal/checks.json
     transition_map: architecture/models/formal/trace/transition-map.json
     trace_schema: architecture/models/formal/trace/trace-schema.json
@@ -59,6 +61,7 @@ formal_models:
       - OBTS-SYNC-DELTA-001
       - OBTS-PER-OP-001
       - OBTS-BRG-PROJ-001
+      - OBTS-SYNC-DIR-001
   - id: OBTS-FM-003
     status: accepted
     path: architecture/models/formal/OBTSBridgeBoundedBody.tla

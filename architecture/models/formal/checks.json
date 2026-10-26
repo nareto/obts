@@ -21,7 +21,8 @@
     "modules/OBTSSafety",
     "OBTSStaleProposal",
     "OBTSDeltaApply",
-    "OBTSMainAdvance"
+    "OBTSMainAdvance",
+    "OBTSDirectoryCheckpoint"
   ],
   "checks": [
     {
@@ -87,6 +88,110 @@
       "expectedInvariant": "TreeGuard",
       "requiredWitness": "Advance",
       "minimumTraceDepth": 3
+    },
+    {
+      "id": "fm002-directory-checkpoint-safety",
+      "model": "OBTSDirectoryCheckpoint",
+      "config": "configs/directory-checkpoint-safety.cfg",
+      "kind": "positive-safety",
+      "maximumDepth": 20,
+      "timeoutMs": 120000,
+      "heapMb": 1536,
+      "maximumDistinctStates": 300000,
+      "baseline": {
+        "generated": 505976,
+        "distinct": 201134,
+        "depth": 11,
+        "minGenerated": 252988,
+        "minDistinct": 100567,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm002-directory-checkpoint-fresh-safety",
+      "model": "OBTSDirectoryCheckpoint",
+      "config": "configs/directory-checkpoint-fresh-safety.cfg",
+      "kind": "positive-safety",
+      "maximumDepth": 20,
+      "timeoutMs": 120000,
+      "heapMb": 1536,
+      "maximumDistinctStates": 300000,
+      "baseline": {
+        "generated": 125953,
+        "distinct": 55675,
+        "depth": 10,
+        "minGenerated": 62976,
+        "minDistinct": 27837,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm002-directory-checkpoint-liveness",
+      "model": "OBTSDirectoryCheckpoint",
+      "config": "configs/directory-checkpoint-liveness.cfg",
+      "kind": "positive-liveness",
+      "maximumDepth": 20,
+      "timeoutMs": 180000,
+      "heapMb": 1536,
+      "maximumDistinctStates": 300000,
+      "baseline": {
+        "generated": 505976,
+        "distinct": 201134,
+        "depth": 11,
+        "minGenerated": 252988,
+        "minDistinct": 100567,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm002-directory-checkpoint-reach-pruned-serve",
+      "model": "OBTSDirectoryCheckpoint",
+      "config": "configs/directory-checkpoint-reach-pruned-serve.cfg",
+      "kind": "reachability",
+      "maximumDepth": 20,
+      "expectedInvariant": "NoPrunedHistoricalServe",
+      "requiredWitness": "Serve",
+      "minimumTraceDepth": 6
+    },
+    {
+      "id": "fm002-directory-checkpoint-reach-seeded-serve",
+      "model": "OBTSDirectoryCheckpoint",
+      "config": "configs/directory-checkpoint-reach-seeded-serve.cfg",
+      "kind": "reachability",
+      "maximumDepth": 20,
+      "expectedInvariant": "NoSeededHistoricalServe",
+      "requiredWitness": "Upgrade",
+      "minimumTraceDepth": 7
+    },
+    {
+      "id": "fm002-directory-checkpoint-negative-no-fold",
+      "model": "OBTSDirectoryCheckpoint",
+      "config": "configs/directory-checkpoint-negative-no-fold.cfg",
+      "kind": "negative-control",
+      "maximumDepth": 20,
+      "expectedInvariant": "UnavailableOnlyBeyondCheckpoint",
+      "requiredWitness": "Prune",
+      "minimumTraceDepth": 6
+    },
+    {
+      "id": "fm002-directory-checkpoint-negative-stale-fold",
+      "model": "OBTSDirectoryCheckpoint",
+      "config": "configs/directory-checkpoint-negative-stale-fold.cfg",
+      "kind": "negative-control",
+      "maximumDepth": 20,
+      "expectedInvariant": "ServedExact",
+      "requiredWitness": "Prune",
+      "minimumTraceDepth": 6
+    },
+    {
+      "id": "fm002-directory-checkpoint-negative-seed-at-oldest",
+      "model": "OBTSDirectoryCheckpoint",
+      "config": "configs/directory-checkpoint-negative-seed-at-oldest.cfg",
+      "kind": "negative-control",
+      "maximumDepth": 20,
+      "expectedInvariant": "ServedExact",
+      "requiredWitness": "Upgrade",
+      "minimumTraceDepth": 7
     },
     {
       "id": "fm001-safety",

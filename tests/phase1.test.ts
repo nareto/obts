@@ -7239,6 +7239,118 @@ describe('Phase 1 sync without conflict resolution', () => {
     await expect(stat(join(receiverDir, '.obts', 'pull-transfer.json'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  it('serves pinned chunked transfers after main advances and retention prunes earlier events', async () => {
+    await server.app.close();
+    server = await createObtsServer({
+      dataDir: join(root, 'pinned-chunk-server-data'),
+      publicBaseUrl: 'http://127.0.0.1:0',
+      sessionSecret: 'test-session-secret-with-enough-entropy',
+      maxUploadBytes: 1_048_576,
+      transferChunkBytes: 1_048_576,
+      maxTransferBytes: 8_388_608
+    });
+    baseUrl = await server.app.listen({ port: 0, host: '127.0.0.1' });
+    const admin = await setupAdminAndVault(baseUrl);
+    const writerDir = join(root, 'pinned-writer');
+    await mkdirp(writerDir);
+    const writer = await pairPlugin(admin, writerDir, 'pinned-writer');
+    const deviceDir = join(root, 'pinned-device');
+    await mkdirp(deviceDir);
+    const device = await pairPlugin(admin, deviceDir, 'pinned-device');
+    const settle = async (plugin: ObtsPluginClient) => {
+      let settled = await plugin.syncOnce();
+      for (let attempt = 0; attempt < 3 && settled.status !== 'Synced'; attempt++) settled = await plugin.syncOnce();
+      expect(settled.status).toBe('Synced');
+    };
+
+    await mkdirp(join(writerDir, 'Projects', 'Empty Child'));
+    await mkdirp(join(writerDir, 'Removed Later'));
+    await writeFile(join(writerDir, 'note.md'), 'directory history\n');
+    await settle(writer);
+    await rm(join(writerDir, 'Removed Later'), { recursive: true });
+    await writeFile(join(writerDir, 'first.bin'), randomBytes(700_000));
+    await writeFile(join(writerDir, 'second.bin'), randomBytes(700_000));
+    await settle(writer);
+
+    const newDevice = new ObtsPluginClient(join(root, 'pinned-new-device'), { serverUrl: baseUrl, deviceName: 'pinned-new-device' });
+    const connection = await newDevice.startOnboarding('Test Vault');
+    expect((await admin.post(`/api/v1/connections/${connection.connection_id}/approve`, {
+      selection: 'existing_vault',
+      vault_id: admin.vaultId
+    })).status).toBe(200);
+    const transport = new TransportClient(baseUrl);
+    const firstChunk = await transport.bootstrapConnectionChunk(connection.connection_id, connection.connection_secret, 0, 'latest');
+    expect(firstChunk.manifest.complete).toBe(false);
+    const pinnedMain = firstChunk.manifest.target_main;
+    const pinnedDirectories = firstChunk.manifest.explicit_directories;
+    expect(pinnedDirectories).toContain('Projects/Empty Child');
+    expect(pinnedDirectories).not.toContain('Removed Later');
+
+    const deviceTransport = (device as unknown as {
+      transport: { pullChunk: (input: { cursor: number }) => Promise<unknown> };
+    }).transport;
+    const devicePull = deviceTransport.pullChunk.bind(deviceTransport);
+    let devicePullCalls = 0;
+    deviceTransport.pullChunk = async (input) => {
+      devicePullCalls += 1;
+      if (devicePullCalls === 2) throw new Error('simulated interruption after pinned pull checkpoint');
+      return await devicePull(input);
+    };
+    await expect(device.syncOnce()).rejects.toThrow('simulated interruption');
+    expect(JSON.parse(await readFile(join(deviceDir, '.obts', 'pull-transfer.json'), 'utf8'))).toMatchObject({
+      target_main: pinnedMain,
+      next_cursor: 1
+    });
+
+    const pinnedEventSeq = (await server.store.snapshot()).events.find((event) =>
+      event.vault_id === admin.vaultId && event.event_type === 'main_advanced' && event.commit_cursors.main === pinnedMain
+    )!.event_seq;
+    const expired = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString();
+    await server.store.mutate((db) => {
+      for (const event of db.events) {
+        if (event.vault_id === admin.vaultId && event.event_seq < pinnedEventSeq) event.created_at = expired;
+      }
+    });
+    await mkdirp(join(writerDir, 'After Pin'));
+    await writeFile(join(writerDir, 'after-pin.md'), 'main advanced during the transfer\n');
+    await settle(writer);
+    const pruned = await server.store.snapshot();
+    expect(pruned.vaults.find((vault) => vault.vault_id === admin.vaultId)?.current_main).not.toBe(pinnedMain);
+    expect(Math.min(...pruned.events.filter((event) => event.vault_id === admin.vaultId).map((event) => event.event_seq)))
+      .toBe(pinnedEventSeq);
+
+    const secondChunk = await transport.bootstrapConnectionChunk(
+      connection.connection_id,
+      connection.connection_secret,
+      firstChunk.manifest.next_cursor,
+      pinnedMain
+    );
+    expect(secondChunk.manifest).toMatchObject({ target_main: pinnedMain, complete: true });
+    expect(secondChunk.manifest.explicit_directories).toEqual(pinnedDirectories);
+
+    const restartedDevice = new ObtsPluginClient(deviceDir, { serverUrl: baseUrl, deviceName: 'pinned-device' });
+    const restartedTransport = (restartedDevice as unknown as {
+      transport: { pullChunk: (input: { cursor: number }) => Promise<unknown> };
+    }).transport;
+    const restartedPull = restartedTransport.pullChunk.bind(restartedTransport);
+    const resumedCursors: number[] = [];
+    restartedTransport.pullChunk = async (input) => {
+      resumedCursors.push(input.cursor);
+      return await restartedPull(input);
+    };
+    await restartedDevice.initialize();
+    await expect(restartedDevice.syncOnce()).resolves.toMatchObject({ status: 'Synced' });
+    expect(resumedCursors[0]).toBe(1);
+    expect(await readFile(join(deviceDir, 'second.bin'))).toEqual(await readFile(join(writerDir, 'second.bin')));
+    expect((await stat(join(deviceDir, 'Projects', 'Empty Child'))).isDirectory()).toBe(true);
+    await expect(stat(join(deviceDir, 'Removed Later'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(stat(join(deviceDir, '.obts', 'pull-transfer.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await settle(restartedDevice);
+    expect(await readFile(join(deviceDir, 'after-pin.md'), 'utf8')).toBe('main advanced during the transfer\n');
+    expect((await stat(join(deviceDir, 'After Pin'))).isDirectory()).toBe(true);
+    expect(pruned.directory_checkpoint_by_vault?.[admin.vaultId]?.event_seq).toBe(pinnedEventSeq - 1);
+  });
+
   it('accepts full-vault attachment uploads through normal device refs', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'full-sync-attachment-device');

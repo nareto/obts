@@ -208,6 +208,15 @@ export type DirectoryStateRow = {
   last_event_seq: number;
 };
 
+/**
+ * Exact explicit-directory state after every vault event through `event_seq`. Event retention folds the
+ * directory intents of pruned events into it, so historical snapshots never need the pruned prefix.
+ */
+export type DirectoryCheckpointRow = {
+  explicit_dirs: string[];
+  event_seq: number;
+};
+
 export type DirectoryProposalResultRow = {
   proposal_id: string;
   request_sha256: string;
@@ -280,6 +289,7 @@ export type DeviceRemovalJob = {
 export type MetadataDb = {
   schema_version: 8;
   operation_history_by_vault?: Record<string, OperationHistoryMetadata>;
+  directory_checkpoint_by_vault?: Record<string, DirectoryCheckpointRow>;
   setup_complete: boolean;
   users: UserRow[];
   sessions: SessionRow[];
@@ -1204,6 +1214,7 @@ export class MetadataStore {
       }
     }
     if (enforceRevocationInvariant(db)) changed = true;
+    if (seedDirectoryCheckpoints(db)) changed = true;
     for (const device of db.devices) {
       const deviceName = migrateDisplayName(device.device_name, 'Unnamed device');
       if (device.device_name !== deviceName) {
@@ -1319,18 +1330,136 @@ export class MetadataStore {
     });
   }
 
+  /**
+   * Retention removes only a contiguous prefix of the vault's events and folds that prefix's directory
+   * intents into the vault's directory checkpoint in the same metadata transaction.
+   */
   private pruneVaultEvents(db: MetadataDb, vaultId: string): void {
     const cutoff = Date.now() - EVENT_RETENTION_MS;
-    const retainedVaultEvents = db.events
-      .filter((event) => event.vault_id === vaultId)
+    const vaultEvents = db.events.filter((event) => event.vault_id === vaultId);
+    const retainedVaultEvents = vaultEvents
       .filter((event) => {
         const createdAt = Date.parse(event.created_at);
         return Number.isNaN(createdAt) || createdAt >= cutoff;
       })
       .slice(-EVENT_RETENTION_LIMIT);
-    const retainedIds = new Set(retainedVaultEvents.map((event) => event.event_id));
-    db.events = db.events.filter((event) => event.vault_id !== vaultId || retainedIds.has(event.event_id));
+    const oldestRetainedSeq = retainedVaultEvents.reduce(
+      (oldest, event) => Math.min(oldest, event.event_seq),
+      (db.event_seq_by_vault[vaultId] ?? 0) + 1
+    );
+    const prunedEvents = vaultEvents
+      .filter((event) => event.event_seq < oldestRetainedSeq)
+      .sort((left, right) => left.event_seq - right.event_seq);
+    if (prunedEvents.length === 0) return;
+    foldDirectoryCheckpoint(db, vaultId, prunedEvents);
+    db.events = db.events.filter((event) => event.vault_id !== vaultId || event.event_seq >= oldestRetainedSeq);
   }
+}
+
+type CheckpointDirectoryIntent = { op: 'create' | 'delete'; path: string };
+
+function eventDirectoryIntents(event: { payload: Record<string, unknown> }): CheckpointDirectoryIntent[] {
+  const rawIntents = event.payload.directory_intents;
+  if (!Array.isArray(rawIntents)) return [];
+  const intents: CheckpointDirectoryIntent[] = [];
+  for (const rawIntent of rawIntents) {
+    if (!rawIntent || typeof rawIntent !== 'object' || Array.isArray(rawIntent)) continue;
+    const intent = rawIntent as { op?: unknown; path?: unknown };
+    if ((intent.op === 'create' || intent.op === 'delete') && typeof intent.path === 'string') {
+      intents.push({ op: intent.op, path: intent.path });
+    }
+  }
+  return intents;
+}
+
+/** Applies one event's intents with the same semantics as the live directory state. */
+function applyEventDirectoryIntents(explicit: Set<string>, event: { payload: Record<string, unknown> }): void {
+  for (const intent of eventDirectoryIntents(event)) {
+    if (intent.op === 'delete') {
+      for (const path of [...explicit]) {
+        if (path === intent.path || path.startsWith(`${intent.path}/`)) explicit.delete(path);
+      }
+      continue;
+    }
+    const segments = intent.path.split('/');
+    for (let index = 1; index < segments.length; index += 1) explicit.add(segments.slice(0, index).join('/'));
+    explicit.add(intent.path);
+  }
+}
+
+/**
+ * Folds a pruned prefix into the checkpoint. A gap between the checkpoint and the prefix cannot be proven, so
+ * the checkpoint is withdrawn and historical reconstruction for the vault fails closed.
+ */
+function foldDirectoryCheckpoint(db: MetadataDb, vaultId: string, prunedEvents: EventEnvelope[]): void {
+  const previous = db.directory_checkpoint_by_vault?.[vaultId] ?? { explicit_dirs: [], event_seq: 0 };
+  const explicit = new Set(previous.explicit_dirs);
+  let eventSeq = previous.event_seq;
+  for (const event of prunedEvents) {
+    if (event.event_seq <= eventSeq) continue;
+    if (event.event_seq !== eventSeq + 1) {
+      if (db.directory_checkpoint_by_vault) delete db.directory_checkpoint_by_vault[vaultId];
+      return;
+    }
+    applyEventDirectoryIntents(explicit, event);
+    eventSeq = event.event_seq;
+  }
+  if (eventSeq === previous.event_seq) return;
+  db.directory_checkpoint_by_vault ??= {};
+  db.directory_checkpoint_by_vault[vaultId] = { explicit_dirs: [...explicit].sort(), event_seq: eventSeq };
+}
+
+/**
+ * The live directory state is exact for every cursor from its last directory-changing event onward. At load
+ * no append is in flight, so it is a valid checkpoint at any cursor in that range.
+ */
+function liveDirectoryCheckpoint(db: MetadataDb, vaultId: string, atLeastEventSeq: number): DirectoryCheckpointRow {
+  const state = db.directory_state_by_vault[vaultId];
+  return {
+    explicit_dirs: [...(state?.explicit_dirs ?? [])].sort(),
+    event_seq: Math.max(state?.last_event_seq ?? 0, atLeastEventSeq)
+  };
+}
+
+/** Seeds a checkpoint for vaults whose retained events no longer start at the first event. */
+function seedDirectoryCheckpoints(db: MetadataDb): boolean {
+  let changed = false;
+  for (const vault of db.vaults) {
+    if (db.directory_checkpoint_by_vault?.[vault.vault_id]) continue;
+    const oldestRetainedSeq = db.events
+      .filter((event) => event.vault_id === vault.vault_id)
+      .reduce((oldest, event) => Math.min(oldest, event.event_seq), (db.event_seq_by_vault[vault.vault_id] ?? 0) + 1);
+    if (oldestRetainedSeq <= 1) continue;
+    db.directory_checkpoint_by_vault ??= {};
+    db.directory_checkpoint_by_vault[vault.vault_id] = liveDirectoryCheckpoint(db, vault.vault_id, oldestRetainedSeq - 1);
+    changed = true;
+  }
+  return changed;
+}
+
+/**
+ * Exact explicit-directory state after `eventSeq`: the retention checkpoint replayed through the retained,
+ * contiguous events. Returns null when that interval cannot be proven.
+ */
+export function directorySnapshotAtEvent(
+  db: Pick<MetadataDb, 'events' | 'directory_checkpoint_by_vault'>,
+  vaultId: string,
+  eventSeq: number
+): string[] | null {
+  const checkpoint = db.directory_checkpoint_by_vault?.[vaultId] ?? { explicit_dirs: [], event_seq: 0 };
+  if (eventSeq < checkpoint.event_seq) return null;
+  const explicit = new Set(checkpoint.explicit_dirs);
+  let expectedEventSeq = checkpoint.event_seq + 1;
+  const replay = db.events
+    .filter((event) => event.vault_id === vaultId && event.event_seq > checkpoint.event_seq && event.event_seq <= eventSeq)
+    .sort((left, right) => left.event_seq - right.event_seq);
+  for (const event of replay) {
+    if (event.event_seq !== expectedEventSeq) return null;
+    applyEventDirectoryIntents(explicit, event);
+    expectedEventSeq += 1;
+  }
+  if (expectedEventSeq !== eventSeq + 1) return null;
+  return [...explicit].sort();
 }
 
 function metadataDirectorySnapshotForMain(
@@ -1352,7 +1481,13 @@ function metadataDirectorySnapshotForMain(
   const mainEvent = [...events].reverse().find((event) =>
     event.event_type === 'main_advanced' && event.commit_cursors.main === main
   );
-  if (!mainEvent || (events[0]?.event_seq ?? 1) > 1) return { eventSeq: 0, explicitDirectories: null };
+  if (!mainEvent) return { eventSeq: 0, explicitDirectories: null };
+  if ((events[0]?.event_seq ?? 1) > 1) {
+    const explicitDirectories = directorySnapshotAtEvent(db, vaultId, mainEvent.event_seq);
+    return explicitDirectories === null
+      ? { eventSeq: 0, explicitDirectories: null }
+      : { eventSeq: mainEvent.event_seq, explicitDirectories };
+  }
   const explicit = new Set<string>();
   for (const event of events) {
     if (event.event_seq > mainEvent.event_seq) break;

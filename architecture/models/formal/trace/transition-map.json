@@ -3306,6 +3306,74 @@
           ]
         }
       }
+    },
+    "OBTSDirectoryCheckpoint": {
+      "rootModule": "OBTSDirectoryCheckpoint.tla",
+      "architectureRevision": 63,
+      "actions": {
+        "AppendEvent": {
+          "contracts": [
+            "OBTS-SYNC-DIR-001"
+          ],
+          "code": [
+            "src/server/metadataStore.ts:992-1007"
+          ],
+          "tests": [
+            "tests/directory-checkpoint.test.ts:56-76"
+          ]
+        },
+        "Prune": {
+          "contracts": [
+            "OBTS-SYNC-DIR-001"
+          ],
+          "code": [
+            "src/server/metadataStore.ts:1337-1357",
+            "src/server/metadataStore.ts:1394-1410"
+          ],
+          "tests": [
+            "tests/directory-checkpoint.test.ts:56-135"
+          ]
+        },
+        "Pin": {
+          "contracts": [
+            "OBTS-SAF-009",
+            "OBTS-SYNC-DIR-001"
+          ],
+          "code": [
+            "src/server/app.ts:1163-1208",
+            "src/server/app.ts:1449-1542"
+          ],
+          "tests": [
+            "tests/phase1.test.ts:7242-7353"
+          ]
+        },
+        "Upgrade": {
+          "contracts": [
+            "OBTS-SYNC-DIR-001"
+          ],
+          "code": [
+            "src/server/metadataStore.ts:1214-1218",
+            "src/server/metadataStore.ts:1425-1438"
+          ],
+          "tests": [
+            "tests/directory-checkpoint.test.ts:136-191"
+          ]
+        },
+        "Serve": {
+          "contracts": [
+            "OBTS-SYNC-DIR-001",
+            "OBTS-SAF-009"
+          ],
+          "code": [
+            "src/server/app.ts:2721-2841",
+            "src/server/metadataStore.ts:1444-1509"
+          ],
+          "tests": [
+            "tests/phase1.test.ts:7242-7353",
+            "tests/directory-checkpoint.test.ts:106-135"
+          ]
+        }
+      }
     }
   }
 }

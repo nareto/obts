@@ -270,10 +270,11 @@ The runner requires nontrivial state/depth counts and each negative control's ex
 | Architecture revision | 32 |
 | Refined contracts | `OBTS-SAF-001` through `OBTS-SAF-006`, `OBTS-SAF-010`, `OBTS-SYNC-IMM-001`, `OBTS-SYNC-IGN-001`, `OBTS-SYNC-ACK-001`, `OBTS-PER-OP-001`, `OBTS-PER-CLIENT-001`, `OBTS-BRG-PROJ-001` |
 | Root specification | `OBTSDistributedSync.tla` |
-| Check matrix | `checks.json` (revision-36 matrix retains all 115 previous checks and adds bounded gate/provenance checks; revision 47 adds ten delta-companion checks and revision 48 adds seven main-advance checks; exact required IDs and measured baselines are machine-readable) |
+| Check matrix | `checks.json` (revision-36 matrix retains all 115 previous checks and adds bounded gate/provenance checks; revision 47 adds ten delta-companion checks, revision 48 adds seven main-advance checks and revision 63 adds eight directory-checkpoint checks; exact required IDs and measured baselines are machine-readable) |
 | Static transition map / future trace schema | `trace/transition-map.json`, `trace/trace-schema.json` |
 | Delta companion / revision | `OBTSDeltaApply.tla`, revision 48; change-proportional apply and capture (`OBTS-SYNC-DELTA-001`) |
 | Main identity companion / revision | `OBTSMainAdvance.tla`, revision 48; exact parent/tree guard and durable target reuse (`OBTS-SYNC-IMM-001`, `OBTS-PER-OP-001`) |
+| Directory retention companion / revision | `OBTSDirectoryCheckpoint.tla`, revision 63; pinned historical directory snapshots survive event retention (`OBTS-SYNC-DIR-001`, `OBTS-SAF-009`) |
 | Executable check | `npm run test:formal` |
 
 `OBTSDistributedSync.tla` is the sole composed `Init`, `CoreNext`/`Next`, safety, and liveness authority. Every positive scenario uses the same composed transition relation; scenario constants and guards bound edits, messages, faults, and their meaningful causal seams without state constraints or scenario-specific action whitelists. The composition always contains Plugin1, Plugin2, Bridge Node, Rust Bridge write/projection, server proposal/classification/CAS/conflict/recovery, client apply/ack, directory, and bounded request/reply bag actions. Focused reachability configurations prove claimed triggers rather than relying on one explosive scenario to establish all coverage.
@@ -392,6 +393,14 @@ The three mutants are the shortcuts this contract forbids: moving refs without c
 The matrix includes safety, fair-retry completion, direct-target and merge-fallback witnesses, recovery after ref publication, and negative controls that omit either the parent or tree guard. `ParentGuard` and `TreeGuard` reject unsupported direct advancement; `PreparedBeforeAdvance` preserves journal ordering. Git parent parsing, actual byte equality and policy computation remain implementation obligations. OpenAPI fields and explicit conflict-resolution parentage are unchanged.
 
 Measured generated/distinct/depth: safety and liveness 160/128/6; direct-target witness 46/46/3; merge witness 25/25/3; recovered publication 113/105/6; unsafe-parent control 28/28/3; unsafe-tree control 43/43/3. The complete sync matrix passes all 192 required checks.
+
+### Directory retention checkpoint companion (revision 63)
+
+`OBTSDirectoryCheckpoint.tla` checks how event retention interacts with historical directory snapshots, which the composed model collapses into one `historyRetained` flag. A vault appends directory-changing or directory-neutral events, a new device pins the then-current main as its transfer target while main keeps advancing, and retention prunes the oldest retained event. Each prune folds the removed event into one per-vault checkpoint whose cursor never moves backward. A store that pruned before the checkpoint existed can be upgraded once; it seeds the cursor at the later of its last directory-changing event and its newest pruned event. Serving a pinned target replays retained events after the checkpoint and must return the exact directory set of that main, or fail closed when the checkpoint is ahead of the target.
+
+`ServedExact` requires every served snapshot to equal the snapshot at the pinned event. `UnavailableOnlyBeyondCheckpoint` requires a refusal only when the target precedes the checkpoint. `CheckpointExact`, `CheckpointContiguous` and the temporal `CheckpointMonotonic` constrain the checkpoint itself; `PinnedEventuallyResolved` requires every pin to be served or refused after the upgrade under weak fairness. The negative controls are the three shortcuts this design forbids: pruning without folding (refuses a target that the checkpoint should cover), advancing the cursor without applying the pruned intent (serves the wrong directory set) and seeding a legacy store at its newest pruned event even when a retained event changed directories later (serves directories created or removed after the pinned main). Two reachability witnesses show a historical target being served after a prune and after a legacy upgrade.
+
+Measured generated/distinct/depth with four events: legacy safety and liveness 505976/201134/11; fresh-store safety 125953/55675/10; pruned-target witness 4418/3782/6; legacy-upgrade witness 25875/17515/7; no-fold control 4418/3782/6; stale-fold control 7946/6470/6; oldest-seed control 26383/17546/7. Path normalization, ancestor creation and descendant removal stay in the implementation and are covered by `tests/directory-checkpoint.test.ts` and the chunked-transfer regression in `tests/phase1.test.ts`.
 
 ## OBTS-FM-003: Focused Bridge Bounded-Body Projection
 

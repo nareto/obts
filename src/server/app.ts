@@ -60,6 +60,7 @@ import { DeviceRemovalService, type DeviceRemovalOptions } from './deviceRemoval
 import { DiagnosticService } from './diagnosticService.js';
 import { GitCommandError, GitDurabilityError, GitService, sha256Hex } from './gitService.js';
 import {
+  directorySnapshotAtEvent,
   hasDurableDeletionRecord,
   MetadataCleanupError,
   MetadataPublicationError,
@@ -2765,20 +2766,12 @@ function eventSnapshotForTarget(
   const eventSeq = mainEvent?.event_seq ?? 0;
   const throughTarget = vaultEvents.filter((event) => event.event_seq <= eventSeq);
   const eventsAfterBaseline = throughTarget.filter((event) => event.event_seq > afterEventSeq);
-  if (eventSeq > afterEventSeq) {
-    let expectedEventSeq = afterEventSeq + 1;
-    for (const event of eventsAfterBaseline) {
-      if (event.event_seq !== expectedEventSeq) {
-        throw new AuthError(409, 'directory_snapshot_unavailable', 'Historical directory evidence is not contiguous through the requested main.');
-      }
-      expectedEventSeq += 1;
-    }
-    if (expectedEventSeq !== eventSeq + 1) {
-      throw new AuthError(409, 'directory_snapshot_unavailable', 'Historical directory evidence ends before the requested main.');
-    }
-  }
-  if (baseExplicitDirectories === undefined && eventSeq > 0 && throughTarget[0]?.event_seq !== 1) {
-    throw new AuthError(409, 'directory_snapshot_unavailable', 'Historical directory evidence does not include the initial directory baseline.');
+  const intervalRetained = eventSeq <= afterEventSeq ||
+    (eventsAfterBaseline.length === eventSeq - afterEventSeq &&
+      eventsAfterBaseline.every((event, index) => event.event_seq === afterEventSeq + 1 + index));
+  const initialBaselineRetained = eventSeq === 0 || throughTarget[0]?.event_seq === 1;
+  if (!intervalRetained || (baseExplicitDirectories === undefined && !initialBaselineRetained)) {
+    return checkpointedEventSnapshot(db, vaultId, deviceId, eventSeq, afterEventSeq, eventsAfterBaseline, intervalRetained, baseExplicitDirectories);
   }
   const directoryIntents = directoryIntentsFromEvents(eventsAfterBaseline);
   const explicit = new Set<string>(baseExplicitDirectories ?? []);
@@ -2805,6 +2798,45 @@ function eventSnapshotForTarget(
       afterEventSeq,
       eventSeq
     )
+  };
+}
+
+/**
+ * Retention pruned part of the history behind an older target. The directory checkpoint still proves the
+ * exact target snapshot; a device baseline older than the retained interval receives the net difference to
+ * that snapshot, as it does for the current main.
+ */
+function checkpointedEventSnapshot(
+  db: MetadataDb,
+  vaultId: string,
+  deviceId: string,
+  eventSeq: number,
+  afterEventSeq: number,
+  eventsAfterBaseline: MetadataDb['events'],
+  intervalRetained: boolean,
+  baseExplicitDirectories: string[] | undefined
+): {
+  eventSeq: number;
+  directoryIntents: DirectoryIntent[];
+  explicitDirectories: string[];
+  directoryAcknowledgements: DirectoryIntentAcknowledgement[];
+} {
+  const explicitDirectories = directorySnapshotAtEvent(db, vaultId, eventSeq);
+  const deviceBaseline = baseExplicitDirectories ?? (afterEventSeq === 0 ? [] : undefined);
+  if (explicitDirectories === null || (!intervalRetained && deviceBaseline === undefined)) {
+    throw new AuthError(409, 'directory_snapshot_unavailable', 'Historical directory evidence is not contiguous through the requested main.');
+  }
+  const eventDirectoryIntents = directoryIntentsFromEvents(eventsAfterBaseline);
+  return {
+    eventSeq,
+    directoryIntents: intervalRetained || deviceBaseline === undefined
+      ? eventDirectoryIntents
+      : compactDirectoryIntents([
+          ...directoryIntentsBetweenSnapshots(deviceBaseline, explicitDirectories),
+          ...eventDirectoryIntents
+        ]),
+    explicitDirectories,
+    directoryAcknowledgements: directoryAcknowledgementsForDevice(db, eventsAfterBaseline, vaultId, deviceId, afterEventSeq, eventSeq)
   };
 }
 

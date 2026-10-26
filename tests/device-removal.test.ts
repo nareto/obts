@@ -873,6 +873,9 @@ describe('device removal crash recovery', () => {
     await revoke(f, f.a);
     const earlier = (await snapshot(f)).devices.find((row) => row.device_id === f.a.deviceId)!.revoked_at;
     expect(earlier).toEqual(expect.any(String));
+    await f.server.store.mutate((db) => {
+      db.directory_checkpoint_by_vault = { [f.vaultId]: { explicit_dirs: ['Folder'], event_seq: 1 } };
+    });
     const held = await f.server.lifecycle.acquireAdmission(f.vaultId);
     const deletion = await f.server.app.inject({
       method: 'DELETE', url: `/api/v1/vaults/${f.vaultId}`, headers: f.owner, payload: { confirmation: `DELETE ${f.vaultId}` }
@@ -888,6 +891,7 @@ describe('device removal crash recovery', () => {
     const after = await snapshot(f);
     expect(after.devices.some((row) => row.vault_id === f.vaultId)).toBe(false);
     expect(after.vaults.some((vault) => vault.vault_id === f.vaultId)).toBe(false);
+    expect(after.directory_checkpoint_by_vault?.[f.vaultId]).toBeUndefined();
   });
 });
 

@@ -742,6 +742,7 @@ export class VaultLifecycleCoordinator {
     delete db.event_seq_by_vault[vaultId];
     delete db.merge_sequence_by_vault[vaultId];
     delete db.directory_state_by_vault[vaultId];
+    if (db.directory_checkpoint_by_vault) delete db.directory_checkpoint_by_vault[vaultId];
     delete db.derived_history_by_vault[vaultId];
     if (db.operation_history_by_vault) delete db.operation_history_by_vault[vaultId];
     db.directory_proposal_results = db.directory_proposal_results.filter((result) => result.vault_id !== vaultId);
