@@ -1005,16 +1005,14 @@ export class GitService {
       deviceChanges = await this.changedPaths(vaultId, base, deviceCommit);
       mergedTextPaths = mergedTextPaths.map((path) => renamePairs.find((pair) => pair.source_path === path)?.destination_path ?? path);
     }
+    // `merge-tree --merge-base` needs Git 2.40, above the ADR 0005 baseline. Re-parent both
+    // sides onto the explicit ancestor so their only merge base is exactly `base`.
+    const [mergeMain, mergeProposal] = await Promise.all([
+      this.createMergeSide(vaultId, currentMain, base),
+      this.createMergeSide(vaultId, mergeDevice, base)
+    ]);
     try {
-      const { stdout } = await this.exec(repo, [
-        'merge-tree',
-        '--write-tree',
-        '--no-messages',
-        '--merge-base',
-        base,
-        currentMain,
-        mergeDevice
-      ]);
+      const { stdout } = await this.exec(repo, ['merge-tree', '--write-tree', '--no-messages', mergeMain, mergeProposal]);
       tree = asText(stdout).trim();
     } catch (error) {
       if (error instanceof GitDurabilityError) throw error;
@@ -1090,6 +1088,11 @@ export class GitService {
   private async createSyntheticCommit(vaultId: string, tree: string, parent: string): Promise<string> {
     const repo = this.repoPath(vaultId);
     return asText((await this.exec(repo, ['commit-tree', tree, '-p', parent, '-m', 'obts: mapped rename proposal'],
+      undefined, serverGitEnv('obts-merge'))).stdout).trim();
+  }
+
+  private async createMergeSide(vaultId: string, commit: string, base: string): Promise<string> {
+    return asText((await this.exec(this.repoPath(vaultId), ['commit-tree', `${commit}^{tree}`, '-p', base, '-m', 'obts: explicit-base merge side'],
       undefined, serverGitEnv('obts-merge'))).stdout).trim();
   }
 

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -113,10 +113,24 @@ async function setMain(f: Fixture, main: string): Promise<void> {
   await f.server.store.mutate((db) => { db.vaults.find((v) => v.vault_id === f.auth.vault.vault_id)!.current_main = main; });
 }
 
-async function fixture(initial: Writes = { 'note.md': BASE, 'image.png': Buffer.from([0, 1]), 'inherited.md': 'base\n' }): Promise<Fixture> {
+// ADR 0005 names Git 2.39 as the production baseline; `merge-tree --merge-base` needs Git 2.40.
+async function baselineGit(root: string): Promise<string> {
+  const path = join(root, 'git-2.39-baseline');
+  await writeFile(path, [
+    '#!/bin/sh',
+    'case " $* " in *" merge-tree "*" --merge-base "*) echo "error: unknown option \\`merge-base\'" >&2; exit 129;; esac',
+    'exec git "$@"', ''
+  ].join('\n'));
+  await chmod(path, 0o755);
+  return path;
+}
+
+async function fixture(initial: Writes = { 'note.md': BASE, 'image.png': Buffer.from([0, 1]), 'inherited.md': 'base\n' },
+  options: { gitBaseline?: boolean } = {}): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), 'obts-stale-proposal-'));
   roots.push(root);
-  const server = await createObtsServer({ dataDir: join(root, 'data'), sessionSecret: 'stale-proposal-test-secret' });
+  const server = await createObtsServer({ dataDir: join(root, 'data'), sessionSecret: 'stale-proposal-test-secret',
+    ...(options.gitBaseline ? { gitBinary: await baselineGit(root) } : {}) });
   servers.push(server);
   const setup = await server.app.inject({ method: 'POST', url: '/api/v1/setup', payload: { username: 'owner', password: 'test-password-with-entropy' } });
   expect(setup.statusCode).toBe(201);
@@ -205,6 +219,35 @@ async function expectConflict(f: Fixture, result: PushResult, main: string): Pro
   expect(conflict.base_commit).toBe(f.m0);
   expect(conflict.current_main).toBe(main);
 }
+
+describe('explicit proposal base on the Git 2.39 baseline', () => {
+  it('integrates a stale cohort carrying unchanged M0 bytes as the current main content', async () => {
+    const f = await fixture(undefined, { gitBaseline: true });
+    const c = await commit(f, f.m0, { 'note.md': REMOTE });
+    await setMain(f, c);
+    const d = await commit(f, c, { 'note.md': BASE });
+    const result = await push(f, d);
+    expect(result.status).toBe('merged');
+    if (result.status !== 'merged') throw new Error('merge missing');
+    expect(await blob(f, result.main, 'note.md')).toBe(REMOTE);
+    expect((await f.server.store.snapshot()).conflicts).toEqual([]);
+  });
+
+  it('merges disjoint stale Markdown and still conflicts on overlapping text', async () => {
+    const f = await fixture(undefined, { gitBaseline: true });
+    const c = await commit(f, f.m0, { 'note.md': REMOTE });
+    await setMain(f, c);
+    const merged = await push(f, await commit(f, c, { 'note.md': LOCAL }));
+    expect(merged.status).toBe('merged');
+    if (merged.status !== 'merged') throw new Error('merge missing');
+    expect(await blob(f, merged.main, 'note.md')).toBe(MERGED);
+
+    const g = await fixture(undefined, { gitBaseline: true });
+    const gc = await commit(g, g.m0, { 'note.md': REMOTE });
+    await setMain(g, gc);
+    await expectConflict(g, await push(g, await commit(g, gc, { 'note.md': BASE.replace('first', 'overlap') })), gc);
+  });
+});
 
 describe('explicit proposal base: authored paths and per-path identities', () => {
   it('merges disjoint stale Markdown from M0 despite parent C', async () => {
