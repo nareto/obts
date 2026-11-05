@@ -7638,7 +7638,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('flushOpenMarkdownEditorsToDisk');
     expect(pluginMain).toContain('ensureNoLocalChangesBeforeApply');
     expect(pluginMain).toContain('visibleVaultMatchesLocalHead');
-    const queuedSync = sourceSection(pluginMain, 'async runQueuedSync()', 'async flushOpenMarkdownEditorsToDisk()');
+    const queuedSync = sourceSection(pluginMain, 'async runQueuedSync()', 'async flushOpenMarkdownEditorsToDisk(');
     expect(queuedSync).toContain('if (this.isSyncInProgress())');
     expect(queuedSync).toContain('this.scheduleQueuedSync(SYNC_DEBOUNCE_MS)');
     expect(pluginMain).toContain('syncOnceOrPollResolvedConflict');

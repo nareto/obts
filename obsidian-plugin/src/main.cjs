@@ -1034,7 +1034,7 @@ module.exports = class ObtsPlugin extends Plugin {
     if (this.syncQueued) this.scheduleQueuedSync(0);
   }
 
-  async flushOpenMarkdownEditorsToDisk() {
+  async flushOpenMarkdownEditorsToDisk(isUnreloadedView = null) {
     const workspace = this.app && this.app.workspace;
     const vault = this.app && this.app.vault;
     if (!workspace || !vault || typeof workspace.getLeavesOfType !== "function" || typeof vault.read !== "function" || typeof vault.modify !== "function") {
@@ -1058,7 +1058,7 @@ module.exports = class ObtsPlugin extends Plugin {
       } catch {
         continue;
       }
-      if (editorText !== diskText) {
+      if (editorText !== diskText && !(isUnreloadedView && await isUnreloadedView(file.path, editorText))) {
         await vault.modify(file, editorText);
         flushed.push(file.path);
       }
@@ -9422,7 +9422,23 @@ class ObtsObsidianClient {
     if (!this.plugin.flushOpenMarkdownEditorsToDisk) {
       return [];
     }
-    return await this.plugin.flushOpenMarkdownEditorsToDisk();
+    return await this.plugin.flushOpenMarkdownEditorsToDisk((filePath, text) => this.isUnreloadedApplyView(filePath, text));
+  }
+
+  // A view still byte-identical to the path at an unsettled apply base has not reloaded the
+  // applied target and authored nothing on that base; its bytes are already preserved there.
+  async isUnreloadedApplyView(filePath, text) {
+    try {
+      const saved = await this.readStaleProvenance();
+      const bases = new Set(saved.horizons.filter((h) => h.touched.some((p) => changedPathsConflict(p, filePath)))
+        .map((h) => this.staleHorizonBase(h, filePath)));
+      if (!bases.size) return false;
+      const oid = (await git.hashBlob({ object: Buffer.from(text) })).oid;
+      for (const base of bases) if (await this.readTreePathOid(base, filePath) === oid) return true;
+    } catch {
+      return false;
+    }
+    return false;
   }
 
   async assertPairingCanStart() {

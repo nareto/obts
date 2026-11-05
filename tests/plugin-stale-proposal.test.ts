@@ -76,6 +76,13 @@ async function fixture() {
   return { root, server, url, vaultId, headers, dir, plugin, core, m0, remote, canonical, provenance, restart, pair };
 }
 
+function openEditor(f: Awaited<ReturnType<typeof fixture>>, path: string, text: () => string) {
+  f.core.plugin.app.workspace = { getLeavesOfType: () => [{ view: { file: { path }, editor: { getValue: text } } }] };
+  f.core.plugin.app.vault.read = async (file: { path: string }) => readFile(join(f.dir, file.path), 'utf8');
+  f.core.plugin.app.vault.modify = async (file: { path: string }, value: string) => f.core.adapter.write(file.path, value);
+  f.core.plugin.flushOpenMarkdownEditorsToDisk = (...args: any[]) => pluginMain.prototype.flushOpenMarkdownEditorsToDisk.call(f.core.plugin, ...args);
+}
+
 async function markHorizonsExpired(core: any) {
   await core.mutateStaleProvenance(async (saved: any) => { for (const h of saved.horizons) h.expiry = Date.now() - 1; });
 }
@@ -159,6 +166,34 @@ describe('client stale authoring cohorts with the real server', () => {
     const q = await assertProposal(f, c);
     expect((await f.core.uploadQueuedCommit(q)).status).toBe('merged');
     expect(await f.canonical()).toBe(MERGED);
+  });
+
+  it('never writes an unreloaded pre-apply editor view back over applied server bytes', async () => {
+    const f = await fixture();
+    await f.remote();
+    let view = BASE;
+    openEditor(f, 'note.md', () => view);
+    await f.core.pullAndApply(true);
+    expect(await readFile(join(f.dir, 'note.md'), 'utf8')).toBe(REMOTE);
+    expect((await f.core.readQueue()).pending_commit).toBeFalsy();
+    await markHorizonsExpired(f.core);
+    expect(await f.core.flushEditorBuffersToDisk()).toEqual([]);
+    expect(await readFile(join(f.dir, 'note.md'), 'utf8')).toBe(REMOTE);
+    view = REMOTE;
+    expect((await f.plugin.syncOnce()).status).toBe('Synced');
+    expect(await f.canonical()).toBe(REMOTE);
+    expect((await f.core.readQueue()).pending_commit).toBeFalsy();
+    expect((await f.provenance()).obligations).toEqual({});
+  });
+
+  it('still flushes an edit typed into a view that has not reloaded the applied bytes', async () => {
+    const f = await fixture();
+    await f.remote();
+    openEditor(f, 'note.md', () => BASE);
+    await f.core.pullAndApply(true);
+    openEditor(f, 'note.md', () => LOCAL);
+    expect(await f.core.flushEditorBuffersToDisk()).toEqual(['note.md']);
+    expect(await readFile(join(f.dir, 'note.md'), 'utf8')).toBe(LOCAL);
   });
 
   it('drains the adapter after expiry before releasing the durable horizon', async () => {
