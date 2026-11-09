@@ -54,14 +54,27 @@ pub enum NewNoteFileType {
     #[default]
     Md,
     Base,
+    Canvas,
 }
 
 impl NewNoteFileType {
+    pub const ALL: [Self; 3] = [Self::Md, Self::Base, Self::Canvas];
+
     pub fn extension(self) -> &'static str {
         match self {
             Self::Md => "md",
             Self::Base => "base",
+            Self::Canvas => "canvas",
         }
+    }
+
+    /// Supported vault text file type for a vault-relative path, matched on its
+    /// case-insensitive extension.
+    pub fn from_path(path: &str) -> Option<Self> {
+        let (_, extension) = path.rsplit_once('.')?;
+        Self::ALL
+            .into_iter()
+            .find(|file_type| extension.eq_ignore_ascii_case(file_type.extension()))
     }
 
     pub fn is_markdown(self) -> bool {
@@ -267,14 +280,28 @@ impl NewNoteRequest {
         Ok(path)
     }
 
-    pub fn apply_markdown_create_metadata(
+    /// Records creation metadata (timestamp, policy-added tags, owner) in the
+    /// new file: Markdown frontmatter or canvas `metadata.frontmatter`. Bases
+    /// files carry no policy metadata.
+    pub fn apply_create_metadata(
         &mut self,
         created_at: DateTime<Utc>,
         add_tags: &[String],
         owner_principal: Option<&str>,
     ) -> Result<(), WriteError> {
-        if !self.file_type.is_markdown() {
-            return Ok(());
+        match self.file_type {
+            NewNoteFileType::Md => {}
+            NewNoteFileType::Base => return Ok(()),
+            NewNoteFileType::Canvas => {
+                self.content = crate::canvas::apply_canvas_create_metadata(
+                    &self.content,
+                    frontmatter_timestamp(created_at),
+                    add_tags,
+                    owner_principal,
+                )
+                .map_err(|reason| WriteError::InvalidCreate { reason })?;
+                return Ok(());
+            }
         }
 
         let (frontmatter, body) = parse_frontmatter(&self.content);
@@ -603,8 +630,9 @@ fn trim_filename_segment(segment: String) -> String {
 fn with_file_type_extension(path: &str, file_type: NewNoteFileType) -> String {
     let extension = format!(".{}", file_type.extension());
     let lower = path.to_ascii_lowercase();
-    for existing_extension in [".md", ".base"] {
-        if lower.ends_with(existing_extension) {
+    for existing_type in NewNoteFileType::ALL {
+        let existing_extension = format!(".{}", existing_type.extension());
+        if lower.ends_with(&existing_extension) {
             return format!(
                 "{}{}",
                 &path[..path.len() - existing_extension.len()],
@@ -772,7 +800,7 @@ mod tests {
         for now in timestamp_fixtures() {
             let mut note = request("Test");
             note.content = "---\ncreated: old\ncustom: retained\n---\n\nBody".to_string();
-            note.apply_markdown_create_metadata(now, &[], None).unwrap();
+            note.apply_create_metadata(now, &[], None).unwrap();
 
             let (frontmatter, body) = parse_frontmatter(&note.content);
             assert_eq!(
@@ -890,6 +918,44 @@ mod tests {
         assert_eq!(path, "00New/Project Dashboard.base");
     }
 
+    #[test]
+    fn canvas_file_type_replaces_configured_markdown_extension() {
+        let settings = NewNotePathSettings {
+            base_path: "00New".to_string(),
+            path_template: "{base}/{title}.md".to_string(),
+            date_format: "%Y-%m-%d".to_string(),
+            max_title_slug_length: 60,
+            max_title_length: 200,
+        };
+
+        let mut request = request("Decision Map");
+        request.file_type = NewNoteFileType::Canvas;
+        let path = request
+            .validate_write_with_settings_at(fixed_now(), &settings)
+            .expect("valid canvas path");
+
+        assert_eq!(path, "00New/Decision Map.canvas");
+    }
+
+    #[test]
+    fn file_type_from_path_matches_supported_extensions_case_insensitively() {
+        assert_eq!(
+            NewNoteFileType::from_path("a/b.md"),
+            Some(NewNoteFileType::Md)
+        );
+        assert_eq!(
+            NewNoteFileType::from_path("a/b.BASE"),
+            Some(NewNoteFileType::Base)
+        );
+        assert_eq!(
+            NewNoteFileType::from_path("a/b.Canvas"),
+            Some(NewNoteFileType::Canvas)
+        );
+        assert_eq!(NewNoteFileType::from_path("a/b.png"), None);
+        assert_eq!(NewNoteFileType::from_path("a.md/b"), None);
+        assert_eq!(NewNoteFileType::from_path("canvas"), None);
+    }
+
     const LONG_TITLE: &str =
         "Weekly review of reading notes - what I learned about distributed systems";
 
@@ -1005,6 +1071,10 @@ mod tests {
         assert_eq!(
             created_file_title("11New/x.base", NewNoteFileType::Base),
             "x"
+        );
+        assert_eq!(
+            created_file_title("11New/Map.canvas", NewNoteFileType::Canvas),
+            "Map"
         );
     }
 

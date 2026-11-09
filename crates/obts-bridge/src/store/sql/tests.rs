@@ -228,6 +228,110 @@ async fn postgres_create_then_edit_waits_for_healthy_maintenance() {
 
 #[tokio::test]
 #[ignore = "requires synthetic PostgreSQL; run explicitly with --ignored"]
+async fn postgres_canvas_policy_columns_gate_agent_edits() {
+    let f = Fixture::new().await;
+    f.service
+        .store
+        .set_authorization_config(std::collections::BTreeMap::from([(
+            "agent".to_string(),
+            AccessPolicy::default_agent(),
+        )]))
+        .await;
+    let agent = AuthContext::new(ContextName::new("agent"), "mcp_token:planner".to_string());
+    let other = AuthContext::new(ContextName::new("agent"), "mcp_token:other".to_string());
+    std::fs::write(
+        f.root.path().join("User.canvas"),
+        r#"{"nodes":[],"edges":[],"metadata":{"frontmatter":{"tags":["private"]}}}"#,
+    )
+    .unwrap();
+    f.project().await;
+    let created = f
+        .service
+        .create_vault_file(
+            &agent,
+            crate::new_note::NewNoteRequest {
+                title: "Plan".into(),
+                content: r#"{"nodes":[{"id":"a1","type":"text","text":"Step","x":0,"y":0,"width":200,"height":60}],"edges":[]}"#.into(),
+                template_id: None,
+                file_type: crate::new_note::NewNoteFileType::Canvas,
+            },
+        )
+        .await
+        .unwrap();
+    f.project().await;
+    let columns = |path: String| {
+        let pool = f.service.store.db().pool.clone();
+        async move {
+            sqlx::query_as::<_, (Vec<String>, Option<String>)>(
+                "SELECT policy_tags, policy_owner FROM vault_files WHERE path=$1",
+            )
+            .bind(path)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(
+        columns(created.id.to_string()).await,
+        (
+            vec!["ai-created".to_string()],
+            Some("mcp_token:planner".to_string())
+        )
+    );
+    assert_eq!(
+        columns("User.canvas".to_string()).await,
+        (vec!["private".to_string()], None)
+    );
+    let file = f.service.get_vault_file(&agent, &created.id).await.unwrap();
+    let moved = file.content.replace(r#""x":0"#, r#""x":240"#);
+    let replace = |revision: String, content: String| UpdateNoteRequest {
+        content: Some(content),
+        content_patch: None,
+        tags: None,
+        metadata: None,
+        expected_revision: Some(revision),
+    };
+    assert!(matches!(
+        f.service
+            .edit_vault_file(
+                &other,
+                &created.id,
+                replace(file.revision.clone(), moved.clone())
+            )
+            .await,
+        Err(ServiceError::Write(WriteError::PolicyDenied { .. }))
+    ));
+    assert!(matches!(
+        f.service
+            .edit_vault_file(
+                &agent,
+                &created.id,
+                replace(
+                    file.revision.clone(),
+                    moved.replace("\"ai-created\"", "\"mine\"")
+                )
+            )
+            .await,
+        Err(ServiceError::Write(WriteError::InvalidUpdate { .. }))
+    ));
+    f.service
+        .edit_vault_file(
+            &agent,
+            &created.id,
+            replace(file.revision.clone(), moved.clone()),
+        )
+        .await
+        .unwrap();
+    drop(file);
+    f.project().await;
+    let edited = f.service.get_vault_file(&agent, &created.id).await.unwrap();
+    assert_eq!(edited.content, moved);
+    drop(edited);
+    f.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires synthetic PostgreSQL; run explicitly with --ignored"]
 async fn postgres_queued_writers_share_deadline_and_cancel_safely() {
     let mut f = Fixture::new().await;
     std::fs::write(f.root.path().join("Queued.md"), "# Original\n").unwrap();

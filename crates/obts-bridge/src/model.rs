@@ -70,10 +70,10 @@ pub struct Note {
     pub updated_at: DateTime<Utc>,
 }
 
-/// A raw readable vault file (supported text files: .md, .base).
+/// A raw readable vault file (supported text files: .md, .base, .canvas).
 ///
-/// `content` is the exact file content including YAML frontmatter for .md and
-/// raw YAML for .base. Parsed note semantics (frontmatter, tags, links, etc.)
+/// `content` is the exact file content including YAML frontmatter for .md,
+/// raw YAML for .base and raw JSON Canvas for .canvas. Parsed note semantics (frontmatter, tags, links, etc.)
 /// are available through the existing note-index APIs for .md files.
 #[derive(Debug, Clone, Serialize)]
 pub struct VaultFile {

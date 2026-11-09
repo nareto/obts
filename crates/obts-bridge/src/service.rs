@@ -16,8 +16,7 @@ use crate::filesystem::{FilesystemError, FilesystemSource};
 use crate::headless::{HeadlessClient, HeadlessError, HeadlessFilesystemGuard};
 use crate::model::{Note, NoteId, VaultFile};
 use crate::new_note::{
-    NewNoteFileType, NewNoteRequest, PersistenceFailureKind, UpdateNoteRequest, WriteError,
-    created_file_title,
+    NewNoteRequest, PersistenceFailureKind, UpdateNoteRequest, WriteError, created_file_title,
 };
 use crate::search::{SearchMode, SearchResponse};
 use crate::store::{
@@ -1166,11 +1165,7 @@ impl VaultBridgeService {
                 id: file_id.clone(),
                 revision: whole_file_revision(&file.content),
                 path: file.path.clone(),
-                file_type: if file.path.ends_with(".md") {
-                    NewNoteFileType::Md
-                } else {
-                    NewNoteFileType::Base
-                },
+                file_type: crate::store::file_type_from_path(&file.path),
                 size_bytes: file.content.len(),
                 content_sha256,
                 content: file.content,
@@ -1208,11 +1203,7 @@ impl VaultBridgeService {
                     id: file_id.clone(),
                     revision: whole_file_revision(&current.content),
                     path: current.path.clone(),
-                    file_type: if current.path.ends_with(".md") {
-                        NewNoteFileType::Md
-                    } else {
-                        NewNoteFileType::Base
-                    },
+                    file_type: crate::store::file_type_from_path(&current.path),
                     size_bytes: current.content.len(),
                     content_sha256: current_sha256,
                     content: current.content,
@@ -1967,5 +1958,133 @@ mod obts_tests {
             "Another long title that keeps going well past the configured"
         );
         assert!(note.title_truncated);
+    }
+
+    #[tokio::test]
+    async fn agents_edit_only_canvases_they_created() {
+        let store = VaultStore::new(10);
+        store
+            .set_authorization_config(BTreeMap::from([(
+                "agent".into(),
+                AccessPolicy::default_agent(),
+            )]))
+            .await;
+        let root = tempdir().unwrap();
+        let source = Arc::new(FilesystemSource::new(root.path()).unwrap());
+        let user_canvas = r#"{"nodes":[{"id":"u1","type":"text","text":"mine","x":0,"y":0,"width":100,"height":60}],"edges":[]}"#;
+        let user_revision = source.create("User.canvas", user_canvas).await.unwrap();
+        store
+            .project_filesystem_file(RecoveredVaultFileState {
+                path: "User.canvas".into(),
+                content: user_canvas.into(),
+                file_type: NewNoteFileType::Canvas,
+                couchdb_rev: user_revision,
+                created_at: Some(Utc::now()),
+                updated_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        let service = VaultBridgeService::new_with_filesystem(store, source, None);
+        let agent = AuthContext::new(ContextName::new("agent"), "mcp_token:planner".into());
+        let other = AuthContext::new(ContextName::new("agent"), "mcp_token:other".into());
+        let replace = |revision: &str, content: String| UpdateNoteRequest {
+            content: Some(content),
+            content_patch: None,
+            tags: None,
+            metadata: None,
+            expected_revision: Some(revision.to_string()),
+        };
+
+        assert!(matches!(
+            service
+                .create_vault_file(
+                    &agent,
+                    NewNoteRequest {
+                        title: "Broken".into(),
+                        content: r#"{"nodes":[{"id":"a"}]}"#.into(),
+                        template_id: None,
+                        file_type: NewNoteFileType::Canvas,
+                    },
+                )
+                .await,
+            Err(ServiceError::Write(WriteError::InvalidCreate { .. }))
+        ));
+        let created = service
+            .create_vault_file(
+                &agent,
+                NewNoteRequest {
+                    title: "Plan".into(),
+                    content: r#"{"nodes":[{"id":"a1","type":"text","text":"Step one","x":0,"y":0,"width":200,"height":60}],"edges":[]}"#.into(),
+                    template_id: None,
+                    file_type: NewNoteFileType::Canvas,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(created.id.as_str().ends_with("-plan.canvas"));
+        assert_eq!(created.file_type, NewNoteFileType::Canvas);
+        assert!(!created.indexed_as_note);
+        let file = service.get_vault_file(&agent, &created.id).await.unwrap();
+        assert_eq!(file.file_type, NewNoteFileType::Canvas);
+        assert!(file.content.contains(r#""created_by":"mcp_token:planner""#));
+        assert!(file.content.contains(r#""tags":["ai-created"]"#));
+
+        let moved = file.content.replace(r#""x":0"#, r#""x":240"#);
+        let edited = service
+            .edit_vault_file(&agent, &created.id, replace(&file.revision, moved.clone()))
+            .await
+            .unwrap();
+        let file = service.get_vault_file(&agent, &created.id).await.unwrap();
+        assert_eq!(file.revision, edited.revision);
+        assert_eq!(file.content, moved);
+
+        assert!(matches!(
+            service
+                .edit_vault_file(&other, &created.id, replace(&file.revision, moved.clone()))
+                .await,
+            Err(ServiceError::Write(WriteError::PolicyDenied { .. }))
+        ));
+        let user = NoteId::new("User.canvas");
+        let user_file = service.get_vault_file(&agent, &user).await.unwrap();
+        assert!(matches!(
+            service
+                .edit_vault_file(
+                    &agent,
+                    &user,
+                    replace(&user_file.revision, user_canvas.replace("mine", "taken"))
+                )
+                .await,
+            Err(ServiceError::Write(WriteError::PolicyDenied { .. }))
+        ));
+        for (candidate, expected) in [
+            (
+                moved.replace(r#""tags":["ai-created"]"#, r#""tags":[]"#),
+                "ai-created",
+            ),
+            (
+                moved.replace("mcp_token:planner", "mcp_token:other"),
+                "created_by",
+            ),
+            (moved.replace(r#""edges":[]"#, r#""edges":{}"#), "edges"),
+        ] {
+            let error = service
+                .edit_vault_file(&agent, &created.id, replace(&file.revision, candidate))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, ServiceError::Write(WriteError::InvalidUpdate { reason }) if reason.contains(expected)),
+                "{error:?}"
+            );
+        }
+        let mut with_tags = replace(&file.revision, moved.clone());
+        with_tags.tags = Some(vec!["extra".into()]);
+        assert!(matches!(
+            service
+                .edit_vault_file(&agent, &created.id, with_tags)
+                .await,
+            Err(ServiceError::Write(WriteError::InvalidUpdate { .. }))
+        ));
+        let unchanged = service.get_vault_file(&agent, &created.id).await.unwrap();
+        assert_eq!(unchanged.content, moved);
     }
 }

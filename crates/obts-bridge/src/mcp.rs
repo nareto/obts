@@ -2320,6 +2320,15 @@ mod tests {
         assert!(create_vault_file.description.contains("file_type"));
         assert!(create_vault_file.description.contains("title_truncated"));
         assert!(create_vault_file.description.contains("word boundary"));
+        assert!(
+            create_vault_file
+                .description
+                .contains("metadata.frontmatter")
+        );
+        assert_eq!(
+            create_vault_file.input_schema["properties"]["file_type"]["enum"],
+            json!(["md", "base", "canvas"])
+        );
 
         let get_vault_file = tool_named("get_vault_file");
         assert!(get_vault_file.description.contains("raw"));
@@ -2331,6 +2340,8 @@ mod tests {
         assert!(edit_vault_file.description.contains("mutually exclusive"));
         assert!(edit_vault_file.description.contains("403"));
         assert!(edit_vault_file.description.contains("YAML"));
+        assert!(edit_vault_file.description.contains("JSON Canvas"));
+        assert!(edit_vault_file.description.contains("created_by"));
     }
 
     #[test]

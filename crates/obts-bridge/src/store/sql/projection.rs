@@ -160,8 +160,10 @@ impl VaultStore {
         let result: Result<(), sqlx::Error> = async {
             #[cfg(test)]
             if self.forced_projection_failure.read().await.is_some() { return Err(sqlx::Error::Protocol("injected projection failure".into())); }
-            writer.row("INSERT INTO vault_files(path,content,couchdb_rev,created_at,updated_at,indexed_at,projection_complete,projected_row_count) VALUES($1,'',$2,$3,$4,$4,FALSE,0) ON CONFLICT(path) DO UPDATE SET content='',couchdb_rev=$2,created_at=$3,updated_at=$4,indexed_at=$4,projection_complete=FALSE,projected_row_count=0",
-                Parameters::default().bind(&write.path)?.bind(&revision)?.bind(write.created_at)?.bind(write.updated_at)?).await?;
+            let policy = (write.note.is_none()).then(|| raw_file_policy_note(&write.path, &write.content, write.created_at, write.updated_at));
+            let (policy_tags, policy_owner) = policy.map(|policy| (policy.tags, policy.owner)).unwrap_or_default();
+            writer.row("INSERT INTO vault_files(path,content,couchdb_rev,created_at,updated_at,indexed_at,projection_complete,projected_row_count,policy_tags,policy_owner) VALUES($1,'',$2,$3,$4,$4,FALSE,0,$5,$6) ON CONFLICT(path) DO UPDATE SET content='',couchdb_rev=$2,created_at=$3,updated_at=$4,indexed_at=$4,projection_complete=FALSE,projected_row_count=0,policy_tags=$5,policy_owner=$6",
+                Parameters::default().bind(&write.path)?.bind(&revision)?.bind(write.created_at)?.bind(write.updated_at)?.bind(policy_tags)?.bind(policy_owner)?).await?;
             writer.flush().await?;
             // Invalidating the file commits before any independently committed derived rows.
             let mut expected = 1i64;

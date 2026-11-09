@@ -69,6 +69,8 @@ Bridge-generated Markdown frontmatter `created` (on creation) and `updated` (on 
 
 New-file names are generated from the request `title` through `new_note.path_template`. `{title}` is limited by `new_note.max_title_length` (default 200 bytes) and `{slug}` by `new_note.max_title_slug_length` (default 60 bytes). A longer value is cut at a word boundary, or at a character boundary when a single overlong word leaves no usable boundary. Create receipts report the final `title` (the file name without folder or extension) and `title_truncated`, so callers can tell when a title was shortened.
 
+Bridge writes Markdown, Bases and JSON Canvas (`file_type: canvas`) files. Canvas policy metadata lives in `metadata.frontmatter` (`tags`, `created_by`, `created`), so an agent can edit a canvas it created under the same owner and `ai-created` rules as a note. Created canvases are re-serialized with sorted keys and one node or edge per line; edits are stored verbatim but must stay valid JSON Canvas and keep the owner and protected tags.
+
 Containers do not automatically inherit the host timezone. Configure the runtime with a named timezone and zoneinfo data (for example `TZ=Europe/Rome`), or mount the host's `/etc/localtime` read-only. Named zones supply daylight-saving transitions rather than a fixed offset. Recreate the container after changing a host timezone bind mount so it picks up the new file.
 
 ## Markdown export

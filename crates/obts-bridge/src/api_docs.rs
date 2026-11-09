@@ -135,7 +135,7 @@ pub(crate) fn openapi_spec() -> Value {
                             "description": "Opaque whole-file revision required as expected_revision for an edit."
                         },
                         "path": {"type": "string"},
-                        "file_type": {"type": "string", "enum": ["md", "base"]},
+                        "file_type": {"type": "string", "enum": ["md", "base", "canvas"]},
                         "content": {"type": "string"},
                         "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
                         "size_bytes": {"type": "integer", "minimum": 0},
@@ -466,7 +466,7 @@ pub(crate) fn openapi_spec() -> Value {
                         },
                         "content": {
                             "type": "string",
-                            "description": "Complete raw file content. For Markdown, server policy may add managed frontmatter such as tags, owner, or created."
+                            "description": "Complete raw file content. For Markdown, server policy may add managed frontmatter such as tags, owner, or created. For canvas, provide a JSON Canvas document; server policy records the same metadata in `metadata.frontmatter` and re-serializes the document with sorted keys."
                         },
                         "template_id": {
                             "type": "string",
@@ -474,7 +474,7 @@ pub(crate) fn openapi_spec() -> Value {
                         },
                         "file_type": {
                             "type": "string",
-                            "enum": ["md", "base"],
+                            "enum": ["md", "base", "canvas"],
                             "default": "md"
                         }
                     }
@@ -488,7 +488,7 @@ pub(crate) fn openapi_spec() -> Value {
                         "title_truncated": {"type": "boolean", "description": "True when a configured length limit shortened the title-derived part of the generated path."},
                         "revision": {"type": "string", "pattern": "^v1:sha256:[0-9a-f]{64}$"},
                         "status": {"type": "string", "enum": ["created", "accepted"]},
-                        "file_type": {"type": "string", "enum": ["md", "base"]},
+                        "file_type": {"type": "string", "enum": ["md", "base", "canvas"]},
                         "indexed_as_note": {"type": "boolean"},
                         "local_projection": {"type": "string", "enum": ["applied", "pending"]},
                         "operation_id": {"type": "string"}
@@ -1108,7 +1108,7 @@ pub(crate) fn openapi_spec() -> Value {
             "/api/v1/vault-files": {
                 "post": {
                     "tags": ["obts_bridge"],
-                    "summary": "Create a raw Markdown or Base vault file",
+                    "summary": "Create a raw Markdown, Base or canvas vault file",
                     "security": [{"api_key": []}],
                     "requestBody": {
                         "required": true,

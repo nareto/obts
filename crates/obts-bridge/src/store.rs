@@ -2942,9 +2942,7 @@ impl VaultStore {
         now: DateTime<Utc>,
     ) -> Result<NewNoteRequest, WriteError> {
         validate_create_template_reference(&request)?;
-        if request.file_type == NewNoteFileType::Base {
-            validate_base_file_content(&request.content)?;
-        }
+        validate_created_file_content(request.file_type, &request.content)?;
         let note = policy_note_from_create_request(&request, path, now)?;
         let config = self.authorization_config().await;
         let Some(decision) = policy_decision_for(&config, auth, "create", &note, now) else {
@@ -2956,7 +2954,7 @@ impl VaultStore {
         };
 
         let owner_principal = decision.set_owner.then_some(auth.principal.as_str());
-        request.apply_markdown_create_metadata(now, &decision.add_tags, owner_principal)?;
+        request.apply_create_metadata(now, &decision.add_tags, owner_principal)?;
         self.validate_create_template_content(auth, &request)
             .await?;
 
@@ -3019,7 +3017,9 @@ impl VaultStore {
                     })?;
                 validate_markdown_content_against_template(&request.content, &template.frontmatter)
             }
-            NewNoteFileType::Base => validate_base_file_content(&request.content),
+            NewNoteFileType::Base | NewNoteFileType::Canvas => {
+                validate_created_file_content(request.file_type, &request.content)
+            }
         }
     }
 
@@ -3052,9 +3052,7 @@ impl VaultStore {
         now: DateTime<Utc>,
     ) -> Result<PreparedVaultWrite, WriteError> {
         let path = self.validate_new_note_write_at(&request, now).await?;
-        if request.file_type == NewNoteFileType::Base {
-            validate_base_file_content(&request.content)?;
-        }
+        validate_created_file_content(request.file_type, &request.content)?;
         let note = if request.file_type.is_markdown() {
             let max_link_context_chars = self.settings.read().await.max_link_context_chars;
             Some(note_input_from_raw_markdown(
@@ -3750,7 +3748,7 @@ impl VaultStore {
         Ok(())
     }
 
-    /// Create a raw vault file (md or base) with policy enforcement.
+    /// Create a raw vault file (md, base or canvas) with policy enforcement.
     pub async fn create_vault_file(
         &self,
         auth: &AuthContext,
@@ -3759,9 +3757,7 @@ impl VaultStore {
     ) -> Result<NewNoteResponse, WriteError> {
         let path = self.validate_new_note_write_at(&request, now).await?;
         validate_create_template_reference(&request)?;
-        if request.file_type == NewNoteFileType::Base {
-            validate_base_file_content(&request.content)?;
-        }
+        validate_created_file_content(request.file_type, &request.content)?;
 
         let note = policy_note_from_create_request(&request, &path, now)?;
         let config = self.authorization_config().await;
@@ -3774,9 +3770,7 @@ impl VaultStore {
         };
 
         let owner_principal = decision.set_owner.then_some(auth.principal.as_str());
-        if request.file_type.is_markdown() {
-            request.apply_markdown_create_metadata(now, &decision.add_tags, owner_principal)?;
-        }
+        request.apply_create_metadata(now, &decision.add_tags, owner_principal)?;
         self.validate_create_template_content(auth, &request)
             .await?;
 
@@ -3848,17 +3842,9 @@ impl VaultStore {
             } else {
                 None
             };
-            let policy_note =
-                stored_note
-                    .map(policy_note_from_stored)
-                    .unwrap_or_else(|| PolicyNote {
-                        path: path.clone(),
-                        title: title_from_note_id(&path),
-                        tags: Vec::new(),
-                        created_at: file.created_at,
-                        updated_at: file.updated_at,
-                        owner: None,
-                    });
+            let policy_note = stored_note.map(policy_note_from_stored).unwrap_or_else(|| {
+                raw_file_policy_note(&path, &file.content, file.created_at, file.updated_at)
+            });
             (
                 file.content.clone(),
                 file.created_at,
@@ -4055,7 +4041,19 @@ impl VaultStore {
             );
             (content, Some(note))
         } else {
-            validate_base_file_content(&candidate_content)?;
+            validate_raw_file_content(file_type, &candidate_content)
+                .map_err(|reason| WriteError::InvalidUpdate { reason })?;
+            if file_type == NewNoteFileType::Canvas {
+                crate::canvas::validate_canvas_edit(
+                    &candidate_content,
+                    &crate::canvas::CanvasPolicyMetadata {
+                        tags: policy_note.tags.clone(),
+                        owner: policy_note.owner.clone(),
+                    },
+                    &decision.preserve_tags,
+                )
+                .map_err(|reason| WriteError::InvalidUpdate { reason })?;
+            }
             (candidate_content, None)
         };
 
@@ -5102,24 +5100,38 @@ fn vault_file_readable_for_policy_from_inner(
         };
         policy_note_from_stored(note)
     } else {
-        PolicyNote {
-            path: path.to_string(),
-            title: title_from_note_id(path),
-            tags: Vec::new(),
-            created_at: file.created_at,
-            updated_at: file.updated_at,
-            owner: None,
-        }
+        raw_file_policy_note(path, &file.content, file.created_at, file.updated_at)
     };
     policy_allows(config, auth, "read", &policy_note, now)
 }
 
-fn file_type_from_path(path: &str) -> NewNoteFileType {
-    if path.to_ascii_lowercase().ends_with(".md") {
-        NewNoteFileType::Md
+/// Authorization view of a non-Markdown vault file. Canvas files carry tags and
+/// an owner in `metadata.frontmatter`; Bases files carry neither.
+pub(crate) fn raw_file_policy_note(
+    path: &str,
+    content: &str,
+    created_at: Option<DateTime<Utc>>,
+    updated_at: DateTime<Utc>,
+) -> PolicyNote {
+    let metadata = if file_type_from_path(path) == NewNoteFileType::Canvas {
+        crate::canvas::canvas_policy_metadata(content)
     } else {
-        NewNoteFileType::Base
+        crate::canvas::CanvasPolicyMetadata::default()
+    };
+    PolicyNote {
+        path: path.to_string(),
+        title: title_from_note_id(path),
+        tags: metadata.tags,
+        created_at,
+        updated_at,
+        owner: metadata.owner,
     }
+}
+
+/// File type of a supported vault file path. Callers only pass paths accepted by
+/// `is_supported_vault_file_path`; anything else is treated as a raw Bases file.
+pub(crate) fn file_type_from_path(path: &str) -> NewNoteFileType {
+    NewNoteFileType::from_path(path).unwrap_or(NewNoteFileType::Base)
 }
 
 fn source_policy_note(file: &crate::filesystem::FilesystemFile) -> (Option<NoteInput>, PolicyNote) {
@@ -5144,13 +5156,8 @@ fn source_policy_note(file: &crate::filesystem::FilesystemFile) -> (Option<NoteI
             updated_at: note.updated_at,
             owner: owner_from_frontmatter(&note.frontmatter).map(str::to_string),
         })
-        .unwrap_or_else(|| PolicyNote {
-            path: path.clone(),
-            title: title_from_note_id(path),
-            tags: Vec::new(),
-            created_at: file.created_at,
-            updated_at: file.updated_at,
-            owner: None,
+        .unwrap_or_else(|| {
+            raw_file_policy_note(path, &file.content, file.created_at, file.updated_at)
         });
     (note, policy)
 }
@@ -5896,8 +5903,13 @@ fn policy_note_from_create_request(
 fn create_request_tags_and_owner(
     request: &NewNoteRequest,
 ) -> Result<(Vec<String>, Option<String>), WriteError> {
-    if !request.file_type.is_markdown() {
-        return Ok((Vec::new(), None));
+    match request.file_type {
+        NewNoteFileType::Md => {}
+        NewNoteFileType::Base => return Ok((Vec::new(), None)),
+        NewNoteFileType::Canvas => {
+            let metadata = crate::canvas::canvas_policy_metadata(&request.content);
+            return Ok((metadata.tags, metadata.owner));
+        }
     }
 
     let (frontmatter, body) = parse_frontmatter(&request.content);
@@ -5983,18 +5995,28 @@ fn validate_markdown_content_against_template(
     Ok(())
 }
 
-fn validate_base_file_content(content: &str) -> Result<(), WriteError> {
-    let value = serde_yaml::from_str::<serde_yaml::Value>(content).map_err(|error| {
-        WriteError::InvalidCreate {
-            reason: format!("base content is not valid YAML: {error}"),
+fn validate_created_file_content(
+    file_type: NewNoteFileType,
+    content: &str,
+) -> Result<(), WriteError> {
+    validate_raw_file_content(file_type, content)
+        .map_err(|reason| WriteError::InvalidCreate { reason })
+}
+
+/// Structural validation of raw vault file content by file type.
+fn validate_raw_file_content(file_type: NewNoteFileType, content: &str) -> Result<(), String> {
+    match file_type {
+        NewNoteFileType::Md => Ok(()),
+        NewNoteFileType::Base => {
+            let value = serde_yaml::from_str::<serde_yaml::Value>(content)
+                .map_err(|error| format!("base content is not valid YAML: {error}"))?;
+            if !matches!(value, serde_yaml::Value::Mapping(_)) {
+                return Err("base content must be a YAML mapping".to_string());
+            }
+            Ok(())
         }
-    })?;
-    if !matches!(value, serde_yaml::Value::Mapping(_)) {
-        return Err(WriteError::InvalidCreate {
-            reason: "base content must be a YAML mapping".to_string(),
-        });
+        NewNoteFileType::Canvas => crate::canvas::parse_valid_canvas(content).map(drop),
     }
-    Ok(())
 }
 
 fn json_type_name(value: &Value) -> &'static str {
@@ -6637,10 +6659,7 @@ fn note_id_from_deletion_change(change: &ChangeEvent) -> Option<NoteId> {
             .get("path")
             .and_then(Value::as_str)
             .map(crate::livesync::normalize_note_path)
-            .filter(|value| {
-                let lower = value.to_ascii_lowercase();
-                lower.ends_with(".md") || lower.ends_with(".base")
-            })
+            .filter(|value| is_supported_vault_file_path(value))
             .filter(|value| !value.is_empty())
         {
             return Some(NoteId::new(path));
@@ -7458,11 +7477,8 @@ fn deletion_file_doc_id(change: &ChangeEvent) -> Option<String> {
         return None;
     }
 
-    (change.id.starts_with("f:") || {
-        let lower = change.id.to_ascii_lowercase();
-        lower.ends_with(".md") || lower.ends_with(".base")
-    })
-    .then(|| change.id.clone())
+    (change.id.starts_with("f:") || is_supported_vault_file_path(&change.id))
+        .then(|| change.id.clone())
 }
 
 fn snippet_for(content: &str, query: &str) -> String {

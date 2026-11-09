@@ -12,6 +12,24 @@ fn unavailable(_: impl std::fmt::Display) -> ServiceError {
     ServiceError::IndexCatchingUp
 }
 
+/// Authorization view of a non-Markdown vault file from its indexed policy
+/// columns, so policy applies before the body is hydrated.
+fn raw_file_policy_from_row(
+    path: &str,
+    row: &PgRow,
+    created_at: Option<DateTime<Utc>>,
+    updated_at: DateTime<Utc>,
+) -> Result<PolicyNote, ServiceError> {
+    Ok(PolicyNote {
+        path: path.to_string(),
+        title: title_from_note_id(path),
+        tags: row.try_get("policy_tags").map_err(unavailable)?,
+        created_at,
+        updated_at,
+        owner: row.try_get("policy_owner").map_err(unavailable)?,
+    })
+}
+
 fn metadata(row: &PgRow) -> Result<StoredNote, sqlx::Error> {
     Ok(StoredNote {
         id: NoteId::new(row.try_get::<String, _>("id")?),
@@ -242,7 +260,7 @@ impl VaultStore {
         id: &NoteId,
     ) -> Result<VaultFile, ServiceError> {
         let row = sqlx::query(
-            "SELECT couchdb_rev, created_at, updated_at FROM vault_files WHERE path=$1",
+            "SELECT couchdb_rev, created_at, updated_at, policy_tags, policy_owner FROM vault_files WHERE path=$1",
         )
         .bind(id.as_str())
         .fetch_optional(&self.db().pool)
@@ -255,14 +273,7 @@ impl VaultStore {
         if is_markdown_note_path(id.as_str()) {
             self.sql_authorized(auth, id).await?;
         } else {
-            let policy = PolicyNote {
-                path: id.to_string(),
-                title: title_from_note_id(id.as_str()),
-                tags: Vec::new(),
-                created_at,
-                updated_at,
-                owner: None,
-            };
+            let policy = raw_file_policy_from_row(id.as_str(), &row, created_at, updated_at)?;
             if !policy_allows(
                 &self.authorization_config().await,
                 auth,
@@ -279,11 +290,7 @@ impl VaultStore {
             id: id.clone(),
             revision: whole_file_revision(&file.content),
             path: file.path.clone(),
-            file_type: if is_markdown_note_path(id.as_str()) {
-                NewNoteFileType::Md
-            } else {
-                NewNoteFileType::Base
-            },
+            file_type: super::file_type_from_path(id.as_str()),
             content_sha256: hex::encode(Sha256::digest(file.content.as_bytes())),
             size_bytes: file.content.len(),
             content: file.content.clone(),
@@ -1310,7 +1317,7 @@ impl VaultStore {
         let now = Utc::now();
         let path = id.to_string();
         let row = sqlx::query(
-            "SELECT couchdb_rev, created_at, updated_at FROM vault_files WHERE path=$1",
+            "SELECT couchdb_rev, created_at, updated_at, policy_tags, policy_owner FROM vault_files WHERE path=$1",
         )
         .bind(&path)
         .fetch_optional(&self.db().pool)
@@ -1329,17 +1336,10 @@ impl VaultStore {
         } else {
             None
         };
-        let policy = note
-            .as_ref()
-            .map(policy_note_from_stored)
-            .unwrap_or_else(|| PolicyNote {
-                path: path.clone(),
-                title: title_from_note_id(&path),
-                tags: Vec::new(),
-                created_at,
-                updated_at,
-                owner: None,
-            });
+        let policy = match note.as_ref() {
+            Some(note) => policy_note_from_stored(note),
+            None => raw_file_policy_from_row(&path, &row, created_at, updated_at)?,
+        };
         let config = self.authorization_config().await;
         if !policy_allows(&config, auth, "read", &policy, now) {
             return Err(ServiceError::NotFound);

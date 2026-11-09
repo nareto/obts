@@ -146,7 +146,7 @@ pub fn normalize_note_path(path: &str) -> String {
 
 /// Best-effort vault file id extraction from a file metadata document.
 ///
-/// Returns a vault-relative path for supported text file types (.md, .base).
+/// Returns a vault-relative path for supported text file types (.md, .base, .canvas).
 pub fn file_document_vault_file_id(file: &FileDocument) -> Option<String> {
     if !is_supported_note_file_type(&file.doc_type) {
         return None;
@@ -483,8 +483,7 @@ pub(crate) fn is_markdown_note_path(path: &str) -> bool {
     path.to_ascii_lowercase().ends_with(".md")
 }
 
-/// Returns true for supported vault text file paths (.md, .base).
+/// Returns true for supported vault text file paths (.md, .base, .canvas).
 pub(crate) fn is_supported_vault_file_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.ends_with(".md") || lower.ends_with(".base")
+    crate::new_note::NewNoteFileType::from_path(path).is_some()
 }

@@ -1453,11 +1453,7 @@ fn recovered_file(file: FilesystemFile) -> RecoveredVaultFileState {
     RecoveredVaultFileState {
         path: file.path.clone(),
         content: file.content,
-        file_type: if file.path.ends_with(".md") {
-            NewNoteFileType::Md
-        } else {
-            NewNoteFileType::Base
-        },
+        file_type: NewNoteFileType::from_path(&file.path).unwrap_or_default(),
         couchdb_rev: file.revision,
         created_at: file.created_at,
         updated_at: file.updated_at,
@@ -1895,7 +1891,9 @@ fn path_to_slashes(path: &Path) -> Result<String, FilesystemError> {
 }
 
 fn is_supported_path(path: &str) -> bool {
-    path.ends_with(".md") || path.ends_with(".base")
+    NewNoteFileType::ALL
+        .into_iter()
+        .any(|file_type| path.ends_with(&format!(".{}", file_type.extension())))
 }
 
 fn is_excluded_path(path: &str) -> bool {
@@ -2777,11 +2775,16 @@ mod tests {
         std::fs::create_dir_all(root.path().join(".obts")).expect("obts dir");
         std::fs::write(root.path().join(".obts/state.json"), "secret").expect("state");
         std::fs::write(root.path().join("image.png"), b"png").expect("image");
+        std::fs::write(root.path().join("data.json"), "{}").expect("json");
         std::fs::write(root.path().join("note.md"), "# Note\n").expect("note");
+        std::fs::write(root.path().join("board.canvas"), "{}").expect("canvas");
         let source = FilesystemSource::new(root.path()).expect("source");
 
         let files = source.scan().await.expect("scan");
-        assert_eq!(files.keys().cloned().collect::<Vec<_>>(), vec!["note.md"]);
+        assert_eq!(
+            files.keys().cloned().collect::<Vec<_>>(),
+            vec!["board.canvas", "note.md"]
+        );
     }
 
     #[tokio::test]
