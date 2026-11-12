@@ -216,6 +216,52 @@ export class GitService {
     return repositories.sort();
   }
 
+  /**
+   * Counts the repository's packfiles. Every push can add one pack, and each pack costs an object
+   * lookup probe, so this stays a directory listing rather than a repository walk: it is the cheap
+   * trigger an automatic consolidation checks before it decides to do any work.
+   */
+  async countRepositoryPacks(vaultId: string): Promise<number> {
+    let names: string[];
+    try {
+      names = await readdir(join(this.repoPath(vaultId), 'objects', 'pack'));
+    } catch (error) {
+      if (isMissing(error)) return 0;
+      throw error;
+    }
+    let packs = 0;
+    for (const name of names) if (/^pack-[0-9a-f]{40}\.pack$/u.test(name)) packs += 1;
+    return packs;
+  }
+
+  /**
+   * Counts unpacked objects without asking Git: `git count-objects` opens the whole store and is an
+   * order of magnitude slower than listing the fan-out directories on every push.
+   */
+  async countLooseObjects(vaultId: string): Promise<number> {
+    const objectsDir = join(this.repoPath(vaultId), 'objects');
+    let entries;
+    try {
+      entries = await readdir(objectsDir, { withFileTypes: true });
+    } catch (error) {
+      if (isMissing(error)) return 0;
+      throw error;
+    }
+    let loose = 0;
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !/^[0-9a-f]{2}$/u.test(entry.name)) continue;
+      let names: string[];
+      try {
+        names = await readdir(join(objectsDir, entry.name));
+      } catch (error) {
+        if (isMissing(error)) continue;
+        throw error;
+      }
+      for (const name of names) if (/^[0-9a-f]{38}$/u.test(name)) loose += 1;
+    }
+    return loose;
+  }
+
   async isBareRepositoryShape(repo: string): Promise<boolean> {
     this.assertDurabilityAvailable();
     return await this.isBareRepositoryShapeInRepo(repo, null);
@@ -1466,6 +1512,42 @@ export class GitService {
     ).trim();
   }
 
+  /**
+   * Incrementally consolidates packs and refreshes the commit-graph without making any reachability
+   * decision, so it can never drop an object the store holds (OBTS-PER-MAINT-001).
+   *
+   * Git 2.39 accepts `--geometric` only without `-a`/`-A`: geometric repacking is not driven by
+   * reachability. It rolls the packs below the geometric cut plus every loose object into replacement
+   * packs, and, with `-d`, deletes exactly those superseded packs whose complete object set the
+   * replacement pack already contains (`prune-packed` likewise removes only loose objects a pack holds).
+   * Unreachable objects -- conflict/device history, quarantine-only material, objects no ref reaches
+   * yet -- therefore survive. `-c core.fsync=all` hardens the replacement packs and index before Git
+   * removes the packs they supersede; the trailing tree sync keeps the repository's own durability
+   * barrier. Removing unreachable objects stays the explicit `runMaintenance` action.
+   */
+  async compactRepository(vaultId: string): Promise<{ repackMs: number; commitGraphMs: number }> {
+    this.assertDurabilityAvailable();
+    const repo = this.repoPath(vaultId);
+    const harden = ['-c', 'core.fsync=all', '-c', 'core.fsyncMethod=fsync'];
+    const repackStarted = Date.now();
+    await this.exec(repo, [...harden, 'repack', '-d', '--geometric=2', '-q'], undefined, undefined, {
+      maxBuffer: 16 * 1024 * 1024
+    });
+    const repackMs = Date.now() - repackStarted;
+    const commitGraphStarted = Date.now();
+    await this.exec(repo, [...harden, 'commit-graph', 'write', '--reachable', '--no-progress'], undefined, undefined, {
+      maxBuffer: 16 * 1024 * 1024
+    });
+    const commitGraphMs = Date.now() - commitGraphStarted;
+    await this.fsyncTree(repo);
+    return { repackMs, commitGraphMs };
+  }
+
+  /**
+   * Explicit owner-initiated maintenance: verify, repack everything into one pack, and prune
+   * unreachable objects. This is the only server path allowed to remove unreachable objects; the
+   * automatic consolidation (`compactRepository`) deliberately never does (OBTS-PER-MAINT-001).
+   */
   async runMaintenance(vaultId: string): Promise<string> {
     this.assertDurabilityAvailable();
     const repo = this.repoPath(vaultId);

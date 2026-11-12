@@ -183,6 +183,7 @@ export class SyncService {
   private readonly locks = new Map<string, Promise<void>>();
   private readonly unportableCounts = new Map<string, { key: string; count: number }>();
   private readonly reviewAdvanceVerdicts = new Map<string, boolean>();
+  private gitMaintenance: { schedule(vaultId: string): void } | null = null;
 
   constructor(
     private readonly store: MetadataStore,
@@ -192,8 +193,35 @@ export class SyncService {
     private readonly log: OperationalLog = silentOperationalLog
   ) {}
 
+  /**
+   * Attaches the automatic pack consolidation (OBTS-PER-MAINT-001). Every canonical write that can add
+   * Git objects asks it for a background threshold check; the check never runs on the request path.
+   */
+  attachGitMaintenance(maintenance: { schedule(vaultId: string): void } | null): void {
+    this.gitMaintenance = maintenance;
+  }
+
   async runWithVaultLock<T>(vaultId: string, fn: () => Promise<T>): Promise<T> {
-    return await this.withVaultLock(vaultId, fn, true);
+    const result = await this.withVaultLock(vaultId, fn, true);
+    this.scheduleGitMaintenance(vaultId);
+    return result;
+  }
+
+  /**
+   * Runs `action` under the vault's canonical mutation serialization and deletion admission without the
+   * completed-history archival an ordinary write performs. Automatic maintenance uses it so a
+   * consolidation never overlaps a canonical writer and a vault deletion drains it.
+   */
+  async withVaultSerialization<T>(vaultId: string, action: () => Promise<T>): Promise<T> {
+    return await this.withVaultLock(vaultId, action);
+  }
+
+  private scheduleGitMaintenance(vaultId: string): void {
+    try {
+      this.gitMaintenance?.schedule(vaultId);
+    } catch {
+      // A scheduling failure must never change the outcome of the canonical write that asked for it.
+    }
   }
 
   async getVaultSyncSettings(vaultId: string, actorUserId: string): Promise<Record<string, unknown>> {
@@ -342,6 +370,7 @@ export class SyncService {
         }
       }
       await this.commitVaultSettingsOperation(operationId);
+      this.scheduleGitMaintenance(input.vaultId);
       return { vault_id: vault.vault_id, current_main: targetMain, root_ignore: input.rootIgnore,
         metadata_conflict_rules: rules, root_ignore_oid: preview.root_ignore_oid };
     }, true);
@@ -553,6 +582,7 @@ export class SyncService {
           throw new Error('Prepared name repair operation is invalid.');
         }
       });
+      this.scheduleGitMaintenance(input.vaultId);
       return {
         vault_id: input.vaultId, previous_main: input.expectedMain, current_main: targetMain,
         renamed_count: preview.renames.length, link_updated_count: linkUpdatedCount
@@ -638,6 +668,7 @@ export class SyncService {
         this.log.emit('info', 'push_integrated', {
           vault_id: vault.vault_id, device_id: device.device_id, ...pushLogFields(result), ...latency, duration_ms: Date.now() - started
         });
+        this.scheduleGitMaintenance(vault.vault_id);
       }, true);
     }
   }
@@ -655,6 +686,9 @@ export class SyncService {
       ...(staged?.transferId ? { transfer_id: staged.transferId } : {}),
       ...pushLogFields(result), ...latency, duration_ms: Date.now() - started
     });
+    // The upload may have added a pack (staged chunk transfer) or loose objects (direct push) even when
+    // the merge itself was rejected or conflicted, so any non-rejected outcome is worth a cheap check.
+    if (result.status !== 'rejected') this.scheduleGitMaintenance(auth.vault.vault_id);
     return result;
   }
 
@@ -1282,6 +1316,7 @@ export class SyncService {
         };
         operation.updated_at = nowIso();
       });
+      this.scheduleGitMaintenance(input.vaultId);
     }, true);
     return await this.getConflictReviewPackage(input.vaultId, input.conflictId);
   }
@@ -1693,6 +1728,7 @@ export class SyncService {
       this.log.emit('info', 'conflict_resolved', {
         vault_id: input.vaultId, conflict_id: input.conflictId, resolution: input.resolutionKind, user_id: input.actorUserId
       });
+      this.scheduleGitMaintenance(input.vaultId);
       return {
         status: 'resolved',
         conflict_id: input.conflictId,

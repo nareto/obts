@@ -92,6 +92,11 @@ export async function runCli(
       await server.app.listen({ host, port });
       const address = server.app.server.address();
       log!.emit('info', 'server_listening', { host, port: typeof address === 'object' && address !== null ? address.port : port, log_level: log!.level });
+      // Bounded pack/loose-object check at startup: a server that accumulated a pack backlog
+      // (for example before automatic consolidation existed) is consolidated once, and every later
+      // start is a directory-listing no-op. It runs after `listen` so readiness and health probes are
+      // never held behind a first large consolidation.
+      void server.gitMaintenance.startupSweep().catch((error: unknown) => log!.backgroundFailure('git_maintenance', error));
       await waitForShutdown(server);
       return 0;
     }

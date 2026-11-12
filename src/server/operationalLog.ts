@@ -20,12 +20,13 @@ export const STARTUP_PHASES = [
 export type StartupPhase = typeof STARTUP_PHASES[number];
 export const BACKGROUND_TASKS = [
   'diagnostic_prune', 'receipt_expiry', 'pending_deletion', 'deletion_retry_record', 'transfer_processing',
-  'readiness_sample', 'device_removal'
+  'readiness_sample', 'device_removal', 'git_maintenance'
 ] as const;
 type BackgroundTask = typeof BACKGROUND_TASKS[number];
 export const LOG_EVENTS = [
   'http_request', 'server_listening', 'startup_phase', 'vault_integrity_blocked', 'vault_integrity_block_contended',
-  'push_integrated', 'conflict_created', 'conflict_resolved', 'background_task_failed', 'log_lines_dropped'
+  'push_integrated', 'conflict_created', 'conflict_resolved', 'background_task_failed', 'git_maintenance',
+  'log_lines_dropped'
 ] as const;
 type LogEvent = typeof LOG_EVENTS[number];
 
@@ -66,6 +67,10 @@ export type OperationalFields = {
   phase?: StartupPhase;
   source?: 'startup' | 'request' | 'sampler';
   task?: BackgroundTask;
+  packs_before?: number;
+  packs_after?: number;
+  loose_before?: number;
+  loose_after?: number;
 };
 
 export const LOG_ROUTES = [
@@ -169,7 +174,9 @@ const FIELD_VALIDATORS: Record<keyof OperationalFields, Validator> = {
   resolution: enumeration(['keep_server', 'use_device', 'keep_both_files', 'insert_both_blocks', 'manual', 'per_file']),
   failed_checks: (value) => typeof value === 'string' && value.split(',').every((name) => CHECK_NAMES.includes(name)),
   host: pattern(/^[A-Za-z0-9.:_-]{1,253}$/u), port: number, log_level: enumeration(LOG_LEVELS),
-  phase: enumeration(STARTUP_PHASES), source: enumeration(['startup', 'request', 'sampler']), task: enumeration(BACKGROUND_TASKS)
+  phase: enumeration(STARTUP_PHASES), source: enumeration(['startup', 'request', 'sampler']), task: enumeration(BACKGROUND_TASKS),
+  packs_before: (value) => number(value) && Number.isSafeInteger(value), packs_after: (value) => number(value) && Number.isSafeInteger(value),
+  loose_before: (value) => number(value) && Number.isSafeInteger(value), loose_after: (value) => number(value) && Number.isSafeInteger(value)
 };
 export const LOG_FIELD_ALLOWLIST = ['ts', 'level', 'event', 'service', 'version', ...Object.keys(FIELD_VALIDATORS)];
 

@@ -59,6 +59,7 @@ import { DashboardEventHub, type DashboardEventOptions } from './dashboardEvents
 import { DeviceRemovalService, type DeviceRemovalOptions } from './deviceRemovalService.js';
 import { DiagnosticService } from './diagnosticService.js';
 import { GitCommandError, GitDurabilityError, GitService, sha256Hex } from './gitService.js';
+import { GitMaintenanceScheduler, type GitMaintenanceOptions } from './gitMaintenance.js';
 import {
   directorySnapshotAtEvent,
   hasDurableDeletionRecord,
@@ -100,6 +101,7 @@ export type ObtsServer = {
   connections: ConnectionService;
   diagnostics: DiagnosticService;
   sync: SyncService;
+  gitMaintenance: GitMaintenanceScheduler;
   chunkTransfers: ChunkTransferService;
   lifecycle: VaultLifecycleCoordinator;
   readiness: ReadinessSampler;
@@ -133,6 +135,8 @@ export type CreateObtsServerOptions = {
   dashboardEvents?: DashboardEventOptions;
   /** Permanent device removal tuning (drain timeout) and failure-injection checkpoints for tests. */
   deviceRemoval?: DeviceRemovalOptions;
+  /** Automatic pack consolidation thresholds (OBTS-PER-MAINT-001). Defaults are production values. */
+  gitMaintenance?: GitMaintenanceOptions;
 };
 
 export async function createObtsServer(
@@ -160,6 +164,13 @@ export async function createObtsServer(
   const diagnostics = new DiagnosticService(store, config);
   await log.startup('diagnostics_initialized', async () => await diagnostics.initialize());
   const sync = new SyncService(store, git, config.maxUploadBytes, lifecycle, log);
+  const gitMaintenance = new GitMaintenanceScheduler({
+    git,
+    store,
+    log,
+    runExclusive: async (vaultId, action) => await sync.withVaultSerialization(vaultId, action)
+  }, options.gitMaintenance);
+  sync.attachGitMaintenance(gitMaintenance);
   await log.startup('operation_history_compacted', async () => {
     const recovered = await store.snapshot();
     for (const vault of recovered.vaults) {
@@ -454,6 +465,9 @@ export async function createObtsServer(
     dashboardEvents.close();
     // Drain the owned sampler before any dependency it reads (metadata, Git, transfers) closes.
     await readiness.close();
+    // Stop scheduling consolidation and let a running one finish before its dependencies close.
+    gitMaintenance.close();
+    await gitMaintenance.whenIdle();
     await chunkTransfers.close();
     await lifecycle.close();
     await store.close();
@@ -2269,7 +2283,7 @@ export async function createObtsServer(
   diagnosticPruneTimer.unref();
   app.addHook('onClose', async () => clearInterval(diagnosticPruneTimer));
 
-  return { app, config, store, git, auth, connections, diagnostics, sync, chunkTransfers, lifecycle, readiness, dashboardEvents };
+  return { app, config, store, git, auth, connections, diagnostics, sync, gitMaintenance, chunkTransfers, lifecycle, readiness, dashboardEvents };
 }
 
 function removalSummary(job: Pick<DeviceRemovalJob, 'state' | 'retryable' | 'error_code'> | undefined): { state: 'pending' | 'failed'; retryable: boolean; error_code: string | null } | null {
