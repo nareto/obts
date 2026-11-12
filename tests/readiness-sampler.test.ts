@@ -296,7 +296,7 @@ describe('metadata commit-boundary subscription', () => {
     const f = await createStoreFixture(roots);
     const calls: Array<{ previous: MetadataCommit['previous']; current: MetadataCommit['current'] }> = [];
     f.store.subscribeCommits((commit) => { calls.push({ previous: commit.previous, current: commit.current }); });
-    const base = await f.store.snapshot();
+    const base = await f.store.read((db) => db);
     const states = Array.from({ length: 8 }, (_unused, index) => {
       const state = structuredClone(base);
       state.event_seq_by_vault.burst = index;

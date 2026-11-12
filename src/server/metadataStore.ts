@@ -3,7 +3,7 @@ import { lstat, mkdir, open, readFile, readdir, rename, rm, writeFile } from 'no
 import { basename, dirname, join, resolve } from 'node:path';
 
 import { assertNoSymlinkComponents } from './deletionRoot.js';
-import { observeMetadataClone, observeMetadataPersist } from './syncLatency.js';
+import { observeMetadataClone, observeMetadataFreeze, observeMetadataPersist } from './syncLatency.js';
 import { OperationHistoryStore, type HistoryBatch } from './operationHistoryStore.js';
 
 import { newId, nowIso } from '../shared/ids.js';
@@ -12,6 +12,7 @@ import type { DiagnosticEvent } from '../shared/diagnostics.js';
 import type { MetadataConflictRule } from './frontmatterTimestampMerge.js';
 import type {
   ConflictRecord,
+  DeepReadonly,
   DirectoryIntentAcknowledgement,
   EventEnvelope,
   NoteHistoryVersion
@@ -355,7 +356,7 @@ function enforceRevocationInvariant(db: MetadataDb): boolean {
 
 export type MetadataCommitListener = (commit: MetadataCommit) => void;
 
-export type DeepReadonly<T> = T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T;
+export type { DeepReadonly } from '../shared/types.js';
 type Detached<T> = T extends object ? { -readonly [K in keyof T]: Detached<T[K]> } : T;
 
 export type MetadataPersistenceAdapter = {
@@ -461,7 +462,7 @@ export class MetadataStore {
     return this.commits;
   }
 
-  async snapshotVersioned(): Promise<{ db: MetadataDb; version: number }> {
+  async snapshotVersioned(): Promise<{ db: DeepReadonly<MetadataDb>; version: number }> {
     await this.pending;
     if (this.db === null) await this.initialize();
     this.assertOperational();
@@ -596,7 +597,9 @@ export class MetadataStore {
         initialized.operation_history_by_vault![vault.vault_id]!.init_pending = false;
         await this.persist(initialized);
         this.publishState(initialized);
-        candidate = initialized;
+        // The published state is frozen; the loop continues over the remaining vaults, so it must
+        // keep a private candidate instead of the object it just handed to readers.
+        candidate = this.cloneState(initialized);
       }
     }
   }
@@ -863,7 +866,7 @@ export class MetadataStore {
     }
   }
 
-  async snapshot(): Promise<MetadataDb> {
+  async snapshot(): Promise<DeepReadonly<MetadataDb>> {
     await this.pending;
     if (this.db === null) await this.initialize();
     this.assertOperational();
@@ -964,10 +967,11 @@ export class MetadataStore {
 
   /**
    * Publishes a new committed state. It is frozen so no reader can reach through a shared snapshot
-   * into the committed state; every later transaction starts from a private copy.
+   * into the committed state; every later transaction starts from a private copy. The walk is
+   * reported as `freeze_ms` because it is event-loop blocking on every durable boundary.
    */
   private publishState(db: MetadataDb): void {
-    freezeCommittedState(db);
+    observeMetadataFreeze(() => { freezeCommittedState(db); });
     this.db = db;
   }
 
@@ -1554,7 +1558,7 @@ function seedDirectoryCheckpoints(db: MetadataDb): boolean {
  * contiguous events. Returns null when that interval cannot be proven.
  */
 export function directorySnapshotAtEvent(
-  db: Pick<MetadataDb, 'events' | 'directory_checkpoint_by_vault'>,
+  db: Pick<DeepReadonly<MetadataDb>, 'events' | 'directory_checkpoint_by_vault'>,
   vaultId: string,
   eventSeq: number
 ): string[] | null {

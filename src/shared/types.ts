@@ -2,6 +2,12 @@ import type { DiagnosticEvent } from './diagnostics.js';
 
 export const API_VERSION = '2026-07-12.browser-onboarding';
 
+/**
+ * The read-only view of a value. A committed metadata state is shared with readers instead of being
+ * copied per request, so everything a reader receives is deeply readonly.
+ */
+export type DeepReadonly<T> = T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T;
+
 export type StatusLabel =
   | 'Synced'
   | 'Uploading'
@@ -198,7 +204,7 @@ export type DiagnosticEventView = DiagnosticEvent & {
 export type DiagnosticEventsResponse = {
   ingestion_enabled: boolean;
   retention_days: number;
-  events: DiagnosticEventView[];
+  events: Array<DeepReadonly<DiagnosticEventView>>;
   next_cursor: string | null;
 };
 
@@ -489,7 +495,7 @@ export type DirectoryConflictReview = {
 };
 
 export type ConflictReviewPackage = {
-  conflict: ConflictRecord;
+  conflict: DeepReadonly<ConflictRecord>;
   stale: boolean;
   expected_main: string;
   current_main: string;

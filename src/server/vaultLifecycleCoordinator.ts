@@ -13,6 +13,7 @@ import {
   type DeletionErrorCode,
   type DeletionJob,
   type DeletionReceipt,
+  type DeepReadonly,
   type MetadataDb,
   type MetadataStore
 } from './metadataStore.js';
@@ -82,7 +83,7 @@ export class VaultLifecycleCoordinator {
     this.transferLifecycle = transfer;
   }
 
-  restoreDurableBarriers(db: MetadataDb): void {
+  restoreDurableBarriers(db: DeepReadonly<MetadataDb>): void {
     for (const vault of db.vaults) {
       if (!hasDurableDeletionRecord(db, vault.vault_id)) continue;
       const barrier = this.barrier(vault.vault_id);
@@ -531,7 +532,7 @@ export class VaultLifecycleCoordinator {
   private async runWorker(vaultId: string): Promise<void> {
     const barrier = this.barrier(vaultId);
     while (!this.stopping) {
-      let db: MetadataDb;
+      let db: DeepReadonly<MetadataDb>;
       try {
         db = await this.store.snapshot();
       } catch (error) {
@@ -894,7 +895,7 @@ function deviceKey(vaultId: string, deviceId: string): string {
   return `${vaultId}\u0000${deviceId}`;
 }
 
-function hasDeletionJobOrReceipt(db: MetadataDb, vaultId: string): boolean {
+function hasDeletionJobOrReceipt(db: Pick<DeepReadonly<MetadataDb>, 'deletion_jobs' | 'deletion_receipts'>, vaultId: string): boolean {
   return db.deletion_jobs.some((job) => job.vault_id === vaultId) ||
     db.deletion_receipts.some((receipt) => receipt.vault_id === vaultId);
 }

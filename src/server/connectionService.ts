@@ -10,7 +10,14 @@ import type {
 } from '../shared/types.js';
 import { AuthError, hashToken, ownedVaultOrThrow } from './authService.js';
 import type { GitService } from './gitService.js';
-import { hasDurableDeletionRecord, type ConnectionRequestRow, type MetadataStore, type UserRow } from './metadataStore.js';
+import {
+  hasDurableDeletionRecord,
+  type ConnectionRequestRow,
+  type DeepReadonly,
+  type MetadataDb,
+  type MetadataStore,
+  type UserRow
+} from './metadataStore.js';
 import type { VaultLifecycleCoordinator } from './vaultLifecycleCoordinator.js';
 
 const PENDING_CONNECTION_TTL_MS = 10 * 60 * 1000;
@@ -260,15 +267,33 @@ export class ConnectionService {
     changedPaths: string[];
     explicitDirectories: string[];
   }> {
-    const { db, connection } = await this.store.mutate((mutableDb) => {
-      expireConnections(mutableDb.connections);
-      const authenticated = authenticatedConnection(mutableDb.connections, connectionId, secret);
-      return { db: structuredClone(mutableDb), connection: structuredClone(authenticated) };
+    // Only the projections used below leave the mutation: copying the whole state here cost a full
+    // metadata copy while the metadata queue was held.
+    const projection = await this.store.mutate((db) => {
+      expireConnections(db.connections);
+      const authenticated = authenticatedConnection(db.connections, connectionId, secret);
+      const selectedVaultId = authenticated.selected_vault_id;
+      const vault = selectedVaultId === null
+        ? null
+        : db.vaults.find((candidate) => candidate.vault_id === selectedVaultId) ?? null;
+      return {
+        connection: authenticated,
+        vault,
+        explicitDirectories: vault === null ? [] : db.directory_state_by_vault[vault.vault_id]?.explicit_dirs ?? []
+      };
     });
+    const { connection } = projection;
     if (connection.status !== 'approved' || connection.selection !== 'existing_vault' || !connection.selected_vault_id) {
       throw new AuthError(409, 'connection_not_bootstrappable', 'Connection does not target an existing vault.');
     }
-    const vault = ownedVaultOrThrow(db, requireValue(connection.approved_user_id), connection.selected_vault_id);
+    // The same decisions `ownedVaultOrThrow` makes, applied to the vault row the mutation returned.
+    const vault = projection.vault;
+    if (!vault || vault.owner_user_id !== requireValue(connection.approved_user_id)) {
+      throw new AuthError(404, 'not_found', 'Resource not found.');
+    }
+    if (vault.status === 'deleting') {
+      throw new AuthError(409, 'vault_deleting', 'Vault deletion is in progress.');
+    }
     if (vault.status !== 'active' || !vault.root_commit) {
       throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
     }
@@ -287,7 +312,7 @@ export class ConnectionService {
         rootCommit: vault.root_commit!,
         targetMain,
         changedPaths: await this.git.listTreePaths(vault.vault_id, targetMain),
-        explicitDirectories: db.directory_state_by_vault[vault.vault_id]?.explicit_dirs ?? []
+        explicitDirectories: projection.explicitDirectories
       };
     };
     return this.lifecycle
@@ -427,10 +452,12 @@ export class ConnectionService {
     const timestamp = nowIso();
     const deviceId = newId('dev');
     const result = await this.store.mutate((db) => {
-      const mutableConnection = authenticatedConnection(db.connections, connectionId, secret);
-      if (mutableConnection.status !== 'approved') {
-        throw connectionStatusError(mutableConnection);
+      const authenticated = authenticatedConnection(db.connections, connectionId, secret);
+      if (authenticated.status !== 'approved') {
+        throw connectionStatusError(authenticated);
       }
+      // The candidate row this transaction owns; `authenticatedConnection` only decides the credential.
+      const mutableConnection = db.connections.find((candidate) => candidate.connection_id === authenticated.connection_id)!;
       if (hasDurableDeletionRecord(db, targetVaultId)) {
         throw new AuthError(409, 'vault_deleting', 'Vault deletion is in progress.');
       }
@@ -667,15 +694,19 @@ export class ConnectionService {
 }
 
 function connectionTargetVaultId(
-  db: Awaited<ReturnType<MetadataStore['snapshot']>>,
-  connection: ConnectionRequestRow
+  db: Pick<DeepReadonly<MetadataDb>, 'devices'>,
+  connection: DeepReadonly<ConnectionRequestRow>
 ): string | null {
   if (connection.selected_vault_id) return connection.selected_vault_id;
   if (!connection.created_device_id) return null;
   return db.devices.find((device) => device.device_id === connection.created_device_id)?.vault_id ?? null;
 }
 
-function authenticatedConnection(connections: ConnectionRequestRow[], connectionId: string, secret: string): ConnectionRequestRow {
+function authenticatedConnection(
+  connections: readonly DeepReadonly<ConnectionRequestRow>[],
+  connectionId: string,
+  secret: string
+): DeepReadonly<ConnectionRequestRow> {
   const tokenHash = hashToken(secret);
   const connection = connections.find(
     (candidate) =>
@@ -694,7 +725,7 @@ function authenticatedConnection(connections: ConnectionRequestRow[], connection
   return connection;
 }
 
-function isExpiredApproval(connection: ConnectionRequestRow): boolean {
+function isExpiredApproval(connection: DeepReadonly<ConnectionRequestRow>): boolean {
   return connection.status !== 'consumed' && Date.parse(connection.expires_at) <= Date.now();
 }
 
@@ -705,7 +736,7 @@ function expireConnection(connections: ConnectionRequestRow[], connectionId: str
   }
 }
 
-function connectionStatusError(connection: ConnectionRequestRow): AuthError {
+function connectionStatusError(connection: DeepReadonly<ConnectionRequestRow>): AuthError {
   if (connection.status === 'expired') {
     return new AuthError(409, 'connection_expired', 'Connection approval has expired.');
   }

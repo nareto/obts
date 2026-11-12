@@ -1845,7 +1845,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
       `/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}`
     );
     expect(review.status).toBe(200);
-    const beforeResolution = await server.store.snapshot();
+    const beforeResolution = await server.store.read((db) => db);
     const archiveHistory = vi.spyOn(server.store, 'archiveCompletedHistory').mockResolvedValue();
     const resolved = await admin.post<{ resolution_commit: string }>(
       `/api/v1/vaults/${admin.vaultId}/conflicts/${conflicted.conflictId}/resolve`,
@@ -1965,7 +1965,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
   it('rolls forward a prepared conflict refresh when startup finds its protected ref already moved', async () => {
     const fixture = await createStaleConflictFixture('recover-conflict-refresh');
     const protectedRef = `refs/obts/conflicts/${fixture.conflictId}/current`;
-    const beforeRefresh = await server.store.snapshot();
+    const beforeRefresh = await server.store.read((db) => db);
     const archiveHistory = vi.spyOn(server.store, 'archiveCompletedHistory').mockResolvedValue();
     const refreshed = await fixture.admin.post<{ current_main: string }>(
       `/api/v1/vaults/${fixture.admin.vaultId}/conflicts/${fixture.conflictId}/refresh`,
@@ -2015,7 +2015,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
   it('aborts a prepared conflict refresh when startup finds its protected ref did not move', async () => {
     const fixture = await createStaleConflictFixture('abort-conflict-refresh');
     const protectedRef = `refs/obts/conflicts/${fixture.conflictId}/current`;
-    const beforeRefresh = await server.store.snapshot();
+    const beforeRefresh = await server.store.read((db) => db);
     const archiveHistory = vi.spyOn(server.store, 'archiveCompletedHistory').mockResolvedValue();
     const refreshed = await fixture.admin.post<Json>(
       `/api/v1/vaults/${fixture.admin.vaultId}/conflicts/${fixture.conflictId}/refresh`,
@@ -2139,7 +2139,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
   it('blocks startup when a prepared conflict refresh protected ref is neither expected nor target', async () => {
     const fixture = await createStaleConflictFixture('foreign-conflict-refresh-startup');
     const protectedRef = `refs/obts/conflicts/${fixture.conflictId}/current`;
-    const beforeRefresh = await server.store.snapshot();
+    const beforeRefresh = await server.store.read((db) => db);
     const archiveHistory = vi.spyOn(server.store, 'archiveCompletedHistory').mockResolvedValue();
     const refreshed = await fixture.admin.post<Json>(
       `/api/v1/vaults/${fixture.admin.vaultId}/conflicts/${fixture.conflictId}/refresh`,

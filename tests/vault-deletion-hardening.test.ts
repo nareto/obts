@@ -103,13 +103,15 @@ async function addSyntheticDevice(server: ObtsServer, vaultId: string): Promise<
       consumed_at: null, failed_attempts: 0, revoked_at: null, metadata: {}, created_at: new Date().toISOString()
     });
   });
-  const db = await server.store.snapshot();
-  const user = db.users[0];
-  const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
-  const device = db.devices.find((candidate) => candidate.device_id === 'dev_hardening');
-  const token = db.tokens.find((candidate) => candidate.token_id === 'tok_hardening');
-  if (!user || !vault || !device || !token) throw new Error('synthetic device setup failed');
-  return { user, vault, device, token };
+  // A projection read owns its rows: the transfer service takes the device identity it will use.
+  return await server.store.read((db) => {
+    const user = db.users[0];
+    const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
+    const device = db.devices.find((candidate) => candidate.device_id === 'dev_hardening');
+    const token = db.tokens.find((candidate) => candidate.token_id === 'tok_hardening');
+    if (!user || !vault || !device || !token) throw new Error('synthetic device setup failed');
+    return { user, vault, device, token };
+  });
 }
 
 describe('vault deletion hardening', () => {

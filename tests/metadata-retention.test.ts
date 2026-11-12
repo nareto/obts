@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { directorySnapshotAtEvent, MetadataStore, type DeviceRow, type MetadataDb } from '../src/server/metadataStore.js';
+import { directorySnapshotAtEvent, MetadataStore, type DeepReadonly, type DeviceRow, type MetadataDb } from '../src/server/metadataStore.js';
 
 const VAULT = 'vlt_retention';
 const OTHER_VAULT = 'vlt_retention_other';
@@ -53,7 +53,7 @@ async function appendTicks(store: MetadataStore, count: number, vaultId = VAULT)
   }
 }
 
-function retainedSeqs(db: MetadataDb, vaultId = VAULT): number[] {
+function retainedSeqs(db: Pick<DeepReadonly<MetadataDb>, 'events'>, vaultId = VAULT): number[] {
   return db.events.filter((event) => event.vault_id === vaultId).map((event) => event.event_seq).sort((left, right) => left - right);
 }
 

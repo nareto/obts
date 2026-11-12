@@ -4,7 +4,14 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { MetadataStore, isDeviceRevoked, type MetadataCommit, type MetadataDb } from '../src/server/metadataStore.js';
+import {
+  MetadataStore,
+  isDeviceRevoked,
+  type DeepReadonly,
+  type DeviceRow,
+  type MetadataCommit,
+  type MetadataDb
+} from '../src/server/metadataStore.js';
 import { deviceRow } from './helpers/dashboardStoreFixture.js';
 
 const roots: string[] = [];
@@ -29,7 +36,8 @@ async function fixture() {
   return { root, store, path: join(root, 'metadata', 'phase1.json') };
 }
 
-const status = (db: Pick<MetadataDb, 'devices'>, id: string) => db.devices.find((row) => row.device_id === id)!;
+const status = <R extends DeepReadonly<DeviceRow>>(db: { devices: readonly R[] }, id: string): R =>
+  db.devices.find((row) => row.device_id === id)!;
 
 async function persisted(path: string): Promise<MetadataDb> {
   return JSON.parse(await readFile(path, 'utf8')) as MetadataDb;

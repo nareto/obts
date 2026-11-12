@@ -156,7 +156,7 @@ async function pendingInitializationFixture() {
   await addTerminalOperation(store, { target_commit: 'b'.repeat(40), attempt_id: 'initial-attempt', proposal_base: null });
   const expected = await store.exportOperationHistory('vlt_history');
   // A committed snapshot is read-only; editing the file's legacy shape needs a private copy.
-  const disk = structuredClone(await store.snapshot());
+  const disk = await store.read((db) => db);
   disk.operation_history_by_vault!.vlt_history!.init_pending = true;
   await store.close();
   await writeFile(join(root, 'metadata', 'phase1.json'), JSON.stringify(disk));
@@ -317,7 +317,7 @@ describe('durable operation history', () => {
       const { root, store } = await fixture();
       await addTerminalOperation(store, { target_commit: 'b'.repeat(40), attempt_id: 'initial-attempt', attempt_hash: 'initial-hash', proposal_base: null });
       const expected = await store.exportOperationHistory('vlt_history');
-      const legacy = { ...structuredClone(await store.snapshot()), schema_version: 7 };
+      const legacy = { ...await store.read((db) => db), schema_version: 7 };
       delete legacy.operation_history_by_vault;
       for (const row of legacy.sync_operations) delete row.operation_sequence;
       await store.close();
@@ -785,7 +785,7 @@ describe('durable operation history', () => {
       const { store, root } = await fixture();
       const operation = await addTerminalOperation(store, { target_commit: 'b'.repeat(40), attempt_id: 'attempt-init' });
       const metadataPath = join(root, 'metadata', 'phase1.json');
-      const legacy = { ...structuredClone(await store.snapshot()), schema_version: 7 };
+      const legacy = { ...await store.read((db) => db), schema_version: 7 };
       delete legacy.operation_history_by_vault;
       for (const row of legacy.sync_operations) delete row.operation_sequence;
       await store.close();

@@ -634,7 +634,7 @@ export class AuthService {
     });
   }
 
-  private requireAdmin(db: MetadataDb, actorUserId: string): UserRow {
+  private requireAdmin(db: Pick<DeepReadonly<MetadataDb>, 'users'>, actorUserId: string): DeepReadonly<UserRow> {
     const actor = db.users.find((candidate) => candidate.user_id === actorUserId);
     if (!actor || actor.disabled || !actor.is_admin) {
       throw new AuthError(403, 'admin_required', 'Admin privileges are required.');
@@ -650,7 +650,11 @@ function isSessionLive(session: DeepReadonly<SessionRow>, now: number): boolean 
   return Number.isFinite(expiresAt) && Number.isFinite(idleExpiresAt) && expiresAt > now && idleExpiresAt > now;
 }
 
-export function ownedVaultOrThrow(db: MetadataDb, userId: string, vaultId: string): VaultRow {
+export function ownedVaultOrThrow<R extends DeepReadonly<VaultRow>>(
+  db: { vaults: readonly R[] },
+  userId: string,
+  vaultId: string
+): R {
   const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId && candidate.owner_user_id === userId);
   if (!vault) {
     throw new AuthError(404, 'not_found', 'Resource not found.');
@@ -774,7 +778,7 @@ function clearLoginFailures(db: MetadataDb, username: string, sourceIp: string):
   );
 }
 
-function userSummary(db: MetadataDb, user: UserRow): AdminUserSummary {
+function userSummary(db: Pick<DeepReadonly<MetadataDb>, 'vaults'>, user: DeepReadonly<UserRow>): AdminUserSummary {
   return {
     user_id: user.user_id,
     username: user.username,

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { directorySnapshotAtEvent, MetadataStore, type MetadataDb } from '../src/server/metadataStore.js';
+import { directorySnapshotAtEvent, MetadataStore, type DeepReadonly, type MetadataDb } from '../src/server/metadataStore.js';
 
 const VAULT = 'vlt_checkpoint';
 const EXPIRED = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString();
@@ -48,7 +48,7 @@ async function expireThrough(store: MetadataStore, eventSeq: number): Promise<vo
   });
 }
 
-function vaultEventSeqs(db: MetadataDb): number[] {
+function vaultEventSeqs(db: Pick<DeepReadonly<MetadataDb>, 'events'>): number[] {
   return db.events.filter((event) => event.vault_id === VAULT).map((event) => event.event_seq);
 }
 

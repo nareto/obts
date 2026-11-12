@@ -43,7 +43,7 @@ export class DiagnosticService {
   }
 
   async ingestConnection(
-    auth: { connection: ConnectionRequestRow; user: UserRow },
+    auth: { connection: DeepReadonly<ConnectionRequestRow>; user: DeepReadonly<UserRow> },
     value: unknown,
     _sourceIp: string
   ): Promise<{ status: 'accepted' | 'duplicate'; event_id: string }> {
@@ -83,7 +83,7 @@ export class DiagnosticService {
   }
 
   async ingestDevice(
-    auth: AuthenticatedDevice,
+    auth: DeepReadonly<AuthenticatedDevice>,
     value: unknown,
     _sourceIp: string
   ): Promise<{ status: 'accepted' | 'duplicate'; event_id: string }> {

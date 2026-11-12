@@ -28,6 +28,7 @@ import type {
   PerFileResolutionChoice,
   PerFileResolutionEntry,
   PushResult,
+  RenamePair as ConflictRenamePair,
   ResolveConflictResponse
 } from '../shared/types.js';
 import { AuthError, type AuthenticatedDevice } from './authService.js';
@@ -36,18 +37,19 @@ import { parseRenamePairs } from '../shared/validators.js';
 import { hasDurableDeletionRecord } from './metadataStore.js';
 import type { VaultLifecycleCoordinator } from './vaultLifecycleCoordinator.js';
 import { type OperationalLog, pushLogFields, silentOperationalLog } from './operationalLog.js';
+import { PREPARED_TRANSITION_REFRESH_MS } from './liveRefTransition.js';
 import { observeSyncLatency, recordSyncLockWait } from './syncLatency.js';
 import type {
+  DeepReadonly,
   DeviceRow,
   DirectoryProposalResultRow,
   MetadataDb,
   MetadataStore,
-  SyncOperationRow
+  SyncOperationRow,
+  VaultRow
 } from './metadataStore.js';
 
 const MERGE_POLICY_VERSION = 'phase2.semantic-merge.v1';
-// Kept well inside the server's live prepared-transition grace window before a refresh is forced.
-const PREPARED_TRANSITION_REFRESH_MS = 30_000;
 
 function policyConflictPaths(error: PathPolicyViolation | InstanceType<typeof RootIgnorePolicyError>): string[] {
   return error instanceof PathPolicyViolation && typeof error.details?.path === 'string'
@@ -94,12 +96,12 @@ type UploadValidation = {
 };
 
 type DirectoryMergePlan = {
-  proposal: DirectoryProposal;
+  proposal: DeepReadonly<DirectoryProposal>;
   requestSha256: string;
   baseExplicitDirs: string[];
   serverExplicitDirs: string[];
-  cleanIntents: DirectoryProposalIntent[];
-  conflictingIntents: DirectoryProposalIntent[];
+  cleanIntents: ReadonlyArray<DeepReadonly<DirectoryProposalIntent>>;
+  conflictingIntents: ReadonlyArray<DeepReadonly<DirectoryProposalIntent>>;
   affectedRoots: string[];
   expectedEventSeq: number;
 };
@@ -890,7 +892,9 @@ export class SyncService {
         // A live prepared transition is honoured only while its recorded age stays inside the live
         // ref-transition grace window, so a slow promotion must not leave the record aged. Rewriting
         // the whole metadata file is only necessary when the record is actually near that limit; a
-        // fast promotion keeps the freshly persisted timestamp.
+        // fast promotion keeps the freshly persisted timestamp. The record is refreshed before the ref
+        // update below, so the remaining window is `LIVE_REF_TRANSITION_GRACE_MS` minus this record's
+        // age at that moment (see `liveRefTransition.ts` for the invariant).
         // `operation` is the admission row this request created; the prepared record's own age is
         // read from committed state because a concurrent write may have advanced it.
         const preparedRow = (await this.store.snapshot()).sync_operations.find(
@@ -1014,9 +1018,9 @@ export class SyncService {
   }
 
   private async hasUsableDirectoryProposalBaseline(
-    db: MetadataDb,
-    device: DeviceRow,
-    proposal: DirectoryProposal
+    db: Pick<DeepReadonly<MetadataDb>, 'events'>,
+    device: DeepReadonly<DeviceRow>,
+    proposal: DeepReadonly<DirectoryProposal>
   ): Promise<boolean> {
     if (!Array.isArray(device.last_applied_explicit_dirs)) return false;
     if (
@@ -1037,7 +1041,7 @@ export class SyncService {
   private async classifyDirectoryProposal(
     vaultId: string,
     deviceId: string,
-    proposal: DirectoryProposal
+    proposal: DeepReadonly<DirectoryProposal>
   ): Promise<DirectoryMergePlan> {
     const db = await this.store.snapshot();
     const device = requireDevice(db, deviceId);
@@ -1079,11 +1083,11 @@ export class SyncService {
   }
 
   private findDirectoryProposalResult(
-    db: MetadataDb,
+    db: Pick<DeepReadonly<MetadataDb>, 'directory_proposal_results'>,
     vaultId: string,
     deviceId: string,
-    proposal: DirectoryProposal
-  ): DirectoryProposalResultRow | null {
+    proposal: DeepReadonly<DirectoryProposal>
+  ): DeepReadonly<DirectoryProposalResultRow> | null {
     const result = db.directory_proposal_results.find((candidate) => candidate.proposal_id === proposal.proposal_id) ?? null;
     if (!result) return null;
     if (
@@ -1185,13 +1189,16 @@ export class SyncService {
         (snapshotConflict.expected_main !== snapshotVault.current_main ||
           snapshotConflict.current_main !== snapshotVault.current_main ||
           needsDirectoryRefresh);
-      const refreshedDirectoryContext = needsDirectoryRefresh && snapshotConflict.directory_context
-        ? reclassifyDirectoryContext(
-            snapshotConflict.directory_context,
-            currentDirectoryState?.explicit_dirs ?? [],
-            currentDirectoryState?.last_event_seq ?? 0
-          )
-        : snapshotConflict.directory_context;
+      const refreshedDirectoryContext: DirectoryConflictContext | undefined =
+        needsDirectoryRefresh && snapshotConflict.directory_context
+          ? reclassifyDirectoryContext(
+              snapshotConflict.directory_context,
+              currentDirectoryState?.explicit_dirs ?? [],
+              currentDirectoryState?.last_event_seq ?? 0
+            )
+          : snapshotConflict.directory_context === undefined
+            ? undefined
+            : mutableDirectoryContext(snapshotConflict.directory_context);
       const priorDirectoryRoots = new Set(snapshotConflict.directory_context?.affected_roots ?? []);
       const refreshedFilePaths = (needsRefresh
         ? await this.refreshedAffectedPaths(snapshotConflict, snapshotVault.current_main)
@@ -1342,9 +1349,9 @@ export class SyncService {
    * directory reviews.
    */
   async isConflictReviewStale(
-    db: Pick<MetadataDb, 'directory_state_by_vault'>,
+    db: Pick<DeepReadonly<MetadataDb>, 'directory_state_by_vault'>,
     vault: { vault_id: string; current_main: string },
-    conflict: ConflictRecord
+    conflict: DeepReadonly<ConflictRecord>
   ): Promise<boolean> {
     if (conflict.status !== 'open') return false;
     const directoryEventSeq = db.directory_state_by_vault[vault.vault_id]?.last_event_seq ?? 0;
@@ -1355,9 +1362,9 @@ export class SyncService {
   }
 
   async staleConflictReviewIds(
-    db: Pick<MetadataDb, 'directory_state_by_vault'>,
+    db: Pick<DeepReadonly<MetadataDb>, 'directory_state_by_vault'>,
     vault: { vault_id: string; current_main: string },
-    conflicts: ConflictRecord[]
+    conflicts: ReadonlyArray<DeepReadonly<ConflictRecord>>
   ): Promise<Set<string>> {
     const stale = new Set<string>();
     for (const conflict of conflicts) {
@@ -1368,7 +1375,7 @@ export class SyncService {
     return stale;
   }
 
-  private async reviewedMainAdvanceOverlaps(conflict: ConflictRecord, currentMain: string): Promise<boolean> {
+  private async reviewedMainAdvanceOverlaps(conflict: DeepReadonly<ConflictRecord>, currentMain: string): Promise<boolean> {
     if (conflict.expected_main === currentMain) return false;
     const key = JSON.stringify([
       conflict.vault_id,
@@ -1392,7 +1399,7 @@ export class SyncService {
     return overlaps;
   }
 
-  private async computeReviewedMainAdvanceOverlap(conflict: ConflictRecord, currentMain: string): Promise<boolean> {
+  private async computeReviewedMainAdvanceOverlap(conflict: DeepReadonly<ConflictRecord>, currentMain: string): Promise<boolean> {
     const vaultId = conflict.vault_id;
     for (const commit of [conflict.expected_main, currentMain, conflict.device_commit]) {
       if (!(await this.git.commitExists(vaultId, commit))) return true;
@@ -1411,10 +1418,10 @@ export class SyncService {
   }
 
   private async loadResolutionTarget(
-    snapshot: MetadataDb,
+    snapshot: DeepReadonly<MetadataDb>,
     input: { vaultId: string; conflictId: string; expectedMain: string; resolutionKind: ConflictResolutionKind },
     options: { allowResolved?: boolean } = {}
-  ): Promise<{ conflict: ConflictRecord; effectiveMain: string }> {
+  ): Promise<{ conflict: DeepReadonly<ConflictRecord>; effectiveMain: string }> {
     const conflict = this.loadResolutionConflict(snapshot, input, options);
     const vault = requireVault(snapshot, input.vaultId);
     if (conflict.status === 'open' && await this.reviewedMainAdvanceOverlaps(conflict, vault.current_main)) {
@@ -1428,7 +1435,7 @@ export class SyncService {
    * review, the candidate applied on current main. Both must make exactly the same changes to their main.
    */
   private async buildResolutionCandidate(
-    conflict: ConflictRecord,
+    conflict: DeepReadonly<ConflictRecord>,
     effectiveMain: string,
     request: ResolutionRequest
   ): Promise<{ reviewed: ResolutionArtifacts; appliedTree: string }> {
@@ -1439,7 +1446,7 @@ export class SyncService {
     }
     const reviewed = await this.buildResolutionArtifacts(conflict, request);
     if (effectiveMain === conflict.expected_main) return { reviewed, appliedTree: reviewed.tree };
-    const advanced: ConflictRecord = { ...conflict, current_main: effectiveMain, expected_main: effectiveMain };
+    const advanced: DeepReadonly<ConflictRecord> = { ...conflict, current_main: effectiveMain, expected_main: effectiveMain };
     let appliedTree: string;
     try {
       appliedTree = (await this.buildResolutionArtifacts(advanced, request, {
@@ -1478,10 +1485,10 @@ export class SyncService {
   }
 
   private loadResolutionConflict(
-    snapshot: MetadataDb,
+    snapshot: DeepReadonly<MetadataDb>,
     input: { vaultId: string; conflictId: string; expectedMain: string; resolutionKind: ConflictResolutionKind },
     options: { allowResolved?: boolean } = {}
-  ): ConflictRecord {
+  ): DeepReadonly<ConflictRecord> {
     const vault = requireVault(snapshot, input.vaultId);
     if (vault.status === 'blocked_integrity') {
       throw new AuthError(409, 'blocked_integrity', 'Vault persistent state failed integrity checks.');
@@ -1541,13 +1548,13 @@ export class SyncService {
     });
   }
 
-  private async refreshedAffectedPaths(conflict: ConflictRecord, currentMain: string): Promise<string[]> {
+  private async refreshedAffectedPaths(conflict: DeepReadonly<ConflictRecord>, currentMain: string): Promise<string[]> {
     if (
       !(await this.git.commitExists(conflict.vault_id, conflict.base_commit)) ||
       !(await this.git.commitExists(conflict.vault_id, currentMain)) ||
       !(await this.git.commitExists(conflict.vault_id, conflict.device_commit))
     ) {
-      return conflict.affected_paths;
+      return [...conflict.affected_paths];
     }
     const mainChanges = await this.git.changedPaths(conflict.vault_id, conflict.base_commit, currentMain);
     const authoredBase = await this.git.mergeBase(conflict.vault_id, currentMain, conflict.device_commit) ?? conflict.base_commit;
@@ -2422,7 +2429,7 @@ export class SyncService {
     };
   }
 
-  private async conflictReviewPaths(conflict: ConflictRecord): Promise<ConflictReviewPath[]> {
+  private async conflictReviewPaths(conflict: DeepReadonly<ConflictRecord>): Promise<ConflictReviewPath[]> {
     if (
       !(await this.git.commitExists(conflict.vault_id, conflict.base_commit)) ||
       !(await this.git.commitExists(conflict.vault_id, conflict.current_main)) ||
@@ -2689,7 +2696,7 @@ export class SyncService {
   }
 
   private async buildResolutionArtifacts(
-    conflict: ConflictRecord,
+    conflict: DeepReadonly<ConflictRecord>,
     request: ResolutionRequest,
     options: { serverLabelMain?: string } = {}
   ): Promise<ResolutionArtifacts> {
@@ -2835,8 +2842,8 @@ export class SyncService {
   }
 
   private async addDeviceVersionChanges(
-    conflict: ConflictRecord,
-    paths: string[],
+    conflict: DeepReadonly<ConflictRecord>,
+    paths: readonly string[],
     writes: Map<string, Buffer>,
     deletes: string[]
   ): Promise<void> {
@@ -2851,9 +2858,9 @@ export class SyncService {
   }
 
   private async addKeepBothChanges(
-    conflict: ConflictRecord,
+    conflict: DeepReadonly<ConflictRecord>,
     sourceTree: string,
-    paths: string[],
+    paths: readonly string[],
     writes: Map<string, Buffer>,
     copySources: Map<string, string>
   ): Promise<void> {
@@ -2868,8 +2875,8 @@ export class SyncService {
   }
 
   private async addInsertBothBlocksChanges(
-    conflict: ConflictRecord,
-    paths: string[],
+    conflict: DeepReadonly<ConflictRecord>,
+    paths: readonly string[],
     writes: Map<string, Buffer>,
     deletes: string[],
     options: { serverLabelMain?: string }
@@ -2903,7 +2910,7 @@ export class SyncService {
    * A per-file resolution decides each decision unit separately. Paths that one structural review group links, and
    * file/directory paths that overlap, must be decided together; the submitted units must partition the affected paths.
    */
-  private async validatePerFileDecisionUnits(conflict: ConflictRecord, perFile: PerFileResolutionEntry[] | undefined): Promise<void> {
+  private async validatePerFileDecisionUnits(conflict: DeepReadonly<ConflictRecord>, perFile: PerFileResolutionEntry[] | undefined): Promise<void> {
     if (perFile === undefined || perFile.length === 0) {
       throw new AuthError(400, 'invalid_resolution', 'Per-file resolution requires a decision for every affected path.');
     }
@@ -2940,7 +2947,7 @@ export class SyncService {
   }
 
   private async describeResolutionPreview(
-    conflict: ConflictRecord,
+    conflict: DeepReadonly<ConflictRecord>,
     resolutionKind: ConflictResolutionKind,
     artifacts: ResolutionArtifacts
   ): Promise<ConflictPreviewFile[]> {
@@ -2969,7 +2976,7 @@ export class SyncService {
     return files;
   }
 
-  private async conflictContainsBinary(conflict: ConflictRecord, paths: string[] = conflict.affected_paths): Promise<boolean> {
+  private async conflictContainsBinary(conflict: DeepReadonly<ConflictRecord>, paths: readonly string[] = conflict.affected_paths): Promise<boolean> {
     for (const path of paths) {
       const blobs = await Promise.all([
         this.readOptionalBlob(conflict.vault_id, conflict.base_commit, path),
@@ -2982,10 +2989,10 @@ export class SyncService {
   }
 
   private async buildManualFilePlanChanges(
-    conflict: ConflictRecord,
+    conflict: DeepReadonly<ConflictRecord>,
     sourceTree: string,
     manualFilePlan: ManualFilePlanEntry[],
-    decidedPaths: string[] = conflict.affected_paths
+    decidedPaths: readonly string[] = conflict.affected_paths
   ): Promise<{ writes: Map<string, Buffer>; deletes: string[] }> {
     if (manualFilePlan.length === 0) {
       throw new AuthError(400, 'invalid_resolution', 'Manual file plan requires at least one path.');
@@ -3029,7 +3036,7 @@ export class SyncService {
     return { writes, deletes };
   }
 
-  private async conflictFileAffectedPaths(conflict: ConflictRecord): Promise<string[]> {
+  private async conflictFileAffectedPaths(conflict: DeepReadonly<ConflictRecord>): Promise<string[]> {
     const filePathSets = await Promise.all([
       this.git.listTreePaths(conflict.vault_id, conflict.base_commit),
       this.git.listTreePaths(conflict.vault_id, conflict.expected_main),
@@ -3038,7 +3045,7 @@ export class SyncService {
     return conflict.affected_paths.filter((path) => filePathSets.some((paths) => paths.has(path)));
   }
 
-  private async resolutionSourceTree(conflict: ConflictRecord): Promise<string> {
+  private async resolutionSourceTree(conflict: DeepReadonly<ConflictRecord>): Promise<string> {
     if (!(await this.git.commitExists(conflict.vault_id, conflict.base_commit))) {
       return await this.git.treeHash(conflict.vault_id, conflict.expected_main);
     }
@@ -3417,7 +3424,7 @@ export class SyncService {
     };
   }
 
-  private async findOpenConflict(vaultId: string, deviceId: string, deviceCommit: string): Promise<ConflictRecord | null> {
+  private async findOpenConflict(vaultId: string, deviceId: string, deviceCommit: string): Promise<DeepReadonly<ConflictRecord> | null> {
     const db = await this.store.snapshot();
     return (
       db.conflicts.find(
@@ -3452,7 +3459,7 @@ export class SyncService {
     return null;
   }
 
-  private latestEventSeq(vaultId: string, db: MetadataDb): number {
+  private latestEventSeq(vaultId: string, db: Pick<DeepReadonly<MetadataDb>, 'event_seq_by_vault'>): number {
     return db.event_seq_by_vault[vaultId] ?? 0;
   }
 
@@ -3611,7 +3618,7 @@ export class SyncService {
   }
 }
 
-function requireVault(db: MetadataDb, vaultId: string) {
+function requireVault<R extends DeepReadonly<VaultRow>>(db: { vaults: readonly R[] }, vaultId: string): R {
   const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
   if (!vault) {
     throw new Error(`Vault not found: ${vaultId}`);
@@ -3619,7 +3626,7 @@ function requireVault(db: MetadataDb, vaultId: string) {
   return vault;
 }
 
-function requireDevice(db: MetadataDb, deviceId: string): DeviceRow {
+function requireDevice<R extends DeepReadonly<DeviceRow>>(db: { devices: readonly R[] }, deviceId: string): R {
   const device = db.devices.find((candidate) => candidate.device_id === deviceId);
   if (!device) {
     throw new Error(`Device not found: ${deviceId}`);
@@ -3627,7 +3634,7 @@ function requireDevice(db: MetadataDb, deviceId: string): DeviceRow {
   return device;
 }
 
-function requireConflict(db: MetadataDb, vaultId: string, conflictId: string): ConflictRecord {
+function requireConflict<R extends DeepReadonly<ConflictRecord>>(db: { conflicts: readonly R[] }, vaultId: string, conflictId: string): R {
   const conflict = db.conflicts.find(
     (candidate) => candidate.vault_id === vaultId && candidate.conflict_id === conflictId
   );
@@ -3637,7 +3644,7 @@ function requireConflict(db: MetadataDb, vaultId: string, conflictId: string): C
   return conflict;
 }
 
-function requireOperation(db: MetadataDb, operationId: string): SyncOperationRow {
+function requireOperation<R extends DeepReadonly<SyncOperationRow>>(db: { sync_operations: readonly R[] }, operationId: string): R {
   const operation = db.sync_operations.find((candidate) => candidate.operation_id === operationId);
   if (!operation) {
     throw new Error(`Operation not found: ${operationId}`);
@@ -4053,7 +4060,7 @@ function singleSamePath(left: Set<string>, right: Set<string>): boolean {
 
 function applyExplicitRenamePairsToSummary(
   summary: StructuralSummary,
-  pairs: NonNullable<ConflictRecord['rename_pairs']>,
+  pairs: ReadonlyArray<DeepReadonly<ConflictRenamePair>>,
   baseBlobs: Map<string, string>,
   targetBlobs: Map<string, string>
 ): void {
@@ -4076,7 +4083,7 @@ function applyExplicitRenamePairsToSummary(
 
 function buildConflictReviewPaths(input: {
   reason: string;
-  affectedPaths: string[];
+  affectedPaths: readonly string[];
   baseBlobs: Map<string, string>;
   currentBlobs: Map<string, string>;
   deviceBlobs: Map<string, string>;
@@ -4134,7 +4141,7 @@ function reviewSide(
 }
 
 function fallbackConflictReviewPaths(
-  affectedPaths: string[],
+  affectedPaths: readonly string[],
   baseBlobs: Map<string, string>,
   currentBlobs: Map<string, string>,
   deviceBlobs: Map<string, string>
@@ -4202,7 +4209,7 @@ function reviewPathKind(
   return basePath === serverPath && basePath === devicePath ? 'same_path' : 'path_overlap';
 }
 
-function affectedPathsForReviewGroup(affectedPaths: string[], anchors: Array<string | null>): string[] {
+function affectedPathsForReviewGroup(affectedPaths: readonly string[], anchors: Array<string | null>): string[] {
   const concreteAnchors = anchors.filter((path): path is string => path !== null);
   return affectedPaths
     .filter((path) => concreteAnchors.some((anchor) => changedPathsConflict(path, anchor)))
@@ -4354,16 +4361,16 @@ function storedDirectoryIntents(value: unknown): DirectoryIntent[] {
   });
 }
 
-function directoryProposalRequestSha256(proposal: DirectoryProposal): string {
+function directoryProposalRequestSha256(proposal: DeepReadonly<DirectoryProposal>): string {
   return sha256Hex(Buffer.from(stableJson(proposal), 'utf8'));
 }
 
-function proposalIntentAcknowledgements(proposal: DirectoryProposal): DirectoryIntentAcknowledgement[] {
+function proposalIntentAcknowledgements(proposal: DeepReadonly<DirectoryProposal>): DirectoryIntentAcknowledgement[] {
   return proposal.intents.map((intent) => ({ intent_id: intent.intent_id, generation: intent.generation }));
 }
 
 function proposalAcknowledgement(
-  proposal: DirectoryProposal,
+  proposal: DeepReadonly<DirectoryProposal>,
   status: DirectoryProposalAcknowledgement['status']
 ): DirectoryProposalAcknowledgement {
   return {
@@ -4405,12 +4412,12 @@ function storedDirectoryPlan(plan: DirectoryMergePlan | null): Record<string, un
 
 function directoryConflictContext(plan: DirectoryMergePlan): DirectoryConflictContext {
   return {
-    proposal: plan.proposal,
-    base_explicit_dirs: plan.baseExplicitDirs,
-    server_explicit_dirs: plan.serverExplicitDirs,
+    proposal: { ...plan.proposal, intents: plan.proposal.intents.map((intent) => ({ ...intent })) },
+    base_explicit_dirs: [...plan.baseExplicitDirs],
+    server_explicit_dirs: [...plan.serverExplicitDirs],
     clean_intent_ids: plan.cleanIntents.map((intent) => intent.intent_id),
     conflicting_intent_ids: plan.conflictingIntents.map((intent) => intent.intent_id),
-    affected_roots: plan.affectedRoots,
+    affected_roots: [...plan.affectedRoots],
     expected_event_seq: plan.expectedEventSeq
   };
 }
@@ -4425,7 +4432,7 @@ function directoryEventPayload(plan: DirectoryMergePlan | null, deviceId: string
 }
 
 function directoryResolutionEventPayload(
-  conflict: ConflictRecord,
+  conflict: DeepReadonly<ConflictRecord>,
   resolvedIntents: DirectoryIntent[]
 ): Record<string, unknown> {
   const context = conflict.directory_context;
@@ -4466,9 +4473,12 @@ function commitDirectoryPlan(
 }
 
 function upsertDirectoryProposalResult(db: MetadataDb, result: DirectoryProposalResultRow): void {
-  const existing = db.directory_proposal_results.find((candidate) => candidate.proposal_id === result.proposal_id);
-  if (existing) Object.assign(existing, result, { created_at: existing.created_at });
-  else db.directory_proposal_results.push(result);
+  // Candidate-only: the row is replaced rather than mutated in place, so a read-only state passed here
+  // by mistake fails loudly instead of writing through a committed snapshot.
+  const index = db.directory_proposal_results.findIndex((candidate) => candidate.proposal_id === result.proposal_id);
+  const existing = db.directory_proposal_results[index];
+  if (existing === undefined) db.directory_proposal_results.push(result);
+  else db.directory_proposal_results[index] = { ...result, created_at: existing.created_at };
 }
 
 function resolveDirectoryProposalResult(db: MetadataDb, conflict: ConflictRecord, eventSeq: number): void {
@@ -4483,7 +4493,7 @@ function resolveDirectoryProposalResult(db: MetadataDb, conflict: ConflictRecord
 }
 
 function resolvedConflictDirectoryIntents(
-  conflict: ConflictRecord,
+  conflict: DeepReadonly<ConflictRecord>,
   resolutionKind: ConflictResolutionKind
 ): DirectoryIntent[] {
   const context = conflict.directory_context;
@@ -4501,9 +4511,22 @@ function resolvedConflictDirectoryIntents(
   return compactDirectoryIntents([...cleanIntents, ...serverReassertions]);
 }
 
+/** A candidate-owned copy of a directory context read from a committed state. */
+function mutableDirectoryContext(context: DeepReadonly<DirectoryConflictContext>): DirectoryConflictContext {
+  return {
+    proposal: { ...context.proposal, intents: context.proposal.intents.map((intent) => ({ ...intent })) },
+    base_explicit_dirs: [...context.base_explicit_dirs],
+    server_explicit_dirs: [...context.server_explicit_dirs],
+    clean_intent_ids: [...context.clean_intent_ids],
+    conflicting_intent_ids: [...context.conflicting_intent_ids],
+    affected_roots: [...context.affected_roots],
+    expected_event_seq: context.expected_event_seq
+  };
+}
+
 function reclassifyDirectoryContext(
-  context: DirectoryConflictContext,
-  serverExplicitDirs: string[],
+  context: DeepReadonly<DirectoryConflictContext>,
+  serverExplicitDirs: readonly string[],
   expectedEventSeq: number
 ): DirectoryConflictContext {
   const serverIntents = directoryIntentsBetweenSnapshots(context.base_explicit_dirs, serverExplicitDirs);
@@ -4519,7 +4542,7 @@ function reclassifyDirectoryContext(
   });
   const conflictingIds = new Set(conflicting.map((intent) => intent.intent_id));
   return {
-    ...context,
+    ...mutableDirectoryContext(context),
     server_explicit_dirs: [...serverExplicitDirs].sort(),
     clean_intent_ids: context.proposal.intents.filter((intent) => !conflictingIds.has(intent.intent_id)).map((intent) => intent.intent_id),
     conflicting_intent_ids: conflicting.map((intent) => intent.intent_id),
@@ -4546,7 +4569,7 @@ const DIRECTORY_NEUTRAL_EVENT_TYPES = new Set([
 ]);
 
 function hasContiguousDirectoryNeutralEventGap(
-  db: MetadataDb,
+  db: Pick<DeepReadonly<MetadataDb>, 'events'>,
   vaultId: string,
   afterEventSeq: number,
   throughEventSeq: number
@@ -4568,7 +4591,7 @@ function hasContiguousDirectoryNeutralEventGap(
   });
 }
 
-function directoryIntentsBetweenSnapshots(previous: string[], current: string[]): DirectoryIntent[] {
+function directoryIntentsBetweenSnapshots(previous: readonly string[], current: readonly string[]): DirectoryIntent[] {
   const previousSet = new Set(previous);
   const currentSet = new Set(current);
   const deleted = previous
@@ -4581,7 +4604,7 @@ function directoryIntentsBetweenSnapshots(previous: string[], current: string[])
   return compactDirectoryIntents([...deleted, ...created]);
 }
 
-function applyDirectoryIntentsToSnapshot(previous: string[], intents: DirectoryIntent[]): string[] {
+function applyDirectoryIntentsToSnapshot(previous: readonly string[], intents: ReadonlyArray<DeepReadonly<DirectoryIntent>>): string[] {
   const explicit = new Set(previous);
   for (const intent of intents) {
     if (intent.op === 'delete') {
@@ -4596,7 +4619,7 @@ function applyDirectoryIntentsToSnapshot(previous: string[], intents: DirectoryI
   return [...explicit].sort();
 }
 
-function snapshotContainsDirectory(snapshot: string[], root: string): boolean {
+function snapshotContainsDirectory(snapshot: readonly string[], root: string): boolean {
   return snapshot.some((path) => pathsOverlapWithinRoot(path, root));
 }
 
@@ -4626,7 +4649,7 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value) ?? 'null';
 }
 
-function applyDirectoryIntents(db: MetadataDb, vaultId: string, intents: DirectoryIntent[], eventSeq: number): void {
+function applyDirectoryIntents(db: MetadataDb, vaultId: string, intents: ReadonlyArray<DeepReadonly<DirectoryIntent>>, eventSeq: number): void {
   if (intents.length === 0) {
     return;
   }
@@ -4754,7 +4777,7 @@ function decodeReviewText(blob: Buffer | null): string | null {
   }
 }
 
-function buildDirectoryConflictViews(directoryContext: DirectoryConflictContext | undefined): DirectoryConflictReview[] {
+function buildDirectoryConflictViews(directoryContext: DeepReadonly<DirectoryConflictContext> | undefined): DirectoryConflictReview[] {
   const deviceExplicitDirs = directoryContext
     ? applyDirectoryIntentsToSnapshot(directoryContext.base_explicit_dirs, directoryContext.proposal.intents)
     : [];

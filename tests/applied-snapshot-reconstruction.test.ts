@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { ObtsPluginClient } from '../obsidian-plugin/src/core/client.js';
 import { createObtsServer, type ObtsServer } from '../src/server/app.js';
-import type { MetadataDb } from '../src/server/metadataStore.js';
+import type { DeepReadonly, DeviceRow, MetadataDb } from '../src/server/metadataStore.js';
 
 type Json = Record<string, unknown>;
 
@@ -105,7 +105,7 @@ type StuckState = {
   appliedEventSeq: number;
 };
 
-async function waiterDeviceRow(server: ObtsServer): Promise<MetadataDb['devices'][number]> {
+async function waiterDeviceRow(server: ObtsServer): Promise<DeepReadonly<DeviceRow>> {
   const db = await server.store.snapshot();
   const device = db.devices.find((candidate) => candidate.device_name === 'waiter-device');
   if (!device) throw new Error('waiter device disappeared');

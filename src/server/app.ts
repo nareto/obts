@@ -24,12 +24,14 @@ import {
   CHUNK_TRANSFER_CAPABILITY,
   type ChunkBootstrapManifest,
   type ChunkPullManifest,
+  type ConflictRecord,
   type DevicePullManifest,
   type DevicePullRequest,
   type DirectoryConflictContext,
   type DirectoryIntent,
   type DirectoryIntentAcknowledgement,
   type ConflictResolutionKind,
+  type EventEnvelope,
   type ManualFilePlanEntry,
   type NoteHistoryVersion,
   type PerFileResolutionChoice,
@@ -60,6 +62,7 @@ import { DeviceRemovalService, type DeviceRemovalOptions } from './deviceRemoval
 import { DiagnosticService } from './diagnosticService.js';
 import { GitCommandError, GitDurabilityError, GitService, sha256Hex } from './gitService.js';
 import { GitMaintenanceScheduler, type GitMaintenanceOptions } from './gitMaintenance.js';
+import { LIVE_REF_TRANSITION_GRACE_MS } from './liveRefTransition.js';
 import {
   directorySnapshotAtEvent,
   hasDurableDeletionRecord,
@@ -68,6 +71,7 @@ import {
   MetadataStore,
   isDeviceRevoked,
   type DeepReadonly,
+  type ConnectionRequestRow,
   type DeviceRemovalJob,
   type DeviceRow,
   type MetadataDb,
@@ -109,7 +113,6 @@ export type ObtsServer = {
 };
 
 let dashboardRootPromise: Promise<string> | null = null;
-const LIVE_REF_TRANSITION_GRACE_MS = 2 * 60 * 1000;
 
 async function syncableTargetFileSizes(
   git: GitService,
@@ -181,22 +184,24 @@ export async function createObtsServer(
   });
   const chunkTransfers = new ChunkTransferService(config, git, sync, lifecycle, {}, log);
   lifecycle.attachTransferLifecycle(chunkTransfers);
-  await log.startup('transfers_initialized', async () => await chunkTransfers.initialize(async (session) => {
-    const db = await store.snapshot();
-    const vault = db.vaults.find((candidate) => candidate.vault_id === session.vault_id);
-    const device = db.devices.find((candidate) => candidate.device_id === session.device_id);
-    const user = device ? db.users.find((candidate) => candidate.user_id === device.user_id) : undefined;
-    const token = device
-      ? db.tokens.find((candidate) => candidate.kind === 'device' && candidate.device_id === device.device_id && candidate.revoked_at === null)
-      : undefined;
-    if (
-      !vault || vault.status !== 'active' || hasDurableDeletionRecord(db, vault.vault_id) ||
-      !device || device.vault_id !== vault.vault_id || device.status === 'revoked' || device.revoked_at !== null ||
-      !user || user.disabled || user.user_id !== vault.owner_user_id ||
-      !token || token.user_id !== user.user_id || token.vault_id !== vault.vault_id
-    ) return null;
-    return { user, vault, device, token };
-  }));
+  await log.startup('transfers_initialized', async () => await chunkTransfers.initialize(async (session) =>
+    // A projection read: the resolver receives detached rows owned by this caller instead of the
+    // shared committed state, and only the four rows it needs are copied.
+    await store.read((db) => {
+      const vault = db.vaults.find((candidate) => candidate.vault_id === session.vault_id);
+      const device = db.devices.find((candidate) => candidate.device_id === session.device_id);
+      const user = device ? db.users.find((candidate) => candidate.user_id === device.user_id) : undefined;
+      const token = device
+        ? db.tokens.find((candidate) => candidate.kind === 'device' && candidate.device_id === device.device_id && candidate.revoked_at === null)
+        : undefined;
+      if (
+        !vault || vault.status !== 'active' || hasDurableDeletionRecord(db, vault.vault_id) ||
+        !device || device.vault_id !== vault.vault_id || device.status === 'revoked' || device.revoked_at !== null ||
+        !user || user.disabled || user.user_id !== vault.owner_user_id ||
+        !token || token.user_id !== user.user_id || token.vault_id !== vault.vault_id
+      ) return null;
+      return { user, vault, device, token };
+    })));
   await log.startup('pending_jobs_started', async () => await lifecycle.startPendingJobs());
   const deviceRemovals = new DeviceRemovalService(store, git, lifecycle, sync, chunkTransfers, options.deviceRemoval, log);
   await log.startup('device_removals_resumed', async () => await deviceRemovals.resumePending());
@@ -1055,7 +1060,7 @@ export async function createObtsServer(
   app.get('/api/v1/connections/:connectionId/review', async (request) => {
     const session = await authenticateSession(request);
     const { connectionId } = connectionPathParams(request);
-    const renderReview = (connection: Awaited<ReturnType<typeof connections.review>>, db: MetadataDb) => {
+    const renderReview = (connection: Awaited<ReturnType<typeof connections.review>>, db: DeepReadonly<MetadataDb>) => {
       requestLog.annotate(request, { connection_id: connection.connection_id });
       return ({
       connection_id: connection.connection_id,
@@ -2291,11 +2296,11 @@ function removalSummary(job: Pick<DeviceRemovalJob, 'state' | 'retryable' | 'err
 }
 
 function buildDashboardConflicts(
-  db: Pick<MetadataDb, 'devices'>,
+  db: Pick<DeepReadonly<MetadataDb>, 'devices'>,
   vaultId: string,
   staleConflictIds: ReadonlySet<string>,
-  conflicts: MetadataDb['conflicts']
-): Array<MetadataDb['conflicts'][number] & { device_name: string; conflict_type: string; stale: boolean; status_label: string }> {
+  conflicts: ReadonlyArray<DeepReadonly<ConflictRecord>>
+): Array<DeepReadonly<ConflictRecord> & { device_name: string; conflict_type: string; stale: boolean; status_label: string }> {
   return conflicts
     .filter((conflict) => conflict.vault_id === vaultId)
     .map((conflict) => {
@@ -2317,7 +2322,7 @@ function buildDashboardConflicts(
     });
 }
 
-function conflictType(conflict: MetadataDb['conflicts'][number]): string {
+function conflictType(conflict: DeepReadonly<ConflictRecord>): string {
   if (conflict.conflict_kind === 'directory') return 'Directory overlap';
   if (conflict.conflict_kind === 'mixed') return 'File and directory overlap';
   const reason = conflict.validator_results.reason ?? conflict.validator_summary.reason;
@@ -2336,7 +2341,7 @@ function conflictType(conflict: MetadataDb['conflicts'][number]): string {
   return 'Path overlap';
 }
 
-function buildRecentActivity(db: Pick<MetadataDb, 'events'>, vaultId: string): Array<{
+function buildRecentActivity(db: Pick<DeepReadonly<MetadataDb>, 'events'>, vaultId: string): Array<{
   event_id: string;
   event_seq: number;
   event_type: string;
@@ -2457,7 +2462,7 @@ function redactedPathId(path: string): string {
 }
 
 function buildRedactedDiagnostics(
-  db: MetadataDb,
+  db: DeepReadonly<MetadataDb>,
   vaultId: string,
   health: ReadinessSummary,
   observability: {
@@ -2532,7 +2537,7 @@ function buildRedactedDiagnostics(
 
 async function buildNoteHistoryVersions(
   git: GitService,
-  db: MetadataDb,
+  db: DeepReadonly<MetadataDb>,
   vaultId: string,
   currentMain: string,
   path: string,
@@ -2586,7 +2591,7 @@ async function buildNoteHistoryVersions(
 
 async function classifyHistoryOperation(
   git: GitService,
-  db: MetadataDb,
+  db: DeepReadonly<MetadataDb>,
   vaultId: string,
   commit: string,
   parentCommit: string | null,
@@ -2643,7 +2648,7 @@ async function classifyHistoryOperation(
 
 async function inferHistorySourcePath(
   git: GitService,
-  db: MetadataDb,
+  db: DeepReadonly<MetadataDb>,
   vaultId: string,
   currentMain: string,
   targetPath: string,
@@ -2733,7 +2738,7 @@ function readEventCursor(request: FastifyRequest): number {
 }
 
 function eventSnapshotForTarget(
-  db: MetadataDb,
+  db: DeepReadonly<MetadataDb>,
   vaultId: string,
   deviceId: string,
   targetMain: string,
@@ -2821,12 +2826,12 @@ function eventSnapshotForTarget(
  * that snapshot, as it does for the current main.
  */
 function checkpointedEventSnapshot(
-  db: MetadataDb,
+  db: DeepReadonly<MetadataDb>,
   vaultId: string,
   deviceId: string,
   eventSeq: number,
   afterEventSeq: number,
-  eventsAfterBaseline: MetadataDb['events'],
+  eventsAfterBaseline: ReadonlyArray<DeepReadonly<EventEnvelope>>,
   intervalRetained: boolean,
   baseExplicitDirectories: string[] | undefined
 ): {
@@ -2855,9 +2860,9 @@ function checkpointedEventSnapshot(
 }
 
 function historicalAcknowledgementSnapshot(
-  db: MetadataDb,
+  db: DeepReadonly<MetadataDb>,
   vaultId: string,
-  device: MetadataDb['devices'][number],
+  device: DeepReadonly<DeviceRow>,
   appliedMain: string
 ): { eventSeq: number; directoryIntents: never[]; explicitDirectories: string[] } | null {
   try {
@@ -2876,8 +2881,8 @@ function historicalAcknowledgementSnapshot(
 }
 
 function directoryAcknowledgementsForDevice(
-  db: MetadataDb,
-  events: Array<{ payload: Record<string, unknown> }>,
+  db: Pick<DeepReadonly<MetadataDb>, 'directory_proposal_results'>,
+  events: ReadonlyArray<{ readonly payload: DeepReadonly<Record<string, unknown>> }>,
   vaultId: string,
   deviceId: string,
   afterEventSeq: number,
@@ -2917,7 +2922,7 @@ function directoryAcknowledgementsForDevice(
   return [...acknowledgements.values()];
 }
 
-function directoryIntentsBetweenSnapshots(previous: string[], current: string[]): DirectoryIntent[] {
+function directoryIntentsBetweenSnapshots(previous: readonly string[], current: readonly string[]): DirectoryIntent[] {
   const previousSet = new Set(previous);
   const currentSet = new Set(current);
   const deleted = previous
@@ -2930,7 +2935,7 @@ function directoryIntentsBetweenSnapshots(previous: string[], current: string[])
   return compactDirectoryIntents([...deleted, ...created]);
 }
 
-function directoryIntentsFromEvents(events: Array<{ payload: Record<string, unknown> }>): DirectoryIntent[] {
+function directoryIntentsFromEvents(events: ReadonlyArray<{ readonly payload: DeepReadonly<Record<string, unknown>> }>): DirectoryIntent[] {
   const intents: DirectoryIntent[] = [];
   for (const event of events) {
     const rawIntents = event.payload.directory_intents;
@@ -2969,10 +2974,10 @@ function compactDirectoryIntents(intents: DirectoryIntent[]): DirectoryIntent[] 
 function sendEventPage(
   reply: FastifyReply,
   requestId: string,
-  db: MetadataDb,
+  db: DeepReadonly<MetadataDb>,
   vaultId: string,
   after: number
-): FastifyReply | { events: MetadataDb['events']; current_event_seq: number } {
+): FastifyReply | { events: ReadonlyArray<DeepReadonly<EventEnvelope>>; current_event_seq: number } {
   const vaultEvents = db.events
     .filter((event) => event.vault_id === vaultId)
     .sort((left, right) => left.event_seq - right.event_seq);
@@ -3269,8 +3274,8 @@ function readRequiredBoolean(record: Record<string, unknown>, field: string): bo
 }
 
 function connectionReviewTargetVaultId(
-  db: MetadataDb,
-  connection: MetadataDb['connections'][number]
+  db: Pick<DeepReadonly<MetadataDb>, 'devices'>,
+  connection: DeepReadonly<ConnectionRequestRow>
 ): string | null {
   if (connection.selected_vault_id) return connection.selected_vault_id;
   if (!connection.created_device_id) return null;
@@ -3876,7 +3881,7 @@ async function buildReadinessSummary(
   };
 }
 
-function checkEventDelivery(db: MetadataDb): { ok: true } | { ok: false; error: string } {
+function checkEventDelivery(db: DeepReadonly<MetadataDb>): { ok: true } | { ok: false; error: string } {
   for (const [vaultId, currentSeq] of Object.entries(db.event_seq_by_vault)) {
     const vaultEvents = db.events
       .filter((event) => event.vault_id === vaultId)
@@ -3905,7 +3910,7 @@ function metadataVaultIds(db: DeepReadonly<MetadataDb>): string[] {
   ];
 }
 
-async function checkPersistentState(db: MetadataDb, store: MetadataStore, git: GitService): Promise<PersistentStateCheck> {
+async function checkPersistentState(db: DeepReadonly<MetadataDb>, store: MetadataStore, git: GitService): Promise<PersistentStateCheck> {
   if (db.schema_version !== 8) {
     return { ok: false, error: 'metadata schema version is unsupported' };
   }
@@ -4006,7 +4011,7 @@ async function confirmPersistentStateFailure(
 }
 
 /** Cheap main-ref consistency check for a single vault; never runs fsck. */
-async function checkVaultMainRef(db: MetadataDb, vaultId: string, git: GitService): Promise<PersistentStateCheck> {
+async function checkVaultMainRef(db: DeepReadonly<MetadataDb>, vaultId: string, git: GitService): Promise<PersistentStateCheck> {
   const vault = db.vaults.find((candidate) => candidate.vault_id === vaultId);
   if (!vault) return { ok: false, error: 'vault metadata is missing' };
   if (hasDurableDeletionRecord(db, vaultId)) return { ok: true };
@@ -4017,7 +4022,7 @@ async function checkVaultMainRef(db: MetadataDb, vaultId: string, git: GitServic
 }
 
 async function checkVaultPersistentState(
-  db: MetadataDb,
+  db: DeepReadonly<MetadataDb>,
   vaultId: string,
   git: GitService,
   allowPreparedTransitions = false
@@ -4118,7 +4123,7 @@ async function checkVaultPersistentState(
 }
 
 async function preparedRefTransitionAllows(
-  db: MetadataDb,
+  db: DeepReadonly<MetadataDb>,
   vaultId: string,
   ref: string,
   metadataValue: string | null,
@@ -4140,7 +4145,7 @@ async function preparedRefTransitionAllows(
 }
 
 async function preparedConflictRefTransitionAllows(
-  db: MetadataDb,
+  db: DeepReadonly<MetadataDb>,
   vaultId: string,
   conflictId: string,
   kind: string,
@@ -4242,7 +4247,7 @@ function conflictRef(conflictId: string, kind: string): string {
   return `refs/obts/conflicts/${conflictId}/${kind}`;
 }
 
-function conflictProtectedRefs(conflict: MetadataDb['conflicts'][number]): Array<[string, string]> {
+function conflictProtectedRefs(conflict: DeepReadonly<ConflictRecord>): Array<[string, string]> {
   return [
     ['base', conflict.base_commit],
     ['current', conflict.current_main],

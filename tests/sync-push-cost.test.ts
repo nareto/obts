@@ -3,12 +3,13 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createObtsServer, type ObtsServer } from '../src/server/app.js';
 import { hashToken } from '../src/server/authService.js';
 import { sha256Hex } from '../src/server/gitService.js';
 import { OperationalLog } from '../src/server/operationalLog.js';
+import { LIVE_REF_TRANSITION_GRACE_MS, PREPARED_TRANSITION_REFRESH_MS } from '../src/server/liveRefTransition.js';
 import type { MetadataPersistenceAdapter } from '../src/server/metadataStore.js';
 import { API_VERSION, type DevicePushManifest, type PushResult } from '../src/shared/types.js';
 
@@ -200,7 +201,7 @@ async function deviceCommit(f: Fixture, path: string, body: string): Promise<str
     { encoding: 'utf8' }).trim();
 }
 
-async function pushOneFile(f: Fixture): Promise<PushResult> {
+async function pushOneFile(f: Fixture, hooks: { duringPromotion?: () => void } = {}): Promise<PushResult> {
   const main = nativeGit(f.repo, ['rev-parse', 'refs/heads/main']).trim();
   const target = await deviceCommit(f, notePath(3), `${NOTE}\nedited\n`);
   const pack = await f.server.git.exportPack(f.vaultId, target, 'refs/heads/main');
@@ -218,7 +219,10 @@ async function pushOneFile(f: Fixture): Promise<PushResult> {
   try {
     return await f.server.sync.pushDeviceCommit(auth, manifest, Buffer.alloc(0), {
       reader: f.server.git.readerForRepo(transferRepo, join(f.repo, 'objects')),
-      promote: async () => await f.server.git.promoteTransferObjects(f.vaultId, transferRepo)
+      promote: async () => {
+        await f.server.git.promoteTransferObjects(f.vaultId, transferRepo);
+        hooks.duringPromotion?.();
+      }
     });
   } finally {
     await rm(transferRoot, { recursive: true, force: true });
@@ -239,9 +243,13 @@ describe('change-proportional server work', () => {
     expect(() => { (first as unknown as { setup_complete: boolean }).setup_complete = false; }).toThrow(TypeError);
     expect(() => { (first.events as unknown as unknown[]).push({}); }).toThrow(TypeError);
     // A mutation still commits a private candidate; publishing replaced the object instead of editing it.
-    await f.server.store.mutate((db) => { db.setup_complete = true; });
-    expect(await f.server.store.snapshot()).not.toBe(first);
+    // The setup call already completed, so a write that leaked into the shared state would show up here
+    // as the earlier object losing its value.
+    await f.server.store.mutate((db) => { db.setup_complete = false; });
+    const afterMutation = await f.server.store.snapshot();
+    expect(afterMutation).not.toBe(first);
     expect(first.setup_complete).toBe(true);
+    expect(afterMutation.setup_complete).toBe(false);
   });
 
   it('serves a device status poll without copying or republishing the state', async () => {
@@ -268,13 +276,20 @@ describe('change-proportional server work', () => {
     expect(auditAfter.length).toBe(auditBefore);
     expect(auditAfter.filter((row) => row.action === 'main_advanced')).toHaveLength(mainAdvancedAuditBefore);
     const line = f.logLines.filter((entry) => entry.event === 'push_integrated').at(-1)!;
-    // Eight durable boundaries: push admission and prepared state, the live transition refresh, the
-    // device ref commit, merge preparation and target, the merge commit, and the history handoff pair.
+    // Eight durable boundaries: push admission, the prepared operation, the device ref commit, merge
+    // preparation, the merge target, the merge commit, and the operation-history handoff pair. A fast
+    // promotion keeps the prepared timestamp, so the transition refresh is not one of them; the aged
+    // promotion test below covers the case where it is.
     expect(line.persist_count).toBe(8);
     // One candidate copy per metadata transaction (six) plus the two copies the operation-history
     // handoff writes. Reads contribute none: a poll or snapshot must never copy the whole state.
     expect(Number(line.clone_count)).toBeLessThanOrEqual(8);
     expect(Number(line.clone_count)).toBeGreaterThan(0);
+    // Every publication freezes the state it hands to readers. The walk must stay cheaper than the
+    // cloning it protects, so a regression that makes immutability the dominant cost fails here; the
+    // bound is relative to another whole-state phase of the same push so load cannot move it.
+    expect(Number(line.freeze_count)).toBe(Number(line.persist_count));
+    expect(Number(line.freeze_ms)).toBeLessThanOrEqual(Number(line.clone_ms) * 2);
     // Repeating ls-tree/merge-base for the same commit is what made a push scale with metadata size.
     expect(Number(line.git_count)).toBeLessThanOrEqual(34);
     expect(typeof line.git_slowest).toBe('string');
@@ -284,5 +299,31 @@ describe('change-proportional server work', () => {
     const merged = nativeGit(f.repo, ['ls-tree', '-r', 'refs/heads/main', '--name-only']).split('\n');
     expect(merged).toContain(notePath(3));
     expect((await f.server.store.snapshot()).vaults[0]!.current_main).toBe(result.status === 'merged' ? result.main : null);
+  });
+
+  it('refreshes a prepared transition that a slow promotion left near the live grace window', async () => {
+    const f = await fixture();
+    // The recorded age decides the refresh, so the promotion consumes thirty-five seconds of the window.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const result = await pushOneFile(f, {
+        duringPromotion: () => { vi.setSystemTime(Date.now() + PREPARED_TRANSITION_REFRESH_MS + 5_000); }
+      });
+      expect(result.status).toBe('merged');
+    } finally {
+      vi.useRealTimers();
+    }
+    const line = f.logLines.filter((entry) => entry.event === 'push_integrated').at(-1)!;
+    // One extra durable boundary: the prepared record is rewritten right before its ref moves, so the
+    // live ref/metadata gap it opens starts from a fresh timestamp instead of an aged one.
+    expect(line.persist_count).toBe(9);
+    expect(Number(line.freeze_count)).toBe(Number(line.persist_count));
+  });
+
+  it('derives the transition refresh from the grace window that integrity checks honour', () => {
+    // A record that just missed a refresh is at most one threshold old when its ref moves, so the gap
+    // left for the ref update and the metadata commit that records it is grace minus the threshold.
+    expect(PREPARED_TRANSITION_REFRESH_MS).toBe(LIVE_REF_TRANSITION_GRACE_MS / 4);
+    expect(LIVE_REF_TRANSITION_GRACE_MS - PREPARED_TRANSITION_REFRESH_MS).toBeGreaterThan(0);
   });
 });

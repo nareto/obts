@@ -6950,7 +6950,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       pending_commit: queuedCommit
     });
     await server.store.mutate((db) => {
-      db.events = retainedEvents;
+      db.events = [...retainedEvents];
     });
 
     await writeFile(baselineJournalPath, '{malformed');

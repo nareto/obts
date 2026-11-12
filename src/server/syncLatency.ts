@@ -10,6 +10,8 @@ export type SyncLatency = {
   git_slowest_ms: number;
   clone_count: number;
   clone_ms: number;
+  freeze_count: number;
+  freeze_ms: number;
   lock_wait_ms: number;
 };
 export type SyncLatencyReport = Omit<SyncLatency, 'git_slowest'> & { git_slowest?: string };
@@ -18,7 +20,7 @@ const observations = new AsyncLocalStorage<SyncLatency>();
 export async function observeSyncLatency<T>(action: () => Promise<T>): Promise<{ result: T; latency: SyncLatencyReport }> {
   const latency: SyncLatency = {
     persist_count: 0, persist_ms: 0, git_ms: 0, git_count: 0, git_slowest: null, git_slowest_ms: 0,
-    clone_count: 0, clone_ms: 0, lock_wait_ms: 0
+    clone_count: 0, clone_ms: 0, freeze_count: 0, freeze_ms: 0, lock_wait_ms: 0
   };
   const result = await observations.run(latency, action);
   const report: SyncLatencyReport = {
@@ -30,6 +32,8 @@ export async function observeSyncLatency<T>(action: () => Promise<T>): Promise<{
     git_slowest_ms: Math.round(latency.git_slowest_ms),
     clone_count: latency.clone_count,
     clone_ms: Math.round(latency.clone_ms),
+    freeze_count: latency.freeze_count,
+    freeze_ms: Math.round(latency.freeze_ms),
     lock_wait_ms: Math.round(latency.lock_wait_ms)
   };
   return { result, latency: report };
@@ -55,6 +59,19 @@ export function observeMetadataClone<T>(action: () => T): T {
   latency.clone_count++;
   try { return action(); }
   finally { latency.clone_ms += performance.now() - started; }
+}
+
+/**
+ * A publication freeze: the walk that makes a freshly cloned committed state immutable, so it can be
+ * shared with readers. It is event-loop blocking like a clone and is reported separately from it.
+ */
+export function observeMetadataFreeze<T>(action: () => T): T {
+  const latency = observations.getStore();
+  if (!latency) return action();
+  const started = performance.now();
+  latency.freeze_count++;
+  try { return action(); }
+  finally { latency.freeze_ms += performance.now() - started; }
 }
 
 /**
