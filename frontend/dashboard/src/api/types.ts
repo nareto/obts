@@ -206,10 +206,33 @@ export type TroubleshootingDiagnosticContext = {
   };
 };
 
+export type SyncTimingPhase = {
+  point: string;
+  elapsed_bucket: string;
+};
+
+export type SyncTimingAttempt = {
+  attempt_id: string;
+  trigger: string;
+  outcome: string;
+  runtime: string;
+  error_code: string;
+  elapsed_bucket: string;
+  hidden_bucket: string;
+  suspended_bucket: string;
+  scan_mode: string;
+  apply_mode: string;
+  scan_files_bucket: string;
+  target_changes_bucket: string;
+  event_lag_bucket: string;
+  phases: SyncTimingPhase[];
+};
+
 export type DiagnosticEvent = DiagnosticEventBase & (
   | { schema_version: 1 }
   | { schema_version: 2; context: TroubleshootingDiagnosticContext }
   | { schema_version: 3; phase: string; phase_id: string; observation: 'stalled' | 'completed' | 'abandoned'; elapsed_bucket: 'under_30s' | '30s_to_1m' | '1m_to_5m' | '5m_to_15m' | 'over_15m' }
+  | { schema_version: 4; batch_id: string; attempts: SyncTimingAttempt[] }
 );
 
 export type DiagnosticEventsResponse = {

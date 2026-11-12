@@ -23183,7 +23183,7 @@ var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var { findUnportablePaths, isRestrictedNamePlatform, segmentHasReservedCharacters } = require_namePortability();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.7.8";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.7.9";
 var SYNC_DEBOUNCE_MS = 1500;
 var EMPTY_JSON_BODY = "{}";
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
@@ -23224,6 +23224,20 @@ var DIAGNOSTIC_CONSENT_VERSION = 2;
 var TROUBLESHOOTING_DEDUP_MS = 15 * 60 * 1e3;
 var DIAGNOSTIC_FAILURE_COOLDOWN_MS = 60 * 1e3;
 var DIAGNOSTIC_CONTEXT = /* @__PURE__ */ Symbol("obtsDiagnosticContext");
+var SYNC_TIMING_SCHEMA_VERSION = 4;
+var SYNC_TIMING_MAX_ATTEMPTS_PER_EVENT = 6;
+var SYNC_TIMING_MAX_PHASES = 6;
+var SYNC_TIMING_MAX_EVENTS_PER_DAY = 48;
+var SYNC_TIMING_FLUSH_DELAY_MS = 10 * 60 * 1e3;
+var SYNC_TIMING_TICK_MS = 2e3;
+var SYNC_TIMING_SUSPENSION_GAP_MS = 5e3;
+var SYNC_TIMING_MIN_ELAPSED_MS = 30 * 1e3;
+var SYNC_TIMING_REJECTION_COOLDOWN_MS = 6 * 60 * 60 * 1e3;
+var SYNC_TIMING_TRIGGERS = /* @__PURE__ */ new Set(["startup", "interval", "visibility", "watcher", "user", "headless"]);
+var SYNC_TIMING_SCAN_MODES = ["none", "hinted", "incremental", "full"];
+var SYNC_TIMING_APPLY_MODES = ["none", "ref_only", "delta", "full"];
+var SYNC_TIMING_ERROR_CODES = /* @__PURE__ */ new Set(["none", "device_blocked", "conflict_review_required", "server_recovery_required", "blocked_integrity", "device_revoked", "device_identity_mismatch", "not_paired", "sync_lease_blocked", "operation_interrupted_by_reload", "local_state_incomplete", "same_device_non_fast_forward", "apply_recovery_required", "apply_journal_recovery_required", "onboarding_context_required", "onboarding_identity_mismatch", "onboarding_snapshot_changed", "invalid_transfer_checkpoint", "applied_main_acknowledgement_failed", "recovery_evidence_missing", "recovery_checksum_mismatch", "recovery_identity_mismatch", "recovery_target_policy_mismatch", "recovery_state_corrupt", "catchup_recovery_required", "catchup_local_changes", "local_files_diverge_from_journal", "local_changed_during_apply", "preflight_hash_changed", "recovery_bundle_failed", "directory_recovery_decision_required", "directory_recovery_changed", "directory_recovery_journal_invalid", "object_too_large_for_chunk", "unportable_target_paths", "pack_preparation_failed", "network_error", "http_error", "sync_error", "unknown"]);
+var DIAGNOSTIC_POINTS = /* @__PURE__ */ new Set(["onboarding_approved", "bootstrap_response", "multipart_pack", "pack_persist_write", "pack_persist_read", "index_fs_stat", "index_fs_read_file", "index_fs_read", "index_fs_write", "index_pack", "sync_request", "sync_download", "onboarding_download", "transfer_checkpoint_verification", "apply", "apply_recovery_prepare", "apply_preflight_revalidate", "apply_write", "apply_verify", "apply_local_capture", "apply_finalize", "local_snapshot", "directory_inventory", "file_inventory_check", "local_preservation", "provenance", "upload_prepare", "upload_finalize", "recovery", "recovery_directory_decision", "startup_metadata", "startup_git", "startup_state", "recovery_journal", "recovery_target_commit", "recovery_target_tree", "recovery_file_validation", "recovery_bundle", "recovery_file_apply", "recovery_refs", "recovery_state"]);
 var DEFAULT_SETTINGS = {
   serverUrl: "http://127.0.0.1:3000",
   deviceName: "",
@@ -23278,6 +23292,11 @@ module.exports = class ObtsPlugin extends Plugin {
     this.pendingTroubleshootingTransitions = /* @__PURE__ */ new Map();
     this.manualTroubleshootingInFlight = null;
     this.diagnosticNoticeShown = false;
+    this.pendingSyncTiming = [];
+    this.syncTimingFlushTimer = null;
+    this.syncTimingDeliveredAt = [];
+    this.syncTimingRetryNotBefore = 0;
+    this.syncTimingUnsupported = false;
     this.deviceNameRevision = 0;
     this.currentStatusLabel = null;
     this.statusNeedsRecoveryNotice = false;
@@ -23324,6 +23343,7 @@ module.exports = class ObtsPlugin extends Plugin {
       await this.pathMutationGate.ready;
       if (this.unloaded) return;
       this.client = new ObtsObsidianClient(this);
+      this.refreshSyncTimingSink();
       this.settingTab = new ObtsSettingTab(this.app, this);
       this.addSettingTab(this.settingTab);
       this.addCommand({
@@ -23416,14 +23436,15 @@ module.exports = class ObtsPlugin extends Plugin {
       }
       this.registerInterval(
         window.setInterval(() => {
-          void this.runBackgroundSync();
+          void this.runBackgroundSync("interval");
         }, BACKGROUND_SYNC_INTERVAL_MS)
       );
       if (typeof this.registerDomEvent === "function" && typeof document !== "undefined") {
         this.registerDomEvent(document, "visibilitychange", () => {
+          this.client?.noteSyncTimingVisibility?.(document.hidden === true);
           if (document.hidden) return;
           if (this.client && typeof this.client.requestFullInventory === "function") this.client.requestFullInventory();
-          void this.runBackgroundSync();
+          void this.runBackgroundSync("visibility");
         });
       }
     } catch (error) {
@@ -23507,12 +23528,18 @@ module.exports = class ObtsPlugin extends Plugin {
     if (this.settingTab) this.settingTab.clearOperationRefreshTimer();
     this.clearOperationProgress();
     this.clearDegradedStatusTimer();
+    if (this.syncTimingFlushTimer !== null) {
+      window.clearTimeout(this.syncTimingFlushTimer);
+      this.syncTimingFlushTimer = null;
+    }
+    if (Array.isArray(this.pendingSyncTiming)) this.pendingSyncTiming.length = 0;
+    this.client?.clearSyncTimingAttempt?.();
   }
   async initializeClient() {
     if (this.clientReady) return;
     if (!this.clientInitialization) {
       this.clientInitialization = (async () => {
-        if (this.unloaded || !this.beginSync("Initializing obts")) {
+        if (this.unloaded || !this.beginSync("Initializing obts", "startup")) {
           throw new ObtsBlockedError("sync_lease_blocked", this.syncBlockedMessage());
         }
         let completed = false;
@@ -23623,6 +23650,7 @@ module.exports = class ObtsPlugin extends Plugin {
     }, INITIALIZATION_STALL_DIAGNOSTIC_MS);
   }
   setOperationProgress(label, diagnosticPoint) {
+    this.client?.noteSyncTimingPhase?.(diagnosticPoint);
     const phaseChanged = this.activeOperationDiagnosticPoint !== diagnosticPoint;
     const progressLabelChanged = this.activeOperationProgressLabel !== label;
     const previousPhase = phaseChanged ? this.activeMeasuredPhase : null;
@@ -23710,6 +23738,7 @@ module.exports = class ObtsPlugin extends Plugin {
       this.settings.diagnosticConsentServer = "";
       this.settings.diagnosticConsentVersion = 0;
     }
+    this.refreshSyncTimingSink();
     await this.saveSettings();
   }
   async setDiagnosticSharing(enabled) {
@@ -23722,6 +23751,9 @@ module.exports = class ObtsPlugin extends Plugin {
     this.settings.shareErrorDiagnostics = Boolean(enabled);
     this.settings.diagnosticConsentServer = enabled ? destination : "";
     this.settings.diagnosticConsentVersion = enabled ? DIAGNOSTIC_CONSENT_VERSION : 0;
+    this.syncTimingUnsupported = false;
+    this.syncTimingRetryNotBefore = 0;
+    this.refreshSyncTimingSink();
     await this.saveSettings();
   }
   diagnosticSharingEnabled() {
@@ -23850,6 +23882,87 @@ module.exports = class ObtsPlugin extends Plugin {
       return await this.manualTroubleshootingInFlight;
     } finally {
       this.manualTroubleshootingInFlight = null;
+    }
+  }
+  refreshSyncTimingSink() {
+    if (!this.client || typeof this.client.setSyncTimingSink !== "function") return;
+    const enabled = this.diagnosticSharingEnabled();
+    this.client.setSyncTimingSink(enabled ? (attempt) => this.recordSyncTiming(attempt) : null);
+    if (!enabled && Array.isArray(this.pendingSyncTiming)) this.pendingSyncTiming.length = 0;
+  }
+  // One compact batch per flush keeps ~300 daily sync attempts inside the
+  // server's per-device automatic diagnostic budget without a durable spool:
+  // undelivered timing is best effort and may be dropped on unload.
+  recordSyncTiming(attempt) {
+    if (this.unloaded || !attempt || !this.diagnosticSharingEnabled() || this.syncTimingUnsupported) return;
+    this.pendingSyncTiming.push(attempt);
+    if (this.pendingSyncTiming.length >= SYNC_TIMING_MAX_ATTEMPTS_PER_EVENT || attempt.outcome !== "completed" || attempt.trigger === "user") {
+      void this.flushSyncTiming();
+      return;
+    }
+    this.scheduleSyncTimingFlush();
+  }
+  scheduleSyncTimingFlush() {
+    if (this.syncTimingFlushTimer !== null || this.unloaded) return;
+    this.syncTimingFlushTimer = window.setTimeout(() => {
+      this.syncTimingFlushTimer = null;
+      void this.flushSyncTiming();
+    }, SYNC_TIMING_FLUSH_DELAY_MS);
+    if (this.syncTimingFlushTimer && typeof this.syncTimingFlushTimer.unref === "function") this.syncTimingFlushTimer.unref();
+  }
+  async flushSyncTiming() {
+    if (this.syncTimingFlushTimer !== null) {
+      window.clearTimeout(this.syncTimingFlushTimer);
+      this.syncTimingFlushTimer = null;
+    }
+    if (this.pendingSyncTiming.length === 0) return;
+    if (this.unloaded || this.syncTimingUnsupported || !this.diagnosticSharingEnabled()) {
+      this.pendingSyncTiming.length = 0;
+      return;
+    }
+    const now = Date.now();
+    this.syncTimingDeliveredAt = this.syncTimingDeliveredAt.filter((at) => at > now - 24 * 60 * 60 * 1e3);
+    if (now < this.syncTimingRetryNotBefore || this.syncTimingDeliveredAt.length >= SYNC_TIMING_MAX_EVENTS_PER_DAY) {
+      this.pendingSyncTiming.length = 0;
+      return;
+    }
+    const batches = [];
+    while (this.pendingSyncTiming.length > 0) {
+      batches.push(this.pendingSyncTiming.splice(0, SYNC_TIMING_MAX_ATTEMPTS_PER_EVENT));
+    }
+    for (const batch of batches) {
+      if (this.unloaded || this.syncTimingUnsupported) return;
+      if (!await this.deliverSyncTiming(batch)) return;
+    }
+  }
+  async deliverSyncTiming(batch) {
+    const consentDestination = this.settings.diagnosticConsentServer;
+    try {
+      const state = await this.client.readState();
+      if (!state.vault_id || !state.device_id) return false;
+      const token = await this.client.readDeviceToken();
+      if (!token || this.unloaded || !this.diagnosticSharingEnabled() || this.settings.diagnosticConsentServer !== consentDestination) return false;
+      const response = await fetchWithTimeout(`${consentDestination}/api/v1/device/diagnostic-events`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify(buildSyncTimingDiagnostic(batch))
+      });
+      if (response.ok) {
+        this.syncTimingDeliveredAt.push(Date.now());
+        return true;
+      }
+      if (response.status === 429) {
+        const retryAfter = Number(response.headers.get("retry-after"));
+        this.syncTimingRetryNotBefore = Date.now() + (Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter * 1e3, SYNC_TIMING_REJECTION_COOLDOWN_MS) : SYNC_TIMING_REJECTION_COOLDOWN_MS);
+        return false;
+      }
+      if (response.status >= 400 && response.status < 500) {
+        this.syncTimingUnsupported = true;
+        this.pendingSyncTiming.length = 0;
+      }
+      return false;
+    } catch {
+      return false;
     }
   }
   async reportOperationStall(phase) {
@@ -24059,7 +24172,7 @@ module.exports = class ObtsPlugin extends Plugin {
       this.staleSettleTimer = window.setTimeout(() => {
         this.staleSettleTimer = null;
         this.staleSettleAt = null;
-        void this.runBackgroundSync();
+        void this.runBackgroundSync("interval");
       }, Math.max(0, at - Date.now()) + STALE_SETTLE_MARGIN_MS);
     }, () => void 0);
   }
@@ -24080,7 +24193,7 @@ module.exports = class ObtsPlugin extends Plugin {
       return;
     }
     this.syncQueued = false;
-    await this.runAutomaticSync();
+    await this.runAutomaticSync({}, "watcher");
     if (this.syncQueued) this.scheduleQueuedSync(0);
   }
   async flushOpenMarkdownEditorsToDisk(isUnreloadedView = null) {
@@ -24114,7 +24227,7 @@ module.exports = class ObtsPlugin extends Plugin {
     }
     return flushed;
   }
-  async runBackgroundSync() {
+  async runBackgroundSync(trigger = "interval") {
     if (!this.layoutStarted || this.unloaded || typeof document !== "undefined" && document.hidden || !await this.ensureClientReady()) {
       return;
     }
@@ -24137,13 +24250,13 @@ module.exports = class ObtsPlugin extends Plugin {
     const queue = await this.client.readQueue();
     const scanDecision = await this.client.backgroundScanDecision();
     if (queue.pending_commit || queue.status === "queued_local" || scanDecision.required) {
-      await this.runAutomaticSync({ fullAudit: scanDecision.mode === "full" });
+      await this.runAutomaticSync({ fullAudit: scanDecision.mode === "full" }, trigger);
       return;
     }
-    await this.runRemotePoll();
+    await this.runRemotePoll(trigger);
   }
-  async runRemotePoll() {
-    if (!this.beginSync("Checking server")) return;
+  async runRemotePoll(trigger = "interval") {
+    if (!this.beginSync("Checking server", trigger)) return;
     let completed = false;
     try {
       await this.client.pollRemoteEventsAndApply({ deltaApply: true });
@@ -24158,7 +24271,7 @@ module.exports = class ObtsPlugin extends Plugin {
       if (this.syncQueued) this.scheduleQueuedSync(0);
     }
   }
-  async runAutomaticSync(options = {}) {
+  async runAutomaticSync(options = {}, trigger = "interval") {
     if (this.unloaded || typeof document !== "undefined" && document.hidden || !await this.ensureClientReady() || this.isSyncInProgress()) {
       return;
     }
@@ -24168,7 +24281,7 @@ module.exports = class ObtsPlugin extends Plugin {
       if (error?.code === "onboarding_context_required") return;
       throw error;
     }
-    if (!this.beginSync("Background sync")) return;
+    if (!this.beginSync("Background sync", trigger)) return;
     let completed = false;
     try {
       const state = await this.client.readState();
@@ -24196,6 +24309,7 @@ module.exports = class ObtsPlugin extends Plugin {
     }
   }
   async handleAutomaticSyncError(error) {
+    this.client.noteSyncTimingError(error && typeof error === "object" ? error.code : "unknown");
     this.finishMeasuredPhase("abandoned");
     void this.reportDeviceError(error);
     try {
@@ -24267,7 +24381,7 @@ module.exports = class ObtsPlugin extends Plugin {
     if (!await this.ensureClientReady() || this.isSyncInProgress()) {
       return;
     }
-    if (!this.beginSync(initialLabel)) return;
+    if (!this.beginSync(initialLabel, "user")) return;
     let completed = false;
     try {
       const result = await fn();
@@ -24275,6 +24389,7 @@ module.exports = class ObtsPlugin extends Plugin {
       completed = true;
       return result;
     } catch (error) {
+      this.client.noteSyncTimingError(error && typeof error === "object" ? error.code : "unknown");
       this.finishMeasuredPhase("abandoned");
       let handledError = error;
       const message = error instanceof Error ? error.message : "obts sync failed.";
@@ -24310,7 +24425,7 @@ module.exports = class ObtsPlugin extends Plugin {
     }
   }
   async runExclusiveAction(fn, initialLabel = "Obts operation") {
-    if (!await this.ensureClientReady() || !this.beginSync(initialLabel)) {
+    if (!await this.ensureClientReady() || !this.beginSync(initialLabel, "user")) {
       const code = this.operationAvailability() === "restart_required" || this.unloaded ? "operation_interrupted_by_reload" : "sync_lease_blocked";
       throw new ObtsBlockedError(code, this.syncBlockedMessage());
     }
@@ -24392,7 +24507,7 @@ module.exports = class ObtsPlugin extends Plugin {
         this.observedRetiredLease = null;
         try {
           await this.initializeClient();
-          void this.runBackgroundSync();
+          void this.runBackgroundSync("startup");
         } catch (error) {
           this.handleClientInitializationFailure(error);
         }
@@ -24404,7 +24519,7 @@ module.exports = class ObtsPlugin extends Plugin {
       const availability = this.operationAvailability();
       if (availability === "available") {
         this.observedRetiredLease = null;
-        void this.initializeClient().then(() => this.runBackgroundSync()).catch((error) => this.handleClientInitializationFailure(error));
+        void this.initializeClient().then(() => this.runBackgroundSync("startup")).catch((error) => this.handleClientInitializationFailure(error));
         return;
       }
       if (availability === "busy") {
@@ -24432,9 +24547,10 @@ module.exports = class ObtsPlugin extends Plugin {
     if (availability === "restart_required") this.observeRetiredOperation();
     return true;
   }
-  beginSync(initialLabel = "Obts operation") {
+  beginSync(initialLabel = "Obts operation", trigger = "user") {
     const registry = operationRegistry();
     if (this.unloaded || registry.has(this.app.vault.adapter)) return false;
+    if (this.client && typeof this.client.beginSyncTimingAttempt === "function") this.client.beginSyncTimingAttempt(trigger);
     let resolveCompletion;
     const completion = new Promise((resolve) => {
       resolveCompletion = resolve;
@@ -24482,6 +24598,7 @@ module.exports = class ObtsPlugin extends Plugin {
     }
   }
   endSync(completed = false) {
+    if (this.client && typeof this.client.endSyncTimingAttempt === "function") this.client.endSyncTimingAttempt(completed);
     this.finishMeasuredPhase(completed ? "completed" : "abandoned");
     this.clearOperationProgress();
     const registry = operationRegistry();
@@ -24572,6 +24689,154 @@ var ObtsObsidianClient = class {
     this.applyingDeviceStatusResponse = false;
     this.latestDeviceStatusIdentity = null;
     this.deviceStatusReporter = createDeviceStatusReporter({ send: (snapshot) => this.sendDeviceStatus(snapshot) });
+    this.syncTimingAttempt = null;
+    this.syncTimingSink = null;
+  }
+  setSyncTimingSink(sink) {
+    this.syncTimingSink = typeof sink === "function" ? sink : null;
+  }
+  // Unload interrupts whatever ran; nothing is reported, but no timer may
+  // outlive the plugin instance.
+  clearSyncTimingAttempt() {
+    const attempt = this.syncTimingAttempt;
+    this.syncTimingAttempt = null;
+    if (attempt && attempt.tickTimer !== null) clearInterval(attempt.tickTimer);
+  }
+  beginSyncTimingAttempt(trigger) {
+    if (this.syncTimingAttempt) return false;
+    const now = Date.now();
+    const attempt = {
+      attemptId: `stm_${randomHex(16)}`,
+      trigger: SYNC_TIMING_TRIGGERS.has(trigger) ? trigger : "interval",
+      startedAt: now,
+      phases: /* @__PURE__ */ new Map(),
+      phasePoint: null,
+      phaseStartedAt: now,
+      scanMode: "none",
+      applyMode: "none",
+      scanFiles: 0,
+      targetChanges: 0,
+      uploaded: false,
+      hiddenMs: 0,
+      hiddenStartedAt: typeof document !== "undefined" && document.hidden ? now : null,
+      suspendedMs: 0,
+      lastTickAt: now,
+      tickTimer: null,
+      errorCode: "none"
+    };
+    attempt.tickTimer = setInterval(() => this.observeSyncTimingTick(), SYNC_TIMING_TICK_MS);
+    if (attempt.tickTimer && typeof attempt.tickTimer.unref === "function") attempt.tickTimer.unref();
+    this.syncTimingAttempt = attempt;
+    return true;
+  }
+  // A timer gap larger than the interval can only mean the process was
+  // throttled or the device was suspended; wall-clock time keeps counting.
+  observeSyncTimingTick() {
+    const attempt = this.syncTimingAttempt;
+    if (!attempt) return;
+    const now = Date.now();
+    const gap = now - attempt.lastTickAt;
+    if (gap > SYNC_TIMING_SUSPENSION_GAP_MS) attempt.suspendedMs += gap;
+    attempt.lastTickAt = now;
+  }
+  noteSyncTimingVisibility(hidden) {
+    const attempt = this.syncTimingAttempt;
+    if (!attempt) return;
+    const now = Date.now();
+    if (hidden === true) {
+      if (attempt.hiddenStartedAt === null) attempt.hiddenStartedAt = now;
+      return;
+    }
+    if (attempt.hiddenStartedAt !== null) {
+      attempt.hiddenMs += now - attempt.hiddenStartedAt;
+      attempt.hiddenStartedAt = null;
+    }
+  }
+  noteSyncTimingPhase(diagnosticPoint) {
+    const attempt = this.syncTimingAttempt;
+    if (!attempt || typeof diagnosticPoint !== "string" || diagnosticPoint.length === 0) return;
+    if (attempt.phasePoint === diagnosticPoint) return;
+    const now = Date.now();
+    if (attempt.phasePoint) {
+      attempt.phases.set(attempt.phasePoint, (attempt.phases.get(attempt.phasePoint) || 0) + Math.max(0, now - attempt.phaseStartedAt));
+    }
+    attempt.phasePoint = diagnosticPoint;
+    attempt.phaseStartedAt = now;
+  }
+  noteSyncTimingScanMode(mode) {
+    const attempt = this.syncTimingAttempt;
+    if (!attempt || !SYNC_TIMING_SCAN_MODES.includes(mode)) return;
+    attempt.scanMode = mode;
+  }
+  noteSyncTimingApplyMode(mode) {
+    const attempt = this.syncTimingAttempt;
+    if (!attempt || !SYNC_TIMING_APPLY_MODES.includes(mode)) return;
+    if (SYNC_TIMING_APPLY_MODES.indexOf(mode) > SYNC_TIMING_APPLY_MODES.indexOf(attempt.applyMode)) attempt.applyMode = mode;
+  }
+  noteSyncTimingScanFiles(total) {
+    const attempt = this.syncTimingAttempt;
+    if (!attempt || !Number.isSafeInteger(total) || total < 0) return;
+    attempt.scanFiles = Math.max(attempt.scanFiles, total);
+  }
+  noteSyncTimingTargetChanges(total) {
+    const attempt = this.syncTimingAttempt;
+    if (!attempt || !Number.isSafeInteger(total) || total < 0) return;
+    attempt.targetChanges = Math.max(attempt.targetChanges, total);
+  }
+  noteSyncTimingUpload() {
+    if (this.syncTimingAttempt) this.syncTimingAttempt.uploaded = true;
+  }
+  noteSyncTimingError(value) {
+    const attempt = this.syncTimingAttempt;
+    if (!attempt) return;
+    const code = troubleshootingSafeErrorCode(value);
+    if (code !== "none") attempt.errorCode = code;
+  }
+  // An attempt that changed nothing, applied nothing, uploaded nothing and
+  // finished quickly is the ordinary poll; it is not worth a record.
+  endSyncTimingAttempt(completed = false) {
+    const attempt = this.syncTimingAttempt;
+    if (!attempt) return;
+    this.syncTimingAttempt = null;
+    if (attempt.tickTimer !== null) clearInterval(attempt.tickTimer);
+    attempt.tickTimer = null;
+    const now = Date.now();
+    if (attempt.phasePoint) {
+      attempt.phases.set(attempt.phasePoint, (attempt.phases.get(attempt.phasePoint) || 0) + Math.max(0, now - attempt.phaseStartedAt));
+      attempt.phasePoint = null;
+    }
+    if (attempt.hiddenStartedAt !== null) {
+      attempt.hiddenMs += now - attempt.hiddenStartedAt;
+      attempt.hiddenStartedAt = null;
+    }
+    const finalGap = now - attempt.lastTickAt;
+    if (finalGap > SYNC_TIMING_SUSPENSION_GAP_MS) attempt.suspendedMs += finalGap;
+    const elapsedMs = Math.max(0, now - attempt.startedAt);
+    const recorded = {
+      attemptId: attempt.attemptId,
+      trigger: attempt.trigger,
+      runtime: syncTimingRuntimeClass(),
+      startedAt: attempt.startedAt,
+      outcome: completed ? "completed" : attempt.errorCode === "none" ? "abandoned" : "failed",
+      errorCode: attempt.errorCode,
+      elapsedMs,
+      hiddenMs: attempt.hiddenMs,
+      suspendedMs: attempt.suspendedMs,
+      scanMode: attempt.scanMode,
+      applyMode: attempt.applyMode,
+      scanFiles: attempt.scanFiles,
+      targetChanges: attempt.targetChanges,
+      phases: [...attempt.phases.entries()].sort((left, right) => right[1] - left[1]).slice(0, SYNC_TIMING_MAX_PHASES),
+      eventLag: 0
+    };
+    const interesting = recorded.applyMode !== "none" || attempt.uploaded || elapsedMs >= SYNC_TIMING_MIN_ELAPSED_MS || !completed || recorded.scanMode === "full";
+    if (!interesting || !this.syncTimingSink) return;
+    void this.readState().then((state) => {
+      const lag = state && Number.isSafeInteger(state.last_event_seq) && Number.isSafeInteger(state.last_applied_event_seq) ? Math.max(0, state.last_event_seq - state.last_applied_event_seq) : null;
+      recorded.eventLag = lag === null ? -1 : lag;
+      if (!completed && recorded.errorCode === "none" && state) recorded.errorCode = troubleshootingSafeErrorCode(state.last_error_code);
+      if (state && state.vault_id && state.device_id) this.syncTimingSink(buildSyncTimingAttemptRecord(recorded));
+    }, () => void 0);
   }
   requestFullInventory() {
     this.inventoryRequestedSeq += 1;
@@ -25549,7 +25814,23 @@ var ObtsObsidianClient = class {
     }
     return this.lastPackMaintenance;
   }
+  // The headless host calls syncOnce directly, without the plugin's beginSync
+  // lease; that path still owns one timing attempt when nothing else does.
   async syncOnce(options = {}) {
+    const ownedTiming = this.beginSyncTimingAttempt("headless");
+    let completed = false;
+    try {
+      const result = await this.performSyncOnce(options);
+      completed = true;
+      return result;
+    } catch (error) {
+      this.noteSyncTimingError(error && typeof error === "object" ? error.code : "unknown");
+      throw error;
+    } finally {
+      if (ownedTiming) this.endSyncTimingAttempt(completed);
+    }
+  }
+  async performSyncOnce(options = {}) {
     this.gitObjectCache.reset();
     this.gitObjectMemo.clear();
     await this.initialize();
@@ -25596,6 +25877,7 @@ var ObtsObsidianClient = class {
     let uploadResult = null;
     let performedScan = false;
     if (queueBeforeScan.pending_commit) {
+      this.noteSyncTimingUpload();
       uploadResult = await this.uploadQueuedCommit(queueBeforeScan);
       uploaded = true;
     } else {
@@ -25609,6 +25891,7 @@ var ObtsObsidianClient = class {
         await this.reportDeviceStatus().catch(() => void 0);
       }
       const hinted = options.hintedCapture && !options.fullAudit ? await this.captureHintedLocalChanges(queueBeforeScan, flushedPaths) : null;
+      this.noteSyncTimingScanMode(hinted ? "hinted" : options.fullAudit ? "full" : "incremental");
       let staleQueued = false;
       let pendingDirectoryIntents = [];
       let commit2 = null;
@@ -25618,6 +25901,7 @@ var ObtsObsidianClient = class {
         const inventorySeq = this.inventoryRequestedSeq;
         const localInventory = await this.listLocalVaultInventory("", (await this.readRootIgnorePolicy()).policy);
         const localFiles = assertNoCaseCollisions(localInventory.files.filter((filePath) => isSyncableVaultPath(filePath)).sort());
+        this.noteSyncTimingScanFiles(localFiles.length);
         pendingDirectoryIntents = await this.reconcileDirectoryState(localFiles, localInventory.directories);
         if (localFiles.length > 0 && !state.initial_import_confirmed && state.server_device_ref === null) {
           await this.createRecoveryBundle("initial_import", state.local_main, localFiles);
@@ -25666,6 +25950,7 @@ var ObtsObsidianClient = class {
       }
       const queue = await this.readQueue();
       if (queue.pending_commit) {
+        this.noteSyncTimingUpload();
         uploadResult = await this.uploadQueuedCommit(queue);
         uploaded = true;
       }
@@ -27462,6 +27747,20 @@ var ObtsObsidianClient = class {
     return true;
   }
   async pollRemoteEventsAndApply(options = {}) {
+    const ownedTiming = this.beginSyncTimingAttempt("headless");
+    let completed = false;
+    try {
+      const result = await this.performPollRemoteEventsAndApply(options);
+      completed = true;
+      return result;
+    } catch (error) {
+      this.noteSyncTimingError(error && typeof error === "object" ? error.code : "unknown");
+      throw error;
+    } finally {
+      if (ownedTiming) this.endSyncTimingAttempt(completed);
+    }
+  }
+  async performPollRemoteEventsAndApply(options = {}) {
     const state = await this.readState();
     if (!state.vault_id || !state.device_id) {
       return { applied: false, status: "Not paired" };
@@ -27892,6 +28191,7 @@ var ObtsObsidianClient = class {
     return saved.held_proposals.some((held) => Object.keys(held.fallbacks).some(overlaps)) || Boolean(saved.intent && saved.intent.commit !== p && (Object.keys(saved.intent.captures).some(overlaps) || (saved.intent.rename_pairs || []).some((pair) => [pair.source_path, pair.destination_path].some(overlaps)))) || saved.rename_pairs.some((pair) => [pair.source_path, pair.destination_path].some(overlaps));
   }
   async applyTargetMain(targetMain, changedPaths, allowDestructive, extraAffectedPaths = [], requireCleanVisibleState = false, directoryIntents = [], explicitDirectories = [], eventSeq = void 0, cleanVisibleStateVerified = false, confirmedDirectoryRecovery = null, targetFileSizes = {}, consentBaselineBundleId = null, preserveConsentLocalPaths = false, consentBaselineContext = null, rebuild = false, catchupExpectedTree = null, catchupPreservedPaths = [], catchupLegacyStrict = false, options = {}) {
+    this.noteSyncTimingTargetChanges(Array.isArray(changedPaths) ? changedPaths.length : 0);
     await this.admitApplyRecovery();
     const pendingAck = await this.readPendingAppliedAcknowledgement();
     if (pendingAck) {
@@ -27961,11 +28261,13 @@ var ObtsObsidianClient = class {
         last_completed_step: null,
         redacted_error_category: null
       };
+      this.noteSyncTimingApplyMode(refOnly ? "ref_only" : "full");
       if (refOnly) {
         await this.applyRefOnly(state, journal, eventSeq);
         return true;
       }
       const scope = options.deltaApply && requireCleanVisibleState && !rebuild && !catchupExpectedTree && !consentBaselineBundleId && !preserveConsentLocalPaths && !confirmedDirectoryRecovery && extraAffectedPaths.length === 0 && compactedDirectoryIntents.length === 0 && !hasDirectoryWork ? await this.deltaApplyScope(state, targetMain, authoringBase, targetPolicy, explicitDirectorySet) : null;
+      if (scope) this.noteSyncTimingApplyMode("delta");
       const targetEntries = targetPolicy.entries;
       let consentBaselineFingerprints = /* @__PURE__ */ new Map();
       if (consentBaselineBundleId) {
@@ -30365,6 +30667,7 @@ var ObtsObsidianClient = class {
     this.reportOperationProgress(total > 0 ? `${action} ${completed}/${total}` : action, "file_inventory_check");
   }
   reportOperationProgress(label, diagnosticPoint) {
+    this.noteSyncTimingPhase(diagnosticPoint);
     if (typeof this.plugin.setOperationProgress === "function") {
       this.plugin.setOperationProgress(label, diagnosticPoint);
     } else {
@@ -36255,6 +36558,63 @@ function buildMeasuredPhaseDiagnostic(phase) {
     elapsed_bucket: elapsedDiagnosticBucket(phase.elapsedMs)
   };
 }
+function syncTimingDurationBucket(elapsedMs) {
+  if (!Number.isFinite(elapsedMs) || elapsedMs < 250) return "under_250ms";
+  if (elapsedMs < 1e3) return "under_1s";
+  if (elapsedMs < 5e3) return "under_5s";
+  if (elapsedMs < 3e4) return "under_30s";
+  if (elapsedMs < 6e4) return "30s_to_1m";
+  if (elapsedMs < 5 * 6e4) return "1m_to_5m";
+  if (elapsedMs < 15 * 6e4) return "5m_to_15m";
+  return "over_15m";
+}
+function syncTimingCountBucket(count) {
+  if (!Number.isFinite(count) || count < 0) return "unknown";
+  if (count === 0) return "none";
+  if (count === 1) return "one";
+  if (count <= 5) return "two_to_five";
+  if (count <= 20) return "six_to_twenty";
+  if (count <= 100) return "twenty_one_to_hundred";
+  return "over_hundred";
+}
+function syncTimingRuntimeClass() {
+  return obtsRuntime && obtsRuntime.apiVersion === "node-headless" ? "headless" : "foreground";
+}
+function buildSyncTimingAttemptRecord(recorded) {
+  return {
+    attempt_id: recorded.attemptId,
+    trigger: SYNC_TIMING_TRIGGERS.has(recorded.trigger) ? recorded.trigger : "interval",
+    outcome: recorded.outcome,
+    runtime: recorded.runtime,
+    error_code: SYNC_TIMING_ERROR_CODES.has(recorded.errorCode) ? recorded.errorCode : "unknown",
+    elapsed_bucket: syncTimingDurationBucket(recorded.elapsedMs),
+    hidden_bucket: syncTimingDurationBucket(recorded.hiddenMs),
+    suspended_bucket: syncTimingDurationBucket(recorded.suspendedMs),
+    scan_mode: SYNC_TIMING_SCAN_MODES.includes(recorded.scanMode) ? recorded.scanMode : "none",
+    apply_mode: SYNC_TIMING_APPLY_MODES.includes(recorded.applyMode) ? recorded.applyMode : "none",
+    scan_files_bucket: syncTimingCountBucket(recorded.scanFiles),
+    target_changes_bucket: syncTimingCountBucket(recorded.targetChanges),
+    event_lag_bucket: recorded.eventLag < 0 ? "unknown" : syncTimingCountBucket(recorded.eventLag),
+    phases: recorded.phases.filter(([point]) => DIAGNOSTIC_POINTS.has(point)).map(([point, elapsedMs]) => ({ point, elapsed_bucket: syncTimingDurationBucket(elapsedMs) }))
+  };
+}
+function buildSyncTimingDiagnostic(attempts) {
+  return {
+    schema_version: SYNC_TIMING_SCHEMA_VERSION,
+    event_id: `dgr_${randomHex(16)}`,
+    plugin_version: PLUGIN_VERSION,
+    obsidian_version: typeof apiVersion === "string" && apiVersion ? apiVersion : "unknown",
+    platform_family: Platform && Platform.isIosApp ? "ios" : Platform && Platform.isAndroidApp ? "android" : "desktop",
+    flow: "sync",
+    stage: "sync_request",
+    failure_code: "sync_timing",
+    error_class: "unknown",
+    retryable: false,
+    breadcrumbs: [],
+    batch_id: `stm_${randomHex(16)}`,
+    attempts
+  };
+}
 function buildStalledOperationDiagnostic(diagnosticPoint) {
   const recovery = diagnosticPoint.startsWith("recovery_");
   const apply = diagnosticPoint === "apply" || diagnosticPoint.startsWith("apply_");
@@ -36313,13 +36673,12 @@ function makeDiagnosticBreadcrumb(point, outcome, value = void 0, errorCode = "n
   });
 }
 function normalizeDiagnosticBreadcrumb(event) {
-  const points = /* @__PURE__ */ new Set(["onboarding_approved", "bootstrap_response", "multipart_pack", "pack_persist_write", "pack_persist_read", "index_fs_stat", "index_fs_read_file", "index_fs_read", "index_fs_write", "index_pack", "sync_request", "sync_download", "onboarding_download", "transfer_checkpoint_verification", "apply", "apply_recovery_prepare", "apply_preflight_revalidate", "apply_write", "apply_verify", "apply_local_capture", "apply_finalize", "local_snapshot", "directory_inventory", "file_inventory_check", "local_preservation", "provenance", "upload_prepare", "upload_finalize", "recovery", "recovery_directory_decision", "startup_metadata", "startup_git", "startup_state", "recovery_journal", "recovery_target_commit", "recovery_target_tree", "recovery_file_validation", "recovery_bundle", "recovery_file_apply", "recovery_refs", "recovery_state"]);
   const outcomes = /* @__PURE__ */ new Set(["started", "returned", "succeeded", "failed"]);
   const valueKinds = /* @__PURE__ */ new Set(["buffer", "uint8array", "arraybuffer", "string", "null", "other", "unknown"]);
   const sizeBuckets = /* @__PURE__ */ new Set(["empty", "under_64k", "under_1m", "under_16m", "under_64m", "over_64m", "unknown"]);
   const errorCodes = /* @__PURE__ */ new Set(["none", "enoent", "eexist", "eisdir", "enotdir", "enotempty", "eacces", "eperm", "eio", "invalid_type", "unknown"]);
   return {
-    point: points.has(event && event.point) ? event.point : "index_pack",
+    point: DIAGNOSTIC_POINTS.has(event && event.point) ? event.point : "index_pack",
     outcome: outcomes.has(event && event.outcome) ? event.outcome : "failed",
     value_kind: valueKinds.has(event && (event.valueKind || event.value_kind)) ? event.valueKind || event.value_kind : "unknown",
     size_bucket: sizeBuckets.has(event && (event.sizeBucket || event.size_bucket)) ? event.sizeBucket || event.size_bucket : "unknown",

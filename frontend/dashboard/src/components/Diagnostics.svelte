@@ -13,8 +13,8 @@
       <p class="eyebrow">Private server log</p>
       <h2>Troubleshooting diagnostics</h2>
       <p class="muted">
-        Sanitized failure, troubleshooting, and local phase-timing reports shared by your obts plugins. Reports are retained for
-        {diagnostics.retention_days} days.
+        Sanitized failure, troubleshooting, local phase-timing and per-sync timing reports shared by your obts plugins. Reports
+        are retained for {diagnostics.retention_days} days.
       </p>
     </div>
     <span class:status-enabled={diagnostics.ingestion_enabled} class="diagnostic-status">
@@ -33,7 +33,11 @@
         <article class="diagnostic-card">
           <div class="diagnostic-card-heading">
             <div>
-              <strong>{event.schema_version === 3 ? `Operation ${event.observation}` : event.failure_code.replaceAll('_', ' ')}</strong>
+              <strong>{event.schema_version === 3
+                ? `Operation ${event.observation}`
+                : event.schema_version === 4
+                  ? `Sync timing (${event.attempts.length} ${event.attempts.length === 1 ? 'attempt' : 'attempts'})`
+                  : event.failure_code.replaceAll('_', ' ')}</strong>
               <span>{event.flow} / {event.stage}</span>
             </div>
             <time datetime={event.received_at}>{new Date(event.received_at).toLocaleString()}</time>
@@ -51,6 +55,45 @@
               <div><dt>Observation</dt><dd>{event.observation.replaceAll('_', ' ')}</dd></div>
               <div><dt>Phase correlation</dt><dd><code>{event.phase_id}</code></dd></div>
             </dl>
+          {/if}
+          {#if event.schema_version === 4}
+            <table class="diagnostic-timing">
+              <thead>
+                <tr>
+                  <th>Trigger</th>
+                  <th>Outcome</th>
+                  <th>Elapsed</th>
+                  <th>Hidden</th>
+                  <th>Suspended</th>
+                  <th>Scan / apply</th>
+                  <th>Changes</th>
+                  <th>Lag</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each event.attempts as attempt}
+                  <tr>
+                    <td>{attempt.trigger}{attempt.runtime === 'headless' ? ' (headless)' : ''}</td>
+                    <td>{attempt.outcome}{attempt.error_code !== 'none' ? ` / ${attempt.error_code.replaceAll('_', ' ')}` : ''}</td>
+                    <td>{attempt.elapsed_bucket.replaceAll('_', ' ')}</td>
+                    <td>{attempt.hidden_bucket.replaceAll('_', ' ')}</td>
+                    <td>{attempt.suspended_bucket.replaceAll('_', ' ')}</td>
+                    <td>{attempt.scan_mode} / {attempt.apply_mode.replaceAll('_', ' ')}</td>
+                    <td>{attempt.target_changes_bucket.replaceAll('_', ' ')} of {attempt.scan_files_bucket.replaceAll('_', ' ')} scanned</td>
+                    <td>{attempt.event_lag_bucket.replaceAll('_', ' ')}</td>
+                  </tr>
+                  {#if attempt.phases.length > 0}
+                    <tr class="diagnostic-timing-phases">
+                      <td colspan="8">
+                        {#each attempt.phases as phase}
+                          <span><code>{phase.point}</code> {phase.elapsed_bucket.replaceAll('_', ' ')}</span>
+                        {/each}
+                      </td>
+                    </tr>
+                  {/if}
+                {/each}
+              </tbody>
+            </table>
           {/if}
           {#if event.schema_version === 2}
             <dl class="diagnostic-context">

@@ -2,6 +2,10 @@ import {
   DIAGNOSTIC_MAX_BODY_BYTES,
   diagnosticPayloadBytes,
   parseDiagnosticEvent,
+  syncTimingApplyModes,
+  syncTimingDurationBuckets,
+  syncTimingScanModes,
+  syncTimingTriggers,
   type DiagnosticEvent
 } from '../shared/diagnostics.js';
 import { nowIso } from '../shared/ids.js';
@@ -10,6 +14,7 @@ import type { AuthenticatedDevice } from './authService.js';
 import { AuthError } from './authService.js';
 import type { ServerConfig } from './config.js';
 import type { ConnectionRequestRow, MetadataDb, MetadataStore, UserRow } from './metadataStore.js';
+import { silentOperationalLog, type OperationalFields, type OperationalLog } from './operationalLog.js';
 
 const MAX_EVENTS = 10_000;
 const MAX_OWNER_EVENTS = 2_000;
@@ -34,7 +39,8 @@ export class DiagnosticService {
 
   constructor(
     private readonly store: MetadataStore,
-    private readonly config: ServerConfig
+    private readonly config: ServerConfig,
+    private readonly log: OperationalLog = silentOperationalLog
   ) {}
 
   async initialize(): Promise<void> {
@@ -190,9 +196,25 @@ export class DiagnosticService {
       const result = await accept();
       if (result.status === 'accepted') {
         this.acceptedWindow.push({ at: Date.now(), deviceId, connectionId, manual: deviceId !== null && isManualSnapshot(event) });
+        this.logAdmission(event, deviceId, connectionId);
       }
       return result;
     } finally { release(); }
+  }
+
+  // Admission is observable from container logs without exposing the record
+  // itself: schema, lane, outcome counts and the closed vocabularies only.
+  private logAdmission(event: DiagnosticEvent, deviceId: string | null, connectionId: string | null): void {
+    try {
+      const fields: OperationalFields = {
+        diagnostic_schema: event.schema_version,
+        diagnostic_flow: event.flow,
+        ...(deviceId === null ? {} : { device_id: deviceId }),
+        ...(connectionId === null ? {} : { connection_id: connectionId }),
+        ...(event.schema_version === 4 ? syncTimingLogFields(event) : {})
+      };
+      this.log.emit('info', 'diagnostic_admitted', fields);
+    } catch {}
   }
 
   private seedAcceptanceWindow(db: MetadataDb, now: number): void {
@@ -230,6 +252,29 @@ export class DiagnosticService {
       throw new AuthError(429, 'diagnostic_quota_exceeded', 'Diagnostic reporting quota exceeded.');
     }
   }
+}
+
+function syncTimingLogFields(event: Extract<DiagnosticEvent, { schema_version: 4 }>): OperationalFields {
+  const attempts = event.attempts;
+  const countOutcome = (outcome: string) => attempts.filter((attempt) => attempt.outcome === outcome).length;
+  let longest = attempts[0]!;
+  for (const attempt of attempts) {
+    if (syncTimingDurationBuckets.indexOf(attempt.elapsed_bucket) > syncTimingDurationBuckets.indexOf(longest.elapsed_bucket)) longest = attempt;
+  }
+  const listed = (values: readonly string[], allowed: readonly string[]) => allowed.filter((entry) => values.includes(entry)).join(',');
+  const triggers = listed(attempts.map((attempt) => attempt.trigger), syncTimingTriggers);
+  const scanModes = listed(attempts.map((attempt) => attempt.scan_mode), syncTimingScanModes);
+  const applyModes = listed(attempts.map((attempt) => attempt.apply_mode), syncTimingApplyModes);
+  return {
+    diagnostic_attempts: attempts.length,
+    diagnostic_completed: countOutcome('completed'),
+    diagnostic_abandoned: countOutcome('abandoned'),
+    diagnostic_failed: countOutcome('failed'),
+    diagnostic_longest_bucket: longest.elapsed_bucket,
+    ...(triggers ? { diagnostic_triggers: triggers } : {}),
+    ...(scanModes ? { diagnostic_scan_modes: scanModes } : {}),
+    ...(applyModes ? { diagnostic_apply_modes: applyModes } : {})
+  };
 }
 
 function isStoredManualSnapshot(row: MetadataDb['diagnostic_events'][number]): boolean {

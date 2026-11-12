@@ -168,7 +168,7 @@ describe('mobile post-apply progress', () => {
     visit(source);
     expect(points.length).toBeGreaterThan(10);
     for (const point of points) expect(diagnosticPoints).toContain(point);
-    const normalizationPoints = JSON.parse(text.match(/const points = new Set\((\[[^\n]+\])\);/u)![1]!);
+    const normalizationPoints = JSON.parse(text.match(/const DIAGNOSTIC_POINTS = new Set\((\[[^\n]+\])\);/u)![1]!);
     expect(normalizationPoints).toEqual([...diagnosticPoints]);
   });
 });

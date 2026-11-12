@@ -5,7 +5,17 @@ import { describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
 
 import { API_VERSION } from '../src/shared/types.js';
-import { diagnosticPoints } from '../src/shared/diagnostics.js';
+import {
+  diagnosticPoints,
+  SYNC_TIMING_MAX_ATTEMPTS as syncTimingMaxAttempts,
+  SYNC_TIMING_MAX_PHASES as syncTimingMaxPhases,
+  syncTimingApplyModes,
+  syncTimingCountBuckets,
+  syncTimingDurationBuckets,
+  syncTimingOutcomes,
+  syncTimingRuntimes,
+  syncTimingScanModes
+} from '../src/shared/diagnostics.js';
 import { parseChunkPushCreateRequest, parseDevicePushManifest } from '../src/shared/validators.js';
 
 describe('OpenAPI Phase 3 contract', () => {
@@ -279,14 +289,16 @@ describe('OpenAPI Phase 3 contract', () => {
       oneOf: [
         { $ref: '#/components/schemas/DiagnosticEventV1' },
         { $ref: '#/components/schemas/DiagnosticEventV2' },
-        { $ref: '#/components/schemas/DiagnosticEventV3' }
+        { $ref: '#/components/schemas/DiagnosticEventV3' },
+        { $ref: '#/components/schemas/DiagnosticEventV4' }
       ]
     });
     expect(document.components.schemas.DiagnosticEventView).toMatchObject({
       oneOf: [
         { $ref: '#/components/schemas/DiagnosticEventV1View' },
         { $ref: '#/components/schemas/DiagnosticEventV2View' },
-        { $ref: '#/components/schemas/DiagnosticEventV3View' }
+        { $ref: '#/components/schemas/DiagnosticEventV3View' },
+        { $ref: '#/components/schemas/DiagnosticEventV4View' }
       ]
     });
     expect(document.components.schemas.DiagnosticBreadcrumb).toMatchObject({
@@ -298,6 +310,29 @@ describe('OpenAPI Phase 3 contract', () => {
     expect(document.components.schemas.DiagnosticEventV1).toMatchObject({ unevaluatedProperties: false });
     expect(document.components.schemas.DiagnosticEventV2).toMatchObject({ unevaluatedProperties: false });
     expect(document.components.schemas.DiagnosticEventV3).toMatchObject({ unevaluatedProperties: false });
+    expect(document.components.schemas.DiagnosticEventV4).toMatchObject({
+      allOf: [expect.any(Object), { properties: {
+        failure_code: { const: 'sync_timing' },
+        attempts: { type: 'array', maxItems: syncTimingMaxAttempts }
+      } }],
+      unevaluatedProperties: false
+    });
+    expect(document.components.schemas.SyncTimingAttempt).toMatchObject({
+      additionalProperties: false,
+      properties: {
+        outcome: { enum: [...syncTimingOutcomes] },
+        runtime: { enum: [...syncTimingRuntimes] },
+        scan_mode: { enum: [...syncTimingScanModes] },
+        apply_mode: { enum: [...syncTimingApplyModes] },
+        elapsed_bucket: { enum: [...syncTimingDurationBuckets] },
+        scan_files_bucket: { enum: [...syncTimingCountBuckets] },
+        phases: { type: 'array', maxItems: syncTimingMaxPhases }
+      }
+    });
+    expect(document.components.schemas.SyncTimingPhase).toMatchObject({
+      additionalProperties: false,
+      properties: { point: { enum: [...diagnosticPoints] } }
+    });
     expect(document.components.schemas.TroubleshootingDiagnosticContext).toMatchObject({ additionalProperties: false });
     expect(document.components.schemas.TroubleshootingCursorRelations).toMatchObject({ additionalProperties: false });
     expect(document.paths['/connections/{connection_id}/diagnostic-events']?.post?.security).toEqual([{ connectionBearer: [] }]);

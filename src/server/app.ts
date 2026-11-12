@@ -157,7 +157,7 @@ export async function createObtsServer(
   await log.startup('integrity_scanned', async () => await markInconsistentVaults(store, git, log));
   const auth = new AuthService(store);
   const connections = new ConnectionService(store, git, config.publicBaseUrl, lifecycle);
-  const diagnostics = new DiagnosticService(store, config);
+  const diagnostics = new DiagnosticService(store, config, log);
   await log.startup('diagnostics_initialized', async () => await diagnostics.initialize());
   const sync = new SyncService(store, git, config.maxUploadBytes, lifecycle, log);
   await log.startup('operation_history_compacted', async () => {
