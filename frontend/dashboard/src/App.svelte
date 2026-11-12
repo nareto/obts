@@ -561,6 +561,11 @@
     if (activeDevices.some((device) => ['Blocked', 'Needs recovery', 'Integrity failure', 'Conflict resolution needed', 'Out of sync — file exceeds upload limit', 'Out of sync — upload limit exceeded', 'Out of sync — local recovery required', 'Out of sync — file names need repair', 'Server repair required'].includes(device.status_label))) {
       return { label: 'Attention required', role: 'danger' };
     }
+    // A backgrounded device with pending work has not converged, but nothing is
+    // wrong: it reported that it will continue when the app is in the foreground.
+    if (activeDevices.some((device) => device.status_label === 'Paused')) {
+      return { label: 'Sync paused', role: 'info' };
+    }
     if (activeDevices.some((device) => isActiveStatusLabel(device.status_label))) {
       return { label: 'Sync in progress', role: 'info' };
     }

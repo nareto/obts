@@ -3,10 +3,24 @@ import { assertRecord, ValidationError } from './validators.js';
 export const DIAGNOSTIC_SCHEMA_VERSION = 1 as const;
 export const TROUBLESHOOTING_DIAGNOSTIC_SCHEMA_VERSION = 2 as const;
 export const PHASE_DIAGNOSTIC_SCHEMA_VERSION = 3 as const;
+export const SYNC_TIMING_DIAGNOSTIC_SCHEMA_VERSION = 4 as const;
 export const diagnosticElapsedBuckets = ['under_30s', '30s_to_1m', '1m_to_5m', '5m_to_15m', 'over_15m'] as const;
-export const phaseDiagnosticObservations = ['stalled', 'completed', 'abandoned'] as const;
+export const phaseDiagnosticObservations = ['stalled', 'completed', 'abandoned', 'interrupted'] as const;
 export const DIAGNOSTIC_MAX_BODY_BYTES = 8 * 1024;
 export const DIAGNOSTIC_MAX_BREADCRUMBS = 16;
+
+// Schema 4 identifies work, not progress: one bounded batch of finished sync
+// attempts. Counts and durations are bucketed so a record cannot carry vault
+// content, sizes or exact timing to a different trust boundary than schema 3.
+export const syncTimingTriggers = ['startup', 'interval', 'visibility', 'watcher', 'user', 'headless'] as const;
+export const syncTimingOutcomes = ['completed', 'abandoned', 'failed'] as const;
+export const syncTimingRuntimes = ['foreground', 'headless'] as const;
+export const syncTimingScanModes = ['none', 'hinted', 'incremental', 'full'] as const;
+export const syncTimingApplyModes = ['none', 'ref_only', 'delta', 'full'] as const;
+export const syncTimingDurationBuckets = ['under_250ms', 'under_1s', 'under_5s', 'under_30s', '30s_to_1m', '1m_to_5m', '5m_to_15m', 'over_15m'] as const;
+export const syncTimingCountBuckets = ['none', 'one', 'two_to_five', 'six_to_twenty', 'twenty_one_to_hundred', 'over_hundred', 'unknown'] as const;
+export const SYNC_TIMING_MAX_ATTEMPTS = 6;
+export const SYNC_TIMING_MAX_PHASES = 6;
 
 export const diagnosticPlatforms = ['ios', 'android', 'desktop', 'unknown'] as const;
 export const diagnosticFlows = ['onboarding', 'sync', 'apply', 'recovery', 'rebuild', 'plugin'] as const;
@@ -47,7 +61,8 @@ export const diagnosticFailureCodesV1 = [
   'unknown'
 ] as const;
 export const diagnosticFailureCodesV2 = ['troubleshooting_snapshot'] as const;
-export const diagnosticFailureCodes = [...diagnosticFailureCodesV1, ...diagnosticFailureCodesV2] as const;
+export const diagnosticFailureCodesV4 = ['sync_timing'] as const;
+export const diagnosticFailureCodes = [...diagnosticFailureCodesV1, ...diagnosticFailureCodesV2, ...diagnosticFailureCodesV4] as const;
 export const diagnosticErrorClasses = ['type_error', 'transport_error', 'blocked_error', 'error', 'unknown'] as const;
 export const diagnosticPoints = [
   'onboarding_approved',
@@ -159,6 +174,7 @@ export const troubleshootingSafeErrorCodes = [
   'directory_recovery_changed',
   'directory_recovery_journal_invalid',
   'object_too_large_for_chunk',
+  'unportable_target_paths',
   'pack_preparation_failed',
   'network_error',
   'http_error',
@@ -281,7 +297,8 @@ export type DiagnosticFlow = (typeof diagnosticFlows)[number];
 export type DiagnosticStage = (typeof diagnosticStages)[number];
 export type DiagnosticFailureCodeV1 = (typeof diagnosticFailureCodesV1)[number];
 export type DiagnosticFailureCodeV2 = (typeof diagnosticFailureCodesV2)[number];
-export type DiagnosticFailureCode = DiagnosticFailureCodeV1 | DiagnosticFailureCodeV2;
+export type DiagnosticFailureCodeV4 = (typeof diagnosticFailureCodesV4)[number];
+export type DiagnosticFailureCode = DiagnosticFailureCodeV1 | DiagnosticFailureCodeV2 | DiagnosticFailureCodeV4;
 export type DiagnosticErrorClass = (typeof diagnosticErrorClasses)[number];
 export type DiagnosticPoint = (typeof diagnosticPoints)[number];
 export type DiagnosticOutcome = (typeof diagnosticOutcomes)[number];
@@ -393,7 +410,49 @@ export type DiagnosticEventV3 = Omit<DiagnosticEventFields<DiagnosticFailureCode
   elapsed_bucket: DiagnosticElapsedBucket;
 };
 
-export type DiagnosticEvent = DiagnosticEventV1 | DiagnosticEventV2 | DiagnosticEventV3;
+export type SyncTimingTrigger = (typeof syncTimingTriggers)[number];
+export type SyncTimingOutcome = (typeof syncTimingOutcomes)[number];
+export type SyncTimingRuntime = (typeof syncTimingRuntimes)[number];
+export type SyncTimingScanMode = (typeof syncTimingScanModes)[number];
+export type SyncTimingApplyMode = (typeof syncTimingApplyModes)[number];
+export type SyncTimingDurationBucket = (typeof syncTimingDurationBuckets)[number];
+export type SyncTimingCountBucket = (typeof syncTimingCountBuckets)[number];
+
+export type SyncTimingPhase = {
+  point: DiagnosticPoint;
+  elapsed_bucket: SyncTimingDurationBucket;
+};
+
+export type SyncTimingAttempt = {
+  attempt_id: string;
+  trigger: SyncTimingTrigger;
+  outcome: SyncTimingOutcome;
+  runtime: SyncTimingRuntime;
+  error_code: TroubleshootingSafeErrorCode;
+  elapsed_bucket: SyncTimingDurationBucket;
+  hidden_bucket: SyncTimingDurationBucket;
+  suspended_bucket: SyncTimingDurationBucket;
+  scan_mode: SyncTimingScanMode;
+  apply_mode: SyncTimingApplyMode;
+  scan_files_bucket: SyncTimingCountBucket;
+  target_changes_bucket: SyncTimingCountBucket;
+  event_lag_bucket: SyncTimingCountBucket;
+  phases: SyncTimingPhase[];
+};
+
+export type DiagnosticEventV4 = Omit<DiagnosticEventFields<DiagnosticFailureCodeV4>, 'flow' | 'stage' | 'failure_code' | 'error_class' | 'retryable' | 'breadcrumbs'> & {
+  schema_version: typeof SYNC_TIMING_DIAGNOSTIC_SCHEMA_VERSION;
+  flow: 'sync';
+  stage: 'sync_request';
+  failure_code: 'sync_timing';
+  error_class: 'unknown';
+  retryable: false;
+  breadcrumbs: [];
+  batch_id: string;
+  attempts: SyncTimingAttempt[];
+};
+
+export type DiagnosticEvent = DiagnosticEventV1 | DiagnosticEventV2 | DiagnosticEventV3 | DiagnosticEventV4;
 
 const EVENT_KEYS = [
   'schema_version',
@@ -410,6 +469,24 @@ const EVENT_KEYS = [
 ] as const;
 const EVENT_V2_KEYS = [...EVENT_KEYS, 'context'] as const;
 const EVENT_V3_KEYS = [...EVENT_KEYS, 'phase', 'phase_id', 'observation', 'elapsed_bucket'] as const;
+const EVENT_V4_KEYS = [...EVENT_KEYS, 'batch_id', 'attempts'] as const;
+const SYNC_TIMING_ATTEMPT_KEYS = [
+  'attempt_id',
+  'trigger',
+  'outcome',
+  'runtime',
+  'error_code',
+  'elapsed_bucket',
+  'hidden_bucket',
+  'suspended_bucket',
+  'scan_mode',
+  'apply_mode',
+  'scan_files_bucket',
+  'target_changes_bucket',
+  'event_lag_bucket',
+  'phases'
+] as const;
+const SYNC_TIMING_PHASE_KEYS = ['point', 'elapsed_bucket'] as const;
 const BREADCRUMB_KEYS = ['point', 'outcome', 'value_kind', 'size_bucket', 'error_code'] as const;
 const TROUBLESHOOTING_CONTEXT_KEYS = [
   'attempt_id',
@@ -448,6 +525,7 @@ const CURSOR_RELATION_KEYS = [
 const EVENT_ID_PATTERN = /^dgr_[0-9a-f]{32}$/u;
 const ATTEMPT_ID_PATTERN = /^(?:none|rca_[0-9a-f]{32})$/u;
 const PHASE_ID_PATTERN = /^dph_[0-9a-f]{32}$/u;
+const SYNC_TIMING_ID_PATTERN = /^stm_[0-9a-f]{32}$/u;
 const LEGACY_VERSION_PATTERN = /^(?:unknown|[0-9]+(?:\.[0-9]+){1,3}(?:[-+][0-9A-Za-z.-]+)?)$/u;
 const TROUBLESHOOTING_VERSION_PATTERN = /^(?:unknown|[0-9]+(?:\.[0-9]+){1,3})$/u;
 
@@ -473,6 +551,29 @@ export function parseDiagnosticEvent(value: unknown): DiagnosticEvent {
       phase_id: phaseId,
       observation: readEnum(value, 'observation', phaseDiagnosticObservations),
       elapsed_bucket: readEnum(value, 'elapsed_bucket', diagnosticElapsedBuckets)
+    };
+  }
+  if (value.schema_version === SYNC_TIMING_DIAGNOSTIC_SCHEMA_VERSION) {
+    assertExactKeys(value, EVENT_V4_KEYS);
+    const fields = parseEventFields(value, diagnosticFailureCodesV4);
+    if (fields.flow !== 'sync' || fields.stage !== 'sync_request' || fields.failure_code !== 'sync_timing' || fields.error_class !== 'unknown' || fields.retryable || fields.breadcrumbs.length !== 0) {
+      throw new ValidationError('invalid_request', 'Invalid sync timing diagnostic envelope.');
+    }
+    const batchId = readBoundedString(value, 'batch_id', 36);
+    if (!SYNC_TIMING_ID_PATTERN.test(batchId)) throw new ValidationError('invalid_request', 'Invalid sync timing batch ID.');
+    if (!Array.isArray(value.attempts) || value.attempts.length === 0 || value.attempts.length > SYNC_TIMING_MAX_ATTEMPTS) {
+      throw new ValidationError('invalid_request', 'attempts must be a bounded non-empty array.');
+    }
+    const attempts = value.attempts.map((attempt) => parseSyncTimingAttempt(attempt));
+    if (new Set(attempts.map((attempt) => attempt.attempt_id)).size !== attempts.length) {
+      throw new ValidationError('invalid_request', 'Sync timing attempt IDs must be distinct.');
+    }
+    return {
+      ...fields,
+      schema_version: SYNC_TIMING_DIAGNOSTIC_SCHEMA_VERSION,
+      flow: 'sync', stage: 'sync_request', failure_code: 'sync_timing', error_class: 'unknown', retryable: false, breadcrumbs: [],
+      batch_id: batchId,
+      attempts
     };
   }
   if (value.schema_version === TROUBLESHOOTING_DIAGNOSTIC_SCHEMA_VERSION) {
@@ -536,6 +637,43 @@ function parseEventFields<const T extends readonly DiagnosticFailureCode[]>(
     error_class: errorClass,
     retryable: value.retryable,
     breadcrumbs
+  };
+}
+
+function parseSyncTimingAttempt(value: unknown): SyncTimingAttempt {
+  assertRecord(value);
+  assertExactKeys(value, SYNC_TIMING_ATTEMPT_KEYS);
+  const attemptId = readBoundedString(value, 'attempt_id', 36);
+  if (!SYNC_TIMING_ID_PATTERN.test(attemptId)) throw new ValidationError('invalid_request', 'Invalid sync timing attempt ID.');
+  if (!Array.isArray(value.phases) || value.phases.length > SYNC_TIMING_MAX_PHASES) {
+    throw new ValidationError('invalid_request', 'phases must be a bounded array.');
+  }
+  const phases = value.phases.map((phase) => {
+    assertRecord(phase);
+    assertExactKeys(phase, SYNC_TIMING_PHASE_KEYS);
+    return {
+      point: readEnum(phase, 'point', diagnosticPoints),
+      elapsed_bucket: readEnum(phase, 'elapsed_bucket', syncTimingDurationBuckets)
+    };
+  });
+  if (new Set(phases.map((phase) => phase.point)).size !== phases.length) {
+    throw new ValidationError('invalid_request', 'Sync timing phase points must be distinct.');
+  }
+  return {
+    attempt_id: attemptId,
+    trigger: readEnum(value, 'trigger', syncTimingTriggers),
+    outcome: readEnum(value, 'outcome', syncTimingOutcomes),
+    runtime: readEnum(value, 'runtime', syncTimingRuntimes),
+    error_code: readEnum(value, 'error_code', troubleshootingSafeErrorCodes),
+    elapsed_bucket: readEnum(value, 'elapsed_bucket', syncTimingDurationBuckets),
+    hidden_bucket: readEnum(value, 'hidden_bucket', syncTimingDurationBuckets),
+    suspended_bucket: readEnum(value, 'suspended_bucket', syncTimingDurationBuckets),
+    scan_mode: readEnum(value, 'scan_mode', syncTimingScanModes),
+    apply_mode: readEnum(value, 'apply_mode', syncTimingApplyModes),
+    scan_files_bucket: readEnum(value, 'scan_files_bucket', syncTimingCountBuckets),
+    target_changes_bucket: readEnum(value, 'target_changes_bucket', syncTimingCountBuckets),
+    event_lag_bucket: readEnum(value, 'event_lag_bucket', syncTimingCountBuckets),
+    phases
   };
 }
 

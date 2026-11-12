@@ -710,7 +710,7 @@ paths:
           $ref: "#/components/responses/Error"
   /connections/{connection_id}/diagnostic-events:
     post:
-      summary: Accept one opted-in sanitized failure report from an approved onboarding connection.
+      summary: Accept one opted-in sanitized failure, phase or sync-timing report from an approved onboarding connection.
       security:
         - connectionBearer: []
       parameters:
@@ -962,7 +962,7 @@ paths:
           $ref: "#/components/responses/Error"
   /device/diagnostic-events:
     post:
-      summary: Accept one opted-in sanitized failure report from a paired device.
+      summary: Accept one opted-in sanitized failure, phase or sync-timing report from a paired device.
       security:
         - deviceBearer: []
       requestBody:
@@ -2319,7 +2319,7 @@ components:
       properties:
         schema_version:
           type: integer
-          enum: [1, 2, 3]
+          enum: [1, 2, 3, 4]
         event_id:
           type: string
           pattern: "^dgr_[0-9a-f]{32}$"
@@ -2342,7 +2342,7 @@ components:
           enum: [browser_handoff, approval_poll, bootstrap_request, multipart_parse, pack_persist, pack_index, tree_read, sync_request, apply, recovery, plugin_lifecycle, unknown]
         failure_code:
           type: string
-          enum: [invalid_json, missing_buffer_dependency, operation_interrupted_by_reload, sync_lease_blocked, null_pack_slice, pack_index_failed, adapter_read_failed, adapter_write_failed, adapter_stat_failed, multipart_parse_failed, request_failed, onboarding_failed, sync_failed, directory_recovery_decision_required, directory_recovery_changed, directory_recovery_journal_invalid, recovery_failed, operation_stalled, troubleshooting_snapshot, unknown]
+          enum: [invalid_json, missing_buffer_dependency, operation_interrupted_by_reload, sync_lease_blocked, null_pack_slice, pack_index_failed, adapter_read_failed, adapter_write_failed, adapter_stat_failed, multipart_parse_failed, request_failed, onboarding_failed, sync_failed, directory_recovery_decision_required, directory_recovery_changed, directory_recovery_journal_invalid, recovery_failed, operation_stalled, troubleshooting_snapshot, sync_timing, unknown]
         error_class:
           type: string
           enum: [type_error, transport_error, blocked_error, error, unknown]
@@ -2409,7 +2409,7 @@ components:
               $ref: '#/components/schemas/TroubleshootingDiagnosticContext/properties/safe_error_code'
         safe_error_code:
           type: string
-          enum: [none, device_blocked, conflict_review_required, server_recovery_required, blocked_integrity, device_revoked, device_identity_mismatch, not_paired, sync_lease_blocked, operation_interrupted_by_reload, local_state_incomplete, same_device_non_fast_forward, apply_recovery_required, apply_journal_recovery_required, onboarding_context_required, onboarding_identity_mismatch, onboarding_snapshot_changed, invalid_transfer_checkpoint, applied_main_acknowledgement_failed, recovery_evidence_missing, recovery_checksum_mismatch, recovery_identity_mismatch, recovery_target_policy_mismatch, recovery_state_corrupt, catchup_recovery_required, catchup_local_changes, local_files_diverge_from_journal, local_changed_during_apply, preflight_hash_changed, recovery_bundle_failed, directory_recovery_decision_required, directory_recovery_changed, directory_recovery_journal_invalid, object_too_large_for_chunk, pack_preparation_failed, network_error, http_error, sync_error, unknown]
+          enum: [none, device_blocked, conflict_review_required, server_recovery_required, blocked_integrity, device_revoked, device_identity_mismatch, not_paired, sync_lease_blocked, operation_interrupted_by_reload, local_state_incomplete, same_device_non_fast_forward, apply_recovery_required, apply_journal_recovery_required, onboarding_context_required, onboarding_identity_mismatch, onboarding_snapshot_changed, invalid_transfer_checkpoint, applied_main_acknowledgement_failed, recovery_evidence_missing, recovery_checksum_mismatch, recovery_identity_mismatch, recovery_target_policy_mismatch, recovery_state_corrupt, catchup_recovery_required, catchup_local_changes, local_files_diverge_from_journal, local_changed_during_apply, preflight_hash_changed, recovery_bundle_failed, directory_recovery_decision_required, directory_recovery_changed, directory_recovery_journal_invalid, object_too_large_for_chunk, unportable_target_paths, pack_preparation_failed, network_error, http_error, sync_error, unknown]
         client_state:
           type: string
           enum: [uninitialized, initializing, ready, unloaded]
@@ -2539,16 +2539,111 @@ components:
               pattern: "^dph_[0-9a-f]{32}$"
             observation:
               type: string
-              enum: [stalled, completed, abandoned]
+              enum: [stalled, completed, abandoned, interrupted]
             elapsed_bucket:
               type: string
               enum: [under_30s, 30s_to_1m, 1m_to_5m, 5m_to_15m, over_15m]
+      unevaluatedProperties: false
+    SyncTimingPhase:
+      type: object
+      additionalProperties: false
+      required: [point, elapsed_bucket]
+      properties:
+        point:
+          type: string
+          enum: [onboarding_approved, bootstrap_response, multipart_pack, pack_persist_write, pack_persist_read, index_fs_stat, index_fs_read_file, index_fs_read, index_fs_write, index_pack, sync_request, sync_download, onboarding_download, transfer_checkpoint_verification, apply, apply_recovery_prepare, apply_preflight_revalidate, apply_write, apply_verify, apply_local_capture, apply_finalize, local_snapshot, directory_inventory, file_inventory_check, local_preservation, provenance, upload_prepare, upload_finalize, recovery, recovery_directory_decision, startup_metadata, startup_git, startup_state, recovery_journal, recovery_target_commit, recovery_target_tree, recovery_file_validation, recovery_bundle, recovery_file_apply, recovery_refs, recovery_state]
+        elapsed_bucket:
+          description: Bucketed wall-clock time in this phase; never a raw duration.
+          type: string
+          enum: [under_250ms, under_1s, under_5s, under_30s, 30s_to_1m, 1m_to_5m, 5m_to_15m, over_15m]
+    SyncTimingAttempt:
+      type: object
+      additionalProperties: false
+      required: [attempt_id, trigger, outcome, runtime, error_code, elapsed_bucket, hidden_bucket, suspended_bucket, scan_mode, apply_mode, scan_files_bucket, target_changes_bucket, event_lag_bucket, phases]
+      properties:
+        attempt_id:
+          type: string
+          pattern: "^stm_[0-9a-f]{32}$"
+        trigger:
+          type: string
+          enum: [startup, interval, visibility, watcher, user, headless]
+        outcome:
+          type: string
+          enum: [completed, abandoned, failed]
+        runtime:
+          type: string
+          enum: [foreground, headless]
+        error_code:
+          type: string
+          enum: [none, device_blocked, conflict_review_required, server_recovery_required, blocked_integrity, device_revoked, device_identity_mismatch, not_paired, sync_lease_blocked, operation_interrupted_by_reload, local_state_incomplete, same_device_non_fast_forward, apply_recovery_required, apply_journal_recovery_required, onboarding_context_required, onboarding_identity_mismatch, onboarding_snapshot_changed, invalid_transfer_checkpoint, applied_main_acknowledgement_failed, recovery_evidence_missing, recovery_checksum_mismatch, recovery_identity_mismatch, recovery_target_policy_mismatch, recovery_state_corrupt, catchup_recovery_required, catchup_local_changes, local_files_diverge_from_journal, local_changed_during_apply, preflight_hash_changed, recovery_bundle_failed, directory_recovery_decision_required, directory_recovery_changed, directory_recovery_journal_invalid, object_too_large_for_chunk, unportable_target_paths, pack_preparation_failed, network_error, http_error, sync_error, unknown]
+        elapsed_bucket:
+          type: string
+          enum: [under_250ms, under_1s, under_5s, under_30s, 30s_to_1m, 1m_to_5m, 5m_to_15m, over_15m]
+        hidden_bucket:
+          description: Wall-clock time the document was hidden during the attempt, bucketed.
+          type: string
+          enum: [under_250ms, under_1s, under_5s, under_30s, 30s_to_1m, 1m_to_5m, 5m_to_15m, over_15m]
+        suspended_bucket:
+          description: Wall-clock time in timer gaps larger than five seconds, bucketed; reveals device suspension.
+          type: string
+          enum: [under_250ms, under_1s, under_5s, under_30s, 30s_to_1m, 1m_to_5m, 5m_to_15m, over_15m]
+        scan_mode:
+          type: string
+          enum: [none, hinted, incremental, full]
+        apply_mode:
+          type: string
+          enum: [none, ref_only, delta, full]
+        scan_files_bucket:
+          type: string
+          enum: [none, one, two_to_five, six_to_twenty, twenty_one_to_hundred, over_hundred, unknown]
+        target_changes_bucket:
+          type: string
+          enum: [none, one, two_to_five, six_to_twenty, twenty_one_to_hundred, over_hundred, unknown]
+        event_lag_bucket:
+          type: string
+          enum: [none, one, two_to_five, six_to_twenty, twenty_one_to_hundred, over_hundred, unknown]
+        phases:
+          type: array
+          maxItems: 6
+          items:
+            $ref: "#/components/schemas/SyncTimingPhase"
+    DiagnosticEventV4:
+      allOf:
+        - $ref: "#/components/schemas/DiagnosticEventFields"
+        - type: object
+          required: [batch_id, attempts]
+          properties:
+            schema_version:
+              const: 4
+            flow:
+              const: sync
+            stage:
+              const: sync_request
+            failure_code:
+              const: sync_timing
+            error_class:
+              const: unknown
+            retryable:
+              const: false
+            breadcrumbs:
+              type: array
+              maxItems: 0
+            batch_id:
+              type: string
+              pattern: "^stm_[0-9a-f]{32}$"
+            attempts:
+              type: array
+              minItems: 1
+              maxItems: 6
+              items:
+                $ref: "#/components/schemas/SyncTimingAttempt"
       unevaluatedProperties: false
     DiagnosticEvent:
       oneOf:
         - $ref: "#/components/schemas/DiagnosticEventV1"
         - $ref: "#/components/schemas/DiagnosticEventV2"
         - $ref: "#/components/schemas/DiagnosticEventV3"
+        - $ref: "#/components/schemas/DiagnosticEventV4"
     DiagnosticIngestResponse:
       type: object
       additionalProperties: false
@@ -2619,11 +2714,22 @@ components:
               type: string
               format: date-time
       unevaluatedProperties: false
+    DiagnosticEventV4View:
+      allOf:
+        - $ref: "#/components/schemas/DiagnosticEventV4"
+        - type: object
+          required: [received_at]
+          properties:
+            received_at:
+              type: string
+              format: date-time
+      unevaluatedProperties: false
     DiagnosticEventView:
       oneOf:
         - $ref: "#/components/schemas/DiagnosticEventV1View"
         - $ref: "#/components/schemas/DiagnosticEventV2View"
         - $ref: "#/components/schemas/DiagnosticEventV3View"
+        - $ref: "#/components/schemas/DiagnosticEventV4View"
     DiagnosticEventsResponse:
       type: object
       additionalProperties: false
@@ -2658,7 +2764,7 @@ components:
         local_status_label:
           type: string
           maxLength: 80
-          description: Accepted display states and coarse operation-progress buckets are retained; exact counts, unknown values, and legacy labels are normalized before storage and dashboard output.
+          description: Accepted display states, the `Paused` suspension state, and coarse operation-progress buckets are retained; exact counts, unknown values, and legacy labels are normalized before storage and dashboard output.
         local_error_code:
           description: Only allowlisted safe codes are retained; unknown values become sync_error. No paths, object IDs, sizes, or exception messages.
           oneOf:

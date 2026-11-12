@@ -2655,6 +2655,40 @@ pre {
   font-size: 12px;
 }
 
+.diagnostic-timing {
+  width: 100%;
+  margin: 14px 0 0;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.diagnostic-timing th {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-align: left;
+  text-transform: uppercase;
+  padding: 0 10px 6px 0;
+}
+
+.diagnostic-timing td {
+  padding: 6px 10px 6px 0;
+  border-top: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.diagnostic-timing-phases td {
+  border-top: none;
+  padding-top: 0;
+}
+
+.diagnostic-timing-phases span {
+  display: inline-block;
+  margin: 0 10px 4px 0;
+  color: var(--muted);
+}
+
 .diagnostic-trace {
   display: grid;
   gap: 6px;

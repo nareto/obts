@@ -574,7 +574,9 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
     await restarted.initialize();
     const restartedCore = (restarted as unknown as { client: Record<string, any> }).client;
-    expect(await restartedCore.backgroundScanDecision()).toEqual({ required: false, mode: 'none' });
+    // A restarted session schedules an inventory for after catch-up, even when
+    // the last one finished minutes ago: watcher events were lost meanwhile.
+    expect(await restartedCore.backgroundScanDecision()).toEqual({ required: true, mode: 'incremental' });
     const scanStatePath = join(deviceDir, '.obts', 'scan-state.json');
     const recentScanState = JSON.parse(await readFile(scanStatePath, 'utf8')) as Record<string, unknown>;
     await writeFile(scanStatePath, `${JSON.stringify({
@@ -2253,6 +2255,63 @@ describe('Phase 1 sync without conflict resolution', () => {
       status_report_fresh: false,
       plugin_version: '0.4.25'
     });
+  });
+
+  it('reports a backgrounded device as paused instead of synced', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'paused-status-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'paused-phone');
+    const state = await plugin.readState();
+    const token = JSON.parse(await readFile(join(deviceDir, '.obts', 'auth', 'device-token.json'), 'utf8')) as {
+      device_token: string;
+    };
+
+    // The suspended client reports Paused through the ordinary device-status
+    // endpoint; the server must keep that distinct state instead of
+    // normalizing it to a failure or a converged label.
+    const statusResponse = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/device-status`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token.device_token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        plugin_version: RECOMMENDED_PLUGIN_VERSION,
+        local_status_label: 'Paused',
+        local_error_code: null,
+        local_queue_status: 'queued_local',
+        local_main: state.local_main,
+        local_head: state.local_head
+      })
+    });
+    expect(statusResponse.status).toBe(200);
+
+    // Suspension lasts longer than the progress-report window: the reported
+    // pause keeps overriding the server-derived label.
+    await server.store.mutate((db) => {
+      const device = db.devices.find((candidate) => candidate.device_name === 'paused-phone');
+      expect(device).toBeDefined();
+      device!.last_status_report_at = new Date(Date.now() - 6 * 60 * 1000).toISOString();
+    });
+    const paused = await admin.get<{
+      devices: Array<{ device_name: string; status_label: string; local_status_label: string | null; status_report_fresh: boolean }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+    expect(paused.body.devices.find((device) => device.device_name === 'paused-phone')).toMatchObject({
+      status_label: 'Paused',
+      local_status_label: 'Paused',
+      status_report_fresh: true
+    });
+
+    // Past the offline threshold the report is history again, and the dashboard
+    // never turns that history into a claimed convergence.
+    await server.store.mutate((db) => {
+      const device = db.devices.find((candidate) => candidate.device_name === 'paused-phone');
+      device!.last_status_report_at = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+    });
+    const expired = await admin.get<{
+      devices: Array<{ device_name: string; status_label: string }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+    const expiredLabel = expired.body.devices.find((device) => device.device_name === 'paused-phone')!.status_label;
+    expect(expiredLabel).not.toBe('Paused');
+    expect(expiredLabel).not.toBe('Synced');
   });
 
   it('treats the terminal merged queue state as converged during rolling upgrades', async () => {
@@ -7669,9 +7728,13 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(pluginMain).toContain('PERIODIC_FULL_AUDIT_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000');
     expect(pluginMain).toContain('scan-state.json');
     expect(pluginMain).toContain('scan-cache.json');
-    expect(pluginMain).toContain('runBackgroundSync()');
-    expect(pluginMain).toContain('runRemotePoll()');
-    expect(pluginMain).toContain('runAutomaticSync()');
+    expect(pluginMain).toContain('runBackgroundSync("interval")');
+    expect(pluginMain).toContain('runRemotePoll(trigger)');
+    expect(pluginMain).toContain('runAutomaticSync({}, trigger)');
+    expect(pluginMain).toContain('backgroundSyncSuppressedByVisibility()');
+    expect(pluginMain).toContain('queueAutomaticSync("startup")');
+    expect(pluginMain).toContain('this.registerDomEvent(window, "focus"');
+    expect(pluginMain).toContain('this.registerDomEvent(window, "online"');
     expect(pluginMain).toContain('flushOpenMarkdownEditorsToDisk');
     expect(pluginMain).toContain('ensureNoLocalChangesBeforeApply');
     expect(pluginMain).toContain('visibleVaultMatchesLocalHead');
@@ -7679,13 +7742,14 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(queuedSync).toContain('if (this.isSyncInProgress())');
     expect(queuedSync).toContain('this.scheduleQueuedSync(SYNC_DEBOUNCE_MS)');
     expect(pluginMain).toContain('syncOnceOrPollResolvedConflict');
-    const backgroundSync = sourceSection(pluginMain, 'async runBackgroundSync()', 'async runAutomaticSync(options = {})');
-    expect(backgroundSync).toContain('isRetryableLocalError(state.last_error_code)');
+    const backgroundSync = sourceSection(pluginMain, 'async runBackgroundSync(trigger = "interval")', 'async runRemotePoll(');
+    expect(backgroundSync).toContain('isTerminalSyncError(state.last_error_code)');
+    expect(backgroundSync).toContain('POLLED_TERMINAL_ERROR_CODES.has(state.last_error_code)');
     expect(backgroundSync).toContain('backgroundScanDecision()');
     expect(backgroundSync).toContain('scanDecision.required');
-    expect(backgroundSync).toContain('await this.runRemotePoll();');
+    expect(backgroundSync).toContain('await this.runRemotePoll(trigger);');
     expect(backgroundSync).not.toContain('lastFullScanCompletedAt');
-    const automaticSync = sourceSection(pluginMain, 'async runAutomaticSync(options = {})', 'async handleAutomaticSyncError');
+    const automaticSync = sourceSection(pluginMain, 'async runAutomaticSync(options = {}, trigger = "interval")', 'async handleAutomaticSyncError');
     expect(automaticSync).toContain('readPendingOnboarding()');
     expect(automaticSync).toContain('syncOnceOrPollResolvedConflict');
     expect(pluginMain).toContain('OPERATION_STATUS_HEARTBEAT_MS');

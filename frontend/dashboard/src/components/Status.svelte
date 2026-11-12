@@ -3,7 +3,7 @@
 
   export let label: string;
 
-  const activeStatusBases = ['Deleting', 'Verifying contents', 'Preparing upload', 'Uploading', 'Applying', 'Checking', 'Merging', 'Server retrying', 'Repairing baseline', 'Finishing update', 'Waiting for operation'];
+  const activeStatusBases = ['Deleting', 'Verifying contents', 'Preparing upload', 'Uploading', 'Applying', 'Checking', 'Merging', 'Server retrying', 'Repairing baseline', 'Finishing update', 'Waiting for operation', 'Paused'];
 
   $: role = statusRole(label);
   $: icon = statusIcon(label);

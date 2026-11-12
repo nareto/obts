@@ -1,6 +1,9 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import packageJson from '../../package.json' with { type: 'json' };
+import {
+  diagnosticFlows, syncTimingApplyModes, syncTimingDurationBuckets, syncTimingScanModes, syncTimingTriggers
+} from '../shared/diagnostics.js';
 import type { ConflictResolutionKind, PushResult } from '../shared/types.js';
 
 export const LOG_LEVELS = ['error', 'warn', 'info', 'debug', 'silent'] as const;
@@ -26,7 +29,7 @@ type BackgroundTask = typeof BACKGROUND_TASKS[number];
 export const LOG_EVENTS = [
   'http_request', 'server_listening', 'startup_phase', 'vault_integrity_blocked', 'vault_integrity_block_contended',
   'push_integrated', 'conflict_created', 'conflict_resolved', 'background_task_failed', 'git_maintenance',
-  'log_lines_dropped'
+  'diagnostic_admitted', 'log_lines_dropped'
 ] as const;
 type LogEvent = typeof LOG_EVENTS[number];
 
@@ -78,6 +81,16 @@ export type OperationalFields = {
   packs_after?: number;
   loose_before?: number;
   loose_after?: number;
+  diagnostic_schema?: number;
+  diagnostic_flow?: string;
+  diagnostic_attempts?: number;
+  diagnostic_completed?: number;
+  diagnostic_abandoned?: number;
+  diagnostic_failed?: number;
+  diagnostic_longest_bucket?: string;
+  diagnostic_triggers?: string;
+  diagnostic_scan_modes?: string;
+  diagnostic_apply_modes?: string;
 };
 
 export const LOG_ROUTES = [
@@ -162,6 +175,9 @@ type Validator = (value: unknown) => boolean;
 const enumeration = (values: readonly string[]): Validator => (value) => typeof value === 'string' && values.includes(value);
 const pattern = (regex: RegExp): Validator => (value) => typeof value === 'string' && regex.test(value);
 const number: Validator = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+const count: Validator = (value) => number(value) && Number.isSafeInteger(value);
+const listOf = (values: readonly string[]): Validator => (value) =>
+  typeof value === 'string' && value.length > 0 && value.split(',').every((entry) => values.includes(entry));
 const nullable = (validator: Validator): Validator => (value) => value === null || validator(value);
 const id = (prefix: string): Validator => (value) => typeof value === 'string' && value.startsWith(`${prefix}_`) && OPAQUE_ID.test(value);
 const FIELD_VALIDATORS: Record<keyof OperationalFields, Validator> = {
@@ -189,7 +205,14 @@ const FIELD_VALIDATORS: Record<keyof OperationalFields, Validator> = {
   host: pattern(/^[A-Za-z0-9.:_-]{1,253}$/u), port: number, log_level: enumeration(LOG_LEVELS),
   phase: enumeration(STARTUP_PHASES), source: enumeration(['startup', 'request', 'sampler']), task: enumeration(BACKGROUND_TASKS),
   packs_before: (value) => number(value) && Number.isSafeInteger(value), packs_after: (value) => number(value) && Number.isSafeInteger(value),
-  loose_before: (value) => number(value) && Number.isSafeInteger(value), loose_after: (value) => number(value) && Number.isSafeInteger(value)
+  loose_before: (value) => number(value) && Number.isSafeInteger(value), loose_after: (value) => number(value) && Number.isSafeInteger(value),
+  diagnostic_schema: (value) => count(value) && (value as number) >= 1 && (value as number) <= 4,
+  diagnostic_flow: enumeration(diagnosticFlows), diagnostic_attempts: count, diagnostic_completed: count,
+  diagnostic_abandoned: count, diagnostic_failed: count,
+  diagnostic_longest_bucket: enumeration(syncTimingDurationBuckets),
+  diagnostic_triggers: listOf(syncTimingTriggers),
+  diagnostic_scan_modes: listOf(syncTimingScanModes),
+  diagnostic_apply_modes: listOf(syncTimingApplyModes)
 };
 export const LOG_FIELD_ALLOWLIST = ['ts', 'level', 'event', 'service', 'version', ...Object.keys(FIELD_VALIDATORS)];
 

@@ -1220,7 +1220,16 @@ describe('mobile plugin artifact', () => {
       writesBeforeSnapshot();
       return await originalAdapterWriteBinary(...args);
     });
-    const requestsBeforeSnapshot = requests.length;
+    // Per-sync timing telemetry uses the same opted-in route, so count only
+    // troubleshooting snapshots here.
+    const diagnosticKind = (request: Record<string, unknown>) => {
+      try {
+        return (JSON.parse(String(request.body)) as { failure_code?: string }).failure_code ?? 'unknown';
+      } catch {
+        return 'unknown';
+      }
+    };
+    const snapshotsBefore = requests.filter((request) => diagnosticKind(request) === 'troubleshooting_snapshot').length;
     expect((plugin as any).beginSync('Applying server changes')).toBe(true);
     (plugin as any).setOperationProgress('Applying 12/6028', 'apply_write');
     await settingTabs[0]!.display();
@@ -1240,9 +1249,10 @@ describe('mobile plugin artifact', () => {
     expect(renderedElementOptions.some((options) => typeof options.href === 'string' && options.href.includes('vault=vlt_diagnostic'))).toBe(true);
     expect(renderedContainers.some((container) => container.textContent?.includes('local applied copy') && container.textContent.includes('stale while offline'))).toBe(true);
     (settingTabs[0] as any).hide();
-    expect(requests).toHaveLength(requestsBeforeSnapshot + 1);
+    const snapshotRequests = requests.filter((request) => diagnosticKind(request) === 'troubleshooting_snapshot');
+    expect(snapshotRequests).toHaveLength(snapshotsBefore + 1);
     expect(writesBeforeSnapshot).not.toHaveBeenCalled();
-    const snapshotBody = JSON.parse(String(requests.at(-1)?.body)) as Record<string, any>;
+    const snapshotBody = JSON.parse(String(snapshotRequests.at(-1)?.body)) as Record<string, any>;
     expect(snapshotBody).toMatchObject({
       schema_version: 2,
       failure_code: 'troubleshooting_snapshot',
