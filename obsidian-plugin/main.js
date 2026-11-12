@@ -24382,26 +24382,42 @@ module.exports = class ObtsPlugin extends Plugin {
     this.staleSettleTimer = null;
     this.staleSettleAt = null;
   }
+  // A background attempt is dispatched from a timer or an event listener, so no
+  // caller observes its promise: the attempt settles its own sync failure
+  // through handleAutomaticSyncError. That handler is fallible too, and the
+  // case that produces it is unloading, where the vault it records an outcome
+  // in is the one being torn down. Containing what escapes here keeps an
+  // attempt cut short by unload from becoming an unhandled rejection (its
+  // durable state is what the next session's startup recovery reads) while a
+  // failure of a loaded plugin is still reported.
+  containDetachedAttemptFailure(error) {
+    if (this.unloaded) return;
+    void this.reportDeviceError(error);
+  }
   async runQueuedSync() {
-    if (this.unloaded || !this.syncQueued || !await this.ensureClientReady()) return;
-    const retryDelay = this.automaticRetryNotBefore - Date.now();
-    if (retryDelay > 0) {
-      this.scheduleQueuedSync(retryDelay);
-      return;
+    try {
+      if (this.unloaded || !this.syncQueued || !await this.ensureClientReady()) return;
+      const retryDelay = this.automaticRetryNotBefore - Date.now();
+      if (retryDelay > 0) {
+        this.scheduleQueuedSync(retryDelay);
+        return;
+      }
+      if (this.isSyncInProgress()) {
+        this.scheduleQueuedSync(SYNC_DEBOUNCE_MS);
+        return;
+      }
+      const trigger = this.queuedSyncTrigger || "watcher";
+      const dispatch = this.queuedSyncDispatch;
+      this.queuedSyncTrigger = "watcher";
+      this.queuedSyncDispatch = "automatic";
+      this.syncQueued = false;
+      if (dispatch === "background") await this.runBackgroundSync(trigger);
+      else await this.runAutomaticSync({}, trigger);
+      if (this.syncQueued) this.scheduleQueuedSync(0);
+      else this.wakeAttemptActive = false;
+    } catch (error) {
+      this.containDetachedAttemptFailure(error);
     }
-    if (this.isSyncInProgress()) {
-      this.scheduleQueuedSync(SYNC_DEBOUNCE_MS);
-      return;
-    }
-    const trigger = this.queuedSyncTrigger || "watcher";
-    const dispatch = this.queuedSyncDispatch;
-    this.queuedSyncTrigger = "watcher";
-    this.queuedSyncDispatch = "automatic";
-    this.syncQueued = false;
-    if (dispatch === "background") await this.runBackgroundSync(trigger);
-    else await this.runAutomaticSync({}, trigger);
-    if (this.syncQueued) this.scheduleQueuedSync(0);
-    else this.wakeAttemptActive = false;
   }
   async flushOpenMarkdownEditorsToDisk(isUnreloadedView = null) {
     const workspace = this.app && this.app.workspace;
@@ -24435,32 +24451,36 @@ module.exports = class ObtsPlugin extends Plugin {
     return flushed;
   }
   async runBackgroundSync(trigger = "interval") {
-    if (!this.layoutStarted || this.unloaded || backgroundSyncSuppressedByVisibility() || !await this.ensureClientReady()) {
-      return;
+    try {
+      if (!this.layoutStarted || this.unloaded || backgroundSyncSuppressedByVisibility() || !await this.ensureClientReady()) {
+        return;
+      }
+      if (Date.now() < this.automaticRetryNotBefore) return;
+      if (this.syncQueued) {
+        await this.runQueuedSync();
+        return;
+      }
+      if (this.isSyncInProgress()) {
+        return;
+      }
+      const state = await this.client.readState();
+      if (!state.vault_id || !state.device_id) {
+        return;
+      }
+      if (state.last_error_code && isTerminalSyncError(state.last_error_code) && !POLLED_TERMINAL_ERROR_CODES.has(state.last_error_code)) {
+        await this.client.reportDeviceStatus().catch(() => void 0);
+        return;
+      }
+      const queue = await this.client.readQueue();
+      const scanDecision = await this.client.backgroundScanDecision();
+      if (queue.pending_commit || queue.status === "queued_local" || scanDecision.required) {
+        await this.runAutomaticSync({ fullAudit: scanDecision.mode === "full" }, trigger);
+        return;
+      }
+      await this.runRemotePoll(trigger);
+    } catch (error) {
+      this.containDetachedAttemptFailure(error);
     }
-    if (Date.now() < this.automaticRetryNotBefore) return;
-    if (this.syncQueued) {
-      await this.runQueuedSync();
-      return;
-    }
-    if (this.isSyncInProgress()) {
-      return;
-    }
-    const state = await this.client.readState();
-    if (!state.vault_id || !state.device_id) {
-      return;
-    }
-    if (state.last_error_code && isTerminalSyncError(state.last_error_code) && !POLLED_TERMINAL_ERROR_CODES.has(state.last_error_code)) {
-      await this.client.reportDeviceStatus().catch(() => void 0);
-      return;
-    }
-    const queue = await this.client.readQueue();
-    const scanDecision = await this.client.backgroundScanDecision();
-    if (queue.pending_commit || queue.status === "queued_local" || scanDecision.required) {
-      await this.runAutomaticSync({ fullAudit: scanDecision.mode === "full" }, trigger);
-      return;
-    }
-    await this.runRemotePoll(trigger);
   }
   async runRemotePoll(trigger = "interval") {
     if (!this.beginSync("Checking server", trigger)) return;

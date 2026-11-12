@@ -520,3 +520,71 @@ describe('honest persisted status', () => {
     await harness.dispose();
   });
 });
+
+describe('detached attempts', () => {
+  // The attempt a timer dispatches has no caller, so the plugin itself has to
+  // settle it: unloading while an attempt is in flight also takes the vault the
+  // attempt writes its outcome to, and a rejection escaping at that point is an
+  // unhandled rejection in the real app.
+  function failingSync(client: Json, attempts: string[]) {
+    let rejectSync!: (error: unknown) => void;
+    const started = new Promise<void>((resolve) => {
+      client.syncOnce = async () => {
+        attempts.push('sync');
+        resolve();
+        await new Promise((_resolve, reject) => { rejectSync = reject; });
+      };
+    });
+    return { started, fail: (error: unknown) => rejectSync(error) };
+  }
+
+  it('keeps a failure of the failure handler inside the attempt when unloaded mid-sync', async () => {
+    const harness = await createHarness({ mobile: false });
+    await harness.start();
+    harness.reset();
+    const reported: unknown[] = [];
+    harness.plugin.reportDeviceError = async (error: unknown) => { reported.push(error); };
+    // Recording the outcome is the first thing teardown breaks: markBlocked
+    // writes the durable state a torn-down vault no longer accepts.
+    harness.client.markBlocked = async () => { throw new Error('vault unavailable'); };
+    const sync = failingSync(harness.client, harness.notify.attempts);
+
+    harness.plugin.queueAutomaticSync('visibility');
+    const attempt = harness.runQueuedSyncNow();
+    await sync.started;
+    expect(harness.plugin.syncRunning, 'the attempt holds the sync lease').toBe(true);
+    harness.plugin.onunload();
+    sync.fail(new Error('sync failed'));
+
+    // Unloading is not a failure to report: the attempt ends, releases its
+    // lease, and its durable state is left for the next startup. The ordinary
+    // path still hands the original failure to the reporter (which is silent
+    // once unloaded); the failure of the handler that could not record it adds
+    // no reporting of its own.
+    await expect(attempt).resolves.toBeUndefined();
+    await settle();
+    expect(harness.plugin.syncRunning).toBe(false);
+    expect((reported as Error[]).map((error) => error.message)).toEqual(['sync failed']);
+    await harness.dispose();
+  });
+
+  it('still reports a failure of the failure handler while the plugin is loaded', async () => {
+    const harness = await createHarness({ mobile: false });
+    await harness.start();
+    harness.reset();
+    const reported: unknown[] = [];
+    harness.plugin.reportDeviceError = async (error: unknown) => { reported.push(error); };
+    harness.client.markBlocked = async () => { throw new Error('state could not be written'); };
+    harness.client.syncOnce = async () => {
+      harness.notify.attempts.push('sync');
+      throw new Error('sync failed');
+    };
+
+    harness.plugin.queueAutomaticSync('visibility');
+    await harness.runQueuedSyncNow();
+    await settle();
+    expect(harness.notify.attempts).toEqual(['sync']);
+    expect((reported as Error[]).map((error) => error.message)).toEqual(['sync failed', 'state could not be written']);
+    await harness.dispose();
+  });
+});
