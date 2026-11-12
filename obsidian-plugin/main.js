@@ -23193,6 +23193,7 @@ var PERIODIC_FULL_AUDIT_INTERVAL_MS = 7 * 24 * 60 * 60 * 1e3;
 var MIGRATED_FULL_AUDIT_DELAY_MS = 24 * 60 * 60 * 1e3;
 var SCANNER_SCHEMA_VERSION = 1;
 var HINTED_CAPTURE_MAX_PATHS = 256;
+var INVENTORY_DEFERRAL_LIMIT = 1;
 var WATCHER_RENAME_ATTEMPTS = 3;
 var LEGACY_RENAME_LATCH_CODES = /* @__PURE__ */ new Set(["rename_preservation_required", "rename_lineage_ambiguous"]);
 var AUTOMATIC_RETRY_MAX_MS = 5 * 60 * 1e3;
@@ -23443,7 +23444,7 @@ module.exports = class ObtsPlugin extends Plugin {
         this.registerDomEvent(document, "visibilitychange", () => {
           this.client?.noteSyncTimingVisibility?.(document.hidden === true);
           if (document.hidden) return;
-          if (this.client && typeof this.client.requestFullInventory === "function") this.client.requestFullInventory();
+          if (this.client && typeof this.client.scheduleInventoryAfterCatchUp === "function") this.client.scheduleInventoryAfterCatchUp();
           void this.runBackgroundSync("visibility");
         });
       }
@@ -24677,6 +24678,9 @@ var ObtsObsidianClient = class {
     this.lastCursorGuardDiagnostic = "not_observed";
     this.inventoryRequestedSeq = 1;
     this.inventoryCompletedSeq = 0;
+    this.scheduledInventoryDue = true;
+    this.inventoryDeferredBehindCatchUp = false;
+    this.inventoryDeferrals = 0;
     this.deviceStatusSequence = 0;
     this.deviceStatusGeneration = 0;
     this.vaultStatusObservation = 0;
@@ -24838,8 +24842,16 @@ var ObtsObsidianClient = class {
       if (state && state.vault_id && state.device_id) this.syncTimingSink(buildSyncTimingAttemptRecord(recorded));
     }, () => void 0);
   }
+  // An explicit request means hints cannot describe the change, so the fast
+  // paths stay suppressed until a whole-vault inventory finishes.
   requestFullInventory() {
     this.inventoryRequestedSeq += 1;
+    this.scheduledInventoryDue = true;
+  }
+  // Startup and resume want that same inventory, but not before catching up:
+  // they schedule it without invalidating the delta fast paths.
+  scheduleInventoryAfterCatchUp() {
+    this.scheduledInventoryDue = true;
   }
   fullInventoryCurrent() {
     return this.inventoryCompletedSeq >= this.inventoryRequestedSeq;
@@ -25890,6 +25902,11 @@ var ObtsObsidianClient = class {
         }));
         await this.reportDeviceStatus().catch(() => void 0);
       }
+      if (await this.catchUpBeforeScheduledInventory(queueBeforeScan, flushedPaths, options)) {
+        const caughtUpState = await this.readState();
+        await this.reportDeviceStatus().catch(() => void 0);
+        return { status: caughtUpState.status_label, main: caughtUpState.local_main || void 0 };
+      }
       const hinted = options.hintedCapture && !options.fullAudit ? await this.captureHintedLocalChanges(queueBeforeScan, flushedPaths) : null;
       this.noteSyncTimingScanMode(hinted ? "hinted" : options.fullAudit ? "full" : "incremental");
       let staleQueued = false;
@@ -25918,7 +25935,12 @@ var ObtsObsidianClient = class {
         if (!staleQueued && !commit2 && pendingDirectoryIntents.length > 0) {
           commit2 = await this.createMetadataCommit("obts: local directory changes");
         }
-        if (!staleQueued) this.inventoryCompletedSeq = Math.max(this.inventoryCompletedSeq, inventorySeq);
+        if (!staleQueued) {
+          this.inventoryCompletedSeq = Math.max(this.inventoryCompletedSeq, inventorySeq);
+          this.scheduledInventoryDue = false;
+          this.inventoryDeferredBehindCatchUp = false;
+          this.inventoryDeferrals = 0;
+        }
       }
       if (commit2) {
         const currentState = await this.readState();
@@ -25992,6 +26014,37 @@ var ObtsObsidianClient = class {
       main: finalState.local_main || void 0,
       ...uploadResult && uploadResult.conflict_id ? { conflictId: uploadResult.conflict_id } : {}
     };
+  }
+  // OBTS-SYNC-DELTA-001: when a whole-vault inventory is due but nothing local
+  // is waiting, catching up is the only required work and it is proportional
+  // to the remote change. Deferring the inventory behind it keeps a device
+  // that was backgrounded for hours from scanning the vault before it starts
+  // downloading. A full audit (7 d schedule or invalid scan state) is never
+  // deferred, and any local work keeps the ordinary capture-then-upload order.
+  async catchUpBeforeScheduledInventory(queue, flushedPaths, options) {
+    if (options.fullAudit || options.auditContinuation) return false;
+    if (this.inventoryDeferrals >= INVENTORY_DEFERRAL_LIMIT) return false;
+    const decision = await this.backgroundScanDecision();
+    if (!decision.required || decision.mode !== "incremental") return false;
+    const state = await this.readState();
+    if (!state.vault_id || !state.device_id || state.last_error_code) return false;
+    if (!state.initial_import_confirmed && state.server_device_ref === null) return false;
+    if (queue.pending_commit || queue.status === "queued_local" || (queue.changed_paths || []).length > 0) return false;
+    if (Array.isArray(flushedPaths) && flushedPaths.length > 0) return false;
+    if (state.local_head !== state.local_main) return false;
+    if (await readApplyJournalStrict(this.fsp, this.applyJournalPath)) return false;
+    this.inventoryDeferredBehindCatchUp = true;
+    const polled = await this.performPollRemoteEventsAndApply({ deltaApply: true });
+    if (!polled.applied) {
+      this.inventoryDeferredBehindCatchUp = false;
+      return false;
+    }
+    this.inventoryDeferrals += 1;
+    if (typeof this.plugin.scheduleQueuedSync === "function") {
+      this.plugin.syncQueued = true;
+      this.plugin.scheduleQueuedSync(0);
+    }
+    return true;
   }
   async replaceLocalWithServer() {
     await this.initialize();
@@ -28068,8 +28121,14 @@ var ObtsObsidianClient = class {
   }
   // Conservative file-only footprint: directory creation/removal and complex
   // provenance still use full apply. Recovery consumes the same v7 journal.
+  // OBTS-SYNC-DELTA-001: the apply footprint is a function of the target and
+  // the authoring base, and every footprint path is re-read inside the adapter
+  // gate, so a completed inventory is not a precondition. Paths outside the
+  // footprint are neither read nor written here; an unhinted edit there stays
+  // visible for the scheduled inventory (OBTSDeltaApply: CanApply,
+  // NoLocalEditLost).
   async deltaApplyScope(state, targetMain, authoringBase, targetPolicy, explicitDirectories) {
-    if (!this.fullInventoryCurrent() || !authoringBase || state.local_head !== authoringBase || state.local_main !== authoringBase || await this.readDurableCatchup()) return null;
+    if (!authoringBase || state.local_head !== authoringBase || state.local_main !== authoringBase || await this.readDurableCatchup()) return null;
     const queue = await this.readQueue();
     if (queue.pending_commit) return null;
     const saved = await this.readStaleProvenance();
@@ -28261,13 +28320,13 @@ var ObtsObsidianClient = class {
         last_completed_step: null,
         redacted_error_category: null
       };
-      this.noteSyncTimingApplyMode(refOnly ? "ref_only" : "full");
       if (refOnly) {
+        this.noteSyncTimingApplyMode("ref_only");
         await this.applyRefOnly(state, journal, eventSeq);
         return true;
       }
       const scope = options.deltaApply && requireCleanVisibleState && !rebuild && !catchupExpectedTree && !consentBaselineBundleId && !preserveConsentLocalPaths && !confirmedDirectoryRecovery && extraAffectedPaths.length === 0 && compactedDirectoryIntents.length === 0 && !hasDirectoryWork ? await this.deltaApplyScope(state, targetMain, authoringBase, targetPolicy, explicitDirectorySet) : null;
-      if (scope) this.noteSyncTimingApplyMode("delta");
+      this.noteSyncTimingApplyMode(scope ? "delta" : "full");
       const targetEntries = targetPolicy.entries;
       let consentBaselineFingerprints = /* @__PURE__ */ new Map();
       if (consentBaselineBundleId) {
@@ -30146,7 +30205,10 @@ var ObtsObsidianClient = class {
     const scanState = await readJson(this.fsp, this.scanStatePath, null);
     const valid = scanState && scanState.version === 1 && scanState.scanner_schema === SCANNER_SCHEMA_VERSION && scanState.vault_id === state.vault_id && scanState.device_id === state.device_id;
     if (!valid) {
-      if (await this.bootstrapScanCacheFromConvergedState(state, directoryState)) return { required: false, mode: "none" };
+      if (await this.bootstrapScanCacheFromConvergedState(state, directoryState)) {
+        this.scheduledInventoryDue = false;
+        return { required: false, mode: "none" };
+      }
       return { required: true, mode: "full" };
     }
     await this.retireElapsedEmptyHorizons();
@@ -30157,6 +30219,7 @@ var ObtsObsidianClient = class {
     if (Number.isFinite(nextFullAuditAt) ? Date.now() >= nextFullAuditAt : !Number.isFinite(lastFullAuditAt) || Date.now() - lastFullAuditAt >= PERIODIC_FULL_AUDIT_INTERVAL_MS) {
       return { required: true, mode: "full" };
     }
+    if (this.scheduledInventoryDue) return { required: true, mode: "incremental" };
     if (scanState.local_head !== state.local_head || scanState.directory_generation !== directoryState.next_generation || !Number.isFinite(lastInventoryAt) || Date.now() - lastInventoryAt >= PERIODIC_INVENTORY_INTERVAL_MS || !state.last_error_code && await this.hasElapsedStaleHorizon()) {
       return { required: true, mode: "incremental" };
     }
@@ -30337,13 +30400,15 @@ var ObtsObsidianClient = class {
   // Returns null whenever the hints alone cannot show what a whole-vault
   // inventory would capture; the caller then runs that inventory instead.
   // Local deletions, folders, new directories, renames, policy changes and
-  // pending stale or directory obligations all take the inventory path.
+  // pending stale or directory obligations all take the inventory path. A due
+  // inventory also takes precedence, so a resumed device still runs its
+  // scheduled scan before it trusts hints.
   async captureHintedLocalChanges(queue, flushedPaths = []) {
     const hints = [.../* @__PURE__ */ new Set([
       ...queue.changed_paths || [],
       ...(Array.isArray(flushedPaths) ? flushedPaths : []).map((filePath) => normalizePath2(filePath))
     ])].sort();
-    if (!this.fullInventoryCurrent() || hints.length > HINTED_CAPTURE_MAX_PATHS || hints.includes(".gitignore") || new Set(hints.map((filePath) => filePath.toLowerCase())).size !== hints.length) return null;
+    if (hints.length > HINTED_CAPTURE_MAX_PATHS || hints.includes(".gitignore") || new Set(hints.map((filePath) => filePath.toLowerCase())).size !== hints.length) return null;
     const state = await this.readState();
     const base = state.local_head;
     if (!base || base !== state.local_main || !state.initial_import_confirmed && state.server_device_ref === null) return null;
@@ -33503,7 +33568,7 @@ var ObtsObsidianClient = class {
   }
   async clearAcknowledgedDirectoryIntents(acknowledgedIntents, deferReconcile = false) {
     const acknowledgedKeys = new Set((Array.isArray(acknowledgedIntents) ? acknowledgedIntents : []).filter((intent) => intent && typeof intent.intent_id === "string" && Number.isSafeInteger(intent.generation)).map(directoryIntentGenerationKey));
-    if (acknowledgedKeys.size === 0 && this.fullInventoryCurrent() && (deferReconcile || !this.plugin.syncQueued && (await this.readQueue()).changed_paths.length === 0)) return;
+    if (acknowledgedKeys.size === 0 && (this.fullInventoryCurrent() || this.inventoryDeferredBehindCatchUp) && (deferReconcile || !this.plugin.syncQueued && (await this.readQueue()).changed_paths.length === 0)) return;
     await this.reconcileDirectoryState();
     const directoryState = await this.readDirectoryState();
     const remaining = directoryState.pending_intents.filter((intent) => !acknowledgedKeys.has(directoryIntentGenerationKey(intent)));

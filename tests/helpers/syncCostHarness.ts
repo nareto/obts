@@ -116,6 +116,7 @@ class Session {
 
 export type SyncCostFixture = {
   root: string;
+  baseUrl: string;
   writerDir: string;
   readerDir: string;
   writer: ObtsPluginClient;
@@ -173,6 +174,7 @@ export async function createSyncCostFixture(fileCount: number): Promise<SyncCost
   await reader.syncOnce();
   return {
     root,
+    baseUrl,
     writerDir,
     readerDir,
     writer,
@@ -184,6 +186,15 @@ export async function createSyncCostFixture(fileCount: number): Promise<SyncCost
       await rm(root, { recursive: true, force: true });
     }
   };
+}
+
+// A device that was closed or backgrounded comes back as a new client over the
+// same vault: nothing in memory survives, so startup and resume triggers are
+// exercised the way the plugin reaches them.
+export async function resumeClient(fixture: SyncCostFixture, vaultDir: string, deviceName: string): Promise<ObtsPluginClient> {
+  const plugin = new ObtsPluginClient(vaultDir, { serverUrl: fixture.baseUrl, deviceName });
+  await plugin.initialize();
+  return plugin;
 }
 
 export async function writeNote(vaultDir: string, index: number, body: string): Promise<string> {

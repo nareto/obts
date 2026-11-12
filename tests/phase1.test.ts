@@ -574,7 +574,9 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
     await restarted.initialize();
     const restartedCore = (restarted as unknown as { client: Record<string, any> }).client;
-    expect(await restartedCore.backgroundScanDecision()).toEqual({ required: false, mode: 'none' });
+    // A restarted session schedules an inventory for after catch-up, even when
+    // the last one finished minutes ago: watcher events were lost meanwhile.
+    expect(await restartedCore.backgroundScanDecision()).toEqual({ required: true, mode: 'incremental' });
     const scanStatePath = join(deviceDir, '.obts', 'scan-state.json');
     const recentScanState = JSON.parse(await readFile(scanStatePath, 'utf8')) as Record<string, unknown>;
     await writeFile(scanStatePath, `${JSON.stringify({
