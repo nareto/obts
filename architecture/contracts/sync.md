@@ -37,6 +37,14 @@ The visible local vault is the device source of truth; coordination metadata is 
 - Missing or corrupt `state.json` is repaired from the valid device token and intact local Git journal before destructive work.
 - Local edits are committed or recoverably snapshotted before upload.
 
+### OBTS-SYNC-WAKE-001: Background Cadence, Terminal Outcomes, And Honest Status
+
+- A desktop client keeps attempting background synchronization while its window is hidden, minimized, or on another virtual desktop. Window visibility is not evidence that the device, the vault, or the server is unavailable. The mobile client retains its existing background suspension, because the platform suspends the process; resuming schedules the catch-up inventory of OBTS-SYNC-DELTA-001.
+- Finishing client initialization, the window regaining focus, and the network reconnecting each request an attempt through the same coalescing debounce as watcher events, so a burst of wake-ups costs one attempt. None of them forces a vault inventory; the startup and resume inventory stays scheduled behind the catch-up attempt.
+- Only outcomes that cannot make progress without a person are terminal: conflict review, replace-local consent, initial-import confirmation, an already-paired or unregistered local identity, a device the server blocked, revoked, or no longer recognizes, server integrity repair, an object beyond the upload limit, assisted local recovery or any outcome that requires preserved evidence to be reviewed first, and an unfinished onboarding. A terminal outcome keeps its attention status and its server-visible failure; conflict review and device blocks keep their dedicated automatic path (resolution events, server reconciliation) on the ordinary background cadence.
+- Every other outcome, including transport, server-processing, and local policy or path failures that the user's own edits can fix, is retried with bounded exponential backoff capped at five minutes; such a failure never latches until the user intervenes. Retrying is not a shortcut: each attempt repeats the same durable settlement, preservation, and ordering rules and fails closed exactly like the first, keeping its evidence.
+- The persisted status label reports the last attempt, not the current state. A failure recorded before this session attempted anything is presented as the last observed failure with its age, a pending attempt on a retryable failure is presented as checking, and a terminal outcome keeps its own attention label.
+
 ## OBTS-SYNC-IMM-001: Immutable Transfer And Integration
 
 One upload attempt has immutable target commit, expected device ref, proposal base, directory proposal, object plan, root-ignore policy identity, attempt ID, and transfer ID until an authoritative outcome is consumed.

@@ -420,6 +420,9 @@ describe('packaged mobile onboarding recovery', () => {
     const restarted = await mobileHarness(phoneRoot, url);
     expect(await restarted.core.readPendingOnboarding()).toBeNull();
     await restarted.plugin.runExclusiveAction(() => restarted.core.syncOnce());
+    // The restarted device also queues its own catch-up attempt right after
+    // initialization, so convergence is what must be observed, not one instant.
+    await waitUntil(async () => (await restarted.core.readState()).status_label === 'Synced', 30000);
     expect((await restarted.core.readState()).status_label).toBe('Synced');
     expect((await server.store.snapshot()).devices).toHaveLength(2);
   }));

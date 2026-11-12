@@ -35,6 +35,64 @@ const INVENTORY_DEFERRAL_LIMIT = 1;
 const WATCHER_RENAME_ATTEMPTS = 3;
 const LEGACY_RENAME_LATCH_CODES = new Set(["rename_preservation_required", "rename_lineage_ambiguous"]);
 const AUTOMATIC_RETRY_MAX_MS = 5 * 60 * 1000;
+// Below this age a persisted failure is still the current state of the device;
+// above it, the label is presented as the last observed failure with its age.
+const STALE_FAILURE_LABEL_MS = 60 * 1000;
+// The background loop stops retrying only for outcomes that a person has to
+// resolve first. Everything else keeps retrying, capped at AUTOMATIC_RETRY_MAX_MS.
+const TERMINAL_SYNC_ERROR_CODES = new Set([
+  // The owner must decide; a retry cannot pick a winner, consent, or confirm.
+  "conflict_review_required",
+  "replace_local_with_server_required",
+  "initial_import_confirmation_required",
+  "local_state_already_paired",
+  // Device access is decided by the server or the owner.
+  "device_blocked",
+  "device_revoked",
+  "device_identity_mismatch",
+  "not_paired",
+  "same_device_non_fast_forward",
+  "stale_device_ref",
+  // Server-side repair, and objects the upload limits cannot accept.
+  "blocked_integrity",
+  "server_recovery_required",
+  "object_too_large_for_chunk",
+  // Assisted local recovery: preserved evidence has to be reviewed first.
+  "unsafe_local_state",
+  "apply_journal_recovery_required",
+  "apply_recovery_required",
+  "local_state_incomplete",
+  "partial_local_state",
+  "local_ref_recovery_required",
+  "recovery_bundle_failed",
+  "recovery_bundle_verification_failed",
+  "recovery_bundle_durability_unavailable",
+  "stale_intent_mismatch",
+  "stale_base_missing",
+  "stale_provenance_corrupt",
+  "upload_checkpoint_recovery_required",
+  "upload_checkpoint_mismatch",
+  "legacy_upload_checkpoint",
+  "directory_baseline_recovery_journal_invalid",
+  "directory_baseline_recovery_unsafe",
+  "legacy_directory_advance_unsafe",
+  "directory_recovery_journal_invalid",
+  "directory_recovery_journal_mismatch",
+  "directory_recovery_decision_required",
+  "directory_recovery_changed",
+  "catchup_recovery_required",
+  "invalid_transfer_checkpoint",
+  "applied_main_acknowledgement_failed",
+  // Enrollment is user-paced; the background loop waits for it to finish.
+  "onboarding_incomplete",
+  "onboarding_context_required",
+  "onboarding_identity_mismatch",
+  "onboarding_snapshot_changed"
+]);
+// Terminal outcomes that still have a dedicated automatic path: a conflict
+// resolution arrives as an event, and a blocked device is reconciled with the
+// server. They keep the ordinary background cadence instead of a backoff.
+const POLLED_TERMINAL_ERROR_CODES = new Set(["conflict_review_required", "device_blocked"]);
 const OPERATION_STATUS_HEARTBEAT_MS = 30 * 1000;
 const STATUS_LAG_NOTICE_DELAY_MS = 30 * 1000;
 const STATUS_NOTICE_DURATION_MS = 15 * 1000;
@@ -103,6 +161,10 @@ module.exports = class ObtsPlugin extends Plugin {
     this.syncRunning = false;
     this.transientSyncFailures = 0;
     this.automaticRetryNotBefore = 0;
+    this.queuedSyncTrigger = "watcher";
+    // Only an attempt from this session can turn a persisted failure into a
+    // current observation; anything older is presented with its age.
+    this.sessionAttemptBaselineAt = Date.now();
     this.lastCheckingProgressAt = 0;
     this.isApplying = false;
     this.pluginCompatibilityNoticeKey = null;
@@ -314,6 +376,13 @@ module.exports = class ObtsPlugin extends Plugin {
           void this.runBackgroundSync("visibility");
         });
       }
+      // Regaining window focus or a network that comes back is direct evidence
+      // that the device can talk to the server again. Neither forces a vault
+      // inventory; they only join the coalesced attempt queue.
+      if (typeof this.registerDomEvent === "function" && typeof window !== "undefined") {
+        this.registerDomEvent(window, "focus", () => this.queueAutomaticSync("visibility"));
+        this.registerDomEvent(window, "online", () => this.queueAutomaticSync("visibility"));
+      }
     } catch (error) {
       this.unloaded = true;
       this.lifecycleAbortController.abort();
@@ -431,7 +500,7 @@ module.exports = class ObtsPlugin extends Plugin {
             this.initializationStageStartedAt = null;
             this.initializationDiagnosticPoint = null;
             this.initializationDiagnosticToken = null;
-            this.setStatus(readyState.status_label);
+            this.setPersistedStatus(readyState);
             completed = true;
           }
         } finally {
@@ -444,6 +513,9 @@ module.exports = class ObtsPlugin extends Plugin {
     } finally {
       this.clientInitialization = null;
     }
+    // The device is usable the moment initialization finishes: catch up now
+    // instead of waiting for the next background tick.
+    if (this.clientReady && !this.unloaded) this.queueAutomaticSync("startup");
   }
 
   handleClientInitializationFailure(error = null) {
@@ -992,6 +1064,25 @@ module.exports = class ObtsPlugin extends Plugin {
     this.handleStatusTransition(previousBase, presentation.base, options.notify !== false);
   }
 
+  setPersistedStatus(state, options = {}) {
+    this.setStatus(this.persistedStatusLabel(state), options);
+  }
+
+  /**
+   * The persisted label reports the last attempt, not what the device is doing
+   * now. A failure recorded before this session attempted anything is history:
+   * show when it was observed instead of presenting it as the current state.
+   */
+  persistedStatusLabel(state) {
+    const label = normalizePersistedStatusLabel(state && state.status_label, state && state.last_error_code, state && state.last_error_details);
+    if (!state || !state.last_error_code) return label;
+    const observedAt = Date.parse(state.last_error_at || state.updated_at || "");
+    if (!Number.isFinite(observedAt)) return label;
+    const age = Date.now() - observedAt;
+    if (age < STALE_FAILURE_LABEL_MS || observedAt >= this.sessionAttemptBaselineAt) return label;
+    return `${label} (last error ${formatStatusAge(age)} ago)`;
+  }
+
   handleStatusTransition(previousBase, nextBase, notify) {
     const attentionMessage = statusAttentionMessage(nextBase);
     if (attentionMessage && previousBase !== nextBase) {
@@ -1058,8 +1149,35 @@ module.exports = class ObtsPlugin extends Plugin {
     if (typeof settings.openTabById === "function") settings.openTabById(this.manifest && this.manifest.id ? this.manifest.id : "obts");
   }
 
+  // Foreground evidence (finished initialization, window focus, network
+  // reconnect) joins the watcher debounce, so a burst of wake-ups costs one
+  // attempt and none of them forces a vault inventory.
+  queueAutomaticSync(trigger = "visibility") {
+    if (this.unloaded || !this.clientReady || backgroundSyncSuppressedByVisibility()) return;
+    this.queuedSyncTrigger = trigger;
+    this.syncQueued = true;
+    this.scheduleQueuedSync(SYNC_DEBOUNCE_MS);
+    void this.showQueuedSyncStatus();
+  }
+
+  // "Checking" is only honest while the queued attempt can still make
+  // progress: a terminal outcome keeps its attention status until the user
+  // acts on it.
+  async showQueuedSyncStatus() {
+    let state;
+    try {
+      state = await this.client.readState();
+    } catch {
+      return;
+    }
+    if (this.unloaded || this.syncRunning || !this.syncQueued) return;
+    if (state.last_error_code && isTerminalSyncError(state.last_error_code)) return;
+    this.setStatus("Checking");
+  }
+
   queueSyncFromWatcher(paths, renamePair = null) {
     this.syncQueued = true;
+    this.queuedSyncTrigger = "watcher";
     if (renamePair) this.pendingWatcherRenames.push(renamePair);
     for (const candidate of Array.isArray(paths) ? paths : [paths]) {
       if (typeof candidate === "string" && candidate.length > 0) this.pendingWatcherPaths.add(candidate);
@@ -1108,7 +1226,10 @@ module.exports = class ObtsPlugin extends Plugin {
   async syncOnceOrPollResolvedConflict(options) {
     await this.flushWatcherHints();
     const state = await this.client.readState();
-    if (!isPersistentAttentionStatus(statusBaseLabel(state.status_label))) this.setStatus("Checking");
+    // A retryable failure is being retried right now: say so. A terminal one
+    // stays as the recorded outcome until the user acts.
+    const retrying = Boolean(state.last_error_code) && !isTerminalSyncError(state.last_error_code);
+    if (retrying || !isPersistentAttentionStatus(statusBaseLabel(state.status_label))) this.setStatus("Checking");
     if (state.last_error_code === "device_blocked") {
       return await this.client.reconcileDeviceBlocked();
     }
@@ -1164,8 +1285,10 @@ module.exports = class ObtsPlugin extends Plugin {
       this.scheduleQueuedSync(SYNC_DEBOUNCE_MS);
       return;
     }
+    const trigger = this.queuedSyncTrigger || "watcher";
+    this.queuedSyncTrigger = "watcher";
     this.syncQueued = false;
-    await this.runAutomaticSync({}, "watcher");
+    await this.runAutomaticSync({}, trigger);
     if (this.syncQueued) this.scheduleQueuedSync(0);
   }
 
@@ -1202,7 +1325,7 @@ module.exports = class ObtsPlugin extends Plugin {
   }
 
   async runBackgroundSync(trigger = "interval") {
-    if (!this.layoutStarted || this.unloaded || (typeof document !== "undefined" && document.hidden) || !(await this.ensureClientReady())) {
+    if (!this.layoutStarted || this.unloaded || backgroundSyncSuppressedByVisibility() || !(await this.ensureClientReady())) {
       return;
     }
     if (Date.now() < this.automaticRetryNotBefore) return;
@@ -1217,12 +1340,9 @@ module.exports = class ObtsPlugin extends Plugin {
     if (!state.vault_id || !state.device_id) {
       return;
     }
-    if (
-      state.last_error_code &&
-      state.last_error_code !== "conflict_review_required" &&
-      state.last_error_code !== "device_blocked" &&
-      !isRetryableLocalError(state.last_error_code)
-    ) {
+    if (state.last_error_code && isTerminalSyncError(state.last_error_code) && !POLLED_TERMINAL_ERROR_CODES.has(state.last_error_code)) {
+      // No attempt can succeed until the user resolves this; keep the device
+      // status fresh without pretending a retry is coming.
       await this.client.reportDeviceStatus().catch(() => undefined);
       return;
     }
@@ -1241,7 +1361,7 @@ module.exports = class ObtsPlugin extends Plugin {
     try {
       await this.client.pollRemoteEventsAndApply({ deltaApply: true });
       this.clearTransientSyncFailures();
-      this.setStatus((await this.client.readState()).status_label);
+      this.setPersistedStatus(await this.client.readState());
       await this.client.reportDeviceStatus().catch(() => undefined);
       completed = true;
     } catch (error) {
@@ -1253,7 +1373,7 @@ module.exports = class ObtsPlugin extends Plugin {
   }
 
   async runAutomaticSync(options = {}, trigger = "interval") {
-    if (this.unloaded || (typeof document !== "undefined" && document.hidden) || !(await this.ensureClientReady()) || this.isSyncInProgress()) {
+    if (this.unloaded || backgroundSyncSuppressedByVisibility() || !(await this.ensureClientReady()) || this.isSyncInProgress()) {
       return;
     }
     try { if (await this.client.readPendingOnboarding()) return; }
@@ -1265,12 +1385,7 @@ module.exports = class ObtsPlugin extends Plugin {
       if (!state.vault_id || !state.device_id) {
         return;
       }
-      if (
-        state.last_error_code &&
-        state.last_error_code !== "conflict_review_required" &&
-        state.last_error_code !== "device_blocked" &&
-        !isRetryableLocalError(state.last_error_code)
-      ) {
+      if (state.last_error_code && isTerminalSyncError(state.last_error_code) && !POLLED_TERMINAL_ERROR_CODES.has(state.last_error_code)) {
         await this.client.reportDeviceStatus().catch(() => undefined);
         return;
       }
@@ -1280,7 +1395,7 @@ module.exports = class ObtsPlugin extends Plugin {
         hintedCapture: !options.fullAudit
       });
       this.clearTransientSyncFailures();
-      this.setStatus((await this.client.readState()).status_label);
+      this.setPersistedStatus(await this.client.readState());
       await this.client.reportDeviceStatus().catch(() => undefined);
       completed = true;
     } catch (error) {
@@ -1301,9 +1416,9 @@ module.exports = class ObtsPlugin extends Plugin {
       error = reconciliationError;
     }
     if (error instanceof ObtsBlockedError) {
-      this.clearTransientSyncFailures();
       await this.client.markBlocked(error.code, error.details);
-      this.setStatus((await this.client.readState()).status_label);
+      this.noteAutomaticFailure(error.code);
+      this.setPersistedStatus(await this.client.readState());
       await this.client.reportDeviceStatus().catch(() => undefined);
       return;
     }
@@ -1318,24 +1433,24 @@ module.exports = class ObtsPlugin extends Plugin {
       return;
     }
     if (error instanceof ObtsTransportError) {
-      this.clearTransientSyncFailures();
       await this.client.markBlocked(error.code, error.details);
-      this.setStatus((await this.client.readState()).status_label, { notify: false });
+      this.noteAutomaticFailure(error.code);
+      this.setPersistedStatus(await this.client.readState(), { notify: false });
       await this.client.reportDeviceStatus().catch(() => undefined);
       return;
     }
     const currentState = await this.client.readState();
-    if (currentState.last_error_code && isRetryableLocalError(currentState.last_error_code)) {
-      if (currentState.last_error_code === "upload_interrupted" || currentState.last_error_code === "pack_preparation_failed") {
-        this.recordTransientSyncFailure();
-      }
-      this.setStatus(currentState.status_label);
+    if (currentState.last_error_code) {
+      // The client already recorded the outcome; report it and retry it unless
+      // it is one only the user can resolve.
+      this.noteAutomaticFailure(currentState.last_error_code);
+      this.setPersistedStatus(currentState);
       await this.client.reportDeviceStatus().catch(() => undefined);
       return;
     }
-    this.clearTransientSyncFailures();
     await this.client.markBlocked("sync_error");
-    this.setStatus((await this.client.readState()).status_label, { notify: false });
+    this.noteAutomaticFailure("sync_error");
+    this.setPersistedStatus(await this.client.readState(), { notify: false });
     await this.client.reportDeviceStatus().catch(() => undefined);
   }
 
@@ -1345,9 +1460,21 @@ module.exports = class ObtsPlugin extends Plugin {
     }
     await this.client.reconcileDeviceBlocked(true, error.code);
     this.clearTransientSyncFailures();
-    this.setStatus((await this.client.readState()).status_label);
+    this.setPersistedStatus(await this.client.readState());
     await this.client.reportDeviceStatus().catch(() => undefined);
     return true;
+  }
+
+  // A terminal outcome clears the retry schedule: another attempt cannot
+  // succeed before the user acts. Everything else backs off exponentially so a
+  // transient failure is retried instead of latching, and never faster than
+  // the background interval.
+  noteAutomaticFailure(code) {
+    if (isTerminalSyncError(code)) {
+      this.clearTransientSyncFailures();
+      return;
+    }
+    this.recordTransientSyncFailure();
   }
 
   recordTransientSyncFailure() {
@@ -1372,7 +1499,7 @@ module.exports = class ObtsPlugin extends Plugin {
     let completed = false;
     try {
       const result = await fn();
-      this.setStatus((await this.client.readState()).status_label);
+      this.setPersistedStatus(await this.client.readState());
       completed = true;
       return result;
     } catch (error) {
@@ -1402,7 +1529,7 @@ module.exports = class ObtsPlugin extends Plugin {
       const code = preserveError ? handledError.code : "sync_error";
       await this.client.markBlocked(code, preserveError ? handledError.details : undefined);
       const blockedState = await this.client.readState();
-      this.setStatus(blockedState.status_label, { notify: preserveError });
+      this.setPersistedStatus(blockedState, { notify: preserveError });
       await this.client.reportDeviceStatus().catch(() => undefined);
       if (showNotice && (!preserveError || shouldShowRoutineStatusNotice(blockedState.status_label))) {
         new Notice(message);
@@ -3486,7 +3613,7 @@ class ObtsObsidianClient {
       changed_paths: Array.from(new Set([...(current.changed_paths || []), ...changedPaths])).sort(),
       updated_at: nowIso()
     }));
-    if (state.last_error_code && !isRetryableLocalError(state.last_error_code)) return;
+    if (state.last_error_code && !isTerminalSyncError(state.last_error_code)) return;
     const hasCommittedLocal = Boolean(
       queue.pending_commit || (state.local_head && state.local_head !== state.local_main)
     );
@@ -12514,11 +12641,15 @@ class ObtsObsidianClient {
 
   async markBlocked(code, details = undefined) {
     if (code === "blocked_integrity") this.vaultStatusObservation += 1;
+    const now = nowIso();
     await this.writeState(Object.assign({}, await this.readState(), {
       status_label: blockStatusLabel(code, details),
       last_error_code: code,
       last_error_details: details || null,
-      updated_at: nowIso()
+      // The observation time survives later metadata refreshes, so a failure
+      // from an earlier session is never presented as the current state.
+      last_error_at: now,
+      updated_at: now
     }));
     await this.reportDeviceStatus().catch(() => undefined);
   }
@@ -13612,6 +13743,17 @@ function formatElapsed(milliseconds) {
   return `${hours}h ${minutes % 60}m`;
 }
 
+// Compact age for a persisted failure footnote: "2h", "45m", "3d".
+function formatStatusAge(milliseconds) {
+  const seconds = Math.max(0, Math.floor(milliseconds / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
+}
+
 function formatBytes(value) {
   if (value < 1024) return `${value} B`;
   const units = ["KB", "MB", "GB", "TB"];
@@ -14493,8 +14635,16 @@ function sameCachedScanFileMetadata(current, cached) {
     current.mtime === cached.mtime;
 }
 
-function isRetryableLocalError(code) {
-  return code === "local_snapshot_changed" || code === "upload_interrupted" || code === "pack_preparation_failed" || code === "git_error" || code === "server_git_error" || code === "server_processing_error" || code === "stale_directory_proposal_base" || code === "directory_acknowledgement_missing" || code === "invalid_path" || code === "path_collision" || code === "excluded_git_path" || code === "excluded_internal_path" || code === "excluded_path" || code === "unsupported_file_mode" || code === "rename_endpoint_ignored" || code === "unportable_target_paths";
+function isTerminalSyncError(code) {
+  return typeof code === "string" && TERMINAL_SYNC_ERROR_CODES.has(code);
+}
+
+// Mobile platforms suspend a backgrounded app, so automatic attempts wait for
+// the resume path. A desktop window that is hidden, minimized, or on another
+// virtual desktop keeps syncing: on Wayland none of those mean the device is
+// unavailable, and treating them as one left a device silently behind.
+function backgroundSyncSuppressedByVisibility() {
+  return Boolean(Platform && Platform.isMobile) && typeof document !== "undefined" && document.hidden === true;
 }
 
 function isOfflineTransportError(error) {
@@ -15744,6 +15894,7 @@ module.exports.unportableTargetPathsMessage = unportableTargetPathsMessage;
 module.exports.ObtsClientCore = ObtsObsidianClient;
 module.exports.PluginBlockedError = ObtsBlockedError;
 module.exports.TransportError = ObtsTransportError;
+module.exports.isTerminalSyncError = isTerminalSyncError;
 module.exports.buildTroubleshootingDiagnostic = buildTroubleshootingDiagnostic;
 module.exports.localSyncFailureExplanation = localSyncFailureExplanation;
 
