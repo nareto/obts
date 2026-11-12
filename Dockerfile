@@ -1,4 +1,4 @@
-FROM node:24-bookworm-slim AS build
+FROM --platform=$BUILDPLATFORM node:24-bookworm-slim AS build
 
 WORKDIR /app
 COPY package.json package-lock.json ./
@@ -10,7 +10,12 @@ COPY frontend ./frontend
 COPY obsidian-plugin ./obsidian-plugin
 COPY scripts ./scripts
 RUN npm run build
-RUN npm prune --omit=dev
+
+FROM node:24-bookworm-slim AS prod-deps
+
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 
 FROM node:24-bookworm-slim AS runtime
 
@@ -25,7 +30,7 @@ ENV NODE_ENV=production \
 
 WORKDIR /app
 COPY --from=build /app/package.json /app/package-lock.json ./
-COPY --from=build /app/node_modules ./node_modules
+COPY --from=prod-deps /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY openapi ./openapi
 COPY docs ./docs
