@@ -2410,16 +2410,6 @@ export class SyncService {
         }
       });
       commitDirectoryPlan(db, vaultId, deviceId, deviceCommit, directoryPlan, event.event_seq);
-      db.audit_log.push({
-        audit_id: newId('aud'),
-        actor_user_id: device.user_id,
-        actor_device_id: deviceId,
-        vault_id: vaultId,
-        action: 'main_advanced',
-        resource_class: 'vault',
-        resource_id: vaultId,
-        created_at: nowIso()
-      });
       return event.event_seq;
     });
     return {
@@ -2672,16 +2662,6 @@ export class SyncService {
         }
       });
       commitDirectoryPlan(db, vaultId, deviceId, deviceCommit, directoryPlan, event.event_seq);
-      db.audit_log.push({
-        audit_id: newId('aud'),
-        actor_user_id: device.user_id,
-        actor_device_id: deviceId,
-        vault_id: vaultId,
-        action: 'main_advanced',
-        resource_class: 'vault',
-        resource_id: vaultId,
-        created_at: nowIso()
-      });
       return event.event_seq;
     });
 
@@ -3217,16 +3197,6 @@ export class SyncService {
         }
       });
       commitDirectoryPlan(db, vaultId, deviceId, deviceCommit, directoryPlan, event.event_seq);
-      db.audit_log.push({
-        audit_id: newId('aud'),
-        actor_user_id: device.user_id,
-        actor_device_id: deviceId,
-        vault_id: vaultId,
-        action: 'main_advanced',
-        resource_class: 'vault',
-        resource_id: vaultId,
-        created_at: nowIso()
-      });
       return event.event_seq;
     });
 

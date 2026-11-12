@@ -255,8 +255,18 @@ describe('change-proportional server work', () => {
 
   it('integrates a one-file push inside clone, persist and Git command budgets', async () => {
     const f = await fixture();
+    const auditBefore = await f.server.store.read((db) => db.audit_log.length);
+    const mainAdvancedAuditBefore = await f.server.store.read(
+      (db) => db.audit_log.filter((row) => row.action === 'main_advanced').length
+    );
     const result = await pushOneFile(f);
     expect(result.status).toBe('merged');
+    // The per-push audit duplicate of the `main_advanced` event is not written: the event and the
+    // immutable merge commit already record the same transition and actor, so the push adds no
+    // audit row at all.
+    const auditAfter = await f.server.store.read((db) => db.audit_log);
+    expect(auditAfter.length).toBe(auditBefore);
+    expect(auditAfter.filter((row) => row.action === 'main_advanced')).toHaveLength(mainAdvancedAuditBefore);
     const line = f.logLines.filter((entry) => entry.event === 'push_integrated').at(-1)!;
     // Eight durable boundaries: push admission and prepared state, the live transition refresh, the
     // device ref commit, merge preparation and target, the merge commit, and the history handoff pair.

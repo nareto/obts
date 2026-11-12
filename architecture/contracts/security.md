@@ -14,7 +14,7 @@ This is not true E2EE or zero knowledge. A compromised live process, malicious d
 - Cross-owner vault-resource requests return `404` without useful existence leakage.
 - Disabling a user revokes sessions, pending/approved connections, device tokens, and event streams. Every send on an owner dashboard stream rechecks current session/account authority; it cannot serve a stale private snapshot after disablement, revocation, logout, expiry, or metadata/dependency unavailability.
 - Revoking administrator status must not remove the final enabled administrator.
-- User creation/disable/enable, administrator grant/revoke, reset-token creation, login, connection approval/completion, failed authentication, token rotation, and revocation write redacted audit records.
+- User creation/disable/enable, administrator grant/revoke, reset-token creation, login, connection approval/completion, failed authentication, token rotation, and revocation write redacted audit records. Those records are bounded only by the declared retention policy in `OBTS-PER-RETENTION-001`: they are kept for one year within a 20,000-row ceiling that ordinary traffic cannot reach, and no operational retention shortcut may drop them sooner.
 - Revoking a device or rotating its token takes effect server-side immediately; local credential deletion is best-effort cleanup. Revocation is sticky: a device with `revoked_at` set always has status `revoked`, enforced at the metadata commit boundary, so sync completions authenticated before the revoke cannot un-revoke it.
 
 ## Dashboard Sessions

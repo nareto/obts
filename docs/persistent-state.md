@@ -141,9 +141,11 @@ operator can still reach diagnostics and repair controls while one vault is
 blocked. Device-status responses advertise the repaired active state so queued
 clients can perform a fresh scan and resume without reset or reconnect.
 
-Event rows are retained for 30 days or 100,000 events per vault. Clients that
-resume from an older pruned cursor receive `410 event_cursor_expired` and must
-refresh vault state before polling from an available cursor.
+Event rows are retained within a seven-day age window and a 1,500-event
+per-vault count cap. Clients that resume from an older pruned cursor receive
+`410 event_cursor_expired` and must refresh vault state before polling from an
+available cursor. Audit rows are retained for one year within a 20,000-row
+ceiling, and the retired per-push `main_advanced` duplicate is not written.
 
 Operation history is retained indefinitely for retry and admission replay;
 its cold SQLite storage can continue to grow even though completed rows leave

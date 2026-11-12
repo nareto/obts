@@ -17,8 +17,22 @@ import type {
   NoteHistoryVersion
 } from '../shared/types.js';
 
-const EVENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
-const EVENT_RETENTION_LIMIT = 100_000;
+// Retained event history is the incremental replay window for device catch-up plus the directory
+// intents the retention checkpoint has not folded yet. It is not a log of record: Git history is, and
+// a cursor below the window receives `410 event_cursor_expired` and refreshes through the documented
+// path. Both bounds are upper limits, so the shorter window wins and the steady-state file stays
+// proportional to the count cap instead of to uptime.
+const EVENT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const EVENT_RETENTION_LIMIT = 1_500;
+// Audit rows are durable operator evidence, not a replay log, so they are kept far longer than
+// events. The security contract requires the records; it does not require them forever, and
+// unbounded retention was the second largest metadata key after the events themselves.
+const AUDIT_RETENTION_MS = 365 * 24 * 60 * 60 * 1000;
+const AUDIT_RETENTION_LIMIT = 20_000;
+// One row per device push duplicated the `main_advanced` event and immutable Git history, which both
+// already record the same transition with the same actor. The rows are no longer written and any
+// existing rows are retired on load.
+const RETIRED_AUDIT_ACTIONS: ReadonlySet<string> = new Set(['main_advanced']);
 const MAX_OPEN_OPERATION_HISTORY_LEDGERS = 16;
 
 // Metadata temp residue is only removed when its name matches a naming scheme this
@@ -1032,6 +1046,7 @@ export class MetadataStore {
     };
     db.events.push(envelope);
     this.pruneVaultEvents(db, event.vault_id);
+    this.pruneAuditLog(db);
     return envelope;
   }
 
@@ -1350,6 +1365,14 @@ export class MetadataStore {
         changed = true;
       }
     }
+    // Retention runs on the state this load already owns, before the first publication, so an
+    // oversized file left by an earlier release shrinks on the first startup instead of on the
+    // first write. It runs last because the device and checkpoint migrations above read events.
+    if (retireOperationalAuditRows(db)) changed = true;
+    if (this.pruneAuditLog(db, true)) changed = true;
+    for (const vault of db.vaults) {
+      if (this.pruneVaultEvents(db, vault.vault_id)) changed = true;
+    }
     return changed;
   }
 
@@ -1367,31 +1390,85 @@ export class MetadataStore {
 
   /**
    * Retention removes only a contiguous prefix of the vault's events and folds that prefix's directory
-   * intents into the vault's directory checkpoint in the same metadata transaction.
+   * intents into the vault's directory checkpoint in the same metadata transaction. It runs inside an
+   * existing mutation and is amortized: the scan is bounded by the retention count cap, never by uptime.
    */
-  private pruneVaultEvents(db: MetadataDb, vaultId: string): void {
-    const cutoff = Date.now() - EVENT_RETENTION_MS;
+  private pruneVaultEvents(db: MetadataDb, vaultId: string): boolean {
     const vaultEvents = db.events.filter((event) => event.vault_id === vaultId);
-    const retainedVaultEvents = vaultEvents
-      .filter((event) => {
-        const createdAt = Date.parse(event.created_at);
+    if (vaultEvents.length === 0) return false;
+    const retainFrom = eventRetentionFloor(vaultEvents);
+    const prunedEvents = vaultEvents
+      .filter((event) => event.event_seq < retainFrom)
+      .sort((left, right) => left.event_seq - right.event_seq);
+    if (prunedEvents.length === 0) return false;
+    foldDirectoryCheckpoint(db, vaultId, prunedEvents);
+    db.events = db.events.filter((event) => event.vault_id !== vaultId || event.event_seq >= retainFrom);
+    return true;
+  }
+
+  /**
+   * Audit age and count retention. Rows are appended in order, so the write path checks both bounds
+   * against the oldest row and the log length and only scans once a bound is exceeded; a load passes
+   * `rescan` because it applies retention once for a file written by an earlier release.
+   */
+  private pruneAuditLog(db: MetadataDb, rescan = false): boolean {
+    const oldest = db.audit_log[0];
+    if (oldest === undefined) return false;
+    const cutoff = Date.now() - AUDIT_RETENTION_MS;
+    const oldestCreatedAt = Date.parse(oldest.created_at);
+    const expired = Number.isFinite(oldestCreatedAt) && oldestCreatedAt < cutoff;
+    if (!rescan && !expired && db.audit_log.length <= AUDIT_RETENTION_LIMIT) return false;
+    const retained = db.audit_log
+      .filter((row) => {
+        // An undatable record is retained: retention never discards evidence it cannot place in time.
+        const createdAt = Date.parse(row.created_at);
         return Number.isNaN(createdAt) || createdAt >= cutoff;
       })
-      .slice(-EVENT_RETENTION_LIMIT);
-    const oldestRetainedSeq = retainedVaultEvents.reduce(
-      (oldest, event) => Math.min(oldest, event.event_seq),
-      (db.event_seq_by_vault[vaultId] ?? 0) + 1
-    );
-    const prunedEvents = vaultEvents
-      .filter((event) => event.event_seq < oldestRetainedSeq)
-      .sort((left, right) => left.event_seq - right.event_seq);
-    if (prunedEvents.length === 0) return;
-    foldDirectoryCheckpoint(db, vaultId, prunedEvents);
-    db.events = db.events.filter((event) => event.vault_id !== vaultId || event.event_seq >= oldestRetainedSeq);
+      .slice(-AUDIT_RETENTION_LIMIT);
+    if (retained.length === db.audit_log.length) return false;
+    db.audit_log = retained;
+    return true;
   }
 }
 
 type CheckpointDirectoryIntent = { op: 'create' | 'delete'; path: string };
+
+/**
+ * Lowest event sequence a vault retains: the shorter of the age window and the per-vault count cap.
+ *
+ * Deliberately independent of device state. A device cursor cannot extend the window without making
+ * retention unbounded per device or dependent on rows that outlive the device, and at the write rates
+ * this repository is sized for the count cap already decides the window (1,500 events is a couple of
+ * days), so a cursor-based extension could only ever retain events for a device that is about to
+ * refresh anyway. A cursor below the window takes the existing `410 event_cursor_expired` path.
+ */
+function eventRetentionFloor(vaultEvents: EventEnvelope[]): number {
+  const cutoff = Date.now() - EVENT_RETENTION_MS;
+  let newestSeq = 0;
+  let ageFloor = Number.POSITIVE_INFINITY;
+  for (const event of vaultEvents) {
+    if (event.event_seq > newestSeq) newestSeq = event.event_seq;
+    const createdAt = Date.parse(event.created_at);
+    // An undatable event is retained, exactly as before: retention never drops what it cannot date.
+    if ((Number.isNaN(createdAt) || createdAt >= cutoff) && event.event_seq < ageFloor) ageFloor = event.event_seq;
+  }
+  // Event sequences are dense per vault (one increment per append, only whole prefixes are pruned),
+  // so the count cap is a cursor difference rather than a sort of the retained window.
+  const countFloor = newestSeq - EVENT_RETENTION_LIMIT + 1;
+  return Math.max(countFloor, ageFloor);
+}
+
+/**
+ * Retires audit rows that only duplicated another durable record. Removing them is safe because the
+ * same transition stays recorded by the vault event log and by immutable Git history, and neither the
+ * security nor the persistence contract requires an audit row for it.
+ */
+function retireOperationalAuditRows(db: MetadataDb): boolean {
+  const retained = db.audit_log.filter((row) => !RETIRED_AUDIT_ACTIONS.has(row.action));
+  if (retained.length === db.audit_log.length) return false;
+  db.audit_log = retained;
+  return true;
+}
 
 function eventDirectoryIntents(event: { payload: Record<string, unknown> }): CheckpointDirectoryIntent[] {
   const rawIntents = event.payload.directory_intents;

@@ -5550,6 +5550,43 @@ describe('Phase 1 sync without conflict resolution', () => {
         after: 0
       })
     ).rejects.toMatchObject({ status: 410, code: 'event_cursor_expired' });
+
+    // A device that has been offline for two days is still inside the retained window, so it catches
+    // up from its own cursor instead of paying for a full state refresh.
+    await server.store.mutate((db) => {
+      for (const event of db.events.filter((candidate) => candidate.vault_id === admin.vaultId)) {
+        event.created_at = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+      }
+    });
+    await writeFile(join(device1Dir, 'two-days-later.md'), 'caught up from events\n');
+    expect((await plugin1.syncOnce()).status).toBe('Synced');
+    const caughtUp = await plugin2.pollRemoteEventsAndApply();
+    expect(caughtUp).toMatchObject({ applied: true });
+    expect(await readFile(join(device2Dir, 'two-days-later.md'), 'utf8')).toBe('caught up from events\n');
+
+    // A cursor that falls out of the retained window recovers through the documented refresh path and
+    // still applies the new main; the retained window is bounded by the per-vault event count.
+    await writeFile(join(device1Dir, 'after-expiry.md'), 'retained advance\n');
+    expect((await plugin1.syncOnce()).status).toBe('Synced');
+    const beforeExpiry = (await plugin2.readState()).last_event_seq;
+    await server.store.mutate((db) => {
+      for (let index = 0; index < 1_600; index += 1) {
+        server.store.appendEvent(db, {
+          event_type: 'device_state_changed',
+          vault_id: admin.vaultId,
+          resource_ids: {},
+          commit_cursors: {},
+          payload: { status: 'checking' }
+        });
+      }
+    });
+    const retained = await server.store.snapshot();
+    expect(Math.min(...retained.events.filter((event) => event.vault_id === admin.vaultId).map((event) => event.event_seq)))
+      .toBeGreaterThan(beforeExpiry);
+    const recovered = await plugin2.pollRemoteEventsAndApply();
+    expect(recovered).toMatchObject({ applied: true });
+    expect(await readFile(join(device2Dir, 'after-expiry.md'), 'utf8')).toBe('retained advance\n');
+    expect((await plugin2.readState()).last_event_seq).toBeGreaterThan(beforeExpiry);
   });
 
   it('blocks sync on restart when an incomplete apply journal cannot be replayed', async () => {
