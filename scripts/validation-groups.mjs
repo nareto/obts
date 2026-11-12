@@ -23,6 +23,7 @@ export const pluginTests = [
   'tests/plugin-hinted-capture.test.ts',
   'tests/sync-delta-catchup.test.ts',
   'tests/plugin-background-catchup.test.ts',
+  'tests/plugin-mobile-suspension.test.ts',
   'tests/plugin-ancestry-memo.test.ts',
   'tests/plugin-apply-progress.test.ts',
   'tests/plugin-committed-tail-recovery.test.ts',

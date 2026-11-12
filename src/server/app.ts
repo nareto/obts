@@ -910,7 +910,7 @@ export async function createObtsServer(
           const dashboardStatus = isDeviceRevoked(device) ? 'revoked' : device.status;
           const behindMain = dashboardStatus === 'synced' && device.last_applied_main !== vault.current_main;
           const offline = device.last_seen_at !== null && Date.now() - Date.parse(device.last_seen_at) > 24 * 60 * 60 * 1000;
-          const localStatusFresh = isFreshDeviceStatus(device.last_status_report_at);
+          const localStatusFresh = isFreshDeviceStatus(device.last_status_report_at, device.local_status_label);
           const staleDeviceBlockReport = localStatusFresh && device.local_error_code === 'device_blocked';
           const localErrorCode = localStatusFresh && !staleDeviceBlockReport ? safeReportedErrorCode(device.local_error_code) : null;
           const localStatusLabel = localStatusFresh && !staleDeviceBlockReport
@@ -3132,7 +3132,7 @@ const NORMALIZED_ACTIVE_STATUS = new RegExp(String.raw`^(?:${ACTIVE_STATUS_BASES
 function safeReportedStatusLabel(label: string | null, errorCode: string | null): string {
   if (errorCode) return normalizedLocalDashboardLabel(label, errorCode);
   if (label === 'Unsafe local state' || label === 'Review needed' || label === 'Needs recovery') return 'Out of sync';
-  if (label && ['Synced', 'Ahead', 'Behind', 'Offline', 'Out of sync', 'Blocked', 'Server repair required', 'Out of sync — file exceeds upload limit', 'Out of sync — upload limit exceeded', 'Out of sync — local recovery required', 'Out of sync — file names need repair'].includes(label)) return label;
+  if (label && ['Synced', 'Ahead', 'Behind', 'Offline', 'Out of sync', 'Blocked', 'Server repair required', 'Paused', 'Out of sync — file exceeds upload limit', 'Out of sync — upload limit exceeded', 'Out of sync — local recovery required', 'Out of sync — file names need repair'].includes(label)) return label;
   const inventory = label?.match(/^(Applying \(listing vault files\)) [0-9]+ files · [0-9]+ directories( \(taking longer than expected\))?$/u);
   if (inventory) label = `${inventory[1]}${inventory[2] ?? ''}`;
   const active = label?.match(REPORTED_ACTIVE_STATUS);
@@ -4972,20 +4972,28 @@ function normalizedLocalDashboardLabel(label: string | null, code: string | null
   if (code && ['git_error', 'server_git_error', 'server_processing_error'].includes(code)) return 'Server retrying';
   if (code) return 'Out of sync';
   if (label === 'Review needed' || label === 'Unsafe local state' || label === 'Needs recovery') return 'Out of sync';
-  if (label && ['Out of sync', 'Out of sync — file exceeds upload limit', 'Out of sync — upload limit exceeded', 'Out of sync — local recovery required', 'Out of sync — file names need repair', 'Blocked', 'Offline', 'Ahead', 'Behind', 'Server repair required'].includes(label)) return label;
+  if (label && ['Out of sync', 'Out of sync — file exceeds upload limit', 'Out of sync — upload limit exceeded', 'Out of sync — local recovery required', 'Out of sync — file names need repair', 'Blocked', 'Offline', 'Ahead', 'Behind', 'Server repair required', 'Paused'].includes(label)) return label;
   if (label && NORMALIZED_ACTIVE_STATUS.test(label)) return label;
   const progressBase = localStatusBaseLabel(label);
   if (progressBase && ['Verifying contents', 'Preparing upload', 'Uploading', 'Applying', 'Checking', 'Merging', 'Server retrying', 'Repairing baseline', 'Finishing update', 'Waiting for operation'].includes(progressBase)) return progressBase;
   return 'Out of sync';
 }
 
-function isFreshDeviceStatus(reportedAt: string | null): boolean {
-  return reportedAt !== null && Date.now() - Date.parse(reportedAt) <= 5 * 60 * 1000;
+const DEVICE_STATUS_FRESH_MS = 5 * 60 * 1000;
+// A suspended client reported a state that lasts until it runs again
+// (OBTS-SYNC-SUSPEND-001), so the ordinary progress window does not make its
+// report stale; the offline threshold still does.
+const SUSPENDED_DEVICE_STATUS_MS = 24 * 60 * 60 * 1000;
+
+function isFreshDeviceStatus(reportedAt: string | null, label: string | null = null): boolean {
+  if (reportedAt === null) return false;
+  const window = label === 'Paused' ? SUSPENDED_DEVICE_STATUS_MS : DEVICE_STATUS_FRESH_MS;
+  return Date.now() - Date.parse(reportedAt) <= window;
 }
 
 function localStatusBaseLabel(label: string | null): string | null {
   if (label === null) return null;
-  for (const base of ['Verifying contents', 'Preparing upload', 'Uploading', 'Applying', 'Checking', 'Merging', 'Server retrying', 'Repairing baseline', 'Finishing update', 'Waiting for operation']) {
+  for (const base of ['Verifying contents', 'Preparing upload', 'Uploading', 'Applying', 'Checking', 'Merging', 'Server retrying', 'Repairing baseline', 'Finishing update', 'Waiting for operation', 'Paused']) {
     if (label === base || label.startsWith(`${base} `)) return base;
   }
   return label;
@@ -5014,6 +5022,7 @@ function isLocalStatusOverride(label: string | null, errorCode: string | null): 
       base === 'Repairing baseline' ||
       base === 'Finishing update' ||
       base === 'Waiting for operation' ||
+      base === 'Paused' ||
       base === 'Behind' ||
       base === 'Offline' ||
       base === 'Ahead' ||

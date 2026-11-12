@@ -1,5 +1,6 @@
 export type StatusLabel =
   | 'Synced'
+  | 'Paused'
   | 'Deleting'
   | 'Preparing upload'
   | 'Uploading'
@@ -231,7 +232,7 @@ export type SyncTimingAttempt = {
 export type DiagnosticEvent = DiagnosticEventBase & (
   | { schema_version: 1 }
   | { schema_version: 2; context: TroubleshootingDiagnosticContext }
-  | { schema_version: 3; phase: string; phase_id: string; observation: 'stalled' | 'completed' | 'abandoned'; elapsed_bucket: 'under_30s' | '30s_to_1m' | '1m_to_5m' | '5m_to_15m' | 'over_15m' }
+  | { schema_version: 3; phase: string; phase_id: string; observation: 'stalled' | 'completed' | 'abandoned' | 'interrupted'; elapsed_bucket: 'under_30s' | '30s_to_1m' | '1m_to_5m' | '5m_to_15m' | 'over_15m' }
   | { schema_version: 4; batch_id: string; attempts: SyncTimingAttempt[] }
 );
 

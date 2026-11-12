@@ -2539,7 +2539,7 @@ components:
               pattern: "^dph_[0-9a-f]{32}$"
             observation:
               type: string
-              enum: [stalled, completed, abandoned]
+              enum: [stalled, completed, abandoned, interrupted]
             elapsed_bucket:
               type: string
               enum: [under_30s, 30s_to_1m, 1m_to_5m, 5m_to_15m, over_15m]
@@ -2764,7 +2764,7 @@ components:
         local_status_label:
           type: string
           maxLength: 80
-          description: Accepted display states and coarse operation-progress buckets are retained; exact counts, unknown values, and legacy labels are normalized before storage and dashboard output.
+          description: Accepted display states, the `Paused` suspension state, and coarse operation-progress buckets are retained; exact counts, unknown values, and legacy labels are normalized before storage and dashboard output.
         local_error_code:
           description: Only allowlisted safe codes are retained; unknown values become sync_error. No paths, object IDs, sizes, or exception messages.
           oneOf:

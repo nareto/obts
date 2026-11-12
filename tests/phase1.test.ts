@@ -2257,6 +2257,63 @@ describe('Phase 1 sync without conflict resolution', () => {
     });
   });
 
+  it('reports a backgrounded device as paused instead of synced', async () => {
+    const admin = await setupAdminAndVault(baseUrl);
+    const deviceDir = join(root, 'paused-status-device');
+    await mkdirp(deviceDir);
+    const plugin = await pairPlugin(admin, deviceDir, 'paused-phone');
+    const state = await plugin.readState();
+    const token = JSON.parse(await readFile(join(deviceDir, '.obts', 'auth', 'device-token.json'), 'utf8')) as {
+      device_token: string;
+    };
+
+    // The suspended client reports Paused through the ordinary device-status
+    // endpoint; the server must keep that distinct state instead of
+    // normalizing it to a failure or a converged label.
+    const statusResponse = await fetch(`${baseUrl}/api/v1/vaults/${admin.vaultId}/sync/device-status`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token.device_token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        plugin_version: RECOMMENDED_PLUGIN_VERSION,
+        local_status_label: 'Paused',
+        local_error_code: null,
+        local_queue_status: 'queued_local',
+        local_main: state.local_main,
+        local_head: state.local_head
+      })
+    });
+    expect(statusResponse.status).toBe(200);
+
+    // Suspension lasts longer than the progress-report window: the reported
+    // pause keeps overriding the server-derived label.
+    await server.store.mutate((db) => {
+      const device = db.devices.find((candidate) => candidate.device_name === 'paused-phone');
+      expect(device).toBeDefined();
+      device!.last_status_report_at = new Date(Date.now() - 6 * 60 * 1000).toISOString();
+    });
+    const paused = await admin.get<{
+      devices: Array<{ device_name: string; status_label: string; local_status_label: string | null; status_report_fresh: boolean }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+    expect(paused.body.devices.find((device) => device.device_name === 'paused-phone')).toMatchObject({
+      status_label: 'Paused',
+      local_status_label: 'Paused',
+      status_report_fresh: true
+    });
+
+    // Past the offline threshold the report is history again, and the dashboard
+    // never turns that history into a claimed convergence.
+    await server.store.mutate((db) => {
+      const device = db.devices.find((candidate) => candidate.device_name === 'paused-phone');
+      device!.last_status_report_at = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+    });
+    const expired = await admin.get<{
+      devices: Array<{ device_name: string; status_label: string }>;
+    }>(`/api/v1/vaults/${admin.vaultId}/dashboard`);
+    const expiredLabel = expired.body.devices.find((device) => device.device_name === 'paused-phone')!.status_label;
+    expect(expiredLabel).not.toBe('Paused');
+    expect(expiredLabel).not.toBe('Synced');
+  });
+
   it('treats the terminal merged queue state as converged during rolling upgrades', async () => {
     const admin = await setupAdminAndVault(baseUrl);
     const deviceDir = join(root, 'merged-status-device');

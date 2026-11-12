@@ -23288,6 +23288,8 @@ var SYNC_TIMING_REJECTION_COOLDOWN_MS = 6 * 60 * 60 * 1e3;
 var SYNC_TIMING_TRIGGERS = /* @__PURE__ */ new Set(["startup", "interval", "visibility", "watcher", "user", "headless"]);
 var SYNC_TIMING_SCAN_MODES = ["none", "hinted", "incremental", "full"];
 var SYNC_TIMING_APPLY_MODES = ["none", "ref_only", "delta", "full"];
+var SUSPENSION_PUSH_MAX_PATHS = 8;
+var SUSPENSION_PUSH_MAX_BYTES = 512 * 1024;
 var SYNC_TIMING_ERROR_CODES = /* @__PURE__ */ new Set(["none", "device_blocked", "conflict_review_required", "server_recovery_required", "blocked_integrity", "device_revoked", "device_identity_mismatch", "not_paired", "sync_lease_blocked", "operation_interrupted_by_reload", "local_state_incomplete", "same_device_non_fast_forward", "apply_recovery_required", "apply_journal_recovery_required", "onboarding_context_required", "onboarding_identity_mismatch", "onboarding_snapshot_changed", "invalid_transfer_checkpoint", "applied_main_acknowledgement_failed", "recovery_evidence_missing", "recovery_checksum_mismatch", "recovery_identity_mismatch", "recovery_target_policy_mismatch", "recovery_state_corrupt", "catchup_recovery_required", "catchup_local_changes", "local_files_diverge_from_journal", "local_changed_during_apply", "preflight_hash_changed", "recovery_bundle_failed", "directory_recovery_decision_required", "directory_recovery_changed", "directory_recovery_journal_invalid", "object_too_large_for_chunk", "unportable_target_paths", "pack_preparation_failed", "network_error", "http_error", "sync_error", "unknown"]);
 var DIAGNOSTIC_POINTS = /* @__PURE__ */ new Set(["onboarding_approved", "bootstrap_response", "multipart_pack", "pack_persist_write", "pack_persist_read", "index_fs_stat", "index_fs_read_file", "index_fs_read", "index_fs_write", "index_pack", "sync_request", "sync_download", "onboarding_download", "transfer_checkpoint_verification", "apply", "apply_recovery_prepare", "apply_preflight_revalidate", "apply_write", "apply_verify", "apply_local_capture", "apply_finalize", "local_snapshot", "directory_inventory", "file_inventory_check", "local_preservation", "provenance", "upload_prepare", "upload_finalize", "recovery", "recovery_directory_decision", "startup_metadata", "startup_git", "startup_state", "recovery_journal", "recovery_target_commit", "recovery_target_tree", "recovery_file_validation", "recovery_bundle", "recovery_file_apply", "recovery_refs", "recovery_state"]);
 var DEFAULT_SETTINGS = {
@@ -23304,6 +23306,10 @@ module.exports = class ObtsPlugin extends Plugin {
     this.transientSyncFailures = 0;
     this.automaticRetryNotBefore = 0;
     this.queuedSyncTrigger = "watcher";
+    this.queuedSyncDispatch = "automatic";
+    this.wakeAttemptActive = false;
+    this.suspendedWithPendingWork = false;
+    this.suspendedPhase = null;
     this.sessionAttemptBaselineAt = Date.now();
     this.lastCheckingProgressAt = 0;
     this.isApplying = false;
@@ -23496,14 +23502,19 @@ module.exports = class ObtsPlugin extends Plugin {
       if (typeof this.registerDomEvent === "function" && typeof document !== "undefined") {
         this.registerDomEvent(document, "visibilitychange", () => {
           this.client?.noteSyncTimingVisibility?.(document.hidden === true);
-          if (document.hidden) return;
+          if (document.hidden) {
+            if (isMobilePlatform()) void this.handleMobileSuspension();
+            return;
+          }
           if (this.client && typeof this.client.scheduleInventoryAfterCatchUp === "function") this.client.scheduleInventoryAfterCatchUp();
-          void this.runBackgroundSync("visibility");
+          this.resumeFromMobileSuspension();
+          if (isMobilePlatform()) this.queueWakeSync("visibility");
+          else void this.runBackgroundSync("visibility");
         });
       }
       if (typeof this.registerDomEvent === "function" && typeof window !== "undefined") {
-        this.registerDomEvent(window, "focus", () => this.queueAutomaticSync("visibility"));
-        this.registerDomEvent(window, "online", () => this.queueAutomaticSync("visibility"));
+        this.registerDomEvent(window, "focus", () => this.queueWakeEvent());
+        this.registerDomEvent(window, "online", () => this.queueWakeEvent());
       }
     } catch (error) {
       this.unloaded = true;
@@ -24178,9 +24189,97 @@ module.exports = class ObtsPlugin extends Plugin {
   queueAutomaticSync(trigger = "visibility") {
     if (this.unloaded || !this.clientReady || backgroundSyncSuppressedByVisibility()) return;
     this.queuedSyncTrigger = trigger;
+    this.queuedSyncDispatch = "automatic";
     this.syncQueued = true;
     this.scheduleQueuedSync(SYNC_DEBOUNCE_MS);
     void this.showQueuedSyncStatus();
+  }
+  // Window focus and a reconnecting network can both arrive with the resume
+  // event. Mobile dispatches the burst immediately (the platform just returned
+  // the process), desktop keeps the ordinary coalescing debounce.
+  queueWakeEvent() {
+    if (isMobilePlatform()) this.queueWakeSync("visibility");
+    else this.queueAutomaticSync("visibility");
+  }
+  // A resumed app is ready to sync now: the platform froze whatever was running,
+  // so the visible attempt starts as soon as the current task yields instead of
+  // waiting out the watcher debounce. Every event of the same wake burst joins
+  // the one attempt that is queued or already running.
+  queueWakeSync(trigger = "visibility") {
+    if (this.unloaded || !this.clientReady || backgroundSyncSuppressedByVisibility()) return;
+    if (this.wakeAttemptActive) return;
+    this.wakeAttemptActive = true;
+    this.queuedSyncTrigger = trigger;
+    this.queuedSyncDispatch = "background";
+    this.syncQueued = true;
+    this.scheduleQueuedSync(0);
+    void this.showQueuedSyncStatus();
+  }
+  // Leaving the app is not a sync attempt. Android suspends the WebView
+  // shortly after this event, so only work that is cheap and durable runs here:
+  // hints are persisted, a small hinted change set is pushed, and the status
+  // reports Paused when work remains. No vault inventory and no apply start.
+  async handleMobileSuspension() {
+    if (this.unloaded || !this.clientReady) return;
+    this.client.beginSuspension();
+    this.suspendedPhase = this.noteSuspendedPhase();
+    let plan = null;
+    try {
+      await this.flushWatcherHints();
+    } catch {
+    }
+    try {
+      plan = await this.client.backgroundSuspensionPlan();
+      if (plan.pending && plan.within_budget && !this.isSyncInProgress()) {
+        await this.runSuspensionPush();
+        plan = await this.client.backgroundSuspensionPlan();
+      }
+    } catch {
+      plan = plan || { pending: true, within_budget: false };
+    }
+    this.suspendedWithPendingWork = Boolean(plan && plan.pending);
+    this.client.noteSuspendedPendingWork(this.suspendedWithPendingWork);
+    if (this.suspendedWithPendingWork) this.setStatus("Paused");
+    await this.client.reportDeviceStatus().catch(() => void 0);
+  }
+  // One bounded leave-time attempt through the ordinary sync lease: capture the
+  // durable hints and upload them, then stop. `suspendOnly` keeps the attempt
+  // from starting a vault scan or a remote apply the platform would freeze.
+  async runSuspensionPush() {
+    if (!this.beginSync("Checking", "visibility")) return;
+    let completed = false;
+    try {
+      await this.client.pushHintedChangesBeforeSuspend();
+      this.clearTransientSyncFailures();
+      this.setPersistedStatus(await this.client.readState());
+      completed = true;
+    } catch (error) {
+      completed = await this.handleAutomaticSyncError(error) === true;
+    } finally {
+      this.endSync(completed);
+    }
+  }
+  // Coming back from suspension releases the deferral so the resume attempt may
+  // apply a remote advance again, and reports the stage the freeze interrupted.
+  resumeFromMobileSuspension() {
+    const interrupted = this.suspendedPhase;
+    this.suspendedPhase = null;
+    const pending = this.suspendedWithPendingWork;
+    this.suspendedWithPendingWork = false;
+    this.client?.endSuspension?.();
+    if (interrupted) void this.reportInterruptedPhase(interrupted);
+    if (pending && !this.syncRunning) this.setStatus("Checking");
+  }
+  // The measured phase a freeze cut through is the interrupted stage; the
+  // diagnostic is emitted on resume, where delivery is reliable again.
+  noteSuspendedPhase() {
+    const phase = this.activeMeasuredPhase;
+    if (!phase || !this.syncRunning) return null;
+    return { point: phase.point, label: phase.label, phaseId: phase.phaseId, elapsedMs: Math.max(0, Date.now() - phase.startedAt) };
+  }
+  async reportInterruptedPhase(phase) {
+    if (!this.diagnosticSharingEnabled() || !DIAGNOSTIC_POINTS.has(phase.point)) return;
+    await this.reportOperationStall({ ...phase, observation: "interrupted" });
   }
   // "Checking" is only honest while the queued attempt can still make
   // progress: a terminal outcome keeps its attention status until the user
@@ -24295,10 +24394,14 @@ module.exports = class ObtsPlugin extends Plugin {
       return;
     }
     const trigger = this.queuedSyncTrigger || "watcher";
+    const dispatch = this.queuedSyncDispatch;
     this.queuedSyncTrigger = "watcher";
+    this.queuedSyncDispatch = "automatic";
     this.syncQueued = false;
-    await this.runAutomaticSync({}, trigger);
+    if (dispatch === "background") await this.runBackgroundSync(trigger);
+    else await this.runAutomaticSync({}, trigger);
     if (this.syncQueued) this.scheduleQueuedSync(0);
+    else this.wakeAttemptActive = false;
   }
   async flushOpenMarkdownEditorsToDisk(isUnreloadedView = null) {
     const workspace = this.app && this.app.workspace;
@@ -24807,6 +24910,8 @@ var ObtsObsidianClient = class {
     this.deviceStatusReporter = createDeviceStatusReporter({ send: (snapshot) => this.sendDeviceStatus(snapshot) });
     this.syncTimingAttempt = null;
     this.syncTimingSink = null;
+    this.suspendedAt = null;
+    this.suspendedPendingWork = false;
   }
   setSyncTimingSink(sink) {
     this.syncTimingSink = typeof sink === "function" ? sink : null;
@@ -24964,6 +25069,83 @@ var ObtsObsidianClient = class {
   // they schedule it without invalidating the delta fast paths.
   scheduleInventoryAfterCatchUp() {
     this.scheduledInventoryDue = true;
+  }
+  // OBTS-SYNC-SUSPEND-001: leaving the app is not an attempt. `beginSuspension`
+  // marks the platform as about to freeze this process, so an attempt already
+  // running finishes its current step and does not start an apply.
+  beginSuspension() {
+    if (this.suspendedAt === null) this.suspendedAt = Date.now();
+  }
+  endSuspension() {
+    this.suspendedAt = null;
+    this.suspendedPendingWork = false;
+  }
+  suspensionGatesApply() {
+    return this.suspendedAt !== null;
+  }
+  // OBTS-SYNC-SUSPEND-001: a suspended client finishes the step it is in and
+  // defers the work it cannot complete before the platform freezes it.
+  suspensionDeferral(options = {}) {
+    return Boolean(options.suspendOnly) || this.suspensionGatesApply();
+  }
+  // Only the plugin can see the queue, hints and scan schedule, so it decides
+  // whether work is pending; the client only reports that decision.
+  noteSuspendedPendingWork(pending) {
+    this.suspendedPendingWork = pending === true;
+  }
+  // Leave-time budget. The platform can freeze this process at any moment, so
+  // leaving pushes only what the durable hints already describe and can upload
+  // quickly; anything larger, or a vault scan, belongs to the resume attempt.
+  async backgroundSuspensionPlan() {
+    const [queue, state] = await Promise.all([this.readQueue(), this.readState()]);
+    let journal = null;
+    try {
+      journal = await readApplyJournalStrict(this.fsp, this.applyJournalPath);
+    } catch {
+      journal = { unreadable: true };
+    }
+    const candidates = new Set(queue.changed_paths || []);
+    const pendingCommit = typeof queue.pending_commit === "string" && queue.pending_commit.length > 0;
+    if (pendingCommit) {
+      try {
+        for (const filePath of await this.changedTreePaths(queue.pending_proposal_base || state.local_main, queue.pending_commit)) {
+          candidates.add(filePath);
+        }
+      } catch {
+        return { pending: true, within_budget: false, paths: candidates.size, bytes: 0 };
+      }
+    }
+    const localAhead = Boolean(state.local_main && state.local_head && state.local_head !== state.local_main);
+    const pending = pendingCommit || candidates.size > 0 || localAhead || journal !== null;
+    if (!pending) return { pending: false, within_budget: false, paths: 0, bytes: 0 };
+    if (journal !== null) return { pending: true, within_budget: false, paths: candidates.size, bytes: 0 };
+    if (!state.vault_id || !state.device_id || state.last_error_code) {
+      return { pending: true, within_budget: false, paths: candidates.size, bytes: 0 };
+    }
+    let bytes = 0;
+    for (const filePath of [...candidates].sort()) {
+      if (bytes > SUSPENSION_PUSH_MAX_BYTES) break;
+      try {
+        const stat = await this.adapter.stat(filePath);
+        if (stat && stat.type === "file" && Number.isFinite(stat.size)) bytes += Math.max(0, stat.size);
+      } catch {
+      }
+    }
+    const scanDecision = await this.backgroundScanDecision().catch(() => ({ required: true }));
+    const withinBudget = candidates.size <= SUSPENSION_PUSH_MAX_PATHS && candidates.size > 0 && bytes <= SUSPENSION_PUSH_MAX_BYTES && !scanDecision.required;
+    return { pending: true, within_budget: withinBudget, paths: candidates.size, bytes };
+  }
+  // OBTS-SYNC-SUSPEND-001: one bounded leave-time attempt. It captures the
+  // durable hints and uploads them, and never scans the vault or starts a
+  // remote apply, because the platform suspends the process mid-attempt.
+  async pushHintedChangesBeforeSuspend() {
+    return await this.performSyncOnce({ hintedCapture: true, suspendOnly: true });
+  }
+  // A suspended leave path stops before the work it cannot finish; the resume
+  // attempt owns the remote advance and the whole-vault inventory.
+  async deferredSuspensionResult() {
+    const state = await this.readState();
+    return { status: state.status_label, deferred: true };
   }
   fullInventoryCurrent() {
     return this.inventoryCompletedSeq >= this.inventoryRequestedSeq;
@@ -25991,6 +26173,7 @@ var ObtsObsidianClient = class {
       });
     }
     if (!heldQueue.pending_commit && heldEvidence.held_proposals.some((h) => h.commit === heldEvidence.accepted_proposal?.commit && ["merged", "noop"].includes(h.outcome))) {
+      if (this.suspensionDeferral(options)) return await this.deferredSuspensionResult();
       await this.pullAndApply(true);
       state = await this.readState();
     }
@@ -26014,12 +26197,14 @@ var ObtsObsidianClient = class {
         }));
         await this.reportDeviceStatus().catch(() => void 0);
       }
-      if (await this.catchUpBeforeScheduledInventory(queueBeforeScan, flushedPaths, options)) {
+      const suspensionDeferral = this.suspensionDeferral(options);
+      if (!suspensionDeferral && await this.catchUpBeforeScheduledInventory(queueBeforeScan, flushedPaths, options)) {
         const caughtUpState = await this.readState();
         await this.reportDeviceStatus().catch(() => void 0);
         return { status: caughtUpState.status_label, main: caughtUpState.local_main || void 0 };
       }
       const hinted = options.hintedCapture && !options.fullAudit ? await this.captureHintedLocalChanges(queueBeforeScan, flushedPaths) : null;
+      if (suspensionDeferral && !hinted) return await this.deferredSuspensionResult();
       this.noteSyncTimingScanMode(hinted ? "hinted" : options.fullAudit ? "full" : "incremental");
       let staleQueued = false;
       let pendingDirectoryIntents = [];
@@ -26090,7 +26275,7 @@ var ObtsObsidianClient = class {
       }
     }
     const postUploadState = await this.readState();
-    if (postUploadState.last_error_code !== "conflict_review_required") {
+    if (!this.suspensionDeferral(options) && postUploadState.last_error_code !== "conflict_review_required") {
       try {
         const applyOptions = { deltaApply: Boolean(options.hintedCapture && !options.fullAudit) };
         if (uploaded) {
@@ -26124,6 +26309,9 @@ var ObtsObsidianClient = class {
     return {
       status: finalState.status_label,
       main: finalState.local_main || void 0,
+      // A suspended leave attempt stops after the push; the remote advance and
+      // the vault inventory stay owed to the resume attempt.
+      ...this.suspensionDeferral(options) ? { deferred: true } : {},
       ...uploadResult && uploadResult.conflict_id ? { conflictId: uploadResult.conflict_id } : {}
     };
   }
@@ -31884,11 +32072,13 @@ var ObtsObsidianClient = class {
     const stateUpdatedAt = Date.parse(state.updated_at || "");
     const operationIsNewer = operation && (!Number.isFinite(stateUpdatedAt) || operation.progressUpdatedAt > stateUpdatedAt);
     const activeStatusLabel = operation && operation.availability === "busy" && operation.label && operationIsNewer && isReportableOperationStatus(operation.label) ? `${operation.label.replace(/^(Applying \(listing vault files\)) [0-9]+ files · [0-9]+ directories$/u, "$1")}${operation.slow ? " (taking longer than expected)" : ""}`.slice(0, 80) : normalizePersistedStatusLabel(state.status_label, state.last_error_code, state.last_error_details);
+    const suspendedLabel = this.suspendedAt !== null && this.suspendedPendingWork && !isTerminalSyncError(state.last_error_code) ? "Paused" : null;
+    const reportedStatusLabel = suspendedLabel || activeStatusLabel;
     const nameRevision = this.plugin.deviceNameRevision;
     const url = this.url(`/api/v1/vaults/${state.vault_id}/sync/device-status`);
     const body = JSON.stringify({
       plugin_version: PLUGIN_VERSION,
-      local_status_label: activeStatusLabel,
+      local_status_label: reportedStatusLabel,
       local_error_code: state.last_error_code,
       local_queue_status: queue.status,
       local_main: state.local_main,
@@ -35997,8 +36187,11 @@ function sameCachedScanFileMetadata(current, cached) {
 function isTerminalSyncError(code) {
   return typeof code === "string" && TERMINAL_SYNC_ERROR_CODES.has(code);
 }
+function isMobilePlatform() {
+  return Boolean(Platform && Platform.isMobile);
+}
 function backgroundSyncSuppressedByVisibility() {
-  return Boolean(Platform && Platform.isMobile) && typeof document !== "undefined" && document.hidden === true;
+  return isMobilePlatform() && typeof document !== "undefined" && document.hidden === true;
 }
 function isOfflineTransportError(error) {
   return error instanceof ObtsTransportError && error.status === 0;
@@ -36011,7 +36204,7 @@ function isPermanentTransportError(error) {
 }
 function statusBaseLabel(label) {
   const normalized = typeof label === "string" && label.trim().length > 0 ? label.trim() : "Checking";
-  for (const base of ["Checking", "Verifying contents", "Preparing upload", "Uploading", "Merging", "Server retrying", "Repairing baseline", "Applying", "Finishing update", "Waiting for operation"]) {
+  for (const base of ["Checking", "Verifying contents", "Preparing upload", "Uploading", "Merging", "Server retrying", "Repairing baseline", "Applying", "Finishing update", "Waiting for operation", "Paused"]) {
     if (normalized === base || normalized.startsWith(`${base} `)) return base;
   }
   return normalized;
@@ -36022,7 +36215,7 @@ function statusPresentation(label) {
   const action = base === "Conflict resolution needed" ? "Click to open the conflict dashboard." : "Click to open obts settings for details.";
   let tone = "neutral";
   if (base === "Synced") tone = "success";
-  else if (["Checking", "Verifying contents", "Preparing upload", "Uploading", "Applying", "Merging", "Server retrying", "Repairing baseline", "Finishing update", "Waiting for operation"].includes(base)) tone = "active";
+  else if (["Checking", "Verifying contents", "Preparing upload", "Uploading", "Applying", "Merging", "Server retrying", "Repairing baseline", "Finishing update", "Waiting for operation", "Paused"].includes(base)) tone = "active";
   else if (["Ahead", "Behind", "Offline", "Out of sync"].includes(base)) tone = "warning";
   else if (["Conflict resolution needed", "Out of sync \u2014 file exceeds upload limit", "Out of sync \u2014 upload limit exceeded", "Out of sync \u2014 local recovery required", "Out of sync \u2014 file names need repair", "Blocked", "Server repair required", "Integrity failure", "Recovery required", "Restart required"].includes(base)) tone = "danger";
   return {

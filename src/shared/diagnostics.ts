@@ -5,7 +5,7 @@ export const TROUBLESHOOTING_DIAGNOSTIC_SCHEMA_VERSION = 2 as const;
 export const PHASE_DIAGNOSTIC_SCHEMA_VERSION = 3 as const;
 export const SYNC_TIMING_DIAGNOSTIC_SCHEMA_VERSION = 4 as const;
 export const diagnosticElapsedBuckets = ['under_30s', '30s_to_1m', '1m_to_5m', '5m_to_15m', 'over_15m'] as const;
-export const phaseDiagnosticObservations = ['stalled', 'completed', 'abandoned'] as const;
+export const phaseDiagnosticObservations = ['stalled', 'completed', 'abandoned', 'interrupted'] as const;
 export const DIAGNOSTIC_MAX_BODY_BYTES = 8 * 1024;
 export const DIAGNOSTIC_MAX_BREADCRUMBS = 16;
 
