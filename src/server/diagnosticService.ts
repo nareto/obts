@@ -9,7 +9,7 @@ import type { DiagnosticEventsResponse } from '../shared/types.js';
 import type { AuthenticatedDevice } from './authService.js';
 import { AuthError } from './authService.js';
 import type { ServerConfig } from './config.js';
-import type { ConnectionRequestRow, MetadataDb, MetadataStore, UserRow } from './metadataStore.js';
+import type { ConnectionRequestRow, DeepReadonly, DiagnosticEventRow, MetadataDb, MetadataStore, UserRow } from './metadataStore.js';
 
 const MAX_EVENTS = 10_000;
 const MAX_OWNER_EVENTS = 2_000;
@@ -158,10 +158,9 @@ export class DiagnosticService {
 
   async prune(): Promise<void> {
     const now = Date.now();
+    // Decide on the committed snapshot without writing to it: it is shared with every reader.
     const snapshot = await this.store.snapshot();
-    const before = snapshot.diagnostic_events.length;
-    pruneRows(snapshot, now);
-    if (snapshot.diagnostic_events.length === before) return;
+    if (retainedDiagnosticEvents(snapshot, now).length === snapshot.diagnostic_events.length) return;
     await this.store.mutate((db) => pruneRows(db, now));
   }
 
@@ -195,7 +194,7 @@ export class DiagnosticService {
     } finally { release(); }
   }
 
-  private seedAcceptanceWindow(db: MetadataDb, now: number): void {
+  private seedAcceptanceWindow(db: Pick<DeepReadonly<MetadataDb>, 'diagnostic_events'>, now: number): void {
     if (this.acceptanceInitialized) return;
     this.acceptedWindow = db.diagnostic_events.filter(row => Date.parse(row.received_at) > now - DAY_MS)
       .map(row => ({ at: Date.parse(row.received_at), deviceId: row.connection_id === null ? row.device_id : null,
@@ -232,12 +231,12 @@ export class DiagnosticService {
   }
 }
 
-function isStoredManualSnapshot(row: MetadataDb['diagnostic_events'][number]): boolean {
+function isStoredManualSnapshot(row: DeepReadonly<DiagnosticEventRow>): boolean {
   // Enrollment may backfill device_id, but must not change admission provenance.
   return row.connection_id === null && row.device_id !== null && isManualSnapshot(row);
 }
 
-function isManualSnapshot(event: DiagnosticEvent): boolean {
+function isManualSnapshot(event: DeepReadonly<DiagnosticEvent>): boolean {
   return event.schema_version === 2 && event.context.trigger === 'manual';
 }
 
@@ -260,8 +259,18 @@ function appendRow(
 }
 
 function pruneRows(db: MetadataDb, now: number): void {
+  db.diagnostic_events = retainedDiagnosticEvents(db, now);
+}
+
+function retainedDiagnosticEvents<Row extends { expires_at: string; connection_id: string | null; received_at: string }>(
+  db: {
+    readonly connections: ReadonlyArray<{ connection_id: string; status: string }>;
+    readonly diagnostic_events: readonly Row[];
+  },
+  now: number
+): Row[] {
   const connectionById = new Map(db.connections.map((connection) => [connection.connection_id, connection]));
-  db.diagnostic_events = db.diagnostic_events.filter((event) => {
+  return db.diagnostic_events.filter((event) => {
     if (Date.parse(event.expires_at) <= now) return false;
     if (!event.connection_id) return true;
     const connection = connectionById.get(event.connection_id);

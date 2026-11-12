@@ -3,7 +3,7 @@ import { lstat, mkdir, open, readFile, readdir, rename, rm, writeFile } from 'no
 import { basename, dirname, join, resolve } from 'node:path';
 
 import { assertNoSymlinkComponents } from './deletionRoot.js';
-import { observeMetadataPersist } from './syncLatency.js';
+import { observeMetadataClone, observeMetadataPersist } from './syncLatency.js';
 import { OperationHistoryStore, type HistoryBatch } from './operationHistoryStore.js';
 
 import { newId, nowIso } from '../shared/ids.js';
@@ -378,6 +378,9 @@ const defaultPersistenceAdapter: MetadataPersistenceAdapter = {
 
 export class MetadataStore {
   private db: MetadataDb | null = null;
+  // The exact text last durably published for `db`. Cloning a committed state then costs one parse
+  // instead of a stringify plus a parse, and its absence simply falls back to a full copy.
+  private serialized: string | null = null;
   private pending: Promise<void> = Promise.resolve();
   private closed = false;
   private durabilityUncertain = false;
@@ -448,7 +451,7 @@ export class MetadataStore {
     await this.pending;
     if (this.db === null) await this.initialize();
     this.assertOperational();
-    return { db: clone(this.requireDb()), version: this.commits };
+    return { db: this.requireDb(), version: this.commits };
   }
 
   /**
@@ -494,18 +497,22 @@ export class MetadataStore {
       throw new MetadataCleanupError();
     }
     let loaded = false;
+    let rawText: string | null = null;
     try {
-      const raw = await readFile(this.filePath, 'utf8');
-      this.db = JSON.parse(raw) as MetadataDb;
+      rawText = await readFile(this.filePath, 'utf8');
+      this.db = JSON.parse(rawText) as MetadataDb;
       loaded = true;
     } catch (error) {
       if (!isMissing(error)) throw error;
       this.db = createEmptyDb();
     }
-    if (this.normalizeLoadedDb(this.requireDb())) {
+    const migrated = this.normalizeLoadedDb(this.requireDb());
+    if (migrated) {
       await this.persist();
     } else if (!loaded) {
       await this.persist();
+    } else {
+      this.serialized = rawText;
     }
     await this.removeStalePersistenceTemps();
     try {
@@ -514,11 +521,12 @@ export class MetadataStore {
       this.durabilityUncertain = true;
       throw error;
     }
+    freezeCommittedState(this.requireDb());
   }
 
   private async initializeOperationHistory(): Promise<void> {
     const current = this.requireDb();
-    let candidate = clone(current);
+    let candidate = this.cloneState(current);
     let initialized = false;
     candidate.operation_history_by_vault ??= {};
     const vaultIds = new Set(candidate.vaults.map((vault) => vault.vault_id));
@@ -555,8 +563,8 @@ export class MetadataStore {
     }
     if (initialized || candidate.sync_operations.some((operation, index) => operation.operation_sequence !== current.sync_operations[index]?.operation_sequence)) {
       await this.persist(candidate);
-      this.db = candidate;
-      candidate = clone(candidate);
+      this.publishState(candidate);
+      candidate = this.cloneState(candidate);
     }
     for (const vault of candidate.vaults) {
       const state = candidate.operation_history_by_vault![vault.vault_id];
@@ -570,10 +578,10 @@ export class MetadataStore {
       if (state.pending_batch) await this.recoverHistoryBatch(candidate, vault.vault_id, history);
       else if (history.generation !== state.generation || history.maxSequence >= state.next_sequence) throw new Error('Operation history generation or sequence mismatch.');
       if (state.init_pending) {
-        const initialized = clone(this.requireDb());
+        const initialized = this.cloneState(this.requireDb());
         initialized.operation_history_by_vault![vault.vault_id]!.init_pending = false;
         await this.persist(initialized);
-        this.db = initialized;
+        this.publishState(initialized);
         candidate = initialized;
       }
     }
@@ -637,7 +645,7 @@ export class MetadataStore {
   }
 
   private async publishHistoryBatch(vaultId: string, rows: SyncOperationRow[]): Promise<void> {
-    const db = clone(this.requireDb());
+    const db = this.cloneState(this.requireDb());
     const state = db.operation_history_by_vault![vaultId];
     if (!state) throw new Error('Operation history metadata is missing.');
     const history = await this.ensureHistory(vaultId);
@@ -653,7 +661,7 @@ export class MetadataStore {
     };
     state.pending_batch = batch;
     await this.persist(db);
-    this.db = db;
+    this.publishState(db);
     try {
       history.commitBatch(batch);
       await this.finishHistoryBatch(db, vaultId, batch);
@@ -664,7 +672,7 @@ export class MetadataStore {
   }
 
   private async finishHistoryBatch(db: MetadataDb, vaultId: string, batch: HistoryBatch): Promise<void> {
-    const candidate = clone(db);
+    const candidate = this.cloneState(db);
     candidate.sync_operations = candidate.sync_operations.filter((row) =>
       row.vault_id !== vaultId || !batch.rows.some((entry) => entry.operation_id === row.operation_id));
     const state = candidate.operation_history_by_vault![vaultId];
@@ -672,7 +680,7 @@ export class MetadataStore {
     state.generation = batch.target_generation;
     state.pending_batch = null;
     await this.persist(candidate);
-    this.db = candidate;
+    this.publishState(candidate);
   }
 
   async findArchivedAttempt(vaultId: string, deviceId: string, attemptId: string): Promise<{ row: SyncOperationRow; sequence: number } | null> {
@@ -828,17 +836,16 @@ export class MetadataStore {
 
   private async initializePendingHistories(): Promise<void> {
     const db = this.requireDb();
-    this.prepareOperationHistoryMetadata(db);
     for (const vault of db.vaults) {
       if (vault.status === 'deleting' || db.deletion_jobs.some((job) => job.vault_id === vault.vault_id)) continue;
       const state = db.operation_history_by_vault![vault.vault_id]!;
       if (!state.init_pending) continue;
       const history = await this.ensureHistory(vault.vault_id);
       if (history.generation !== state.generation || history.maxSequence >= state.next_sequence) throw new Error('Operation history generation or sequence mismatch.');
-      const initialized = clone(this.requireDb());
+      const initialized = this.cloneState(this.requireDb());
       initialized.operation_history_by_vault![vault.vault_id]!.init_pending = false;
       await this.persist(initialized);
-      this.db = initialized;
+      this.publishState(initialized);
     }
   }
 
@@ -846,14 +853,16 @@ export class MetadataStore {
     await this.pending;
     if (this.db === null) await this.initialize();
     this.assertOperational();
-    return clone(this.requireDb());
+    // The committed state is deeply frozen and is only ever replaced, never mutated in place, so a
+    // read can hand it out directly. Copying it per call made every read cost the whole state.
+    return this.requireDb();
   }
 
   async mutate<T>(fn: (db: MetadataDb) => T | Promise<T>): Promise<T> {
     return await this.enqueue(async () => {
       await this.ensureLoaded();
       this.assertOperational();
-      const candidate = clone(this.requireDb());
+      const candidate = this.cloneState(this.requireDb());
       const result = await fn(candidate);
       enforceRevocationInvariant(candidate);
       this.prepareOperationHistoryMetadata(candidate);
@@ -864,7 +873,7 @@ export class MetadataStore {
         throw error;
       }
       const previous = this.db;
-      this.db = candidate;
+      this.publishState(candidate);
       this.publishCommit(previous, candidate);
       await this.initializePendingHistories();
       return result;
@@ -875,7 +884,7 @@ export class MetadataStore {
     return await this.enqueue(async () => {
       await this.ensureLoaded();
       this.assertOperational();
-      const candidate = clone(this.requireDb());
+      const candidate = this.cloneState(this.requireDb());
       const result = await fn(candidate);
       enforceRevocationInvariant(candidate);
       this.prepareOperationHistoryMetadata(candidate);
@@ -886,7 +895,7 @@ export class MetadataStore {
         throw error;
       }
       const previous = this.db;
-      this.db = candidate;
+      this.publishState(candidate);
       this.publishCommit(previous, candidate);
       await this.initializePendingHistories();
       return result;
@@ -910,7 +919,7 @@ export class MetadataStore {
       this.assertOperational();
       const selected = select(this.requireDb());
       if (!shouldMutate(selected)) return clone(selected) as Detached<T>;
-      const candidate = clone(this.requireDb());
+      const candidate = this.cloneState(this.requireDb());
       const result = update(candidate);
       enforceRevocationInvariant(candidate);
       this.prepareOperationHistoryMetadata(candidate);
@@ -921,11 +930,31 @@ export class MetadataStore {
         throw error;
       }
       const previous = this.db;
-      this.db = candidate;
+      this.publishState(candidate);
       this.publishCommit(previous, candidate);
       await this.initializePendingHistories();
       return clone(result) as Detached<T>;
     });
+  }
+
+  /**
+   * Whole-state copy for a candidate. It is never the committed object, so a transaction can mutate it
+   * freely. When the committed state's serialized form is known the copy is a single parse of it.
+   */
+  private cloneState(source: MetadataDb): MetadataDb {
+    return observeMetadataClone(() => {
+      const cached = this.serialized;
+      return cached !== null && source === this.db ? JSON.parse(cached) as MetadataDb : clone(source);
+    });
+  }
+
+  /**
+   * Publishes a new committed state. It is frozen so no reader can reach through a shared snapshot
+   * into the committed state; every later transaction starts from a private copy.
+   */
+  private publishState(db: MetadataDb): void {
+    freezeCommittedState(db);
+    this.db = db;
   }
 
   async cleanupPersistenceTemps(): Promise<void> {
@@ -1047,6 +1076,10 @@ export class MetadataStore {
 
   private async persistUnmeasured(db: MetadataDb): Promise<void> {
     const serialized = `${JSON.stringify(db)}\n`;
+    // Until this publication is proven durable it is not the committed state, so no candidate may be
+    // cloned from it.
+    const previousSerialized = this.serialized;
+    this.serialized = null;
     const tempFile = `${this.filePath}.${process.pid}.${Date.now()}.${randomBytes(8).toString('hex')}.tmp`;
     try {
       await mkdir(dirname(this.filePath), { recursive: true, mode: 0o700 });
@@ -1076,8 +1109,10 @@ export class MetadataStore {
       try {
         await this.persistence.fsyncDirectory(dirname(this.filePath));
       } catch (error) {
+        this.serialized = previousSerialized;
         throw new MetadataPublicationError(error);
       }
+      this.serialized = serialized;
     } finally {
       if (!renamed && !publicationAmbiguous && !cleanupAttempted) {
         await this.removeTemporaryFile(tempFile);
@@ -1552,6 +1587,19 @@ function createEmptyDb(): MetadataDb {
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+/**
+ * The committed metadata state is handed to readers without copying, so it is frozen: a write through
+ * a snapshot throws instead of silently changing published state behind the write queue's back.
+ */
+function freezeCommittedState<T>(value: T): T {
+  if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  Object.freeze(value);
+  for (const key of Object.keys(value)) {
+    freezeCommittedState((value as Record<string, unknown>)[key]);
+  }
+  return value;
 }
 
 export class MetadataPublicationError extends Error {

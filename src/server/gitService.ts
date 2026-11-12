@@ -83,6 +83,10 @@ export class GitCommandError extends Error {
 export type AncestryVerdict = 'ancestor' | 'not_ancestor' | 'unknown';
 
 const ANCESTRY_CACHE_LIMIT = 4096;
+// Tree listings and name-status diffs of committed objects never change, so one integration that
+// inspects the same commit several times (the merge path does) can reuse the first answer. Listings
+// are not small, so only a handful of commits are retained.
+const OBJECT_READ_CACHE_LIMIT = 8;
 
 export class GitMalformedPackError extends Error {
   constructor() {
@@ -96,11 +100,37 @@ export class GitDurabilityError extends Error {
   }
 }
 
+/**
+ * Only a subcommand keyword is ever reported in operational logs: arguments can carry repository
+ * paths and ref names, which must not reach a log line. A token is accepted only when it looks like
+ * a subcommand name, so option values and paths are skipped instead of being guessed at.
+ */
+const GIT_SUBCOMMAND = /^[a-z][a-z0-9-]{0,31}$/u;
+const GIT_OPTIONS_WITH_VALUES = new Set([
+  '--git-dir', '--work-tree', '-C', '-c', '--config-env', '--namespace', '--super-prefix', '--attr-source', '--exec-path'
+]);
+function gitSubcommandName(args: string[]): string | undefined {
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]!;
+    if (argument.startsWith('-')) {
+      if (GIT_OPTIONS_WITH_VALUES.has(argument)) index += 1;
+      continue;
+    }
+    return GIT_SUBCOMMAND.test(argument) ? argument : undefined;
+  }
+  return undefined;
+}
+
 export class GitService {
   private durabilityUncertain = false;
   // Definitive ancestry answers between two commit ids never change, so they are safe to reuse.
   // Transient or ambiguous failures are deliberately never stored.
   private readonly ancestryCache = new Map<string, boolean>();
+  // Only successful reads are retained: a missing object may be promoted later in the same process.
+  // In-flight reads are retained too, because the merge path reads the same commit from several
+  // concurrent branches and would otherwise spawn one Git process per branch.
+  private readonly treeCache = new Map<string, Promise<GitTreeEntry[]>>();
+  private readonly changedPathsCache = new Map<string, Promise<GitDiffEntry[]>>();
   // OBTS-PER-READY-001: vault IDs whose repository may exist before the vault metadata commit.
   private readonly vaultCreationReservations = new Set<string>();
   // Process-wide counters since server start. They make validation regressions (for example a
@@ -533,14 +563,56 @@ export class GitService {
   }
 
   private async isAncestorInRepo(repo: string, ancestor: string, descendant: string, alternateObjectStore?: string): Promise<boolean> {
+    if (ancestor === descendant) return true;
+    const key = `${repo}\0${ancestor}\0${descendant}`;
+    const cached = this.ancestryCache.get(key);
+    if (cached === true) {
+      this.ancestryCache.delete(key);
+      this.ancestryCache.set(key, true);
+      return true;
+    }
     try {
       await this.exec(repo, ['merge-base', '--is-ancestor', ancestor, descendant], undefined, undefined, {
         allowedAlternateObjectStore: alternateObjectStore
       });
+      // A positive answer is immutable; a negative one may only reflect an object that has not been
+      // promoted into this repository yet, so it is never retained.
+      this.retain(this.ancestryCache, key, true, ANCESTRY_CACHE_LIMIT);
       return true;
     } catch (error) {
       if (error instanceof GitDurabilityError) throw error;
       return false;
+    }
+  }
+
+  private retain<K, V>(cache: Map<K, V>, key: K, value: V, limit: number): void {
+    cache.delete(key);
+    cache.set(key, value);
+    while (cache.size > limit) {
+      const oldest = cache.keys().next();
+      if (oldest.done) break;
+      cache.delete(oldest.value);
+    }
+  }
+
+  /**
+   * Reads an immutable object answer at most once per key. Failures are never retained, so a retry
+   * after a transient Git failure or a later object promotion still reaches Git.
+   */
+  private async memoizedObjectRead<V>(cache: Map<string, Promise<V>>, key: string, load: () => Promise<V>): Promise<V> {
+    const cached = cache.get(key);
+    if (cached !== undefined) {
+      cache.delete(key);
+      cache.set(key, cached);
+      return await cached;
+    }
+    const pending = load();
+    this.retain(cache, key, pending, OBJECT_READ_CACHE_LIMIT);
+    try {
+      return await pending;
+    } catch (error) {
+      if (cache.get(key) === pending) cache.delete(key);
+      throw error;
     }
   }
 
@@ -781,12 +853,24 @@ export class GitService {
   }
 
   private async listTreeEntriesInRepo(repo: string, commit: string, alternateObjectStore?: string, includeDirectories = false): Promise<GitTreeEntry[]> {
+    const cacheKey = `${repo}\0${commit}\0${includeDirectories ? 'tree' : 'blob'}`;
+    if (alternateObjectStore !== undefined) return await this.readTreeEntries(repo, commit, includeDirectories, alternateObjectStore);
+    return await this.memoizedObjectRead(this.treeCache, cacheKey,
+      async () => await this.readTreeEntries(repo, commit, includeDirectories));
+  }
+
+  private async readTreeEntries(
+    repo: string,
+    commit: string,
+    includeDirectories: boolean,
+    alternateObjectStore?: string
+  ): Promise<GitTreeEntry[]> {
     const { stdout } = await this.exec(repo, ['ls-tree', '-r', ...(includeDirectories ? ['-t'] : []), '-l', '-z', commit], undefined, undefined, {
       encoding: 'buffer',
       allowedAlternateObjectStore: alternateObjectStore
     });
     const data = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
-    return splitNul(data)
+    const entries = splitNul(data)
       .filter((entry) => entry.length > 0)
       .map((entry) => {
         const match = /^(\d{6}) (\S+) ([0-9a-f]+)\s+(-|\d+)\t(.+)$/u.exec(entry);
@@ -801,6 +885,7 @@ export class GitService {
           path: match[5]
         };
       });
+    return entries;
   }
 
   async validateTreePathPolicy(vaultId: string, commit: string, maxBlobBytes = Number.POSITIVE_INFINITY): Promise<void> {
@@ -892,6 +977,12 @@ export class GitService {
   }
 
   private async changedPathsInRepo(repo: string, base: string, commit: string, alternateObjectStore?: string): Promise<GitDiffEntry[]> {
+    if (alternateObjectStore !== undefined) return await this.readChangedPaths(repo, base, commit, alternateObjectStore);
+    return await this.memoizedObjectRead(this.changedPathsCache, `${repo}\0${base}\0${commit}`,
+      async () => await this.readChangedPaths(repo, base, commit, undefined));
+  }
+
+  private async readChangedPaths(repo: string, base: string, commit: string, alternateObjectStore?: string): Promise<GitDiffEntry[]> {
     const { stdout } = await this.exec(repo, ['diff', '--name-status', '-M', '-z', base, commit], undefined, undefined, {
       encoding: 'buffer',
       allowedAlternateObjectStore: alternateObjectStore
@@ -1714,6 +1805,7 @@ export class GitService {
   ): Promise<{ stdout: string | Buffer; stderr: string | Buffer }> {
     if (!allowWhenDurabilityUncertain) this.assertDurabilityAvailable();
     const maxBuffer = options.maxBuffer ?? 64 * 1024 * 1024;
+    const subcommand = gitSubcommandName(args.slice(args[0] === '--git-dir' ? 2 : 0));
     return await observeGitCommand(async () => await new Promise<{ stdout: string | Buffer; stderr: string | Buffer }>((resolve, reject) => {
       const child = spawn(this.config.gitBinary, args, {
         env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
@@ -1773,7 +1865,7 @@ export class GitService {
       } else {
         child.stdin.end();
       }
-    }));
+    }), subcommand);
   }
 
   private async validateMergedTextPaths(

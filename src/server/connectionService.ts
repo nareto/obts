@@ -379,7 +379,7 @@ export class ConnectionService {
     const connection = authenticatedConnection(snapshot.connections, connectionId, secret);
     if (connection.status === 'expired') {
       await this.store.mutate((db) => {
-        authenticatedConnection(db.connections, connectionId, secret);
+        expireConnection(db.connections, connectionId);
       });
     }
     if (connection.status !== 'approved' || !connection.approved_user_id || !connection.selection) {
@@ -686,10 +686,23 @@ function authenticatedConnection(connections: ConnectionRequestRow[], connection
   if (!connection) {
     throw new AuthError(401, 'invalid_connection', 'Connection authorization is invalid or expired.');
   }
-  if (connection.status !== 'consumed' && Date.parse(connection.expires_at) <= Date.now()) {
-    connection.status = 'expired';
+  if (isExpiredApproval(connection)) {
+    // Readers are handed a committed snapshot they do not own, so expiry is reported on a copy.
+    // Callers that must persist it use expireConnection within their own transaction.
+    return { ...connection, status: 'expired' };
   }
   return connection;
+}
+
+function isExpiredApproval(connection: ConnectionRequestRow): boolean {
+  return connection.status !== 'consumed' && Date.parse(connection.expires_at) <= Date.now();
+}
+
+/** Applies the same expiry decision `authenticatedConnection` reports, to rows the caller owns. */
+function expireConnection(connections: ConnectionRequestRow[], connectionId: string): void {
+  for (const connection of connections) {
+    if (connection.connection_id === connectionId && isExpiredApproval(connection)) connection.status = 'expired';
+  }
 }
 
 function connectionStatusError(connection: ConnectionRequestRow): AuthError {

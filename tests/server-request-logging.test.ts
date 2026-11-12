@@ -514,10 +514,10 @@ describe('server request and lifecycle observations', () => {
       release();
       await vi.waitFor(() => expect(f.rows().find((row) => row.event === 'push_integrated')).toMatchObject({
         vault_id: f.vaultId, device_id: f.deviceId, transfer_id: transferId, push_status: 'merged', event_seq: expect.any(Number),
-        persist_count: 9, persist_ms: expect.any(Number), git_ms: expect.any(Number)
+        persist_count: 8, persist_ms: expect.any(Number), git_ms: expect.any(Number)
       }), { timeout: 5000 });
       expect(f.rows().filter((row) => row.event === 'push_integrated')).toHaveLength(1);
-      expect(publications).toHaveLength(9);
+      expect(publications).toHaveLength(8);
       const descriptor = publications.at(-2)!;
       const state = descriptor.operation_history_by_vault![f.vaultId]!;
       const batch = state.pending_batch!;

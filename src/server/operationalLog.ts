@@ -39,6 +39,11 @@ export type OperationalFields = {
   persist_count?: number;
   persist_ms?: number;
   git_ms?: number;
+  git_count?: number;
+  git_slowest?: string;
+  clone_count?: number;
+  clone_ms?: number;
+  lock_wait_ms?: number;
   outcome?: 'ok' | 'client_error' | 'server_error' | 'aborted';
   vault_id?: string;
   device_id?: string;
@@ -161,6 +166,11 @@ const FIELD_VALIDATORS: Record<keyof OperationalFields, Validator> = {
   request_id: id('req'), method: enumeration(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'TRACE', 'CONNECT']),
   route: nullable(enumeration(LOG_ROUTES)), status: nullable(number), duration_ms: number,
   persist_count: (value) => number(value) && Number.isSafeInteger(value), persist_ms: number, git_ms: number,
+  git_count: (value) => number(value) && Number.isSafeInteger(value),
+  // A Git subcommand keyword only; arguments carry paths and refs and are never reported.
+  git_slowest: pattern(/^[a-z][a-z0-9-]{0,31}$/u),
+  clone_count: (value) => number(value) && Number.isSafeInteger(value), clone_ms: number,
+  lock_wait_ms: number,
   outcome: enumeration(['ok', 'client_error', 'server_error', 'aborted']),
   vault_id: id('vlt'), device_id: id('dev'), user_id: id('usr'), connection_id: id('con'),
   transfer_id: id('trn'), conflict_id: id('conf'), plugin_version: (value) => value === 'unknown' || pattern(VERSION)(value),

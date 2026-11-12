@@ -155,7 +155,8 @@ async function pendingInitializationFixture() {
   const { root, store } = await fixture();
   await addTerminalOperation(store, { target_commit: 'b'.repeat(40), attempt_id: 'initial-attempt', proposal_base: null });
   const expected = await store.exportOperationHistory('vlt_history');
-  const disk = await store.snapshot();
+  // A committed snapshot is read-only; editing the file's legacy shape needs a private copy.
+  const disk = structuredClone(await store.snapshot());
   disk.operation_history_by_vault!.vlt_history!.init_pending = true;
   await store.close();
   await writeFile(join(root, 'metadata', 'phase1.json'), JSON.stringify(disk));
@@ -316,7 +317,7 @@ describe('durable operation history', () => {
       const { root, store } = await fixture();
       await addTerminalOperation(store, { target_commit: 'b'.repeat(40), attempt_id: 'initial-attempt', attempt_hash: 'initial-hash', proposal_base: null });
       const expected = await store.exportOperationHistory('vlt_history');
-      const legacy = { ...await store.snapshot(), schema_version: 7 };
+      const legacy = { ...structuredClone(await store.snapshot()), schema_version: 7 };
       delete legacy.operation_history_by_vault;
       for (const row of legacy.sync_operations) delete row.operation_sequence;
       await store.close();
@@ -403,7 +404,11 @@ describe('durable operation history', () => {
       expect(store.isDurabilityUncertain()).toBe(true);
       expect(store.isReady()).toBe(false);
       ledger.prepare('UPDATE operations SET canonical_hash=?,canonical_json=?').run(original.canonical_hash!, original.canonical_json!);
-      if (consumer === 'conflicting-copy') (store as unknown as { db: { sync_operations: unknown[] } }).db.sync_operations = [];
+      if (consumer === 'conflicting-copy') {
+        // The committed state is frozen, so an in-process repair replaces it instead of editing it.
+        const committed = (store as unknown as { db: { sync_operations: unknown[] } }).db;
+        (store as unknown as { db: unknown }).db = { ...committed, sync_operations: [] };
+      }
       await expect(store.findArchivedAttempt('vlt_history', 'dev_history', 'missing')).rejects.toBeInstanceOf(MetadataPublicationError);
       await expect(store.findArchivedTargetCandidates('vlt_history', 'dev_history', 'missing')).rejects.toBeInstanceOf(MetadataPublicationError);
       await expect(store.exportOperationHistory('vlt_history')).rejects.toBeInstanceOf(MetadataPublicationError);
@@ -780,7 +785,7 @@ describe('durable operation history', () => {
       const { store, root } = await fixture();
       const operation = await addTerminalOperation(store, { target_commit: 'b'.repeat(40), attempt_id: 'attempt-init' });
       const metadataPath = join(root, 'metadata', 'phase1.json');
-      const legacy = { ...await store.snapshot(), schema_version: 7 };
+      const legacy = { ...structuredClone(await store.snapshot()), schema_version: 7 };
       delete legacy.operation_history_by_vault;
       for (const row of legacy.sync_operations) delete row.operation_sequence;
       await store.close();

@@ -1,5 +1,6 @@
 import { posix } from 'node:path';
 import { createHash } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 
 import { newId, nowIso } from '../shared/ids.js';
 import { assertSyncableTreePaths, PathPolicyViolation } from '../shared/pathPolicy.js';
@@ -35,7 +36,7 @@ import { parseRenamePairs } from '../shared/validators.js';
 import { hasDurableDeletionRecord } from './metadataStore.js';
 import type { VaultLifecycleCoordinator } from './vaultLifecycleCoordinator.js';
 import { type OperationalLog, pushLogFields, silentOperationalLog } from './operationalLog.js';
-import { observeSyncLatency } from './syncLatency.js';
+import { observeSyncLatency, recordSyncLockWait } from './syncLatency.js';
 import type {
   DeviceRow,
   DirectoryProposalResultRow,
@@ -45,6 +46,8 @@ import type {
 } from './metadataStore.js';
 
 const MERGE_POLICY_VERSION = 'phase2.semantic-merge.v1';
+// Kept well inside the server's live prepared-transition grace window before a refresh is forced.
+const PREPARED_TRANSITION_REFRESH_MS = 30_000;
 
 function policyConflictPaths(error: PathPolicyViolation | InstanceType<typeof RootIgnorePolicyError>): string[] {
   return error instanceof PathPolicyViolation && typeof error.details?.path === 'string'
@@ -884,11 +887,23 @@ export class SyncService {
             manifest.rename_pairs ?? []
           );
         }
-        await this.store.mutate((db) => {
-          const op = requireOperation(db, operation.operation_id);
-          if (op.status !== 'prepared') throw new Error('Sync operation is not prepared.');
-          op.updated_at = nowIso();
-        });
+        // A live prepared transition is honoured only while its recorded age stays inside the live
+        // ref-transition grace window, so a slow promotion must not leave the record aged. Rewriting
+        // the whole metadata file is only necessary when the record is actually near that limit; a
+        // fast promotion keeps the freshly persisted timestamp.
+        // `operation` is the admission row this request created; the prepared record's own age is
+        // read from committed state because a concurrent write may have advanced it.
+        const preparedRow = (await this.store.snapshot()).sync_operations.find(
+          (candidate) => candidate.operation_id === operation.operation_id
+        );
+        const preparedAge = preparedRow === undefined ? Number.NaN : Date.now() - Date.parse(preparedRow.updated_at);
+        if (!(preparedAge >= 0 && preparedAge < PREPARED_TRANSITION_REFRESH_MS)) {
+          await this.store.mutate((db) => {
+            const op = requireOperation(db, operation.operation_id);
+            if (op.status !== 'prepared') throw new Error('Sync operation is not prepared.');
+            op.updated_at = nowIso();
+          });
+        }
         await this.git.updateRef(auth.vault.vault_id, auth.device.device_ref, manifest.target_commit, currentDeviceRef);
 
         const refEventSeq = await this.store.mutate((db) => {
@@ -3593,7 +3608,11 @@ export class SyncService {
     });
     const chained = previous.then(() => next);
     this.locks.set(vaultId, chained);
+    // A request that waits behind another vault transition is doing no work of its own; without this
+    // the wait is invisible in the integration breakdown and looks like unexplained latency.
+    const lockWaitStarted = performance.now();
     await previous;
+    recordSyncLockWait(performance.now() - lockWaitStarted);
     let primaryFailure: unknown;
     const operation = async () => {
       try {
