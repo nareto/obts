@@ -197,8 +197,9 @@ async function deviceCommit(f: Fixture, path: string, body: string): Promise<str
   execFileSync('git', ['--git-dir', f.repo, 'read-tree', 'refs/heads/main'], { env });
   execFileSync('git', ['--git-dir', f.repo, 'update-index', '--add', '--cacheinfo', `100644,${blob},${path}`], { env });
   const tree = execFileSync('git', ['--git-dir', f.repo, 'write-tree'], { env, encoding: 'utf8' }).trim();
+  const identity = { GIT_AUTHOR_NAME: 'test', GIT_AUTHOR_EMAIL: 'test@example.invalid', GIT_COMMITTER_NAME: 'test', GIT_COMMITTER_EMAIL: 'test@example.invalid' };
   return execFileSync('git', ['--git-dir', f.repo, 'commit-tree', tree, '-p', 'refs/heads/main', '-m', 'cost push'],
-    { encoding: 'utf8' }).trim();
+    { env: { ...process.env, ...identity }, encoding: 'utf8' }).trim();
 }
 
 async function pushOneFile(f: Fixture, hooks: { duringPromotion?: () => void } = {}): Promise<PushResult> {
