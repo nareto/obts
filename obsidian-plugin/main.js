@@ -23183,7 +23183,7 @@ var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var { findUnportablePaths, isRestrictedNamePlatform, segmentHasReservedCharacters } = require_namePortability();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.7.9";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.7.10";
 var SYNC_DEBOUNCE_MS = 1500;
 var EMPTY_JSON_BODY = "{}";
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
@@ -23192,6 +23192,8 @@ var PERIODIC_INVENTORY_INTERVAL_MS = 6 * 60 * 60 * 1e3;
 var PERIODIC_FULL_AUDIT_INTERVAL_MS = 7 * 24 * 60 * 60 * 1e3;
 var MIGRATED_FULL_AUDIT_DELAY_MS = 24 * 60 * 60 * 1e3;
 var SCANNER_SCHEMA_VERSION = 1;
+var SCAN_CACHE_MTIME_GRANULARITY_MS = 2e3;
+var SCAN_CACHE_MIN_EPOCH_MS = 1e11;
 var HINTED_CAPTURE_MAX_PATHS = 256;
 var INVENTORY_DEFERRAL_LIMIT = 1;
 var WATCHER_RENAME_ATTEMPTS = 3;
@@ -23359,6 +23361,7 @@ module.exports = class ObtsPlugin extends Plugin {
     this.syncTimingUnsupported = false;
     this.deviceNameRevision = 0;
     this.currentStatusLabel = null;
+    this.sessionStatusState = null;
     this.statusNeedsRecoveryNotice = false;
     this.degradedStatusTimer = null;
     this.degradedStatusBase = null;
@@ -23964,7 +23967,11 @@ module.exports = class ObtsPlugin extends Plugin {
   // server's per-device automatic diagnostic budget without a durable spool:
   // undelivered timing is best effort and may be dropped on unload.
   recordSyncTiming(attempt) {
-    if (this.unloaded || !attempt || !this.diagnosticSharingEnabled() || this.syncTimingUnsupported) return;
+    if (this.unloaded || !this.diagnosticSharingEnabled() || this.syncTimingUnsupported) return;
+    if (!attempt) {
+      void this.flushSyncTiming();
+      return;
+    }
     this.pendingSyncTiming.push(attempt);
     if (this.pendingSyncTiming.length >= SYNC_TIMING_MAX_ATTEMPTS_PER_EVENT || attempt.outcome !== "completed" || attempt.trigger === "user") {
       void this.flushSyncTiming();
@@ -24107,7 +24114,25 @@ module.exports = class ObtsPlugin extends Plugin {
     this.handleStatusTransition(previousBase, presentation.base, options.notify !== false);
   }
   setPersistedStatus(state, options = {}) {
+    if (state) this.sessionStatusState = state;
     this.setStatus(this.persistedStatusLabel(state), options);
+  }
+  /**
+   * What the settings tab shows for `Status`. The live label is the truth while
+   * this session runs an attempt or owes a queued one; otherwise the persisted
+   * label is. A transient "Checking" that nothing running or queued owns is not
+   * a state: it reads as "stuck, not syncing" while the device is settled, so
+   * the settled label is reported instead.
+   */
+  settingsStatusLabel(state = null) {
+    const authoritative = state || this.sessionStatusState || null;
+    const persisted = this.persistedStatusLabel(authoritative);
+    const live = this.currentStatusLabel;
+    if (!live) return persisted;
+    if (this.operationAvailability() !== "available" || this.syncQueued) return live;
+    const label = statusBaseLabel(live) === "Checking" ? persisted : live;
+    if (statusBaseLabel(label) !== "Checking") return label;
+    return !authoritative || !authoritative.local_head || authoritative.local_head === authoritative.local_main ? "Synced" : "Ahead";
   }
   /**
    * The persisted label reports the last attempt, not what the device is doing
@@ -24222,6 +24247,7 @@ module.exports = class ObtsPlugin extends Plugin {
   async handleMobileSuspension() {
     if (this.unloaded || !this.clientReady) return;
     this.client.beginSuspension();
+    void this.flushSyncTiming();
     this.suspendedPhase = this.noteSuspendedPhase();
     let plan = null;
     try {
@@ -25072,7 +25098,11 @@ var ObtsObsidianClient = class {
       eventLag: 0
     };
     const interesting = recorded.applyMode !== "none" || attempt.uploaded || elapsedMs >= SYNC_TIMING_MIN_ELAPSED_MS || !completed || recorded.scanMode === "full";
-    if (!interesting || !this.syncTimingSink) return;
+    if (!this.syncTimingSink) return;
+    if (!interesting) {
+      if (attempt.trigger === "user") this.syncTimingSink(null);
+      return;
+    }
     void this.readState().then((state) => {
       const lag = state && Number.isSafeInteger(state.last_event_seq) && Number.isSafeInteger(state.last_applied_event_seq) ? Math.max(0, state.last_event_seq - state.last_applied_event_seq) : null;
       recorded.eventLag = lag === null ? -1 : lag;
@@ -27390,6 +27420,10 @@ var ObtsObsidianClient = class {
       if (journal.journal_version < 5) return target.oid === null;
       if (journal.target_root_ignore_oid !== target.oid) return false;
       if (scope) return (await this.readRootIgnorePolicy()).oid === target.oid && journal.local_only_paths.length === 0 && journal.directory_intents.length === 0 && journal.affected_paths.every((p) => scope.paths.includes(p));
+      if (journal.local_only_paths.length === 0 && (journal.deferred_local_paths || []).length === 0 && !journal.directory_intents.some((intent) => intent.op === "delete")) {
+        this.assertLocalOnlyApplyCollisions(journal.local_only_paths, target.entries);
+        return true;
+      }
       const previous = journal.expected_prior_local_main ? await this.listTreeFiles(journal.expected_prior_local_main) : [];
       const physical = await this.listLocalVaultInventory("");
       const expected = this.localOnlyApplyPaths(target, previous, physical);
@@ -28088,24 +28122,22 @@ var ObtsObsidianClient = class {
       }
       if (completedCatchup?.version === 2) {
         const finalTree = await this.listTreeBlobOids(appliedState.local_main);
-        const finalCapture = await this.captureStableLocalChanges(finalTree);
         const finalProvenance = await this.readStaleProvenance();
         const alreadyAuthored = (filePath) => completedCatchup.preserved_paths.some((p) => changedPathsConflict(filePath, p)) || Object.keys(finalProvenance.obligations).some((p) => changedPathsConflict(filePath, p)) || finalProvenance.horizons.some((h) => h.touched.some((p) => changedPathsConflict(filePath, p)));
-        if (finalCapture.stable) {
-          const authoredPaths = finalCapture.paths.filter(alreadyAuthored);
-          if (authoredPaths.length) await this.preserveCatchupEdits(completedCatchup, finalCapture.snapshot, authoredPaths);
+        const authored = await this.catchupHandoffChangedPaths([
+          ...completedCatchup.preserved_paths,
+          ...completedCatchup.capture_pending_paths || [],
+          ...Object.keys(finalProvenance.obligations),
+          ...finalProvenance.horizons.flatMap((horizon) => horizon.touched)
+        ], finalTree);
+        if (authored === null || authored.length > 0) {
+          if (authored !== null) this.reportOperationProgress("Applying (checking local edits)", "apply_local_capture");
+          await this.settleCatchupHandoffCapture(completedCatchup, await this.captureStableLocalChanges(finalTree), alreadyAuthored);
+        } else {
           const latestCatchup = await this.readDurableCatchup();
-          const oldPending = latestCatchup?.capture_pending_paths || [];
-          const pending = oldPending.filter((p) => finalCapture.paths.some((q) => changedPathsConflict(p, q)));
-          if (pending.length !== oldPending.length && latestCatchup) {
-            await writeJson(
-              this.fsp,
-              this.catchupPath,
-              Object.assign({}, latestCatchup, { capture_pending_paths: pending })
-            );
+          if (latestCatchup && (latestCatchup.capture_pending_paths || []).length > 0) {
+            await writeJson(this.fsp, this.catchupPath, Object.assign({}, latestCatchup, { capture_pending_paths: [] }));
           }
-        } else if (finalCapture.changedPath && alreadyAuthored(finalCapture.changedPath)) {
-          await this.preserveCatchupEdits(completedCatchup, null, [finalCapture.changedPath]);
         }
       }
       const handoff = await this.readDurableCatchup();
@@ -28119,6 +28151,45 @@ var ObtsObsidianClient = class {
       }
     }
     return true;
+  }
+  // The v2 catch-up handoff settles exactly the paths it already carries
+  // provenance for. `null` means they could not be read steadily, so the caller
+  // falls back to the whole-vault stable capture.
+  async catchupHandoffChangedPaths(paths, targetEntries) {
+    const unique = [...new Set(paths.filter((filePath) => isSyncableVaultPath(filePath)))].sort();
+    if (unique.length === 0) return [];
+    const budget = createByteBudget(this.fileBufferBudgetBytes);
+    try {
+      const matches = await runBoundedWork(unique, {
+        concurrency: this.fileWorkConcurrency,
+        yieldEvery: FILE_WORK_YIELD_EVERY
+      }, async (filePath) => this.fingerprintMatchesTarget(
+        (await this.readRecoveryFileSnapshot(filePath, budget)).fingerprint,
+        targetEntries.get(filePath)
+      ));
+      return unique.filter((_, index2) => !matches[index2]);
+    } catch (error) {
+      if (error instanceof LocalSnapshotChangedError || error instanceof ObtsBlockedError && error.code === "target_policy_changed") return null;
+      throw error;
+    }
+  }
+  async settleCatchupHandoffCapture(completedCatchup, finalCapture, alreadyAuthored) {
+    if (finalCapture.stable) {
+      const authoredPaths = finalCapture.paths.filter(alreadyAuthored);
+      if (authoredPaths.length) await this.preserveCatchupEdits(completedCatchup, finalCapture.snapshot, authoredPaths);
+      const latestCatchup = await this.readDurableCatchup();
+      const oldPending = latestCatchup?.capture_pending_paths || [];
+      const pending = oldPending.filter((p) => finalCapture.paths.some((q) => changedPathsConflict(p, q)));
+      if (pending.length !== oldPending.length && latestCatchup) {
+        await writeJson(
+          this.fsp,
+          this.catchupPath,
+          Object.assign({}, latestCatchup, { capture_pending_paths: pending })
+        );
+      }
+    } else if (finalCapture.changedPath && alreadyAuthored(finalCapture.changedPath)) {
+      await this.preserveCatchupEdits(completedCatchup, null, [finalCapture.changedPath]);
+    }
   }
   async pollRemoteEventsAndApply(options = {}) {
     const ownedTiming = this.beginSyncTimingAttempt("headless");
@@ -28910,8 +28981,7 @@ var ObtsObsidianClient = class {
       let localScanPending = false;
       const scopedClean = scope && journal.deferred_local_paths.length === 0 && (await this.affectedApplyPathsNotMatchingTarget(journal, targetEntries)).length === 0;
       const shouldCapturePreservedChanges = !scopedClean && (requireCleanVisibleState || journal.deferred_local_paths.length > 0);
-      const preserved = shouldCapturePreservedChanges ? await this.captureStableLocalChanges(targetEntries) : { paths: [], snapshot: null, stable: true, changedPath: null };
-      this.reportOperationProgress("Applying (finishing)", "apply_finalize");
+      const preserved = shouldCapturePreservedChanges ? await this.captureCommittedTailPreservedChanges(journal, targetEntries) : { paths: [], snapshot: null, stable: true, changedPath: null };
       let preservedLocalChangePaths = preserved.stable ? preserved.paths : [];
       let preservedLocalSnapshot = preserved.stable ? preserved.snapshot : null;
       let preservedDirectoryIntents = [];
@@ -28933,6 +29003,7 @@ var ObtsObsidianClient = class {
         }
       }
       if (requireCleanVisibleState && !scopedClean) {
+        this.reportOperationProgress("Applying (checking directories)", "directory_inventory");
         preservedDirectoryIntents = await this.preserveDirectoryChangesFromTarget(
           targetEntries,
           explicitDirectorySet,
@@ -29522,6 +29593,48 @@ var ObtsObsidianClient = class {
       if (initialization) this.plugin.updateInitializationProgress(progress);
       else this.reportOperationProgress(progress, point);
     };
+  }
+  // OBTS-SYNC-TAIL-001: the committed tail still covers the whole visible
+  // vault, because a file another application writes while the apply runs must
+  // be preserved even though no watcher hint names it. It covers it the way the
+  // incremental inventory does: one recorded stat per path, and bytes only for
+  // the paths the stat cannot prove. A recorded stat (size, mtime and ctime)
+  // that still matches, whose mtime is older than the cache record by the
+  // mtime granularity, together with the target oid for that path, is proof the
+  // bytes did not change; new paths, paths whose stat moved or is too recent,
+  // and footprint paths are the only ones read and hashed. A path the attempt
+  // wrote cannot be proven either: its cached oid is the pre-apply oid, and
+  // proof requires the target oid. A cold, foreign or dateless cache, a moved
+  // vault or a vault that changes under the scan keeps the two-pass stable
+  // capture, which owns the retry and pending-inventory semantics.
+  async captureCommittedTailPreservedChanges(journal, targetEntries) {
+    this.reportOperationProgress(
+      (journal.deferred_local_paths || []).length > 0 ? `Applying (checking local edits) \xB7 ${journal.deferred_local_paths.length} deferred` : "Applying (checking local edits)",
+      "apply_local_capture"
+    );
+    if (!await this.scanCacheCoversVault(journal)) return await this.captureStableLocalChanges(targetEntries);
+    try {
+      const captured = await this.localChangedPathsFromTree(targetEntries, true, {
+        reportOperationProgress: true,
+        verifyInventory: true
+      });
+      return { paths: captured.paths, snapshot: captured.snapshot, stable: true, changedPath: null };
+    } catch (error) {
+      if (error instanceof LocalSnapshotChangedError || error instanceof ObtsBlockedError && error.code === "target_policy_changed") {
+        return await this.captureStableLocalChanges(targetEntries);
+      }
+      throw error;
+    }
+  }
+  // The cached-stat shortcut is only sound for this vault, this device and the
+  // root policy the journal pinned: a policy change reclassifies paths, and a
+  // foreign, missing or dateless cache proves nothing about any of them.
+  async scanCacheCoversVault(journal) {
+    const cache = await this.readScanCache();
+    if (cache.size === 0) return false;
+    const first = cache.values().next().value;
+    if (!first || !Number.isFinite(Number(first.recorded_at_ms))) return false;
+    return (await this.readRootIgnorePolicy()).oid === journal.target_root_ignore_oid;
   }
   async captureStableLocalChanges(targetEntries, attempts = 3, initialization = false) {
     const report = this.createLocalApplyProgress(initialization);
@@ -30806,10 +30919,12 @@ var ObtsObsidianClient = class {
       readJson(this.fsp, this.scanCachePath, null)
     ]);
     if (!cache || cache.version !== 1 || cache.scanner_schema !== SCANNER_SCHEMA_VERSION || cache.vault_id !== state.vault_id || cache.device_id !== state.device_id || !cache.entries || typeof cache.entries !== "object" || Array.isArray(cache.entries)) return /* @__PURE__ */ new Map();
+    const recordedAt = Number(cache.recorded_at_ms);
+    const recordedAtMs = Number.isFinite(recordedAt) && recordedAt > 0 ? recordedAt : null;
     const entries = /* @__PURE__ */ new Map();
     for (const [filePath, value] of Object.entries(cache.entries)) {
       if (!isSyncableVaultPath(filePath) || !value || typeof value !== "object" || !/^[0-9a-f]{40}$/u.test(value.oid || "") || !(value.content_sha256 === null || /^[0-9a-f]{64}$/u.test(value.content_sha256 || "")) || !Number.isFinite(value.size) || value.size < 0) continue;
-      entries.set(filePath, value);
+      entries.set(filePath, Object.assign({}, value, { recorded_at_ms: recordedAtMs }));
     }
     return entries;
   }
@@ -30830,6 +30945,7 @@ var ObtsObsidianClient = class {
       device_id: state.device_id,
       entries: serialized,
       bootstrap_basis: bootstrapBasis,
+      recorded_at_ms: Date.now(),
       updated_at: nowIso()
     });
   }
@@ -35397,7 +35513,7 @@ var ObtsSettingTab = class extends PluginSettingTab {
         }
       }));
       const renameFeedback = containerEl.createDiv({ cls: "obts-feedback", attr: { "aria-live": "polite" } });
-      new Setting(containerEl).setName("Status").setDesc(normalizePersistedStatusLabel(state.status_label, state.last_error_code, state.last_error_details));
+      const statusSetting = new Setting(containerEl).setName("Status").setDesc(this.plugin.settingsStatusLabel(state));
       if (state.last_error_code) {
         new Setting(containerEl).setName("Sync details").setDesc(localSyncFailureExplanation(state.last_error_code, state.last_error_details));
       }
@@ -35405,6 +35521,7 @@ var ObtsSettingTab = class extends PluginSettingTab {
       let syncButton = null;
       const refreshOperation = () => {
         const operation = this.plugin.operationDetails();
+        statusSetting.setDesc(this.plugin.settingsStatusLabel(state));
         operationSetting.setDesc(this.plugin.operationDescription(operation));
         if (syncButton) syncButton.setDisabled(operation.availability !== "available");
       };
@@ -36203,7 +36320,11 @@ function sameScanFileMetadata(left, right) {
   return left.size === right.size && left.mtime === right.mtime && left.ctime === right.ctime;
 }
 function sameCachedScanFileMetadata(current, cached) {
-  return current.size === cached.size && current.mtime !== null && cached.mtime !== null && current.mtime === cached.mtime;
+  if (!sameScanFileMetadata(current, cached)) return false;
+  if (current.mtime === null || current.mtime < SCAN_CACHE_MIN_EPOCH_MS) return false;
+  const recordedAt = Number(cached.recorded_at_ms);
+  if (!Number.isFinite(recordedAt) || recordedAt <= 0) return false;
+  return current.mtime < recordedAt - SCAN_CACHE_MTIME_GRANULARITY_MS;
 }
 function isTerminalSyncError(code) {
   return typeof code === "string" && TERMINAL_SYNC_ERROR_CODES.has(code);

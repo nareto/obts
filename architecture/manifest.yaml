@@ -1,7 +1,7 @@
 schema_version: 1
-revision: 70
+revision: 71
 status: current
-updated: 2026-11-12
+updated: 2026-11-13
 authoritative_artifacts:
   - architecture/manifest.yaml
   - architecture/README.md

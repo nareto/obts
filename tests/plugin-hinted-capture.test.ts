@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -327,7 +327,7 @@ describe('file footprint apply (OBTS-SYNC-DELTA-001)', () => {
     expect(await serverFile(value.core, await currentMain(value.server), 'b.md')).toBe('unrelated local edit\n');
   });
 
-  it('uses full preservation for a concurrent edit inside the footprint', async () => {
+  it('preserves a concurrent edit inside the footprint', async () => {
     const value = await fixture();
     await remoteEdit(value);
     const original = value.core.stageApplyRecoveryFiles.bind(value.core);
@@ -335,11 +335,15 @@ describe('file footprint apply (OBTS-SYNC-DELTA-001)', () => {
       await writeFile(join(value.vaultDir, 'notes/c.md'), 'local concurrent bytes\n');
       return original(...args);
     };
-    const captures = spy(value.core, 'captureStableLocalChanges');
     await value.core.pollRemoteEventsAndApply({ deltaApply: true });
-    expect(captures.length).toBeGreaterThan(0);
+    // The attempt must not publish its target over bytes it read before the
+    // local writer ran, and it must not lose them either: they survive on disk
+    // as work the device holds, not as an invisible file.
     expect(await readFile(join(value.vaultDir, 'notes/c.md'), 'utf8')).toBe('local concurrent bytes\n');
-  });
+    const queue = await value.core.readQueue();
+    expect(queue.pending_commit).toMatch(/^[0-9a-f]{40}$/u);
+    expect(await serverFile(value.core, queue.pending_commit, 'notes/c.md')).toBe('local concurrent bytes\n');
+  }, 120_000);
 
   it('retains differing elapsed horizons and falls back for stale hinted bytes', async () => {
     const value = await fixture();
@@ -410,9 +414,14 @@ describe('file footprint apply (OBTS-SYNC-DELTA-001)', () => {
       await writeFile(join(value.writerDir, 'new/d.md'), 'new folder file\n');
     } else await rm(join(value.writerDir, 'notes'), { recursive: true });
     expect((await settle(value.writer)).at(-1)).toBe('Synced');
-    const captures = spy(value.core, 'captureStableLocalChanges');
+    const scope = spy(value.core, 'deltaApplyScope');
     await value.core.pollRemoteEventsAndApply({ deltaApply: true });
-    expect(captures.length).toBeGreaterThan(0);
+    // A directory change never uses the scoped apply: the full path owns the
+    // directory view and applies the change itself.
+    expect(scope.every((call) => (call.result ?? null) === null)).toBe(true);
+    if (operation === 'create') expect(await readFile(join(value.vaultDir, 'new/d.md'), 'utf8')).toBe('new folder file\n');
+    else await expect(stat(join(value.vaultDir, 'notes'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((await value.core.readQueue()).pending_commit).toBeNull();
   });
 
   it('recovers an interrupted scoped apply using the ordinary v7 journal', async () => {

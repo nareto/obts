@@ -386,7 +386,21 @@ describe('client stale authoring cohorts with the real server', () => {
     const f = await fixture();
     await f.remote();
     f.core.plugin.flushOpenMarkdownEditorsToDisk = async () => f.core.adapter.write('note.md', LOCAL);
-    f.core.captureStableLocalChanges = async () => ({ stable: false, paths: [], snapshot: null, changedPath: 'note.md' });
+    // A file that keeps changing under the tail's own reads: every attempt to
+    // settle the post-apply capture sees the path move again, so the capture
+    // can never prove the change and the tail must defer the scan, not publish.
+    const report = f.core.reportOperationProgress.bind(f.core);
+    let churning = false;
+    f.core.reportOperationProgress = (label: string, point: string) => {
+      if (label.startsWith('Applying (checking local edits)')) churning = true;
+      if (label.startsWith('Applying (finishing)')) churning = false;
+      return report(label, point);
+    };
+    const adapterStat = f.core.adapter.stat.bind(f.core.adapter);
+    f.core.adapter.stat = async (filePath: string) => {
+      if (churning && String(filePath).replace(/^\/+/u, '') === 'note.md') await f.core.adapter.write('note.md', LOCAL);
+      return await adapterStat(filePath);
+    };
     await f.core.pullAndApply(true);
     expect((await f.plugin.readQueue()).pending_commit).toBeNull();
     expect((await f.provenance()).obligations['note.md'].base).toBe(f.m0);
