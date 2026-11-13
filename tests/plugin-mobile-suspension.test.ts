@@ -378,6 +378,69 @@ describe('mobile suspension', () => {
     await harness.dispose();
   });
 
+  it('reopens the wake gate when a resume attempt throws', async () => {
+    const harness = await createHarness();
+    await harness.start();
+    expect(harness.plugin.wakeAttemptActive).toBe(false);
+    // A wake attempt that escapes its handler is contained, but containment
+    // must not latch the gate: after a failure the next resume needs its own
+    // attempt instead of being dropped for the rest of the session.
+    const backgroundSync = harness.plugin.runBackgroundSync;
+    harness.plugin.runBackgroundSync = async () => { throw new Error('wake attempt failed'); };
+    harness.show();
+    expect(harness.plugin.wakeAttemptActive).toBe(true);
+    await waitFor(() => harness.plugin.wakeAttemptActive === false, 5000);
+    harness.plugin.runBackgroundSync = backgroundSync;
+    harness.show();
+    await waitFor(() => harness.notify.attempts.length === 1, 5000);
+    expect(harness.notify.attempts).toEqual(['poll']);
+    await harness.dispose();
+  });
+
+  it('reopens the wake gate when the resume attempt finds no ready client', async () => {
+    const harness = await createHarness();
+    await harness.start();
+    const ensureReady = harness.plugin.ensureClientReady;
+    harness.plugin.ensureClientReady = async () => false;
+    harness.show();
+    expect(harness.plugin.wakeAttemptActive).toBe(true);
+    await waitFor(() => harness.plugin.wakeAttemptActive === false, 5000);
+    // The attempt is still owed: the gate released, the queue did not.
+    expect(harness.plugin.syncQueued).toBe(true);
+    harness.plugin.ensureClientReady = ensureReady;
+    harness.show();
+    await waitFor(() => harness.notify.attempts.length === 1, 5000);
+    expect(harness.notify.attempts).toEqual(['poll']);
+    await harness.dispose();
+  });
+
+  it('keeps the wake gate closed while the attempt is rescheduled', async () => {
+    const harness = await createHarness();
+    await harness.start();
+    // A retry horizon in the future reschedules the wake attempt instead of
+    // dispatching it, so the rest of the resume burst must join that one
+    // attempt rather than queue another.
+    harness.plugin.automaticRetryNotBefore = Date.now() + 60_000;
+    harness.show();
+    await waitFor(() => harness.plugin.queuedSyncTimer !== null, 5000);
+    expect(harness.plugin.wakeAttemptActive).toBe(true);
+    harness.fire('window', 'focus');
+    harness.fire('window', 'online');
+    await settle();
+    expect(harness.plugin.wakeAttemptActive).toBe(true);
+    expect(harness.notify.attempts).toEqual([]);
+
+    // The rescheduled attempt still runs once its horizon passes, and the gate
+    // reopens when that attempt ends.
+    harness.plugin.automaticRetryNotBefore = 0;
+    clearTimeout(harness.plugin.queuedSyncTimer);
+    harness.plugin.queuedSyncTimer = null;
+    await harness.plugin.runQueuedSync();
+    expect(harness.notify.attempts).toEqual(['poll']);
+    expect(harness.plugin.wakeAttemptActive).toBe(false);
+    await harness.dispose();
+  });
+
   it('reports the apply stage a suspension interrupted', async () => {
     const harness = await createHarness();
     await harness.start();

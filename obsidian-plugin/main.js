@@ -24414,9 +24414,10 @@ module.exports = class ObtsPlugin extends Plugin {
       if (dispatch === "background") await this.runBackgroundSync(trigger);
       else await this.runAutomaticSync({}, trigger);
       if (this.syncQueued) this.scheduleQueuedSync(0);
-      else this.wakeAttemptActive = false;
     } catch (error) {
       this.containDetachedAttemptFailure(error);
+    } finally {
+      if (this.queuedSyncTimer === null) this.wakeAttemptActive = false;
     }
   }
   async flushOpenMarkdownEditorsToDisk(isUnreloadedView = null) {

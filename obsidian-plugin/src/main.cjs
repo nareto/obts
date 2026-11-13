@@ -1427,9 +1427,15 @@ module.exports = class ObtsPlugin extends Plugin {
       if (dispatch === "background") await this.runBackgroundSync(trigger);
       else await this.runAutomaticSync({}, trigger);
       if (this.syncQueued) this.scheduleQueuedSync(0);
-      else this.wakeAttemptActive = false;
     } catch (error) {
       this.containDetachedAttemptFailure(error);
+    } finally {
+      // The wake gate coalesces every event of one resume burst into a single
+      // attempt, so it may only stay closed while that attempt still has a
+      // follow-up timer pending. An attempt that ends here without one (client
+      // not ready, nothing left to sync, or a contained failure) must reopen the
+      // gate; otherwise the next resume would be silently dropped.
+      if (this.queuedSyncTimer === null) this.wakeAttemptActive = false;
     }
   }
 
