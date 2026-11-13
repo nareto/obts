@@ -516,6 +516,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     const plugin = await pairPlugin(admin, deviceDir, 'incremental-scan-device');
     await writeFile(join(deviceDir, 'alpha.md'), 'alpha one\n');
     await writeFile(join(deviceDir, 'beta.md'), 'beta one\n');
+    await ageFilesBeyondScanProof(deviceDir, ['alpha.md', 'beta.md']);
     await plugin.recordLocalChangeHint(['alpha.md', 'beta.md']);
     expect((await plugin.syncOnce()).status).toBe('Synced');
 
@@ -535,6 +536,7 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(await core.backgroundScanDecision()).toEqual({ required: false, mode: 'none' });
 
     await writeFile(join(deviceDir, 'beta.md'), 'beta two\n');
+    await ageFilesBeyondScanProof(deviceDir, ['beta.md']);
     expect((await plugin.syncOnce()).status).toBe('Synced');
     expect(visibleReads.filter((filePath) => filePath === 'beta.md').length).toBeGreaterThan(0);
     expect(visibleReads).not.toContain('alpha.md');
@@ -6173,16 +6175,24 @@ describe('Phase 1 sync without conflict resolution', () => {
     };
 
     expect((await plugin2.syncOnce()).status).toBe('Synced');
-    expect(snapshotCount).toBe(3);
+    // Two captures, not three: the local commit before the pull, then the
+    // committed tail, which proves every unchanged path from the scan cache that
+    // commit just recorded. The tail's second stable pass is the fallback for a
+    // cache that cannot prove the vault, which this settled device never takes.
+    expect(snapshotCount).toBe(2);
     expect(diagnosticPoints).toContain('file_inventory_check');
     expect(diagnosticPoints).toContain('apply_verify');
-    expect(diagnosticPoints).toContain('local_preservation');
+    // The fast tail names its stage as apply_local_capture and counts the
+    // whole-vault stat pass under apply_verify; local_preservation belongs to
+    // the stable-capture fallback.
+    expect(diagnosticPoints).toContain('apply_local_capture');
     expect(diagnosticPoints).toContain('directory_inventory');
     expect(diagnosticPoints).toContain('apply_finalize');
     expect(diagnosticPoints).toContain('sync_request');
+    expect(progressLabels).toContain('Applying (checking local edits)');
     expect(progressLabels).toContain('Applying (listing vault files)');
     expect(progressLabels).toContain('Applying (finishing)');
-    expect(progressLabels.some(label => /^Applying \(checking local edits\) [0-9]+\/[0-9]+$/u.test(label))).toBe(true);
+    expect(progressLabels.some(label => /^Applying \(verifying vault\) [0-9]+\/[0-9]+$/u.test(label))).toBe(true);
   });
 
   it('rebuilds from server main and turns snapshot-only local edits into a recovery commit', async () => {
@@ -8391,6 +8401,18 @@ async function isDirectory(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+// A scan-cache entry only proves a path's bytes when its recorded mtime is older
+// than the cache record by the mtime granularity a coarse filesystem clock can
+// misreport. A test that writes a file and syncs it in the same millisecond
+// leaves that path unproven, which is the safe re-read but not the behavior
+// under test here: age the file so the next sync can prove it unchanged.
+const SCAN_PROOF_AGE_MS = 10_000;
+
+async function ageFilesBeyondScanProof(vaultDir: string, filePaths: string[]): Promise<void> {
+  const when = new Date(Date.now() - SCAN_PROOF_AGE_MS);
+  for (const filePath of filePaths) await utimes(join(vaultDir, filePath), when, when);
 }
 
 async function awaitState(plugin: ObtsPluginClient) {
