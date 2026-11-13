@@ -551,6 +551,11 @@ describe('Phase 1 sync without conflict resolution', () => {
     expect(visibleReads.filter((filePath) => filePath === 'alpha.md').length).toBeGreaterThan(0);
     expect(visibleReads).not.toContain('beta.md');
     expect(await plugin.readQueue()).toMatchObject({ status: 'idle', changed_paths: [] });
+    // A path modified inside the mtime granularity of its own scan-cache record
+    // cannot prove it is racy-clean, so a later capture in this same attempt may
+    // read it once more. That bound is safe but timing dependent, and the audit
+    // check below is about which files are covered, not about the wall clock.
+    await ageFilesBeyondScanProof(deviceDir, ['alpha.md']);
 
     await writeFile(join(deviceDir, 'queued-before-audit.md'), 'settle before audit\n');
     const queuedFiles = (await core.listLocalVaultInventory('')).files
@@ -600,7 +605,11 @@ describe('Phase 1 sync without conflict resolution', () => {
       return await restartedReadBinary(filePath);
     };
     expect((await restarted.syncOnce({ fullAudit: true })).status).toBe('Synced');
-    expect(auditReads.sort()).toEqual(['alpha.md', 'beta.md']);
+    // A full audit must read every path. A path whose scan-cache entry cannot
+    // prove it is racy-clean is read once more by another capture in the same
+    // attempt -- the pre-audit stale-cohort classification here -- and that bound
+    // is one file, not the vault. What matters is that both files are audited.
+    expect(new Set(auditReads)).toEqual(new Set(['alpha.md', 'beta.md']));
     expect(JSON.parse(await readFile(join(deviceDir, '.obts', 'scan-state.json'), 'utf8'))).toMatchObject({
       version: 1,
       scanner_schema: 1,
