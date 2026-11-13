@@ -106,6 +106,18 @@ function owned<T extends unknown[]>(body: (fixture: MobileFixture, ...args: T) =
     return fixture.lifecycle.run('test continuation', () => body(fixture, ...args));
   };
 }
+// A restarted device schedules its own catch-up attempt, and that attempt holds
+// the plugin's sync lease. Driving `core.syncOnce()` directly would bypass the
+// lease and run two syncs against one client, racing on the upload queue, so a
+// test that needs the device to settle asks for the same automatic attempt a
+// resumed device uses and waits for convergence.
+async function settleAutomatically(device: Harness) {
+  device.plugin.queueAutomaticSync();
+  await waitUntil(async () => {
+    const state = await device.core.readState();
+    return state.status_label === 'Synced' && (await device.core.readQueue()).pending_commit === null;
+  }, 30000);
+}
 async function verifyRecovery(phoneRoot: string) {
   const recoveryRoot = join(phoneRoot, '.obts/recovery');
   const bundles = (await readdir(recoveryRoot)).filter(name => name.startsWith('rec_'));
@@ -138,7 +150,7 @@ describe('packaged mobile onboarding recovery', () => {
     expect(await readFile(join(phoneRoot, '.obts/onboarding.json'), 'utf8')).toBe(journal);
   }));
 
-  it.each(['approved', 'consumed'])('completes same enrollment while preserving later local edits: %s', owned(async ({ url, server, seed, prepared, mobileHarness }, status: string) => {
+  it.each(['approved', 'consumed'])('completes same enrollment while preserving later local edits: %s', owned(async ({ url, server, vaultId, seed, prepared, mobileHarness }, status: string) => {
     await seed();
     const { h, phoneRoot, connection } = await prepared();
     const saved = await h.core.readPendingOnboarding();
@@ -154,9 +166,11 @@ describe('packaged mobile onboarding recovery', () => {
     expect((await server.store.snapshot()).devices).toHaveLength(2);
     expect(restarted.requests.filter(path => path === '/api/v1/connections')).toHaveLength(0);
     expect(await readFile(join(phoneRoot, 'note.md'), 'utf8')).toBe('later local edit\n');
-    expect(await restarted.core.readQueue()).toMatchObject({ status: 'queued_local', pending_commit: expect.any(String) });
-    expect((await restarted.core.syncOnce()).status).toBe('Synced');
+    // The edit made after setup is queued as local work, but the resumed device
+    // is already uploading it, so only the outcome is a stable observation.
+    await settleAutomatically(restarted);
     expect(await readFile(join(phoneRoot, 'note.md'), 'utf8')).toBe('later local edit\n');
+    expect((await restarted.core.readState()).local_main).toBe((await server.store.snapshot()).vaults.find(vault => vault.vault_id === vaultId)!.current_main);
   }));
 
   it('completes setup and queues edits when the local snapshot keeps changing during baseline capture', owned(async ({ seed, prepared }) => {
@@ -339,7 +353,7 @@ describe('packaged mobile onboarding recovery', () => {
     expect(restarted.requests.filter(path => path.endsWith('/sync/pull-chunk'))).toHaveLength(0);
   }));
 
-  it('completes a historical replacement resume and queues edits made after saved consent', owned(async ({ url, server, seed, prepared, mobileHarness }) => {
+  it('completes a historical replacement resume and queues edits made after saved consent', owned(async ({ url, server, vaultId, seed, prepared, mobileHarness }) => {
     await seed();
     const { h, phoneRoot } = await prepared();
     const saved = await h.core.readPendingOnboarding();
@@ -352,9 +366,13 @@ describe('packaged mobile onboarding recovery', () => {
     await waitUntil(() => !modal.onboardingRunning);
     expect(modal.contentEl.allText).toContain('Sync is ready');
     expect(await readFile(join(phoneRoot, 'note.md'), 'utf8')).toBe('later local edit\n');
-    expect(await restarted.core.readQueue()).toMatchObject({ status: 'queued_local', pending_commit: expect.any(String) });
     expect(await restarted.core.readPendingOnboarding()).toBeNull();
     expect((await server.store.snapshot()).devices).toHaveLength(2);
+    // The edit made after saved consent must reach the server through the
+    // device's own catch-up attempt, not merely sit in the upload queue.
+    await settleAutomatically(restarted);
+    expect(await readFile(join(phoneRoot, 'note.md'), 'utf8')).toBe('later local edit\n');
+    expect((await restarted.core.readState()).local_main).toBe((await server.store.snapshot()).vaults.find(vault => vault.vault_id === vaultId)!.current_main);
   }));
 
   it.each(['checkpoint', 'pending-ack'])('settles %s before catching up to an advanced main', owned(async ({ url, server, seed, prepared, mobileHarness }, boundary: string) => {
