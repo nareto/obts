@@ -42,9 +42,9 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 ));
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
-// node_modules/base64-js/index.js
+// ../../obts/node_modules/base64-js/index.js
 var require_base64_js = __commonJS({
-  "node_modules/base64-js/index.js"(exports2) {
+  "../../obts/node_modules/base64-js/index.js"(exports2) {
     "use strict";
     exports2.byteLength = byteLength;
     exports2.toByteArray = toByteArray;
@@ -143,9 +143,9 @@ var require_base64_js = __commonJS({
   }
 });
 
-// node_modules/ieee754/index.js
+// ../../obts/node_modules/ieee754/index.js
 var require_ieee754 = __commonJS({
-  "node_modules/ieee754/index.js"(exports2) {
+  "../../obts/node_modules/ieee754/index.js"(exports2) {
     exports2.read = function(buffer, offset, isLE, mLen, nBytes) {
       var e, m;
       var eLen = nBytes * 8 - mLen - 1;
@@ -226,9 +226,9 @@ var require_ieee754 = __commonJS({
   }
 });
 
-// node_modules/buffer/index.js
+// ../../obts/node_modules/buffer/index.js
 var require_buffer = __commonJS({
-  "node_modules/buffer/index.js"(exports2) {
+  "../../obts/node_modules/buffer/index.js"(exports2) {
     "use strict";
     var base64 = require_base64_js();
     var ieee754 = require_ieee754();
@@ -2096,9 +2096,9 @@ var require_git_object_cache = __commonJS({
   }
 });
 
-// node_modules/async-lock/lib/index.js
+// ../../obts/node_modules/async-lock/lib/index.js
 var require_lib = __commonJS({
-  "node_modules/async-lock/lib/index.js"(exports2, module2) {
+  "../../obts/node_modules/async-lock/lib/index.js"(exports2, module2) {
     "use strict";
     var AsyncLock2 = function(opts) {
       opts = opts || {};
@@ -2321,17 +2321,17 @@ var require_lib = __commonJS({
   }
 });
 
-// node_modules/async-lock/index.js
+// ../../obts/node_modules/async-lock/index.js
 var require_async_lock = __commonJS({
-  "node_modules/async-lock/index.js"(exports2, module2) {
+  "../../obts/node_modules/async-lock/index.js"(exports2, module2) {
     "use strict";
     module2.exports = require_lib();
   }
 });
 
-// node_modules/inherits/inherits_browser.js
+// ../../obts/node_modules/inherits/inherits_browser.js
 var require_inherits_browser = __commonJS({
-  "node_modules/inherits/inherits_browser.js"(exports2, module2) {
+  "../../obts/node_modules/inherits/inherits_browser.js"(exports2, module2) {
     if (typeof Object.create === "function") {
       module2.exports = function inherits(ctor, superCtor) {
         if (superCtor) {
@@ -2361,9 +2361,9 @@ var require_inherits_browser = __commonJS({
   }
 });
 
-// node_modules/safe-buffer/index.js
+// ../../obts/node_modules/safe-buffer/index.js
 var require_safe_buffer = __commonJS({
-  "node_modules/safe-buffer/index.js"(exports2, module2) {
+  "../../obts/node_modules/safe-buffer/index.js"(exports2, module2) {
     var buffer = require_buffer();
     var Buffer3 = buffer.Buffer;
     function copyProps(src, dst) {
@@ -2419,9 +2419,9 @@ var require_safe_buffer = __commonJS({
   }
 });
 
-// node_modules/isarray/index.js
+// ../../obts/node_modules/isarray/index.js
 var require_isarray = __commonJS({
-  "node_modules/isarray/index.js"(exports2, module2) {
+  "../../obts/node_modules/isarray/index.js"(exports2, module2) {
     var toString = {}.toString;
     module2.exports = Array.isArray || function(arr) {
       return toString.call(arr) == "[object Array]";
@@ -2429,121 +2429,121 @@ var require_isarray = __commonJS({
   }
 });
 
-// node_modules/es-errors/type.js
+// ../../obts/node_modules/es-errors/type.js
 var require_type = __commonJS({
-  "node_modules/es-errors/type.js"(exports2, module2) {
+  "../../obts/node_modules/es-errors/type.js"(exports2, module2) {
     "use strict";
     module2.exports = TypeError;
   }
 });
 
-// node_modules/es-object-atoms/index.js
+// ../../obts/node_modules/es-object-atoms/index.js
 var require_es_object_atoms = __commonJS({
-  "node_modules/es-object-atoms/index.js"(exports2, module2) {
+  "../../obts/node_modules/es-object-atoms/index.js"(exports2, module2) {
     "use strict";
     module2.exports = Object;
   }
 });
 
-// node_modules/es-errors/index.js
+// ../../obts/node_modules/es-errors/index.js
 var require_es_errors = __commonJS({
-  "node_modules/es-errors/index.js"(exports2, module2) {
+  "../../obts/node_modules/es-errors/index.js"(exports2, module2) {
     "use strict";
     module2.exports = Error;
   }
 });
 
-// node_modules/es-errors/eval.js
+// ../../obts/node_modules/es-errors/eval.js
 var require_eval = __commonJS({
-  "node_modules/es-errors/eval.js"(exports2, module2) {
+  "../../obts/node_modules/es-errors/eval.js"(exports2, module2) {
     "use strict";
     module2.exports = EvalError;
   }
 });
 
-// node_modules/es-errors/range.js
+// ../../obts/node_modules/es-errors/range.js
 var require_range = __commonJS({
-  "node_modules/es-errors/range.js"(exports2, module2) {
+  "../../obts/node_modules/es-errors/range.js"(exports2, module2) {
     "use strict";
     module2.exports = RangeError;
   }
 });
 
-// node_modules/es-errors/ref.js
+// ../../obts/node_modules/es-errors/ref.js
 var require_ref = __commonJS({
-  "node_modules/es-errors/ref.js"(exports2, module2) {
+  "../../obts/node_modules/es-errors/ref.js"(exports2, module2) {
     "use strict";
     module2.exports = ReferenceError;
   }
 });
 
-// node_modules/es-errors/syntax.js
+// ../../obts/node_modules/es-errors/syntax.js
 var require_syntax = __commonJS({
-  "node_modules/es-errors/syntax.js"(exports2, module2) {
+  "../../obts/node_modules/es-errors/syntax.js"(exports2, module2) {
     "use strict";
     module2.exports = SyntaxError;
   }
 });
 
-// node_modules/es-errors/uri.js
+// ../../obts/node_modules/es-errors/uri.js
 var require_uri = __commonJS({
-  "node_modules/es-errors/uri.js"(exports2, module2) {
+  "../../obts/node_modules/es-errors/uri.js"(exports2, module2) {
     "use strict";
     module2.exports = URIError;
   }
 });
 
-// node_modules/math-intrinsics/abs.js
+// ../../obts/node_modules/math-intrinsics/abs.js
 var require_abs = __commonJS({
-  "node_modules/math-intrinsics/abs.js"(exports2, module2) {
+  "../../obts/node_modules/math-intrinsics/abs.js"(exports2, module2) {
     "use strict";
     module2.exports = Math.abs;
   }
 });
 
-// node_modules/math-intrinsics/floor.js
+// ../../obts/node_modules/math-intrinsics/floor.js
 var require_floor = __commonJS({
-  "node_modules/math-intrinsics/floor.js"(exports2, module2) {
+  "../../obts/node_modules/math-intrinsics/floor.js"(exports2, module2) {
     "use strict";
     module2.exports = Math.floor;
   }
 });
 
-// node_modules/math-intrinsics/max.js
+// ../../obts/node_modules/math-intrinsics/max.js
 var require_max = __commonJS({
-  "node_modules/math-intrinsics/max.js"(exports2, module2) {
+  "../../obts/node_modules/math-intrinsics/max.js"(exports2, module2) {
     "use strict";
     module2.exports = Math.max;
   }
 });
 
-// node_modules/math-intrinsics/min.js
+// ../../obts/node_modules/math-intrinsics/min.js
 var require_min = __commonJS({
-  "node_modules/math-intrinsics/min.js"(exports2, module2) {
+  "../../obts/node_modules/math-intrinsics/min.js"(exports2, module2) {
     "use strict";
     module2.exports = Math.min;
   }
 });
 
-// node_modules/math-intrinsics/pow.js
+// ../../obts/node_modules/math-intrinsics/pow.js
 var require_pow = __commonJS({
-  "node_modules/math-intrinsics/pow.js"(exports2, module2) {
+  "../../obts/node_modules/math-intrinsics/pow.js"(exports2, module2) {
     "use strict";
     module2.exports = Math.pow;
   }
 });
 
-// node_modules/math-intrinsics/round.js
+// ../../obts/node_modules/math-intrinsics/round.js
 var require_round = __commonJS({
-  "node_modules/math-intrinsics/round.js"(exports2, module2) {
+  "../../obts/node_modules/math-intrinsics/round.js"(exports2, module2) {
     "use strict";
     module2.exports = Math.round;
   }
 });
 
-// node_modules/math-intrinsics/isNaN.js
+// ../../obts/node_modules/math-intrinsics/isNaN.js
 var require_isNaN = __commonJS({
-  "node_modules/math-intrinsics/isNaN.js"(exports2, module2) {
+  "../../obts/node_modules/math-intrinsics/isNaN.js"(exports2, module2) {
     "use strict";
     module2.exports = Number.isNaN || function isNaN2(a) {
       return a !== a;
@@ -2551,9 +2551,9 @@ var require_isNaN = __commonJS({
   }
 });
 
-// node_modules/math-intrinsics/sign.js
+// ../../obts/node_modules/math-intrinsics/sign.js
 var require_sign = __commonJS({
-  "node_modules/math-intrinsics/sign.js"(exports2, module2) {
+  "../../obts/node_modules/math-intrinsics/sign.js"(exports2, module2) {
     "use strict";
     var $isNaN = require_isNaN();
     module2.exports = function sign(number) {
@@ -2565,17 +2565,17 @@ var require_sign = __commonJS({
   }
 });
 
-// node_modules/gopd/gOPD.js
+// ../../obts/node_modules/gopd/gOPD.js
 var require_gOPD = __commonJS({
-  "node_modules/gopd/gOPD.js"(exports2, module2) {
+  "../../obts/node_modules/gopd/gOPD.js"(exports2, module2) {
     "use strict";
     module2.exports = Object.getOwnPropertyDescriptor;
   }
 });
 
-// node_modules/gopd/index.js
+// ../../obts/node_modules/gopd/index.js
 var require_gopd = __commonJS({
-  "node_modules/gopd/index.js"(exports2, module2) {
+  "../../obts/node_modules/gopd/index.js"(exports2, module2) {
     "use strict";
     var $gOPD = require_gOPD();
     if ($gOPD) {
@@ -2589,9 +2589,9 @@ var require_gopd = __commonJS({
   }
 });
 
-// node_modules/es-define-property/index.js
+// ../../obts/node_modules/es-define-property/index.js
 var require_es_define_property = __commonJS({
-  "node_modules/es-define-property/index.js"(exports2, module2) {
+  "../../obts/node_modules/es-define-property/index.js"(exports2, module2) {
     "use strict";
     var $defineProperty = Object.defineProperty || false;
     if ($defineProperty) {
@@ -2605,9 +2605,9 @@ var require_es_define_property = __commonJS({
   }
 });
 
-// node_modules/has-symbols/shams.js
+// ../../obts/node_modules/has-symbols/shams.js
 var require_shams = __commonJS({
-  "node_modules/has-symbols/shams.js"(exports2, module2) {
+  "../../obts/node_modules/has-symbols/shams.js"(exports2, module2) {
     "use strict";
     module2.exports = function hasSymbols() {
       if (typeof Symbol !== "function" || typeof Object.getOwnPropertySymbols !== "function") {
@@ -2660,9 +2660,9 @@ var require_shams = __commonJS({
   }
 });
 
-// node_modules/has-symbols/index.js
+// ../../obts/node_modules/has-symbols/index.js
 var require_has_symbols = __commonJS({
-  "node_modules/has-symbols/index.js"(exports2, module2) {
+  "../../obts/node_modules/has-symbols/index.js"(exports2, module2) {
     "use strict";
     var origSymbol = typeof Symbol !== "undefined" && Symbol;
     var hasSymbolSham = require_shams();
@@ -2684,26 +2684,26 @@ var require_has_symbols = __commonJS({
   }
 });
 
-// node_modules/get-proto/Reflect.getPrototypeOf.js
+// ../../obts/node_modules/get-proto/Reflect.getPrototypeOf.js
 var require_Reflect_getPrototypeOf = __commonJS({
-  "node_modules/get-proto/Reflect.getPrototypeOf.js"(exports2, module2) {
+  "../../obts/node_modules/get-proto/Reflect.getPrototypeOf.js"(exports2, module2) {
     "use strict";
     module2.exports = typeof Reflect !== "undefined" && Reflect.getPrototypeOf || null;
   }
 });
 
-// node_modules/get-proto/Object.getPrototypeOf.js
+// ../../obts/node_modules/get-proto/Object.getPrototypeOf.js
 var require_Object_getPrototypeOf = __commonJS({
-  "node_modules/get-proto/Object.getPrototypeOf.js"(exports2, module2) {
+  "../../obts/node_modules/get-proto/Object.getPrototypeOf.js"(exports2, module2) {
     "use strict";
     var $Object = require_es_object_atoms();
     module2.exports = $Object.getPrototypeOf || null;
   }
 });
 
-// node_modules/function-bind/implementation.js
+// ../../obts/node_modules/function-bind/implementation.js
 var require_implementation = __commonJS({
-  "node_modules/function-bind/implementation.js"(exports2, module2) {
+  "../../obts/node_modules/function-bind/implementation.js"(exports2, module2) {
     "use strict";
     var ERROR_MESSAGE = "Function.prototype.bind called on incompatible ";
     var toStr = Object.prototype.toString;
@@ -2777,42 +2777,42 @@ var require_implementation = __commonJS({
   }
 });
 
-// node_modules/function-bind/index.js
+// ../../obts/node_modules/function-bind/index.js
 var require_function_bind = __commonJS({
-  "node_modules/function-bind/index.js"(exports2, module2) {
+  "../../obts/node_modules/function-bind/index.js"(exports2, module2) {
     "use strict";
     var implementation = require_implementation();
     module2.exports = Function.prototype.bind || implementation;
   }
 });
 
-// node_modules/call-bind-apply-helpers/functionCall.js
+// ../../obts/node_modules/call-bind-apply-helpers/functionCall.js
 var require_functionCall = __commonJS({
-  "node_modules/call-bind-apply-helpers/functionCall.js"(exports2, module2) {
+  "../../obts/node_modules/call-bind-apply-helpers/functionCall.js"(exports2, module2) {
     "use strict";
     module2.exports = Function.prototype.call;
   }
 });
 
-// node_modules/call-bind-apply-helpers/functionApply.js
+// ../../obts/node_modules/call-bind-apply-helpers/functionApply.js
 var require_functionApply = __commonJS({
-  "node_modules/call-bind-apply-helpers/functionApply.js"(exports2, module2) {
+  "../../obts/node_modules/call-bind-apply-helpers/functionApply.js"(exports2, module2) {
     "use strict";
     module2.exports = Function.prototype.apply;
   }
 });
 
-// node_modules/call-bind-apply-helpers/reflectApply.js
+// ../../obts/node_modules/call-bind-apply-helpers/reflectApply.js
 var require_reflectApply = __commonJS({
-  "node_modules/call-bind-apply-helpers/reflectApply.js"(exports2, module2) {
+  "../../obts/node_modules/call-bind-apply-helpers/reflectApply.js"(exports2, module2) {
     "use strict";
     module2.exports = typeof Reflect !== "undefined" && Reflect && Reflect.apply;
   }
 });
 
-// node_modules/call-bind-apply-helpers/actualApply.js
+// ../../obts/node_modules/call-bind-apply-helpers/actualApply.js
 var require_actualApply = __commonJS({
-  "node_modules/call-bind-apply-helpers/actualApply.js"(exports2, module2) {
+  "../../obts/node_modules/call-bind-apply-helpers/actualApply.js"(exports2, module2) {
     "use strict";
     var bind = require_function_bind();
     var $apply = require_functionApply();
@@ -2822,9 +2822,9 @@ var require_actualApply = __commonJS({
   }
 });
 
-// node_modules/call-bind-apply-helpers/index.js
+// ../../obts/node_modules/call-bind-apply-helpers/index.js
 var require_call_bind_apply_helpers = __commonJS({
-  "node_modules/call-bind-apply-helpers/index.js"(exports2, module2) {
+  "../../obts/node_modules/call-bind-apply-helpers/index.js"(exports2, module2) {
     "use strict";
     var bind = require_function_bind();
     var $TypeError = require_type();
@@ -2839,9 +2839,9 @@ var require_call_bind_apply_helpers = __commonJS({
   }
 });
 
-// node_modules/dunder-proto/get.js
+// ../../obts/node_modules/dunder-proto/get.js
 var require_get = __commonJS({
-  "node_modules/dunder-proto/get.js"(exports2, module2) {
+  "../../obts/node_modules/dunder-proto/get.js"(exports2, module2) {
     "use strict";
     var callBind = require_call_bind_apply_helpers();
     var gOPD = require_gopd();
@@ -2870,9 +2870,9 @@ var require_get = __commonJS({
   }
 });
 
-// node_modules/get-proto/index.js
+// ../../obts/node_modules/get-proto/index.js
 var require_get_proto = __commonJS({
-  "node_modules/get-proto/index.js"(exports2, module2) {
+  "../../obts/node_modules/get-proto/index.js"(exports2, module2) {
     "use strict";
     var reflectGetProto = require_Reflect_getPrototypeOf();
     var originalGetProto = require_Object_getPrototypeOf();
@@ -2890,9 +2890,9 @@ var require_get_proto = __commonJS({
   }
 });
 
-// node_modules/hasown/index.js
+// ../../obts/node_modules/hasown/index.js
 var require_hasown = __commonJS({
-  "node_modules/hasown/index.js"(exports2, module2) {
+  "../../obts/node_modules/hasown/index.js"(exports2, module2) {
     "use strict";
     var call = Function.prototype.call;
     var $hasOwn = Object.prototype.hasOwnProperty;
@@ -2901,9 +2901,9 @@ var require_hasown = __commonJS({
   }
 });
 
-// node_modules/get-intrinsic/index.js
+// ../../obts/node_modules/get-intrinsic/index.js
 var require_get_intrinsic = __commonJS({
-  "node_modules/get-intrinsic/index.js"(exports2, module2) {
+  "../../obts/node_modules/get-intrinsic/index.js"(exports2, module2) {
     "use strict";
     var undefined2;
     var $Object = require_es_object_atoms();
@@ -3232,9 +3232,9 @@ var require_get_intrinsic = __commonJS({
   }
 });
 
-// node_modules/call-bound/index.js
+// ../../obts/node_modules/call-bound/index.js
 var require_call_bound = __commonJS({
-  "node_modules/call-bound/index.js"(exports2, module2) {
+  "../../obts/node_modules/call-bound/index.js"(exports2, module2) {
     "use strict";
     var GetIntrinsic = require_get_intrinsic();
     var callBindBasic = require_call_bind_apply_helpers();
@@ -3255,9 +3255,9 @@ var require_call_bound = __commonJS({
   }
 });
 
-// node_modules/is-callable/index.js
+// ../../obts/node_modules/is-callable/index.js
 var require_is_callable = __commonJS({
-  "node_modules/is-callable/index.js"(exports2, module2) {
+  "../../obts/node_modules/is-callable/index.js"(exports2, module2) {
     "use strict";
     var fnToStr = Function.prototype.toString;
     var reflectApply = typeof Reflect === "object" && Reflect !== null && Reflect.apply;
@@ -3373,9 +3373,9 @@ var require_is_callable = __commonJS({
   }
 });
 
-// node_modules/for-each/index.js
+// ../../obts/node_modules/for-each/index.js
 var require_for_each = __commonJS({
-  "node_modules/for-each/index.js"(exports2, module2) {
+  "../../obts/node_modules/for-each/index.js"(exports2, module2) {
     "use strict";
     var isCallable = require_is_callable();
     var toStr = Object.prototype.toString;
@@ -3433,9 +3433,9 @@ var require_for_each = __commonJS({
   }
 });
 
-// node_modules/possible-typed-array-names/index.js
+// ../../obts/node_modules/possible-typed-array-names/index.js
 var require_possible_typed_array_names = __commonJS({
-  "node_modules/possible-typed-array-names/index.js"(exports2, module2) {
+  "../../obts/node_modules/possible-typed-array-names/index.js"(exports2, module2) {
     "use strict";
     module2.exports = [
       "Float16Array",
@@ -3454,9 +3454,9 @@ var require_possible_typed_array_names = __commonJS({
   }
 });
 
-// node_modules/available-typed-arrays/index.js
+// ../../obts/node_modules/available-typed-arrays/index.js
 var require_available_typed_arrays = __commonJS({
-  "node_modules/available-typed-arrays/index.js"(exports2, module2) {
+  "../../obts/node_modules/available-typed-arrays/index.js"(exports2, module2) {
     "use strict";
     var possibleNames = require_possible_typed_array_names();
     var g = typeof globalThis === "undefined" ? global : globalThis;
@@ -3472,9 +3472,9 @@ var require_available_typed_arrays = __commonJS({
   }
 });
 
-// node_modules/define-data-property/index.js
+// ../../obts/node_modules/define-data-property/index.js
 var require_define_data_property = __commonJS({
-  "node_modules/define-data-property/index.js"(exports2, module2) {
+  "../../obts/node_modules/define-data-property/index.js"(exports2, module2) {
     "use strict";
     var $defineProperty = require_es_define_property();
     var $SyntaxError = require_syntax();
@@ -3520,9 +3520,9 @@ var require_define_data_property = __commonJS({
   }
 });
 
-// node_modules/has-property-descriptors/index.js
+// ../../obts/node_modules/has-property-descriptors/index.js
 var require_has_property_descriptors = __commonJS({
-  "node_modules/has-property-descriptors/index.js"(exports2, module2) {
+  "../../obts/node_modules/has-property-descriptors/index.js"(exports2, module2) {
     "use strict";
     var $defineProperty = require_es_define_property();
     var hasPropertyDescriptors = function hasPropertyDescriptors2() {
@@ -3542,9 +3542,9 @@ var require_has_property_descriptors = __commonJS({
   }
 });
 
-// node_modules/set-function-length/index.js
+// ../../obts/node_modules/set-function-length/index.js
 var require_set_function_length = __commonJS({
-  "node_modules/set-function-length/index.js"(exports2, module2) {
+  "../../obts/node_modules/set-function-length/index.js"(exports2, module2) {
     "use strict";
     var GetIntrinsic = require_get_intrinsic();
     var define2 = require_define_data_property();
@@ -3595,9 +3595,9 @@ var require_set_function_length = __commonJS({
   }
 });
 
-// node_modules/call-bind-apply-helpers/applyBind.js
+// ../../obts/node_modules/call-bind-apply-helpers/applyBind.js
 var require_applyBind = __commonJS({
-  "node_modules/call-bind-apply-helpers/applyBind.js"(exports2, module2) {
+  "../../obts/node_modules/call-bind-apply-helpers/applyBind.js"(exports2, module2) {
     "use strict";
     var bind = require_function_bind();
     var $apply = require_functionApply();
@@ -3608,9 +3608,9 @@ var require_applyBind = __commonJS({
   }
 });
 
-// node_modules/call-bind/index.js
+// ../../obts/node_modules/call-bind/index.js
 var require_call_bind = __commonJS({
-  "node_modules/call-bind/index.js"(exports2, module2) {
+  "../../obts/node_modules/call-bind/index.js"(exports2, module2) {
     "use strict";
     var setFunctionLength = require_set_function_length();
     var $defineProperty = require_es_define_property();
@@ -3633,9 +3633,9 @@ var require_call_bind = __commonJS({
   }
 });
 
-// node_modules/has-tostringtag/shams.js
+// ../../obts/node_modules/has-tostringtag/shams.js
 var require_shams2 = __commonJS({
-  "node_modules/has-tostringtag/shams.js"(exports2, module2) {
+  "../../obts/node_modules/has-tostringtag/shams.js"(exports2, module2) {
     "use strict";
     var hasSymbols = require_shams();
     module2.exports = function hasToStringTagShams() {
@@ -3644,9 +3644,9 @@ var require_shams2 = __commonJS({
   }
 });
 
-// node_modules/which-typed-array/index.js
+// ../../obts/node_modules/which-typed-array/index.js
 var require_which_typed_array = __commonJS({
-  "node_modules/which-typed-array/index.js"(exports2, module2) {
+  "../../obts/node_modules/which-typed-array/index.js"(exports2, module2) {
     "use strict";
     var forEach = require_for_each();
     var availableTypedArrays = require_available_typed_arrays();
@@ -3768,9 +3768,9 @@ var require_which_typed_array = __commonJS({
   }
 });
 
-// node_modules/is-typed-array/index.js
+// ../../obts/node_modules/is-typed-array/index.js
 var require_is_typed_array = __commonJS({
-  "node_modules/is-typed-array/index.js"(exports2, module2) {
+  "../../obts/node_modules/is-typed-array/index.js"(exports2, module2) {
     "use strict";
     var whichTypedArray = require_which_typed_array();
     module2.exports = function isTypedArray(value) {
@@ -3779,9 +3779,9 @@ var require_is_typed_array = __commonJS({
   }
 });
 
-// node_modules/typed-array-buffer/index.js
+// ../../obts/node_modules/typed-array-buffer/index.js
 var require_typed_array_buffer = __commonJS({
-  "node_modules/typed-array-buffer/index.js"(exports2, module2) {
+  "../../obts/node_modules/typed-array-buffer/index.js"(exports2, module2) {
     "use strict";
     var $TypeError = require_type();
     var callBound = require_call_bound();
@@ -3796,9 +3796,9 @@ var require_typed_array_buffer = __commonJS({
   }
 });
 
-// node_modules/to-buffer/index.js
+// ../../obts/node_modules/to-buffer/index.js
 var require_to_buffer = __commonJS({
-  "node_modules/to-buffer/index.js"(exports2, module2) {
+  "../../obts/node_modules/to-buffer/index.js"(exports2, module2) {
     "use strict";
     var Buffer3 = require_safe_buffer().Buffer;
     var isArray = require_isarray();
@@ -3860,9 +3860,9 @@ var require_to_buffer = __commonJS({
   }
 });
 
-// node_modules/sha.js/hash.js
+// ../../obts/node_modules/sha.js/hash.js
 var require_hash = __commonJS({
-  "node_modules/sha.js/hash.js"(exports2, module2) {
+  "../../obts/node_modules/sha.js/hash.js"(exports2, module2) {
     "use strict";
     var Buffer3 = require_safe_buffer().Buffer;
     var toBuffer = require_to_buffer();
@@ -3921,9 +3921,9 @@ var require_hash = __commonJS({
   }
 });
 
-// node_modules/sha.js/sha1.js
+// ../../obts/node_modules/sha.js/sha1.js
 var require_sha1 = __commonJS({
-  "node_modules/sha.js/sha1.js"(exports2, module2) {
+  "../../obts/node_modules/sha.js/sha1.js"(exports2, module2) {
     "use strict";
     var inherits = require_inherits_browser();
     var Hash2 = require_hash();
@@ -4008,9 +4008,9 @@ var require_sha1 = __commonJS({
   }
 });
 
-// node_modules/crc-32/crc32.js
+// ../../obts/node_modules/crc-32/crc32.js
 var require_crc32 = __commonJS({
-  "node_modules/crc-32/crc32.js"(exports2) {
+  "../../obts/node_modules/crc-32/crc32.js"(exports2) {
     var CRC32;
     (function(factory) {
       if (typeof DO_NOT_EXPORT_CRC === "undefined") {
@@ -4106,9 +4106,9 @@ var require_crc32 = __commonJS({
   }
 });
 
-// node_modules/pako/lib/utils/common.js
+// ../../obts/node_modules/pako/lib/utils/common.js
 var require_common = __commonJS({
-  "node_modules/pako/lib/utils/common.js"(exports2) {
+  "../../obts/node_modules/pako/lib/utils/common.js"(exports2) {
     "use strict";
     var TYPED_OK = typeof Uint8Array !== "undefined" && typeof Uint16Array !== "undefined" && typeof Int32Array !== "undefined";
     function _has(obj, key) {
@@ -4197,9 +4197,9 @@ var require_common = __commonJS({
   }
 });
 
-// node_modules/pako/lib/zlib/trees.js
+// ../../obts/node_modules/pako/lib/zlib/trees.js
 var require_trees = __commonJS({
-  "node_modules/pako/lib/zlib/trees.js"(exports2) {
+  "../../obts/node_modules/pako/lib/zlib/trees.js"(exports2) {
     "use strict";
     var utils = require_common();
     var Z_FIXED = 4;
@@ -4839,9 +4839,9 @@ var require_trees = __commonJS({
   }
 });
 
-// node_modules/pako/lib/zlib/adler32.js
+// ../../obts/node_modules/pako/lib/zlib/adler32.js
 var require_adler32 = __commonJS({
-  "node_modules/pako/lib/zlib/adler32.js"(exports2, module2) {
+  "../../obts/node_modules/pako/lib/zlib/adler32.js"(exports2, module2) {
     "use strict";
     function adler32(adler, buf, len, pos) {
       var s1 = adler & 65535 | 0, s2 = adler >>> 16 & 65535 | 0, n = 0;
@@ -4861,9 +4861,9 @@ var require_adler32 = __commonJS({
   }
 });
 
-// node_modules/pako/lib/zlib/crc32.js
+// ../../obts/node_modules/pako/lib/zlib/crc32.js
 var require_crc322 = __commonJS({
-  "node_modules/pako/lib/zlib/crc32.js"(exports2, module2) {
+  "../../obts/node_modules/pako/lib/zlib/crc32.js"(exports2, module2) {
     "use strict";
     function makeTable() {
       var c, table = [];
@@ -4889,9 +4889,9 @@ var require_crc322 = __commonJS({
   }
 });
 
-// node_modules/pako/lib/zlib/messages.js
+// ../../obts/node_modules/pako/lib/zlib/messages.js
 var require_messages = __commonJS({
-  "node_modules/pako/lib/zlib/messages.js"(exports2, module2) {
+  "../../obts/node_modules/pako/lib/zlib/messages.js"(exports2, module2) {
     "use strict";
     module2.exports = {
       2: "need dictionary",
@@ -4916,9 +4916,9 @@ var require_messages = __commonJS({
   }
 });
 
-// node_modules/pako/lib/zlib/deflate.js
+// ../../obts/node_modules/pako/lib/zlib/deflate.js
 var require_deflate = __commonJS({
-  "node_modules/pako/lib/zlib/deflate.js"(exports2) {
+  "../../obts/node_modules/pako/lib/zlib/deflate.js"(exports2) {
     "use strict";
     var utils = require_common();
     var trees = require_trees();
@@ -5965,9 +5965,9 @@ var require_deflate = __commonJS({
   }
 });
 
-// node_modules/pako/lib/utils/strings.js
+// ../../obts/node_modules/pako/lib/utils/strings.js
 var require_strings = __commonJS({
-  "node_modules/pako/lib/utils/strings.js"(exports2) {
+  "../../obts/node_modules/pako/lib/utils/strings.js"(exports2) {
     "use strict";
     var utils = require_common();
     var STR_APPLY_OK = true;
@@ -6107,9 +6107,9 @@ var require_strings = __commonJS({
   }
 });
 
-// node_modules/pako/lib/zlib/zstream.js
+// ../../obts/node_modules/pako/lib/zlib/zstream.js
 var require_zstream = __commonJS({
-  "node_modules/pako/lib/zlib/zstream.js"(exports2, module2) {
+  "../../obts/node_modules/pako/lib/zlib/zstream.js"(exports2, module2) {
     "use strict";
     function ZStream() {
       this.input = null;
@@ -6129,9 +6129,9 @@ var require_zstream = __commonJS({
   }
 });
 
-// node_modules/pako/lib/deflate.js
+// ../../obts/node_modules/pako/lib/deflate.js
 var require_deflate2 = __commonJS({
-  "node_modules/pako/lib/deflate.js"(exports2) {
+  "../../obts/node_modules/pako/lib/deflate.js"(exports2) {
     "use strict";
     var zlib_deflate = require_deflate();
     var utils = require_common();
@@ -6290,9 +6290,9 @@ var require_deflate2 = __commonJS({
   }
 });
 
-// node_modules/pako/lib/zlib/inffast.js
+// ../../obts/node_modules/pako/lib/zlib/inffast.js
 var require_inffast = __commonJS({
-  "node_modules/pako/lib/zlib/inffast.js"(exports2, module2) {
+  "../../obts/node_modules/pako/lib/zlib/inffast.js"(exports2, module2) {
     "use strict";
     var BAD = 30;
     var TYPE = 12;
@@ -6519,9 +6519,9 @@ var require_inffast = __commonJS({
   }
 });
 
-// node_modules/pako/lib/zlib/inftrees.js
+// ../../obts/node_modules/pako/lib/zlib/inftrees.js
 var require_inftrees = __commonJS({
-  "node_modules/pako/lib/zlib/inftrees.js"(exports2, module2) {
+  "../../obts/node_modules/pako/lib/zlib/inftrees.js"(exports2, module2) {
     "use strict";
     var utils = require_common();
     var MAXBITS = 15;
@@ -6835,9 +6835,9 @@ var require_inftrees = __commonJS({
   }
 });
 
-// node_modules/pako/lib/zlib/inflate.js
+// ../../obts/node_modules/pako/lib/zlib/inflate.js
 var require_inflate = __commonJS({
-  "node_modules/pako/lib/zlib/inflate.js"(exports2) {
+  "../../obts/node_modules/pako/lib/zlib/inflate.js"(exports2) {
     "use strict";
     var utils = require_common();
     var adler32 = require_adler32();
@@ -8074,9 +8074,9 @@ var require_inflate = __commonJS({
   }
 });
 
-// node_modules/pako/lib/zlib/constants.js
+// ../../obts/node_modules/pako/lib/zlib/constants.js
 var require_constants = __commonJS({
-  "node_modules/pako/lib/zlib/constants.js"(exports2, module2) {
+  "../../obts/node_modules/pako/lib/zlib/constants.js"(exports2, module2) {
     "use strict";
     module2.exports = {
       /* Allowed flush values; see deflate() and inflate() below for details */
@@ -8121,9 +8121,9 @@ var require_constants = __commonJS({
   }
 });
 
-// node_modules/pako/lib/zlib/gzheader.js
+// ../../obts/node_modules/pako/lib/zlib/gzheader.js
 var require_gzheader = __commonJS({
-  "node_modules/pako/lib/zlib/gzheader.js"(exports2, module2) {
+  "../../obts/node_modules/pako/lib/zlib/gzheader.js"(exports2, module2) {
     "use strict";
     function GZheader() {
       this.text = 0;
@@ -8141,9 +8141,9 @@ var require_gzheader = __commonJS({
   }
 });
 
-// node_modules/pako/lib/inflate.js
+// ../../obts/node_modules/pako/lib/inflate.js
 var require_inflate2 = __commonJS({
-  "node_modules/pako/lib/inflate.js"(exports2) {
+  "../../obts/node_modules/pako/lib/inflate.js"(exports2) {
     "use strict";
     var zlib_inflate = require_inflate();
     var utils = require_common();
@@ -8315,9 +8315,9 @@ var require_inflate2 = __commonJS({
   }
 });
 
-// node_modules/pako/index.js
+// ../../obts/node_modules/pako/index.js
 var require_pako = __commonJS({
-  "node_modules/pako/index.js"(exports2, module2) {
+  "../../obts/node_modules/pako/index.js"(exports2, module2) {
     "use strict";
     var assign = require_common().assign;
     var deflate2 = require_deflate2();
@@ -8329,9 +8329,9 @@ var require_pako = __commonJS({
   }
 });
 
-// node_modules/pify/index.js
+// ../../obts/node_modules/pify/index.js
 var require_pify = __commonJS({
-  "node_modules/pify/index.js"(exports2, module2) {
+  "../../obts/node_modules/pify/index.js"(exports2, module2) {
     "use strict";
     var processFn = (fn, options) => function(...args) {
       const P = options.promiseModule;
@@ -8394,9 +8394,9 @@ var require_pify = __commonJS({
   }
 });
 
-// node_modules/ignore/index.js
+// ../../obts/node_modules/ignore/index.js
 var require_ignore = __commonJS({
-  "node_modules/ignore/index.js"(exports2, module2) {
+  "../../obts/node_modules/ignore/index.js"(exports2, module2) {
     function makeArray(subject) {
       return Array.isArray(subject) ? subject : [subject];
     }
@@ -8781,9 +8781,9 @@ var require_ignore = __commonJS({
   }
 });
 
-// node_modules/clean-git-ref/lib/index.js
+// ../../obts/node_modules/clean-git-ref/lib/index.js
 var require_lib2 = __commonJS({
-  "node_modules/clean-git-ref/lib/index.js"(exports2, module2) {
+  "../../obts/node_modules/clean-git-ref/lib/index.js"(exports2, module2) {
     "use strict";
     function escapeRegExp(string) {
       return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -8814,9 +8814,9 @@ var require_lib2 = __commonJS({
   }
 });
 
-// node_modules/diff3/onp.js
+// ../../obts/node_modules/diff3/onp.js
 var require_onp = __commonJS({
-  "node_modules/diff3/onp.js"(exports2, module2) {
+  "../../obts/node_modules/diff3/onp.js"(exports2, module2) {
     module2.exports = function(a_, b_) {
       var a = a_, b = b_, m = a.length, n = b.length, reverse = false, ed = null, offset = m + 1, path2 = [], pathposi = [], ses = [], lcs = "", SES_DELETE = -1, SES_COMMON = 0, SES_ADD = 1;
       var tmp1, tmp2;
@@ -8943,9 +8943,9 @@ var require_onp = __commonJS({
   }
 });
 
-// node_modules/diff3/diff3.js
+// ../../obts/node_modules/diff3/diff3.js
 var require_diff3 = __commonJS({
-  "node_modules/diff3/diff3.js"(exports2, module2) {
+  "../../obts/node_modules/diff3/diff3.js"(exports2, module2) {
     var onp = require_onp();
     function longestCommonSubsequence(file1, file2) {
       var diff = new onp(file1, file2);
@@ -9145,7 +9145,7 @@ var require_diff3 = __commonJS({
   }
 });
 
-// node_modules/isomorphic-git/index.js
+// ../../obts/node_modules/isomorphic-git/index.js
 var isomorphic_git_exports = {};
 __export(isomorphic_git_exports, {
   Errors: () => Errors,
@@ -16804,7 +16804,7 @@ async function writeTree({ fs, dir, gitdir = join(dir, ".git"), tree }) {
 }
 var import_async_lock, import_sha1, import_crc_32, import_pako, import_pify, import_ignore, import_clean_git_ref, import_diff3, BaseError, UnmergedPathsError, InternalError, UnsafeFilepathError, BufferCursor, MAX_UINT32, supportsSubtleSHA1, GitIndex, lock, IndexCache, GitIndexManager, GitWalkerIndex, GitWalkSymbol, NotFoundError, ObjectTypeError, InvalidOidError, NoRefspecError, GitPackedRefs, GitRefSpec, GitRefSpecSet, num, bool, schema, SECTION_LINE_REGEX, SECTION_REGEX, VARIABLE_LINE_REGEX, VARIABLE_NAME_REGEX, VARIABLE_VALUE_COMMENT_REGEX, extractSectionLine, extractVariableLine, removeComments, hasOddNumberOfQuotes, removeQuotes, lower, getPath, normalizePath, findLastIndex, GitConfig, GitConfigManager, refpaths, GIT_FILES, lock$1, GitRefManager, GitTree, GitObject, StreamReader, supportsDecompressionStream, GitPackIndex, PackfileCache, AlreadyExistsError, AmbiguousError, CheckoutConflictError, CherryPickMergeCommitError, CherryPickRootCommitError, CommitNotFetchedError, EmptyServerResponseError, FastForwardError, GitPushError, HttpError, InvalidFilepathError, InvalidRefNameError, MaxDepthError, MergeNotSupportedError, MergeConflictError, MissingNameError, MissingParameterError, MultipleGitError, ParseError, PushRejectedError, RemoteCapabilityError, SmartHttpError, UnknownTransportError, UrlParseError, UserCanceledError, IndexResetError, NoCommitError, Errors, GitAnnotatedTag, GitCommit, GitWalkerRepo, GitWalkerFs, flat, RunningMinimum, commands, FileSystem, GitIgnoreManager, supportsCompressionStream, bad, worthWalking, LINEBREAKS, _TreeMap, lock$2, abbreviateRx, GitPktLine, corsProxify, updateHeaders, stringifyBody, GitRemoteHTTP, GitRemoteManager, lock$3, GitShallowManager, pkg, FIFO, GitSideBand, EMPTY_OID, types, GitRefStash, GitStashManager, index, isomorphic_git_default;
 var init_isomorphic_git = __esm({
-  "node_modules/isomorphic-git/index.js"() {
+  "../../obts/node_modules/isomorphic-git/index.js"() {
     import_async_lock = __toESM(require_async_lock(), 1);
     import_sha1 = __toESM(require_sha1(), 1);
     import_crc_32 = __toESM(require_crc32(), 1);
@@ -20528,9 +20528,9 @@ ${obj.gpgsig ? obj.gpgsig : ""}`;
   }
 });
 
-// node_modules/path-browserify/index.js
+// ../../obts/node_modules/path-browserify/index.js
 var require_path_browserify = __commonJS({
-  "node_modules/path-browserify/index.js"(exports2, module2) {
+  "../../obts/node_modules/path-browserify/index.js"(exports2, module2) {
     "use strict";
     function assertPath(path2) {
       if (typeof path2 !== "string") {
@@ -20935,9 +20935,9 @@ var require_path_browserify = __commonJS({
   }
 });
 
-// node_modules/sha.js/sha.js
+// ../../obts/node_modules/sha.js/sha.js
 var require_sha = __commonJS({
-  "node_modules/sha.js/sha.js"(exports2, module2) {
+  "../../obts/node_modules/sha.js/sha.js"(exports2, module2) {
     "use strict";
     var inherits = require_inherits_browser();
     var Hash2 = require_hash();
@@ -21019,9 +21019,9 @@ var require_sha = __commonJS({
   }
 });
 
-// node_modules/sha.js/sha256.js
+// ../../obts/node_modules/sha.js/sha256.js
 var require_sha256 = __commonJS({
-  "node_modules/sha.js/sha256.js"(exports2, module2) {
+  "../../obts/node_modules/sha.js/sha256.js"(exports2, module2) {
     "use strict";
     var inherits = require_inherits_browser();
     var Hash2 = require_hash();
@@ -21181,9 +21181,9 @@ var require_sha256 = __commonJS({
   }
 });
 
-// node_modules/sha.js/sha224.js
+// ../../obts/node_modules/sha.js/sha224.js
 var require_sha224 = __commonJS({
-  "node_modules/sha.js/sha224.js"(exports2, module2) {
+  "../../obts/node_modules/sha.js/sha224.js"(exports2, module2) {
     "use strict";
     var inherits = require_inherits_browser();
     var Sha256 = require_sha256();
@@ -21222,9 +21222,9 @@ var require_sha224 = __commonJS({
   }
 });
 
-// node_modules/sha.js/sha512.js
+// ../../obts/node_modules/sha.js/sha512.js
 var require_sha512 = __commonJS({
-  "node_modules/sha.js/sha512.js"(exports2, module2) {
+  "../../obts/node_modules/sha.js/sha512.js"(exports2, module2) {
     "use strict";
     var inherits = require_inherits_browser();
     var Hash2 = require_hash();
@@ -21565,9 +21565,9 @@ var require_sha512 = __commonJS({
   }
 });
 
-// node_modules/sha.js/sha384.js
+// ../../obts/node_modules/sha.js/sha384.js
 var require_sha384 = __commonJS({
-  "node_modules/sha.js/sha384.js"(exports2, module2) {
+  "../../obts/node_modules/sha.js/sha384.js"(exports2, module2) {
     "use strict";
     var inherits = require_inherits_browser();
     var SHA512 = require_sha512();
@@ -21617,9 +21617,9 @@ var require_sha384 = __commonJS({
   }
 });
 
-// node_modules/sha.js/index.js
+// ../../obts/node_modules/sha.js/index.js
 var require_sha2 = __commonJS({
-  "node_modules/sha.js/index.js"(exports2, module2) {
+  "../../obts/node_modules/sha.js/index.js"(exports2, module2) {
     "use strict";
     module2.exports = function SHA(algorithm) {
       var alg = algorithm.toLowerCase();
@@ -23183,7 +23183,7 @@ var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var { findUnportablePaths, isRestrictedNamePlatform, segmentHasReservedCharacters } = require_namePortability();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.7.10";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.7.11";
 var SYNC_DEBOUNCE_MS = 1500;
 var EMPTY_JSON_BODY = "{}";
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
@@ -23265,6 +23265,8 @@ var MOBILE_FILE_WORK_CONCURRENCY = 2;
 var DESKTOP_FILE_BUFFER_BUDGET_BYTES = 64 * 1024 * 1024;
 var MOBILE_FILE_BUFFER_BUDGET_BYTES = 16 * 1024 * 1024;
 var FILE_WORK_YIELD_EVERY = 25;
+var APPLY_JOURNAL_QUARANTINE_DIR = "recovery-corrupt";
+var APPLY_JOURNAL_HEAL_MAX_CANDIDATES = 64;
 var FILE_PROGRESS_INTERVAL_MS = 250;
 var MOBILE_PACK_READ_ATTEMPTS = 5;
 var MOBILE_PACK_READ_RETRY_MS = 100;
@@ -25318,9 +25320,19 @@ var ObtsObsidianClient = class {
     try {
       journal = await readApplyJournalStrict(this.fsp, this.applyJournalPath);
     } catch {
-      await this.writeState(Object.assign({}, state, { status_label: "Out of sync \u2014 local recovery required", last_error_code: "apply_journal_recovery_required", apply_validation_reason: "recovery_state_corrupt", updated_at: nowIso() }));
-      return;
+      const healed = await this.healUnreadableApplyJournal();
+      if (healed === "retired" || healed === "absent") {
+        state = await this.clearApplyJournalLatch(await this.readState());
+        if (healed === "absent") journal = await readApplyJournalStrict(this.fsp, this.applyJournalPath).catch(() => null);
+      } else if (healed === "resume") {
+        journal = await readApplyJournalStrict(this.fsp, this.applyJournalPath).catch(() => null);
+      }
+      if (healed !== "retired" && healed !== "absent" && !journal) {
+        await this.writeState(Object.assign({}, state, { status_label: "Out of sync \u2014 local recovery required", last_error_code: "apply_journal_recovery_required", apply_validation_reason: "recovery_state_corrupt", updated_at: nowIso() }));
+        return;
+      }
     }
+    if (!journal && !await exists(this.fsp, this.applyLockPath)) state = await this.clearApplyJournalLatch(state);
     if (journal) await this.retainApplyProvenance(journal);
     if (!journal) state = await this.repairLocalStateIfNeeded(state);
     if (!journal) await this.recoverStaleProposalIntent();
@@ -26436,6 +26448,7 @@ var ObtsObsidianClient = class {
     return { status: "Synced", main: pulled.manifest.target_main };
   }
   async rebuildFromServerMain() {
+    await this.removeUnreadableApplyJournalAfterQuarantine();
     await this.initialize();
     await this.recoverUploadCheckpointIfNeeded();
     const state = await this.readState();
@@ -28374,6 +28387,7 @@ var ObtsObsidianClient = class {
     const state = await this.readState();
     const localFiles = await this.scanSyncableFiles();
     const recoveryBundleId = localFiles.length > 0 ? await this.createRecoveryBundle("rebuild_from_server", state.local_main, localFiles) : null;
+    await this.removeUnreadableApplyJournalAfterQuarantine();
     this.deviceStatusGeneration += 1;
     await this.fsp.rm(this.authPath, { force: true });
     await this.fsp.rm(this.pendingAppliedAckPath, { force: true });
@@ -28406,16 +28420,411 @@ var ObtsObsidianClient = class {
     });
     return { status: "Not paired", recoveryBundleId };
   }
+  // OBTS-PER-JOURNAL-001: an unreadable apply journal is contained instead of
+  // reinterpreted. The bytes are copied and verified first; only a checksum
+  // authenticated bundle copy bound to a durable apply identity can be
+  // reconstructed, and retirement needs proof that nothing visible moved.
+  async healUnreadableApplyJournal() {
+    let found;
+    try {
+      found = await this.unreadableApplyJournalBytes();
+    } catch {
+      return "blocked";
+    }
+    if (!found) return "absent";
+    try {
+      await this.quarantineUnreadableApplyJournal(found.raw, found.classification);
+    } catch {
+      return "blocked";
+    }
+    return await this.resolveUnreadableApplyJournal();
+  }
+  async resolveUnreadableApplyJournal() {
+    let carriers;
+    let evidence;
+    try {
+      carriers = await this.discoverApplyJournalCarriers();
+      evidence = await this.verifyApplyJournalBundleCandidates(carriers);
+    } catch {
+      return "blocked";
+    }
+    const state = carriers.state;
+    const selected = selectApplyRecoveryBundle(evidence.candidates, carriers);
+    if (selected) {
+      let journal;
+      try {
+        journal = reconstructApplyJournal(selected.journal, selected.bundleId);
+      } catch {
+        return "blocked";
+      }
+      if (await this.applyRecoveryValidationReason(journal, state)) return "blocked";
+      if (!await this.validateApplyJournalPolicy(journal).catch(() => false)) return "blocked";
+      await writeJson(this.fsp, this.applyJournalPath, journal);
+      await this.dropApplyLockWithoutIdentity();
+      return "resume";
+    }
+    if (evidence.candidates.length > 0 || evidence.veto) return "blocked";
+    if (!carriers.lockApplyId) return "blocked";
+    if (!await this.proveApplyWindowNotMutated(carriers)) return "blocked";
+    return await this.retireUnmutatedApplyJournal(carriers) ? "retired" : "blocked";
+  }
+  async unreadableApplyJournalBytes() {
+    try {
+      if (await readApplyJournalStrict(this.fsp, this.applyJournalPath)) return null;
+    } catch {
+    }
+    let raw;
+    try {
+      raw = await this.fsp.readFileBounded(this.applyJournalPath, this.fileBufferBudgetBytes);
+    } catch (error) {
+      if (error && error.code === "ENOENT") return null;
+      throw error;
+    }
+    const classification = classifyUnreadableApplyJournal(raw);
+    return classification.reason ? { raw, classification } : null;
+  }
+  async quarantineUnreadableApplyJournal(raw, classification) {
+    const root = path.join(this.obtsDir, APPLY_JOURNAL_QUARANTINE_DIR);
+    const digestPrefix = classification.sha256.slice(0, 8);
+    const existingCopyName = new RegExp(`_${digestPrefix}(?:-[0-9]+)?$`, "u");
+    const entries = await this.fsp.readdir(root, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (entry.isDirectory() && entry.name.startsWith(".partial-")) {
+        await this.fsp.rm(path.join(root, entry.name), { recursive: true, force: true }).catch(() => void 0);
+      }
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name.startsWith(".partial-") || !existingCopyName.test(entry.name)) continue;
+      const existing = path.join(root, entry.name, "apply-journal.json");
+      const bytes = await this.fsp.readFileBounded(existing, this.fileBufferBudgetBytes).catch(() => null);
+      if (bytes && sha256(bytes) === classification.sha256) return path.join(root, entry.name);
+    }
+    const stamp = utcStamp();
+    const baseName = `${stamp}_${digestPrefix}`;
+    let name = baseName;
+    for (let index2 = 2; await exists(this.fsp, path.join(root, name)); index2 += 1) name = `${baseName}-${index2}`;
+    const finalDir = path.join(root, name);
+    const partialDir = path.join(root, `.partial-${name}`);
+    await this.fsp.rm(partialDir, { recursive: true, force: true }).catch(() => void 0);
+    try {
+      await this.fsp.mkdir(partialDir, { recursive: true, mode: 448 });
+      const copied = ["apply-journal.json", "reason.json"];
+      const skipped = [];
+      await this.fsp.writeFile(path.join(partialDir, "apply-journal.json"), raw, { mode: 384 });
+      for (const sibling of await this.unreadableApplyJournalSiblings()) {
+        const bytes = await this.fsp.readFileBounded(path.join(this.obtsDir, sibling), this.fileBufferBudgetBytes).catch(() => null);
+        if (!bytes) {
+          skipped.push(sibling);
+          continue;
+        }
+        await this.fsp.writeFile(path.join(partialDir, sibling), bytes, { mode: 384 });
+        copied.push(sibling);
+      }
+      await this.fsp.writeFile(path.join(partialDir, "reason.json"), `${JSON.stringify({
+        version: 1,
+        reason: classification.reason,
+        size: classification.size,
+        sha256: classification.sha256,
+        skipped
+      }, null, 2)}
+`, { mode: 384 });
+      if (typeof this.fsp.syncFile === "function") {
+        for (const filePath of copied) await this.fsp.syncFile(path.join(partialDir, filePath));
+      }
+      if (typeof this.fsp.syncDirectory === "function") {
+        await this.fsp.syncDirectory(partialDir);
+        await this.fsp.syncDirectory(this.obtsDir);
+      }
+      if (sha256(await this.fsp.readFile(path.join(partialDir, "apply-journal.json"))) !== classification.sha256) {
+        throw new Error("Apply journal quarantine verification failed.");
+      }
+      await this.fsp.rename(partialDir, finalDir);
+      if (typeof this.fsp.syncDirectory === "function") await this.fsp.syncDirectory(root);
+      return finalDir;
+    } catch (error) {
+      await this.fsp.rm(partialDir, { recursive: true, force: true }).catch(() => void 0);
+      throw error;
+    }
+  }
+  async unreadableApplyJournalSiblings() {
+    const names = await this.fsp.readdir(this.obtsDir).catch(() => []);
+    return names.filter((name) => name.startsWith("apply-journal.json.tmp-") || name.startsWith("apply-journal.json.obts-replace-backup-")).sort();
+  }
+  // Durable evidence written before any visible mutation: the lock marker, the
+  // displaced pre-image directory and the stale-provenance horizon. An
+  // unreadable lock is never a carrier. Whether a carrier still describes the
+  // interrupted window is decided against the candidate, so the lingering
+  // horizon of a settled apply cannot claim it, and neither carrier depends on
+  // local head having caught up with local main: an apply interrupted while
+  // local proposals were pending keeps its evidence.
+  async discoverApplyJournalCarriers() {
+    let lockApplyId = null;
+    try {
+      const details = await this.fsp.lstat(this.applyLockPath);
+      if (details.isFile() && !details.isSymbolicLink()) {
+        const marker = JSON.parse(await this.fsp.readFile(this.applyLockPath, "utf8"));
+        if (isApplyId(marker?.apply_id)) lockApplyId = marker.apply_id;
+      }
+    } catch {
+    }
+    const displacedApplyIds = /* @__PURE__ */ new Set();
+    const displaced = await this.fsp.readdir(path.join(this.obtsDir, "apply-displaced"), { withFileTypes: true }).catch(() => []);
+    for (const entry of displaced) {
+      if (entry.isDirectory() && isApplyId(entry.name)) displacedApplyIds.add(entry.name);
+    }
+    const horizons = /* @__PURE__ */ new Map();
+    try {
+      const saved = await this.readStaleProvenance();
+      for (const horizon of saved.horizons || []) {
+        if (isApplyId(horizon.apply_id) && /^[0-9a-f]{40}$/u.test(horizon.base || "")) horizons.set(horizon.apply_id, horizon.base);
+      }
+    } catch {
+    }
+    const state = await this.readState();
+    const qualifyingApplyIds = /* @__PURE__ */ new Set();
+    for (const [applyId, base] of horizons) if (base === state.local_main) qualifyingApplyIds.add(applyId);
+    for (const applyId of displacedApplyIds) qualifyingApplyIds.add(applyId);
+    if (lockApplyId) qualifyingApplyIds.add(lockApplyId);
+    let pendingAcknowledgementMain = null;
+    let pendingAcknowledgementReadable = true;
+    try {
+      pendingAcknowledgementMain = (await this.readPendingAppliedAcknowledgement())?.target_main || null;
+    } catch {
+      pendingAcknowledgementReadable = false;
+    }
+    return {
+      lockApplyId,
+      displacedApplyIds,
+      horizons,
+      qualifyingApplyIds,
+      pendingAcknowledgementMain,
+      pendingAcknowledgementReadable,
+      state,
+      mainRef: await this.resolveRef("refs/heads/main").catch(() => null),
+      localRef: await this.resolveRef("refs/heads/local").catch(() => null)
+    };
+  }
+  /**
+   * Bundle evidence for the interrupted window. Manifests are read cheaply for
+   * every published bundle, because a bundle that cannot be read or that names
+   * the locked identity vetoes retirement whether or not it verifies. Checksums
+   * are only walked for bundles whose identity is a qualifying carrier.
+   */
+  async verifyApplyJournalBundleCandidates(carriers) {
+    const state = carriers.state;
+    const recoveryRoot = path.join(this.obtsDir, "recovery");
+    const entries = await this.fsp.readdir(recoveryRoot, { withFileTypes: true }).catch(() => []);
+    const bundleIds = entries.filter((entry) => entry.isDirectory() && /^rec_[A-Za-z0-9_-]+$/u.test(entry.name)).map((entry) => entry.name).sort().reverse().slice(0, APPLY_JOURNAL_HEAL_MAX_CANDIDATES);
+    const candidates = [];
+    let veto = false;
+    for (const bundleId of bundleIds) {
+      const manifest = await readJson(this.fsp, path.join(recoveryRoot, bundleId, "manifest.json"), null);
+      if (!manifest || typeof manifest !== "object" || Array.isArray(manifest) || manifest.bundle_id !== bundleId) {
+        veto = true;
+        continue;
+      }
+      if (carriers.lockApplyId && manifest.apply_id === carriers.lockApplyId) veto = true;
+      if (!carriers.qualifyingApplyIds.has(manifest.apply_id)) continue;
+      const candidate = await this.verifyApplyJournalBundleCandidate(bundleId, manifest, state);
+      if (!candidate || !applyWindowCarrierHolds(carriers, candidate)) continue;
+      candidates.push(candidate);
+    }
+    return { candidates, veto };
+  }
+  async verifyApplyJournalBundleCandidate(bundleId, manifest, state) {
+    const bundleDir = path.join(this.obtsDir, "recovery", bundleId);
+    const [complete, journalCopy] = await Promise.all([
+      readJson(this.fsp, path.join(bundleDir, "complete.json"), null),
+      readJson(this.fsp, path.join(bundleDir, "journal", "apply-journal.json"), null)
+    ]);
+    if (!complete || !journalCopy) return null;
+    if (complete.bundle_id !== bundleId) return null;
+    if (!["pull_apply", "rebuild_from_server"].includes(manifest.operation_type)) return null;
+    if (!isApplyId(manifest.apply_id) || !/^[0-9a-f]{40}$/u.test(manifest.target_main || "")) return null;
+    if ((manifest.vault_id ?? "unknown") !== (state.vault_id || "unknown")) return null;
+    if ((manifest.device_id ?? "unknown") !== (state.device_id || "unknown")) return null;
+    let journal;
+    try {
+      journal = parseApplyJournal(journalCopy);
+    } catch {
+      return null;
+    }
+    if (journal.recovery_bundle_id) return null;
+    if (journal.apply_id !== manifest.apply_id || journal.target_main !== manifest.target_main || !applyRecoveryOperationMatches(journal.operation_type, manifest.operation_type) || stableJson(journal.affected_paths) !== stableJson(manifest.affected_paths)) return null;
+    if (!await this.commitExists(manifest.target_main)) return null;
+    try {
+      const recorded = await this.fsp.readFileBounded(path.join(bundleDir, "checksums.sha256"), this.fileBufferBudgetBytes, "utf8");
+      const actual = await bundleChecksums(this.fsp, bundleDir, this.fileBufferBudgetBytes);
+      if (recorded !== `${actual.join("\n")}
+`) return null;
+    } catch {
+      return null;
+    }
+    return {
+      bundleId,
+      applyId: journal.apply_id,
+      targetMain: journal.target_main,
+      authoringBase: journal.authoring_base ?? null,
+      journal
+    };
+  }
+  // No visible file mutation precedes bundle publication, so an unmoved local
+  // and coordination ref, no displaced pre-image and no outstanding
+  // acknowledgement prove the interrupted apply wrote nothing visible.
+  async proveApplyWindowNotMutated(carriers) {
+    const state = carriers.state;
+    if (carriers.displacedApplyIds.size > 0) return false;
+    if (!state.local_main || !state.local_head) return false;
+    if (carriers.mainRef !== state.local_main || carriers.localRef !== state.local_head) return false;
+    if (!carriers.pendingAcknowledgementReadable || carriers.pendingAcknowledgementMain) return false;
+    return await this.commitExists(state.local_main);
+  }
+  // Quarantine is already durable here. The lock goes first so a kill before the
+  // journal removal cannot leave an unreadable journal under an unheld lock, and
+  // the latch is cleared last so the same kill stays retryable. A lock this
+  // installation may not reclaim keeps the journal and the block instead.
+  async retireUnmutatedApplyJournal(carriers) {
+    if (!await this.dropMatchingApplyLock(carriers.lockApplyId)) return false;
+    await this.fsp.rm(this.applyJournalPath, { force: true });
+    this.requestFullInventory();
+    this.plugin.syncQueued = true;
+    await this.clearApplyJournalLatch(await this.readState());
+    return true;
+  }
+  async clearApplyJournalLatch(state) {
+    const latched = state.last_error_code === "apply_journal_recovery_required";
+    if (!latched && !state.apply_validation_reason) return state;
+    const cleared = Object.assign({}, state, {
+      last_error_code: latched ? null : state.last_error_code,
+      apply_validation_reason: null,
+      updated_at: nowIso()
+    });
+    if (latched) cleared.status_label = "Checking";
+    await this.writeState(cleared);
+    return cleared;
+  }
+  // Lock removal follows the lock protocol: the marker must be one this
+  // installation could reclaim (the legacy shape, or a managed-headless marker
+  // of another generation), and the file that is removed must still be the one
+  // that was inspected and re-read.
+  async dropMatchingApplyLock(applyId) {
+    if (!isApplyId(applyId)) return false;
+    if (this.applyLockOwner) {
+      return this.applyLockOwner.applyId === applyId ? await this.releaseApplyLock(applyId).catch(() => false) : false;
+    }
+    const owner = this.managedHeadlessOwner;
+    const ownedByProtocol = (marker2) => Boolean(marker2) && marker2.apply_id === applyId && (owner ? owner.canReclaim(marker2) : isLegacyApplyLockMarker(marker2, applyId));
+    let details;
+    let marker;
+    try {
+      details = await this.fsp.lstat(this.applyLockPath);
+      if (!details.isFile() || details.isSymbolicLink()) return false;
+      marker = JSON.parse(await this.fsp.readFile(this.applyLockPath, "utf8"));
+    } catch {
+      return false;
+    }
+    if (!ownedByProtocol(marker)) return false;
+    const beforeRemoval = await this.fsp.lstat(this.applyLockPath);
+    const current = JSON.parse(await this.fsp.readFile(this.applyLockPath, "utf8"));
+    if (applyLockFileChanged(details, beforeRemoval) || JSON.stringify(current) !== JSON.stringify(marker) || !ownedByProtocol(current)) return false;
+    await this.fsp.rm(this.applyLockPath, { force: true });
+    return true;
+  }
+  // The user-triggered rebuild and reset are the only escapes from an
+  // unreadable journal that cannot be proven safe: quarantine first, then stop
+  // the unreadable file from blocking the replacement operation. The displaced
+  // pre-images of the abandoned window are archived with the other recovery
+  // evidence, so a later heal never mistakes them for a live pre-image.
+  async removeUnreadableApplyJournalAfterQuarantine() {
+    const found = await this.unreadableApplyJournalBytes();
+    if (!found) {
+      if (!await exists(this.fsp, this.applyJournalPath)) await this.dropApplyLockWithoutIdentity();
+      return false;
+    }
+    await this.quarantineUnreadableApplyJournal(found.raw, found.classification);
+    const carriers = await this.discoverApplyJournalCarriers();
+    try {
+      await this.archiveDisplacedApplyDirs();
+    } catch {
+      throw new ObtsBlockedError("displaced_recovery_archive_failed", "The abandoned apply's displaced recovery evidence could not be archived.");
+    }
+    await this.dropMatchingApplyLock(carriers.lockApplyId);
+    await this.fsp.rm(this.applyJournalPath, { force: true });
+    await this.dropApplyLockWithoutIdentity();
+    return true;
+  }
+  // Copies from in-place writes and evidence from legacy removals share the
+  // same archive lifecycle; neither may be discarded on completion. The escape
+  // archives beside any earlier archive of the same identity rather than
+  // leaving the source live, and never deletes either copy.
+  async archiveDisplacedApplyDir(applyId, unique = false) {
+    const displacedRoot = path.join(this.obtsDir, "apply-displaced", applyId);
+    if (!await this.adapterExists(displacedRoot)) return true;
+    const archiveRoot = path.join(this.obtsDir, "recovery-displaced", applyId);
+    await this.fsp.mkdir(path.dirname(archiveRoot), { recursive: true, mode: 448 });
+    let target = archiveRoot;
+    if (unique) {
+      const stamp = utcStamp();
+      if (await this.adapterExists(target)) target = `${archiveRoot}.${stamp}`;
+      for (let index2 = 2; await this.adapterExists(target); index2 += 1) target = `${archiveRoot}.${stamp}-${index2}`;
+    } else if (await this.adapterExists(archiveRoot)) {
+      return false;
+    }
+    await this.fsp.rename(displacedRoot, target);
+    return true;
+  }
+  async archiveDisplacedApplyDirs() {
+    const root = path.join(this.obtsDir, "apply-displaced");
+    const entries = await this.fsp.readdir(root, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (entry.isDirectory() && isApplyId(entry.name)) await this.archiveDisplacedApplyDir(entry.name, true);
+    }
+  }
+  // Only a marker that carries no apply identity is dropped here, and only with
+  // no in-process owner holding the lock: a marker that names its operation, or
+  // a lock that cannot be read at all, still belongs to the lock protocol.
+  async dropApplyLockWithoutIdentity() {
+    if (this.applyLockOwner) return false;
+    let details;
+    try {
+      details = await this.fsp.lstat(this.applyLockPath);
+    } catch {
+      return false;
+    }
+    if (!details.isFile() || details.isSymbolicLink()) return false;
+    let text;
+    try {
+      text = await this.fsp.readFile(this.applyLockPath, "utf8");
+    } catch {
+      return false;
+    }
+    let marker;
+    try {
+      marker = JSON.parse(text);
+    } catch {
+      marker = void 0;
+    }
+    if (isApplyId(marker?.apply_id)) return false;
+    const beforeRemoval = await this.fsp.lstat(this.applyLockPath).catch(() => null);
+    if (!beforeRemoval || applyLockFileChanged(details, beforeRemoval)) return false;
+    await this.fsp.rm(this.applyLockPath, { force: true });
+    return true;
+  }
   async admitApplyRecovery() {
     let journal;
     try {
       journal = await readApplyJournalStrict(this.fsp, this.applyJournalPath);
     } catch {
-      throw new ObtsBlockedError("apply_journal_recovery_required", "The apply journal is unreadable or invalid. Preserve it and restore verified recovery evidence before resuming.");
+      const healed = await this.healUnreadableApplyJournal();
+      if (healed === "retired" || healed === "absent") await this.clearApplyJournalLatch(await this.readState());
+      journal = await readApplyJournalStrict(this.fsp, this.applyJournalPath).catch(() => null);
+      if (!journal && healed !== "retired" && healed !== "absent") {
+        throw new ObtsBlockedError("apply_journal_recovery_required", "The apply journal is unreadable or invalid. Its bytes are quarantined under .obts/recovery-corrupt; use Rebuild from server main to replace the local snapshot before resuming.");
+      }
     }
     if (!journal) return;
     await this.initialize();
-    const remaining = await readApplyJournalStrict(this.fsp, this.applyJournalPath);
+    const remaining = await readApplyJournalStrict(this.fsp, this.applyJournalPath).catch(() => null);
     if (remaining) {
       const reason = applyRecoveryReason(await this.readState(), remaining);
       throw new ObtsBlockedError("apply_journal_recovery_required", `The interrupted apply is still blocked (${reason}). Keep the setup journal, local files and recovery bundles. Resolve this recorded recovery issue before resuming; a new apply cannot replace the unfinished operation.`);
@@ -28436,7 +28845,7 @@ var ObtsObsidianClient = class {
         const manifest = await readRecoveryJsonStrict(this.fsp, path.join(bundle, "manifest.json"), "recovery_state_corrupt", "Recovery manifest is unreadable.");
         if (!complete || !manifest) return "recovery_evidence_missing";
         if (complete.bundle_id !== journal.recovery_bundle_id || manifest.bundle_id !== journal.recovery_bundle_id) return "recovery_identity_mismatch";
-        if (manifest.vault_id !== (state.vault_id || "unknown") || manifest.device_id !== (state.device_id || "unknown") || manifest.operation_type !== journal.operation_type || journal.journal_version >= 6 && manifest.apply_id !== journal.apply_id) return "recovery_identity_mismatch";
+        if (manifest.vault_id !== (state.vault_id || "unknown") || manifest.device_id !== (state.device_id || "unknown") || !applyRecoveryOperationMatches(journal.operation_type, manifest.operation_type) || journal.journal_version >= 6 && manifest.apply_id !== journal.apply_id) return "recovery_identity_mismatch";
         if (manifest.target_main !== journal.target_main || stableJson(manifest.affected_paths) !== stableJson(journal.affected_paths)) return "recovery_target_policy_mismatch";
         const savedJournal = parseApplyJournal(await readJson(this.fsp, path.join(bundle, "journal", "apply-journal.json"), null));
         for (const key of ["apply_id", "target_main", "expected_prior_local_main", "expected_prior_local_device_ref", "affected_paths", "preflight_sha256", "preflight_fingerprints", "directory_intents", "explicit_directories", "pre_apply_directories", "pre_apply_directory_ctimes", "confirmed_directory_roots", "confirmed_directory_inventory", "preserve_local_changes", "event_seq", "target_file_sizes", "target_root_ignore_oid", "local_only_paths", "local_only_presence"]) {
@@ -28872,7 +29281,7 @@ var ObtsObsidianClient = class {
         try {
           journal.recovery_bundle_id = await this.finalizeRecoveryBundle(
             stagedRecovery,
-            "pull_apply",
+            journal.operation_type,
             targetMain,
             affectedPaths,
             journal
@@ -28992,7 +29401,7 @@ var ObtsObsidianClient = class {
       } else if (preservedLocalChangePaths.length > 0) {
         await this.recordDeferredApplyPaths(journal, preservedLocalChangePaths);
         try {
-          await this.createRecoveryBundle("rebuild_from_server", targetMain, preservedLocalChangePaths);
+          await this.createRecoveryBundle("rebuild_from_server", targetMain, preservedLocalChangePaths, journal);
         } catch (error) {
           if (!(error instanceof LocalSnapshotChangedError)) throw error;
           preservedLocalChangePaths = [];
@@ -29029,6 +29438,7 @@ var ObtsObsidianClient = class {
         // a suspension can still interrupt.
         status_label: "Checking",
         last_error_code: null,
+        apply_validation_reason: null,
         last_event_seq: Math.max(state.last_event_seq || 0, eventSeq || 0),
         last_applied_event_seq: Math.max(state.last_applied_event_seq || 0, eventSeq || 0),
         updated_at: nowIso()
@@ -29104,7 +29514,7 @@ var ObtsObsidianClient = class {
     if (!skipCapture) {
       if (preservedPaths.length > 0 && !options.bundleWritten) {
         report("Writing recovered local change bundle", "recovery_bundle");
-        await this.createRecoveryBundle("rebuild_from_server", targetMain, preservedPaths);
+        await this.createRecoveryBundle("rebuild_from_server", targetMain, preservedPaths, journal);
       }
       if (initialization) {
         report("Restoring recovered refs", "recovery_refs");
@@ -29212,7 +29622,7 @@ var ObtsObsidianClient = class {
       this.plugin.isApplying = true;
       if (preservedLocalChangePaths.length > 0) {
         this.plugin.setInitializationStage("Writing interrupted apply recovery bundle", "recovery_bundle");
-        await this.createRecoveryBundle("rebuild_from_server", journal.target_main, preservedLocalChangePaths);
+        await this.createRecoveryBundle("rebuild_from_server", journal.target_main, preservedLocalChangePaths, journal);
       }
       this.plugin.setInitializationStage("Restoring interrupted directory changes", "recovery_file_apply");
       const residualTombstoneDirectories = await this.applyDirectoryChanges(
@@ -29448,7 +29858,7 @@ var ObtsObsidianClient = class {
         if (preservedLocalChangePaths.length > 0) {
           this.plugin.setInitializationStage("Writing recovered local change bundle", "recovery_bundle");
           try {
-            await this.createRecoveryBundle("rebuild_from_server", journal.target_main, preservedLocalChangePaths);
+            await this.createRecoveryBundle("rebuild_from_server", journal.target_main, preservedLocalChangePaths, journal);
           } catch (error) {
             if (!(error instanceof LocalSnapshotChangedError)) throw error;
             preservedLocalChangePaths = [];
@@ -32752,13 +33162,9 @@ var ObtsObsidianClient = class {
     }
     if (journal && isApplyId(journal.apply_id)) {
       const displacedRoot = path.join(this.obtsDir, "apply-displaced", journal.apply_id);
-      if (await this.adapterExists(displacedRoot)) {
-        const archiveRoot = path.join(this.obtsDir, "recovery-displaced", journal.apply_id);
-        await this.fsp.mkdir(path.dirname(archiveRoot), { recursive: true, mode: 448 });
-        if (await this.adapterExists(archiveRoot)) {
-          throw new ObtsBlockedError("displaced_recovery_archive_exists", "Displaced recovery evidence already exists for this apply operation.");
-        }
-        await this.fsp.rename(displacedRoot, archiveRoot);
+      const archived = await this.archiveDisplacedApplyDir(journal.apply_id);
+      if (!archived && await this.adapterExists(displacedRoot)) {
+        throw new ObtsBlockedError("displaced_recovery_archive_exists", "Displaced recovery evidence already exists for this apply operation.");
       }
     }
     await this.fsp.rm(this.applyJournalPath, { force: true });
@@ -36475,7 +36881,7 @@ function localSyncFailureExplanation(code, details) {
     const move = paths.length === 2 ? `the move ${paths[0]} -> ${paths[1]}` : "a file move";
     return `Your root .gitignore now hides ${move}, which was already waiting to upload. Nothing was lost. Undo that .gitignore change and sync retries by itself; you can re-apply it once this move has uploaded.`;
   }
-  if (safeCode === "apply_journal_recovery_required" || safeCode === "apply_recovery_required") return `Local apply recovery needs review (${safeCode}). Preserve the vault and .obts state; restart Obsidian once, then inspect the recovery journal if this persists.`;
+  if (safeCode === "apply_journal_recovery_required" || safeCode === "apply_recovery_required") return `Local apply recovery needs review (${safeCode}). Reload or restart the app once so an interrupted apply can finish; if sync still cannot continue, run Rebuild from server main from the command palette. The unreadable journal is preserved under .obts/recovery-corrupt for diagnostics.`;
   if (safeCode === "directory_recovery_journal_invalid") return "The local directory recovery journal is invalid. Preserve .obts/directory-recovery.json and the vault; send sanitized diagnostics before assisted recovery.";
   if (safeCode === "apply_lock_active") return "A local apply lock is active. Another operation may still own it; do not remove the lock. If it persists after restarting Obsidian, preserve the vault and .obts state for recovery support.";
   if (safeCode === "recovery_bundle_failed") return "Recovery evidence could not be completed, so destructive apply stopped. Check local storage and permissions; preserve the vault and .obts state before retrying.";
@@ -36521,6 +36927,56 @@ async function readApplyJournalStrict(fsp, filePath) {
     if (error && error.code === "ENOENT") return null;
     throw error;
   }
+}
+function classifyUnreadableApplyJournal(raw) {
+  const bytes = Buffer2.from(raw);
+  const digest = sha256(bytes);
+  const text = bytes.toString("utf8");
+  if (!text.trim()) return { reason: "empty", size: bytes.length, sha256: digest };
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return { reason: "not_json", size: bytes.length, sha256: digest };
+  }
+  try {
+    parseApplyJournal(value);
+  } catch {
+    return { reason: "schema", size: bytes.length, sha256: digest };
+  }
+  return { reason: null, size: bytes.length, sha256: digest };
+}
+function reconstructApplyJournal(copy, bundleId) {
+  return parseApplyJournal(Object.assign({}, copy, {
+    phase: "writing_files",
+    last_completed_step: null,
+    recovery_bundle_id: bundleId,
+    deferred_local_paths: []
+  }));
+}
+function selectApplyRecoveryBundle(candidates, carriers) {
+  if (carriers.lockApplyId) return candidates.find((candidate) => candidate.applyId === carriers.lockApplyId) || null;
+  if (new Set(candidates.map((candidate) => candidate.applyId)).size !== 1) return null;
+  return candidates[0] || null;
+}
+function applyWindowCarrierHolds(carriers, candidate) {
+  if (carriers.lockApplyId === candidate.applyId) return true;
+  if (carriers.displacedApplyIds.has(candidate.applyId)) return true;
+  const base = carriers.horizons.get(candidate.applyId);
+  return Boolean(base) && base === carriers.state.local_main && candidate.authoringBase === base && candidate.targetMain !== carriers.state.local_main;
+}
+function applyRecoveryOperationMatches(journalOperation, manifestOperation) {
+  if (journalOperation === manifestOperation) return true;
+  return journalOperation === "rebuild_from_server" && manifestOperation === "pull_apply";
+}
+function applyLockFileChanged(before, after) {
+  if (before.dev === void 0 || before.ino === void 0) {
+    return after.size !== before.size || after.mtimeMs !== before.mtimeMs;
+  }
+  return after.dev !== before.dev || after.ino !== before.ino;
+}
+function utcStamp() {
+  return (/* @__PURE__ */ new Date()).toISOString().replace(/[-:]/gu, "").replace(/\.\d+Z$/u, "Z");
 }
 function parseApplyJournal(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Apply journal is invalid.");

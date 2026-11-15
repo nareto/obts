@@ -27,6 +27,7 @@ export const pluginTests = [
   'tests/plugin-ancestry-memo.test.ts',
   'tests/plugin-apply-progress.test.ts',
   'tests/plugin-committed-tail-recovery.test.ts',
+  'tests/plugin-apply-journal-heal.test.ts',
   'tests/plugin-apply-tail-cost.test.ts',
   'tests/plugin-committed-tail-racy-clean.test.ts',
   'tests/plugin-settings-status.test.ts',

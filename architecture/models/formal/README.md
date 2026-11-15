@@ -17,6 +17,7 @@ Formal models are bounded refinements of stable contracts in `architecture/contr
 | TLC configuration | `OBTSApplyRecovery.cfg`, `OBTSApplyRecoveryLiveness.cfg` |
 | Executable check | `npm run test:formal` |
 | In-place companion / revision | `OBTSApplyInPlace.tla`, revision 36; gated modify/delete safety, liveness, recovery/seam witnesses and gate-off/external controls; `OBTSStaleProposal.tla` provenance companion (revision 36, acknowledgement per-path rule revision 62) |
+| Unreadable-journal companion / revision | `OBTSApplyJournalHeal.tla`, revision 72; quarantine-before-disturb ordering, identity-bound reconstruction, evidence-derived phase, retirement proof, torn-marker repair on resume, fail-closed block and rebuild escape; six mandatory negative controls |
 
 The model covers one client, one path, the captured local version, one concurrent local edit, a target server version, recovery staging/publication, mutation, verification, ref and coordination publication, acknowledgement intent, cleanup, one crash, and restart. Values stand for exact bytes plus path identity and provenance.
 
@@ -98,6 +99,32 @@ The held-P rebuild projection records P identity and fallback before mutation, k
 
 The isolated `held-repair` extension snapshots original pins in `PrepareOriginalPins` before any held or F5 fallback publication, choosing an older pin present or absent nondeterministically. `CorruptCompanion` loses path association but retains pins; `RepairCompanion` uses M0 when an older original pin exists, otherwise permitting P. A separate prior-held path durably publishes the M0 fallback in `HoldPDerived`, advances canonical to C while P stays queued (`AdvanceHeldCanonical`), and then corrupts/repairs with that fallback pin retained. This covers first corruption with/without older evidence and corruption after a prior canonical rebuild without conflating pre-publication and durable-held ordering. The required repair-horizon held-exemption mutant fails `HeldOlderWins` at `RepairCompanion` through `PrepareOriginalPins -> CorruptCompanion -> RepairCompanion`, not parsing or resource failure. The trace map uses current plugin method ranges; `PrepareOriginalPins` maps to the original-ref snapshot block in `rebuildFromServerMain`. This bounded extension assumes comparable validated ancestry; implementation ambiguity fails closed. Repair baselines (generated/distinct/depth): positive 614/261/11; exemption mutant 22/15/4.
 
+### Unreadable journal containment companion (revision 72)
+
+`OBTSApplyJournalHeal.tla` refines `OBTS-PER-JOURNAL-001` together with the preservation obligations of `OBTS-SAF-001`, `OBTS-SAF-002` and `OBTS-SAF-005`. It bounds one client, one apply, one affected path, at most one complete candidate bundle (matching or foreign), one crash, and corruption injectable at planning, recovery publication, file writing, verification and the committed tail. Values stand for exact content bytes. The active journal file is readable, unreadable or absent; the tear phase is model evidence, not something a reader could claim; and the apply identity is carried by the lock marker that is durable before the journal, with `TearLock` modelling that same marker lost in the no-fsync window, which reconstruction repairs because the reconstructed journal owns the window again (`ReconstructRepairsLock`). A carrier qualifies only while the window it names is still open: a completed apply can leave its stale-provenance horizon and its verified bundle behind (`PriorApplySettled`), and that residue may neither authorize reconstruction of the interrupted window nor veto its retirement. Journal replacement and removal are separate actions from discovery and pre-validation, so the containment order is checkable rather than assumed.
+
+`QuarantineFirst` requires a copied, flushed, re-read and digest-verified quarantine before the active journal is replaced or removed. `BundleIdentityChecked` requires the selected bundle's apply identity to equal the durable carrier's. `PhaseFromEvidence` forces a reconstructed journal to the file-writing phase instead of the copy's claimed phase. `RetireNeedsProof` requires the no-visible-mutation proof: no candidate bundle of the interrupted window (a foreign or settled one neither authorizes nor blocks), local and coordination refs at their recorded prior values, no displaced pre-image, no mutated path and no pending applied acknowledgement. `RetireNeedsLock` requires the window's own readable lock identity, because the weaker carriers can still identify an interrupted apply for reconstruction but cannot prove which operation left the bytes behind. Reconstruction keeps the selected bundle identity so recovery does not publish a second bundle, re-derives the deferred set from durable evidence, and hands the apply to the existing byte classifier: recorded preflight bytes are written, target bytes or a verified displaced pre-image are completion, and anything else is preserved in a bundle and queued as local work. A bundle-less empty-directory intent is the named residual: it carries no bytes, may already have been applied without a bundle, and is re-observed by the full inventory that retirement requests. A failed quarantine barrier, a foreign-only candidate, an ambiguous identity and a reconstruction that does not validate all leave the unreadable journal in place as the block, from which only the user-triggered rebuild or reset path escapes, and only after quarantine.
+
+The six required negative controls each own one invariant: removing the active journal without a verified quarantine fails `CorruptBytesPreserved`, reconstructing from a foreign bundle fails `ReconstructOnlyMatchingBundle`, accepting the lingering carrier of a settled earlier apply fails `ReconstructOnlyMatchingBundle` at `ReconstructJournal`, trusting the copied phase and its claimed step fails `NoLocalVersionLost` through the snapshot write it enables, retiring without the proof fails `NoRetireWithoutProof`, and retiring after the lock identity was torn fails `NoRetireWithoutLockIdentity` at `RetireJournal`. Reachability witnesses cover resume, retirement (with and without an unrelated earlier bundle present), block and the committed tail (refs and bytes already at target, a pending local edit preserved and queued, acknowledgement rebuilt). The companion assumes crash-safe publication, checksum-verified bundles and a durable apply carrier; it proves neither filesystem atomicity nor checksum, `DataAdapter`, or production behaviour, and a second loss inside the quarantine barrier is outside its assumptions. It is registered in `trace/transition-map.json` as `OBTSApplyJournalHeal`, mapping every `CompanionActions` entry to current plugin code ranges and `tests/plugin-apply-journal-heal.test.ts`; a static action-to-code map is design traceability, not runtime replay or implementation conformance.
+
+TLC 2.19, one worker, fingerprint polynomial 0, 1 GiB heap. `REACHED` and `REJECTED` mean required invariant-counterexample witnesses, not unexpected failures. Measured generated/distinct/depth baselines and half-baseline floors are enforced in `checks.json`; configs are `configs/heal-*.cfg`.
+
+| Check | Result | Generated | Distinct | Depth |
+| --- | --- | ---: | ---: | ---: |
+| `fm001-heal-safety` | PASS | 8,740 | 4,590 | 24 |
+| `fm001-heal-liveness` | PASS | 8,740 | 4,590 | 24 |
+| `fm001-heal-reach-resume` | REACHED | 1,133 | 769 | 11 |
+| `fm001-heal-reach-retire` | REACHED | 541 | 377 | 9 |
+| `fm001-heal-reach-block` | REACHED | 542 | 378 | 9 |
+| `fm001-heal-reach-committed-tail` | REACHED | 8,269 | 4,464 | 21 |
+| `fm001-heal-reach-retire-history` | REACHED | 1,010 | 686 | 10 |
+| `fm001-heal-negative-no-quarantine` | REJECTED | 175 | 132 | 7 |
+| `fm001-heal-negative-foreign-bundle` | REJECTED | 908 | 637 | 10 |
+| `fm001-heal-negative-copy-phase` | REJECTED | 2,963 | 1,895 | 14 |
+| `fm001-heal-negative-retire-unproven` | REJECTED | 1,134 | 770 | 11 |
+| `fm001-heal-negative-settled-carrier` | REJECTED | 1,066 | 716 | 10 |
+| `fm001-heal-negative-retire-torn-lock` | REJECTED | 846 | 583 | 10 |
+
 ### Revision-36 companion TLC evidence
 
 TLC 2.19, one worker, fingerprint polynomial 0, 1 GiB heap. `REACHED` and `REJECTED` mean required invariant-counterexample witnesses, not unexpected failures. Measured generated/distinct/depth baselines and half-baseline floors are enforced in `checks.json`.
@@ -177,7 +204,7 @@ TLC 2.19, one worker, fingerprint polynomial 0, 1 GiB heap. `REACHED` and `REJEC
 
 ### Known omissions
 
-The pilot does not cover directories, multiple paths, write concurrency, editor-buffer capture, Git object structure, network/server acknowledgement, byte/checksum implementation, mobile lifecycle, process kill, power loss, filesystem semantics, corrupted finalized bundles, or competing client instances. The companion adds the bounded compare/write interleaving and one symbolic interrupted write, not a proof of byte-level storage atomicity. Those require executable fault tests and platform evidence; a green TLC result makes no claim about them.
+The pilot does not cover directories, multiple paths, write concurrency, editor-buffer capture, Git object structure, network/server acknowledgement, byte/checksum implementation, mobile lifecycle, process kill, power loss, filesystem semantics, or competing client instances; corrupted finalized bundles are covered only by the bounded revision-72 heal companion, which likewise proves neither filesystem atomicity, checksum implementation, `DataAdapter` behaviour nor production conformance. The companion adds the bounded compare/write interleaving and one symbolic interrupted write, not a proof of byte-level storage atomicity. Those require executable fault tests and platform evidence; a green TLC result makes no claim about them.
 
 ## OBTS-FM-013: Managed Headless Ownership And Maintenance Failure
 

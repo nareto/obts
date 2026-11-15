@@ -15,6 +15,7 @@
   "sanyModules": [
     "OBTSApplyRecovery",
     "OBTSApplyInPlace",
+    "OBTSApplyJournalHeal",
     "OBTSDistributedSync",
     "modules/OBTSDomain",
     "modules/OBTSApplyRefinement",
@@ -3055,6 +3056,273 @@
         "minGenerated": 11,
         "minDistinct": 7,
         "minDepth": 2
+      }
+    },
+    {
+      "id": "fm001-heal-safety",
+      "model": "OBTSApplyJournalHeal",
+      "config": "configs/heal-safety.cfg",
+      "kind": "positive-safety",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "baseline": {
+        "generated": 8740,
+        "distinct": 4590,
+        "depth": 24,
+        "minGenerated": 4370,
+        "minDistinct": 2295,
+        "minDepth": 12
+      }
+    },
+    {
+      "id": "fm001-heal-liveness",
+      "model": "OBTSApplyJournalHeal",
+      "config": "configs/heal-liveness.cfg",
+      "kind": "positive-liveness",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "baseline": {
+        "generated": 8740,
+        "distinct": 4590,
+        "depth": 24,
+        "minGenerated": 4370,
+        "minDistinct": 2295,
+        "minDepth": 12
+      }
+    },
+    {
+      "id": "fm001-heal-reach-resume",
+      "model": "OBTSApplyJournalHeal",
+      "config": "configs/heal-reach-resume.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoResume",
+      "requiredWitness": "ReconstructJournal",
+      "minimumTraceDepth": 6,
+      "baseline": {
+        "generated": 1133,
+        "distinct": 769,
+        "depth": 11,
+        "minGenerated": 566,
+        "minDistinct": 384,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm001-heal-reach-retire",
+      "model": "OBTSApplyJournalHeal",
+      "config": "configs/heal-reach-retire.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoRetirement",
+      "requiredWitness": "RetireJournal",
+      "minimumTraceDepth": 5,
+      "baseline": {
+        "generated": 541,
+        "distinct": 377,
+        "depth": 9,
+        "minGenerated": 270,
+        "minDistinct": 188,
+        "minDepth": 4
+      }
+    },
+    {
+      "id": "fm001-heal-reach-block",
+      "model": "OBTSApplyJournalHeal",
+      "config": "configs/heal-reach-block.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoBlock",
+      "requiredWitness": "BlockJournal",
+      "minimumTraceDepth": 5,
+      "baseline": {
+        "generated": 542,
+        "distinct": 378,
+        "depth": 9,
+        "minGenerated": 271,
+        "minDistinct": 189,
+        "minDepth": 4
+      }
+    },
+    {
+      "id": "fm001-heal-reach-committed-tail",
+      "model": "OBTSApplyJournalHeal",
+      "config": "configs/heal-reach-committed-tail.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoCommittedTailRecovery",
+      "requiredWitness": "ClearJournal",
+      "minimumTraceDepth": 12,
+      "baseline": {
+        "generated": 8269,
+        "distinct": 4464,
+        "depth": 21,
+        "minGenerated": 4134,
+        "minDistinct": 2232,
+        "minDepth": 10
+      }
+    },
+    {
+      "id": "fm001-heal-reach-retire-history",
+      "model": "OBTSApplyJournalHeal",
+      "config": "configs/heal-reach-retire-history.cfg",
+      "kind": "reachability",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoRetireWithHistory",
+      "requiredWitness": "RetireJournal",
+      "minimumTraceDepth": 6,
+      "baseline": {
+        "generated": 1010,
+        "distinct": 686,
+        "depth": 10,
+        "minGenerated": 505,
+        "minDistinct": 343,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm001-heal-negative-retire-torn-lock",
+      "model": "OBTSApplyJournalHeal",
+      "config": "configs/heal-negative-retire-torn-lock.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoRetireWithoutLockIdentity",
+      "requiredWitness": "RetireJournal",
+      "minimumTraceDepth": 7,
+      "baseline": {
+        "generated": 846,
+        "distinct": 583,
+        "depth": 10,
+        "minGenerated": 423,
+        "minDistinct": 291,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm001-heal-negative-no-quarantine",
+      "model": "OBTSApplyJournalHeal",
+      "config": "configs/heal-negative-no-quarantine.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "CorruptBytesPreserved",
+      "requiredWitness": "RetireJournal",
+      "minimumTraceDepth": 4,
+      "baseline": {
+        "generated": 175,
+        "distinct": 132,
+        "depth": 7,
+        "minGenerated": 87,
+        "minDistinct": 66,
+        "minDepth": 3
+      }
+    },
+    {
+      "id": "fm001-heal-negative-foreign-bundle",
+      "model": "OBTSApplyJournalHeal",
+      "config": "configs/heal-negative-foreign-bundle.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "ReconstructOnlyMatchingBundle",
+      "requiredWitness": "ReconstructJournal",
+      "minimumTraceDepth": 6,
+      "baseline": {
+        "generated": 908,
+        "distinct": 637,
+        "depth": 10,
+        "minGenerated": 454,
+        "minDistinct": 318,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm001-heal-negative-copy-phase",
+      "model": "OBTSApplyJournalHeal",
+      "config": "configs/heal-negative-copy-phase.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoLocalVersionLost",
+      "requiredWitness": "WriteFromCopiedStep",
+      "minimumTraceDepth": 8,
+      "baseline": {
+        "generated": 2963,
+        "distinct": 1895,
+        "depth": 14,
+        "minGenerated": 1481,
+        "minDistinct": 947,
+        "minDepth": 7
+      }
+    },
+    {
+      "id": "fm001-heal-negative-retire-unproven",
+      "model": "OBTSApplyJournalHeal",
+      "config": "configs/heal-negative-retire-unproven.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "NoRetireWithoutProof",
+      "requiredWitness": "RetireJournal",
+      "minimumTraceDepth": 6,
+      "baseline": {
+        "generated": 1134,
+        "distinct": 770,
+        "depth": 11,
+        "minGenerated": 567,
+        "minDistinct": 385,
+        "minDepth": 5
+      }
+    },
+    {
+      "id": "fm001-heal-negative-settled-carrier",
+      "model": "OBTSApplyJournalHeal",
+      "config": "configs/heal-negative-settled-carrier.cfg",
+      "kind": "negative-control",
+      "timeoutMs": 60000,
+      "heapMb": 1024,
+      "maximumDistinctStates": 100000,
+      "maximumDepth": 250,
+      "expectedInvariant": "ReconstructOnlyMatchingBundle",
+      "requiredWitness": "ReconstructJournal",
+      "minimumTraceDepth": 7,
+      "baseline": {
+        "generated": 1066,
+        "distinct": 716,
+        "depth": 10,
+        "minGenerated": 533,
+        "minDistinct": 358,
+        "minDepth": 5
       }
     },
     {

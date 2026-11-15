@@ -120,6 +120,10 @@ const MOBILE_FILE_WORK_CONCURRENCY = 2;
 const DESKTOP_FILE_BUFFER_BUDGET_BYTES = 64 * 1024 * 1024;
 const MOBILE_FILE_BUFFER_BUDGET_BYTES = 16 * 1024 * 1024;
 const FILE_WORK_YIELD_EVERY = 25;
+// OBTS-PER-JOURNAL-001: an unreadable apply journal is copied byte-exactly into
+// an evidence-only, never-pruned directory before the active file is disturbed.
+const APPLY_JOURNAL_QUARANTINE_DIR = "recovery-corrupt";
+const APPLY_JOURNAL_HEAL_MAX_CANDIDATES = 64;
 const FILE_PROGRESS_INTERVAL_MS = 250;
 const MOBILE_PACK_READ_ATTEMPTS = 5;
 const MOBILE_PACK_READ_RETRY_MS = 100;
@@ -2427,9 +2431,21 @@ class ObtsObsidianClient {
     try {
       journal = await readApplyJournalStrict(this.fsp, this.applyJournalPath);
     } catch {
-      await this.writeState(Object.assign({}, state, { status_label: "Out of sync — local recovery required", last_error_code: "apply_journal_recovery_required", apply_validation_reason: "recovery_state_corrupt", updated_at: nowIso() }));
-      return;
+      const healed = await this.healUnreadableApplyJournal();
+      if (healed === "retired" || healed === "absent") {
+        state = await this.clearApplyJournalLatch(await this.readState());
+        if (healed === "absent") journal = await readApplyJournalStrict(this.fsp, this.applyJournalPath).catch(() => null);
+      } else if (healed === "resume") {
+        journal = await readApplyJournalStrict(this.fsp, this.applyJournalPath).catch(() => null);
+      }
+      if (healed !== "retired" && healed !== "absent" && !journal) {
+        await this.writeState(Object.assign({}, state, { status_label: "Out of sync — local recovery required", last_error_code: "apply_journal_recovery_required", apply_validation_reason: "recovery_state_corrupt", updated_at: nowIso() }));
+        return;
+      }
     }
+    // A retire that lost its last write, or a journal removed by the explicit
+    // escape, must not leave the latch behind with nothing left to recover.
+    if (!journal && !(await exists(this.fsp, this.applyLockPath))) state = await this.clearApplyJournalLatch(state);
     if (journal) await this.retainApplyProvenance(journal);
     if (!journal) state = await this.repairLocalStateIfNeeded(state);
     if (!journal) await this.recoverStaleProposalIntent();
@@ -3661,6 +3677,9 @@ class ObtsObsidianClient {
   }
 
   async rebuildFromServerMain() {
+    // The escape runs first: a marker without an apply identity must not reach
+    // startup recovery, which would latch it as another operation's lock.
+    await this.removeUnreadableApplyJournalAfterQuarantine();
     await this.initialize();
     await this.recoverUploadCheckpointIfNeeded();
     const state = await this.readState();
@@ -5734,6 +5753,7 @@ class ObtsObsidianClient {
     const state = await this.readState();
     const localFiles = await this.scanSyncableFiles();
     const recoveryBundleId = localFiles.length > 0 ? await this.createRecoveryBundle("rebuild_from_server", state.local_main, localFiles) : null;
+    await this.removeUnreadableApplyJournalAfterQuarantine();
     this.deviceStatusGeneration += 1;
     await this.fsp.rm(this.authPath, { force: true });
     await this.fsp.rm(this.pendingAppliedAckPath, { force: true });
@@ -5767,13 +5787,449 @@ class ObtsObsidianClient {
     return { status: "Not paired", recoveryBundleId };
   }
 
+  // OBTS-PER-JOURNAL-001: an unreadable apply journal is contained instead of
+  // reinterpreted. The bytes are copied and verified first; only a checksum
+  // authenticated bundle copy bound to a durable apply identity can be
+  // reconstructed, and retirement needs proof that nothing visible moved.
+  async healUnreadableApplyJournal() {
+    let found;
+    try {
+      found = await this.unreadableApplyJournalBytes();
+    } catch {
+      return "blocked";
+    }
+    if (!found) return "absent";
+    try {
+      await this.quarantineUnreadableApplyJournal(found.raw, found.classification);
+    } catch {
+      return "blocked";
+    }
+    return await this.resolveUnreadableApplyJournal();
+  }
+
+  async resolveUnreadableApplyJournal() {
+    let carriers;
+    let evidence;
+    try {
+      carriers = await this.discoverApplyJournalCarriers();
+      evidence = await this.verifyApplyJournalBundleCandidates(carriers);
+    } catch {
+      return "blocked";
+    }
+    const state = carriers.state;
+    const selected = selectApplyRecoveryBundle(evidence.candidates, carriers);
+    if (selected) {
+      let journal;
+      try {
+        journal = reconstructApplyJournal(selected.journal, selected.bundleId);
+      } catch {
+        return "blocked";
+      }
+      if (await this.applyRecoveryValidationReason(journal, state)) return "blocked";
+      if (!(await this.validateApplyJournalPolicy(journal).catch(() => false))) return "blocked";
+      await writeJson(this.fsp, this.applyJournalPath, journal);
+      // A lock with no apply identity is this window's tear, not another
+      // operation's marker: the reconstructed journal owns the window again.
+      await this.dropApplyLockWithoutIdentity();
+      return "resume";
+    }
+    // A verified bundle of the interrupted window that cannot be selected is
+    // ambiguity, and ambiguity fails closed with its evidence intact.
+    if (evidence.candidates.length > 0 || evidence.veto) return "blocked";
+    // Retirement needs the interrupted window's own durable identity. The lock
+    // is written before the journal, so with no readable lock nothing proves
+    // which operation left the bytes, and the explicit escape is the only way
+    // past them.
+    if (!carriers.lockApplyId) return "blocked";
+    if (!(await this.proveApplyWindowNotMutated(carriers))) return "blocked";
+    return (await this.retireUnmutatedApplyJournal(carriers)) ? "retired" : "blocked";
+  }
+
+  async unreadableApplyJournalBytes() {
+    try {
+      if (await readApplyJournalStrict(this.fsp, this.applyJournalPath)) return null;
+    } catch { /* classified below */ }
+    let raw;
+    try {
+      raw = await this.fsp.readFileBounded(this.applyJournalPath, this.fileBufferBudgetBytes);
+    } catch (error) {
+      if (error && error.code === "ENOENT") return null;
+      throw error;
+    }
+    const classification = classifyUnreadableApplyJournal(raw);
+    return classification.reason ? { raw, classification } : null;
+  }
+
+  async quarantineUnreadableApplyJournal(raw, classification) {
+    const root = path.join(this.obtsDir, APPLY_JOURNAL_QUARANTINE_DIR);
+    const digestPrefix = classification.sha256.slice(0, 8);
+    const existingCopyName = new RegExp(`_${digestPrefix}(?:-[0-9]+)?$`, "u");
+    const entries = await this.fsp.readdir(root, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (entry.isDirectory() && entry.name.startsWith(".partial-")) {
+        await this.fsp.rm(path.join(root, entry.name), { recursive: true, force: true }).catch(() => undefined);
+      }
+    }
+    // Dedupe on the recorded digest, never on the directory name: a copy that
+    // lost bytes in the same window must not stand in for the real evidence.
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name.startsWith(".partial-") || !existingCopyName.test(entry.name)) continue;
+      const existing = path.join(root, entry.name, "apply-journal.json");
+      const bytes = await this.fsp.readFileBounded(existing, this.fileBufferBudgetBytes).catch(() => null);
+      if (bytes && sha256(bytes) === classification.sha256) return path.join(root, entry.name);
+    }
+    const stamp = utcStamp();
+    const baseName = `${stamp}_${digestPrefix}`;
+    let name = baseName;
+    for (let index = 2; await exists(this.fsp, path.join(root, name)); index += 1) name = `${baseName}-${index}`;
+    const finalDir = path.join(root, name);
+    const partialDir = path.join(root, `.partial-${name}`);
+    await this.fsp.rm(partialDir, { recursive: true, force: true }).catch(() => undefined);
+    try {
+      await this.fsp.mkdir(partialDir, { recursive: true, mode: 0o700 });
+      const copied = ["apply-journal.json", "reason.json"];
+      const skipped = [];
+      await this.fsp.writeFile(path.join(partialDir, "apply-journal.json"), raw, { mode: 0o600 });
+      for (const sibling of await this.unreadableApplyJournalSiblings()) {
+        const bytes = await this.fsp.readFileBounded(path.join(this.obtsDir, sibling), this.fileBufferBudgetBytes)
+          .catch(() => null);
+        if (!bytes) {
+          skipped.push(sibling);
+          continue;
+        }
+        await this.fsp.writeFile(path.join(partialDir, sibling), bytes, { mode: 0o600 });
+        copied.push(sibling);
+      }
+      await this.fsp.writeFile(path.join(partialDir, "reason.json"), `${JSON.stringify({
+        version: 1, reason: classification.reason, size: classification.size, sha256: classification.sha256,
+        skipped
+      }, null, 2)}\n`, { mode: 0o600 });
+      if (typeof this.fsp.syncFile === "function") {
+        for (const filePath of copied) await this.fsp.syncFile(path.join(partialDir, filePath));
+      }
+      if (typeof this.fsp.syncDirectory === "function") {
+        await this.fsp.syncDirectory(partialDir);
+        await this.fsp.syncDirectory(this.obtsDir);
+      }
+      if (sha256(await this.fsp.readFile(path.join(partialDir, "apply-journal.json"))) !== classification.sha256) {
+        throw new Error("Apply journal quarantine verification failed.");
+      }
+      await this.fsp.rename(partialDir, finalDir);
+      if (typeof this.fsp.syncDirectory === "function") await this.fsp.syncDirectory(root);
+      return finalDir;
+    } catch (error) {
+      await this.fsp.rm(partialDir, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async unreadableApplyJournalSiblings() {
+    const names = await this.fsp.readdir(this.obtsDir).catch(() => []);
+    return names.filter((name) => name.startsWith("apply-journal.json.tmp-") ||
+      name.startsWith("apply-journal.json.obts-replace-backup-")).sort();
+  }
+
+  // Durable evidence written before any visible mutation: the lock marker, the
+  // displaced pre-image directory and the stale-provenance horizon. An
+  // unreadable lock is never a carrier. Whether a carrier still describes the
+  // interrupted window is decided against the candidate, so the lingering
+  // horizon of a settled apply cannot claim it, and neither carrier depends on
+  // local head having caught up with local main: an apply interrupted while
+  // local proposals were pending keeps its evidence.
+  async discoverApplyJournalCarriers() {
+    let lockApplyId = null;
+    try {
+      const details = await this.fsp.lstat(this.applyLockPath);
+      if (details.isFile() && !details.isSymbolicLink()) {
+        const marker = JSON.parse(await this.fsp.readFile(this.applyLockPath, "utf8"));
+        if (isApplyId(marker?.apply_id)) lockApplyId = marker.apply_id;
+      }
+    } catch { /* an unreadable lock is not a carrier */ }
+    const displacedApplyIds = new Set();
+    const displaced = await this.fsp.readdir(path.join(this.obtsDir, "apply-displaced"), { withFileTypes: true }).catch(() => []);
+    for (const entry of displaced) {
+      if (entry.isDirectory() && isApplyId(entry.name)) displacedApplyIds.add(entry.name);
+    }
+    const horizons = new Map();
+    try {
+      const saved = await this.readStaleProvenance();
+      for (const horizon of saved.horizons || []) {
+        if (isApplyId(horizon.apply_id) && /^[0-9a-f]{40}$/u.test(horizon.base || "")) horizons.set(horizon.apply_id, horizon.base);
+      }
+    } catch { /* provenance corruption is latched before the journal is read */ }
+    const state = await this.readState();
+    const qualifyingApplyIds = new Set();
+    for (const [applyId, base] of horizons) if (base === state.local_main) qualifyingApplyIds.add(applyId);
+    // A completed apply archives its displaced directory before it removes the
+    // journal, so a surviving one is always the interrupted window's; the
+    // user-triggered escape archives the one it abandons.
+    for (const applyId of displacedApplyIds) qualifyingApplyIds.add(applyId);
+    if (lockApplyId) qualifyingApplyIds.add(lockApplyId);
+    let pendingAcknowledgementMain = null;
+    let pendingAcknowledgementReadable = true;
+    try {
+      pendingAcknowledgementMain = (await this.readPendingAppliedAcknowledgement())?.target_main || null;
+    } catch {
+      pendingAcknowledgementReadable = false;
+    }
+    return {
+      lockApplyId,
+      displacedApplyIds,
+      horizons,
+      qualifyingApplyIds,
+      pendingAcknowledgementMain,
+      pendingAcknowledgementReadable,
+      state,
+      mainRef: await this.resolveRef("refs/heads/main").catch(() => null),
+      localRef: await this.resolveRef("refs/heads/local").catch(() => null)
+    };
+  }
+
+  /**
+   * Bundle evidence for the interrupted window. Manifests are read cheaply for
+   * every published bundle, because a bundle that cannot be read or that names
+   * the locked identity vetoes retirement whether or not it verifies. Checksums
+   * are only walked for bundles whose identity is a qualifying carrier.
+   */
+  async verifyApplyJournalBundleCandidates(carriers) {
+    const state = carriers.state;
+    const recoveryRoot = path.join(this.obtsDir, "recovery");
+    const entries = await this.fsp.readdir(recoveryRoot, { withFileTypes: true }).catch(() => []);
+    const bundleIds = entries
+      .filter((entry) => entry.isDirectory() && /^rec_[A-Za-z0-9_-]+$/u.test(entry.name))
+      .map((entry) => entry.name)
+      .sort()
+      .reverse()
+      .slice(0, APPLY_JOURNAL_HEAL_MAX_CANDIDATES);
+    const candidates = [];
+    let veto = false;
+    for (const bundleId of bundleIds) {
+      const manifest = await readJson(this.fsp, path.join(recoveryRoot, bundleId, "manifest.json"), null);
+      if (!manifest || typeof manifest !== "object" || Array.isArray(manifest) || manifest.bundle_id !== bundleId) {
+        veto = true;
+        continue;
+      }
+      if (carriers.lockApplyId && manifest.apply_id === carriers.lockApplyId) veto = true;
+      if (!carriers.qualifyingApplyIds.has(manifest.apply_id)) continue;
+      const candidate = await this.verifyApplyJournalBundleCandidate(bundleId, manifest, state);
+      if (!candidate || !applyWindowCarrierHolds(carriers, candidate)) continue;
+      candidates.push(candidate);
+    }
+    return { candidates, veto };
+  }
+
+  async verifyApplyJournalBundleCandidate(bundleId, manifest, state) {
+    const bundleDir = path.join(this.obtsDir, "recovery", bundleId);
+    const [complete, journalCopy] = await Promise.all([
+      readJson(this.fsp, path.join(bundleDir, "complete.json"), null),
+      readJson(this.fsp, path.join(bundleDir, "journal", "apply-journal.json"), null)
+    ]);
+    if (!complete || !journalCopy) return null;
+    if (complete.bundle_id !== bundleId) return null;
+    if (!["pull_apply", "rebuild_from_server"].includes(manifest.operation_type)) return null;
+    if (!isApplyId(manifest.apply_id) || !/^[0-9a-f]{40}$/u.test(manifest.target_main || "")) return null;
+    if ((manifest.vault_id ?? "unknown") !== (state.vault_id || "unknown")) return null;
+    if ((manifest.device_id ?? "unknown") !== (state.device_id || "unknown")) return null;
+    let journal;
+    try {
+      journal = parseApplyJournal(journalCopy);
+    } catch {
+      return null;
+    }
+    // Only the bundle published before the first visible write can source a
+    // reconstruction, and its journal copy names no recovery bundle. A later
+    // bundle of the same window holds post-apply bytes and only vetoes.
+    if (journal.recovery_bundle_id) return null;
+    if (journal.apply_id !== manifest.apply_id || journal.target_main !== manifest.target_main ||
+        !applyRecoveryOperationMatches(journal.operation_type, manifest.operation_type) ||
+        stableJson(journal.affected_paths) !== stableJson(manifest.affected_paths)) return null;
+    if (!(await this.commitExists(manifest.target_main))) return null;
+    try {
+      const recorded = await this.fsp.readFileBounded(path.join(bundleDir, "checksums.sha256"), this.fileBufferBudgetBytes, "utf8");
+      const actual = await bundleChecksums(this.fsp, bundleDir, this.fileBufferBudgetBytes);
+      if (recorded !== `${actual.join("\n")}\n`) return null;
+    } catch {
+      return null;
+    }
+    return {
+      bundleId,
+      applyId: journal.apply_id,
+      targetMain: journal.target_main,
+      authoringBase: journal.authoring_base ?? null,
+      journal
+    };
+  }
+
+  // No visible file mutation precedes bundle publication, so an unmoved local
+  // and coordination ref, no displaced pre-image and no outstanding
+  // acknowledgement prove the interrupted apply wrote nothing visible.
+  async proveApplyWindowNotMutated(carriers) {
+    const state = carriers.state;
+    if (carriers.displacedApplyIds.size > 0) return false;
+    if (!state.local_main || !state.local_head) return false;
+    if (carriers.mainRef !== state.local_main || carriers.localRef !== state.local_head) return false;
+    // No operation that could have written these bytes is admitted while an
+    // acknowledgement is pending, readable or not, so either one is ambiguity.
+    if (!carriers.pendingAcknowledgementReadable || carriers.pendingAcknowledgementMain) return false;
+    return await this.commitExists(state.local_main);
+  }
+
+  // Quarantine is already durable here. The lock goes first so a kill before the
+  // journal removal cannot leave an unreadable journal under an unheld lock, and
+  // the latch is cleared last so the same kill stays retryable. A lock this
+  // installation may not reclaim keeps the journal and the block instead.
+  async retireUnmutatedApplyJournal(carriers) {
+    if (!(await this.dropMatchingApplyLock(carriers.lockApplyId))) return false;
+    await this.fsp.rm(this.applyJournalPath, { force: true });
+    this.requestFullInventory();
+    this.plugin.syncQueued = true;
+    await this.clearApplyJournalLatch(await this.readState());
+    return true;
+  }
+
+  async clearApplyJournalLatch(state) {
+    const latched = state.last_error_code === "apply_journal_recovery_required";
+    if (!latched && !state.apply_validation_reason) return state;
+    const cleared = Object.assign({}, state, {
+      last_error_code: latched ? null : state.last_error_code,
+      apply_validation_reason: null,
+      updated_at: nowIso()
+    });
+    if (latched) cleared.status_label = "Checking";
+    await this.writeState(cleared);
+    return cleared;
+  }
+
+  // Lock removal follows the lock protocol: the marker must be one this
+  // installation could reclaim (the legacy shape, or a managed-headless marker
+  // of another generation), and the file that is removed must still be the one
+  // that was inspected and re-read.
+  async dropMatchingApplyLock(applyId) {
+    if (!isApplyId(applyId)) return false;
+    if (this.applyLockOwner) {
+      return this.applyLockOwner.applyId === applyId ? await this.releaseApplyLock(applyId).catch(() => false) : false;
+    }
+    const owner = this.managedHeadlessOwner;
+    const ownedByProtocol = (marker) => Boolean(marker) && marker.apply_id === applyId &&
+      (owner ? owner.canReclaim(marker) : isLegacyApplyLockMarker(marker, applyId));
+    let details;
+    let marker;
+    try {
+      details = await this.fsp.lstat(this.applyLockPath);
+      if (!details.isFile() || details.isSymbolicLink()) return false;
+      marker = JSON.parse(await this.fsp.readFile(this.applyLockPath, "utf8"));
+    } catch {
+      return false;
+    }
+    if (!ownedByProtocol(marker)) return false;
+    const beforeRemoval = await this.fsp.lstat(this.applyLockPath);
+    const current = JSON.parse(await this.fsp.readFile(this.applyLockPath, "utf8"));
+    if (applyLockFileChanged(details, beforeRemoval) ||
+        JSON.stringify(current) !== JSON.stringify(marker) || !ownedByProtocol(current)) return false;
+    await this.fsp.rm(this.applyLockPath, { force: true });
+    return true;
+  }
+
+  // The user-triggered rebuild and reset are the only escapes from an
+  // unreadable journal that cannot be proven safe: quarantine first, then stop
+  // the unreadable file from blocking the replacement operation. The displaced
+  // pre-images of the abandoned window are archived with the other recovery
+  // evidence, so a later heal never mistakes them for a live pre-image.
+  async removeUnreadableApplyJournalAfterQuarantine() {
+    const found = await this.unreadableApplyJournalBytes();
+    if (!found) {
+      // A torn marker can outlive the journal it belonged to. It identifies no
+      // operation, so it must not block the replacement the escape admits.
+      if (!(await exists(this.fsp, this.applyJournalPath))) await this.dropApplyLockWithoutIdentity();
+      return false;
+    }
+    await this.quarantineUnreadableApplyJournal(found.raw, found.classification);
+    const carriers = await this.discoverApplyJournalCarriers();
+    try {
+      await this.archiveDisplacedApplyDirs();
+    } catch {
+      throw new ObtsBlockedError("displaced_recovery_archive_failed", "The abandoned apply's displaced recovery evidence could not be archived.");
+    }
+    await this.dropMatchingApplyLock(carriers.lockApplyId);
+    await this.fsp.rm(this.applyJournalPath, { force: true });
+    await this.dropApplyLockWithoutIdentity();
+    return true;
+  }
+
+  // Copies from in-place writes and evidence from legacy removals share the
+  // same archive lifecycle; neither may be discarded on completion. The escape
+  // archives beside any earlier archive of the same identity rather than
+  // leaving the source live, and never deletes either copy.
+  async archiveDisplacedApplyDir(applyId, unique = false) {
+    const displacedRoot = path.join(this.obtsDir, "apply-displaced", applyId);
+    if (!(await this.adapterExists(displacedRoot))) return true;
+    const archiveRoot = path.join(this.obtsDir, "recovery-displaced", applyId);
+    await this.fsp.mkdir(path.dirname(archiveRoot), { recursive: true, mode: 0o700 });
+    let target = archiveRoot;
+    if (unique) {
+      const stamp = utcStamp();
+      if (await this.adapterExists(target)) target = `${archiveRoot}.${stamp}`;
+      for (let index = 2; await this.adapterExists(target); index += 1) target = `${archiveRoot}.${stamp}-${index}`;
+    } else if (await this.adapterExists(archiveRoot)) {
+      return false;
+    }
+    await this.fsp.rename(displacedRoot, target);
+    return true;
+  }
+
+  async archiveDisplacedApplyDirs() {
+    const root = path.join(this.obtsDir, "apply-displaced");
+    const entries = await this.fsp.readdir(root, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (entry.isDirectory() && isApplyId(entry.name)) await this.archiveDisplacedApplyDir(entry.name, true);
+    }
+  }
+
+  // Only a marker that carries no apply identity is dropped here, and only with
+  // no in-process owner holding the lock: a marker that names its operation, or
+  // a lock that cannot be read at all, still belongs to the lock protocol.
+  async dropApplyLockWithoutIdentity() {
+    if (this.applyLockOwner) return false;
+    let details;
+    try {
+      details = await this.fsp.lstat(this.applyLockPath);
+    } catch {
+      return false;
+    }
+    if (!details.isFile() || details.isSymbolicLink()) return false;
+    let text;
+    try {
+      text = await this.fsp.readFile(this.applyLockPath, "utf8");
+    } catch {
+      return false;
+    }
+    let marker;
+    try {
+      marker = JSON.parse(text);
+    } catch {
+      marker = undefined;
+    }
+    if (isApplyId(marker?.apply_id)) return false;
+    const beforeRemoval = await this.fsp.lstat(this.applyLockPath).catch(() => null);
+    if (!beforeRemoval || applyLockFileChanged(details, beforeRemoval)) return false;
+    await this.fsp.rm(this.applyLockPath, { force: true });
+    return true;
+  }
+
   async admitApplyRecovery() {
     let journal;
     try { journal = await readApplyJournalStrict(this.fsp, this.applyJournalPath); }
-    catch { throw new ObtsBlockedError("apply_journal_recovery_required", "The apply journal is unreadable or invalid. Preserve it and restore verified recovery evidence before resuming."); }
+    catch {
+      const healed = await this.healUnreadableApplyJournal();
+      if (healed === "retired" || healed === "absent") await this.clearApplyJournalLatch(await this.readState());
+      journal = await readApplyJournalStrict(this.fsp, this.applyJournalPath).catch(() => null);
+      if (!journal && healed !== "retired" && healed !== "absent") {
+        throw new ObtsBlockedError("apply_journal_recovery_required", "The apply journal is unreadable or invalid. Its bytes are quarantined under .obts/recovery-corrupt; use Rebuild from server main to replace the local snapshot before resuming.");
+      }
+    }
     if (!journal) return;
     await this.initialize();
-    const remaining = await readApplyJournalStrict(this.fsp, this.applyJournalPath);
+    const remaining = await readApplyJournalStrict(this.fsp, this.applyJournalPath).catch(() => null);
     if (remaining) {
       const reason = applyRecoveryReason(await this.readState(), remaining);
       throw new ObtsBlockedError("apply_journal_recovery_required", `The interrupted apply is still blocked (${reason}). Keep the setup journal, local files and recovery bundles. Resolve this recorded recovery issue before resuming; a new apply cannot replace the unfinished operation.`);
@@ -5796,7 +6252,7 @@ class ObtsObsidianClient {
         if (!complete || !manifest) return "recovery_evidence_missing";
         if (complete.bundle_id !== journal.recovery_bundle_id || manifest.bundle_id !== journal.recovery_bundle_id) return "recovery_identity_mismatch";
         if (manifest.vault_id !== (state.vault_id || "unknown") || manifest.device_id !== (state.device_id || "unknown") ||
-          manifest.operation_type !== journal.operation_type ||
+          !applyRecoveryOperationMatches(journal.operation_type, manifest.operation_type) ||
           journal.journal_version >= 6 && manifest.apply_id !== journal.apply_id) return "recovery_identity_mismatch";
         if (manifest.target_main !== journal.target_main || stableJson(manifest.affected_paths) !== stableJson(journal.affected_paths)) return "recovery_target_policy_mismatch";
         const savedJournal = parseApplyJournal(await readJson(this.fsp, path.join(bundle, "journal", "apply-journal.json"), null));
@@ -6329,7 +6785,7 @@ class ObtsObsidianClient {
         try {
           journal.recovery_bundle_id = await this.finalizeRecoveryBundle(
             stagedRecovery,
-            "pull_apply",
+            journal.operation_type,
             targetMain,
             affectedPaths,
             journal
@@ -6457,7 +6913,7 @@ class ObtsObsidianClient {
       } else if (preservedLocalChangePaths.length > 0) {
         await this.recordDeferredApplyPaths(journal, preservedLocalChangePaths);
         try {
-          await this.createRecoveryBundle("rebuild_from_server", targetMain, preservedLocalChangePaths);
+          await this.createRecoveryBundle("rebuild_from_server", targetMain, preservedLocalChangePaths, journal);
         } catch (error) {
           if (!(error instanceof LocalSnapshotChangedError)) throw error;
           preservedLocalChangePaths = [];
@@ -6495,6 +6951,7 @@ class ObtsObsidianClient {
         // a suspension can still interrupt.
         status_label: "Checking",
         last_error_code: null,
+        apply_validation_reason: null,
         last_event_seq: Math.max(state.last_event_seq || 0, eventSeq || 0),
         last_applied_event_seq: Math.max(state.last_applied_event_seq || 0, eventSeq || 0),
         updated_at: nowIso()
@@ -6581,7 +7038,7 @@ class ObtsObsidianClient {
     if (!skipCapture) {
       if (preservedPaths.length > 0 && !options.bundleWritten) {
         report("Writing recovered local change bundle", "recovery_bundle");
-        await this.createRecoveryBundle("rebuild_from_server", targetMain, preservedPaths);
+        await this.createRecoveryBundle("rebuild_from_server", targetMain, preservedPaths, journal);
       }
       // A journal can be committed before its refs move (the ref-only path
       // publishes the phase first), so recovery re-asserts them before the
@@ -6711,7 +7168,7 @@ class ObtsObsidianClient {
       this.plugin.isApplying = true;
       if (preservedLocalChangePaths.length > 0) {
         this.plugin.setInitializationStage("Writing interrupted apply recovery bundle", "recovery_bundle");
-        await this.createRecoveryBundle("rebuild_from_server", journal.target_main, preservedLocalChangePaths);
+        await this.createRecoveryBundle("rebuild_from_server", journal.target_main, preservedLocalChangePaths, journal);
       }
       this.plugin.setInitializationStage("Restoring interrupted directory changes", "recovery_file_apply");
       const residualTombstoneDirectories = await this.applyDirectoryChanges(
@@ -6962,7 +7419,7 @@ class ObtsObsidianClient {
         if (preservedLocalChangePaths.length > 0) {
           this.plugin.setInitializationStage("Writing recovered local change bundle", "recovery_bundle");
           try {
-            await this.createRecoveryBundle("rebuild_from_server", journal.target_main, preservedLocalChangePaths);
+            await this.createRecoveryBundle("rebuild_from_server", journal.target_main, preservedLocalChangePaths, journal);
           } catch (error) {
             if (!(error instanceof LocalSnapshotChangedError)) throw error;
             preservedLocalChangePaths = [];
@@ -10701,15 +11158,9 @@ class ObtsObsidianClient {
     }
     if (journal && isApplyId(journal.apply_id)) {
       const displacedRoot = path.join(this.obtsDir, "apply-displaced", journal.apply_id);
-      if (await this.adapterExists(displacedRoot)) {
-        const archiveRoot = path.join(this.obtsDir, "recovery-displaced", journal.apply_id);
-        await this.fsp.mkdir(path.dirname(archiveRoot), { recursive: true, mode: 0o700 });
-        if (await this.adapterExists(archiveRoot)) {
-          throw new ObtsBlockedError("displaced_recovery_archive_exists", "Displaced recovery evidence already exists for this apply operation.");
-        }
-        // Copies from in-place writes and evidence from legacy removals share
-        // the same archive lifecycle; neither may be discarded on completion.
-        await this.fsp.rename(displacedRoot, archiveRoot);
+      const archived = await this.archiveDisplacedApplyDir(journal.apply_id);
+      if (!archived && await this.adapterExists(displacedRoot)) {
+        throw new ObtsBlockedError("displaced_recovery_archive_exists", "Displaced recovery evidence already exists for this apply operation.");
       }
     }
     await this.fsp.rm(this.applyJournalPath, { force: true });
@@ -15265,7 +15716,7 @@ function localSyncFailureExplanation(code, details) {
     const move = paths.length === 2 ? `the move ${paths[0]} -> ${paths[1]}` : "a file move";
     return `Your root .gitignore now hides ${move}, which was already waiting to upload. Nothing was lost. Undo that .gitignore change and sync retries by itself; you can re-apply it once this move has uploaded.`;
   }
-  if (safeCode === "apply_journal_recovery_required" || safeCode === "apply_recovery_required") return `Local apply recovery needs review (${safeCode}). Preserve the vault and .obts state; restart Obsidian once, then inspect the recovery journal if this persists.`;
+  if (safeCode === "apply_journal_recovery_required" || safeCode === "apply_recovery_required") return `Local apply recovery needs review (${safeCode}). Reload or restart the app once so an interrupted apply can finish; if sync still cannot continue, run Rebuild from server main from the command palette. The unreadable journal is preserved under .obts/recovery-corrupt for diagnostics.`;
   if (safeCode === "directory_recovery_journal_invalid") return "The local directory recovery journal is invalid. Preserve .obts/directory-recovery.json and the vault; send sanitized diagnostics before assisted recovery.";
   if (safeCode === "apply_lock_active") return "A local apply lock is active. Another operation may still own it; do not remove the lock. If it persists after restarting Obsidian, preserve the vault and .obts state for recovery support.";
   if (safeCode === "recovery_bundle_failed") return "Recovery evidence could not be completed, so destructive apply stopped. Check local storage and permissions; preserve the vault and .obts state before retrying.";
@@ -15314,6 +15765,80 @@ async function readApplyJournalStrict(fsp, filePath) {
     if (error && error.code === "ENOENT") return null;
     throw error;
   }
+}
+
+function classifyUnreadableApplyJournal(raw) {
+  const bytes = Buffer.from(raw);
+  const digest = sha256(bytes);
+  const text = bytes.toString("utf8");
+  if (!text.trim()) return { reason: "empty", size: bytes.length, sha256: digest };
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return { reason: "not_json", size: bytes.length, sha256: digest };
+  }
+  try {
+    parseApplyJournal(value);
+  } catch {
+    return { reason: "schema", size: bytes.length, sha256: digest };
+  }
+  return { reason: null, size: bytes.length, sha256: digest };
+}
+
+// A reconstructed journal is derived state: the file-writing phase, the last
+// completed step and the deferral list come from current evidence, never from
+// the copied record.
+function reconstructApplyJournal(copy, bundleId) {
+  return parseApplyJournal(Object.assign({}, copy, {
+    phase: "writing_files",
+    last_completed_step: null,
+    recovery_bundle_id: bundleId,
+    deferred_local_paths: []
+  }));
+}
+
+// Deterministic and fail-closed: the locked identity wins, otherwise every
+// candidate must share one carried identity. The candidate list is already
+// scoped to qualifying carriers, so an unselectable list is ambiguity.
+function selectApplyRecoveryBundle(candidates, carriers) {
+  if (carriers.lockApplyId) return candidates.find((candidate) => candidate.applyId === carriers.lockApplyId) || null;
+  if (new Set(candidates.map((candidate) => candidate.applyId)).size !== 1) return null;
+  return candidates[0] || null;
+}
+
+// The lock names the window outright, and a surviving displaced directory can
+// only belong to it. A horizon is evidence of the window only while its base is
+// still the current main, the candidate was authored on that base, and the
+// candidate's own target is not what the main already is: that is what excludes
+// the lingering horizon of a settled apply, including a settled rebuild whose
+// target equals its base.
+function applyWindowCarrierHolds(carriers, candidate) {
+  if (carriers.lockApplyId === candidate.applyId) return true;
+  if (carriers.displacedApplyIds.has(candidate.applyId)) return true;
+  const base = carriers.horizons.get(candidate.applyId);
+  return Boolean(base) && base === carriers.state.local_main &&
+    candidate.authoringBase === base && candidate.targetMain !== carriers.state.local_main;
+}
+
+// 0.7.10 published every recovery bundle with the literal pull_apply operation
+// type, so a rebuild journal and its bundle legitimately disagree on upgrade.
+function applyRecoveryOperationMatches(journalOperation, manifestOperation) {
+  if (journalOperation === manifestOperation) return true;
+  return journalOperation === "rebuild_from_server" && manifestOperation === "pull_apply";
+}
+
+// The mobile adapter exposes no device/inode pair, so the re-read guard falls
+// back to the size and modification time the stat does provide.
+function applyLockFileChanged(before, after) {
+  if (before.dev === undefined || before.ino === undefined) {
+    return after.size !== before.size || after.mtimeMs !== before.mtimeMs;
+  }
+  return after.dev !== before.dev || after.ino !== before.ino;
+}
+
+function utcStamp() {
+  return new Date().toISOString().replace(/[-:]/gu, "").replace(/\.\d+Z$/u, "Z");
 }
 
 function parseApplyJournal(value) {
