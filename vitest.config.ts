@@ -11,7 +11,11 @@ export default defineConfig({
     exclude: excludedTests,
     testTimeout: 30_000,
     hookTimeout: 30_000,
-    fileParallelism: group === 'fast',
+    // Test files run in parallel in every group. Sequential execution made the
+    // whole suite cost the sum of every file (over an hour on four cores), while
+    // the files themselves spend most of their time waiting on a fixture's server
+    // and Git, so several files overlap almost for free.
+    fileParallelism: true,
     ...(group === 'fast' ? { maxWorkers: 2 } : {})
   }
 });
