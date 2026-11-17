@@ -3,6 +3,7 @@ const { Plugin, PluginSettingTab, Setting, Notice, Modal, Platform, requestUrl, 
 const { Buffer } = require("buffer");
 if (typeof globalThis.Buffer === "undefined") globalThis.Buffer = Buffer;
 const { createGitObjectCache, createImmutableObjectMemo, withGitObjectCaches } = require("./git-object-cache.cjs");
+const { isAncestorByParents } = require("./git-ancestry.cjs");
 const gitObjectCaches = new WeakMap();
 const git = withGitObjectCaches(require("isomorphic-git"), (fs) => gitObjectCaches.get(fs) || null);
 const { createPackConsolidator } = require("./git-pack-consolidation.cjs");
@@ -11359,7 +11360,11 @@ class ObtsObsidianClient {
       // Keep exact, unbounded ancestry. Only a successful walk (including a
       // proven negative) is memoized; missing objects and I/O failures retry.
       return await this.gitObjectMemo.get(`ancestor:${ancestor}:${descendant}`, () =>
-        git.isDescendent({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: descendant, ancestor, depth: -1 }));
+        isAncestorByParents({
+          ancestor,
+          descendant,
+          readParents: async (oid) => (await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid })).commit.parent
+        }));
     } catch {
       return false;
     }

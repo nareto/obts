@@ -14,7 +14,8 @@ export const fastTests = [
   'tests/dashboard-deletion-ui.test.ts',
   'tests/dashboard-live-status.test.ts',
   'tests/openapi-contract.test.ts',
-  'tests/name-portability.test.ts'
+  'tests/name-portability.test.ts',
+  'tests/git-ancestry.test.ts'
 ];
 
 export const pluginTests = [
@@ -25,6 +26,7 @@ export const pluginTests = [
   'tests/plugin-background-catchup.test.ts',
   'tests/plugin-mobile-suspension.test.ts',
   'tests/plugin-ancestry-memo.test.ts',
+  'tests/plugin-ancestry-cost.test.ts',
   'tests/plugin-apply-progress.test.ts',
   'tests/plugin-committed-tail-recovery.test.ts',
   'tests/plugin-apply-journal-heal.test.ts',

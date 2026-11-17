@@ -2096,6 +2096,53 @@ var require_git_object_cache = __commonJS({
   }
 });
 
+// obsidian-plugin/src/git-ancestry.cjs
+var require_git_ancestry = __commonJS({
+  "obsidian-plugin/src/git-ancestry.cjs"(exports2, module2) {
+    "use strict";
+    var FROM_D = 1;
+    var FROM_A = 2;
+    var BOTH = FROM_D | FROM_A;
+    async function isAncestorByParents2({ ancestor, descendant, readParents }) {
+      if (ancestor === descendant) return true;
+      const flags = /* @__PURE__ */ new Map([[descendant, FROM_D], [ancestor, FROM_A]]);
+      const queue = [descendant, ancestor];
+      const queued = new Set(queue);
+      let nonStale = queue.length;
+      while (nonStale > 0) {
+        const oid = queue.shift();
+        queued.delete(oid);
+        const reachedBy = flags.get(oid);
+        if (reachedBy !== BOTH) nonStale -= 1;
+        let parents;
+        try {
+          parents = await readParents(oid);
+        } catch (error) {
+          if (reachedBy & FROM_A) continue;
+          throw error;
+        }
+        for (const parent of parents) {
+          const previous = flags.get(parent) || 0;
+          const next = previous | reachedBy;
+          if (next === previous) continue;
+          if (parent === ancestor && next & FROM_D) return true;
+          if (parent === descendant && next & FROM_A) return false;
+          flags.set(parent, next);
+          if (queued.has(parent)) {
+            if (previous !== BOTH && next === BOTH) nonStale -= 1;
+          } else {
+            queue.push(parent);
+            queued.add(parent);
+            if (next !== BOTH) nonStale += 1;
+          }
+        }
+      }
+      return false;
+    }
+    module2.exports = { isAncestorByParents: isAncestorByParents2 };
+  }
+});
+
 // node_modules/async-lock/lib/index.js
 var require_lib = __commonJS({
   "node_modules/async-lock/lib/index.js"(exports2, module2) {
@@ -23170,6 +23217,7 @@ var { Plugin, PluginSettingTab, Setting, Notice, Modal, Platform, requestUrl, ap
 var { Buffer: Buffer2 } = require_buffer();
 if (typeof globalThis.Buffer === "undefined") globalThis.Buffer = Buffer2;
 var { createGitObjectCache, createImmutableObjectMemo, withGitObjectCaches } = require_git_object_cache();
+var { isAncestorByParents } = require_git_ancestry();
 var gitObjectCaches = /* @__PURE__ */ new WeakMap();
 var git = withGitObjectCaches((init_isomorphic_git(), __toCommonJS(isomorphic_git_exports)), (fs) => gitObjectCaches.get(fs) || null);
 var { createPackConsolidator } = require_git_pack_consolidation();
@@ -23183,7 +23231,7 @@ var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var { findUnportablePaths, isRestrictedNamePlatform, segmentHasReservedCharacters } = require_namePortability();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.7.11";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.7.12";
 var SYNC_DEBOUNCE_MS = 1500;
 var EMPTY_JSON_BODY = "{}";
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
@@ -33348,7 +33396,11 @@ var ObtsObsidianClient = class {
   async isAncestor(ancestor, descendant) {
     if (ancestor === descendant) return true;
     try {
-      return await this.gitObjectMemo.get(`ancestor:${ancestor}:${descendant}`, () => git.isDescendent({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid: descendant, ancestor, depth: -1 }));
+      return await this.gitObjectMemo.get(`ancestor:${ancestor}:${descendant}`, () => isAncestorByParents({
+        ancestor,
+        descendant,
+        readParents: async (oid) => (await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid })).commit.parent
+      }));
     } catch {
       return false;
     }
