@@ -1,7 +1,20 @@
 import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
-describe('dashboard protocol formal checker', () => {
+function toolPresent(tool: string): boolean {
+  return spawnSync(tool, ['--help'], { stdio: 'ignore' }).error === undefined;
+}
+
+// scripts/check-dashboard-protocols-model.mjs runs SANY and TLC either from TLA2TOOLS_JAR with
+// java, or from tla2sany and tlc on PATH (what .github/workflows/formal-model.yml installs). A
+// host with neither cannot model-check, so this skips there with that reason and still runs
+// unchanged where the tools exist.
+const tlaToolsAvailable = process.env.TLA2TOOLS_JAR
+  ? existsSync(process.env.TLA2TOOLS_JAR)
+  : toolPresent('tla2sany') && toolPresent('tlc');
+
+describe.skipIf(!tlaToolsAvailable)('dashboard protocol formal checker', () => {
   it('explores positive designs, required witnesses, and exact negative controls', () => {
     const result = spawnSync('node', ['scripts/check-dashboard-protocols-model.mjs'], {
       encoding: 'utf8',
