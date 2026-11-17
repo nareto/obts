@@ -24,9 +24,9 @@ async function fixture() {
   await plugin.initialize();
   const core = (plugin as unknown as { client: Record<string, any> }).client;
   const tree = await core.writeTreeFromEntries(new Map());
-  const writeCommit = async (parents: string[], message: string) =>
+  const writeCommit = async (parents: string[], message: string, timestamp = signature.timestamp) =>
     await git.writeCommit({ fs: core.fs, dir: core.vaultDir, gitdir: core.gitdir,
-      commit: { tree, parent: parents, author: signature, committer: signature, message } });
+      commit: { tree, parent: parents, author: signature, committer: { ...signature, timestamp }, message } });
   return { dir, core, writeCommit };
 }
 
@@ -43,15 +43,16 @@ function countCommitReads(core: Record<string, any>): { reads: number } {
   return counter;
 }
 
+// One commit per second, as real history records them: a parent is always
+// older than its child, which is what keeps both ends of the walk in the same
+// region of the history.
 async function longHistory(length: number) {
   const { dir, core, writeCommit } = await fixture();
-  let tip = await writeCommit([], 'root\n');
-  let parent = tip;
-  for (let index = 1; index < length; index += 1) {
-    parent = tip;
-    tip = await writeCommit([tip], `commit ${index}\n`);
+  const commits: string[] = [];
+  for (let index = 0; index < length; index += 1) {
+    commits.push(await writeCommit(index === 0 ? [] : [commits[index - 1]!], `commit ${index}\n`, signature.timestamp + index));
   }
-  return { dir, core, tip, parent };
+  return { dir, core, commits };
 }
 
 describe('ancestry cost on a real repository', () => {
@@ -80,26 +81,32 @@ describe('ancestry cost on a real repository', () => {
     expect(await core.isAncestor(branchTip, branchTip)).toBe(true);
   });
 
-  it('decides both directions of a long history in a bounded number of commit reads', async () => {
+  it('decides both directions of a long history in about the distance in commit reads', async () => {
     const length = 1500;
-    const { core, tip, parent } = await longHistory(length);
+    const { core, commits } = await longHistory(length);
+    const tip = commits[length - 1]!;
     const reads = countCommitReads(core);
 
-    expect(await core.isAncestor(tip, parent)).toBe(false);
-    const forward = reads.reads;
-    reads.reads = 0;
-    expect(await core.isAncestor(parent, tip)).toBe(true);
-    const backward = reads.reads;
+    for (const distance of [1, 100]) {
+      const older = commits[length - 1 - distance]!;
+      // The old walk started at the descendant only, so this negative answer
+      // cost every commit below the tip: length - 2 == 1498 from any distance.
+      expect(await core.isAncestor(tip, older)).toBe(false);
+      const forward = reads.reads;
+      reads.reads = 0;
+      expect(await core.isAncestor(older, tip)).toBe(true);
+      const backward = reads.reads;
+      reads.reads = 0;
 
-    // The old walk started at the descendant only, so the forward answer cost
-    // every commit below the tip: length - 2 == 1498.
-    expect(forward).toBeLessThanOrEqual(8);
-    expect(backward).toBeLessThanOrEqual(8);
-    expect(forward + backward).toBeLessThan(length / 10);
+      expect(forward).toBeLessThanOrEqual(distance + 3);
+      expect(backward).toBeLessThanOrEqual(distance + 3);
+    }
   }, 120_000);
 
   it('keeps the cursor guard bounded when the write advances the cursors by one commit', async () => {
-    const { dir, core, tip, parent } = await longHistory(1500);
+    const { dir, core, commits } = await longHistory(1500);
+    const parent = commits[commits.length - 2]!;
+    const tip = commits[commits.length - 1]!;
     const state = Object.assign({}, await core.readState(), {
       vault_id: 'vault-ancestry',
       device_id: 'device-ancestry',

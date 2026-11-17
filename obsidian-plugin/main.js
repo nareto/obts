@@ -2103,25 +2103,67 @@ var require_git_ancestry = __commonJS({
     var FROM_D = 1;
     var FROM_A = 2;
     var BOTH = FROM_D | FROM_A;
-    async function isAncestorByParents2({ ancestor, descendant, readParents }) {
+    function before(a, b) {
+      if (a.priority !== b.priority) return a.priority > b.priority;
+      return a.order < b.order;
+    }
+    function pushEntry(heap, entry) {
+      heap.push(entry);
+      let index2 = heap.length - 1;
+      while (index2 > 0) {
+        const parent = index2 - 1 >> 1;
+        if (!before(heap[index2], heap[parent])) break;
+        [heap[index2], heap[parent]] = [heap[parent], heap[index2]];
+        index2 = parent;
+      }
+    }
+    function popEntry(heap) {
+      const top = heap[0];
+      const last = heap.pop();
+      if (heap.length > 0) {
+        heap[0] = last;
+        let index2 = 0;
+        for (; ; ) {
+          const left = index2 * 2 + 1;
+          if (left >= heap.length) break;
+          const right = left + 1;
+          const child = right < heap.length && before(heap[right], heap[left]) ? right : left;
+          if (!before(heap[child], heap[index2])) break;
+          [heap[index2], heap[child]] = [heap[child], heap[index2]];
+          index2 = child;
+        }
+      }
+      return top;
+    }
+    async function isAncestorByParents2({ ancestor, descendant, readCommit: readCommit2 }) {
       if (ancestor === descendant) return true;
       const flags = /* @__PURE__ */ new Map([[descendant, FROM_D], [ancestor, FROM_A]]);
-      const queue = [descendant, ancestor];
-      const queued = new Set(queue);
-      let nonStale = queue.length;
+      const queue = [];
+      const queued = /* @__PURE__ */ new Set();
+      let order = 0;
+      const enqueue = (oid, priority) => {
+        queued.add(oid);
+        pushEntry(queue, { oid, priority, order });
+        order += 1;
+      };
+      enqueue(descendant, Number.POSITIVE_INFINITY);
+      enqueue(ancestor, Number.POSITIVE_INFINITY);
+      let nonStale = 2;
       while (nonStale > 0) {
-        const oid = queue.shift();
+        const oid = popEntry(queue).oid;
         queued.delete(oid);
         const reachedBy = flags.get(oid);
         if (reachedBy !== BOTH) nonStale -= 1;
-        let parents;
+        let commit2;
         try {
-          parents = await readParents(oid);
+          commit2 = await readCommit2(oid);
         } catch (error) {
           if (reachedBy & FROM_A) continue;
           throw error;
         }
-        for (const parent of parents) {
+        const timestamp = Number(commit2 && commit2.committer && commit2.committer.timestamp);
+        const priority = Number.isFinite(timestamp) ? timestamp : 0;
+        for (const parent of commit2 && commit2.parent || []) {
           const previous = flags.get(parent) || 0;
           const next = previous | reachedBy;
           if (next === previous) continue;
@@ -2131,8 +2173,7 @@ var require_git_ancestry = __commonJS({
           if (queued.has(parent)) {
             if (previous !== BOTH && next === BOTH) nonStale -= 1;
           } else {
-            queue.push(parent);
-            queued.add(parent);
+            enqueue(parent, priority);
             if (next !== BOTH) nonStale += 1;
           }
         }
@@ -33399,7 +33440,8 @@ var ObtsObsidianClient = class {
       return await this.gitObjectMemo.get(`ancestor:${ancestor}:${descendant}`, () => isAncestorByParents({
         ancestor,
         descendant,
-        readParents: async (oid) => (await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid })).commit.parent
+        // The walk only uses committer timestamps to order its reads.
+        readCommit: async (oid) => (await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid })).commit
       }));
     } catch {
       return false;

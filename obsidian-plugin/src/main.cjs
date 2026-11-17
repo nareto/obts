@@ -11363,7 +11363,8 @@ class ObtsObsidianClient {
         isAncestorByParents({
           ancestor,
           descendant,
-          readParents: async (oid) => (await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid })).commit.parent
+          // The walk only uses committer timestamps to order its reads.
+          readCommit: async (oid) => (await git.readCommit({ fs: this.fs, dir: this.vaultDir, gitdir: this.gitdir, oid })).commit
         }));
     } catch {
       return false;
