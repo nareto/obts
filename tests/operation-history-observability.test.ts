@@ -9,6 +9,7 @@ import { createObtsServer, type ObtsServer } from '../src/server/app.js';
 import { MetadataStore, type MetadataDb, type SyncOperationRow } from '../src/server/metadataStore.js';
 import { OperationHistoryStore } from '../src/server/operationHistoryStore.js';
 import { OperationalLog } from '../src/server/operationalLog.js';
+import { ReadinessSampler } from '../src/server/readinessSampler.js';
 import { commit, historyCheckpointFixture, manifest, multipart } from './helpers/historyCheckpointFixture.js';
 
 const roots: string[] = [];
@@ -332,12 +333,8 @@ it('populated server startup and real pending merge do not snapshot per old push
   const consumerSnapshots: number[] = [];
   const consumerQueries: number[] = [];
   for (const size of [8, 512]) {
-    // The counted window must contain the consumer's own statements only. The server
-    // starts a readiness sample as it comes up, and whether that sample is still in
-    // flight when the window opens depends on how fast the host is: joining it puts
-    // its statements inside the window, a sample that finished before the window
-    // leaves them outside. With no automatic sample, the diagnostics request inside
-    // the window starts exactly one, in both iterations.
+    // The fixture's own server is closed before anything is measured, so it runs no
+    // sample of its own either.
     const f = await fixture({ readiness: { autoStart: false } });
     const vaultId = f.auth.vault.vault_id;
     await addRows(f, size);
@@ -360,13 +357,21 @@ it('populated server startup and real pending merge do not snapshot per old push
     const exportRows = vi.spyOn(OperationHistoryStore.prototype, 'exportRows');
     const exportHistory = vi.spyOn(MetadataStore.prototype, 'exportOperationHistory');
     const select = vi.spyOn(DatabaseSync.prototype, 'prepare');
+    const samples = vi.spyOn(ReadinessSampler.prototype, 'sample');
     const materializedQueries: string[] = [];
     const all = StatementSync.prototype.all;
     const materialize = vi.spyOn(StatementSync.prototype, 'all').mockImplementation(function (this: StatementSync, ...args: unknown[]) {
       materializedQueries.push(this.sourceSQL);
       return Reflect.apply(all, this, args);
     });
-    f.server = await createObtsServer({ dataDir: f.root, sessionSecret: 'checkpoint-test-secret' });
+    // The counted window below must contain the consumer's own statements only. This server starts
+    // its automatic readiness sample on the first request, which is the first request inside that
+    // window, and whether the sample is still in flight when the diagnostics request arrives depends
+    // on how fast the host is: a sample still running then joins the diagnostics read and puts its
+    // statements inside the window, a sample that already finished leaves a fresh one inside it.
+    // Without an automatic sample, the diagnostics request inside the window starts exactly one.
+    f.server = await createObtsServer({ dataDir: f.root, sessionSecret: 'checkpoint-test-secret' },
+      { readiness: { autoStart: false } });
     servers.push(f.server);
     startupSnapshots.push(snapshot.mock.calls.length);
     expect(exportRows).not.toHaveBeenCalled();
@@ -390,12 +395,17 @@ it('populated server startup and real pending merge do not snapshot per old push
     }
     expect(sql.some((query) => /attempt_id=\?/u.test(query))).toBe(true);
     consumerQueries.push(sql.length);
+    // Exactly one readiness sample may be requested inside the window: the diagnostics export's own.
+    // An automatic startup sample would run alongside it, and how many of its statements landed
+    // inside the window would depend on host speed instead of on the consumer's behaviour.
+    expect(samples).toHaveBeenCalledTimes(1);
     expect(materializedQueries.filter((query) => /\bFROM operations\b/iu.test(query))).toEqual([]);
     materialize.mockRestore();
     snapshot.mockRestore();
     exportRows.mockRestore();
     exportHistory.mockRestore();
     select.mockRestore();
+    samples.mockRestore();
   }
   expect(startupSnapshots[1]).toBeLessThanOrEqual(startupSnapshots[0]! + 2);
   expect(consumerSnapshots[1]).toBeLessThanOrEqual(consumerSnapshots[0]! + 2);
