@@ -332,7 +332,13 @@ it('populated server startup and real pending merge do not snapshot per old push
   const consumerSnapshots: number[] = [];
   const consumerQueries: number[] = [];
   for (const size of [8, 512]) {
-    const f = await fixture();
+    // The counted window must contain the consumer's own statements only. The server
+    // starts a readiness sample as it comes up, and whether that sample is still in
+    // flight when the window opens depends on how fast the host is: joining it puts
+    // its statements inside the window, a sample that finished before the window
+    // leaves them outside. With no automatic sample, the diagnostics request inside
+    // the window starts exactly one, in both iterations.
+    const f = await fixture({ readiness: { autoStart: false } });
     const vaultId = f.auth.vault.vault_id;
     await addRows(f, size);
     await f.server.sync.archiveStartupHistory(vaultId);
