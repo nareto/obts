@@ -115,7 +115,7 @@ function stallMidBody(_req: IncomingMessage, res: ServerResponse): void {
 afterEach(async () => {
   vi.unstubAllGlobals();
   await Promise.all(servers.splice(0).map((server) => server.close()));
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })));
 });
 
 describe('headless request classification', () => {

@@ -5,7 +5,7 @@ import { afterEach, expect, it } from 'vitest';
 import { CHILD_SEAM_DEADLINE_MS } from './helpers/childSeam.js';
 import { retainedCatchupHarness } from './helpers/retainedCatchupHarness.js';
 const roots: string[] = [];
-afterEach(async () => { await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
+afterEach(async () => { await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }))); });
 async function killAtBoundary(root: string, boundary: string) {
   const child = fork('tests/fixtures/retained-catchup-child.mjs', [root, boundary], { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
   const exit = new Promise(resolve => child.once('exit', (_code, signal) => resolve(signal)));

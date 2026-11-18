@@ -70,7 +70,7 @@ beforeEach(async () => {
 afterEach(async () => {
   vi.restoreAllMocks();
   for (const instance of servers.splice(0)) await instance.app.close();
-  if (root) await rm(root, { recursive: true, force: true });
+  if (root) await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 describe('OBTS-DASH-NAME-001 name repair API', () => {

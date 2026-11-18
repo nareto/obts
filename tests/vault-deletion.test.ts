@@ -35,7 +35,7 @@ describe('server-owned vault deletion lifecycle', () => {
   afterEach(async () => {
     heldAdmission?.release();
     await server?.app.close();
-    if (root) await rm(root, { recursive: true, force: true });
+    if (root) await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   });
 
   it('requires the full target confirmation, does not require recent auth, and retains a redacted receipt', async () => {

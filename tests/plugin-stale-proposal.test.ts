@@ -28,7 +28,7 @@ const stableJson = (value: any): string => JSON.stringify(value, (_key, item) =>
 afterEach(async () => {
   vi.restoreAllMocks();
   await Promise.all(servers.splice(0).map((s) => s.app.close()));
-  await Promise.all(roots.splice(0).map((r) => rm(r, { recursive: true, force: true })));
+  await Promise.all(roots.splice(0).map((r) => rm(r, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })));
 });
 
 async function fixture() {

@@ -11,7 +11,7 @@ const EXPIRED = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString();
 const roots: string[] = [];
 
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true })));
+  await Promise.all(roots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })));
 });
 
 type Intent = { op: 'create' | 'delete'; path: string };

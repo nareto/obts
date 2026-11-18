@@ -16,7 +16,7 @@ import { deviceRow } from './helpers/dashboardStoreFixture.js';
 
 const roots: string[] = [];
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true })));
+  await Promise.all(roots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })));
 });
 
 const REVOKED_AT = '2026-01-01T00:00:00.000Z';

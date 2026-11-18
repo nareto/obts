@@ -118,7 +118,7 @@ export class DashboardHarness {
   async cleanup(): Promise<void> {
     for (const stream of this.streams.splice(0)) stream.abort();
     await Promise.all(this.servers.splice(0).map(async (server) => await server.app.close()));
-    await Promise.all(this.roots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true })));
+    await Promise.all(this.roots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })));
   }
 }
 

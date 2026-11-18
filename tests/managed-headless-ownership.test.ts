@@ -33,7 +33,7 @@ describe('managed Linux headless ownership', () => {
     try {
       expect(createManagedHeadlessOwnership(root)).toBeNull();
     } finally {
-      await rm(root, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     }
   });
   it.each(['write', 'close'])('cleans an unpublished marker after injected %s failure', async (failurePoint) => {
@@ -65,7 +65,7 @@ describe('managed Linux headless ownership', () => {
       await expect(readFile(marker)).rejects.toMatchObject({ code: 'ENOENT' });
       expect(await readdir(obts)).toEqual([]);
     } finally {
-      await rm(root, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     }
   });
 
@@ -82,7 +82,7 @@ describe('managed Linux headless ownership', () => {
       expect(await readFile(marker, 'utf8')).toBe(contents);
       expect(await readdir(obts)).toEqual(['apply.lock']);
     } finally {
-      await rm(root, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     }
   });
   it('keeps the flock through supervisor death and releases it only when the Node child exits', async () => {
@@ -121,7 +121,7 @@ describe('managed Linux headless ownership', () => {
       expect(acquired).toBe(true);
     } finally {
       supervisor.kill('SIGKILL');
-      await rm(root, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     }
   });
 });

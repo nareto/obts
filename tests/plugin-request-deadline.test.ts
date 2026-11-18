@@ -11,7 +11,7 @@ afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(
 async function fixture(request: (request: any, send: () => Promise<any>) => Promise<any>) {
   const root = await mkdtemp(join(process.cwd(), 'tmp/plugin-request-deadline-'));
   const client = await mobileHarness(root, 'http://127.0.0.1:1', { request, platform: 'android' });
-  cleanups.push(async () => { client.dispose(); await rm(root, { recursive: true, force: true }); });
+  cleanups.push(async () => { client.dispose(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); });
   return { ...client, root };
 }
 

@@ -46,7 +46,7 @@ afterEach(async () => {
     expect(owner.children.size).toBe(0);
     expect(owner.work.size).toBe(0);
   }
-  for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
+  for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 describe('mobile restart test lifecycle', () => {

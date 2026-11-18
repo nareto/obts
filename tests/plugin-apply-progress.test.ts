@@ -13,7 +13,7 @@ async function fixture() {
   await mkdir('tmp/apply-progress-tests', { recursive: true });
   const root = await mkdtemp(join(process.cwd(), 'tmp/apply-progress-tests/client-'));
   const client = await mobileHarness(root, 'http://127.0.0.1:1');
-  cleanups.push(async () => { client.dispose(); await rm(root, { recursive: true, force: true }); });
+  cleanups.push(async () => { client.dispose(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); });
   await writeFile(join(root, 'first.md'), 'first\n');
   await writeFile(join(root, 'second.md'), 'second\n');
   const progress: Array<{ label: string; point: string }> = [];

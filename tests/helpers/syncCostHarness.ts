@@ -183,7 +183,7 @@ export async function createSyncCostFixture(fileCount: number): Promise<SyncCost
     async close() {
       meter.uninstall();
       await server.app.close();
-      await rm(root, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     }
   };
 }

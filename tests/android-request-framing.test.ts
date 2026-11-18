@@ -95,7 +95,7 @@ beforeEach(async () => {
 afterEach(async () => {
   for (const h of harnesses.splice(0)) h.dispose();
   await server?.app.close();
-  if (root) await rm(root, { recursive: true, force: true });
+  if (root) await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 describe('Android request framing', () => {

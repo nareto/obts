@@ -108,7 +108,7 @@ describe('sync timing delivery from the Obsidian plugin', () => {
         };
       }
     });
-    cleanups.push(async () => { client.dispose(); await rm(root, { recursive: true, force: true }); });
+    cleanups.push(async () => { client.dispose(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); });
     await client.core.writeState({ ...await client.core.readState(), vault_id: 'vault', device_id: 'device' });
     client.core.readDeviceToken = async () => 'synthetic';
     await client.plugin.setDiagnosticSharing(true);

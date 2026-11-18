@@ -15,7 +15,7 @@ const tick = async () => { for (let i = 0; i < 12; i += 1) await Promise.resolve
 
 afterEach(async () => {
   vi.restoreAllMocks();
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })));
 });
 
 async function fixture() {

@@ -105,7 +105,7 @@ describe('opt-in error diagnostics backend', () => {
     vi.useRealTimers();
     vi.restoreAllMocks();
     await Promise.all(servers.splice(0).map(async (server) => await server.app.close()));
-    await Promise.all(roots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true })));
+    await Promise.all(roots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })));
   });
 
   it('accepts approved connection and paired-device reports, deduplicates, lists, and deletes them', async () => {

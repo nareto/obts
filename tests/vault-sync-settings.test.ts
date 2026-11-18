@@ -17,7 +17,7 @@ describe('owner-managed vault sync settings', () => {
 
   afterEach(async () => {
     await server?.app.close();
-    if (root) await rm(root, { recursive: true, force: true });
+    if (root) await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   });
 
   async function setup() {

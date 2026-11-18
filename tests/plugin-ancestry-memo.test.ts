@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { ObtsPluginClient } from '../src/client/core.js';
 
 const roots: string[] = [];
-afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
+afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }))); });
 
 async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), 'obts-ancestry-memo-'));

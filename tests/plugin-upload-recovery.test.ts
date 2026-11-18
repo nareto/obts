@@ -14,7 +14,7 @@ const hash = (value: string) => createHash('sha256').update(value).digest('hex')
 afterEach(async () => {
   vi.restoreAllMocks();
   await Promise.all(servers.splice(0).map((s) => s.app.close()));
-  await Promise.all(roots.splice(0).map((r) => rm(r, { recursive: true, force: true })));
+  await Promise.all(roots.splice(0).map((r) => rm(r, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })));
 });
 async function fixture(withDirectory = false) {
   const root = await mkdtemp(join(tmpdir(), 'obts-upload-recovery-'));

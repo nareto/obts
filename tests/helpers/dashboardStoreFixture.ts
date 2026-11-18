@@ -77,5 +77,5 @@ export async function createStoreFixture(roots: string[]) {
 }
 
 export async function removeRoots(roots: string[]): Promise<void> {
-  await Promise.all(roots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true })));
+  await Promise.all(roots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })));
 }

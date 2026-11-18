@@ -77,7 +77,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
 
   afterEach(async () => {
     await server.app.close();
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   });
 
   async function createStaleConflictFixture(prefix: string, existingAdmin?: BrowserSession): Promise<{

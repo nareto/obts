@@ -18,7 +18,7 @@ async function fixture() {
   await mkdir('tmp/settings-status-tests', { recursive: true });
   const root = await mkdtemp(join(process.cwd(), 'tmp/settings-status-tests/client-'));
   const client = await mobileHarness(root, 'http://127.0.0.1:3000');
-  cleanups.push(async () => { client.dispose(); await rm(root, { recursive: true, force: true }); });
+  cleanups.push(async () => { client.dispose(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); });
   await client.core.writeState({
     ...await client.core.readState(),
     vault_id: 'synthetic-vault',

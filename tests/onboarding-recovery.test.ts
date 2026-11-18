@@ -5,7 +5,7 @@ import { ObtsPluginClient } from '../src/client/core.js';
 import { parseDiagnosticEvent } from '../src/shared/diagnostics.js';
 
 const roots: string[] = [];
-afterEach(async () => { await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
+afterEach(async () => { await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }))); });
 async function client() {
   await mkdir('tmp/recovery-tests', { recursive: true });
   const root = await mkdtemp(join(process.cwd(), 'tmp/recovery-tests/client-'));

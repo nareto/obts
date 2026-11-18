@@ -19,7 +19,7 @@ describe('Phase 3 deployable history state', () => {
   afterEach(async () => {
     vi.restoreAllMocks();
     await Promise.all(checkpointServers.splice(0).map(async (server) => await server.app.close()));
-    await Promise.all(roots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true })));
+    await Promise.all(roots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })));
   });
 
   it('upgrades Phase 2 metadata in place and initializes rebuildable history indexes', async () => {

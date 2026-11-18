@@ -37,7 +37,7 @@ const harness = new DashboardHarness();
 afterEach(async () => {
   await harness.cleanup();
   await Promise.all(servers.splice(0).map(async (server) => await server.app.close().catch(() => undefined)));
-  await Promise.all(roots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true })));
+  await Promise.all(roots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })));
 });
 
 async function boot(options: CreateObtsServerOptions = {}, dataDir?: string): Promise<ObtsServer> {
