@@ -684,15 +684,17 @@ describe('Phase 1 sync without conflict resolution', () => {
       return await putPushChunk(...args);
     };
 
-    await expect(plugin.syncOnce()).resolves.toMatchObject({ status: 'Ahead' });
+    // The accepted push is acknowledged by a ref-only apply: the paths that
+    // arrived during the upload stay hinted for the next capture instead of
+    // being preserved into a local commit.
+    await expect(plugin.syncOnce()).resolves.toMatchObject({ status: 'Checking' });
     expect(injected).toBe(true);
     expect(await plugin.readQueue()).toMatchObject({
-      pending_commit: expect.any(String),
+      pending_commit: null,
       status: 'queued_local',
       changed_paths: ['during-upload.md', ...(editExisting ? ['first.md'] : [])]
     });
     core.putPushChunk = putPushChunk;
-    await expect(plugin.syncOnce()).resolves.toMatchObject({ status: 'Checking' });
     await expect(plugin.syncOnce()).resolves.toMatchObject({ status: 'Synced' });
     const finalMain = (await plugin.readState()).local_main;
     expect(await server.git.listTreePaths(admin.vaultId, finalMain!)).toEqual(
