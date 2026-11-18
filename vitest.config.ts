@@ -13,9 +13,12 @@ export default defineConfig({
     // HTTP, so it costs seconds even on an idle machine. On a shared four-core CI
     // host the slower ones crossed 30 s and failed on the deadline while still
     // making progress: a merge-recovery or crash-image case routinely ran 20-30 s.
-    // The tests are unchanged; only the deadline matches the hardware again.
-    testTimeout: 120_000,
-    hookTimeout: 120_000,
+    // The tests are unchanged; only the deadline matches the hardware again. That
+    // host runs up to four pipelines at once, and with three test files in flight
+    // the slowest case that still passed cost 77 s, so the same deadline now leaves
+    // it the margin the sub-second cases have instead of 1.5x.
+    testTimeout: 180_000,
+    hookTimeout: 180_000,
     // Test files run in parallel in every group. Sequential execution made the
     // whole suite cost the sum of every file (over an hour on four cores), while
     // the files themselves spend most of their time waiting on a fixture's server

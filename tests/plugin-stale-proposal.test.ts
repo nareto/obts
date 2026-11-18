@@ -9,6 +9,7 @@ import git from 'isomorphic-git';
 import { ObtsPluginClient } from '../src/client/core.js';
 import { NodeDataAdapter } from '../src/client/nodeDataAdapter.js';
 import { createObtsServer, type ObtsServer } from '../src/server/app.js';
+import { CHILD_SEAM_DEADLINE_MS } from './helpers/childSeam.js';
 
 const BASE = 'first\n\nunchanged middle\n\nlast\n';
 const REMOTE = BASE.replace('first', 'remote');
@@ -18,10 +19,6 @@ const roots: string[] = [];
 const servers: ObtsServer[] = [];
 const nativeWrite = NodeDataAdapter.prototype.writeBinary;
 const pluginMain = createRequire(import.meta.url)('../obsidian-plugin/src/main.cjs') as any;
-// A SIGKILL child boots the whole plugin and has to reach its publication seam
-// before the parent kills it. Booting took longer than 15 s whenever the host was
-// shared, so the parent gave up on a child that was still working.
-const CHILD_SEAM_DEADLINE_MS = 60_000;
 const stableJson = (value: any): string => JSON.stringify(value, (_key, item) =>
   item && typeof item === 'object' && !Array.isArray(item)
     ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b)))
@@ -385,7 +382,7 @@ describe('client stale authoring cohorts with the real server', () => {
     const child = fork('tests/fixtures/stale-proposal-child.mjs', [f.dir, f.url, seam], { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
     try {
       await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error('Stale seam timeout')), 15000);
+        const timer = setTimeout(() => reject(new Error('Stale seam timeout')), CHILD_SEAM_DEADLINE_MS);
         child.once('message', (message: any) => { clearTimeout(timer); expect(message.seam).toBe(seam); resolve(); });
         child.once('exit', () => { clearTimeout(timer); reject(new Error('Child exited before the durable seam')); });
       });

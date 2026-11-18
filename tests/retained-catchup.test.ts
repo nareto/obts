@@ -2,6 +2,7 @@ import { fork } from 'node:child_process';
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
+import { CHILD_SEAM_DEADLINE_MS } from './helpers/childSeam.js';
 import { retainedCatchupHarness } from './helpers/retainedCatchupHarness.js';
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
@@ -9,7 +10,7 @@ async function killAtBoundary(root: string, boundary: string) {
   const child = fork('tests/fixtures/retained-catchup-child.mjs', [root, boundary], { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
   const exit = new Promise(resolve => child.once('exit', (_code, signal) => resolve(signal)));
   const message: any = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error(`Catch-up ${boundary} seam timeout`)); }, 15000);
+    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error(`Catch-up ${boundary} seam timeout`)); }, CHILD_SEAM_DEADLINE_MS);
     child.once('message', message => { clearTimeout(timer); resolve(message); });
   });
   child.kill('SIGKILL');
@@ -23,7 +24,7 @@ async function interrupted(kill: boolean, withExtra = false) {
     const child = fork('tests/fixtures/retained-catchup-child.mjs', [root, withExtra ? 'extra' : 'single'], { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
     const exit = new Promise(resolve => child.once('exit', (_code, signal) => resolve(signal)));
     const message: any = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Catch-up seam timeout')); }, 15000);
+      const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Catch-up seam timeout')); }, CHILD_SEAM_DEADLINE_MS);
       child.once('message', message => { clearTimeout(timer); resolve(message); });
     });
     child.kill('SIGKILL');
