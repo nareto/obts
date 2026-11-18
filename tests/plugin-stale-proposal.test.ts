@@ -18,6 +18,10 @@ const roots: string[] = [];
 const servers: ObtsServer[] = [];
 const nativeWrite = NodeDataAdapter.prototype.writeBinary;
 const pluginMain = createRequire(import.meta.url)('../obsidian-plugin/src/main.cjs') as any;
+// A SIGKILL child boots the whole plugin and has to reach its publication seam
+// before the parent kills it. Booting took longer than 15 s whenever the host was
+// shared, so the parent gave up on a child that was still working.
+const CHILD_SEAM_DEADLINE_MS = 60_000;
 const stableJson = (value: any): string => JSON.stringify(value, (_key, item) =>
   item && typeof item === 'object' && !Array.isArray(item)
     ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b)))
@@ -203,9 +207,24 @@ describe('client stale authoring cohorts with the real server', () => {
     await f.core.mutateStaleProvenance(async (saved: any) => { for (const h of saved.horizons) h.expiry = Date.now() - 1; });
     let release!: () => void;
     f.core.adapter.promise = new Promise<void>((resolve) => { release = resolve; });
+    // The cohort captures the vault once before it parks on the adapter drain and
+    // again after it. A raw write landing while the first capture is still reading
+    // note.md is a legitimate "contents changed during a checkpoint" outcome, so
+    // wait for that capture to finish instead of for a fixed 20 ms that a loaded
+    // host does not honour.
+    const capturePaths = f.core.localChangedPathsFromTree.bind(f.core);
+    let signalFirstCapture!: () => void;
+    const firstCapture = new Promise<void>((resolve) => { signalFirstCapture = resolve; });
+    let captures = 0;
+    f.core.localChangedPathsFromTree = async (...args: any[]) => {
+      const result = await capturePaths(...args);
+      captures += 1;
+      if (captures === 1) signalFirstCapture();
+      return result;
+    };
     let completed = false;
     const expirePromise = f.core.queueStaleCohort((await f.plugin.readState()).local_main, f.m0).then(() => { completed = true; });
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await firstCapture;
     expect(completed).toBe(false);
     expect((await f.provenance()).horizons.length).toBeGreaterThan(0);
     const bytes = Buffer.from(LOCAL);
@@ -910,7 +929,7 @@ describe('accepted ordinary rename base boundaries', () => {
     const child = fork('tests/fixtures/stale-proposal-child.mjs', [f.dir, f.url, seam], { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
     try {
       await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error('Publication seam timeout')), 15000);
+        const timer = setTimeout(() => reject(new Error('Publication seam timeout')), CHILD_SEAM_DEADLINE_MS);
         child.once('message', (message: any) => { clearTimeout(timer); expect(message.seam).toBe(seam); resolve(); });
         child.once('exit', () => { clearTimeout(timer); reject(new Error('Child exited before publication seam')); });
       });
@@ -1054,7 +1073,7 @@ it.each(['replacement-intent', 'replacement-ref', 'accepted-record', 'accepted-c
   const child = fork('tests/fixtures/stale-proposal-child.mjs', [f.dir, f.url, seam], { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
   try {
     await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('Publication seam timeout')), 15000);
+      const timer = setTimeout(() => reject(new Error('Publication seam timeout')), CHILD_SEAM_DEADLINE_MS);
       child.once('message', (message: any) => { clearTimeout(timer); expect(message.seam).toBe(seam); resolve(); });
       child.once('exit', () => { clearTimeout(timer); reject(new Error('Child exited before publication seam')); });
     });

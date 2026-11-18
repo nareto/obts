@@ -82,6 +82,11 @@ class ApplyCounter {
   }
 }
 
+// Each measured case builds two fixtures and drives a full catch-up apply over them:
+// the eight-file one costs 27 s on an idle workstation and crossed the old 120 s
+// deadline on a shared four-core host while it was still progressing.
+const APPLY_MEASUREMENT_DEADLINE_MS = 300_000;
+
 const cleanups: Array<() => Promise<void>> = [];
 
 afterEach(async () => {
@@ -184,7 +189,7 @@ describe('committed apply tail is proportional to the change', () => {
     // no whole-vault read, no second pass over the bytes.
     expect(large.vaultCalls - small.vaultCalls).toBeLessThanOrEqual(160 - 40 + 8);
     expect(await noteBytes(large.vaultDir, 40)).toBe('remote edit 0\n');
-  }, 120_000);
+  }, APPLY_MEASUREMENT_DEADLINE_MS);
 
   it('reads and hashes only the change for a larger catch-up', async () => {
     const small = await measureFullApplyCatchUp(40, 8);
@@ -202,7 +207,7 @@ describe('committed apply tail is proportional to the change', () => {
     expect(small.vaultReadKiB).toBeLessThanOrEqual(16);
     expect(large.vaultCalls - small.vaultCalls).toBeLessThanOrEqual(160 - 40 + 8);
     expect(await noteBytes(large.vaultDir, 47)).toBe('remote edit 7\n');
-  }, 120_000);
+  }, APPLY_MEASUREMENT_DEADLINE_MS);
 
   it('preserves a footprint edit that no watcher hint named', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });

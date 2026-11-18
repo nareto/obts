@@ -115,7 +115,11 @@ describe('Phase 1 sync without conflict resolution', () => {
 
   afterEach(async () => {
     await server.app.close();
-    await rm(root, { recursive: true, force: true });
+    // A fixture root holds thousands of files and a plugin may still be finishing a
+    // write when the test ends, so a recursive removal needs the retries that Node
+    // only performs when asked: without them a concurrent writer surfaces as
+    // ENOTEMPTY from the cleanup instead of the test's own result.
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   it('runs first setup once and initializes vault main to a real empty-tree commit', async () => {
@@ -6679,6 +6683,11 @@ describe('Phase 1 sync without conflict resolution', () => {
     await expect(stat(join(deviceDir, '.obts', 'upload-transfer.json'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  // Each case builds a vault of 3274 tracked entries and 3894 ignored local files and
+  // drives several whole-vault syncs, so it costs one to two minutes even on a fast
+  // workstation (135 s / 59 s / 58 s measured here). The deadline is sized to that
+  // work with room for the four-way sharing this host is configured for, instead of
+  // the 180 s that failed a case that was still progressing.
   it.each(['open', 'injected-processing', 'completed'])(
     'handles a withdrawn completed directory advance with a %s transfer', async (transferOutcome) => {
     const admin = await setupAdminAndVault(baseUrl);
@@ -6929,7 +6938,7 @@ describe('Phase 1 sync without conflict resolution', () => {
       .toBe(`visible unsynced ${filePath}\n`);
     expect(await readFile(join(phoneDir, '.local-cache', 'ignored-0.md'), 'utf8')).toBe('ignored bytes 0\n');
     expect(await phone.syncOnce()).toMatchObject({ status: 'Synced' });
-  }, 180_000);
+  }, 600_000);
 
   it('repairs a stale directory baseline without replacing queued local history', async () => {
     const admin = await setupAdminAndVault(baseUrl);

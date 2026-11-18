@@ -20,6 +20,24 @@ import {
 
 const sleep = async (ms: number) => await new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Waits until the background deletion worker has settled this vault: the job is either gone because
+ * the deletion finished, or it carries the error code of the retry it recorded. A fixed sleep below
+ * only says that nothing had happened yet, and on a shared four-core host the worker's own residue
+ * classification takes longer than a few tens of milliseconds.
+ */
+async function settledDeletionSnapshot(server: ObtsServer, vaultId: string, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  let snapshot = await server.store.snapshot();
+  while (Date.now() < deadline) {
+    const job = snapshot.deletion_jobs.find((candidate) => candidate.vault_id === vaultId);
+    if (!job || job.error_code !== null) return snapshot;
+    await sleep(20);
+    snapshot = await server.store.snapshot();
+  }
+  return snapshot;
+}
+
 const diagnosticReport = {
   schema_version: 1,
   event_id: 'dgr_0123456789abcdef0123456789abcdef',
@@ -286,8 +304,7 @@ describe('vault deletion hardening', () => {
       method: 'DELETE', url: `/api/v1/vaults/${vaultId}`, headers: { cookie, 'x-obts-csrf': csrf }, payload: { confirmation: `DELETE ${vaultId}` }
     });
     expect(accepted.statusCode).toBe(202);
-    await sleep(80);
-    const snapshot = await server.store.snapshot();
+    const snapshot = await settledDeletionSnapshot(server, vaultId);
     expect(snapshot.deletion_jobs.some((job) => job.vault_id === vaultId)).toBe(true);
     expect(snapshot.deletion_receipts.some((receipt) => receipt.vault_id === vaultId)).toBe(false);
     await expect(lstat(join(dataDir, 'git', `${vaultId}.git`))).resolves.toBeTruthy();
@@ -311,8 +328,7 @@ describe('vault deletion hardening', () => {
       method: 'DELETE', url: `/api/v1/vaults/${vaultId}`, headers: { cookie, 'x-obts-csrf': csrf }, payload: { confirmation: `DELETE ${vaultId}` }
     });
     expect(accepted.statusCode).toBe(202);
-    await sleep(80);
-    const snapshot = await server.store.snapshot();
+    const snapshot = await settledDeletionSnapshot(server, vaultId);
     expect(snapshot.deletion_jobs.some((job) => job.vault_id === vaultId)).toBe(true);
     expect(snapshot.deletion_receipts.some((receipt) => receipt.vault_id === vaultId)).toBe(false);
     await expect(lstat(join(dataDir, 'git', `${vaultId}.git`))).resolves.toBeTruthy();
@@ -352,8 +368,7 @@ describe('vault deletion hardening', () => {
       method: 'DELETE', url: `/api/v1/vaults/${vaultId}`, headers: { cookie, 'x-obts-csrf': csrf }, payload: { confirmation: `DELETE ${vaultId}` }
     });
     expect(accepted.statusCode).toBe(202);
-    await sleep(80);
-    const snapshot = await server.store.snapshot();
+    const snapshot = await settledDeletionSnapshot(server, vaultId);
     expect(snapshot.deletion_jobs.some((job) => job.vault_id === vaultId)).toBe(true);
     expect(snapshot.deletion_receipts.some((receipt) => receipt.vault_id === vaultId)).toBe(false);
     expect(await readFile(join(outside, 'sentinel'), 'utf8')).toBe('preserve');
@@ -459,8 +474,7 @@ describe('vault deletion hardening', () => {
       method: 'DELETE', url: `/api/v1/vaults/${vaultId}`, headers: { cookie, 'x-obts-csrf': csrf }, payload: { confirmation: `DELETE ${vaultId}` }
     });
     expect(accepted.statusCode).toBe(202);
-    await sleep(80);
-    const snapshot = await server.store.snapshot();
+    const snapshot = await settledDeletionSnapshot(server, vaultId);
     expect(snapshot.deletion_receipts.some((receipt) => receipt.vault_id === vaultId)).toBe(false);
     expect(snapshot.deletion_jobs.find((job) => job.vault_id === vaultId)?.error_code).toBe('unattributed_residue');
     await expect(lstat(join(dataDir, 'transfers', 'trn_malformed', 'session.json'))).resolves.toBeTruthy();
@@ -492,8 +506,7 @@ describe('vault deletion hardening', () => {
       method: 'DELETE', url: `/api/v1/vaults/${vaultId}`, headers: { cookie, 'x-obts-csrf': csrf }, payload: { confirmation: `DELETE ${vaultId}` }
     });
     expect(accepted.statusCode).toBe(202);
-    await sleep(80);
-    const snapshot = await server.store.snapshot();
+    const snapshot = await settledDeletionSnapshot(server, vaultId);
     expect(snapshot.deletion_receipts.some((receipt) => receipt.vault_id === vaultId)).toBe(false);
     expect(snapshot.deletion_jobs.find((job) => job.vault_id === vaultId)?.error_code).toBe('unattributed_residue');
     await expect(lstat(join(dataDir, 'transfers', created.descriptor.transfer_id))).resolves.toBeTruthy();
@@ -548,8 +561,7 @@ describe('vault deletion hardening', () => {
       method: 'DELETE', url: `/api/v1/vaults/${vaultId}`, headers: { cookie, 'x-obts-csrf': csrf }, payload: { confirmation: `DELETE ${vaultId}` }
     });
     expect(accepted.statusCode).toBe(202);
-    await sleep(80);
-    const snapshot = await server.store.snapshot();
+    const snapshot = await settledDeletionSnapshot(server, vaultId);
     expect(snapshot.deletion_receipts.some((receipt) => receipt.vault_id === vaultId)).toBe(false);
     expect(snapshot.deletion_jobs.find((job) => job.vault_id === vaultId)?.error_code).toBe('unattributed_residue');
     await expect(lstat(join(dataDir, 'git', 'unknown-material'))).resolves.toBeTruthy();

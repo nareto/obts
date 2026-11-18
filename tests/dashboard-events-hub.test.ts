@@ -150,17 +150,22 @@ describe('dashboard event hub', () => {
     const f = await hubFixture();
     const a = f.open('ses_a', 'usr_a');
     const b = f.open('ses_b', 'usr_b');
+    // The coalescing window is real time: with a 5 ms window, a host slow enough to
+    // spend longer than that between two commits publishes the vault-level
+    // invalidation before the account-level rename arrives. Held timers make the
+    // three commits land in one window on any host; what is published is unchanged.
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
     await f.store.mutate((db) => { db.devices[0]!.status = 'ahead'; });
     await f.store.mutate((db) => { db.devices[0]!.local_status_label = 'Synced'; });
     await f.store.mutate((db) => { db.vaults[1]!.display_name = 'renamed'; });
-    await settle();
+    await vi.advanceTimersByTimeAsync(10);
     expect(a.sink.events()).toEqual([
       { event: 'refresh', data: {} },
       { event: 'invalidate', data: { account: true, vault_ids: [] } }
     ]);
     expect(b.sink.events()).toEqual([{ event: 'refresh', data: {} }]);
     await f.store.mutate((db) => { db.devices[1]!.status = 'ahead'; });
-    await settle();
+    await vi.advanceTimersByTimeAsync(10);
     expect(b.sink.events().at(-1)).toEqual({ event: 'invalidate', data: { account: false, vault_ids: ['vlt_b'] } });
     expect(JSON.stringify(a.sink.events())).not.toContain('vlt_b');
     f.hub.close();
