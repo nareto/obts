@@ -5145,7 +5145,27 @@ describe('Phase 1 sync without conflict resolution', () => {
       return snapshot;
     };
 
+    // The repair probe below needs the vault durably blocked, and a blocked vault legitimately refuses
+    // device traffic, so the push in flight must not poll while that state is in place: hold its
+    // transfer-status request at the client until the block is cleared. The repair runs slower or
+    // faster with the host, and the poll interval is well inside that spread, so without the hold a
+    // loaded host answers the poll with the refusal the block is supposed to produce and the push
+    // fails for a reason this case is not about.
+    const originalFetch = globalThis.fetch;
+    const transferPollPath = /\/sync\/push-transfers\/[^/]+$/u;
+    let holdTransferPolls = false;
+    let releaseTransferPolls!: () => void;
+    const transferPollsReleased = new Promise<void>((resolve) => { releaseTransferPolls = resolve; });
+    globalThis.fetch = async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      const target = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (holdTransferPolls && (init?.method ?? 'GET') === 'GET' && transferPollPath.test(target.pathname)) {
+        await transferPollsReleased;
+      }
+      return await originalFetch(input, init);
+    };
+
     await writeFile(join(deviceDir, 'next.md'), 'next\n');
+    holdTransferPolls = true;
     injectReadinessRace = true;
     try {
       const ready = await fetch(`${baseUrl}/health/ready`);
@@ -5169,6 +5189,9 @@ describe('Phase 1 sync without conflict resolution', () => {
       releaseRefUpdate();
       server.git.updateRef = originalUpdateRef;
       server.store.snapshot = originalSnapshot;
+      holdTransferPolls = false;
+      releaseTransferPolls();
+      globalThis.fetch = originalFetch;
     }
     expect(raceInjected).toBe(true);
     await expect(syncing).resolves.toMatchObject({ status: 'Synced' });
