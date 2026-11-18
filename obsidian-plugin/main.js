@@ -28964,21 +28964,30 @@ var ObtsObsidianClient = class {
     if (!authoringBase || state.local_head !== authoringBase || !state.local_main) return false;
     if (Object.keys(prior.obligations).length > 0 || prior.held_proposals.length > 0 || prior.rename_pairs.length > 0 || prior.queued_replacement || prior.intent && !["merged", "noop"].includes(prior.intent.outcome)) return false;
     if (await this.readDurableCatchup()) return false;
-    if ((await this.readQueue()).changed_paths.length > 0) return false;
     if (!await exists(this.fsp, this.directoryStatePath)) return false;
     const directoryState = await this.readDirectoryState();
     if (directoryState.pending_intents.length > 0 || directoryState.explicit_empty_dirs.some((dirPath) => !explicitDirectories.includes(dirPath))) return false;
     if (!await this.commitExists(authoringBase) || !await this.commitExists(state.local_main)) return false;
     if (await this.readCommitTreeOid(authoringBase) !== await this.readCommitTreeOid(targetMain)) return false;
+    try {
+      await this.plugin.flushWatcherHints?.();
+    } catch {
+      return false;
+    }
+    const { obligations, rename_pairs: renamePairs } = await this.readStaleProvenance();
+    if (renamePairs.length > 0) return false;
     const footprint = /* @__PURE__ */ new Set([
       ...await this.changedTreePaths(state.local_main, targetMain),
-      ...Object.keys((await this.readStaleProvenance()).obligations)
+      ...Object.keys(obligations)
     ]);
     if (footprint.has(".gitignore")) return false;
+    const hinted = new Set((await this.readQueue()).changed_paths);
     try {
       for (const filePath of [...footprint].sort()) {
         const { fingerprint } = await this.readRecoveryFileSnapshot(filePath);
-        if (!this.fingerprintMatchesTarget(fingerprint, await this.readTreePathOid(targetMain, filePath))) return false;
+        if (this.fingerprintMatchesTarget(fingerprint, await this.readTreePathOid(targetMain, filePath))) continue;
+        if (hinted.has(filePath) && !Object.hasOwn(obligations, filePath) && fingerprint.kind === "file" && !this.fingerprintMatchesTarget(fingerprint, await this.readTreePathOid(state.local_main, filePath))) continue;
+        return false;
       }
     } catch (error) {
       if (error instanceof LocalSnapshotChangedError) return false;

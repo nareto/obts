@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -180,9 +180,31 @@ describe('ref-only apply (OBTS-SYNC-DELTA-001)', () => {
     const settled = { ...state, local_main: main };
     expect(await value.core.refOnlyApplyEligible(settled, main, main, empty)).toBe(true);
 
+    // A hinted edit on top of local_head stays for ordinary capture over T;
+    // bytes equal to the pre-apply main or a deletion still need a full apply.
+    await writeFile(join(value.vaultDir, 'a.md'), 'a2 typing\n');
+    expect(await value.core.refOnlyApplyEligible(state, main, main, empty)).toBe(false);
+    await value.plugin.recordLocalChangeHint(['a.md', 'b.md']);
+    expect(await value.core.refOnlyApplyEligible(state, main, main, empty)).toBe(true);
+    // A stale-proposal obligation recorded after `prior` was read, a rename a
+    // late watcher flush records, or a flush that fails keeps the full apply.
+    await value.core.mutateStaleProvenance(async (saved: any) => { saved.obligations['a.md'] = obligation; });
+    expect(await value.core.refOnlyApplyEligible(state, main, main, empty)).toBe(false);
+    await value.core.mutateStaleProvenance(async (saved: any) => { delete saved.obligations['a.md']; });
+    const host = value.core.plugin;
+    const flush = host.flushWatcherHints;
+    host.flushWatcherHints = async () => { throw new Error('hint write failed'); };
+    expect(await value.core.refOnlyApplyEligible(state, main, main, empty)).toBe(false);
+    host.flushWatcherHints = flush;
+    expect(await value.core.refOnlyApplyEligible(state, main, main, empty)).toBe(true);
+    await writeFile(join(value.vaultDir, 'a.md'), 'a0\n');
+    expect(await value.core.refOnlyApplyEligible(state, main, main, empty)).toBe(false);
+    await rm(join(value.vaultDir, 'a.md'));
+    expect(await value.core.refOnlyApplyEligible(state, main, main, empty)).toBe(false);
+    await writeFile(join(value.vaultDir, 'a.md'), 'a1 local\n');
+
     // Local work a full apply would publish: an empty folder the target does
-    // not list, even when directory state adopted it without an intent, and a
-    // pending watcher hint.
+    // not list, even when directory state adopted it without an intent.
     await mkdir(join(value.vaultDir, 'Empty'));
     await value.core.refreshDirectoryStateFromDisk([]);
     expect(await value.core.refOnlyApplyEligible(settled, main, main, empty, [])).toBe(false);
@@ -190,8 +212,38 @@ describe('ref-only apply (OBTS-SYNC-DELTA-001)', () => {
     await rm(join(value.vaultDir, 'Empty'), { recursive: true });
     await value.core.refreshDirectoryStateFromDisk([]);
     expect(await value.core.refOnlyApplyEligible(settled, main, main, empty)).toBe(true);
-    await value.plugin.recordLocalChangeHint(['b.md']);
+
+    await rename(join(value.vaultDir, 'b.md'), join(value.vaultDir, 'c.md'));
+    host.flushWatcherHints = async () => { await value.core.recordLocalRenameHint('b.md', 'c.md'); };
     expect(await value.core.refOnlyApplyEligible(settled, main, main, empty)).toBe(false);
+    expect((await value.core.readStaleProvenance()).rename_pairs).toHaveLength(1);
+    host.flushWatcherHints = flush;
+  });
+
+  it('accepts its own push by ref-only apply while the user keeps editing the pushed file', async () => {
+    const value = await fixture();
+    const refOnly = spy(value.core, 'applyRefOnly');
+    const staged = spy(value.core, 'stageApplyRecoveryFiles');
+    const preserved = spy(value.core, 'queuePreservedLocalChanges');
+    let typed = 0;
+    spy(value.core, 'pushInChunks', async () => {
+      typed += 1;
+      if (typed > 1) return;
+      await writeFile(join(value.vaultDir, 'a.md'), 'a2 still typing\n');
+      await value.plugin.recordLocalChangeHint(['a.md']);
+    });
+
+    await writeFile(join(value.vaultDir, 'a.md'), 'a1 local\n');
+    expect((await settle(value.plugin)).at(-1)).toBe('Synced');
+
+    expect(typed).toBe(2);
+    expect(refOnly).toHaveLength(2);
+    expect(staged).toHaveLength(0);
+    expect(preserved).toHaveLength(0);
+    const main = await currentMain(value.server);
+    await expectSettledAt(value, value.core, main);
+    expect(await blobAt(value.core, main, 'a.md')).toBe('a2 still typing\n');
+    expect(await readFile(join(value.vaultDir, 'a.md'), 'utf8')).toBe('a2 still typing\n');
   });
 
   it('leaves an unrelated edit made during the ref-only apply for ordinary capture', async () => {

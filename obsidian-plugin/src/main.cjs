@@ -6285,8 +6285,6 @@ class ObtsObsidianClient {
     if (Object.keys(prior.obligations).length > 0 || prior.held_proposals.length > 0 || prior.rename_pairs.length > 0 ||
         prior.queued_replacement || (prior.intent && !["merged", "noop"].includes(prior.intent.outcome))) return false;
     if (await this.readDurableCatchup()) return false;
-    // A full apply also captures hinted local edits on top of the target.
-    if ((await this.readQueue()).changed_paths.length > 0) return false;
     // A full apply turns local empty folders the target lacks into intents.
     // Without recorded directory state, or with a recorded empty folder the
     // target does not list, only that path can preserve them.
@@ -6296,15 +6294,32 @@ class ObtsObsidianClient {
         directoryState.explicit_empty_dirs.some((dirPath) => !explicitDirectories.includes(dirPath))) return false;
     if (!(await this.commitExists(authoringBase)) || !(await this.commitExists(state.local_main))) return false;
     if (await this.readCommitTreeOid(authoringBase) !== await this.readCommitTreeOid(targetMain)) return false;
+    // Hints from saves that already finished must be durable before they are
+    // read, and a rename they record is lineage `prior` never saw.
+    try {
+      await this.plugin.flushWatcherHints?.();
+    } catch {
+      return false;
+    }
+    const { obligations, rename_pairs: renamePairs } = await this.readStaleProvenance();
+    if (renamePairs.length > 0) return false;
     const footprint = new Set([
       ...await this.changedTreePaths(state.local_main, targetMain),
-      ...Object.keys((await this.readStaleProvenance()).obligations)
+      ...Object.keys(obligations)
     ]);
     if (footprint.has(".gitignore")) return false;
+    const hinted = new Set((await this.readQueue()).changed_paths);
     try {
       for (const filePath of [...footprint].sort()) {
         const { fingerprint } = await this.readRecoveryFileSnapshot(filePath);
-        if (!this.fingerprintMatchesTarget(fingerprint, await this.readTreePathOid(targetMain, filePath))) return false;
+        if (this.fingerprintMatchesTarget(fingerprint, await this.readTreePathOid(targetMain, filePath))) continue;
+        // T's tree is local_head's, so a hinted file holding neither T's nor
+        // the pre-apply main's bytes is a later edit on top of local_head. It
+        // stays visible and hinted for ordinary capture over T. Bytes equal to
+        // the pre-apply main may be a head that was never materialized.
+        if (hinted.has(filePath) && !Object.hasOwn(obligations, filePath) && fingerprint.kind === "file" &&
+            !this.fingerprintMatchesTarget(fingerprint, await this.readTreePathOid(state.local_main, filePath))) continue;
+        return false;
       }
     } catch (error) {
       if (error instanceof LocalSnapshotChangedError) return false;

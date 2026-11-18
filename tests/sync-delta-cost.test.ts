@@ -145,6 +145,43 @@ describe('sync cost is proportional to the change', () => {
     expect(overlapSettled.calls).toBeLessThanOrEqual(110);
   }, 300_000);
 
+  // Typing that continues while this device's own push is in flight leaves a
+  // hinted edit on top of the accepted tree. Acknowledging the push must stay
+  // a ref-only apply instead of a whole-vault apply plus preserve commit.
+  it('measures background maintenance while typing continues during own pushes', async () => {
+    const core = (fixture.reader as unknown as { client: any }).client;
+    const pushInChunks = core.pushInChunks;
+    const queuePreservedLocalChanges = core.queuePreservedLocalChanges;
+    let typed = 0;
+    let preserved = 0;
+    core.pushInChunks = async (...args: unknown[]) => {
+      typed += 1;
+      await fixture.reader.recordLocalChangeHint([await writeNote(fixture.readerDir, 36, `still typing ${typed}\n`)]);
+      return await pushInChunks.apply(core, args);
+    };
+    core.queuePreservedLocalChanges = async (...args: unknown[]) => {
+      preserved += 1;
+      return await queuePreservedLocalChanges.apply(core, args);
+    };
+    try {
+      await fixture.reader.recordLocalChangeHint([await writeNote(fixture.readerDir, 36, 'typing 0\n')]);
+      for (let cycle = 0; cycle < 3; cycle += 1) {
+        const { value, cost } = await fixture.meter.measure(() => fixture.reader.maintenanceTick());
+        report[`bg typing during own push ${cycle}`] = { ...cost, statuses: value.status, localPacks: await countLocalPacks(fixture.readerDir) };
+        // 27 as an ordinary own push, plus the post-push folder reconcile
+        // that follow-up hints still owe; a whole-vault apply reads every file.
+        expect(cost.byArea.vault ?? 0).toBe(109);
+        expect(cost.calls).toBeLessThanOrEqual(1500);
+      }
+    } finally {
+      core.pushInChunks = pushInChunks;
+      core.queuePreservedLocalChanges = queuePreservedLocalChanges;
+    }
+    expect(typed).toBe(3);
+    expect(preserved).toBe(0);
+    await measureBackground('bg typing settle');
+  }, 300_000);
+
   it('keeps syncing when local pack maintenance fails', async () => {
     const core = (fixture.reader as unknown as { client: any }).client;
     const consolidator = core.packConsolidator;
