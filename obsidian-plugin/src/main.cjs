@@ -12653,7 +12653,7 @@ class ObtsObsidianClient {
     // Background apply leaves outside-footprint work for the next capture,
     // including folder hints. With no acknowledgement, nothing needs clearing.
     if (acknowledgedKeys.size === 0 && (this.fullInventoryCurrent() || this.inventoryDeferredBehindCatchUp) &&
-        (deferReconcile || !this.plugin.syncQueued && (await this.readQueue()).changed_paths.length === 0)) return;
+        (deferReconcile || await this.pendingHintsRecordNoFolderChange())) return;
     await this.reconcileDirectoryState();
     const directoryState = await this.readDirectoryState();
     const remaining = directoryState.pending_intents.filter((intent) => !acknowledgedKeys.has(directoryIntentGenerationKey(intent)));
@@ -12661,6 +12661,34 @@ class ObtsObsidianClient {
       pending_intents: remaining,
       updated_at: nowIso()
     }));
+  }
+
+  // OBTS-SYNC-DELTA-001: a folder that appears, disappears or is renamed is
+  // always its own watcher hint, and such a hint forces the whole-vault
+  // inventory that records it. Hints that are existing files owe no folder
+  // state, but a recorded empty folder that is gone still does: the next apply
+  // recreates it from the target, and only this walk records the deletion.
+  async pendingHintsRecordNoFolderChange() {
+    try {
+      await this.plugin.flushWatcherHints?.();
+    } catch {
+      return false;
+    }
+    if ((this.plugin.pendingWatcherRenames || []).length > 0) return false;
+    const hints = new Set([...((await this.readQueue()).changed_paths || []), ...(this.plugin.pendingWatcherPaths || [])]);
+    for (const filePath of hints) {
+      let stat;
+      try {
+        stat = await this.adapter.stat(filePath);
+      } catch {
+        return false;
+      }
+      if (stat?.type !== "file") return false;
+    }
+    for (const dirPath of (await this.readDirectoryState()).explicit_empty_dirs) {
+      if (!(await this.adapterIsDirectory(dirPath))) return false;
+    }
+    return true;
   }
 
   async classifyDirectoryIntentsForRecovery(remoteIntents) {

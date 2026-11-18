@@ -23272,7 +23272,7 @@ var { blobSizeFromGit } = require_blob_size_reader();
 var { createRootIgnorePolicy, MAX_ROOT_IGNORE_BYTES } = require_rootIgnore();
 var { findUnportablePaths, isRestrictedNamePlatform, segmentHasReservedCharacters } = require_namePortability();
 var API_VERSION = obtsRuntime.obtsApiVersion || "2026-07-12.browser-onboarding";
-var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.7.12";
+var PLUGIN_VERSION = obtsRuntime.obtsPluginVersion || "0.7.13";
 var SYNC_DEBOUNCE_MS = 1500;
 var EMPTY_JSON_BODY = "{}";
 var BACKGROUND_SYNC_INTERVAL_MS = 10 * 1e3;
@@ -34516,7 +34516,7 @@ var ObtsObsidianClient = class {
   }
   async clearAcknowledgedDirectoryIntents(acknowledgedIntents, deferReconcile = false) {
     const acknowledgedKeys = new Set((Array.isArray(acknowledgedIntents) ? acknowledgedIntents : []).filter((intent) => intent && typeof intent.intent_id === "string" && Number.isSafeInteger(intent.generation)).map(directoryIntentGenerationKey));
-    if (acknowledgedKeys.size === 0 && (this.fullInventoryCurrent() || this.inventoryDeferredBehindCatchUp) && (deferReconcile || !this.plugin.syncQueued && (await this.readQueue()).changed_paths.length === 0)) return;
+    if (acknowledgedKeys.size === 0 && (this.fullInventoryCurrent() || this.inventoryDeferredBehindCatchUp) && (deferReconcile || await this.pendingHintsRecordNoFolderChange())) return;
     await this.reconcileDirectoryState();
     const directoryState = await this.readDirectoryState();
     const remaining = directoryState.pending_intents.filter((intent) => !acknowledgedKeys.has(directoryIntentGenerationKey(intent)));
@@ -34524,6 +34524,33 @@ var ObtsObsidianClient = class {
       pending_intents: remaining,
       updated_at: nowIso()
     }));
+  }
+  // OBTS-SYNC-DELTA-001: a folder that appears, disappears or is renamed is
+  // always its own watcher hint, and such a hint forces the whole-vault
+  // inventory that records it. Hints that are existing files owe no folder
+  // state, but a recorded empty folder that is gone still does: the next apply
+  // recreates it from the target, and only this walk records the deletion.
+  async pendingHintsRecordNoFolderChange() {
+    try {
+      await this.plugin.flushWatcherHints?.();
+    } catch {
+      return false;
+    }
+    if ((this.plugin.pendingWatcherRenames || []).length > 0) return false;
+    const hints = /* @__PURE__ */ new Set([...(await this.readQueue()).changed_paths || [], ...this.plugin.pendingWatcherPaths || []]);
+    for (const filePath of hints) {
+      let stat;
+      try {
+        stat = await this.adapter.stat(filePath);
+      } catch {
+        return false;
+      }
+      if (stat?.type !== "file") return false;
+    }
+    for (const dirPath of (await this.readDirectoryState()).explicit_empty_dirs) {
+      if (!await this.adapterIsDirectory(dirPath)) return false;
+    }
+    return true;
   }
   async classifyDirectoryIntentsForRecovery(remoteIntents) {
     const directoryState = await this.readDirectoryState();

@@ -268,6 +268,11 @@ describe('hinted capture (OBTS-SYNC-DELTA-001)', () => {
     await value.core.clearAcknowledgedDirectoryIntents([]);
     expect(reconciles).toHaveLength(0);
 
+    // A hint that is an existing file records no folder change.
+    await value.plugin.recordLocalChangeHint(['a.md']);
+    await value.core.clearAcknowledgedDirectoryIntents([]);
+    expect(reconciles).toHaveLength(0);
+
     await value.plugin.recordLocalChangeHint(['notes']);
     await value.core.clearAcknowledgedDirectoryIntents([]);
     expect(reconciles).toHaveLength(1);
@@ -276,6 +281,24 @@ describe('hinted capture (OBTS-SYNC-DELTA-001)', () => {
     value.core.requestFullInventory();
     await value.core.clearAcknowledgedDirectoryIntents([]);
     expect(reconciles).toHaveLength(2);
+  });
+
+  it('reconciles a recorded empty folder that is gone even when every hint is a file', async () => {
+    const value = await fixture();
+    const reconciles = spy(value.core, 'reconcileDirectoryState');
+    await mkdir(join(value.vaultDir, 'Gone'));
+    await value.core.reconcileDirectoryState();
+    expect((await value.core.readDirectoryState()).explicit_empty_dirs).toContain('Gone');
+
+    await value.plugin.recordLocalChangeHint(['a.md']);
+    await value.core.clearAcknowledgedDirectoryIntents([]);
+    expect(reconciles).toHaveLength(1);
+
+    await rm(join(value.vaultDir, 'Gone'), { recursive: true });
+    await value.core.clearAcknowledgedDirectoryIntents([]);
+    expect(reconciles).toHaveLength(2);
+    expect((await value.core.readDirectoryState()).pending_intents)
+      .toContainEqual(expect.objectContaining({ op: 'delete', path: 'Gone' }));
   });
 });
 

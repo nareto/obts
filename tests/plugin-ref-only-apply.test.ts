@@ -120,6 +120,12 @@ async function blobAt(core: Core, commit: string, filePath: string): Promise<str
   return Buffer.from(await core.readBlobOid(entries.get(filePath))).toString('utf8');
 }
 
+async function serverDirectories(server: ObtsServer): Promise<string[]> {
+  const snapshot = await server.store.snapshot();
+  const vaultId = snapshot.vaults[0]!.vault_id;
+  return [...(snapshot.directory_state_by_vault[vaultId]?.explicit_dirs ?? [])].sort();
+}
+
 describe('ref-only apply (OBTS-SYNC-DELTA-001)', () => {
   it('accepts its own merged push without reading or writing vault files', async () => {
     const value = await fixture();
@@ -244,6 +250,62 @@ describe('ref-only apply (OBTS-SYNC-DELTA-001)', () => {
     await expectSettledAt(value, value.core, main);
     expect(await blobAt(value.core, main, 'a.md')).toBe('a2 still typing\n');
     expect(await readFile(join(value.vaultDir, 'a.md'), 'utf8')).toBe('a2 still typing\n');
+  });
+
+  it('leaves a folder created while its own push was in flight to the next inventory', async () => {
+    const value = await fixture();
+    const reconciles = spy(value.core, 'reconcileDirectoryState');
+    let walkedAtPush = 0;
+    let first = true;
+    spy(value.core, 'pushInChunks', async () => {
+      if (!first) return;
+      first = false;
+      await mkdir(join(value.vaultDir, 'Empty'));
+      await writeFile(join(value.vaultDir, 'a.md'), 'a2 still typing\n');
+      await value.plugin.recordLocalChangeHint(['a.md']);
+      walkedAtPush = reconciles.length;
+    });
+
+    await writeFile(join(value.vaultDir, 'a.md'), 'a1 local\n');
+    await value.plugin.recordLocalChangeHint(['a.md']);
+    await value.plugin.syncOnce();
+    // The acknowledgement found only a file hint, so no walk followed the push.
+    expect(reconciles).toHaveLength(walkedAtPush);
+
+    expect((await settle(value.plugin)).at(-1)).toBe('Synced');
+    expect(await serverDirectories(value.server)).toContain('Empty');
+    expect((await value.core.readDirectoryState()).explicit_empty_dirs).toContain('Empty');
+  });
+
+  it('keeps a folder its own push emptied by a deletion', async () => {
+    const value = await fixture();
+    await mkdir(join(value.vaultDir, 'notes'));
+    await writeFile(join(value.vaultDir, 'notes', 'x.md'), 'x0\n');
+    await value.plugin.recordLocalChangeHint(['notes/x.md']);
+    expect((await settle(value.plugin)).at(-1)).toBe('Synced');
+    expect(await serverDirectories(value.server)).not.toContain('notes');
+
+    const reconciles = spy(value.core, 'reconcileDirectoryState');
+    let walkedAtPush = 0;
+    let first = true;
+    spy(value.core, 'pushInChunks', async () => {
+      if (!first) return;
+      first = false;
+      await rm(join(value.vaultDir, 'notes', 'x.md'));
+      await writeFile(join(value.vaultDir, 'a.md'), 'a2 still typing\n');
+      await value.plugin.recordLocalChangeHint(['a.md', 'notes/x.md']);
+      walkedAtPush = reconciles.length;
+    });
+
+    await writeFile(join(value.vaultDir, 'a.md'), 'a1 local\n');
+    await value.plugin.recordLocalChangeHint(['a.md']);
+    await value.plugin.syncOnce();
+    // A hint whose path is gone still owes the walk, which records the folder.
+    expect(reconciles.length).toBeGreaterThan(walkedAtPush);
+
+    expect((await settle(value.plugin)).at(-1)).toBe('Synced');
+    expect(await serverDirectories(value.server)).toContain('notes');
+    expect(await value.core.adapterIsDirectory('notes')).toBe(true);
   });
 
   it('leaves an unrelated edit made during the ref-only apply for ordinary capture', async () => {
