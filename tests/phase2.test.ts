@@ -2349,19 +2349,10 @@ describe('Phase 2 dashboard conflict resolution', () => {
     expect((await server.store.snapshot()).conflicts.find((conflict) => conflict.conflict_id === result.conflictId)?.status).toBe('open');
   });
 
-  it('supports keep-both, insert-both, and manual conflict resolutions as merge commits', async () => {
-    const admin = await setupAdminAndVault(baseUrl);
-    for (const [index, resolutionKind] of (['keep_both_files', 'insert_both_blocks', 'manual'] as const).entries()) {
-      if (index > 0) {
-        const vault = await admin.post<{ vault_id: string }>(
-          '/api/v1/vaults',
-          {
-            display_name: `Vault ${resolutionKind}`
-          }
-        );
-        expect(vault.status).toBe(201);
-        admin.vaultId = vault.body.vault_id;
-      }
+  it.each(['keep_both_files', 'insert_both_blocks', 'manual'] as const)(
+    'supports the %s conflict resolution as a merge commit',
+    async (resolutionKind) => {
+      const admin = await setupAdminAndVault(baseUrl);
       const desktopDir = join(root, `desktop-${resolutionKind}`);
       const tabletDir = join(root, `tablet-${resolutionKind}`);
       await mkdir(desktopDir, { recursive: true });
@@ -2427,7 +2418,7 @@ describe('Phase 2 dashboard conflict resolution', () => {
         );
       }
     }
-  });
+  );
 
   it('rejects manual conflict resolutions that edit paths outside the conflict package', async () => {
     const admin = await setupAdminAndVault(baseUrl);
