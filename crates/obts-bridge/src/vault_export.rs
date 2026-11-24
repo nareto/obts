@@ -520,7 +520,11 @@ mod tests {
 
         let mut zip = ZipArchive::new(Cursor::new(bytes)).expect("open ZIP");
         assert_eq!(
-            zip.by_index(0).expect("manifest entry").name(),
+            zip.by_index(0)
+                .expect("manifest entry")
+                .name()
+                .expect("manifest entry name")
+                .as_ref(),
             "manifest.json"
         );
         let mut manifest_json = String::new();
